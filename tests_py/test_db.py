@@ -27,6 +27,12 @@ def test_tree_version_bump(tmp_path):
     db.bump_tree_version(conn)
     assert db.get_tree_version(conn) == 2
 
+def test_models_seed_has_five(tmp_path):
+    conn = db.init_db(str(tmp_path / "t.db"))
+    ids = {r[0] for r in conn.execute("SELECT id FROM models").fetchall()}
+    assert ids == {"qwen3-8b", "qwen3-32b", "claude-sonnet",
+                   "llava-omni", "sdxl-image"}
+
 def test_balanced_template_loaded(tmp_path):
     conn = db.init_db(str(tmp_path / "t.db"))
     tops = conn.execute(

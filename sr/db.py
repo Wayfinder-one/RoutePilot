@@ -301,6 +301,13 @@ _SEED_MODELS = [
      ["text", "long_ctx", "medium", "medium_speed"], 2),
     ("claude-sonnet", "anthropic", "claude-sonnet",
      ["text", "long_ctx", "expensive", "slow"], 3),
+    # 种子树去向引用的两个多媒体模型（设计方案 §3.6 模型卡清单）：
+    # llava-omni「文字＋图片 · 中等 · 中速」、sdxl-image「只画图 · 便宜 · 慢」。
+    # 不在阶梯（step NULL，阶梯读 settings.ladder），价格未定价（price NULL）。
+    ("llava-omni", "local", "llava-omni",
+     ["text", "image", "medium", "medium_speed"], None),
+    ("sdxl-image", "local", "sdxl-image",
+     ["image", "cheap", "slow"], None),
 ]
 
 _SEED_TAG_SETTINGS = [
