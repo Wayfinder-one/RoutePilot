@@ -5,7 +5,9 @@ let JSDOM;
 try { ({ JSDOM } = require('jsdom')); }
 catch { ({ JSDOM } = require(process.env.JSDOM_PATH ||
   '/Users/yuansu/.workbuddy/binaries/node/workspace/node_modules/jsdom')); }
-const html = fs.readFileSync(require('path').join(__dirname, '..', 'console-mockup.html'), 'utf8');
+const __pick = f => [require('path').join(__dirname, '..', f),
+  require('path').join(__dirname, '..', 'docs', 'prototypes', f)].find(p => fs.existsSync(p));
+const html = fs.readFileSync(__pick('console-mockup.html'), 'utf8');
 const dom = new JSDOM(html, { runScripts: 'dangerously', pretendToBeVisual: true });
 const { window } = dom, doc = window.document;
 window.Element.prototype.scrollIntoView = function () {};

@@ -8,7 +8,9 @@ try { ({ JSDOM } = require('jsdom')); }
 catch { ({ JSDOM } = require(process.env.JSDOM_PATH ||
   '/Users/yuansu/.workbuddy/binaries/node/workspace/node_modules/jsdom')); }
 
-const FILE = process.env.TARGET || path.join(__dirname, '..', 'console-v6.html');
+const __pick = f => [path.join(__dirname, '..', f),
+  path.join(__dirname, '..', 'docs', 'prototypes', f)].find(p => fs.existsSync(p));
+const FILE = process.env.TARGET || __pick('console-v6.html');
 const html = fs.readFileSync(FILE, 'utf8');
 
 // ── 语法检查：把内联脚本抽出来交给 vm 解析 ──────────────────────────
