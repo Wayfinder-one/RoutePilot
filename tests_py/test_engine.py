@@ -121,3 +121,32 @@ def test_templates_four_shapes():
              "context": {"value": 2}, "time_window": {"value": "night"}}
     assert evaluate(qual, night, CUTS).model == "qwen3-32b"
 
+
+# ── Task 6 折入项（Task 5 评审 Minor b，已批准）：真·全 miss 场景——兜底分支停用
+#    的内存树上，evaluate 返回防御决定，evaluate_trace 的 decision 与之恒等
+#    （{path, also_match, decision} 形状恒成立，decision 不再出现 None）。
+
+_MISS_SIG = {   # 精心全 miss：不命中安全/多媒体/编程/法律/成本/专属任一分支
+    "domain": {"value": "other", "confidence": 0.4},
+    "complexity": {"value": 0, "confidence": 0.4},
+    "jailbreak": {"value": 0, "confidence": 0.9},
+    "pii": {"value": [], "confidence": 0.9},
+    "modality": {"value": "text", "confidence": 0.9},
+    "user_feedback": {"value": None, "confidence": 0.4},
+    "fact_check": {"value": "no_check", "confidence": 0.8},
+    "keyword": {"value": []}, "language": {"value": "zh"}, "structure": {"value": "plain"},
+    "context": {"value": 2}, "turns": {"value": 0}, "tenant": {"value": "anonymous"},
+    "time_window": {"value": "weekday_day"}, "event": {"value": "none"},
+    "similarity": {"value": 0}, "reask": {"value": "no"},
+}
+
+def test_full_miss_defensive_decision(tmp_path):
+    conn = db.init_db(str(tmp_path / "t.db"))
+    conn.execute("UPDATE tree SET enabled=0 WHERE idx=90")   # 停用兜底分支 → 真·全 miss
+    nodes = rows_to_tree(conn.execute("SELECT * FROM tree ORDER BY idx").fetchall())
+    d = evaluate(nodes, _MISS_SIG, CUTS)
+    assert d.model is None and d.source == "fallback"        # 防御决定
+    tr = evaluate_trace(nodes, _MISS_SIG, CUTS)
+    assert tr["decision"] == d                               # trace 决策与 evaluate 恒等
+    assert tr["path"] and all(p["result"] != "hit" for p in tr["path"])
+

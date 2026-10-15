@@ -1,4 +1,5 @@
-"""分流树引擎：cond 求值 + first-hit-wins evaluate + 试算轨迹 + 四模板（spec §5.1–5.3）。
+"""分流树引擎：cond 求值 + first-hit-wins evaluate + 试算轨迹 + 四模板（spec §5.1–5.3）
++ 会话沿用（spec §4.4：extract_session / resolve_session）。
 
 模块职责（全项目的心脏）：
 - :data:`RouteDecision` —— spec §5.1 末定义逐字（kind/model/source/think/fallbacks/
@@ -6,26 +7,41 @@
 - :func:`match` / :func:`_atom` —— §5.1 条件语法：子句列表默认 AND；``or`` / ``not``
   只包普通子句不嵌套；``conf_min`` 把握度门槛走 :func:`sr.tags.conf_band`
   （规则标签 confidence=None 永不满足任何门槛）。
-- :func:`evaluate` —— §5.2 求值：节点 idx 升序 × 分支 idx 升序，首个 enabled 且
-  match 的分支 resolve（first-hit-wins）；special（会话沿用）本任务直接 continue
-  视为 miss（真沿用判定 Task 6）；兜底节点 cond=[] 由 match 恒真自然兜底。
-- :func:`evaluate_trace` —— 同一循环的试算版（§5.2 试算形状）：逐节点轨迹 path +
-  also_match（命中后被上方抢先的分支）+ decision，`POST /admin/tree/try` 的数据来源。
+- :func:`_walk` —— evaluate / evaluate_trace 的公共求值内核（Task 6 折入项 c）：
+  按 §5.2 同一循环顺序产出 skip/miss/hit/also 事件，两个消费端零重复。
+- :func:`evaluate` —— §5.2 求值：首个 hit 事件 resolve（first-hit-wins）；special
+  （会话沿用）分支恒视为 miss——沿用/解锁在进树前由 resolve_session 处理（§4.4）；
+  兜底节点 cond=[] 由 match 恒真自然兜底；全 miss（无兜底的坏树，体检硬错误 §10
+  拦截保存，正常不可达）返回防御性决定，不抛异常。
+- :func:`evaluate_trace` —— 同一内核的试算版（§5.2 试算形状）：逐节点轨迹 path +
+  also_match（命中后被上方抢先的分支）+ decision，`POST /admin/tree/try` 的数据来源；
+  全 miss 时 decision 复用 evaluate 的同一防御决定（Task 6 折入项 a），
+  ``{path, also_match, decision}`` 形状恒成立。
+- :func:`extract_session` —— §4.4 会话标识三级：x-session-id 头 → OpenAI ``user`` /
+  Anthropic ``metadata.user_id`` → sha1 退化指纹（仅 session_sticky 开启时启用，
+  R1 风险见 §4.4）。
+- :func:`resolve_session` —— §4.4 会话沿用判定：会话不存在 / idle 过期 / 阶梯无处
+  可升 → None 继续走树；无解锁反馈直接沿用（source='sticky'）；wrong_answer /
+  want_different 反馈解锁升一档或换一个（source='unlocked'，unlocks+1）。
 - :func:`rows_to_tree` —— tree 表行（parent IS NULL = 节点行，其余 = 分支行）→ 内存树。
 - :data:`TEMPLATES` —— §5.3 四模板 balanced/saver/quality/compliance；值为可被
   sr.db 落库的树定义（节点 dict 列表，与 init_db 种子同构）。
 
-依赖方向：engine → tags（conf_band / PII_KEYS）；engine 不 import db——db 单向
-import 本模块的 TEMPLATES，无循环依赖。
+依赖方向：engine → tags（conf_band / PII_KEYS）、engine → models（ladder_up /
+ladder_next，§4.4 解锁升档用）；engine 不 import db——db 单向 import 本模块的
+TEMPLATES，models 不 import 工程内模块，均无循环依赖。
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import random
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
+from sr.models import ladder_next, ladder_up
 from sr.tags import PII_KEYS, conf_band
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -42,7 +58,8 @@ class RouteDecision:
     source: str = "tree"                     # spec §5.1 枚举：'tree' | 'sticky' |
                                              # 'unlocked' | 'trial' | 'direct' |
                                              # 'fallback'；树命中 'tree'，试水掷签
-                                             # 后 'trial'，Task 6 另有 sticky/unlocked
+                                             # 后 'trial'，会话沿用/解锁由
+                                             # resolve_session 产 'sticky'/'unlocked'
     think: str | None = None                 # 'off' | 'light' | 'deep'（§5.1 透传上游）
     fallbacks: list[str] = field(default_factory=list)   # 回退链（可能为空，§5.1 fallback）
     block_msg: dict | None = None            # {"zh":…,"en":…}（§6.5 双语）
@@ -366,39 +383,85 @@ def rows_to_tree(rows: list) -> list[Node]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5) evaluate + resolve —— first-hit-wins（spec §5.2 伪码；Task 6 前的 M1 形态）
+# 5) _walk + evaluate + resolve —— first-hit-wins（spec §5.2 伪码）
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _walk(nodes: list[Node], signals: dict, conf_thresholds):
+    """evaluate / evaluate_trace 的公共求值内核（Task 6 折入项 c：消两份循环）。
+
+    按 §5.2 同一顺序（节点 idx 升序 × 分支 idx 升序）产出事件元组：
+    - ``("skip", node)``                    停用节点；
+    - ``("miss", node, reason)``            节点无命中（reason: new_session|no_match）；
+    - ``("hit", node, i, action, trial)``   首个 enabled 且 match 的非 special 分支；
+    - ``("also", node, i)``                 命中后余下节点里 match 的被抢先分支。
+
+    special 分支（起点会话沿用）恒视为 miss——沿用/解锁在进树前由 resolve_session
+    处理（§4.4 流程：先查会话，再走树），树内节点 0 仅供控制台展示语义。
+    """
+
+    def branch_hit(branch) -> bool:
+        return branch.enabled and match(branch.cond, signals, conf_thresholds)
+
+    hit = False
+    for node in nodes:
+        if hit:                                     # 命中后只收集 also_match
+            for i, branch in enumerate(node.branches):
+                if branch_hit(branch):
+                    yield ("also", node, i)
+            continue
+        if not node.enabled:
+            yield ("skip", node)
+            continue
+        found = None
+        for i, branch in enumerate(node.branches):
+            if not branch_hit(branch):
+                continue
+            if branch.action.get("kind") == "special":
+                continue                            # §4.4：沿用/解锁在进树前判定
+            found = (i, branch)
+            break
+        if found is None:
+            yield ("miss", node,
+                   "new_session" if node.kind == "sticky" else "no_match")
+        else:
+            i, branch = found
+            yield ("hit", node, i, branch.action, branch.trial)
+            hit = True
+
+
+def _defensive() -> RouteDecision:
+    """全树未命中（无兜底的坏树，体检硬错误 §10 拦截保存，正常不可达）的防御决定。
+
+    evaluate 与 evaluate_trace 全 miss 时共用本函数（Task 6 折入项 a：trace 的
+    decision 不再为 None）；每次新建实例，避免调用方互相改到同一对象。
+    """
+    return RouteDecision(kind="route", model=None, source="fallback")
 
 
 def evaluate(nodes: list[Node], signals: dict, conf_thresholds) -> RouteDecision:
     """节点 idx 升序 × 分支 idx 升序，首个 enabled 且 match 的分支 resolve。
 
-    - special 分支（起点会话沿用）即使 match 也 continue 视为 miss——真沿用判定
-      在 Task 6，本任务「新会话起点不适用」；节点 0 三分支全跳过后继续下一节点。
+    - 遍历顺序与命中语义在 :func:`_walk`（与 evaluate_trace 共用，行为不变）。
     - 兜底节点（kind=fallback）分支 cond=[] 由 match 恒真自然命中，无需特判。
-    - 停用节点/分支跳过；全树未命中（无兜底的坏树，体检硬错误 §10 拦截保存，
-      正常不可达）返回 model=None、source='fallback' 的防御性决定，不抛异常。
+    - 全树未命中（无兜底的坏树）返回 :func:`_defensive` 的防御性决定，不抛异常。
     """
-    for node in nodes:                              # idx 升序：位置即优先级
-        if not node.enabled:
-            continue
-        for i, branch in enumerate(node.branches):  # 同级亦按 idx
-            if not branch.enabled or not match(branch.cond, signals, conf_thresholds):
-                continue
-            if branch.action.get("kind") == "special":
-                continue                            # Task 6；新会话起点不适用 → miss
-            return _resolve(branch.action, branch.trial, [node.idx, i])
-    return RouteDecision(kind="route", model=None, source="fallback")
+    for ev in _walk(nodes, signals, conf_thresholds):
+        if ev[0] == "hit":
+            _, node, i, action, trial = ev
+            return _resolve(action, trial, [node.idx, i])
+    return _defensive()
 
 
 def _resolve(action: dict, trial: dict | None, hit_path: list[int]) -> RouteDecision:
-    """分支 action + trial 列 → RouteDecision（§5.1 去向表；Task 6 前不含 special）。
+    """分支 action + trial 列 → RouteDecision（§5.1 去向表；special 不经过本函数）。
 
     - trial 掷签 ``random.random() < ratio``（控制者裁定口径）命中 → 改道 trial.to、
       source='trial'，think/fallback 仍取原 action；trial 优先取分支列，缺省回退
       §5.1 示例中内嵌 action 的 trial 键。
     - block → kind='block' + block_msg（model/think 为 None，回退链为空）。
-    - special 不进入本函数（调用方按 miss continue）。
+    - special 不进入本函数（_walk 按恒 miss 跳过；沿用/解锁的 RouteDecision 由
+      resolve_session 直接构造，不经树 resolve）。
     """
     if trial is None:
         trial = action.get("trial")
@@ -417,7 +480,7 @@ def _resolve(action: dict, trial: dict | None, hit_path: list[int]) -> RouteDeci
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6) evaluate_trace —— 试算轨迹 + also_match（§5.2 试算形状；与 evaluate 同一循环）
+# 6) evaluate_trace —— 试算轨迹 + also_match（§5.2 试算形状；与 evaluate 同一内核）
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -427,41 +490,169 @@ def evaluate_trace(nodes: list[Node], signals: dict, conf_thresholds) -> dict:
     返回 ``{"path": […], "also_match": […], "decision": …}``：
     - path 每节点一条 ``{"node": idx, "branch": i|null, "result": hit|miss|skip,
       "reason": …}``；命中节点记 ``{"node": idx, "branch": i, "result": "hit"}``
-      （无需 reason）；起点节点（sticky）miss 记 reason="new_session"（本任务语义：
-      新会话起点不适用）；其余 miss 记 "no_match"；停用节点记 result="skip"、
-      reason="node_disabled"。
-    - 命中后继续扫余下节点收集 also_match（``{"node": idx, "branch": i}``，命中
-      但被上方抢先的分支，不再 resolve）——「试算高亮 + 标灰被抢先分支」的数据来源。
-    - decision 与 evaluate 同一 resolve 路径（trial 掷签同语义）。
+      （无需 reason）；起点节点（sticky）miss 记 reason="new_session"（沿用/解锁
+      在进树前由 resolve_session 判定，§4.4）；其余 miss 记 "no_match"；停用节点记
+      result="skip"、reason="node_disabled"。
+    - also_match 收集命中后被上方抢先的分支（``{"node": idx, "branch": i}``）——
+      「试算高亮 + 标灰被抢先分支」的数据来源。
+    - decision 与 evaluate 同一 _resolve 路径（trial 掷签同语义）；全 miss 时取
+      evaluate 同款防御决定（Task 6 折入项 a），形状恒成立。
     """
     path: list[dict] = []
     also_match: list[dict] = []
     decision: RouteDecision | None = None
-    hit = False
-    for node in nodes:
-        if hit:                                     # 命中后只收集 also_match
-            for i, branch in enumerate(node.branches):
-                if branch.enabled and match(branch.cond, signals, conf_thresholds):
-                    also_match.append({"node": node.idx, "branch": i})
-            continue
-        if not node.enabled:
-            path.append({"node": node.idx, "branch": None, "result": "skip",
+    for ev in _walk(nodes, signals, conf_thresholds):
+        if ev[0] == "skip":
+            path.append({"node": ev[1].idx, "branch": None, "result": "skip",
                          "reason": "node_disabled"})
-            continue
-        hit_at = None
-        for i, branch in enumerate(node.branches):
-            if not branch.enabled or not match(branch.cond, signals, conf_thresholds):
-                continue
-            if branch.action.get("kind") == "special":
-                continue                            # Task 6；新会话起点不适用 → miss
-            hit_at = i
-            break
-        if hit_at is None:
-            path.append({"node": node.idx, "branch": None, "result": "miss",
-                         "reason": "new_session" if node.kind == "sticky" else "no_match"})
-        else:
-            branch = node.branches[hit_at]
-            decision = _resolve(branch.action, branch.trial, [node.idx, hit_at])
-            path.append({"node": node.idx, "branch": hit_at, "result": "hit"})
-            hit = True
+        elif ev[0] == "miss":
+            path.append({"node": ev[1].idx, "branch": None, "result": "miss",
+                         "reason": ev[2]})
+        elif ev[0] == "hit":
+            _, node, i, action, trial = ev
+            decision = _resolve(action, trial, [node.idx, i])
+            path.append({"node": node.idx, "branch": i, "result": "hit"})
+        else:                                       # ("also", node, i)
+            also_match.append({"node": ev[1].idx, "branch": ev[2]})
+    if decision is None:
+        decision = _defensive()                     # 真·全 miss → 与 evaluate 恒等
     return {"path": path, "also_match": also_match, "decision": decision}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) 会话沿用 —— extract_session 三级标识 + resolve_session 判定（spec §4.4）
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 沿用语义的反馈（§4.4 is_unlocked 集合之外）与解锁语义的反馈：
+_UNLOCK_FEEDBACK = {"wrong_answer", "want_different"}
+# 接口裁定：裁定原文把「换个说法」写作 'rephrase'，§4.4 的规范键是 'want_different'，
+# 两串都收（宽容别名，规范化归 §6.8 tags 层）。
+_REPHRASE_FEEDBACK = {"want_different", "rephrase"}
+
+
+def _header(headers: dict, name: str) -> str | None:
+    """大小写不敏感取请求头；缺失返回 None（server 层的 headers 是朴素 dict）。"""
+    name = name.lower()
+    for k, v in (headers or {}).items():
+        if isinstance(k, str) and k.lower() == name:
+            return v
+    return None
+
+
+def _first_user_text(body: dict) -> str:
+    """首条 user 消息文本（指纹第 3 段）；非字符串内容（多模态分片等）JSON 序列化，
+    保证同一请求恒得同一指纹；无 user 消息返回空串。"""
+    for msg in body.get("messages") or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            return json.dumps(content, ensure_ascii=False, sort_keys=True)
+    return ""
+
+
+def extract_session(proto: str, body: dict, headers: dict, client_ip: str,
+                    sticky_enabled: bool = True) -> str | None:
+    """会话标识三级，优先级从高到低（spec §4.4）：
+
+    1. 请求头 ``x-session-id``（客户端显式给出，推荐）；
+    2. OpenAI 兼容体的 ``user`` 字段 / Anthropic 体的 ``metadata.user_id``；
+    3. 退化指纹 ``sha1(客户端 IP + Authorization 头 + 首条 user 消息文本)``（40 位
+       小写 hex）——可能把不同会话误判为同一个（R1 风险，§4.4），故仅当
+       session_sticky 开启时才启用。
+
+    各级取到空值即落下一级；全空返回 None（无会话）。
+    接口裁定：简报签名 4 参拿不到 settings，故加第 5 个带默认值形参
+    ``sticky_enabled``（指纹门控），server 层（Task 8）传 settings 值；
+    简报 6 个测试按 4 参调用全部成立（默认 True）。
+    """
+    sid = _header(headers, "x-session-id")
+    if sid:
+        return sid
+    if proto == "anthropic":
+        sid = (body.get("metadata") or {}).get("user_id")
+    else:                       # openai 兼容体（未知 proto 按其超集形态处理）
+        sid = body.get("user")
+    if sid:
+        return sid
+    if not sticky_enabled:
+        return None
+    digest = hashlib.sha1(
+        (client_ip + (_header(headers, "authorization") or "")
+         + _first_user_text(body)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _elapsed_s(ts: str) -> float:
+    """sessions.last_active 距今的秒数。
+
+    兼容两种写法：sqlite ``datetime('now')`` 的 UTC ``YYYY-MM-DD HH:MM:SS``
+    （naive → 视作 UTC）与 ISO 8601 带时区（db._now 同款，控制台/导入可能混入）。
+    解析失败返回 0（视为刚活跃：宁可多沿用，不因脏时间戳误杀会话）。
+    """
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).total_seconds()
+
+
+def resolve_session(conn, session_id: str | None, signals, settings, feedback=None):
+    """会话沿用判定（spec §4.4 伪码逐行）→ RouteDecision；返回 None 则继续走树。
+
+    - ``session_sticky != '1'`` 或无 session_id → None（§4.4 卫语句
+      ``if session_id and settings.session_sticky``：整个沿用块被跳过；指纹级的
+      单独门控在 extract_session 的 sticky_enabled 形参）。
+    - 会话行不存在 → None。
+    - idle 过期（last_active 距今 > ``session_idle`` 秒）→ None，视为新会话；
+      不删会话行（保留 turns/unlocks 供统计，M1 从简忽略，下次同 id 命中会被
+      UPDATE 覆盖——声明记任务报告）。
+    - 反馈未传入 feedback=None（sticky_detect_feedback=0 时 server 层不传值，§4.4
+      反馈来源优先级）或 satisfied / need_clarification → 直接沿用 current_model：
+      source='sticky'，think=None、fallbacks=[]（M1 无分支记忆，沿用不复原上轮
+      think/fallback 链——裁定声明，记任务报告）。
+    - feedback='wrong_answer' → ``ladder_up or ladder_next``；'want_different'
+      （含裁定别名 'rephrase'）→ ladder_next；解锁成功 unlocks+1，
+      source='unlocked'（think/fallbacks 同上取空）。
+    - 解锁但阶梯无处可升/可换（未配置或到顶回环失效，两函数均 None）→ 返回 None
+      退化「重新走树」（§4.4 R3），不动 unlocks。
+    - 沿用/解锁成功都更新 last_active（sqlite ``datetime('now')``，UTC
+      ``YYYY-MM-DD HH:MM:SS``——与简报测试种子同款）与 turns+1。
+    - signals 形参本任务不消费（树求值由调用方在 None 之后自做；保留形参位次与
+      简报签名一致）。
+    - 本函数不自行 commit（约定同 sr/db.py，事务由调用方控制）。
+    """
+    if not session_id or settings.get("session_sticky") != "1":
+        return None
+    row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if row is None:
+        return None
+    idle = int(settings.get("session_idle") or 1800)     # 默认半小时（§4.4）
+    if row["last_active"] and _elapsed_s(row["last_active"]) > idle:
+        return None                                      # 超阈值 → 新会话（§4.4）
+    if feedback in _UNLOCK_FEEDBACK | _REPHRASE_FEEDBACK:
+        # 反馈解锁：升一档或换一个（§4.4：ladder_up(row.current_model) or ladder_next）
+        current = row["current_model"] or ""
+        if feedback == "wrong_answer":
+            new_model = ladder_up(conn, current) or ladder_next(conn, current)
+        else:                    # want_different / rephrase → 换一个（ladder_next）
+            new_model = ladder_next(conn, current)
+        if new_model is None:
+            return None          # 阶梯未配置/无处可去 → 重新走树（§4.4 R3），不动 unlocks
+        conn.execute(
+            "UPDATE sessions SET current_model = ?, last_active = datetime('now'), "
+            "turns = turns + 1, unlocks = unlocks + 1 WHERE id = ?",
+            (new_model, session_id))
+        return RouteDecision(kind="route", model=new_model, source="unlocked",
+                             think=None, fallbacks=[])
+    # 沿用：feedback=None（sticky_detect_feedback=0 时 server 层不传值）/ satisfied /
+    # need_clarification / 枚举外未知值（保守沿用，§4.4 is_unlocked 白名单外不解锁）。
+    if not row["current_model"]:
+        return None              # 无可沿用模型（§4.4：沿用要求 row.current_model）
+    conn.execute(
+        "UPDATE sessions SET last_active = datetime('now'), turns = turns + 1 "
+        "WHERE id = ?", (session_id,))
+    return RouteDecision(kind="route", model=row["current_model"], source="sticky",
+                         think=None, fallbacks=[])
