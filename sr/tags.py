@@ -377,3 +377,226 @@ def tag_rules(text: str, headers: dict, n_messages: int, now: datetime,
         "time_window": _rule(_time_window_of(now)),
         "event": _rule(event),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) tag_heuristic() + tag_all() —— 9 个启发式模型标签（spec §4.6 表逐行落地）
+# ─────────────────────────────────────────────────────────────────────────────
+# 关键词表不新造：学科/难度/核实/模态词表、越狱正则、PII 正则均从 console-v7.html
+# `inferTags`（L2425–2470）原样移植；console 没有的（user_feedback 句首短句表）按
+# §4.6 行文补最小词表。逻辑以 §4.6 表为准（console 的 JS 打分逻辑不移植）。
+
+# console-v7.html `const DOM_KW`（L2425）逐词移植，13 组 71 词；键 = 控制台中文组名
+# → §6.3 规范键（计算机→computer_science、法律→law、医学→health……工程→engineering）。
+# 组序保持 console 原序 —— §4.6「命中最多者」并列为多时，console 取先扫到的组
+# （`h.length > domHits.length` 严格大于），dict 插入序即复现该平局行为。
+DOM_KW: dict[str, list[str]] = {
+    "computer_science": [
+        "代码", "编程", "函数", "数据库", "系统", "并发", "分片", "架构",
+        "算法", "服务器", "接口", "递归", "编译", "微服务", "队列", "python",
+        "java", "rust", "sql", "api", "bug"],
+    "law": ["法律", "合同", "诉讼", "侵权", "法规", "仲裁", "条款"],
+    "health": ["症状", "用药", "诊断", "病历", "治疗", "处方"],
+    "math": ["证明", "方程", "积分", "矩阵", "导数"],
+    "physics": ["量子", "力学", "电磁", "相对论"],
+    "economics": ["股价", "汇率", "通胀", "基金", "经济"],
+    "business": ["营销", "转化率", "融资", "商业计划"],
+    "psychology": ["焦虑", "抑郁", "情绪", "压力"],
+    "history": ["朝代", "历史", "战役", "皇帝"],
+    "philosophy": ["存在主义", "伦理", "形而上学"],
+    "chemistry": ["反应", "分子", "催化剂"],
+    "biology": ["基因", "细胞", "蛋白"],
+    "engineering": ["施工", "图纸", "材料强度"],
+}
+
+# console-v7.html `const HARD_KW`（L2440）逐词移植，13 词（§4.6 complexity 行的
+# 「设计/架构/论证/推导」类词表即此表）。
+HARD_KW: list[str] = [
+    "设计", "架构", "方案", "优化", "权衡", "推导", "论证", "排查",
+    "重构", "分片", "事务", "为什么", "如何"]
+
+# console-v7.html `const FACT_KW`（L2441）逐词移植，6 词。
+FACT_KW: list[str] = ["最新", "新闻", "股价", "汇率", "靠谱", "真假"]
+
+# console-v7.html inferTags 内联 modality 词表（L2455）逐词移植：
+# 图片类 8 词、文字加图片类 5 词（console 原样，含语义偏宽的「以及」——不修正）。
+_MODALITY_IMG_KW: list[str] = [
+    "画", "海报", "图片", "插图", "配图", "draw", "image", "picture"]
+_MODALITY_TEXT_KW: list[str] = ["并配", "以及", "说明", "文案", "图文"]
+
+# console-v7.html inferTags 越狱正则（L2464）原样移植（JS /…/i → IGNORECASE）。
+_JAILBREAK_RE = re.compile(
+    r"ignore (all |previous )?instructions|忽略(之前|所有|以上)?的?指令|越狱|jailbreak",
+    re.IGNORECASE)
+
+# console-v7.html inferTags PII 正则组（L2465–2469）原样移植；命中型 → §6.3 规范键。
+# 身份证优先于银行卡（console 的 if/else if 结构一并保留）。
+_PII_PHONE_RE = re.compile(r"1[3-9]\d{9}")
+_PII_ID_RE = re.compile(r"\d{17}[\dXx]")
+_PII_BANK_RE = re.compile(r"(?<!\d)\d{16,19}(?!\d)")
+_PII_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_PII_PASSWORD_RE = re.compile(r"(密码|口令|password|pwd)\s*[:：为是]", re.IGNORECASE)
+
+# user_feedback 句首短句表 —— console-v7.html 无此表（控制台写死「满意」），
+# 按 §4.6 行文补最小词表；组序 = §4.6 行文序（wrong_answer → want_different →
+# satisfied），句首命中即取该组、不再看后续组。
+_FEEDBACK_KW: list[tuple[str, list[str]]] = [
+    ("wrong_answer", ["不对", "错了", "wrong", "not what i"]),
+    ("want_different", ["换一种", "再来个"]),
+    ("satisfied", ["谢谢", "很好"]),
+]
+
+# 启发式置信度常量：命中即给固定值，全部压在 0.3–0.5 区间 —— §4.6 硬约束
+# 「confidence 不得超过『不太确定』档（§6.3 档 1）」，默认切点下档 1 = [0.30, 0.60)，
+# 故取 ≤ 0.5，保证精细分支 conf_min ≥ 2 在降级模式下永不误命中（§4.6 末段）。
+# §4.6 表给 jailbreak / pii 标「中（0.6）」，与上述硬约束冲突，按更严的约束取
+# 0.5（0.5 仍落档 1），出入记任务报告。
+_CONF_DOMAIN = 0.4       # §4.6 上限 0.5
+_CONF_COMPLEXITY = 0.4   # §4.6 上限 0.5
+_CONF_FACT_CHECK = 0.4   # §4.6 上限 0.5
+_CONF_MODALITY = 0.4     # §4.6 上限 0.5
+_CONF_JAILBREAK = 0.5    # §4.6 上限 0.5（表值 0.6 受档 1 约束压到 0.5）
+_CONF_PII = 0.5          # §4.6 上限 0.5（同上）
+_CONF_FEEDBACK = 0.4     # §4.6 上限 0.5
+_CONF_SIMILARITY = 0.4   # §4.6 上限 0.5
+
+# similarity/reask 切点（简报 Step 3 给定）：字符 3-gram Jaccard ≥0.6 → reask=yes、
+# similarity 档 2；0.3–0.6 → 档 1、reask=no；<0.3 → 档 0。
+_SIMILAR_REASK = 0.6
+_SIMILAR_SOME = 0.3
+
+
+def _char_trigrams(s: str) -> set[str]:
+    """字符 3-gram 集合（similarity/reask 用，简报指定口径）。"""
+    return {s[i:i + 3] for i in range(len(s) - 2)}
+
+
+def _jaccard(a: str, b: str) -> float:
+    """字符 3-gram Jaccard = |A∩B| / |A∪B|；并集为空（两边都短于 3 字）→ 0.0
+    （无可比 gram 按不相似处理，边界声明，记任务报告）。"""
+    ga, gb = _char_trigrams(a), _char_trigrams(b)
+    union = ga | gb
+    if not union:
+        return 0.0
+    return len(ga & gb) / len(union)
+
+
+def _heu(value, confidence) -> dict:
+    """启发式模型标签统一形状（is_rule=False 以区别于规则标签）。"""
+    return {"value": value, "confidence": confidence, "is_rule": False}
+
+
+def tag_heuristic(text: str, last_msg: str | None) -> dict[str, dict]:
+    """9 个模型标签的启发式打标（spec §4.6 表逐行；heuristic 降级模式）。
+
+    返回 9 键齐全（domain/complexity/fact_check/modality/jailbreak/pii/
+    user_feedback/similarity/reask），形状 ``{"value":…, "confidence": float|None,
+    "is_rule": False}``。**全部 confidence ≤ 0.5**（§4.6 档 1 上限）。
+
+    置信度口径（§4.6 未逐行写明无命中情形，以下为实现裁定并记任务报告）：
+    正向命中 → 该标签的固定常量（0.3–0.5）；无命中 → value 取缺省档、
+    confidence = None（不给负向断言背书，保守可用）：
+    - domain 无命中 → "other"；complexity → 0（easy）；fact_check → "no_check"；
+    - modality 无命中 → "text"；jailbreak 无命中 → 档 0；pii 无命中 → []；
+    - user_feedback 无命中 → None；last_msg 为 None → similarity 档 0、reask=no。
+    """
+    low = text.lower()
+
+    # domain：逐组数命中，命中最多者胜；并列取先扫到的组（console 原序 + 严格大于）。
+    dom_value, dom_conf = "other", None
+    dom_hits: list[str] = []
+    for key, words in DOM_KW.items():
+        hits = [w for w in words if w.lower() in low]
+        if len(hits) > len(dom_hits):
+            dom_hits, dom_value = hits, key
+    if dom_hits:
+        dom_conf = _CONF_DOMAIN
+
+    # complexity：HARD_KW 命中或词数 > 200 → hard(1)；词数口径与 §4.5 context 一致
+    # （CJK 按字、其余按空白分词）。
+    hard = bool([w for w in HARD_KW if w.lower() in low]) or \
+        len(_CJK_RE.findall(text)) + len(_CJK_RE.sub(" ", text).split()) > 200
+    cx_value, cx_conf = (1, _CONF_COMPLEXITY) if hard else (0, None)
+
+    # fact_check：FACT_KW 命中 → needs_check；否则缺省 no_check。
+    if any(w.lower() in low for w in FACT_KW):
+        fc_value, fc_conf = "needs_check", _CONF_FACT_CHECK
+    else:
+        fc_value, fc_conf = "no_check", None
+
+    # modality：图片类词命中为前提；同时命中文字加图片类词 → text_image（console 结构）。
+    if any(w.lower() in low for w in _MODALITY_IMG_KW):
+        if any(w.lower() in low for w in _MODALITY_TEXT_KW):
+            mod_value, mod_conf = "text_image", _CONF_MODALITY
+        else:
+            mod_value, mod_conf = "image", _CONF_MODALITY
+    else:
+        mod_value, mod_conf = "text", None
+
+    # jailbreak：注入模式表命中 → 档 3（§4.6）；无命中 → 档 0。
+    if _JAILBREAK_RE.search(text):
+        jb_value, jb_conf = 3, _CONF_JAILBREAK
+    else:
+        jb_value, jb_conf = 0, None
+
+    # pii：五条正则依 console 结构求并（身份证/银行卡二选一，身份证优先）。
+    pii_value: list[str] = []
+    if _PII_PHONE_RE.search(text):
+        pii_value.append("phone_number")
+    if _PII_ID_RE.search(text):
+        pii_value.append("cn_id_card")
+    elif _PII_BANK_RE.search(text):
+        pii_value.append("cn_bank_card")
+    if _PII_EMAIL_RE.search(text):
+        pii_value.append("email_address")
+    if _PII_PASSWORD_RE.search(text):
+        pii_value.append("password")
+    pii_conf = _CONF_PII if pii_value else None
+
+    # user_feedback：句首短句表（strip 后前缀匹配，英文不区分大小写），组序即优先级。
+    fb_value, fb_conf = None, None
+    stripped = text.strip().lower()
+    for value, words in _FEEDBACK_KW:
+        if any(stripped.startswith(w) for w in words):
+            fb_value, fb_conf = value, _CONF_FEEDBACK
+            break
+
+    # similarity / reask：与 sessions.last_msg 的字符 3-gram Jaccard 切三档
+    # （≥0.6 → 2 + reask=yes；0.3–0.6 → 1；<0.3 → 0）；last_msg 为 None 无从比较。
+    if last_msg is None:
+        sim_value, sim_conf = 0, None
+        reask_value, reask_conf = "no", None
+    else:
+        j = _jaccard(text, last_msg)
+        if j >= _SIMILAR_REASK:
+            sim_value, sim_conf = 2, _CONF_SIMILARITY
+            reask_value, reask_conf = "yes", _CONF_SIMILARITY
+        elif j >= _SIMILAR_SOME:
+            sim_value, sim_conf = 1, _CONF_SIMILARITY
+            reask_value, reask_conf = "no", None
+        else:
+            sim_value, sim_conf = 0, None
+            reask_value, reask_conf = "no", None
+
+    # 键序随 TAGS 注册表中 model 标签序。
+    return {
+        "domain": _heu(dom_value, dom_conf),
+        "complexity": _heu(cx_value, cx_conf),
+        "fact_check": _heu(fc_value, fc_conf),
+        "similarity": _heu(sim_value, sim_conf),
+        "modality": _heu(mod_value, mod_conf),
+        "jailbreak": _heu(jb_value, jb_conf),
+        "pii": _heu(pii_value, pii_conf),
+        "user_feedback": _heu(fb_value, fb_conf),
+        "reask": _heu(reask_value, reask_conf),
+    }
+
+
+def tag_all(text: str, headers: dict, n_messages: int, now: datetime,
+            last_msg: str | None) -> dict[str, dict]:
+    """全量打标 = 8 规则标签（tag_rules）∪ 9 启发式模型标签（tag_heuristic），17 键。
+
+    heuristic 模式的入口产物；两子产物键不相交，合并序 = 规则标签在前、模型标签在后。
+    """
+    return {**tag_rules(text, headers, n_messages, now),
+            **tag_heuristic(text, last_msg)}
