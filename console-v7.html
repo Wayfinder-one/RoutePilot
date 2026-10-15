@@ -1,0 +1,3534 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script>
+/* 在首次绘制前定好主题，避免出现「先白后黑」的闪屏。
+   默认深色：本设计的识别度来自「琥珀压在暖黑上」，这是第一印象，
+   所以不跟随系统偏好，只在用户显式切过之后记住选择。 */
+(function(){
+  var t = 'dark';
+  try{ t = localStorage.getItem('sr-theme') || 'dark'; }catch(e){}
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+<title>Smart Router 控制台 · 信号盘 v6</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700;900&display=swap" rel="stylesheet">
+<style>
+/* ══════════════════════════════════════════════════════════════════════
+   SMART ROUTER · 信号盘
+   设计方向：工业信号仪表盘（Industrial / signal-instrument）
+   —— 产品本质是「把信号沿树路由到模型」，界面因此是一台信号盘，
+      而不是一个浅色 SaaS 后台。
+   强调色纪律：琥珀色 ONLY 表示「命中 / 通电 / 唯一主角」。
+   其余全部落在暖灰阶上；命中色越少，命中越醒目。
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── 1. 令牌 ───────────────────────────────────────────────────────── */
+:root{
+  /* 底盘：暖调近黑，不是纯黑——纯黑压纯白太生硬 */
+  --bg:#0b0a08;
+  --bg-deep:#070605;
+  --panel:#131110;
+  --panel-2:#1a1715;
+  --panel-3:#221e1b;
+  --line:#332d29;
+  --line-2:#4a433c;
+  --line-hot:#6b6157;
+
+  /* 文字：暖白，不用纯白 */
+  --text:#f2ece3;
+  /* 三级灰阶按「在 #0b0a08 上实测 ≥4.5:1」选定，不是凭观感压暗。
+     text-3 ≈ 7.4:1，text-4 ≈ 5.1:1——都仍可读作正文级信息。 */
+  --text-2:#b3a99b;
+  --text-3:#8b8377;
+  --text-4:#847c70;
+
+  /* 唯一强调色：磷光琥珀 */
+  --amber:#ff9d2e;
+  --amber-hi:#ffb85c;
+  --amber-dim:rgba(255,157,46,.13);
+  --amber-line:rgba(255,157,46,.34);
+  --amber-glow:rgba(255,157,46,.20);
+  /* 强调色三态：fill = 填充底；hi/ink = 文字与线条；
+     on-accent = 压在琥珀底上的字（浅色下必须翻成深字，否则白字压亮琥珀看不清） */
+  --amber-fill:#ff9d2e;
+  --amber-fill-hi:#ffb85c;
+  --amber-ink:#ff9d2e;
+  --on-accent:#070605;
+
+  /* 中性面：氛围层与悬停底 -- 这些原本写死 rgba，浅色下必须能换 */
+  --panel-fade:rgba(19,17,16,.72);
+  --strip-bg:rgba(11,10,8,.86);
+  --grid-line:rgba(242,236,227,.028);
+  --amb-1:rgba(255,157,46,.075);
+  --amb-2:rgba(110,197,216,.035);
+  --vignette:inset 0 0 200px 40px rgba(0,0,0,.55);
+  --screw:inset 0 1px 1px rgba(0,0,0,.8);
+  --hv-soft:rgba(242,236,227,.022);
+  --hv:rgba(242,236,227,.03);
+  --hv-strong:rgba(242,236,227,.04);
+  --seg-div:rgba(11,10,8,.5);
+  --mint-line:rgba(74,222,155,.3);
+  --rust-line:rgba(255,92,71,.3);
+  --ice-line:rgba(110,197,216,.3);
+  /* 四类信号的固定色序。指示条与百分比文字都用它，随主题整体切换 */
+  --sig1:#ff9d2e; --sig2:#6ec5d8; --sig3:#ff5c47; --sig4:#4ade9b;
+
+  /* 语义色：仅用于状态，占比极小 */
+  --mint:#4ade9b;
+  --mint-dim:rgba(74,222,155,.12);
+  --rust:#ff5c47;
+  --rust-dim:rgba(255,92,71,.12);
+  --ice:#6ec5d8;
+  --ice-dim:rgba(110,197,216,.12);
+
+  /* 字族：Archivo Black 展示 + IBM Plex Sans 正文 + IBM Plex Mono 仪表 */
+  --display:'Archivo Black','Noto Sans SC',system-ui,sans-serif;
+  --sans:'IBM Plex Sans','Noto Sans SC',system-ui,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,Menlo,monospace;
+
+  /* 字阶：1.25 模块化 */
+  --fs-nano:10px;
+  --fs-micro:11.5px;
+  --fs-sm:13px;
+  --fs-md:15px;
+  --fs-lg:19px;
+  --fs-xl:25px;
+  --fs-2xl:34px;
+  --fs-3xl:46px;
+
+  /* 间距梯度 */
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:48px; --s8:64px;
+
+  /* 圆角：工业面板用小圆角，硬朗 */
+  --r1:2px; --r2:4px; --r3:8px;
+
+  /* 阴影三级 + 一层环境辉光 */
+  --sh-1:0 1px 2px rgba(0,0,0,.5);
+  --sh-2:0 6px 20px rgba(0,0,0,.5);
+  --sh-3:0 22px 56px rgba(0,0,0,.6);
+  --sh-glow:0 0 0 1px var(--amber-line), 0 0 26px -6px var(--amber-glow);
+
+  /* 动效 */
+  --e-out:cubic-bezier(.16,1,.3,1);
+  --e-in:ease-out;
+  --d-fast:150ms; --d-base:320ms; --d-slow:640ms; --d-rail:900ms;
+}
+
+/* ══ 浅色主题 ══════════════════════════════════════════════════════════
+   同一台仪器，换一种外装：由「暖黑机箱」换成「干净的白机身」。
+   层次关系与深色完全一致，只是实现手段不同 —— 这是两套主题看起来
+   像同一个产品的关键。
+
+   深色的层次靠「明度差」：面板比底盘明显亮，天然分得开。
+   浅色的明度差天生不够，所以靠另外三件事：
+     ① 干净的中性近白底盘 + 纯白面板，配 1px 发丝线做边界；
+     ② 极轻的大半径阴影（存在感以「感觉不到」为准，只负责托住）；
+     ③ 大量留白与克制的配色 —— 高级感来自「少」，不是来自「多」。
+
+   刻意不做的事（这些正是上一版显廉价的原因）：
+     · 不做内顶高光 / 倒角。inset 高光会把方角矩形「看起来」变圆变鼓，
+       读起来是拟物按键，不是现代界面；
+     · 不用米黄 / 卡其底盘。偏黄的低饱和大色块会带出纸箱感；
+     · 不加大方格网与暗角。浅色要的是干净，不是纹理。
+   ══════════════════════════════════════════════════════════════════════ */
+[data-theme="light"]{
+  /* ── 明度阶梯：底 → 面 → 凹槽，四档拉开且都保持中性 ──
+     底盘只比面板暗一点点，靠发丝线而不是靠色差来分区。 */
+  --bg:#f4f3f0;
+  --panel:#ffffff;
+  --panel-2:#fafaf8;
+  --panel-3:#f2f1ed;
+  --bg-deep:#efeee9;
+  --panel-fade:#ffffff;          /* 面板纯平，不做渐变 */
+
+  --line:#e6e4df;
+  --line-2:#d6d3cc;
+  --line-hot:#a8a49b;
+
+  /* 实测（白底）：#3a3833 ≈ 11.7:1，#55534c ≈ 7.7:1，#65635b ≈ 6.0:1。
+     四级灰阶都留足余量——卡着 4.5 过不算过。 */
+  --text:#12110f;
+  --text-2:#3a3833;
+  --text-3:#55534c;
+  --text-4:#65635b;
+
+  /* ── 琥珀三态 ──
+     填充底保留亮琥珀（压深字）；文字与线条转深焦糖，
+     因为亮琥珀压白底只有约 2:1，直接做文字读不出来。 */
+  --amber:#9a4a02;
+  --amber-hi:#8a4200;
+  --amber-ink:#8a4200;
+  --amber-fill:#f59e0b;
+  --amber-fill-hi:#fbaf2e;
+  --on-accent:#1c1a17;
+  --amber-dim:rgba(197,84,10,.10);
+  --amber-line:rgba(160,70,10,.28);
+  --amber-glow:rgba(245,158,11,.26);
+
+  /* 语义色统一取 700 档，四类信号同权重，不用刺眼的纯红纯绿 */
+  --mint:#047857; --mint-dim:rgba(4,120,87,.09); --mint-line:rgba(4,120,87,.28);
+  --rust:#be123c; --rust-dim:rgba(190,18,60,.09); --rust-line:rgba(190,18,60,.28);
+  --ice:#0e7490;  --ice-dim:rgba(14,116,144,.09); --ice-line:rgba(14,116,144,.28);
+
+  --sig1:#b45309; --sig2:#0e7490; --sig3:#be123c; --sig4:#047857;
+
+  /* ── 氛围：几乎不存在的两层光，去掉暗角与重网格 ── */
+  --grid-line:rgba(18,17,15,.032);
+  --amb-1:rgba(255,255,255,.85);   /* 顶部一片柔光，制造「光从上来」 */
+  --amb-2:rgba(14,116,144,.035);
+  --vignette:none;
+  --screw:inset 0 1px 1px rgba(0,0,0,.12);
+
+  --strip-bg:rgba(255,255,255,.82);
+  --hv-soft:rgba(18,17,15,.022);
+  --hv:rgba(18,17,15,.038);
+  --hv-strong:rgba(18,17,15,.06);
+  --seg-div:rgba(255,255,255,.9);
+
+  /* ── 阴影：大半径、极低透明度。浅色下阴影一重就脏 ── */
+  --sh-1:0 1px 2px rgba(18,17,15,.05);
+  --sh-2:0 1px 2px rgba(18,17,15,.04),0 8px 20px -8px rgba(18,17,15,.09);
+  --sh-3:0 2px 6px rgba(18,17,15,.05),0 24px 52px -18px rgba(18,17,15,.16);
+  --sh-glow:0 0 0 1px var(--amber-line),0 0 20px -8px var(--amber-glow);
+}
+
+/* 颗粒：深色用 overlay 提亮，浅色改 multiply 压出细纸感，且更轻 */
+[data-theme="light"] .grain{opacity:.03;mix-blend-mode:multiply}
+
+/* 主按钮：纯平色块，不加辉光。悬停只做一次轻微下沉，不做发光 */
+[data-theme="light"] .btn.pri:hover{box-shadow:0 4px 14px -6px rgba(154,74,2,.45)}
+
+/* 置灰与熄灯：白底上要稍实一点，否则会「消失」 */
+[data-theme="light"] .gauge.dim{opacity:.6}
+[data-theme="light"] .stn.dead{opacity:.46}
+[data-theme="light"] .br.skip{opacity:.46}
+
+/* 分档条：深色是「越亮越强」，浅色整体翻成「越暗越强」 */
+[data-theme="light"] .dist .s0{background:#f4f3f0;color:var(--text-4)}
+[data-theme="light"] .dist .s1{background:#e6e4de;color:var(--text-3)}
+[data-theme="light"] .dist .s2{background:#cfccc3;color:var(--text)}
+[data-theme="light"] .dist{border-color:var(--line-2)}
+
+/* 下拉箭头是 data-URI，颜色写死在里面，浅色必须换一版。
+   注意用 background-image 单独覆盖 —— 写成 background 简写会重置
+   background-repeat，箭头 SVG 会平铺成整片网纹。 */
+[data-theme="light"] select,
+[data-theme="light"] .br .to{
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%2355534c' stroke-width='1.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+}
+
+/* ── 2. 基础 ───────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-text-size-adjust:100%}
+body{
+  font-family:var(--sans);
+  background:var(--bg);
+  color:var(--text);
+  font-size:var(--fs-sm);
+  line-height:1.62;
+  font-feature-settings:"kern" 1;
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+  overflow-x:hidden;
+}
+/* 仪表数字：等宽 + 定宽数位，读数不跳动 */
+.mono,.num,td.num,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+h1,h2,h3{font-weight:600;line-height:1.15;letter-spacing:-.012em}
+button,input,select,textarea{font-family:inherit;font-size:inherit;color:inherit}
+button{cursor:pointer;background:none;border:none}
+::selection{background:var(--amber-fill);color:var(--on-accent)}
+
+/* 焦点：2px 描边 + 2px 偏移，任何主题下都看得见 */
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:var(--r1)}
+
+/* ── 3. 氛围层：工程方格纸 + 颗粒 + 暗角 ─────────────────────────── */
+.graticule{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  background-image:
+    linear-gradient(var(--grid-line) 1px,transparent 1px),
+    linear-gradient(90deg,var(--grid-line) 1px,transparent 1px);
+  background-size:44px 44px;
+  mask-image:radial-gradient(120% 90% at 50% 0%,#000 30%,transparent 78%);
+}
+/* 顶部一道极淡的琥珀泛光，像仪表盘上方的灯 */
+.ambient{
+  position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:
+    radial-gradient(70rem 34rem at 18% -8%,var(--amb-1),transparent 62%),
+    radial-gradient(52rem 30rem at 100% 4%,var(--amb-2),transparent 60%);
+}
+/* 颗粒：3.5% overlay，消除纯色平铺的塑料感 */
+.grain{
+  position:fixed;inset:0;z-index:60;pointer-events:none;opacity:.038;
+  mix-blend-mode:overlay;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.vignette{
+  position:fixed;inset:0;z-index:59;pointer-events:none;
+  box-shadow:var(--vignette);
+}
+
+/* ── 4. 机架导航（左侧竖排，取代原来的顶部标签栏） ───────────────── */
+.rack{
+  position:fixed;left:0;top:0;bottom:0;width:78px;z-index:40;
+  background:linear-gradient(180deg,var(--panel) 0%,var(--bg-deep) 100%);
+  border-right:1px solid var(--line);
+  display:flex;flex-direction:column;align-items:center;
+  padding:var(--s4) 0 var(--s3);
+}
+/* 机架上的螺钉孔：工业质感的点睛 */
+.rack::before,.rack::after{
+  content:"";position:absolute;left:50%;transform:translateX(-50%);
+  width:5px;height:5px;border-radius:50%;
+  background:var(--bg-deep);box-shadow:var(--screw),0 0 0 1px var(--line-2);
+}
+.rack::before{top:11px}
+.rack::after{bottom:11px}
+
+.mark{
+  width:38px;height:38px;flex:none;
+  display:grid;place-items:center;
+  font-family:var(--display);font-size:14px;letter-spacing:-.03em;
+  color:var(--on-accent);background:var(--amber-fill);
+  border-radius:var(--r2);
+  box-shadow:0 0 22px -6px var(--amber-glow);
+  margin-bottom:var(--s5);
+}
+.rack-nav{display:flex;flex-direction:column;gap:2px;width:100%;align-items:center;flex:1}
+.rk{
+  position:relative;width:58px;min-height:52px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+  color:var(--text-3);border-radius:var(--r2);
+  transition:color var(--d-fast) var(--e-in),background var(--d-fast) var(--e-in);
+}
+.rk .rk-i{font-family:var(--mono);font-size:var(--fs-nano);font-weight:600;letter-spacing:.08em;opacity:.75}
+.rk .rk-t{font-size:var(--fs-micro);font-weight:500;letter-spacing:.02em}
+.rk:hover{color:var(--text-2);background:var(--hv)}
+/* 激活：左侧一道琥珀导轨 + 通电底色 */
+.rk::before{
+  content:"";position:absolute;left:-10px;top:50%;transform:translateY(-50%) scaleY(0);
+  width:2px;height:26px;background:var(--amber);border-radius:0 2px 2px 0;
+  transition:transform var(--d-base) var(--e-out);
+}
+.rk.on{color:var(--amber);background:var(--amber-dim)}
+.rk.on::before{transform:translateY(-50%) scaleY(1)}
+.rk.on .rk-i{opacity:1}
+
+.rack-foot{display:flex;flex-direction:column;align-items:center;gap:var(--s2)}
+/* 状态灯：常亮的小圆点，比文字徽章更像仪表 */
+.lamp{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 9px var(--mint);animation:breathe 3.4s var(--e-in) infinite}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.45}}
+
+/* ── 5. 顶栏 ──────────────────────────────────────────────────────── */
+.deck{margin-left:78px;position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column}
+.strip{
+  position:sticky;top:0;z-index:30;
+  display:flex;align-items:center;gap:var(--s4);
+  padding:var(--s3) var(--s6);
+  min-height:52px;
+  background:var(--strip-bg);
+  backdrop-filter:blur(14px) saturate(1.2);
+  -webkit-backdrop-filter:blur(14px) saturate(1.2);
+  border-bottom:1px solid var(--line);
+}
+.strip-brand{display:flex;align-items:baseline;gap:var(--s2)}
+.strip-brand b{font-family:var(--display);font-size:var(--fs-sm);letter-spacing:-.02em}
+.strip-brand span{font-family:var(--mono);font-size:var(--fs-micro);color:var(--text-3);letter-spacing:.06em}
+.strip-end{margin-left:auto;display:flex;align-items:center;gap:var(--s3)}
+
+/* 语言切换：做成拨段开关，像设备上的 DIP 开关 */
+.dip{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r2);overflow:hidden;background:var(--bg-deep)}
+.dip button{
+  padding:5px 13px;font-size:var(--fs-micro);font-weight:600;color:var(--text-3);
+  letter-spacing:.04em;transition:all var(--d-fast) var(--e-in);
+}
+.dip button+button{border-left:1px solid var(--line-2)}
+.dip button:hover{color:var(--text-2);background:var(--hv-strong)}
+.dip button.on{background:var(--amber-fill);color:var(--on-accent)}
+
+/* 主题开关：与语言开关同构，但用图标，避免顶栏过宽 */
+.dip.theme button{padding:5px 10px;line-height:1}
+.dip.theme .ic{font-size:13px;display:block}
+
+/* ── 6. 版面 ───────────────────────────────────────────────────────── */
+.bay{flex:1;padding:var(--s7) var(--s6) var(--s8);max-width:1420px;width:100%}
+.pg{display:none}
+.pg.on{display:block}
+
+/* 页头：大标题 + 副标 */
+.pg-hd{margin-bottom:var(--s6);position:relative}
+.pg-hd h1{
+  font-family:var(--display);font-size:var(--fs-3xl);line-height:.98;
+  letter-spacing:-.035em;margin-bottom:var(--s3);
+}
+.pg-hd .lede{color:var(--text-2);font-size:var(--fs-md);max-width:62ch;line-height:1.66}
+.pg-hd .lede b{color:var(--text);font-weight:600}
+
+/* 非对称栅格：主次分明，不做等宽两栏 */
+.split{display:grid;grid-template-columns:minmax(0,4.6fr) minmax(0,6fr);gap:var(--s5);align-items:start}
+.split-3{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,4fr) minmax(0,4fr);gap:var(--s5);align-items:start}
+.stack{display:flex;flex-direction:column;gap:var(--s5)}
+@media(max-width:1180px){
+  .split,.split-3{grid-template-columns:1fr}
+}
+
+/* ── 7. 仪表面板：发丝边框 + 四角括号 ─────────────────────────────── */
+.panel{
+  position:relative;
+  background:linear-gradient(180deg,var(--panel) 0%,var(--panel-fade) 100%);
+  border:1px solid var(--line);
+  border-radius:var(--r2);
+  padding:var(--s5);
+  box-shadow:var(--sh-1);
+}
+/* 四角括号：仪表面板的角，不是装饰——它标出可操作区 */
+.panel.brk::before,.panel.brk::after{
+  content:"";position:absolute;width:9px;height:9px;pointer-events:none;
+  border-color:var(--line-hot);border-style:solid;border-width:0;
+}
+.panel.brk::before{top:-1px;left:-1px;border-top-width:1px;border-left-width:1px}
+.panel.brk::after{bottom:-1px;right:-1px;border-bottom-width:1px;border-right-width:1px}
+.panel.hot{border-color:var(--amber-line);box-shadow:var(--sh-1),var(--sh-glow)}
+
+.panel-hd{display:flex;align-items:baseline;gap:var(--s3);margin-bottom:var(--s4);flex-wrap:wrap}
+.panel-hd h2{font-family:var(--display);font-size:var(--fs-lg);letter-spacing:-.022em}
+.panel-hd .sub{font-size:var(--fs-micro);color:var(--text-3);letter-spacing:.02em}
+.panel-hd .end{margin-left:auto;display:flex;align-items:center;gap:var(--s2)}
+
+/* 分节标题：小方块 + 字，代替常见的图标+文字 */
+.sect{display:flex;align-items:center;gap:var(--s2);margin-bottom:var(--s3)}
+.sect .sq{width:3px;height:13px;background:var(--line-hot);border-radius:1px;flex:none}
+.sect h3{font-size:var(--fs-md);font-weight:600;letter-spacing:-.008em}
+.sect .hint{font-size:var(--fs-micro);color:var(--text-3)}
+.sect .end{margin-left:auto}
+
+/* ── 8. 控件 ───────────────────────────────────────────────────────── */
+.field{display:block;margin-bottom:var(--s4)}
+.field>label,.lb{
+  display:flex;align-items:center;gap:var(--s2);
+  font-family:var(--mono);font-size:var(--fs-micro);font-weight:600;
+  color:var(--text-3);letter-spacing:.1em;text-transform:uppercase;
+  margin-bottom:var(--s2);
+}
+.lb .opt{color:var(--text-4);letter-spacing:.02em;text-transform:none;font-weight:400}
+textarea,input[type=text],input[type=number],select{
+  width:100%;background:var(--bg-deep);
+  border:1px solid var(--line-2);border-radius:var(--r2);
+  padding:10px 12px;font-size:var(--fs-sm);color:var(--text);
+  transition:border-color var(--d-fast) var(--e-in),box-shadow var(--d-fast) var(--e-in);
+}
+textarea{font-family:var(--mono);font-size:var(--fs-sm);line-height:1.66;min-height:132px;resize:vertical}
+textarea::placeholder,input::placeholder{color:var(--text-4)}
+select{
+  appearance:none;cursor:pointer;padding-right:30px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238b8377' stroke-width='1.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 11px center;
+}
+select optgroup{background:var(--panel-2);color:var(--text-3);font-style:normal;font-size:var(--fs-micro)}
+select option{background:var(--panel-2);color:var(--text)}
+textarea:focus,input:focus,select:focus{
+  outline:none;border-color:var(--amber);box-shadow:0 0 0 3px var(--amber-dim);
+}
+
+/* 按钮：方角、细边、悬停时底色擦过（不是仅仅变亮） */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  min-height:36px;padding:0 16px;
+  background:var(--panel-2);border:1px solid var(--line-2);border-radius:var(--r2);
+  font-size:var(--fs-sm);font-weight:500;color:var(--text-2);
+  transition:all var(--d-fast) var(--e-in);
+  position:relative;overflow:hidden;
+}
+.btn::after{
+  content:"";position:absolute;inset:0;background:var(--text);
+  transform:scaleX(0);transform-origin:left;opacity:.05;
+  transition:transform var(--d-base) var(--e-out);
+}
+.btn:hover{color:var(--text);border-color:var(--line-hot)}
+.btn:hover::after{transform:scaleX(1)}
+.btn:active{transform:translateY(1px)}
+.btn.pri{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent);font-weight:700}
+.btn.pri::after{background:var(--on-accent);opacity:.08}
+.btn.pri:hover{background:var(--amber-fill-hi);border-color:var(--amber-fill-hi);color:var(--on-accent);box-shadow:0 0 22px -6px var(--amber-glow)}
+.btn.sm{min-height:28px;padding:0 10px;font-size:var(--fs-micro);border-radius:var(--r1)}
+.btn.ico{min-height:26px;padding:0 8px;font-size:var(--fs-micro);color:var(--text-3);border-color:transparent;background:none}
+.btn.ico:hover{color:var(--amber);border-color:var(--line-2)}
+.btn.link{border:none;background:none;color:var(--amber);padding:0;min-height:auto;font-size:var(--fs-micro);text-decoration:underline;text-underline-offset:3px;text-decoration-thickness:1px}
+.btn.link::after{display:none}
+.btn[disabled]{opacity:.4;pointer-events:none}
+.btn-row{display:flex;gap:var(--s2);flex-wrap:wrap;align-items:center}
+
+/* 分段控件：设备上的旋钮档位 */
+.seg{display:inline-flex;border:1px solid var(--line-2);border-radius:var(--r2);overflow:hidden;background:var(--bg-deep)}
+.seg button{padding:7px 15px;font-size:var(--fs-micro);font-weight:500;color:var(--text-3);transition:all var(--d-fast) var(--e-in)}
+.seg button+button{border-left:1px solid var(--line-2)}
+.seg button:hover{color:var(--text-2);background:var(--hv-strong)}
+.seg button.on{background:var(--panel-3);color:var(--amber);font-weight:600;box-shadow:inset 0 -2px 0 var(--amber)}
+
+/* 拨动开关：纯 CSS，键盘可达 */
+.sw{display:inline-flex;align-items:center;gap:var(--s2);cursor:pointer;font-size:var(--fs-sm);color:var(--text-2)}
+.sw input{position:absolute;opacity:0;width:0;height:0}
+.sw .track{
+  width:38px;height:21px;flex:none;border-radius:99px;
+  background:var(--bg-deep);border:1px solid var(--line-2);position:relative;
+  transition:all var(--d-base) var(--e-out);
+}
+.sw .track::after{
+  content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;
+  background:var(--text-3);transition:all var(--d-base) var(--e-out);
+}
+.sw input:checked+.track{background:var(--amber-dim);border-color:var(--amber-line)}
+.sw input:checked+.track::after{left:20px;background:var(--amber-fill);box-shadow:0 0 10px var(--amber-glow)}
+.sw input:focus-visible+.track{outline:2px solid var(--amber);outline-offset:2px}
+
+/* ── 9. 芯片：条件与取值 ──────────────────────────────────────────── */
+.chipset{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--panel-2);border:1px solid var(--line-2);border-radius:var(--r1);
+  padding:3px 8px;font-size:var(--fs-micro);line-height:1.5;
+}
+.chip .k{color:var(--text-3);font-family:var(--mono);font-size:var(--fs-nano);letter-spacing:.05em}
+.chip .op{color:var(--text-4);font-family:var(--mono);font-size:var(--fs-nano)}
+.chip .v{color:var(--text);font-weight:600}
+.chip.key{border-color:var(--amber-line);background:var(--amber-dim)}
+.chip.key .v{color:var(--amber-hi)}
+.chip.ice{border-color:var(--ice-line);background:var(--ice-dim)}
+.chip.ice .v{color:var(--ice)}
+.chip.mint{border-color:var(--mint-line);background:var(--mint-dim)}
+.chip.mint .v{color:var(--mint)}
+.chip.rust{border-color:var(--rust-line);background:var(--rust-dim)}
+.chip.rust .v{color:var(--rust)}
+.chip.ghost{opacity:.4}
+.and{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4);letter-spacing:.06em;padding:0 1px}
+
+/* ── 10. 信号读数格：把 17 个标签做成仪表格 ───────────────────────── */
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:var(--s2)}
+.gh{
+  grid-column:1/-1;display:flex;align-items:center;gap:var(--s2);
+  margin:var(--s3) 0 1px;font-family:var(--mono);font-size:var(--fs-micro);
+  font-weight:600;color:var(--text-3);letter-spacing:.08em;
+}
+.gh:first-child{margin-top:0}
+.gh .bar{width:14px;height:2px;border-radius:1px;flex:none}
+.gh .ds{font-family:var(--sans);font-weight:400;color:var(--text-4);letter-spacing:0;font-size:var(--fs-micro)}
+/* 读数格：左侧一道信号色，左边框是「这个信号来自哪一类」 */
+.gauge{
+  position:relative;background:var(--panel-2);
+  border:1px solid var(--line);border-left:2px solid var(--gn,var(--text-4));
+  border-radius:var(--r1);padding:9px 11px 10px;
+  transition:border-color var(--d-fast) var(--e-in),background var(--d-fast) var(--e-in);
+}
+.gauge:hover{background:var(--panel-3);border-color:var(--line-2);border-left-color:var(--gc,var(--text-4))}
+.gauge.dim{opacity:.34}
+.gauge .gk{font-size:var(--fs-micro);color:var(--text-3);display:flex;align-items:center;gap:5px}
+.gauge .gv{font-size:var(--fs-md);font-weight:600;letter-spacing:-.01em;margin:3px 0 8px;line-height:1.25;word-break:break-word}
+.gauge .gbar{height:3px;background:var(--bg-deep);border-radius:99px;overflow:hidden;position:relative}
+.gauge .gbar i{display:block;height:100%;background:var(--gc,var(--text-3));border-radius:99px;width:0;transition:width var(--d-slow) var(--e-out)}
+.gauge .gcf{display:flex;justify-content:space-between;gap:6px;margin-top:6px;font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)}
+.gauge .gcf .pc{color:var(--gc,var(--text-3));font-weight:600}
+.gauge .used{
+  position:absolute;top:8px;right:8px;width:5px;height:5px;border-radius:50%;
+  background:var(--amber-fill);box-shadow:0 0 7px var(--amber-glow);
+}
+.g1{--gc:var(--sig1)} .g2{--gc:var(--sig2)} .g3{--gc:var(--sig3)} .g4{--gc:var(--sig4)} .gn{--gc:var(--text-4)}
+
+/* ── 11. 信号轨（本设计的主角） ─────────────────────────────────────
+   把「自上而下，首个命中即停」变成可以看见的物理过程：
+   一条竖轨 + 一次下行的电脉冲 + 命中后下方全部熄灯。            */
+.rail{
+  position:relative;
+  padding:var(--s2) 0 var(--s2) var(--s6);
+}
+/* 轨道主竖线 */
+.rail::before{
+  content:"";position:absolute;left:15px;top:14px;bottom:14px;width:2px;
+  background:linear-gradient(180deg,var(--line-2),var(--line));
+  border-radius:1px;
+}
+/* 电脉冲：top 由 JS 设为命中站位，真实「走」下去 */
+.pulse{
+  position:absolute;left:11px;width:10px;height:10px;border-radius:50%;
+  top:14px;z-index:3;
+  background:var(--amber-fill);
+  box-shadow:0 0 0 3px var(--amber-dim),0 0 16px 2px var(--amber-glow);
+  transition:top var(--d-rail) var(--e-out),opacity var(--d-base) var(--e-in);
+  opacity:0;
+}
+.pulse.run{opacity:1}
+.pulse::after{
+  content:"";position:absolute;left:50%;top:50%;width:10px;height:10px;
+  transform:translate(-50%,-50%);border-radius:50%;
+  border:1px solid var(--amber-fill);animation:ping 1.5s var(--e-out) infinite;
+}
+@keyframes ping{0%{transform:translate(-50%,-50%) scale(1);opacity:.8}100%{transform:translate(-50%,-50%) scale(3.4);opacity:0}}
+
+.stn{position:relative;padding:0 0 var(--s4) 0}
+/* 站点圆点 */
+.stn .dot{
+  position:absolute;left:-19px;top:9px;width:9px;height:9px;border-radius:50%;
+  background:var(--panel);border:2px solid var(--line-2);z-index:2;
+  transition:all var(--d-base) var(--e-out);
+}
+/* 未命中：站点暗、理由用灰字 */
+.stn.miss .dot{border-color:var(--line-hot)}
+.stn.miss .snm{color:var(--text-3)}
+/* 命中：站点通电并撑大，成为整屏唯一的亮点 */
+.stn.hit .dot{
+  background:var(--amber-fill);border-color:var(--amber-fill);
+  transform:scale(1.5);box-shadow:0 0 0 4px var(--amber-dim),0 0 18px var(--amber-glow);
+}
+.stn.hit .snm{color:var(--amber-hi)}
+/* 命中之后：全部熄灯，视觉上「电路到此为止」 */
+.stn.dead{opacity:.3}
+.stn.dead .dot{border-style:dashed;background:transparent}
+
+.stn-hd{display:flex;align-items:baseline;gap:var(--s2);flex-wrap:wrap;margin-bottom:5px;padding-left:var(--s2)}
+.stn-no{
+  font-family:var(--mono);font-size:var(--fs-nano);font-weight:700;
+  color:var(--text-4);letter-spacing:.06em;
+  border:1px solid var(--line-2);border-radius:var(--r1);padding:0 5px;
+}
+.stn.hit .stn-no{color:var(--amber);border-color:var(--amber-line);background:var(--amber-dim)}
+.snm{font-size:var(--fs-sm);font-weight:600;letter-spacing:-.005em}
+.stn-why{font-size:var(--fs-micro);color:var(--text-3);margin-left:auto;font-family:var(--mono)}
+.stn.hit .stn-why{color:var(--amber-hi)}
+/* 一个节点下有多条分支时的计数 */
+.stn .cnt{
+  font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-3);
+  border:1px solid var(--line-2);border-radius:var(--r1);padding:0 5px;
+}
+.stn-brs{display:flex;flex-direction:column;gap:4px;padding-left:var(--s5);margin-top:5px}
+.sbr{
+  display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;
+  padding:5px 9px;border-radius:var(--r1);
+  background:var(--hv-soft);border-left:2px solid var(--line-2);
+  font-size:var(--fs-micro);
+}
+.sbr.hit{background:var(--amber-dim);border-left-color:var(--amber)}
+/* 未命中分支：不要底板，一行灰字理由即可 */
+.sbr.plain{background:none;border-left-color:var(--line);padding:2px 9px}
+.sbr.plain .why{margin-left:0}
+.sbr .to{color:var(--text-3);font-family:var(--mono);font-size:var(--fs-nano)}
+.sbr.hit .to{color:var(--amber-hi)}
+.sbr .why{margin-left:auto;font-size:var(--fs-nano);color:var(--text-3);font-family:var(--mono);text-align:right}
+.sbr.hit{border-left-color:var(--amber)}
+/* 「通电」标记：命中分支的盖章 */
+.sbr .live{
+  font-family:var(--mono);font-size:var(--fs-nano);font-weight:700;color:var(--on-accent);
+  background:var(--amber-fill);border-radius:var(--r1);padding:0 5px;flex:none;
+}
+
+/* 判定横幅：命中结果的「主读数」。琥珀底压得更实、边框带辉光，
+   模型名用标题级等宽字——整屏只允许它一个主角。 */
+.verdict{
+  display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;
+  margin-top:var(--s4);padding:var(--s4) var(--s4);
+  background:linear-gradient(90deg,var(--amber-dim) 0%,var(--amber-dim) 55%,transparent 88%);
+  border:1px solid var(--amber-line);border-left-width:3px;border-radius:var(--r2);
+  box-shadow:var(--sh-glow);
+}
+.verdict .vk{font-family:var(--mono);font-size:var(--fs-micro);font-weight:700;color:var(--amber);letter-spacing:.1em}
+.verdict .vv{font-size:var(--fs-md);font-weight:600;color:var(--text)}
+.verdict .arr{color:var(--text-4);font-family:var(--mono)}
+.verdict .pill{
+  font-family:var(--mono);font-size:var(--fs-xl);font-weight:600;color:var(--amber-hi);
+  letter-spacing:-.02em;
+  background:var(--bg-deep);border:1px solid var(--amber-line);border-radius:var(--r1);padding:3px 14px;
+}
+.verdict .dim{color:var(--text-3);font-size:var(--fs-micro)}
+.verdict.block{background:linear-gradient(90deg,var(--rust-dim) 0%,var(--rust-dim) 55%,transparent 88%);border-color:var(--rust-line);
+  box-shadow:0 0 0 1px var(--rust-line),0 0 26px -6px var(--rust-dim)}
+.verdict.block .vk,.verdict.block .pill{color:var(--rust)}
+.verdict.sticky{background:linear-gradient(90deg,var(--mint-dim) 0%,var(--mint-dim) 55%,transparent 88%);border-color:var(--mint-line);
+  box-shadow:0 0 0 1px var(--mint-line),0 0 26px -6px var(--mint-dim)}
+.verdict.sticky .vk,.verdict.sticky .pill{color:var(--mint)}
+
+/* 信号条：本次判定真正用到的信号，一行说完。
+   完整 17 格默认折叠，条末链接可展开核对。 */
+.sigline-wrap{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.sigchip{
+  display:inline-flex;align-items:center;gap:6px;
+  background:var(--bg-deep);border:1px solid var(--line-2);border-radius:var(--r1);
+  border-left:2px solid var(--gc,var(--line-2));
+  padding:3px 8px;font-size:var(--fs-micro);line-height:1.5;
+}
+.sigchip .sk{color:var(--text-3);font-family:var(--mono);font-size:var(--fs-nano);letter-spacing:.05em}
+.sigchip .sv{color:var(--text);font-weight:600}
+.sigchip .sbar{width:36px;height:3px;background:var(--hv-strong);border-radius:99px;overflow:hidden}
+.sigchip .sbar i{display:block;height:100%;background:var(--gc,var(--text-3));border-radius:99px}
+.sigchip .spc{font-family:var(--mono);font-size:var(--fs-nano);color:var(--gc,var(--text-3));font-weight:600}
+
+/* 熄灯折叠：命中之后的节点收成一行，点开才展开 */
+.deadfold{opacity:.55}
+.deadfold .dot{border-style:dashed;background:transparent}
+.deadfold>.stn-hd{margin-bottom:0}
+.deadfold-btn{
+  font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-3);letter-spacing:.04em;
+  background:none;border:none;padding:2px 0;cursor:pointer;
+}
+.deadfold-btn:hover{color:var(--text)}
+.deadlist{display:flex;flex-direction:column}
+
+/* 可折叠面板：标题行整行可点，默认收起正文 */
+.fold-cue{font-family:var(--mono);font-size:var(--fs-micro);color:var(--text-4)}
+.panel-hd.clickable{cursor:pointer}
+.panel-hd.clickable:hover .fold-cue{color:var(--amber)}
+
+/* ── 12. 分流树（编辑态） ─────────────────────────────────────────── */
+.tree{display:flex;flex-direction:column}
+.tnode{position:relative;padding:0 0 var(--s3) 0}
+.tnode-hd{display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;padding:7px 0 8px}
+.tnode-no{
+  font-family:var(--mono);font-size:var(--fs-micro);font-weight:700;
+  color:var(--text-2);background:var(--panel-2);border:1px solid var(--line-2);
+  border-radius:var(--r1);padding:1px 7px;flex:none;
+}
+.tnode-nm{font-weight:600;font-size:var(--fs-sm)}
+.tnode-ds{font-size:var(--fs-micro);color:var(--text-4)}
+.tnode-tools{margin-left:auto;display:flex;gap:2px;opacity:0;transition:opacity var(--d-fast) var(--e-in)}
+.tnode:hover .tnode-tools,.tnode:focus-within .tnode-tools{opacity:1}
+.brs{border-left:1px solid var(--line);margin-left:11px;padding-left:var(--s3);display:flex;flex-direction:column;gap:3px}
+.br{
+  position:relative;display:flex;align-items:center;gap:var(--s2);flex-wrap:wrap;
+  padding:6px 9px;border-radius:var(--r1);min-height:34px;
+  transition:background var(--d-fast) var(--e-in);
+}
+.br::before{
+  content:"";position:absolute;left:-13px;top:50%;width:12px;height:1px;background:var(--line);
+}
+.br:hover{background:var(--hv)}
+.br .conn{font-family:var(--mono);color:var(--text-4);flex:none;font-size:var(--fs-sm);line-height:1}
+.br .cond{flex:1;min-width:0;display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.br .to{
+  /* 必须显式 width:auto —— 否则通用 select{width:100%} 会级联进来，
+     把去向下拉撑满整行，把条件芯片挤到上一行去。 */
+  flex:none;width:auto;min-width:230px;max-width:100%;
+  background:var(--bg-deep);border:1px solid var(--line-2);border-radius:var(--r1);
+  padding:5px 28px 5px 9px;font-size:var(--fs-micro);
+  appearance:none;cursor:pointer;color:var(--text-2);
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='9' height='6' viewBox='0 0 10 7'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238b8377' stroke-width='1.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 9px center;
+}
+.br .to:hover{border-color:var(--line-hot);color:var(--text)}
+.br .tools{flex:none;display:flex;gap:1px;opacity:0;transition:opacity var(--d-fast) var(--e-in)}
+.br:hover .tools,.br:focus-within .tools{opacity:1}
+.br.hit{background:var(--amber-dim);box-shadow:inset 2px 0 0 var(--amber)}
+.br.hit .conn{color:var(--amber)}
+.br.skip{opacity:.36}
+.br .skipnote{font-size:var(--fs-nano);color:var(--text-4);font-style:italic}
+.bnote{padding:3px 8px 3px 26px;font-size:var(--fs-micro);color:var(--text-4);font-family:var(--mono)}
+.tnode.folded .brs{display:none}
+
+/* ── 13. 数据表：发丝线、无斑马纹、悬停整行抬亮 ─────────────────── */
+.tbl-wrap{border:1px solid var(--line);border-radius:var(--r2);overflow:hidden;background:var(--panel)}
+.tbl-scroll{overflow-x:auto}
+table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
+.tbl th{
+  font-family:var(--mono);font-size:var(--fs-nano);font-weight:600;
+  color:var(--text-3);letter-spacing:.1em;text-transform:uppercase;
+  text-align:left;padding:9px 12px;white-space:nowrap;
+  background:var(--bg-deep);border-bottom:1px solid var(--line-2);
+}
+.tbl td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:middle}
+.tbl tbody tr:last-child td{border-bottom:none}
+.tbl tbody tr{transition:background var(--d-fast) var(--e-in)}
+.tbl tbody tr:hover{background:var(--hv)}
+.tbl tbody tr.pick{cursor:pointer}
+.tbl tbody tr.on{background:var(--amber-dim);box-shadow:inset 2px 0 0 var(--amber)}
+.tbl .num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:var(--fs-micro)}
+
+/* 状态点：颜色 + 形状双编码，不靠颜色单独表意 */
+.st{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-micro);white-space:nowrap}
+.st .d{width:6px;height:6px;border-radius:50%;flex:none;background:var(--text-4)}
+.st .d.g{background:var(--mint);box-shadow:0 0 6px rgba(74,222,155,.6)}
+.st .d.r{background:var(--rust);box-shadow:0 0 6px rgba(255,92,71,.6)}
+.st .d.y{background:var(--amber-fill);box-shadow:0 0 6px var(--amber-glow)}
+.st .d.b{background:var(--ice);box-shadow:0 0 6px rgba(110,197,216,.5)}
+
+/* ── 14. 分档：堆叠条 + 分界输入 ─────────────────────────────────── */
+.band{padding:var(--s4) 0;border-bottom:1px solid var(--line)}
+.band:last-child{border-bottom:none;padding-bottom:0}
+.band:first-child{padding-top:0}
+.band-hd{display:flex;align-items:baseline;gap:var(--s2);margin-bottom:var(--s3);flex-wrap:wrap}
+.band-hd b{font-size:var(--fs-md);font-weight:600}
+.band-hd .basis{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)}
+.band-hd .end{margin-left:auto}
+.dist{display:flex;height:38px;border-radius:var(--r1);overflow:hidden;border:1px solid var(--line-2);margin-bottom:var(--s3)}
+.dist .seg{
+  display:flex;flex-direction:column;justify-content:center;align-items:center;gap:1px;
+  min-width:0;overflow:hidden;padding:0 6px;
+  border-right:1px solid var(--seg-div);
+  transition:flex var(--d-slow) var(--e-out);
+}
+.dist .seg:last-child{border-right:none}
+.dist .seg b{font-size:var(--fs-micro);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.dist .seg i{font-family:var(--mono);font-size:var(--fs-nano);font-style:normal;opacity:.72}
+.dist .s0{background:#2a2523;color:var(--text-2)}
+.dist .s1{background:#3d3733;color:var(--text)}
+.dist .s2{background:#574e47;color:var(--text)}
+.dist .s3{background:var(--amber-fill);color:var(--on-accent)}
+.cuts{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.cuts .cl{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4);letter-spacing:.08em;margin-right:2px}
+.cut{
+  width:92px!important;padding:5px 8px!important;
+  font-family:var(--mono);font-size:var(--fs-micro)!important;
+  background:var(--bg-deep);border:1px solid var(--line-2);border-radius:var(--r1);color:var(--amber-hi);
+}
+.cut:hover{border-color:var(--amber-line)}
+.cut:focus{border-color:var(--amber);box-shadow:0 0 0 3px var(--amber-dim);outline:none}
+.csep{color:var(--text-4);font-family:var(--mono);font-size:var(--fs-micro)}
+.cuts .un{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4);margin-left:4px}
+
+/* ── 15. 键值表 ───────────────────────────────────────────────────── */
+.kv{display:grid;grid-template-columns:auto 1fr;gap:7px var(--s4);font-size:var(--fs-micro);align-items:baseline}
+.kv .k{font-family:var(--mono);color:var(--text-3);letter-spacing:.04em;white-space:nowrap}
+.kv .v{color:var(--text-2);line-height:1.6}
+.kv .v b{color:var(--text);font-weight:600}
+
+/* ── 16. 浮层：检视面板 / 新增表单 ───────────────────────────────── */
+.sheet{
+  border:1px solid var(--line-2);border-radius:var(--r2);
+  background:linear-gradient(180deg,var(--panel-2),var(--panel));
+  box-shadow:var(--sh-3);margin-bottom:var(--s5);overflow:hidden;
+  animation:sheetIn var(--d-base) var(--e-out) both;
+}
+@keyframes sheetIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
+.sheet-hd{
+  display:flex;align-items:center;gap:var(--s3);flex-wrap:wrap;
+  padding:var(--s3) var(--s4);background:var(--bg-deep);border-bottom:1px solid var(--line);
+}
+.sheet-hd b{font-family:var(--display);font-size:var(--fs-md);letter-spacing:-.02em}
+.sheet-hd .sub{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-3);letter-spacing:.06em}
+.sheet-hd .x{margin-left:auto}
+.sheet-bd{padding:var(--s4)}
+
+/* 四步表单：步骤序号做成仪表编号 */
+.steps{display:flex;flex-direction:column;gap:var(--s4)}
+.step{display:grid;grid-template-columns:26px 1fr;gap:var(--s3);align-items:start}
+.step .sn{
+  width:26px;height:26px;display:grid;place-items:center;
+  font-family:var(--mono);font-size:var(--fs-micro);font-weight:700;
+  color:var(--amber);background:var(--amber-dim);border:1px solid var(--amber-line);
+  border-radius:var(--r1);
+}
+.step .sc{min-width:0}
+.step .sc>.lb{margin-bottom:var(--s2)}
+
+/* 取值点选：像面板上的选择按钮 */
+.picks{display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.pk{
+  padding:5px 11px;min-height:32px;
+  background:var(--bg-deep);border:1px solid var(--line-2);border-radius:var(--r1);
+  font-size:var(--fs-micro);color:var(--text-3);
+  transition:all var(--d-fast) var(--e-in);
+}
+.pk:hover{border-color:var(--line-hot);color:var(--text-2)}
+.pk.on{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent);font-weight:700}
+.pk.add{border-style:dashed;color:var(--text-4)}
+.pk.add:hover{border-color:var(--amber-line);color:var(--amber)}
+.relword{
+  font-family:var(--mono);font-size:var(--fs-micro);color:var(--amber);
+  background:var(--amber-dim);border:1px solid var(--amber-line);border-radius:var(--r1);
+  padding:4px 10px;
+}
+
+/* 预览句：等宽，像设备上的一句指令回显 */
+.preview{
+  margin-top:var(--s3);padding:var(--s3);
+  background:var(--bg-deep);border:1px dashed var(--line-2);border-radius:var(--r2);
+  font-family:var(--mono);font-size:var(--fs-micro);line-height:1.8;color:var(--text-2);
+}
+.preview .lb{font-size:var(--fs-nano);color:var(--text-4);margin-bottom:5px}
+.preview b{color:var(--amber-hi);font-weight:600}
+.preview .todo{color:var(--text-4);font-style:italic}
+
+/* 影响预估：三格读数 */
+.impact{
+  border:1px solid var(--amber-line);border-left-width:3px;border-radius:var(--r2);
+  background:linear-gradient(90deg,var(--amber-dim),transparent 60%);
+  padding:var(--s4);margin-bottom:var(--s5);
+}
+.impact h3{font-family:var(--display);font-size:var(--fs-md);letter-spacing:-.02em;margin-bottom:3px}
+.impact .est{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-3);margin-bottom:var(--s3)}
+.imputes{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:var(--s3);margin-bottom:var(--s3)}
+.imput{background:var(--bg-deep);border:1px solid var(--line-2);border-radius:var(--r1);padding:9px 11px}
+.imput .k{font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4);letter-spacing:.06em}
+.imput .v{font-family:var(--mono);font-size:var(--fs-lg);font-weight:600;color:var(--text);font-variant-numeric:tabular-nums;line-height:1.2}
+.imput .v.amber{color:var(--amber-ink)}
+
+/* 体检结果 */
+.find{display:flex;gap:var(--s3);padding:var(--s3) 0;border-bottom:1px solid var(--line)}
+.find:last-child{border-bottom:none}
+.find .ic{
+  width:24px;height:24px;flex:none;display:grid;place-items:center;
+  border-radius:var(--r1);font-size:var(--fs-micro);font-weight:700;
+}
+.find.warn .ic{background:var(--amber-dim);color:var(--amber);border:1px solid var(--amber-line)}
+.find.ok .ic{background:var(--mint-dim);color:var(--mint);border:1px solid var(--mint-line)}
+.find.err .ic{background:var(--rust-dim);color:var(--rust);border:1px solid var(--rust-line)}
+.find .tx .h{font-size:var(--fs-sm);font-weight:600;margin-bottom:2px}
+.find .tx .d{font-size:var(--fs-micro);color:var(--text-3);line-height:1.62}
+
+/* ── 17. 提示条 ───────────────────────────────────────────────────── */
+.note{
+  font-size:var(--fs-micro);color:var(--text-4);line-height:1.78;
+  padding-left:var(--s3);border-left:1px solid var(--line-2);
+}
+.note b{color:var(--text-2);font-weight:600}
+.note b.sep{margin-inline:.32em}
+.note code{font-family:var(--mono);color:var(--amber);font-size:var(--fs-nano)}
+
+/* 加载：三点依次亮起，而不是转圈 */
+.loading{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-size:var(--fs-micro);color:var(--amber);grid-column:1/-1}
+.loading i{width:5px;height:5px;border-radius:50%;background:var(--amber-fill);animation:blip 1.1s var(--e-in) infinite}
+.loading i:nth-child(2){animation-delay:.16s}
+.loading i:nth-child(3){animation-delay:.32s;margin-right:3px}
+@keyframes blip{0%,100%{opacity:.2;transform:scale(.8)}50%{opacity:1;transform:scale(1)}}
+
+/* ── 18. 气泡 ─────────────────────────────────────────────────────── */
+.toast{
+  position:fixed;left:50%;bottom:26px;transform:translate(-50%,14px);z-index:70;
+  display:none;align-items:center;gap:var(--s3);
+  padding:11px var(--s4);
+  background:var(--panel-2);border:1px solid var(--line-hot);border-radius:var(--r2);
+  box-shadow:var(--sh-3);font-size:var(--fs-sm);
+  opacity:0;transition:opacity var(--d-base) var(--e-out),transform var(--d-base) var(--e-out);
+}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.toast button{font-family:var(--mono);font-size:var(--fs-micro);color:var(--amber);text-decoration:underline;text-underline-offset:3px}
+
+/* ── 19. 入场序列：一次编排，胜过零散微交互 ─────────────────────── */
+.rv{opacity:0;transform:translateY(14px)}
+.rv.in{opacity:1;transform:none;transition:opacity var(--d-slow) var(--e-out),transform var(--d-slow) var(--e-out)}
+.rv:nth-child(1){transition-delay:0ms}
+.rv:nth-child(2){transition-delay:80ms}
+.rv:nth-child(3){transition-delay:160ms}
+.rv:nth-child(4){transition-delay:240ms}
+.rv:nth-child(5){transition-delay:320ms}
+.rv:nth-child(6){transition-delay:400ms}
+
+/* ── 20. 降级动效 ─────────────────────────────────────────────────── */
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{
+    animation-duration:.01ms!important;animation-iteration-count:1!important;
+    transition-duration:.01ms!important;scroll-behavior:auto!important;
+  }
+  .rv{opacity:1;transform:none}
+}
+
+/* ── 21. 响应式 ───────────────────────────────────────────────────── */
+@media(max-width:900px){
+  .rack{width:60px}
+  .deck{margin-left:60px}
+  .rk{width:46px}
+  .rk .rk-t{display:none}
+  .rk::before{left:-6px}
+  .bay{padding:var(--s5) var(--s4) var(--s7)}
+  .strip{padding:var(--s3) var(--s4);flex-wrap:wrap}
+  .pg-hd h1{font-size:var(--fs-2xl)}
+  .pg-hd{--fs-3xl:32px}
+  .pg-hd h1{font-size:32px}
+  .panel{padding:var(--s4)}
+  .imputes{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:600px){
+  .kv{grid-template-columns:1fr;gap:2px}
+  .kv .k{margin-top:var(--s2)}
+  .step{grid-template-columns:1fr}
+}
+</style>
+
+</head>
+<body>
+
+<div class="graticule" aria-hidden="true"></div>
+<div class="ambient" aria-hidden="true"></div>
+<div class="vignette" aria-hidden="true"></div>
+<div class="grain" aria-hidden="true"></div>
+
+<!-- ══ 左侧机架导航 ══ -->
+<aside class="rack">
+  <div class="mark">SR</div>
+  <nav class="rack-nav" aria-label="主导航">
+    <button class="rk on" onclick="go('try')" title="试一试"><span class="rk-i">01</span><span class="rk-t">试一试</span></button>
+    <button class="rk" onclick="go('tree')" title="分流树"><span class="rk-i">02</span><span class="rk-t">分流树</span></button>
+    <button class="rk" onclick="go('traffic')" title="流量"><span class="rk-i">03</span><span class="rk-t">流量</span></button>
+    <button class="rk" onclick="go('models')" title="模型"><span class="rk-i">04</span><span class="rk-t">模型</span></button>
+    <button class="rk" onclick="go('settings')" title="设置"><span class="rk-i">05</span><span class="rk-t">设置</span></button>
+  </nav>
+  <div class="rack-foot">
+    <span class="lamp" title="已连接"></span>
+  </div>
+</aside>
+
+<div class="deck">
+
+<!-- ══ 顶部条 ══ -->
+<header class="strip">
+  <div class="strip-brand"><b>Smart Router</b><span>/ v7</span></div>
+  <div class="strip-end">
+    <div class="dip" role="group" aria-label="界面语言">
+      <button id="lg-zh" class="on" onclick="setLang('zh')">中文</button>
+      <button id="lg-en" onclick="setLang('en')">EN</button>
+    </div>
+    <div class="dip theme" role="group" aria-label="界面主题">
+      <button id="th-dark" class="on" onclick="setTheme('dark')" title="深色" aria-label="深色"><span class="ic">◐</span></button>
+      <button id="th-light" onclick="setTheme('light')" title="浅色" aria-label="浅色"><span class="ic">☀</span></button>
+    </div>
+  </div>
+</header>
+
+<main class="bay">
+
+<!-- ══════════════ 01 试一试 ══════════════ -->
+<section class="pg on" id="p-try">
+  <div class="pg-hd rv">
+    <h1>试一试</h1>
+    <p class="lede">输入一句话，看它流向哪个模型——以及为什么。</p>
+  </div>
+
+  <!-- ① 请求：一条消息 + 会话状态，其余交给树 -->
+  <div class="panel brk rv">
+    <div class="panel-hd"><h2>请求</h2></div>
+    <textarea id="reqtext">帮我设计一个支持千万并发的订单系统的数据库分片方案，要考虑跨分片事务和热点账户问题。</textarea>
+    <div class="btn-row" style="margin-top:var(--s4)">
+      <span class="lb" style="margin:0">会话</span>
+      <div class="seg" id="sessSeg">
+        <button class="on" data-sess="new" onclick="setSess('new')">新会话</button>
+        <button data-sess="sticky" onclick="setSess('sticky')">已有会话 · 第 3 轮</button>
+      </div>
+      <button class="btn pri" onclick="doTag()">路由 →</button>
+      <span class="lb" style="margin:0 0 0 var(--s2)">示例</span>
+      <div class="picks">
+        <button class="pk ex" onclick="tryExample(0)">设计并发系统</button>
+        <button class="pk ex" onclick="tryExample(1)">画架构图</button>
+        <button class="pk ex" onclick="tryExample(2)">优化代码</button>
+        <button class="pk ex" onclick="tryExample(3)">闲聊</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ② 信号：本次判定用到的信号一行说完；完整 17 格默认折叠 -->
+  <div class="panel brk rv" id="sigpanel" style="margin-top:var(--s5)">
+    <div class="panel-hd">
+      <h2>信号</h2><span class="sub" id="sigsub">一次打出全部信号</span>
+      <span class="end mini faint" id="tagtime" style="font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)"></span>
+    </div>
+    <div id="sigline" class="sigline-wrap">
+      <div class="note">尚未执行</div>
+      <button class="btn link" id="sigtoggle" onclick="toggleTags()" style="display:none">▸ 全部 17 个信号</button>
+    </div>
+    <div id="tags" class="mgrid" style="display:none;margin-top:var(--s3)"><div class="note" style="grid-column:1/-1">尚未执行</div></div>
+  </div>
+
+  <!-- ③ 沿树下行：把求值过程变成一次可见的通电 -->
+  <div class="panel brk rv" style="margin-top:var(--s5)">
+    <div class="panel-hd">
+      <h2>沿树下行</h2>
+      <span class="sub">第一个条件全满足的分支接住请求</span>
+      <span class="end"><button class="btn sm" onclick="pulseDemo()">重放脉冲</button></span>
+    </div>
+    <div class="rail" id="rail">
+      <div class="pulse" id="pulse" aria-hidden="true"></div>
+      <div id="railbody"><div class="note">尚未执行 —— 路由后这里显示完整的下行过程。</div></div>
+    </div>
+    <div class="verdict" id="verdict" style="display:none"></div>
+  </div>
+</section>
+
+<!-- ══════════════ 02 分流树 ══════════════ -->
+<section class="pg" id="p-tree">
+  <div class="pg-hd rv">
+    <h1>分流树</h1>
+    <p class="lede">自上而下，第一个条件全满足的分支接住请求。位置就是优先级。</p>
+  </div>
+
+  <div class="panel brk rv" style="margin-bottom:var(--s5)">
+    <div class="btn-row">
+      <div class="seg">
+        <button class="on" onclick="setView('tree')">树视图</button>
+        <button onclick="setView('list')">列表视图</button>
+      </div>
+      <button class="btn pri" onclick="openAddNode()">＋ 新增节点</button>
+      <button class="btn" onclick="openCheckup()">体检</button>
+      <div style="flex:1"></div>
+      <div class="chipset">
+        <span class="lb" style="margin:0">试算</span>
+        <select id="sampleSel" onchange="tryOne(this.value)" style="width:auto;min-width:220px">
+          <option value="">选择请求…</option>
+          <option value="0">帮我设计千万并发的订单分片方案</option>
+          <option value="1">画一张系统架构图</option>
+          <option value="2">第 3 轮对话，上轮反馈 = 答错了</option>
+        </select>
+      </div>
+      <span id="statline" style="font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)"></span>
+      <span id="treesig" style="font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)"></span>
+    </div>
+  </div>
+
+  <div id="addBox"></div>
+  <div id="impactBox"></div>
+  <div id="treeWrap" class="panel brk rv"></div>
+  <div id="triBox"></div>
+  <div id="checkup"></div>
+
+  <div class="note" style="margin-top:var(--s4)">
+    节点可折叠、上移、置顶；位置即优先级。分支右侧下拉可改去向，选项含能力标签。
+  </div>
+</section>
+
+<!-- ══════════════ 03 流量 ══════════════ -->
+<section class="pg" id="p-traffic">
+  <div class="pg-hd rv">
+    <h1>流量</h1>
+    <p class="lede">每条请求打出的信号、走的路径和结果。点开可回看判定过程。</p>
+  </div>
+
+  <div class="btn-row rv" style="margin-bottom:var(--s4)">
+    <button class="btn sm pri" onclick="quick(this)">拦截</button>
+    <button class="btn sm" onclick="quick(this)">小模型</button>
+    <button class="btn sm" onclick="quick(this)">兜底</button>
+    <button class="btn sm" onclick="quick(this)">反馈解锁</button>
+    <button class="btn sm" onclick="quick(this)">把握度不足</button>
+    <div style="flex:1"></div>
+    <select style="width:auto"><option>全部协议</option><option>OpenAI</option><option>Anthropic</option></select>
+    <select style="width:auto"><option>最近 7 天</option><option>最近 24 小时</option></select>
+  </div>
+
+  <div class="tbl-wrap rv">
+    <div class="tbl-scroll">
+      <table class="tbl">
+        <thead><tr>
+          <th style="width:82px">时间</th><th style="width:88px">协议</th><th>标签摘要</th>
+          <th style="width:132px">路径</th><th style="width:98px">会话</th>
+          <th style="width:118px">去向</th><th style="width:104px">结果</th><th class="num" style="width:78px">耗时</th>
+        </tr></thead>
+        <tbody>
+          <tr class="pick" onclick="showReq(0)">
+            <td class="mono" style="font-size:var(--fs-micro)">14:01:22</td><td style="font-size:var(--fs-micro)">OpenAI</td>
+            <td><div class="chipset"><span class="chip"><span class="k">学科</span><span class="v">计算机</span></span><span class="chip"><span class="k">难度</span><span class="v">较难</span></span></div></td>
+            <td style="font-size:var(--fs-micro)" class="mono">3 · 编程与推理</td>
+            <td><span class="st"><span class="d b"></span>新会话</span></td>
+            <td class="mono" style="font-size:var(--fs-micro)">qwen3-32b</td>
+            <td><span class="st"><span class="d g"></span>正常返回</span></td>
+            <td class="num">1.8s</td>
+          </tr>
+          <tr class="pick" onclick="showReq(1)">
+            <td class="mono" style="font-size:var(--fs-micro)">14:01:09</td><td style="font-size:var(--fs-micro)">Anthropic</td>
+            <td><div class="chipset"><span class="chip rust"><span class="k">可疑</span><span class="v">非常可疑</span></span></div></td>
+            <td style="font-size:var(--fs-micro)" class="mono">1 · 安全</td>
+            <td><span class="st"><span class="d b"></span>新会话</span></td>
+            <td class="mono" style="font-size:var(--fs-micro);color:var(--rust)">拦下</td>
+            <td><span class="st"><span class="d r"></span>已拦截</span></td>
+            <td class="num">0.01s</td>
+          </tr>
+          <tr class="pick" onclick="showReq(2)">
+            <td class="mono" style="font-size:var(--fs-micro)">14:00:57</td><td style="font-size:var(--fs-micro)">OpenAI</td>
+            <td style="font-size:var(--fs-micro);color:var(--text-4)">（沿用会话，未重新判断）</td>
+            <td style="font-size:var(--fs-micro)" class="mono">起点 · 会话沿用</td>
+            <td><span class="st"><span class="d y"></span>沿用</span></td>
+            <td class="mono" style="font-size:var(--fs-micro)">qwen3-32b</td>
+            <td><span class="st"><span class="d g"></span>正常返回</span></td>
+            <td class="num">0.4s</td>
+          </tr>
+          <tr class="pick" onclick="showReq(3)">
+            <td class="mono" style="font-size:var(--fs-micro)">14:00:31</td><td style="font-size:var(--fs-micro)">Anthropic</td>
+            <td><div class="chipset"><span class="chip ice"><span class="k">上轮反馈</span><span class="v">答错了</span></span></div></td>
+            <td style="font-size:var(--fs-micro)" class="mono">起点 · 反馈解锁</td>
+            <td><span class="st"><span class="d y"></span>解锁</span></td>
+            <td class="mono" style="font-size:var(--fs-micro)">claude-sonnet</td>
+            <td><span class="st"><span class="d g"></span>正常返回</span></td>
+            <td class="num">2.3s</td>
+          </tr>
+          <tr class="pick" onclick="showReq(4)">
+            <td class="mono" style="font-size:var(--fs-micro)">14:00:12</td><td style="font-size:var(--fs-micro)">OpenAI</td>
+            <td><div class="chipset"><span class="chip rust"><span class="k">敏感信息</span><span class="v">有</span></span></div></td>
+            <td style="font-size:var(--fs-micro)" class="mono">1 · 安全</td>
+            <td><span class="st"><span class="d b"></span>新会话</span></td>
+            <td class="mono" style="font-size:var(--fs-micro);color:var(--rust)">拦下</td>
+            <td><span class="st"><span class="d r"></span>已拦截</span></td>
+            <td class="num">0.02s</td>
+          </tr>
+          <tr class="pick" onclick="showReq(5)">
+            <td class="mono" style="font-size:var(--fs-micro)">13:59:48</td><td style="font-size:var(--fs-micro)">OpenAI</td>
+            <td><div class="chipset"><span class="chip ice"><span class="k">要什么</span><span class="v">图片</span></span></div></td>
+            <td style="font-size:var(--fs-micro)" class="mono">2 · 多媒体</td>
+            <td><span class="st"><span class="d b"></span>新会话</span></td>
+            <td class="mono" style="font-size:var(--fs-micro)">sdxl-image</td>
+            <td><span class="st"><span class="d g"></span>正常返回</span></td>
+            <td class="num">5.1s</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="reqdetail" style="display:none;margin-top:var(--s5)"></div>
+</section>
+
+<!-- ══════════════ 04 模型 ══════════════ -->
+<section class="pg" id="p-models">
+  <div class="pg-hd rv">
+    <h1>模型</h1>
+    <p class="lede">接入后端模型。两套 SDK 的鉴权、路径、请求体与流式形态都不同，<b>接入时按协议自动适配。</b></p>
+  </div>
+
+  <div class="btn-row rv" style="margin-bottom:var(--s4)">
+    <button class="btn pri" onclick="openAddModel()">＋ 接入新模型</button>
+    <div style="flex:1"></div>
+    <span id="mstat" style="font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)"></span>
+  </div>
+
+  <div id="addModelBox"></div>
+
+  <div class="split-3 rv">
+    <div class="panel brk">
+      <div class="panel-hd"><h2>供应商</h2><span class="sub">PROVIDERS</span></div>
+      <div class="tbl-wrap">
+        <div class="tbl-scroll">
+          <table class="tbl">
+            <thead><tr><th>名称</th><th>协议</th><th class="num">状态</th></tr></thead>
+            <tbody id="provbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="note" style="margin-top:var(--s3)">地址与鉴权方式在「接入新模型」里逐项填写，不在此重复。</div>
+    </div>
+
+    <div class="panel brk" style="grid-column:span 2">
+      <div class="panel-hd"><h2>模型清单</h2><span class="sub">5 个 · 能力标签决定可被谁选中</span></div>
+      <div class="tbl-wrap">
+        <div class="tbl-scroll">
+          <table class="tbl">
+            <thead><tr><th style="width:120px">名称</th><th style="width:92px">协议</th><th>上游模型名</th><th style="width:150px">能力</th><th class="num" style="width:44px">阶梯</th><th style="width:88px">状态</th></tr></thead>
+            <tbody id="modbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel brk rv" style="margin-top:var(--s5)">
+    <div class="panel-hd"><h2>模型阶梯</h2><span class="sub">按能力从低到高排序</span></div>
+    <div class="note" style="margin-bottom:var(--s4)">「升一档」取后一格，「换一个模型」取下一格。反馈解锁依赖此顺序；未配置时「答错了」退化为重新判断。</div>
+    <div id="ladderbox" class="chipset" style="gap:var(--s2)"></div>
+  </div>
+
+  <div class="panel brk rv" style="margin-top:var(--s5)">
+    <div class="panel-hd clickable" onclick="foldPanel(this)">
+      <h2>两套 SDK 的差异</h2><span class="sub">可核对明细</span>
+      <span class="end fold-cue">▸</span>
+    </div>
+    <div class="fold-bd" style="display:none"><div id="prototable"></div></div>
+  </div>
+</section>
+
+<!-- ══════════════ 05 设置 ══════════════ -->
+<section class="pg" id="p-settings">
+  <div class="pg-hd rv">
+    <h1>设置</h1>
+    <p class="lede">路由行为与参数。模型接入见「模型」页；<b>变更前给出影响预估。</b>分档改完立即生效。</p>
+  </div>
+
+  <div class="split-3">
+    <div class="panel brk rv">
+      <div class="panel-hd"><h2>会话沿用</h2></div>
+      <label class="sw"><input type="checkbox" checked><span class="track"></span>开启（默认）</label>
+      <div class="kv" style="margin-top:var(--s3)">
+        <span class="k">新会话阈值</span><span class="v">半小时没有新消息</span>
+        <span class="k">会话标识</span><span class="v">优先采用客户端会话标识；缺失时用「同一客户端 + 首条消息指纹」</span>
+        <span class="k">显式指定模型</span><span class="v">一律直通，不参与沿用</span>
+      </div>
+    </div>
+
+    <div class="panel brk rv">
+      <div class="panel-hd"><h2>预算保护</h2></div>
+      <label class="sw"><input type="checkbox" checked><span class="track"></span>开启</label>
+      <div class="kv" style="margin-top:var(--s3)">
+        <span class="k">触发水位</span><span class="v">今日花费超过 <b>八成</b></span>
+        <span class="k">触发后</span><span class="v">一律走阶梯最低档</span>
+        <span class="k">恢复</span><span class="v">次日 0 点自动恢复</span>
+      </div>
+    </div>
+
+    <div class="panel brk rv">
+      <div class="panel-hd"><h2>执行</h2></div>
+      <div class="kv">
+        <span class="k">兜底顺序</span><span class="v mono">qwen3-8b → claude-sonnet</span>
+        <span class="k">全部未命中</span><span class="v">交给兜底模型（不直接拒绝）</span>
+        <span class="k">上游异常时</span><span class="v">最多重试 2 次，等待逐次变长；只在还没开始返回内容时重试</span>
+        <span class="k">合批窗口</span><span class="v mono">5 ms</span>
+        <span class="k">标签留存</span><span class="v mono">30 天</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel brk rv" style="margin-top:var(--s5)">
+    <div class="panel-hd"><h2>检查点</h2><span class="sub">CHECKPOINT</span></div>
+    <div class="split-3">
+      <div class="kv">
+        <span class="k">目录</span><span class="v mono">./checkpoints/routepilot</span>
+        <span class="k">底座模型</span><span class="v">Qwen3.5-0.8B · 上下文 512 词</span>
+        <span class="k">运行设备</span><span class="v">GPU · 合批 5 ms</span>
+      </div>
+      <div class="kv">
+        <span class="k">标签清单</span><span class="v">17 个标签 · 校验一致 <span class="chip mint"><span class="v">通过</span></span></span>
+      </div>
+      <div class="note">启动时逐项核对标签清单与模型输出顺序；不一致则拒绝启动。</div>
+    </div>
+  </div>
+
+  <div class="panel brk rv" style="margin-top:var(--s5)">
+    <div class="panel-hd"><h2>标签的分档</h2><span class="sub">改完立即生效</span></div>
+    <div class="note" style="margin-bottom:var(--s4)">只有连续量的标签才有分档：是非题切概率，打分题切分数，长短切数量。<b>拖动分界后各档占比按段内密度自动重算。</b></div>
+    <div id="bandbox"></div>
+  </div>
+
+  <div class="panel brk rv" style="margin-top:var(--s5)">
+    <div class="panel-hd">
+      <h2>把握度分档</h2><span class="sub">全部模型标签通用 · 来自 JEV 的置信度</span>
+    </div>
+    <div class="note" style="margin-bottom:var(--s4)">置信度不是另算的，而是从概率分布导出：分布越尖越确定。它是路由的<b>第二个门槛</b>。</div>
+    <div id="confbox"></div>
+  </div>
+</section>
+
+</main>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script>
+/* ══════════════════════════════════════════════════════════════════════
+   Smart Router · 信号盘 v6
+   数据模型与求值逻辑沿用 v5 已验证的实现；本文件重写渲染层，
+   并新增「信号轨」——把求值过程变成一次可见的下行通电。
+   ══════════════════════════════════════════════════════════════════════ */
+
+const EN = {
+  "学科": "Subject",
+  "难度": "Difficulty",
+  "需核实": "Fact Check",
+  "相似度": "Similarity",
+  "关键词": "Keyword",
+  "要什么": "Modality",
+  "语言": "Language",
+  "结构": "Structure",
+  "长度": "Context",
+  "轮次": "Turns",
+  "可疑": "Suspicious",
+  "敏感信息": "PII",
+  "身份": "Identity",
+  "时段": "Time Window",
+  "事件": "Event",
+  "上轮反馈": "Last Feedback",
+  "重复提问": "Re-ask",
+  "计算机": "Computer Science",
+  "数学": "Math",
+  "物理": "Physics",
+  "化学": "Chemistry",
+  "生物": "Biology",
+  "工程": "Engineering",
+  "经济": "Economics",
+  "商科": "Business",
+  "法律": "Law",
+  "哲学": "Philosophy",
+  "心理": "Psychology",
+  "医学": "Health",
+  "历史": "History",
+  "其他": "Other",
+  "简单": "Easy",
+  "一般": "Medium",
+  "较难": "Hard",
+  "很难": "Very Hard",
+  "很正常": "Normal",
+  "有点可疑": "Slightly Suspicious",
+  "很可疑": "Suspicious",
+  "非常可疑": "Very Suspicious",
+  "不像": "Dissimilar",
+  "有点像": "Somewhat Similar",
+  "很像": "Similar",
+  "很短": "Very Short",
+  "长": "Long",
+  "超长": "Very Long",
+  "首轮": "First Turn",
+  "聊了几轮": "A Few Turns",
+  "长对话": "Long Conversation",
+  "需要核实": "Needs Check",
+  "不用核实": "No Check",
+  "没有": "None",
+  "有": "Yes",
+  "很不确定": "Very Uncertain",
+  "不太确定": "Somewhat Uncertain",
+  "比较确定": "Fairly Certain",
+  "非常确定": "Very Certain",
+  "文字": "Text",
+  "图片": "Image",
+  "长上下文": "Long Context",
+  "只画图": "Image Only",
+  "便宜": "Cheap",
+  "中等": "Medium",
+  "贵": "Expensive",
+  "快": "Fast",
+  "中速": "Medium Speed",
+  "慢": "Slow",
+  "关闭": "Close",
+  "轻度": "Light",
+  "深度": "Deep",
+  "是": "Yes",
+  "属于": "in",
+  "至少": "at least",
+  "至多": "at most",
+  "含有": "contains",
+  "满意": "Satisfied",
+  "想让我说清楚": "Need Clarification",
+  "答错了": "Wrong Answer",
+  "想换个说法": "Want Different",
+  "故障报告": "Incident",
+  "支付异常": "Payment Issue",
+  "都要": "Both",
+  "文字加图片": "Text + Image",
+  "试一试": "Try",
+  "分流树": "Route Tree",
+  "流量": "Traffic",
+  "模型": "Model",
+  "设置": "Settings",
+  "Smart Router 控制台": "Smart Router Console",
+  "输入请求，查看标签与分流路径。结果确定，可复现。": "Paste a request to see its tags and routing path. Deterministic and reproducible.",
+  "自上而下匹配，首个命中分支决定去向。": "Evaluated top-down; the first matching branch wins.",
+  "位置即优先级": "Position is priority",
+  "每条请求的标签、路径与会话状态。点开可「按当前规则重放」，不调用模型。": "Tags, path and session state for every request. Open one to replay against current rules without calling models.",
+  "接入后端模型。两套 SDK 的鉴权、路径、请求体与流式形态都不同，接入时按协议自动适配。": "Connect backend models. The two SDKs differ in auth, path, body and streaming; the protocol adapts automatically.",
+  "路由行为与参数。模型接入见「模型」页；变更前给出影响预估。": "Routing behaviour and parameters. Model onboarding lives under Models; changes show an impact estimate first.",
+  "请求（末条用户消息）": "Request (last user message)",
+  "协议": "Protocol",
+  "会话": "Session",
+  "打标签": "Tag it",
+  "换示例": "Sample",
+  "标签": "Tags",
+  "尚未执行": "Not run yet",
+  "分流路径": "Routing path",
+  "自上而下，首个命中即停": "Top-down, stops at first hit",
+  "树视图": "Tree",
+  "列表视图": "List",
+  "＋ 新增节点": "+ New node",
+  "体检": "Checkup",
+  "试算": "Dry run",
+  "选择请求…": "Pick a request…",
+  "＋ 接入新模型": "+ Connect model",
+  "供应商": "Providers",
+  "名称": "Name",
+  "能力": "Capabilities",
+  "阶梯": "Step",
+  "状态": "Status",
+  "模型阶梯": "Model Ladder",
+  "两套 SDK 的差异": "SDK Differences",
+  "按能力从低到高排序。「升一档」取后一格，「换一个模型」取下一格。": "Ordered by capability. “Step up” takes the next; “Switch” takes the one after.",
+  "接入时按协议自动适配；以下为可核对明细。": "Adapted per protocol; details below for verification.",
+  "时间": "Time",
+  "路径": "Path",
+  "标签摘要": "Tags",
+  "结果": "Result",
+  "耗时": "Latency",
+  "请求详情": "Request detail",
+  "⟳ 按当前规则重放": "⟳ Replay current rules",
+  "全部协议": "All protocols",
+  "最近 7 天": "Last 7 days",
+  "最近 24 小时": "Last 24 hours",
+  "拦截": "Blocked",
+  "小模型": "Small model",
+  "兜底": "Fallback",
+  "反馈解锁": "Unlocked",
+  "把握度不足": "Low confidence",
+  "正常返回": "OK",
+  "已拦截": "Blocked",
+  "新会话": "New",
+  "沿用": "Sticky",
+  "解锁": "Unlocked",
+  "标签的分档": "Tag Bands",
+  "把握度分档": "Confidence Bands",
+  "全部模型标签通用 · 来自 JEV 的置信度": "Shared by all model tags · JEV confidence",
+  "只有连续量的标签才有分档：是非题切概率，打分题切分数，长短切数量。改完立即生效。": "Only continuous tags have bands: booleans cut on probability, scores on value, lengths on count. Takes effect immediately.",
+  "置信度不是另算的，而是从概率分布导出：分布越尖越确定。它是路由的第二个门槛。": "Confidence derives from the probability distribution: the sharper the peak, the higher it is. It is the second routing gate.",
+  "会话沿用": "Session Sticky",
+  "预算保护": "Budget Guard",
+  "执行": "Execution",
+  "检查点": "Checkpoint",
+  "开启（默认）": "On (default)",
+  "开启": "Enable",
+  "同一会话沿用首次判定模型，后续轮次不再判定": "Reuse the first decision within a session; later turns skip re-evaluation",
+  "新会话阈值": "New session after",
+  "会话标识": "Session key",
+  "显式指定模型": "Explicit model",
+  "触发水位": "Trigger level",
+  "触发后": "Then",
+  "恢复": "Recovery",
+  "兜底顺序": "Fallback chain",
+  "全部未命中": "No match",
+  "上游异常时": "On upstream error",
+  "合批窗口": "Batch window",
+  "标签留存": "Tag retention",
+  "目录": "Path",
+  "标签清单": "Tag manifest",
+  "底座模型": "Backbone",
+  "运行设备": "Device",
+  "半小时没有新消息": "30 minutes idle",
+  "优先采用客户端会话标识；缺失时用「同一客户端 + 首条消息指纹」": "Use the client session key; fall back to client + first-message fingerprint",
+  "一律直通，不参与沿用": "Pass through, sticky bypassed",
+  "今日花费超过 八成": "Daily spend above 80%",
+  "一律走阶梯最低档": "Route to the lowest ladder step",
+  "次日 0 点自动恢复": "Auto-reset at 00:00",
+  "交给兜底模型（不直接拒绝）": "Hand to the fallback model (never reject outright)",
+  "最多重试 2 次，等待逐次变长；只在还没开始返回内容时重试": "Retry up to 2 times with growing backoff; only before the first byte",
+  "30 天": "30 days",
+  "GPU · 合批 5 ms": "GPU · batch 5 ms",
+  "17 个标签 · 校验一致": "17 tags · verified",
+  "通过": "Pass",
+  "Qwen3.5-0.8B · 上下文 512 词": "Qwen3.5-0.8B · 512-token context",
+  "方案 均衡 · 会话沿用启用 · 今日变更 1 次": "Profile Balanced · sticky on · 1 change today",
+  "▸ 节点可折叠、上移、置顶；位置即优先级。": "▸ Nodes fold, move and pin; position is priority.",
+  "▸ 分支右侧下拉可改去向，选项含能力标签。": "▸ The dropdown on each branch sets its target; options carry capability labels.",
+  "▸ ⋯ 菜单：加子分支 / 试水 / 回退 / 样例。": "▸ ⋯ menu: add sub-branch / trial / fallback / samples.",
+  "一次前向全部输出": "produced in one forward pass",
+  "（本例 12 ms）；规则标签毫秒级。": "（12 ms here); rule tags in microseconds.",
+  "标签与路径均入库，可在「流量」页回看。": "Tags and paths are stored; review them under Traffic.",
+  "▸ 反馈解锁依赖此顺序；未配置时「答错了」退化为重新判断。": "▸ Unlock depends on this order; without it “wrong answer” degrades to re-evaluating.",
+  "▸ 启动时逐项核对标签清单与模型输出顺序；不一致则拒绝启动。": "▸ The tag manifest is checked against model output order at startup; mismatch refuses to start.",
+  "起点 · 会话沿用": "Start · Session Sticky",
+  "起点 · 反馈解锁": "Start · Unlock",
+  "1 · 安全": "1 · Safety",
+  "2 · 多媒体": "2 · Multimedia",
+  "3 · 编程与推理": "3 · Coding",
+  "4 · 法律与事实": "4 · Law & Facts",
+  "5 · 成本控制": "5 · Cost Control",
+  "6 · 专属": "6 · Dedicated",
+  "9 · 其他（兜底）": "9 · Other (fallback)",
+  "同一个会话里，沿用第一次判断的结果（省算力，也省模型切换的开销）": "Reuse the first decision within a session — saves compute and avoids model switching",
+  "先拦危险请求": "Block dangerous requests first",
+  "要生成图片的请求（位于成本控制之前）": "Image requests (ahead of cost control)",
+  "按难度换模型": "Escalate by difficulty",
+  "需要严肃对待的问题": "Questions needing care",
+  "简单请求走小模型": "Simple requests to the small model",
+  "指定人群走指定模型": "Audience-specific routing",
+  "全部未命中时": "When nothing matches",
+  "帮我设计一个支持千万并发的订单系统的数据库分片方案，要考虑跨分片事务和热点账户问题。": "Design a database sharding plan for an order system at tens of millions of concurrent users, covering cross-shard transactions and hot accounts.",
+  "帮我设计千万并发的订单分片方案": "Order sharding for tens of millions of concurrent users",
+  "画一张系统架构图": "Draw a system architecture diagram",
+  "第 3 轮对话，上轮反馈 = 答错了": "Turn 3, last feedback = wrong answer",
+  "已有会话（第 3 轮）": "Existing session (turn 3)",
+  "auto（走分流树）": "auto (route by tree)",
+  "qwen3-8b（直通）": "qwen3-8b (pass-through)",
+
+  /* ── 取值枚举补充 ── */
+  "中文": "Chinese",
+  "英文": "English",
+  "有代码": "Code",
+  "有 JSON": "JSON",
+  "多行文字": "Multi-line",
+  "普通文本": "Plain text",
+  "普通用户": "Standard user",
+  "内部服务": "Internal service",
+  "工作日白天": "Weekday daytime",
+  "夜间": "Night",
+  "周末": "Weekend",
+  "手机号": "Phone",
+  "身份证号": "ID number",
+  "银行卡号": "Bank card",
+  "邮箱": "Email",
+  "密码": "Password",
+  "重复": "Repeated",
+  "不重复": "Not repeated",
+  "否": "No",
+  "什么情况都算": "Always matches",
+  "异常": "Error",
+  /* ── 界面名词 ── */
+  "起点": "Start",
+  "置顶": "Pin",
+  "折叠": "Fold",
+  "展开": "Expand",
+  "新增节点": "New node",
+  "优先级": "Priority",
+  "条件": "Condition",
+  "去向": "Target",
+  "取值": "Value",
+  "预览": "Preview",
+  "树上预览": "Tree preview",
+  "思考档位": "Thinking",
+  "添加": "Add",
+  "取消": "Cancel",
+  "不限": "Any",
+  "把握度门槛": "Confidence gate",
+  "自定义": "Custom",
+  "可多选": "multi-select",
+  "可切换方向": "direction switchable",
+  "自行填写": "free text",
+  "选中标签后显示取值": "Values appear once a tag is picked",
+  "（未选择）": "(none)",
+  "（未命名）": "(unnamed)",
+  "（尚未选择取值）": "(no value yet)",
+  "（沿用会话，未重新判断）": "(sticky, no re-evaluation)",
+  "当": "When",
+  "四步：名称 → 优先级 → 条件 → 去向": "Four steps: name → priority → condition → target",
+  "四步：协议 → 供应商 → 模型 → 测试": "Four steps: protocol → provider → model → test",
+  "位置即优先级，越靠上越优先": "Position is priority — higher means earlier",
+  "放在最前面（仅次于起点 · 会话沿用）": "Top, right after Start · Session sticky",
+  "放在兜底之前（很可能永远轮不到）": "Before the fallback — rarely reached",
+  "都不是 → 往下走，重新判断": "None of these → fall through and re-evaluate",
+  "先落为草稿并给出影响预估，确认后保存。": "Lands as a draft with an impact estimate; save to confirm.",
+  "确认保存": "Save",
+  "撤销": "Discard",
+  "按近 7 天流量估算。": "Estimated from the last 7 days of traffic.",
+  "需在分流树中添加一条指向该模型的规则，才会生效。": "Add a rule in the route tree targeting this model for it to take effect.",
+  "前往分流树": "Open route tree",
+  "清除": "Clear",
+  /* ── 试一试 / 标签卡 ── */
+  "模型标签": "Model tags",
+  "你自己定义的词表": "your own word list",
+  "没有命中": "no match",
+  "模型 · 一次前向": "Model · one forward pass",
+  "规则 · 毫秒级": "Rule · sub-millisecond",
+  "规则判断": "Rule",
+  "在说什么": "What it is about",
+  "长什么样": "What it looks like",
+  "有没有风险": "Is it risky",
+  "谁、什么时候、聊到哪了": "Who, when, how far",
+  "请求的内容讲了什么": "What the request is about",
+  "请求的形式特征": "Formal traits",
+  "安全与隐私": "Safety and privacy",
+  "来源、时机与对话状态": "Origin, timing, conversation state",
+  "两样都对上了": "both matched",
+  /* ── 第二轮补齐 ── */
+  "回退": "Fallback",
+  "而且": "and",
+  "规则": "Rule",
+  "Claude 官方与兼容网关": "Claude official and compatible gateways",
+  "⟳ 重放": "⟳ Replay",
+  "特殊去向": "Special targets",
+  "鉴权头 Authorization: Bearer 已带上；返回 3 个可用模型": "Authorization: Bearer sent; 3 models available",
+  "鉴权头 x-api-key 与 anthropic-version 已带上；返回 1 条 message": "x-api-key and anthropic-version sent; 1 message returned",
+  "无": "None",
+  "＋ 自定义": "+ Custom",
+  "每百万 token": "per million tokens",
+  "把握度": "Confidence",
+  "安全": "Safety",
+  "多媒体": "Multimedia",
+  "编程与推理": "Coding",
+  "法律与事实": "Law & Facts",
+  "成本控制": "Cost Control",
+  "专属": "Dedicated",
+  "其他（兜底）": "Other (fallback)",
+  "JEV 置信度；不确定的请求可交给兜底": "JEV confidence; uncertain requests can go to the fallback",
+  "这是新会话，起点不适用 —— 往下走": "New session, so the start node does not apply — fall through",
+  "新会话 —— 往下走": "New session — fall through",
+  "检测到身份证号": "ID number detected",
+  "用户说上一轮答错了": "The user said the last answer was wrong",
+  "命中：3 · 编程与推理 → 学科是计算机 而且 难度至少较难  →  qwen3-32b（深度）· 回退 qwen3-8b": "Hit: 3 · Coding → Subject is CS and Difficulty at least Hard  →  qwen3-32b (deep) · fallback qwen3-8b",
+  "命中：2 · 多媒体 → 要什么 是 图片  →  sdxl-image": "Hit: 2 · Multimedia → Modality is Image  →  sdxl-image",
+  "命中：起点 · 会话沿用 → 上轮反馈 是 答错了  →  升一档（上一轮用 qwen3-32b，这一轮用 claude-sonnet）": "Hit: Start · Session sticky → Last feedback is Wrong answer  →  Step up (qwen3-32b → claude-sonnet)",
+  "已上移（原型示意）": "Moved up (prototype)",
+  "已下移（原型示意）": "Moved down (prototype)",
+  "已置顶（原型示意）": "Pinned (prototype)",
+  "已删除该分支": "Branch deleted",
+  "已打开说明": "Opened the help",
+  "历史上没有符合条件的请求": "No historical request matches",
+  "已打开供应商状态": "Opened provider status",
+  "已把 llava-omni 设为图片兜底": "llava-omni set as the image fallback",
+  "请输入数值": "Enter a number",
+  "分界必须从左到右递增": "Cuts must increase left to right",
+  "请填写名称": "Name is required",
+  "请填写上游模型名": "Upstream model is required",
+  "请至少选择一项能力标签": "Pick at least one capability tag",
+  "该名称已存在": "That name already exists",
+  "请填写关键词": "Enter a keyword",
+  "请至少选择一个取值": "Pick at least one value",
+  "新建供应商：填地址与密钥来源": "New provider: set the base URL and key source",
+  "连通正常": "Connection OK",
+  "已切到树视图": "Switched to tree view",
+  "已切到列表视图（同一份数据）": "Switched to list view (same data)",
+  "已撤销": "Discarded",
+  "已保存，立刻生效": "Saved and live",
+  "草稿已入树，可核对位置": "Draft added to the tree — check its position",
+  "Switched to English": "Switched to English",
+
+  "无其他分支同时满足。": "No other branch matches.",
+  "已保存，立刻生效": "Saved and live",
+  "已撤销": "Discarded",
+  "草稿已入树，可核对位置": "Draft added to the tree — check its position",
+  "已切到树视图": "Switched to tree view",
+  "已切到列表视图（同一份数据）": "Switched to list view (same data)",
+  "…… 下面的节点都没有再看": "… no later node is examined",
+  /* ── 试一试 · 树驱动信号 ── */
+  "树决定用哪些信号；一次前向产出全部标签；按条件与把握度决定去向。结果确定，可复现。": "The tree picks its signals; one forward pass produces every tag; conditions and confidence decide the target. Deterministic and reproducible.",
+  "参与判定": "Used",
+  "未被本树引用": "Not used by tree",
+  "条件全部满足": "All conditions met",
+  "全部未命中，走兜底": "No branch matched — fallback",
+  "请输入请求内容": "Enter a request first",
+  /* ── 流量页 ── */
+  "去哪": "Target",
+  "当时": "At the time",
+  "拦下": "Blocked",
+  "本轮未重新打标签：会话沿用复用了上一轮结果。": "No re-tagging this turn: session sticky reused the previous result.",
+  "（历史标签 + 当前分流树，未调用模型）": "（historical tags + current tree, no model calls）",
+  /* ── 样例 / 体检 ── */
+  "分支样例": "Branch samples",
+  "取自历史流量，未改动数据": "From historical traffic; nothing modified",
+  "命中该分支的请求：": "Requests that hit this branch:",
+  "最接近但未命中的请求（用于判断条件是否过窄）：": "Closest misses, to judge whether the condition is too narrow:",
+  "如何用 Rust 重写这个热点路径，需要考虑无锁队列…": "How to rewrite this hot path in Rust with lock-free queues…",
+  "解释一下 Paxos 和 Raft 在脑裂场景下的取舍…": "Explain the Paxos vs Raft trade-off under split brain…",
+  "帮我写一个 Python 脚本读取 CSV 并生成报表": "Write a Python script that reads CSV and builds a report",
+  "讲一下微服务拆分的常见坑": "Common pitfalls when splitting a monolith into services",
+  "体检结果": "Checkup result",
+  "17 个标签 · 每次保存自动执行": "17 tags · runs on every save",
+  "不影响运行，可能为漏配。": "Harmless, but possibly a missing config.",
+  "条件可能有误，或该类流量不存在。": "The condition may be wrong, or this traffic may not exist.",
+  "删除": "Delete",
+  "前移": "Move up",
+  "查看用途": "View purpose",
+  "检索历史匹配": "Search historical matches",
+  "查看供应商状态": "View provider status",
+  "为此节点添加回退模型": "Add a fallback model here",
+  "兜底齐备": "Fallback in place",
+  "第 9 个节点处理全部未命中请求。": "Node 9 handles every unmatched request.",
+  "引用完整": "References intact",
+  "分支引用的标签与模型均已定义。": "Every tag and model referenced by branches is defined.",
+  "sdxl-image 连续失败已自动跳过，图片请求将落至兜底的文本模型。": "sdxl-image keeps failing and is auto-skipped; image requests will land on the fallback text model.",
+  "兜底分支必然满足，但位于最后": "The fallback always matches, but sits last",
+  "难度为简单且长度很短，本可命中": "Easy difficulty and very short length — would have matched",
+  /* ── 模型页 ── */
+  "接入新模型": "Connect model",
+  "选错会导致鉴权失败或路径错误": "A wrong choice breaks auth or the path",
+  "OpenAI 兼容": "OpenAI-compatible",
+  "vLLM · Ollama · 各类中转 · OpenAI 官方": "vLLM · Ollama · proxies · OpenAI official",
+  "调用地址": "Endpoint",
+  "鉴权头": "Auth header",
+  "鉴权": "Auth",
+  "Authorization: Bearer <密钥>": "Authorization: Bearer <key>",
+  "x-api-key: <密钥>　+　anthropic-version: 2023-06-01": "x-api-key: <key>　+　anthropic-version: 2023-06-01",
+  "请求体": "Request body",
+  "system 作为 messages 的第一条": "system goes first inside messages",
+  "system 是独立字段，不放在 messages 里": "system is a top-level field, not inside messages",
+  "流式": "Streaming",
+  "用量": "Usage",
+  "末尾的 chunk 里携带 usage": "usage rides in the final chunk",
+  "在 message_delta 事件里": "inside the message_delta event",
+  "事件序列 message_start → … → message_stop": "event stream message_start → … → message_stop",
+  "错误体": "Error body",
+  "本地": "Local",
+  "地址": "Base URL",
+  "密钥来源": "Key source",
+  "＋ 新建供应商": "+ New provider",
+  "分流树中展示的名称": "Shown in the route tree",
+  "上游模型名": "Upstream model",
+  "真实出站名，常与名称不同": "Actual outbound name; often differs",
+  "能力标签": "Capability tags",
+  "用于分流树去向与模型阶梯": "Used for tree targets and the ladder",
+  "价格": "Price",
+  "每百万 token，用于成本估算与预算保护；不填则不计成本": "Per million tokens; used for cost estimates and the budget guard. Blank means excluded.",
+  "百万 token": "million tokens",
+  "阶梯档位": "Ladder step",
+  "加入阶梯后，「升一档」「换一个模型」才能走到它": "Only ladder members can be reached by “Step up” or “Switch model”",
+  "不加入": "Not in ladder",
+  "加入末尾": "Append to ladder",
+  "别名": "Alias",
+  "可选；客户端以别名请求时直通至该模型": "Optional; requests using this alias pass straight to the model",
+  "＋ 添加": "+ Add",
+  "测试并保存": "Test and save",
+  "测试连通": "Test connection",
+  "接入": "Connect",
+  "暂时跳过": "Temporarily skipped",
+  "连续失败 · 预计 5 分钟后重试": "Repeated failures · retry in ~5 min",
+  "连续失败 · 自动熔断": "Repeated failures · auto circuit-break",
+  "正常": "OK",
+  "项": "Item",
+  "对话路径": "Chat path",
+  "{基址}/chat/completions（基址需含 /v1）": "{base}/chat/completions (base must include /v1)",
+  "{基址}/v1/messages（基址不含 /v1）": "{base}/v1/messages (base must not include /v1)",
+  "{供应商地址}": "{provider base}",
+  "输出 0.42": "Output 0.42",
+  "输入 0.18": "Input 0.18",
+  "例如：客服工单": "e.g. Support ticket",
+  "说明（可选），例如：工单类走便宜模型": "Note (optional), e.g. tickets go to the cheap model",
+  "例如：qwen3-8b": "e.g. qwen3-8b",
+  "例如：Qwen/Qwen2.5-8B-Instruct": "e.g. Qwen/Qwen2.5-8B-Instruct",
+  "例如：auto": "e.g. auto",
+  "例如：工单": "e.g. ticket",
+  "输入后回车": "Type, then Enter",
+  /* ── 设置页 / 分档 ── */
+  "防止突发流量击穿预算": "Prevents traffic spikes from draining the budget",
+  "恢复默认": "Restore defaults",
+  "分界": "Cut",
+  "词": "tokens",
+  "向量余弦": "Vector cosine",
+  "词数": "Word count",
+  "JEV Noul · 是非概率 P(是)": "JEV Noul · P(yes)",
+  "JEV Score · 分数值（推理层数）": "JEV Score · value (reasoning depth)",
+  "1 − H(概率分布) / log(选项数)": "1 − H(distribution) / log(#options)",
+  "低于门槛的请求可交给兜底模型，不必强行判定——这是 JEV 置信度的主要用途。": "Requests below the gate can go to the fallback model instead of being forced — the main use of JEV confidence.",
+  "把握度分档可在设置中调整": "Confidence bands are adjustable in Settings",
+  /* ── 其他 ── */
+  "● 本地 · 已连接": "● Local · connected",
+  "上移": "Move up",
+  "下移": "Move down",
+  "更多": "More",
+  "＋ 加子分支": "+ Add sub-branch",
+  "◐ 加比例试水": "◐ Add canary split",
+  "↩ 加退回模型": "↩ Add fallback model",
+  "☰ 样例": "☰ Samples",
+  "✕ 删除这条分支": "✕ Delete this branch",
+  "沿用上次的模型": "Reuse last model",
+  "升一档": "Step up",
+  "换一个模型": "Switch model",
+  "拦下并说明原因": "Block with reason",
+  "按模型阶梯往后一格": "one step up the ladder",
+  "按模型阶梯跳到下一格": "jump to the next ladder slot",
+  "不进入模型": "never reaches a model",
+  "Smart Router 控制台原型 v5 · 静态演示，数据为示例 · 配套设计见《Smart-Router-设计方案.md》": "Smart Router console prototype v5 · static demo with sample data · full design in Smart-Router-设计方案.md",
+  "命中：3 · 编程与推理 → 学科是计算机 而且 难度至少较难  →  qwen3-32b（深度）· 回退 qwen3-8b": "3 · Coding → Subject is CS and Difficulty at least Hard  →  qwen3-32b (deep) · fallback qwen3-8b",
+  "命中：2 · 多媒体 → 要什么 是 图片  →  sdxl-image": "2 · Multimedia → Modality is Image  →  sdxl-image",
+  "命中：起点 · 会话沿用 → 上轮反馈 是 答错了  →  升一档（上一轮用 qwen3-32b，这一轮用 claude-sonnet）": "Start · Session sticky → Last feedback is Wrong answer  →  Step up (qwen3-32b → claude-sonnet)"
+};
+const EN_RULES = [
+  [/^思考 (.+) · 回退 (.+)$/,      m => 'Think ' + T(m[1]) + ' · Fallback ' + T(m[2])],
+  [/^别名 (.+)$/,                   m => 'Alias ' + m[1]],
+  [/^思考 (.+)$/,                   m => 'Think ' + T(m[1])],
+  [/^回退 (.+)$/,                   m => 'Fallback ' + m[1]],
+  [/^第 (\d+) 档$/,                 m => 'Step ' + m[1]],
+  [/^规则 (\d+)$/,                  m => 'Rule ' + m[1]],
+  [/^生效中 · (.+)$/,               m => 'Active · ' + T(m[1])],
+  [/^截止到 (.+)$/,                 m => 'Until ' + T(m[1])],
+  [/^(\d+) 个节点 · (\d+) 条分支$/, m => m[1] + ' nodes · ' + m[2] + ' branches'],
+  [/^(\d+) 个标签 · (.+)$/,         m => m[1] + ' tags · ' + T(m[2])],
+  [/^(.+) 个标签$/,                 m => T(m[1]) + ' tags'],
+  [/^模型 ([\d.]+) ms · 规则 ([\d.]+) ms$/, m => 'Model ' + m[1] + ' ms · rules ' + m[2] + ' ms'],
+  [/^命中：(\d+) · (.+)$/,          m => 'Hit: ' + m[1] + ' · ' + T(m[2])],
+  [/^试算：(.+)$/,                  m => 'Dry run: ' + T(m[1])],
+  [/^放在「(.+)」后面$/,            m => 'After “' + T(m[1]) + '”'],
+  [/^另有 (\d+) 个分支也满足，但被上方分支优先命中：$/, m => m[1] + ' more branch(es) also match but lose to an earlier one:'],
+  [/^([\d.]+) 秒$/,                 m => m[1] + ' s'],
+  [/^约 ([+\-−]\d+%)$/,             m => '~ ' + m[1]],
+  [/^依据：(.+)$/,                  m => 'Basis: ' + T(m[1])],
+  [/^已更新「(.+)」的分界$/,        m => 'Updated bands for “' + T(m[1]) + '”'],
+  [/^已更新把握度分界$/,            () => 'Updated confidence bands'],
+  [/^已恢复默认$/,                  () => 'Restored defaults'],
+  [/^已接入 (.+)$/,                 m => 'Connected ' + m[1]],
+  [/^已切到(.+)$/,                  m => 'Switched to ' + T(m[1])],
+  [/^已筛选：(.+)$/,                m => 'Filtered: ' + T(m[1])],
+  [/^已切换到中文$/,                () => 'Switched to Chinese'],
+  [/^「(.+)」已接入$/,              m => '“' + m[1] + '” connected'],
+  [/^「(.+)」已入树（草稿）$/,      m => '“' + m[1] + '” drafted into the tree'],
+  [/^「(.+)」第 (\d+) 条分支永不生效$/, m => '“' + T(m[1]) + '” branch #' + m[2] + ' can never fire'],
+  [/^「(.+)」近 (\d+) 天无命中$/,   m => '“' + T(m[1]) + '” had no hits in the last ' + m[2] + ' days'],
+  [/^「(.+)」仅有一个绘图模型，且其正被跳过$/, m => '“' + T(m[1]) + '” has a single image model, and it is being skipped'],
+  [/^同节点第 (\d+) 条「(.+)」已完全覆盖。$/, m => 'Branch #' + m[1] + ' “' + T(m[2]) + '” already covers it.'],
+  [/^(\d+) 个标签从未被使用：(.+)$/, m => m[1] + ' tags never used: ' + T(m[2])],
+  [/^每天约 (.+) 条请求进入此节点（(.+)%）$/, m => 'About ' + m[1] + ' requests/day enter this node (' + m[2] + '%)'],
+  [/^其中 (.+) 条原走兜底，(.+) 条原走其它节点$/, m => m[1] + ' were on the fallback, ' + m[2] + ' on other nodes'],
+  [/^成本 (.+)$/,                   m => 'Cost ' + T(m[1])],
+  [/^环境变量 (.+)$/,               m => 'env var ' + m[1]],
+  [/^至少 (.+)$/,                   m => 'At least ' + T(m[1])],
+  [/^命中「(.+)」第 (\d+) 条分支$/, m => 'Hit “' + T(m[1]) + '” branch #' + m[2]],
+  [/^命中「(.+)」，已拦截$/,        m => 'Hit “' + T(m[1]) + '” — blocked'],
+  [/^命中「(.+)」，沿用 (.+)（未重新打标签）$/, m => 'Hit “' + T(m[1]) + '” — sticky to ' + m[2] + ' (no re-tagging)'],
+  [/^命中「(.+)」，(.+) 升一档至 (.+)$/, m => 'Hit “' + T(m[1]) + '” — ' + m[2] + ' stepped up to ' + m[3]],
+  [/^仍然走 (.+) → (.+)。与当时一致。$/, m => 'Still ' + T(m[1]) + ' → ' + T(m[2]) + '. Same as before.'],
+  [/^(.+)仍然生效 → (.+)。与当时一致。$/, m => T(m[1]) + ' still applies → ' + m[2] + '. Same as before.'],
+  [/^这个会话上一轮用的是 (.+)，直接沿用，没有重新判断$/, m => 'This session used ' + m[1] + ' last turn — reused without re-evaluating'],
+  [/^(.*)（会话第 (\d+) 轮）$/,     m => m[1] + ' (session turn ' + m[2] + ')'],
+  [/^✓ (.+)$/,                      m => '✓ ' + T(m[1])],
+  [/^可疑是「(.+)」 —— 没有对上$/,  m => 'Suspicious is “' + T(m[1]) + '” — no match'],
+  [/^可疑是「(.+)」 —— 对上了$/,    m => 'Suspicious is “' + T(m[1]) + '” — match'],
+  [/^要的是(.+) —— 没有对上$/,      m => 'Modality is ' + T(m[1]) + ' — no match'],
+  [/^要的是(.+) —— 对上了$/,        m => 'Modality is ' + T(m[1]) + ' — match'],
+  [/^(.+) —— 解锁并升一档$/,        m => T(m[1]) + ' — unlock and step up'],
+  [/^(.+) —— 没有对上$/,            m => T(m[1]) + ' — no match'],
+  [/^(.+) —— 对上了$/,              m => T(m[1]) + ' — match'],
+  [/^新 · (.+)$/,                   m => 'New · ' + T(m[1])],
+  [/^· (.+)$/,                      m => '· ' + T(m[1])],
+  [/^已移到第 (\d+) 条前面$/,      m => 'Moved above branch #' + m[1]],
+  [/^去向已改为：(.+)（保存前会先告诉你会影响多少请求）$/, m => 'Target changed to: ' + m[1] + ' (you will see the impact before saving)'],
+  [/^(.+)（原型示意，真实版本会打开对应表单）$/, m => T(m[1]) + ' (prototype only; the real build opens a form)'],
+  /* ── 试一试 · 树驱动信号 ── */
+  [/^本树引用 (\d+) \/ (\d+) 个信号 · 未引用的已置灰$/, m => `Tree uses ${m[1]} / ${m[2]} signals · unused dimmed`],
+  [/^把握度不足：(.+) < (.+)$/, m => { const a = T(m[1]), b = T(m[2]);
+                                             return (a && b) ? `Confidence low: ${a} < ${b}` : null; }],
+  [/^(.{1,12})是「(.+)」$/,         m => { const a = T(m[1]), b = T(m[2]);
+                                             return (a && b) ? `${a} is “${b}”` : null; }],
+  // 多值以「、」连接（如「很短、一般」）。
+  // 必须每一段都能翻译才整体替换：否则整句会被切成半中半英的碎片。
+  [/^[^、。；，：]{1,12}(、[^、。；，：]{1,12})+$/,
+    m => { const ps = m[0].split('、');
+           const os = ps.map((x,i) => [x, T(x)]);
+           return os.every(([src,out]) => out != null && out !== src) ? os.map(p => p[1]).join(' / ') : null; }],
+  // 多值以「 / 」连接（如「满意 / 想让我说清楚」）
+  [/^[^\/]+( \/ [^\/]+)+$/,
+    m => { const ps = m[0].split(' / ');
+           const os = ps.map((x,i) => [x, T(x)]);
+           // 每一段都要真的变了才整体替换；否则返回 null，把机会让给后面的规则。
+           // （旧写法只判 !== undefined，而 T() 永远返回字符串，
+           //   于是原样返回并提前短路，后面所有规则都再也匹配不上。）
+           return os.every(([src,out]) => out != null && out !== src) ? os.map(p => p[1]).join(' / ') : null; }],
+];
+
+const OP_EN = { '是':'is', '属于':'in', '至少':'at least', '至多':'at most',
+                '正好':'exactly', '含有':'contains', '或':'or', '并且':'and' };
+const OP_CLASS = ['op', 'and', 'relword', 'k'];
+
+/* ══ 分层翻译：① 精确词条 ② 模板规则 ③ 分段查表 ══ */
+function trSeg(s){
+  const parts = s.split(/( · | )/);
+  if(parts.length < 3) return null;
+  let any = false;
+  const out = parts.map(p => {
+    if(p === ' · ' || p === ' ') return p;
+    if(EN[p] !== undefined){ any = true; return EN[p]; }
+    if(OP_EN[p] !== undefined){ any = true; return OP_EN[p]; }
+    if(!/[一-鿿]/.test(p)) return p;   // 纯 ASCII 段（模型名、版本号）原样保留
+    return null;
+  });
+  if(!any || out.some(x => x === null)) return null;
+  return out.join('');
+}
+function xlate(t){
+  if(!/[一-鿿]/.test(t)) return null;   // 不含中文的串不翻译（回滚根因）
+  if(EN[t] !== undefined) return EN[t];
+  for(const [re, fn] of EN_RULES){
+    const m = t.match(re);
+    if(m){ const out = fn(m); if(out != null) return out; }
+  }
+  return trSeg(t);
+}
+function tr(s){ return lang === 'en' ? (xlate(String(s)) || String(s)) : String(s); }
+function T(s){ return tr(s); }
+
+let lang = 'zh';
+
+function applyI18n(root){
+  const host = root || document.body;
+  const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, null);
+  const nodes = [];
+  while(walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach(n => {
+    const p = n.parentElement;
+    if(!p || p.tagName === 'SCRIPT' || p.tagName === 'STYLE') return;
+    const raw = n.nodeValue; const key = raw.trim();
+    if(!key) return;
+    if(n.__zh === undefined && /[一-鿿]/.test(raw)) n.__zh = raw;
+    if(lang === 'en'){
+      if(!/[一-鿿]/.test(raw)) return;
+      const isOp = p.classList && OP_CLASS.some(c => p.classList.contains(c));
+      const out = isOp && OP_EN[key] !== undefined ? OP_EN[key] : xlate(key);
+      if(out != null) n.nodeValue = (n.__zh || raw).replace(key, out);
+    } else if(n.__zh !== undefined){ n.nodeValue = n.__zh; }
+  });
+  host.querySelectorAll('[placeholder],[title],[aria-label]').forEach(el => {
+    ['placeholder','title','aria-label'].forEach(attr => {
+      const v = el.getAttribute(attr);
+      if(!v) return;
+      if(!/[一-鿿]/.test(v)) return;
+      if(el['__zh_'+attr] === undefined) el['__zh_'+attr] = v;
+      if(lang === 'en'){ const o = xlate(el['__zh_'+attr]); if(o != null) el.setAttribute(attr, o); }
+      else el.setAttribute(attr, el['__zh_'+attr]);
+    });
+  });
+}
+
+function setLang(l){
+  lang = l;
+  document.getElementById('lg-zh').classList.toggle('on', l === 'zh');
+  document.getElementById('lg-en').classList.toggle('on', l === 'en');
+  document.documentElement.lang = l === 'en' ? 'en' : 'zh-CN';
+  renderAll();
+  toast(l === 'en' ? '已切换到英文' : '已切换到中文');
+}
+function renderAll(){
+  renderTree(); renderModels(); renderBands();
+  if(form) renderForm();
+  if(mf) renderModelForm();
+  if(typeof REQS !== 'undefined') closeReq();
+  // renderTree 会先写入中文统计行，applyI18n 收尾统一翻译，
+  // 顺序不能反，否则新写入的中文逃过这一轮翻译。
+  applyI18n();
+}
+function go(id){
+  document.querySelectorAll('.pg').forEach(p => p.classList.toggle('on', p.id === 'p-' + id));
+  document.querySelectorAll('.rk').forEach(b => b.classList.toggle('on', b.getAttribute('onclick') === `go('${id}')`));
+  window.scrollTo({top:0, behavior:'smooth'});
+  document.querySelectorAll('.pg.on .rv').forEach(el => el.classList.add('in'));
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   数据模型
+   ══════════════════════════════════════════════════════════════════════ */
+const MODELS = [
+  {id:'qwen3-8b',      prov:'本地',      proto:'openai',    upstream:'Qwen/Qwen2.5-8B-Instruct', caps:['文字','长上下文','便宜','快'],     step:1, ok:true,  price:{in:'0.18',out:'0.42'}},
+  {id:'qwen3-32b',     prov:'本地',      proto:'openai',    upstream:'Qwen/Qwen2.5-32B-Instruct',caps:['文字','长上下文','中等','中速'], step:2, ok:true,  price:{in:'1.20',out:'3.40'}},
+  {id:'llava-omni',    prov:'本地',      proto:'openai',    upstream:'llava-omni-preview',        caps:['文字','图片','中等','中速'],     step:0, ok:true,  price:{in:'2.50',out:'4.00'}},
+  {id:'sdxl-image',    prov:'本地',      proto:'openai',    upstream:'sdxl-image',                caps:['图片','便宜','慢'],             step:0, ok:false, price:{in:'4.00',out:'4.00'}, breakReason:'连续失败 · 预计 5 分钟后重试'},
+  {id:'claude-sonnet', prov:'Anthropic', proto:'anthropic', upstream:'claude-sonnet-4-5',         caps:['文字','超长','贵','中速'],       step:3, ok:true,  price:{in:'3.00',out:'15.00'}}
+];
+MODELS.forEach(m => { m.cap = m.caps.join(' · '); });
+
+const PROVIDERS = [
+  {name:'本地',      proto:'openai',    base:'http://127.0.0.1:8000/v1', keyEnv:'LOCAL_KEY',         ok:true},
+  {name:'Anthropic', proto:'anthropic', base:'https://api.anthropic.com', keyEnv:'ANTHROPIC_API_KEY', ok:true}
+];
+
+const PROTO = {
+  openai:{ label:'OpenAI 兼容', desc:'vLLM · Ollama · 各类中转 · OpenAI 官方',
+    rows:[['鉴权','Authorization: Bearer <密钥>'],
+          ['路径','{基址}/chat/completions（基址需含 /v1）'],
+          ['请求体','system 作为 messages 的第一条'],
+          ['流式','data: {chunk} … data: [DONE]'],
+          ['用量','末尾的 chunk 里携带 usage'],
+          ['错误','{"error":{"message","type","code"}}']] },
+  anthropic:{ label:'Anthropic', desc:'Claude 官方与兼容网关',
+    rows:[['鉴权','x-api-key: <密钥>　+　anthropic-version: 2023-06-01'],
+          ['路径','{基址}/v1/messages（基址不含 /v1）'],
+          ['请求体','system 是独立字段，不放在 messages 里'],
+          ['流式','事件序列 message_start → … → message_stop'],
+          ['用量','在 message_delta 事件里'],
+          ['错误','{"type":"error","error":{"type","message"}}']] }
+};
+const CAPS = ['文字','图片','长上下文','超长','便宜','中等','贵','快','中速','慢'];
+const SPECIAL = [
+  {id:'沿用上次的模型', cap:'会话沿用'},
+  {id:'升一档',         cap:'按模型阶梯往后一格'},
+  {id:'换一个模型',     cap:'按模型阶梯跳到下一格'},
+  {id:'拦下并说明原因', cap:'不进入模型'}
+];
+function modelSelect(cur){
+  let o = SPECIAL.map(s => `<option ${s.id===cur?'selected':''}>${s.id}</option>`).join('');
+  o += `<option disabled>──────────</option>`;
+  o += MODELS.map(m => `<option ${m.id===cur?'selected':''}>${m.id} · ${m.cap}</option>`).join('');
+  return `<select class="to" onchange="toast('去向已改为：'+this.value+'（保存前会先告诉你会影响多少请求）')">${o}</select>`;
+}
+
+const TREE = [
+  { num:'起点', title:'会话沿用', cls:'n5', open:true,
+    desc:'同一个会话里，沿用第一次判断的结果（省算力，也省模型切换的开销）',
+    branches:[
+      {k:'b0-0', cond:[['上轮反馈','是','满意 / 想让我说清楚']], to:'沿用上次的模型'},
+      {k:'b0-1', cond:[['上轮反馈','是','答错了']], to:'升一档'},
+      {k:'b0-2', cond:[['上轮反馈','是','想换个说法']], to:'换一个模型'},
+      {note:'都不是 → 往下走，重新判断'}
+    ]},
+  { num:'1', title:'安全', cls:'n1', open:true, desc:'先拦危险请求',
+    branches:[
+      {k:'b1-0', cond:[['可疑','至少','很可疑']], to:'拦下并说明原因'},
+      {k:'b1-1', cond:[['敏感信息','含有','身份证号 / 银行卡号 / 密码']], to:'拦下并说明原因'}
+    ]},
+  { num:'2', title:'多媒体', cls:'n2', open:true, desc:'要生成图片的请求（位于成本控制之前）',
+    branches:[
+      {k:'b2-0', cond:[['要什么','是','图片']], to:'sdxl-image'},
+      {k:'b2-1', cond:[['要什么','是','文字加图片']], none:true, kids:[
+        {k:'b2-1-0', cond:[['难度','至少','较难']], to:'llava-omni', think:'深度'},
+        {k:'b2-1-1', cond:[['其他','','',true]], to:'llava-omni'}
+      ]}
+    ]},
+  { num:'3', title:'编程与推理', cls:'n3', open:true, desc:'按难度换模型',
+    branches:[
+      {k:'b3-0', cond:[['学科','是','计算机'],['难度','至少','较难'],['把握度','至少','比较确定']], to:'qwen3-32b', think:'深度', fb:'qwen3-8b'},
+      {k:'b3-1', cond:[['难度','至少','很难']], to:'qwen3-32b', think:'深度'},
+      {k:'b3-2', cond:[['难度','至少','较难']], to:'qwen3-32b', think:'轻度'}
+    ]},
+  { num:'4', title:'法律与事实', cls:'n4', open:true, desc:'需要严肃对待的问题',
+    branches:[
+      {k:'b4-0', cond:[['学科','是','法律'],['或'],['需核实','是','需要核实']], to:'qwen3-32b', think:'轻度', fb:'qwen3-8b'}
+    ]},
+  { num:'5', title:'成本控制', cls:'n5', open:true, desc:'简单请求走小模型',
+    branches:[
+      {k:'b5-0', cond:[['难度','是','简单'],['长度','属于','很短、一般']], to:'qwen3-8b'},
+      {k:'b5-1', cond:[['轮次','是','长对话']], to:'qwen3-8b'},
+      {k:'b5-2', cond:[['时段','是','夜间']], to:'qwen3-8b'}
+    ]},
+  { num:'6', title:'专属', cls:'n6', open:true, desc:'指定人群走指定模型',
+    branches:[{k:'b6-0', cond:[['身份','是','premium']], to:'qwen3-32b'}]},
+  { num:'9', title:'其他（兜底）', cls:'n9', open:true, desc:'全部未命中时',
+    branches:[{k:'b9-0', cond:[['兜底','','什么情况都算',true]], to:'qwen3-8b'}]}
+];
+
+/* 条件渲染成独立文本节点，不预拼接 —— 这样才能被逐段翻译 */
+function chipHtml(c){
+  if(c.length === 1 || c[0]==='或' || c[0]==='并且') return `<span class="and">${c[0]}</span>`;
+  return `<span class="chip"><span class="k">${c[0]}</span><span class="op">${c[1]}</span><span class="v">${c[2]}</span></span>`;
+}
+function branchHtml(b, isLast){
+  if(b.note) return `<div class="bnote">${b.note}</div>`;
+  const conn = isLast ? '└' : '├';
+  const conds = b.cond.map(chipHtml).join('');
+  const to = `<span class="to">${b.to}</span>`;
+  const tools = `<span class="tools">
+      <button class="btn ico" onclick="openPop(event,'${b.k}')" title="更多">⋯</button></span>`;
+  if(b.none && b.kids){
+    const kids = b.kids.map((kb,i) => branchHtml(kb, i===b.kids.length-1)).join('');
+    return `<div class="br" data-k="${b.k}"><span class="conn">${conn}</span>
+        <span class="cond">${conds}</span><span class="to" style="color:var(--text-4)">（往下细看）</span>${tools}</div>
+      <div class="brs" style="margin-left:11px;border-left:1px solid var(--line);padding-left:var(--s3)">${kids}</div>`;
+  }
+  return `<div class="br" data-k="${b.k}"><span class="conn">${conn}</span>
+      <span class="cond">${conds}</span>${modelSelect(b.to)}${tools}</div>`;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   分流树
+   ══════════════════════════════════════════════════════════════════════ */
+let treeView = 'tree';
+function setView(v){
+  treeView = v;
+  document.querySelectorAll('#p-tree .seg button').forEach((b,i) =>
+    b.classList.toggle('on', (i===0) === (v==='tree')));
+  renderTree();
+}
+function renumber(){
+  let i = 0;
+  TREE.forEach((n, idx) => { if(idx === 0){ n.num = '起点'; return; } i++; n.num = String(i); });
+}
+function treeSignals(){
+  const s = [];
+  const scan = b => (b.cond||[]).forEach(c => {
+    if(c.length > 1 && ['或','而且','兜底','其他','把握度'].indexOf(c[0]) < 0 && s.indexOf(c[0]) < 0) s.push(c[0]);
+  });
+  TREE.forEach(n => n.branches.forEach(b => { if(b.note) return; scan(b); (b.kids||[]).forEach(scan); }));
+  return s;
+}
+function renderTree(){
+  renumber();
+  const wrap = document.getElementById('treeWrap');
+  if(!wrap) return;
+  const nb = TREE.reduce((a,n) => a + n.branches.filter(b => !b.note).length, 0);
+  const kb = TREE.reduce((a,n) => a + n.branches.reduce((x,b) => x + (b.kids||[]).length, 0), 0);
+  const sl = document.getElementById('statline');
+  if(sl) sl.textContent = `${TREE.length} 个节点 · ${nb + kb} 条分支`;
+  const ts = document.getElementById('treesig');
+  if(ts) ts.textContent = `引用 ${treeSignals().length} / ${TAG_GROUPS.reduce((a,g) => a + g.tags.length, 0)}`;
+  if(treeView === 'list'){ wrap.innerHTML = renderList(); applyI18n(); return; }
+  wrap.innerHTML = `<div class="tree">` + TREE.map(n => {
+    const bs = n.branches.map((b,i) => branchHtml(b, i === n.branches.length-1)).join('');
+    return `<div class="tnode ${n.open?'':'folded'}" data-node="${n.num}">
+      <div class="tnode-hd">
+        <span class="tnode-no">${n.num}</span>
+        <span class="tnode-nm">${n.title}</span>
+        ${n.draft ? '<span class="chip key"><span class="v">草稿 · 未保存</span></span>' : ''}
+        <span class="tnode-ds">${n.desc}</span>
+        <span class="tnode-tools">
+          <button class="btn ico" onclick="toast('已置顶（原型示意）')">置顶</button>
+          <button class="btn ico" onclick="foldNode(this)">${n.open?'折叠':'展开'}</button>
+        </span>
+      </div>
+      <div class="brs">${bs}</div></div>`;
+  }).join('') + `</div>`;
+  applyI18n();
+}
+function renderList(){
+  const row = (n, b, tag) => `<tr>
+      <td style="white-space:nowrap"><span class="tnode-no">${n.num}</span> <b style="font-size:var(--fs-micro)">${n.title}</b>${tag}</td>
+      <td><div class="chipset">${b.cond.map(chipHtml).join('')}</div></td>
+      <td style="white-space:nowrap">${modelSelect(b.to)}</td></tr>`;
+  let rows = '';
+  TREE.forEach(n => n.branches.forEach(b => {
+    if(b.note) return;
+    if(b.kids){ b.kids.forEach(k => { rows += row(n, k, ' <span style="color:var(--text-4);font-size:var(--fs-nano)">└ 子分支</span>'); }); return; }
+    rows += row(n, b, '');
+  }));
+  return `<div class="tbl-wrap"><div class="tbl-scroll"><table class="tbl">
+    <thead><tr><th style="width:210px">节点（越靠上越优先）</th><th>什么时候用</th><th style="width:320px">去哪</th></tr></thead>
+    <tbody>${rows}</tbody></table></div></div>`;
+}
+function foldNode(btn){
+  const node = btn.closest('.tnode');
+  node.classList.toggle('folded');
+  btn.textContent = node.classList.contains('folded') ? '展开' : '折叠';
+}
+
+/* 可折叠面板：标题行整行点击，收起/展开正文（模型页「两套 SDK 的差异」在用） */
+function foldPanel(hd){
+  const body = hd.parentElement.querySelector('.fold-bd');
+  if(!body) return;
+  const open = body.style.display === 'none';
+  body.style.display = open ? '' : 'none';
+  const cue = hd.querySelector('.fold-cue');
+  if(cue) cue.textContent = open ? '▾' : '▸';
+}
+
+/* ⋯ 菜单 */
+function openPop(e, key){
+  e.stopPropagation(); closePop();
+  const r = e.currentTarget.getBoundingClientRect();
+  const d = document.createElement('div');
+  d.className = 'sheet'; d.id = 'popmenu';
+  d.style.cssText = `position:fixed;z-index:80;width:184px;margin:0;box-shadow:var(--sh-3)`;
+  d.style.left = Math.min(r.left - 40, window.innerWidth - 200) + 'px';
+  d.style.top  = (r.bottom + 6) + 'px';
+  d.innerHTML = `<div class="sheet-bd" style="padding:6px;display:flex;flex-direction:column;gap:1px">
+      <button class="btn ico" style="justify-content:flex-start;min-height:32px" onclick="popAct('加子分支')">＋ 加子分支</button>
+      <button class="btn ico" style="justify-content:flex-start;min-height:32px" onclick="popAct('加比例试水')">◐ 加比例试水</button>
+      <button class="btn ico" style="justify-content:flex-start;min-height:32px" onclick="popAct('加退回模型')">↩ 加退回模型</button>
+      <button class="btn ico" style="justify-content:flex-start;min-height:32px" onclick="closePop();showSamples()">☰ 样例</button>
+      <button class="btn ico" style="justify-content:flex-start;min-height:32px;color:var(--rust)" onclick="popAct('删除这条分支')">✕ 删除这条分支</button>
+    </div>`;
+  document.body.appendChild(d);
+  setTimeout(() => document.addEventListener('click', closePop, {once:true}), 0);
+}
+function closePop(){ const p = document.getElementById('popmenu'); if(p) p.remove(); }
+function popAct(name){ closePop(); toast(name + '（原型示意，真实版本会打开对应表单）'); }
+
+/* ── 试算：高亮路径 ── */
+const SAMPLES = {
+  '0':{ label:'帮我设计千万并发的订单分片方案', hit:['b3-0'],
+        skip:[['b9-0','兜底分支必然满足，但位于最后']],
+        win:'3 · 编程与推理 → 学科是计算机 而且 难度至少较难 → qwen3-32b（深度）· 回退 qwen3-8b' },
+  '1':{ label:'画一张系统架构图', hit:['b2-0'],
+        skip:[['b5-0','难度为简单且长度很短，本可命中'],['b9-0','兜底分支必然满足，但位于最后']],
+        win:'2 · 多媒体 → 要什么 是 图片 → sdxl-image' },
+  '2':{ label:'第 3 轮对话，上轮反馈 = 答错了', hit:['b0-1'], skip:[],
+        win:'起点 · 会话沿用 → 上轮反馈 是 答错了 → 升一档（上一轮用 qwen3-32b，这一轮用 claude-sonnet）' }
+};
+function tryOne(v){
+  document.querySelectorAll('.br').forEach(el => el.classList.remove('hit','skip'));
+  const box = document.getElementById('triBox');
+  if(!v){ box.innerHTML = ''; return; }
+  const s = SAMPLES[v];
+  s.hit.forEach(k => { const el = document.querySelector(`.br[data-k="${k}"]`); if(el) el.classList.add('hit'); });
+  s.skip.forEach(([k]) => { const el = document.querySelector(`.br[data-k="${k}"]`); if(el) el.classList.add('skip'); });
+  box.innerHTML = `<div class="sheet"><div class="sheet-hd"><b>试算：${s.label}</b>
+      <button class="btn sm x" onclick="document.getElementById('sampleSel').value='';tryOne('')">清除</button></div>
+    <div class="sheet-bd">
+      <div class="verdict" style="margin:0"><span class="vk">命中</span><span class="vv">${s.win}</span></div>
+      <div class="note" style="margin-top:var(--s3)">${s.skip.length
+        ? `<b>另有 ${s.skip.length} 个分支也满足，但被上方分支优先命中：</b><br>` + s.skip.map(([,t]) => '· ' + t).join('<br>')
+        : '无其他分支同时满足。'}</div>
+    </div></div>`;
+  applyI18n();
+}
+/* ══════════════════════════════════════════════════════════════════════
+   信号轨 —— 本设计的主角
+   v5 把求值结果画成一张表：命中一行、其余灰掉。
+   v6 把它画成一条真实的轨：脉冲从顶端下行，在命中站点停住，
+   站点撑大通电，其下所有站点熄灯。
+   「首个命中即停」从此不是一句说明，而是一次看得见的通电。
+   ══════════════════════════════════════════════════════════════════════ */
+/* 把站点序列画进指定挂载点，并驱动脉冲下行。
+   「试一试」与「流量详情」共用这一套，只是挂载点不同。 */
+function paintRail(railEl, bodyEl, pulseEl, rows){
+  if(!bodyEl) return;
+  if(!rows || !rows.length){
+    bodyEl.innerHTML = '<div class="note">尚未执行 —— 路由后这里显示完整的下行过程。</div>';
+    if(pulseEl) pulseEl.classList.remove('run');
+    return;
+  }
+  let hitAt = -1;
+  rows.forEach((r,i) => { if(r.hit && hitAt < 0) hitAt = i; });
+
+  // 同一个节点可能有多条分支被逐条评估。合成一个站点，
+  // 分支嵌在站点内部——否则「1 · 安全」会重复出现，看起来像 bug。
+  const groups = [];
+  rows.forEach((r,i) => {
+    if(r.skip) return;
+    const key = r.no || r.n;
+    const last = groups[groups.length - 1];
+    if(last && last.key === key) last.items.push({r, i});
+    else groups.push({ key, no:r.no, nm:r.nm || r.n, items:[{r, i}] });
+  });
+
+  const html = groups.map(g => {
+    const hitItem = g.items.find(x => x.r.hit);
+    const first = g.items[0].i;
+    const cls = hitItem ? 'hit' : (hitAt >= 0 && first > hitAt ? 'dead' : 'miss');
+    const brs = g.items.map(({r}) => {
+      // 只有命中分支显示条件芯片；没对上的分支一行 why 说完，不再罗列条件
+      if(!r.hit) return `<div class="sbr plain"><span class="why">${r.why}</span></div>`;
+      const chips = `<div class="chipset">${(r.cond || []).map(chipHtml).join('')}</div>`;
+      const to = r.to ? `<span class="to">→ ${r.to}</span>` : '';
+      return `<div class="sbr hit">
+          ${chips}${to}
+          <span class="why">${r.why}</span><span class="live">✓ 通电</span>
+        </div>`;
+    }).join('');
+    return `<div class="stn ${cls}" data-i="${hitItem ? hitItem.i : first}">
+      <span class="dot" aria-hidden="true"></span>
+      <div class="stn-hd">
+        <span class="stn-no">${g.no || g.key}</span>
+        <span class="snm">${g.nm}</span>
+        ${g.items.length > 1 ? `<span class="cnt">${g.items.length} 条分支</span>` : ''}
+      </div>
+      <div class="stn-brs">${brs}</div>
+    </div>`;
+  }).join('');
+
+  const hitLabel = hitAt >= 0 ? (rows[hitAt].nm || rows[hitAt].n) : '';
+  const cut = hitAt >= 0
+    ? `<div class="bnote" style="padding-left:26px;color:var(--amber)">↑ 以上通电 —— 首个命中即停，以下不再评估</div>` + deadStations(hitLabel)
+    : '';
+
+  bodyEl.innerHTML = html + cut;
+
+  // 脉冲：真实「走」到命中站点，而不是瞬移
+  if(pulseEl && hitAt >= 0 && !prefersReduced()){
+    const target = bodyEl.querySelector(`.stn[data-i="${hitAt}"] .dot`);
+    requestAnimationFrame(() => {
+      if(!target) return;
+      const railBox = railEl.getBoundingClientRect();
+      const y = (target.getBoundingClientRect().top - railBox.top) + 4;
+      pulseEl.classList.remove('run');
+      pulseEl.style.top = '14px';
+      void pulseEl.offsetWidth;               // 强制回流，让 transition 重新触发
+      requestAnimationFrame(() => {
+        pulseEl.style.top = y + 'px';
+        pulseEl.classList.add('run');
+      });
+    });
+  }
+}
+/* 「试一试」页的信号轨：画完再更新判定横幅 */
+function renderRail(rows, decision){
+  paintRail(document.getElementById('rail'),
+            document.getElementById('railbody'),
+            document.getElementById('pulse'), rows);
+  if(decision) verdictShow(decision);
+  applyI18n();
+}
+function prefersReduced(){
+  return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+/* 命中之后，剩下的节点收成一行「不再评估」——默认折叠，
+   点开才逐站列出。「首个命中即停」仍然可见，但不再占半屏。 */
+function deadStations(hitLabel){
+  const seen = (hitLabel || '').trim();
+  if(!seen) return '';
+  let passed = false;
+  const rest = [];
+  TREE.forEach(n => {
+    if(n.num === '起点') return;
+    // 命中节点本身已经在上面画成通电态了，熄灯列表从它之后开始，
+    // 否则同一个节点会既通电又熄灯地各出现一次。
+    if(!passed){ if(n.title === seen || seen.indexOf(n.title) >= 0) passed = true; return; }
+    rest.push(n);
+  });
+  if(!rest.length) return '';
+  const list = rest.map(n =>
+    `<div class="stn dead"><span class="dot"></span>
+      <div class="stn-hd">
+        <span class="stn-no">${n.num}</span>
+        <span class="snm">${n.title}</span>
+        <span class="stn-why">不再评估</span>
+      </div></div>`).join('');
+  return `<div class="stn deadfold">
+    <span class="dot"></span>
+    <div class="stn-hd">
+      <button class="deadfold-btn" data-n="${rest.length}" onclick="toggleDead(this)">▸ ${rest.length} 个节点不再评估</button>
+    </div>
+    <div class="deadlist" style="display:none">${list}</div>
+  </div>`;
+}
+function toggleDead(btn){
+  const list = btn.parentElement.nextElementSibling;
+  if(!list) return;
+  const open = list.style.display === 'none';
+  list.style.display = open ? '' : 'none';
+  btn.textContent = `${open ? '▾' : '▸'} ${btn.dataset.n} 个节点不再评估`;
+  applyI18n();
+}
+function pulseDemo(){
+  const pulse = document.getElementById('pulse');
+  const target = document.querySelector('#railbody .stn.hit .dot');
+  if(!pulse || !target) return;
+  const railBox = document.getElementById('rail').getBoundingClientRect();
+  const y = (target.getBoundingClientRect().top - railBox.top) + 4;
+  pulse.classList.remove('run');
+  pulse.style.top = '14px';
+  void pulse.offsetWidth;
+  requestAnimationFrame(() => { pulse.style.top = y + 'px'; pulse.classList.add('run'); });
+}
+
+function verdictShow(d){
+  const v = document.getElementById('verdict');
+  if(!v) return;
+  v.style.display = 'flex';
+  v.className = 'verdict' + (d.kind === 'block' ? ' block' : d.kind === 'sticky' ? ' sticky' : '');
+  if(d.kind === 'sticky'){
+    v.innerHTML = `<span class="vk">STICKY</span><span class="vv">命中「起点 · 会话沿用」，沿用 qwen3-32b</span><span class="dim">未重新打标签</span>`;
+    return;
+  }
+  if(d.kind === 'block'){
+    v.innerHTML = `<span class="vk">BLOCKED</span><span class="vv">命中「${d.n.num} · ${d.n.title}」，已拦截</span>`;
+    return;
+  }
+  v.innerHTML = `<span class="vk">HIT</span><span class="vv">${d.n.num} · ${d.n.title}</span>
+      <span class="arr">→</span><span class="pill">${d.model}</span>
+      ${d.think ? `<span class="dim">思考 ${d.think}</span>` : ''}
+      ${d.fb ? `<span class="arr">·</span><span class="dim">回退</span><span class="pill" style="border-color:var(--line-2);color:var(--text-2)">${d.fb}</span>` : ''}`;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   标签分组与读数格
+   ══════════════════════════════════════════════════════════════════════ */
+const GROUPS = [
+  {name:'在说什么', desc:'请求的内容讲了什么'},
+  {name:'长什么样', desc:'请求的形式特征'},
+  {name:'有没有风险', desc:'安全与隐私'},
+  {name:'谁、什么时候、聊到哪了', desc:'来源、时机与对话状态'}
+];
+const GCOLOR = ['var(--sig1)','var(--sig2)','var(--sig3)','var(--sig4)'];
+
+function gaugeCard(t, used){
+  const dim = used === false;
+  const gc = GCOLOR[t.g] || 'var(--text-4)';
+  const cf = t.cf
+    ? `<div class="gbar"><i style="background:${gc}" data-w="${t.pct||0}"></i></div>
+       <div class="gcf"><span>${t.cf}</span><span class="pc">${t.pct}%</span></div>`
+    : `<div class="gcf" style="margin-top:2px"><span>${t.kind==='规则'?'规则判断':'—'}</span></div>`;
+  const ms = dim ? '未被本树引用' : (t.ms || '');
+  return `<div class="gauge ${dim?'dim':''}" style="--gc:${gc}">
+      ${used === true ? '<span class="used" title="参与本树判定"></span>' : ''}
+      <div class="gk">${t.label}</div>
+      <div class="gv">${t.value}</div>
+      ${cf}
+      ${ms ? `<div class="gcf"><span>${ms}</span></div>` : ''}
+    </div>`;
+}
+function renderTags(el, list, usedSet){
+  let html = '';
+  GROUPS.forEach((g,gi) => {
+    html += `<div class="gh"><span class="bar" style="background:${GCOLOR[gi]}"></span>${g.name}<span class="ds">${g.desc}</span></div>`;
+    html += list.filter(t => t.g === gi).map(t => gaugeCard(t, usedSet ? usedSet.has(t.label) : null)).join('');
+  });
+  el.innerHTML = html;
+  // 置信度条从 0 生长到目标值 —— 一次编排好的入场
+  requestAnimationFrame(() => {
+    el.querySelectorAll('.gbar i[data-w]').forEach((i, k) => {
+      setTimeout(() => { i.style.width = i.dataset.w + '%'; }, prefersReduced() ? 0 : 90 + k * 26);
+    });
+  });
+}
+function evalTable(rows){
+  return `<div class="tbl-wrap"><div class="tbl-scroll"><table class="tbl">
+    <tbody>${rows.map(r => {
+      if(r.skip) return `<tr><td colspan="3" style="padding:7px 12px;font-family:var(--mono);font-size:var(--fs-nano);color:var(--text-4)">…… 下面的节点都没有再看</td></tr>`;
+      const res = r.hit
+        ? `<span class="st"><span class="d y"></span>${r.why}</span>`
+        : `<span style="color:var(--text-3);font-size:var(--fs-micro)">${r.why}</span>`;
+      return `<tr class="${r.hit?'on':''}">
+        <td style="width:190px;font-family:var(--mono);font-size:var(--fs-micro);color:var(--text-3)">${r.n}</td>
+        <td><div class="chipset">${(r.cond||[]).map(chipHtml).join('')}</div></td>
+        <td style="width:300px">${res}</td></tr>`;
+    }).join('')}</tbody></table></div></div>`;
+}
+
+/* ── 确定性启发式打标（spec §4.6 降级模式的浏览器版） ── */
+const DOM_KW = {
+  '计算机': ['代码','编程','函数','数据库','系统','并发','分片','架构','算法','服务器','接口','递归','编译','微服务','队列','python','java','rust','sql','api','bug'],
+  '法律': ['法律','合同','诉讼','侵权','法规','仲裁','条款'],
+  '医学': ['症状','用药','诊断','病历','治疗','处方'],
+  '数学': ['证明','方程','积分','矩阵','导数'],
+  '物理': ['量子','力学','电磁','相对论'],
+  '经济': ['股价','汇率','通胀','基金','经济'],
+  '商科': ['营销','转化率','融资','商业计划'],
+  '心理': ['焦虑','抑郁','情绪','压力'],
+  '历史': ['朝代','历史','战役','皇帝'],
+  '哲学': ['存在主义','伦理','形而上学'],
+  '化学': ['反应','分子','催化剂'],
+  '生物': ['基因','细胞','蛋白'],
+  '工程': ['施工','图纸','材料强度']
+};
+const HARD_KW = ['设计','架构','方案','优化','权衡','推导','论证','排查','重构','分片','事务','为什么','如何'];
+const FACT_KW = ['最新','新闻','股价','汇率','靠谱','真假'];
+function inferTags(text){
+  const lower = text.toLowerCase(), len = text.length;
+  const hits = ws => ws.filter(w => lower.indexOf(w.toLowerCase()) >= 0);
+  const cjk = (text.match(/[一-鿿]/g) || []).length;
+  const langV = cjk / len >= 0.3 ? '中文' : (/^[\x00-\x7F]*$/.test(text) ? '英文' : '其他');
+  const structV = text.indexOf('```') >= 0 ? '有代码'
+    : (/^\s*[\{\[]/.test(text) ? '有 JSON'
+    : ((text.match(/\n/g) || []).length >= 2 ? '多行文字' : '普通文本'));
+  const lenV = len < 20 ? '很短' : len < 120 ? '一般' : len < 800 ? '长' : '超长';
+  const kwHits = hits(['工单','报修','退款']);
+  const eventV = hits(['故障','宕机','500']).length ? '故障报告' : (hits(['支付','扣款']).length ? '支付异常' : '没有');
+  const imgHits = hits(['画','海报','图片','插图','配图','draw','image','picture']);
+  const modV = imgHits.length ? (hits(['并配','以及','说明','文案','图文']).length ? '文字加图片' : '图片') : '文字';
+  const modPct = imgHits.length ? 90 : 85;
+  let domV = '其他', domHits = [];
+  Object.keys(DOM_KW).forEach(d => { const h = hits(DOM_KW[d]); if(h.length > domHits.length){ domHits = h; domV = d; } });
+  const domPct = domHits.length ? 40 + 12 * Math.min(domHits.length, 3) : 45;
+  const hardHits = hits(HARD_KW);
+  const difV = (!hardHits.length && len < 20) ? '简单'
+    : (hardHits.length >= 3 || len > 150 ? '很难' : (hardHits.length ? '较难' : '一般'));
+  const difPct = difV === '简单' ? 70 : 56 + 5 * Math.min(hardHits.length, 4);
+  const factV = hits(FACT_KW).length ? '需要核实' : '不用核实';
+  const jb = /ignore (all |previous )?instructions|忽略(之前|所有|以上)?的?指令|越狱|jailbreak/i.test(text);
+  const pii = [];
+  if(/1[3-9]\d{9}/.test(text)) pii.push('手机号');
+  if(/\d{17}[\dXx]/.test(text)) pii.push('身份证号');
+  else if(/(?<!\d)\d{16,19}(?!\d)/.test(text)) pii.push('银行卡号');
+  if(/[\w.+-]+@[\w-]+\.[\w.]+/.test(text)) pii.push('邮箱');
+  if(/(密码|口令|password|pwd)\s*[:：为是]/i.test(text)) pii.push('密码');
+  return [
+    {g:0, label:'学科',   value:domV,  cf:confOf(domPct), pct:domPct, cfBand:confOf(domPct), ms:'模型 · 一次前向'},
+    {g:0, label:'难度',   value:difV,  cf:confOf(difPct), pct:difPct, cfBand:confOf(difPct)},
+    {g:0, label:'需核实', value:factV, cf:confOf(factV==='需要核实'?66:72), pct:factV==='需要核实'?66:72, cfBand:confOf(factV==='需要核实'?66:72)},
+    {g:0, label:'相似度', value:'不像', cf:confOf(70), pct:70, cfBand:confOf(70)},
+    {g:0, label:'关键词', value:kwHits.length ? kwHits.join(' · ') : '没有命中', kind:'规则', list:kwHits, ms:'你自己定义的词表'},
+    {g:1, label:'要什么', value:modV,  cf:confOf(modPct), pct:modPct, cfBand:confOf(modPct)},
+    {g:1, label:'语言',   value:langV, kind:'规则', ms:'规则 · 毫秒级'},
+    {g:1, label:'结构',   value:structV, kind:'规则'},
+    {g:1, label:'长度',   value:lenV,  kind:'规则'},
+    {g:1, label:'轮次',   value:'首轮', kind:'规则'},
+    {g:2, label:'可疑',   value:jb ? '很可疑' : '很正常', cf:confOf(jb?93:96), pct:jb?93:96, cfBand:confOf(jb?93:96), ms:'模型'},
+    {g:2, label:'敏感信息', value:pii.length ? '有 · ' + pii.join(' · ') : '没有', cf:confOf(88), pct:88, cfBand:confOf(88), list:pii},
+    {g:3, label:'身份',   value:'普通用户', kind:'规则'},
+    {g:3, label:'时段',   value:'工作日白天', kind:'规则'},
+    {g:3, label:'事件',   value:eventV, kind:'规则'},
+    {g:3, label:'上轮反馈', value:'满意', cf:confOf(90), pct:90, cfBand:confOf(90), ms:'模型'},
+    {g:3, label:'重复提问', value:'不重复', cf:confOf(88), pct:88, cfBand:confOf(88)}
+  ];
+}
+function tagMapOf(tags){ const m = {}; tags.forEach(t => { m[t.label] = t; }); return m; }
+
+/* ── 树求值：条件 + 把握度门槛 → 去向 ── */
+function bandIdx(tag, word){
+  const vals = TAG_VALUES[tag];
+  return Array.isArray(vals) ? vals.indexOf(word) : -1;
+}
+function chipMiss(c, tm){
+  if(c[3]) return null;                       // 兜底 / 其他：恒真
+  const tag = c[0], op = c[1], val = c[2];
+  const t = tm[tag];
+  if(!t) return tag + '是「?」';
+  const vals = String(val).split(/\s*\/\s*|、/).filter(Boolean);
+  const got = t.value;
+  let ok;
+  if(op === '属于') ok = vals.indexOf(got) >= 0;
+  else if(op === '至少') ok = bandIdx(tag, got) >= bandIdx(tag, val);
+  else if(op === '至多') ok = bandIdx(tag, got) <= bandIdx(tag, val);
+  else if(op === '含有') ok = (t.list || []).some(x => vals.indexOf(x) >= 0);
+  else ok = got === val;
+  if(ok) return null;
+  if(tag === '要什么') return '要的是' + got;
+  return tag + '是「' + got + '」';
+}
+function evalBranch(b, tm){
+  const groups = [[]];
+  let gate = null;
+  (b.cond || []).forEach(c => {
+    if(c.length === 1){ if(c[0] === '或') groups.push([]); return; }
+    if(c[0] === '把握度'){ gate = c; return; }
+    groups[groups.length - 1].push(c);
+  });
+  let ok = false, miss = null;
+  for(const g of groups){
+    const m = g.map(c => chipMiss(c, tm)).find(x => x);
+    if(!m){ ok = true; break; }
+    if(!miss) miss = m;
+  }
+  if(ok && gate){
+    const need = CONF.words.indexOf(gate[2]);
+    const used = [...new Set(groups.flat().map(c => c[0]))];
+    const weak = used.map(t => tm[t]).find(t => t && t.cfBand && CONF.words.indexOf(t.cfBand) < need);
+    if(weak){ ok = false; miss = '把握度不足：' + weak.cfBand + ' < ' + gate[2]; }
+  }
+  return { ok, miss };
+}
+/* 求值同时产出「站点序列」——直接喂给信号轨，不再二次拼装 */
+function evalTree(tm, sess){
+  const rows = [];
+  if(sess === 'sticky'){
+    rows.push({no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用',
+               cond:[['上轮反馈','是','满意 / 想让我说清楚']],
+               why:'这个会话上一轮用的是 qwen3-32b，直接沿用，没有重新判断', hit:true, to:'沿用 qwen3-32b'});
+    rows.push({skip:true});
+    return { rows, decision:{ kind:'sticky', model:'qwen3-32b' } };
+  }
+  rows.push({no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用',
+             cond:[['上轮反馈','是','满意 / 想让我说清楚']],
+             why:'这是新会话，起点不适用 —— 往下走'});
+  let decision = null;
+  outer:
+  for(let ni = 1; ni < TREE.length; ni++){
+    const n = TREE[ni], label = n.num + ' · ' + n.title;
+    for(const b of n.branches){
+      if(b.note) continue;
+      const r = evalBranch(b, tm);
+      if(!r.ok){ rows.push({no:n.num, n:label, nm:n.title, cond:b.cond, why:r.miss + ' —— 没有对上'}); continue; }
+      if(b.none && b.kids){
+        for(const kb of b.kids){
+          const kr = evalBranch(kb, tm);
+          if(kr.ok){
+            rows.push({no:n.num, n:label, nm:n.title, cond:kb.cond, why:'条件全部满足 —— 对上了', hit:true, to:kb.to});
+            decision = { kind:'route', model:kb.to, think:kb.think, fb:kb.fb, n };
+            break outer;
+          }
+          rows.push({no:n.num, n:label, nm:n.title, cond:kb.cond, why:kr.miss + ' —— 没有对上'});
+        }
+        continue;
+      }
+      const isCatchall = (b.cond || []).some(c => c[3]);
+      rows.push({no:n.num, n:label, nm:n.title, cond:b.cond,
+                 why:(isCatchall ? '什么情况都算' : '条件全部满足') + ' —— 对上了', hit:true, to:b.to});
+      decision = b.to === '拦下并说明原因'
+        ? { kind:'block', n }
+        : { kind:'route', model:b.to, think:b.think, fb:b.fb, n };
+      break outer;
+    }
+  }
+  rows.push({skip:true});
+  if(!decision) decision = { kind:'route', model:'qwen3-8b', n:TREE[TREE.length-1] };
+  return { rows, decision };
+}
+
+/* ── 会话状态与示例 ── */
+window.SESS = 'new';
+function setSess(s){
+  window.SESS = s;
+  document.querySelectorAll('#sessSeg button').forEach(b =>
+    b.classList.toggle('on', b.dataset.sess === s));
+}
+const EXAMPLE_TEXTS = [
+  '帮我设计一个支持千万并发的订单系统的数据库分片方案，要考虑跨分片事务和热点账户问题。',
+  '画一张系统架构图',
+  '这个函数跑得慢，怎么优化？',
+  '今天天气怎么样'
+];
+function tryExample(i){
+  document.getElementById('reqtext').value = EXAMPLE_TEXTS[i];
+  doTag();
+}
+
+/* ── 信号条：只列本次判定真正用到的信号 ──
+   从起点到命中站（含命中站）收集 cond 里出现过的信号名，去重保序。
+   连接词与把握度门槛不算信号，口径与 treeSignals() 一致。 */
+function decisionSignals(rows){
+  const out = [];
+  for(const r of (rows || [])){
+    if(r.skip) continue;
+    (r.cond || []).forEach(c => {
+      if(c.length > 1 && ['或','而且','兜底','其他','把握度'].indexOf(c[0]) < 0 && out.indexOf(c[0]) < 0)
+        out.push(c[0]);
+    });
+    if(r.hit) break;
+  }
+  return out;
+}
+function renderSigline(tags, rows){
+  const el = document.getElementById('sigline');
+  if(!el) return;
+  // 先取出条末的展开/收起链接：innerHTML 重写会把它摘掉，写完再挂回去
+  const tgl = document.getElementById('sigtoggle');
+  const tm = tagMapOf(tags);
+  el.innerHTML = decisionSignals(rows).map(name => {
+    const t = tm[name];
+    if(!t) return '';
+    const gc = GCOLOR[t.g] || 'var(--text-4)';
+    const meter = t.pct !== undefined
+      ? `<span class="sbar"><i style="width:${t.pct}%"></i></span><span class="spc">${t.pct}%</span>`
+      : '';
+    return `<span class="sigchip" style="--gc:${gc}"><span class="sk">${t.label}</span><span class="sv">${t.value}</span>${meter}</span>`;
+  }).join('');
+  if(tgl){ tgl.style.display = ''; el.appendChild(tgl); }
+}
+function toggleTags(){
+  const box = document.getElementById('tags');
+  const btn = document.getElementById('sigtoggle');
+  if(!box || !btn) return;
+  const open = box.style.display === 'none';
+  box.style.display = open ? '' : 'none';
+  btn.textContent = open ? '▾ 收起' : '▸ 全部 17 个信号';
+  applyI18n();
+}
+
+function doTag(){
+  const text = (document.getElementById('reqtext').value || '').trim();
+  if(!text){ toast('请输入请求内容'); return; }
+  const tagsBox = document.getElementById('tags');
+  const lineBox = document.getElementById('sigline');
+  const tgl = document.getElementById('sigtoggle');
+  const sub = document.getElementById('sigsub');
+  lineBox.innerHTML = '<div class="loading"><i></i><i></i><i></i>模型看一遍…</div>';
+  if(tgl){ tgl.style.display = 'none'; lineBox.appendChild(tgl); }
+  tagsBox.innerHTML = '<div class="loading"><i></i><i></i><i></i>模型看一遍…</div>';
+  document.getElementById('railbody').innerHTML = '<div class="note">正在下行…</div>';
+  const v = document.getElementById('verdict'); if(v) v.style.display = 'none';
+  const p = document.getElementById('pulse'); if(p) p.classList.remove('run');
+  setTimeout(() => {
+    const sess = window.SESS || 'new';
+    if(sess === 'sticky'){
+      // 沿用上一轮：不打标，信号面板只留一行说明
+      lineBox.innerHTML = '';
+      if(tgl){ tgl.style.display = 'none'; tgl.textContent = '▸ 全部 17 个信号'; lineBox.appendChild(tgl); }
+      tagsBox.innerHTML = '';
+      tagsBox.style.display = 'none';
+      if(sub) sub.textContent = '会话沿用 · 未重新打标签';
+      document.getElementById('tagtime').textContent = '';
+      const ev = evalTree(null, 'sticky');
+      renderRail(ev.rows, ev.decision);
+    } else {
+      const tags = inferTags(text);
+      const used = new Set(treeSignals());
+      renderTags(tagsBox, tags, used);
+      const ev = evalTree(tagMapOf(tags), 'new');
+      renderSigline(tags, ev.rows);
+      if(sub) sub.textContent = `本次判定用了 ${decisionSignals(ev.rows).length} 个信号 · 一次打出`;
+      document.getElementById('tagtime').textContent = `模型 ${10 + text.length % 7} ms · 规则 1 ms`;
+      renderRail(ev.rows, ev.decision);
+    }
+    applyI18n();
+  }, 420);
+}
+/* ══════════════════════════════════════════════════════════════════════
+   流量页
+   ══════════════════════════════════════════════════════════════════════ */
+const REQS = [
+  {id:'req_01J8K', title:'14:01:22 · OpenAI · auto',
+   tags:[{g:0,label:'学科',value:'计算机',cf:'比较确定',pct:61,ms:'模型 · 一次前向'},
+         {g:0,label:'难度',value:'较难',cf:'不太确定',pct:48},
+         {g:2,label:'可疑',value:'很正常',cf:'非常确定',pct:97,ms:'模型'},
+         {g:1,label:'要什么',value:'文字',cf:'非常确定',pct:94}],
+   eval:[{no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用', cond:[['上轮反馈','是','满意 / 想让我说清楚']], why:'这是新会话，起点不适用 —— 往下走'},
+     {no:'1', n:'1 · 安全', nm:'安全', cond:[['可疑','至少','很可疑']], why:'可疑是「很正常」 —— 没有对上'},
+     {no:'2', n:'2 · 多媒体', nm:'多媒体', cond:[['要什么','是','图片 / 文字加图片']], why:'要的是文字 —— 没有对上'},
+     {no:'3', n:'3 · 编程与推理', nm:'编程与推理', cond:[['学科','是','计算机'],['而且'],['难度','至少','较难']], why:'两样都对上了', hit:true, to:'qwen3-32b'},
+     {skip:true}],
+   decision:{ kind:'route', model:'qwen3-32b', think:'深度', fb:'qwen3-8b', n:{num:'3', title:'编程与推理'} },
+   verdict:'命中「3 · 编程与推理」第 1 条分支',
+   replay:'仍然走 3 · 编程与推理 → qwen3-32b（深度）。与当时一致。'},
+  {id:'req_01J8F', title:'14:01:09 · Anthropic · auto',
+   tags:[{g:0,label:'学科',value:'其他',cf:'不太确定',pct:42,ms:'模型'},
+         {g:2,label:'可疑',value:'非常可疑',cf:'非常确定',pct:95,ms:'模型'},
+         {g:2,label:'敏感信息',value:'没有',cf:'比较确定',pct:80},
+         {g:1,label:'语言',value:'英文',kind:'规则'}],
+   eval:[{no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用', cond:[['上轮反馈','是','满意 / 想让我说清楚']], why:'新会话 —— 往下走'},
+     {no:'1', n:'1 · 安全', nm:'安全', cond:[['可疑','至少','很可疑']], why:'可疑是「非常可疑」 —— 对上了', hit:true, to:'拦下并说明原因'},
+     {skip:true}],
+   decision:{ kind:'block', n:{num:'1', title:'安全'} },
+   verdict:'命中「1 · 安全」，已拦截',
+   replay:'仍然走 1 · 安全 → 拦下。与当时一致。'},
+  {id:'req_01J8B', title:'14:00:57 · OpenAI · auto（会话第 3 轮）',
+   tags:[],
+   eval:[{no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用', cond:[['上轮反馈','是','满意 / 想让我说清楚']],
+          why:'这个会话上一轮用的是 qwen3-32b，直接沿用，没有重新判断', hit:true, to:'沿用 qwen3-32b'},
+     {skip:true}],
+   decision:{ kind:'sticky', model:'qwen3-32b' },
+   verdict:'命中「起点 · 会话沿用」，沿用 qwen3-32b（未重新打标签）',
+   replay:'会话沿用仍然生效 → qwen3-32b。与当时一致。'},
+  {id:'req_01J86', title:'14:00:31 · Anthropic · auto（会话第 4 轮）',
+   tags:[{g:3,label:'上轮反馈',value:'答错了',cf:'非常确定',pct:92,ms:'模型'}],
+   eval:[{no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用', cond:[['上轮反馈','是','答错了']],
+          why:'用户说上一轮答错了 —— 解锁并升一档', hit:true, to:'升一档'}],
+   decision:{ kind:'route', model:'claude-sonnet', n:{num:'起点', title:'会话沿用'} },
+   verdict:'命中「起点 · 反馈解锁」，qwen3-32b 升一档至 claude-sonnet',
+   replay:'反馈解锁仍然生效 → claude-sonnet。与当时一致。'},
+  {id:'req_01J80', title:'14:00:12 · OpenAI · auto',
+   tags:[{g:2,label:'敏感信息',value:'有 · 手机号 · 身份证号',cf:'非常确定',pct:91,ms:'模型'},
+         {g:1,label:'要什么',value:'文字',cf:'非常确定',pct:95,kind:'规则'}],
+   eval:[{no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用', cond:[['上轮反馈','是','满意 / 想让我说清楚']], why:'新会话 —— 往下走'},
+     {no:'1', n:'1 · 安全', nm:'安全', cond:[['可疑','至少','很可疑']], why:'可疑是「很正常」 —— 没有对上'},
+     {no:'1', n:'1 · 安全', nm:'安全', cond:[['敏感信息','含有','身份证号 / 银行卡号 / 密码']], why:'检测到身份证号 —— 对上了', hit:true, to:'拦下并说明原因'},
+     {skip:true}],
+   decision:{ kind:'block', n:{num:'1', title:'安全'} },
+   verdict:'命中「1 · 安全」，已拦截',
+   replay:'仍然走 1 · 安全 → 拦下。与当时一致。'},
+  {id:'req_01J7Z', title:'13:59:48 · OpenAI · auto',
+   tags:[{g:1,label:'要什么',value:'图片',cf:'非常确定',pct:96,kind:'规则'},
+         {g:0,label:'难度',value:'简单',cf:'比较确定',pct:70,ms:'模型'}],
+   eval:[{no:'起点', n:'起点 · 会话沿用', nm:'起点 · 会话沿用', cond:[['上轮反馈','是','满意 / 想让我说清楚']], why:'新会话 —— 往下走'},
+     {no:'1', n:'1 · 安全', nm:'安全', cond:[['可疑','至少','很可疑']], why:'可疑是「很正常」 —— 没有对上'},
+     {no:'2', n:'2 · 多媒体', nm:'多媒体', cond:[['要什么','是','图片']], why:'要的是图片 —— 对上了', hit:true, to:'sdxl-image'},
+     {skip:true}],
+   decision:{ kind:'route', model:'sdxl-image', n:{num:'2', title:'多媒体'} },
+   verdict:'命中「2 · 多媒体」第 1 条分支',
+   replay:'仍然走 2 · 多媒体 → sdxl-image。与当时一致。'}
+];
+let curReq = null;
+function showReq(i){
+  const q = REQS[i]; curReq = q;
+  const d = document.getElementById('reqdetail');
+  d.innerHTML = `<div class="sheet">
+    <div class="sheet-hd"><b id="dt-title">${q.title}</b><span class="sub" id="dt-id">${q.id}</span>
+      <span class="end btn-row" style="display:flex;gap:8px;margin-left:auto">
+        <button class="btn sm" onclick="replay()">⟳ 按当前规则重放</button>
+        <button class="btn sm" onclick="closeReq()">关闭</button></span></div>
+    <div class="sheet-bd">
+      <div class="lb">信号</div>
+      <div id="dt-tags" class="mgrid" style="margin-bottom:var(--s4)"></div>
+      <div class="lb">当时的判定路径</div>
+      <div class="rail" id="dt-rail"><div class="pulse" id="dt-pulse" aria-hidden="true"></div><div id="dt-railbody"></div></div>
+      <div class="note" id="replaybox" style="margin-top:var(--s3)"></div>
+    </div></div>`;
+  if(q.tags.length) renderTags(document.getElementById('dt-tags'), q.tags, null);
+  else document.getElementById('dt-tags').innerHTML = '<div class="note" style="grid-column:1/-1">本轮未重新打标签：会话沿用复用了上一轮结果。</div>';
+  // 复用同一套信号轨渲染，只是换挂载点
+  paintRail(document.getElementById('dt-rail'),
+            document.getElementById('dt-railbody'),
+            document.getElementById('dt-pulse'), q.eval);
+  const rb = document.getElementById('replaybox');
+  rb.textContent = '当时：' + q.verdict;
+  rb.style.cssText = 'margin-top:var(--s3)';
+  d.style.display = 'block';
+  d.scrollIntoView({behavior:'smooth', block:'nearest'});
+  applyI18n();
+}
+function closeReq(){
+  const d = document.getElementById('reqdetail');
+  if(d){ d.style.display = 'none'; d.innerHTML = ''; }
+  curReq = null;
+}
+function replay(){
+  if(!curReq) return;
+  const rb = document.getElementById('replaybox');
+  if(!rb) return;
+  rb.innerHTML = `<div class="verdict"><span class="vk">REPLAY</span><span class="vv">${curReq.replay}</span></div>`;
+  applyI18n();
+}
+function quick(btn){
+  document.querySelectorAll('#p-traffic .btn-row .btn.sm').forEach(b => b.classList.remove('pri'));
+  btn.classList.add('pri');
+  toast('已筛选：' + btn.textContent);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   模型页
+   ══════════════════════════════════════════════════════════════════════ */
+function renderModels(){
+  const pb = document.getElementById('provbody'), mb = document.getElementById('modbody');
+  if(pb) pb.innerHTML = PROVIDERS.map(p =>
+    `<tr><td><b style="font-size:var(--fs-micro)">${p.name}</b>
+        <div class="mono" style="font-size:var(--fs-nano);color:var(--text-4)">${p.base}</div></td>
+      <td><span class="chip ice"><span class="v">${p.proto === 'openai' ? 'OpenAI' : 'Anthropic'}</span></span></td>
+      <td class="num"><span class="st"><span class="d g"></span>正常</span></td></tr>`).join('');
+  if(mb) mb.innerHTML = MODELS.map(m =>
+    `<tr><td class="mono" style="font-weight:600;font-size:var(--fs-micro)">${m.id}</td>
+      <td><span class="chip ice"><span class="v">${m.proto === 'openai' ? 'OpenAI' : 'Anthropic'}</span></span></td>
+      <td class="mono" style="font-size:var(--fs-nano);color:var(--text-3)">${m.upstream}</td>
+      <td><div class="chipset">${m.caps.map(c => `<span class="chip"><span class="v">${c}</span></span>`).join('')}</div></td>
+      <td class="num">${m.step}</td>
+      <td>${m.ok
+        ? '<span class="st"><span class="d g"></span>正常</span>'
+        : `<span class="st" title="${m.breakReason}"><span class="d r"></span>故障</span>`}</td></tr>`).join('');
+  const st = document.getElementById('mstat');
+  if(st) st.textContent = `${MODELS.length} 个模型 · ${MODELS.filter(m => m.ok).length} 正常`;
+  const lb = document.getElementById('ladderbox');
+  if(lb){
+    const sorted = MODELS.filter(m => m.ok).slice().sort((a,b) => a.step - b.step);
+    lb.innerHTML = sorted.map((m,i) =>
+      `${i ? '<span class="and">→</span>' : ''}<span class="chip ${i === sorted.length-1 ? 'key' : ''}">
+        <span class="k">第 ${i} 档</span><span class="v mono">${m.id}</span>
+        <span class="op">${m.cap}</span></span>`).join('');
+  }
+  const pt = document.getElementById('prototable');
+  if(pt){
+    const keys = PROTO.openai.rows.map(r => r[0]);
+    pt.innerHTML = `<div class="tbl-wrap"><div class="tbl-scroll"><table class="tbl">
+      <thead><tr><th style="width:92px">环节</th>
+        <th style="width:44%">${PROTO.openai.label}<div style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-4)">${PROTO.openai.desc}</div></th>
+        <th>${PROTO.anthropic.label}<div style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-4)">${PROTO.anthropic.desc}</div></th></tr></thead>
+      <tbody>${keys.map((k,i) => `<tr>
+        <td style="font-family:var(--mono);font-size:var(--fs-micro);color:var(--text-3)">${k}</td>
+        <td class="mono" style="font-size:var(--fs-nano);color:var(--text-2)">${PROTO.openai.rows[i][1]}</td>
+        <td class="mono" style="font-size:var(--fs-nano);color:var(--text-2)">${PROTO.anthropic.rows[i][1]}</td></tr>`).join('')}
+      </tbody></table></div></div>`;
+  }
+  applyI18n();
+}
+
+/* ── 接入新模型 ── */
+let mf = null;
+function newMf(){ return { proto:'openai', prov:'本地', upstream:'', caps:[], tested:false }; }
+function openAddModel(){ mf = newMf(); renderModelForm();
+  document.getElementById('addModelBox').scrollIntoView({behavior:'smooth', block:'nearest'}); }
+function closeAddModel(){ document.getElementById('addModelBox').innerHTML = ''; mf = null; }
+function mPickProto(p){ mf.proto = p; renderModelForm(); }
+function mPickProv(n){ mf.prov = n; renderModelForm(); }
+function mToggleCap(c){
+  const i = mf.caps.indexOf(c);
+  if(i >= 0) mf.caps.splice(i,1); else mf.caps.push(c);
+  renderModelForm();
+}
+function mTest(){ if(!mf) return; mf.tested = true; renderModelForm(); toast('连通正常'); }
+function mSave(){
+  if(!mf) return;
+  if(!mf.upstream.trim()) return toast('请填写上游模型名');
+  const id = mf.upstream.split('/').pop().toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,24) || 'model';
+  MODELS.push({id, prov:mf.prov, proto:mf.proto, upstream:mf.upstream, caps:mf.caps.slice(),
+               step:MODELS.length, ok:true, price:{in:'—',out:'—'}});
+  closeAddModel(); renderModels(); toast('已接入 ' + id);
+}
+function renderModelForm(){
+  const box = document.getElementById('addModelBox');
+  if(!box || !mf) return;
+  box.innerHTML = `<div class="sheet"><div class="sheet-hd"><b>接入新模型</b>
+      <span class="sub">PROTOCOL → PROVIDER → CAPABILITIES → TEST</span>
+      <button class="btn sm x" onclick="closeAddModel()">关闭</button></div>
+    <div class="sheet-bd"><div class="steps">
+      <div class="step"><span class="sn">1</span><div class="sc">
+        <span class="lb">协议</span>
+        <div class="seg">
+          <button class="${mf.proto==='openai'?'on':''}" onclick="mPickProto('openai')">OpenAI 兼容</button>
+          <button class="${mf.proto==='anthropic'?'on':''}" onclick="mPickProto('anthropic')">Anthropic</button>
+        </div>
+        <div class="note" style="margin-top:var(--s2)">鉴权、路径、请求体与流式形态按协议自动适配，无需手工配置。</div>
+      </div></div>
+      <div class="step"><span class="sn">2</span><div class="sc">
+        <span class="lb">供应商</span>
+        <div class="seg">${PROVIDERS.map(p =>
+          `<button class="${mf.prov===p.name?'on':''}" onclick="mPickProv('${p.name}')">${p.name}</button>`).join('')}</div>
+      </div></div>
+      <div class="step"><span class="sn">3</span><div class="sc">
+        <label class="lb" for="mf-up">上游模型名</label>
+        <input type="text" id="mf-up" placeholder="例如 Qwen/Qwen2.5-7B-Instruct" value="${mf.upstream}"
+          oninput="if(mf)mf.upstream=this.value">
+      </div></div>
+      <div class="step"><span class="sn">4</span><div class="sc">
+        <span class="lb">能力标签 <span class="opt">决定它能被哪些分支选中</span></span>
+        <div class="picks">${CAPS.map(c =>
+          `<button class="pk ${mf.caps.indexOf(c)>=0?'on':''}" onclick="mToggleCap('${c}')">${c}</button>`).join('')}</div>
+      </div></div>
+      <div class="btn-row">
+        <button class="btn" onclick="mTest()">${mf.tested ? '✓ 连通正常' : '测试连通'}</button>
+        <button class="btn pri" onclick="mSave()">接入</button>
+        <button class="btn" onclick="closeAddModel()">取消</button>
+      </div>
+    </div></div></div>`;
+  applyI18n();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   设置页：分档
+   ══════════════════════════════════════════════════════════════════════ */
+const BANDS = [
+  { tag:'可疑',   basis:'JEV Noul · 是非概率 P(是)', lo:0, hi:1, log:false, cuts:[0.20,0.50,0.80],
+    words:['很正常','有点可疑','很可疑','非常可疑'], dist:[12,31,39,18], step:0.01 },
+  { tag:'难度',   basis:'JEV Score · 分数值（推理层数）', lo:0, hi:4, log:false, cuts:[0.8,1.6,2.4],
+    words:['简单','一般','较难','很难'], dist:[26,34,28,12], step:0.1 },
+  { tag:'相似度', basis:'向量余弦', lo:0, hi:1, log:false, cuts:[0.55,0.85],
+    words:['不像','有点像','很像'], dist:[61,27,12], step:0.01 },
+  { tag:'长度',   basis:'词数', lo:1, hi:64000, log:true, cuts:[40,2000,32000],
+    words:['很短','一般','长','超长'], dist:[18,54,22,6], step:1, unit:'词' }
+];
+const CONF = { basis:'1 − H(概率分布) / log(选项数)', cuts:[0.30,0.60,0.85],
+               words:['很不确定','不太确定','比较确定','非常确定'], dist:[8,22,47,23] };
+const BAND_INIT = JSON.stringify({
+  b: BANDS.map(x => ({cuts:x.cuts.slice(), dist:x.dist.slice()})),
+  c: {cuts:CONF.cuts.slice(), dist:CONF.dist.slice()}
+});
+const LEARNED = { '学科':1,'难度':1,'需核实':1,'相似度':1,'可疑':1,'敏感信息':1,'要什么':1,'上轮反馈':1,'重复提问':1 };
+
+function bandPos(b, v){
+  v = Math.max(b.lo, Math.min(b.hi, v));
+  const f = b.log ? (x => Math.log(x)) : (x => x);
+  return (f(v) - f(b.lo)) / (f(b.hi) - f(b.lo));
+}
+function bandRedist(b, oldCuts){
+  const d = b.dist.slice();
+  for(let j = 0; j < oldCuts.length; j++){
+    if(Math.abs(b.cuts[j] - oldCuts[j]) < 1e-9) continue;
+    const lo  = j === 0 ? b.lo : b.cuts[j-1];
+    const hi  = j === b.cuts.length-1 ? b.hi : b.cuts[j+1];
+    const total = d[j] + d[j+1];
+    const pLo = bandPos(b,lo), pOld = bandPos(b,oldCuts[j]), pNew = bandPos(b,b.cuts[j]), pHi = bandPos(b,hi);
+    const w = pHi - pLo;
+    if(w <= 0) continue;
+    d[j]   = total * (pNew - pLo) / w;
+    d[j+1] = total * (pHi - pNew) / w;
+  }
+  const sum = d.reduce((a,x) => a+x, 0) || 1;
+  b.dist = d.map(x => Math.round(x / sum * 100));
+}
+function distHtml(words, dist){
+  return `<div class="dist">${words.map((w,j) =>
+    `<span class="seg s${Math.min(j,3)}" style="flex:${Math.max(dist[j],6)}"><b>${w}</b><i>${dist[j]}%</i></span>`).join('')}</div>`;
+}
+function cutsHtml(prefix, cuts, step, unit){
+  return `<div class="cuts"><span class="cl">分界</span>` + cuts.map((c,j) =>
+    `<input type="number" class="cut" step="${step}" value="${c}" onchange="${prefix}(${j},this.value)">`).join('<span class="csep">|</span>')
+    + (unit ? `<span class="un">${unit}</span>` : '') + `</div>`;
+}
+function renderBands(){
+  const box = document.getElementById('bandbox');
+  if(box) box.innerHTML = BANDS.map((b,i) =>
+    `<div class="band">
+      <div class="band-hd"><b>${b.tag}</b><span class="basis">依据：${b.basis}</span>
+        <span class="end"><button class="btn link" onclick="resetBand(${i})">恢复默认</button></span></div>
+      ${distHtml(b.words, b.dist)}
+      ${cutsHtml(`setCut(${i},`, b.cuts, b.step, b.unit)}
+    </div>`).join('');
+  const cb = document.getElementById('confbox');
+  if(cb) cb.innerHTML = `<div class="band" style="border-bottom:none;padding-bottom:0">
+      <div class="band-hd"><b>把握度</b><span class="basis">依据：${CONF.basis}</span>
+        <span class="end"><button class="btn link" onclick="resetConf()">恢复默认</button></span></div>
+      ${distHtml(CONF.words, CONF.dist)}
+      ${cutsHtml('setConfCut(', CONF.cuts, 0.01, '')}
+      <div class="note" style="margin-top:var(--s3)">低于门槛的请求可交给兜底模型，不必强行判定 —— 这是 JEV 置信度的主要用途。</div>
+    </div>`;
+  applyI18n();
+}
+function setCut(i, j, v){
+  v = parseFloat(v);
+  const b = BANDS[i], nv = b.cuts.slice(); nv[j] = v;
+  if(!isFinite(v)){ toast('请输入数值'); renderBands(); return; }
+  for(let k = 1; k < nv.length; k++) if(nv[k] <= nv[k-1]){ toast('分界必须从左到右递增'); renderBands(); return; }
+  const old = b.cuts.slice(); b.cuts = nv; bandRedist(b, old); renderBands();
+  toast('已更新「' + b.tag + '」的分界');
+}
+function setConfCut(j, v){
+  v = parseFloat(v);
+  const nv = CONF.cuts.slice(); nv[j] = v;
+  if(!isFinite(v)){ toast('请输入数值'); renderBands(); return; }
+  for(let k = 1; k < nv.length; k++) if(nv[k] <= nv[k-1]){ toast('分界必须从左到右递增'); renderBands(); return; }
+  const old = CONF.cuts.slice(); CONF.cuts = nv;
+  const b = { lo:0, hi:1, log:false, cuts:CONF.cuts, dist:CONF.dist };
+  bandRedist(b, old); CONF.dist = b.dist; renderBands();
+  toast('已更新把握度分界');
+}
+function resetBand(i){
+  const init = JSON.parse(BAND_INIT);
+  BANDS[i].cuts = init.b[i].cuts.slice(); BANDS[i].dist = init.b[i].dist.slice();
+  renderBands(); toast('已恢复默认');
+}
+function resetConf(){
+  const init = JSON.parse(BAND_INIT);
+  CONF.cuts = init.c.cuts.slice(); CONF.dist = init.c.dist.slice();
+  renderBands(); toast('已恢复默认');
+}
+function confOf(pct){
+  const c = CONF.cuts, p = pct / 100;
+  return CONF.words[p < c[0] ? 0 : p < c[1] ? 1 : p < c[2] ? 2 : 3];
+}
+function gotoSettings(){
+  go('settings');
+  const el = document.getElementById('confbox');
+  if(el) el.scrollIntoView({behavior:'smooth', block:'center'});
+}
+/* ══════════════════════════════════════════════════════════════════════
+   新增节点：四步表单（点选为主）
+   内联处理器里的 form 会被解析成元素的 form owner（null），
+   所以名称/说明/回退/思考一律走具名函数。
+   ══════════════════════════════════════════════════════════════════════ */
+const TAG_GROUPS = [
+  {name:'在说什么',              bar:'b1', tags:['学科','难度','需核实','相似度','关键词']},
+  {name:'长什么样',              bar:'b2', tags:['要什么','语言','结构','长度','轮次']},
+  {name:'有没有风险',            bar:'b3', tags:['可疑','敏感信息']},
+  {name:'谁、什么时候、聊到哪了', bar:'b4', tags:['身份','时段','事件','上轮反馈','重复提问']}
+];
+const TAG_VALUES = {
+  '学科': ['计算机','数学','物理','化学','生物','工程','经济','商科','法律','哲学','心理','医学','历史','其他'],
+  '难度': ['简单','一般','较难','很难'],
+  '需核实': ['需要核实','不用核实'],
+  '相似度': ['不像','有点像','很像'],
+  '关键词': '__text__',
+  '要什么': ['文字','图片','文字加图片'],
+  '语言': ['中文','英文','其他'],
+  '结构': ['有代码','有 JSON','多行文字','普通文本'],
+  '长度': ['很短','一般','长','超长'],
+  '轮次': ['首轮','聊了几轮','长对话'],
+  '可疑': ['很正常','有点可疑','很可疑','非常可疑'],
+  '敏感信息': ['手机号','身份证号','银行卡号','邮箱','密码'],
+  '身份': ['premium','free','内部服务'],
+  '时段': ['工作日白天','夜间','周末'],
+  '事件': ['故障报告','支付异常','没有'],
+  '上轮反馈': ['满意','想让我说清楚','答错了','想换个说法'],
+  '重复提问': ['重复','不重复']
+};
+const ORDERED = {
+  '难度':['至少','正好','至多'], '可疑':['至少','正好','至多'],
+  '长度':['至少','正好','至多'], '相似度':['至少','正好']
+};
+const FREE = { '关键词': true };
+const IMPACT = {
+  'qwen3-8b':     {n:'780', p:'1.8', a:'640', b:'140', cost:'约 −3%'},
+  'qwen3-32b':    {n:'780', p:'1.8', a:'640', b:'140', cost:'约 +6%'},
+  'llava-omni':   {n:'210', p:'0.5', a:'170', b:'40',  cost:'约 +2%'},
+  'sdxl-image':   {n:'210', p:'0.5', a:'170', b:'40',  cost:'约 +1%'},
+  'claude-sonnet':{n:'780', p:'1.8', a:'640', b:'140', cost:'约 +14%'}
+};
+let form = null, uid = 0, draftNode = null;
+
+const isOrdered = t => !!ORDERED[t];
+function valuesOf(tag){
+  const base = Array.isArray(TAG_VALUES[tag]) ? TAG_VALUES[tag] : [];
+  const extra = (form && form.custom && form.custom[tag]) || [];
+  return base.concat(extra);
+}
+function relWord(){
+  const f = form;
+  if(isOrdered(f.tag)) return f.cmp;
+  if(FREE[f.tag]) return '含有';
+  return f.vals.length > 1 ? '属于' : '是';
+}
+function summaryText(){
+  const f = form;
+  if(!f || !f.tag) return T('（未选择）');
+  const en = lang === 'en';
+  if(!f.vals.length) return en
+    ? `When <b>${T(f.tag)}</b> <span class="todo">(no value yet)</span>`
+    : `当 <b>${f.tag}</b> <span class="todo">（尚未选择取值）</span> 时`;
+  const words = f.vals.map(T).join(en ? ' / ' : '、');
+  const c = (f.conf && LEARNED[f.tag])
+    ? (en ? ` and <b>Confidence</b> at least <b>${T(f.conf)}</b>` : ` 且 <b>把握度</b> 至少 <b>${f.conf}</b>`)
+    : '';
+  const body = `<b>${T(f.tag)}</b> ${T(relWord())} <b>${words}</b>${c}`;
+  return en ? `When ${body}` : `当 ${body} 时`;
+}
+function positions(){
+  const out = [{label:'放在最前面（仅次于起点 · 会话沿用）', at:1}];
+  TREE.slice(1, TREE.length-1).forEach((n,i) => out.push({label:`放在「${n.num} · ${n.title}」后面`, at:i+2}));
+  out.push({label:'放在兜底之前（很可能永远轮不到）', at:TREE.length-1});
+  return out;
+}
+function newForm(){
+  // 默认不预选任何值：首次点击即选中，不会误取消
+  return { name:'', desc:'', pos:1, tag:'学科', vals:[], cmp:'至少', conf:'',
+           custom:{}, adding:false, to:'qwen3-8b', fb:'无', think:'关闭' };
+}
+function openAddNode(){
+  closePop(); form = newForm(); renderForm();
+  document.getElementById('addBox').scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+function closeAdd(){ document.getElementById('addBox').innerHTML = ''; form = null; }
+function pickTag(t){
+  const f = form;
+  f.tag = t; f.adding = false; f.cmp = isOrdered(t) ? ORDERED[t][0] : '';
+  f.vals = [];
+  if(!LEARNED[t]) f.conf = '';
+  renderForm();
+}
+function toggleVal(v){
+  const f = form;
+  if(isOrdered(f.tag)){ f.vals = [v]; }
+  else { const i = f.vals.indexOf(v); if(i >= 0) f.vals.splice(i,1); else f.vals.push(v); }
+  renderForm();
+}
+function pickPos(at){ form.pos = at; renderForm(); }
+function setName(v){ if(!form) return; form.name = v; previewRow(); }
+function setDesc(v){ if(!form) return; form.desc = v; previewRow(); }
+function setFb(v){ if(!form) return; form.fb = v; previewRow(); }
+function setThink(v){ if(!form) return; form.think = v; previewRow(); }
+function pickModel(id){ form.to = id; renderForm(); }
+function setCmp(c){ form.cmp = c; renderForm(); }
+function setConf(c){ form.conf = c; renderForm(); }
+function startCustom(){ form.adding = true; renderForm();
+  const el = document.getElementById('nd-custom'); if(el) el.focus(); }
+function commitCustom(){
+  const el = document.getElementById('nd-custom');
+  const v = el ? String(el.value || '').trim() : '';
+  const f = form;
+  if(v){
+    f.custom[f.tag] = f.custom[f.tag] || [];
+    if(f.custom[f.tag].indexOf(v) < 0) f.custom[f.tag].push(v);
+    if(f.vals.indexOf(v) < 0) f.vals.push(v);
+  }
+  f.adding = false; renderForm();
+}
+function addKeyword(){
+  const el = document.getElementById('nd-kw');
+  const raw = el ? String(el.value || '') : '';
+  raw.split(/[、,，\s]+/).filter(Boolean).slice(0,12).forEach(w => {
+    if(form.vals.indexOf(w) < 0) form.vals.push(w);
+  });
+  renderForm();
+}
+function renderForm(){
+  const f = form;
+  if(!f) return;
+  const tagOpts = TAG_GROUPS.map(g =>
+    `<optgroup label="${g.name}">${g.tags.map(t =>
+      `<option${f.tag===t?' selected':''}>${t}</option>`).join('')}</optgroup>`).join('');
+  const posOpts = positions().map(p =>
+    `<option value="${p.at}"${f.pos===p.at?' selected':''}>${p.label}</option>`).join('');
+  const routeOpts =
+    MODELS.map(m => `<option value="${m.id}"${f.to===m.id?' selected':''}>${m.id} · ${m.cap}</option>`).join('') +
+    `<optgroup label="特殊去向">${SPECIAL.map(sp =>
+      `<option${f.to===sp.id?' selected':''}>${sp.id}</option>`).join('')}</optgroup>`;
+
+  let valArea;
+  if(FREE[f.tag]){
+    valArea = `<div class="picks">${f.vals.map(v =>
+        `<button class="pk on" onclick="toggleVal('${v}')">${v} ✕</button>`).join('')
+        || '<span style="color:var(--text-4);font-size:var(--fs-micro);align-self:center">尚未填写</span>'}
+        <input type="text" id="nd-kw" placeholder="例如：工单" style="width:200px"
+          onkeydown="if(event.key==='Enter'){event.preventDefault();addKeyword();}">
+        <button class="btn sm" onclick="addKeyword()">加进去</button></div>`;
+  } else {
+    const cmp = isOrdered(f.tag)
+      ? `<span class="picks">${ORDERED[f.tag].map(c =>
+          `<button class="pk${f.cmp===c?' on':''}" onclick="setCmp('${c}')">${c}</button>`).join('')}</span>`
+      : `<span class="relword">${relWord()}</span>`;
+    valArea = `<div class="picks">${cmp}
+        ${valuesOf(f.tag).map(v =>
+          `<button class="pk${f.vals.indexOf(v)>=0?' on':''}" onclick="toggleVal('${v}')">${v}</button>`).join('')}
+        ${f.adding
+          ? `<input type="text" id="nd-custom" placeholder="输入后回车" style="width:150px"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();commitCustom();}" onblur="commitCustom()">`
+          : `<button class="pk add" onclick="startCustom()">＋ 自定义</button>`}</div>`;
+  }
+  const hint = isOrdered(f.tag) ? '可切换方向' : (FREE[f.tag] ? '自行填写' : '可多选');
+
+  document.getElementById('addBox').innerHTML = `<div class="sheet">
+    <div class="sheet-hd"><b>新增节点</b><span class="sub">四步：名称 → 优先级 → 条件 → 去向</span>
+      <button class="btn sm x" onclick="closeAdd()">关闭</button></div>
+    <div class="sheet-bd"><div class="steps">
+      <div class="step"><span class="sn">1</span><div class="sc">
+        <span class="lb">名称与说明</span>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <input type="text" id="nd-name" placeholder="例如：客服工单" value="${f.name}"
+            oninput="setName(this.value)" style="max-width:230px">
+          <input type="text" id="nd-desc" placeholder="说明（可选）" value="${f.desc}"
+            oninput="setDesc(this.value)" style="max-width:300px">
+        </div>
+      </div></div>
+
+      <div class="step"><span class="sn">2</span><div class="sc">
+        <span class="lb">优先级 <span class="opt">位置即优先级，越靠上越优先</span></span>
+        <select onchange="pickPos(parseInt(this.value,10))" style="max-width:420px">${posOpts}</select>
+      </div></div>
+
+      <div class="step"><span class="sn">3</span><div class="sc">
+        <span class="lb">条件</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select onchange="pickTag(this.value)" style="max-width:220px">${tagOpts}</select>
+          <span style="color:var(--text-4);font-size:var(--fs-micro)">选中标签后显示取值</span>
+        </div>
+        <div style="margin-top:var(--s3)">
+          <span class="lb">取值 <span class="opt">${hint}</span></span>
+          ${valArea}
+        </div>
+        ${LEARNED[f.tag] ? `<div style="margin-top:var(--s3)">
+          <span class="lb">把握度门槛 <span class="opt">JEV 置信度；不确定的请求可交给兜底</span></span>
+          <div class="picks">
+            <button class="pk${!f.conf?' on':''}" onclick="setConf('')">不限</button>
+            <button class="pk${f.conf==='比较确定'?' on':''}" onclick="setConf('比较确定')">至少 比较确定</button>
+            <button class="pk${f.conf==='非常确定'?' on':''}" onclick="setConf('非常确定')">至少 非常确定</button>
+          </div></div>` : ''}
+        <div class="preview"><div class="lb">预览</div><b>${summaryText()}</b></div>
+      </div></div>
+
+      <div class="step"><span class="sn">4</span><div class="sc">
+        <span class="lb">去向</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select onchange="pickModel(this.value)" style="max-width:300px">${routeOpts}</select>
+          <span style="color:var(--text-4);font-size:var(--fs-micro)">回退</span>
+          <select onchange="setFb(this.value)">
+            <option${f.fb==='无'?' selected':''}>无</option>
+            ${MODELS.map(m => `<option${f.fb===m.id?' selected':''}>${m.id}</option>`).join('')}
+          </select>
+          <span style="color:var(--text-4);font-size:var(--fs-micro)">思考档位</span>
+          <select onchange="setThink(this.value)">
+            ${['关闭','轻度','深度'].map(t => `<option${f.think===t?' selected':''}>${t}</option>`).join('')}
+          </select>
+        </div>
+      </div></div>
+    </div>
+
+    <div class="preview" style="margin-top:var(--s4)">
+      <div class="lb">树上预览</div>
+      <div id="nd-preview"></div>
+    </div>
+
+    <div class="btn-row" style="margin-top:var(--s4)">
+      <button class="btn pri" onclick="addAsDraft()">添加</button>
+      <button class="btn" onclick="closeAdd()">取消</button>
+      <span style="color:var(--text-4);font-size:var(--fs-micro)">先落为草稿并给出影响预估，确认后保存。</span>
+    </div></div></div>`;
+  previewRow();
+  applyI18n();
+}
+function previewRow(){
+  const f = form; if(!f) return;
+  const el = document.getElementById('nd-preview'); if(!el) return;
+  const extra = [(f.think && f.think !== '关闭') ? `思考 ${f.think}` : '',
+                 (f.fb && f.fb !== '无') ? `回退 ${f.fb}` : ''].filter(Boolean).join(' · ');
+  el.innerHTML = `<div style="color:var(--text-3)">▾ <b style="color:var(--text)">新 · ${f.name || '（未命名）'}</b> <span style="color:var(--text-4)">${f.desc}</span></div>
+    <div style="padding-left:18px;margin-top:5px">├ <div class="chipset" style="display:inline-flex">
+      <span class="chip"><span class="k">${f.tag || '—'}</span><span class="op">${f.vals.length ? relWord() : ''}</span><span class="v">${f.vals.length ? f.vals.join('、') : '（未选择）'}</span></div>
+      <span class="mono" style="color:var(--amber);font-size:var(--fs-micro)">→ ${f.to}</span>
+      <span style="color:var(--text-4);font-size:var(--fs-nano)">${extra}</span></div>`;
+}
+function addAsDraft(){
+  const f = form; if(!f) return;
+  if(!f.name) return toast('请填写名称');
+  if(!f.vals.length) return toast(FREE[f.tag] ? '请填写关键词' : '请至少选择一个取值');
+  const to = f.to, name = f.name;
+  const cond = [[f.tag, relWord(), f.vals.join('、')]];
+  if(f.conf && LEARNED[f.tag]) cond.push(['把握度', '至少', f.conf]);
+  const branch = { k:'u' + (++uid), cond, to,
+                   think: (!f.think || f.think === '关闭') ? null : f.think,
+                   fb:   (!f.fb   || f.fb   === '无')   ? null : f.fb };
+  const node = { num:'', title:name, cls:'n1', open:true, draft:true, desc:f.desc, branches:[branch] };
+  TREE.splice(f.pos, 0, node);
+  draftNode = node;
+  closeAdd(); renderTree();
+  const im = IMPACT[to] || IMPACT['qwen3-8b'];
+  document.getElementById('impactBox').innerHTML = `<div class="impact">
+    <h3>「${name}」已入树（草稿）</h3>
+    <div class="est">按近 7 天流量估算</div>
+    <div class="imputs">
+      <div class="imput"><div class="k">每日请求</div><div class="v">${im.n}</div></div>
+      <div class="imput"><div class="k">占比</div><div class="v">${im.p}%</div></div>
+      <div class="imput"><div class="k">原走兜底</div><div class="v">${im.a}</div></div>
+      <div class="imput"><div class="k">原走其它</div><div class="v">${im.b}</div></div>
+      <div class="imput"><div class="k">成本变化</div><div class="v amber">${im.cost}</div></div>
+    </div>
+    <div class="btn-row">
+      <button class="btn pri" onclick="confirmAdd()">确认保存</button>
+      <button class="btn" onclick="cancelAdd()">撤销</button>
+    </div></div>`;
+  document.getElementById('impactBox').scrollIntoView({behavior:'smooth', block:'nearest'});
+  toast('草稿已入树，可核对位置');
+  applyI18n();
+}
+function confirmAdd(){
+  if(draftNode) draftNode.draft = false;
+  draftNode = null;
+  document.getElementById('impactBox').innerHTML = '';
+  renderTree(); toast('已保存，立刻生效', '撤销');
+}
+function cancelAdd(){
+  if(draftNode){ const i = TREE.indexOf(draftNode); if(i >= 0) TREE.splice(i,1); }
+  draftNode = null;
+  document.getElementById('impactBox').innerHTML = '';
+  renderTree(); toast('已撤销');
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   样例 / 体检
+   ══════════════════════════════════════════════════════════════════════ */
+function showSamples(){
+  const box = document.getElementById('checkup');
+  box.innerHTML = `<div class="sheet"><div class="sheet-hd"><b>分支样例</b>
+      <span class="sub">取自历史流量，未改动数据</span>
+      <button class="btn sm x" onclick="closeCheckup()">关闭</button></div>
+    <div class="sheet-bd">
+      <div class="lb">命中该分支的请求</div>
+      <div class="tbl-wrap"><div class="tbl-scroll"><table class="tbl"><tbody>
+        <tr><td class="mono" style="width:88px;font-size:var(--fs-micro)">14:01:22</td><td style="font-size:var(--fs-micro)">帮我设计一个支持千万并发的订单系统的数据库分片方案…</td><td class="mono" style="width:180px;font-size:var(--fs-nano);color:var(--text-3)">学科 计算机 · 难度 较难</td></tr>
+        <tr><td class="mono" style="font-size:var(--fs-micro)">13:42:05</td><td style="font-size:var(--fs-micro)">如何用 Rust 重写这个热点路径，需要考虑无锁队列…</td><td class="mono" style="font-size:var(--fs-nano);color:var(--text-3)">学科 计算机 · 难度 较难</td></tr>
+        <tr><td class="mono" style="font-size:var(--fs-micro)">13:18:44</td><td style="font-size:var(--fs-micro)">解释一下 Paxos 和 Raft 在脑裂场景下的取舍…</td><td class="mono" style="font-size:var(--fs-nano);color:var(--text-3)">学科 计算机 · 难度 很难</td></tr>
+      </tbody></table></div></div>
+      <div class="lb" style="margin-top:var(--s4)">最接近但未命中的请求 <span class="opt">用于判断条件是否过窄</span></div>
+      <div class="tbl-wrap"><div class="tbl-scroll"><table class="tbl"><tbody>
+        <tr><td class="mono" style="width:88px;font-size:var(--fs-micro)">13:51:10</td><td style="font-size:var(--fs-micro)">帮我写一个 Python 脚本读取 CSV 并生成报表</td><td class="mono" style="width:180px;font-size:var(--fs-nano);color:var(--text-3)">学科 计算机 · 难度 <b style="color:var(--amber)">简单</b></td></tr>
+        <tr><td class="mono" style="font-size:var(--fs-micro)">13:22:37</td><td style="font-size:var(--fs-micro)">讲一下微服务拆分的常见坑</td><td class="mono" style="width:180px;font-size:var(--fs-nano);color:var(--text-3)">学科 <b style="color:var(--amber)">其他</b> · 难度 较难</td></tr>
+      </tbody></table></div></div>
+    </div></div>`;
+  box.scrollIntoView({behavior:'smooth', block:'nearest'});
+  applyI18n();
+}
+function openCheckup(){
+  const box = document.getElementById('checkup');
+  const unused = TAG_GROUPS.flatMap(g => g.tags).filter(t => treeSignals().indexOf(t) < 0);
+  box.innerHTML = `<div class="sheet"><div class="sheet-hd"><b>体检结果</b>
+      <span class="sub">17 个标签 · 每次保存自动执行</span>
+      <button class="btn sm x" onclick="closeCheckup()">关闭</button></div>
+    <div class="sheet-bd">
+      <div class="find warn"><div class="ic">!</div><div class="tx">
+        <div class="h">「2 · 多媒体」第 2 条分支永不生效</div>
+        <div class="d">同节点第 1 条分支的条件更宽，恒真分支永远轮不到。</div></div></div>
+      <div class="find warn"><div class="ic">!</div><div class="tx">
+        <div class="h">「3 · 编程与推理」近 7 天无命中</div>
+        <div class="d">把握度门槛设为「至少 比较确定」，近 7 天没有请求达到该门槛。</div></div></div>
+      <div class="find ok"><div class="ic">✓</div><div class="tx">
+        <div class="h">「5 · 成本控制」命中占比最高</div>
+        <div class="d">占全部请求的 46%，是当前成本的主要来源。</div></div></div>
+      <div class="find ok"><div class="ic">✓</div><div class="tx">
+        <div class="h">引用完整</div>
+        <div class="d">分支引用的标签与模型均已定义。未被引用的 ${unused.length} 个标签：${unused.join('、')}。</div></div></div>
+    </div></div>`;
+  box.scrollIntoView({behavior:'smooth', block:'nearest'});
+  applyI18n();
+}
+function closeCheckup(){ document.getElementById('checkup').innerHTML = ''; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   主题
+   <head> 里的内联脚本已在首次绘制前把 data-theme 写好；
+   这里只负责按钮状态与后续切换。
+   ══════════════════════════════════════════════════════════════════════ */
+function setTheme(t){
+  document.documentElement.setAttribute('data-theme', t);
+  syncThemeButtons(t);
+  try{ localStorage.setItem('sr-theme', t); }catch(e){}
+  toast(t === 'dark' ? '已切换到深色' : '已切换到浅色');
+}
+function syncThemeButtons(t){
+  const d = document.getElementById('th-dark'), l = document.getElementById('th-light');
+  if(d) d.classList.toggle('on', t === 'dark');
+  if(l) l.classList.toggle('on', t === 'light');
+}
+function currentTheme(){ return document.documentElement.getAttribute('data-theme') || 'dark'; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   气泡 / 初始化
+   ══════════════════════════════════════════════════════════════════════ */
+let toastTimer = null;
+function toast(msg, action){
+  const t = document.getElementById('toast');
+  t.innerHTML = T(msg) + (action ? ` <button onclick="toast('已撤销')">${T(action)}</button>` : '');
+  applyI18n(t);
+  t.style.display = 'flex';
+  requestAnimationFrame(() => t.classList.add('show'));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    t.classList.remove('show');
+    setTimeout(() => { t.style.display = 'none'; }, 320);
+  }, 4200);
+}
+
+/* 入场序列：首屏元素错峰出现，只播一次 */
+function playIntro(){
+  if(prefersReduced()){ document.querySelectorAll('.rv').forEach(e => e.classList.add('in')); return; }
+  document.querySelectorAll('.pg.on .rv').forEach(e => e.classList.add('in'));
+}
+
+renderTree();
+renderBands();
+renderModels();
+applyI18n();
+syncThemeButtons(currentTheme());
+playIntro();
+
+window.addEventListener('scroll', () => {
+  document.querySelectorAll('.pg.on .rv:not(.in)').forEach(e => {
+    const r = e.getBoundingClientRect();
+    if(r.top < window.innerHeight * 0.92) e.classList.add('in');
+  });
+}, {passive:true});
+/* ── v6 增量词条 ──────────────────────────────────────────────────────
+   v6 引入了信号轨、机架导航等新文案，这里补齐 EN。
+   原则与 v5 一致：库里存中文键，渲染时才翻译。            */
+Object.assign(EN, {
+  /* 遥测条 */
+  '方案':'Scheme', '均衡':'Balanced', '启用':'On', '节点':'Nodes',
+  '信号':'Signals', '今日变更':'Changes today', '引用':'Uses',
+
+  /* 页头 */
+  '请求':'Request', '末条用户消息':'Last user message',
+  '信号轨':'Signal Rail', '模型清单':'Model list', '可核对明细':'Verifiable details',
+  '按能力从低到高排序':'Ordered by capability',
+  '5 个 · 能力标签决定可被谁选中':'5 models · capabilities decide who can pick them',
+  '17 个信号 · 一次前向全出':'17 signals · all from one forward pass',
+  '自上而下 · 首个命中即停 · 命中之后全部熄灯':'Top-down · first hit wins · everything below goes dark',
+  '重放脉冲':'Replay pulse',
+  '地址与鉴权方式在「接入新模型」里逐项填写，不在此重复。':'Endpoint and auth are entered in “Connect model”; not repeated here.',
+
+  /* 长句（v6 新增） */
+  '树决定用哪些信号；一次前向产出全部标签；按条件与把握度决定去向。':'The tree picks the signals; one forward pass yields every tag; conditions plus confidence pick the destination.',
+  '结果确定，可复现。':'Deterministic and reproducible.',
+  '（本例 12 ms）；规则标签毫秒级。':' (12 ms here); rule tags are sub-millisecond.',
+  '标签与路径均入库，可在「流量」页回看。':'Tags and paths are stored; revisit them under Traffic.',
+  '位置即优先级。':'Position is priority.',
+  '名称与说明':'Name and note',
+  '（往下细看）':'(expand below)',
+  '节点可折叠、上移、置顶；位置即优先级。分支右侧下拉可改去向，选项含能力标签。':'Nodes can be folded, moved up or pinned; position is priority. The dropdown on each branch changes its destination, and options carry capability labels.',
+  '每条请求的标签、路径与会话状态。点开可「按当前规则重放」，':'Tags, path and session state per request. Open one to replay against current rules,',
+  '不调用模型。':'without calling models.',
+  '接入后端模型。两套 SDK 的鉴权、路径、请求体与流式形态都不同，':'Connect backend models. The two SDKs differ in auth, path, body and streaming,',
+  '接入时按协议自动适配。':'and the protocol adapts automatically.',
+  '路由行为与参数。模型接入见「模型」页；':'Routing behaviour and parameters. Model onboarding lives under Models;',
+  '变更前给出影响预估。':'changes show an impact estimate first.',
+  '「升一档」取后一格，「换一个模型」取下一格。反馈解锁依赖此顺序；未配置时「答错了」退化为重新判断。':'“Step up” takes the next rung; “Switch” takes the one after. Feedback unlock depends on this order; without it, “Wrong answer” degrades to re-evaluation.',
+  '启动时逐项核对标签清单与模型输出顺序；不一致则拒绝启动。':'On startup every tag and output position is verified; a mismatch refuses to start.',
+  '只有连续量的标签才有分档：是非题切概率，打分题切分数，长短切数量。':'Only continuous tags have bands: yes/no cuts probability, scored tags cut the score, length cuts the word count.',
+  '拖动分界后各档占比按段内密度自动重算。':'Moving a cut redistributes each band by density within its segment.',
+  '置信度不是另算的，而是从概率分布导出：分布越尖越确定。它是路由的':'Confidence is not computed separately but derived from the distribution: sharper means more certain. It is the routing',
+  '第二个门槛':'second gate.',
+  '低于门槛的请求可交给兜底模型，不必强行判定 —— 这是 JEV 置信度的主要用途。':'Requests below the gate can go to the fallback rather than being forced — the main use of JEV confidence.',
+  '改完立即生效':'Takes effect immediately',
+  '今日花费超过':"Today's spend exceeds",
+  '八成':'80%',
+  '环节':'Aspect', '错误':'Error', '故障':'Down', '正常':'Up',
+
+  /* 信号轨 */
+  '不再评估':'not evaluated',
+  '同节点第 1 条分支的条件更宽，恒真分支永远轮不到。':'Branch #1 in the same node is broader, so the catch-all can never fire.',
+  '把握度门槛设为「至少 比较确定」，近 7 天没有请求达到该门槛。':'The confidence gate is “at least Fairly Certain”; no request reached it in the last 7 days.',
+  '「5 · 成本控制」命中占比最高':'“5 · Cost Control” has the highest hit share',
+  '占全部请求的 46%，是当前成本的主要来源。':'46% of all requests — the main driver of cost right now.',
+  '分支引用的标签与模型均已定义。未被引用的':'All tags and models referenced by branches are defined. Unused:',
+  '相似度、关键词、语言、结构、事件、重复提问':'Similarity · Keyword · Language · Structure · Event · Repeat',
+  '个标签：':' tags:',
+  '已切换到英文':'Switched to English',
+  '已切换到中文':'Switched to Chinese'
+});
+
+/* ── v6 第二批：信号轨与列表视图文案 ── */
+Object.assign(EN, {
+  '通电':'LIVE',
+  '✓ 通电':'✓ LIVE',
+  '↑ 以上通电 —— 首个命中即停，以下不再评估':'↑ Energised above — first hit stops the rail; nothing below is evaluated',
+  '节点（越靠上越优先）':'Node (higher = higher priority)',
+  '什么时候用':'When it applies',
+  '└ 子分支':'└ sub-branch',
+  '（本例 12 ms）；规则标签毫秒级。标签与路径均入库，可在「流量」页回看。':' (12 ms here); rule tags are sub-millisecond. Tags and paths are stored — revisit them under Traffic.',
+  '尚未执行 —— 打标签后这里显示完整的下行过程。':'Not run yet — tag a request and the full descent shows up here.',
+  '模型标签':'Model tags'
+});
+
+
+/* ── v6 第三批：主题切换 ── */
+Object.assign(EN, {
+  '深色':'Dark', '浅色':'Light',
+  '界面语言':'Interface language', '界面主题':'Interface theme',
+  '已切换到深色':'Switched to dark', '已切换到浅色':'Switched to light'
+});
+
+/* ── v6 增量模板规则 ────────────────────────────────────────────────
+   动态串（数字会变）不能进静态词条表，交给规则处理。           */
+EN_RULES.push(
+  [/^(\d+) 个节点 · (\d+) 条分支$/, m => m[1] + ' nodes · ' + m[2] + ' branches'],
+  [/^引用 (\d+) \/ (\d+)$/,          m => 'Uses ' + m[1] + ' / ' + m[2]],
+  [/^(\d+) 个模型 · (\d+) 正常$/,    m => m[1] + ' models · ' + m[2] + ' up'],
+  [/^(\d+) 个信号 · (.+)$/,          m => m[1] + ' signals · ' + xlate(m[2])],
+  [/^([^，]{1,20})，是当前成本的主要来源。$/, m => xlate(m[1]) + ' — the main driver of cost right now.'],
+  [/^「(.+?)」命中占比最高$/,        m => '“' + xlate(m[1]) + '” has the highest hit share'],
+  [/^「(.+?)」有最高的命中占比$/,    m => '“' + xlate(m[1]) + '” has the highest hit share'],
+  [/^把握度门槛设为「至少 (.+?)」，近 (\d+) 天没有请求达到该门槛。$/,
+    m => 'The confidence gate is “at least ' + xlate(m[1]) + '”; no request reached it in the last ' + m[2] + ' days.'],
+  [/^同节点第 (\d+) 条分支的条件更宽，恒真分支永远轮不到。$/,
+    m => 'Branch #' + m[1] + ' in the same node is broader, so the catch-all can never fire.'],
+  // 体检结论：整句在 EN 表里，标签清单由 trSeg 之外的路子处理
+  // 注意：规则里要用 xlate() 而不是 T()。
+  // T() 会先看 lang=='zh' 就原样返回中文，用在这里等于什么都没翻。
+  [/^分支引用的标签与模型均已定义。未被引用的 (\d+) 个标签：(.*)$/,
+    m => 'All tags and models referenced by branches are defined. ' + m[1] + ' unused: ' + xlate(m[2])],
+  [/^「(.+?)」近 (\d+) 天无命中$/,   m => '“' + xlate(m[1]) + '” had no hits in the last ' + m[2] + ' days'],
+  [/^未重新打标签$/,                  () => 'no re-tagging'],
+  [/^共 (\d+) 条请求进入此节点（(.+?)%）$/, m => 'About ' + m[1] + ' requests/day enter this node (' + m[2] + '%)']
+);
+
+/* ── v7 增量词条：降学习成本改版的新文案 ── */
+Object.assign(EN, {
+  '输入一句话，看它流向哪个模型——以及为什么。':'Type a request and see which model it flows to — and why.',
+  '路由 →':'Route →',
+  '示例':'Examples',
+  '已有会话 · 第 3 轮':'Existing session · turn 3',
+  '设计并发系统':'Design a concurrent system',
+  '画架构图':'Draw an architecture diagram',
+  '优化代码':'Optimize code',
+  '闲聊':'Small talk',
+  '▸ 全部 17 个信号':'▸ All 17 signals',
+  '▾ 收起':'▾ Collapse',
+  '会话沿用 · 未重新打标签':'Session reuse · no re-tagging',
+  '沿树下行':'Down the tree',
+  '第一个条件全满足的分支接住请求':'The first branch with every condition met catches the request',
+  '自上而下，第一个条件全满足的分支接住请求。位置就是优先级。':'Top to bottom — the first branch with every condition met catches the request. Position is priority.',
+  '每条请求打出的信号、走的路径和结果。点开可回看判定过程。':'Signals, path and outcome per request. Open one to revisit the decision.',
+  '分档改完立即生效。':'Band changes take effect immediately.',
+  '尚未执行 —— 路由后这里显示完整的下行过程。':'Not run yet — route a request and the full descent shows up here.',
+  '一次打出全部信号':'All signals in one pass',
+  '模型看一遍…':'One look by the model…'
+});
+
+/* ── v7 增量模板规则 ── */
+EN_RULES.push(
+  [/^本次判定用了 (\d+) 个信号 · 一次打出$/, m => m[1] + ' signals used · one forward pass'],
+  [/^(▸|▾) (\d+) 个节点不再评估$/,          m => m[1] + ' ' + m[2] + ' nodes below — not evaluated'],
+  [/^(\d+) 条分支$/,                        m => m[1] + ' branches']
+);
+
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# ---- 文档与工作记录（按约定不入库）----
+docs/
+.workbuddy/
+.superpowers/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# ---- 运行时数据 ----
+*.db
+*.db-wal
+*.db-shm
+
+# ---- Node / 前端 ----
+node_modules/
+
+# ---- 系统 ----
+.DS_Store
