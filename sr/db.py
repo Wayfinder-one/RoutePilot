@@ -1,4 +1,5 @@
-"""SQLite 读写层：建表（spec §3.1/§3.2 逐字）、默认配置与 balanced 种子树、版本号、审计。
+"""SQLite 读写层：建表（spec §3.1/§3.2 逐字）、默认配置与种子落库（balanced 树定义
+在 sr/engine.TEMPLATES，本模块只落库）、版本号、审计。
 
 约定：
 - 所有入库字符串一律语言无关键（spec §3.1 存储约定）；节点 name/desc 与 block_msg
@@ -12,6 +13,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import datetime
+
+from sr.engine import TEMPLATES
 
 # 预置键（spec §3.1 settings 表注释），值一律字符串。
 DEFAULT_SETTINGS: dict[str, str] = {
@@ -163,126 +166,8 @@ CREATE INDEX idx_req_session ON requests(session_id);
 CREATE INDEX idx_tree_order ON tree(parent, idx);
 """
 
-# balanced 种子树（spec §5.3 所指「设计方案 §3.2 的 8 节点树」）。
-# cond/action 用规范键，语法见 spec §5.1（op ∈ is/in/gte/lte/contains；or/not 只包普通子句；
-# cond:[] 兜底仅出现在最后一个节点 idx=9）。
-# 源：console-v7.html `const TREE` 的 8 节点，中文显示词按 §6.3 键表换成规范键；
-# 难度按 spec §2.2 两档收敛：`至少 较难/很难` 统一落 {"op":"is","values":[1]}（hard）。
-# idx 编号：顶层节点 = 设计方案节点号；分支 = 父 idx*10 + 段内序号（§9.2 示例：节点 3 分支 0 → 30），
-# 节点 0（起点）的 0 段与顶层节点号冲突，特例落 100+序号；子分支同公式（21 → 210/211）。
-# Task 5 落地后将本常量收回 sr/engine.py 的 TEMPLATES（config.apply_template 调用），此处删除。
-_BLOCK_MSG = {"zh": "请求被安全策略拦截", "en": "Blocked by safety policy"}
-
-BALANCED_YAML: list[dict] = [
-    {"idx": 0, "name": "会话沿用",
-     "desc": "同一个会话里，沿用第一次判断的结果（省算力，也省模型切换的开销）",
-     "branches": [
-         # 上轮反馈 是 满意 / 想让我说清楚 → 沿用上次的模型（多值 → in）
-         {"idx": 100,
-          "cond": [{"tag": "user_feedback", "op": "in",
-                    "values": ["satisfied", "need_clarification"]}],
-          "action": {"kind": "special", "special": "sticky"}},
-         # 上轮反馈 是 答错了 → 升一档
-         {"idx": 101,
-          "cond": [{"tag": "user_feedback", "op": "is", "values": ["wrong_answer"]}],
-          "action": {"kind": "special", "special": "ladder_up"}},
-         # 上轮反馈 是 想换个说法 → 换一个模型
-         {"idx": 102,
-          "cond": [{"tag": "user_feedback", "op": "is", "values": ["want_different"]}],
-          "action": {"kind": "special", "special": "ladder_next"}},
-     ]},
-    {"idx": 1, "name": "安全", "desc": "先拦危险请求",
-     "branches": [
-         # 可疑 至少 很可疑（§6.3 档位索引 2）
-         {"idx": 10,
-          "cond": [{"tag": "jailbreak", "op": "gte", "values": [2]}],
-          "action": {"kind": "block", "block_msg": _BLOCK_MSG}},
-         # 敏感信息 含有 身份证号 / 银行卡号 / 密码
-         {"idx": 11,
-          "cond": [{"tag": "pii", "op": "contains",
-                    "values": ["cn_id_card", "cn_bank_card", "password"]}],
-          "action": {"kind": "block", "block_msg": _BLOCK_MSG}},
-     ]},
-    {"idx": 2, "name": "多媒体", "desc": "要生成图片的请求（位于成本控制之前）",
-     "branches": [
-         # 要什么 是 图片
-         {"idx": 20,
-          "cond": [{"tag": "modality", "op": "is", "values": ["image"]}],
-          "action": {"kind": "route", "model": "sdxl-image"}},
-         # 要什么 是 文字加图片 →（往下细看）；本行动作为分组层兜底，
-         # 两个子分支恒命中其一（末位为「其他」），正常求值不可达。
-         {"idx": 21,
-          "cond": [{"tag": "modality", "op": "is", "values": ["text_image"]}],
-          "action": {"kind": "route", "model": "llava-omni"},
-          "branches": [
-              # 难度 至少 较难 → llava-omni（深度）；两档制落 is [1]
-              {"idx": 210,
-               "cond": [{"tag": "complexity", "op": "is", "values": [1]}],
-               "action": {"kind": "route", "model": "llava-omni", "think": "deep"}},
-              # 其他 → llava-omni（cond:[] 仅限最后节点，此处用 not 表达「其他」）
-              {"idx": 211,
-               "cond": [{"not": {"tag": "complexity", "op": "is", "values": [1]}}],
-               "action": {"kind": "route", "model": "llava-omni"}},
-          ]},
-     ]},
-    {"idx": 3, "name": "编程与推理", "desc": "按难度换模型",
-     "branches": [
-         # 学科 是 计算机 而且 难度 至少 较难（把握度 至少 比较确定 → conf_min 并入该子句）
-         {"idx": 30,
-          "cond": [{"tag": "domain", "op": "is", "values": ["computer_science"]},
-                   {"tag": "complexity", "op": "is", "values": [1], "conf_min": 2}],
-          "action": {"kind": "route", "model": "qwen3-32b", "think": "deep",
-                     "fallback": ["qwen3-8b"]}},
-         # 难度 至少 很难 → 深度
-         {"idx": 31,
-          "cond": [{"tag": "complexity", "op": "is", "values": [1]}],
-          "action": {"kind": "route", "model": "qwen3-32b", "think": "deep"}},
-         # 难度 至少 较难 → 轻度
-         {"idx": 32,
-          "cond": [{"tag": "complexity", "op": "is", "values": [1]}],
-          "action": {"kind": "route", "model": "qwen3-32b", "think": "light"}},
-     ]},
-    {"idx": 4, "name": "法律与事实", "desc": "需要严肃对待的问题",
-     "branches": [
-         # 学科 是 法律 或者 需核实 是 需要核实
-         {"idx": 40,
-          "cond": [{"or": [{"tag": "domain", "op": "is", "values": ["law"]},
-                           {"tag": "fact_check", "op": "is",
-                            "values": ["needs_check"]}]}],
-          "action": {"kind": "route", "model": "qwen3-32b", "think": "light",
-                     "fallback": ["qwen3-8b"]}},
-     ]},
-    {"idx": 5, "name": "成本控制", "desc": "简单请求走小模型",
-     "branches": [
-         # 难度 是 简单 而且 长度 属于 很短、一般（context 档位 0/1）
-         {"idx": 50,
-          "cond": [{"tag": "complexity", "op": "is", "values": [0]},
-                   {"tag": "context", "op": "in", "values": [0, 1]}],
-          "action": {"kind": "route", "model": "qwen3-8b"}},
-         # 轮次 是 长对话（档位 2）
-         {"idx": 51,
-          "cond": [{"tag": "turns", "op": "is", "values": [2]}],
-          "action": {"kind": "route", "model": "qwen3-8b"}},
-         # 时段 是 夜间
-         {"idx": 52,
-          "cond": [{"tag": "time_window", "op": "is", "values": ["night"]}],
-          "action": {"kind": "route", "model": "qwen3-8b"}},
-     ]},
-    {"idx": 6, "name": "专属", "desc": "指定人群走指定模型",
-     "branches": [
-         # 身份 是 premium
-         {"idx": 60,
-          "cond": [{"tag": "tenant", "op": "is", "values": ["premium"]}],
-          "action": {"kind": "route", "model": "qwen3-32b"}},
-     ]},
-    {"idx": 9, "name": "其他（兜底）", "desc": "全部未命中时",
-     "branches": [
-         # 什么情况都算（cond:[] 兜底，仅最后节点）
-         {"idx": 90,
-          "cond": [],
-          "action": {"kind": "route", "model": "qwen3-8b"}},
-     ]},
-]
+# balanced 种子树定义在 sr/engine.py 的 TEMPLATES["balanced"]（Task 5 自本文件迁出，
+# 内容零改动；_seed 落库与模板切换共用）。
 
 # 种子供应商/模型（本任务计划授权的补种，Task 6/3 依赖）。
 # base_url 为本地占位；部署时经控制台或 YAML 导入覆盖。caps 表意见 spec §6.2，
@@ -376,7 +261,7 @@ def _seed(conn: sqlite3.Connection) -> None:
         "INSERT INTO conf_settings (id, thresholds) VALUES (1, ?)",
         (_dump(_SEED_CONF_SETTINGS),),
     )
-    for node in BALANCED_YAML:
+    for node in TEMPLATES["balanced"]:
         # 节点行：cond/action 为 NOT NULL 占位（求值只读分支行）
         conn.execute(
             "INSERT INTO tree (idx, parent, name, desc, cond, action, trial, enabled) "
