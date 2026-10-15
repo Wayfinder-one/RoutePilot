@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) TagDef + TAGS —— 17 标签注册表（spec §4.1 表 + §6.3 键表逐行录入）
@@ -212,3 +214,166 @@ def conf_band(p: float, thresholds: list[float] | None = None) -> int:
     """
     cuts = DEFAULT_CONF_THRESHOLDS if thresholds is None else thresholds
     return sum(1 for t in cuts if p >= t)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) tag_rules() —— 8 个规则标签（spec §4.5 表逐条；Task 3 追加，不改既有定义）
+# ─────────────────────────────────────────────────────────────────────────────
+
+# context 词数四档切点（spec §4.5「按 tag_settings 切四档」，与 sr/db.py
+# _SEED_TAG_SETTINGS 的 context 行同值）。裁定：tag_rules 不读库——tag_settings
+# 的 context 行留给 admin 展示与 M2；M2 接线时如需跟随库值，由调用方读表后
+# 走独立路径，不改本默认常量。
+DEFAULT_CONTEXT_THRESHOLDS: list[int] = [20, 100, 400]
+
+# spec §4.5 未写明档位边界归属，取左闭右开 [t_i, t_{i+1})（含等号，与
+# conf_band「达到切点个数」同语义）：<20 → 0（很短），20–99 → 1（一般），
+# 100–399 → 2（长），≥400 → 3（很长）。
+
+# CJK：基本区 U+4E00–U+9FFF（不含假名/谚文/全角标点，§4.5「CJK 字符」按汉字取）。
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
+
+# event 两张正则表（简报 Step 3 给定，逐字采用；英文词不区分大小写）。
+# 同一文本同时命中两类时 incident 优先（spec §4.5 未写明优先级，裁定声明）。
+_INCIDENT_RE = re.compile(r"故障|宕机|500|5\d\d 错误|incident|down", re.IGNORECASE)
+_PAYMENT_RE = re.compile(r"支付|扣款|退款|payment|refund", re.IGNORECASE)
+
+
+def _language_of(text: str) -> str:
+    """§4.5 language：CJK 占比 ≥0.3 → zh；ASCII 字母占比 ≥0.8 → en；否则 other。
+
+    分母口径（spec 未写明，声明）：去除全部空白字符后的字符数，标点计入。
+    不扣标点/空白——常规英文句子的空格+标点不至于把字母占比拉下 0.8，
+    而把标点也计入可让「中文夹英文」文本稳定落 zh/other 而非误判 en。
+    """
+    body = re.sub(r"\s+", "", text)
+    total = len(body)
+    if not total:
+        return "other"                      # 空文本无语言信号，按「否则」落 other
+    if len(_CJK_RE.findall(body)) / total >= 0.3:
+        return "zh"                         # CJK 判定在前：混排且 CJK 达标即 zh
+    if len(_ASCII_LETTER_RE.findall(body)) / total >= 0.8:
+        return "en"
+    return "other"
+
+
+def _structure_of(text: str) -> str:
+    """§4.5 structure：code（``` 围栏或缩进行）→ json（可解析）→ multiline → plain。
+
+    判定顺序按 §4.5 表列序（围栏优先于 JSON：围栏内的 JSON 算代码）。
+    multiline 阈值声明：spec 字面「≥ 3 个换行」与简报测试冲突——测试要求
+    3 行（2 个换行符）即 multiline，按测试契约取「行数 ≥ 3」，已记任务报告。
+    json 声明：仅 dict/list 算结构化（"123"/"true" 等标量虽是合法 JSON，
+    作为消息正文没有结构语义，不判 json）。
+    """
+    if "```" in text:
+        return "code"
+    lines = text.split("\n")
+    if any(line[:1] in (" ", "\t") for line in lines):
+        return "code"                       # 缩进代码行（行首空白即算）
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, (dict, list)):
+        return "json"
+    if len(lines) >= 3:
+        return "multiline"
+    return "plain"
+
+
+def _context_band(text: str, thresholds: list[int]) -> int:
+    """§4.5 context：词数（CJK 按字、其余按空白分词）切四档，左闭右开。"""
+    n_words = len(_CJK_RE.findall(text)) + len(_CJK_RE.sub(" ", text).split())
+    return sum(1 for t in thresholds if n_words >= t)
+
+
+def _turns_band(n_messages: int) -> int:
+    """§4.5 turns：1 → 0（首轮）；2–9 → 1；≥10 → 2（长对话）。0 条按首轮算。"""
+    if n_messages <= 1:
+        return 0
+    if n_messages < 10:
+        return 1
+    return 2
+
+
+def _tenant_of(headers: dict) -> str:
+    """§4.5 tenant：请求头 x-sr-tenant 原值（不归一）；缺省/空 → anonymous。
+
+    键匹配不区分大小写（HTTP 头语义）；原值含首尾空白时原样保留（「原值」）。
+    """
+    for key, value in (headers or {}).items():
+        if str(key).lower() == "x-sr-tenant" and value:
+            return str(value)
+    return "anonymous"
+
+
+def _time_window_of(now: datetime) -> str:
+    """§4.5 time_window：周六日 → weekend；工作日 09:00–18:00 → weekday_day；否则 night。
+
+    只用传入的 now（可测），函数内不取系统时间。边界声明（spec 未写明）：
+    白天窗口取左闭右开 [09:00, 18:00)，18:00 整落 night；weekend 全天命中、
+    不再看小时（§4.5 周六日一行未限定时段）。
+    """
+    if now.weekday() >= 5:                  # Monday=0 … Saturday=5, Sunday=6
+        return "weekend"
+    if 9 <= now.hour < 18:
+        return "weekday_day"
+    return "night"
+
+
+def _keyword_hits(text: str, kw_table: dict[str, list[str]] | None) -> list[str]:
+    """§4.5 keyword：设置页词表子串命中（大小写不敏感），返回命中词扁平列表。
+
+    按词表迭代序返回；同一词命中多次/多组只收一次（首次出现位置为准）。
+    未传 kw_table 或无命中 → []。
+    """
+    if not kw_table:
+        return []
+    low = text.lower()
+    hits: list[str] = []
+    for words in kw_table.values():
+        for word in words:
+            word = str(word)
+            if word and word.lower() in low and word not in hits:
+                hits.append(word)
+    return hits
+
+
+def _rule(value) -> dict:
+    """规则标签统一形状（§4.5 末行：无把握度，confidence = None）。"""
+    return {"value": value, "confidence": None, "is_rule": True}
+
+
+def tag_rules(text: str, headers: dict, n_messages: int, now: datetime,
+              kw_table: dict[str, list[str]] | None = None) -> dict[str, dict]:
+    """8 个规则标签打标（spec §4.5 表逐条；Task 3）。
+
+    返回 ``{tag_key: {"value": ..., "confidence": None, "is_rule": True}}``，
+    键序随 TAGS 注册表中 rule 标签序：keyword / language / structure / context /
+    turns / tenant / time_window / event。规则标签不参与把握度门槛（§4.5 末行）。
+
+    取舍与边界声明（spec 未写明处，均为实现裁定并已记任务报告）：
+    - context 阈值用模块常量 DEFAULT_CONTEXT_THRESHOLDS，不读 tag_settings 表；
+    - context / time_window 档位边界取左闭右开（含下界、不含上界）；
+    - language 占比分母 = 去空白后的字符数；空文本落 other；
+    - structure 的 multiline 取「行数 ≥ 3」（测试契约，覆盖 spec「≥3 个换行」字面）；
+    - event 双表同中时 incident 优先；时间判定只用传入 now。
+    """
+    if _INCIDENT_RE.search(text):
+        event = "incident"
+    elif _PAYMENT_RE.search(text):
+        event = "payment_issue"
+    else:
+        event = "none"
+    return {
+        "keyword": _rule(_keyword_hits(text, kw_table)),
+        "language": _rule(_language_of(text)),
+        "structure": _rule(_structure_of(text)),
+        "context": _rule(_context_band(text, DEFAULT_CONTEXT_THRESHOLDS)),
+        "turns": _rule(_turns_band(n_messages)),
+        "tenant": _rule(_tenant_of(headers)),
+        "time_window": _rule(_time_window_of(now)),
+        "event": _rule(event),
+    }

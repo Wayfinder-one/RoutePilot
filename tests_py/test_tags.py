@@ -34,3 +34,49 @@ def test_conf_band_default_cuts():
     assert conf_band(0.45) == 1
     assert conf_band(0.75) == 2
     assert conf_band(0.95) == 3
+
+# ── Task 3：规则标签 tag_rules（spec §4.5，简报测试代码逐字采用） ──────────────
+
+from datetime import datetime
+from sr.tags import tag_rules
+
+H = {}
+def run(text, n=1, now=datetime(2026, 10, 14, 10, 0), headers=None, **kw):   # 周三 10:00
+    # 简报原文 helper 未透传 kw_table 而 test_event_and_keyword 传了它，此处补 **kw
+    # 透传（最小修正，断言代码逐字不变），已记任务报告。
+    return tag_rules(text, headers or H, n, now, **kw)
+
+def test_language():
+    assert run("帮我写个函数")["language"]["value"] == "zh"
+    assert run("write a function for me")["language"]["value"] == "en"
+
+def test_structure():
+    assert run("```python\npass\n```")["structure"]["value"] == "code"
+    assert run('{"a": 1}')["structure"]["value"] == "json"
+    assert run("line1\nline2\nline3")["structure"]["value"] == "multiline"
+    assert run("hello")["structure"]["value"] == "plain"
+
+def test_context_and_turns():
+    assert run("短")["context"]["value"] == 0
+    assert run("x", n=1)["turns"]["value"] == 0
+    assert run("x", n=5)["turns"]["value"] == 1
+    assert run("x", n=12)["turns"]["value"] == 2
+
+def test_tenant_header():
+    assert run("x", headers={"x-sr-tenant": "premium"})["tenant"]["value"] == "premium"
+    assert run("x")["tenant"]["value"] == "anonymous"
+
+def test_time_window():
+    assert run("x")["time_window"]["value"] == "weekday_day"
+    assert run("x", now=datetime(2026, 10, 17, 15, 0))["time_window"]["value"] == "weekend"  # 周六
+    assert run("x", now=datetime(2026, 10, 14, 23, 0))["time_window"]["value"] == "night"
+
+def test_event_and_keyword():
+    assert run("线上服务宕机了，全是 500")["event"]["value"] == "incident"
+    assert run("申请退款，扣款异常")["event"]["value"] == "payment_issue"
+    assert run("你好")["event"]["value"] == "none"
+    r = run("def f(): pass", kw_table={"code_words": ["def", "import"]})
+    assert r["keyword"]["value"] == ["def"]
+
+def test_rule_tags_have_no_confidence():
+    assert all(v["confidence"] is None for v in run("随便一句").values())
