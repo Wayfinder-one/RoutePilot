@@ -2,7 +2,9 @@
 
 :func:`create_app` 返回 FastAPI 应用，双协议端点（§7.1 路径同构）：
 
-- ``POST /v1/chat/completions`` —— OpenAI 协议（§7.3）
+- ``POST /v1/chat/completions`` 与 ``POST /chat/completions`` —— OpenAI 协议（§7.3；
+  双路径同 handler：§7.3 口径 base_url 含 ``/v1`` 时 router 打前者的父路径，
+  种子/测试 fixture 的 base_url 不含 ``/v1`` 时打后者——Task 8 集成时补的别名）
 - ``POST /v1/messages``        —— Anthropic 协议（§7.4）
 
 应答为回显式固定内容：
@@ -176,7 +178,8 @@ def create_app() -> FastAPI:
     app = FastAPI(title="smart-router fake-upstream", docs_url=None, redoc_url=None)
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request):
+    @app.post("/chat/completions")   # base_url 不含 /v1 的种子口径（§7.3 base_url 含
+    async def chat_completions(request: Request):   # /v1 时 router 打到本路径；两口径都接）
         body, fail, err = await _prep(request)
         if err is not None:
             return err
