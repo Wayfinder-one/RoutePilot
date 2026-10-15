@@ -1,0 +1,433 @@
+"""sr/health.py —— 分流树体检：§10 八项检查 + Finding 形状（§9.2 audit 形状）。
+
+模块职责：
+- :class:`Finding` —— 一条体检结论（level/code/node/branch + 双语 message + fix）；
+  :meth:`Finding.to_json` 按 §9.2 audit 形状直出（``message`` 为 ``{"zh":…,"en":…}``
+  双语字典，控制台按当前语言取键渲染）。
+- 八个 ``check_*`` —— §10 CHECKS 表逐项（函数名/硬错误标记逐字）。表内 True →
+  ``hard``（拦截保存）；False 按「误配后果」分两级：``warn`` = 疑似配置错误
+  （dead_branch / duplicate / conf_on_rule），``info`` = 仅提示（unused_tags /
+  no_hits）。§9.2 只定义了 hard/warn/info 三级枚举，未逐项给非硬级，此划分为本
+  实现裁定（记任务报告），与简报测试断言（duplicate/dead_branch 非 hard）一致。
+- :data:`CHECKS` + :func:`run_checkup` —— §10 代码逐字（函数表 + is_hard 循环）。
+
+接口裁定（记任务报告）：
+- :func:`run_checkup` 增加可选第 4 参 ``hits``（hit_branch "N.M" → 近 30 天命中
+  数，Task 5 裁定 M=分支位置序号）：check_no_hits 是八项里唯一需要运行数据的
+  检查，§10 纯函数签名拿不到 DB——由 server 层查好传入；``hits=None``（无流量
+  或库外直调）时该检查整体跳过。简报 3 参调用不受影响。
+- 折入项（Task 5 评审遗留）：cond 子句 ``values`` 为空列表会让 engine._atom 取
+  ``values[0]`` 抛 IndexError。§10 CHECKS 表没有独立的「子句语法」检查项，控制者
+  裁定并入 check_bad_ref（hard）：空 values / 非法 op 与「引用不存在的标签/模型」
+  同属「子句引用了引擎无法求值的东西」，在同一检查内处理（见 check_bad_ref 注释）。
+
+依赖方向：health → tags（TagDef 只读）、health → engine（Node/Branch 结构），
+均单向；server 单向 import 本模块，无循环依赖。
+"""
+
+from __future__ import annotations
+
+from collections import Counter
+from dataclasses import dataclass
+
+from sr.engine import Branch, Node
+from sr.tags import TagDef
+
+# cond 子句合法操作符（§5.1 语法；引擎查表外的 op 会 KeyError → 体检拦下）。
+_OPS = {"is", "in", "gte", "lte", "contains"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Finding —— §9.2 audit 形状的内存态（message 双语拆两字段，序列化时合字典）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class Finding:
+    """一条体检结论（§9.2 audit 形状；字段序 = 简报 Produces 逐字）。"""
+
+    level: str            # 'hard' | 'warn' | 'info'（§9.2 三级枚举）
+    code: str             # §10 八项 code（check_* 去前缀，如 "no_fallback"）
+    node: int | None      # 节点 idx；全树级结论为 None
+    branch: int | None    # 分支 idx（tree.idx，§9.2 GET 同口径）；非分支级 None
+    message_zh: str       # 中文结论（控制台 zh 态直出）
+    message_en: str       # 英文结论（en 态直出）
+    fix: dict | None = None   # 修复建议 {"action": …}（§9.2 示例形状）
+
+    def to_json(self) -> dict:
+        """→ §9.2 audit findings 逐项形状（message 双语字典直出）。"""
+        return {"level": self.level, "code": self.code, "node": self.node,
+                "branch": self.branch,
+                "message": {"zh": self.message_zh, "en": self.message_en},
+                "fix": self.fix}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) 公共小件：分支遍历 / cond 规范形
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _iter_branches(nodes: list[Node]):
+    """全部分支（含 kids 子分支）→ (node, branch)。
+
+    M1 求值不下钻 kids（Task 5 裁定），但 kids 是落库行（rows_to_tree 如实挂载），
+    体检不因「暂不求值」免检——结构类检查（bad_ref / special_misplaced /
+    conf_on_rule / unused_tags 的引用收集）走本遍历。
+    """
+    for n in nodes:
+        stack = list(n.branches)
+        while stack:
+            b = stack.pop(0)
+            yield n, b
+            stack.extend(b.kids)
+
+
+def _atom_key(c: dict) -> tuple:
+    """普通子句 → 可哈希规范形（dead_branch / duplicate 的「条件相同/被覆盖」判定）。"""
+    values = c.get("values")
+    if not isinstance(values, list):
+        values = []
+    return (c.get("tag"), c.get("op"),
+            tuple(sorted(repr(v) for v in values)), c.get("conf_min"))
+
+
+def _cond_key(cond: list) -> tuple:
+    """cond 列表 → 规范形元组（§5.1 三种子句：普通 / or 组 / not 包装）。"""
+    out = []
+    for c in cond:
+        if not isinstance(c, dict):
+            out.append(("?", repr(c)))          # 非法子句：保底可哈希（bad_ref 会另报）
+        elif "or" in c:
+            out.append(("or", frozenset(_atom_key(a) for a in c["or"]
+                                        if isinstance(a, dict))))
+        elif "not" in c:
+            inner = c["not"]
+            out.append(("not", _atom_key(inner) if isinstance(inner, dict)
+                        else ("?", repr(inner))))
+        else:
+            out.append(_atom_key(c))
+    return tuple(out)
+
+
+def _covers(a_key: tuple, b_key: tuple) -> bool:
+    """规范条件 A「覆盖」B：A 的每个子句在 B 中至少等量出现（多重集包含）。
+
+    A 条件为空（兜底 cond=[]）⇒ Counter() ⊆ 任意 ⇒ 覆盖一切后序分支（§5.2
+    first-hit-wins 语义下的正确推论）。"""
+    ca, cb = Counter(a_key), Counter(b_key)
+    return all(cb[k] >= n for k, n in ca.items())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) 八项检查（§10 CHECKS 表顺序 = 本节顺序；签名 (nodes, models, tag_defs, is_hard)）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def check_dead_branch(nodes: list[Node], models, tag_defs, is_hard: bool) -> list:
+    """分支被上方完全覆盖（§10）→ warn。
+
+    「覆盖」的 M1 判定（声明记任务报告）：按求值顺序（节点 idx 升序 × 分支内
+    列表序，§5.2）扫 enabled 的非 special 分支，前序分支 A 的规范条件 ⊆ 当前
+    分支 B 的规范条件（:func:`_covers`，逐子句多重集包含）→ B 死支。不做完整
+    逻辑蕴含证明（or/not 语义展开），同条件重复与「更宽条件在前」两类已覆盖，
+    满足 §14.1「分支被上方完全覆盖」覆盖点；special 分支不参与——engine 视其
+    恒 miss（§4.4），不遮蔽后序分支。"""
+    level = "hard" if is_hard else "warn"
+    findings: list[Finding] = []
+    seen: list[tuple[tuple, Node, Branch]] = []
+    for n in nodes:
+        if not n.enabled:
+            continue
+        for b in n.branches:
+            if not b.enabled or b.action.get("kind") == "special":
+                continue
+            key = _cond_key(b.cond)
+            for akey, an, ab in seen:
+                if _covers(akey, key):
+                    findings.append(Finding(
+                        level, "dead_branch", n.idx, b.idx,
+                        f"分支 {b.idx} 被上方分支 {an.idx}.{ab.idx} 完全覆盖，永远命中不到",
+                        f"Branch {b.idx} is fully covered by branch {an.idx}.{ab.idx} "
+                        f"above it and can never be reached",
+                        {"action": "remove_branch"}))
+                    break
+            seen.append((key, n, b))
+    return findings
+
+
+def check_unused_tags(nodes: list[Node], models, tag_defs: dict[str, TagDef],
+                      is_hard: bool) -> list:
+    """标签从未被任何规则引用（§10）→ info（含 kids 子分支的引用收集）。"""
+    referenced: set[str] = set()
+
+    def walk(clauses: list) -> None:
+        for c in clauses:
+            if not isinstance(c, dict):
+                continue
+            if "or" in c:
+                walk(c["or"])
+            elif "not" in c:
+                walk([c["not"]])
+            elif isinstance(c.get("tag"), str):
+                referenced.add(c["tag"])
+
+    for _, b in _iter_branches(nodes):
+        walk(b.cond)
+    return [Finding("info", "unused_tags", None, None,
+                    f"标签「{tag_defs[t].zh}」（{t}）未被任何分支条件引用",
+                    f"Tag '{t}' is not referenced by any branch condition",
+                    {"action": "review_tag", "tag": t})
+            for t in tag_defs if t not in referenced]
+
+
+def check_no_hits(nodes: list[Node], models, tag_defs, is_hard: bool,
+                  hits: dict[str, int] | None = None) -> list:
+    """分支近 30 天无命中（§10）→ info。
+
+    ``hits`` 由 server 层从 requests 表聚合（键 "N.M" = 节点 idx + 分支位置序号，
+    Task 5 裁定口径）；None（窗口内无流量或库外直调）→ 整体跳过——无数据下
+    「全部 0 命中」是噪声不是结论。special 分支同样跳过：沿用/解锁在进树前由
+    resolve_session 判定（§4.4），hit_branch 永不记录它们。M1 求值不下钻，
+    kids 分支无 hit 口径，不在本检查范围。"""
+    if hits is None:
+        return []
+    level = "hard" if is_hard else "info"
+    findings: list[Finding] = []
+    for n in nodes:
+        if not n.enabled:
+            continue
+        for i, b in enumerate(n.branches):
+            if not b.enabled or b.action.get("kind") == "special":
+                continue
+            if hits.get(f"{n.idx}.{i}", 0) == 0:
+                findings.append(Finding(
+                    level, "no_hits", n.idx, b.idx,
+                    f"分支 {n.idx}.{i} 近 30 天无一次命中",
+                    f"Branch {n.idx}.{i} has had no hits in the last 30 days",
+                    {"action": "review_branch"}))
+    return findings
+
+
+def check_no_fallback(nodes: list[Node], models, tag_defs, is_hard: bool) -> list:
+    """没有兜底节点（§10）← 硬错误。
+
+    判定取双口径：kind=="fallback"（rows_to_tree 推导）或存在 cond=[] 分支
+    （§5.1 兜底语法）——手组内存树（估算/导入中间态）可能缺 kind 标记。"""
+    has_fallback = any(
+        n.kind == "fallback" or any(b.cond == [] for b in n.branches)
+        for n in nodes)
+    if not has_fallback:
+        return [Finding("hard" if is_hard else "warn", "no_fallback", None, None,
+                        "没有兜底节点：全部未命中的请求将无路可走",
+                        "No fallback node: requests that match nothing have "
+                        "nowhere to go",
+                        {"action": "add_fallback"})]
+    return []
+
+
+def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
+                  is_hard: bool) -> list:
+    """引用不存在的标签或模型（§10）← 硬错误。
+
+    折入项（Task 5 评审，控制者裁定）：本检查同时承担「子句语法」守门——
+    §10 CHECKS 表没有独立的子句语法检查项，空 ``values``（engine._atom 取
+    values[0] 会 IndexError）与非法 ``op``（engine 查表 KeyError）并入此处，
+    同为 hard。语义：子句引用了引擎无法求值的东西，与「引用不存在的标签/模型」
+    同级。
+
+    值空间校验：值不在标签值空间（如 domain 无 "astrology"）同报——引擎求值
+    恒 False 的静默死支比报错更难排查（§6.8「不静默兜底」同精神）。有序档位
+    标签按档位索引校验（0 ≤ v < 档数，§3.1 tags.value 存索引口径）；值空间为
+    空元组的标签（free / 动态词表）不校验。
+    """
+    level = "hard" if is_hard else "warn"
+    findings: list[Finding] = []
+
+    def where(n: Node, b: Branch) -> str:
+        return f"节点 {n.idx} 分支 {b.idx}"
+
+    def clause_errors(clauses: list, n: Node, b: Branch) -> None:
+        for c in clauses:
+            if not isinstance(c, dict):
+                findings.append(Finding(level, "bad_ref", n.idx, b.idx,
+                                        f"{where(n, b)}：条件子句不是对象：{c!r}",
+                                        f"{where(n, b)}: condition clause is not "
+                                        f"an object: {c!r}",
+                                        {"action": "fix_clause"}))
+            elif "or" in c:
+                clause_errors(c["or"], n, b)
+            elif "not" in c:
+                clause_errors([c["not"]], n, b)
+            else:
+                tag = c.get("tag")
+                if tag not in tag_defs:
+                    findings.append(Finding(
+                        level, "bad_ref", n.idx, b.idx,
+                        f"{where(n, b)}：引用了不存在的标签 {tag!r}",
+                        f"{where(n, b)}: references unknown tag {tag!r}",
+                        {"action": "fix_clause"}))
+                    continue
+                if c.get("op") not in _OPS:
+                    findings.append(Finding(
+                        level, "bad_ref", n.idx, b.idx,
+                        f"{where(n, b)}：标签 {tag} 的操作符 {c.get('op')!r} 非法"
+                        f"（允许：{sorted(_OPS)}）",
+                        f"{where(n, b)}: invalid operator {c.get('op')!r} for tag "
+                        f"{tag} (allowed: {sorted(_OPS)})",
+                        {"action": "fix_clause"}))
+                values = c.get("values")
+                if not isinstance(values, list) or not values:
+                    # 折入项：空 values → engine IndexError，hard 拦截（见函数 docstring）
+                    findings.append(Finding(
+                        level, "bad_ref", n.idx, b.idx,
+                        f"{where(n, b)}：标签 {tag} 的 values 为空——引擎求值会崩溃",
+                        f"{where(n, b)}: empty values for tag {tag} — the engine "
+                        f"would crash evaluating it",
+                        {"action": "fix_clause"}))
+                    continue
+                spec = tag_defs[tag]
+                if not spec.values:
+                    continue              # free / 动态词表：不做静态校验（§4.1）
+                for v in values:
+                    if spec.kind == "ordered":
+                        ok = isinstance(v, int) and not isinstance(v, bool) \
+                            and 0 <= v < len(spec.values)
+                    else:
+                        ok = v in spec.values
+                    if not ok:
+                        findings.append(Finding(
+                            level, "bad_ref", n.idx, b.idx,
+                            f"{where(n, b)}：值 {v!r} 不在标签 {tag} 的值空间内",
+                            f"{where(n, b)}: value {v!r} is outside the value "
+                            f"space of tag {tag}",
+                            {"action": "fix_clause"}))
+
+    for n, b in _iter_branches(nodes):
+        clause_errors(b.cond, n, b)
+        act = b.action
+        if act.get("kind") == "route":
+            refs = [act.get("model"), *act.get("fallback", [])]
+            trial = b.trial if b.trial is not None else act.get("trial")
+            if isinstance(trial, dict):
+                refs.append(trial.get("to"))
+            for m in refs:
+                if m not in models:
+                    findings.append(Finding(
+                        level, "bad_ref", n.idx, b.idx,
+                        f"{where(n, b)}：引用了不存在的模型 {m!r}",
+                        f"{where(n, b)}: references unknown model {m!r}",
+                        {"action": "fix_model"}))
+    return findings
+
+
+def check_duplicate(nodes: list[Node], models, tag_defs, is_hard: bool) -> list:
+    """两条规则条件完全相同（§10）→ warn。
+
+    范围与 dead_branch 相同（enabled 非 special、按求值顺序、含跨节点同条件）；
+    规范形全等（:func:`_cond_key`）即报，后者为重复（前者先生效）。"""
+    level = "hard" if is_hard else "warn"
+    findings: list[Finding] = []
+    first: dict[tuple, tuple[Node, Branch]] = {}
+    for n in nodes:
+        if not n.enabled:
+            continue
+        for b in n.branches:
+            if not b.enabled or b.action.get("kind") == "special":
+                continue
+            key = _cond_key(b.cond)
+            if key in first:
+                fn, fb = first[key]
+                findings.append(Finding(
+                    level, "duplicate", n.idx, b.idx,
+                    f"分支 {b.idx} 与分支 {fn.idx}.{fb.idx} 条件完全相同，只有前者会生效",
+                    f"Branch {b.idx} duplicates branch {fn.idx}.{fb.idx}; only "
+                    f"the first one can ever match",
+                    {"action": "merge_branches"}))
+            else:
+                first[key] = (n, b)
+    return findings
+
+
+def check_special_misplaced(nodes: list[Node], models, tag_defs,
+                            is_hard: bool) -> list:
+    """特殊去向出现在「会话沿用」之外的节点（§10）← 硬错误。
+
+    会话沿用节点 = kind=="sticky"（idx 0 起点，§5.1/§9.2）；special 落到别的
+    节点会被 engine 恒判 miss（§4.4），语义失效且误导控制台。"""
+    level = "hard" if is_hard else "warn"
+    findings: list[Finding] = []
+    for n, b in _iter_branches(nodes):
+        if b.action.get("kind") == "special" and n.kind != "sticky":
+            findings.append(Finding(
+                level, "special_misplaced", n.idx, b.idx,
+                f"特殊去向出现在非会话沿用节点：节点 {n.idx} 分支 {b.idx}"
+                f"（special 仅允许在会话沿用节点）",
+                f"Special action outside the session node: node {n.idx} branch "
+                f"{b.idx} (special is only allowed in the sticky session node)",
+                {"action": "move_to_session_node"}))
+    return findings
+
+
+def check_conf_on_rule(nodes: list[Node], models,
+                       tag_defs: dict[str, TagDef], is_hard: bool) -> list:
+    """规则标签配了把握度门槛（§10）→ warn（永不满足，疑似误配）。
+
+    规则标签 confidence 恒 None（§4.5），conf_min 门槛永不满足（engine._atom
+    对 None 直接判 False，§5.1）——静默死支，报 warn 让控制台提示疑似误配。"""
+    level = "hard" if is_hard else "warn"
+    findings: list[Finding] = []
+
+    def walk(clauses: list, n: Node, b: Branch) -> None:
+        for c in clauses:
+            if not isinstance(c, dict):
+                continue
+            if "or" in c:
+                walk(c["or"], n, b)
+            elif "not" in c:
+                walk([c["not"]], n, b)
+            elif "conf_min" in c and c.get("tag") in tag_defs \
+                    and tag_defs[c["tag"]].source == "rule":
+                findings.append(Finding(
+                    level, "conf_on_rule", n.idx, b.idx,
+                    f"规则标签 {c['tag']} 配了把握度门槛（规则标签没有置信度，"
+                    f"门槛永不满足）",
+                    f"Rule tag {c['tag']} has a confidence threshold (rule tags "
+                    f"carry no confidence, so the gate can never pass)",
+                    {"action": "remove_conf_min"}))
+
+    for n, b in _iter_branches(nodes):
+        walk(b.cond, n, b)
+    return findings
+
+
+# §10 CHECKS 表逐字（函数, 是否硬错误）；check_no_hits 的 hits 由 run_checkup 传。
+CHECKS: list[tuple] = [
+    (check_dead_branch,    False),  # 分支被上方完全覆盖
+    (check_unused_tags,    False),  # 标签从未被任何规则引用
+    (check_no_hits,        False),  # 分支近 30 天无命中
+    (check_no_fallback,    True),   # 没有兜底节点 ← 硬错误
+    (check_bad_ref,        True),   # 引用不存在的标签或模型 ← 硬错误
+    (check_duplicate,      False),  # 两条规则条件完全相同
+    (check_special_misplaced, True),  # 特殊去向出现在「会话沿用」之外的节点 ← 硬错误
+    (check_conf_on_rule,   False),  # 规则标签配了把握度门槛（永不满足，疑似误配）
+]
+
+
+def run_checkup(nodes: list[Node], models, tag_defs,
+                hits: dict[str, int] | None = None) -> list[Finding]:
+    """八项体检（§10 逐字：函数表循环 + is_hard 标记）→ list[Finding]。
+
+    :param nodes: 内存树（rows_to_tree 产物或同构 Node 列表）。
+    :param models: 可用模型字典（{model_id: …}，按 id 集合语义消费——简报测试
+      传 ``{"qwen3-8b": {}, …}`` 即此口径）。
+    :param tag_defs: 标签注册表（sr.tags.TAGS）。
+    :param hits: 可选，hit_branch → 近 30 天命中数（check_no_hits 用，见模块
+      docstring 接口裁定）；None 跳过该检查。
+    """
+    findings: list[Finding] = []
+    for fn, is_hard in CHECKS:
+        if fn is check_no_hits:
+            findings.extend(fn(nodes, models, tag_defs, is_hard, hits=hits))
+        else:
+            findings.extend(fn(nodes, models, tag_defs, is_hard))
+    return findings

@@ -145,8 +145,13 @@ def _anthropic_stream(body: dict, fail: str | None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) create_app —— 双端点 + 公共查询参（latency_ms / fail）
+# 4) create_app —— 双端点 + 模型目录 + 公共查询参（latency_ms / fail）
 # ─────────────────────────────────────────────────────────────────────────────
+
+# §9.4 接入测试 step1「GET {base}/models」的目录内容：种子模型全集（sr/db.py
+# _SEED_MODELS 的 id；Task 10 接入测试探测用，静态清单即可——fake 不做鉴权）。
+_KNOWN_MODELS = ("qwen3-8b", "qwen3-32b", "claude-sonnet", "llava-omni",
+                 "sdxl-image")
 
 
 def _error_envelope(path: str, fail: str | None) -> dict:
@@ -176,6 +181,13 @@ async def _prep(request: Request) -> tuple[dict, str | None, JSONResponse | None
 def create_app() -> FastAPI:
     """构造假上游 FastAPI 应用（docs 关闭：测试底座不需要 OpenAPI 面）。"""
     app = FastAPI(title="smart-router fake-upstream", docs_url=None, redoc_url=None)
+
+    @app.get("/v1/models")
+    @app.get("/models")     # base_url 含/不含 /v1 两口径都接（同 chat 路由别名逻辑）
+    async def list_models():
+        """§9.4 接入测试 step1 的探测面：OpenAI 模型目录（静态种子全集）。"""
+        return {"object": "list",
+                "data": [{"id": m, "object": "model"} for m in _KNOWN_MODELS]}
 
     @app.post("/v1/chat/completions")
     @app.post("/chat/completions")   # base_url 不含 /v1 的种子口径（§7.3 base_url 含

@@ -1,12 +1,14 @@
-"""sr/server.py —— /v1 双协议路由主流程 + admin 读端点 + /metrics
-（spec §7.1 端点 / §7.2 十二步 / §7.5 流式红线 / §9.1-9.2 / §11.1）。
+"""sr/server.py —— /v1 双协议路由主流程 + admin 读/写端点 + /metrics
+（spec §7.1 端点 / §7.2 十二步 / §7.5 流式红线 / §9.1-9.2 / §10 / §11.1）。
 
 模块职责（集成 Task 1-7 全部模块，spec §7.2 十二步逐项对齐，对照表见任务报告）：
 - :func:`create_app` —— 工厂：``POST /v1/chat/completions``（OpenAI）、
   ``POST /v1/messages``（Anthropic）、``GET /v1/models``（auto + 全部别名，§7.1）；
   Task 9 起加 admin 读端点（§9.1 引导序列七 GET + ``/admin/traffic/{id}``）、
-  ``GET /metrics``（§11.1 手工 OpenMetrics）；控制台托管 ``GET /`` 与 admin
-  写端点归 Task 10/12。
+  ``GET /metrics``（§11.1 手工 OpenMetrics）；Task 10 起加 admin 写端点
+  （tree 整树替换/新增/删除/审计/试算/预估/模板、models 接入/修改/探测、
+  settings/bands、export/import，§9 表 + §9.4 探测序列）；控制台托管
+  ``GET /`` 归 Task 12。
 - :func:`_handle` —— 十二步主流程：协议解析 → IR → 主文本 → model 判定
   （auto 走树 / 具体名或别名直通 R2 / 其他 400）→ 会话沿用 → 打标 → 走树 →
   供应商解析 → 上游调用 → 入站名回写 → requests+tags 入库 → 诊断响应头。
@@ -32,11 +34,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from datetime import datetime, timedelta
 
 import httpx
+import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
@@ -45,11 +49,13 @@ from sr.adapters import UpstreamError
 from sr.adapters import openai as oai
 from sr.adapters import anthropic as anth
 from sr.adapters.anthropic import StreamState
-from sr.engine import (RouteDecision, evaluate, extract_session, resolve_session,
+from sr.engine import (Branch, Node, RouteDecision, TEMPLATES, evaluate,
+                       evaluate_trace, extract_session, resolve_session,
                        rows_to_tree)
+from sr.health import run_checkup
 from sr.i18n import MESSAGES, detect_lang
 from sr.models import is_circuit_open, record_failure, record_success, resolve_backend
-from sr.tags import DEFAULT_CONF_THRESHOLDS, tag_all
+from sr.tags import DEFAULT_CONF_THRESHOLDS, TAGS, conf_band, tag_all
 
 # 两协议适配器（§7.1 按路径判定 proto → 同构七件套）
 ADAPTERS = {"openai": oai, "anthropic": anth}
@@ -60,6 +66,18 @@ PING_INTERVAL_S = 15.0
 DEFAULT_MAX_TOKENS = 1024
 # 反馈解锁的显式头取值（§4.4 反馈来源 1：x-sr-feedback）
 FEEDBACK_VALUES = {"satisfied", "need_clarification", "wrong_answer", "want_different"}
+
+# §9.4 流式首包断言预算（秒）：「大量故障只在流式暴露」，首包 3s 内必须到。
+STREAM_FIRST_BYTE_S = 3.0
+
+# 影响预估（POST /admin/tree/estimate）的均摊 token 假设：重放只有标签包、没有
+# 真实 usage，成本按 价目 × 以下常量 折算（§9.2 cost_delta 口径）；复盘回填
+# estimates.actual 时按 requests.cost 实算，不经此常量（§11.4）。
+AVG_IN = 800        # 平均输入 tokens / 请求
+AVG_OUT = 600       # 平均输出 tokens / 请求
+
+# admin 写端点的 changes.actor（§3.1 changes 表；M1 无登录体系，固定操作者）。
+_WRITE_ACTOR = "admin"
 
 # 跨协议非流式 shim 的终止原因互查（与 sr/adapters/anthropic._STOP_REASON 互为逆表；
 # 协议层未导出该私有表，server 层按 §7.3/§7.4 枚举自持，多出值映射 None 不猜语义）
@@ -611,14 +629,16 @@ class Metrics:
 def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
                           routed_to: str | None, outcome: str,
                           session_tag: str, hit_branch: str | None,
-                          primary: str | None = None,
-                          final: str | None = None) -> None:
+                          primary: str | None = None, final: str | None = None,
+                          decision: RouteDecision | None = None) -> None:
     """一次 /v1 请求的请求级计数（在 _log_request 的每个落账点调用）。
 
     - route 标签取诊断头同源值（树命中 = "N.M" 路径，否则 direct/sticky/
       unlocked/fallback，取不到记 "none"）；
     - model 标签 = 实际去向（block / 模型 id；error 行 routed_to 为 NULL → ""）；
-    - primary≠final 且非试水（trial 改道是灰度不是回退）记 sr_fallback_total。
+    - primary≠final 且非试水记 sr_fallback_total（Task 10 折入项：旧实现用诊断头
+      字符串 ``diag.get("x-sr-route") != "trial"`` 排除试水，而 source=trial 时该头
+      是 "N.M"——恒真死代码；改按 decision.source 判定，不再依赖诊断头字符串）。
     """
     route = diag.get("x-sr-route", "none")
     metrics.inc("sr_requests_total", {"proto": proto, "route": route,
@@ -629,7 +649,8 @@ def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
         metrics.inc("sr_session_sticky_total")
     elif session_tag == "unlocked":
         metrics.inc("sr_session_unlock_total")
-    if final and primary and final != primary and diag.get("x-sr-route") != "trial":
+    if final and primary and final != primary and \
+            (decision is None or decision.source != "trial"):
         metrics.inc("sr_fallback_total", {"from": primary, "to": final})
 
 
@@ -863,7 +884,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to="block", outcome="block",
-                                  session_tag=session_tag, hit_branch=hit_branch)
+                                  session_tag=session_tag, hit_branch=hit_branch,
+                                  decision=decision)
             conn.commit()
             return _error(proto, 403, message, "permission_error", "content_blocked",
                           diag)
@@ -878,7 +900,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
-                                  session_tag=session_tag, hit_branch=hit_branch)
+                                  session_tag=session_tag, hit_branch=hit_branch,
+                                  decision=decision)
             conn.commit()
             return _error(proto, 502, "routing produced no model",
                           "api_error", "no_route", diag)
@@ -901,7 +924,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
-                                  session_tag=session_tag, hit_branch=hit_branch)
+                                  session_tag=session_tag, hit_branch=hit_branch,
+                                  decision=decision)
             conn.commit()
             return _error(proto, exc.status or 502, exc.message,
                           exc.type if exc.type != "config_error" else "api_error",
@@ -921,7 +945,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
         _bump_request_metrics(metrics, proto=proto, diag=diag,
                               routed_to=final_model, outcome="upstream",
                               session_tag=session_tag, hit_branch=hit_branch,
-                              primary=decision.model, final=final_model)
+                              primary=decision.model, final=final_model,
+                              decision=decision)
         if mode == "tree" and session_id:
             # 树命中成功才写会话（直通 R2 不参与沿用；沿用轮 resolve_session 已记账）
             if session_tag == "new":
@@ -952,8 +977,180 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 9) create_app —— 端点装配（§7.1 /v1 + §9.1-9.2 admin 读端点 + /metrics；
-#    控制台托管 GET / 与 admin 写端点归 Task 10/12）
+# 9) admin 写端点辅助：树 JSON 解析 / 重编号 / 落库 / 体检参数（Task 10，§9-§10）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _models_set(conn) -> dict[str, dict]:
+    """models 表 → ``{model_id: {}}``（run_checkup 按 id 集合语义消费，简报测试
+    传 ``{"qwen3-8b": {}, …}`` 即此口径）。"""
+    return {r["id"]: {} for r in conn.execute("SELECT id FROM models")}
+
+
+def _hits_30d(conn) -> dict[str, int] | None:
+    """近 30 天 hit_branch → 命中数（check_no_hits 数据源，"N.M" = 节点 idx +
+    分支位置序号，Task 5 裁定）；窗口内无任何流量 → None（体检跳过该检查：
+    零流量报「全部无命中」是噪声不是结论）。"""
+    cutoff = (datetime.now().astimezone()
+              - timedelta(days=30)).isoformat(timespec="seconds")
+    total = conn.execute("SELECT COUNT(*) c FROM requests WHERE ts >= ?",
+                         (cutoff,)).fetchone()["c"]
+    if not total:
+        return None
+    return {r["hit_branch"]: r["c"] for r in conn.execute(
+        "SELECT hit_branch, COUNT(*) c FROM requests "
+        "WHERE ts >= ? AND hit_branch IS NOT NULL GROUP BY hit_branch", (cutoff,))}
+
+
+def _take_idx(idx, require_idx: bool, seen: set) -> int:
+    """idx 校验：整数、（require_idx 时）必填、全树唯一（tree.idx 是全表主键，
+    节点/分支共用一个编号空间，§3.1）。非法抛 ValueError（端点转 400）。"""
+    if not isinstance(idx, int) or isinstance(idx, bool):
+        if require_idx:
+            raise ValueError(f"idx must be an integer: {idx!r}")
+        return -1                                  # 候选节点/estimate 占位
+    if idx in seen:
+        raise ValueError(f"duplicate idx: {idx}")
+    seen.add(idx)
+    return idx
+
+
+def _branch_from_json(obj, *, require_idx: bool, seen: set) -> Branch:
+    """§9.2 分支 JSON → Branch（cond/action 原样收，零剥键——GET→PUT 回环无损）。"""
+    if not isinstance(obj, dict):
+        raise ValueError("branch must be an object")
+    idx = _take_idx(obj.get("idx"), require_idx, seen)
+    cond = obj.get("cond")
+    action = obj.get("action")
+    if not isinstance(cond, list):
+        raise ValueError(f"branch {idx}: cond must be a list")
+    if not isinstance(action, dict):
+        raise ValueError(f"branch {idx}: action must be an object")
+    kids = [_branch_from_json(k, require_idx=require_idx, seen=seen)
+            for k in (obj.get("kids") or [])]
+    if len(kids) > 9:
+        raise ValueError(f"branch {idx}: more than 9 kids (idx convention, §9.2)")
+    trial = obj.get("trial")
+    if trial is not None and not isinstance(trial, dict):
+        raise ValueError(f"branch {idx}: trial must be an object or null")
+    return Branch(idx=idx, cond=cond, action=action, trial=trial,
+                  enabled=bool(obj.get("enabled", True)), kids=kids)
+
+
+def _node_from_json(obj, *, require_idx: bool, seen: set) -> Node:
+    """§9.2 节点 JSON → Node。``kind`` 不入参（读侧由 rows_to_tree 按内容推导，
+    Task 9 口径）；候选节点（POST nodes / estimate）可无 idx（require_idx=False）。"""
+    if not isinstance(obj, dict):
+        raise ValueError("node must be an object")
+    idx = _take_idx(obj.get("idx"), require_idx, seen)
+    branches = [_branch_from_json(b, require_idx=require_idx, seen=seen)
+                for b in (obj.get("branches") or [])]
+    if len(branches) > 9:
+        raise ValueError(f"node {idx}: more than 9 branches (idx convention, §9.2)")
+    return Node(idx=idx, kind=str(obj.get("kind") or "normal"),
+                name=str(obj.get("name") or ""), desc=obj.get("desc"),
+                enabled=bool(obj.get("enabled", True)), branches=branches)
+
+
+def _tree_from_json(body) -> list[Node]:
+    """PUT /admin/tree（或 import 的 tree 节）请求体 → Node 列表。
+
+    形状非法抛 ValueError（端点统一转 400）：body 是对象、nodes 非空列表、
+    全行 idx 整数且唯一、每节点分支数/每分支子分支数 ≤ 9（「父 idx*10 + 段内
+    序号」的段内上限，§9.2）。GET 附带的 version/kind 等键忽略。"""
+    if not isinstance(body, dict) or not isinstance(body.get("nodes"), list) \
+            or not body["nodes"]:
+        raise ValueError("body must be {nodes: [...]} with at least one node")
+    seen: set = set()
+    return [_node_from_json(n, require_idx=True, seen=seen) for n in body["nodes"]]
+
+
+def _renumber(nodes: list[Node]) -> None:
+    """位置序 → idx（§9.2 约定：分支 = 父 idx*10 + 段内序号；节点 0 的 0 段与
+    顶层节点号冲突，特例落 100+序号——seed 同款）。全树 ≤ 10 节点、每段 ≤ 9 子
+    （调用方校验）时编号空间互不重叠。"""
+    for i, n in enumerate(nodes):
+        n.idx = i
+        for j, b in enumerate(n.branches):
+            b.idx = (100 + j) if i == 0 else (i * 10 + j)
+            for k, kid in enumerate(b.kids):
+                kid.idx = b.idx * 10 + k
+
+
+def _write_branch_rows(conn, parent_idx: int, b: Branch) -> None:
+    """分支行 INSERT（kids 递归；分支行 name 存空串——显示名由控制台按 cond
+    渲染，§3.1；updated_at/by 记审计面）。"""
+    conn.execute(
+        "INSERT INTO tree (idx, parent, name, desc, cond, action, trial, enabled, "
+        "updated_at, updated_by) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?, ?)",
+        (b.idx, parent_idx, db._dump(b.cond), db._dump(b.action),
+         None if b.trial is None else db._dump(b.trial),
+         1 if b.enabled else 0, db._now(), _WRITE_ACTOR))
+    for kid in b.kids:
+        _write_branch_rows(conn, b.idx, kid)
+
+
+def _write_tree_rows(conn, nodes: list[Node]) -> None:
+    """整树落库（事务由调用方 commit）：先 DELETE 后按 §3.1 行结构 INSERT。
+    节点行 cond/action 为 NOT NULL 占位（'[]' / 'null'，init_db._seed 同款）。"""
+    conn.execute("DELETE FROM tree")
+    for n in nodes:
+        conn.execute(
+            "INSERT INTO tree (idx, parent, name, desc, cond, action, trial, "
+            "enabled, updated_at, updated_by) "
+            "VALUES (?, NULL, ?, ?, '[]', 'null', NULL, ?, ?, ?)",
+            (n.idx, n.name, n.desc, 1 if n.enabled else 0, db._now(), _WRITE_ACTOR))
+        for b in n.branches:
+            _write_branch_rows(conn, n.idx, b)
+
+
+def _checkup_or_422(conn, nodes: list[Node]):
+    """保存前体检（§10 强制行为）：有 hard → 422 ``{"findings": […]}``（硬错误
+    优先排序，控制台首屏直指拦截原因；全量 findings 由 /admin/tree/audit 提供）；
+    通过 → None。"""
+    findings = run_checkup(nodes, _models_set(conn), TAGS, hits=_hits_30d(conn))
+    if any(f.level == "hard" for f in findings):
+        ordered = sorted(findings, key=lambda f: f.level != "hard")
+        return JSONResponse({"findings": [f.to_json() for f in ordered]},
+                            status_code=422)
+    return None
+
+
+def _signal_from_row(tag: str, raw: str, confidence, is_rule) -> dict:
+    """tags 行 → 引擎可求值的信号包（tags 表重放的唯一入口：try 的
+    request_id 路径与 estimate 重放共用）。
+
+    值形态按标签 kind 复原（§3.1 存储约定 × engine 求值需求）：ordered 标签
+    存档位索引的数字串（_store_tags 对非字符串 json.dumps → "1"），_tag_value
+    只反序列化 [/{ 开头的串——裸数字串须按 kind 转 int，否则 engine 的
+    is/gte/lte 整数比较（§5.1）恒 False；multi（pii）的 JSON 数组由 _tag_value
+    解析；choice/noul/free 原样字符串。未知标签保守原样（不过求值会 miss）。"""
+    value = _tag_value(raw)
+    spec = TAGS.get(tag)
+    if spec is not None and spec.kind == "ordered" and isinstance(value, str) \
+            and value.lstrip("-").isdigit():
+        value = int(value)
+    return {"value": value, "confidence": confidence, "is_rule": is_rule}
+
+
+def _est_cost(model: str | None, prices: dict) -> tuple[float | None, bool]:
+    """重放样本的单次成本估算（AVG_IN/AVG_OUT 假设见模块常量注释）。
+
+    返回 (成本, 价格缺失)。model=None（防御性 fallback，本就没服务）按 0 计；
+    模型不在价目表或价格 NULL → 价格缺失（调用方把 cost_delta 置 null，§9.2）。"""
+    if model is None:
+        return 0.0, False
+    if model not in prices:
+        return None, True
+    pin, pout = prices[model]
+    if pin is None or pout is None:
+        return None, True
+    return (pin * AVG_IN + pout * AVG_OUT) / 1_000_000, False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10) create_app —— 端点装配（§7.1 /v1 + §9.1-9.2 admin 读端点 + Task 10 写端点
+#     + /metrics；控制台托管 GET / 归 Task 12）
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1130,6 +1327,779 @@ def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
         """指定语言的翻译表（前端启动时加载，§9.1）。lang ∈ zh|en；其他回落
         zh（裁定 5 二选一取回落：§6.1「默认 zh」，控制台引导永不断链）。"""
         return JSONResponse(MESSAGES.get(lang) or MESSAGES["zh"])
+
+    # ── admin 写端点（§9 表「写」各行 + §10 保存前体检 + §9.4 探测；Task 10）──
+    @app.put("/admin/tree")
+    async def admin_put_tree(request: Request):
+        """整树替换（§9/§10）：请求体 = GET /admin/tree 同形状 → 体检（hard
+        422 拦截，findings 硬错误优先）→ 过则事务内 DELETE+INSERT 整树 +
+        ``tree_version+1`` + changes 审计。写侧与 Task 9 读侧同样零剥键，
+        GET→PUT 回环无损（含 kids 子分支行）。"""
+        try:
+            body = await request.json()
+            nodes = _tree_from_json(body)
+        except Exception as exc:                   # JSON 或形状非法 → 400
+            return JSONResponse({"detail": f"invalid tree payload: {exc}"},
+                                status_code=400)
+        conn = db.get(db_path)
+        try:
+            blocked = _checkup_or_422(conn, nodes)
+            if blocked is not None:
+                return blocked
+            old = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
+            _write_tree_rows(conn, nodes)
+            db.bump_tree_version(conn)
+            db.log_change(conn, _WRITE_ACTOR, "tree", "*",
+                          before={"version": old["version"], "nodes": old["nodes"]},
+                          after={"nodes": body["nodes"]})
+            conn.commit()
+            version = db.get_tree_version(conn)
+        finally:
+            conn.close()
+        return JSONResponse(_tree_json(nodes, version))
+
+    @app.post("/admin/tree/audit")
+    async def admin_tree_audit():
+        """体检当前树、不写库（§9）：findings 按 §10 CHECKS 顺序全量返回。"""
+        conn = db.get(db_path)
+        try:
+            findings = run_checkup(_load_tree(conn, db_path), _models_set(conn),
+                                   TAGS, hits=_hits_30d(conn))
+        finally:
+            conn.close()
+        return JSONResponse({"findings": [f.to_json() for f in findings]})
+
+    @app.post("/admin/tree/try")
+    async def admin_tree_try(request: Request):
+        """试算（§9.2）：``{text}`` 现打标或 ``{request_id}`` 取入库信号包重放；
+        复用 tag_all + evaluate_trace（§5.2 试算形状），不调上游。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"},
+                                status_code=400)
+        conn = db.get(db_path)
+        try:
+            cuts = _conf_cuts(conn)
+            rid = body.get("request_id")
+            if rid is not None:
+                rows = conn.execute(
+                    "SELECT tag, value, confidence, is_rule FROM tags "
+                    "WHERE request_id = ? ORDER BY rowid", (rid,)).fetchall()
+                if not rows:
+                    return JSONResponse({"detail": "request not found"},
+                                        status_code=404)
+                signals = {r["tag"]: _signal_from_row(r["tag"], r["value"],
+                                                      r["confidence"],
+                                                      r["is_rule"])
+                           for r in rows}
+                answer_ms = 0.0                  # 重放无打标耗时（§9.2 answer_ms）
+            else:
+                text = body.get("text")
+                if not isinstance(text, str):
+                    return JSONResponse(
+                        {"detail": "body requires \"text\" or \"request_id\""},
+                        status_code=400)
+                t1 = time.monotonic()
+                signals = tag_all(text, dict(request.headers), 1,
+                                  datetime.now().astimezone(), None)
+                answer_ms = (time.monotonic() - t1) * 1000
+            trace = evaluate_trace(_load_tree(conn, db_path), signals, cuts)
+        finally:
+            conn.close()
+        d = trace["decision"]
+        return JSONResponse({
+            "tagger": tagger,
+            "tags": [{"tag": t, "value": s["value"],
+                      "confidence": s["confidence"],
+                      "conf_band": None if s["confidence"] is None
+                      else conf_band(s["confidence"], cuts),
+                      "is_rule": bool(s.get("is_rule"))}
+                     for t, s in signals.items()],
+            "path": trace["path"], "also_match": trace["also_match"],
+            "decision": {"kind": d.kind, "model": d.model, "think": d.think,
+                         "fallback": d.fallbacks, "source": d.source,
+                         "hit_path": d.hit_path},
+            "answer_ms": round(answer_ms, 1)})
+
+    @app.post("/admin/tree/estimate")
+    async def admin_tree_estimate(request: Request):
+        """影响预估（§9.2）：近 N 天入库标签重放「现树 vs 现树在 pos 插候选」。
+
+        - 样本 = 窗口内 requests×tags 信号包（沿用/直通行无全量标签，天然缺席）；
+        - 改道 = 候选节点成为新树命中点（hit_path 首位 == 候选）；
+        - from_fallback = 改道样本的原去向是兜底（命中兜底节点或防御性
+          fallback），from_other = 其余改道；
+        - cost_delta = Σ(新成本 − 原成本)，成本按 models.price_in/out ×
+          AVG_IN=800 / AVG_OUT=600 折算（均摊假设，常量注释见模块头）；
+          任一涉及模型价格缺失 → null（§9.2）。
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"},
+                                status_code=400)
+        try:
+            cand = _node_from_json(body.get("node"), require_idx=False, seen=set())
+        except ValueError as exc:
+            return JSONResponse({"detail": f"invalid candidate node: {exc}"},
+                                status_code=400)
+        pos, days = body.get("pos"), body.get("days", 7)
+        if not isinstance(pos, int) or isinstance(pos, bool) \
+                or not isinstance(days, int) or isinstance(days, bool) or days < 1:
+            return JSONResponse(
+                {"detail": "pos must be an integer and days a positive integer"},
+                status_code=400)
+        conn = db.get(db_path)
+        try:
+            nodes = _load_tree(conn, db_path)
+            if not 1 <= pos <= len(nodes):
+                return JSONResponse(
+                    {"detail": f"pos out of range 1..{len(nodes)}"}, status_code=400)
+            cand.idx = 10 ** 6 + pos            # 临时 idx：不与现树冲突、仅定位用
+            cand_nodes = list(nodes[:pos]) + [cand] + list(nodes[pos:])
+            cuts = _conf_cuts(conn)
+            prices = {r["id"]: (r["price_in"], r["price_out"])
+                      for r in conn.execute(
+                          "SELECT id, price_in, price_out FROM models")}
+            cutoff = (datetime.now().astimezone()
+                      - timedelta(days=days)).isoformat(timespec="seconds")
+            packs: dict[str, dict] = {}
+            for r in conn.execute(
+                    "SELECT t.request_id rid, t.tag, t.value, t.confidence, "
+                    "t.is_rule FROM tags t JOIN requests r ON r.id = t.request_id "
+                    "WHERE r.ts >= ? ORDER BY t.rowid", (cutoff,)):
+                packs.setdefault(r["rid"], {})[r["tag"]] = _signal_from_row(
+                    r["tag"], r["value"], r["confidence"], r["is_rule"])
+            fb_idx = {n.idx for n in nodes if n.kind == "fallback"}
+            total = diverted = from_fb = 0
+            cost_delta = 0.0
+            price_missing = False
+            for signals in packs.values():
+                total += 1
+                base = evaluate(nodes, signals, cuts)
+                new = evaluate(cand_nodes, signals, cuts)
+                if not new.hit_path or new.hit_path[0] != cand.idx:
+                    continue                    # 候选节点没抢到流量
+                diverted += 1
+                if base.source == "fallback" or \
+                        (base.hit_path and base.hit_path[0] in fb_idx):
+                    from_fb += 1                # 原去向是兜底（节点或防御决定）
+                c0, miss0 = _est_cost(base.model, prices)
+                c1, miss1 = _est_cost(new.model, prices)
+                price_missing = price_missing or miss0 or miss1
+                if c0 is not None and c1 is not None:
+                    cost_delta += c1 - c0
+        finally:
+            conn.close()
+        return JSONResponse({"sample_days": days,
+                             "daily": round(total / days, 2),
+                             "ratio": round(diverted / total, 4) if total else 0.0,
+                             "from_fallback": from_fb,
+                             "from_other": diverted - from_fb,
+                             "cost_delta": None if price_missing
+                             else round(cost_delta, 6)})
+
+    @app.get("/admin/tree/estimates")
+    async def admin_tree_estimates():
+        """预估列表（§11.4 复盘）：estimates 全行，actual NULL = 未复盘。"""
+        conn = db.get(db_path)
+        try:
+            rows = conn.execute("SELECT * FROM estimates "
+                                "ORDER BY ts DESC, rowid DESC").fetchall()
+        finally:
+            conn.close()
+        return JSONResponse([{"id": r["id"], "ts": r["ts"], "node": r["node"],
+                              "params": json.loads(r["params"]),
+                              "est": json.loads(r["est"]),
+                              "actual": json.loads(r["actual"]) if r["actual"]
+                              else None} for r in rows])
+
+    @app.post("/admin/tree/nodes")
+    async def admin_tree_add_node(request: Request):
+        """新增节点（§9）：候选插到求值位置 pos。树表以 idx 为序（§3.1），要使
+        「插在 pos」对求值顺序真实生效必须重编后继节点 idx——否则预估口径与实际
+        求值顺序脱节；代价是 requests.hit_branch 历史行失配（M1 取舍，记任务
+        报告）。sticky 节点必须保持 idx 0（rows_to_tree 按 idx==0 推导），故
+        pos ≥ 1。带 estimate 时写 estimates 表快照（§9.2 末段 / §11.4）。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"},
+                                status_code=400)
+        try:
+            cand = _node_from_json(body.get("node"), require_idx=False, seen=set())
+        except ValueError as exc:
+            return JSONResponse({"detail": f"invalid node: {exc}"}, status_code=400)
+        pos = body.get("pos")
+        if not isinstance(pos, int) or isinstance(pos, bool):
+            return JSONResponse({"detail": "pos must be an integer"}, status_code=400)
+        conn = db.get(db_path)
+        try:
+            nodes = sorted(_load_tree(conn, db_path), key=lambda n: n.idx)
+            if not 1 <= pos <= len(nodes):
+                return JSONResponse(
+                    {"detail": f"pos out of range 1..{len(nodes)}"}, status_code=400)
+            if len(nodes) >= 10:
+                return JSONResponse(
+                    {"detail": "tree exceeds the M1 idx convention (10 nodes)"},
+                    status_code=400)
+            new_nodes = nodes[:pos] + [cand] + nodes[pos:]
+            _renumber(new_nodes)
+            blocked = _checkup_or_422(conn, new_nodes)
+            if blocked is not None:
+                return blocked
+            old = _tree_json(nodes, db.get_tree_version(conn))
+            _write_tree_rows(conn, new_nodes)
+            db.bump_tree_version(conn)
+            if "estimate" in body:
+                if not isinstance(body["estimate"], dict):
+                    return JSONResponse(
+                        {"detail": "estimate must be the object returned by "
+                                   "POST /admin/tree/estimate"}, status_code=400)
+                conn.execute(
+                    "INSERT INTO estimates (id, ts, node, params, est, actual) "
+                    "VALUES (?, ?, ?, ?, ?, NULL)",
+                    (uuid.uuid4().hex, db._now(), str(cand.idx),
+                     db._dump(body["node"]), db._dump(body["estimate"])))
+            db.log_change(conn, _WRITE_ACTOR, "tree", str(cand.idx),
+                          before={"version": old["version"], "nodes": old["nodes"]},
+                          after={"pos": pos, "node": body.get("node")})
+            conn.commit()
+            version = db.get_tree_version(conn)
+        finally:
+            conn.close()
+        return JSONResponse(_tree_json(new_nodes, version))
+
+    @app.delete("/admin/tree/nodes/{idx}")
+    async def admin_tree_delete_node(idx: int):
+        """删除节点（§9）：连带其分支行；删后体检，hard 拦截（如删兜底 → 422）。"""
+        conn = db.get(db_path)
+        try:
+            nodes = sorted(_load_tree(conn, db_path), key=lambda n: n.idx)
+            victim = next((n for n in nodes if n.idx == idx), None)
+            if victim is None:
+                return JSONResponse({"detail": f"node {idx} not found"},
+                                    status_code=404)
+            rest = [n for n in nodes if n is not victim]
+            blocked = _checkup_or_422(conn, rest)
+            if blocked is not None:
+                return blocked
+            old = _tree_json(nodes, db.get_tree_version(conn))
+            _write_tree_rows(conn, rest)
+            db.bump_tree_version(conn)
+            db.log_change(conn, _WRITE_ACTOR, "tree", str(idx),
+                          before={"version": old["version"], "nodes": old["nodes"]},
+                          after=None)
+            conn.commit()
+            version = db.get_tree_version(conn)
+        finally:
+            conn.close()
+        return JSONResponse(_tree_json(rest, version))
+
+    @app.post("/admin/tree/template")
+    async def admin_tree_template(request: Request):
+        """切换模板（§5.3）：TEMPLATES[name] 整树替换 + version+1 + 审计；
+        未知模板名 400。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        name = body.get("name") if isinstance(body, dict) else None
+        if name not in TEMPLATES:
+            return JSONResponse(
+                {"detail": f"unknown template: {name!r} (known: {sorted(TEMPLATES)})"},
+                status_code=400)
+        conn = db.get(db_path)
+        try:
+            old = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
+            conn.execute("DELETE FROM tree")
+            for node in TEMPLATES[name]:
+                conn.execute(
+                    "INSERT INTO tree (idx, parent, name, desc, cond, action, "
+                    "trial, enabled) VALUES (?, NULL, ?, ?, '[]', 'null', NULL, 1)",
+                    (node["idx"], node["name"], node.get("desc")))
+                for branch in node.get("branches", []):
+                    db._seed_branch(conn, node["idx"], branch)   # 与 init_db 同一条落库路径
+            db.bump_tree_version(conn)
+            db.log_change(conn, _WRITE_ACTOR, "tree", "template",
+                          before={"version": old["version"], "nodes": old["nodes"]},
+                          after={"template": name})
+            conn.commit()
+            version = db.get_tree_version(conn)
+        finally:
+            conn.close()
+        return JSONResponse({"version": version, "template": name})
+
+    @app.post("/admin/models")
+    async def admin_add_model(request: Request):
+        """接入新模型（§9）：proto 跟随 provider（§8.1）；provider 不存在 400、
+        id 已存在 409；写 changes 审计。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"},
+                                status_code=400)
+        mid, provider, upstream = body.get("id"), body.get("provider"), \
+            body.get("upstream")
+        if not (isinstance(mid, str) and mid and isinstance(provider, str)
+                and isinstance(upstream, str) and upstream):
+            return JSONResponse(
+                {"detail": "id/provider/upstream are required strings"},
+                status_code=400)
+        caps, aliases = body.get("caps", []), body.get("aliases", [])
+        if not isinstance(caps, list) or not isinstance(aliases, list):
+            return JSONResponse({"detail": "caps/aliases must be lists"},
+                                status_code=400)
+        step = body.get("step")
+        if step is not None and (not isinstance(step, int) or isinstance(step, bool)):
+            return JSONResponse({"detail": "step must be an integer or null"},
+                                status_code=400)
+        price_in, price_out = body.get("price_in"), body.get("price_out")
+        for p in (price_in, price_out):
+            if (p is not None and not isinstance(p, (int, float))) \
+                    or isinstance(p, bool):
+                return JSONResponse(
+                    {"detail": "price_in/price_out must be numbers or null"},
+                    status_code=400)
+        enabled = bool(body.get("enabled", True))
+        conn = db.get(db_path)
+        try:
+            prov = conn.execute("SELECT proto FROM providers WHERE name = ?",
+                                (provider,)).fetchone()
+            if prov is None:
+                return JSONResponse({"detail": f"unknown provider: {provider!r}"},
+                                    status_code=400)
+            if conn.execute("SELECT 1 FROM models WHERE id = ?", (mid,)).fetchone():
+                return JSONResponse({"detail": f"model exists: {mid}"},
+                                    status_code=409)
+            conn.execute(
+                "INSERT INTO models (id, provider, proto, upstream, caps, aliases, "
+                "step, price_in, price_out, enabled) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, provider, prov["proto"], upstream, db._dump(caps),
+                 db._dump(aliases), step, price_in, price_out,
+                 1 if enabled else 0))
+            db.log_change(conn, _WRITE_ACTOR, "models", mid, before=None,
+                          after={"id": mid, "provider": provider,
+                                 "upstream": upstream, "caps": caps,
+                                 "aliases": aliases, "step": step,
+                                 "price_in": price_in, "price_out": price_out,
+                                 "enabled": enabled})
+            ladder = [s.strip() for s in
+                      (_load_settings(conn).get("ladder") or "").split(",")
+                      if s.strip()]
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({"id": mid, "provider": provider,
+                             "proto": prov["proto"], "upstream": upstream,
+                             "caps": caps, "aliases": aliases, "step": step,
+                             "price_in": price_in, "price_out": price_out,
+                             "ok": True, "break_reason": None,
+                             "enabled": enabled, "on_ladder": mid in ladder})
+
+    @app.put("/admin/models/{mid}")
+    async def admin_update_model(mid: str, request: Request):
+        """修改模型（§9：阶梯/启用/停用等）：白名单字段部分更新 + 审计；
+        未知字段 400、未知模型 404。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        allowed = {"upstream", "caps", "aliases", "step",
+                   "price_in", "price_out", "enabled"}
+        if not isinstance(body, dict) or not body or set(body) - allowed:
+            return JSONResponse(
+                {"detail": f"updatable fields: {sorted(allowed)}"}, status_code=400)
+        if not isinstance(body.get("caps", []), list) \
+                or not isinstance(body.get("aliases", []), list):
+            return JSONResponse({"detail": "caps/aliases must be lists"},
+                                status_code=400)
+        if "step" in body and (not isinstance(body["step"], int)
+                               or isinstance(body["step"], bool)) \
+                and body["step"] is not None:
+            return JSONResponse({"detail": "step must be an integer or null"},
+                                status_code=400)
+        for k in ("price_in", "price_out"):
+            if k in body and ((not isinstance(body[k], (int, float))
+                               and body[k] is not None)
+                              or isinstance(body[k], bool)):
+                return JSONResponse(
+                    {"detail": f"{k} must be a number or null"}, status_code=400)
+        conn = db.get(db_path)
+        try:
+            row = conn.execute("SELECT * FROM models WHERE id = ?", (mid,)).fetchone()
+            if row is None:
+                return JSONResponse({"detail": f"model not found: {mid}"},
+                                    status_code=404)
+            before = {k: row[k] for k in row.keys()}
+            sets, params = [], []
+            for k, v in body.items():
+                if k in ("caps", "aliases"):
+                    v = db._dump(v)
+                elif k == "enabled":
+                    v = 1 if v else 0
+                sets.append(f"{k} = ?")
+                params.append(v)
+            conn.execute(f"UPDATE models SET {', '.join(sets)} WHERE id = ?",
+                         [*params, mid])
+            db.log_change(conn, _WRITE_ACTOR, "models", mid, before=before,
+                          after={**before, **body})
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({"ok": True})
+
+    @app.post("/admin/models/{mid}/test")
+    async def admin_model_test(mid: str):
+        """接入测试（§9.4 两步探测，设计方案 B5）：
+
+        ① ``connect``——非流式连通：openai → ``GET {base}/models``；
+           anthropic → 最小 ``POST /v1/messages``；
+        ② ``stream_first_byte``——发 ``stream: true`` 最小请求，断言
+           :data:`STREAM_FIRST_BYTE_S` 秒内收到第一个数据帧。
+
+        逐步返回 ``{name, ok, ms, detail}``；上游不可达/超时 → 该步 ok=false
+        （整体 ``ok`` 为 false，HTTP 仍 200——探测失败是结论不是故障）。key_env
+        未设置时不带鉴权头（对真上游会 401 → ok=false，也是有效探测结论）。
+        """
+        conn = db.get(db_path)
+        try:
+            model = conn.execute("SELECT * FROM models WHERE id = ?",
+                                 (mid,)).fetchone()
+            if model is None:
+                return JSONResponse({"detail": f"model not found: {mid}"},
+                                    status_code=404)
+            prov = conn.execute("SELECT * FROM providers WHERE name = ?",
+                                (model["provider"],)).fetchone()
+        finally:
+            conn.close()
+        if prov is None:
+            return JSONResponse(
+                {"detail": f"provider missing: {model['provider']}"}, status_code=400)
+        key = os.environ.get(prov["key_env"] or "")
+        proto = prov["proto"]
+        headers: dict = {}
+        if key:
+            headers = ({"Authorization": f"Bearer {key}"} if proto == "openai"
+                       else {"x-api-key": key,
+                             "anthropic-version": "2023-06-01"})
+        base = prov["base_url"].rstrip("/")
+        steps: list[dict] = []
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            # ── step1 非流式连通（§9.4-1）──
+            t0 = time.monotonic()
+            try:
+                if proto == "openai":
+                    url = f"{base}/models"
+                    resp = await client.get(url, headers=headers)
+                else:
+                    url = f"{base}/v1/messages"
+                    resp = await client.post(url, headers=headers, json={
+                        "model": model["upstream"], "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "ping"}]})
+                steps.append({"name": "connect",
+                              "ok": 200 <= resp.status_code < 300,
+                              "ms": round((time.monotonic() - t0) * 1000, 1),
+                              "detail": f"HTTP {resp.status_code} {url}"})
+            except httpx.HTTPError as exc:
+                steps.append({"name": "connect", "ok": False,
+                              "ms": round((time.monotonic() - t0) * 1000, 1),
+                              "detail": f"unreachable: {exc}"})
+            # ── step2 流式首包（§9.4-2：3s 内第一个数据帧）──
+            t0 = time.monotonic()
+            url, payload = \
+                (f"{base}/chat/completions", {"model": model["upstream"],
+                                              "stream": True, "max_tokens": 1,
+                                              "messages": [{"role": "user",
+                                                            "content": "ping"}]}) \
+                if proto == "openai" else \
+                (f"{base}/v1/messages", {"model": model["upstream"],
+                                         "stream": True, "max_tokens": 1,
+                                         "messages": [{"role": "user",
+                                                       "content": "ping"}]})
+            resp = None
+            try:
+                req = client.build_request("POST", url, json=payload,
+                                           headers=headers)
+                resp = await client.send(req, stream=True)
+                if resp.status_code != 200:
+                    steps.append({"name": "stream_first_byte", "ok": False,
+                                  "ms": round((time.monotonic() - t0) * 1000, 1),
+                                  "detail": f"HTTP {resp.status_code} {url}"})
+                else:
+                    first = await asyncio.wait_for(
+                        resp.aiter_bytes().__anext__(),
+                        timeout=STREAM_FIRST_BYTE_S)
+                    steps.append({"name": "stream_first_byte", "ok": bool(first),
+                                  "ms": round((time.monotonic() - t0) * 1000, 1),
+                                  "detail": f"first frame {len(first)} bytes"})
+            except asyncio.TimeoutError:
+                steps.append({"name": "stream_first_byte", "ok": False,
+                              "ms": round((time.monotonic() - t0) * 1000, 1),
+                              "detail": f"no first frame within "
+                                        f"{STREAM_FIRST_BYTE_S}s"})
+            except (httpx.HTTPError, StopAsyncIteration) as exc:
+                steps.append({"name": "stream_first_byte", "ok": False,
+                              "ms": round((time.monotonic() - t0) * 1000, 1),
+                              "detail": f"unreachable/empty: {exc}"})
+            finally:
+                if resp is not None:
+                    await resp.aclose()
+        return JSONResponse({"ok": all(s["ok"] for s in steps), "steps": steps})
+
+    @app.put("/admin/settings")
+    async def admin_put_settings(request: Request):
+        """修改设置（§9）：键集必须与 DEFAULT_SETTINGS 完全一致（多/缺都 400，
+        防拼写漂移）；值一律转字符串（§3.1）。``tree_version`` 系统管理（只随
+        树写操作递增）：校验要求在场（GET 原样回传），写库时跳过。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"},
+                                status_code=400)
+        want, got = set(db.DEFAULT_SETTINGS), set(body)
+        if got != want:
+            return JSONResponse(
+                {"detail": "settings key set must equal DEFAULT_SETTINGS; "
+                           f"unknown: {sorted(got - want)}, "
+                           f"missing: {sorted(want - got)}"},
+                status_code=400)
+        conn = db.get(db_path)
+        try:
+            before = _load_settings(conn)
+            for k, v in body.items():
+                if k == "tree_version":
+                    continue                    # 系统管理键：不收写入口
+                conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (k, str(v)))
+            db.log_change(conn, _WRITE_ACTOR, "settings", "*", before=before,
+                          after=body)
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({"ok": True})
+
+    @app.put("/admin/bands")
+    async def admin_put_bands(request: Request):
+        """修改分档（§9）：与 GET /admin/bands 同形状回写（conf 切点 + 各标签
+        档位表，只更新 thresholds、不动 keywords）；结构非法 400。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict) \
+                or not isinstance(body.get("conf_thresholds"), list) \
+                or not isinstance(body.get("tag_thresholds"), list):
+            return JSONResponse(
+                {"detail": "body must be {conf_thresholds: [...], "
+                           "tag_thresholds: [{tag, thresholds}]}"},
+                status_code=400)
+        cuts = body["conf_thresholds"]
+        if not cuts or len(set(cuts)) != len(cuts) or sorted(cuts) != cuts \
+                or not all(isinstance(c, (int, float)) and not isinstance(c, bool)
+                           and 0 < c < 1 for c in cuts):
+            return JSONResponse(
+                {"detail": "conf_thresholds must be distinct ascending "
+                           "numbers in (0,1)"}, status_code=400)
+        tag_rows = []
+        for t in body["tag_thresholds"]:
+            if not isinstance(t, dict) or not isinstance(t.get("tag"), str) \
+                    or not isinstance(t.get("thresholds"), list) \
+                    or not all(isinstance(x, (int, float))
+                               and not isinstance(x, bool)
+                               for x in t["thresholds"]):
+                return JSONResponse(
+                    {"detail": f"invalid tag_thresholds item: {t!r}"},
+                    status_code=400)
+            tag_rows.append((t["tag"], db._dump(t["thresholds"])))
+        conn = db.get(db_path)
+        try:
+            before = {"conf_thresholds": _conf_cuts(conn),
+                      "tag_thresholds": [
+                          {"tag": r["tag"], "thresholds": json.loads(r["thresholds"])}
+                          for r in conn.execute(
+                              "SELECT tag, thresholds FROM tag_settings ORDER BY tag")]}
+            conn.execute(
+                "INSERT INTO conf_settings (id, thresholds) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET thresholds = excluded.thresholds",
+                (db._dump(cuts),))
+            for tag_, th in tag_rows:
+                conn.execute(
+                    "INSERT INTO tag_settings (tag, thresholds) VALUES (?, ?) "
+                    "ON CONFLICT(tag) DO UPDATE SET thresholds = excluded.thresholds",
+                    (tag_, th))
+            db.log_change(conn, _WRITE_ACTOR, "bands", "*", before=before,
+                          after=body)
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({"ok": True})
+
+    @app.get("/admin/export")
+    async def admin_export():
+        """导出 YAML（§9.2：providers/models/tree/settings 四节；pyyaml
+        safe_dump，依赖白名单 §13 明列）。providers/models 只导可编辑配置——
+        ok/break_reason 是熔断运行态，不进配置包。"""
+        conn = db.get(db_path)
+        try:
+            providers = [{"name": r["name"], "proto": r["proto"],
+                          "base_url": r["base_url"], "key_env": r["key_env"],
+                          "extra": json.loads(r["extra"] or "{}")}
+                         for r in conn.execute(
+                             "SELECT * FROM providers ORDER BY name")]
+            models = [{"id": r["id"], "provider": r["provider"],
+                       "upstream": r["upstream"],
+                       "caps": json.loads(r["caps"] or "[]"),
+                       "aliases": json.loads(r["aliases"] or "[]"),
+                       "step": r["step"], "price_in": r["price_in"],
+                       "price_out": r["price_out"], "enabled": bool(r["enabled"])}
+                      for r in conn.execute("SELECT * FROM models ORDER BY id")]
+            tree = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
+            settings = _load_settings(conn)
+        finally:
+            conn.close()
+        text = yaml.safe_dump({"providers": providers, "models": models,
+                               "tree": tree, "settings": settings},
+                              allow_unicode=True, sort_keys=False)
+        return PlainTextResponse(text, media_type="application/x-yaml")
+
+    @app.post("/admin/import")
+    async def admin_import(request: Request):
+        """导入 YAML（§9）：normalize 全量校验（四节结构 + 字段/值域/引用）+
+        run_checkup，hard 整包拒绝（422，不部分写入）；过则单事务写入
+        providers → models → settings → tree（UPSERT，不删既有行）。"""
+        raw = await request.body()
+        try:
+            data = yaml.safe_load(raw)
+        except yaml.YAMLError as exc:
+            return JSONResponse({"detail": f"invalid YAML: {exc}"}, status_code=400)
+        if not isinstance(data, dict):
+            return JSONResponse(
+                {"detail": "YAML package must be a mapping with "
+                           "providers/models/tree/settings"}, status_code=400)
+        missing = [s for s in ("providers", "models", "tree", "settings")
+                   if s not in data]
+        if missing:
+            return JSONResponse({"detail": f"missing sections: {missing}"},
+                                status_code=400)
+        provs = []
+        for p in data["providers"]:
+            if not isinstance(p, dict) or not isinstance(p.get("name"), str) \
+                    or p.get("proto") not in ("openai", "anthropic") \
+                    or not isinstance(p.get("base_url"), str):
+                return JSONResponse(
+                    {"detail": f"invalid provider row: {p!r}"}, status_code=400)
+            extra = p.get("extra")
+            if not isinstance(extra, dict):
+                extra = {}
+            provs.append((p["name"], p["proto"], p["base_url"],
+                          p.get("key_env"), db._dump(extra)))
+        prov_names = {p[0] for p in provs}
+        model_rows = []
+        for m in data["models"]:
+            if not isinstance(m, dict) or not isinstance(m.get("id"), str) \
+                    or not isinstance(m.get("provider"), str) \
+                    or not isinstance(m.get("upstream"), str):
+                return JSONResponse({"detail": f"invalid model row: {m!r}"},
+                                    status_code=400)
+            if m["provider"] not in prov_names:
+                return JSONResponse(
+                    {"detail": f"model {m['id']}: unknown provider "
+                               f"{m['provider']!r}"}, status_code=400)
+            caps, aliases = m.get("caps", []), m.get("aliases", [])
+            if not isinstance(caps, list) or not isinstance(aliases, list):
+                return JSONResponse(
+                    {"detail": f"model {m['id']}: caps/aliases must be lists"},
+                    status_code=400)
+            step = m.get("step")
+            if step is not None and (not isinstance(step, int)
+                                     or isinstance(step, bool)):
+                return JSONResponse(
+                    {"detail": f"model {m['id']}: step must be int or null"},
+                    status_code=400)
+            model_rows.append((m["id"], m["provider"], m["upstream"],
+                               db._dump(caps), db._dump(aliases), step,
+                               m.get("price_in"), m.get("price_out"),
+                               1 if m.get("enabled", True) else 0))
+        settings = data["settings"]
+        if not isinstance(settings, dict) \
+                or set(settings) - set(db.DEFAULT_SETTINGS):
+            return JSONResponse(
+                {"detail": "settings keys must be within DEFAULT_SETTINGS"},
+                status_code=400)
+        try:
+            nodes = _tree_from_json(data["tree"])
+        except ValueError as exc:
+            return JSONResponse({"detail": f"invalid tree: {exc}"}, status_code=400)
+        conn = db.get(db_path)
+        try:
+            model_ids = set(_models_set(conn)) | {r[0] for r in model_rows}
+            findings = run_checkup(nodes, {m: {} for m in model_ids}, TAGS)
+            if any(f.level == "hard" for f in findings):
+                ordered = sorted(findings, key=lambda f: f.level != "hard")
+                return JSONResponse(
+                    {"findings": [f.to_json() for f in ordered]}, status_code=422)
+            for name, proto, base_url, key_env, extra in provs:
+                conn.execute(
+                    "INSERT INTO providers (name, proto, base_url, key_env, extra) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(name) DO UPDATE SET proto = excluded.proto, "
+                    "base_url = excluded.base_url, key_env = excluded.key_env, "
+                    "extra = excluded.extra",
+                    (name, proto, base_url, key_env, extra))
+            for mid_, provider, upstream, caps, aliases, step, pin, pout, en \
+                    in model_rows:
+                conn.execute(
+                    "INSERT INTO models (id, provider, proto, upstream, caps, "
+                    "aliases, step, price_in, price_out, enabled) "
+                    "VALUES (?, ?, (SELECT proto FROM providers WHERE name = ?), "
+                    "?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, "
+                    "proto = excluded.proto, upstream = excluded.upstream, "
+                    "caps = excluded.caps, aliases = excluded.aliases, "
+                    "step = excluded.step, price_in = excluded.price_in, "
+                    "price_out = excluded.price_out, enabled = excluded.enabled",
+                    (mid_, provider, provider, upstream, caps, aliases, step,
+                     pin, pout, en))
+            for k, v in settings.items():
+                if k != "tree_version":         # 系统管理键：不收写入口
+                    conn.execute(
+                        "INSERT INTO settings (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (k, str(v)))
+            old = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
+            _write_tree_rows(conn, nodes)
+            db.bump_tree_version(conn)
+            db.log_change(conn, _WRITE_ACTOR, "import", "*",
+                          before={"version": old["version"], "nodes": old["nodes"]},
+                          after={"sections": sorted(data)})
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({"ok": True})
 
     # ── /metrics（§11.1 手工 OpenMetrics，裁定 6）──
     @app.get("/metrics")
