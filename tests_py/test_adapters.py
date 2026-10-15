@@ -53,6 +53,22 @@ def test_anthropic_event_sequence():
     assert any(e.startswith("event: message_delta") for e in evts)  # usage
     assert evts[-1].startswith("event: message_stop")
 
+def test_include_usage_double_terminates_once():
+    # include_usage 真实线序：finish chunk → 纯 usage chunk（choices:[]）前后脚两包；
+    # 终止段（message_delta + message_stop）只发一次（spec §7.4 单 message_stop）。
+    state = anthropic.StreamState()
+    evts = []
+    for ch in [{"choices":[{"delta":{"content":"你"}}]},
+               {"choices":[{"delta":{}, "finish_reason":"stop"}]},
+               {"choices":[], "usage":{"prompt_tokens":1, "completion_tokens":2}}]:
+        evts += anthropic.ir_to_events(openai.chunk_to_ir(ch), state)
+    assert sum(e.startswith("event: message_stop") for e in evts) == 1
+    assert sum(e.startswith("event: message_delta") for e in evts) == 1
+    md = json.loads(next(e for e in evts
+                         if e.startswith("event: message_delta")).split("data: ", 1)[1])
+    assert md["usage"]["input_tokens"] == 1 and md["usage"]["output_tokens"] == 2
+    assert md["delta"]["stop_reason"] == "end_turn"     # 取 finish chunk，不被 usage chunk 清掉
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 以下为本任务自加：fake-upstream 验收器具测试（spec §14.4 底座行为锁死）

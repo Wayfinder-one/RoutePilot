@@ -15,8 +15,8 @@
 - :class:`StreamState` + :func:`ir_to_events` —— IRChunk → Anthropic SSE 事件块
   列表（§7.4 事件序列，§7.6-3 重发）：message_start → (content_block_start →
   content_block_delta\\* → content_block_stop)\\* → message_delta(usage/stop_reason)
-  → message_stop；跨 chunk 状态（content_block_index/started/stop_reason）由
-  StreamState 维护。
+  → message_stop；跨 chunk 状态（content_block_index/started/closed/stop_reason）
+  由 StreamState 维护（closed 为终止闩，终止段只发一次）。
 - :func:`parse_error` —— §7.4 错误信封 ``{"type":"error","error":{"type",
   "message"}}`` → 统一 :class:`~sr.adapters.UpstreamError`。
 
@@ -168,14 +168,18 @@ class StreamState:
     """跨 chunk 流式状态（简报接口三字段；§7.6-3 维护 content_block_index/stop_reason）。
 
     ``content_block_index = -1`` 表示文本块尚未开（content_block_start 未发）；
-    ``started`` 表示 message_start 已发；``stop_reason`` 在终止时写入并随
-    message_delta 发出。M1 只发单文本块，index 恒 0——字段仍按接口保留，
-    多块（tool_use 等）留 M2 扩展。
+    ``started`` 表示 message_start 已发；``closed`` 为终止闩——终止段
+    （message_delta + message_stop）只随首次终止触发产出一次，其后任何 chunk
+    幂等跳过（spec §7.4 以单个 message_stop 结束；OpenAI include_usage 线序里
+    finish chunk 与纯 usage chunk（choices:[]）前后脚两包，无闩会双终止）。
+    ``stop_reason`` 由 finish chunk 先行锁存、随 message_delta 发出。M1 只发单
+    文本块，index 恒 0——字段仍按接口保留，多块（tool_use 等）留 M2 扩展。
     """
 
     content_block_index: int = -1   # 当前内容块序号；-1 = content_block_start 未发
     started: bool = False           # message_start 是否已发
-    stop_reason: str | None = None  # 终止原因（message_delta 时写入）
+    closed: bool = False            # 终止闩：message_delta+message_stop 是否已发
+    stop_reason: str | None = None  # 终止原因（finish 锁存，message_delta 时发出）
 
 
 def ir_to_events(ic: IRChunk, state: StreamState,
@@ -187,10 +191,18 @@ def ir_to_events(ic: IRChunk, state: StreamState,
 
     - 首个 chunk 先补 ``message_start``（state.started 惰性触发一次）；
     - 有文本 delta：块未开先补 ``content_block_start``，再发 ``content_block_delta``；
-    - finish **或** usage 到达即收尾：``content_block_stop`` → ``message_delta``
-      （stop_reason + usage）→ ``message_stop``。usage 单独触发收尾是硬要求——
-      OpenAI include_usage 的末 chunk 无 finish_reason（简报测试第三包即此形状），
-      不认 usage 会永远等不到终止事件。
+    - **终止段（message_delta + message_stop）只发一次**（state.closed 闩，closed 后
+      任何 chunk 不再产终止事件，spec §7.4 以单个 message_stop 结束）。触发方：
+      **usage 到达**即收尾（content_block_stop → message_delta → message_stop）——
+      usage 单独触发是硬要求，OpenAI include_usage 的末 chunk 无 finish_reason
+      （简报测试第三包即此形状），不认 usage 会永远等不到终止事件；message_delta
+      的 usage 数字必须落在这一包（§7.4 message_delta 携带最终用量）。
+      **finish 先到**（include_usage 真实线序：finish chunk → 纯 usage chunk
+      前后脚两包）：只锁存 stop_reason + 关文本块（content_block_stop），终止段
+      留给随后的 usage chunk，从而 message_delta 同时带上 stop_reason 与 usage
+      数字——若在 finish 包就收尾，usage 尚未到达，数字会被后到的 usage 包顶丢
+      或产出双终止。finish 与 usage 同包到达（部分上游合并形状）时一次收尾兼顾
+      两者。
 
     ``model`` 为可选入站名（Task 8 传 §7.2-10 回写用的 model_asked），仅写进
     message_start 的 message.model；不传回空串。§7.4 的 15s ``ping`` 心跳是
@@ -214,12 +226,22 @@ def ir_to_events(ic: IRChunk, state: StreamState,
         evts.append(_sse("content_block_delta", {
             "type": "content_block_delta", "index": state.content_block_index,
             "delta": {"type": "text_delta", "text": ic.text}}))
-    if ic.finish is not None or ic.usage is not None:  # 终止：finish 或 usage 任一到达
+    if ic.finish is not None and not state.closed:
+        # finish 先到（include_usage 线序首包）：锁 stop_reason + 关文本块；
+        # 终止段不在此发——usage 数字在后到的 usage 包里，message_delta 必须带上。
         if state.content_block_index >= 0:
             evts.append(_sse("content_block_stop", {
                 "type": "content_block_stop", "index": state.content_block_index}))
             state.content_block_index = -1
-        state.stop_reason = _STOP_REASON.get(ic.finish) if ic.finish else None
+        state.stop_reason = _STOP_REASON.get(ic.finish)
+    if ic.usage is not None and not state.closed:
+        state.closed = True                                # 终止闩：终止段只发一次
+        if state.content_block_index >= 0:
+            evts.append(_sse("content_block_stop", {
+                "type": "content_block_stop", "index": state.content_block_index}))
+            state.content_block_index = -1
+        if ic.finish:                                      # 同包带 finish：就地锁存
+            state.stop_reason = _STOP_REASON.get(ic.finish)
         evts.append(_sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": state.stop_reason, "stop_sequence": None},
