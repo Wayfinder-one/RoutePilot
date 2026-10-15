@@ -1,0 +1,102 @@
+"""协议适配层公共件：统一中间表示 IR + 流式 chunk 归一 + 上游错误统一 + think 映射。
+
+模块职责（spec §7 协议适配）：
+- :class:`IR` —— §7.2-2 「解析请求体 → IR」的产物：一次入站请求的协议无关表示
+  （proto/messages/system/tools/params/stream/model_asked/extensions，字段序按
+  实施计划 Task 7 接口逐字）。``system`` 从 OpenAI messages[0].role='system' /
+  Anthropic 独立 system 字段归一到本字段（§7.3/§7.4 请求体差异的吸收点）。
+- :class:`IRChunk` —— §7.6-2 「归一化为内部 chunk」的三要素：content delta 文本 /
+  finish / usage。跨协议流式（§7.6）以它为中转：上游 chunk → IRChunk → 客户端
+  事件（openai.chunk_to_ir → anthropic.ir_to_events 或反向同理）。
+- :class:`UpstreamError` —— 上游错误统一形状 ``(status, message, type)``；
+  openai.parse_error / anthropic.parse_error 各自从 §7.3/§7.4 错误信封构造之，
+  server 层（Task 8）只认这一个形状。
+- ``PARAM_KEYS`` —— 两协议顶层同义采样参数的归一键集（缺失为 None）：
+  Anthropic ``stop_sequences`` 归一为 ``stop``，其余同名直取。
+- ``THINK_OPENAI`` / ``THINK_ANTHROPIC`` —— think 值域（RouteDecision.think：
+  'off' | 'light' | 'deep'，engine §5.1）到协议字段的映射表：
+  deep → ``reasoning_effort='high'`` / ``thinking.budget_tokens=8192``；
+  light → ``'low'`` / ``2048``；off → 不加字段（表中 None 占位，to_upstream 判空跳过）。
+
+依赖方向：openai/anthropic 单向 import 本模块，本模块不 import 工程内任何模块
+（协议层无状态；编排、重试、会话归 server 层 Task 8）。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) IR / IRChunk —— §7.2-2 与 §7.6-2 的数据形状（字段序按实施计划 Task 7）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class IR:
+    """一次入站请求的协议无关表示（§7.2-2）。"""
+
+    proto: str                                     # 'openai' | 'anthropic'（§7.1 按路径判定）
+    messages: list                                 # 除 system 外的消息数组（块结构原样保留）
+    system: str | None = None                      # 系统提示（两协议归一；None = 未带）
+    tools: list | None = None                      # tools 原样透传
+    params: dict = field(default_factory=dict)     # 采样参数归一（PARAM_KEYS，缺失为 None）
+    stream: bool = False                           # 是否流式
+    model_asked: str | None = None                 # 入站 model 名（§7.2-10 响应回写用）
+    extensions: dict = field(default_factory=dict) # 协议特有其余字段（stream_options /
+                                                   # metadata / thinking…，to_upstream 原样回放）
+
+
+@dataclass
+class IRChunk:
+    """一个流式 chunk 的归一三要素（§7.6-2：content delta + usage + finish）。"""
+
+    text: str | None = None      # content delta 文本（None = 本 chunk 无文本）
+    finish: str | None = None    # finish_reason（OpenAI）/ stop_reason（Anthropic）
+    usage: dict | None = None    # usage 原样（§7.3 include_usage 时末 chunk 带）
+
+
+class UpstreamError(Exception):
+    """上游错误统一形状（Task 7 接口裁定）：server 层只认 (status, message, type)。"""
+
+    def __init__(self, status: int, message: str, type: str):
+        self.status = status
+        self.message = message
+        self.type = type
+        super().__init__(f"[{status}] {type}: {message}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) 采样参数归一键 + think 映射常量（简报接口：映射表常量写在本模块）
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 两协议顶层同义采样参数的归一键集；缺失为 None。Anthropic 的 stop_sequences
+# 归一为 stop（§7.4 请求体 ↔ §7.3 请求体同义字段），其余同名直取。
+PARAM_KEYS = ("max_tokens", "temperature", "top_p", "stop", "top_k")
+
+# think 值域 → OpenAI reasoning_effort（deep='high' / light='low' / off=不加字段）
+THINK_OPENAI = {"deep": "high", "light": "low", "off": None}
+# think 值域 → Anthropic thinking.budget_tokens（deep=8192 / light=2048 / off=不加字段）
+THINK_ANTHROPIC = {"deep": 8192, "light": 2048, "off": None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) parse_error 共用内核：payload 容错为 dict（str/bytes 先试 JSON，失败按纯文本）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def error_payload(payload) -> dict:
+    """上游错误响应体 → dict（parse_error 两协议共用）。
+
+    上游 5xx 的 body 不保证是合法 JSON（反代截断、纯文本栈都常见），解析失败时
+    降级为 ``{"error": {"message": <原文>}}``，让 message 至少保住原文供诊断。
+    """
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return {"error": {"message": payload}}
+    return payload if isinstance(payload, dict) else {}
