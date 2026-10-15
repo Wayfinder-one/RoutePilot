@@ -39,9 +39,10 @@ class RouteDecision:
 
     kind: str                                # 'route' | 'block'
     model: str | None = None                 # 最终模型 id（block 时为 None）
-    source: str = "rule"                     # 树命中 'rule'（spec §5.1 枚举字面写作
-                                             # 'tree'，按控制者裁定取 'rule'）；试水掷签
-                                             # 后 'trial'；Task 6 另有 sticky/unlocked
+    source: str = "tree"                     # spec §5.1 枚举：'tree' | 'sticky' |
+                                             # 'unlocked' | 'trial' | 'direct' |
+                                             # 'fallback'；树命中 'tree'，试水掷签
+                                             # 后 'trial'，Task 6 另有 sticky/unlocked
     think: str | None = None                 # 'off' | 'light' | 'deep'（§5.1 透传上游）
     fallbacks: list[str] = field(default_factory=list)   # 回退链（可能为空，§5.1 fallback）
     block_msg: dict | None = None            # {"zh":…,"en":…}（§6.5 双语）
@@ -402,7 +403,7 @@ def _resolve(action: dict, trial: dict | None, hit_path: list[int]) -> RouteDeci
     if trial is None:
         trial = action.get("trial")
     if action.get("kind") == "block":
-        return RouteDecision(kind="block", model=None, source="rule", think=None,
+        return RouteDecision(kind="block", model=None, source="tree", think=None,
                              fallbacks=[], block_msg=action.get("block_msg"),
                              hit_path=hit_path)
     fallbacks = list(action.get("fallback", []))
@@ -410,7 +411,7 @@ def _resolve(action: dict, trial: dict | None, hit_path: list[int]) -> RouteDeci
         return RouteDecision(kind="route", model=trial.get("to"), source="trial",
                              think=action.get("think"), fallbacks=fallbacks,
                              block_msg=None, hit_path=hit_path)
-    return RouteDecision(kind="route", model=action.get("model"), source="rule",
+    return RouteDecision(kind="route", model=action.get("model"), source="tree",
                          think=action.get("think"), fallbacks=fallbacks,
                          block_msg=None, hit_path=hit_path)
 
