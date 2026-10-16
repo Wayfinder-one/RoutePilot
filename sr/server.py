@@ -41,11 +41,11 @@ import uuid
 from datetime import datetime, timedelta
 
 import httpx
-import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 
 import sr.db as db
+from sr import config
 from sr.adapters import UpstreamError
 from sr.adapters import openai as oai
 from sr.adapters import anthropic as anth
@@ -1181,6 +1181,16 @@ def _signal_from_row(tag: str, raw: str, confidence, is_rule) -> dict:
     return {"value": value, "confidence": confidence, "is_rule": is_rule}
 
 
+def _tags_payload(signals: dict, cuts: list) -> list[dict]:
+    """信号包 → §9.2 tags 列表形状（tree/try 与 traffic replay 共用的渲染）。"""
+    return [{"tag": t, "value": s["value"],
+             "confidence": s["confidence"],
+             "conf_band": None if s["confidence"] is None
+             else conf_band(s["confidence"], cuts),
+             "is_rule": bool(s.get("is_rule"))}
+            for t, s in signals.items()]
+
+
 def _est_cost(model: str | None, prices: dict) -> tuple[float | None, bool]:
     """重放样本的单次成本估算（AVG_IN/AVG_OUT 假设见模块常量注释）。
 
@@ -1370,6 +1380,75 @@ def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
                              "upstream_ms": r["upstream_ms"], "cost": r["cost"],
                              "tags": tags})
 
+    def _dash(v) -> str:
+        """verdict 文案里的空值占位（None → "—"，避免打印 "None"）。"""
+        return "—" if v is None else str(v)
+
+    @app.post("/admin/traffic/{rid}/replay")
+    async def admin_traffic_replay(rid: str):
+        """按当前规则重放（§9 端点表；不调模型，Task 11 补）：
+        requests 行 + tags 行重建信号包（_signal_from_row，与 tree/try 的
+        request_id 路径同源）→ **当前树** evaluate → 与当时记录的 hit_branch /
+        routed_to 对比 → verdict + diff（形状对齐 §9.2：tags/decision 取
+        tree/try 口径，was 取 traffic 行字段口径）。
+
+        - verdict 三值：「与当时一致…」（diff={}）/「与当时不一致…」（diff 列
+          不一致字段）/「无法重放…」（沿用/解锁行跳过打标不落全量标签，diff=
+          null——不冒充一致或不一致）。
+        - now 口径：树决定 block → routed_to="block"；hit_path → "N.M" 串，
+          与写入路径（裁定 2）同一格式。注意当时 routed_to 是**最终去向**（含
+          上游回退/试水），重放只还原树决定——主链成功时两者相等，回退/试水行
+          会如实报「不一致」（试水掷签本身不可复现，树有 trial 时同 tree/try）。
+        """
+        conn = db.get(db_path)
+        try:
+            r = conn.execute("SELECT * FROM requests WHERE id = ?",
+                             (rid,)).fetchone()
+            if r is None:
+                return JSONResponse({"detail": "request not found"},
+                                    status_code=404)
+            tag_rows = conn.execute(
+                "SELECT tag, value, confidence, is_rule FROM tags "
+                "WHERE request_id = ? ORDER BY rowid", (rid,)).fetchall()
+            cuts = _conf_cuts(conn)
+            if not tag_rows:
+                return JSONResponse({
+                    "id": rid, "tags": [],
+                    "was": {"hit_branch": r["hit_branch"],
+                            "routed_to": r["routed_to"]},
+                    "now": None, "diff": None,
+                    "verdict": "无法重放：该请求无入库标签"
+                               "（会话沿用/解锁行不落全量标签）"})
+            signals = {t["tag"]: _signal_from_row(t["tag"], t["value"],
+                                                  t["confidence"],
+                                                  t["is_rule"])
+                       for t in tag_rows}
+            decision = evaluate(_load_tree(conn, db_path), signals, cuts)
+        finally:
+            conn.close()
+        was = {"hit_branch": r["hit_branch"], "routed_to": r["routed_to"]}
+        now = {"hit_branch": ".".join(map(str, decision.hit_path))
+               if decision.hit_path else None,
+               "routed_to": "block" if decision.kind == "block"
+               else decision.model}
+        diff = {k: {"was": was[k], "now": now[k]}
+                for k in ("hit_branch", "routed_to") if was[k] != now[k]}
+        if not diff:
+            verdict = (f"与当时一致：hit_branch {_dash(was['hit_branch'])}，"
+                       f"routed_to {_dash(was['routed_to'])}")
+        else:
+            verdict = "与当时不一致：" + "；".join(
+                f"{k} {_dash(v['was'])}→{_dash(v['now'])}"
+                for k, v in diff.items())
+        return JSONResponse({
+            "id": rid, "tags": _tags_payload(signals, cuts),
+            "was": was, "now": now, "diff": diff, "verdict": verdict,
+            "decision": {"kind": decision.kind, "model": decision.model,
+                         "think": decision.think,
+                         "fallback": decision.fallbacks,
+                         "source": decision.source,
+                         "hit_path": decision.hit_path}})
+
     @app.get("/admin/i18n/{lang}")
     async def admin_i18n(lang: str):
         """指定语言的翻译表（前端启动时加载，§9.1）。lang ∈ zh|en；其他回落
@@ -1461,12 +1540,7 @@ def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
         d = trace["decision"]
         return JSONResponse({
             "tagger": tagger,
-            "tags": [{"tag": t, "value": s["value"],
-                      "confidence": s["confidence"],
-                      "conf_band": None if s["confidence"] is None
-                      else conf_band(s["confidence"], cuts),
-                      "is_rule": bool(s.get("is_rule"))}
-                     for t, s in signals.items()],
+            "tags": _tags_payload(signals, cuts),
             "path": trace["path"], "also_match": trace["also_match"],
             "decision": {"kind": d.kind, "model": d.model, "think": d.think,
                          "fallback": d.fallbacks, "source": d.source,
@@ -2016,144 +2090,35 @@ def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
     @app.get("/admin/export")
     async def admin_export():
         """导出 YAML（§9.2：providers/models/tree/settings 四节；pyyaml
-        safe_dump，依赖白名单 §13 明列）。providers/models 只导可编辑配置——
-        ok/break_reason 是熔断运行态，不进配置包。"""
+        safe_dump，依赖白名单 §13 明列）。核心逻辑在 sr/config.export_yaml
+        （Task 11 裁定 1 抽出，CLI ``sr export`` 同源转调），本层只包 HTTP 响应。
+        providers/models 只导可编辑配置——ok/break_reason 是熔断运行态，不进
+        配置包。"""
         conn = db.get(db_path)
         try:
-            providers = [{"name": r["name"], "proto": r["proto"],
-                          "base_url": r["base_url"], "key_env": r["key_env"],
-                          "extra": json.loads(r["extra"] or "{}")}
-                         for r in conn.execute(
-                             "SELECT * FROM providers ORDER BY name")]
-            models = [{"id": r["id"], "provider": r["provider"],
-                       "upstream": r["upstream"],
-                       "caps": json.loads(r["caps"] or "[]"),
-                       "aliases": json.loads(r["aliases"] or "[]"),
-                       "step": r["step"], "price_in": r["price_in"],
-                       "price_out": r["price_out"], "enabled": bool(r["enabled"])}
-                      for r in conn.execute("SELECT * FROM models ORDER BY id")]
-            tree = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
-            settings = _load_settings(conn)
+            text = config.export_yaml(conn)
         finally:
             conn.close()
-        text = yaml.safe_dump({"providers": providers, "models": models,
-                               "tree": tree, "settings": settings},
-                              allow_unicode=True, sort_keys=False)
         return PlainTextResponse(text, media_type="application/x-yaml")
 
     @app.post("/admin/import")
     async def admin_import(request: Request):
         """导入 YAML（§9）：normalize 全量校验（四节结构 + 字段/值域/引用）+
         run_checkup，hard 整包拒绝（422，不部分写入）；过则单事务写入
-        providers → models → settings → tree（UPSERT，不删既有行）。"""
+        providers → models → settings → tree（UPSERT，不删既有行）。
+        核心逻辑在 sr/config.import_yaml（Task 11 裁定 1 抽出，CLI ``sr import``
+        同源转调）：ValueError（YAML/结构/引用非法）→ 400 detail；hard findings
+        → 422 findings；成功 → 200 {"ok": true}。"""
         raw = await request.body()
-        try:
-            data = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            return JSONResponse({"detail": f"invalid YAML: {exc}"}, status_code=400)
-        if not isinstance(data, dict):
-            return JSONResponse(
-                {"detail": "YAML package must be a mapping with "
-                           "providers/models/tree/settings"}, status_code=400)
-        missing = [s for s in ("providers", "models", "tree", "settings")
-                   if s not in data]
-        if missing:
-            return JSONResponse({"detail": f"missing sections: {missing}"},
-                                status_code=400)
-        provs = []
-        for p in data["providers"]:
-            if not isinstance(p, dict) or not isinstance(p.get("name"), str) \
-                    or p.get("proto") not in ("openai", "anthropic") \
-                    or not isinstance(p.get("base_url"), str):
-                return JSONResponse(
-                    {"detail": f"invalid provider row: {p!r}"}, status_code=400)
-            extra = p.get("extra")
-            if not isinstance(extra, dict):
-                extra = {}
-            provs.append((p["name"], p["proto"], p["base_url"],
-                          p.get("key_env"), db._dump(extra)))
-        prov_names = {p[0] for p in provs}
-        model_rows = []
-        for m in data["models"]:
-            if not isinstance(m, dict) or not isinstance(m.get("id"), str) \
-                    or not isinstance(m.get("provider"), str) \
-                    or not isinstance(m.get("upstream"), str):
-                return JSONResponse({"detail": f"invalid model row: {m!r}"},
-                                    status_code=400)
-            if m["provider"] not in prov_names:
-                return JSONResponse(
-                    {"detail": f"model {m['id']}: unknown provider "
-                               f"{m['provider']!r}"}, status_code=400)
-            caps, aliases = m.get("caps", []), m.get("aliases", [])
-            if not isinstance(caps, list) or not isinstance(aliases, list):
-                return JSONResponse(
-                    {"detail": f"model {m['id']}: caps/aliases must be lists"},
-                    status_code=400)
-            step = m.get("step")
-            if step is not None and (not isinstance(step, int)
-                                     or isinstance(step, bool)):
-                return JSONResponse(
-                    {"detail": f"model {m['id']}: step must be int or null"},
-                    status_code=400)
-            model_rows.append((m["id"], m["provider"], m["upstream"],
-                               db._dump(caps), db._dump(aliases), step,
-                               m.get("price_in"), m.get("price_out"),
-                               1 if m.get("enabled", True) else 0))
-        settings = data["settings"]
-        if not isinstance(settings, dict) \
-                or set(settings) - set(db.DEFAULT_SETTINGS):
-            return JSONResponse(
-                {"detail": "settings keys must be within DEFAULT_SETTINGS"},
-                status_code=400)
-        try:
-            nodes = _tree_from_json(data["tree"])
-        except ValueError as exc:
-            return JSONResponse({"detail": f"invalid tree: {exc}"}, status_code=400)
         conn = db.get(db_path)
         try:
-            model_ids = set(_models_set(conn)) | {r[0] for r in model_rows}
-            findings = run_checkup(nodes, {m: {} for m in model_ids}, TAGS)
-            if any(f.level == "hard" for f in findings):
-                ordered = sorted(findings, key=lambda f: f.level != "hard")
-                return JSONResponse(
-                    {"findings": [f.to_json() for f in ordered]}, status_code=422)
-            for name, proto, base_url, key_env, extra in provs:
-                conn.execute(
-                    "INSERT INTO providers (name, proto, base_url, key_env, extra) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(name) DO UPDATE SET proto = excluded.proto, "
-                    "base_url = excluded.base_url, key_env = excluded.key_env, "
-                    "extra = excluded.extra",
-                    (name, proto, base_url, key_env, extra))
-            for mid_, provider, upstream, caps, aliases, step, pin, pout, en \
-                    in model_rows:
-                conn.execute(
-                    "INSERT INTO models (id, provider, proto, upstream, caps, "
-                    "aliases, step, price_in, price_out, enabled) "
-                    "VALUES (?, ?, (SELECT proto FROM providers WHERE name = ?), "
-                    "?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(id) DO UPDATE SET provider = excluded.provider, "
-                    "proto = excluded.proto, upstream = excluded.upstream, "
-                    "caps = excluded.caps, aliases = excluded.aliases, "
-                    "step = excluded.step, price_in = excluded.price_in, "
-                    "price_out = excluded.price_out, enabled = excluded.enabled",
-                    (mid_, provider, provider, upstream, caps, aliases, step,
-                     pin, pout, en))
-            for k, v in settings.items():
-                if k != "tree_version":         # 系统管理键：不收写入口
-                    conn.execute(
-                        "INSERT INTO settings (key, value) VALUES (?, ?) "
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (k, str(v)))
-            old = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
-            _write_tree_rows(conn, nodes)
-            db.bump_tree_version(conn)
-            db.log_change(conn, _WRITE_ACTOR, "import", "*",
-                          before={"version": old["version"], "nodes": old["nodes"]},
-                          after={"sections": sorted(data)})
-            conn.commit()
+            findings = config.import_yaml(conn, raw)
+        except ValueError as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=400)
         finally:
             conn.close()
+        if findings is not None:
+            return JSONResponse({"findings": findings}, status_code=422)
         return JSONResponse({"ok": True})
 
     # ── /metrics（§11.1 手工 OpenMetrics，裁定 6）──
