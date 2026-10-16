@@ -1,0 +1,72 @@
+/* Bilingual dictionary. zh is default; setLang persists to localStorage. */
+const I18N = {
+  zh: {
+    'nav.overview': '概览', 'nav.pipeline': '分流配置', 'nav.lab': '试算',
+    'nav.models': '模型与设置', 'app.title': 'Smart Router',
+    'common.save': '保存', 'common.add': '添加', 'common.delete': '删除',
+    'common.loading': '加载中…', 'common.saved': '已保存',
+    'group.safety': '安全', 'group.domain': '领域', 'group.difficulty': '难度',
+    'group.context': '上下文', 'group.session': '会话', 'group.rule': '规则',
+    'pipe.palette': '信号（拖入分支）',
+    'pipe.palhint': '信号由打标器一次前向产出；规则信号确定性命中，置信度恒为 1。',
+    'pipe.pipeline': '分流管道（按序执行，首个命中节点决定去向）',
+    'pipe.savelabel': '保存管道', 'pipe.gate': '闸门', 'pipe.score': '打分',
+    'pipe.addgate': '+ 闸门节点', 'pipe.addscore': '+ 打分节点', 'pipe.branch': '+ 分支',
+    'pipe.confmin': '置信度门槛', 'pipe.weight': '权重', 'pipe.minscore': '门槛分',
+    'pipe.block': '拦截', 'pipe.route': '直达', 'pipe.reject': '动作：拒绝请求',
+    'pipe.branchname': '分支名',
+    'pipe.ph.gate': '无条件行 → 总是命中（兜底）；拖入信号添加条件',
+    'pipe.ph.score': '把左侧信号拖到这里',
+    'pipe.desc.gate': '分支按序，首个「全部条件行命中且置信度达标」的分支生效；均不满足 → 流向下一节点',
+    'pipe.desc.score': '全部分支并行打分，score 最高且 ≥ 门槛分者胜；无一过线 → 流向下一节点',
+    'lab.run': '打标并试算', 'lab.signals': '打标结果（一次前向，全部信号）',
+    'lab.blocked': '请求被拦截', 'lab.noroute': '全管道未命中（请检查兜底节点）',
+    'lab.hit': '命中', 'lab.miss': '未命中', 'lab.block': '拦截', 'lab.none': '无',
+    'lab.trace': '试算轨迹', 'lab.placeholder': '输入一条用户请求…',
+    'models.profile': '擅长画像', 'models.kw': '关键词词表',
+    'models.addgroup': '+ 词表组', 'models.savekw': '保存词表',
+    'ov.total': '总请求', 'ov.blocked': '拦截数', 'ov.blockrate': '拦截率',
+    'ov.dailyavg': '近 14 天日均', 'ov.routes': '分流分布', 'ov.empty': '暂无请求',
+  },
+  en: {
+    'nav.overview': 'Overview', 'nav.pipeline': 'Routing', 'nav.lab': 'Playground',
+    'nav.models': 'Models & Settings', 'app.title': 'Smart Router',
+    'common.save': 'Save', 'common.add': 'Add', 'common.delete': 'Delete',
+    'common.loading': 'Loading…', 'common.saved': 'Saved',
+    'group.safety': 'Safety', 'group.domain': 'Domain', 'group.difficulty': 'Difficulty',
+    'group.context': 'Context', 'group.session': 'Session', 'group.rule': 'Rule',
+    'pipe.palette': 'Signals (drag into a branch)',
+    'pipe.palhint': 'Signals come from one tagger forward pass; rule signals are deterministic, confidence = 1.',
+    'pipe.pipeline': 'Routing pipeline (ordered; the first node that hits decides)',
+    'pipe.savelabel': 'Save pipeline', 'pipe.gate': 'Gate', 'pipe.score': 'Score',
+    'pipe.addgate': '+ Gate node', 'pipe.addscore': '+ Score node', 'pipe.branch': '+ Branch',
+    'pipe.confmin': 'conf threshold', 'pipe.weight': 'weight', 'pipe.minscore': 'min score',
+    'pipe.block': 'block', 'pipe.route': 'route', 'pipe.reject': 'action: reject request',
+    'pipe.branchname': 'branch name',
+    'pipe.ph.gate': 'No condition rows → always hits (fallback); drag a signal to add one',
+    'pipe.ph.score': 'Drag a signal here',
+    'pipe.desc.gate': 'Branches in order; the first whose rows all hit with confidence >= threshold wins; none -> next node',
+    'pipe.desc.score': 'All branches score in parallel; the highest score >= min wins; none -> next node',
+    'lab.run': 'Tag & try', 'lab.signals': 'Tag result (one forward pass, all signals)',
+    'lab.blocked': 'Request blocked', 'lab.noroute': 'No node hit (check the fallback)',
+    'lab.hit': 'hit', 'lab.miss': 'miss', 'lab.block': 'block', 'lab.none': 'none',
+    'lab.trace': 'Trace', 'lab.placeholder': 'Enter a user request…',
+    'models.profile': 'Profile', 'models.kw': 'Keyword lexicon',
+    'models.addgroup': '+ Group', 'models.savekw': 'Save lexicon',
+    'ov.total': 'Total requests', 'ov.blocked': 'Blocked', 'ov.blockrate': 'Block rate',
+    'ov.dailyavg': '14-day daily avg', 'ov.routes': 'Route distribution',
+    'ov.empty': 'No requests yet',
+  },
+};
+let LANG = localStorage.getItem('router_lang') || 'zh';
+function t(key) { return (I18N[LANG] && I18N[LANG][key]) || I18N.zh[key] || key; }
+function setLang(l) {
+  LANG = l; localStorage.setItem('router_lang', l);
+  document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  document.querySelectorAll('.langtog button').forEach(b =>
+    b.classList.toggle('on', b.dataset.lang === l));
+  if (typeof window.onLangChange === 'function') window.onLangChange();
+}

@@ -1,0 +1,3 @@
+{"name": "smart-router-console", "private": true,
+ "devDependencies": {"playwright-core": "^1.40.0"},
+ "scripts": {"check:console": "node scripts/console_check.js"}}
