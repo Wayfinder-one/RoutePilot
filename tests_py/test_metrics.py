@@ -460,3 +460,62 @@ def test_circuit_state_visible_across_instances(tmp_path):
     finally:
         c2.close()
     clear_circuit_state()
+
+
+def test_circuit_half_open_probe_survives_conn(tmp_path):
+    """窗口过期后**即使传 conn** 也放行探测（D1 评审曾误报此处为回归）。
+
+    两级判定的语义边界：本进程有完整状态（计数 ≥3）时，是否查 DB 由窗口决定；
+    窗口已过 → 直接放行，不被 `models.ok==0` 拉回 True。
+    """
+    import time
+    import sr.models as models
+    from sr.models import (HALF_OPEN_AFTER_S, clear_circuit_state,
+                           is_circuit_open, record_failure, record_success)
+
+    path = str(tmp_path / "t.db")
+    db.init_db(path).close()
+    clear_circuit_state()
+    conn = db.get(path)
+    try:
+        for _ in range(3):
+            record_failure(conn, "qwen3-8b")          # 打开熔断（DB ok=0）
+        assert is_circuit_open("qwen3-8b", conn) is True
+        models._CIRCUIT_OPENED_AT["qwen3-8b"] = \
+            time.monotonic() - (HALF_OPEN_AFTER_S + 1)   # 伪造：窗口已过
+        assert is_circuit_open("qwen3-8b", conn) is False   # 放行探测
+        record_success(conn, "qwen3-8b")                   # 探测成功 → 恢复
+        assert is_circuit_open("qwen3-8b", conn) is False
+    finally:
+        conn.close()
+        clear_circuit_state()
+
+
+def test_circuit_db_quarantine_latches_half_open_window(tmp_path):
+    """跨 worker/重启后的 DB 隔离在本进程 latch 出半开窗口 → 能自愈，不永久跳过。
+
+    旧实现（M3-10 首版）：本进程无状态 + DB ok=0 → 恒跳过，只能靠人工 reset；
+    真实调用点总传 conn，多 worker 下其余 worker 永不探测。
+    """
+    import time
+    import sr.models as models
+    from sr.models import (HALF_OPEN_AFTER_S, clear_circuit_state,
+                           is_circuit_open)
+
+    path = str(tmp_path / "t.db")
+    db.init_db(path).close()
+    clear_circuit_state()
+    conn = db.get(path)
+    try:
+        conn.execute("UPDATE models SET ok = 0, break_reason = '连续失败 · 自动熔断' "
+                     "WHERE id = 'qwen3-8b'")
+        conn.commit()
+        clear_circuit_state()                       # 模拟「另一个 worker / 重启」
+        assert is_circuit_open("qwen3-8b", conn) is True     # 首次观察 → 隔离
+        assert models._FAIL_COUNTS["qwen3-8b"] == 3          # 已 latch 窗口起点
+        models._CIRCUIT_OPENED_AT["qwen3-8b"] = \
+            time.monotonic() - (HALF_OPEN_AFTER_S + 1)       # 窗口过期
+        assert is_circuit_open("qwen3-8b", conn) is False    # 放行一次探测
+    finally:
+        conn.close()
+        clear_circuit_state()
