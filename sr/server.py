@@ -653,6 +653,13 @@ def _from_upstream(client_proto: str, up_proto: str, resp: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 # 6) §11.1 指标：内存计数器 + 手工 OpenMetrics 文本（依赖白名单无
 #    prometheus_client，禁新增依赖——裁定 6）
+#
+#    部署约束（M2 前置 7，audit A4）：Metrics 是**进程内**内存 dict（启动 backfill
+#    自 DB），uvicorn 多 worker 下 /metrics 抓到哪个 worker 就出哪份——总量既不准
+#    也不稳定。M1 部署口径 = **单 worker**（``sr serve`` 只调 ``uvicorn.run()``，
+#    不暴露 ``--workers``，即 uvicorn 默认单进程）。多进程聚合（multiprocess 模式
+#    或显式分片）留 M3；若将来放开多 worker，须先解决本约束。``_FAIL_COUNTS``
+#    （sr/models.py 熔断计数）同为进程级，受限一致。
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -853,8 +860,13 @@ def _traffic_filter(conn, f: str, db_path: str) -> tuple[str, list]:
     if f in simple:
         return simple[f], []
     if f == "small":
-        ladder0 = (_load_settings(conn).get("ladder") or "").split(",")[0].strip()
-        return "routed_to = ?", [ladder0]
+        # backlog 修：空阶梯曾落 routed_to = ''（恒空但语义隐晦）。显式化——
+        # 无阶梯则「去了小模型」为空集（同 low_conf 的无门槛早退）。
+        lad = [s.strip() for s in (_load_settings(conn).get("ladder") or "").split(",")
+               if s.strip()]
+        if not lad:
+            return "1 = 0", []
+        return "routed_to = ?", [lad[0]]
     if f == "low_conf":
         gated: dict[str, list[str]] = {}
         for node in _load_tree(conn, db_path):
@@ -1587,9 +1599,11 @@ def create_app(db_path: str, tagger: Tagger,
                 where.append("proto = ?")
                 params.append(proto)
             if hours:
+                # backlog 修：ts 存本地 ISO（带偏移），曾用字符串比较——夏令时/换时区
+                # 下偏移不一，字典序会错。改用 SQLite datetime() 归一到 UTC 再比。
                 cutoff = (datetime.now().astimezone()
                           - timedelta(hours=hours)).isoformat(timespec="seconds")
-                where.append("ts >= ?")
+                where.append("datetime(ts) >= datetime(?)")
                 params.append(cutoff)
             if f:
                 clause, fparams = _traffic_filter(conn, f, db_path)

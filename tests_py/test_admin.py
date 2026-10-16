@@ -253,6 +253,21 @@ def _seed_request(app, *, hit_branch, confidence):
         conn.close()
 
 
+def _seed_request_ts(app, ts, *, routed_to="qwen3-8b"):
+    """直插一条 requests 行（显式 ts / routed_to），驱动 hours / small 筛选的 WHERE。"""
+    conn = sqlite3.connect(app.state.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO requests (id, ts, proto, model_asked, hit_branch, "
+            "routed_to, session_id, session_tag, outcome, status, answer_ms, "
+            "upstream_ms, cost) VALUES (?, ?, 'openai', 'auto', NULL, ?, NULL, "
+            "'new', 'upstream', 200, 1.0, 5.0, NULL)",
+            (uuid.uuid4().hex, ts, routed_to))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # ── 简报 Step 1 测试（逐字；裁定 1 的修正见 test_tree_shape 注释） ──────────────
 
 def test_bootstrap_seven_gets(app):           # §9.1 引导序列
@@ -348,6 +363,40 @@ def test_traffic_low_conf_filter(app):
     rows = get(app, "/admin/traffic?f=low_conf").json()["rows"]
     assert len(rows) == 1
     assert rows[0]["hit_branch"] == "3.0"
+
+def test_traffic_hours_filter_uses_real_instant(app):
+    """backlog 修：hours 曾用本地 ISO 字符串比较——跨偏移（夏令时/异区）会错序。
+    改用 SQLite datetime() 归一到 UTC。窗口内一条（23h 前，UTC 偏移表示）、
+    窗口外一条（30h 前，本地偏移表示）——只有前者应命中。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now().astimezone()
+    _seed_request_ts(app, (now - timedelta(hours=23)).astimezone(timezone.utc)
+                     .isoformat(timespec="seconds"), routed_to="qwen3-8b")
+    _seed_request_ts(app, (now - timedelta(hours=30)).isoformat(timespec="seconds"),
+                     routed_to="qwen3-32b")
+    rows = get(app, "/admin/traffic?hours=24").json()["rows"]
+    assert {r["routed_to"] for r in rows} == {"qwen3-8b"}, \
+        [(r["routed_to"], r["ts"]) for r in rows]
+
+def test_traffic_small_filter_first_ladder(app):
+    """small = 落到阶梯最低档（§4.3）：只命中 routed_to = ladder[0]。"""
+    _seed_request_ts(app, db._now(), routed_to="qwen3-8b")
+    _seed_request_ts(app, db._now(), routed_to="qwen3-32b")
+    rows = get(app, "/admin/traffic?f=small").json()["rows"]
+    assert [r["routed_to"] for r in rows] == ["qwen3-8b"]
+
+def test_traffic_small_filter_empty_ladder_is_empty(app):
+    """backlog 修：无阶梯配置时 small 应显式空集（旧实现落 routed_to = ''——
+    当年若真有 routed_to 为空串的行会被误收）。"""
+    conn = sqlite3.connect(app.state.db_path)
+    try:
+        conn.execute("UPDATE settings SET value = '' WHERE key = 'ladder'")
+        conn.commit()
+    finally:
+        conn.close()
+    _seed_request_ts(app, db._now(), routed_to="")
+    _seed_request_ts(app, db._now(), routed_to="qwen3-8b")
+    assert get(app, "/admin/traffic?f=small").json()["rows"] == []
 
 def test_metrics_backfill_from_requests(app):
     """裁定 6：启动时从 requests 表 backfill sr_requests_total——第二个 app
