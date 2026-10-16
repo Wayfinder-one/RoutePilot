@@ -721,3 +721,95 @@ def test_resolve_failure_message_is_generic(app, monkeypatch):
     assert j["error"]["type"] == "api_error" and j["error"]["code"] == "upstream_error"
     assert sentinel not in r.text
     assert any(sentinel in repr(a) for a in logged), logged     # 细节留在服务端日志
+
+
+# ── M2（audit Major）：预算保护执行点 ──────────────────────────────────────────
+# 审核报告 §2-M2：budget_protect/budget_water/budget_route 三键原有种苗与校验，
+# 但 _handle 全流程无执行点、sr_budget_triggered_total 只声明无 inc——设置页开关
+# 假装在工作。以下钉死补上的执行点：evaluate 之后、上游调用之前，当日花费
+# ≥ 日限额 × 水位 → tree/trial 决定改写到 budget_route（保留 think/fallbacks），
+# 响应头 x-sr-budget: 1 + 指标 +1；sticky/unlocked/direct 是显式行为不覆盖。
+# 注：requests.cost 主链当前恒 None（M3 回填前），直插 cost 行是测试造数的唯一
+# 途径；SUM 与比较机制真实，触发条件待 M3 cost 回填后自然生效。
+
+def _seed_daily_cost(app, cost: float) -> None:
+    """直插一条当日 requests 行（cost 非零）造出当日花费基数。"""
+    conn = db.get(app.state.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO requests (id, ts, proto, model_asked, hit_branch, routed_to, "
+            "session_id, session_tag, outcome, status, answer_ms, upstream_ms, cost) "
+            "VALUES ('cost-seed', ?, 'openai', 'auto', NULL, 'qwen3-32b', NULL, 'new', "
+            "'upstream', 200, 0, 0, ?)", (db._now(), cost))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_HARD_TEXT = {"model": "auto", "messages": [{"role": "user",
+              "content": "帮我设计一个支持千万并发的订单系统，要考虑分库分表"}]}
+
+
+def test_budget_protection_triggers_at_water_level(app):
+    """当日花费恰 = 限额 × 水位（8.0 = 10.0 × 0.8，≥ 触发）→ tree 决定被改写到
+    budget_route：routed_to=budget_route 值、响应头 x-sr-budget=1、指标 +1、
+    树命中路径不变（只改去向）。"""
+    _seed_daily_cost(app, 8.0)
+    r = asyncio.get_event_loop().run_until_complete(
+        _post(app, "/v1/chat/completions", _HARD_TEXT))
+    assert r.status_code == 200, r.text
+    assert r.headers["x-sr-budget"] == "1"
+    assert r.headers["x-sr-route"].startswith("3.")          # 树命中不变，只改去向
+    budget_route = _admin_get(app, "/admin/settings").json()["budget_route"]
+    conn = db.get(app.state.db_path)
+    try:
+        row = conn.execute("SELECT * FROM requests WHERE id != 'cost-seed' "
+                           "ORDER BY rowid DESC").fetchone()
+        assert row["routed_to"] == budget_route
+        assert row["outcome"] == "upstream"      # 主模型已改写 → 不算回退
+    finally:
+        conn.close()
+    assert "sr_budget_triggered_total 1" in _admin_get(app, "/metrics").text
+
+
+def test_budget_protection_skips_sticky(app):
+    """会话沿用（显式行为）不被预算覆盖：首轮自然走树落 qwen3-32b，种入当日
+    花费后同会话第二轮仍沿用上轮模型，无 x-sr-budget 头、指标不增。"""
+    h = {"x-session-id": "sess-budget"}
+    loop = asyncio.get_event_loop()
+    r1 = loop.run_until_complete(_post(app, "/v1/chat/completions", _HARD_TEXT, h))
+    assert r1.headers["x-sr-model"] == "qwen3-32b"
+    assert "x-sr-budget" not in r1.headers
+    _seed_daily_cost(app, 8.0)
+    r2 = loop.run_until_complete(_post(app, "/v1/chat/completions", _HARD_TEXT, h))
+    assert r2.headers["x-sr-session"] == "sticky"
+    assert r2.headers["x-sr-model"] == "qwen3-32b"           # 沿用不被改写
+    assert "x-sr-budget" not in r2.headers
+    assert "sr_budget_triggered_total 1" not in \
+        _admin_get(app, "/metrics").text
+
+
+def test_budget_protect_disabled_no_trigger(app):
+    """budget_protect=0 → 当日花费越线也不改写（设置页开关真实生效）。"""
+    _seed_daily_cost(app, 8.0)
+    s = _admin_get(app, "/admin/settings").json()
+    s["budget_protect"] = "0"
+    assert _admin_put(app, "/admin/settings", s).status_code == 200
+    r = asyncio.get_event_loop().run_until_complete(
+        _post(app, "/v1/chat/completions", _HARD_TEXT))
+    assert r.status_code == 200
+    assert r.headers["x-sr-model"] == "qwen3-32b"            # 未被改写
+    assert "x-sr-budget" not in r.headers
+
+
+def test_validate_settings_budget_daily_limit(app):
+    """budget_daily_limit_usd 值校验（新预置键）：须可解析为正 float；
+    'abc' / '-1' 报错（I2 口径：一次 200 写坏设置会持久打崩 /v1 预算比较）。"""
+    from sr.server import validate_settings
+    models = {"qwen3-8b", "qwen3-32b", "claude-sonnet"}
+    base = dict(db.DEFAULT_SETTINGS)
+    assert validate_settings(base, models) == []
+    for bad_val in ("abc", "-1"):
+        errs = validate_settings(dict(base, budget_daily_limit_usd=bad_val),
+                                 models)
+        assert errs and any("budget_daily_limit_usd" in e for e in errs), bad_val

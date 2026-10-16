@@ -136,6 +136,15 @@ def _settings_water(v) -> bool:
     return 0.0 < f < 1.0
 
 
+def _settings_positive_float(v) -> bool:
+    """正浮点（字符串数字形态；bool 不算——同 _settings_positive_int 口径）。"""
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return False
+    return f > 0.0
+
+
 def validate_settings(settings, models) -> list[str]:
     """按 key 白名单校验设置值 → 非法消息列表（空列表 = 合法）。
 
@@ -160,6 +169,10 @@ def validate_settings(settings, models) -> list[str]:
         elif key == "budget_water":
             if not _settings_water(val):
                 errs.append(f"budget_water must be a float in (0,1): {val!r}")
+        elif key == "budget_daily_limit_usd":
+            if not _settings_positive_float(val):
+                errs.append(f"budget_daily_limit_usd must be a positive float: "
+                            f"{val!r}")
         elif key in ("session_sticky", "sticky_detect_feedback", "budget_protect"):
             if not _settings_flag(val):
                 errs.append(f"{key} must be 0 or 1: {val!r}")
@@ -1025,6 +1038,24 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             conn.commit()
             return _error(proto, 502, "routing produced no model",
                           "api_error", "no_route", diag)
+
+        # ── M2（audit Major）预算保护执行点（审核报告 §2-M2：三键原为空转死功能）──
+        # evaluate 之后、上游调用之前：当日花费 ≥ 日限额 × 水位 → 把 tree/trial
+        # 决定改写到 budget_route（保留原 think 与 fallbacks，outcome 的 fallback
+        # 判定自然以改写后 model 为主模型）。口径：sticky/unlocked/direct 不覆盖——
+        # 显式行为（用户点名 / 会话沿用 / 反馈解锁）优先于预算收敛，只有「树替用户
+        # 做的决定」才被预算改写。cost 列主链当前恒 None（M3 回填），SUM 机制真实、
+        # 触发条件待 M3 cost 回填后生效。
+        if settings.get("budget_protect") == "1" \
+                and decision.source in ("tree", "trial"):
+            daily = conn.execute(
+                "SELECT COALESCE(SUM(cost), 0) FROM requests "
+                "WHERE ts >= date('now', 'start of day')").fetchone()[0]
+            if daily >= float(settings["budget_daily_limit_usd"]) \
+                    * float(settings["budget_water"]):
+                decision.model = settings["budget_route"]
+                metrics.inc("sr_budget_triggered_total")
+                diag["x-sr-budget"] = "1"
 
         # ── 8–9 供应商解析 + 上游调用（候选链 + 重试 + 熔断 + 首包锁定） ──
         try:

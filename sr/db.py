@@ -23,6 +23,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "sticky_detect_feedback": "0",
     "budget_protect": "1",
     "budget_water": "0.8",
+    "budget_daily_limit_usd": "10.0",   # 当日花费（USD）触发线基数（× budget_water）
     "budget_route": "qwen3-8b",
     "max_retries": "2",
     "batch_window_ms": "5",
@@ -93,6 +94,7 @@ CREATE TABLE settings (
   --   sticky_detect_feedback (0/1，沿用前是否仍打 user_feedback，见 §4.4)
   --   budget_protect (1/0)
   --   budget_water (0.8)
+  --   budget_daily_limit_usd (10.0)
   --   budget_route (qwen3-8b)
   --   max_retries (2)
   --   batch_window_ms (5)
