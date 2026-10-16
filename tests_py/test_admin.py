@@ -1025,3 +1025,72 @@ def test_put_model_ok_and_break_reason(app):
     assert put(app, f"/admin/models/{mid}", {"ok": 2}).status_code == 400
     assert put(app, f"/admin/models/{mid}", {"ok": True}).status_code == 400
     assert put(app, f"/admin/models/{mid}", {"break_reason": 5}).status_code == 400
+
+
+# ── M7（audit Major）：conf 切点越档告警 ──────────────────────────────────────
+# 审核报告 §2-M7：启发式置信度 ≤0.5 保证「永不误命中 conf_min≥2 精细分支」，前提
+# 是默认切点 [0.30,0.60,0.85]。PUT /admin/bands 可实时改切点——第二切 ≤0.5 时该
+# 保证静默失效（如 [0.2,0.4,0.7] 下 0.4/0.5 升到档 2，balanced 分支 30 开始命中）。
+# 修法：不拦截（合法配置），响应加双语 warning + 服务端日志一条。
+
+def test_bands_conf_cut_below_half_warns(app, caplog):
+    """第二切 ≤0.5 → 200 且 body 含双语 warning（zh/en 各一句）；服务端日志
+    记一条；恢复默认切点 → 无 warning 键。"""
+    import logging
+    b = get(app, "/admin/bands").json()
+    b["conf_thresholds"] = [0.2, 0.4, 0.7]
+    with caplog.at_level(logging.WARNING, logger="sr.server"):
+        r = put(app, "/admin/bands", b)
+    assert r.status_code == 200, r.text
+    w = r.json().get("warning")
+    assert w and set(w) == {"zh", "en"}, r.json()
+    assert "4.6" in w["zh"] and "4.6" in w["en"]        # 指向 §4.6 保证
+    assert any("0.4" in rec.message or "cut" in rec.message.lower()
+               for rec in caplog.records), caplog.records
+    b["conf_thresholds"] = [0.30, 0.60, 0.85]            # 恢复默认
+    r2 = put(app, "/admin/bands", b)
+    assert r2.status_code == 200
+    assert not r2.json().get("warning")                  # 无 warning 键或 None
+
+
+# ── M8（audit Major）：tag_settings 死旋钮接线 ────────────────────────────────
+# 审核报告 §2-M8：tag_rules 用模块常量不认库，PUT /admin/bands 持久化的
+# context 四档是「改了不生效的旋钮」，违反 §4.2 第 5 步「控制台可改，立即生效」。
+# 修法：调用方（server 打标点）每请求读 tag_settings 表注入 tag_all——无缓存层，
+# SQLite 单 SELECT 代价可忽略。
+
+def test_tag_settings_context_thresholds_take_effect(app):
+    """context 切点改成 [1,2,6] 后发一条 5 词请求：入库 context 档 = 2（默认
+    [20,100,400] 下应为 0）；GET /admin/bands 回显新值；恢复默认后同文本回到 0。"""
+    b = get(app, "/admin/bands").json()
+    for t in b["tag_thresholds"]:
+        if t["tag"] == "context":
+            t["thresholds"] = [1, 2, 6]
+    assert put(app, "/admin/bands", b).status_code == 200
+    tags = {t["tag"]: t["thresholds"]
+            for t in get(app, "/admin/bands").json()["tag_thresholds"]}
+    assert tags["context"] == [1, 2, 6]                  # GET 回显新值
+
+    def _context_band_of(text: str, sess: str) -> str:
+        # 独立 x-session-id：避免 sha1 指纹把同文本请求并成 sticky 轮（沿用轮
+        # 跳过打标不落全量标签，§14.2）。
+        r = post(app, "/v1/chat/completions",
+                 {"model": "auto",
+                  "messages": [{"role": "user", "content": text}]},
+                 {"x-session-id": sess})
+        assert r.status_code == 200, r.text
+        conn = db.get(app.state.db_path)
+        try:
+            rid = conn.execute("SELECT id FROM requests ORDER BY rowid DESC "
+                               "LIMIT 1").fetchone()["id"]
+            return conn.execute(
+                "SELECT value FROM tags WHERE request_id = ? AND tag = 'context'",
+                (rid,)).fetchone()["value"]
+        finally:
+            conn.close()
+
+    assert _context_band_of("今天天气好", "ctx-a") == "2"   # 5 词 ≥ 1、≥ 2、< 6
+    b["tag_thresholds"] = [{"tag": "context",
+                            "thresholds": [20, 100, 400]}]
+    assert put(app, "/admin/bands", b).status_code == 200
+    assert _context_band_of("今天天气好", "ctx-b") == "0"   # 恢复默认立即回到 0 档

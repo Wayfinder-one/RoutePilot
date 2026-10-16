@@ -221,9 +221,9 @@ def conf_band(p: float, thresholds: list[float] | None = None) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # context 词数四档切点（spec §4.5「按 tag_settings 切四档」，与 sr/db.py
-# _SEED_TAG_SETTINGS 的 context 行同值）。裁定：tag_rules 不读库——tag_settings
-# 的 context 行留给 admin 展示与 M2；M2 接线时如需跟随库值，由调用方读表后
-# 走独立路径，不改本默认常量。
+# _SEED_TAG_SETTINGS 的 context 行同值）。M8（audit Major）接线：server 打标点
+# 每请求读 tag_settings 表后经 context_thresholds 形参注入（无行则用本默认值），
+# §4.2 第 5 步「控制台可改，立即生效」——本模块仍不读库，读表是调用方职责。
 DEFAULT_CONTEXT_THRESHOLDS: list[int] = [20, 100, 400]
 
 # spec §4.5 未写明档位边界归属，取左闭右开 [t_i, t_{i+1})（含等号，与
@@ -347,7 +347,8 @@ def _rule(value) -> dict:
 
 
 def tag_rules(text: str, headers: dict, n_messages: int, now: datetime,
-              kw_table: dict[str, list[str]] | None = None) -> dict[str, dict]:
+              kw_table: dict[str, list[str]] | None = None,
+              context_thresholds: list[int] | None = None) -> dict[str, dict]:
     """8 个规则标签打标（spec §4.5 表逐条；Task 3）。
 
     返回 ``{tag_key: {"value": ..., "confidence": None, "is_rule": True}}``，
@@ -355,7 +356,8 @@ def tag_rules(text: str, headers: dict, n_messages: int, now: datetime,
     turns / tenant / time_window / event。规则标签不参与把握度门槛（§4.5 末行）。
 
     取舍与边界声明（spec 未写明处，均为实现裁定并已记任务报告）：
-    - context 阈值用模块常量 DEFAULT_CONTEXT_THRESHOLDS，不读 tag_settings 表；
+    - context 阈值取 context_thresholds（M8：调用方读 tag_settings 表注入，
+      None 用 DEFAULT_CONTEXT_THRESHOLDS）；本函数不读库；
     - context / time_window 档位边界取左闭右开（含下界、不含上界）；
     - language 占比分母 = 去空白后的字符数；空文本落 other；
     - structure 的 multiline 取「行数 ≥ 3」（测试契约，覆盖 spec「≥3 个换行」字面）；
@@ -371,7 +373,9 @@ def tag_rules(text: str, headers: dict, n_messages: int, now: datetime,
         "keyword": _rule(_keyword_hits(text, kw_table)),
         "language": _rule(_language_of(text)),
         "structure": _rule(_structure_of(text)),
-        "context": _rule(_context_band(text, DEFAULT_CONTEXT_THRESHOLDS)),
+        "context": _rule(_context_band(
+            text, DEFAULT_CONTEXT_THRESHOLDS if context_thresholds is None
+            else context_thresholds)),
         "turns": _rule(_turns_band(n_messages)),
         "tenant": _rule(_tenant_of(headers)),
         "time_window": _rule(_time_window_of(now)),
@@ -593,10 +597,13 @@ def tag_heuristic(text: str, last_msg: str | None) -> dict[str, dict]:
 
 
 def tag_all(text: str, headers: dict, n_messages: int, now: datetime,
-            last_msg: str | None) -> dict[str, dict]:
+            last_msg: str | None,
+            context_thresholds: list[int] | None = None) -> dict[str, dict]:
     """全量打标 = 8 规则标签（tag_rules）∪ 9 启发式模型标签（tag_heuristic），17 键。
 
     heuristic 模式的入口产物；两子产物键不相交，合并序 = 规则标签在前、模型标签在后。
+    context_thresholds 透传 tag_rules（M8：None = 模块默认，见 tag_rules 注释）。
     """
-    return {**tag_rules(text, headers, n_messages, now),
+    return {**tag_rules(text, headers, n_messages, now,
+                        context_thresholds=context_thresholds),
             **tag_heuristic(text, last_msg)}

@@ -62,7 +62,8 @@ from sr.health import Finding, run_checkup
 from sr.i18n import MESSAGES, detect_lang
 from sr.models import (is_circuit_open, record_failure, record_success,
                        reset_circuit, resolve_backend)
-from sr.tags import DEFAULT_CONF_THRESHOLDS, TAGS, conf_band, tag_all
+from sr.tags import (DEFAULT_CONF_THRESHOLDS, DEFAULT_CONTEXT_THRESHOLDS,
+                     TAGS, conf_band, tag_all)
 
 # 两协议适配器（§7.1 按路径判定 proto → 同构七件套）
 ADAPTERS = {"openai": oai, "anthropic": anth}
@@ -195,6 +196,19 @@ def _conf_cuts(conn) -> list[float]:
     """conf_settings 单行切点 → list（缺行回默认 [0.30, 0.60, 0.85]，§3.1）。"""
     row = conn.execute("SELECT thresholds FROM conf_settings WHERE id = 1").fetchone()
     return json.loads(row["thresholds"]) if row else list(DEFAULT_CONF_THRESHOLDS)
+
+
+def _context_thresholds(conn) -> list[int]:
+    """tag_settings context 行切点 → list（缺行回默认 [20, 100, 400]，§4.5）。
+
+    M8（audit Major）：原 tag_rules 只认模块常量，PUT /admin/bands 持久化的
+    context 四档改了不生效（死旋钮）。每请求一次 SELECT 注入打标点——控制台
+    改档立即生效（§4.2 第 5 步），SQLite 单点查代价可忽略，刻意不加缓存层。
+    """
+    row = conn.execute(
+        "SELECT thresholds FROM tag_settings WHERE tag = 'context'").fetchone()
+    return json.loads(row["thresholds"]) if row \
+        else list(DEFAULT_CONTEXT_THRESHOLDS)
 
 
 def _load_tree(conn, db_path: str) -> list:
@@ -929,6 +943,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
         settings = _load_settings(conn)
         nodes = _load_tree(conn, db_path)
         cuts = _conf_cuts(conn)
+        ctx_thresholds = _context_thresholds(conn)   # M8：tag_settings context 行
         req_headers = dict(request.headers)
         accept_lang = request.headers.get("accept-language")
         session_id: str | None = None
@@ -957,7 +972,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
                 sticky_enabled=(settings.get("session_sticky") == "1"))
             t1 = time.monotonic()
             signals = tag_all(text, req_headers, len(ir.messages),
-                              datetime.now().astimezone(), _last_msg(conn, session_id))
+                              datetime.now().astimezone(),
+                              _last_msg(conn, session_id), ctx_thresholds)
             answer_ms = (time.monotonic() - t1) * 1000
             metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0)
         else:
@@ -974,7 +990,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
                 # §4.4 反馈来源 2：开启后沿用路径仍做一次前向，只为读 user_feedback
                 pre_signals = tag_all(text, req_headers, len(ir.messages),
                                       datetime.now().astimezone(),
-                                      _last_msg(conn, session_id))
+                                      _last_msg(conn, session_id), ctx_thresholds)
                 feedback = pre_signals["user_feedback"]["value"]
             sess = resolve_session(conn, session_id, pre_signals, settings,
                                    feedback=feedback)
@@ -988,7 +1004,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
                 t1 = time.monotonic()
                 signals = pre_signals or tag_all(text, req_headers, len(ir.messages),
                                                  datetime.now().astimezone(),
-                                                 _last_msg(conn, session_id))
+                                                 _last_msg(conn, session_id),
+                                                 ctx_thresholds)
                 answer_ms = (time.monotonic() - t1) * 1000
                 metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0)
                 # ── 7 走分流树 → RouteDecision ──
@@ -1743,8 +1760,11 @@ def create_app(db_path: str, tagger: str = "heuristic",
                         {"detail": "body requires \"text\" or \"request_id\""},
                         status_code=400)
                 t1 = time.monotonic()
+                # M8：试算现打标与 /v1 主链同一注入口径（否则 try 展示的 context
+                # 档与真实路由不一致）。
                 signals = tag_all(text, dict(request.headers), 1,
-                                  datetime.now().astimezone(), None)
+                                  datetime.now().astimezone(), None,
+                                  _context_thresholds(conn))
                 answer_ms = (time.monotonic() - t1) * 1000
             trace = evaluate_trace(_load_tree(conn, db_path), signals, cuts)
         finally:
@@ -2329,6 +2349,25 @@ def create_app(db_path: str, tagger: str = "heuristic",
             conn.commit()
         finally:
             conn.close()
+        # ── M7（audit Major）conf 切点越档告警（审核报告 §2-M7）────────────────
+        # 启发式置信度 ≤0.5 保证「永不误命中 conf_min≥2 精细分支」的前提是默认切点
+        # [0.30,0.60,0.85]；第二切 ≤0.5 时 0.4/0.5 的启发式信号升入「比较确定」档，
+        # §4.6 降级保守保证静默失效。合法配置不拦截，响应附双语 warning + 日志。
+        # 单切点（档位数 1）下启发式最高档 1，永不越档，无需告警。
+        if len(cuts) >= 2 and cuts[1] <= 0.5:
+            warning = {
+                "zh": "该切点组合下启发式打标（置信度 ≤ 0.5）可能进入「比较确定」"
+                      "档：§4.6 的降级保守保证（永不误命中 conf_min ≥ 2 精细分支）"
+                      "会减弱；检查点模式下不受影响。",
+                "en": "With these cut points, heuristic tagging (confidence "
+                      "<= 0.5) may reach the 'fairly sure' band: the §4.6 "
+                      "degraded-mode guarantee (never false-hitting conf_min >= 2 "
+                      "refined branches) is weakened. Checkpoint mode is "
+                      "unaffected.",
+            }
+            logger.warning("M7: conf cuts %s weaken the heuristic degraded-mode "
+                           "guarantee (§4.6)", cuts)
+            return JSONResponse({"ok": True, "warning": warning})
         return JSONResponse({"ok": True})
 
     @app.get("/admin/export")
