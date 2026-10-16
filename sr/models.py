@@ -132,9 +132,11 @@ def is_circuit_open(model_id: str, conn=None) -> bool:
     1. **本进程**有完整状态（连续失败计数 ≥3）：未过半开窗口 → 打开；过了窗口 →
        放行一次探测（返回 False）。半开语义与 M3 一致。
     2. 本进程**没有**状态时查 DB ``models.ok == 0``（另一 worker 打开的熔断，或本
-       进程重启后 DB 里仍记着隔离）：打开。DB 无打开时刻，故该路径不放行半开探测
-       ——宁可多隔离一次，也不误放。``conn`` 省略（None）时退化为纯进程内判定，
-       供单测与无库调用。
+       进程重启后 DB 里仍记着隔离）：打开，并在本进程 latch 出「计数 3 + 打开时刻
+       = 现在」，使半开窗口在该 worker 同样生效——否则它会永久跳过这个模型，只能
+       靠人工 reset（M3 半开的本意是自愈）。DB 里没有打开时刻，故窗口从**本进程
+       首次观察到**起算（偏保守，不误放）。``conn`` 省略（None）时退化为纯进程内
+       判定，供单测与无库调用。
     """
     with _FAIL_LOCK:
         if _FAIL_COUNTS.get(model_id, 0) >= 3:
@@ -146,6 +148,10 @@ def is_circuit_open(model_id: str, conn=None) -> bool:
         row = conn.execute("SELECT ok FROM models WHERE id = ?",
                            (model_id,)).fetchone()
         if row is not None and row["ok"] == 0:
+            with _FAIL_LOCK:
+                if model_id not in _FAIL_COUNTS:      # 首次观察到 → latch 窗口起点
+                    _FAIL_COUNTS[model_id] = 3
+                    _CIRCUIT_OPENED_AT[model_id] = time.monotonic()
             return True
     return False
 
