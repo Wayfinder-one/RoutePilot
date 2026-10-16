@@ -1953,6 +1953,18 @@ const PROVIDERS = [
 ];
 
 const CAPS = ['文字','图片','长上下文','超长','便宜','中等','贵','快','中速','慢'];
+/* 会话内手动新增的能力标签：与内置 CAPS 一起参与展示与勾选（有「新增标签」功能）。 */
+const CAPS_EXTRA = [];
+function mCapOptions(){ return CAPS.concat(CAPS_EXTRA); }
+function mAddCap(){
+  const el = document.getElementById('mf-newcap');
+  const v = ((el && el.value) || '').trim();
+  if(!v) return;
+  if(CAPS.indexOf(v) < 0 && CAPS_EXTRA.indexOf(v) < 0) CAPS_EXTRA.push(v);
+  if(mf && mf.caps.indexOf(v) < 0) mf.caps.push(v);     /* 新增即选中 */
+  renderModelForm();
+  const el2 = document.getElementById('mf-newcap'); if(el2) el2.focus();
+}
 const SPECIAL = [
   {id:'沿用上次的模型', cap:'会话沿用'},
   {id:'升一档',         cap:'按模型阶梯往后一格'},
@@ -2757,8 +2769,13 @@ function renderModels(){
 
 /* ── 接入新模型 ── */
 let mf = null;
-function newMf(){ return { proto:'openai', prov:'本地', newProv:false, provName:'',
-  base:'', keyEnv:'', upstream:'', caps:[], priceIn:'', priceOut:'', tested:false }; }
+/* 供应商选项：排除内置的 local（本地假上游 / 种子），只列可实际接入的供应商。 */
+function mProvOptions(){
+  return PROVIDERS.filter(p => p.name !== 'local' && p.name !== '本地');
+}
+function newMf(){ return { proto:'openai', prov:(mProvOptions()[0] || {}).name || '',
+  newProv:false, provName:'', base:'', keyEnv:'', upstream:'', caps:[],
+  priceIn:'', priceOut:'', tested:false }; }
 function openAddModel(){ mf = newMf(); renderModelForm();
   document.getElementById('addModelBox').scrollIntoView({behavior:'smooth', block:'nearest'}); }
 function closeAddModel(){ document.getElementById('addModelBox').innerHTML = ''; mf = null; }
@@ -2805,7 +2822,7 @@ function renderModelForm(){
       <div class="step"><span class="sn">2</span><div class="sc">
         <span class="lb">供应商 <span class="opt">基址 URL 与密钥来源在这里</span></span>
         <div class="seg">
-          ${PROVIDERS.map(p =>
+          ${mProvOptions().map(p =>
             `<button class="${(!mf.newProv && mf.prov===p.name)?'on':''}" onclick="mPickProv('${SRW_jsAttr(p.name)}')">${SRW_esc(p.name)}</button>`).join('')}
           <button class="${mf.newProv?'on':''}" onclick="mNewProv()">＋ 新建供应商</button>
         </div>
@@ -2836,8 +2853,13 @@ function renderModelForm(){
       </div></div>
       <div class="step"><span class="sn">4</span><div class="sc">
         <span class="lb">能力标签 <span class="opt">决定它能被哪些分支选中</span></span>
-        <div class="picks">${CAPS.map(c =>
+        <div class="picks">${mCapOptions().map(c =>
           `<button class="pk ${mf.caps.indexOf(c)>=0?'on':''}" onclick="mToggleCap('${SRW_jsAttr(c)}')">${SRW_esc(c)}</button>`).join('')}</div>
+        <div style="display:flex;gap:var(--s2);margin-top:var(--s3)">
+          <input type="text" id="mf-newcap" placeholder="新增能力标签，回车或点「添加」"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();mAddCap();}">
+          <button class="btn" onclick="mAddCap()">＋ 添加标签</button>
+        </div>
       </div></div>
       <div class="btn-row">
         <button class="btn" onclick="mTest()">${mf.tested ? '✓ 连通正常' : '测试连通'}</button>

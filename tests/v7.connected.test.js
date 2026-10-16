@@ -639,6 +639,8 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   setInput('mf-base', 'https://api.siliconflow.cn/v1');
   setInput('mf-keyenv', 'SILICONFLOW_API_KEY');
   setInput('mf-up', 'Qwen/Qwen3-8B');
+  ldoc.getElementById('mf-newcap').value = 'tool_use';
+  lw.mAddCap();
   lw.mSave();
   await until(() => L.calls.some(c => c[0] === '/admin/providers' && c[1].method === 'POST'),
     5000, 'POST /admin/providers');
@@ -651,6 +653,8 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   const mBody = mCall ? JSON.parse(mCall[1].body) : {};
   t('再 POST /admin/models（provider 指向新供应商）', mBody.provider === 'siliconflow',
     JSON.stringify(mBody));
+  t('新增能力标签进入请求体 caps', Array.isArray(mBody.caps) && mBody.caps.indexOf('tool_use') >= 0,
+    JSON.stringify(mBody.caps));
 
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
