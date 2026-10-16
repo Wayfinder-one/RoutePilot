@@ -804,6 +804,66 @@ def test_budget_protect_disabled_no_trigger(app):
     assert "x-sr-budget" not in r.headers
 
 
+def _set_prices(app, *models_prices):
+    conn = db.get(app.state.db_path)
+    try:
+        for mid, pin, pout in models_prices:
+            conn.execute("UPDATE models SET price_in=?, price_out=? WHERE id=?",
+                         (pin, pout, mid))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _last_request(app):
+    conn = db.get(app.state.db_path)
+    try:
+        return conn.execute(
+            "SELECT * FROM requests ORDER BY rowid DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+
+
+def test_cost_backfilled_nonstream(app):
+    """M3：非流式落账按价目×usage 回填 requests.cost（旧实现 _cost_of 的 usage
+    分支是死代码，cost 主链恒 NULL——预算保护/预估复盘因此拿不到真实花费）。"""
+    _set_prices(app, ("qwen3-8b", 0.5, 2.0), ("qwen3-32b", 2.0, 8.0))
+    r = asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert r.status_code == 200, r.text
+    row = _last_request(app)
+    assert row["routed_to"] and row["cost"] is not None and row["cost"] > 0, \
+        dict(row)
+
+
+def test_cost_backfilled_stream(app):
+    """M3：流式落账在首包（无 usage），末包 usage 在续传结束后由
+    _relay_with_cost 回填 cost。"""
+    _set_prices(app, ("qwen3-8b", 0.5, 2.0), ("qwen3-32b", 2.0, 8.0))
+    r = asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "stream": True,
+         "messages": [{"role": "user", "content": "hi"}]}))
+    assert r.status_code == 200 and "[DONE]" in r.text
+    row = _last_request(app)
+    assert row["cost"] is not None and row["cost"] > 0, dict(row)
+
+
+def test_cost_null_when_no_price(app):
+    """无价目（price NULL）时 cost 保持 NULL——不臆造 0 花费。"""
+    conn = db.get(app.state.db_path)
+    try:
+        conn.execute("UPDATE models SET price_in=NULL, price_out=NULL")
+        conn.commit()
+    finally:
+        conn.close()
+    asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert _last_request(app)["cost"] is None
+
+
 def test_validate_settings_budget_daily_limit(app):
     """budget_daily_limit_usd 值校验（新预置键）：须可解析为正 float；
     'abc' / '-1' 报错（I2 口径：一次 200 写坏设置会持久打崩 /v1 预算比较）。"""

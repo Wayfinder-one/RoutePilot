@@ -214,7 +214,7 @@ async def _call_stream(conn, ir, decision: RouteDecision, settings: dict,
 
 async def _relay_stream(client_proto: str, up_proto: str, model_asked: str | None,
                         resp: httpx.Response, client: httpx.AsyncClient,
-                        aiter, first_frame: bytes):
+                        aiter, first_frame: bytes, usage_sink: dict | None = None):
     """续传上游流并按客户端协议重发（裁定 8）。
 
     ``aiter`` 是 _call_stream 移交的已启动字节迭代器（httpx 流只许消费一次）。
@@ -310,6 +310,9 @@ async def _relay_stream(client_proto: str, up_proto: str, model_asked: str | Non
                 # **忠实截断**（§7.5：不补写终止符、不换模型），错误进日志。
                 logger.warning("malformed upstream chunk (truncating stream): %r", exc)
                 break
+            if usage_sink is not None and ic.usage is not None:
+                # M3：把末包 usage 交给调用方（流式首包落账时拿不到，续传后回填 cost）
+                usage_sink["usage"] = ic.usage
             if client_proto == "openai":
                 if ic.text is None and ic.finish is None and ic.usage is None:
                     continue                       # 过滤空帧（裁定 8）

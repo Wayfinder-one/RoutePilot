@@ -218,7 +218,10 @@ def _upsert_session(conn, session_id: str, model: str, text: str) -> None:
 
 
 def _cost_of(conn, model_id: str, usage: dict | None) -> float | None:
-    """按 models 价目 × usage 估成本（§3.1 cost 列）；无价目/无 usage → NULL。"""
+    """按 models 价目 × usage 估成本（§3.1 cost 列）；无价目/无 usage → NULL。
+
+    usage 键容错：OpenAI prompt/completion_tokens；Anthropic input/output_tokens。
+    """
     if not usage:
         return None
     row = conn.execute("SELECT price_in, price_out FROM models WHERE id = ?",
@@ -228,6 +231,33 @@ def _cost_of(conn, model_id: str, usage: dict | None) -> float | None:
     pin = usage.get("prompt_tokens", usage.get("input_tokens") or 0) or 0
     pout = usage.get("completion_tokens", usage.get("output_tokens") or 0) or 0
     return (pin * row["price_in"] + pout * row["price_out"]) / 1_000_000
+
+
+def _finalize_cost(db_path: str, rid: str, model_id: str, usage: dict) -> None:
+    """流式续传结束后回填 requests.cost（M3）：流式落账在首包，当时没有 usage。"""
+    conn = db.get(db_path)
+    try:
+        cost = _cost_of(conn, model_id, usage)
+        if cost is not None:
+            conn.execute("UPDATE requests SET cost = ? WHERE id = ?", (cost, rid))
+            conn.commit()
+    finally:
+        conn.close()
+
+
+async def _relay_with_cost(client_proto: str, up_proto: str, model_asked,
+                           resp, client, aiter, first_frame: bytes,
+                           db_path: str, rid: str, model_id: str):
+    """_relay_stream 的薄包装：记录末包 usage，续传结束后回填该请求的 cost（M3）。
+
+    不改变对外字节流（忠实透传/截断语义不变），只在流收束后补一次库写。
+    """
+    sink: dict = {}
+    async for chunk in _relay_stream(client_proto, up_proto, model_asked, resp,
+                                     client, aiter, first_frame, usage_sink=sink):
+        yield chunk
+    if sink.get("usage"):
+        _finalize_cost(db_path, rid, model_id, sink["usage"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -504,8 +534,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
         # 决定改写到 budget_route（保留原 think 与 fallbacks，outcome 的 fallback
         # 判定自然以改写后 model 为主模型）。口径：sticky/unlocked/direct 不覆盖——
         # 显式行为（用户点名 / 会话沿用 / 反馈解锁）优先于预算收敛，只有「树替用户
-        # 做的决定」才被预算改写。cost 列主链当前恒 None（M3 回填），SUM 机制真实、
-        # 触发条件待 M3 cost 回填后生效。
+        # 做的决定」才被预算改写。cost 列已由 M3 回填（非流式即时 / 流式续传后），
+        # SUM 机制与触发条件均真实生效。
         if settings.get("budget_protect") == "1" \
                 and decision.source in ("tree", "trial"):
             daily = conn.execute(
@@ -556,11 +586,14 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
         # 与 _bump_request_metrics 的 sr_fallback_total 同源。
         outcome = "fallback" if _is_fallback(decision.model, final_model, decision) \
             else "upstream"
+        # M3：cost 回填——非流式在此时已拿到上游 usage（价目 × token）；流式首包
+        # 尚无 usage，落账先 NULL，续传结束后由 _relay_with_cost 回填（见下）。
+        usage = data.get("usage") if (not ir.stream and isinstance(data, dict)) else None
         rid = _log_request(conn, proto=proto, asked=asked, hit_branch=hit_branch,
                            routed_to=final_model, session_id=session_id,
                            session_tag=session_tag, outcome=outcome, status=200,
                            answer_ms=answer_ms, upstream_ms=upstream_ms,
-                           cost=_cost_of(conn, final_model, None),
+                           cost=_cost_of(conn, final_model, usage),
                            tree_version=tree_version)
         _store_tags(conn, rid, signals)
         metrics.observe("sr_upstream_latency_seconds", {"model": final_model},
@@ -592,7 +625,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
         # ── 9(续)/10 响应体按客户端协议转换 + 入站名回写 + 诊断头 ──
         if ir.stream:
             return StreamingResponse(
-                _relay_stream(proto, backend.proto, asked, resp, client, aiter, first),
+                _relay_with_cost(proto, backend.proto, asked, resp, client, aiter,
+                                 first, db_path, rid, final_model),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", **diag})
         return JSONResponse(_cross_from_upstream(proto, backend.proto, data, asked),
