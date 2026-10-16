@@ -323,31 +323,30 @@ class CheckpointTagger:
     def _default_model_factory():
         """真实训练侧模型工厂：返回 ``callable(cfg) -> model``。
 
-        优先 ``smart_router.modeling.router.SmartRouterModel``（本仓库约定的训练侧
-        权威实现，``from_pretrained`` 建 backbone + 头）；回退 ``routepilot.model``
-        （spec 文本里的旧包名）。都缺失则显式报错，不静默降级。
+        B1（audit）：**只认权威实现** `smart_router.modeling.router.SmartRouterModel`
+        （签名已在 76 的 smart-router-train 上核对：`from_pretrained(RouterConfig)` +
+        `forward(input_ids, attention_mask, *, with_embedding)` → 扁平 dict）。
+        旧实现还回退 `routepilot.model.RoutePilotModel`——该包在本项目任何环境都不存在
+        （76 上实测 `ModuleNotFoundError`），属死代码，只会把「装错/没装训练侧」的
+        真实原因藏在第二层异常里。现在直接报错并给出可行修法。
         """
         try:
             from smart_router.modeling.router import RouterConfig as TrainCfg
             from smart_router.modeling.router import SmartRouterModel
-
-            def build(cfg):
-                train_cfg = TrainCfg(base_model=cfg.base_model,
-                                     max_length=cfg.max_length,
-                                     embedding_dim=cfg.embedding_dim,
-                                     dtype=cfg.dtype)
-                return SmartRouterModel.from_pretrained(train_cfg)
-            return build
-        except Exception:                                   # noqa: BLE001
-            pass
-        try:
-            from routepilot.model import RoutePilotModel      # type: ignore
-            return lambda cfg: RoutePilotModel(cfg)
         except Exception as exc:                            # noqa: BLE001
             raise CheckpointError(
-                "找不到训练侧模型类（smart_router.modeling.router.SmartRouterModel "
-                "或 routepilot.model.RoutePilotModel）——请安装 smart-router-train "
-                "并把其 src 加入 PYTHONPATH，或经 model_factory 注入同契约模型") from exc
+                "找不到训练侧模型类 smart_router.modeling.router.SmartRouterModel"
+                "（checkpoint 模式需要：装 ML 依赖 `pip install -r requirements-ml.txt`，"
+                "并把 smart-router-train 的 src 加入 PYTHONPATH；"
+                "或经 model_factory 注入同契约模型）") from exc
+
+        def build(cfg):
+            train_cfg = TrainCfg(base_model=cfg.base_model,
+                                 max_length=cfg.max_length,
+                                 embedding_dim=cfg.embedding_dim,
+                                 dtype=cfg.dtype)
+            return SmartRouterModel.from_pretrained(train_cfg)
+        return build
 
     def _warmup(self, samples: list[str]) -> None:
         """预热 4 条样本（§2.3-5）：断言输出形状与取值范围正常。"""
@@ -387,28 +386,33 @@ class CheckpointTagger:
         def _tolist(t):
             return t.detach().float().cpu().tolist()
 
-        # 归一为 {classification: {name: [[…]]}, multilabel: {name: [[…]]}, embedding_head: [[…]]}。
-        # 支持两种上游形状：
-        #  (a) 契约式嵌套 {classification_heads, multilabel_heads, embedding_head}
-        #      （spec §4.2-3 的写法，测试合成模型用）；
-        #  (b) 真训练侧 SmartRouterModel 的**扁平** dict {head_name: logits, "embedding": vec}。
+        # B1（audit）：**只认真实训练侧契约**——`SmartRouterModel.forward()` 返回
+        # 扁平 dict：``{head_name: logits, ..., "embedding": vec}``（已在 76 的
+        # smart-router-train 上核对签名：`forward(input_ids, attention_mask, *,
+        # with_embedding)`）。旧实现额外兼容「契约式嵌套」
+        # ``{classification_heads, multilabel_heads, embedding_head}`` 的第二条路径，
+        # 让契约漂移在**请求期**静默降级；合成测试也照假形状写，于是「测试绿、生产错」。
+        # 现在缺键即显式报错（fail fast，错误里点名缺了哪个头）。
+        if not isinstance(out, dict):
+            raise CheckpointError(
+                "checkpoint 模型 forward 必须返回 dict（真实契约："
+                "{head_name: logits, 'embedding': vec}），"
+                f"实际是 {type(out).__name__}")
+        missing = [s.json_key for s in self.files.head_specs if s.json_key not in out]
+        if "embedding" not in out:
+            missing.append("embedding")
+        if missing:
+            raise CheckpointError(
+                f"checkpoint 模型输出与 tags.json 不一致——缺 {missing}；"
+                "真实契约是扁平 dict（SmartRouterModel.forward 的返回值），"
+                "请确认训练侧与 tags.json 同源")
         norm = {"classification": {}, "multilabel": {}}
-        if isinstance(out, dict) and "classification_heads" in out:
-            cls_raw = out["classification_heads"]
-            ml_raw = out.get("multilabel_heads", {})
-            emb_raw = out.get("embedding_head", out.get("embedding"))
-        else:
-            cls_raw = {s.json_key: out[s.json_key]
-                       for s in self.files.head_specs if s.head == "classification"}
-            ml_raw = {s.json_key: out[s.json_key]
-                      for s in self.files.head_specs if s.head == "multilabel"}
-            emb_raw = out.get("embedding")
         for spec in self.files.head_specs:
             if spec.head == "classification":
-                norm["classification"][spec.json_key] = _tolist(cls_raw[spec.json_key])
+                norm["classification"][spec.json_key] = _tolist(out[spec.json_key])
             elif spec.head == "multilabel":
-                norm["multilabel"][spec.json_key] = _tolist(ml_raw[spec.json_key])
-        norm["embedding_head"] = _tolist(emb_raw)
+                norm["multilabel"][spec.json_key] = _tolist(out[spec.json_key])
+        norm["embedding_head"] = _tolist(out["embedding"])
         return norm
 
     def _signals_from_row(self, row: dict, req: TagRequest) -> tuple[dict, list[float]]:

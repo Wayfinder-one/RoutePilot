@@ -1,9 +1,10 @@
 """M2：CheckpointTagger 的 torch 前向端到端（合成模型，验证 CUDA/bf16/微批/嵌入）。
 
-不需真实 RoutePilot 检查点——训练侧模型类不在本仓库，这里用一个**同契约**的
-合成模型（``forward(input_ids, attention_mask, with_embedding=True)`` 返回
-classification_heads / multilabel_heads / embedding_head）经 ``model_factory``
-注入，从而验证 CheckpointTagger 的加载（§2.3）/前向（§4.2）/嵌入比对全链路。
+不需真实检查点——训练侧模型类不在本仓库，这里用一个**同契约**的合成模型
+（``forward(input_ids, attention_mask, with_embedding=True)`` 返回**扁平** dict
+``{head_name: logits, "embedding": vec}``，与 `SmartRouterModel.forward` 一致；
+B1 起代码只认这一种形状）经 ``model_factory`` 注入，从而验证 CheckpointTagger 的
+加载（§2.3）/前向（§4.2）/嵌入比对全链路。
 
 运行：
 - 无 torch → 自动 skip（本机开发机）；
@@ -64,12 +65,16 @@ class TinyRoutePilot(torch.nn.Module):
         self.emb_head = torch.nn.Linear(_HIDDEN, cfg.embedding_dim)
 
     def forward(self, input_ids, attention_mask=None, with_embedding=True):
+        # B1（audit）：合成模型必须复现**真实训练侧契约**——`SmartRouterModel.forward`
+        # 返回扁平 dict {head_name: logits, ..., "embedding": vec}。旧测试返回
+        # {classification_heads, multilabel_heads, embedding_head} 的嵌套形状，于是
+        # 只有「双形状回退」那一版代码能过，测试绿而生产契约未被验证。
         base = self.emb(input_ids).mean(dim=1)
-        return {
-            "classification_heads": {k: v(base) for k, v in self.cls.items()},
-            "multilabel_heads": {"pii": self.pii(base)},
-            "embedding_head": self.emb_head(base),
-        }
+        out = {k: v(base) for k, v in self.cls.items()}
+        out["pii"] = self.pii(base)
+        if with_embedding:
+            out["embedding"] = torch.nn.functional.normalize(self.emb_head(base), dim=-1)
+        return out
 
 
 def _make_checkpoint(tmp_path, *, device=DEVICE):
@@ -173,3 +178,24 @@ def _run_script():
 
 if __name__ == "__main__":
     sys.exit(_run_script())
+
+
+def test_nested_shape_is_rejected_with_clear_error(tmp_path):
+    """B1：非真实契约（嵌套形状）必须**显式报错**，不再静默降级。"""
+    class Nested(TinyRoutePilot):
+        # 参数与 TinyRoutePilot 完全一致（state_dict 能加载），只把 **forward 返回值**
+        # 换成旧的嵌套假形状——这样失败点必然落在「形状契约」而不是加载期。
+        def forward(self, input_ids, attention_mask=None, with_embedding=True):
+            base = self.emb(input_ids).mean(dim=1)
+            return {"classification_heads": {k: v(base) for k, v in self.cls.items()},
+                    "multilabel_heads": {"pii": self.pii(base)},
+                    "embedding_head": self.emb_head(base)}     # 旧假形状
+
+    d = _make_checkpoint(tmp_path)
+    # fail fast：契约不符必须在**构造期（预热前向）**就报错——checkpoint 模式的
+    # 「生产不可达」因此能在启动时暴露，而不是等到请求期静默降级。
+    with pytest.raises(CheckpointError) as ei:
+        CheckpointTagger(d, device="cpu", model_factory=Nested,
+                         tokenizer_factory=lambda cfg: TinyTokenizer())
+    msg = str(ei.value)
+    assert "扁平" in msg and "tags.json" in msg, msg

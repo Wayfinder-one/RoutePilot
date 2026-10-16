@@ -1,0 +1,16 @@
+# checkpoint 模式（M2）附加依赖 —— spec §13 约定：torch 不进主依赖 requirements.txt。
+#
+# 适用场景：`sr serve --checkpoint DIR`（§2.5）与 `sr eval --checkpoint`。
+# 除了本文件，还需要把训练侧仓库的 src 加进 PYTHONPATH，例如：
+#   PYTHONPATH=/opt/smart-router:/opt/smart-router-train/src \
+#     python -m sr serve --db sr.db --checkpoint <dir> --host 0.0.0.0 --port 8899
+# 训练侧模型类：smart_router.modeling.router.SmartRouterModel（B1 起为唯一权威契约，
+# 签名 forward(input_ids, attention_mask, *, with_embedding) → 扁平 dict）。
+#
+# 版本范围对齐训练侧 pyproject（transformers>=5.0 / accelerate>=1.0 / safetensors>=0.4 /
+# huggingface-hub>=0.34 / numpy>=1.26）；括号内为 2026-10-16 在 76 上实测通过的版本。
+torch>=2.2,<3            # 2.9.1+cu128
+transformers>=5.0        # 5.10.2
+safetensors>=0.4         # 0.8.0
+huggingface-hub>=0.34    # 1.32.0
+numpy>=1.26              # 2.2.6

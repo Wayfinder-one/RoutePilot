@@ -209,3 +209,52 @@ def test_tagger_vec_none_not_written(make_app):
     finally:
         conn.close()
     assert row is not None and row["last_vec"] is None
+
+
+def test_session_last_vec_is_read_into_tag_request(make_app):
+    """B2（audit）：`sessions.last_vec` 的**读侧**必须接进 `TagRequest`。
+
+    写侧早已落库（见上面两个 vec 用例），但旧实现三处 TagRequest 都没带 `last_vec`
+    → checkpoint 模式下 similarity 恒 0、reask 恒 no（76 实测两者都是空档）。
+    这里造「已有会话 + 上轮向量」并关掉沿用，强制本请求重新打标，断言读侧接通。
+    """
+    fake = FakeTagger()
+    app = make_app(fake)
+    conn = db.get(app.state.db_path)
+    try:
+        conn.execute("UPDATE settings SET value='0' WHERE key='session_sticky'")
+        conn.execute(
+            "INSERT INTO sessions (id, current_model, last_active, turns, last_msg,"
+            " last_vec) VALUES ('vec-read-s1','qwen3-8b', datetime('now'), 1,"
+            " '上一轮的问题', ?)",
+            (json.dumps([0.1, 0.2, 0.3]).encode("utf-8"),))
+        conn.commit()
+    finally:
+        conn.close()
+    _run(_post(app, "/v1/chat/completions",
+               {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+               headers={"x-session-id": "vec-read-s1"}))
+    assert len(fake.calls) == 1, fake.calls
+    assert fake.calls[0].last_vec == [0.1, 0.2, 0.3]
+    assert fake.calls[0].last_msg == "上一轮的问题"     # 顺带钉住 last_msg 读侧
+
+
+def test_session_last_vec_dirty_blob_is_ignored(make_app):
+    """脏 BLOB（非 JSON / 非数组）按「无上轮向量」处理，不抛、不拖垮请求。"""
+    fake = FakeTagger()
+    app = make_app(fake)
+    conn = db.get(app.state.db_path)
+    try:
+        conn.execute("UPDATE settings SET value='0' WHERE key='session_sticky'")
+        conn.execute(
+            "INSERT INTO sessions (id, current_model, last_active, turns, last_vec)"
+            " VALUES ('vec-bad-s1','qwen3-8b', datetime('now'), 1, ?)",
+            (b"{not json",))
+        conn.commit()
+    finally:
+        conn.close()
+    r = _run(_post(app, "/v1/chat/completions",
+                   {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"x-session-id": "vec-bad-s1"}))
+    assert r.status_code in (200, 403, 502) and len(fake.calls) == 1
+    assert fake.calls[0].last_vec is None

@@ -311,9 +311,18 @@ async def _relay_stream(client_proto: str, up_proto: str, model_asked: str | Non
                 # **忠实截断**（§7.5：不补写终止符、不换模型），错误进日志。
                 logger.warning("malformed upstream chunk (truncating stream): %r", exc)
                 break
-            if usage_sink is not None and ic.usage is not None:
-                # M3：把末包 usage 交给调用方（流式首包落账时拿不到，续传后回填 cost）
-                usage_sink["usage"] = ic.usage
+            if usage_sink is not None:
+                # M3：把末包 usage 交给调用方（流式首包落账时拿不到，续传后回填 cost）。
+                # B3（audit）：必须**合并**而非覆盖——Anthropic 的 input_tokens 只在
+                # message_start 出现（`chunk_to_ir` 存进 `IRChunk.input_tokens`），
+                # message_delta 的 usage 只有 output_tokens；旧实现既只取 `ic.usage`
+                # 又是覆盖式赋值 → 输入侧被抹成 0，计价系统性低估。
+                # OpenAI 流式的 usage 自带 prompt_tokens，合并语义同样正确。
+                if ic.usage is not None:
+                    usage_sink.setdefault("usage", {}).update(ic.usage)
+                if ic.input_tokens is not None:
+                    usage_sink.setdefault("usage", {}) \
+                              .setdefault("input_tokens", ic.input_tokens)
             if client_proto == "openai":
                 if ic.text is None and ic.finish is None and ic.usage is None:
                     continue                       # 过滤空帧（裁定 8）

@@ -142,6 +142,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                 text=text, headers=req_headers, n_messages=len(ir.messages),
                 now=datetime.now().astimezone(),
                 last_msg=_last_msg(conn, session_id),
+                last_vec=_last_vec(conn, session_id),      # B2：上轮嵌入（similarity/reask）
                 context_thresholds=ctx_thresholds))
             signals = tag_result.signals
             answer_ms = (time.monotonic() - t1) * 1000
@@ -163,6 +164,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                     text=text, headers=req_headers, n_messages=len(ir.messages),
                     now=datetime.now().astimezone(),
                     last_msg=_last_msg(conn, session_id),
+                    last_vec=_last_vec(conn, session_id),   # B2：反馈探测路径同样带上
                     context_thresholds=ctx_thresholds))
                 pre_signals = tag_result.signals
                 feedback = pre_signals["user_feedback"]["value"]
@@ -182,6 +184,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                         n_messages=len(ir.messages),
                         now=datetime.now().astimezone(),
                         last_msg=_last_msg(conn, session_id),
+                        last_vec=_last_vec(conn, session_id),   # B2
                         context_thresholds=ctx_thresholds))
                     signals = tag_result.signals
                 else:
@@ -205,6 +208,10 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             hit_branch = diag["x-sr-route"]       # 裁定 2：hit_branch 存 "N.M" 串
 
         # block → 403 + 双语 block_msg 按 accept-language（裁定 6）
+        # audit step 3：预算改写是否命中（在拦截/无模型路径之前先定义——那些
+        # 分支也要落账，虽然它们不可能是预算行）
+        budget_forced = False
+
         if decision.kind == "block":
             msg_map = decision.block_msg or {}
             message = msg_map.get(detect_lang(accept_lang)) or msg_map.get("en") \
@@ -213,7 +220,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                                routed_to="block", session_id=session_id,
                                session_tag=session_tag, outcome="block", status=403,
                                answer_ms=answer_ms, upstream_ms=None, cost=None,
-                               tree_version=tree_version)
+                               tree_version=tree_version, budget=budget_forced)
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to="block", outcome="block",
@@ -230,7 +237,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                                routed_to=None, session_id=session_id,
                                session_tag=session_tag, outcome="error", status=502,
                                answer_ms=answer_ms, upstream_ms=None, cost=None,
-                               tree_version=tree_version)
+                               tree_version=tree_version, budget=budget_forced)
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
@@ -249,15 +256,16 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
         # SUM 机制与触发条件均真实生效。
         if settings.get("budget_protect") == "1" \
                 and decision.source in ("tree", "trial"):
-            daily = conn.execute(
-                "SELECT COALESCE(SUM(cost), 0) FROM requests "
-                "WHERE ts >= date('now', 'start of day')").fetchone()[0]
+            # 预算窗口归一（audit 快修）：见 _daily_spend 的 docstring——两侧过
+            # `datetime()`，起点按本地时区算，避免非 UTC 机器上错一天。
+            daily = _daily_spend(conn)
             # .get 带默认（代码既有约定，同 max_retries/session_idle）：M1 之前
             # 初始化的旧库缺新键时不至 KeyError 成每请求 500；PUT /admin/settings
             # 全键写入后即愈合。
             if daily >= float(settings.get("budget_daily_limit_usd") or 10.0) \
                     * float(settings.get("budget_water") or 0.8):
                 decision.model = settings["budget_route"]
+                budget_forced = True      # audit step 3：逐行标记，replay 口径据此排除
                 metrics.inc("sr_budget_triggered_total", conn=conn)
                 diag["x-sr-budget"] = "1"
 
@@ -276,7 +284,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                                session_tag=session_tag, outcome="error",
                                status=exc.status, answer_ms=answer_ms,
                                upstream_ms=None, cost=None,
-                               tree_version=tree_version)
+                               tree_version=tree_version, budget=budget_forced)
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
@@ -305,7 +313,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                            session_tag=session_tag, outcome=outcome, status=200,
                            answer_ms=answer_ms, upstream_ms=upstream_ms,
                            cost=_cost_of(conn, final_model, usage),
-                           tree_version=tree_version)
+                           tree_version=tree_version, budget=budget_forced)
         _store_tags(conn, rid, signals)
         metrics.observe("sr_upstream_latency_seconds", {"model": final_model},
                         (upstream_ms or 0) / 1000.0, conn=conn)

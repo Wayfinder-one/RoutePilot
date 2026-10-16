@@ -102,6 +102,31 @@ def _last_msg(conn, session_id: str | None) -> str | None:
     row = conn.execute("SELECT last_msg FROM sessions WHERE id = ?",
                        (session_id,)).fetchone()
     return row["last_msg"] if row is not None else None
+
+
+def _last_vec(conn, session_id: str | None):
+    """sessions.last_vec（上轮嵌入向量）——checkpoint 的 similarity/reask 输入。
+
+    B2（audit）：写侧一直在写（`UPDATE sessions SET last_vec = ?`，JSON bytes），
+    但**读侧缺失**：`TagRequest` 从来没带过 `last_vec`，于是 checkpoint 模式下
+    `similarity` 恒 0、`reask` 恒 no（实测 76：两者都为空档）。这里把 BLOB 解回
+    list[float]；脏数据/非数组一律按「无上轮向量」处理（不抛，保持单请求可用）。
+    """
+    if not session_id:
+        return None
+    row = conn.execute("SELECT last_vec FROM sessions WHERE id = ?",
+                       (session_id,)).fetchone()
+    if row is None or row["last_vec"] is None:
+        return None
+    try:
+        raw = row["last_vec"]
+        vec = json.loads(bytes(raw).decode("utf-8") if isinstance(raw, (bytes, bytearray))
+                         else raw)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return vec if isinstance(vec, list) and vec else None
+
+
 def _error(proto: str, status: int, message: str, etype: str,
            code: str | None = None, headers: dict | None = None) -> JSONResponse:
     """按客户端协议回错误信封（§7.3 / §7.4 各自形状）。"""
@@ -129,7 +154,7 @@ def _store_tags(conn, request_id: str, signals: dict | None) -> None:
              sig.get("confidence"), 1 if sig.get("is_rule") else 0))
 def _log_request(conn, *, proto, asked, hit_branch, routed_to, session_id,
                  session_tag, outcome, status, answer_ms, upstream_ms, cost,
-                 tree_version=None) -> str:
+                 tree_version=None, budget=0) -> str:
     """requests 表一行（§3.1 列口径）；返回行 id 供 tags 外键。
 
     ``tree_version``（M2）：判定当时的树版本；控制台对「记录版本 ≠ 当前版本」的
@@ -139,9 +164,10 @@ def _log_request(conn, *, proto, asked, hit_branch, routed_to, session_id,
     conn.execute(
         "INSERT INTO requests (id, ts, proto, model_asked, hit_branch, routed_to, "
         "session_id, session_tag, outcome, status, answer_ms, upstream_ms, cost, "
-        "tree_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "tree_version, budget) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (rid, db._now(), proto, asked, hit_branch, routed_to, session_id,
-         session_tag, outcome, status, answer_ms, upstream_ms, cost, tree_version))
+         session_tag, outcome, status, answer_ms, upstream_ms, cost, tree_version,
+         1 if budget else 0))
     return rid
 def _upsert_session(conn, session_id: str, model: str, text: str) -> None:
     """树命中成功后写会话（§4.4：current_model 供下一轮沿用，last_msg 供相似度）。"""
@@ -151,6 +177,26 @@ def _upsert_session(conn, session_id: str, model: str, text: str) -> None:
         "ON CONFLICT(id) DO UPDATE SET current_model = excluded.current_model, "
         "last_active = datetime('now'), turns = turns + 1, last_msg = excluded.last_msg",
         (session_id, model, text))
+def _daily_spend(conn, now: datetime | None = None) -> float:
+    """当日累计花费（预算保护判定用）——**两侧都过 `datetime()` 归一**。
+
+    快修（audit）：`requests.ts` 存的是**本地带偏移**的 ISO 串
+    （如 `2026-10-16T22:12:45+08:00`），而 `date('now','start of day')` 给的是
+    UTC 日期串；直接字符串比较在非 UTC 机器上会错一天（本地 00:00–08:00 期间，
+    UTC 还是前一天，"今天"的判定会把昨天的行算进来 → 预算提前触发）。
+    这里把窗口起点按**本地时区**算出（`now` 默认本地现在，测试可注入），
+    再让 SQLite 用 `datetime()` 把两侧归一到同一时刻比较。
+    """
+    base = now or datetime.now().astimezone()
+    if base.tzinfo is None:
+        base = base.astimezone()
+    day_start = base.replace(hour=0, minute=0, second=0, microsecond=0) \
+                    .isoformat(timespec="seconds")
+    return conn.execute(
+        "SELECT COALESCE(SUM(cost), 0) FROM requests "
+        "WHERE datetime(ts) >= datetime(?)", (day_start,)).fetchone()[0]
+
+
 def _cost_of(conn, model_id: str, usage: dict | None) -> float | None:
     """按 models 价目 × usage 估成本（§3.1 cost 列）；无价目/无 usage → NULL。
 
