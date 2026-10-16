@@ -30,6 +30,20 @@ def test_anthropic_parse_system_field():
     ir = anthropic.parse(AN_BODY)
     assert ir.system == "你是助手" and anthropic.main_text(ir) == "画一张架构图"
 
+def test_openai_parse_keeps_mid_conversation_system_in_place():
+    """backlog 修：仅抽取**开头连续**的 system；对话中间的 system 消息位置不变
+    （旧实现把所有 system 抽走再前插到 messages[0]，静默挪位）。"""
+    ir = openai.parse({"model": "auto", "messages": [
+        {"role": "system", "content": "顶部"},
+        {"role": "user", "content": "hi"},
+        {"role": "system", "content": "中间"},
+        {"role": "assistant", "content": "yo"}]})
+    assert ir.system == "顶部"
+    assert [m["role"] for m in ir.messages] == ["user", "system", "assistant"]
+    up = openai.to_upstream(ir, "m", None)
+    assert [m["role"] for m in up["messages"]] == \
+        ["system", "user", "system", "assistant"]        # 顶部前插，中间原位
+
 def test_think_param_mapping():
     assert openai.to_upstream(openai.parse(OA_BODY), "m", "deep")["reasoning_effort"] == "high"
     body = anthropic.to_upstream(anthropic.parse(AN_BODY), "m", "light")

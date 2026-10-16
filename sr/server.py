@@ -588,7 +588,14 @@ async def _relay_stream(client_proto: str, up_proto: str, model_asked: str | Non
                 chunk = json.loads(payload)
             except ValueError:
                 continue
-            ic = ADAPTERS[up_proto].chunk_to_ir(chunk)
+            try:
+                ic = ADAPTERS[up_proto].chunk_to_ir(chunk)
+            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+                # backlog 修：上游畸形帧（choices 非数组 / delta 非对象 / 顶层非对象等）
+                # 旧实现让 KeyError/AttributeError 逃出生成器（未捕获异常）；改为
+                # **忠实截断**（§7.5：不补写终止符、不换模型），错误进日志。
+                logger.warning("malformed upstream chunk (truncating stream): %r", exc)
+                break
             if client_proto == "openai":
                 if ic.text is None and ic.finish is None and ic.usage is None:
                     continue                       # 过滤空帧（裁定 8）

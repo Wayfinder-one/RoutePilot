@@ -814,3 +814,41 @@ def test_validate_settings_budget_daily_limit(app):
         errs = validate_settings(dict(base, budget_daily_limit_usd=bad_val),
                                  models)
         assert errs and any("budget_daily_limit_usd" in e for e in errs), bad_val
+
+
+# ── backlog minor：畸形上游流式帧 → 忠实截断（不逃出未捕获异常） ──────────────────
+
+def _collect_relay(up_frames):
+    from sr.server import _relay_stream
+
+    class _Dummy:
+        async def aclose(self):
+            return None
+
+    async def frames():
+        for f in up_frames:
+            yield f.encode()
+
+    async def collect():
+        return [b async for b in _relay_stream(
+            "openai", "openai", "m", _Dummy(), _Dummy(), frames(), b"")]
+
+    return b"".join(asyncio.get_event_loop().run_until_complete(collect())).decode()
+
+
+def test_relay_stream_truncates_on_malformed_chunk():
+    """backlog 修：choices 非数组 / delta 非对象等畸形帧，旧实现让
+    KeyError/AttributeError 逃出 _relay_stream（未捕获异常）；现改为**忠实截断**
+    （§7.5：不补写终止符、不换模型）。"""
+    NL2 = chr(10) * 2
+    first = 'data: {"choices":[{"delta":{"content":"hi"}}]}' + NL2
+    tail = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}' + NL2
+    bads = [
+        'data: {"choices":{"delta":{"content":"x"}}}' + NL2,   # choices 非数组
+        'data: {"choices":[{"delta":"oops"}]}' + NL2,          # delta 非对象
+        'data: [1, 2, 3]' + NL2,                               # 顶层非对象
+    ]
+    for bad in bads:
+        out = _collect_relay([first, bad, tail])
+        assert "hi" in out, out
+        assert "[DONE]" not in out, out          # 截断：未见到终止包不补写

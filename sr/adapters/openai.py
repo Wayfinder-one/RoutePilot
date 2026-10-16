@@ -37,14 +37,20 @@ _CHUNK_ID = "chatcmpl-smart-router"
 
 
 def parse(body: dict) -> IR:
-    """OpenAI 请求体 → IR（§7.2-2）：system 出 messages，采样参数归一。"""
+    """OpenAI 请求体 → IR（§7.2-2）：system 出 messages，采样参数归一。
+
+    backlog 修：只把**开头连续**的 system 消息抽进 ``ir.system``。旧实现抽走所有
+    system 消息再于出站时前插到 ``messages[0]``——对话**中间**的 system 消息会被
+    静默挪到最前（保真问题）。中间的 system 消息现原样留在 ``messages`` 里、
+    位置不变（IR 只有单个 system 字段，装不下多个位置的 system）。
+    """
     system_parts: list[str] = []
     messages: list = []
     for m in body.get("messages") or []:
-        if isinstance(m, dict) and m.get("role") == "system":
+        if not messages and isinstance(m, dict) and m.get("role") == "system":
             text = text_of(m.get("content"))
             if text:
-                system_parts.append(text)      # 多条 system 换行拼接，不静默丢弃
+                system_parts.append(text)      # 多条开头的 system 换行拼接，不静默丢弃
         else:
             messages.append(m)
     params = {k: body.get(k) for k in PARAM_KEYS}          # 缺失为 None
