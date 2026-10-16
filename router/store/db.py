@@ -44,7 +44,11 @@ MIGRATIONS = [
 
 
 def connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=10.0)
+    # check_same_thread=False: under uvicorn, FastAPI runs this dependency's
+    # generator (and its teardown) across different threadpool threads. Every
+    # connection is request-scoped and never used concurrently, so relaxing the
+    # thread check is safe; WAL + busy_timeout handle cross-connection writers.
+    conn = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 10000")
