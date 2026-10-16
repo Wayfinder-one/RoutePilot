@@ -67,6 +67,9 @@ class IRChunk:
     finish: str | None = None    # finish_reason（OpenAI）/ stop_reason（Anthropic）
     usage: dict | None = None    # usage 原样（§7.3 include_usage 时末 chunk 带）
     raw_finish: str | None = None  # Anthropic stop_reason 原值旁路（同协议回环用）
+    input_tokens: int | None = None  # Anthropic message_start 的 input_tokens
+                                     # （backlog：同协议回环曾恒 0——上游 message_start
+                                     # 被丢、我方合成值硬编码 0；此字段把它带过去）
 
 
 class UpstreamError(Exception):

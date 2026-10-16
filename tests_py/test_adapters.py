@@ -342,3 +342,39 @@ def test_cross_protocol_finish_to_stop_still_uses_shared_table():
         assert ic.raw_finish is None
         md = _message_delta(anthropic.ir_to_events(ic, anthropic.StreamState()))
         assert md["delta"]["stop_reason"] == want, (finish, md)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# backlog 修：同协议 anthropic→anthropic 流式 input_tokens 恒 0——上游
+# message_start 携带真实输入用量，旧实现整包丢弃、合成 message_start 硬编码 0。
+# 修法：chunk_to_ir 把 message.usage.input_tokens 存进 IRChunk.input_tokens，
+# ir_to_events 合成 message_start 时回填。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _message_start(evts: list[str]) -> dict:
+    return json.loads(next(e for e in evts
+                           if e.startswith("event: message_start")).split("data: ", 1)[1])
+
+
+def test_anthropic_message_start_input_tokens_roundtrip():
+    """同协议回环：上游 message_start 的 input_tokens 原样出现在重发里。"""
+    ic = anthropic.chunk_to_ir(_an_event(
+        "message_start", message={"usage": {"input_tokens": 7, "output_tokens": 1}}))
+    assert ic.input_tokens == 7
+    state = anthropic.StreamState()
+    evts = anthropic.ir_to_events(ic, state)
+    assert _message_start(evts)["message"]["usage"]["input_tokens"] == 7
+
+
+def test_message_start_missing_input_tokens_falls_back_to_zero():
+    """无 message_start 来源（OpenAI 上游 / 上游未带用量）仍回退 0，不报错。"""
+    st = anthropic.StreamState()
+    evts = anthropic.ir_to_events(openai.chunk_to_ir(
+        {"choices": [{"delta": {"content": "x"}}]}), st)
+    assert _message_start(evts)["message"]["usage"]["input_tokens"] == 0
+    # message_start 但 usage 缺 input_tokens 键 → 也回 0
+    ic = anthropic.chunk_to_ir(_an_event("message_start", message={"usage": {}}))
+    assert ic.input_tokens is None
+    assert _message_start(anthropic.ir_to_events(ic, anthropic.StreamState())
+                          )["message"]["usage"]["input_tokens"] == 0

@@ -124,10 +124,13 @@ def from_upstream(resp: dict, model_asked: str | None) -> dict:
 
 
 def chunk_to_ir(chunk: dict) -> IRChunk:
-    """Anthropic 流事件 → IRChunk：text_delta 文本 / message_delta 的终止与用量。
+    """Anthropic 流事件 → IRChunk：text_delta 文本 / message_delta 的终止与用量 /
+    message_start 的 input_tokens。
 
-    message_start / content_block_start / content_block_stop / ping 不产三要素，
-    回空 IRChunk（文本收集只需盯 ``content_block_delta`` 与 ``message_delta``）。
+    content_block_start / content_block_stop / ping 不产三要素，回空 IRChunk
+    （文本收集只需盯 ``content_block_delta`` 与 ``message_delta``）。``message_start``
+    只取 ``message.usage.input_tokens`` 存进 :attr:`IRChunk.input_tokens`，供
+    ir_to_events 合成 message_start 时回填（backlog：同协议回环 input_tokens 恒 0）。
 
     **I4**：IRChunk.finish 的口径是 OpenAI finish_reason（它要经 openai.ir_to_chunk
     直接重发给 OpenAI 客户端），故这里就把 Anthropic 的 stop_reason 归一
@@ -141,6 +144,12 @@ def chunk_to_ir(chunk: dict) -> IRChunk:
     丢成 null。非 message_delta 事件不带原值（默认 None）。
     """
     kind = chunk.get("type")
+    if kind == "message_start":
+        # backlog 修：同协议回环 input_tokens 恒 0——上游 message_start 携带真实
+        # 输入用量，旧实现把它整包丢弃、合成 message_start 硬编码 0。这里把
+        # input_tokens 带进 IRChunk，ir_to_events 合成 message_start 时取用。
+        usage = (chunk.get("message") or {}).get("usage") or {}
+        return IRChunk(input_tokens=usage.get("input_tokens"))
     if kind == "content_block_delta":
         delta = chunk.get("delta") or {}
         text = delta.get("text") if delta.get("type", "text_delta") == "text_delta" else None
@@ -218,7 +227,8 @@ def ir_to_events(ic: IRChunk, state: StreamState,
             "message": {"id": "msg_smart-router", "type": "message",
                         "role": "assistant", "model": model or "",
                         "content": [], "stop_reason": None, "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0}}}))
+                        "usage": {"input_tokens": ic.input_tokens or 0,
+                                  "output_tokens": 0}}}))
     if ic.text:                                        # 空 delta 不产事件
         if state.content_block_index < 0:
             state.content_block_index = 0
