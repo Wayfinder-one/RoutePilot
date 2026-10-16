@@ -555,6 +555,48 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   t('整个文档无注入的 <img>（含标题/表格/详情）', gdoc.querySelectorAll('img').length === 0,
     '实际 ' + gdoc.querySelectorAll('img').length);
 
+  /* ════ E. backlog 修：renderModelForm 属性注入 + 设置开关失败回滚 ════ */
+  group('backlog 修 · 模型表单属性转义 + 设置开关失败回滚');
+  const INJ = "x')} <img src=y onerror=alert(1)>";
+  const H = makeDom({ routes: Object.assign({}, CONNECT_ROUTES, {
+    '/admin/providers': () => jsonResponse([
+      { name: INJ, proto: 'openai', base_url: 'http://x/v1', key_env: '',
+        extra: {}, ok: true, break_reason: null }, PROVIDERS_JSON[0]]),
+    '/admin/settings': (m) => m === 'PUT' ? jsonResponse({}, 500)
+      : jsonResponse(SETTINGS_JSON) } ) });
+  await until(() => H.window.SR_MODE === 'connected', 5000, 'connected (inject)');
+  const hdoc = H.window.document;
+  t('SRW_jsAttr 就位（接线层属性转义）', typeof H.window.SRW_jsAttr === 'function');
+  H.window.openAddModel();
+  await pend(200);
+  const mbox = hdoc.getElementById('addModelBox');
+  t('接入表单不产生 provider 名注入的 <img>', mbox.querySelectorAll('img').length === 0,
+    '实际 ' + mbox.querySelectorAll('img').length);
+  let threw = null;
+  try { const pseg = mbox.querySelectorAll('.seg')[1];
+        pseg && pseg.querySelector('button') && pseg.querySelector('button').click(); }
+  catch (e) { threw = e; }
+  t('点击含引号的供应商按钮不抛异常（转义后是合法 JS 字面量）', !threw,
+    threw && threw.message);
+  await pend(150);
+  const onBtn = hdoc.getElementById('addModelBox')
+    .querySelectorAll('.seg')[1].querySelector('button.on');
+  t('选中的供应商名原样回显（转义往返无损）', onBtn && onBtn.textContent === INJ,
+    onBtn && onBtn.textContent);
+  H.window.closeAddModel();
+
+  const swBoxes = hdoc.querySelectorAll('#p-settings .sw input');
+  t('设置页开关已接线', swBoxes.length >= 2, '实际 ' + swBoxes.length);
+  const first = swBoxes[0];
+  const before = first.checked;                 // session_sticky='1' → true
+  first.checked = !before;
+  first.dispatchEvent(new H.window.Event('change', { bubbles: true }));
+  await until(() => H.calls.some(c => c[0] === '/admin/settings' && c[1].method === 'PUT'),
+    5000, 'PUT /admin/settings');
+  await pend(300);
+  t('设置保存失败 → 勾选态回滚到原值', first.checked === before,
+    first.checked + ' vs ' + before);
+
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
   if (fail) { console.log('\n失败项：'); bad.forEach(b => console.log('  · ' + b)); process.exit(1); }

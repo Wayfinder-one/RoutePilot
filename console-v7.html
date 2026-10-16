@@ -2875,17 +2875,17 @@ function renderModelForm(){
       <div class="step"><span class="sn">2</span><div class="sc">
         <span class="lb">供应商</span>
         <div class="seg">${PROVIDERS.map(p =>
-          `<button class="${mf.prov===p.name?'on':''}" onclick="mPickProv('${p.name}')">${p.name}</button>`).join('')}</div>
+          `<button class="${mf.prov===p.name?'on':''}" onclick="mPickProv('${SRW_jsAttr(p.name)}')">${SRW_esc(p.name)}</button>`).join('')}</div>
       </div></div>
       <div class="step"><span class="sn">3</span><div class="sc">
         <label class="lb" for="mf-up">上游模型名</label>
-        <input type="text" id="mf-up" placeholder="例如 Qwen/Qwen2.5-7B-Instruct" value="${mf.upstream}"
+        <input type="text" id="mf-up" placeholder="例如 Qwen/Qwen2.5-7B-Instruct" value="${SRW_esc(mf.upstream)}"
           oninput="if(mf)mf.upstream=this.value">
       </div></div>
       <div class="step"><span class="sn">4</span><div class="sc">
         <span class="lb">能力标签 <span class="opt">决定它能被哪些分支选中</span></span>
         <div class="picks">${CAPS.map(c =>
-          `<button class="pk ${mf.caps.indexOf(c)>=0?'on':''}" onclick="mToggleCap('${c}')">${c}</button>`).join('')}</div>
+          `<button class="pk ${mf.caps.indexOf(c)>=0?'on':''}" onclick="mToggleCap('${SRW_jsAttr(c)}')">${SRW_esc(c)}</button>`).join('')}</div>
       </div></div>
       <div class="btn-row">
         <button class="btn" onclick="mTest()">${mf.tested ? '✓ 连通正常' : '测试连通'}</button>
@@ -3585,6 +3585,15 @@ function SRW_esc(v){
   return String(v === null || v === undefined ? '' : v)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+/* onclick 里嵌字面量字符串的转义（backlog：renderModelForm 把 provider 名插进
+   onclick 属性，含引号即属性注入）。步骤：先按 JS 单引号字符串转义（\ ' 换行），
+   再整体 HTML 转义（属性用双引号，" 必须变 &quot; 防属性逃逸）。渲染文本另用 SRW_esc。 */
+function SRW_jsAttr(v){
+  const s = String(v === null || v === undefined ? '' : v)
+    .replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+  return SRW_esc(s);
 }
 /* 渲染包装：把卡片（仪表墙 / 信号条）的显示字段先转义再交给基线渲染函数。
    **只用于「API 数据」渲染路径**——demo 数据是内置常量，原样透传（§9.3 不变式：
@@ -4409,21 +4418,25 @@ function SRW_wireSettings(){
   const wire = (box, key, label) => {
     if(!box) return;
     box.checked = st[key] === '1' || st[key] === 'true';
-    box.addEventListener('change', () => SRW_putSetting(key, box.checked ? '1' : '0', label));
+    box.addEventListener('change', () => {
+      const next = box.checked;
+      // 保存失败回滚勾选态（backlog：否则 UI 显示已改、服务端未改）
+      SRW_putSetting(key, next ? '1' : '0', label, () => { box.checked = !next; });
+    });
   };
   wire(boxes[0], 'session_sticky', '会话沿用');
   wire(boxes[1], 'budget_protect', '预算保护');
 }
-function SRW_putSetting(key, val, label){
+function SRW_putSetting(key, val, label, onFail){
   const body = Object.assign({}, SRW_DATA.settings);
   body[key] = val;
-  fetch('/admin/settings', { method: 'PUT', headers: SRW_JSON_HDR, body: JSON.stringify(body) })
+  return fetch('/admin/settings', { method: 'PUT', headers: SRW_JSON_HDR, body: JSON.stringify(body) })
     .then(r => {
       if(!r.ok) throw new Error('HTTP ' + r.status);
       SRW_DATA.settings = body;
       toast('「' + label + '」已保存');
     })
-    .catch(() => toast('设置保存失败'));
+    .catch(() => { if(onFail) onFail(); toast('设置保存失败'); });
 }
 
 /* 模型接入四步：POST /admin/models → POST /admin/models/{id}/test（逐步骤渲染） */
