@@ -10,6 +10,11 @@ def test_domain_keys_match_checkpoint_order():
         "economics","engineering","health","history","law","math","other",
         "philosophy","physics","psychology"]
 
+def test_fact_check_labels_match_checkpoint_order():
+    # backlog（M2 前置 1）：values 顺序须 = 检查点 tags.json labels 顺序
+    # （spec §2.2：["no_check","needs_check"]）；顺序反了 M2 加载断言会拒绝启动。
+    assert TAGS["fact_check"].values == ("no_check", "needs_check")
+
 def test_normalize_lowercase_and_underscore():
     assert normalize("domain", "computer science") == "computer_science"
     assert normalize("pii", "CN_ID_CARD") == "cn_id_card"
@@ -77,6 +82,15 @@ def test_event_and_keyword():
     assert run("你好")["event"]["value"] == "none"
     r = run("def f(): pass", kw_table={"code_words": ["def", "import"]})
     assert r["keyword"]["value"] == ["def"]
+
+def test_event_no_substring_false_positive():
+    # backlog 修：裸子串 down/500 会误报——download/breakdown 命中 down、
+    # 1500 命中 500。加 ASCII 邻界后不再命中（中文紧邻仍命中，见下）。
+    assert run("帮我 download 这个文件")["event"]["value"] == "none"
+    assert run("check the breakdown report")["event"]["value"] == "none"
+    assert run("error code 1500 from the gateway")["event"]["value"] == "none"
+    assert run("incidental remark")["event"]["value"] == "none"     # incident 的邻界
+    assert run("服务器down了")["event"]["value"] == "incident"      # 中文紧邻仍命中
 
 def test_rule_tags_have_no_confidence():
     assert all(v["confidence"] is None for v in run("随便一句").values())

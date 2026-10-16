@@ -86,7 +86,9 @@ TAGS: dict[str, TagDef] = {
         tuple(ORDERED_VALUES["complexity"])),
     "fact_check": TagDef(
         "fact_check", "需核实", "Fact Check", "noul", "model",
-        ("needs_check", "no_check")),
+        # 顺序 = 检查点 tags.json labels 顺序（spec §2.2：["no_check","needs_check"]）。
+        # M2 加载断言「标签顺序一致」逐项比对，顺序反了会拒绝启动（backlog M2 前置 1）。
+        ("no_check", "needs_check")),
     "similarity": TagDef(
         "similarity", "相似度", "Similarity", "ordered", "model",
         tuple(ORDERED_VALUES["similarity"])),
@@ -234,9 +236,15 @@ DEFAULT_CONTEXT_THRESHOLDS: list[int] = [20, 100, 400]
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _ASCII_LETTER_RE = re.compile(r"[A-Za-z]")
 
-# event 两张正则表（简报 Step 3 给定，逐字采用；英文词不区分大小写）。
+# event 两张正则表（简报 Step 3 给定；英文词不区分大小写）。
 # 同一文本同时命中两类时 incident 优先（spec §4.5 未写明优先级，裁定声明）。
-_INCIDENT_RE = re.compile(r"故障|宕机|500|5\d\d 错误|incident|down", re.IGNORECASE)
+# backlog 修：原 `500|down` 裸子串会误报——"download"/"breakdown" 命中 down、
+# "1500" 命中 500。英文词加 ASCII 字母/数字邻界（不用 \b：CJK 在 Unicode 下也是
+# \w，"服务器down了" 会被 \b 挡掉）。中文词/「5\d\d 错误」保持原样。
+_INCIDENT_RE = re.compile(
+    r"故障|宕机|(?<![0-9])500(?![0-9])|(?<![0-9])5\d\d 错误"
+    r"|(?<![A-Za-z])incident(?![A-Za-z])|(?<![A-Za-z])down(?![A-Za-z])",
+    re.IGNORECASE)
 _PAYMENT_RE = re.compile(r"支付|扣款|退款|payment|refund", re.IGNORECASE)
 
 
@@ -390,7 +398,7 @@ def tag_rules(text: str, headers: dict, n_messages: int, now: datetime,
 # `inferTags`（L2425–2470）原样移植；console 没有的（user_feedback 句首短句表）按
 # §4.6 行文补最小词表。逻辑以 §4.6 表为准（console 的 JS 打分逻辑不移植）。
 
-# console-v7.html `const DOM_KW`（L2425）逐词移植，13 组 71 词；键 = 控制台中文组名
+# console-v7.html `const DOM_KW`（L2425）逐词移植，13 组 72 词；键 = 控制台中文组名
 # → §6.3 规范键（计算机→computer_science、法律→law、医学→health……工程→engineering）。
 # 组序保持 console 原序 —— §4.6「命中最多者」并列为多时，console 取先扫到的组
 # （`h.length > domHits.length` 严格大于），dict 插入序即复现该平局行为。
