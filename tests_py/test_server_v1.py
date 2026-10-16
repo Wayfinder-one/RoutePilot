@@ -308,3 +308,66 @@ def test_stream_midstream_no_fallback(app, tmp_path, _failing_upstream):
     conn = db.get(str(tmp_path/"t.db"))
     row = conn.execute("SELECT * FROM requests ORDER BY rowid DESC").fetchone()
     assert row["routed_to"] == "qwen3-32b" and row["outcome"] == "upstream"
+
+
+# ── I4（终审 Important）：Anthropic 上游 → OpenAI 客户端 **流式** 终止帧归一 ──────
+# 实测缺口：finish_reason 直传（OpenAI 客户端收到 end_turn/max_tokens/…）。底座
+# 用 8123 的 fake-upstream（同端口双协议），只把模型换成 proto='anthropic' 即可
+# 让 router 走 anthropic 上游路径；可达性走 §4.4 会话解锁（sticky → ladder_next
+# 到 claude-sonnet），与终审描述的「树/阶梯选中 anthropic 供应商模型」同源。
+
+def test_stream_anthropic_upstream_finish_reason_translated(app, tmp_path):
+    conn = db.get(str(tmp_path/"t.db"))
+    conn.execute("UPDATE providers SET base_url='http://127.0.0.1:8123'")
+    # 种子已把 claude-sonnet 挂在 anthropic 供应商（proto='anthropic'）——只须把
+    # 会话锁到阶梯下一档就是它；fake-upstream 的 /v1/messages 固定回 end_turn。
+    conn.execute("INSERT OR REPLACE INTO sessions (id, current_model, last_active, "
+                 "turns, unlocks, last_msg) VALUES "
+                 "('i4', 'qwen3-32b', datetime('now'), 1, 0, 'x')")
+    conn.commit()
+    conn.close()
+    r = asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "stream": True,
+         "messages": [{"role": "user", "content": "帮我设计一个订单系统分片方案"}]},
+        {"x-session-id": "i4"}))                      # 无反馈 → sticky 沿用 qwen3-32b
+    assert r.status_code == 200, r.text
+    assert r.headers["x-sr-model"] == "qwen3-32b"
+    rb = asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "stream": True,
+         "messages": [{"role": "user", "content": "帮我设计一个订单系统分片方案"}]},
+        {"x-session-id": "i4", "x-sr-feedback": "wrong_answer"}))   # 解锁 → 阶梯下一档
+    assert rb.status_code == 200, rb.text
+    assert rb.headers["x-sr-model"] == "claude-sonnet"      # 选中 anthropic 供应商模型
+    assert rb.headers["x-sr-upstream-model"]
+    assert "text/event-stream" in rb.headers["content-type"]
+    frames = [json.loads(p[6:]) for p in rb.text.split("\n\n")
+              if p.startswith("data: ") and p[6:].strip() not in ("", "[DONE]")]
+    finishes = [c["choices"][0].get("finish_reason") for c in frames if c.get("choices")]
+    assert "stop" in finishes, rb.text                      # end_turn → stop（旧实现为 end_turn）
+    assert not ({"end_turn", "max_tokens", "tool_use", "stop_sequence"} & set(finishes)), \
+        finishes                                           # 不再泄漏 Anthropic 枚举
+    assert rb.text.rstrip().endswith("data: [DONE]")        # usage 包触发终止后补 [DONE]
+
+
+# ── M-c（终审 Minor）：/v1 兜底 500 不回吐内部异常原文 ─────────────────────────
+
+def test_internal_error_message_is_generic(app, monkeypatch):
+    """兜底 500 的 message 必须是通用文案（如 "internal error"），不得包含 Python
+    异常原文（可能带路径/SQL/环境细节）；异常本身仍进服务端日志供排障。"""
+    import sr.server as server_mod
+    sentinel = "SENTINEL-INTERNAL-DETAIL-/tmp/secret.db"
+
+    def _boom(*a, **k):
+        raise RuntimeError(sentinel)
+
+    monkeypatch.setattr(server_mod, "evaluate", _boom)
+    r = asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert r.status_code == 500
+    msg = r.json()["error"]["message"]
+    assert msg == "internal error", msg                 # 通用文案（不再 f"…: {exc}"）
+    assert sentinel not in r.text
+    assert r.json()["error"]["type"] == "api_error"

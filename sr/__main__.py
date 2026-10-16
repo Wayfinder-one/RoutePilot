@@ -73,7 +73,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _do_import(conn, path: str) -> int:
-    """读 YAML 文件 → config.import_yaml；按退出码约定返回（0/1/2）。"""
+    """读 YAML 文件 → config.import_yaml；按退出码约定返回（0/1/2）。
+
+    I3（终审 Important）：结构类异常（TypeError/KeyError，如「节存在但值为 null」
+    的旧行为）必须落到 rc=2 + 一行消息，**不得**让原始 traceback 逃出——
+    §12 的 0/1/2 退出码契约是 CLI 的对外接口。config.import_yaml 现在已就地把
+    这类输入转 ValueError，这里再兜一层防未来回归。
+    """
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as exc:
@@ -83,6 +89,9 @@ def _do_import(conn, path: str) -> int:
         findings = config.import_yaml(conn, text, actor="cli")
     except ValueError as exc:
         print(f"sr: invalid package: {exc}", file=sys.stderr)
+        return 2
+    except (TypeError, KeyError, AttributeError) as exc:   # 输入形状问题 → rc=2
+        print(f"sr: invalid package: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     if findings is not None:
         print(json.dumps({"findings": findings}, ensure_ascii=False, indent=2))

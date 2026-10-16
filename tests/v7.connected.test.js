@@ -501,6 +501,60 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
     !/（来自 API）/.test(F.window.document.getElementById('treeWrap').textContent));
   t('顶栏出现「演示模式」标注', /演示模式/.test(F.window.document.querySelector('.strip').textContent));
 
+  /* ════ D. I5（终审 Important）：不可信流量 → DOM 的存储型 XSS ════
+     链路：x-sr-tenant 原值（未归一）→ tags.value → GET /admin/traffic 回吐 →
+     接线层 apiTagsToLocal/SRW_valueWord → 基线 renderTags/gaugeCard/renderSigline
+     拼 innerHTML。约束：基线（前 ~3532 行）零改动，转义只在接线层边界做。 */
+  group('I5 · 不可信流量 → DOM 转义（tenant 含 <img onerror>）');
+  const XSS = '<img src=x onerror=alert(1)>';
+  /* 期望的转义形态 = 接线层 SRW_esc 的输出。判据用 innerHTML：jsdom 的
+     textContent 会把 &lt; 解码回 <，不能用于区分「文本」与「标签」；配合 img
+     元素计数断言，二者共同证明载荷被消解为文本而非元素。 */
+  const XSS_ESCAPED = XSS.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  const xTags = TRY_JSON.tags.map(t =>
+    t.tag === 'tenant' ? Object.assign({}, t, { value: XSS }) : t);
+  const xBrief = TRAFFIC_JSON.rows.map(r => Object.assign({}, r, {
+    tags_brief: [{ tag: 'tenant', value: XSS }] }));
+  const G = makeDom({ routes: Object.assign({}, CONNECT_ROUTES, {
+    '/admin/tree/try': () => jsonResponse(Object.assign({}, TRY_JSON, { tags: xTags })),
+    '/admin/traffic': () => jsonResponse({ total: 1, rows: xBrief }),
+    '/admin/traffic/r_01J8K9ZZZ': () => jsonResponse(
+      Object.assign({}, TRAFFIC_DETAIL_JSON, { tags: xTags })),
+  }) });
+  await until(() => G.window.SR_MODE === 'connected', 5000, 'connected (xss tenant)');
+  const gdoc = G.window.document;
+  G.window.setSess('new');
+  G.window.doTag();
+  await until(() => gdoc.querySelectorAll('#tags .gauge').length === 17, 5000, '仪表墙');
+  await pend(400);
+  t('SRW_esc 就位（接线层导出转义函数）', typeof G.window.SRW_esc === 'function');
+  t('仪表墙不产生 tenant 注入的 <img> 元素', gdoc.querySelectorAll('#tags img').length === 0,
+    '实际 ' + gdoc.querySelectorAll('#tags img').length);
+  t('信号条不产生 tenant 注入的 <img> 元素', gdoc.querySelectorAll('#sigline img').length === 0,
+    '实际 ' + gdoc.querySelectorAll('#sigline img').length);
+  t('注入载荷以文本原样呈现（无 HTML 标签进入 DOM）',
+    /&lt;img src=x onerror=alert\(1\)&gt;/.test(gdoc.getElementById('tags').innerHTML) &&
+    !/<img/i.test(gdoc.getElementById('tags').innerHTML));
+  t('仪表墙 innerHTML 里是转义后的实体（未被双重转义）',
+    gdoc.getElementById('tags').innerHTML.indexOf(XSS_ESCAPED) >= 0 &&
+    gdoc.getElementById('tags').innerHTML.indexOf('&amp;lt;') < 0);
+  G.window.showReq(0);
+  await until(() => gdoc.querySelector('#p-traffic tbody tr'), 5000, '流量行');
+  await pend(400);
+  t('流量表 tags_brief 芯片同样转义（不产生 <img>）',
+    gdoc.querySelectorAll('#p-traffic img').length === 0,
+    '实际 ' + gdoc.querySelectorAll('#p-traffic img').length);
+  t('流量表 chip innerHTML 里是转义后的实体（未被双重转义）',
+    gdoc.querySelector('#p-traffic tbody').innerHTML.indexOf(XSS_ESCAPED) >= 0 &&
+    gdoc.querySelector('#p-traffic tbody').innerHTML.indexOf('&amp;lt;') < 0);
+  await until(() => gdoc.querySelector('#dt-tags .gauge'), 5000, '详情标签墙');
+  await pend(300);
+  t('详情标签墙不产生注入元素（apiTagsToLocal 同一路径）',
+    gdoc.querySelectorAll('#dt-tags img, #dt-title img, #dt-id img').length === 0);
+  t('整个文档无注入的 <img>（含标题/表格/详情）', gdoc.querySelectorAll('img').length === 0,
+    '实际 ' + gdoc.querySelectorAll('img').length);
+
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
   if (fail) { console.log('\n失败项：'); bad.forEach(b => console.log('  · ' + b)); process.exit(1); }

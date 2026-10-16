@@ -141,3 +141,67 @@ def test_fake_latency_ms_delays_response():
     t0 = time.monotonic()
     FAKE.post("/v1/chat/completions?latency_ms=120", json={"model": "m", "messages": [USER]})
     assert time.monotonic() - t0 >= 0.12
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# I4（终审 Important）：跨协议终止原因归一 + 互查表消重
+# 实测：Anthropic 上游 → OpenAI 客户端 **流式** 时 finish_reason 直传
+# （end_turn/max_tokens/tool_use/stop_sequence 原样吐给 OpenAI 客户端）；非流式
+# 反而是对的。修法 = adapters 导出唯一表（STOP_TO_FINISH/FINISH_TO_STOP），
+# chunk_to_ir 与 server 共用。
+# ─────────────────────────────────────────────────────────────────────────────
+
+from sr.adapters import STOP_TO_FINISH, FINISH_TO_STOP          # noqa: E402
+
+
+def _an_event(kind: str, **data) -> dict:
+    return {"type": kind, **data}
+
+
+def test_anthropic_stop_reason_to_openai_finish_reason_stream():
+    """Anthropic message_delta 的四种 stop_reason → OpenAI finish_reason（§7.6）。"""
+    for stop, want in (("end_turn", "stop"), ("max_tokens", "length"),
+                       ("tool_use", "tool_calls"), ("stop_sequence", "stop")):
+        ic = anthropic.chunk_to_ir(_an_event(
+            "message_delta", delta={"stop_reason": stop},
+            usage={"input_tokens": 1, "output_tokens": 2}))
+        assert ic.finish == want, (stop, ic.finish)
+        out = openai.ir_to_chunk(ic, "auto")
+        assert out["choices"][0]["finish_reason"] == want, stop
+
+
+def test_anthropic_unknown_stop_reason_is_none():
+    """枚举外取值不猜语义（回 None，而不是原样透传）。"""
+    ic = anthropic.chunk_to_ir(_an_event(
+        "message_delta", delta={"stop_reason": "pause_turn"}, usage={}))
+    assert ic.finish is None
+
+
+def test_openai_finish_reason_to_anthropic_stop_reason_reverse():
+    """反向（OpenAI 上游 → Anthropic 客户端）同样归一到 §7.4 枚举。"""
+    for finish, want in (("stop", "end_turn"), ("length", "max_tokens"),
+                         ("tool_calls", "tool_use"), ("function_call", "tool_use")):
+        state = anthropic.StreamState()
+        evts = []
+        evts += anthropic.ir_to_events(openai.chunk_to_ir(
+            {"choices": [{"delta": {"content": "x"}}]}), state)
+        evts += anthropic.ir_to_events(openai.chunk_to_ir(
+            {"choices": [{"delta": {}, "finish_reason": finish}],
+             "usage": {"prompt_tokens": 1, "completion_tokens": 1}}), state)
+        md = json.loads(next(e for e in evts
+                             if e.startswith("event: message_delta")).split("data: ", 1)[1])
+        assert md["delta"]["stop_reason"] == want, (finish, md)
+
+
+def test_stop_finish_tables_are_the_single_shared_source():
+    """消重（rollup #24 真问题是「漏用」）：唯一表在 sr/adapters，
+    server 与 anthropic 适配器都取同一对象，不再各持私有副本。"""
+    from sr import server
+    assert server.STOP_TO_FINISH is STOP_TO_FINISH
+    assert server.FINISH_TO_STOP is FINISH_TO_STOP
+    assert anthropic._STOP_REASON is FINISH_TO_STOP
+    # 互逆：Anthropic → OpenAI 后再回 Anthropic 稳定（stop_sequence 按语义声明
+    # 折叠到 "stop"，不参与可逆性断言）
+    for stop, finish in STOP_TO_FINISH.items():
+        assert FINISH_TO_STOP[finish] == ("end_turn" if stop == "stop_sequence"
+                                          else stop), stop

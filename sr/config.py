@@ -45,6 +45,17 @@ def _srv():
     return server
 
 
+def validate_settings(settings, models) -> list[str]:
+    """设置值校验（**同一份实现**：I2 要求 /admin/settings 与本模块共用）。
+
+    实现落在 sr/server.validate_settings（server 顶层 import 本模块，本模块只能
+    延迟反向引用，见模块头依赖方向说明）；此处只是稳定的模块级入口，供 CLI 与
+    测试直接 ``config.validate_settings(...)`` 调用。返回非法消息列表（空 = 合法），
+    不抛异常。
+    """
+    return _srv().validate_settings(settings, models)
+
+
 def _tree_now(conn) -> dict:
     """当前树 → §9.2 JSON 形状（不经 server 的树缓存：本模块只拿 conn，
     直接 rows_to_tree——与缓存内容恒等，缓存镜像的就是这张表）。"""
@@ -79,8 +90,13 @@ def import_yaml(conn: sqlite3.Connection, text, *, actor: str = "admin"):
     :param text: YAML 文本/字节（HTTP 端点转原始 body，CLI 转文件内容）。
     :returns: None（成功，已 commit）；hard findings 列表（``f.to_json()`` dict，
               硬错误优先排序——原端点口径，整包未写）。
-    :raises ValueError: YAML 解析失败 / 非映射 / 缺节 / 行形状或引用非法
-              （消息与原端点 detail 逐字一致）。
+    :raises ValueError: YAML 解析失败 / 非映射 / 缺节 / 节值非法（含 **null 节**）
+              / 行形状或引用非法（消息与原端点 detail 逐字一致）。
+
+    I3（终审 Important）：``providers`` / ``models`` 只查「键在不在」是不够的——
+    ``providers:``（YAML null）或 ``providers: {}`` 会让下面的 ``for`` 直接
+    TypeError ``'NoneType' object is not iterable`` 逃出端点（真 uvicorn = 裸 500）
+    并破坏 CLI 的 0/1/2 退出码契约。非 list（含 null）一律 ValueError。
     """
     try:
         data = yaml.safe_load(text)
@@ -92,6 +108,10 @@ def import_yaml(conn: sqlite3.Connection, text, *, actor: str = "admin"):
     missing = [s for s in _SECTIONS if s not in data]
     if missing:
         raise ValueError(f"missing sections: {missing}")
+    for section in ("providers", "models"):          # I3：null / 非 list 一律拒绝
+        if not isinstance(data[section], list):
+            raise ValueError(f"invalid {section} section: expected a list, "
+                             f"got {type(data[section]).__name__}")
     provs = []
     for p in data["providers"]:
         if not isinstance(p, dict) or not isinstance(p.get("name"), str) \
@@ -133,6 +153,11 @@ def import_yaml(conn: sqlite3.Connection, text, *, actor: str = "admin"):
     except ValueError as exc:
         raise ValueError(f"invalid tree: {exc}") from exc   # 原端点 detail 前缀
     model_ids = set(_srv()._models_set(conn)) | {r[0] for r in model_rows}
+    # I2：与 PUT /admin/settings 共用同一 validate_settings（键集 + 类型 + 值域 +
+    # ladder/budget_route 的模型引用），import 与端点不出现两套口径。
+    settings_errs = _srv().validate_settings(settings, model_ids)
+    if settings_errs:
+        raise ValueError("invalid settings: " + "; ".join(settings_errs))
     findings = run_checkup(nodes, {m: {} for m in model_ids}, TAGS)
     if any(f.level == "hard" for f in findings):
         ordered = sorted(findings, key=lambda f: f.level != "hard")

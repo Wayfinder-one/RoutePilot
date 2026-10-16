@@ -529,6 +529,181 @@ def test_put_settings_whitelist(app):
     short = {k: v for k, v in s.items() if k != "ladder"}
     assert put(app, "/admin/settings", short).status_code == 400
 
+
+# ── I2（终审 Important）：/admin/settings 值校验 ────────────────────────────────
+# 实测：{"session_idle":"abc","max_retries":"abc",…} → 200 {"ok":true}，此后
+# **每个** /v1 请求 500 `invalid literal for int()`（engine int(session_idle)、
+# server int(max_retries)）。键集校验不够，必须按 key 校验类型与值域 → 400。
+
+def _settings_of(app):
+    return get(app, "/admin/settings").json()
+
+
+def test_put_settings_rejects_invalid_values_400(app):
+    """非法值（非字符串整数 / 超范围浮点 / 非 0|1 开关 / 未知 ladder 模型 /
+    conf_min 式幻影键）一律 400，且**库未变**——一次 200 写坏设置会持久打崩 /v1。"""
+    base = _settings_of(app)
+    illegal = [
+        ("session_idle", "abc"),         # int() 崩点（engine.py）
+        ("session_idle", "0"),           # 非正整数
+        ("max_retries", "abc"),          # int() 崩点（server.py）
+        ("max_retries", "1.5"),
+        ("batch_window_ms", "-1"),
+        ("retention_days", "x"),
+        ("budget_water", "2"),           # 必须 ∈ (0,1)
+        ("budget_water", "abc"),
+        ("session_sticky", "yes"),       # 只许 0/1
+        ("sticky_detect_feedback", "on"),
+        ("budget_protect", "2"),
+        ("ladder", ""),                  # 非空逗号串
+        ("ladder", "qwen3-8b,no-such-model"),
+        ("budget_route", "no-such-model"),
+        ("tree_version", "abc"),         # GET 原样回传，写侧仍须类型合法
+    ]
+    for key, val in illegal:
+        s = dict(base)
+        s[key] = val
+        r = put(app, "/admin/settings", s)
+        assert r.status_code == 400, (key, val, r.status_code, r.text)
+        assert _settings_of(app)[key] == base[key], key   # 库确实没被写
+    assert put(app, "/admin/settings", base).status_code == 200
+
+
+def test_put_settings_accepts_legal_values(app):
+    """合法值 200 且落库生效（含边界：budget_water 0.5、开关 0、idle 正整数）。"""
+    s = _settings_of(app)
+    s.update({"session_idle": "600", "max_retries": "3", "batch_window_ms": "10",
+              "retention_days": "7", "budget_water": "0.5", "session_sticky": "0",
+              "sticky_detect_feedback": "1", "budget_protect": "0",
+              "ladder": "qwen3-8b,qwen3-32b", "budget_route": "qwen3-32b"})
+    assert put(app, "/admin/settings", s).status_code == 200
+    after = _settings_of(app)
+    for k in ("session_idle", "max_retries", "budget_water", "session_sticky",
+              "ladder", "budget_route"):
+        assert after[k] == s[k], k
+
+
+def test_validate_settings_reusable_and_covers_import(app):
+    """I2 要求校验函数可复用：`config` 层直调同一 validate_settings。
+
+    - 非法 → 非空消息列表（可读、定位到 key），不抛异常；
+    - 合法 → 空列表；
+    - 非 dict（YAML 的 `settings:` 写成 null/字符串）→ 报错而不是 TypeError 逃逸；
+    - 键集不等 DEFAULT_SETTINGS → 报错。
+    """
+    from sr import config
+    import sr.db as db
+    base = dict(db.DEFAULT_SETTINGS)
+    models = {"qwen3-8b", "qwen3-32b", "claude-sonnet"}
+    assert config.validate_settings(base, models) == []
+    for bad in ({"session_idle": "abc"}, {"budget_water": "0"},
+                {"session_sticky": "x"}, {"ladder": "nope"},
+                {"budget_route": "nope"}, dict(base, extra="1")):
+        msgs = config.validate_settings(bad, models)
+        assert msgs, bad
+        assert all(isinstance(m, str) for m in msgs)
+    for not_a_dict in (None, "abc", []):
+        assert config.validate_settings(not_a_dict, models)
+    assert config.validate_settings({k: v for k, v in base.items()
+                                     if k != "ladder"}, models)
+
+
+def test_import_yaml_settings_invalid_rejected_no_write(tmp_path):
+    """import_yaml 与 /admin/settings 同源：settings 值非法 → ValueError（整包不写）。"""
+    import yaml
+    from sr import config
+    conn = db.init_db(str(tmp_path / "cfg2.db"))
+    try:
+        text = config.export_yaml(conn)
+        data = yaml.safe_load(text)
+        data["settings"]["session_idle"] = "abc"
+        with pytest.raises(ValueError):
+            config.import_yaml(conn, yaml.safe_dump(data, allow_unicode=True))
+        row = conn.execute("SELECT value FROM settings WHERE key='session_idle'").fetchone()
+        assert row["value"] == "1800"                    # 整包未写
+    finally:
+        conn.close()
+
+
+# ── I3（终审 Important）：节存在但值为 null → 不得裸 500 / 裸 traceback ──────────
+# 实测：`providers:\nmodels: []\n…`（providers 键在但值为 null）→ import_yaml 的
+# `for p in data["providers"]` 抛 TypeError `'NoneType' object is not iterable`
+# 逃出端点（真 uvicorn = 裸 500），CLI 则打印原始 traceback 破坏 0/1/2 退出码契约。
+
+_NULL_SECTION_YAML = """providers:
+models: []
+tree:
+  version: 1
+  nodes:
+  - idx: 9
+    name: 其他（兜底）
+    desc: 兜底
+    enabled: true
+    branches:
+    - idx: 90
+      cond: []
+      action: {kind: route, model: qwen3-8b}
+settings: {}
+"""
+
+
+def test_import_null_section_is_400_not_500(app):
+    """POST /admin/import：null 节 → 400 + detail（不是 500，也不写库）。"""
+    before = get(app, "/admin/tree").json()
+    r = post_raw(app, "/admin/import", _NULL_SECTION_YAML)
+    assert r.status_code == 400, (r.status_code, r.text)
+    assert "invalid providers section" in r.json()["detail"], r.text
+    after = get(app, "/admin/tree").json()
+    assert after["nodes"] == before["nodes"] and after["version"] == before["version"]
+
+    r2 = post_raw(app, "/admin/import",
+                  _NULL_SECTION_YAML.replace("providers:\nmodels: []",
+                                             "providers: []\nmodels:"))
+    assert r2.status_code == 400 and "invalid models section" in r2.json()["detail"]
+
+
+def test_import_null_section_valueerror_at_config_layer(tmp_path):
+    """同一输入的模块契约：config.import_yaml 抛 ValueError（供 CLI rc=2）。"""
+    from sr import config
+    conn = db.init_db(str(tmp_path / "cfg3.db"))
+    try:
+        with pytest.raises(ValueError, match="invalid providers section"):
+            config.import_yaml(conn, _NULL_SECTION_YAML)
+        with pytest.raises(ValueError, match="invalid models section"):
+            config.import_yaml(conn, _NULL_SECTION_YAML.replace(
+                "providers:\nmodels: []", "providers: []\nmodels:"))
+    finally:
+        conn.close()
+
+
+def test_put_tree_rejects_malformed_conds_422(app):
+    """I1（终审 Important）端点级回归：三类「旧闸门放行 → /v1 持久 500」的 cond
+    必须被 PUT /admin/tree 以 422 拦在落库前，且树零改动。
+
+    逐条对应终审实测：① or 内层再嵌 or（/v1 500 KeyError 'tag'）；② ordered 标签
+    配 contains（500 int 不是容器）；③ conf_min 非整数（500 '<' not supported）。
+    """
+    base = get(app, "/admin/tree").json()
+    illegal = [
+        [{"or": [{"or": [{"tag": "domain", "op": "is", "values": ["law"]}]},
+                 {"tag": "fact_check", "op": "is", "values": ["needs_check"]}]}],
+        [{"tag": "complexity", "op": "contains", "values": [1]}],
+        [{"tag": "domain", "op": "is", "values": ["law"], "conf_min": "x"}],
+        [{"tag": "pii", "op": "gte", "values": ["email_address"]}],
+    ]
+    for cond in illegal:
+        t = get(app, "/admin/tree").json()
+        b40 = next(b for n in t["nodes"] if n["idx"] == 4
+                   for b in n["branches"] if b["idx"] == 40)
+        b40["cond"] = cond
+        r = put(app, "/admin/tree", t)
+        assert r.status_code == 422, (cond, r.status_code, r.text)
+        assert any(f["code"] == "bad_ref" and f["level"] == "hard"
+                   for f in r.json()["findings"]), cond
+    after = get(app, "/admin/tree").json()               # 整树零改动（不部分写入）
+    assert after["nodes"] == base["nodes"] and after["version"] == base["version"]
+
+
 def test_put_bands_roundtrip(app):
     """PUT /admin/bands：与 GET 同形状回写生效；坏结构 400。"""
     b = get(app, "/admin/bands").json()

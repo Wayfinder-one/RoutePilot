@@ -13,7 +13,10 @@ from sr.engine import rows_to_tree
 from sr.tags import TAGS
 from sr.health import run_checkup
 
-MODELS = {"qwen3-8b": {}, "qwen3-32b": {}, "claude-sonnet": {}}   # 测试替身：id 集合即可
+# 测试替身：id 集合即可。必须覆盖 balanced 种子树引用的全部模型——否则 bad_ref
+# 会因「引用了不存在的模型」恒有 hard，new 的「正例不误报」断言就失去分辨力。
+MODELS = {"qwen3-8b": {}, "qwen3-32b": {}, "claude-sonnet": {},
+          "sdxl-image": {}, "llava-omni": {}}
 
 @pytest.fixture
 def base_nodes(tmp_path):
@@ -60,3 +63,106 @@ def test_empty_values_is_hard_error(base_nodes):
     base_nodes[4].branches[0].cond = [{"tag": "domain", "op": "is", "values": []}]
     f = run_checkup(base_nodes, MODELS, TAGS)
     assert any(x.code == "bad_ref" and x.level == "hard" for x in f)
+
+
+# ── I1（终审 Important）：cond 语法闸门三段补齐，均 hard ─────────────────────────
+# 漏拦三类实测均 PUT /admin/tree 200，随后 /v1 持久 500：
+#   ① or/not 内层再嵌 or/not（engine._atom 收到 {"or": …} → KeyError 'tag'）
+#   ② op 与标签 kind 不匹配（ordered 配 contains → int 不是容器 / pii 配 gte）
+#   ③ conf_min 非整数（"x" → '<' not supported between int and str）
+
+
+def _bad_ref_hard(findings):
+    return [f for f in findings if f.code == "bad_ref" and f.level == "hard"]
+
+
+def test_nested_or_is_hard_bad_ref(base_nodes):
+    """① or 内层再嵌 or → hard bad_ref（引擎只会 KeyError 'tag'）。"""
+    base_nodes[1].branches[0].cond = [
+        {"or": [{"or": [{"tag": "domain", "op": "is", "values": ["law"]}]},
+                {"tag": "fact_check", "op": "is", "values": ["needs_check"]}]}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_nested_or_atom_is_hard_bad_ref(base_nodes):
+    """① or 内层的 not 包装同样非法（§5.1 or/not 只包普通子句）。"""
+    base_nodes[1].branches[0].cond = [
+        {"or": [{"not": {"tag": "domain", "op": "is", "values": ["law"]}},
+                {"tag": "fact_check", "op": "is", "values": ["needs_check"]}]}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_nested_not_inner_is_hard_bad_ref(base_nodes):
+    """① not 内层裹 or/not → hard bad_ref。"""
+    base_nodes[1].branches[0].cond = [
+        {"not": {"or": [{"tag": "domain", "op": "is", "values": ["law"]}]}}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_legal_or_still_passes(base_nodes):
+    """合法 or（两个普通子句）/ 合法 not（单个普通子句）不误报（I1 不得过拦）。"""
+    base_nodes[1].branches[0].cond = [
+        {"or": [{"tag": "domain", "op": "is", "values": ["law"]},
+                {"tag": "fact_check", "op": "is", "values": ["needs_check"]}]}]
+    base_nodes[2].branches[0].cond = [
+        {"not": {"tag": "complexity", "op": "is", "values": [1]}}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert not _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_ordered_tag_with_contains_is_hard_bad_ref(base_nodes):
+    """② ordered 标签（int 档位）配 contains → hard bad_ref（int 不是容器）。"""
+    base_nodes[1].branches[0].cond = [
+        {"tag": "complexity", "op": "contains", "values": [1]}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_multi_tag_with_gte_is_hard_bad_ref(base_nodes):
+    """② 列表值标签（pii）配 gte → hard bad_ref（list >= list 崩）。"""
+    base_nodes[1].branches[0].cond = [
+        {"tag": "pii", "op": "gte", "values": ["email_address"]}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_normal_op_kind_combos_still_pass(base_nodes):
+    """② 合法 op×kind 组合不误报：ordered 用 gte/lte/is、multi 用 contains、
+    choice 用 in（I1 只拦真会崩的组合）。"""
+    base_nodes[1].branches[0].cond = [
+        {"tag": "complexity", "op": "gte", "values": [1]},
+        {"tag": "pii", "op": "contains", "values": ["email_address"]},
+        {"tag": "domain", "op": "in", "values": ["law", "math"]}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert not _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_conf_min_non_int_is_hard_bad_ref(base_nodes):
+    """③ conf_min 非整数（"x" / 1.5 / True）→ hard bad_ref，不得落库后 /v1 500。"""
+    for bad in ("x", 1.5, True):
+        base_nodes[1].branches[0].cond = [
+            {"tag": "domain", "op": "is", "values": ["law"], "conf_min": bad}]
+        f = run_checkup(base_nodes, MODELS, TAGS)
+        assert _bad_ref_hard(f), (bad, [x.to_json() for x in f])
+
+
+def test_conf_min_int_is_legal(base_nodes):
+    """③ conf_min 整数合法（正例：conf_min 本身是 §5.1 语法的一部分）。"""
+    base_nodes[1].branches[0].cond = [
+        {"tag": "domain", "op": "is", "values": ["law"], "conf_min": 2}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert not _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+def test_rule_tag_with_conf_min_stays_warn_not_hard(base_nodes):
+    """I1 关键提醒：规则标签配 conf_min 仍按 §10 走 conf_on_rule **warn**，
+    不得因为新加的 conf_min 类型闸门连带改成 hard（终审已确认的陷阱）。"""
+    base_nodes[1].branches[0].cond = [
+        {"tag": "language", "op": "is", "values": ["zh"], "conf_min": 2}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert any(x.code == "conf_on_rule" and x.level == "warn" for x in f), \
+        [x.to_json() for x in f]
+    assert not _bad_ref_hard(f), [x.to_json() for x in f]

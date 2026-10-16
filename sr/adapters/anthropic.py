@@ -28,13 +28,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from sr.adapters import (PARAM_KEYS, THINK_ANTHROPIC, IR, IRChunk, UpstreamError,
+from sr.adapters import (FINISH_TO_STOP, PARAM_KEYS, STOP_TO_FINISH,
+                         THINK_ANTHROPIC, IR, IRChunk, UpstreamError,
                          error_payload)
 
-# OpenAI finish_reason → Anthropic stop_reason（跨协议 message_delta 用）。
-# 未收录值映射为 None——不猜语义，客户端拿到 null 自行判断。
-_STOP_REASON = {"stop": "end_turn", "length": "max_tokens",
-                "tool_calls": "tool_use", "function_call": "tool_use"}
+# OpenAI finish_reason → Anthropic stop_reason（跨协议 message_delta 用，§7.4 枚举）。
+# I4 消重：唯一表在 sr/adapters/__init__.py；本别名保留既有引用点（含既有测试）
+# 不动。未收录值映射为 None——不猜语义，客户端拿到 null 自行判断。
+_STOP_REASON = FINISH_TO_STOP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,6 +147,12 @@ def chunk_to_ir(chunk: dict) -> IRChunk:
 
     message_start / content_block_start / content_block_stop / ping 不产三要素，
     回空 IRChunk（文本收集只需盯 ``content_block_delta`` 与 ``message_delta``）。
+
+    **I4**：IRChunk.finish 的口径是 OpenAI finish_reason（它要经 openai.ir_to_chunk
+    直接重发给 OpenAI 客户端），故这里就把 Anthropic 的 stop_reason 归一
+    （``STOP_TO_FINISH``）——旧实现原样透传，OpenAI 客户端会收到 end_turn /
+    max_tokens / tool_use / stop_sequence。ir_to_events 另用 message_delta 的
+    ``delta.stop_reason`` 原值，不受本归一无影响。
     """
     kind = chunk.get("type")
     if kind == "content_block_delta":
@@ -154,7 +161,8 @@ def chunk_to_ir(chunk: dict) -> IRChunk:
         return IRChunk(text=text)
     if kind == "message_delta":
         delta = chunk.get("delta") or {}
-        return IRChunk(finish=delta.get("stop_reason"), usage=chunk.get("usage"))
+        return IRChunk(finish=STOP_TO_FINISH.get(delta.get("stop_reason")),
+                       usage=chunk.get("usage"))
     return IRChunk()
 
 

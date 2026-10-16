@@ -310,20 +310,49 @@ def match(cond, signals, cuts):
 
 
 def _atom(c, signals, cuts):
-    sig = signals.get(c["tag"])
+    """单个普通子句求值；**任何非法形状一律 False，绝不抛异常**。
+
+    I1（终审 Important）解析层兜底：体检（health.check_bad_ref）是主闸门，会把
+    嵌套 or/not、op×kind 不匹配、非整数 conf_min 等在 PUT /admin/tree / import
+    前 422 拦下；但历史库、旧包或任何绕闸路径仍可能让非法子句落库——此时若按
+    §5.1 字面实现（values[0] / op 查表 / int 比较），每条 /v1 请求都会 500 且
+    持久不复原。语义上「引擎无法求值的子句」按恒 False 处理（与未知标签
+    ``sig is None`` 同口径），由体检/审计面板暴露问题，不在请求路径炸。
+    """
+    if not isinstance(c, dict):
+        return False
+    sig = signals.get(c.get("tag"))
     if sig is None:
         return False
     v = sig["value"]
-    ok = {"is":  lambda: v == c["values"][0],
-          "in":  lambda: v in c["values"],
-          "gte": lambda: isinstance(v, int) and v >= c["values"][0],
-          "lte": lambda: isinstance(v, int) and v <= c["values"][0],
-          "contains": lambda: any(x in (v or []) for x in c["values"])}[c["op"]]()
-    if not ok:
+    values = c.get("values")
+    if not isinstance(values, list) or not values:
+        return False
+    ops = {
+        "is":  lambda: v == values[0],
+        "in":  lambda: v in values,
+        "gte": lambda: isinstance(v, int) and not isinstance(v, bool)
+        and v >= values[0],
+        "lte": lambda: isinstance(v, int) and not isinstance(v, bool)
+        and v <= values[0],
+        "contains": lambda: isinstance(v, (list, tuple))
+        and any(x in v for x in values),
+    }
+    fn = ops.get(c.get("op"))
+    if fn is None:
+        return False
+    if not fn():
         return False
     if "conf_min" in c:                       # 把握度门槛：规则标签 confidence=None → 永不满足
+        cm = c["conf_min"]
         cf = sig.get("confidence")
-        if cf is None or conf_band(cf, cuts) < c["conf_min"]:
+        if not isinstance(cm, int) or isinstance(cm, bool) or cf is None:
+            return False
+        try:
+            band = conf_band(cf, cuts)
+        except (TypeError, ValueError):       # 信号包 confidence 非数：防御性拒绝
+            return False
+        if band < cm:
             return False
     return True
 

@@ -35,7 +35,9 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -49,6 +51,7 @@ from fastapi.responses import (JSONResponse, PlainTextResponse, FileResponse,
 import sr.db as db
 from sr import config
 from sr.adapters import UpstreamError
+from sr.adapters import FINISH_TO_STOP, STOP_TO_FINISH
 from sr.adapters import openai as oai
 from sr.adapters import anthropic as anth
 from sr.adapters.anthropic import StreamState
@@ -82,12 +85,14 @@ AVG_OUT = 600       # 平均输出 tokens / 请求
 # admin 写端点的 changes.actor（§3.1 changes 表；M1 无登录体系，固定操作者）。
 _WRITE_ACTOR = "admin"
 
-# 跨协议非流式 shim 的终止原因互查（与 sr/adapters/anthropic._STOP_REASON 互为逆表；
-# 协议层未导出该私有表，server 层按 §7.3/§7.4 枚举自持，多出值映射 None 不猜语义）
-_STOP_TO_FINISH = {"end_turn": "stop", "max_tokens": "length",
-                   "tool_use": "tool_calls", "stop_sequence": "stop"}
-_FINISH_TO_STOP = {"stop": "end_turn", "length": "max_tokens",
-                   "tool_calls": "tool_use", "function_call": "tool_use"}
+# 服务端日志（M-c：内部异常只进日志，不回吐客户端）
+logger = logging.getLogger("sr.server")
+
+# 终止原因互查表：**唯一一份**在 sr/adapters/__init__.py（I4 顺带消重，rollup #24
+# 的真问题是「漏用」——流式路径的 adapters 与这里的非流式 shim 曾各持一份）。别名
+# 保留在本地，server 其余引用点不必改。
+_STOP_TO_FINISH = STOP_TO_FINISH
+_FINISH_TO_STOP = FINISH_TO_STOP
 
 # 树缓存（裁定 4：模块级 {"version": int, "nodes": list}；每请求开头 SELECT
 # tree_version，变了重载）。多一枚 "path" 键：同进程先后挂多个库（pytest tmp_path）
@@ -103,6 +108,73 @@ _TREE_CACHE: dict = {"path": None, "version": None, "nodes": []}
 def _load_settings(conn) -> dict:
     """settings 表 → ``{key: value}``（值一律字符串，§3.1）。"""
     return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+
+
+# ── settings 值校验（I2，终审 Important）────────────────────────────────────────
+# 消费点对值形态有硬要求：engine 用 int(session_idle)、server 用 int(max_retries)/
+# int(batch_window_ms)、budget_water 直接进预算比较、ladder/budget_route 是模型 id
+# 引用。旧实现只校验键集，一次 PUT 200 写入 "abc" 就会让**每个** /v1 请求 500 且
+# 持久不复原。以下白名单校验由 /admin/settings 与 config.import_yaml 共用
+# （config 侧延迟 import 本函数，避免模块级反向引用成环）。
+
+def _settings_positive_int(v) -> bool:
+    """正整数（字符串数字形态；bool 不算——它在 Python 里是 int 的子类）。"""
+    return re.fullmatch(r"[1-9][0-9]*", str(v).strip()) is not None
+
+
+def _settings_flag(v) -> bool:
+    """0/1 开关（字符串数字形态）。"""
+    return str(v).strip() in ("0", "1")
+
+
+def _settings_water(v) -> bool:
+    """预算水位：浮点且 ∈ (0,1)（budget_protect 触发线，开区间与 bands 切点同口径）。"""
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < f < 1.0
+
+
+def validate_settings(settings, models) -> list[str]:
+    """按 key 白名单校验设置值 → 非法消息列表（空列表 = 合法）。
+
+    :param settings: ``{key: value}``（值可为字符串或 YAML 原生标量）。
+    :param models: 可用模型 id 集合（ladder / budget_route 的引用校验）。
+    :returns: 逐条可读错误（定位到 key 与当前值）；不抛异常——调用方决定 400
+              还是 ValueError（I2 要求 /admin/settings 与 config.import_yaml 共用）。
+    """
+    if not isinstance(settings, dict):
+        return ["settings must be a mapping"]
+    errs: list[str] = []
+    want, got = set(db.DEFAULT_SETTINGS), set(settings)
+    if got != want:
+        return [f"settings key set must equal DEFAULT_SETTINGS; "
+                f"unknown: {sorted(got - want)}, missing: {sorted(want - got)}"]
+    mids = {str(m) for m in (models or ())}
+    for key, val in settings.items():
+        if key in ("session_idle", "max_retries", "batch_window_ms",
+                   "retention_days", "tree_version"):
+            if not _settings_positive_int(val):
+                errs.append(f"{key} must be a positive integer: {val!r}")
+        elif key == "budget_water":
+            if not _settings_water(val):
+                errs.append(f"budget_water must be a float in (0,1): {val!r}")
+        elif key in ("session_sticky", "sticky_detect_feedback", "budget_protect"):
+            if not _settings_flag(val):
+                errs.append(f"{key} must be 0 or 1: {val!r}")
+        elif key == "ladder":
+            parts = [p.strip() for p in str(val).split(",") if p.strip()]
+            if not parts:
+                errs.append(f"ladder must be a non-empty comma-separated "
+                            f"model list: {val!r}")
+            for m in parts:
+                if m not in mids:
+                    errs.append(f"ladder references unknown model: {m!r}")
+        elif key == "budget_route":
+            if str(val).strip() not in mids:
+                errs.append(f"budget_route references unknown model: {val!r}")
+    return errs
 
 
 def _conf_cuts(conn) -> list[float]:
@@ -429,8 +501,11 @@ async def _relay_stream(client_proto: str, up_proto: str, model_asked: str | Non
                 frames.put_nowait(frame)
                 if frame is None:
                     return
-        except Exception:
-            frames.put_nowait(None)            # 读错误按收束处理：忠实截断（§7.5）
+        except Exception as exc:
+            # 读错误按收束处理：忠实截断（§7.5）。M-c/rollup #20：旧实现静默吞掉，
+            # 客户端只看到「流突然结束」，排障无线索——错误进日志，行为不变。
+            logger.warning("upstream stream reader failed (truncating): %r", exc)
+            frames.put_nowait(None)
 
     task = asyncio.create_task(reader())
     try:
@@ -969,10 +1044,13 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
                 headers={"Cache-Control": "no-cache", **diag})
         return JSONResponse(_from_upstream(proto, backend.proto, data, asked),
                             headers=diag)
-    except Exception as exc:                      # 兜底：错误信封按客户端协议
+    except Exception:                             # 兜底：错误信封按客户端协议
         if conn is not None:
             conn.rollback()
-        return _error(proto, 500, f"internal error: {exc}", "api_error",
+        # M-c（终审 Minor）：文案不回吐 Python 异常原文（可能含路径/SQL/环境细节），
+        # 完整异常进服务端日志供运维定位。
+        logger.exception("internal error handling %s %s", proto, asked)
+        return _error(proto, 500, "internal error", "api_error",
                       "internal", {"x-sr-tagger": tagger})
     finally:
         if conn is not None:                      # 400/block/502 等提前返回路径也关连接
@@ -2017,8 +2095,11 @@ def create_app(db_path: str, tagger: str = "heuristic",
     @app.put("/admin/settings")
     async def admin_put_settings(request: Request):
         """修改设置（§9）：键集必须与 DEFAULT_SETTINGS 完全一致（多/缺都 400，
-        防拼写漂移）；值一律转字符串（§3.1）。``tree_version`` 系统管理（只随
-        树写操作递增）：校验要求在场（GET 原样回传），写库时跳过。"""
+        防拼写漂移）；**值类型与值域同校验**（I2：非法值 400，否则一次 200 写坏
+        ``session_idle``/``max_retries`` 会让每个 /v1 请求 500 且持久不复原）。
+        值一律转字符串（§3.1）。``tree_version`` 系统管理（只随树写操作递增）：
+        校验要求在场（GET 原样回传），写库时跳过。校验函数
+        :func:`validate_settings` 与 config.import_yaml 同源。"""
         try:
             body = await request.json()
         except Exception:
@@ -2027,15 +2108,11 @@ def create_app(db_path: str, tagger: str = "heuristic",
         if not isinstance(body, dict):
             return JSONResponse({"detail": "request body must be a JSON object"},
                                 status_code=400)
-        want, got = set(db.DEFAULT_SETTINGS), set(body)
-        if got != want:
-            return JSONResponse(
-                {"detail": "settings key set must equal DEFAULT_SETTINGS; "
-                           f"unknown: {sorted(got - want)}, "
-                           f"missing: {sorted(want - got)}"},
-                status_code=400)
         conn = db.get(db_path)
         try:
+            errs = validate_settings(body, _models_set(conn))
+            if errs:
+                return JSONResponse({"detail": "; ".join(errs)}, status_code=400)
             before = _load_settings(conn)
             for k, v in body.items():
                 if k == "tree_version":
@@ -2129,13 +2206,19 @@ def create_app(db_path: str, tagger: str = "heuristic",
         providers → models → settings → tree（UPSERT，不删既有行）。
         核心逻辑在 sr/config.import_yaml（Task 11 裁定 1 抽出，CLI ``sr import``
         同源转调）：ValueError（YAML/结构/引用非法）→ 400 detail；hard findings
-        → 422 findings；成功 → 200 {"ok": true}。"""
+        → 422 findings；成功 → 200 {"ok": true}。I3：结构类异常（TypeError/
+        KeyError，如**节存在但值为 null**）同样转 400 并记日志，不让裸 500 逃出。"""
         raw = await request.body()
         conn = db.get(db_path)
         try:
             findings = config.import_yaml(conn, raw)
         except ValueError as exc:
             return JSONResponse({"detail": str(exc)}, status_code=400)
+        except (TypeError, KeyError) as exc:      # I3：结构类异常兜底 → 400，不裸 500
+            logger.warning("import package structurally invalid: %r", exc)
+            return JSONResponse(
+                {"detail": f"invalid package: {type(exc).__name__}: {exc}"},
+                status_code=400)
         finally:
             conn.close()
         if findings is not None:

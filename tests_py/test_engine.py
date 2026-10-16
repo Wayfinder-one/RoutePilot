@@ -150,3 +150,34 @@ def test_full_miss_defensive_decision(tmp_path):
     assert tr["decision"] == d                               # trace 决策与 evaluate 恒等
     assert tr["path"] and all(p["result"] != "hit" for p in tr["path"])
 
+
+# ── I1 解析层兜底（终审 Important 末段）：体检是主闸，但历史库/绕闸数据仍可能
+#    带非法子句落库——引擎绝不能崩（/v1 持久 500 的代价），一律求值 False。
+
+def test_atom_never_crashes_on_malformed_clauses():
+    """旧闸门三类漏拦的 cond，engine 求值必须回布尔值而不是抛异常。
+
+    - 明确按「无法求值 ⇒ False」的：嵌套 or（旧实现 KeyError 'tag'）、
+      op×kind 不匹配、非整数 conf_min、空/缺 values、未知 op、未知标签。
+    - ``not`` 内层裹 or/not 这类「旧实现也不崩」的形状只要求不抛异常（它的真值
+      由内层子句的可求值性决定，不在本测试钉口径）。
+    """
+    must_be_false = [
+        {"or": [{"or": [{"tag": "domain", "op": "is", "values": ["law"]}]}]},   # KeyError 'tag'
+        {"tag": "complexity", "op": "contains", "values": [1]},                 # ordered×contains
+        {"tag": "pii", "op": "gte", "values": ["email_address"]},               # multi×gte
+        {"tag": "domain", "op": "is", "values": ["law"], "conf_min": "x"},      # conf_min 非 int
+        {"tag": "domain", "op": "is", "values": ["law"], "conf_min": 1.5},
+        {"tag": "domain", "op": "is", "values": []},                           # 空 values
+        {"tag": "domain", "op": "is"},                                          # 缺 values
+        {"tag": "domain", "op": "nope", "values": ["law"]},                     # 未知 op
+        {"tag": "no_such_tag", "op": "is", "values": ["x"]},                    # 未知标签
+    ]
+    for c in must_be_false:
+        assert match([c], SIG, CUTS) is False, c           # 不抛异常即达标
+    for c in ({"not": {"or": [{"tag": "domain", "op": "is", "values": ["law"]}]}},
+              {"or": [{"not": {"tag": "domain", "op": "is", "values": ["law"]}}]},
+              {"not": {"not": {"tag": "domain", "op": "is", "values": ["law"]}}}):
+        assert isinstance(match([c], SIG, CUTS), bool), c
+    assert evaluate([], SIG, CUTS).model is None          # 空树同样走防御决定
+

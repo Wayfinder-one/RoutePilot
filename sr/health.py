@@ -36,6 +36,24 @@ from sr.tags import TagDef
 # cond 子句合法操作符（§5.1 语法；引擎查表外的 op 会 KeyError → 体检拦下）。
 _OPS = {"is", "in", "gte", "lte", "contains"}
 
+# op 与标签 kind 的兼容表（I1(b)，终审 Important）：引擎 _atom 的 op 分支对不匹配
+# 的 dtype 会崩（ordered 的 int 档位走 contains → `x in 1` 抛 TypeError；pii 的
+# list 值走 gte → `list >= list` 抛 TypeError），旧闸门只查「op 在不在 _OPS」，
+# 三类漏拦实测都可以 PUT 200 落库、之后 /v1 持久 500。表外的自由/动态词表标签
+# （tenant/free、keyword/multi 空值空间）不静态校验——引擎对它们求值不崩。
+# 说明：`is`/`in` 对任何 kind 都安全（== / in 不挑 dtype），故不入 _OP_KINDS。
+_OP_KINDS = {
+    "contains": {"multi"},            # 只有列表值标签（pii / keyword）
+    "gte": {"ordered"},               # 只有档位索引标签（int 比较）
+    "lte": {"ordered"},
+}
+
+
+def _op_kind_ok(op, spec) -> bool:
+    """op 是否适用于该标签 kind（I1(b)）；未列出的 op 放行（见 _OP_KINDS 说明）。"""
+    allow = _OP_KINDS.get(op)
+    return allow is None or spec.kind in allow
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Finding —— §9.2 audit 形状的内存态（message 双语拆两字段，序列化时合字典）
@@ -235,6 +253,22 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
     同为 hard。语义：子句引用了引擎无法求值的东西，与「引用不存在的标签/模型」
     同级。
 
+    I1（终审 Important）再补三类「体检放行但 /v1 持久 500」的语法闸门，同为
+    hard（PUT 200 落库后每条请求都崩，代价远高于一次 422）：
+
+    (a) ``or`` / ``not`` 内层子句不得再含 ``or`` / ``not``（§5.1「or/not 只包
+        普通子句不嵌套」；嵌套时 engine._atom 收到 ``{"or": …}`` 立刻 KeyError
+        ``'tag'``）；
+    (b) ``contains`` 仅列表值标签（multi）、``gte`` / ``lte`` 仅档位标签
+        （ordered）；``is`` / ``in`` 放行（见 :data:`_OP_KINDS`，不匹配时
+        engine 的 op 分支抛 TypeError）；
+    (c) ``conf_min`` 必须是 int（bool 不算）——字符串会让 conf_band 比较抛
+        ``'<' not supported between int and str``。
+
+    **注意**：规则标签配 conf_min 仍归 :func:`check_conf_on_rule` 的 **warn**
+    （§10 现状，I1 明确不连带改成 hard）——本函数只查 conf_min 的类型，不查
+    标签 source。
+
     值空间校验：值不在标签值空间（如 domain 无 "astrology"）同报——引擎求值
     恒 False 的静默死支比报错更难排查（§6.8「不静默兜底」同精神）。有序档位
     标签按档位索引校验（0 ≤ v < 档数，§3.1 tags.value 存索引口径）；值空间为
@@ -246,61 +280,79 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
     def where(n: Node, b: Branch) -> str:
         return f"节点 {n.idx} 分支 {b.idx}"
 
-    def clause_errors(clauses: list, n: Node, b: Branch) -> None:
+    def bad(n: Node, b: Branch, zh: str, en: str) -> None:
+        findings.append(Finding(level, "bad_ref", n.idx, b.idx, zh, en,
+                                {"action": "fix_clause"}))
+
+    def atom(c: dict, n: Node, b: Branch) -> None:
+        """普通子句校验（or/not 内层调用，故内层再嵌 or/not 在此拦下，I1(a)）。"""
+        if not isinstance(c, dict):
+            bad(n, b, f"{where(n, b)}：条件子句不是对象：{c!r}",
+                f"{where(n, b)}: condition clause is not an object: {c!r}")
+            return
+        if "or" in c or "not" in c:         # I1(a)：内层不得再嵌 or/not
+            bad(n, b,
+                f"{where(n, b)}：or/not 内层不得再嵌 or/not（§5.1 只包普通子句）",
+                f"{where(n, b)}: or/not must not nest another or/not "
+                f"(§5.1 wraps plain clauses only)")
+            return
+        tag = c.get("tag")
+        if tag not in tag_defs:
+            bad(n, b, f"{where(n, b)}：引用了不存在的标签 {tag!r}",
+                f"{where(n, b)}: references unknown tag {tag!r}")
+            return
+        if c.get("op") not in _OPS:
+            bad(n, b,
+                f"{where(n, b)}：标签 {tag} 的操作符 {c.get('op')!r} 非法"
+                f"（允许：{sorted(_OPS)}）",
+                f"{where(n, b)}: invalid operator {c.get('op')!r} for tag {tag} "
+                f"(allowed: {sorted(_OPS)})")
+        elif not _op_kind_ok(c["op"], tag_defs[tag]):        # I1(b)
+            bad(n, b,
+                f"{where(n, b)}：标签 {tag}（{tag_defs[tag].kind}）不适用操作符 "
+                f"{c['op']!r}——引擎求值会崩溃",
+                f"{where(n, b)}: operator {c['op']!r} does not apply to tag {tag} "
+                f"(kind {tag_defs[tag].kind}) — the engine would crash")
+        values = c.get("values")
+        if not isinstance(values, list) or not values:
+            # 折入项：空 values → engine IndexError，hard 拦截（见函数 docstring）
+            bad(n, b, f"{where(n, b)}：标签 {tag} 的 values 为空——引擎求值会崩溃",
+                f"{where(n, b)}: empty values for tag {tag} — the engine would "
+                f"crash evaluating it")
+            return
+        spec = tag_defs[tag]
+        if not spec.values:
+            return                            # free / 动态词表：不做静态校验（§4.1）
+        for v in values:
+            if spec.kind == "ordered":
+                ok = isinstance(v, int) and not isinstance(v, bool) \
+                    and 0 <= v < len(spec.values)
+            else:
+                ok = v in spec.values
+            if not ok:
+                bad(n, b, f"{where(n, b)}：值 {v!r} 不在标签 {tag} 的值空间内",
+                    f"{where(n, b)}: value {v!r} is outside the value space of "
+                    f"tag {tag}")
+        if "conf_min" in c:                   # I1(c)：conf_min 必须 int（bool 不算）
+            cm = c["conf_min"]
+            if not isinstance(cm, int) or isinstance(cm, bool):
+                bad(n, b,
+                    f"{where(n, b)}：标签 {tag} 的 conf_min 必须是整数（当前 "
+                    f"{cm!r}）——引擎比较会崩溃",
+                    f"{where(n, b)}: conf_min for tag {tag} must be an integer "
+                    f"(got {cm!r}) — the comparison would crash")
+
+    def clause_errors(clauses, n: Node, b: Branch) -> None:
         for c in clauses:
             if not isinstance(c, dict):
-                findings.append(Finding(level, "bad_ref", n.idx, b.idx,
-                                        f"{where(n, b)}：条件子句不是对象：{c!r}",
-                                        f"{where(n, b)}: condition clause is not "
-                                        f"an object: {c!r}",
-                                        {"action": "fix_clause"}))
+                atom(c, n, b)
             elif "or" in c:
-                clause_errors(c["or"], n, b)
+                for sc in c["or"]:
+                    atom(sc, n, b)
             elif "not" in c:
-                clause_errors([c["not"]], n, b)
+                atom(c["not"], n, b)
             else:
-                tag = c.get("tag")
-                if tag not in tag_defs:
-                    findings.append(Finding(
-                        level, "bad_ref", n.idx, b.idx,
-                        f"{where(n, b)}：引用了不存在的标签 {tag!r}",
-                        f"{where(n, b)}: references unknown tag {tag!r}",
-                        {"action": "fix_clause"}))
-                    continue
-                if c.get("op") not in _OPS:
-                    findings.append(Finding(
-                        level, "bad_ref", n.idx, b.idx,
-                        f"{where(n, b)}：标签 {tag} 的操作符 {c.get('op')!r} 非法"
-                        f"（允许：{sorted(_OPS)}）",
-                        f"{where(n, b)}: invalid operator {c.get('op')!r} for tag "
-                        f"{tag} (allowed: {sorted(_OPS)})",
-                        {"action": "fix_clause"}))
-                values = c.get("values")
-                if not isinstance(values, list) or not values:
-                    # 折入项：空 values → engine IndexError，hard 拦截（见函数 docstring）
-                    findings.append(Finding(
-                        level, "bad_ref", n.idx, b.idx,
-                        f"{where(n, b)}：标签 {tag} 的 values 为空——引擎求值会崩溃",
-                        f"{where(n, b)}: empty values for tag {tag} — the engine "
-                        f"would crash evaluating it",
-                        {"action": "fix_clause"}))
-                    continue
-                spec = tag_defs[tag]
-                if not spec.values:
-                    continue              # free / 动态词表：不做静态校验（§4.1）
-                for v in values:
-                    if spec.kind == "ordered":
-                        ok = isinstance(v, int) and not isinstance(v, bool) \
-                            and 0 <= v < len(spec.values)
-                    else:
-                        ok = v in spec.values
-                    if not ok:
-                        findings.append(Finding(
-                            level, "bad_ref", n.idx, b.idx,
-                            f"{where(n, b)}：值 {v!r} 不在标签 {tag} 的值空间内",
-                            f"{where(n, b)}: value {v!r} is outside the value "
-                            f"space of tag {tag}",
-                            {"action": "fix_clause"}))
+                atom(c, n, b)
 
     for n, b in _iter_branches(nodes):
         clause_errors(b.cond, n, b)

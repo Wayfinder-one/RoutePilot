@@ -17,6 +17,9 @@
   'off' | 'light' | 'deep'，engine §5.1）到协议字段的映射表：
   deep → ``reasoning_effort='high'`` / ``thinking.budget_tokens=8192``；
   light → ``'low'`` / ``2048``；off → 不加字段（表中 None 占位，to_upstream 判空跳过）。
+- ``STOP_TO_FINISH`` / ``FINISH_TO_STOP`` —— OpenAI finish_reason ↔ Anthropic
+  stop_reason 的**唯一**互查表（I4）：server 的跨协议非流式 shim 与
+  anthropic.chunk_to_ir（流式归一路径）共用，不再各抄一份、不再漏用。
 
 依赖方向：openai/anthropic 单向 import 本模块，本模块不 import 工程内任何模块
 （协议层无状态；编排、重试、会话归 server 层 Task 8）。
@@ -79,6 +82,27 @@ PARAM_KEYS = ("max_tokens", "temperature", "top_p", "stop", "top_k")
 THINK_OPENAI = {"deep": "high", "light": "low", "off": None}
 # think 值域 → Anthropic thinking.budget_tokens（deep=8192 / light=2048 / off=不加字段）
 THINK_ANTHROPIC = {"deep": 8192, "light": 2048, "off": None}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b) 终止原因互查表（I4：**唯一导出表**，server 与 adapters 共用）
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenAI finish_reason ↔ Anthropic stop_reason 是两条协议里同义而拼写不同的枚举。
+# 旧实现把这张表抄了两份（server._STOP_TO_FINISH / anthropic._STOP_REASON），且
+# 流式路径**漏用**——Anthropic 上游 → OpenAI 客户端的流式终止帧直接把 end_turn /
+# max_tokens / tool_use / stop_sequence 原样吐给 OpenAI 客户端（终审实测）；非流式
+# shim 反而是对的。消重后两边都从这里取，杜绝再次漂移。
+#   语义损失声明：OpenAI 侧无「自然结束 vs stop 序列」的区分，Anthropic 的
+#   end_turn 与 stop_sequence 都映射到 "stop"（信息丢失但不误报终止类型）；
+#   枚举外取值一律 None（不猜语义）。
+STOP_TO_FINISH: dict[str, str] = {
+    "end_turn": "stop", "max_tokens": "length",
+    "tool_use": "tool_calls", "stop_sequence": "stop",
+}
+FINISH_TO_STOP: dict[str, str] = {
+    "stop": "end_turn", "length": "max_tokens",
+    "tool_calls": "tool_use", "function_call": "tool_use",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
