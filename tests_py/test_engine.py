@@ -143,7 +143,9 @@ _MISS_SIG = {   # 精心全 miss：不命中安全/多媒体/编程/法律/成�
 
 def test_full_miss_defensive_decision(tmp_path):
     conn = db.init_db(str(tmp_path / "t.db"))
-    conn.execute("UPDATE tree SET enabled=0 WHERE idx=90")   # 停用兜底分支 → 真·全 miss
+    # 停用兜底分支 + 节点 3 分支 32（M9 后 32 = 简单+长文 → 8b 轻度，_MISS_SIG 的
+    # complexity=0/context=2 会命中它）→ 构造真·全 miss
+    conn.execute("UPDATE tree SET enabled=0 WHERE idx IN (90, 32)")
     nodes = rows_to_tree(conn.execute("SELECT * FROM tree ORDER BY idx").fetchall())
     d = evaluate(nodes, _MISS_SIG, CUTS)
     assert d.model is None and d.source == "fallback"        # 防御决定

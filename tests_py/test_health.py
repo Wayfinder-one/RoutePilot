@@ -663,3 +663,19 @@ def test_import_checkup_crash_config_layer_returns_findings(tmp_path):
         assert "SENTINEL" not in str(findings)
     finally:
         conn.close()
+
+
+# ── M9（audit Major）：出厂树零告警 ────────────────────────────────────────────
+# 审核报告 §2-M9：四档难度收敛两档后，balanced 分支 31（难→32b 深度）与 32
+# （原「较难→32b 轻度」cond 逐字相同）使全新库体检必出 duplicate + dead_branch
+# 两条 warn——出厂树应是零 findings 范本，现在告警信号被永久稀释。修复后：
+# 30 学科+难+把握度门槛→32b 深度；31 难→32b 深度；32 简单→8b 轻度。
+
+def test_factory_tree_checkup_has_no_hard_no_warn(tmp_path):
+    """全新库 run_checkup（不经 run_checkup_safe，直出原始结论）：零 hard、零 warn；
+    仅允许 unused_tags info（17 标签非全部被出厂树引用）。"""
+    conn = db.init_db(str(tmp_path / "t.db"))
+    nodes = rows_to_tree(conn.execute("SELECT * FROM tree ORDER BY idx").fetchall())
+    findings = run_checkup(nodes, MODELS, TAGS)
+    assert [f.to_json() for f in findings if f.level in ("hard", "warn")] == []
+    assert all(f.level == "info" for f in findings)

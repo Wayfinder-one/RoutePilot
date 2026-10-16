@@ -176,10 +176,16 @@ _BALANCED: list[dict] = [
          {"idx": 31,
           "cond": [{"tag": "complexity", "op": "is", "values": [1]}],
           "action": {"kind": "route", "model": "qwen3-32b", "think": "deep"}},
-         # 难度 至少 较难 → 轻度
+         # 难度 是 简单 而且 长度 属于 长、很长（context 档 2/3）→ 轻度
+         # （M9，audit Major：原「至少 较难」与 31 cond 逐字相同——四档收敛两档后
+         # 不可区分，全新库体检必出 duplicate + dead_branch；若只写 complexity is
+         # [0] 又会完全覆盖节点 5 分支 50（easy+短上下文）再造 dead_branch，故加
+         # context 长档守卫；简单且短仍由成本控制节点接管——「按难度换模型」闭环：
+         # 难→32b 深度，简单→8b 轻度/成本档）
          {"idx": 32,
-          "cond": [{"tag": "complexity", "op": "is", "values": [1]}],
-          "action": {"kind": "route", "model": "qwen3-32b", "think": "light"}},
+          "cond": [{"tag": "complexity", "op": "is", "values": [0]},
+                   {"tag": "context", "op": "in", "values": [2, 3]}],
+          "action": {"kind": "route", "model": "qwen3-8b", "think": "light"}},
      ]},
     {"idx": 4, "name": "法律与事实", "desc": "需要严肃对待的问题",
      "branches": [
@@ -247,12 +253,15 @@ def _route_all_to(nodes: list[dict], model: str) -> list[dict]:
 def _quality(nodes: list[dict]) -> list[dict]:
     """quality：仅 context 档 0 落最低档，其余不变（§5.3「默认高档，简单请求才降级」）。
 
-    以 balanced 为底改两处（裁定声明，记任务报告）：
+    以 balanced 为底改三处（裁定声明，记任务报告）：
     - 成本控制（节点 5）三条降级支收窄为一条 context 档 0 → qwen3-8b
       （原 50 的 easy+短/中、51 长对话、52 夜间不再降档，否则「仅 context 档 0
       落最低档」不成立）；
     - 兜底（节点 9）去向升为 qwen3-32b——兜底是「默认」路径，若仍落 8b 则
-      §5.3「默认高档」与主句同时被违反（夜间/长对话/未命中流量全绕回最低档）。
+      §5.3「默认高档」与主句同时被违反（夜间/长对话/未命中流量全绕回最低档）；
+    - 编程与推理（节点 3）分支 32 升回 qwen3-32b（M9 后 balanced 的 32 = 简单+
+      长文 → 8b 轻度，在 quality 下破坏「仅 context 档 0 落最低档」）——保留
+      think light、形状对齐分支 40（同模型轻度思考）。
     """
     out = copy.deepcopy(nodes)
     for node in out:
@@ -264,6 +273,10 @@ def _quality(nodes: list[dict]) -> list[dict]:
             ]
         elif node["idx"] == 9:
             node["branches"][0]["action"]["model"] = "qwen3-32b"
+        elif node["idx"] == 3:
+            for b in node["branches"]:
+                if b["idx"] == 32:
+                    b["action"]["model"] = "qwen3-32b"
     return out
 
 
