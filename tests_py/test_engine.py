@@ -181,3 +181,20 @@ def test_atom_never_crashes_on_malformed_clauses():
         assert isinstance(match([c], SIG, CUTS), bool), c
     assert evaluate([], SIG, CUTS).model is None          # 空树同样走防御决定
 
+
+# ── 收尾微修（本 commit）：or/not 子句体非 list/dict → 一律 False，不抛 ──────────
+# 备注 1：旧实现 match([{"or": 5}]) 直接 TypeError 逃出（PUT 落库后 /v1 持久
+# 500）；{"not": 5} 更隐蔽——_atom(5) 判 False 后「not False」反成 True（本该
+# 无法求值 ⇒ False）。三类非 list/dict 形状统一口径：不抛 + 整体 False。
+
+def test_match_non_list_or_not_bodies_are_false_not_crash():
+    for c in ({"or": 5}, {"not": 5}, {"or": [5]}):
+        assert match([c], SIG, CUTS) is False, c
+    # AND 语义：非法子句不因前序合法子句已被求值而漏判
+    legal = {"tag": "domain", "op": "is", "values": ["computer_science"]}
+    assert match([legal, {"or": 5}], SIG, CUTS) is False
+    assert match([legal, {"not": 5}], SIG, CUTS) is False
+    # 正例不误伤：合法 or/not 仍按 §5.1 求值
+    assert match([{"or": [legal]}], SIG, CUTS) is True
+    assert match([{"not": {"tag": "jailbreak", "op": "gte", "values": [2]}}], SIG, CUTS) is True
+

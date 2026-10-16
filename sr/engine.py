@@ -6,7 +6,9 @@
   block_msg/hit_path，可空字段默认 None）。
 - :func:`match` / :func:`_atom` —— §5.1 条件语法：子句列表默认 AND；``or`` / ``not``
   只包普通子句不嵌套；``conf_min`` 把握度门槛走 :func:`sr.tags.conf_band`
-  （规则标签 confidence=None 永不满足任何门槛）。
+  （规则标签 confidence=None 永不满足任何门槛）。**形状防御**（收尾微修）：
+  ``or`` 体非 list、``not`` 体非 dict、子句本身非 dict 一律整体 False 且不抛
+  ——体检是主闸（PUT /admin/tree 422），历史库/绕闸数据不得让 /v1 持久 500。
 - :func:`_walk` —— evaluate / evaluate_trace 的公共求值内核（Task 6 折入项 c）：
   按 §5.2 同一循环顺序产出 skip/miss/hit/also 事件，两个消费端零重复。
 - :func:`evaluate` —— §5.2 求值：首个 hit 事件 resolve（first-hit-wins）；special
@@ -298,11 +300,19 @@ TEMPLATES: dict[str, list] = {
 
 def match(cond, signals, cuts):
     for clause in cond:                       # 默认 AND
+        if not isinstance(clause, dict):
+            return False                      # 非 dict 子句：无法求值 ⇒ False（不抛）
         if "or" in clause:
-            if not any(_atom(c, signals, cuts) for c in clause["or"]):
+            body = clause["or"]
+            if not isinstance(body, list):
+                return False                  # or 体非数组：无法求值 ⇒ False（不抛）
+            if not any(_atom(c, signals, cuts) for c in body):
                 return False
         elif "not" in clause:
-            if _atom(clause["not"], signals, cuts):
+            body = clause["not"]
+            if not isinstance(body, dict):
+                return False                  # not 体非普通子句对象 ⇒ False（不抛）
+            if _atom(body, signals, cuts):
                 return False
         elif not _atom(clause, signals, cuts):
             return False

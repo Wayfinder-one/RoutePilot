@@ -11,12 +11,15 @@
 - :func:`from_upstream` —— 上游响应 → 客户端响应：``model`` 回写入站名
   （§7.2-10），其余原样。
 - :func:`chunk_to_ir` —— Anthropic 流事件 → IRChunk：``content_block_delta`` 的
-  text_delta / ``message_delta`` 的 stop_reason + usage（§7.6-2 反向同理）。
+  text_delta / ``message_delta`` 的 stop_reason + usage（§7.6-2 反向同理）；
+  stop_reason 双写——``finish`` 归一到 OpenAI 口径，``raw_finish`` 存协议原值
+  （同协议回环的忠实放行）。
 - :class:`StreamState` + :func:`ir_to_events` —— IRChunk → Anthropic SSE 事件块
   列表（§7.4 事件序列，§7.6-3 重发）：message_start → (content_block_start →
   content_block_delta\\* → content_block_stop)\\* → message_delta(usage/stop_reason)
   → message_stop；跨 chunk 状态（content_block_index/started/closed/stop_reason）
-  由 StreamState 维护（closed 为终止闩，终止段只发一次）。
+  由 StreamState 维护（closed 为终止闩，终止段只发一次）。stop_reason 优先
+  ``raw_finish``（同协议），无原值时查共享表（跨协议）。
 - :func:`parse_error` —— §7.4 错误信封 ``{"type":"error","error":{"type",
   "message"}}`` → 统一 :class:`~sr.adapters.UpstreamError`。
 
@@ -151,8 +154,13 @@ def chunk_to_ir(chunk: dict) -> IRChunk:
     **I4**：IRChunk.finish 的口径是 OpenAI finish_reason（它要经 openai.ir_to_chunk
     直接重发给 OpenAI 客户端），故这里就把 Anthropic 的 stop_reason 归一
     （``STOP_TO_FINISH``）——旧实现原样透传，OpenAI 客户端会收到 end_turn /
-    max_tokens / tool_use / stop_sequence。ir_to_events 另用 message_delta 的
-    ``delta.stop_reason`` 原值，不受本归一无影响。
+    max_tokens / tool_use / stop_sequence。
+
+    **同协议原值旁路**（收尾微修）：stop_reason 的原值同时存进
+    ``IRChunk.raw_finish``，供 :func:`ir_to_events` 在 anthropic→anthropic 回环里
+    原样放行——归一是**有损**的（stop_sequence 与 end_turn 都折到 "stop"），
+    回程若只查 finish 就会把 stop_sequence 误报成 end_turn、refusal/pause_turn
+    丢成 null。非 message_delta 事件不带原值（默认 None）。
     """
     kind = chunk.get("type")
     if kind == "content_block_delta":
@@ -161,8 +169,10 @@ def chunk_to_ir(chunk: dict) -> IRChunk:
         return IRChunk(text=text)
     if kind == "message_delta":
         delta = chunk.get("delta") or {}
-        return IRChunk(finish=STOP_TO_FINISH.get(delta.get("stop_reason")),
-                       usage=chunk.get("usage"))
+        raw = delta.get("stop_reason")
+        return IRChunk(finish=STOP_TO_FINISH.get(raw),
+                       usage=chunk.get("usage"),
+                       raw_finish=raw)
     return IRChunk()
 
 
@@ -180,7 +190,8 @@ class StreamState:
     （message_delta + message_stop）只随首次终止触发产出一次，其后任何 chunk
     幂等跳过（spec §7.4 以单个 message_stop 结束；OpenAI include_usage 线序里
     finish chunk 与纯 usage chunk（choices:[]）前后脚两包，无闩会双终止）。
-    ``stop_reason`` 由 finish chunk 先行锁存、随 message_delta 发出。M1 只发单
+    ``stop_reason`` 由 finish chunk 先行锁存、随 message_delta 发出（取值优先
+    IRChunk.raw_finish，见 :func:`_stop_reason`）。M1 只发单
     文本块，index 恒 0——字段仍按接口保留，多块（tool_use 等）留 M2 扩展。
     """
 
@@ -211,6 +222,11 @@ def ir_to_events(ic: IRChunk, state: StreamState,
       数字——若在 finish 包就收尾，usage 尚未到达，数字会被后到的 usage 包顶丢
       或产出双终止。finish 与 usage 同包到达（部分上游合并形状）时一次收尾兼顾
       两者。
+    - **stop_reason 取值**（收尾微修）：优先 :attr:`IRChunk.raw_finish`（Anthropic
+      上游原值，同协议回环原样放行——stop_sequence 不再被归一成 "stop" 后回程
+      误报 end_turn）；``raw_finish`` 为 None（来源是 OpenAI chunk）时仍由共享表
+      ``FINISH_TO_STOP`` 映射，跨协议行为不变。锁存/收尾的触发条件同样认
+      ``raw_finish``（Anthropic 的 pause_turn/refusal 映射不到 finish，但原值要发）。
 
     ``model`` 为可选入站名（Task 8 传 §7.2-10 回写用的 model_asked），仅写进
     message_start 的 message.model；不传回空串。§7.4 的 15s ``ping`` 心跳是
@@ -234,28 +250,40 @@ def ir_to_events(ic: IRChunk, state: StreamState,
         evts.append(_sse("content_block_delta", {
             "type": "content_block_delta", "index": state.content_block_index,
             "delta": {"type": "text_delta", "text": ic.text}}))
-    if ic.finish is not None and not state.closed:
+    if (ic.finish is not None or ic.raw_finish is not None) and not state.closed:
         # finish 先到（include_usage 线序首包）：锁 stop_reason + 关文本块；
         # 终止段不在此发——usage 数字在后到的 usage 包里，message_delta 必须带上。
         if state.content_block_index >= 0:
             evts.append(_sse("content_block_stop", {
                 "type": "content_block_stop", "index": state.content_block_index}))
             state.content_block_index = -1
-        state.stop_reason = _STOP_REASON.get(ic.finish)
+        state.stop_reason = _stop_reason(ic)
     if ic.usage is not None and not state.closed:
         state.closed = True                                # 终止闩：终止段只发一次
         if state.content_block_index >= 0:
             evts.append(_sse("content_block_stop", {
                 "type": "content_block_stop", "index": state.content_block_index}))
             state.content_block_index = -1
-        if ic.finish:                                      # 同包带 finish：就地锁存
-            state.stop_reason = _STOP_REASON.get(ic.finish)
+        if ic.finish or ic.raw_finish:                     # 同包带终止：就地锁存
+            state.stop_reason = _stop_reason(ic)
         evts.append(_sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": state.stop_reason, "stop_sequence": None},
             "usage": _usage(ic.usage)}))
         evts.append(_sse("message_stop", {"type": "message_stop"}))
     return evts
+
+
+def _stop_reason(ic: IRChunk) -> str | None:
+    """IRChunk → Anthropic ``stop_reason``：有协议原值优先原样，否则查共享表。
+
+    同协议回环（anthropic→anthropic）走原值旁路，保住 ``stop_sequence`` /
+    ``end_turn`` 的区别与枚举外原值；``raw_finish`` 为 None（来源是 OpenAI
+    chunk）时按 §7.4 经 :data:`FINISH_TO_STOP` 映射，枚举外取值回 None（不猜）。
+    """
+    if ic.raw_finish is not None:
+        return ic.raw_finish
+    return _STOP_REASON.get(ic.finish)
 
 
 def _usage(usage: dict | None) -> dict:

@@ -110,12 +110,20 @@ def _atom_key(c: dict) -> tuple:
 
 
 def _cond_key(cond: list) -> tuple:
-    """cond 列表 → 规范形元组（§5.1 三种子句：普通 / or 组 / not 包装）。"""
+    """cond 列表 → 规范形元组（§5.1 三种子句：普通 / or 组 / not 包装）。
+
+    形状非法（``or`` 体非 list / ``not`` 体非 dict）时给保底可哈希形，绝不迭代
+    非可迭代体——本检查在 CHECKS 表里先于 check_bad_ref 跑，旧实现会在这里
+    TypeError 逃出体检（PUT /admin/tree 500）；非法形状的 hard finding 由
+    check_bad_ref 报。"""
     out = []
     for c in cond:
         if not isinstance(c, dict):
             out.append(("?", repr(c)))          # 非法子句：保底可哈希（bad_ref 会另报）
         elif "or" in c:
+            if not isinstance(c["or"], list):
+                out.append(("or?", repr(c["or"])))      # 非法体：保底可哈希
+                continue
             out.append(("or", frozenset(_atom_key(a) for a in c["or"]
                                         if isinstance(a, dict))))
         elif "not" in c:
@@ -183,7 +191,8 @@ def check_unused_tags(nodes: list[Node], models, tag_defs: dict[str, TagDef],
             if not isinstance(c, dict):
                 continue
             if "or" in c:
-                walk(c["or"])
+                if isinstance(c["or"], list):       # 非 list 体：check_bad_ref 报 hard
+                    walk(c["or"])
             elif "not" in c:
                 walk([c["not"]])
             elif isinstance(c.get("tag"), str):
@@ -264,6 +273,12 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
         engine 的 op 分支抛 TypeError）；
     (c) ``conf_min`` 必须是 int（bool 不算）——字符串会让 conf_band 比较抛
         ``'<' not supported between int and str``。
+
+    收尾微修再补形状闸门（d）：``or`` 的体必须是 list、``not`` 的体必须是
+    dict，否则 hard bad_ref——旧实现体检自身在 ``for sc in c["or"]``（乃至更早的
+    ``_cond_key``）抛 TypeError 逃出 run_checkup，PUT /admin/tree 直接 500
+    （库虽无写入，但错误码与语义都不对）；``{"or": [5]}`` 这类「臂非 dict」由
+    :func:`atom` 的「条件子句不是对象」覆盖。
 
     **注意**：规则标签配 conf_min 仍归 :func:`check_conf_on_rule` 的 **warn**
     （§10 现状，I1 明确不连带改成 hard）——本函数只查 conf_min 的类型，不查
@@ -347,10 +362,26 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
             if not isinstance(c, dict):
                 atom(c, n, b)
             elif "or" in c:
-                for sc in c["or"]:
+                body = c["or"]
+                if not isinstance(body, list):      # 非法体：旧实现 for 迭代抛 TypeError
+                    bad(n, b,
+                        f"{where(n, b)}：or 的子句体必须是数组（当前 {body!r}）"
+                        f"——引擎求值会崩溃",
+                        f"{where(n, b)}: the 'or' body must be an array "
+                        f"(got {body!r}) — the engine would crash")
+                    continue
+                for sc in body:                     # 臂非 dict 由 atom 报「不是对象」
                     atom(sc, n, b)
             elif "not" in c:
-                atom(c["not"], n, b)
+                body = c["not"]
+                if not isinstance(body, dict):      # 非法体：not 只包单个普通子句
+                    bad(n, b,
+                        f"{where(n, b)}：not 的子句体必须是对象（当前 {body!r}）"
+                        f"——引擎求值会崩溃",
+                        f"{where(n, b)}: the 'not' body must be an object "
+                        f"(got {body!r}) — the engine would crash")
+                    continue
+                atom(body, n, b)
             else:
                 atom(c, n, b)
 
@@ -434,7 +465,8 @@ def check_conf_on_rule(nodes: list[Node], models,
             if not isinstance(c, dict):
                 continue
             if "or" in c:
-                walk(c["or"], n, b)
+                if isinstance(c["or"], list):       # 非 list 体：check_bad_ref 报 hard
+                    walk(c["or"], n, b)
             elif "not" in c:
                 walk([c["not"]], n, b)
             elif "conf_min" in c and c.get("tag") in tag_defs \

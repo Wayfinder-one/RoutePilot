@@ -166,3 +166,78 @@ def test_rule_tag_with_conf_min_stays_warn_not_hard(base_nodes):
     assert any(x.code == "conf_on_rule" and x.level == "warn" for x in f), \
         [x.to_json() for x in f]
     assert not _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+# ── 收尾微修（本 commit）备注 1：or/not 子句体非 list/dict → hard bad_ref ────────
+# 旧实现：check_bad_ref 的 clause_errors 直接 `for sc in c["or"]` → TypeError 逃出
+# run_checkup（PUT /admin/tree 500，库无写入）；更早的 check_dead_branch
+# （_cond_key）与 check_unused_tags（walk）同样会先炸。三类形状：or 体非 list、
+# not 体非 dict、or 臂非 dict（后者原本已由 atom 报「条件子句不是对象」）。
+
+
+def test_or_not_body_non_list_is_hard_bad_ref(base_nodes):
+    for cond in ([{"or": 5}], [{"not": 5}], [{"or": [5]}]):
+        base_nodes[1].branches[0].cond = cond
+        f = run_checkup(base_nodes, MODELS, TAGS)      # 旧实现此处 TypeError
+        assert _bad_ref_hard(f), (cond, [x.to_json() for x in f])
+
+
+def test_legal_or_not_bodies_still_pass_after_shape_gate(base_nodes):
+    """形状闸门不得误伤合法 or/not（or 体 list、not 体 dict）。"""
+    base_nodes[1].branches[0].cond = [
+        {"or": [{"tag": "domain", "op": "is", "values": ["law"]},
+                {"tag": "fact_check", "op": "is", "values": ["needs_check"]}]}]
+    base_nodes[2].branches[0].cond = [
+        {"not": {"tag": "complexity", "op": "is", "values": [1]}}]
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert not _bad_ref_hard(f), [x.to_json() for x in f]
+
+
+# ── 端点级回归：PUT /admin/tree 三类形状 → 422 且树零写入 ──────────────────────
+# 自建最小 app（模式照抄 test_admin.py：ASGITransport + Python 3.14 垫片），
+# 以免改动 test_admin.py——本任务改动范围限本文件与同批三个模块。
+
+import asyncio as _asyncio                                  # noqa: E402
+import httpx as _httpx                                      # noqa: E402
+from sr.server import create_app as _create_app             # noqa: E402
+
+_asyncio.set_event_loop(_asyncio.new_event_loop())          # 3.14 起无隐式环
+
+
+@pytest.fixture
+def app(tmp_path):
+    conn = db.init_db(str(tmp_path / "t.db"))
+    conn.close()
+    return _create_app(str(tmp_path / "t.db"), tagger="heuristic")
+
+
+def _admin_get(app, path):
+    async def go():
+        async with _httpx.AsyncClient(transport=_httpx.ASGITransport(app=app),
+                                      base_url="http://t") as c:
+            return await c.get(path)
+    return _asyncio.get_event_loop().run_until_complete(go())
+
+
+def _admin_put(app, path, json=None):
+    async def go():
+        async with _httpx.AsyncClient(transport=_httpx.ASGITransport(app=app),
+                                      base_url="http://t") as c:
+            return await c.put(path, json=json)
+    return _asyncio.get_event_loop().run_until_complete(go())
+
+
+def test_put_tree_non_list_or_not_body_422_zero_write(app):
+    base = _admin_get(app, "/admin/tree").json()
+    for cond in ([{"or": 5}], [{"not": 5}], [{"or": [5]}]):
+        t = _admin_get(app, "/admin/tree").json()
+        b40 = next(b for n in t["nodes"] if n["idx"] == 4
+                   for b in n["branches"] if b["idx"] == 40)
+        b40["cond"] = cond
+        r = _admin_put(app, "/admin/tree", t)
+        assert r.status_code == 422, (cond, r.status_code, r.text)
+        assert any(f["code"] == "bad_ref" and f["level"] == "hard"
+                   for f in r.json()["findings"]), (cond, r.text)
+    after = _admin_get(app, "/admin/tree").json()             # 整树零写入
+    assert after["nodes"] == base["nodes"], "nodes 被改动"
+    assert after["version"] == base["version"], "tree_version 被改动"

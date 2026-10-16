@@ -53,11 +53,20 @@ class IR:
 
 @dataclass
 class IRChunk:
-    """一个流式 chunk 的归一三要素（§7.6-2：content delta + usage + finish）。"""
+    """一个流式 chunk 的归一三要素（§7.6-2：content delta + usage + finish）。
+
+    ``raw_finish``（收尾微修）是**协议原值旁路**：当上游是 Anthropic 时，
+    anthropic.chunk_to_ir 把原始 ``stop_reason`` 存这里，anthropic.ir_to_events
+    优先用它——同协议回环（anthropic→anthropic）因此能保住 ``stop_sequence``
+    与 ``end_turn`` 的区别（只查 ``finish`` 会把两者都折成 "stop" 再映射回
+    end_turn）。OpenAI 来源的 chunk 该字段恒 None，跨协议路径仍由
+    ``FINISH_TO_STOP`` 决定，行为不变。
+    """
 
     text: str | None = None      # content delta 文本（None = 本 chunk 无文本）
     finish: str | None = None    # finish_reason（OpenAI）/ stop_reason（Anthropic）
     usage: dict | None = None    # usage 原样（§7.3 include_usage 时末 chunk 带）
+    raw_finish: str | None = None  # Anthropic stop_reason 原值旁路（同协议回环用）
 
 
 class UpstreamError(Exception):

@@ -205,3 +205,74 @@ def test_stop_finish_tables_are_the_single_shared_source():
     for stop, finish in STOP_TO_FINISH.items():
         assert FINISH_TO_STOP[finish] == ("end_turn" if stop == "stop_sequence"
                                           else stop), stop
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 收尾微修（本 commit）备注 2：同协议 anthropic→anthropic 流式 stop_reason 原样
+# 回环。旧实现 ir_to_events 只查 _STOP_REASON.get(ic.finish)，而 ic.finish 已被
+# chunk_to_ir 归一为 OpenAI 语义（stop_sequence → "stop"）→ 回程再映射就把
+# stop_sequence 误报成 end_turn、refusal/pause_turn 丢成 null。
+# 修法：chunk_to_ir 把原始 Anthropic stop_reason 存进 IRChunk.raw_finish，
+# ir_to_events 优先用它；raw_finish 为 None（来源是 OpenAI chunk）时仍走共享表。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _an_message_delta(stop: str):
+    return anthropic.chunk_to_ir(_an_event(
+        "message_delta", delta={"stop_reason": stop},
+        usage={"input_tokens": 1, "output_tokens": 2}))
+
+
+def _message_delta(evts: list[str]) -> dict:
+    return json.loads(next(e for e in evts
+                           if e.startswith("event: message_delta")).split("data: ", 1)[1])
+
+
+def test_same_protocol_anthropic_stop_reason_roundtrip():
+    """同协议回环：四个 stop_reason 原样（旧实现 stop_sequence → end_turn）。"""
+    for stop in ("end_turn", "max_tokens", "tool_use", "stop_sequence"):
+        state = anthropic.StreamState()
+        evts = anthropic.ir_to_events(anthropic.chunk_to_ir(_an_event(
+            "content_block_delta", index=0,
+            delta={"type": "text_delta", "text": "好"})), state)
+        evts += anthropic.ir_to_events(_an_message_delta(stop), state)
+        md = _message_delta(evts)
+        assert md["delta"]["stop_reason"] == stop, (stop, md)
+        assert md["usage"]["output_tokens"] == 2, md          # usage 不被丢
+        assert evts[-1].startswith("event: message_stop")
+
+
+def test_anthropic_chunk_to_ir_keeps_raw_stop_reason():
+    """chunk_to_ir 双写：finish 保持 OpenAI 口径（跨协议用），raw_finish 存原值。"""
+    ic = _an_message_delta("stop_sequence")
+    assert ic.finish == "stop" and ic.raw_finish == "stop_sequence"
+    # OpenAI chunk 无 Anthropic 原值 → raw_finish 默认 None（跨协议走共享表）
+    assert openai.chunk_to_ir(
+        {"choices": [{"delta": {}, "finish_reason": "stop"}]}).raw_finish is None
+    assert anthropic.chunk_to_ir(
+        _an_event("content_block_delta", index=0,
+                  delta={"type": "text_delta", "text": "x"})).raw_finish is None
+
+
+def test_same_protocol_unknown_stop_reason_passes_through_raw():
+    """同协议不做映射：枚举外的 Anthropic 原值（pause_turn/refusal）也原样转发
+    （旧实现丢成 null）。跨协议路径仍按共享表回 null，见
+    test_anthropic_unknown_stop_reason_is_none——raw_finish 仅 Anthropic 来源有值。"""
+    for stop in ("pause_turn", "refusal"):
+        ic = _an_message_delta(stop)
+        assert ic.finish is None and ic.raw_finish == stop, stop
+        md = _message_delta(anthropic.ir_to_events(ic, anthropic.StreamState()))
+        assert md["delta"]["stop_reason"] == stop, (stop, md)
+
+
+def test_cross_protocol_finish_to_stop_still_uses_shared_table():
+    """跨协议（OpenAI chunk → Anthropic 客户端）行为不变：raw_finish 恒 None 时
+    仍由 FINISH_TO_STOP 决定，四种 finish_reason 映射与既有测试一致。"""
+    for finish, want in (("stop", "end_turn"), ("length", "max_tokens"),
+                         ("tool_calls", "tool_use"), ("function_call", "tool_use"),
+                         ("content_filter", None)):        # 枚举外 → None（不猜）
+        ic = openai.chunk_to_ir({"choices": [{"delta": {}, "finish_reason": finish}],
+                                 "usage": {"prompt_tokens": 1, "completion_tokens": 1}})
+        assert ic.raw_finish is None
+        md = _message_delta(anthropic.ir_to_events(ic, anthropic.StreamState()))
+        assert md["delta"]["stop_reason"] == want, (finish, md)
