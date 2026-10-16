@@ -185,7 +185,11 @@ def put_json(port: int, path: str, body) -> httpx.Response:
 
 def test_e2e_loop(tmp_path):
     fake = start_proc("fake-upstream", 8123)
-    srv  = start_proc("serve", 8899, db=tmp_path/"sr.db")   # 无 --checkpoint → heuristic
+    try:
+        srv = start_proc("serve", 8899, db=tmp_path/"sr.db")  # 无 --checkpoint → heuristic
+    except BaseException:                  # 第二个进程起不来时别把第一个漏在后台
+        stop(fake)
+        raise
     try:
         r = post_json(8899, "/v1/chat/completions",
                       {"model": "auto", "messages": [{"role": "user",
@@ -332,6 +336,26 @@ def test_cli_import_null_section_exit_2_no_traceback(tmp_path):
     assert "invalid providers section" in r.stderr
     assert "Traceback" not in r.stderr and "Traceback" not in r.stdout
     assert run_cli("export", "--db", str(dbn)).stdout == before   # 库零写入
+
+
+def test_cli_export_import_uninitialized_db_exit_2_no_traceback(tmp_path):
+    """backlog 修：export/import 对未初始化库曾先静默建空文件、再裸 traceback。
+    现在显式拒绝（rc=2，可读消息，不建文件、不打栈）。"""
+    missing = tmp_path/"never.db"
+    r = run_cli("export", "--db", str(missing))
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "未初始化" in r.stderr
+    assert "Traceback" not in r.stderr and "Traceback" not in r.stdout
+    assert not missing.exists()                          # 未静默建库
+
+    pkg = tmp_path/"pkg.yaml"
+    pkg.write_text("providers: []\nmodels: []\ntree:\n  version: 1\n"
+                   "  nodes: []\nsettings: {}\n", encoding="utf-8")
+    r = run_cli("import", "--db", str(missing), str(pkg))
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "未初始化" in r.stderr
+    assert "Traceback" not in r.stderr and "Traceback" not in r.stdout
+    assert not missing.exists()
 
 
 def test_cli_serve_refuses_missing_checkpoint(tmp_path):

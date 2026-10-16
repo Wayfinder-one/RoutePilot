@@ -2,7 +2,7 @@
 Produces 接口。argparse 五个子命令：
 
 - ``sr init --db PATH [--import BOOTSTRAP.YAML]``
-      建库（sr.db.init_db：十表 + 索引 + 默认 settings + balanced 种子树，幂等）；
+      建库（sr.db.init_db：11 表 + 索引 + 默认 settings + balanced 种子树，幂等）；
       ``--import`` 走 sr/config.import_yaml（normalize 校验 + 体检 + 单事务写入，
       控制者裁定 1 同源）。
 - ``sr serve --db PATH [--port 8899] [--host HOST] [--checkpoint DIR]
@@ -148,6 +148,12 @@ def main(argv=None) -> int:
         fake_upstream.run(host=args.host, port=args.port)
         return 0
     if args.cmd == "export":
+        if not db.is_initialized(args.db):
+            # backlog 修：未初始化库曾先静默建空文件、再在 config 层裸 traceback。
+            # 这里显式拒绝（rc=2，同「输入非法」），不建文件、不打栈。
+            print(f"sr export: 库未初始化，请先 `sr init --db {args.db}`"
+                  f"（不静默建库）", file=sys.stderr)
+            return 2
         conn = db.get(args.db)
         try:
             sys.stdout.write(config.export_yaml(conn))
@@ -155,6 +161,10 @@ def main(argv=None) -> int:
             conn.close()
         return 0
     if args.cmd == "import":
+        if not db.is_initialized(args.db):
+            print(f"sr import: 库未初始化，请先 `sr init --db {args.db}`"
+                  f"（不静默建库）", file=sys.stderr)
+            return 2
         conn = db.get(args.db)
         try:
             return _do_import(conn, args.file)

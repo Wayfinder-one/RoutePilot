@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
 from datetime import datetime
 
@@ -190,11 +192,12 @@ _SEED_MODELS = [
      ["text", "long_ctx", "expensive", "slow"], 3),
     # 种子树去向引用的两个多媒体模型（设计方案 §3.6 模型卡清单）：
     # llava-omni「文字＋图片 · 中等 · 中速」、sdxl-image「只画图 · 便宜 · 慢」。
-    # 不在阶梯（step NULL，阶梯读 settings.ladder），价格未定价（price NULL）。
+    # 不在阶梯：step = 0（spec §3.1 schema 注释「0 = 不在阶梯」，与列 DEFAULT 0 一致；
+    # 旧种子写 None 与注释不统一，backlog 修）。价格未定价（price NULL）。
     ("llava-omni", "local", "llava-omni",
-     ["text", "image", "medium", "medium_speed"], None),
+     ["text", "image", "medium", "medium_speed"], 0),
     ("sdxl-image", "local", "sdxl-image",
-     ["image", "cheap", "slow"], None),
+     ["image", "cheap", "slow"], 0),
 ]
 
 _SEED_TAG_SETTINGS = [
@@ -203,6 +206,12 @@ _SEED_TAG_SETTINGS = [
 ]
 
 _SEED_CONF_SETTINGS = [0.30, 0.60, 0.85]  # 把握度切点（单行，id=1）
+
+# 建库后必须齐全的表（11 张，自 SCHEMA 提取——避免两处各写一份名单漂移）。
+# backlog：旧幂等探测只认 settings 表，指向「有 settings、缺其余表」的残缺/外来库时
+# 会误判为已初始化 → 后续查询裸 OperationalError。
+_REQUIRED_TABLES: frozenset[str] = frozenset(
+    re.findall(r"CREATE TABLE\s+(\w+)", SCHEMA))
 
 
 def _now() -> str:
@@ -224,19 +233,51 @@ def get(path: str) -> sqlite3.Connection:
     return conn
 
 
-def init_db(path: str) -> sqlite3.Connection:
-    """建十表 + 索引 + 默认 settings + 默认模板 balanced（含补种供应商/模型/分档）。
+def _existing_tables(conn: sqlite3.Connection) -> set[str]:
+    """库内表名集合（sqlite_master）。"""
+    return {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
 
-    幂等：库已初始化（settings 表存在）时原样返回连接，不重放种子。
+
+def is_initialized(path: str) -> bool:
+    """库是否已完成 :func:`init_db` 建表（11 张表齐全）。不建文件、不建表。
+
+    backlog：``sr export`` / ``sr import`` 对未初始化库曾先静默建空文件、再在
+    config 层裸 OperationalError——CLI 侧先用本函数判定，给出干净退出码。
+    非 SQLite 文件 / 无法打开一律按「未初始化」处理（不抛）。
+    """
+    if not os.path.exists(path):
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return _REQUIRED_TABLES <= _existing_tables(conn)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+
+def init_db(path: str) -> sqlite3.Connection:
+    """建 11 表 + 索引 + 默认 settings + 默认模板 balanced（含补种供应商/模型/分档）。
+
+    幂等：库内 11 张表齐全时原样返回连接，不重放种子。残缺库（部分表存在，
+    如外来库恰好有 settings）不静默续用——抛 RuntimeError 明确指出缺表，
+    避免后续查询在别处裸 OperationalError（backlog）。
     """
     conn = get(path)
-    initialized = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'"
-    ).fetchone()
-    if not initialized:
-        conn.executescript(SCHEMA)
-        _seed(conn)
-        conn.commit()
+    have = _existing_tables(conn)
+    missing = _REQUIRED_TABLES - have
+    if not missing:
+        return conn
+    if have & _REQUIRED_TABLES:            # 部分表在 → 库不完整，不冒然补建
+        conn.close()
+        raise RuntimeError(
+            f"库 {path} 不完整（缺表 {sorted(missing)}），非本程序建库？"
+            "请另择路径或先修复/删除后再 init")
+    conn.executescript(SCHEMA)
+    _seed(conn)
+    conn.commit()
     return conn
 
 
