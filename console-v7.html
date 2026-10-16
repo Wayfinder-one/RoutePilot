@@ -2757,12 +2757,14 @@ function renderModels(){
 
 /* ── 接入新模型 ── */
 let mf = null;
-function newMf(){ return { proto:'openai', prov:'本地', upstream:'', caps:[], tested:false }; }
+function newMf(){ return { proto:'openai', prov:'本地', newProv:false, provName:'',
+  base:'', keyEnv:'', upstream:'', caps:[], priceIn:'', priceOut:'', tested:false }; }
 function openAddModel(){ mf = newMf(); renderModelForm();
   document.getElementById('addModelBox').scrollIntoView({behavior:'smooth', block:'nearest'}); }
 function closeAddModel(){ document.getElementById('addModelBox').innerHTML = ''; mf = null; }
 function mPickProto(p){ mf.proto = p; renderModelForm(); }
-function mPickProv(n){ mf.prov = n; renderModelForm(); }
+function mPickProv(n){ mf.prov = n; mf.newProv = false; renderModelForm(); }
+function mNewProv(){ mf.newProv = true; renderModelForm(); }
 function mToggleCap(c){
   const i = mf.caps.indexOf(c);
   if(i >= 0) mf.caps.splice(i,1); else mf.caps.push(c);
@@ -2772,16 +2774,24 @@ function mTest(){ if(!mf) return; mf.tested = true; renderModelForm(); toast('�
 function mSave(){
   if(!mf) return;
   if(!mf.upstream.trim()) return toast('请填写上游模型名');
+  let provName = mf.prov;
+  if(mf.newProv){
+    if(!mf.provName.trim()) return toast('请填写供应商名称');
+    if(!mf.base.trim()) return toast('请填写基址 URL');
+    provName = mf.provName.trim();
+    if(!PROVIDERS.some(p => p.name === provName))
+      PROVIDERS.push({ name: provName, base: mf.base.trim(), proto: mf.proto, ok: true });
+  }
   const id = mf.upstream.split('/').pop().toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,24) || 'model';
-  MODELS.push({id, prov:mf.prov, proto:mf.proto, upstream:mf.upstream, caps:mf.caps.slice(),
-               step:MODELS.length, ok:true, price:{in:'—',out:'—'}});
+  MODELS.push({id, prov:provName, proto:mf.proto, upstream:mf.upstream, caps:mf.caps.slice(),
+               step:MODELS.length, ok:true, price:{in:mf.priceIn || '—', out:mf.priceOut || '—'}});
   closeAddModel(); renderModels(); toast('已接入 ' + id);
 }
 function renderModelForm(){
   const box = document.getElementById('addModelBox');
   if(!box || !mf) return;
   box.innerHTML = `<div class="sheet"><div class="sheet-hd"><b>接入新模型</b>
-      <span class="sub">PROTOCOL → PROVIDER → CAPABILITIES → TEST</span>
+      <span class="sub">PROTOCOL → PROVIDER → MODEL → CAPABILITIES</span>
       <button class="btn sm x" onclick="closeAddModel()">关闭</button></div>
     <div class="sheet-bd"><div class="steps">
       <div class="step"><span class="sn">1</span><div class="sc">
@@ -2793,14 +2803,36 @@ function renderModelForm(){
         <div class="note" style="margin-top:var(--s2)">鉴权、路径、请求体与流式形态按协议自动适配，无需手工配置。</div>
       </div></div>
       <div class="step"><span class="sn">2</span><div class="sc">
-        <span class="lb">供应商</span>
-        <div class="seg">${PROVIDERS.map(p =>
-          `<button class="${mf.prov===p.name?'on':''}" onclick="mPickProv('${SRW_jsAttr(p.name)}')">${SRW_esc(p.name)}</button>`).join('')}</div>
+        <span class="lb">供应商 <span class="opt">基址 URL 与密钥来源在这里</span></span>
+        <div class="seg">
+          ${PROVIDERS.map(p =>
+            `<button class="${(!mf.newProv && mf.prov===p.name)?'on':''}" onclick="mPickProv('${SRW_jsAttr(p.name)}')">${SRW_esc(p.name)}</button>`).join('')}
+          <button class="${mf.newProv?'on':''}" onclick="mNewProv()">＋ 新建供应商</button>
+        </div>
+        ${mf.newProv ? `<div style="display:flex;flex-direction:column;gap:var(--s2);margin-top:var(--s3)">
+          <label class="lb" for="mf-pname">供应商名称</label>
+          <input type="text" id="mf-pname" placeholder="例如 siliconflow" value="${SRW_esc(mf.provName)}"
+            oninput="if(mf)mf.provName=this.value">
+          <label class="lb" for="mf-base">基址 URL</label>
+          <input type="text" id="mf-base" placeholder="例如 https://api.siliconflow.cn/v1" value="${SRW_esc(mf.base)}"
+            oninput="if(mf)mf.base=this.value">
+          <label class="lb" for="mf-keyenv">密钥来源（环境变量名；密钥本身不入库）</label>
+          <input type="text" id="mf-keyenv" placeholder="例如 SILICONFLOW_API_KEY" value="${SRW_esc(mf.keyEnv)}"
+            oninput="if(mf)mf.keyEnv=this.value">
+        </div>` : ''}
       </div></div>
       <div class="step"><span class="sn">3</span><div class="sc">
         <label class="lb" for="mf-up">上游模型名</label>
         <input type="text" id="mf-up" placeholder="例如 Qwen/Qwen2.5-7B-Instruct" value="${SRW_esc(mf.upstream)}"
           oninput="if(mf)mf.upstream=this.value">
+        <div style="display:flex;gap:var(--s3);margin-top:var(--s3)">
+          <div style="flex:1"><label class="lb" for="mf-pin">输入价 / 百万 token <span class="opt">可选</span></label>
+            <input type="text" id="mf-pin" placeholder="0.5" value="${SRW_esc(mf.priceIn)}"
+              oninput="if(mf)mf.priceIn=this.value"></div>
+          <div style="flex:1"><label class="lb" for="mf-pout">输出价 / 百万 token <span class="opt">可选</span></label>
+            <input type="text" id="mf-pout" placeholder="2" value="${SRW_esc(mf.priceOut)}"
+              oninput="if(mf)mf.priceOut=this.value"></div>
+        </div>
       </div></div>
       <div class="step"><span class="sn">4</span><div class="sc">
         <span class="lb">能力标签 <span class="opt">决定它能被哪些分支选中</span></span>
@@ -3952,6 +3984,14 @@ async function SRW_refreshModels(){
   renderModels();
   applyI18n();
 }
+async function SRW_refreshProviders(){
+  const r = await fetch('/admin/providers');
+  if(!r.ok) throw new Error('HTTP ' + r.status);
+  SRW_DATA.providers = await r.json();
+  SRW_applyModels();
+  renderModels();
+  applyI18n();
+}
 
 /* ── 流量页接管：tbody 由 GET /admin/traffic 重渲染（行结构对齐演示版）── */
 function SRW_nodeByHitBranch(hb){
@@ -4383,22 +4423,43 @@ function SRW_putSetting(key, val, label, onFail){
 }
 
 /* 模型接入四步：POST /admin/models → POST /admin/models/{id}/test（逐步骤渲染） */
-function SRW_modelPayload(){
+function SRW_modelPayload(providerName){
   const id = mf.upstream.split('/').pop().toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24) || 'model';
-  return { id: id, provider: mf.prov, upstream: mf.upstream,
-           caps: mf.caps.map(c => SRW_KEY_BY_LABEL[c] || c) };
+  const payload = { id: id, provider: providerName || mf.prov, upstream: mf.upstream,
+                    caps: mf.caps.map(c => SRW_KEY_BY_LABEL[c] || c) };
+  const pin = parseFloat(mf.priceIn), pout = parseFloat(mf.priceOut);
+  if(!isNaN(pin)) payload.price_in = pin;
+  if(!isNaN(pout)) payload.price_out = pout;
+  return payload;
 }
 async function SRW_mSaveRemote(){
   if(!mf.upstream.trim()) return toast('请填写上游模型名');
   try {
+    let provName = mf.prov;
+    if(mf.newProv){
+      /* 先建供应商（基址 URL + 密钥来源），再建模型——旧流程缺的正是这一步 */
+      if(!mf.provName.trim()) throw new Error('请填写供应商名称');
+      if(!mf.base.trim()) throw new Error('请填写基址 URL');
+      provName = mf.provName.trim();
+      const rp = await fetch('/admin/providers', { method: 'POST', headers: SRW_JSON_HDR,
+        body: JSON.stringify({ name: provName, proto: mf.proto,
+                               base_url: mf.base.trim(),
+                               key_env: mf.keyEnv.trim() || null }) });
+      if(!rp.ok){
+        const d = await rp.json().catch(() => ({}));
+        throw new Error(d.detail || ('HTTP ' + rp.status));
+      }
+      await SRW_refreshProviders();
+    }
     if(!mf.savedId){
+      const payload = SRW_modelPayload(provName);
       const r = await fetch('/admin/models', { method: 'POST', headers: SRW_JSON_HDR,
-        body: JSON.stringify(SRW_modelPayload()) });
+        body: JSON.stringify(payload) });
       if(!r.ok){
         const d = await r.json().catch(() => ({}));
         throw new Error(d.detail || ('HTTP ' + r.status));
       }
-      mf.savedId = SRW_modelPayload().id;
+      mf.savedId = payload.id;
     }
     await SRW_refreshModels();
     closeAddModel();

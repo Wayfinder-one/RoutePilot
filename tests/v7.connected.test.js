@@ -619,6 +619,39 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   const ktr = K.window.document.querySelectorAll('#p-traffic tbody tr')[0];
   t('版本一致 → 无失效标记', ktr.innerHTML.indexOf('⚠') < 0, ktr.innerHTML.slice(0, 220));
 
+  /* ════ G. 接入模型：新建供应商（base_url + 密钥来源）两步写入 ════ */
+  group('模型接入 · 新建供应商（base_url / 密钥来源）→ 两步写入');
+  const L = makeDom({ routes: CONNECT_ROUTES });
+  await until(() => L.window.SR_MODE === 'connected', 5000, 'connected (add-provider)');
+  const ldoc = L.window.document, lw = L.window;
+  const setInput = (id, val) => {
+    const el = ldoc.getElementById(id); el.value = val;
+    el.dispatchEvent(new lw.Event('input', { bubbles: true }));
+  };
+  lw.openAddModel();
+  await pend(120);
+  t('表单默认不显示 base_url 输入', !ldoc.getElementById('mf-base'));
+  lw.mNewProv();
+  await pend(120);
+  t('点「新建供应商」显示 base_url 输入', !!ldoc.getElementById('mf-base'));
+  t('显示密钥来源输入（环境变量名）', !!ldoc.getElementById('mf-keyenv'));
+  setInput('mf-pname', 'siliconflow');
+  setInput('mf-base', 'https://api.siliconflow.cn/v1');
+  setInput('mf-keyenv', 'SILICONFLOW_API_KEY');
+  setInput('mf-up', 'Qwen/Qwen3-8B');
+  lw.mSave();
+  await until(() => L.calls.some(c => c[0] === '/admin/providers' && c[1].method === 'POST'),
+    5000, 'POST /admin/providers');
+  await pend(300);
+  const pBody = JSON.parse(L.calls.find(c => c[0] === '/admin/providers' && c[1].method === 'POST')[1].body);
+  t('先 POST /admin/providers（带 base_url + key_env）',
+    pBody.name === 'siliconflow' && pBody.base_url === 'https://api.siliconflow.cn/v1' &&
+    pBody.key_env === 'SILICONFLOW_API_KEY', JSON.stringify(pBody));
+  const mCall = L.calls.find(c => c[0] === '/admin/models' && c[1].method === 'POST');
+  const mBody = mCall ? JSON.parse(mCall[1].body) : {};
+  t('再 POST /admin/models（provider 指向新供应商）', mBody.provider === 'siliconflow',
+    JSON.stringify(mBody));
+
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
   if (fail) { console.log('\n失败项：'); bad.forEach(b => console.log('  · ' + b)); process.exit(1); }

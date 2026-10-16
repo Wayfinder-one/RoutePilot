@@ -955,6 +955,32 @@ def test_models_add_and_update(app):
     assert put(app, "/admin/models/nope", {"enabled": True}).status_code == 404
 
 
+def test_admin_add_provider(app):
+    """POST /admin/providers（§9）：新建/更新供应商（base_url + key_env）；该供应商
+    名下 models.proto 跟随；非法 400。接入模型前先有它——旧实现只有读端点。"""
+    r = post(app, "/admin/providers", {"name": "siliconflow", "proto": "openai",
+        "base_url": "https://api.siliconflow.cn/v1", "key_env": "SILICONFLOW_API_KEY"})
+    assert r.status_code == 200, r.text
+    prov = {p["name"]: p for p in get(app, "/admin/providers").json()}["siliconflow"]
+    assert prov["base_url"] == "https://api.siliconflow.cn/v1"
+    assert prov["key_env"] == "SILICONFLOW_API_KEY" and prov["proto"] == "openai"
+    # 模型接入用该供应商
+    assert post(app, "/admin/models", {"id": "sf-1", "provider": "siliconflow",
+        "upstream": "Qwen/Qwen3-8B", "caps": ["text", "cheap"]}).status_code == 200
+    # 更新覆盖：改 proto → 该供应商名下 models.proto 跟随（§8.1）
+    assert post(app, "/admin/providers", {"name": "siliconflow", "proto": "anthropic",
+        "base_url": "https://gw.example/v1"}).status_code == 200
+    m = {x["id"]: x for x in get(app, "/admin/models").json()}["sf-1"]
+    assert m["provider"] == "siliconflow" and m["proto"] == "anthropic"
+    prov = {p["name"]: p for p in get(app, "/admin/providers").json()}["siliconflow"]
+    assert prov["base_url"] == "https://gw.example/v1" and prov["key_env"] is None
+    # 校验
+    for bad in ({"name": "x", "proto": "bogus", "base_url": "u"},
+                {"name": "", "proto": "openai", "base_url": "u"},
+                {"name": "y", "proto": "openai"}):
+        assert post(app, "/admin/providers", bad).status_code == 400, bad
+
+
 # ── Task 10 修复回归：POST /admin/tree/nodes 重编撞号（评审 A-③，500 → 422/200） ──
 #
 # 根因（task-10-fix-report.md 详）：候选插到 pos 触发后继节点 idx 重编（_renumber

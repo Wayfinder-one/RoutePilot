@@ -799,6 +799,64 @@ def create_app(db_path: str, tagger: Tagger,
                               "ok": bool(r["ok"]),
                               "break_reason": r["break_reason"]} for r in rows])
 
+    @app.post("/admin/providers")
+    async def admin_add_provider(request: Request):
+        """新建/更新供应商（§9）：接入模型前先有它——base_url + key_env（密钥环境
+        变量名，密钥本身不入库）。name 已存在则覆盖更新（含 base_url/key_env/extra），
+        并把该供应商名下 models.proto 同步为新 proto（§8.1「proto 跟随 provider」）；
+        写 changes 审计。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be a JSON object"},
+                                status_code=400)
+        name, proto, base_url = body.get("name"), body.get("proto"), body.get("base_url")
+        if not (isinstance(name, str) and name.strip()):
+            return JSONResponse({"detail": "name is required"}, status_code=400)
+        if proto not in ("openai", "anthropic"):
+            return JSONResponse(
+                {"detail": "proto must be 'openai' or 'anthropic'"}, status_code=400)
+        if not (isinstance(base_url, str) and base_url.strip()):
+            return JSONResponse({"detail": "base_url is required"}, status_code=400)
+        key_env = body.get("key_env")
+        if key_env is not None and not isinstance(key_env, str):
+            return JSONResponse({"detail": "key_env must be a string or null"},
+                                status_code=400)
+        extra = body.get("extra") or {}
+        if not isinstance(extra, dict):
+            return JSONResponse({"detail": "extra must be an object"},
+                                status_code=400)
+        name, base_url = name.strip(), base_url.strip()
+        key_env = (key_env or "").strip() or None
+        conn = db.get(db_path)
+        try:
+            before = conn.execute("SELECT * FROM providers WHERE name = ?",
+                                  (name,)).fetchone()
+            before_json = None if before is None else {
+                "name": before["name"], "proto": before["proto"],
+                "base_url": before["base_url"], "key_env": before["key_env"],
+                "extra": json.loads(before["extra"] or "{}")}
+            conn.execute(
+                "INSERT INTO providers (name, proto, base_url, key_env, extra) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET proto = excluded.proto, "
+                "base_url = excluded.base_url, key_env = excluded.key_env, "
+                "extra = excluded.extra",
+                (name, proto, base_url, key_env, db._dump(extra)))
+            conn.execute("UPDATE models SET proto = ? WHERE provider = ?",
+                         (proto, name))          # §8.1 proto 跟随 provider
+            after = {"name": name, "proto": proto, "base_url": base_url,
+                     "key_env": key_env, "extra": extra}
+            db.log_change(conn, WRITE_ACTOR, "providers", name,
+                          before=before_json, after=after)
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({**after, "ok": True, "break_reason": None})
+
     @app.get("/admin/models")
     async def admin_models():
         """模型列表（含阶梯、熔断状态，§8 表）：caps/aliases 反序列化、
