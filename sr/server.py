@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import time
@@ -52,7 +53,7 @@ from sr.adapters.anthropic import StreamState
 from sr.engine import (Branch, Node, RouteDecision, TEMPLATES, evaluate,
                        evaluate_trace, extract_session, resolve_session,
                        rows_to_tree)
-from sr.health import run_checkup
+from sr.health import Finding, run_checkup
 from sr.i18n import MESSAGES, detect_lang
 from sr.models import is_circuit_open, record_failure, record_success, resolve_backend
 from sr.tags import DEFAULT_CONF_THRESHOLDS, TAGS, conf_band, tag_all
@@ -1077,6 +1078,53 @@ def _renumber(nodes: list[Node]) -> None:
                 kid.idx = b.idx * 10 + k
 
 
+def _row_idxs(nodes: list[Node]):
+    """全树落库行 idx（节点 + 分支 + kids 递归）——tree.idx 是全表主键（§3.1），
+    节点/分支共用一个编号空间；撞号检测口径与 _write_tree_rows 的行集一致。"""
+    for n in nodes:
+        yield n.idx
+        stack = list(n.branches)
+        while stack:
+            b = stack.pop(0)
+            yield b.idx
+            stack.extend(b.kids)
+
+
+def _idx_conflict(nodes: list[Node]) -> int | None:
+    """重编后的首个撞号 idx（无撞号 → None）。
+
+    撞号来源是 §9.2 编号公式的固有重叠：节点 1 的第 0 条分支派生子分支
+    10×10+k = 100+k，与节点 0 特例段 100+序号相撞（节点号 ≥ 10 同理落 100+
+    段）。_write_tree_rows 是直接 INSERT，撞号以 tree.idx 主键 IntegrityError
+    （HTTP 500）收场，必须在写库前拦下转 422。"""
+    seen: set[int] = set()
+    for idx in _row_idxs(nodes):
+        if idx in seen:
+            return idx
+        seen.add(idx)
+    return None
+
+
+def _tree_full_422(conflict: int | None = None) -> JSONResponse:
+    """idx 空间耗尽/无法无损重编 → 422 findings（与体检拦截同形状；code
+    "tree_full"、message 双语、引导改用 PUT /admin/tree 整树替换）。不写库、
+    不记 log_change——与体检 422 路径同语义（事务未动，无可回滚内容）。"""
+    where_zh = f"（撞号 idx {conflict}）" if conflict is not None else ""
+    where_en = f": conflict at idx {conflict}" if conflict is not None else ""
+    finding = Finding(
+        "hard", "tree_full", None, None,
+        f"分流树编号空间已用尽{where_zh}：M1 编号约定（分支 = 父 idx×10 + 段内"
+        "序号，节点 0 占 100+ 段）下无法无损重编，保存会使分支号与既有行相撞。"
+        "请改用 PUT /admin/tree 整树替换。",
+        f"The tree idx space is exhausted{where_en}: under the M1 convention "
+        "(branch idx = parent idx × 10 + position, node 0 occupies the 100+ "
+        "range) this tree cannot be renumbered losslessly and would collide "
+        "with existing rows. Use PUT /admin/tree to replace the whole tree "
+        "instead.",
+        {"action": "use_put_tree"})
+    return JSONResponse({"findings": [finding.to_json()]}, status_code=422)
+
+
 def _write_branch_rows(conn, parent_idx: int, b: Branch) -> None:
     """分支行 INSERT（kids 递归；分支行 name 存空串——显示名由控制台按 cond
     渲染，§3.1；updated_at/by 记审计面）。"""
@@ -1550,11 +1598,18 @@ def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
                 return JSONResponse(
                     {"detail": f"pos out of range 1..{len(nodes)}"}, status_code=400)
             if len(nodes) >= 10:
-                return JSONResponse(
-                    {"detail": "tree exceeds the M1 idx convention (10 nodes)"},
-                    status_code=400)
-            new_nodes = nodes[:pos] + [cand] + nodes[pos:]
-            _renumber(new_nodes)
+                return _tree_full_422()      # 节点号 ≥10 必撞节点 0 的 100+ 段
+            # _renumber 原地改写 idx；nodes 是树缓存（裁定 4）共享的 Node/Branch
+            # 对象，直接重编会在「重编后 422/异常」路径把重编号幻影树留在缓存里
+            # （GET 回读失真）——深拷贝后再重编，缓存对象零触碰。cand 是请求级
+            # 新对象，插进副本原地重编，下方 estimates/审计仍读 cand.idx。
+            pool = copy.deepcopy(nodes)
+            pool[pos:pos] = [cand]
+            _renumber(pool)
+            new_nodes = pool
+            conflict = _idx_conflict(new_nodes)
+            if conflict is not None:
+                return _tree_full_422(conflict)   # 修复前：IntegrityError → 500
             blocked = _checkup_or_422(conn, new_nodes)
             if blocked is not None:
                 return blocked

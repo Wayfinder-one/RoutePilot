@@ -588,3 +588,111 @@ def test_models_add_and_update(app):
     assert m["step"] == 2 and not m["enabled"]
     assert put(app, "/admin/models/glm-4-air", {"hack": 1}).status_code == 400
     assert put(app, "/admin/models/nope", {"enabled": True}).status_code == 404
+
+
+# ── Task 10 修复回归：POST /admin/tree/nodes 重编撞号（评审 A-③，500 → 422/200） ──
+#
+# 根因（task-10-fix-report.md 详）：候选插到 pos 触发后继节点 idx 重编（_renumber
+# 按 §9.2 公式原地改写），两条路会炸——①重编结果撞 tree.idx 全表主键（如候选落
+# idx 1 且首分支带 kids：子分支 10×10+k = 100+k 撞节点 0 特例段 100+）→
+# IntegrityError 未捕获 500；②nodes 是树缓存共享对象，重编在 4xx/异常路径把
+# 幻影编号留进缓存 → GET 回读失真。修复：深拷贝后重编 + 写库前撞号检测 →
+# 可无损重编 200 / 无法重编 422 findings code="tree_full"。
+
+
+def _kids_node(name="客服工单"):
+    """带一条子分支的候选节点（kids 是重编链里 parent/idx 双重改写的行）。"""
+    return {"name": name, "kind": "normal",
+            "branches": [{"cond": [{"tag": "event", "op": "is",
+                                    "values": ["payment_issue"]}],
+                          "action": {"kind": "route", "model": "qwen3-8b"},
+                          "kids": [{"cond": [{"tag": "complexity", "op": "is",
+                                              "values": [1]}],
+                                    "action": {"kind": "route",
+                                               "model": "qwen3-32b"}}]}]}
+
+
+def _tree_rows(app):
+    """tree 表全行（排序确定），供逐行相等断言。"""
+    conn = sqlite3.connect(app.state.db_path)
+    try:
+        return conn.execute("SELECT * FROM tree ORDER BY idx").fetchall()
+    finally:
+        conn.close()
+
+
+def _all_idxs(tree: dict) -> list:
+    """GET 树的全部行 idx（节点 + 分支 + kids 递归）——tree.idx 全表主键口径。"""
+    def walk(branches):
+        for b in branches:
+            yield b["idx"]
+            yield from walk(b["kids"])
+    return [n["idx"] for n in tree["nodes"]] \
+        + [i for n in tree["nodes"] for i in walk(n["branches"])]
+
+
+def test_add_node_kids_renumber_roundtrip(app):
+    """撞号风险但可无损重编 → 200 且树自洽：候选带 kids 插在 pos=2，触发整链
+    重派生（候选 2→分支 20+kids 200；被顺移的多媒体 2→3：21→31、kids
+    210/211→310/311），GET 回读须无撞号、kids parent 同步、GET→PUT 回环无损。"""
+    before = get(app, "/admin/tree").json()
+    r = post(app, "/admin/tree/nodes", {"node": _kids_node(), "pos": 2})
+    assert r.status_code == 200, r.text
+    t = get(app, "/admin/tree").json()
+    assert t["version"] == before["version"] + 1
+    assert [n["idx"] for n in t["nodes"]] == [0, 1, 2, 3, 4, 5, 6, 7, 8]  # 候选=2，兜底仍末位
+    idxs = _all_idxs(t)
+    assert len(idxs) == len(set(idxs))                 # 全行无撞号
+    # 重派生落点：候选分支 20 → kids 200；多媒体顺移后 21→31 → kids 310/311
+    cand = t["nodes"][2]
+    assert cand["name"] == "客服工单"
+    assert [b["idx"] for b in cand["branches"]] == [20]
+    assert [k["idx"] for k in cand["branches"][0]["kids"]] == [200]
+    mm = t["nodes"][3]
+    assert [b["idx"] for b in mm["branches"]] == [30, 31]
+    assert [k["idx"] for k in mm["branches"][1]["kids"]] == [310, 311]
+    assert mm["branches"][1]["kids"][0]["cond"] == \
+        [{"tag": "complexity", "op": "is", "values": [1]}]   # kids 内容不丢
+    # 库行 parent 与新 idx 同步（kids 完整、无悬空、无撞号）
+    parents = {r[0]: r[1] for r in _tree_rows(app)}
+    assert len(parents) == len(idxs)
+    assert all(p is None or p in parents for p in parents.values())
+    assert parents[200] == 20 and parents[310] == 31 and parents[311] == 31
+    # GET→PUT 回环无损（回读结构可直接整树回写）
+    assert put(app, "/admin/tree", t).status_code == 200
+    assert get(app, "/admin/tree").json()["nodes"] == t["nodes"]
+
+
+def test_add_node_unrenumberable_422_tree_untouched(app):
+    """idx 空间耗尽/无法无损重编 → 422 findings code="tree_full"（绝不 500），
+    且树纹丝不动：GET 回读（含 version）与插入前全等 + 库行逐行相等。
+
+    撞号构造：候选带 kids 插在 pos=1 → 候选落 idx 1，其第 0 条分支重编为 10、
+    子分支 = 10×10+k = 100+k，撞节点 0（会话沿用特例段 100/101/102）。修复前
+    IntegrityError 500，且树缓存被原地重编污染（GET 回读幻影树）。末段补验
+    「节点数满 10 后再插」的空间耗尽同口径 422（修复前 400 detail）。"""
+    before = get(app, "/admin/tree").json()
+    rows_before = _tree_rows(app)
+    r = post(app, "/admin/tree/nodes", {"node": _kids_node(), "pos": 1})
+    assert r.status_code == 422, r.text               # 修复前：500 IntegrityError
+    f = r.json()["findings"][0]
+    assert f["code"] == "tree_full" and f["level"] == "hard"
+    assert set(f["message"]) == {"zh", "en"}          # 双语 findings
+    assert "PUT /admin/tree" in f["message"]["en"] and "整树替换" in f["message"]["zh"]
+    assert f["fix"] == {"action": "use_put_tree"}
+    assert get(app, "/admin/tree").json() == before   # 缓存污染在此暴露
+    assert _tree_rows(app) == rows_before             # 库行逐行相等
+    # 空间耗尽（补到 10 节点后再插第 11 个）→ 同口径 422 tree_full，树不动
+    plain = {"name": "plain", "kind": "normal",
+             "branches": [{"cond": [{"tag": "event", "op": "is",
+                                     "values": ["incident"]}],
+                           "action": {"kind": "route", "model": "qwen3-8b"}}]}
+    for pos in (3, 4):
+        assert post(app, "/admin/tree/nodes",
+                    {"node": plain, "pos": pos}).status_code == 200
+    full = get(app, "/admin/tree").json()
+    assert len(full["nodes"]) == 10
+    r = post(app, "/admin/tree/nodes", {"node": plain, "pos": 5})
+    assert r.status_code == 422 and r.json()["findings"][0]["code"] == "tree_full"
+    assert get(app, "/admin/tree").json() == full
+    assert len(_tree_rows(app)) == len(_all_idxs(full))
