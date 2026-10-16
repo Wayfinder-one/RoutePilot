@@ -181,6 +181,24 @@ def test_gauge_last_writer_wins_across_instances(tmp_path):
     assert _samples(b.render(), "sr_estimate_error") == ["sr_estimate_error 0.9"]
 
 
+def test_gauge_interleaved_writes_no_lost_update(tmp_path):
+    """gauge 语义是「最后写入者胜」：A 写完 B 写、B 写完 A 再写 → A 的值。
+
+    D1 补强（防回归）：若把 gauge 误做成「每实例本地缓存、只在首次落库」，
+    A 的第二次 set 就会看不见 B 的写入（或反之）——总量看似对，末值却错。
+    这里钉住「每次都无条件 UPSERT」，两实例交替写不丢更新。
+    """
+    path = _new_db(tmp_path)
+    a, b = Metrics(path), Metrics(path)
+    a.set("sr_estimate_error", 0.1)
+    b.set("sr_estimate_error", 0.9)
+    a.set("sr_eval_route_match_rate", 0.2)      # 换族写：不得清掉 sr_estimate_error
+    assert _samples(a.render(), "sr_estimate_error") == ["sr_estimate_error 0.9"]
+    a.set("sr_estimate_error", 0.3)             # A 再次写 → A 赢
+    assert _samples(a.render(), "sr_estimate_error") == ["sr_estimate_error 0.3"]
+    assert _samples(b.render(), "sr_estimate_error") == ["sr_estimate_error 0.3"]
+
+
 def test_cross_instance_via_two_app_instances_same_db(tmp_path):
     """简报 §1 验收测试等价模拟：实例 A 打 N 次、实例 B 打 M 次 →
     任一实例 /metrics 都出 N+M（多进程正确性的等价模拟）。"""
