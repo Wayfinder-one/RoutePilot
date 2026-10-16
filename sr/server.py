@@ -53,6 +53,7 @@ from sr.adapters.cross import from_upstream as _cross_from_upstream
 from sr.engine import (Branch, Node, RouteDecision, TEMPLATES, evaluate,
                        evaluate_trace, extract_session, resolve_session,
                        rows_to_tree)
+import sr.eval as eval_mod
 from sr.health import run_checkup_safe
 from sr.i18n import MESSAGES, detect_lang
 from sr.metrics import Metrics, _bump_request_metrics, _is_fallback  # A1：指标（原在 server）
@@ -675,7 +676,8 @@ def _checkup_or_422(conn, nodes: list[Node]):
     走 :func:`run_checkup_safe`：体检自身崩溃按 hard finding 降级（M5），
     不得变成 PUT 500。
     """
-    findings = run_checkup_safe(nodes, db.model_ids(conn), TAGS, hits=_hits_30d(conn))
+    findings = run_checkup_safe(nodes, db.model_ids(conn), TAGS, hits=_hits_30d(conn),
+                                estimates=eval_mod.estimate_deviations(conn))
     if any(f.level == "hard" for f in findings):
         ordered = sorted(findings, key=lambda f: f.level != "hard")
         return JSONResponse({"findings": [f.to_json() for f in ordered]},
@@ -1038,7 +1040,8 @@ def create_app(db_path: str, tagger: Tagger,
         conn = db.get(db_path)
         try:
             findings = run_checkup_safe(_load_tree(conn, db_path), db.model_ids(conn),
-                                        TAGS, hits=_hits_30d(conn))
+                                        TAGS, hits=_hits_30d(conn),
+                                        estimates=eval_mod.estimate_deviations(conn))
         finally:
             conn.close()
         return JSONResponse({"findings": [f.to_json() for f in findings]})
@@ -1182,18 +1185,73 @@ def create_app(db_path: str, tagger: Tagger,
 
     @app.get("/admin/tree/estimates")
     async def admin_tree_estimates():
-        """预估列表（§11.4 复盘）：estimates 全行，actual NULL = 未复盘。"""
+        """预估列表（§11.4 复盘）：estimates 全行，actual NULL = 未复盘。
+
+        M3：读时惰性回填（ts 已满 7 天的未复盘行按真实流量算 actual，幂等）+ 置
+        sr_estimate_error gauge（最近一次复盘偏差）。"""
         conn = db.get(db_path)
         try:
+            if eval_mod.backfill_estimates(conn):
+                conn.commit()
             rows = conn.execute("SELECT * FROM estimates "
                                 "ORDER BY ts DESC, rowid DESC").fetchall()
+            err = eval_mod.estimate_error(conn)
         finally:
             conn.close()
+        if err is not None:
+            metrics.set("sr_estimate_error", err)
         return JSONResponse([{"id": r["id"], "ts": r["ts"], "node": r["node"],
                               "params": json.loads(r["params"]),
                               "est": json.loads(r["est"]),
                               "actual": json.loads(r["actual"]) if r["actual"]
                               else None} for r in rows])
+
+    @app.post("/admin/eval")
+    async def admin_eval(request: Request):
+        """评测（§11.4）：``{"source":"replay","days":7}`` 或
+        ``{"source":"labels","labels":[{text,expect_model|expect_branch}]}``。
+        结果落 changes(tbl='eval') + 置 sr_eval_route_match_rate gauge。"""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"detail": "request body is not valid JSON"},
+                                status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "request body must be an object"},
+                                status_code=400)
+        source = body.get("source")
+        conn = db.get(db_path)
+        try:
+            if source == "replay":
+                report = eval_mod.replay_eval(conn, db_path,
+                                              days=int(body.get("days") or 7))
+            elif source == "labels":
+                recs = body.get("labels")
+                if not isinstance(recs, list):
+                    return JSONResponse({"detail": "labels must be a list"},
+                                        status_code=400)
+                report = await eval_mod.labels_eval(conn, db_path, recs, tagger)
+            else:
+                return JSONResponse(
+                    {"detail": "source must be 'replay' or 'labels'"},
+                    status_code=400)
+            eval_mod.log_eval(conn, report, actor=WRITE_ACTOR)
+            conn.commit()
+        finally:
+            conn.close()
+        if report.rate is not None:
+            metrics.set("sr_eval_route_match_rate", report.rate)
+        return JSONResponse(report.to_json())
+
+    @app.get("/admin/evals")
+    async def admin_evals(limit: int = 3):
+        """最近 N 次评测报告（§11.4：控制台「分流树」页查看最近三次）。"""
+        conn = db.get(db_path)
+        try:
+            reports = eval_mod.recent_evals(conn, max(1, min(limit, 20)))
+        finally:
+            conn.close()
+        return JSONResponse(reports)
 
     @app.post("/admin/tree/nodes")
     async def admin_tree_add_node(request: Request):

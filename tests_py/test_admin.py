@@ -415,6 +415,39 @@ def test_traffic_small_filter_empty_ladder_is_empty(app):
     _seed_request_ts(app, db._now(), routed_to="qwen3-8b")
     assert get(app, "/admin/traffic?f=small").json()["rows"] == []
 
+def test_admin_eval_replay_and_recent(app):
+    """POST /admin/eval（replay）+ GET /admin/evals + sr_eval_route_match_rate（§11.4）。"""
+    post_blocked_request(app)                     # 一条 new 会话请求（有标签）
+    r = post(app, "/admin/eval", {"source": "replay", "days": 7})
+    assert r.status_code == 200, r.text
+    rep = r.json()
+    assert rep["source"] == "replay" and rep["total"] >= 1 and "rate" in rep
+    recent = get(app, "/admin/evals").json()
+    assert len(recent) == 1 and recent[0]["source"] == "replay"
+    body = get(app, "/metrics").text
+    assert "sr_eval_route_match_rate" in body
+    assert post(app, "/admin/eval", {"source": "bogus"}).status_code == 400
+
+
+def test_admin_estimates_backfill_and_gauge(app):
+    """GET /admin/tree/estimates 惰性回填 actual + sr_estimate_error gauge（§11.4）。"""
+    conn = sqlite3.connect(app.state.db_path)
+    from datetime import datetime, timedelta
+    est_ts = (datetime.now().astimezone()
+              - timedelta(days=10)).isoformat(timespec="seconds")
+    conn.execute("INSERT INTO estimates (id, ts, node, params, est, actual) "
+                 "VALUES ('e1', ?, '3', '{}', ?, NULL)",
+                 (est_ts, db._dump({"daily": 100, "cost_delta": 0})))
+    conn.commit()
+    conn.close()
+    rows = get(app, "/admin/tree/estimates").json()
+    assert rows and rows[0]["actual"] is not None            # 已回填
+    body = get(app, "/metrics").text
+    samples = [l for l in body.splitlines()
+               if l.startswith("sr_estimate_error") and not l.startswith("#")]
+    assert samples and float(samples[0].split()[-1]) > 0      # 偏差 → gauge 有样本
+
+
 def test_metrics_backfill_from_requests(app):
     """裁定 6：启动时从 requests 表 backfill sr_requests_total——第二个 app
     实例不发任何 /v1 请求，其计数应来自库中已有行（每 outcome 一行样本）。"""

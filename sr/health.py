@@ -673,7 +673,29 @@ def check_conf_on_rule(nodes: list[Node], models,
     return findings
 
 
-# §10 CHECKS 表逐字（函数, 是否硬错误）；check_no_hits 的 hits 由 run_checkup 传。
+def check_estimate_accuracy(nodes, models, tag_defs, is_hard, estimates=None):
+    """M3（§11.4）：已复盘预估偏差 > 50% → info「估得不准」（估得不准本身也可观测）。
+
+    estimates 由调用方查库传入（``[{node, est_daily, actual_daily, deviation}]``，
+    见 sr/eval.estimate_deviations）；None/空跳过。
+    """
+    out: list[Finding] = []
+    for d in estimates or []:
+        est = d.get("est_daily") or 0
+        act = d.get("actual_daily") or 0
+        dev = d.get("deviation") or 0
+        out.append(Finding(
+            "info", "estimate_off", None, None,
+            f"预估复盘偏差偏高（节点 {d.get('node')}）：预估日均 {est:.0f} 条，"
+            f"实际 {act:.0f} 条（偏差 {dev * 100:.0f}%）。",
+            f"Estimate review deviation is high (node {d.get('node')}): estimated "
+            f"{est:.0f}/day vs actual {act:.0f}/day ({dev * 100:.0f}% off).",
+            {"action": "review_estimate"}))
+    return out
+
+
+# §10 CHECKS 表逐字（函数, 是否硬错误）；check_no_hits 的 hits / check_estimate_accuracy
+# 的 estimates 由 run_checkup 传（DB 数据，纯函数签名拿不到——接口裁定同 hits）。
 CHECKS: list[tuple] = [
     (check_dead_branch,    False),  # 分支被上方完全覆盖
     (check_unused_tags,    False),  # 标签从未被任何规则引用
@@ -683,12 +705,14 @@ CHECKS: list[tuple] = [
     (check_duplicate,      False),  # 两条规则条件完全相同
     (check_special_misplaced, True),  # 特殊去向出现在「会话沿用」之外的节点 ← 硬错误
     (check_conf_on_rule,   False),  # 规则标签配了把握度门槛（永不满足，疑似误配）
+    (check_estimate_accuracy, False),  # M3：预估复盘偏差 > 50%（估得不准可观测）
 ]
 
 
 def run_checkup(nodes: list[Node], models, tag_defs,
-                hits: dict[str, int] | None = None) -> list[Finding]:
-    """八项体检（§10 逐字：函数表循环 + is_hard 标记）→ list[Finding]。
+                hits: dict[str, int] | None = None,
+                estimates: list | None = None) -> list[Finding]:
+    """体检（§10 八项 + M3 预估复盘 info：函数表循环 + is_hard 标记）→ list[Finding]。
 
     :param nodes: 内存树（rows_to_tree 产物或同构 Node 列表）。
     :param models: 可用模型字典（{model_id: …}，按 id 集合语义消费——简报测试
@@ -696,18 +720,23 @@ def run_checkup(nodes: list[Node], models, tag_defs,
     :param tag_defs: 标签注册表（sr.tags.TAGS）。
     :param hits: 可选，hit_branch → 近 30 天命中数（check_no_hits 用，见模块
       docstring 接口裁定）；None 跳过该检查。
+    :param estimates: 可选，偏差超阈的已复盘预估列表（check_estimate_accuracy 用，
+      M3 §11.4）；None 跳过。
     """
     findings: list[Finding] = []
     for fn, is_hard in CHECKS:
         if fn is check_no_hits:
             findings.extend(fn(nodes, models, tag_defs, is_hard, hits=hits))
+        elif fn is check_estimate_accuracy:
+            findings.extend(fn(nodes, models, tag_defs, is_hard, estimates=estimates))
         else:
             findings.extend(fn(nodes, models, tag_defs, is_hard))
     return findings
 
 
 def run_checkup_safe(nodes: list[Node], models, tag_defs,
-                     hits: dict[str, int] | None = None) -> list[Finding]:
+                     hits: dict[str, int] | None = None,
+                     estimates: list | None = None) -> list[Finding]:
     """run_checkup 的**崩溃安全**入口（M5，audit Major）：体检内部异常降级为一条
     hard finding（code="checkup_error"），绝不逃逸成 PUT /admin/tree 500。
 
@@ -723,7 +752,7 @@ def run_checkup_safe(nodes: list[Node], models, tag_defs,
     patch ``sr.health.run_checkup``）。
     """
     try:
-        return run_checkup(nodes, models, tag_defs, hits=hits)
+        return run_checkup(nodes, models, tag_defs, hits=hits, estimates=estimates)
     except Exception as exc:                    # 体检自身崩溃：绝不变成 500
         logger.exception("run_checkup crashed (degraded to hard finding): %r", exc)
         return [Finding(

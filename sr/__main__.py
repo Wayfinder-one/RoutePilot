@@ -21,6 +21,9 @@ Produces 接口。argparse 五个子命令：
       四节 YAML 打到 stdout（转调 sr/config.export_yaml）。
 - ``sr import --db PATH FILE``
       YAML 包校验 + 写入（转调 sr/config.import_yaml，actor="cli"）。
+- ``sr eval --db PATH --replay-last 7d | --labels FILE.jsonl [--checkpoint DIR]``
+      评测（spec §11.4）：历史回放（近 N 天入库标签跑当前树）或标注集（经打标器
+      打标）。报告打到 stdout 并落 changes(tbl='eval')。
 
 退出码：``0`` 成功；``1`` import 包被体检 hard findings 拒绝（findings JSON 打到
 stdout，整包未写）；``2`` 输入非法（ValueError：YAML/结构/引用，消息在 stderr）
@@ -31,6 +34,7 @@ stdout，整包未写）；``2`` 输入非法（ValueError：YAML/结构/引用�
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -44,7 +48,7 @@ def _parser() -> argparse.ArgumentParser:
         prog="sr", description="Smart Router 命令行（spec §12 启动流程；"
                                "M1：heuristic 模式闭环）")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="{init,serve,"
-                           "fake-upstream,export,import}")
+                           "fake-upstream,export,import,eval}")
 
     q = sub.add_parser("init", help="建库（幂等）+ 可选导入 bootstrap.yaml")
     q.add_argument("--db", required=True, help="SQLite 路径")
@@ -71,6 +75,20 @@ def _parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser("export", help="导出四节 YAML 到 stdout")
     q.add_argument("--db", required=True, help="SQLite 路径")
+
+    q = sub.add_parser("eval", help="评测：历史回放 / 标注集（spec §11.4）")
+    q.add_argument("--db", required=True, help="SQLite 路径")
+    g = q.add_mutually_exclusive_group(required=True)
+    g.add_argument("--replay-last", metavar="ND",
+                   help="历史回放：近 N 天入库标签跑当前树（如 7d）")
+    g.add_argument("--labels", metavar="FILE",
+                   help="标注集 jsonl（{text, expect_model|expect_branch}）")
+    q.add_argument("--checkpoint", default=None, metavar="DIR",
+                   help="标注集评测用的 checkpoint 打标器（缺省 heuristic）")
+    q.add_argument("--device", default=None, metavar="DEV",
+                   help="checkpoint 打标器设备（cuda / cpu，缺省自动）")
+    q.add_argument("--batch-window-ms", type=int, default=0, metavar="MS",
+                   help="checkpoint 微批窗口（§4.3；0 = 不批）")
 
     q = sub.add_parser("import", help="导入四节 YAML 配置包（校验+写入）")
     q.add_argument("--db", required=True, help="SQLite 路径")
@@ -146,6 +164,55 @@ def _serve(args) -> int:
     return 0
 
 
+def _do_eval(args) -> int:
+    """评测入口（spec §11.4）：历史回放 / 标注集 → 报告打到 stdout，落 changes。
+
+    退出码同约定：0 成功；2 输入非法（库未初始化 / 标注集不可读 / YAML 行坏）。
+    """
+    if not db.is_initialized(args.db):
+        print(f"sr eval: 库未初始化，请先 `sr init --db {args.db}`", file=sys.stderr)
+        return 2
+    import sr.eval as eval_mod
+    conn = db.get(args.db)
+    try:
+        if args.replay_last is not None:
+            raw = str(args.replay_last).strip().rstrip("dD")
+            try:
+                days = int(raw or 7)
+            except ValueError:
+                print(f"sr eval: --replay-last 需形如 7d：{args.replay_last!r}",
+                      file=sys.stderr)
+                return 2
+            report = eval_mod.replay_eval(conn, args.db, days=days)
+        else:
+            try:
+                lines = Path(args.labels).read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                print(f"sr eval: cannot read {args.labels}: {exc}", file=sys.stderr)
+                return 2
+            records = []
+            for ln in lines:
+                if ln.strip():
+                    try:
+                        records.append(json.loads(ln))
+                    except ValueError as exc:
+                        print(f"sr eval: bad jsonl line: {exc}", file=sys.stderr)
+                        return 2
+            try:
+                tagger = _build_tagger(args)
+            except Exception as exc:               # noqa: BLE001（checkpoint 校验等）
+                print(f"sr eval: tagger 构建失败：{exc}", file=sys.stderr)
+                return 2
+            report = asyncio.run(
+                eval_mod.labels_eval(conn, args.db, records, tagger))
+        eval_mod.log_eval(conn, report, actor="cli")
+        conn.commit()
+    finally:
+        conn.close()
+    print(json.dumps(report.to_json(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     if args.cmd == "init":
@@ -181,6 +248,8 @@ def main(argv=None) -> int:
         finally:
             conn.close()
         return 0
+    if args.cmd == "eval":
+        return _do_eval(args)
     if args.cmd == "import":
         if not db.is_initialized(args.db):
             print(f"sr import: 库未初始化，请先 `sr init --db {args.db}`"
