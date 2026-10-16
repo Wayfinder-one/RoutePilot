@@ -6,15 +6,15 @@ Produces 接口。argparse 五个子命令：
       ``--import`` 走 sr/config.import_yaml（normalize 校验 + 体检 + 单事务写入，
       控制者裁定 1 同源）。
 - ``sr serve --db PATH [--port 8899] [--host HOST] [--checkpoint DIR]
-        [--console FILE]``
-      §12 启动序列：显式 ``--checkpoint`` 时本任务只校验**目录存在性**——
-      存在则打印「M2 才支持，当前以 heuristic 启动」警告并继续（不静默失败），
-      不存在则拒绝启动（§15「校验失败拒绝启动，不静默降级」）；未指定 →
-      heuristic。打标器注入 ``HeuristicTagger()``（A2：sr.tagger.Tagger 协议
-      对象；M2 的 --checkpoint 分支加载 CheckpointTagger 后派第二实现）。
+        [--device DEV] [--batch-window-ms MS] [--console FILE]``
+      §12 启动序列：显式 ``--checkpoint`` → 按 §2.3 校验 router_config.json /
+      model.pt / tags.json（与 sr.tags 逐项断言：名称/类型/标签数/标签顺序），
+      通过则注入 ``CheckpointTagger``（torch 前向 + 嵌入头，name="checkpoint"）；
+      **校验失败拒绝启动**（§2.5/§15，不静默降级）。未指定 → heuristic 模式
+      （注入 ``HeuristicTagger``；A2 打标器是注入的 sr.tagger.Tagger 协议对象）。
+      ``--device`` 选 cuda/cpu（缺省自动），``--batch-window-ms`` 是 §4.3 微批窗口。
       ``--console`` 换 GET / 托管的控制台文件（Task 12，缺省仓库根
-      console-v7.html）。
-      对未 init 的库先幂等 init（快速开始 ``sr serve`` 一步可达）。
+      console-v7.html）。对未 init 的库先幂等 init（快速开始 ``sr serve`` 一步可达）。
 - ``sr fake-upstream [--port 8123] [--host HOST]``
       转调 sr.fake_upstream.run（Task 7/8 的故障注入假上游，§14.4 e2e 底座）。
 - ``sr export --db PATH``
@@ -51,12 +51,17 @@ def _parser() -> argparse.ArgumentParser:
     q.add_argument("--import", dest="import_file", metavar="BOOTSTRAP.YAML",
                    help="导入四节 YAML 配置包（校验+写入，同 sr import）")
 
-    q = sub.add_parser("serve", help="启动路由进程（无检查点 → heuristic）")
+    q = sub.add_parser("serve", help="启动路由进程（--checkpoint → checkpoint 模式）")
     q.add_argument("--db", required=True, help="SQLite 路径")
     q.add_argument("--port", type=int, default=8899, help="监听端口（默认 8899）")
     q.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     q.add_argument("--checkpoint", default=None, metavar="DIR",
-                   help="检查点目录（M2 才支持加载；本任务只校验目录存在）")
+                   help="检查点目录（显式给定 → 校验 router_config.json/model.pt/"
+                        "tags.json，通过则 checkpoint 模式，失败拒绝启动）")
+    q.add_argument("--device", default=None, metavar="DEV",
+                   help="checkpoint 模式设备（cuda / cpu / cuda:1；缺省自动）")
+    q.add_argument("--batch-window-ms", type=int, default=0, metavar="MS",
+                   help="checkpoint 微批窗口（§4.3；0 = 不批，直接前向）")
     q.add_argument("--console", default=None, metavar="FILE",
                    help="GET / 托管的控制台 HTML（默认仓库根 console-v7.html）")
 
@@ -100,27 +105,43 @@ def _do_import(conn, path: str) -> int:
     return 0
 
 
+def _build_tagger(args):
+    """按 ``--checkpoint`` 决定打标器：显式给定 → 校验 + CheckpointTagger（§2.3/§2.5）；
+    未指定 → HeuristicTagger（heuristic 模式，§2.5）。校验失败抛 :class:`CheckpointError`。"""
+    if args.checkpoint is None:
+        from sr.tagger import HeuristicTagger
+        return HeuristicTagger()
+    from sr.checkpoint import CheckpointTagger
+    return CheckpointTagger(args.checkpoint, device=args.device,
+                            batch_window_ms=args.batch_window_ms)
+
+
 def _serve(args) -> int:
-    """§12 serve 启动序列（M1 口径）：checkpoint 只验存在性 + 警告可见；heuristic。"""
+    """§12 serve 启动序列：--checkpoint 显式给定 → 内容校验（§2.3），通过建
+    CheckpointTagger，失败拒绝启动（§2.5/§15「校验失败不静默降级」）。"""
     if args.checkpoint is not None:
-        cp = Path(args.checkpoint)
-        if not cp.is_dir():
-            # §15：显式 --checkpoint 但校验失败 → 拒绝启动，不静默降级
-            print(f"sr serve: --checkpoint 目录不存在，拒绝启动（不静默降级，"
-                  f"spec §15）: {cp}", file=sys.stderr, flush=True)
+        # 显式指定即用户认为它有效：目录/文件/标签清单任一不符 → 拒绝启动
+        from sr.checkpoint import CheckpointError
+        try:
+            tagger = _build_tagger(args)
+        except CheckpointError as exc:
+            print(f"sr serve: --checkpoint 校验失败，拒绝启动"
+                  f"（不静默降级，spec §2.5/§15）: {exc}", file=sys.stderr,
+                  flush=True)
             return 2
-        # §12：检查点加载是 M2；本任务显式给定时校验目录存在并警告（不静默失败）
-        print(f"sr serve: --checkpoint {cp}：M2 才支持，当前以 heuristic 启动",
-              file=sys.stderr, flush=True)
+        except ImportError as exc:              # torch / transformers 未安装
+            print(f"sr serve: checkpoint 模式需要 torch / transformers，"
+                  f"当前环境缺失，拒绝启动: {exc}", file=sys.stderr, flush=True)
+            return 2
+        print(f"sr serve: checkpoint 模式（{tagger.device}，"
+              f"max_length={tagger.max_length}）", file=sys.stderr, flush=True)
+    else:
+        tagger = _build_tagger(args)
     conn = db.init_db(args.db)             # 幂等：未 init 的库直接 serve 也可用
     conn.close()
     import uvicorn
     from sr.server import create_app
-    from sr.tagger import HeuristicTagger
-    # A2：打标器是注入的协议对象（sr.tagger.Tagger）。M1 恒 HeuristicTagger；
-    # M2 在 --checkpoint 分支加载 CheckpointTagger（torch 前向 + 嵌入头，
-    # name="checkpoint"）替换此处注入——警告分支维持 heuristic 不变。
-    uvicorn.run(create_app(args.db, HeuristicTagger(), console_path=args.console),
+    uvicorn.run(create_app(args.db, tagger, console_path=args.console),
                 host=args.host, port=args.port)
     return 0
 

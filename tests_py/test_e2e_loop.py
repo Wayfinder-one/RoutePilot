@@ -370,30 +370,21 @@ def test_cli_serve_refuses_missing_checkpoint(tmp_path):
     assert "不存在" in r.stderr + r.stdout
 
 
-def test_cli_serve_checkpoint_dir_warns_and_starts(tmp_path):
-    """§12：--checkpoint 指向存在目录 → 打「M2 才支持，当前以 heuristic 启动」警告
-    （不静默失败）并以 heuristic 正常起服务。"""
+def test_cli_serve_checkpoint_incomplete_dir_refuses(tmp_path):
+    """M2 §2.3/§2.5：--checkpoint 指向存在但内容不全的目录 → 校验失败，拒绝启动。
+    旧行为（存在即打「M2 才支持」警告并以 heuristic 启动）已废——显式指定意味着用户
+    认为它有效，静默降级是欺骗；现在按 §2.3 校验 router_config.json/model.pt/tags.json。"""
     cp = tmp_path/"ckpt"
-    cp.mkdir()
+    cp.mkdir()                              # 只有空目录，缺 router_config.json
     dbs = tmp_path/"s2.db"
     assert run_cli("init", "--db", str(dbs)).returncode == 0
-    logf = tempfile.NamedTemporaryFile(prefix="sr-e2e-ckpt-", suffix=".log",
-                                       delete=False)
-    proc = subprocess.Popen(
+    r = subprocess.run(
         [sys.executable, "-m", "sr", "serve", "--db", str(dbs), "--port", "18899",
          "--checkpoint", str(cp)],
-        stdout=logf, stderr=subprocess.STDOUT, env=_sub_env(), cwd=str(REPO))
-    proc.log_path, proc.port = logf.name, 18899
-    log_text = ""
-    try:
-        _wait_ready(18899, "/admin/settings", logf.name, proc)
-        r = httpx.get("http://127.0.0.1:18899/v1/models", timeout=10)
-        assert r.headers["x-sr-tagger"] == "heuristic"       # 警告后照常 heuristic 启动
-        log_text = Path(logf.name).read_text(                # stop 会删日志，先读
-            encoding="utf-8", errors="replace")
-    finally:
-        stop(proc)
-    assert "M2 才支持" in log_text, log_text                  # 警告可见，非静默
+        capture_output=True, text=True, env=_sub_env(), cwd=str(REPO), timeout=60)
+    assert r.returncode == 2, (r.returncode, r.stdout, r.stderr)
+    assert "校验失败" in r.stderr, r.stderr
+    assert "router_config.json" in r.stderr, r.stderr
 
 
 # ── 补充：POST /admin/traffic/{id}/replay（进程内快速版 + 边界） ───────────────
