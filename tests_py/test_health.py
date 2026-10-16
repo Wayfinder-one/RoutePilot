@@ -200,6 +200,7 @@ def test_legal_or_not_bodies_still_pass_after_shape_gate(base_nodes):
 import asyncio as _asyncio                                  # noqa: E402
 import httpx as _httpx                                      # noqa: E402
 from sr.server import create_app as _create_app             # noqa: E402
+from sr.tagger import HeuristicTagger                       # noqa: E402
 
 _asyncio.set_event_loop(_asyncio.new_event_loop())          # 3.14 起无隐式环
 
@@ -208,7 +209,7 @@ _asyncio.set_event_loop(_asyncio.new_event_loop())          # 3.14 起无隐式�
 def app(tmp_path):
     conn = db.init_db(str(tmp_path / "t.db"))
     conn.close()
-    return _create_app(str(tmp_path / "t.db"), tagger="heuristic")
+    return _create_app(str(tmp_path / "t.db"), HeuristicTagger())
 
 
 def _admin_get(app, path):

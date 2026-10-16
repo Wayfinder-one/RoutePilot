@@ -10,7 +10,8 @@ Produces 接口。argparse 五个子命令：
       §12 启动序列：显式 ``--checkpoint`` 时本任务只校验**目录存在性**——
       存在则打印「M2 才支持，当前以 heuristic 启动」警告并继续（不静默失败），
       不存在则拒绝启动（§15「校验失败拒绝启动，不静默降级」）；未指定 →
-      heuristic。tagger 恒 ``"heuristic"``（M2 接检查点加载后才派第二值）。
+      heuristic。打标器注入 ``HeuristicTagger()``（A2：sr.tagger.Tagger 协议
+      对象；M2 的 --checkpoint 分支加载 CheckpointTagger 后派第二实现）。
       ``--console`` 换 GET / 托管的控制台文件（Task 12，缺省仓库根
       console-v7.html）。
       对未 init 的库先幂等 init（快速开始 ``sr serve`` 一步可达）。
@@ -115,7 +116,11 @@ def _serve(args) -> int:
     conn.close()
     import uvicorn
     from sr.server import create_app
-    uvicorn.run(create_app(args.db, tagger="heuristic", console_path=args.console),
+    from sr.tagger import HeuristicTagger
+    # A2：打标器是注入的协议对象（sr.tagger.Tagger）。M1 恒 HeuristicTagger；
+    # M2 在 --checkpoint 分支加载 CheckpointTagger（torch 前向 + 嵌入头，
+    # name="checkpoint"）替换此处注入——警告分支维持 heuristic 不变。
+    uvicorn.run(create_app(args.db, HeuristicTagger(), console_path=args.console),
                 host=args.host, port=args.port)
     return 0
 

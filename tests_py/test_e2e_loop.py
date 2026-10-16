@@ -42,6 +42,7 @@ import uvicorn
 import sr.db as db
 from sr.fake_upstream import create_app as fake_create_app
 from sr.server import create_app
+from sr.tagger import HeuristicTagger
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -415,7 +416,7 @@ def app(tmp_path):
     conn.execute("UPDATE providers SET base_url='http://127.0.0.1:8125'")
     conn.commit()
     conn.close()
-    return create_app(str(tmp_path/"t.db"), tagger="heuristic")
+    return create_app(str(tmp_path/"t.db"), HeuristicTagger())
 
 
 def _run(coro):

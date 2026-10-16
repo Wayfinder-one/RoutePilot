@@ -63,7 +63,8 @@ from sr.i18n import MESSAGES, detect_lang
 from sr.models import (is_circuit_open, record_failure, record_success,
                        reset_circuit, resolve_backend)
 from sr.tags import (DEFAULT_CONF_THRESHOLDS, DEFAULT_CONTEXT_THRESHOLDS,
-                     TAGS, conf_band, tag_all)
+                     TAGS, conf_band)
+from sr.tagger import Tagger, TagRequest, TagResult
 
 # 两协议适配器（§7.1 按路径判定 proto → 同构七件套）
 ADAPTERS = {"openai": oai, "anthropic": anth}
@@ -910,9 +911,15 @@ def _tags_brief(conn, ids: list[str]) -> dict[str, list]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-async def _handle(proto: str, request: Request, db_path: str, tagger: str,
+async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                   metrics: Metrics):
-    """``POST /v1/chat/completions`` / ``POST /v1/messages`` 共用主流程。"""
+    """``POST /v1/chat/completions`` / ``POST /v1/messages`` 共用主流程。
+
+    打标经注入的 :class:`sr.tagger.Tagger`（A2，审核报告 §3-A2）：
+    ``result = await tagger.tag(TagRequest(...))``，signals 形状与旧 tag_all
+    完全一致；``tag_result.vec`` 非 None（M2 checkpoint 嵌入头）时在会话
+    写库路径落 sessions.last_vec。
+    """
     conn = None
     try:
         # ── 1–2 按路径判定协议 + 解析请求体 → IR ──
@@ -921,11 +928,11 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
         except Exception:
             return _error(proto, 400, "request body is not valid JSON",
                           "invalid_request_error", "invalid_json",
-                          {"x-sr-tagger": tagger})
+                          {"x-sr-tagger": tagger.name})
         if not isinstance(body, dict):
             return _error(proto, 400, "request body must be a JSON object",
                           "invalid_request_error", "invalid_json",
-                          {"x-sr-tagger": tagger})
+                          {"x-sr-tagger": tagger.name})
         ir = ADAPTERS[proto].parse(body)
         if proto == "anthropic" and ir.params.get("max_tokens") is None:
             # anthropic 客户端 max_tokens 必填，缺失兜底 1024（裁定 9，声明记任务报告）
@@ -946,6 +953,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
         session_tag = "new"
         answer_ms = 0.0
         signals: dict | None = None
+        tag_result: TagResult | None = None   # A2：注入打标器的原始产物（vec 通道）
         hit_branch: str | None = None
 
         # ── 4 model 判定：auto → 树；具体名/别名 → 直通 R2；其他 → 400 ──
@@ -956,7 +964,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             if row is None or not row["enabled"]:
                 return _error(proto, 400, f"unknown model: {asked}",
                               "invalid_request_error", "model_not_found",
-                              {"x-sr-tagger": tagger})
+                              {"x-sr-tagger": tagger.name})
             mode = "direct"
 
         if mode == "direct":
@@ -967,9 +975,12 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
                 request.client.host if request.client else "",
                 sticky_enabled=(settings.get("session_sticky") == "1"))
             t1 = time.monotonic()
-            signals = tag_all(text, req_headers, len(ir.messages),
-                              datetime.now().astimezone(),
-                              _last_msg(conn, session_id), ctx_thresholds)
+            tag_result = await tagger.tag(TagRequest(
+                text=text, headers=req_headers, n_messages=len(ir.messages),
+                now=datetime.now().astimezone(),
+                last_msg=_last_msg(conn, session_id),
+                context_thresholds=ctx_thresholds))
+            signals = tag_result.signals
             answer_ms = (time.monotonic() - t1) * 1000
             metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0)
         else:
@@ -984,9 +995,12 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             pre_signals: dict | None = None
             if feedback is None and settings.get("sticky_detect_feedback") == "1":
                 # §4.4 反馈来源 2：开启后沿用路径仍做一次前向，只为读 user_feedback
-                pre_signals = tag_all(text, req_headers, len(ir.messages),
-                                      datetime.now().astimezone(),
-                                      _last_msg(conn, session_id), ctx_thresholds)
+                tag_result = await tagger.tag(TagRequest(
+                    text=text, headers=req_headers, n_messages=len(ir.messages),
+                    now=datetime.now().astimezone(),
+                    last_msg=_last_msg(conn, session_id),
+                    context_thresholds=ctx_thresholds))
+                pre_signals = tag_result.signals
                 feedback = pre_signals["user_feedback"]["value"]
             sess = resolve_session(conn, session_id, pre_signals, settings,
                                    feedback=feedback)
@@ -998,17 +1012,23 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
                 session_tag = "new"
                 # ── 6 打标签（一次前向） ──
                 t1 = time.monotonic()
-                signals = pre_signals or tag_all(text, req_headers, len(ir.messages),
-                                                 datetime.now().astimezone(),
-                                                 _last_msg(conn, session_id),
-                                                 ctx_thresholds)
+                if pre_signals is None:
+                    tag_result = await tagger.tag(TagRequest(
+                        text=text, headers=req_headers,
+                        n_messages=len(ir.messages),
+                        now=datetime.now().astimezone(),
+                        last_msg=_last_msg(conn, session_id),
+                        context_thresholds=ctx_thresholds))
+                    signals = tag_result.signals
+                else:
+                    signals = pre_signals         # 反馈探测前向的产物直接复用
                 answer_ms = (time.monotonic() - t1) * 1000
                 metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0)
                 # ── 7 走分流树 → RouteDecision ──
                 decision = evaluate(nodes, signals, cuts)
 
         # ── 12(预备) 诊断头取值（裁定 1）──
-        diag: dict = {"x-sr-tagger": tagger, "x-sr-session": session_tag}
+        diag: dict = {"x-sr-tagger": tagger.name, "x-sr-session": session_tag}
         if decision.source == "direct":
             diag["x-sr-route"] = "direct"
         elif decision.source in ("sticky", "unlocked"):
@@ -1129,6 +1149,14 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             else:
                 conn.execute("UPDATE sessions SET last_msg = ? WHERE id = ?",
                              (text, session_id))
+            # A2/M2 接线：checkpoint 打标器回传嵌入向量（result.vec）时写
+            # sessions.last_vec（db.py 列已存在，BLOB 存 JSON bytes，读侧
+            # json.loads 还原）——heuristic 恒 None 此分支不触发，M2
+            # CheckpointTagger 落地即生效。
+            if tag_result is not None and tag_result.vec is not None:
+                conn.execute(
+                    "UPDATE sessions SET last_vec = ? WHERE id = ?",
+                    (json.dumps(tag_result.vec).encode("utf-8"), session_id))
         conn.commit()
         # conn 交由外层 finally 统一关闭（在返回前，流式续传不占库连接）
         conn = None
@@ -1148,7 +1176,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
         # 完整异常进服务端日志供运维定位。
         logger.exception("internal error handling %s %s", proto, asked)
         return _error(proto, 500, "internal error", "api_error",
-                      "internal", {"x-sr-tagger": tagger})
+                      "internal", {"x-sr-tagger": tagger.name})
     finally:
         if conn is not None:                      # 400/block/502 等提前返回路径也关连接
             conn.close()
@@ -1425,12 +1453,15 @@ def _est_cost(model: str | None, prices: dict) -> tuple[float | None, bool]:
 _CONSOLE_DEFAULT = Path(__file__).resolve().parent.parent / "console-v7.html"
 
 
-def create_app(db_path: str, tagger: str = "heuristic",
+def create_app(db_path: str, tagger: Tagger,
                console_path: str | None = None) -> FastAPI:
     """构造路由应用（简报 Produces 接口逐字）。
 
     :param db_path: SQLite 路径（调用方先 init_db；本层每请求自开连接）。
-    :param tagger: ``checkpoint`` | ``heuristic``（x-sr-tagger 回显，裁定 1）。
+    :param tagger: 注入的打标器（A2，审核报告 §3-A2）——``sr.tagger.Tagger``
+        协议实例（``HeuristicTagger()`` / M2 的 ``CheckpointTagger``）；
+        ``name`` 进 x-sr-tagger 诊断头，``tag`` 为 async。必填位置参数，
+        无字符串兼容分支。
     :param console_path: GET / 托管的控制台 HTML（Task 12，§9.1）；缺省仓库根
         console-v7.html，``sr serve --console`` 可换。文件缺失不拦启动——
         控制台 404，路由主链不受影响。
@@ -1727,7 +1758,7 @@ def create_app(db_path: str, tagger: str = "heuristic",
     @app.post("/admin/tree/try")
     async def admin_tree_try(request: Request):
         """试算（§9.2）：``{text}`` 现打标或 ``{request_id}`` 取入库信号包重放；
-        复用 tag_all + evaluate_trace（§5.2 试算形状），不调上游。"""
+        复用注入 tagger.tag + evaluate_trace（§5.2 试算形状），不调上游。"""
         try:
             body = await request.json()
         except Exception:
@@ -1760,17 +1791,19 @@ def create_app(db_path: str, tagger: str = "heuristic",
                         status_code=400)
                 t1 = time.monotonic()
                 # M8：试算现打标与 /v1 主链同一注入口径（否则 try 展示的 context
-                # 档与真实路由不一致）。
-                signals = tag_all(text, dict(request.headers), 1,
-                                  datetime.now().astimezone(), None,
-                                  _context_thresholds(conn))
+                # 档与真实路由不一致）。A2：同一注入 tagger（async）。
+                try_result = await tagger.tag(TagRequest(
+                    text=text, headers=dict(request.headers), n_messages=1,
+                    now=datetime.now().astimezone(), last_msg=None,
+                    context_thresholds=_context_thresholds(conn)))
+                signals = try_result.signals
                 answer_ms = (time.monotonic() - t1) * 1000
             trace = evaluate_trace(_load_tree(conn, db_path), signals, cuts)
         finally:
             conn.close()
         d = trace["decision"]
         return JSONResponse({
-            "tagger": tagger,
+            "tagger": tagger.name,
             "tags": _tags_payload(signals, cuts),
             "path": trace["path"], "also_match": trace["also_match"],
             "decision": {"kind": d.kind, "model": d.model, "think": d.think,
@@ -2436,6 +2469,6 @@ def create_app(db_path: str, tagger: str = "heuristic",
         return JSONResponse({"object": "list",
                              "data": [{"id": i, "object": "model",
                                        "owned_by": "smart-router"} for i in ids]},
-                            headers={"x-sr-tagger": tagger})
+                            headers={"x-sr-tagger": tagger.name})
 
     return app

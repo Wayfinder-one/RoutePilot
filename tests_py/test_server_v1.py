@@ -27,6 +27,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sr.server import create_app
 import sr.db as db
 from sr.fake_upstream import create_app as fake_create_app
+from sr.tagger import HeuristicTagger
 
 # Python 3.14 不再隐式建环；简报逐字兼容垫片（见文件头说明）
 asyncio.set_event_loop(asyncio.new_event_loop())
@@ -150,7 +151,7 @@ def app(tmp_path):
     # 把所有模型的 base_url 指到 fake-upstream（fixture 内起 8123 端口）
     conn.execute("UPDATE providers SET base_url='http://127.0.0.1:8123'")
     conn.commit()
-    return create_app(str(tmp_path/"t.db"), tagger="heuristic")
+    return create_app(str(tmp_path/"t.db"), HeuristicTagger())
 
 async def _post(app, path, body, headers=None):
     transport = httpx.ASGITransport(app=app)

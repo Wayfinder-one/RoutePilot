@@ -37,6 +37,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from sr.server import create_app
+from sr.tagger import HeuristicTagger
 import sr.db as db
 from sr.fake_upstream import create_app as fake_create_app
 
@@ -52,7 +53,7 @@ def app(tmp_path):
     conn.execute("UPDATE providers SET base_url='http://127.0.0.1:8123'")
     conn.commit()
     conn.close()
-    return create_app(str(tmp_path / "t.db"), tagger="heuristic")
+    return create_app(str(tmp_path / "t.db"), HeuristicTagger())
 
 
 @pytest.fixture(autouse=True)
@@ -352,7 +353,7 @@ def test_metrics_backfill_from_requests(app):
     """裁定 6：启动时从 requests 表 backfill sr_requests_total——第二个 app
     实例不发任何 /v1 请求，其计数应来自库中已有行（每 outcome 一行样本）。"""
     post_blocked_request(app)
-    app2 = create_app(app.state.db_path, tagger="heuristic")
+    app2 = create_app(app.state.db_path, HeuristicTagger())
     body = get(app2, "/metrics").text
     line = next(l for l in body.splitlines()
                 if l.startswith("sr_requests_total{") and 'outcome="block"' in l)
