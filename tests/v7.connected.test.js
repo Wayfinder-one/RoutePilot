@@ -385,6 +385,122 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   t('演示顶栏无「启发式打标」、无「演示模式」以外的接线痕迹',
     !/启发式打标/.test(ddoc.querySelector('.strip').textContent));
 
+  /* ════ C. 缺陷修复回归（task-12-fix）：详情标题派生 / or 保真回写 / 引导守卫 ════ */
+  group('缺陷修复 · connected 详情标题派生（SRW_rowTitle，行无 title 字段）');
+  w.showReq(0);
+  await until(() => doc.getElementById('dt-title') &&
+    doc.getElementById('dt-title').textContent.trim() !== '', 5000, 'dt-title');
+  await pend(400);
+  const dtTitle = doc.getElementById('dt-title').textContent;
+  t('详情页 dt-title 不含 "undefined"（GET /admin/traffic 行没有 title 字段）',
+    dtTitle.length > 0 && !/undefined/.test(dtTitle), dtTitle);
+  t('标题派生自 tags_brief「标签 · 取值」（学科 · 计算机）',
+    dtTitle === '学科 · 计算机', dtTitle);
+  t('SRW_rowTitle：tags_brief 缺失退 hit_branch + routed_to',
+    w.SRW_rowTitle({ id: 'rX', hit_branch: '3.0', routed_to: 'qwen3-8b' }) === '3.0 → qwen3-8b',
+    w.SRW_rowTitle({ id: 'rX', hit_branch: '3.0', routed_to: 'qwen3-8b' }));
+  t('SRW_rowTitle：再退 row.id，tags_brief 串截 40 字符',
+    w.SRW_rowTitle({ id: 'r9' }) === 'r9' &&
+    w.SRW_rowTitle({ tags_brief: [{ tag: 'keyword', value: 'x'.repeat(60) }], id: 'rY' }).length === 40,
+    JSON.stringify(w.SRW_rowTitle({ tags_brief: [{ tag: 'keyword', value: 'x'.repeat(60) }], id: 'rY' })));
+  w.closeReq();
+
+  group('缺陷修复 · or 子句保真回写（chips 往返结构全等）');
+  const OR_TREE_JSON = { version: 9, nodes: [
+    { idx: 4, kind: 'normal', name: '法律与事实（or 回归）', desc: 'or 往返不变式（来自 API）', enabled: true,
+      branches: [
+        { idx: 40, cond: [{ or: [{ tag: 'domain', op: 'is', values: ['law'] },
+                                 { tag: 'fact_check', op: 'is', values: ['needs_check'] }] }],
+          action: { kind: 'route', model: 'qwen3-32b' }, trial: null, enabled: true, kids: [] },
+        { idx: 41, cond: [{ tag: 'domain', op: 'is', values: ['law'] },
+                          { or: [{ tag: 'complexity', op: 'is', values: [1] },
+                                 { tag: 'fact_check', op: 'is', values: ['needs_check'] }] }],
+          action: { kind: 'route', model: 'qwen3-8b' }, trial: null, enabled: true, kids: [] },
+        { idx: 42, cond: [{ or: [{ tag: 'domain', op: 'is', values: ['law'] },
+                                 { tag: 'domain', op: 'is', values: ['history'] }] },
+                          { or: [{ tag: 'complexity', op: 'is', values: [1] },
+                                 { tag: 'complexity', op: 'is', values: [0] }] }],
+          action: { kind: 'route', model: 'qwen3-8b' }, trial: null, enabled: true, kids: [] },
+        { idx: 43, cond: [{ tag: 'complexity', op: 'is', values: [1], conf_min: 2 },
+                          { or: [{ tag: 'pii', op: 'contains', values: ['email_address'] },
+                                 { tag: 'fact_check', op: 'is', values: ['no_check'] }] }],
+          action: { kind: 'route', model: 'qwen3-8b' }, trial: null, enabled: true, kids: [] }] },
+    { idx: 9, kind: 'fallback', name: '其他（兜底）', desc: '兜底（来自 API）', enabled: true,
+      branches: [{ idx: 90, cond: [], action: { kind: 'route', model: 'qwen3-8b' },
+                   trial: null, enabled: true, kids: [] }] }] };
+  const E_PUTS = [];
+  const E = makeDom({ routes: Object.assign({}, CONNECT_ROUTES, {
+    '/admin/tree': (m, opts) => {
+      if (m === 'PUT') E_PUTS.push(String((opts && opts.body) || ''));
+      return jsonResponse(OR_TREE_JSON);
+    } }) });
+  await until(() => E.window.SR_MODE === 'connected', 5000, 'connected (or tree)');
+  const edoc = E.window.document;
+  await pend(400);
+  await new Promise(res => { const s = edoc.createElement('script');
+    s.textContent = 'window.__RT = TREE.map(n => ({ idx: n._idx, branches: (n.branches||[])' +
+      '.map(b => ({ k: b.k, rt: SRW_chipsToCond(b.cond), api: b._apiCond, chips: b.cond })) }));';
+    edoc.body.appendChild(s); res(true); });
+  const rt = E.window.__RT;
+  const orNode = rt.find(n => n.idx === 4);
+  const rtOf = i => orNode.branches[i];
+  t('apiTreeToLocal 留存原始 cond（_apiCond 就位）',
+    rt.every(n => n.branches.every(b => !!b.api)), 'api 字段缺失');
+  t('单 or 子句结构全等：{or:[{domain is law},{fact_check is needs_check}]}（此前回写成 A∧B）',
+    deepEqual(rtOf(0).rt, rtOf(0).api) &&
+    deepEqual(rtOf(0).rt, OR_TREE_JSON.nodes[0].branches[0].cond),
+    JSON.stringify(rtOf(0).rt));
+  t('atom 与 or 混排结构全等：[atom, {or:…}]（引擎 AND 语义不被摊平成 or）',
+    deepEqual(rtOf(1).rt, rtOf(1).api),
+    JSON.stringify(rtOf(1).rt));
+  t('连续两个 or 子句结构全等：[{or:…},{or:…}]',
+    deepEqual(rtOf(2).rt, rtOf(2).api),
+    JSON.stringify(rtOf(2).rt));
+  t('把握度 + or 混排结构全等（conf_min 回到原原子身上）',
+    deepEqual(rtOf(3).rt, rtOf(3).api),
+    JSON.stringify(rtOf(3).rt));
+  t('兜底空条件往返仍为 []', deepEqual(rt.find(n => n.idx === 9).branches[0].rt, []));
+  t('子句边界以「而且」chip 显式占位（树页可见 AND 结构）',
+    /而且/.test(edoc.getElementById('treeWrap').textContent));
+  E.window.saveTreeRemote();
+  await until(() => E_PUTS.length > 0, 5000, 'PUT /admin/tree (or tree)');
+  await pend(300);
+  const savedOr = JSON.parse(E_PUTS[0]);
+  t('保存放行：PUT /admin/tree 载荷里 or 分支 cond 结构全等',
+    deepEqual(savedOr.nodes[0].branches[0].cond, OR_TREE_JSON.nodes[0].branches[0].cond) &&
+    deepEqual(savedOr.nodes[0].branches[3].cond, OR_TREE_JSON.nodes[0].branches[3].cond),
+    E_PUTS[0].slice(0, 240));
+  t('可编辑树保存不被拦截（体检面板保持为空）',
+    edoc.getElementById('checkup').innerHTML === '',
+    edoc.getElementById('checkup').textContent.slice(0, 80));
+
+  group('缺陷修复 · 不可编辑条件（not 子句）保存前拒绝，绝不静默改语义');
+  t('前置：A 树确实含 not 子句分支（c211）',
+    (() => { const n2 = treeNow.find(n => n._idx === 2);
+      return n2.branches.some(b => (b.kids || []).some(kb => kb.k === 'c211')); })());
+  w.saveTreeRemote();
+  await pend(400);
+  t('含 not 子句 → 整树保存被拒（不发 PUT /admin/tree）',
+    !A.calls.some(c => c[0] === '/admin/tree' && c[1].method === 'PUT'));
+  t('拒绝提示进体检面板（逐字提示语）',
+    /该分支含控制台暂不可编辑的条件，请勿修改此分支/.test(doc.getElementById('checkup').textContent),
+    doc.getElementById('checkup').textContent.slice(0, 120));
+  t('提示定位到分支（node 2 · branch 211 · code cond_readonly）',
+    /node 2/.test(doc.getElementById('checkup').textContent) &&
+    /branch 211/.test(doc.getElementById('checkup').textContent) &&
+    /cond_readonly/.test(doc.getElementById('checkup').textContent));
+
+  group('缺陷修复 · Minor 守卫（SRW_TM / providers 形状）');
+  t('doTag 已跑过：不再产生隐式全局 SRW_TM（已删除）', w.SRW_TM === undefined, String(w.SRW_TM));
+  const F = makeDom({ routes: Object.assign({}, CONNECT_ROUTES, {
+    '/admin/providers': () => jsonResponse({ detail: 'not an array' }) }) });
+  await until(() => F.window.SR_MODE === 'demo', 5000, 'demo (providers 非数组)');
+  t('providers 响应非数组 → 直接落演示模态', F.window.SR_MODE === 'demo', F.window.SR_MODE);
+  t('落演示时 TREE 未被覆写（仍是内置数据，无 API 文案）',
+    /先拦危险请求/.test(F.window.document.getElementById('treeWrap').textContent) &&
+    !/（来自 API）/.test(F.window.document.getElementById('treeWrap').textContent));
+  t('顶栏出现「演示模式」标注', /演示模式/.test(F.window.document.querySelector('.strip').textContent));
+
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
   if (fail) { console.log('\n失败项：'); bad.forEach(b => console.log('  · ' + b)); process.exit(1); }

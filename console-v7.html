@@ -3549,7 +3549,10 @@ Object.assign(EN, {
   '启发式打标': 'Heuristic tagging',
   '试算中…': 'Tracing…',
   '暂无流量记录': 'No traffic yet',
-  '保存被体检拦截（422）': 'Save blocked by checkup (422)'
+  '保存被体检拦截（422）': 'Save blocked by checkup (422)',
+  '该分支含控制台暂不可编辑的条件，请勿修改此分支':
+    'This branch has conditions the console cannot edit yet; please leave it unchanged',
+  '保存被拦截（条件不可编辑）': 'Save blocked (non-editable conditions)'
 });
 
 /* ── 接线层状态 ── */
@@ -3685,6 +3688,8 @@ function SRW_nodeLocal(n, i, total){
 function SRW_branchLocal(b){
   const action = b.action || {};
   return { k: 'c' + b.idx, cond: SRW_chipsFromCond(b.cond),
+           /* 加载时原始 cond（规范键）：保存前逐分支核验回写结构全等，失真即拒写 */
+           _apiCond: b.cond,
            to: SRW_actionWord(action), think: SRW_thinkWord(action),
            fb: (action.fallback && action.fallback[0]) || null,
            none: !!(b.kids && b.kids.length),
@@ -3699,27 +3704,35 @@ const SRW_SPECIAL_REV = { sticky: '沿用上次的模型', ladder_up: '升一档
 function SRW_thinkWord(a){
   return a.think ? (I18N_ZH['think.' + a.think] || a.think) : null;
 }
-/* cond 子句（§5.1）→ 演示 chip 三元组；[] 兜底与 not → 恒真 chip（展示层语义） */
+/* cond 子句（§5.1）→ 演示 chip 三元组；[] 兜底与 not → 恒真 chip（展示层语义）。
+   子句（cond 列表元素，引擎语义 = AND，engine.py match）之间插入「而且」chip：
+   求值层（evalBranch/chipHtml）忽略它，但它是子句边界的显式占位，
+   让 SRW_chipsToCond 能把「或」组从子句序列里无歧义地还原（保真回写的一半）。 */
 function SRW_chipsFromCond(cond){
   if(!Array.isArray(cond) || !cond.length) return [['兜底', '', '什么情况都算', true]];
   const chips = [];
   cond.forEach(c => {
     if(!c || typeof c !== 'object') return;
+    const seg = [];
     if(c.or){
       c.or.forEach((sc, j) => {
-        if(j) chips.push(['或']);
+        if(j) seg.push(['或']);
         const chip = SRW_clauseChip(sc);
-        if(chip) chips.push(chip);
+        if(chip) seg.push(chip);
       });
     } else if(c.not){
-      chips.push(['其他', '', '', true]);
+      seg.push(['其他', '', '', true]);   /* 展示占位；回写侧遇「其他」即拒绝（不可编辑） */
     } else {
       const chip = SRW_clauseChip(c);
       if(chip){
-        chips.push(chip);
+        seg.push(chip);
         if(c.conf_min !== null && c.conf_min !== undefined)
-          chips.push(['把握度', '至少', I18N_ZH['conf.' + c.conf_min] || ('档 ' + c.conf_min)]);
+          seg.push(['把握度', '至少', I18N_ZH['conf.' + c.conf_min] || ('档 ' + c.conf_min)]);
       }
+    }
+    if(seg.length){
+      if(chips.length) chips.push(['而且']);
+      seg.forEach(x => chips.push(x));
     }
   });
   return chips.length ? chips : [['兜底', '', '什么情况都算', true]];
@@ -3853,7 +3866,7 @@ async function doTagRemote(){
     const data = await r.json();
     SRW_taggerBadge(data.tagger);
     const tags = apiTagsToLocal(data.tags || []);
-    SRW_TM = tagMapOf(tags);
+    /* （不设 SRW_TM：本地求值已全部由服务端承担，tagMapOf 在 pathToRows 内按需调用） */
     const rows = pathToRows(data.path || [], tags);
     renderTags(document.getElementById('tags'), tags, new Set(treeSignals()));
     renderSigline(tags, rows);
@@ -3883,6 +3896,8 @@ async function SRW_bootConnected(){
     for(let i = 0; i < rs.length; i++)
       if(!rs[i] || !rs[i].ok) throw new Error(paths[i] + ' HTTP ' + (rs[i] ? rs[i].status : 'null'));
     six = await Promise.all(rs.map(r => r.json()));
+    /* providers 必须是数组：不合格在触碰 TREE 之前就落演示模态（TREE 不动，§9.3） */
+    if(!Array.isArray(six[1])) throw new Error('/admin/providers 响应非数组');
     tree = SRW_TREE_CACHE;
     if(!tree){                            /* 兜底：探测正文不可用时补拉一次 */
       const r = await fetch('/admin/tree');
@@ -4097,13 +4112,38 @@ window.saveTreeRemote = async function(){
   if(window.SR_MODE !== 'connected') return toast('演示模式：整树保存只在已连接模态可用');
   for(const n of TREE) for(const b of (n.branches || []))
     if(!/^c\d+$/.test(b.k || '')) return toast('存在未保存的草稿节点，请先确认或撤销');
-  const body = { nodes: TREE.map(n => ({
+  /* 回写保真闸门：逐分支回写并与加载时原始 cond（_apiCond）结构比对。
+     chips 表示无法无损表达的结构（not 子句、or 内把握度等）在此拦截 ——
+     有失真就整树拒绝保存，绝不静默改语义（提示进体检面板）。 */
+  const bad = [];
+  const condOf = (b, nodeIdx) => {
+    try {
+      const cond = SRW_chipsToCond(b.cond);
+      if(b._apiCond && !SRW_clauseEq(cond, b._apiCond)) throw new Error('回写失真');
+      return cond;
+    } catch (e) {
+      bad.push({ level: 'hard', code: 'cond_readonly',
+                 node: nodeIdx === undefined ? null : nodeIdx,
+                 branch: /^c\d+$/.test(b.k || '') ? parseInt(b.k.slice(1), 10) : null,
+                 message: { zh: '该分支含控制台暂不可编辑的条件，请勿修改此分支',
+                            en: 'This branch has conditions the console cannot edit yet; please leave it unchanged' } });
+      return null;
+    }
+  };
+  const laid = TREE.map(n => ({ n: n, br: (n.branches || []).map(b => ({
+    b: b, cond: condOf(b, n._idx),
+    kids: (b.kids || []).map(kb => ({ kb: kb, cond: condOf(kb, n._idx) })) })) }));
+  if(bad.length){
+    SRW_renderFindings(bad, '保存被拦截（条件不可编辑）');
+    return toast('该分支含控制台暂不可编辑的条件，请勿修改此分支');
+  }
+  const body = { nodes: laid.map(({ n, br }) => ({
     idx: n._idx, kind: n._kind, name: n.title, desc: n.desc || null, enabled: true,
-    branches: (n.branches || []).map(b => ({
-      idx: parseInt(b.k.slice(1), 10), cond: SRW_chipsToCond(b.cond),
+    branches: br.map(({ b, cond, kids }) => ({
+      idx: parseInt(b.k.slice(1), 10), cond: cond,
       action: SRW_chipsToAction(b), trial: null, enabled: true,
-      kids: (b.kids || []).map(kb => ({
-        idx: parseInt(kb.k.slice(1), 10), cond: SRW_chipsToCond(kb.cond),
+      kids: kids.map(({ kb, cond: kcond }) => ({
+        idx: parseInt(kb.k.slice(1), 10), cond: kcond,
         action: SRW_chipsToAction(kb), trial: null, enabled: true, kids: [] }))
     }))
   })) };
@@ -4121,28 +4161,71 @@ window.saveTreeRemote = async function(){
   } catch (e) { toast('保存失败：' + (e.message || e)); }
 };
 
-/* chips（中文显示词）→ cond 子句 / action（写路径反向边界） */
+/* chips（中文显示词）→ cond 子句 / action（写路径反向边界）。
+   SRW_chipsToCond 是 SRW_chipsFromCond 的逆变换：「而且」关合当前子句；
+   「或」把后一个 chip 并入当前子句的 or 组；「把握度」门槛挂到当前子句
+   （回写时落在该子句末一个原子身上）；「兜底」恒真 chip → 空条件 []。
+   「其他」恒真 chip（not 子句的展示占位）在 chips 上没有可回写的语义 ——
+   遇到即抛错，由 saveTreeRemote 拦成体检提示，绝不静默改语义。 */
+const SRW_OR_FILL = { orFill: true };   /* 「或」已吞掉、等待下一 chip 填充的占位 */
 function SRW_chipsToCond(chips){
   const out = [];
-  let pendingOr = false;
+  let cur = null, curConf = null;
+  const close = function(){
+    if(cur){
+      while(cur.length && cur[cur.length - 1] === SRW_OR_FILL) cur.pop();  /* 悬空「或」容错 */
+      if(cur.length){
+        const clause = cur.length === 1 ? SRW_chipClause(cur[0])
+                                        : { or: cur.map(SRW_chipClause) };
+        if(curConf !== null && curConf !== undefined){
+          const tgt = cur.length === 1 ? clause : clause.or[clause.or.length - 1];
+          tgt.conf_min = curConf;
+        }
+        out.push(clause);
+      }
+    } else if(curConf !== null && curConf !== undefined && out.length){
+      out[out.length - 1].conf_min = curConf;    /* 兜底：门槛挂到最近一个已收子句 */
+    }
+    cur = null; curConf = null;
+  };
   (chips || []).forEach(c => {
-    if(c.length === 1){ if(c[0] === '或') pendingOr = true; return; }
-    if(c[3]) return;                                   /* 兜底/其他恒真 chip 不回写 */
-    if(c[0] === '把握度'){
-      const last = out[out.length - 1];
-      if(last) last.conf_min = SRW_CONF_N[c[2]] !== undefined ? SRW_CONF_N[c[2]] : 2;
+    if(!c || !c.length) return;
+    if(c.length === 1){                               /* 连接词 */
+      if(c[0] === '或' && cur && cur.length) cur.push(SRW_OR_FILL);
+      else if(c[0] === '而且') close();               /* 子句边界 */
       return;
     }
-    const key = SRW_KEY_BY_LABEL[c[0]] || c[0];
-    const values = String(c[2]).split(/\s*\/\s*|、/).filter(Boolean)
-      .map(w => SRW_valueToKey(key, w));
-    let op = { '是': 'is', '属于': 'in', '至少': 'gte', '至多': 'lte', '正好': 'is', '含有': 'contains' }[c[1]] || 'is';
-    if(op === 'is' && values.length > 1) op = 'in';
-    const clause = { tag: key, op: op, values: values };
-    if(pendingOr){ out.push({ or: [clause] }); pendingOr = false; }
-    else out.push(clause);
+    if(c[3]){                                         /* 恒真 chip：兜底 / 其他 */
+      if(c[0] === '其他') throw new Error('该分支含控制台暂不可编辑的条件，请勿修改此分支');
+      return;                                         /* 兜底 → 空条件 */
+    }
+    if(c[0] === '把握度'){
+      curConf = SRW_CONF_N[c[2]] !== undefined ? SRW_CONF_N[c[2]] : 2;
+      return;
+    }
+    if(cur && cur.length && cur[cur.length - 1] === SRW_OR_FILL) cur[cur.length - 1] = c;
+    else { close(); cur = [c]; }
   });
+  close();
   return out;
+}
+function SRW_chipClause(c){
+  const key = SRW_KEY_BY_LABEL[c[0]] || c[0];
+  const values = String(c[2]).split(/\s*\/\s*|、/).filter(Boolean)
+    .map(w => SRW_valueToKey(key, w));
+  let op = { '是': 'is', '属于': 'in', '至少': 'gte', '至多': 'lte', '正好': 'is', '含有': 'contains' }[c[1]] || 'is';
+  if(op === 'is' && values.length > 1) op = 'in';
+  return { tag: key, op: op, values: values };
+}
+/* cond 结构全等（键序无关、数组有序）——保存前的回写保真核验 */
+function SRW_clauseEq(a, b){
+  if(a === b) return true;
+  if(!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  if(Array.isArray(a) || Array.isArray(b))
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length &&
+      a.every((x, i) => SRW_clauseEq(x, b[i]));
+  const ka = Object.keys(a).sort(), kb = Object.keys(b).sort();
+  return ka.length === kb.length && ka.every((k, i) => k === kb[i] && SRW_clauseEq(a[k], b[k]));
 }
 function SRW_chipsToAction(b){
   if(SRW_SPECIAL[b.to]) return { kind: 'special', special: SRW_SPECIAL[b.to] };
@@ -4359,12 +4442,25 @@ async function SRW_mTestRemote(){
   } catch (e) { toast('测试失败：' + (e.message || e)); }
 }
 
+/* 流量行 → 详情标题：GET /admin/traffic 的行没有 title 字段（server.py 只回
+   id/ts/proto/model_asked/tags_brief/hit_branch/routed_to/…），从行内字段派生：
+   优先 tags_brief（「标签 · 取值」短串，截 40 字符）→ 退 hit_branch + routed_to
+   → 再退 row.id。 */
+function SRW_rowTitle(row){
+  if(!row) return '';
+  const brief = (row.tags_brief || []).filter(b => b && b.tag).map(b =>
+    (I18N_ZH['tag.' + b.tag] || b.tag) + ' · ' + SRW_valueWord(b.tag, b.value));
+  if(brief.length) return brief.join(' · ').slice(0, 40);
+  if(row.hit_branch || row.routed_to) return (row.hit_branch || '—') + ' → ' + (row.routed_to || '—');
+  return String(row.id || '');
+}
+
 /* 流量详情（connected）：详情标签 + 按 request_id 重放判定路径 */
 async function SRW_showReqRemote(i){
   const row = SRW_TRAFFIC[i];
   const d = document.getElementById('reqdetail');
   const blocked = row.outcome === 'block';
-  d.innerHTML = '<div class="sheet"><div class="sheet-hd"><b id="dt-title">' + row.title + '</b>' +
+  d.innerHTML = '<div class="sheet"><div class="sheet-hd"><b id="dt-title">' + SRW_rowTitle(row) + '</b>' +
     '<span class="sub" id="dt-id">' + row.id + '</span>' +
     '<span class="end btn-row" style="display:flex;gap:8px;margin-left:auto">' +
     '<button class="btn sm" onclick="replay()">⟳ 按当前规则重放</button>' +
@@ -4375,7 +4471,7 @@ async function SRW_showReqRemote(i){
     '<div class="rail" id="dt-rail"><div class="pulse" id="dt-pulse" aria-hidden="true"></div>' +
     '<div id="dt-railbody"><div class="note">加载中…</div></div></div>' +
     '<div class="note" id="replaybox" style="margin-top:var(--s3)"></div></div></div>';
-  curReq = { id: row.id, title: row.title };
+  curReq = { id: row.id, title: SRW_rowTitle(row) };
   d.style.display = 'block';
   d.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   try {
