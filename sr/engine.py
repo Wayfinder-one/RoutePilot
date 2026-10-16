@@ -646,10 +646,10 @@ def evaluate_trace(nodes: list[Node], signals: dict, conf_thresholds) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # 沿用语义的反馈（§4.4 is_unlocked 集合之外）与解锁语义的反馈：
+# 审核 §4 清单：'rephrase' 是裁定原文的 typo 别名（§4.4 规范键 'want_different'），
+# 曾以 _REPHRASE_FEEDBACK 双键宽容收取——已删。server 层 FEEDBACK_VALUES 从不收
+# 'rephrase'（x-sr-feedback 头值先被归 None），生产行为不变。
 _UNLOCK_FEEDBACK = {"wrong_answer", "want_different"}
-# 接口裁定：裁定原文把「换个说法」写作 'rephrase'，§4.4 的规范键是 'want_different'，
-# 两串都收（宽容别名，规范化归 §6.8 tags 层）。
-_REPHRASE_FEEDBACK = {"want_different", "rephrase"}
 
 
 def _header(headers: dict, name: str) -> str | None:
@@ -736,7 +736,7 @@ def resolve_session(conn, session_id: str | None, signals, settings, feedback=No
       source='sticky'，think=None、fallbacks=[]（M1 无分支记忆，沿用不复原上轮
       think/fallback 链——裁定声明，记任务报告）。
     - feedback='wrong_answer' → ``ladder_up or ladder_next``；'want_different'
-      （含裁定别名 'rephrase'）→ ladder_next；解锁成功 unlocks+1，
+      → ladder_next；解锁成功 unlocks+1，
       source='unlocked'（think/fallbacks 同上取空）。
     - 解锁但阶梯无处可升/可换（未配置或到顶回环失效，两函数均 None）→ 返回 None
       退化「重新走树」（§4.4 R3），不动 unlocks。
@@ -754,12 +754,12 @@ def resolve_session(conn, session_id: str | None, signals, settings, feedback=No
     idle = int(settings.get("session_idle") or 1800)     # 默认半小时（§4.4）
     if row["last_active"] and _elapsed_s(row["last_active"]) > idle:
         return None                                      # 超阈值 → 新会话（§4.4）
-    if feedback in _UNLOCK_FEEDBACK | _REPHRASE_FEEDBACK:
+    if feedback in _UNLOCK_FEEDBACK:
         # 反馈解锁：升一档或换一个（§4.4：ladder_up(row.current_model) or ladder_next）
         current = row["current_model"] or ""
         if feedback == "wrong_answer":
             new_model = ladder_up(conn, current) or ladder_next(conn, current)
-        else:                    # want_different / rephrase → 换一个（ladder_next）
+        else:                    # want_different → 换一个（ladder_next）
             new_model = ladder_next(conn, current)
         if new_model is None:
             return None          # 阶梯未配置/无处可去 → 重新走树（§4.4 R3），不动 unlocks

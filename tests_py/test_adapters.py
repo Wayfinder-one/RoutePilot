@@ -261,7 +261,11 @@ def test_stop_finish_tables_are_the_single_shared_source():
     from sr import server
     assert server.STOP_TO_FINISH is STOP_TO_FINISH
     assert server.FINISH_TO_STOP is FINISH_TO_STOP
-    assert anthropic._STOP_REASON is FINISH_TO_STOP
+    # 兼容别名已删（审核 §4 清单）：server 不再暴露 _STOP_TO_FINISH/_FINISH_TO_STOP，
+    # anthropic 不再暴露 _STOP_REASON——引用点直接用 adapters 的表名。
+    assert not hasattr(server, "_STOP_TO_FINISH")
+    assert not hasattr(server, "_FINISH_TO_STOP")
+    assert not hasattr(anthropic, "_STOP_REASON")
     # 互逆：Anthropic → OpenAI 后再回 Anthropic 稳定（stop_sequence 按语义声明
     # 折叠到 "stop"，不参与可逆性断言）
     for stop, finish in STOP_TO_FINISH.items():

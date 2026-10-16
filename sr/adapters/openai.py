@@ -16,7 +16,7 @@
   → 统一 :class:`~sr.adapters.UpstreamError`。
 
 依赖方向：仅 import sr.adapters（IR/IRChunk/UpstreamError/PARAM_KEYS/
-THINK_OPENAI/error_payload），无工程内其他依赖。
+THINK_OPENAI/error_payload/text_of），无工程内其他依赖。
 """
 
 from __future__ import annotations
@@ -24,35 +24,15 @@ from __future__ import annotations
 import time
 
 from sr.adapters import (PARAM_KEYS, THINK_OPENAI, IR, IRChunk, UpstreamError,
-                         error_payload)
+                         error_payload, text_of)
+
 
 # ir_to_chunk 产出的 chunk 公共头（id/created 非协议语义字段，固定值即可）
 _CHUNK_ID = "chatcmpl-smart-router"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) content 归一：str 原样；块数组取 text 块拼接（两协议同构，本模块私有）
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _text_of(content) -> str:
-    """content → 文本：str 原样；块数组取 ``type='text'`` 块的 text 拼接。
-
-    非文本块（image_url / input_audio 等）不产文本，跳过——M1 主文本只服务
-    打标与分流（§7.2-3），多模态内容本就不进标签器。
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(blk.get("text", "") for blk in content
-                       if isinstance(blk, dict) and blk.get("type", "text") == "text")
-    return str(content)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2) parse / main_text —— §7.2-2/3
+# 1) parse / main_text —─ §7.2-2/3（content 归一用公共件 sr.adapters.text_of）
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -62,7 +42,7 @@ def parse(body: dict) -> IR:
     messages: list = []
     for m in body.get("messages") or []:
         if isinstance(m, dict) and m.get("role") == "system":
-            text = _text_of(m.get("content"))
+            text = text_of(m.get("content"))
             if text:
                 system_parts.append(text)      # 多条 system 换行拼接，不静默丢弃
         else:
@@ -84,7 +64,7 @@ def main_text(ir: IR) -> str:
     """最后一条 role=user 消息的文本（§7.2-3）；无 user 消息回空串。"""
     for m in reversed(ir.messages):
         if isinstance(m, dict) and m.get("role") == "user":
-            return _text_of(m.get("content"))
+            return text_of(m.get("content"))
     return ""
 
 

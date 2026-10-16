@@ -33,33 +33,11 @@ from dataclasses import dataclass
 
 from sr.adapters import (FINISH_TO_STOP, PARAM_KEYS, STOP_TO_FINISH,
                          THINK_ANTHROPIC, IR, IRChunk, UpstreamError,
-                         error_payload)
+                         error_payload, text_of)
 
-# OpenAI finish_reason → Anthropic stop_reason（跨协议 message_delta 用，§7.4 枚举）。
-# I4 消重：唯一表在 sr/adapters/__init__.py；本别名保留既有引用点（含既有测试）
-# 不动。未收录值映射为 None——不猜语义，客户端拿到 null 自行判断。
-_STOP_REASON = FINISH_TO_STOP
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1) content 归一（与 openai._text_of 同构；协议层互相不 import，各自私有）
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _text_of(content) -> str:
-    """content → 文本：str 原样；块数组取 ``type='text'`` 块的 text 拼接。
-
-    §7.4 请求体 content 为块数组（text/image/tool_use/tool_result），只有 text 块
-    产文本；tool_result 等非文本块跳过（M1 主文本只服务打标与分流，§7.2-3）。
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "".join(blk.get("text", "") for blk in content
-                       if isinstance(blk, dict) and blk.get("type", "text") == "text")
-    return str(content)
+# 跨协议 stop_reason 归一直接用 sr.adapters 的 FINISH_TO_STOP（I4 唯一表；
+# 审核 §4 清单：原 _STOP_REASON 兼容别名已删，未收录值映射为 None——不猜语义，
+# 客户端拿到 null 自行判断）。
 
 
 def _sse(event: str, data: dict) -> str:
@@ -83,7 +61,7 @@ def parse(body: dict) -> IR:
     known = set(PARAM_KEYS) | {"model", "messages", "system", "stream", "tools",
                                "stop_sequences"}
     extensions = {k: v for k, v in body.items() if k not in known}
-    system = _text_of(body.get("system")) or None
+    system = text_of(body.get("system")) or None
     return IR(proto="anthropic",
               messages=body.get("messages") or [],
               system=system,
@@ -98,7 +76,7 @@ def main_text(ir: IR) -> str:
     """最后一条 role=user 消息：content 块数组取 text 块拼接（§7.2-3）。"""
     for m in reversed(ir.messages):
         if isinstance(m, dict) and m.get("role") == "user":
-            return _text_of(m.get("content"))
+            return text_of(m.get("content"))
     return ""
 
 
@@ -283,7 +261,7 @@ def _stop_reason(ic: IRChunk) -> str | None:
     """
     if ic.raw_finish is not None:
         return ic.raw_finish
-    return _STOP_REASON.get(ic.finish)
+    return FINISH_TO_STOP.get(ic.finish)
 
 
 def _usage(usage: dict | None) -> dict:

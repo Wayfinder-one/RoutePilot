@@ -133,3 +133,24 @@ def error_payload(payload) -> dict:
         except ValueError:
             return {"error": {"message": payload}}
     return payload if isinstance(payload, dict) else {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b) content 归一（两协议同构公共件，审核 §4 清单：原 openai/anthropic 逐字重复）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def text_of(content) -> str:
+    """content → 文本：str 原样；块数组取 ``type='text'`` 块的 text 拼接。
+
+    非文本块（image_url / input_audio / tool_use / tool_result 等）不产文本，跳过
+    ——M1 主文本只服务打标与分流（§7.2-3），多模态内容本就不进标签器。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(blk.get("text", "") for blk in content
+                       if isinstance(blk, dict) and blk.get("type", "text") == "text")
+    return str(content)

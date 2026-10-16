@@ -90,16 +90,11 @@ _WRITE_ACTOR = "admin"
 # 服务端日志（M-c：内部异常只进日志，不回吐客户端）
 logger = logging.getLogger("sr.server")
 
-# 终止原因互查表：**唯一一份**在 sr/adapters/__init__.py（I4 顺带消重，rollup #24
-# 的真问题是「漏用」——流式路径的 adapters 与这里的非流式 shim 曾各持一份）。别名
-# 保留在本地，server 其余引用点不必改。
-_STOP_TO_FINISH = STOP_TO_FINISH
-_FINISH_TO_STOP = FINISH_TO_STOP
-
-# 树缓存（裁定 4：模块级 {"version": int, "nodes": list}；每请求开头 SELECT
-# tree_version，变了重载）。多一枚 "path" 键：同进程先后挂多个库（pytest tmp_path）
-# 时 version 都从 1 起步，不辨库会串树——按库路径隔离，出入记任务报告。
-_TREE_CACHE: dict = {"path": None, "version": None, "nodes": []}
+# 树缓存（裁定 4：模块级 dict，按库路径分槽 {db_path: {"version", "nodes"}}；
+# 每请求开头 SELECT tree_version，变了才重载该槽）。同进程先后挂多个库（pytest
+# tmp_path）时 version 都从 1 起步——按路径分槽后多库场景是自然命中而非特判重置
+# （审核 §4 清单：原单槽 + "path" 键特判的收口），生产单库行为不变。
+_TREE_CACHE: dict = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,14 +208,14 @@ def _context_thresholds(conn) -> list[int]:
 
 def _load_tree(conn, db_path: str) -> list:
     """树缓存读取（裁定 4 + §12 worker 口径）：开头一条 SELECT tree_version；
-    没变用内存树，变了（或换了库）从 SQLite 重新载入并原子替换。"""
+    该库路径的槽没变用内存树，变了（或该库首次载入）从 SQLite 重载并原子替换
+    该槽。槽按 db_path 分键（审核 §4 清单），同进程多库互不串树。"""
     version = db.get_tree_version(conn)
-    if _TREE_CACHE["path"] != db_path or _TREE_CACHE["version"] != version:
+    slot = _TREE_CACHE.get(db_path)
+    if slot is None or slot["version"] != version:
         rows = conn.execute("SELECT * FROM tree").fetchall()
-        _TREE_CACHE["path"] = db_path
-        _TREE_CACHE["version"] = version
-        _TREE_CACHE["nodes"] = rows_to_tree(rows)
-    return _TREE_CACHE["nodes"]
+        _TREE_CACHE[db_path] = {"version": version, "nodes": rows_to_tree(rows)}
+    return _TREE_CACHE[db_path]["nodes"]
 
 
 def _lookup_model(conn, name: str):
@@ -635,7 +630,7 @@ def _from_upstream(client_proto: str, up_proto: str, resp: dict,
                 "role": "assistant", "model": model_asked,
                 "content": [{"type": "text",
                              "text": (choice.get("message") or {}).get("content") or ""}],
-                "stop_reason": _FINISH_TO_STOP.get(finish), "stop_sequence": None,
+                "stop_reason": FINISH_TO_STOP.get(finish), "stop_sequence": None,
                 "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                           "output_tokens": usage.get("completion_tokens", 0)}}
     # anthropic 上游 → openai 客户端
@@ -646,7 +641,7 @@ def _from_upstream(client_proto: str, up_proto: str, resp: dict,
             "object": "chat.completion", "created": int(time.time()),
             "model": model_asked,
             "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": _STOP_TO_FINISH.get(resp.get("stop_reason"))}],
+                         "finish_reason": STOP_TO_FINISH.get(resp.get("stop_reason"))}],
             "usage": {"prompt_tokens": usage.get("input_tokens", 0),
                       "completion_tokens": usage.get("output_tokens", 0),
                       "total_tokens": usage.get("input_tokens", 0)
