@@ -506,6 +506,115 @@ def test_v1_no_500_when_action_serialization_fails(app, tmp_path):
     assert r.json()["error"]["code"] == "upstream_error"
     assert "Traceback" not in r.text
 
+# ── C1 批次 Important：action.kind 缺失/拼错 → PUT 200 后 /v1 永久 502 ─────────
+# 旧闸门 `if act.get("kind") != "route": continue`：kind 缺失或拼错的分支整体跳过
+# action 校验 → PUT 200 落库、findings 空，随后命中该分支的 /v1 因引擎产出
+# model=None 而恒 502 no_route。五类畸形 PUT 必须 422 + hard + 库零写入。
+
+_MALFORMED_ACTION_KINDS = [
+    {},                        # kind 缺失（旧实现：PUT 200）
+    {"kind": "rout"},          # kind 拼错（旧实现：PUT 200）
+    {"kind": "route"},         # route 无 model
+    {"kind": "block"},         # block 无 block_msg
+    {"kind": "special"},       # special 无 special 值
+]
+
+
+def _set_action(t, node, branch, action):
+    """把指定分支的 action 整块换成 ``action``（C1 用例的统一改动点）。"""
+    next(b for n in t["nodes"] if n["idx"] == node
+         for b in n["branches"] if b["idx"] == branch)["action"] = action
+
+
+def _set_route_action(t, action):
+    """节点 9 分支 90 的 action（C1 用例的主改动点）。"""
+    _set_action(t, 9, 90, action)
+
+
+@pytest.mark.parametrize("action", _MALFORMED_ACTION_KINDS)
+def test_put_tree_rejects_malformed_action_kind_422_zero_write(app, action):
+    """五类畸形 action.kind → 422 + hard bad_ref + 库零写入（C1 Important 端点级）。"""
+    before = _admin_get(app, "/admin/tree").json()
+    r, _ = _put_tree_edit(app, lambda t: _set_route_action(t, dict(action)))
+    assert r.status_code == 422, (action, r.status_code, r.text)
+    f = [x for x in r.json()["findings"] if x["code"] == "bad_ref"]
+    assert f and all(x["level"] == "hard" for x in f), (action, r.text)
+    assert all(x["message"]["zh"] and x["message"]["en"] for x in f), action
+    after = _admin_get(app, "/admin/tree").json()
+    assert after["nodes"] == before["nodes"] and after["version"] == before["version"]
+
+
+def test_add_node_rejects_missing_action_kind_422_zero_write(app):
+    """写路径二（POST /admin/tree/nodes）同过体检：缺 kind → 422，树不动。"""
+    before = _admin_get(app, "/admin/tree").json()
+    r = _admin_post(app, "/admin/tree/nodes", {"pos": 1, "node": {
+        "name": "坏 kind", "kind": "normal",
+        "branches": [{"cond": [{"tag": "event", "op": "is", "values": ["incident"]}],
+                      "action": {"model": "qwen3-8b"}}]}})
+    assert r.status_code == 422, (r.status_code, r.text)
+    assert any(x["code"] == "bad_ref" and x["level"] == "hard"
+               for x in r.json()["findings"]), r.text
+    assert _admin_get(app, "/admin/tree").json() == before
+
+
+def test_legal_action_kinds_still_save(app):
+    """三种 kind 的合法形状照旧 200（新闸门不误伤）。"""
+    for node, branch, action in [
+            (9, 90, {"kind": "route", "model": "qwen3-8b"}),
+            (9, 90, {"kind": "block",
+                     "block_msg": {"zh": "拦截", "en": "Blocked"}}),
+            # special 只允许落在起点节点（节点 0）：落到别处会被既有
+            # special_misplaced 拦下，与本次 kind 闸门无关
+            (0, 100, {"kind": "special", "special": "ladder_up"})]:
+        r, _ = _put_tree_edit(
+            app, lambda t, a=(node, branch, action):
+            _set_action(t, a[0], a[1], dict(a[2])))
+        assert r.status_code == 200, (node, branch, action, r.status_code, r.text)
+
+
+# 绕闸坏数据（直接 SQL 写坏 kind）：命中该分支的 /v1 不得裸 500——沿用现有
+# §7 信封（EngineModel=None → 502 no_route；block 无 msg → 403 通用文案）。
+@pytest.mark.parametrize("action,expect", [
+    ({}, 502),
+    ({"kind": "rout"}, 502),
+    ({"kind": "route"}, 502),
+    ({"kind": "special"}, 502),
+    ({"kind": "block"}, 403),                 # block_msg 缺失 → 通用文案，仍非 500
+])
+def test_v1_no_500_when_bad_action_kind_bypasses_gate(app, tmp_path, action, expect):
+    _disable_non_fallback(app, tmp_path)
+    conn = db.get(str(tmp_path/"t.db"))
+    conn.execute("UPDATE tree SET action = ? WHERE idx = 90 AND parent = 9",
+                 (json.dumps(action),))
+    _bump_tree_version(conn)
+    conn.commit()
+    conn.close()
+    r = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
+        "model": "auto", "messages": [{"role": "user", "content": "随便问一句"}]}))
+    assert r.status_code != 500, (action, r.text)
+    assert r.status_code == expect, (action, r.status_code, r.text)
+    j = r.json()
+    assert j["error"]["code"] == ("no_route" if expect == 502 else "content_blocked")
+    assert j["error"]["type"] == ("api_error" if expect == 502 else "permission_error")
+    assert "Traceback" not in r.text
+
+
+def test_audit_reports_precise_finding_for_non_dict_action_row(app, tmp_path):
+    """绕闸 ``action: null`` 行：POST /admin/tree/audit 出精确 bad_ref hard，
+    不是通用 checkup_error（C1 Minor 3：旧实现 check_dead_branch 先崩）。"""
+    conn = db.get(str(tmp_path/"t.db"))
+    conn.execute("UPDATE tree SET action = 'null' WHERE idx = 90 AND parent = 9")
+    conn.commit()
+    conn.close()
+    r = _admin_post(app, "/admin/tree/audit", None)
+    assert r.status_code == 200, (r.status_code, r.text)
+    f = r.json()["findings"]
+    assert not any(x["code"] == "checkup_error" for x in f), f
+    hit = [x for x in f if x["code"] == "bad_ref" and x["level"] == "hard"
+           and x["node"] == 9 and x["branch"] == 90]
+    assert hit and "action" in hit[0]["message"]["zh"], f
+
+
 def test_stream_midstream_no_fallback(app, tmp_path, _failing_upstream):
     """§7.5 流式红线：上游首包后切断——已锁定主模型，不重试、不换模型、不回退；
     忠实透传（无终止包则客户端也收不到 [DONE]，这是红线的验收口径）。"""
@@ -586,3 +695,29 @@ def test_internal_error_message_is_generic(app, monkeypatch):
     assert msg == "internal error", msg                 # 通用文案（不再 f"…: {exc}"）
     assert sentinel not in r.text
     assert r.json()["error"]["type"] == "api_error"
+
+
+# ── C1 Minor 6：resolve 失败的 502 信封回吐异常 repr（与 M-c 同口径收口） ────────
+
+def test_resolve_failure_message_is_generic(app, monkeypatch):
+    """候选后端解析失败 → 502 信封给通用文案，不回吐 Python 异常原文；
+    异常本身仍进服务端日志（logger.warning）。"""
+    import sr.server as server_mod
+    sentinel = "SENTINEL-RESOLVE-DETAIL-/tmp/secret.env"
+
+    def _boom(*a, **k):
+        raise KeyError(sentinel)
+
+    logged = []
+    monkeypatch.setattr(server_mod, "resolve_backend", _boom)
+    monkeypatch.setattr(server_mod.logger, "warning",
+                        lambda *a, **k: logged.append(a))
+    r = asyncio.get_event_loop().run_until_complete(_post(
+        app, "/v1/chat/completions",
+        {"model": "auto", "messages": [{"role": "user", "content": "hi"}]}))
+    assert r.status_code == 502, (r.status_code, r.text)
+    j = r.json()
+    assert j["error"]["message"] == "upstream resolve failed", j["error"]
+    assert j["error"]["type"] == "api_error" and j["error"]["code"] == "upstream_error"
+    assert sentinel not in r.text
+    assert any(sentinel in repr(a) for a in logged), logged     # 细节留在服务端日志

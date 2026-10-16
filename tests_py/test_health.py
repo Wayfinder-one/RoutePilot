@@ -410,6 +410,237 @@ def test_import_bad_think_422_zero_write(app):
     assert _admin_get(app, "/admin/tree").json() == before
 
 
+# ── C1 批次 Important：`action.kind` 缺失/拼错 = 合法配置变永久 502 ────────────
+# 旧闸门 `if act.get("kind") != "route": continue`（health.py:419）在 kind 缺失或
+# 拼错时**整体跳过**该 action 的校验：`{"kind":"rout"}` / `{}` 实测 PUT 200 落库、
+# findings 空，随后命中该分支的 /v1 因引擎产出 model=None 而恒 502 no_route。
+# 修法：kind 不在 {route, block, special} → hard bad_ref；三种 kind 各自的必填字段
+# （route.model 的存在性沿用既有 refs 检查、block.block_msg、special.special）同族 hard。
+# 「special 只能在起点节点」是既有的 check_special_misplaced，本闸门不重复报。
+
+def _b90(nodes):
+    """出厂树节点 9 分支 90 的 Branch（C1 用例的统一改动点）。"""
+    return next(b for n in nodes if n.idx == 9
+                for b in n.branches if b.idx == 90)
+
+
+# 简报验收的五类畸形 action（逐类 PUT 必须 422 + hard + 库零写入）
+_MALFORMED_ACTIONS = [
+    {},                        # kind 缺失（旧实现：整体跳过 → PUT 200）
+    {"kind": "rout"},          # kind 拼错（旧实现：整体跳过 → PUT 200）
+    {"kind": "route"},         # route 无 model（旧实现已由 refs 的 None 拦下）
+    {"kind": "block"},         # block 无 block_msg
+    {"kind": "special"},       # special 无 special 值
+]
+
+
+@pytest.mark.parametrize("action", _MALFORMED_ACTIONS)
+def test_action_kind_malformed_is_hard_bad_ref(base_nodes, action):
+    """五类畸形 action 一律 hard bad_ref（C1 Important 的单元级验收）。"""
+    _b90(base_nodes).action = action
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert _bad_ref_hard(f), (action, [x.to_json() for x in f])
+    assert not any(x.code == "checkup_error" for x in f), [x.to_json() for x in f]
+
+
+def test_action_kind_gate_rejects_unknown_values(base_nodes):
+    """kind 值域外（None / 数字 / 空串）同属 hard bad_ref，不是只有缺键才拦。"""
+    for bad in (None, 5, "", "Route", "blocks"):
+        _b90(base_nodes).action = {"kind": bad}
+        f = check_bad_ref(base_nodes, MODELS, TAGS, True)
+        assert _bad_ref_hard(f), (bad, [x.to_json() for x in f])
+
+
+def test_action_kind_gate_does_not_touch_factory_tree(base_nodes):
+    """出厂种子树零 hard：新闸门不得误伤既定形状（route/block/special 三种都合法）。"""
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert not [x for x in f if x.level == "hard"], [x.to_json() for x in f]
+
+
+def test_action_kind_gate_accepts_legal_actions(base_nodes):
+    """三种 kind 的合法形状都放行；special 的位置问题归 check_special_misplaced。"""
+    _b90(base_nodes).action = {"kind": "route", "model": "qwen3-8b"}
+    assert not _bad_ref_hard(check_bad_ref(base_nodes, MODELS, TAGS, True))
+    _b90(base_nodes).action = {"kind": "block",
+                               "block_msg": {"zh": "拦截", "en": "Blocked"}}
+    assert not _bad_ref_hard(check_bad_ref(base_nodes, MODELS, TAGS, True))
+    base_nodes[0].branches[0].action = {"kind": "special", "special": "sticky"}
+    assert not _bad_ref_hard(check_bad_ref(base_nodes, MODELS, TAGS, True))
+
+
+@pytest.mark.parametrize("bad_msg", [
+    "Blocked",                            # 非对象 → server 的 msg_map.get 会 AttributeError
+    {"zh": "拦截"},                        # 缺 en（§5.1/§6.5 双语形状）
+    {"en": "Blocked"},                    # 缺 zh
+    {"zh": "", "en": "Blocked"},          # 空串等同缺失
+    {"zh": "拦截", "en": 5},              # 非字符串
+])
+def test_block_action_requires_bilingual_block_msg(base_nodes, bad_msg):
+    """block 必须有 §5.1 形状的双语 block_msg（缺/错形状 → hard bad_ref）。"""
+    _b90(base_nodes).action = {"kind": "block", "block_msg": bad_msg}
+    f = check_bad_ref(base_nodes, MODELS, TAGS, True)
+    assert _bad_ref_hard(f), (bad_msg, [x.to_json() for x in f])
+
+
+def test_block_action_with_legal_block_msg_passes(base_nodes):
+    """正例：双语 block_msg 是合法形状（出厂树节点 1 就是它）。"""
+    _b90(base_nodes).action = {"kind": "block",
+                               "block_msg": {"zh": "拦截", "en": "Blocked"}}
+    assert not _bad_ref_hard(check_bad_ref(base_nodes, MODELS, TAGS, True))
+
+
+@pytest.mark.parametrize("bad_special", [None, "sticky2", "ladder", "", 3, "unlock"])
+def test_special_action_requires_known_special_value(base_nodes, bad_special):
+    """special 值必须是 sticky/ladder_up/ladder_next（缺/未知 → hard bad_ref）。"""
+    base_nodes[0].branches[0].action = {"kind": "special", "special": bad_special}
+    f = check_bad_ref(base_nodes, MODELS, TAGS, True)
+    assert _bad_ref_hard(f), (bad_special, [x.to_json() for x in f])
+
+
+def test_special_placement_still_reported_only_by_special_misplaced(base_nodes):
+    """提醒落实：special 落在非起点节点由 special_misplaced 报，本闸门不重复报
+    （值域合法时不产生 bad_ref）。"""
+    base_nodes[3].branches[0].action = {"kind": "special", "special": "sticky"}
+    f = check_bad_ref(base_nodes, MODELS, TAGS, True)
+    assert not _bad_ref_hard(f), [x.to_json() for x in f]
+    assert any(x.code == "special_misplaced" and x.level == "hard"
+               for x in run_checkup(base_nodes, MODELS, TAGS))
+
+
+# ── C1 Minor 1：refs 无条件 append(to) → 幻影「模型 None」finding ───────────────
+
+def test_trial_missing_to_reports_exactly_one_finding(base_nodes):
+    """trial 缺 to：只报「to 必填」这一条，不再多报「引用了不存在的模型 None」。"""
+    _b90(base_nodes).action = {"kind": "route", "model": "qwen3-8b",
+                               "trial": {"ratio": 0.5}}
+    hits = [x for x in check_bad_ref(base_nodes, MODELS, TAGS, True)
+            if x.node == 9 and x.branch == 90]
+    assert len(hits) == 1, [x.to_json() for x in hits]
+    assert "trial.to" in hits[0].message_zh, hits[0].to_json()
+    assert "不存在的模型" not in hits[0].message_zh, hits[0].to_json()
+
+
+def test_fallback_null_element_reports_exactly_one_finding(base_nodes):
+    """fallback:[null]：只报「元素必须是模型 id 字符串」，不再多报幻影 None 模型。"""
+    _b90(base_nodes).action = {"kind": "route", "model": "qwen3-8b",
+                               "fallback": [None]}
+    hits = [x for x in check_bad_ref(base_nodes, MODELS, TAGS, True)
+            if x.node == 9 and x.branch == 90]
+    assert len(hits) == 1, [x.to_json() for x in hits]
+    assert "fallback" in hits[0].message_zh, hits[0].to_json()
+
+
+def test_fallback_unknown_model_still_reported(base_nodes):
+    """去重不得放过真·未知模型：fallback 里的合法字符串 id 仍走 refs 检查。"""
+    _b90(base_nodes).action = {"kind": "route", "model": "qwen3-8b",
+                               "fallback": ["ghost-model"]}
+    hits = [x for x in check_bad_ref(base_nodes, MODELS, TAGS, True)
+            if x.node == 9 and x.branch == 90]
+    assert len(hits) == 1 and "ghost-model" in hits[0].message_zh, \
+        [x.to_json() for x in hits]
+
+
+# ── C1 Minor 2：action 形状 findings 复用 bad() → fix_clause 误导 ──────────────
+
+def test_action_shape_findings_use_action_scoped_fix_not_fix_clause(base_nodes):
+    """值域/形状类（think / fallback 非 list / trial.ratio）→ fix_action；
+    模型引用类（未知模型 / trial.to）→ fix_model；两类都绝不给 fix_clause
+    （fix_clause 指向「改条件」，对 action 是误导）。"""
+    _b90(base_nodes).action = {"kind": "route", "model": "qwen3-8b",
+                               "think": "crazy", "fallback": None,
+                               "trial": {"ratio": "0.5", "to": "ghost-model"}}
+    hits = [x for x in check_bad_ref(base_nodes, MODELS, TAGS, True)
+            if x.node == 9 and x.branch == 90]
+    assert len(hits) >= 4, [x.to_json() for x in hits]   # think+fallback+ratio+未知模型
+    assert not any(x.fix == {"action": "fix_clause"} for x in hits), \
+        [x.to_json() for x in hits]
+
+    def fix_of(kw):
+        got = [x.fix for x in hits if kw in x.message_zh]
+        assert len(got) == 1, (kw, [x.to_json() for x in hits])
+        return got[0]
+
+    assert fix_of("think") == {"action": "fix_action"}
+    assert fix_of("fallback") == {"action": "fix_action"}
+    assert fix_of("trial.ratio") == {"action": "fix_action"}
+    assert fix_of("不存在的模型") == {"action": "fix_model"}
+
+
+def test_model_reference_findings_keep_fix_model(base_nodes):
+    """模型引用类（未知 model / trial.to 引用未知模型 / fallback 元素非 id）→ fix_model。"""
+    _b90(base_nodes).action = {"kind": "route", "model": "ghost-model"}
+    hits = [x for x in check_bad_ref(base_nodes, MODELS, TAGS, True)
+            if x.node == 9 and x.branch == 90]
+    assert hits and all(x.fix == {"action": "fix_model"} for x in hits), \
+        [x.to_json() for x in hits]
+
+
+def test_clause_findings_keep_fix_clause(base_nodes):
+    """条件子句类仍归 fix_clause（本次改动不得反向误伤既有建议）。"""
+    _b90(base_nodes).cond = [{"tag": "no-such-tag", "op": "is", "values": [1]}]
+    hits = [x for x in check_bad_ref(base_nodes, MODELS, TAGS, True)
+            if x.node == 9 and x.branch == 90]
+    assert hits and all(x.fix == {"action": "fix_clause"} for x in hits), \
+        [x.to_json() for x in hits]
+
+
+# ── C1 Minor 3：check_dead_branch 在形状守卫之前 `b.action.get` → 守卫不可达 ────
+# 旧实现 CHECKS 表首项 check_dead_branch（health.py:169）先做 `b.action.get("kind")`，
+# action 非 dict 时 AttributeError 逃出 run_checkup，被 run_checkup_safe 兜成通用
+# checkup_error —— check_bad_ref 里「action 必须是对象」的精确 finding 事实不可达。
+
+@pytest.mark.parametrize("bad_action", [None, "route", 7, ["route"], True])
+def test_non_dict_action_yields_precise_finding_not_checkup_error(base_nodes,
+                                                                  bad_action):
+    """action 非 dict → run_checkup 自身不崩，出精确 bad_ref（不是 checkup_error）。
+
+    旧实现在这里 AttributeError（生产上 = 422 checkup_error，精确原因丢失）。
+    """
+    _b90(base_nodes).action = bad_action
+    f = run_checkup(base_nodes, MODELS, TAGS)
+    assert not any(x.code == "checkup_error" for x in f), [x.to_json() for x in f]
+    hits = [x for x in f if x.code == "bad_ref" and x.node == 9 and x.branch == 90]
+    assert hits and hits[0].level == "hard", [x.to_json() for x in f]
+    assert "action" in hits[0].message_zh
+
+
+def test_non_dict_action_survives_all_checks_with_hits(base_nodes):
+    """带 hits 跑（check_no_hits 也读 b.action）时同样不得崩。"""
+    _b90(base_nodes).action = None
+    f = run_checkup(base_nodes, MODELS, TAGS, hits={})
+    assert not any(x.code == "checkup_error" for x in f), [x.to_json() for x in f]
+    assert any(x.code == "bad_ref" and x.level == "hard" for x in f)
+
+
+@pytest.mark.parametrize("bad_action", [None, "route", 7, ["route"]])
+def test_non_dict_action_does_not_crash_other_checks(base_nodes, bad_action):
+    """逐个检查函数直调同样不崩（check_duplicate / check_special_misplaced /
+    check_dead_branch / check_no_hits 都读 b.action.get）。"""
+    from sr.health import (check_dead_branch, check_duplicate, check_no_hits,
+                           check_special_misplaced)
+    _b90(base_nodes).action = bad_action
+    for fn in (check_dead_branch, check_duplicate, check_special_misplaced):
+        fn(base_nodes, MODELS, TAGS, False)
+    check_no_hits(base_nodes, MODELS, TAGS, False, hits={})
+
+
+def test_import_bad_action_kind_422_zero_write(app):
+    """写路径三（import）：缺 kind 的 action 整包拒绝 422 + hard bad_ref，
+    树零写入（与 PUT / POST nodes 三条写路径同过体检）。"""
+    import yaml
+    before = _admin_get(app, "/admin/tree").json()
+    data = yaml.safe_load(_admin_get(app, "/admin/export").text)
+    node9 = next(n for n in data["tree"]["nodes"] if n["idx"] == 9)
+    node9["branches"][0]["action"] = {"model": "qwen3-8b"}      # 缺 kind
+    r = _admin_post_raw(app, "/admin/import",
+                        yaml.safe_dump(data, allow_unicode=True))
+    assert r.status_code == 422, (r.status_code, r.text)
+    f = [x for x in r.json()["findings"] if x["code"] == "bad_ref"]
+    assert f and all(x["level"] == "hard" for x in f), r.text
+    assert "kind" in f[0]["message"]["zh"], f[0]
+    assert _admin_get(app, "/admin/tree").json() == before
+
+
 def test_import_checkup_crash_config_layer_returns_findings(tmp_path):
     """同一保护的模块契约：config.import_yaml 里 run_checkup 崩 → 回 findings
     （不是异常逃逸）。"""

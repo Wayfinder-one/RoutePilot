@@ -498,11 +498,14 @@ def _defensive() -> RouteDecision:
     return RouteDecision(kind="route", model=None, source="fallback")
 
 
+# 空 route action 的**模板**（只读）。所有使用点都 ``dict(_EMPTY_ACTION)`` 复制——
+# C1 Minor 4：旧实现把本模块级可变 dict 直接返回给调用方，任何就地改（如
+# `_action_of(b)["model"] = x`）都会污染之后所有「空 action」分支（跨请求串味）。
 _EMPTY_ACTION: dict = {"kind": "route"}
 
 
 def _action_of(branch) -> dict:
-    """分支 action 防御取值：非 dict（null / 标量）→ 空 route action（M4）。
+    """分支 action 防御取值：非 dict（null / 标量）→ 空 route action 的新副本（M4）。
 
     历史库或绕闸数据里的 ``action: null`` 在旧实现让 ``action.get(...)``
     AttributeError 逃出 evaluate（/v1 持久 500）；空 action 的 model 为 None，
@@ -510,7 +513,7 @@ def _action_of(branch) -> dict:
     体检 bad_ref 仍是主闸。
     """
     action = branch.action
-    return action if isinstance(action, dict) else _EMPTY_ACTION
+    return action if isinstance(action, dict) else dict(_EMPTY_ACTION)
 
 
 def evaluate(nodes: list[Node], signals: dict, conf_thresholds) -> RouteDecision:
@@ -551,7 +554,7 @@ def _resolve(action: dict, trial: dict | None, hit_path: list[int]) -> RouteDeci
       引擎不替体检做决定。
     """
     if not isinstance(action, dict):
-        action = _EMPTY_ACTION
+        action = dict(_EMPTY_ACTION)            # C1 Minor 4：副本，不共享模块级 dict
     if trial is None:
         trial = action.get("trial")
     if action.get("kind") == "block":

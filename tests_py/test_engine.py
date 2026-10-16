@@ -295,3 +295,30 @@ def test_evaluate_never_raises_on_malformed_actions(tmp_path):
         assert isinstance(d, RouteDecision) and d.model, bad
         tr = evaluate_trace(base, SIG, CUTS)
         assert isinstance(tr["decision"], RouteDecision), bad
+
+
+# ── C1 Minor 4：`_EMPTY_ACTION` 模块级可变 dict 被共享返回 ───────────────────────
+# 旧实现：action 非 dict 时 `_action_of`/`_resolve` 返回同一个模块级 dict，任何调用方
+# 就地改它都会污染之后所有「空 action」分支（跨请求串味）。修法：每次新建 dict。
+
+def test_action_of_returns_fresh_dict_each_call():
+    """`_action_of` 对非 dict action 每次返回新 dict（不是同一模块级对象）。"""
+    from sr.engine import _EMPTY_ACTION, _action_of, Branch
+
+    b = Branch(idx=1, cond=[], action=None, trial=None, enabled=True, kids=[])
+    a1, a2 = _action_of(b), _action_of(b)
+    assert a1 == {"kind": "route"} and a2 == {"kind": "route"}
+    assert a1 is not a2, "两次调用返回了同一对象（模块级共享可变 dict）"
+    a1["model"] = "polluted"                       # 就地改不得污染下一次
+    assert _action_of(b) == {"kind": "route"}
+    assert _EMPTY_ACTION == {"kind": "route"}, _EMPTY_ACTION
+
+
+def test_resolve_does_not_share_empty_action_dict():
+    """`_resolve(None, …)` 的兜底同样不得写回模块级 dict。"""
+    from sr.engine import _EMPTY_ACTION, _resolve
+
+    d = _resolve(None, None, [1, 0])
+    assert d.model is None and d.kind == "route"
+    assert _EMPTY_ACTION == {"kind": "route"}, _EMPTY_ACTION
+

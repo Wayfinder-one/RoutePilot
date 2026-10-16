@@ -56,6 +56,25 @@ def _op_kind_ok(op, spec) -> bool:
     return allow is None or spec.kind in allow
 
 
+# action.kind 值域（§5.1 去向表三种）与 special 值域（§5.1 三个语义）。
+# C1 Important：kind 是去向的判别键——缺失或拼错时配置整体不可解释，必须 hard 拦。
+_ACTION_KINDS = {"route", "block", "special"}
+_SPECIALS = {"sticky", "ladder_up", "ladder_next"}
+
+
+def _action_kind(b: Branch) -> str | None:
+    """分支 action 的 kind；action 非 dict（历史库/绕闸 ``action: null``）→ None。
+
+    结构类检查（dead_branch / no_hits / duplicate / special_misplaced）都用它取
+    kind，别再用 ``b.action.get(...)``——C1 Minor 3：旧实现 check_dead_branch
+    （CHECKS 表首项）先对非 dict action 调 ``.get`` 抛 AttributeError，逃出
+    run_checkup 后被 run_checkup_safe 兜成通用 checkup_error，使 check_bad_ref 里
+    「action 必须是对象」的**精确** finding 在 run_checkup 路径事实不可达。
+    """
+    act = b.action
+    return act.get("kind") if isinstance(act, dict) else None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1) Finding —— §9.2 audit 形状的内存态（message 双语拆两字段，序列化时合字典）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +185,7 @@ def check_dead_branch(nodes: list[Node], models, tag_defs, is_hard: bool) -> lis
         if not n.enabled:
             continue
         for b in n.branches:
-            if not b.enabled or b.action.get("kind") == "special":
+            if not b.enabled or _action_kind(b) == "special":
                 continue
             key = _cond_key(b.cond)
             for akey, an, ab in seen:
@@ -225,7 +244,7 @@ def check_no_hits(nodes: list[Node], models, tag_defs, is_hard: bool,
         if not n.enabled:
             continue
         for i, b in enumerate(n.branches):
-            if not b.enabled or b.action.get("kind") == "special":
+            if not b.enabled or _action_kind(b) == "special":
                 continue
             if hits.get(f"{n.idx}.{i}", 0) == 0:
                 findings.append(Finding(
@@ -316,8 +335,23 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
         return f"节点 {n.idx} 分支 {b.idx}"
 
     def bad(n: Node, b: Branch, zh: str, en: str) -> None:
+        """条件子句类 finding：fix 指向「改条件」（fix_clause，既有枚举）。"""
         findings.append(Finding(level, "bad_ref", n.idx, b.idx, zh, en,
                                 {"action": "fix_clause"}))
+
+    def bad_action(n: Node, b: Branch, zh: str, en: str,
+                   fix: str = "fix_action") -> None:
+        """action 形状/值域类 finding：fix 指向「改行动作」，不是「改条件」。
+
+        C1 Minor 2：旧实现复用 ``bad()`` → ``fix={"action":"fix_clause"}``，对
+        think/fallback/trial 是误导性建议（控制台会引导去改条件）。分两档：
+        - 形状/值域类（kind / block_msg / special / think / fallback 非 list /
+          trial 形状 / ratio）→ ``fix_action``（既有枚举：非 dict action 也用它）；
+        - 模型引用类（未知模型 / fallback 元素非 id / trial.to）→ ``fix_model``
+          （调用点显式传 fix="fix_model"）。
+        """
+        findings.append(Finding(level, "bad_ref", n.idx, b.idx, zh, en,
+                                {"action": fix}))
 
     def atom(c: dict, n: Node, b: Branch) -> None:
         """普通子句校验（or/not 内层调用，故内层再嵌 or/not 在此拦下，I1(a)）。"""
@@ -409,15 +443,58 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
         clause_errors(b.cond, n, b)
         act = b.action
         if not isinstance(act, dict):              # 形状闸门（M4）：action 必须是对象
-            findings.append(Finding(
-                level, "bad_ref", n.idx, b.idx,
-                f"{where(n, b)}：action 必须是对象（当前 {act!r}）——引擎求值会崩溃",
-                f"{where(n, b)}: action must be an object (got {act!r}) — the "
-                f"engine would crash evaluating it",
-                {"action": "fix_action"}))
+            bad_action(n, b,
+                       f"{where(n, b)}：action 必须是对象（当前 {act!r}）"
+                       f"——引擎求值会崩溃",
+                       f"{where(n, b)}: action must be an object (got {act!r}) — "
+                       f"the engine would crash evaluating it")
             continue
-        if act.get("kind") != "route":
+        # ── C1 Important：kind 闸门（§5.1 去向表的判别键）──────────────────────
+        # 旧实现 `if act.get("kind") != "route": continue`：kind 缺失或拼错时**整体
+        # 跳过** action 校验（payload 校验只要求 action 是对象）。实测 `action={}`
+        # 与 `{"kind":"rout"}` → PUT 200、findings 空、落库成功，随后命中该分支的
+        # /v1 恒 502 no_route（引擎 route 分支取不到 model → model=None）；而
+        # `{"kind":"special"}` 无值则让分支恒 miss。三类都是「PUT 200 后永久
+        # 502」，与 (e)(f)(g) 同族 → 同族 hard bad_ref。
+        kind = act.get("kind")
+        if kind not in _ACTION_KINDS:
+            bad_action(n, b,
+                       f"{where(n, b)}：action.kind 必须是 "
+                       f"{sorted(_ACTION_KINDS)} 之一（当前 {kind!r}）"
+                       f"——缺失或拼错会让这个去向无法解释，请求永久 502",
+                       f"{where(n, b)}: action.kind must be one of "
+                       f"{sorted(_ACTION_KINDS)} (got {kind!r}) — a missing or "
+                       f"misspelled kind makes the action uninterpretable and "
+                       f"the route would fail permanently")
             continue
+        if kind == "special":
+            # special 值域（§5.1 三个语义）。「只允许出现在起点节点」是既有的
+            # check_special_misplaced，此处不重复报（简报明确提醒）。
+            sp = act.get("special")
+            if sp not in _SPECIALS:
+                bad_action(n, b,
+                           f"{where(n, b)}：special 必须是 "
+                           f"{sorted(_SPECIALS)} 之一（当前 {sp!r}）"
+                           f"——引擎无法执行该特殊去向",
+                           f"{where(n, b)}: special must be one of "
+                           f"{sorted(_SPECIALS)} (got {sp!r}) — the engine cannot "
+                           f"perform this special action")
+            continue
+        if kind == "block":
+            # block_msg 形状（§5.1/§6.5 双语对象）；server 的 block 分支对它做
+            # ``msg_map.get(...)``，非对象（或双语缺一）会让 403 响应组装崩。
+            msg = act.get("block_msg")
+            if not (isinstance(msg, dict)
+                    and all(isinstance(msg.get(k), str) and msg[k]
+                            for k in ("zh", "en"))):
+                bad_action(n, b,
+                           f"{where(n, b)}：block_msg 必须是 {{\"zh\":…,\"en\":…}} "
+                           f"双语对象（当前 {msg!r}）——拦截文案取不到会让响应崩溃",
+                           f"{where(n, b)}: block_msg must be a bilingual object "
+                           f"{{\"zh\":…,\"en\":…}} (got {msg!r}) — the block "
+                           f"message cannot be rendered")
+            continue
+        # kind == "route"：以下沿用 M3/M4 的既有校验
         # ── M3：think 值域（off | light | deep；None = 未指定）───────────────
         # 值域外 / 非字符串 think 会在 to_upstream 抛 ValueError（值域外）或
         # TypeError（非字符串 → dict 查表 unhashable），_call_* 只捕
@@ -427,12 +504,13 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
         think = act.get("think")
         if think is not None and (not isinstance(think, str)
                                   or think not in THINK_OPENAI):
-            bad(n, b,
-                f"{where(n, b)}：think 值 {think!r} 非法"
-                f"（允许：{sorted(THINK_OPENAI)} 或未指定）——上游请求体会构造失败",
-                f"{where(n, b)}: invalid think value {think!r} "
-                f"(allowed: {sorted(THINK_OPENAI)} or unset) — building the "
-                f"upstream request body would fail")
+            bad_action(n, b,
+                       f"{where(n, b)}：think 值 {think!r} 非法"
+                       f"（允许：{sorted(THINK_OPENAI)} 或未指定）"
+                       f"——上游请求体会构造失败",
+                       f"{where(n, b)}: invalid think value {think!r} "
+                       f"(allowed: {sorted(THINK_OPENAI)} or unset) — building the "
+                       f"upstream request body would fail")
         # ── M4/M5：fallback 形状 + 引用 ──────────────────────────────────────
         # 旧实现 refs = [model, *act.get("fallback", [])]：键在且值为 null 时默认值
         # 不生效，`*None` 抛 TypeError 逃出 run_checkup（PUT /admin/tree 500）——
@@ -442,61 +520,71 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
         # 无法解释回退链），hard 拦截；键不存在的 route action（种子树/控制台
         # SRW_chipsToAction 就是这种形状）合法。引擎侧对 null 按 ``[]`` 防御——
         # 闸门拦得住，历史库也要能跑。
+        # C1 Minor 1：refs 只收「形状合法的模型 id」——旧实现无条件
+        # ``refs = [model, *fallback]`` / ``refs.append(to)``，对 fallback:[null]
+        # 或缺失的 trial.to 除精确 finding 外还多报一条幻影「引用了不存在的模型
+        # None」（误导控制台）。
         if "fallback" not in act:
             refs = [act.get("model")]
         else:
             fallback = act["fallback"]
             if not isinstance(fallback, list):
-                bad(n, b,
-                    f"{where(n, b)}：fallback 必须是数组（当前 {fallback!r}）"
-                    f"——回退链无法解释（要清空回退链请省略该字段）",
-                    f"{where(n, b)}: fallback must be an array (got {fallback!r}) "
-                    f"— the fallback chain is uninterpretable (omit the field to "
-                    f"clear the chain)")
+                bad_action(n, b,
+                           f"{where(n, b)}：fallback 必须是数组（当前 {fallback!r}）"
+                           f"——回退链无法解释（要清空回退链请省略该字段）",
+                           f"{where(n, b)}: fallback must be an array "
+                           f"(got {fallback!r}) — the fallback chain is "
+                           f"uninterpretable (omit the field to clear the chain)")
                 refs = [act.get("model")]
             else:
-                refs = [act.get("model"), *fallback]
+                refs = [act.get("model")]
                 for m in fallback:
                     if not isinstance(m, str) or not m:
-                        bad(n, b,
-                            f"{where(n, b)}：fallback 元素必须是模型 id 字符串"
-                            f"（当前 {m!r}）",
-                            f"{where(n, b)}: every fallback item must be a model "
-                            f"id string (got {m!r})")
+                        bad_action(n, b,
+                                   f"{where(n, b)}：fallback 元素必须是模型 id "
+                                   f"字符串（当前 {m!r}）",
+                                   f"{where(n, b)}: every fallback item must be a "
+                                   f"model id string (got {m!r})",
+                                   fix="fix_model")
+                    else:
+                        refs.append(m)
         # ── M4：trial 形状（ratio 数值 ∈[0,1]、to 必填字符串）——缺 to 时引擎
         # 产出 model=None/source='trial'，server 当 502 no_route（合法配置变永久
         # 502）。
         trial = b.trial if b.trial is not None else act.get("trial")
         if trial is not None:
             if not isinstance(trial, dict):
-                bad(n, b,
-                    f"{where(n, b)}：trial 必须是对象或 null（当前 {trial!r}）",
-                    f"{where(n, b)}: trial must be an object or null (got {trial!r})")
+                bad_action(n, b,
+                           f"{where(n, b)}：trial 必须是对象或 null（当前 {trial!r}）",
+                           f"{where(n, b)}: trial must be an object or null "
+                           f"(got {trial!r})")
             else:
                 ratio = trial.get("ratio", 0)
                 if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) \
                         or not 0 <= ratio <= 1:
-                    bad(n, b,
-                        f"{where(n, b)}：trial.ratio 必须是 0–1 的数值（当前 "
-                        f"{ratio!r}）——试水掷签会崩溃",
-                        f"{where(n, b)}: trial.ratio must be a number in [0, 1] "
-                        f"(got {ratio!r}) — the trial coin flip would crash")
+                    bad_action(n, b,
+                               f"{where(n, b)}：trial.ratio 必须是 0–1 的数值"
+                               f"（当前 {ratio!r}）——试水掷签会崩溃",
+                               f"{where(n, b)}: trial.ratio must be a number in "
+                               f"[0, 1] (got {ratio!r}) — the trial coin flip "
+                               f"would crash")
                 to = trial.get("to")
                 if not isinstance(to, str) or not to:
-                    bad(n, b,
-                        f"{where(n, b)}：trial.to 必填且必须是模型 id（当前 {to!r}）"
-                        f"——缺失时去向为空，请求会永久 502",
-                        f"{where(n, b)}: trial.to is required and must be a model "
-                        f"id (got {to!r}) — without it the request has no route "
-                        f"and would fail permanently")
-                refs.append(to)
+                    bad_action(n, b,
+                               f"{where(n, b)}：trial.to 必填且必须是模型 id"
+                               f"（当前 {to!r}）——缺失时去向为空，请求会永久 502",
+                               f"{where(n, b)}: trial.to is required and must be "
+                               f"a model id (got {to!r}) — without it the request "
+                               f"has no route and would fail permanently",
+                               fix="fix_model")
+                else:
+                    refs.append(to)
         for m in refs:
             if m not in models:
-                findings.append(Finding(
-                    level, "bad_ref", n.idx, b.idx,
-                    f"{where(n, b)}：引用了不存在的模型 {m!r}",
-                    f"{where(n, b)}: references unknown model {m!r}",
-                    {"action": "fix_model"}))
+                bad_action(n, b,
+                           f"{where(n, b)}：引用了不存在的模型 {m!r}",
+                           f"{where(n, b)}: references unknown model {m!r}",
+                           fix="fix_model")
     return findings
 
 
@@ -512,7 +600,7 @@ def check_duplicate(nodes: list[Node], models, tag_defs, is_hard: bool) -> list:
         if not n.enabled:
             continue
         for b in n.branches:
-            if not b.enabled or b.action.get("kind") == "special":
+            if not b.enabled or _action_kind(b) == "special":
                 continue
             key = _cond_key(b.cond)
             if key in first:
@@ -537,7 +625,7 @@ def check_special_misplaced(nodes: list[Node], models, tag_defs,
     level = "hard" if is_hard else "warn"
     findings: list[Finding] = []
     for n, b in _iter_branches(nodes):
-        if b.action.get("kind") == "special" and n.kind != "sticky":
+        if _action_kind(b) == "special" and n.kind != "sticky":
             findings.append(Finding(
                 level, "special_misplaced", n.idx, b.idx,
                 f"特殊去向出现在非会话沿用节点：节点 {n.idx} 分支 {b.idx}"

@@ -334,7 +334,11 @@ def _outbound_payload_or_none(ir, cand, decision: RouteDecision, conn):
     try:
         backend = resolve_backend(conn, cand)
     except Exception as exc:              # KeyError / env 缺失：配置面问题
-        return None, UpstreamError(502, f"resolve {cand}: {exc}", "config_error")
+        # C1 Minor 6（pre-existing）：旧实现把 `{exc}` 原样塞进 502 信封（可能带
+        # 环境变量名/路径等细节）。收口到既有 M-c 口径——信封给通用文案，异常原文
+        # 只进服务端日志。
+        logger.warning("resolve_backend failed for %s: %r", cand, exc)
+        return None, UpstreamError(502, "upstream resolve failed", "config_error")
     try:
         return backend, _outbound_payload(ir, backend, decision.think)
     except Exception as exc:              # M3/M4：出站体构造失败（值域外 think 等）
@@ -1278,7 +1282,7 @@ def _write_tree_rows(conn, nodes: list[Node]) -> None:
 
 
 def run_checkup_safe(nodes: list[Node], models, tag_defs,
-                     hits: dict[str, int] | None = None) -> list:
+                     hits: dict[str, int] | None = None) -> list[Finding]:
     """run_checkup 的**崩溃安全**入口（M5，audit Major）：体检内部异常降级为一条
     hard finding（code="checkup_error"），绝不逃逸成 PUT /admin/tree 500。
 
@@ -1305,8 +1309,9 @@ def run_checkup_safe(nodes: list[Node], models, tag_defs,
 
 
 def _checkup_or_422(conn, nodes: list[Node]):
-    """保存前体检（§10 强制行为）：有 hard → 422 ``{"findings": […]}}``（硬错误
+    """保存前体检（§10 强制行为）：有 hard → 422 ``{"findings": […]}``（硬错误
     优先排序，控制台首屏直指拦截原因；全量 findings 由 /admin/tree/audit 提供）；
+
     通过 → None。
 
     走 :func:`run_checkup_safe`：体检自身崩溃按 hard finding 降级（M5），
