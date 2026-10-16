@@ -72,6 +72,26 @@ class IRChunk:
                                      # 被丢、我方合成值硬编码 0；此字段把它带过去）
 
 
+@dataclass
+class IRResponse:
+    """一次**非流式**响应的协议无关表示（A3：跨协议经 IR 中转，不再两两互转）。
+
+    由各适配器的 ``response_to_ir`` 从上游响应产出、``ir_to_response`` 渲染为客户端
+    响应。M1 跨协议面是纯文本（tool_calls 等复杂面留 M2），故只需 text/finish/usage。
+
+    ``finish`` 是 OpenAI finish_reason 口径（跨协议统一）；``raw_finish`` 是协议原生
+    终止值（Anthropic stop_reason），同协议回环/原生渲染优先用它。``usage`` 原样
+    （各适配器渲染时按需归一键名）。
+    """
+
+    text: str = ""
+    finish: str | None = None
+    raw_finish: str | None = None
+    usage: dict = field(default_factory=dict)
+    model_asked: str | None = None
+    id: str | None = None
+
+
 class UpstreamError(Exception):
     """上游错误统一形状（Task 7 接口裁定）：server 层只认 (status, message, type)。"""
 

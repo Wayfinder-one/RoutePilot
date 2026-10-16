@@ -324,14 +324,13 @@ def test_run_checkup_does_not_crash_on_fallback_null(base_nodes):
 
 def test_checkup_error_degrades_to_hard_finding_not_500(app, monkeypatch):
     """run_checkup 抛异常 → PUT /admin/tree 回 422 + hard checkup_error（不是 500）。"""
-    import sr.server as server_mod
     import sr.health as health_mod
 
     def _boom(*a, **k):
         raise RuntimeError("SENTINEL-CHECKUP-CRASH")
 
+    # A1：run_checkup_safe 在 sr.health，查的是 sr.health 模块全局名
     monkeypatch.setattr(health_mod, "run_checkup", _boom)
-    monkeypatch.setattr(server_mod, "run_checkup", _boom)
     before = _admin_get(app, "/admin/tree").json()
     r = _admin_put(app, "/admin/tree", before)
     assert r.status_code == 422, (r.status_code, r.text)
@@ -345,14 +344,12 @@ def test_checkup_error_degrades_to_hard_finding_not_500(app, monkeypatch):
 def test_import_checkup_crash_422_not_500(app, monkeypatch):
     """import 路径同样受保护（config.import_yaml 里也有 run_checkup 调用点）。"""
     import sr.config as config_mod
-    import sr.server as server_mod
     import sr.health as health_mod
 
     def _boom(*a, **k):
         raise RuntimeError("SENTINEL-CHECKUP-CRASH")
 
     monkeypatch.setattr(health_mod, "run_checkup", _boom)
-    monkeypatch.setattr(server_mod, "run_checkup", _boom)
     yml = _admin_get(app, "/admin/export").text
     r = _admin_post_raw(app, "/admin/import", yml)
     assert r.status_code == 422, (r.status_code, r.text)
@@ -646,19 +643,19 @@ def test_import_checkup_crash_config_layer_returns_findings(tmp_path):
     """同一保护的模块契约：config.import_yaml 里 run_checkup 崩 → 回 findings
     （不是异常逃逸）。"""
     import sr.config as config_mod
-    import sr.server as server_mod
+    import sr.health as health_mod
 
     conn = db.init_db(str(tmp_path / "cfg-boom.db"))
     try:
         text = config_mod.export_yaml(conn)
-        orig = server_mod.run_checkup
-        # server.run_checkup_safe 查的是 server 模块全局名（不是 sr.health.run_checkup）
-        server_mod.run_checkup = lambda *a, **k: (_ for _ in ()).throw(
+        orig = health_mod.run_checkup
+        # run_checkup_safe 自 A1 起在 sr.health，查的是 sr.health 模块全局名
+        health_mod.run_checkup = lambda *a, **k: (_ for _ in ()).throw(
             RuntimeError("SENTINEL-CHECKUP-CRASH"))
         try:
             findings = config_mod.import_yaml(conn, text)
         finally:
-            server_mod.run_checkup = orig
+            health_mod.run_checkup = orig
         assert isinstance(findings, list) and findings
         assert findings[0]["code"] == "checkup_error"
         assert "SENTINEL" not in str(findings)

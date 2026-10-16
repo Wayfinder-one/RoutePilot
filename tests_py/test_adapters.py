@@ -270,15 +270,13 @@ def test_openai_finish_reason_to_anthropic_stop_reason_reverse():
 
 
 def test_stop_finish_tables_are_the_single_shared_source():
-    """消重（rollup #24 真问题是「漏用」）：唯一表在 sr/adapters，
-    server 与 anthropic 适配器都取同一对象，不再各持私有副本。"""
-    from sr import server
-    assert server.STOP_TO_FINISH is STOP_TO_FINISH
-    assert server.FINISH_TO_STOP is FINISH_TO_STOP
-    # 兼容别名已删（审核 §4 清单）：server 不再暴露 _STOP_TO_FINISH/_FINISH_TO_STOP，
-    # anthropic 不再暴露 _STOP_REASON——引用点直接用 adapters 的表名。
-    assert not hasattr(server, "_STOP_TO_FINISH")
-    assert not hasattr(server, "_FINISH_TO_STOP")
+    """消重（rollup #24 真问题是「漏用」）：唯一表在 sr/adapters，各消费点取同一
+    对象，不再各持私有副本。A1 后 server 不再直接持有该表（非流式跨协议已迁
+    sr/adapters/cross.py 经 IRResponse 中转、流式在 sr/upstream.py），故不再断言
+    server 暴露它——改为断言 adapters 是唯一来源、anthropic 适配器取同一对象。"""
+    assert anthropic.STOP_TO_FINISH is STOP_TO_FINISH
+    assert anthropic.FINISH_TO_STOP is FINISH_TO_STOP
+    # 兼容别名已删（审核 §4 清单）：anthropic 不再暴露 _STOP_REASON。
     assert not hasattr(anthropic, "_STOP_REASON")
     # 互逆：Anthropic → OpenAI 后再回 Anthropic 稳定（stop_sequence 按语义声明
     # 折叠到 "stop"，不参与可逆性断言）
@@ -392,3 +390,39 @@ def test_message_start_missing_input_tokens_falls_back_to_zero():
     assert ic.input_tokens is None
     assert _message_start(anthropic.ir_to_events(ic, anthropic.StreamState())
                           )["message"]["usage"]["input_tokens"] == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# A3：非流式跨协议经 IRResponse 中转（sr/adapters/cross.py）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_cross_from_upstream_via_ir():
+    from sr.adapters import cross
+
+    o = {"id": "chatcmpl-x", "choices": [{"index": 0, "finish_reason": "stop",
+          "message": {"role": "assistant", "content": "hi"}}],
+         "usage": {"prompt_tokens": 5, "completion_tokens": 7}}
+    # 同协议：原样回写 model（其余字段不动）
+    same = cross.from_upstream("openai", "openai", o, "auto")
+    assert same["model"] == "auto" and same["choices"][0]["message"]["content"] == "hi"
+
+    # openai 上游 → anthropic 客户端（usage 键归一 prompt/completion → input/output）
+    a = cross.from_upstream("anthropic", "openai", o, "auto")
+    assert a["type"] == "message" and a["content"][0]["text"] == "hi"
+    assert a["stop_reason"] == "end_turn"                       # stop → end_turn
+    assert a["usage"] == {"input_tokens": 5, "output_tokens": 7}
+
+    # anthropic 上游 → openai 客户端（input/output → prompt/completion/total）
+    an = {"id": "msg-x", "content": [{"type": "text", "text": "yo"}],
+          "stop_reason": "max_tokens", "usage": {"input_tokens": 3, "output_tokens": 4}}
+    ou = cross.from_upstream("openai", "anthropic", an, "auto")
+    assert ou["choices"][0]["message"]["content"] == "yo"
+    assert ou["choices"][0]["finish_reason"] == "length"        # max_tokens → length
+    assert ou["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+
+
+def test_cross_from_upstream_tolerates_malformed_upstream():
+    """上游响应形状畸形不得让跨协议 shim 抛异常（response_to_ir 防御）。"""
+    from sr.adapters import cross
+    assert cross.from_upstream("anthropic", "openai", {"choices": "oops"}, "auto")["type"] == "message"
+    assert cross.from_upstream("openai", "anthropic", {"content": "oops"}, "auto")["object"] == "chat.completion"

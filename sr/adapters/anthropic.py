@@ -32,7 +32,7 @@ import json
 from dataclasses import dataclass
 
 from sr.adapters import (FINISH_TO_STOP, PARAM_KEYS, STOP_TO_FINISH,
-                         THINK_ANTHROPIC, IR, IRChunk, UpstreamError,
+                         THINK_ANTHROPIC, IR, IRChunk, IRResponse, UpstreamError,
                          error_payload, text_of)
 
 # 跨协议 stop_reason 归一直接用 sr.adapters 的 FINISH_TO_STOP（I4 唯一表；
@@ -116,6 +116,39 @@ def from_upstream(resp: dict, model_asked: str | None) -> dict:
     out = dict(resp)
     out["model"] = model_asked
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b) response_to_ir / ir_to_response —— 非流式跨协议经 IR 中转（A3）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def response_to_ir(resp: dict) -> IRResponse:
+    """Anthropic 非流式响应 → :class:`IRResponse`（A3）：content 取 text 块拼接，
+    finish 归一到 OpenAI 口径、原值存 raw_finish（同协议回环/原生渲染用）。"""
+    text = "".join(blk.get("text", "") for blk in (resp.get("content") or [])
+                   if isinstance(blk, dict) and blk.get("type") == "text")
+    raw = resp.get("stop_reason")
+    return IRResponse(text=text, finish=STOP_TO_FINISH.get(raw), raw_finish=raw,
+                      usage=resp.get("usage") or {}, id=resp.get("id"))
+
+
+def ir_to_response(ir: IRResponse, model_asked: str | None) -> dict:
+    """IRResponse → Anthropic 非流式响应（anthropic 客户端；来源为 openai）。
+
+    stop_reason 优先协议原值（raw_finish），否则由 FINISH_TO_STOP 从归一 finish
+    映射；usage 键归一：OpenAI prompt/completion → Anthropic input/output
+    （与旧跨协议 shim 逐字一致）。
+    """
+    usage = ir.usage or {}
+    stop = ir.raw_finish if ir.raw_finish is not None \
+        else FINISH_TO_STOP.get(ir.finish)
+    return {"id": ir.id or "msg_smart-router", "type": "message",
+            "role": "assistant", "model": model_asked,
+            "content": [{"type": "text", "text": ir.text}],
+            "stop_reason": stop, "stop_sequence": None,
+            "usage": {"input_tokens": usage.get("prompt_tokens", 0),
+                      "output_tokens": usage.get("completion_tokens", 0)}}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

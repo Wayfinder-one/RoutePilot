@@ -326,6 +326,13 @@ def _seed_branch(conn: sqlite3.Connection, parent: int, branch: dict) -> None:
         _seed_branch(conn, branch["idx"], kid)
 
 
+def model_ids(conn: sqlite3.Connection) -> dict[str, dict]:
+    """models 表 → ``{model_id: {}}``（run_checkup 按 id 集合语义消费，简报测试
+    传 ``{"qwen3-8b": {}, …}`` 即此口径）。A1：自 sr/server.py 迁入（config.
+    import_yaml 与 server 端点共用，无需反向 import server）。"""
+    return {r["id"]: {} for r in conn.execute("SELECT id FROM models")}
+
+
 def get_tree_version(conn: sqlite3.Connection) -> int:
     row = conn.execute(
         "SELECT value FROM settings WHERE key = 'tree_version'").fetchone()

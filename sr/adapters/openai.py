@@ -23,8 +23,8 @@ from __future__ import annotations
 
 import time
 
-from sr.adapters import (PARAM_KEYS, THINK_OPENAI, IR, IRChunk, UpstreamError,
-                         error_payload, text_of)
+from sr.adapters import (PARAM_KEYS, THINK_OPENAI, IR, IRChunk, IRResponse,
+                         UpstreamError, error_payload, text_of)
 
 
 # ir_to_chunk 产出的 chunk 公共头（id/created 非协议语义字段，固定值即可）
@@ -110,6 +110,46 @@ def from_upstream(resp: dict, model_asked: str | None) -> dict:
     out = dict(resp)
     out["model"] = model_asked
     return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b) response_to_ir / ir_to_response —— 非流式跨协议经 IR 中转（A3）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def response_to_ir(resp: dict) -> IRResponse:
+    """OpenAI 非流式响应 → :class:`IRResponse`（A3：任何协议对都过 IR）。
+
+    choices 非数组 / message 非对象等畸形形状按空取（跨协议 shim 是 M1 最小实现，
+    不因上游形状异常逃出 AttributeError）。
+    """
+    choices = resp.get("choices")
+    choice = (choices[0] if isinstance(choices, list) and choices
+              and isinstance(choices[0], dict) else {})
+    message = choice.get("message")
+    message = message if isinstance(message, dict) else {}
+    content = message.get("content")
+    return IRResponse(text=content if isinstance(content, str) else "",
+                      finish=choice.get("finish_reason"), raw_finish=None,
+                      usage=resp.get("usage") or {}, id=resp.get("id"))
+
+
+def ir_to_response(ir: IRResponse, model_asked: str | None) -> dict:
+    """IRResponse → OpenAI 非流式响应（openai 客户端；来源为 anthropic）。
+
+    usage 键归一：Anthropic input/output → OpenAI prompt/completion/total
+    （与旧跨协议 shim 逐字一致）。
+    """
+    usage = ir.usage or {}
+    pin = usage.get("input_tokens", 0)
+    pout = usage.get("output_tokens", 0)
+    return {"id": ir.id or _CHUNK_ID, "object": "chat.completion",
+            "created": int(time.time()), "model": model_asked,
+            "choices": [{"index": 0,
+                         "message": {"role": "assistant", "content": ir.text},
+                         "finish_reason": ir.finish}],
+            "usage": {"prompt_tokens": pin, "completion_tokens": pout,
+                      "total_tokens": pin + pout}}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

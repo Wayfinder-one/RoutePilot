@@ -27,12 +27,16 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass
 
 from sr.adapters import THINK_OPENAI
 from sr.engine import Branch, Node
 from sr.tags import TagDef
+
+# 服务端日志（run_checkup_safe 的崩溃降级用；内核异常只进日志，不回吐客户端）
+logger = logging.getLogger("sr.health")
 
 # cond 子句合法操作符（§5.1 语法；引擎查表外的 op 会 KeyError → 体检拦下）。
 _OPS = {"is", "in", "gte", "lte", "contains"}
@@ -700,3 +704,32 @@ def run_checkup(nodes: list[Node], models, tag_defs,
         else:
             findings.extend(fn(nodes, models, tag_defs, is_hard))
     return findings
+
+
+def run_checkup_safe(nodes: list[Node], models, tag_defs,
+                     hits: dict[str, int] | None = None) -> list[Finding]:
+    """run_checkup 的**崩溃安全**入口（M5，audit Major）：体检内部异常降级为一条
+    hard finding（code="checkup_error"），绝不逃逸成 PUT /admin/tree 500。
+
+    体检是给坏数据兜底的最后闸门，它自己不能先倒——旧实现对 run_checkup 无
+    try/except，体检里任何一个未预料的 TypeError（如 `fallback: null` 的 `*None`）
+    都是 500（真 uvicorn 下 HTML/无信封）。口径声明（二选一，本实现取前者）：
+    **降级为 hard finding** → 仍按 422 拦截保存（不放行、不掩盖：库零写入这一
+    fail-safe 行为不变），message 为通用文案 + 服务端日志留原始异常，不回吐 Python
+    异常原文。正常路径零开销（同一函数对象转发）；三条写路径与 import 全部经此入口。
+
+    A1：自 sr/server.py 迁入（本模块是体检的自然归属；迁入后 config.import_yaml
+    直接 import 本函数，不再反向 import sr.server——test_health 的崩溃用例改为
+    patch ``sr.health.run_checkup``）。
+    """
+    try:
+        return run_checkup(nodes, models, tag_defs, hits=hits)
+    except Exception as exc:                    # 体检自身崩溃：绝不变成 500
+        logger.exception("run_checkup crashed (degraded to hard finding): %r", exc)
+        return [Finding(
+            "hard", "checkup_error", None, None,
+            "体检内部错误：本次改动无法完成检查，已按硬错误拦截保存"
+            "（详细原因见服务端日志）",
+            "Internal checkup error: this change could not be validated and was "
+            "blocked as a hard error (see server logs for details)",
+            {"action": "retry_or_report"})]

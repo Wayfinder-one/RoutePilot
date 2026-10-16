@@ -420,3 +420,24 @@ def test_resolve_session_single_ladder_no_false_unlock(tmp_path):
     assert d is None, d
     assert conn.execute("SELECT unlocks FROM sessions WHERE id='s1'").fetchone()[0] == 0
 
+
+# ── A1/M2：_renumber 递归（三层嵌套不再以 idx=-1 落库） ──────────────────────────
+
+def test_renumber_handles_three_levels():
+    from sr.engine import Branch, Node
+    from sr.treeio import _renumber
+
+    def _b(kids):
+        return Branch(idx=-1, cond=[], action={"kind": "route", "model": "m"},
+                      trial=None, enabled=True, kids=kids)
+
+    grand = _b([])
+    kid = _b([grand])
+    branch = _b([kid])
+    node = Node(idx=-1, branches=[branch])
+    _renumber([node])
+    assert node.idx == 0
+    assert branch.idx == 100          # 节点 0 特例段 100+j
+    assert kid.idx == 1000            # 父分支×10 + 段内序号
+    assert grand.idx == 10000         # 再下一层也递归编号（旧实现留 -1）
+

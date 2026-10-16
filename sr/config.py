@@ -11,7 +11,7 @@
 - :func:`export_yaml` —— 只导可编辑配置（providers/models 的 ok/break_reason 是
   熔断运行态，不进配置包——Task 9 端点口径原样迁入）。
 - :func:`import_yaml` —— normalize 全量校验（四节结构 + 字段/值域/引用）+ 体检
-  run_checkup（经 ``server.run_checkup_safe``：体检自身崩溃降级为 hard finding，
+  run_checkup（经 ``sr.health.run_checkup_safe``：体检自身崩溃降级为 hard finding，
   不逃逸成 500，M5）：hard 整包拒绝（返回 findings 列表，**不写库**）；过则单事务
   UPSERT 写入 providers → models → settings → tree（不删既有行）+ 审计 + commit，
   返回 None。``actor`` 记 changes.actor（端点转调为 "admin"，CLI 为 "cli"）。
@@ -20,9 +20,10 @@
 消费方：sr/server（GET /admin/export、POST /admin/import 转调，裁定 1）与
 sr/__main__（``sr export`` / ``sr import`` / ``sr init --import``）。
 
-依赖方向：本模块 → sr.db / sr.engine / sr.health / sr.tags（均无环）；对
-sr.server 的树辅助（_tree_from_json / _tree_json / _write_tree_rows）用**函数内
-延迟 import**——server 顶层 import 本模块，模块级反向引用会成环。
+依赖方向（A1 后）：本模块 → sr.db / sr.engine / sr.health / sr.settings / sr.tags /
+sr.treeio，**不再 import sr.server**——原「函数内延迟 import server 的树辅助」这一
+反向依赖已被拆分消除（树辅助进了 sr.treeio、设置进了 sr.settings、体检安全入口
+进了 sr.health）。``validate_settings`` 由 sr.settings 直接再导出，供 CLI/测试调用。
 """
 
 from __future__ import annotations
@@ -33,34 +34,20 @@ import sqlite3
 import yaml
 
 import sr.db as db
+from sr.health import run_checkup_safe
+from sr.settings import _load_settings, validate_settings
 from sr.tags import TAGS
+from sr.treeio import _tree_from_json, _tree_json, _write_tree_rows
 
 # 四节包必需节（缺任一 → ValueError "missing sections: …"，与原端点消息逐字一致）
 _SECTIONS = ("providers", "models", "tree", "settings")
-
-
-def _srv():
-    """延迟取 sr.server（树 JSON 辅助所在；见模块头依赖方向说明）。"""
-    from sr import server
-    return server
-
-
-def validate_settings(settings, models) -> list[str]:
-    """设置值校验（**同一份实现**：I2 要求 /admin/settings 与本模块共用）。
-
-    实现落在 sr/server.validate_settings（server 顶层 import 本模块，本模块只能
-    延迟反向引用，见模块头依赖方向说明）；此处只是稳定的模块级入口，供 CLI 与
-    测试直接 ``config.validate_settings(...)`` 调用。返回非法消息列表（空 = 合法），
-    不抛异常。
-    """
-    return _srv().validate_settings(settings, models)
 
 
 def _tree_now(conn) -> dict:
     """当前树 → §9.2 JSON 形状（不经 server 的树缓存：本模块只拿 conn，
     直接 rows_to_tree——与缓存内容恒等，缓存镜像的就是这张表）。"""
     from sr.engine import rows_to_tree
-    return _srv()._tree_json(
+    return _tree_json(
         rows_to_tree(conn.execute("SELECT * FROM tree").fetchall()),
         db.get_tree_version(conn))
 
@@ -78,7 +65,7 @@ def export_yaml(conn: sqlite3.Connection) -> str:
                "step": r["step"], "price_in": r["price_in"],
                "price_out": r["price_out"], "enabled": bool(r["enabled"])}
               for r in conn.execute("SELECT * FROM models ORDER BY id")]
-    settings = _srv()._load_settings(conn)
+    settings = _load_settings(conn)
     return yaml.safe_dump({"providers": providers, "models": models,
                            "tree": _tree_now(conn), "settings": settings},
                           allow_unicode=True, sort_keys=False)
@@ -149,16 +136,16 @@ def import_yaml(conn: sqlite3.Connection, text, *, actor: str = "admin"):
             or set(settings) - set(db.DEFAULT_SETTINGS):
         raise ValueError("settings keys must be within DEFAULT_SETTINGS")
     try:
-        nodes = _srv()._tree_from_json(data["tree"])
+        nodes = _tree_from_json(data["tree"])
     except ValueError as exc:
         raise ValueError(f"invalid tree: {exc}") from exc   # 原端点 detail 前缀
-    model_ids = set(_srv()._models_set(conn)) | {r[0] for r in model_rows}
+    model_ids = set(db.model_ids(conn)) | {r[0] for r in model_rows}
     # I2：与 PUT /admin/settings 共用同一 validate_settings（键集 + 类型 + 值域 +
     # ladder/budget_route 的模型引用），import 与端点不出现两套口径。
-    settings_errs = _srv().validate_settings(settings, model_ids)
+    settings_errs = validate_settings(settings, model_ids)
     if settings_errs:
         raise ValueError("invalid settings: " + "; ".join(settings_errs))
-    findings = _srv().run_checkup_safe(nodes, {m: {} for m in model_ids}, TAGS)
+    findings = run_checkup_safe(nodes, {m: {} for m in model_ids}, TAGS)
     if any(f.level == "hard" for f in findings):
         ordered = sorted(findings, key=lambda f: f.level != "hard")
         return [f.to_json() for f in ordered]
@@ -191,7 +178,7 @@ def import_yaml(conn: sqlite3.Connection, text, *, actor: str = "admin"):
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (k, str(v)))
-    _srv()._write_tree_rows(conn, nodes)
+    _write_tree_rows(conn, nodes)
     db.bump_tree_version(conn)
     db.log_change(conn, actor, "import", "*",
                   before={"version": old["version"], "nodes": old["nodes"]},

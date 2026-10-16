@@ -1,27 +1,26 @@
 """sr/server.py —— /v1 双协议路由主流程 + admin 读/写端点 + /metrics
 （spec §7.1 端点 / §7.2 十二步 / §7.5 流式红线 / §9.1-9.2 / §10 / §11.1）。
 
+A1（audit §3）拆分后：本文件只留「入口职责」——create_app 装配 + _handle 主流程 +
+admin 端点。领域逻辑已分居：
+- sr/metrics.py      指标（Metrics/_bump_request_metrics/_is_fallback）
+- sr/settings.py     settings 读写与值校验（_load_settings/validate_settings）
+- sr/treeio.py       树 JSON 双向序列化/重编号/落库（_tree_json/_tree_from_json/…）
+- sr/upstream.py     上游调用/流式管道（_call_nonstream/_call_stream/_relay_stream）
+- sr/adapters/cross.py  非流式跨协议经 IRResponse 中转（A3）
+- sr/adapters/registry.py  协议注册表 ADAPTERS（A3，server/upstream/cross 共用）
+拆分后 config.py 不再反向 import 本模块（依赖方向倒挂已消除）。
+
 模块职责（集成 Task 1-7 全部模块，spec §7.2 十二步逐项对齐，对照表见任务报告）：
 - :func:`create_app` —— 工厂：``POST /v1/chat/completions``（OpenAI）、
   ``POST /v1/messages``（Anthropic）、``GET /v1/models``（auto + 全部别名，§7.1）；
-  Task 9 起加 admin 读端点（§9.1 引导序列七 GET + ``/admin/traffic/{id}``）、
-  ``GET /metrics``（§11.1 手工 OpenMetrics）；Task 10 起加 admin 写端点
-  （tree 整树替换/新增/删除/审计/试算/预估/模板、models 接入/修改/探测、
-  settings/bands、export/import，§9 表 + §9.4 探测序列）；控制台托管
-  ``GET /`` 归 Task 12。
+  admin 读端点（§9.1 引导序列七 GET + ``/admin/traffic/{id}``）、``GET /metrics``
+  （§11.1 手工 OpenMetrics）；admin 写端点（tree 整树替换/新增/删除/审计/试算/
+  预估/模板、models 接入/修改/探测、settings/bands、export/import，§9 表 + §9.4
+  探测序列）；控制台托管 ``GET /`` 归 Task 12。
 - :func:`_handle` —— 十二步主流程：协议解析 → IR → 主文本 → model 判定
   （auto 走树 / 具体名或别名直通 R2 / 其他 400）→ 会话沿用 → 打标 → 走树 →
   供应商解析 → 上游调用 → 入站名回写 → requests+tags 入库 → 诊断响应头。
-- :func:`_call_nonstream` / :func:`_call_stream` —— 候选链（主模型 → fallbacks 依序）
-  + 每候选 max_retries 次重试 + 熔断跳过（§8.3）；流式首包（上游首字节）即锁定，
-  此后不重试、不换模型、不回退（§7.5 红线，裁定 5）。
-- :func:`_relay_stream` —— 流式管道：上游 SSE 帧 → chunk_to_ir → IRChunk →
-  按客户端协议重发（openai.ir_to_chunk 逐帧 + [DONE] / anthropic StreamState +
-  ir_to_events + 15s ping 心跳），跨协议 §7.6 以 IRChunk 为中转；空帧过滤、
-  上游切断忠实透传（不补终止符——§7.5 红线的可观测口径）。
-- :class:`Metrics` —— §11.1 指标的内存计数器（依赖白名单无 prometheus_client，
-  纯文本手拼 OpenMetrics，裁定 6）；create_app 时从 requests 表 backfill
-  ``sr_requests_total``，/metrics 渲染成 classic text 格式。
 - admin 读端点 —— §9.2 形状逐字：tree（rows_to_tree 逆组装，cond/action 原样
   透出规范键）、providers/models/settings/bands、traffic（f 五种快捷筛选各一条
   WHERE + 分页 50）、traffic/{id}（详情 + 全量标签）、i18n/{lang}（sr.i18n.MESSAGES）。
@@ -37,7 +36,6 @@ import copy
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -51,26 +49,25 @@ from fastapi.responses import (JSONResponse, PlainTextResponse, FileResponse,
 import sr.db as db
 from sr import config
 from sr.adapters import UpstreamError
-from sr.adapters import FINISH_TO_STOP, STOP_TO_FINISH
-from sr.adapters import openai as oai
-from sr.adapters import anthropic as anth
-from sr.adapters.anthropic import StreamState
+from sr.adapters.cross import from_upstream as _cross_from_upstream
 from sr.engine import (Branch, Node, RouteDecision, TEMPLATES, evaluate,
                        evaluate_trace, extract_session, resolve_session,
                        rows_to_tree)
-from sr.health import Finding, run_checkup
+from sr.health import run_checkup_safe
 from sr.i18n import MESSAGES, detect_lang
-from sr.models import (is_circuit_open, record_failure, record_success,
-                       reset_circuit, resolve_backend)
+from sr.metrics import Metrics, _bump_request_metrics, _is_fallback  # A1：指标（原在 server）
+from sr.models import reset_circuit
+from sr.settings import _load_settings, validate_settings   # A1：设置模块（原在 server）
 from sr.tags import (DEFAULT_CONF_THRESHOLDS, DEFAULT_CONTEXT_THRESHOLDS,
                      TAGS, conf_band)
 from sr.tagger import Tagger, TagRequest, TagResult
+from sr.treeio import (WRITE_ACTOR, _branch_from_json, _idx_conflict,
+                       _node_from_json, _renumber, _row_idxs, _take_idx,
+                       _tree_from_json, _tree_full_422, _tree_json,
+                       _write_tree_rows)   # A1：树 JSON/重编号/落库（原在 server）
+from sr.upstream import (ADAPTERS, _call_nonstream, _call_stream,
+                         _relay_stream)   # A1：上游调用/流式管道 + 协议注册表（原在 server）
 
-# 两协议适配器（§7.1 按路径判定 proto → 同构七件套）
-ADAPTERS = {"openai": oai, "anthropic": anth}
-
-# 客户端 anthropic 的 ping 心跳间隔（§7.4「15s ping」逐字）
-PING_INTERVAL_S = 15.0
 # anthropic 客户端 max_tokens 缺失时的出站兜底（裁定 9）
 DEFAULT_MAX_TOKENS = 1024
 # 反馈解锁的显式头取值（§4.4 反馈来源 1：x-sr-feedback）
@@ -85,9 +82,6 @@ STREAM_FIRST_BYTE_S = 3.0
 AVG_IN = 800        # 平均输入 tokens / 请求
 AVG_OUT = 600       # 平均输出 tokens / 请求
 
-# admin 写端点的 changes.actor（§3.1 changes 表；M1 无登录体系，固定操作者）。
-_WRITE_ACTOR = "admin"
-
 # 服务端日志（M-c：内部异常只进日志，不回吐客户端）
 logger = logging.getLogger("sr.server")
 
@@ -99,94 +93,10 @@ _TREE_CACHE: dict = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1) 小工具：设置加载 / 树缓存 / 模型查找（detect_lang 自 Task 9 起在 sr/i18n.py）
+# 1) 小工具：树缓存 / 模型查找（detect_lang 在 sr/i18n.py；设置见 sr/settings.py）
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def _load_settings(conn) -> dict:
-    """settings 表 → ``{key: value}``（值一律字符串，§3.1）。"""
-    return {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
-
-
-# ── settings 值校验（I2，终审 Important）────────────────────────────────────────
-# 消费点对值形态有硬要求：engine 用 int(session_idle)、server 用 int(max_retries)/
-# int(batch_window_ms)、budget_water/budget_daily_limit_usd 直接进预算比较（M2
-# 执行点）、ladder/budget_route 是模型 id
-# 引用。旧实现只校验键集，一次 PUT 200 写入 "abc" 就会让**每个** /v1 请求 500 且
-# 持久不复原。以下白名单校验由 /admin/settings 与 config.import_yaml 共用
-# （config 侧延迟 import 本函数，避免模块级反向引用成环）。
-
-def _settings_positive_int(v) -> bool:
-    """正整数（字符串数字形态；bool 不算——它在 Python 里是 int 的子类）。"""
-    return re.fullmatch(r"[1-9][0-9]*", str(v).strip()) is not None
-
-
-def _settings_flag(v) -> bool:
-    """0/1 开关（字符串数字形态）。"""
-    return str(v).strip() in ("0", "1")
-
-
-def _settings_water(v) -> bool:
-    """预算水位：浮点且 ∈ (0,1)（budget_protect 触发线，开区间与 bands 切点同口径）。"""
-    try:
-        f = float(str(v).strip())
-    except (TypeError, ValueError):
-        return False
-    return 0.0 < f < 1.0
-
-
-def _settings_positive_float(v) -> bool:
-    """正浮点（字符串数字形态；bool 不算——同 _settings_positive_int 口径）。"""
-    try:
-        f = float(str(v).strip())
-    except (TypeError, ValueError):
-        return False
-    return f > 0.0
-
-
-def validate_settings(settings, models) -> list[str]:
-    """按 key 白名单校验设置值 → 非法消息列表（空列表 = 合法）。
-
-    :param settings: ``{key: value}``（值可为字符串或 YAML 原生标量）。
-    :param models: 可用模型 id 集合（ladder / budget_route 的引用校验）。
-    :returns: 逐条可读错误（定位到 key 与当前值）；不抛异常——调用方决定 400
-              还是 ValueError（I2 要求 /admin/settings 与 config.import_yaml 共用）。
-    """
-    if not isinstance(settings, dict):
-        return ["settings must be a mapping"]
-    errs: list[str] = []
-    want, got = set(db.DEFAULT_SETTINGS), set(settings)
-    if got != want:
-        return [f"settings key set must equal DEFAULT_SETTINGS; "
-                f"unknown: {sorted(got - want)}, missing: {sorted(want - got)}"]
-    mids = {str(m) for m in (models or ())}
-    for key, val in settings.items():
-        if key in ("session_idle", "max_retries", "batch_window_ms",
-                   "retention_days", "tree_version"):
-            if not _settings_positive_int(val):
-                errs.append(f"{key} must be a positive integer: {val!r}")
-        elif key == "budget_water":
-            if not _settings_water(val):
-                errs.append(f"budget_water must be a float in (0,1): {val!r}")
-        elif key == "budget_daily_limit_usd":
-            if not _settings_positive_float(val):
-                errs.append(f"budget_daily_limit_usd must be a positive float: "
-                            f"{val!r}")
-        elif key in ("session_sticky", "sticky_detect_feedback", "budget_protect"):
-            if not _settings_flag(val):
-                errs.append(f"{key} must be 0 or 1: {val!r}")
-        elif key == "ladder":
-            parts = [p.strip() for p in str(val).split(",") if p.strip()]
-            if not parts:
-                errs.append(f"ladder must be a non-empty comma-separated "
-                            f"model list: {val!r}")
-            for m in parts:
-                if m not in mids:
-                    errs.append(f"ladder references unknown model: {m!r}")
-        elif key == "budget_route":
-            if str(val).strip() not in mids:
-                errs.append(f"budget_route references unknown model: {val!r}")
-    return errs
+# A1：_load_settings / validate_settings 已迁 sr/settings.py（server 顶层 import 它，
+# 消除 config.py 对 sr.server 的反向 import）。
 
 
 def _conf_cuts(conn) -> list[float]:
@@ -316,522 +226,11 @@ def _cost_of(conn, model_id: str, usage: dict | None) -> float | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) 上游调用：候选链 + 重试 + 熔断 + §7.5 首包锁定（裁定 5）
+# 7) admin 读端点辅助：traffic 筛选（§9.2 形状，Task 9）
+#    树逆组装（_branch_json/_tree_json）与写侧树解析/重编号/落库已迁 sr/treeio.py（A1）；
+#    上游调用/流式管道（_chain/_call_*/_relay_stream）已迁 sr/upstream.py（A1）；
+#    非流式跨协议 shim（_from_upstream）已迁 sr/adapters/cross.py（A3）。
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def _chain(decision: RouteDecision) -> list[str]:
-    """候选链：主模型 → decision.fallbacks 依序，去重去空（裁定 5）。"""
-    out: list[str] = []
-    for m in [decision.model, *decision.fallbacks]:
-        if m and m not in out:
-            out.append(m)
-    return out
-
-
-def _outbound_payload(ir, backend, think: str | None) -> dict:
-    """§7.2-9 出站体：按上游协议序列化 + 出站名 + think 映射。
-
-    上游 openai 且流式一律补 ``stream_options.include_usage``（裁定 7：Task 7
-    修复的契约——终止段以 usage 包为终点）。
-    """
-    payload = ADAPTERS[backend.proto].to_upstream(ir, backend.upstream_name, think)
-    if ir.stream and backend.proto == "openai":
-        so = dict(payload.get("stream_options") or {})
-        so["include_usage"] = True
-        payload["stream_options"] = so
-    return payload
-
-
-def _outbound_payload_or_none(ir, cand, decision: RouteDecision, conn):
-    """候选 → (backend, payload)；配置面不可用时回 (None, UpstreamError)。
-
-    两处失败同族（都是「这个候选没法出站」，换下一候选）：
-    - ``resolve_backend`` 抛异常（KeyError / 环境变量缺失）：配置面问题；
-    - ``_outbound_payload`` 抛异常——M3/M4（audit Major）：值域外/非字符串 think
-      让 to_upstream 抛 ValueError/TypeError，坏 action 形状抛 KeyError。旧实现
-      只捕 UpstreamError/httpx.HTTPError → 逃逸成兜底 500，**每条**请求持久 500。
-
-    两种都按 §7 错误信封收口为 502 upstream_error（config_error 在 _handle 里
-    归一到 api_error），文案通用、不回吐 Python 异常原文（M-c）；原始异常只进
-    服务端日志。
-    """
-    try:
-        backend = resolve_backend(conn, cand)
-    except Exception as exc:              # KeyError / env 缺失：配置面问题
-        # C1 Minor 6（pre-existing）：旧实现把 `{exc}` 原样塞进 502 信封（可能带
-        # 环境变量名/路径等细节）。收口到既有 M-c 口径——信封给通用文案，异常原文
-        # 只进服务端日志。
-        logger.warning("resolve_backend failed for %s: %r", cand, exc)
-        return None, UpstreamError(502, "upstream resolve failed", "config_error")
-    try:
-        return backend, _outbound_payload(ir, backend, decision.think)
-    except Exception as exc:              # M3/M4：出站体构造失败（值域外 think 等）
-        logger.warning("outbound payload build failed for %s: %r", cand, exc)
-        return None, UpstreamError(502, "failed to build upstream request body",
-                                   "config_error")
-
-
-async def _call_nonstream(conn, ir, decision: RouteDecision, settings: dict,
-                    metrics: Metrics | None = None):
-    """非流式上游调用。返回 (backend, model_id, resp_json, upstream_ms)；
-    全链失败抛最后一个 UpstreamError。每失败记 record_failure，成功记
-    record_success（裁定 5）；is_circuit_open 的候选直接跳过。
-    metrics 可选：每次尝试失败记 sr_retry_total{model,status}；失败后刚好
-    越过熔断阈值（本候选此后会被跳过，不会再进来）记 sr_circuit_open_total。
-
-    候选级配置失败（解析后端 / 构造出站体，含 M3/M4 的坏 action 形状）经
-    :func:`_outbound_payload_or_none` 统一换下一候选，不裸 500。
-    """
-    max_retries = int(settings.get("max_retries") or 0)
-    last: UpstreamError | None = None
-    for cand in _chain(decision):
-        if is_circuit_open(cand):
-            continue
-        backend, payload = _outbound_payload_or_none(ir, cand, decision, conn)
-        if backend is None:
-            last = payload
-            continue
-        for _ in range(max_retries + 1):  # 每候选最多重试 max_retries 次（裁定 5）
-            t0 = time.monotonic()
-            client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
-            try:
-                resp = await client.post(backend.url, json=payload,
-                                         headers=backend.headers)
-                ms = (time.monotonic() - t0) * 1000
-                if resp.status_code != 200:
-                    raise ADAPTERS[backend.proto].parse_error(resp.status_code,
-                                                              resp.content)
-                try:
-                    data = resp.json()
-                except ValueError:
-                    raise UpstreamError(502, "upstream returned invalid JSON",
-                                        "api_error")
-                record_success(conn, cand)
-                return backend, cand, data, ms
-            except UpstreamError as exc:
-                record_failure(conn, cand)
-                last = exc
-                if metrics is not None:
-                    metrics.inc("sr_retry_total",
-                                {"model": cand, "status": str(exc.status or 0)})
-                    if is_circuit_open(cand):
-                        metrics.inc("sr_circuit_open_total", {"model": cand})
-            except httpx.HTTPError as exc:
-                record_failure(conn, cand)
-                last = UpstreamError(502, f"upstream unreachable: {exc}", "api_error")
-                if metrics is not None:
-                    metrics.inc("sr_retry_total", {"model": cand, "status": "0"})
-                    if is_circuit_open(cand):
-                        metrics.inc("sr_circuit_open_total", {"model": cand})
-            finally:
-                await client.aclose()
-    raise last or UpstreamError(502, "no upstream candidate available", "api_error")
-
-
-async def _call_stream(conn, ir, decision: RouteDecision, settings: dict,
-                 metrics: Metrics | None = None):
-    """流式上游调用：首包（上游首字节）未发出前允许重试与回退（§7.5）。
-
-    返回 (backend, model_id, resp, client, aiter, first_frame, upstream_ms)——aiter
-    是已启动的上游字节迭代器（httpx 响应流只许消费一次，必须把同一迭代器交给
-    _relay_stream 续传，不能重开 aiter_bytes），first_frame 是已收到的首个字节块。
-    锁定即 record_success；首包前的每一失败记 record_failure（裁定 5）+ 可选
-    metrics 计 sr_retry_total / sr_circuit_open_total（口径同 _call_nonstream）。"""
-    max_retries = int(settings.get("max_retries") or 0)
-    last: UpstreamError | None = None
-
-    def _fail(cand: str, status) -> None:
-        if metrics is not None:
-            metrics.inc("sr_retry_total", {"model": cand, "status": str(status)})
-            if is_circuit_open(cand):
-                metrics.inc("sr_circuit_open_total", {"model": cand})
-
-    for cand in _chain(decision):
-        if is_circuit_open(cand):
-            continue
-        backend, payload = _outbound_payload_or_none(ir, cand, decision, conn)
-        if backend is None:                 # M3/M4 同 _call_nonstream：换下一候选
-            last = payload
-            continue
-        for _ in range(max_retries + 1):
-            t0 = time.monotonic()
-            client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0))
-            try:
-                req = client.build_request("POST", backend.url, json=payload,
-                                           headers=backend.headers)
-                resp = await client.send(req, stream=True)
-            except httpx.HTTPError as exc:
-                record_failure(conn, cand)
-                last = UpstreamError(502, f"upstream unreachable: {exc}", "api_error")
-                _fail(cand, 0)
-                await client.aclose()
-                continue
-            if resp.status_code != 200:            # 首包未发：仍可重试 / 回退
-                raw = await resp.aread()
-                await resp.aclose()
-                await client.aclose()
-                record_failure(conn, cand)
-                last = ADAPTERS[backend.proto].parse_error(resp.status_code, raw)
-                _fail(cand, last.status)
-                continue
-            try:
-                aiter = resp.aiter_bytes()         # 流只消费一次：迭代器从此移交
-                first = await aiter.__anext__()    # 等上游首字节
-            except (StopAsyncIteration, httpx.HTTPError) as exc:
-                record_failure(conn, cand)
-                last = UpstreamError(502, f"empty/broken upstream stream: {exc!r}",
-                                     "api_error")
-                _fail(cand, 0)
-                await resp.aclose()
-                await client.aclose()
-                continue
-            # ── 锁定：首包已到手，此后不重试不换模型不回退（§7.5 红线）──
-            record_success(conn, cand)
-            return (backend, cand, resp, client, aiter, first,
-                    (time.monotonic() - t0) * 1000)
-    raise last or UpstreamError(502, "no upstream candidate available", "api_error")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 4) 流式管道：上游 SSE 帧 → IRChunk → 客户端协议（§7.6 + §7.4 ping + §7.5 忠实透传）
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-async def _relay_stream(client_proto: str, up_proto: str, model_asked: str | None,
-                        resp: httpx.Response, client: httpx.AsyncClient,
-                        aiter, first_frame: bytes):
-    """续传上游流并按客户端协议重发（裁定 8）。
-
-    ``aiter`` 是 _call_stream 移交的已启动字节迭代器（httpx 流只许消费一次）。
-
-    - 帧解析：按 SSE 空行切帧、收集 data: 行（openai 无 event 行；anthropic 的
-      event 行仅凭 data.type 即可分派，忽略不拆）。
-    - openai 客户端：逐 IRChunk 经 ir_to_chunk 重发（过滤空帧）+ 终止后 ``[DONE]``；
-    - anthropic 客户端：StreamState/ir_to_events 重发 §7.4 事件序列 + 每 15s 注释行
-      ping 心跳（wait_for 预算制，上游静默也照发）；
-    - 上游 ``data: [DONE]`` 不透传——我方 [DONE] 只在见过终止包（finish/usage）后
-      补发；上游半途切断（fail=midstream，§7.5 验收器具）则客户端同样收不到终止符，
-      忠实透传，绝不补写、绝不换模型。
-    """
-    buf = first_frame
-    data_lines: list[str] = []
-    state = StreamState() if client_proto == "anthropic" else None
-    saw_terminator = False
-    last_ping = time.monotonic()
-
-    async def next_frame() -> str | None:
-        """下一完整 SSE 帧；上游流收束回 None（PEP 479：async generator 体内
-        不得让 StopAsyncIteration 逃逸，否则 RuntimeError）。"""
-        nonlocal buf, data_lines
-        while True:
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                s = line.decode("utf-8", "replace").rstrip("\r")
-                if not s:
-                    if data_lines:
-                        out = "\n".join(data_lines)
-                        data_lines.clear()
-                        return out
-                elif s.startswith("data:"):
-                    data_lines.append(s[5:].strip())
-            try:
-                buf += await aiter.__anext__()
-            except StopAsyncIteration:
-                if data_lines:                 # 残余无终止空行的末帧，如实吐出
-                    out = "\n".join(data_lines)
-                    data_lines.clear()
-                    return out
-                return None
-
-    # 上游读取放独立 task：ping 心跳的 wait_for 只取消 queue.get（可安全取消），
-    # 绝不取消 httpx 的上游读——响应流被取消一次即坏，后续帧全丢（实测踩坑）。
-    frames: asyncio.Queue = asyncio.Queue()    # 无界：读端只受上游流速约束（M1 取舍）
-
-    async def reader():
-        try:
-            while True:
-                frame = await next_frame()
-                frames.put_nowait(frame)
-                if frame is None:
-                    return
-        except Exception as exc:
-            # 读错误按收束处理：忠实截断（§7.5）。M-c/rollup #20：旧实现静默吞掉，
-            # 客户端只看到「流突然结束」，排障无线索——错误进日志，行为不变。
-            logger.warning("upstream stream reader failed (truncating): %r", exc)
-            frames.put_nowait(None)
-
-    task = asyncio.create_task(reader())
-    try:
-        while True:
-            if client_proto == "anthropic":        # §7.4 15s ping 心跳（裁定 8）
-                budget = PING_INTERVAL_S - (time.monotonic() - last_ping)
-                if budget <= 0:
-                    yield b": ping\n\n"
-                    last_ping = time.monotonic()
-                    continue
-                try:
-                    frame = await asyncio.wait_for(frames.get(), timeout=budget)
-                except asyncio.TimeoutError:
-                    yield b": ping\n\n"
-                    last_ping = time.monotonic()
-                    continue
-            else:
-                frame = await frames.get()         # None → 上游流收束
-            if frame is None:
-                break
-            last_ping = time.monotonic()
-            payload = frame.strip()
-            if not payload or payload == "[DONE]":
-                continue
-            try:
-                chunk = json.loads(payload)
-            except ValueError:
-                continue
-            try:
-                ic = ADAPTERS[up_proto].chunk_to_ir(chunk)
-            except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
-                # backlog 修：上游畸形帧（choices 非数组 / delta 非对象 / 顶层非对象等）
-                # 旧实现让 KeyError/AttributeError 逃出生成器（未捕获异常）；改为
-                # **忠实截断**（§7.5：不补写终止符、不换模型），错误进日志。
-                logger.warning("malformed upstream chunk (truncating stream): %r", exc)
-                break
-            if client_proto == "openai":
-                if ic.text is None and ic.finish is None and ic.usage is None:
-                    continue                       # 过滤空帧（裁定 8）
-                out = oai.ir_to_chunk(ic, model_asked)
-                yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n".encode()
-                if ic.finish is not None or ic.usage is not None:
-                    saw_terminator = True
-            else:
-                for evt in anth.ir_to_events(ic, state, model_asked):
-                    yield evt.encode()
-                if ic.usage is not None:
-                    saw_terminator = True
-        if client_proto == "openai" and saw_terminator:
-            yield b"data: [DONE]\n\n"
-    finally:
-        task.cancel()                              # 处理端提前退出时回收读任务
-        try:
-            await task
-        except BaseException:
-            pass
-        await resp.aclose()
-        await client.aclose()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) 跨协议非流式 shim（§7.6 只写了流式；非流式 M1 最小实现：纯文本面互转）
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _from_upstream(client_proto: str, up_proto: str, resp: dict,
-                   model_asked: str | None) -> dict:
-    """上游响应 → 客户端响应：同协议走 from_upstream（§7.2-10 入站名回写）；
-    跨协议按纯文本面最小互转（tool_calls 等复杂面 M2），model 一律回写。"""
-    if client_proto == up_proto:
-        return ADAPTERS[client_proto].from_upstream(resp, model_asked)
-    if up_proto == "openai":                      # openai 上游 → anthropic 客户端
-        choice = (resp.get("choices") or [{}])[0]
-        finish = choice.get("finish_reason")
-        usage = resp.get("usage") or {}
-        return {"id": resp.get("id") or "msg_smart-router", "type": "message",
-                "role": "assistant", "model": model_asked,
-                "content": [{"type": "text",
-                             "text": (choice.get("message") or {}).get("content") or ""}],
-                "stop_reason": FINISH_TO_STOP.get(finish), "stop_sequence": None,
-                "usage": {"input_tokens": usage.get("prompt_tokens", 0),
-                          "output_tokens": usage.get("completion_tokens", 0)}}
-    # anthropic 上游 → openai 客户端
-    text = "".join(blk.get("text", "") for blk in resp.get("content") or []
-                   if isinstance(blk, dict) and blk.get("type") == "text")
-    usage = resp.get("usage") or {}
-    return {"id": resp.get("id") or "chatcmpl-smart-router",
-            "object": "chat.completion", "created": int(time.time()),
-            "model": model_asked,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                         "finish_reason": STOP_TO_FINISH.get(resp.get("stop_reason"))}],
-            "usage": {"prompt_tokens": usage.get("input_tokens", 0),
-                      "completion_tokens": usage.get("output_tokens", 0),
-                      "total_tokens": usage.get("input_tokens", 0)
-                      + usage.get("output_tokens", 0)}}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6) §11.1 指标：内存计数器 + 手工 OpenMetrics 文本（依赖白名单无
-#    prometheus_client，禁新增依赖——裁定 6）
-#
-#    部署约束（M2 前置 7，audit A4）：Metrics 是**进程内**内存 dict（启动 backfill
-#    自 DB），uvicorn 多 worker 下 /metrics 抓到哪个 worker 就出哪份——总量既不准
-#    也不稳定。M1 部署口径 = **单 worker**（``sr serve`` 只调 ``uvicorn.run()``，
-#    不暴露 ``--workers``，即 uvicorn 默认单进程）。多进程聚合（multiprocess 模式
-#    或显式分片）留 M3；若将来放开多 worker，须先解决本约束。``_FAIL_COUNTS``
-#    （sr/models.py 熔断计数）同为进程级，受限一致。
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# §11.1 指标清单（family 名, 类型, HELP；顺序 = 渲染顺序 = §11.1 逐字）。
-# sr_eval_route_match_rate / sr_estimate_error 两 gauge 归 Task 11 评测闭环，
-# 此处先声明 family（无样本时只出 HELP/TYPE 行，名称在 /metrics 恒可见）。
-_METRIC_FAMILIES: list[tuple[str, str, str]] = [
-    ("sr_requests_total", "counter",
-     "Total /v1 requests by proto/route/model/outcome"),
-    ("sr_route_hits_total", "counter", "Tree branch hits by route path"),
-    ("sr_answer_latency_seconds", "summary", "Tagging latency (answer_ms)"),
-    ("sr_upstream_latency_seconds", "summary",
-     "Upstream first-byte latency by model"),
-    ("sr_no_match_total", "counter",
-     "Requests matched no branch (defensive fallback)"),
-    ("sr_fallback_total", "counter", "Fallback chain promotions"),
-    ("sr_retry_total", "counter", "Upstream attempt failures by model/status"),
-    ("sr_session_sticky_total", "counter", "Session sticky hits"),
-    ("sr_session_unlock_total", "counter", "Feedback unlocks"),
-    ("sr_budget_triggered_total", "counter", "Budget protection triggers"),
-    ("sr_circuit_open_total", "counter", "Circuit breaker openings by model"),
-    ("sr_eval_route_match_rate", "gauge", "Latest eval route match rate"),
-    ("sr_estimate_error", "gauge", "Latest estimate review error"),
-]
-
-
-def _label_key(labels: dict | None) -> tuple:
-    """标签 dict → 可哈希键（排序保证同标签集归并）。"""
-    return tuple(sorted((labels or {}).items()))
-
-
-def _label_str(labels: tuple) -> str:
-    """标签键 → Prometheus 文本 ``{k="v",...}``（值转义 \\ \" 与换行）。"""
-    if not labels:
-        return ""
-
-    def esc(v) -> str:
-        s = str(v)
-        s = s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        return s
-
-    return "{" + ",".join(f'{k}="{esc(v)}"' for k, v in labels) + "}"
-
-
-class Metrics:
-    """§11.1 计数器（内存 dict；每 app 实例一份，app.state.metrics 隔离）。
-
-    - counter：``inc(name, labels, n)``；
-    - summary（时延）：``observe(name, labels, seconds)`` 渲染为 ``_count/_sum``；
-    - gauge：``set(name, value)``（评测闭环接入前无样本）。
-    """
-
-    def __init__(self):
-        self.counters: dict[tuple, float] = {}
-        self.summaries: dict[tuple, list] = {}     # key → [count, sum_seconds]
-        self.gauges: dict[tuple, float] = {}
-
-    def inc(self, name: str, labels: dict | None = None, n: float = 1) -> None:
-        key = (name, _label_key(labels))
-        self.counters[key] = self.counters.get(key, 0) + n
-
-    def observe(self, name: str, labels: dict | None, seconds: float) -> None:
-        s = self.summaries.setdefault((name, _label_key(labels)), [0, 0.0])
-        s[0] += 1
-        s[1] += seconds
-
-    def set(self, name: str, value: float, labels: dict | None = None) -> None:
-        self.gauges[(name, _label_key(labels))] = value
-
-    def backfill_requests(self, conn) -> None:
-        """启动 backfill：requests 表按 (proto, hit_branch, routed_to, outcome)
-        聚合灌入 sr_requests_total（裁定 6 只 backfill 此一族；hit_branch 为
-        NULL 的非树请求 route 记 "none"——运行期 live 路径用诊断头值，重启后
-        两口径对非树行不逐一对齐，记任务报告）。"""
-        rows = conn.execute(
-            "SELECT proto, hit_branch, routed_to, outcome, COUNT(*) n "
-            "FROM requests GROUP BY proto, hit_branch, routed_to, outcome")
-        for r in rows:
-            self.inc("sr_requests_total",
-                     {"proto": r["proto"], "route": r["hit_branch"] or "none",
-                      "model": r["routed_to"] or "", "outcome": r["outcome"] or ""},
-                     r["n"])
-
-    def render(self) -> str:
-        """§11.1 清单 → classic OpenMetrics 文本（HELP/TYPE 恒出，样本有则出）。"""
-        lines: list[str] = []
-        for name, typ, help_text in _METRIC_FAMILIES:
-            lines.append(f"# HELP {name} {help_text}")
-            lines.append(f"# TYPE {name} {typ}")
-            if typ == "counter":
-                for (n, labels), v in sorted(self.counters.items()):
-                    if n == name:
-                        lines.append(f"{name}{_label_str(labels)} {v:g}")
-            elif typ == "summary":
-                for (n, labels), (c, s) in sorted(self.summaries.items()):
-                    if n == name:
-                        lines.append(f"{name}_count{_label_str(labels)} {c}")
-                        lines.append(f"{name}_sum{_label_str(labels)} {s:.6f}")
-            else:
-                for (n, labels), v in sorted(self.gauges.items()):
-                    if n == name:
-                        lines.append(f"{name}{_label_str(labels)} {v:g}")
-        return "\n".join(lines) + "\n"
-
-
-def _is_fallback(primary: str | None, final: str | None,
-                 decision: RouteDecision | None) -> bool:
-    """回退判定（M1 的**唯一**口径：最终去向 ≠ 决策主模型，试水不算回退）。
-
-    `outcome="fallback"` 的写侧（requests 行）与 `sr_fallback_total` 的指标侧
-    共用本函数——旧实现只有指标侧有这个判定，写侧恒 "upstream"，两处口径矛盾
-    （流量页 f=fallback 恒空）。试水（decision.source == 'trial'）改道不是回退
-    失败升级，排除（Task 10 折入项口径不变）。
-    """
-    return bool(final and primary and final != primary
-                and (decision is None or decision.source != "trial"))
-
-
-def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
-                          routed_to: str | None, outcome: str,
-                          session_tag: str, hit_branch: str | None,
-                          primary: str | None = None, final: str | None = None,
-                          decision: RouteDecision | None = None) -> None:
-    """一次 /v1 请求的请求级计数（在 _log_request 的每个落账点调用）。
-
-    - route 标签取诊断头同源值（树命中 = "N.M" 路径，否则 direct/sticky/
-      unlocked/fallback，取不到记 "none"）；
-    - model 标签 = 实际去向（block / 模型 id；error 行 routed_to 为 NULL → ""）；
-    - primary≠final 且非试水记 sr_fallback_total（Task 10 折入项：旧实现用诊断头
-      字符串 ``diag.get("x-sr-route") != "trial"`` 排除试水，而 source=trial 时该头
-      是 "N.M"——恒真死代码；改按 decision.source 判定，不再依赖诊断头字符串）。
-      判定与本函数外的 requests.outcome 共用 :func:`_is_fallback`（M1）。
-    """
-    route = diag.get("x-sr-route", "none")
-    metrics.inc("sr_requests_total", {"proto": proto, "route": route,
-                                      "model": routed_to or "", "outcome": outcome})
-    if hit_branch:
-        metrics.inc("sr_route_hits_total", {"route": hit_branch})
-    if session_tag == "sticky":
-        metrics.inc("sr_session_sticky_total")
-    elif session_tag == "unlocked":
-        metrics.inc("sr_session_unlock_total")
-    if _is_fallback(primary, final, decision):
-        metrics.inc("sr_fallback_total", {"from": primary, "to": final})
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7) admin 读端点辅助：树逆组装 / traffic 筛选（§9.2 形状，Task 9）
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def _branch_json(b) -> dict:
-    """Branch → §9.2 分支形状；cond/action 原样透出（含 conf_min/fallback/
-    block_msg 等全部规范键，不剥任何键——Task 10 GET→PUT 回环依赖此保证）。"""
-    return {"idx": b.idx, "cond": b.cond, "action": b.action, "trial": b.trial,
-            "enabled": b.enabled, "kids": [_branch_json(k) for k in b.kids]}
-
-
-def _tree_json(nodes: list, version: int) -> dict:
-    """rows_to_tree 的逆组装 → §9.2 首块形状（与原型 TREE 结构一一对应）。"""
-    return {"version": version,
-            "nodes": [{"idx": n.idx, "kind": n.kind, "name": n.name,
-                       "desc": n.desc, "enabled": n.enabled,
-                       "branches": [_branch_json(b) for b in n.branches]}
-                      for n in nodes]}
 
 
 def _confmin_tags(clauses: list) -> list[str]:
@@ -1186,7 +585,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                 _relay_stream(proto, backend.proto, asked, resp, client, aiter, first),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", **diag})
-        return JSONResponse(_from_upstream(proto, backend.proto, data, asked),
+        return JSONResponse(_cross_from_upstream(proto, backend.proto, data, asked),
                             headers=diag)
     except Exception:                             # 兜底：错误信封按客户端协议
         if conn is not None:
@@ -1206,12 +605,6 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _models_set(conn) -> dict[str, dict]:
-    """models 表 → ``{model_id: {}}``（run_checkup 按 id 集合语义消费，简报测试
-    传 ``{"qwen3-8b": {}, …}`` 即此口径）。"""
-    return {r["id"]: {} for r in conn.execute("SELECT id FROM models")}
-
-
 def _hits_30d(conn) -> dict[str, int] | None:
     """近 30 天 hit_branch → 命中数（check_no_hits 数据源，"N.M" = 节点 idx +
     分支位置序号，Task 5 裁定）；窗口内无任何流量 → None（体检跳过该检查：
@@ -1227,180 +620,6 @@ def _hits_30d(conn) -> dict[str, int] | None:
         "WHERE ts >= ? AND hit_branch IS NOT NULL GROUP BY hit_branch", (cutoff,))}
 
 
-def _take_idx(idx, require_idx: bool, seen: set) -> int:
-    """idx 校验：整数、（require_idx 时）必填、全树唯一（tree.idx 是全表主键，
-    节点/分支共用一个编号空间，§3.1）。非法抛 ValueError（端点转 400）。"""
-    if not isinstance(idx, int) or isinstance(idx, bool):
-        if require_idx:
-            raise ValueError(f"idx must be an integer: {idx!r}")
-        return -1                                  # 候选节点/estimate 占位
-    if idx in seen:
-        raise ValueError(f"duplicate idx: {idx}")
-    seen.add(idx)
-    return idx
-
-
-def _branch_from_json(obj, *, require_idx: bool, seen: set) -> Branch:
-    """§9.2 分支 JSON → Branch（cond/action 原样收，零剥键——GET→PUT 回环无损）。"""
-    if not isinstance(obj, dict):
-        raise ValueError("branch must be an object")
-    idx = _take_idx(obj.get("idx"), require_idx, seen)
-    cond = obj.get("cond")
-    action = obj.get("action")
-    if not isinstance(cond, list):
-        raise ValueError(f"branch {idx}: cond must be a list")
-    if not isinstance(action, dict):
-        raise ValueError(f"branch {idx}: action must be an object")
-    kids = [_branch_from_json(k, require_idx=require_idx, seen=seen)
-            for k in (obj.get("kids") or [])]
-    if len(kids) > 9:
-        raise ValueError(f"branch {idx}: more than 9 kids (idx convention, §9.2)")
-    trial = obj.get("trial")
-    if trial is not None and not isinstance(trial, dict):
-        raise ValueError(f"branch {idx}: trial must be an object or null")
-    return Branch(idx=idx, cond=cond, action=action, trial=trial,
-                  enabled=bool(obj.get("enabled", True)), kids=kids)
-
-
-def _node_from_json(obj, *, require_idx: bool, seen: set) -> Node:
-    """§9.2 节点 JSON → Node。``kind`` 不入参（读侧由 rows_to_tree 按内容推导，
-    Task 9 口径）；候选节点（POST nodes / estimate）可无 idx（require_idx=False）。"""
-    if not isinstance(obj, dict):
-        raise ValueError("node must be an object")
-    idx = _take_idx(obj.get("idx"), require_idx, seen)
-    branches = [_branch_from_json(b, require_idx=require_idx, seen=seen)
-                for b in (obj.get("branches") or [])]
-    if len(branches) > 9:
-        raise ValueError(f"node {idx}: more than 9 branches (idx convention, §9.2)")
-    return Node(idx=idx, kind=str(obj.get("kind") or "normal"),
-                name=str(obj.get("name") or ""), desc=obj.get("desc"),
-                enabled=bool(obj.get("enabled", True)), branches=branches)
-
-
-def _tree_from_json(body) -> list[Node]:
-    """PUT /admin/tree（或 import 的 tree 节）请求体 → Node 列表。
-
-    形状非法抛 ValueError（端点统一转 400）：body 是对象、nodes 非空列表、
-    全行 idx 整数且唯一、每节点分支数/每分支子分支数 ≤ 9（「父 idx*10 + 段内
-    序号」的段内上限，§9.2）。GET 附带的 version/kind 等键忽略。"""
-    if not isinstance(body, dict) or not isinstance(body.get("nodes"), list) \
-            or not body["nodes"]:
-        raise ValueError("body must be {nodes: [...]} with at least one node")
-    seen: set = set()
-    return [_node_from_json(n, require_idx=True, seen=seen) for n in body["nodes"]]
-
-
-def _renumber(nodes: list[Node]) -> None:
-    """位置序 → idx（§9.2 约定：分支 = 父 idx*10 + 段内序号；节点 0 的 0 段与
-    顶层节点号冲突，特例落 100+序号——seed 同款）。全树 ≤ 10 节点、每段 ≤ 9 子
-    （调用方校验）时编号空间互不重叠。"""
-    for i, n in enumerate(nodes):
-        n.idx = i
-        for j, b in enumerate(n.branches):
-            b.idx = (100 + j) if i == 0 else (i * 10 + j)
-            for k, kid in enumerate(b.kids):
-                kid.idx = b.idx * 10 + k
-
-
-def _row_idxs(nodes: list[Node]):
-    """全树落库行 idx（节点 + 分支 + kids 递归）——tree.idx 是全表主键（§3.1），
-    节点/分支共用一个编号空间；撞号检测口径与 _write_tree_rows 的行集一致。"""
-    for n in nodes:
-        yield n.idx
-        stack = list(n.branches)
-        while stack:
-            b = stack.pop(0)
-            yield b.idx
-            stack.extend(b.kids)
-
-
-def _idx_conflict(nodes: list[Node]) -> int | None:
-    """重编后的首个撞号 idx（无撞号 → None）。
-
-    撞号来源是 §9.2 编号公式的固有重叠：节点 1 的第 0 条分支派生子分支
-    10×10+k = 100+k，与节点 0 特例段 100+序号相撞（节点号 ≥ 10 同理落 100+
-    段）。_write_tree_rows 是直接 INSERT，撞号以 tree.idx 主键 IntegrityError
-    （HTTP 500）收场，必须在写库前拦下转 422。"""
-    seen: set[int] = set()
-    for idx in _row_idxs(nodes):
-        if idx in seen:
-            return idx
-        seen.add(idx)
-    return None
-
-
-def _tree_full_422(conflict: int | None = None) -> JSONResponse:
-    """idx 空间耗尽/无法无损重编 → 422 findings（与体检拦截同形状；code
-    "tree_full"、message 双语、引导改用 PUT /admin/tree 整树替换）。不写库、
-    不记 log_change——与体检 422 路径同语义（事务未动，无可回滚内容）。"""
-    where_zh = f"（撞号 idx {conflict}）" if conflict is not None else ""
-    where_en = f": conflict at idx {conflict}" if conflict is not None else ""
-    finding = Finding(
-        "hard", "tree_full", None, None,
-        f"分流树编号空间已用尽{where_zh}：M1 编号约定（分支 = 父 idx×10 + 段内"
-        "序号，节点 0 占 100+ 段）下无法无损重编，保存会使分支号与既有行相撞。"
-        "请改用 PUT /admin/tree 整树替换。",
-        f"The tree idx space is exhausted{where_en}: under the M1 convention "
-        "(branch idx = parent idx × 10 + position, node 0 occupies the 100+ "
-        "range) this tree cannot be renumbered losslessly and would collide "
-        "with existing rows. Use PUT /admin/tree to replace the whole tree "
-        "instead.",
-        {"action": "use_put_tree"})
-    return JSONResponse({"findings": [finding.to_json()]}, status_code=422)
-
-
-def _write_branch_rows(conn, parent_idx: int, b: Branch) -> None:
-    """分支行 INSERT（kids 递归；分支行 name 存空串——显示名由控制台按 cond
-    渲染，§3.1；updated_at/by 记审计面）。"""
-    conn.execute(
-        "INSERT INTO tree (idx, parent, name, desc, cond, action, trial, enabled, "
-        "updated_at, updated_by) VALUES (?, ?, '', NULL, ?, ?, ?, ?, ?, ?)",
-        (b.idx, parent_idx, db._dump(b.cond), db._dump(b.action),
-         None if b.trial is None else db._dump(b.trial),
-         1 if b.enabled else 0, db._now(), _WRITE_ACTOR))
-    for kid in b.kids:
-        _write_branch_rows(conn, b.idx, kid)
-
-
-def _write_tree_rows(conn, nodes: list[Node]) -> None:
-    """整树落库（事务由调用方 commit）：先 DELETE 后按 §3.1 行结构 INSERT。
-    节点行 cond/action 为 NOT NULL 占位（'[]' / 'null'，init_db._seed 同款）。"""
-    conn.execute("DELETE FROM tree")
-    for n in nodes:
-        conn.execute(
-            "INSERT INTO tree (idx, parent, name, desc, cond, action, trial, "
-            "enabled, updated_at, updated_by) "
-            "VALUES (?, NULL, ?, ?, '[]', 'null', NULL, ?, ?, ?)",
-            (n.idx, n.name, n.desc, 1 if n.enabled else 0, db._now(), _WRITE_ACTOR))
-        for b in n.branches:
-            _write_branch_rows(conn, n.idx, b)
-
-
-def run_checkup_safe(nodes: list[Node], models, tag_defs,
-                     hits: dict[str, int] | None = None) -> list[Finding]:
-    """run_checkup 的**崩溃安全**入口（M5，audit Major）：体检内部异常降级为一条
-    hard finding（code="checkup_error"），绝不逃逸成 PUT /admin/tree 500。
-
-    体检是给坏数据兜底的最后闸门，它自己不能先倒——旧实现 `_checkup_or_422` 与
-    `config.import_yaml` 都对 `run_checkup` 无 try/except，体检里任何一个未预料的
-    TypeError（如 `fallback: null` 的 `*None`）都是 500（真 uvicorn 下 HTML/无信封）。
-    口径声明（二选一，本实现取前者）：**降级为 hard finding** → 仍按 422 拦截保存
-    （不放行、不掩盖：库零写入这一 fail-safe 行为不变），message 为通用文案 +
-    服务端日志留原始异常，不回吐 Python 异常原文。
-
-    正常路径零开销（同一函数对象转发）；三条写路径与 import 全部经此入口。
-    """
-    try:
-        return run_checkup(nodes, models, tag_defs, hits=hits)
-    except Exception as exc:                    # 体检自身崩溃：绝不变成 500
-        logger.exception("run_checkup crashed (degraded to hard finding): %r", exc)
-        return [Finding(
-            "hard", "checkup_error", None, None,
-            "体检内部错误：本次改动无法完成检查，已按硬错误拦截保存"
-            "（详细原因见服务端日志）",
-            "Internal checkup error: this change could not be validated and was "
-            "blocked as a hard error (see server logs for details)",
-            {"action": "retry_or_report"})]
 
 
 def _checkup_or_422(conn, nodes: list[Node]):
@@ -1412,7 +631,7 @@ def _checkup_or_422(conn, nodes: list[Node]):
     走 :func:`run_checkup_safe`：体检自身崩溃按 hard finding 降级（M5），
     不得变成 PUT 500。
     """
-    findings = run_checkup_safe(nodes, _models_set(conn), TAGS, hits=_hits_30d(conn))
+    findings = run_checkup_safe(nodes, db.model_ids(conn), TAGS, hits=_hits_30d(conn))
     if any(f.level == "hard" for f in findings):
         ordered = sorted(findings, key=lambda f: f.level != "hard")
         return JSONResponse({"findings": [f.to_json() for f in ordered]},
@@ -1756,7 +975,7 @@ def create_app(db_path: str, tagger: Tagger,
             old = _tree_json(_load_tree(conn, db_path), db.get_tree_version(conn))
             _write_tree_rows(conn, nodes)
             db.bump_tree_version(conn)
-            db.log_change(conn, _WRITE_ACTOR, "tree", "*",
+            db.log_change(conn, WRITE_ACTOR, "tree", "*",
                           before={"version": old["version"], "nodes": old["nodes"]},
                           after={"nodes": body["nodes"]})
             conn.commit()
@@ -1770,7 +989,7 @@ def create_app(db_path: str, tagger: Tagger,
         """体检当前树、不写库（§9）：findings 按 §10 CHECKS 顺序全量返回。"""
         conn = db.get(db_path)
         try:
-            findings = run_checkup_safe(_load_tree(conn, db_path), _models_set(conn),
+            findings = run_checkup_safe(_load_tree(conn, db_path), db.model_ids(conn),
                                         TAGS, hits=_hits_30d(conn))
         finally:
             conn.close()
@@ -1985,7 +1204,7 @@ def create_app(db_path: str, tagger: Tagger,
                     "VALUES (?, ?, ?, ?, ?, NULL)",
                     (uuid.uuid4().hex, db._now(), str(cand.idx),
                      db._dump(body["node"]), db._dump(body["estimate"])))
-            db.log_change(conn, _WRITE_ACTOR, "tree", str(cand.idx),
+            db.log_change(conn, WRITE_ACTOR, "tree", str(cand.idx),
                           before={"version": old["version"], "nodes": old["nodes"]},
                           after={"pos": pos, "node": body.get("node")})
             conn.commit()
@@ -2011,7 +1230,7 @@ def create_app(db_path: str, tagger: Tagger,
             old = _tree_json(nodes, db.get_tree_version(conn))
             _write_tree_rows(conn, rest)
             db.bump_tree_version(conn)
-            db.log_change(conn, _WRITE_ACTOR, "tree", str(idx),
+            db.log_change(conn, WRITE_ACTOR, "tree", str(idx),
                           before={"version": old["version"], "nodes": old["nodes"]},
                           after=None)
             conn.commit()
@@ -2046,7 +1265,7 @@ def create_app(db_path: str, tagger: Tagger,
                 for branch in node.get("branches", []):
                     db._seed_branch(conn, node["idx"], branch)   # 与 init_db 同一条落库路径
             db.bump_tree_version(conn)
-            db.log_change(conn, _WRITE_ACTOR, "tree", "template",
+            db.log_change(conn, WRITE_ACTOR, "tree", "template",
                           before={"version": old["version"], "nodes": old["nodes"]},
                           after={"template": name})
             conn.commit()
@@ -2107,7 +1326,7 @@ def create_app(db_path: str, tagger: Tagger,
                 (mid, provider, prov["proto"], upstream, db._dump(caps),
                  db._dump(aliases), step, price_in, price_out,
                  1 if enabled else 0))
-            db.log_change(conn, _WRITE_ACTOR, "models", mid, before=None,
+            db.log_change(conn, WRITE_ACTOR, "models", mid, before=None,
                           after={"id": mid, "provider": provider,
                                  "upstream": upstream, "caps": caps,
                                  "aliases": aliases, "step": step,
@@ -2183,7 +1402,7 @@ def create_app(db_path: str, tagger: Tagger,
                 params.append(v)
             conn.execute(f"UPDATE models SET {', '.join(sets)} WHERE id = ?",
                          [*params, mid])
-            db.log_change(conn, _WRITE_ACTOR, "models", mid, before=before,
+            db.log_change(conn, WRITE_ACTOR, "models", mid, before=before,
                           after={**before, **body})
             conn.commit()
         finally:
@@ -2205,7 +1424,7 @@ def create_app(db_path: str, tagger: Tagger,
                                     status_code=404)
             before = {"ok": bool(row["ok"]), "break_reason": row["break_reason"]}
             reset_circuit(conn, mid)
-            db.log_change(conn, _WRITE_ACTOR, "models", mid, before=before,
+            db.log_change(conn, WRITE_ACTOR, "models", mid, before=before,
                           after={"ok": True, "break_reason": None})
             conn.commit()
         finally:
@@ -2329,7 +1548,7 @@ def create_app(db_path: str, tagger: Tagger,
                                 status_code=400)
         conn = db.get(db_path)
         try:
-            errs = validate_settings(body, _models_set(conn))
+            errs = validate_settings(body, db.model_ids(conn))
             if errs:
                 return JSONResponse({"detail": "; ".join(errs)}, status_code=400)
             before = _load_settings(conn)
@@ -2340,7 +1559,7 @@ def create_app(db_path: str, tagger: Tagger,
                     "INSERT INTO settings (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (k, str(v)))
-            db.log_change(conn, _WRITE_ACTOR, "settings", "*", before=before,
+            db.log_change(conn, WRITE_ACTOR, "settings", "*", before=before,
                           after=body)
             conn.commit()
         finally:
@@ -2397,7 +1616,7 @@ def create_app(db_path: str, tagger: Tagger,
                     "INSERT INTO tag_settings (tag, thresholds) VALUES (?, ?) "
                     "ON CONFLICT(tag) DO UPDATE SET thresholds = excluded.thresholds",
                     (tag_, th))
-            db.log_change(conn, _WRITE_ACTOR, "bands", "*", before=before,
+            db.log_change(conn, WRITE_ACTOR, "bands", "*", before=before,
                           after=body)
             conn.commit()
         finally:

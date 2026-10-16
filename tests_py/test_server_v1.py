@@ -703,15 +703,16 @@ def test_internal_error_message_is_generic(app, monkeypatch):
 def test_resolve_failure_message_is_generic(app, monkeypatch):
     """候选后端解析失败 → 502 信封给通用文案，不回吐 Python 异常原文；
     异常本身仍进服务端日志（logger.warning）。"""
-    import sr.server as server_mod
+    import sr.upstream as upstream_mod
     sentinel = "SENTINEL-RESOLVE-DETAIL-/tmp/secret.env"
 
     def _boom(*a, **k):
         raise KeyError(sentinel)
 
     logged = []
-    monkeypatch.setattr(server_mod, "resolve_backend", _boom)
-    monkeypatch.setattr(server_mod.logger, "warning",
+    # A1：resolve_backend / 上游调用已迁 sr.upstream，patch 该模块全局名
+    monkeypatch.setattr(upstream_mod, "resolve_backend", _boom)
+    monkeypatch.setattr(upstream_mod.logger, "warning",
                         lambda *a, **k: logged.append(a))
     r = asyncio.get_event_loop().run_until_complete(_post(
         app, "/v1/chat/completions",
