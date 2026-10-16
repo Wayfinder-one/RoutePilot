@@ -33,6 +33,23 @@ def test_models_seed_has_five(tmp_path):
     assert ids == {"qwen3-8b", "qwen3-32b", "claude-sonnet",
                    "llava-omni", "sdxl-image"}
 
+def test_migrate_adds_tree_version_column(tmp_path):
+    """M2：旧库缺 requests.tree_version 时 init_db 自动 ALTER 补列（幂等）。"""
+    path = str(tmp_path / "old.db")
+    conn = db.init_db(path)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
+    assert "tree_version" in cols
+    conn.execute("ALTER TABLE requests DROP COLUMN tree_version")   # 模拟旧库
+    conn.commit()
+    conn.close()
+    conn2 = db.init_db(path)                                        # 触发迁移
+    try:
+        cols2 = {r[1] for r in conn2.execute("PRAGMA table_info(requests)")}
+        assert "tree_version" in cols2
+    finally:
+        conn2.close()
+
+
 def test_models_not_in_ladder_have_step_zero(tmp_path):
     # backlog 修：多媒体种子曾写 step NULL，与 spec §3.1 注释「0=不在阶梯」不统一。
     conn = db.init_db(str(tmp_path / "t.db"))

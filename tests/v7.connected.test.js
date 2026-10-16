@@ -119,12 +119,13 @@ const MODELS_JSON = [
   { id: 'qwen3-32b', provider: '本地', proto: 'openai', upstream: 'Qwen/Qwen3-32B',
     caps: ['text', 'medium'], aliases: ['auto', 'big'], step: 1,
     price_in: 2, price_out: 8, ok: true, break_reason: null, enabled: true, on_ladder: true }];
-const TRAFFIC_JSON = { total: 1, rows: [
+const TRAFFIC_JSON = { total: 1, tree_version: 7, rows: [
   { id: 'r_01J8K9ZZZ', ts: '2026-10-15T14:01:22+08:00', proto: 'openai',
     model_asked: 'auto',
     tags_brief: [{ tag: 'domain', value: 'computer_science' }],
     hit_branch: '3.0', routed_to: 'qwen3-32b', session_tag: 'new',
-    outcome: 'upstream', status: 200, answer_ms: 12.1, upstream_ms: 1800 }] };
+    outcome: 'upstream', status: 200, answer_ms: 12.1, upstream_ms: 1800,
+    tree_version: 7 }] };
 const TRAFFIC_DETAIL_JSON = { id: 'r_01J8K9ZZZ', ts: '2026-10-15T14:01:22+08:00',
   proto: 'openai', model_asked: 'auto', hit_branch: '3.0', routed_to: 'qwen3-32b',
   session_id: 's1', session_tag: 'new', outcome: 'upstream', status: 200,
@@ -596,6 +597,25 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   await pend(300);
   t('设置保存失败 → 勾选态回滚到原值', first.checked === before,
     first.checked + ' vs ' + before);
+
+  /* ════ F. M2：历史行 tree_version 失效标记 ════ */
+  group('M2 · 历史行 tree_version 失效标记');
+  const staleRow = Object.assign({}, TRAFFIC_JSON.rows[0], { tree_version: 7 });
+  const J = makeDom({ routes: Object.assign({}, CONNECT_ROUTES, {
+    '/admin/traffic': () => jsonResponse({ total: 1, tree_version: 9, rows: [staleRow] }) }) });
+  await until(() => J.window.SR_MODE === 'connected', 5000, 'connected (stale)');
+  await until(() => J.window.document.querySelector('#p-traffic tbody tr'), 5000, 'traffic row');
+  await pend(300);
+  const jtr = J.window.document.querySelectorAll('#p-traffic tbody tr')[0];
+  t('记录版本 ≠ 当前版本 → 命中分支列出现失效标记',
+    jtr.innerHTML.indexOf('⚠') >= 0 && jtr.innerHTML.indexOf('分支归属可能已失效') >= 0,
+    jtr.innerHTML.slice(0, 220));
+  const K = makeDom({ routes: CONNECT_ROUTES });
+  await until(() => K.window.SR_MODE === 'connected', 5000, 'connected (ok)');
+  await until(() => K.window.document.querySelector('#p-traffic tbody tr'), 5000, 'traffic row');
+  await pend(300);
+  const ktr = K.window.document.querySelectorAll('#p-traffic tbody tr')[0];
+  t('版本一致 → 无失效标记', ktr.innerHTML.indexOf('⚠') < 0, ktr.innerHTML.slice(0, 220));
 
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);

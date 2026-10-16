@@ -190,15 +190,20 @@ def _store_tags(conn, request_id: str, signals: dict | None) -> None:
 
 
 def _log_request(conn, *, proto, asked, hit_branch, routed_to, session_id,
-                 session_tag, outcome, status, answer_ms, upstream_ms, cost) -> str:
-    """requests 表一行（§3.1 列口径）；返回行 id 供 tags 外键。"""
+                 session_tag, outcome, status, answer_ms, upstream_ms, cost,
+                 tree_version=None) -> str:
+    """requests 表一行（§3.1 列口径）；返回行 id 供 tags 外键。
+
+    ``tree_version``（M2）：判定当时的树版本；控制台对「记录版本 ≠ 当前版本」的
+    历史行提示「分支归属可能已失效」（新增节点会重编 idx，旧 hit_branch 会静默错指）。
+    """
     rid = uuid.uuid4().hex
     conn.execute(
         "INSERT INTO requests (id, ts, proto, model_asked, hit_branch, routed_to, "
-        "session_id, session_tag, outcome, status, answer_ms, upstream_ms, cost) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "session_id, session_tag, outcome, status, answer_ms, upstream_ms, cost, "
+        "tree_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (rid, db._now(), proto, asked, hit_branch, routed_to, session_id,
-         session_tag, outcome, status, answer_ms, upstream_ms, cost))
+         session_tag, outcome, status, answer_ms, upstream_ms, cost, tree_version))
     return rid
 
 
@@ -363,6 +368,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
         conn = db.get(db_path)
         settings = _load_settings(conn)
         nodes = _load_tree(conn, db_path)
+        tree_version = db.get_tree_version(conn)     # M2：落 requests.tree_version
         cuts = _conf_cuts(conn)
         ctx_thresholds = _context_thresholds(conn)   # M8：tag_settings context 行
         req_headers = dict(request.headers)
@@ -465,7 +471,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             rid = _log_request(conn, proto=proto, asked=asked, hit_branch=hit_branch,
                                routed_to="block", session_id=session_id,
                                session_tag=session_tag, outcome="block", status=403,
-                               answer_ms=answer_ms, upstream_ms=None, cost=None)
+                               answer_ms=answer_ms, upstream_ms=None, cost=None,
+                               tree_version=tree_version)
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to="block", outcome="block",
@@ -481,7 +488,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             rid = _log_request(conn, proto=proto, asked=asked, hit_branch=hit_branch,
                                routed_to=None, session_id=session_id,
                                session_tag=session_tag, outcome="error", status=502,
-                               answer_ms=answer_ms, upstream_ms=None, cost=None)
+                               answer_ms=answer_ms, upstream_ms=None, cost=None,
+                               tree_version=tree_version)
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
@@ -526,7 +534,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                                routed_to=None, session_id=session_id,
                                session_tag=session_tag, outcome="error",
                                status=exc.status, answer_ms=answer_ms,
-                               upstream_ms=None, cost=None)
+                               upstream_ms=None, cost=None,
+                               tree_version=tree_version)
             _store_tags(conn, rid, signals)
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
@@ -551,7 +560,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                            routed_to=final_model, session_id=session_id,
                            session_tag=session_tag, outcome=outcome, status=200,
                            answer_ms=answer_ms, upstream_ms=upstream_ms,
-                           cost=_cost_of(conn, final_model, None))
+                           cost=_cost_of(conn, final_model, None),
+                           tree_version=tree_version)
         _store_tags(conn, rid, signals)
         metrics.observe("sr_upstream_latency_seconds", {"model": final_model},
                         (upstream_ms or 0) / 1000.0)
@@ -843,15 +853,18 @@ def create_app(db_path: str, tagger: Tagger,
                 f"SELECT * FROM requests{wsql} ORDER BY ts DESC, rowid DESC "
                 "LIMIT 50 OFFSET ?", [*params, (page - 1) * 50]).fetchall()
             brief = _tags_brief(conn, [r["id"] for r in rows])
+            current_version = db.get_tree_version(conn)   # M2：控制台比对用
         finally:
             conn.close()
-        return JSONResponse({"total": total, "rows": [
+        return JSONResponse({"total": total, "tree_version": current_version,
+                             "rows": [
             {"id": r["id"], "ts": r["ts"], "proto": r["proto"],
              "model_asked": r["model_asked"], "tags_brief": brief.get(r["id"], []),
              "hit_branch": r["hit_branch"], "routed_to": r["routed_to"],
              "session_tag": r["session_tag"], "outcome": r["outcome"],
              "status": r["status"], "answer_ms": r["answer_ms"],
-             "upstream_ms": r["upstream_ms"]} for r in rows]})
+             "upstream_ms": r["upstream_ms"], "tree_version": r["tree_version"]}
+            for r in rows]})
 
     @app.get("/admin/traffic/{rid}")
     async def admin_traffic_detail(rid: str):
@@ -877,6 +890,7 @@ def create_app(db_path: str, tagger: Tagger,
                              "outcome": r["outcome"], "status": r["status"],
                              "answer_ms": r["answer_ms"],
                              "upstream_ms": r["upstream_ms"], "cost": r["cost"],
+                             "tree_version": r["tree_version"],
                              "tags": tags})
 
     def _dash(v) -> str:

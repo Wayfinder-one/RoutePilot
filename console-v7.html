@@ -1450,6 +1450,7 @@ const EN = {
   "新会话": "New",
   "沿用": "Sticky",
   "解锁": "Unlocked",
+  "分支归属可能已失效": "Branch attribution may be stale",
   "标签的分档": "Tag Bands",
   "把握度分档": "Confidence Bands",
   "全部模型标签通用 · 来自 JEV 的置信度": "Shared by all model tags · JEV confidence",
@@ -3559,6 +3560,7 @@ Object.assign(EN, {
 const I18N_ZH = {};            /* /admin/i18n/zh 键表（§9.1 引导第一项） */
 const SRW_DATA = { providers: [], models: [], bands: null, settings: {} };
 let SRW_TRAFFIC = [];          /* 流量行（showReq(i) 的下标） */
+let SRW_TRAFFIC_VERSION = null; /* 流量列表的当前树版本（M2：与行记录版本比对） */
 let SRW_LAST_EST = null;       /* 最近一次影响预估（确认保存随 nodes 落库） */
 const SRW_JSON_HDR = { 'Content-Type': 'application/json' };
 /* 17 卡版式（spec §6.3 键序 × 卡墙分组 g）——「键 → 显示词」边界只列这一次 */
@@ -4030,12 +4032,14 @@ function SRW_nodeByHitBranch(hb){
 }
 function SRW_applyTraffic(data){
   SRW_TRAFFIC = (data && data.rows) || [];
+  SRW_TRAFFIC_VERSION = data && data.tree_version;   /* M2：当前树版本 */
   const tb = document.querySelector('#p-traffic tbody');
   if(!tb) return;
   if(!SRW_TRAFFIC.length){
     tb.innerHTML = '<tr><td colspan="8" style="padding:18px;color:var(--text-4);font-size:var(--fs-micro)">暂无流量记录</td></tr>';
     return;
   }
+  const cur = SRW_TRAFFIC_VERSION;
   const sessMap = { new: ['b', '新会话'], sticky: ['y', '沿用'], unlocked: ['y', '解锁'] };
   const outMap = { upstream: ['g', '正常返回'], block: ['r', '已拦截'],
                    error: ['r', '上游异常'], fallback: ['y', '已回退'] };
@@ -4046,13 +4050,21 @@ function SRW_applyTraffic(data){
     const ss = sessMap[r.session_tag] || ['b', r.session_tag || '—'];
     const oc = outMap[r.outcome] || ['y', r.outcome || '—'];
     const blocked = r.outcome === 'block';
+    /* M2：记录版本 ≠ 当前版本 → 该行 hit_branch 的分支归属可能已失效（新增节点
+       会重编 idx）。仅在确有命中分支时提示。 */
+    const stale = cur !== undefined && cur !== null &&
+      r.tree_version !== undefined && r.tree_version !== null &&
+      r.tree_version !== cur && !!r.hit_branch;
+    const hb = SRW_nodeByHitBranch(r.hit_branch) + (stale
+      ? ' <span style="color:var(--rust);cursor:help" title="' + SRW_esc(T('分支归属可能已失效')) +
+        '">⚠</span>' : '');
     return '<tr class="pick" data-rid="' + r.id + '" onclick="showReq(' + i + ')">' +
       '<td class="mono" style="font-size:var(--fs-micro)">' + String(r.ts || '').slice(11, 19) + '</td>' +
       '<td style="font-size:var(--fs-micro)">' + (r.proto === 'anthropic' ? 'Anthropic' : 'OpenAI') + '</td>' +
       '<td>' + (chips ? '<div class="chipset">' + chips + '</div>' :
         '<span style="font-size:var(--fs-micro);color:var(--text-4)">（沿用会话，未重新判断）</span>') + '</td>' +
       '<td style="font-size:var(--fs-micro)' + (blocked ? ';color:var(--rust)' : '') + '" class="mono">' +
-        SRW_nodeByHitBranch(r.hit_branch) + '</td>' +
+        hb + '</td>' +
       '<td><span class="st"><span class="d ' + ss[0] + '"></span>' + ss[1] + '</span></td>' +
       '<td class="mono" style="font-size:var(--fs-micro)' + (blocked ? ';color:var(--rust)' : '') + '">' +
         (blocked ? '拦下' : (r.routed_to || '—')) + '</td>' +

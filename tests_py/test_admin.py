@@ -338,11 +338,11 @@ def test_traffic_row_and_detail_shape(app):
     未知 id 404。"""
     post_blocked_request(app)
     body = get(app, "/admin/traffic").json()
-    assert set(body) == {"total", "rows"} and body["total"] == 1
+    assert set(body) == {"total", "tree_version", "rows"} and body["total"] == 1
     row = body["rows"][0]
     assert list(row) == ["id", "ts", "proto", "model_asked", "tags_brief",
                          "hit_branch", "routed_to", "session_tag", "outcome",
-                         "status", "answer_ms", "upstream_ms"]
+                         "status", "answer_ms", "upstream_ms", "tree_version"]
     assert row["outcome"] == "block" and row["routed_to"] == "block"   # 库中实际值
     assert row["hit_branch"] == "1.0"               # 安全节点 b1-0（jailbreak gte 2）
     assert {"tag", "value"} <= set(row["tags_brief"][0])
@@ -363,6 +363,23 @@ def test_traffic_low_conf_filter(app):
     rows = get(app, "/admin/traffic?f=low_conf").json()["rows"]
     assert len(rows) == 1
     assert rows[0]["hit_branch"] == "3.0"
+
+def test_traffic_records_tree_version_and_reports_current(app):
+    """M2：requests 记判定当时的 tree_version；/admin/traffic 顶层给当前版本，
+    行给记录版本——控制台据此对「记录版本 ≠ 当前版本」的行标「分支归属可能已失效」。"""
+    post_blocked_request(app)                       # 记 v1
+    body = get(app, "/admin/traffic").json()
+    assert body["tree_version"] == 1
+    assert body["rows"][0]["tree_version"] == 1
+    # 改树（整树 PUT → version+1）；旧行记录版本仍为 1，与当前 2 不符
+    put(app, "/admin/tree", get(app, "/admin/tree").json())
+    body2 = get(app, "/admin/traffic").json()
+    assert body2["tree_version"] == 2
+    assert body2["rows"][0]["tree_version"] == 1
+    # 详情也带记录版本
+    detail = get(app, "/admin/traffic/" + body2["rows"][0]["id"]).json()
+    assert detail["tree_version"] == 1
+
 
 def test_traffic_hours_filter_uses_real_instant(app):
     """backlog 修：hours 曾用本地 ISO 字符串比较——跨偏移（夏令时/异区）会错序。

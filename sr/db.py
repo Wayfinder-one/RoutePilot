@@ -120,7 +120,9 @@ CREATE TABLE requests (
   status      INTEGER,
   answer_ms   REAL,                 -- 打标签耗时
   upstream_ms REAL,                 -- 上游耗时
-  cost        REAL                   -- 本次成本（USD）
+  cost        REAL,                  -- 本次成本（USD）
+  tree_version INTEGER              -- 判定当时的 tree_version（M2）；与当前不符
+                                     -- = 分支归属可能已失效（新增节点会重编 idx）
 );
 
 CREATE TABLE tags (
@@ -269,6 +271,7 @@ def init_db(path: str) -> sqlite3.Connection:
     have = _existing_tables(conn)
     missing = _REQUIRED_TABLES - have
     if not missing:
+        _migrate(conn)                     # 已建库：补新增列（幂等）
         return conn
     if have & _REQUIRED_TABLES:            # 部分表在 → 库不完整，不冒然补建
         conn.close()
@@ -279,6 +282,18 @@ def init_db(path: str) -> sqlite3.Connection:
     _seed(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """轻量 schema 迁移：给既有库补新增列（PRAGMA 探测 + ALTER，幂等）。
+
+    M2：requests.tree_version（§3.1）是后加的列——旧库 CREATE TABLE 时没有它，
+    必须 ALTER 补上，否则「记录当时 tree_version」的写侧 INSERT 会因缺列失败。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
+    if cols and "tree_version" not in cols:
+        conn.execute("ALTER TABLE requests ADD COLUMN tree_version INTEGER")
+        conn.commit()
 
 
 def _seed(conn: sqlite3.Connection) -> None:
