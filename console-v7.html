@@ -3778,7 +3778,19 @@ function SRW_chipsFromCond(cond){
         if(chip) seg.push(chip);
       });
     } else if(c.not){
-      seg.push(['其他', '', '', true]);   /* 展示占位；回写侧遇「其他」即拒绝（不可编辑） */
+      /* M2：not 子句可编辑了——chip 展示为「非 <值>」并携带原原子（第 5 位），
+         chipsToCond 据此原样重建 {not: 原子}（回写保真，clauseEq 通过）。 */
+      const inner = c.not;
+      const chip = SRW_clauseChip(inner);
+      if(chip){
+        const neg = chip.slice();
+        neg[2] = '非 ' + neg[2];
+        neg[3] = true;
+        neg[4] = inner;
+        seg.push(neg);
+      } else {
+        seg.push(['其他', '', '', true, inner]);
+      }
     } else {
       const chip = SRW_clauseChip(c);
       if(chip){
@@ -4232,8 +4244,8 @@ window.saveTreeRemote = async function(){
    SRW_chipsToCond 是 SRW_chipsFromCond 的逆变换：「而且」关合当前子句；
    「或」把后一个 chip 并入当前子句的 or 组；「把握度」门槛挂到当前子句
    （回写时落在该子句末一个原子身上）；「兜底」恒真 chip → 空条件 []。
-   「其他」恒真 chip（not 子句的展示占位）在 chips 上没有可回写的语义 ——
-   遇到即抛错，由 saveTreeRemote 拦成体检提示，绝不静默改语义。 */
+   M2：not 子句的 chip（第 4 位 true、第 5 位携带原原子）原样回写成 {not: 原子}
+   ——不再整树拒绝（回写保真由 saveTreeRemote 的 clauseEq 逐分支核验）。 */
 const SRW_OR_FILL = { orFill: true };   /* 「或」已吞掉、等待下一 chip 填充的占位 */
 function SRW_chipsToCond(chips){
   const out = [];
@@ -4262,8 +4274,8 @@ function SRW_chipsToCond(chips){
       else if(c[0] === '而且') close();               /* 子句边界 */
       return;
     }
-    if(c[3]){                                         /* 恒真 chip：兜底 / 其他 */
-      if(c[0] === '其他') throw new Error('该分支含控制台暂不可编辑的条件，请勿修改此分支');
+    if(c[3]){                                         /* 恒真 chip：兜底 / not（带原原子） */
+      if(c[4] !== undefined){ close(); out.push({ not: c[4] }); return; }
       return;                                         /* 兜底 → 空条件 */
     }
     if(c[0] === '把握度'){

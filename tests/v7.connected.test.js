@@ -475,21 +475,23 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
     edoc.getElementById('checkup').innerHTML === '',
     edoc.getElementById('checkup').textContent.slice(0, 80));
 
-  group('缺陷修复 · 不可编辑条件（not 子句）保存前拒绝，绝不静默改语义');
+  group('M2 · not 子句可编辑（chips 回写保真，不再整树拒绝）');
   t('前置：A 树确实含 not 子句分支（c211）',
     (() => { const n2 = treeNow.find(n => n._idx === 2);
       return n2.branches.some(b => (b.kids || []).some(kb => kb.k === 'c211')); })());
   w.saveTreeRemote();
-  await pend(400);
-  t('含 not 子句 → 整树保存被拒（不发 PUT /admin/tree）',
-    !A.calls.some(c => c[0] === '/admin/tree' && c[1].method === 'PUT'));
-  t('拒绝提示进体检面板（逐字提示语）',
-    /该分支含控制台暂不可编辑的条件，请勿修改此分支/.test(doc.getElementById('checkup').textContent),
-    doc.getElementById('checkup').textContent.slice(0, 120));
-  t('提示定位到分支（node 2 · branch 211 · code cond_readonly）',
-    /node 2/.test(doc.getElementById('checkup').textContent) &&
-    /branch 211/.test(doc.getElementById('checkup').textContent) &&
-    /cond_readonly/.test(doc.getElementById('checkup').textContent));
+  await until(() => A.calls.some(c => c[0] === '/admin/tree' && c[1].method === 'PUT'),
+    5000, 'PUT /admin/tree');
+  await pend(300);
+  const treePut = A.calls.filter(c => c[0] === '/admin/tree' && c[1].method === 'PUT').slice(-1)[0];
+  t('含 not 子句 → 整树保存成功（发出 PUT /admin/tree）', !!treePut);
+  const sentBody = JSON.parse(treePut[1].body);
+  const kb211 = sentBody.nodes.find(n => n.idx === 2)
+    .branches.flatMap(b => b.kids || []).find(k => k.idx === 211);
+  t('not 子句原样回写（回写保真，无静默改语义）',
+    JSON.stringify(kb211.cond) ===
+      JSON.stringify([{ not: { tag: 'complexity', op: 'is', values: [1] } }]),
+    JSON.stringify(kb211.cond));
 
   group('缺陷修复 · Minor 守卫（SRW_TM / providers 形状）');
   t('doTag 已跑过：不再产生隐式全局 SRW_TM（已删除）', w.SRW_TM === undefined, String(w.SRW_TM));
