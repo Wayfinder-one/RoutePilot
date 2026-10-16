@@ -3616,7 +3616,20 @@ async function bootDetect(){
       if(window.AbortSignal && typeof window.AbortSignal.timeout === 'function')
         opt.signal = window.AbortSignal.timeout(1500);
     } catch (e) { /* 老运行时无 timeout：退化为无限时探测 */ }
-    const r = await fetch('/admin/tree', opt);
+    let r;
+    try {
+      r = await fetch('/admin/tree', opt);
+    } catch (e) {
+      /* 跨 realm 的 AbortSignal（jsdom、部分嵌入式运行时：本地 AbortSignal 传给
+         宿主 fetch 会被判非法）会抛 "Expected signal ... to be an instance of
+         AbortSignal"——去掉 signal 重试一次，避免把「有服务」误判成 demo。
+         注意不能用 instanceof（宿主抛的异常不属于本 realm 的 TypeError），
+         改按消息文本判定。真实浏览器不会走到这里。 */
+      if (opt.signal && /signal/i.test(String((e && e.message) || e))) {
+        delete opt.signal;
+        r = await fetch('/admin/tree', opt);
+      } else { throw e; }
+    }
     if(r && r.ok){
       try { SRW_TREE_CACHE = await r.json(); } catch (e) { return 'demo'; }
       return 'connected';
