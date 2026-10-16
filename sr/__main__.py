@@ -5,11 +5,14 @@ Produces 接口。argparse 五个子命令：
       建库（sr.db.init_db：十表 + 索引 + 默认 settings + balanced 种子树，幂等）；
       ``--import`` 走 sr/config.import_yaml（normalize 校验 + 体检 + 单事务写入，
       控制者裁定 1 同源）。
-- ``sr serve --db PATH [--port 8899] [--host HOST] [--checkpoint DIR]``
+- ``sr serve --db PATH [--port 8899] [--host HOST] [--checkpoint DIR]
+        [--console FILE]``
       §12 启动序列：显式 ``--checkpoint`` 时本任务只校验**目录存在性**——
       存在则打印「M2 才支持，当前以 heuristic 启动」警告并继续（不静默失败），
       不存在则拒绝启动（§15「校验失败拒绝启动，不静默降级」）；未指定 →
       heuristic。tagger 恒 ``"heuristic"``（M2 接检查点加载后才派第二值）。
+      ``--console`` 换 GET / 托管的控制台文件（Task 12，缺省仓库根
+      console-v7.html）。
       对未 init 的库先幂等 init（快速开始 ``sr serve`` 一步可达）。
 - ``sr fake-upstream [--port 8123] [--host HOST]``
       转调 sr.fake_upstream.run（Task 7/8 的故障注入假上游，§14.4 e2e 底座）。
@@ -53,6 +56,8 @@ def _parser() -> argparse.ArgumentParser:
     q.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
     q.add_argument("--checkpoint", default=None, metavar="DIR",
                    help="检查点目录（M2 才支持加载；本任务只校验目录存在）")
+    q.add_argument("--console", default=None, metavar="FILE",
+                   help="GET / 托管的控制台 HTML（默认仓库根 console-v7.html）")
 
     q = sub.add_parser("fake-upstream", help="故障注入假上游（§14.4 e2e 底座）")
     q.add_argument("--port", type=int, default=8123, help="监听端口（默认 8123）")
@@ -101,7 +106,7 @@ def _serve(args) -> int:
     conn.close()
     import uvicorn
     from sr.server import create_app
-    uvicorn.run(create_app(args.db, tagger="heuristic"),
+    uvicorn.run(create_app(args.db, tagger="heuristic", console_path=args.console),
                 host=args.host, port=args.port)
     return 0
 

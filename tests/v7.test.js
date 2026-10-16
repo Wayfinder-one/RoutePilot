@@ -372,6 +372,25 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   ok('反复切换后交互仍可用', (w.doTag(), await pend(700),
      doc.querySelectorAll('#railbody .stn.hit').length === 1));
 
+  /* ── Task 12：演示模态不受接线影响（spec §9.3 不变式）──
+     jsdom 以 about: 打开 → bootDetect 判 demo → 接线层零介入。 */
+  group('演示模态不受接线影响（Task 12）');
+  ok('无后端环境落入演示模态（SR_MODE=demo）', w.SR_MODE === 'demo', w.SR_MODE);
+  ok('接线层已随页载入（bootDetect 可用）', typeof w.bootDetect === 'function');
+  ok('接线层 Produces 函数齐备', ['apiTreeToLocal', 'pathToRows', 'doTagRemote', 'renderAllRemote']
+     .every(f => typeof w[f] === 'function'));
+  ok('顶栏标注「演示模式」（§9.1 演示行）', /演示模式/.test(doc.querySelector('.strip-brand').textContent),
+     doc.querySelector('.strip-brand').textContent);
+  ok('顶栏无「启发式打标」（connected 专属）', !/启发式打标/.test(doc.querySelector('.strip-brand').textContent));
+  ok('内置树未被 API 数据覆盖（节点 3 说明仍为演示文案）',
+     X.TREE[3].desc === '按难度换模型', X.TREE[3] && X.TREE[3].desc);
+  ok('演示 doTag 仍走内置推断（信号轨照常通电）',
+     (doc.getElementById('reqtext').value = '画一张系统架构图', w.setSess('new'), w.doTag(), await pend(700),
+      doc.querySelectorAll('#railbody .stn.hit').length === 1));
+  ok('信号墙仍是本地 17 卡（inferTags 未被接线替代）',
+     doc.querySelectorAll('#tags .gauge').length === 17,
+     '实际 ' + doc.querySelectorAll('#tags .gauge').length);
+
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
   if (fail) { console.log('\n失败项：'); bad.forEach(b => console.log('  · ' + b)); process.exit(1); }

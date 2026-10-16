@@ -39,10 +39,12 @@ import os
 import time
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import (JSONResponse, PlainTextResponse, FileResponse,
+                               StreamingResponse)
 
 import sr.db as db
 from sr import config
@@ -1208,15 +1210,23 @@ def _est_cost(model: str | None, prices: dict) -> tuple[float | None, bool]:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 10) create_app —— 端点装配（§7.1 /v1 + §9.1-9.2 admin 读端点 + Task 10 写端点
-#     + /metrics；控制台托管 GET / 归 Task 12）
+#     + /metrics + 控制台托管 GET /（Task 12，§9.1 双模））
 # ─────────────────────────────────────────────────────────────────────────────
 
+# 控制台文件默认仓库根的 console-v7.html（§9.1：单文件、无构建链；路径可经
+# ``sr serve --console`` 换）
+_CONSOLE_DEFAULT = Path(__file__).resolve().parent.parent / "console-v7.html"
 
-def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
+
+def create_app(db_path: str, tagger: str = "heuristic",
+               console_path: str | None = None) -> FastAPI:
     """构造路由应用（简报 Produces 接口逐字）。
 
     :param db_path: SQLite 路径（调用方先 init_db；本层每请求自开连接）。
     :param tagger: ``checkpoint`` | ``heuristic``（x-sr-tagger 回显，裁定 1）。
+    :param console_path: GET / 托管的控制台 HTML（Task 12，§9.1）；缺省仓库根
+        console-v7.html，``sr serve --console`` 可换。文件缺失不拦启动——
+        控制台 404，路由主链不受影响。
 
     构造时从 requests 表 backfill sr_requests_total（裁定 6），计数器挂
     ``app.state.metrics``（每 app 实例独立，测试互不串扰）。
@@ -1231,6 +1241,17 @@ def create_app(db_path: str, tagger: str = "heuristic") -> FastAPI:
     finally:
         conn.close()
     app.state.metrics = metrics
+    app.state.console_path = console_path
+
+    # ── 控制台托管（§9.1：单文件双模；页面自行 bootDetect 判 connected/demo）──
+    @app.get("/")
+    async def console_root():
+        p = Path(app.state.console_path) if app.state.console_path \
+            else _CONSOLE_DEFAULT
+        if not p.is_file():
+            return JSONResponse(
+                {"detail": f"console file not found: {p}"}, status_code=404)
+        return FileResponse(p, media_type="text/html; charset=utf-8")
 
     # ── /v1 双协议主流程（§7.1）──
     @app.post("/v1/chat/completions")
