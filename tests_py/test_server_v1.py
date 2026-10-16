@@ -47,9 +47,9 @@ def _reset_fail_counts():
     """熔断计数是 sr.models 模块级内存 dict，用例间清零防串扰（spec §8.3）。"""
     import sr.models as models
 
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
     yield
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
 
 
 def _serve(app, port: int):

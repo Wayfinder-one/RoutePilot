@@ -23,9 +23,9 @@ def _reset_fail_counts():
     """熔断计数是 sr.models 模块级内存 dict，用例间清零防串扰（spec §8.3）。"""
     import sr.models as models
 
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
     yield
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
 
 
 def _conn(tmp_path):
@@ -112,3 +112,22 @@ def test_circuit_recover(tmp_path):
     assert not is_circuit_open(m)
     row = conn.execute("SELECT ok, break_reason FROM models WHERE id=?", (m,)).fetchone()
     assert row["ok"] == 1 and row["break_reason"] is None
+
+
+def test_circuit_half_open_after_window(tmp_path, monkeypatch):
+    """M3：熔断打开后经过 HALF_OPEN_AFTER_S 放行一次探测（is_circuit_open 回 False）；
+    未过窗仍打开；成功清零恢复。"""
+    import sr.models as models
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(models.time, "monotonic", lambda: clock["t"])
+    conn = _conn(tmp_path)
+    m = "qwen3-8b"
+    for _ in range(3):
+        record_failure(conn, m)
+    assert is_circuit_open(m)                       # 刚打开
+    clock["t"] += 1.0
+    assert is_circuit_open(m)                       # 未过窗仍打开
+    clock["t"] += models.HALF_OPEN_AFTER_S          # 过半开窗口
+    assert not is_circuit_open(m)                   # 半开：放行一次探测
+    record_success(conn, m)
+    assert not is_circuit_open(m)                   # 探测成功 → 清零恢复

@@ -92,9 +92,9 @@ def _reset_fail_counts():
     （同 test_session / test_server_v1 / test_e2e_loop 口径）。"""
     import sr.models as models
 
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
     yield
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
 
 
 @pytest.fixture

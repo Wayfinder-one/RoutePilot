@@ -420,9 +420,9 @@ def _reset_fail_counts():
     502——用例前后清零（同 test_server_v1 / test_session 口径）。"""
     import sr.models as models
 
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
     yield
-    models._FAIL_COUNTS.clear()
+    models.clear_circuit_state()
 
 
 @pytest.fixture

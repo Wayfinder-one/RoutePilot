@@ -11,13 +11,15 @@
   达 3 次写库 ``models.ok=0`` + break_reason；成功清零并恢复 ``ok=1``。
 
 约定：写库函数不自行 commit，事务由调用方控制（约定同 sr/db.py）；
-半开探测（5 分钟后发一次探测请求，成功则恢复，§8.3 末注释）属 M3 定时器，
-本任务只留注释占位。
+半开探测（M3）：连续失败达阈值后经 HALF_OPEN_AFTER_S 放行一次探测（见
+:func:`is_circuit_open`）；人工复位 :func:`reset_circuit`（M6）。
 """
 
 from __future__ import annotations
 
 import os
+import threading
+import time
 from dataclasses import dataclass
 
 
@@ -110,18 +112,38 @@ def ladder_next(conn, model_id: str) -> str | None:
 # 3) 熔断 —— spec §8.3 逐字（fail_counts 内存 dict + 阈值 3 + 写库 ok/break_reason）
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 连续失败计数（内存 dict；spec §8.3 逐字，模块私有加下划线）
+# 连续失败计数（内存 dict；spec §8.3 逐字，模块私有加下划线）。
+# 半开探测（M3）：连续失败达阈值后置「打开时刻」，超过 HALF_OPEN_AFTER_S 允许一次
+# 探测（is_circuit_open 回 False）；成功/复位清计数与时刻。多线程（uvicorn 线程 /
+# 测试线程）共享，读写一律持锁。
 _FAIL_COUNTS: dict[str, int] = {}
+_FAIL_LOCK = threading.Lock()
+_CIRCUIT_OPENED_AT: dict[str, float] = {}
+
+# 半开探测窗口（spec §8.3 末注「5 分钟后发一次探测请求」）
+HALF_OPEN_AFTER_S = 300.0
 
 
 def is_circuit_open(model_id: str) -> bool:
-    """熔断是否打开：内存连续失败计数 ≥ 3（spec §8.3 逐字）。"""
-    return _FAIL_COUNTS.get(model_id, 0) >= 3  # 连续 3 次失败
+    """熔断是否打开：内存连续失败计数 ≥ 3 **且未过半开窗口**（spec §8.3）。
+
+    M3：达到阈值后经过 HALF_OPEN_AFTER_S（默认 5 分钟）即「半开」——放行一次探测，
+    成功则 record_success 清零恢复，失败则再次打开。旧实现 ≥3 次即永久隔离（被跳过
+    的模型永远等不到 record_success），唯一出路是重启进程或人工 reset。
+    """
+    with _FAIL_LOCK:
+        if _FAIL_COUNTS.get(model_id, 0) < 3:
+            return False
+        opened = _CIRCUIT_OPENED_AT.get(model_id, 0.0)
+        return (time.monotonic() - opened) < HALF_OPEN_AFTER_S
 
 
 def record_failure(conn, model_id: str) -> None:
-    """失败计数 +1；达 3 次写库 ok=0 + break_reason（spec §8.3 逐字）。"""
-    _FAIL_COUNTS[model_id] = _FAIL_COUNTS.get(model_id, 0) + 1
+    """失败计数 +1；达 3 次写库 ok=0 + break_reason（spec §8.3 逐字）+ 记打开时刻。"""
+    with _FAIL_LOCK:
+        _FAIL_COUNTS[model_id] = _FAIL_COUNTS.get(model_id, 0) + 1
+        if _FAIL_COUNTS[model_id] >= 3:
+            _CIRCUIT_OPENED_AT[model_id] = time.monotonic()
     if _FAIL_COUNTS[model_id] >= 3:
         conn.execute("UPDATE models SET ok = 0, break_reason = ? WHERE id = ?",
                      ("连续失败 · 自动熔断", model_id))
@@ -129,19 +151,25 @@ def record_failure(conn, model_id: str) -> None:
 
 def record_success(conn, model_id: str) -> None:
     """成功清零计数并恢复 ok=1（spec §8.3 逐字）。"""
-    _FAIL_COUNTS.pop(model_id, None)
+    with _FAIL_LOCK:
+        _FAIL_COUNTS.pop(model_id, None)
+        _CIRCUIT_OPENED_AT.pop(model_id, None)
     conn.execute("UPDATE models SET ok = 1, break_reason = NULL WHERE id = ?",
                  (model_id,))
 
 
 def reset_circuit(conn, model_id: str) -> None:
     """人工复位（M6，audit Major）：清内存连续失败计数 + 恢复 ok=1 /
-    break_reason=NULL。原实现 ≥3 次失败后进程内永久隔离（被跳过的模型永远等不到
-    record_success），唯一恢复途径是重启进程，且重启后内存清零、DB 仍 ok=0——
-    展示与行为分裂。半开探测定时器仍留 M3，本函数是 M1 给出的管理出口。"""
-    _FAIL_COUNTS.pop(model_id, None)
+    break_reason=NULL。半开探测定时器见 :func:`is_circuit_open`（M3）。"""
+    with _FAIL_LOCK:
+        _FAIL_COUNTS.pop(model_id, None)
+        _CIRCUIT_OPENED_AT.pop(model_id, None)
     conn.execute("UPDATE models SET ok = 1, break_reason = NULL WHERE id = ?",
                  (model_id,))
 
-# 半开探测：5 分钟后发一次探测请求，成功则恢复（spec §8.3 末注释逐字）。
-# 本任务（M1 Task 6）只留注释占位：需要定时器，M3 再做定时探测。
+
+def clear_circuit_state() -> None:
+    """清空全部熔断内存状态（测试隔离用；生产不调用）。"""
+    with _FAIL_LOCK:
+        _FAIL_COUNTS.clear()
+        _CIRCUIT_OPENED_AT.clear()
