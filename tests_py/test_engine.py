@@ -7,8 +7,8 @@
 domain 置信度取档 1 中点 0.45；其余逐字未动。
 """
 
-from sr.engine import (RouteDecision, match, evaluate, evaluate_trace,
-                       rows_to_tree, TEMPLATES)
+from sr.engine import (Branch, Node, RouteDecision, match, evaluate, evaluate_trace,
+                       rows_to_tree, resolve_session, TEMPLATES)
 import sr.db as db
 
 SIG = {   # 一份「编程且难」的信号包（规范键/档位）
@@ -323,4 +323,100 @@ def test_resolve_does_not_share_empty_action_dict():
     d = _resolve(None, None, [1, 0])
     assert d.model is None and d.kind == "route"
     assert _EMPTY_ACTION == {"kind": "route"}, _EMPTY_ACTION
+
+
+# ── backlog minor：also_match 语义（同节点被抢先分支 + 停用节点不混入） ────────────
+
+def _br(idx, cond, action, enabled=True):
+    return Branch(idx=idx, cond=cond, action=action, trial=None, enabled=enabled, kids=[])
+
+
+def test_also_match_same_node_and_excludes_disabled():
+    """§5.2「被上方抢先」：命中节点内排在本命中之后的分支、及其后 enabled 节点的
+    match 分支都要收录；停用节点的分支不得混入（旧实现漏收前者、误收后者）。"""
+    nodes = [
+        Node(idx=1, branches=[
+            _br(10, [], {"kind": "route", "model": "m1"}),      # 命中（cond [] 恒真）
+            _br(11, [], {"kind": "route", "model": "m2"}),      # 同节点、被抢先
+        ]),
+        Node(idx=2, enabled=False, branches=[                    # 停用节点
+            _br(20, [], {"kind": "route", "model": "m3"}),      # 不应进 also_match
+        ]),
+        Node(idx=3, branches=[
+            _br(30, [], {"kind": "route", "model": "m4"}),      # 下方节点、被抢先
+        ]),
+    ]
+    tr = evaluate_trace(nodes, SIG, CUTS)
+    am = {(a["node"], a["branch"]) for a in tr["also_match"]}
+    assert (1, 1) in am, am               # 同节点内被抢先
+    assert (3, 0) in am, am               # 下方节点被抢先
+    assert (2, 0) not in am, am           # 停用节点的分支不混入
+    assert tr["decision"].model == "m1"   # 命中仍是首个分支
+
+
+def test_also_match_excludes_pre_hit_special_match():
+    """命中之前的分支若 match（只可能是被跳过的 special）也不算「被上方抢先」
+    （用户口径：只收第一个命中之后的分支）。"""
+    nodes = [Node(idx=1, branches=[
+        _br(10, [], {"kind": "special", "special": "sticky"}),  # match 但 special → 跳过
+        _br(11, [], {"kind": "route", "model": "hit"}),         # 命中
+        _br(12, [], {"kind": "route", "model": "post"}),        # 命中后被抢先
+    ])]
+    tr = evaluate_trace(nodes, SIG, CUTS)
+    am = {(a["node"], a["branch"]) for a in tr["also_match"]}
+    assert tr["decision"].model == "hit"
+    assert (1, 2) in am, am
+    assert (1, 0) not in am and (1, 1) not in am, am
+
+
+# ── backlog minor：模板按语义锚点定位，不靠裸 idx ────────────────────────────────
+
+def test_templates_anchor_by_role_not_raw_idx():
+    """结构调整（顶层 idx 整体平移）后，_quality/_compliance 仍改对节点。"""
+    import copy
+    from sr.engine import _quality, _compliance, _by_role
+
+    shifted = copy.deepcopy(TEMPLATES["balanced"])
+    for node in shifted:                                # 模拟节点重编号
+        node["idx"] += 100
+
+    q = _quality(shifted)
+    cost = _by_role(q, "cost")
+    assert [b["cond"] for b in cost["branches"]] == \
+        [[{"tag": "context", "op": "is", "values": [0]}]]
+    assert _by_role(q, "fallback")["branches"][0]["action"]["model"] == "qwen3-32b"
+
+    c = _compliance(shifted)
+    jb = next(b for b in _by_role(c, "safety")["branches"]
+              if b["cond"][0].get("tag") == "jailbreak")
+    assert jb["cond"][0]["values"] == [1]
+    pii = next(b for b in _by_role(c, "safety")["branches"]
+               if b["cond"][0].get("tag") == "pii")
+    assert len(pii["cond"][0]["values"]) == 30          # PII_KEYS 全集
+
+
+def test_by_role_raises_when_anchor_missing():
+    """锚点缺失 → 显式报错（不再静默改错对象）。"""
+    import pytest
+    from sr.engine import _by_role
+
+    with pytest.raises(ValueError):
+        _by_role([{"idx": 5}], "cost")
+
+
+# ── backlog minor：单档阶梯回环不得假解锁 ───────────────────────────────────────
+
+def test_resolve_session_single_ladder_no_false_unlock(tmp_path):
+    """阶梯只有一档时 ladder_next 到头回第一格 = 自己（§8.2）；应视为「无处可换」
+    退化为重新走树，而非 source='unlocked' + unlocks+1 却没换模型。"""
+    conn = db.init_db(str(tmp_path / "t.db"))
+    conn.execute("UPDATE settings SET value = 'qwen3-8b' WHERE key = 'ladder'")
+    conn.execute("INSERT INTO sessions(id, current_model, last_active, turns, unlocks)"
+                 " VALUES('s1','qwen3-8b', datetime('now'), 1, 0)")
+    conn.commit()
+    d = resolve_session(conn, "s1", None,
+                        {"session_sticky": "1", "session_idle": "1800"},
+                        feedback="want_different")
+    assert d is None, d
+    assert conn.execute("SELECT unlocks FROM sessions WHERE id='s1'").fetchone()[0] == 0
 

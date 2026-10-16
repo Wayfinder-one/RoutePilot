@@ -103,6 +103,8 @@ class Node:
 
 # balanced 种子树（原 sr/db.py BALANCED_YAML 逐字迁入，内容零改动——迁移做了
 # 「git HEAD 旧字面量 vs 本常量」的逐字段全等 + 规范化 JSON 字节比对，见任务报告）。
+# 例外：4 个节点各带一个 `_role` 语义锚点（safety/reasoning/cost/fallback），仅供
+# _quality/_compliance 定位用（backlog：免裸 idx 位置假设）；落库/序列化路径不读它。
 # cond/action 用规范键，语法见 spec §5.1（op ∈ is/in/gte/lte/contains；or/not 只包
 # 普通子句；cond:[] 兜底仅出现在最后一个节点 idx=9）。
 # 源：console-v7.html `const TREE` 的 8 节点，中文显示词按 §6.3 键表换成规范键；
@@ -130,7 +132,7 @@ _BALANCED: list[dict] = [
           "cond": [{"tag": "user_feedback", "op": "is", "values": ["want_different"]}],
           "action": {"kind": "special", "special": "ladder_next"}},
      ]},
-    {"idx": 1, "name": "安全", "desc": "先拦危险请求",
+    {"idx": 1, "name": "安全", "desc": "先拦危险请求", "_role": "safety",
      "branches": [
          # 可疑 至少 很可疑（§6.3 档位索引 2）
          {"idx": 10,
@@ -164,7 +166,7 @@ _BALANCED: list[dict] = [
                "action": {"kind": "route", "model": "llava-omni"}},
           ]},
      ]},
-    {"idx": 3, "name": "编程与推理", "desc": "按难度换模型",
+    {"idx": 3, "name": "编程与推理", "desc": "按难度换模型", "_role": "reasoning",
      "branches": [
          # 学科 是 计算机 而且 难度 至少 较难（把握度 至少 比较确定 → conf_min 并入该子句）
          {"idx": 30,
@@ -197,7 +199,7 @@ _BALANCED: list[dict] = [
           "action": {"kind": "route", "model": "qwen3-32b", "think": "light",
                      "fallback": ["qwen3-8b"]}},
      ]},
-    {"idx": 5, "name": "成本控制", "desc": "简单请求走小模型",
+    {"idx": 5, "name": "成本控制", "desc": "简单请求走小模型", "_role": "cost",
      "branches": [
          # 难度 是 简单 而且 长度 属于 很短、一般（context 档位 0/1）
          {"idx": 50,
@@ -220,7 +222,7 @@ _BALANCED: list[dict] = [
           "cond": [{"tag": "tenant", "op": "is", "values": ["premium"]}],
           "action": {"kind": "route", "model": "qwen3-32b"}},
      ]},
-    {"idx": 9, "name": "其他（兜底）", "desc": "全部未命中时",
+    {"idx": 9, "name": "其他（兜底）", "desc": "全部未命中时", "_role": "fallback",
      "branches": [
          # 什么情况都算（cond:[] 兜底，仅最后节点）
          {"idx": 90,
@@ -250,49 +252,66 @@ def _route_all_to(nodes: list[dict], model: str) -> list[dict]:
     return out
 
 
+def _by_role(nodes: list[dict], role: str) -> dict:
+    """按语义锚点 ``_role`` 取 balanced 模板节点（backlog：替换裸 ``idx ==`` 位置假设）。
+
+    模板结构调整（换节点号）时不再静默改错对象——找不到锚点即抛错（模块 import 期
+    即暴露，属开发期错误）。``_role`` 仅存在于内存模板 dict，落库路径（_seed_branch /
+    节点 INSERT）只读 idx/name/desc/branches，不写库。
+    """
+    for node in nodes:
+        if node.get("_role") == role:
+            return node
+    raise ValueError(
+        f"balanced 模板缺少 _role={role!r} 的节点——"
+        "_quality/_compliance 与模板结构不同步（勿只按 idx 猜测）")
+
+
 def _quality(nodes: list[dict]) -> list[dict]:
     """quality：仅 context 档 0 落最低档，其余不变（§5.3「默认高档，简单请求才降级」）。
 
     以 balanced 为底改三处（裁定声明，记任务报告）：
-    - 成本控制（节点 5）三条降级支收窄为一条 context 档 0 → qwen3-8b
+    - 成本控制节点（``_role="cost"``）三条降级支收窄为一条 context 档 0 → qwen3-8b
       （原 50 的 easy+短/中、51 长对话、52 夜间不再降档，否则「仅 context 档 0
       落最低档」不成立）；
-    - 兜底（节点 9）去向升为 qwen3-32b——兜底是「默认」路径，若仍落 8b 则
-      §5.3「默认高档」与主句同时被违反（夜间/长对话/未命中流量全绕回最低档）；
-    - 编程与推理（节点 3）分支 32 升回 qwen3-32b（M9 后 balanced 的 32 = 简单+
-      长文 → 8b 轻度，在 quality 下破坏「仅 context 档 0 落最低档」）——保留
-      think light、形状对齐分支 40（同模型轻度思考）。
+    - 兜底节点（``_role="fallback"``）去向升为 qwen3-32b——兜底是「默认」路径，若仍
+      落 8b 则 §5.3「默认高档」与主句同时被违反（夜间/长对话/未命中流量全绕回最低档）；
+    - 编程与推理节点（``_role="reasoning"``）里带 context 子句的分支（balanced 的
+      32 = 简单+长文 → 8b 轻度）升回 qwen3-32b——否则破坏「仅 context 档 0 落最低档」。
     """
     out = copy.deepcopy(nodes)
-    for node in out:
-        if node["idx"] == 5:
-            node["branches"] = [
-                {"idx": 50,
-                 "cond": [{"tag": "context", "op": "is", "values": [0]}],
-                 "action": {"kind": "route", "model": "qwen3-8b"}},
-            ]
-        elif node["idx"] == 9:
-            node["branches"][0]["action"]["model"] = "qwen3-32b"
-        elif node["idx"] == 3:
-            for b in node["branches"]:
-                if b["idx"] == 32:
-                    b["action"]["model"] = "qwen3-32b"
+    _by_role(out, "cost")["branches"] = [
+        {"idx": 50,
+         "cond": [{"tag": "context", "op": "is", "values": [0]}],
+         "action": {"kind": "route", "model": "qwen3-8b"}},
+    ]
+    fallback = _by_role(out, "fallback")
+    fallback["branches"][0]["action"]["model"] = "qwen3-32b"
+    for branch in _by_role(out, "reasoning")["branches"]:
+        if any(isinstance(c, dict) and c.get("tag") == "context"
+               for c in branch["cond"]):
+            branch["action"]["model"] = "qwen3-32b"
     return out
 
 
 def _compliance(nodes: list[dict]) -> list[dict]:
     """compliance：可疑 ≥1 或 敏感信息非空 一律 block（§5.3「严格合规」）。
 
-    以 balanced 为底改，仅放宽安全（节点 1）两条分支的条件，其余逐字不变：
+    以 balanced 为底改，仅放宽安全节点（``_role="safety"``）两条分支的条件，其余逐字
+    不变（按子句 tag 定位，不再按分支序号）：
     - jailbreak 门槛从档 2（很可疑）放宽到档 1（≥1 即拦）；
     - pii 从三型扩为值空间全集（tags.PII_KEYS 全 30 型）——contains 全集 ⇔ 非空
       （cond 语法无「非空」操作符，§5.1 op 枚举固定，全集 contains 是等价表达）。
     """
     out = copy.deepcopy(nodes)
-    for node in out:
-        if node["idx"] == 1:
-            node["branches"][0]["cond"][0]["values"] = [1]
-            node["branches"][1]["cond"][0]["values"] = list(PII_KEYS)
+    for branch in _by_role(out, "safety")["branches"]:
+        for clause in branch["cond"]:
+            if not isinstance(clause, dict):
+                continue
+            if clause.get("tag") == "jailbreak":
+                clause["values"] = [1]
+            elif clause.get("tag") == "pii":
+                clause["values"] = list(PII_KEYS)
     return out
 
 
@@ -463,7 +482,8 @@ def _walk(nodes: list[Node], signals: dict, conf_thresholds):
     - ``("skip", node)``                    停用节点；
     - ``("miss", node, reason)``            节点无命中（reason: new_session|no_match）；
     - ``("hit", node, i, action, trial)``   首个 enabled 且 match 的非 special 分支；
-    - ``("also", node, i)``                 命中后余下节点里 match 的被抢先分支。
+    - ``("also", node, i)``                 被「上方」抢先的 match 分支（命中节点内
+      排在本命中之后的 + 其后 enabled 节点里的）——停用节点的分支不计。
 
     special 分支（起点会话沿用）恒视为 miss——沿用/解锁在进树前由 resolve_session
     处理（§4.4 流程：先查会话，再走树），树内节点 0 仅供控制台展示语义。
@@ -478,6 +498,10 @@ def _walk(nodes: list[Node], signals: dict, conf_thresholds):
     hit = False
     for node in nodes:
         if hit:                                     # 命中后只收集 also_match
+            # backlog 修：停用节点的分支不算「被上方抢先」，旧实现会把它们混入
+            # also_match（试算面板标灰错位）。
+            if not node.enabled:
+                continue
             for i, branch in enumerate(node.branches):
                 if branch_hit(branch):
                     yield ("also", node, i)
@@ -499,6 +523,11 @@ def _walk(nodes: list[Node], signals: dict, conf_thresholds):
         else:
             i, branch = found
             yield ("hit", node, i, _action_of(branch), branch.trial)
+            # backlog 修：命中节点内、排在本命中之后的 match 分支同样是「被上方
+            # （同节点更靠上）抢先」——旧实现直接 break，漏收这些分支（标灰缺失）。
+            for j in range(i + 1, len(node.branches)):
+                if branch_hit(node.branches[j]):
+                    yield ("also", node, j)
             hit = True
 
 
@@ -761,8 +790,11 @@ def resolve_session(conn, session_id: str | None, signals, settings, feedback=No
             new_model = ladder_up(conn, current) or ladder_next(conn, current)
         else:                    # want_different → 换一个（ladder_next）
             new_model = ladder_next(conn, current)
-        if new_model is None:
-            return None          # 阶梯未配置/无处可去 → 重新走树（§4.4 R3），不动 unlocks
+        if new_model is None or new_model == current:
+            # 阶梯未配置/无处可去 → 重新走树（§4.4 R3），不动 unlocks。
+            # backlog 修：单档阶梯时 ladder_next 到头回第一格 = 自己（§8.2 语义），
+            # 旧实现会 source='unlocked' + unlocks+1 却没换模型——按「无处可换」处理。
+            return None
         conn.execute(
             "UPDATE sessions SET current_model = ?, last_active = datetime('now'), "
             "turns = turns + 1, unlocks = unlocks + 1 WHERE id = ?",
