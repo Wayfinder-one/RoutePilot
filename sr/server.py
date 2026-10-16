@@ -109,7 +109,8 @@ def _load_settings(conn) -> dict:
 
 # ── settings 值校验（I2，终审 Important）────────────────────────────────────────
 # 消费点对值形态有硬要求：engine 用 int(session_idle)、server 用 int(max_retries)/
-# int(batch_window_ms)、budget_water 直接进预算比较、ladder/budget_route 是模型 id
+# int(batch_window_ms)、budget_water/budget_daily_limit_usd 直接进预算比较（M2
+# 执行点）、ladder/budget_route 是模型 id
 # 引用。旧实现只校验键集，一次 PUT 200 写入 "abc" 就会让**每个** /v1 请求 500 且
 # 持久不复原。以下白名单校验由 /admin/settings 与 config.import_yaml 共用
 # （config 侧延迟 import 本函数，避免模块级反向引用成环）。
@@ -1064,8 +1065,11 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
             daily = conn.execute(
                 "SELECT COALESCE(SUM(cost), 0) FROM requests "
                 "WHERE ts >= date('now', 'start of day')").fetchone()[0]
-            if daily >= float(settings["budget_daily_limit_usd"]) \
-                    * float(settings["budget_water"]):
+            # .get 带默认（代码既有约定，同 max_retries/session_idle）：M1 之前
+            # 初始化的旧库缺新键时不至 KeyError 成每请求 500；PUT /admin/settings
+            # 全键写入后即愈合。
+            if daily >= float(settings.get("budget_daily_limit_usd") or 10.0) \
+                    * float(settings.get("budget_water") or 0.8):
                 decision.model = settings["budget_route"]
                 metrics.inc("sr_budget_triggered_total")
                 diag["x-sr-budget"] = "1"
