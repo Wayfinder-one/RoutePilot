@@ -1187,45 +1187,22 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
 
   <div id="addModelBox"></div>
 
-  <div class="split-3 rv">
-    <div class="panel brk">
-      <div class="panel-hd"><h2>供应商</h2><span class="sub">PROVIDERS</span></div>
-      <div class="tbl-wrap">
-        <div class="tbl-scroll">
-          <table class="tbl">
-            <thead><tr><th>名称</th><th>协议</th><th class="num">状态</th></tr></thead>
-            <tbody id="provbody"></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="note" style="margin-top:var(--s3)">地址与鉴权方式在「接入新模型」里逐项填写，不在此重复。</div>
-    </div>
-
-    <div class="panel brk" style="grid-column:span 2">
-      <div class="panel-hd"><h2>模型清单</h2><span class="sub">5 个 · 能力标签决定可被谁选中</span></div>
-      <div class="tbl-wrap">
-        <div class="tbl-scroll">
-          <table class="tbl">
-            <thead><tr><th style="width:120px">名称</th><th style="width:92px">协议</th><th>上游模型名</th><th style="width:150px">能力</th><th class="num" style="width:44px">阶梯</th><th style="width:88px">状态</th></tr></thead>
-            <tbody id="modbody"></tbody>
-          </table>
-        </div>
+  <div class="panel brk rv">
+    <div class="panel-hd"><h2>模型清单</h2><span class="sub">5 个 · 能力标签决定可被谁选中</span></div>
+    <div class="tbl-wrap">
+      <div class="tbl-scroll">
+        <table class="tbl">
+          <thead><tr><th style="width:120px">名称</th><th style="width:92px">协议</th><th>上游模型名</th><th style="width:150px">能力</th><th class="num" style="width:44px">阶梯</th><th style="width:88px">状态</th></tr></thead>
+          <tbody id="modbody"></tbody>
+        </table>
       </div>
     </div>
-  </div>
 
-  <div class="panel brk rv" style="margin-top:var(--s5)">
-    <div class="panel-hd"><h2>模型阶梯</h2><span class="sub">按能力从低到高排序</span></div>
+    <div class="panel-hd" style="margin-top:var(--s5)">
+      <h2>模型阶梯</h2><span class="sub">按能力从低到高排序</span>
+    </div>
     <div class="note" style="margin-bottom:var(--s4)">「升一档」取后一格，「换一个模型」取下一格。反馈解锁依赖此顺序；未配置时「答错了」退化为重新判断。</div>
     <div id="ladderbox" class="chipset" style="gap:var(--s2)"></div>
-  </div>
-
-  <div class="panel brk rv" style="margin-top:var(--s5)">
-    <div class="panel-hd clickable" onclick="foldPanel(this)">
-      <h2>两套 SDK 的差异</h2><span class="sub">可核对明细</span>
-      <span class="end fold-cue">▸</span>
-    </div>
-    <div class="fold-bd" style="display:none"><div id="prototable"></div></div>
   </div>
 </section>
 
@@ -1981,22 +1958,6 @@ const PROVIDERS = [
   {name:'Anthropic', proto:'anthropic', base:'https://api.anthropic.com', keyEnv:'ANTHROPIC_API_KEY', ok:true}
 ];
 
-const PROTO = {
-  openai:{ label:'OpenAI 兼容', desc:'vLLM · Ollama · 各类中转 · OpenAI 官方',
-    rows:[['鉴权','Authorization: Bearer <密钥>'],
-          ['路径','{基址}/chat/completions（基址需含 /v1）'],
-          ['请求体','system 作为 messages 的第一条'],
-          ['流式','data: {chunk} … data: [DONE]'],
-          ['用量','末尾的 chunk 里携带 usage'],
-          ['错误','{"error":{"message","type","code"}}']] },
-  anthropic:{ label:'Anthropic', desc:'Claude 官方与兼容网关',
-    rows:[['鉴权','x-api-key: <密钥>　+　anthropic-version: 2023-06-01'],
-          ['路径','{基址}/v1/messages（基址不含 /v1）'],
-          ['请求体','system 是独立字段，不放在 messages 里'],
-          ['流式','事件序列 message_start → … → message_stop'],
-          ['用量','在 message_delta 事件里'],
-          ['错误','{"type":"error","error":{"type","message"}}']] }
-};
 const CAPS = ['文字','图片','长上下文','超长','便宜','中等','贵','快','中速','慢'];
 const SPECIAL = [
   {id:'沿用上次的模型', cap:'会话沿用'},
@@ -2146,16 +2107,6 @@ function foldNode(btn){
   const node = btn.closest('.tnode');
   node.classList.toggle('folded');
   btn.textContent = node.classList.contains('folded') ? '展开' : '折叠';
-}
-
-/* 可折叠面板：标题行整行点击，收起/展开正文（模型页「两套 SDK 的差异」在用） */
-function foldPanel(hd){
-  const body = hd.parentElement.querySelector('.fold-bd');
-  if(!body) return;
-  const open = body.style.display === 'none';
-  body.style.display = open ? '' : 'none';
-  const cue = hd.querySelector('.fold-cue');
-  if(cue) cue.textContent = open ? '▾' : '▸';
 }
 
 /* ⋯ 菜单 */
@@ -2795,12 +2746,7 @@ function quick(btn){
    模型页
    ══════════════════════════════════════════════════════════════════════ */
 function renderModels(){
-  const pb = document.getElementById('provbody'), mb = document.getElementById('modbody');
-  if(pb) pb.innerHTML = PROVIDERS.map(p =>
-    `<tr><td><b style="font-size:var(--fs-micro)">${p.name}</b>
-        <div class="mono" style="font-size:var(--fs-nano);color:var(--text-4)">${p.base}</div></td>
-      <td><span class="chip ice"><span class="v">${p.proto === 'openai' ? 'OpenAI' : 'Anthropic'}</span></span></td>
-      <td class="num"><span class="st"><span class="d g"></span>正常</span></td></tr>`).join('');
+  const mb = document.getElementById('modbody');
   if(mb) mb.innerHTML = MODELS.map(m =>
     `<tr><td class="mono" style="font-weight:600;font-size:var(--fs-micro)">${m.id}</td>
       <td><span class="chip ice"><span class="v">${m.proto === 'openai' ? 'OpenAI' : 'Anthropic'}</span></span></td>
@@ -2819,19 +2765,6 @@ function renderModels(){
       `${i ? '<span class="and">→</span>' : ''}<span class="chip ${i === sorted.length-1 ? 'key' : ''}">
         <span class="k">第 ${i} 档</span><span class="v mono">${m.id}</span>
         <span class="op">${m.cap}</span></span>`).join('');
-  }
-  const pt = document.getElementById('prototable');
-  if(pt){
-    const keys = PROTO.openai.rows.map(r => r[0]);
-    pt.innerHTML = `<div class="tbl-wrap"><div class="tbl-scroll"><table class="tbl">
-      <thead><tr><th style="width:92px">环节</th>
-        <th style="width:44%">${PROTO.openai.label}<div style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-4)">${PROTO.openai.desc}</div></th>
-        <th>${PROTO.anthropic.label}<div style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text-4)">${PROTO.anthropic.desc}</div></th></tr></thead>
-      <tbody>${keys.map((k,i) => `<tr>
-        <td style="font-family:var(--mono);font-size:var(--fs-micro);color:var(--text-3)">${k}</td>
-        <td class="mono" style="font-size:var(--fs-nano);color:var(--text-2)">${PROTO.openai.rows[i][1]}</td>
-        <td class="mono" style="font-size:var(--fs-nano);color:var(--text-2)">${PROTO.anthropic.rows[i][1]}</td></tr>`).join('')}
-      </tbody></table></div></div>`;
   }
   applyI18n();
 }

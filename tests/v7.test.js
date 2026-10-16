@@ -2,7 +2,7 @@
    覆盖：语法、初始化、五页可渲染、信号轨通电与精简、信号条与折叠卡墙、
         分流树、表单、分档、中英切换、主题切换
    v7 表示层改动：遥测条移除、页头编号移除、请求面板去下拉、信号条 + 卡墙默认折叠、
-   miss 站点不列条件、熄灯折叠、SDK 差异默认折叠。
+   miss 站点不列条件、熄灯折叠。
    沿用既有教训：白名单只放裸标识符；脚本评分 + 真实浏览器截图两者都要。*/
 const fs = require('fs');
 const path = require('path');
@@ -87,10 +87,11 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   ok('分流树已渲染', doc.querySelectorAll('.tnode').length === 8,
      '实际 ' + doc.querySelectorAll('.tnode').length);
   ok('模型清单已渲染', doc.querySelectorAll('#modbody tr').length === 5);
-  ok('供应商已渲染', doc.querySelectorAll('#provbody tr').length === 2);
+  ok('模型页不再单列供应商面板', !doc.getElementById('provbody'));
   ok('分档 4 组已渲染', doc.querySelectorAll('#bandbox .band').length === 4);
   ok('把握度分档已渲染', doc.querySelectorAll('#confbox .dist .seg').length === 4);
-  ok('SDK 差异 6 行', doc.querySelectorAll('#prototable tbody tr').length === 6);
+  ok('模型页不再单列 SDK 差异面板', !doc.getElementById('prototable'));
+  ok('模型阶梯并入模型清单面板', !!doc.querySelector('#p-models .panel #ladderbox'));
 
   group('v7 降学习成本 · 表示层');
   ok('遥测条已移除', !doc.querySelector('.tele'));
@@ -256,12 +257,6 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   ok('故障模型状态可辨', /故障/.test(doc.getElementById('modbody').textContent));
   ok('模型阶梯 4 档（故障模型不入阶梯）', doc.querySelectorAll('#ladderbox .chip').length === 4,
      '实际 ' + doc.querySelectorAll('#ladderbox .chip').length);
-  const protoPanel = doc.getElementById('prototable').parentElement;
-  ok('SDK 差异默认折叠', protoPanel.style.display === 'none');
-  w.foldPanel(doc.querySelector('#p-models .panel-hd.clickable'));
-  ok('点标题展开 SDK 差异', doc.getElementById('prototable').parentElement.style.display === '');
-  w.foldPanel(doc.querySelector('#p-models .panel-hd.clickable'));
-  ok('再点标题收起', doc.getElementById('prototable').parentElement.style.display === 'none');
   w.openAddModel();
   ok('接入表单已打开', !!doc.getElementById('mf-up'));
   w.mToggleCap('文字');
@@ -310,10 +305,9 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   const statlineZh = doc.getElementById('statline').textContent;
   const navZh = [...doc.querySelectorAll('.rk-t')].map(n => n.textContent).join(',');
 
-  // 展开所有动态面板，确保覆盖完整（含信号墙与 SDK 差异这两个默认折叠区）
+  // 展开所有动态面板，确保覆盖完整（含信号墙与判定明细等默认折叠区）
   w.showReq(0); w.openCheckup(); w.go('tree'); w.setView('list');
   w.toggleTags();
-  w.foldPanel(doc.querySelector('#p-models .panel-hd.clickable'));
   w.setLang('en');
   await pend(300);
   const enResid = residuals(doc.body, true);
