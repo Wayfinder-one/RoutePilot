@@ -961,3 +961,67 @@ def test_add_node_unrenumberable_422_tree_untouched(app):
     assert r.status_code == 422 and r.json()["findings"][0]["code"] == "tree_full"
     assert get(app, "/admin/tree").json() == full
     assert len(_tree_rows(app)) == len(_all_idxs(full))
+
+
+# ── M6（audit Major）：熔断复位端点 ────────────────────────────────────────────
+# 审核报告 §2-M6：_FAIL_COUNTS ≥ 3 后进程内永久隔离（被跳过的模型永远等不到
+# record_success），原唯一恢复途径是重启进程，且重启后内存清零、DB 仍 ok=0——
+# 展示与行为分裂。POST /admin/models/{id}/reset 补上人工复位（内存计数与
+# models.ok/break_reason 一并复位）；PUT 白名单加 ok/break_reason 让管理员也能
+# 手动置状态。
+
+def _fail3(app, mid: str) -> None:
+    """连续 3 次 record_failure（§8.3 阈值），达 3 次写库 ok=0 + break_reason。"""
+    import sr.models as models_mod
+    conn = db.get(app.state.db_path)
+    try:
+        for _ in range(3):
+            models_mod.record_failure(conn, mid)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_circuit_reset_endpoint(app):
+    """POST /admin/models/{id}/reset：清 _FAIL_COUNTS + 恢复 models.ok=1 /
+    break_reason=NULL，复位后不再 open；返回 {"id", "ok": true}；未知 id 404。"""
+    import sr.models as models_mod
+    mid = "qwen3-32b"
+    _fail3(app, mid)
+    assert models_mod.is_circuit_open(mid)
+    conn = db.get(app.state.db_path)
+    try:
+        row = conn.execute("SELECT ok, break_reason FROM models WHERE id = ?",
+                           (mid,)).fetchone()
+        assert row["ok"] == 0 and row["break_reason"]
+    finally:
+        conn.close()
+    r = post(app, f"/admin/models/{mid}/reset", {})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"id": mid, "ok": True}
+    assert not models_mod.is_circuit_open(mid)          # 内存计数已清
+    m = {x["id"]: x for x in get(app, "/admin/models").json()}[mid]
+    assert m["ok"] and m["break_reason"] is None        # 读端点一致
+    assert post(app, "/admin/models/nope/reset", {}).status_code == 404
+
+
+def test_put_model_ok_and_break_reason(app):
+    """PUT /admin/models/{id} 白名单加 ok（0/1）与 break_reason：手动置状态与
+    读端点/库行一致；值非法（ok=2 / ok=true / break_reason 非字符串）400。"""
+    mid = "qwen3-8b"
+    assert put(app, f"/admin/models/{mid}",
+               {"ok": 0, "break_reason": "手动隔离"}).status_code == 200
+    m = {x["id"]: x for x in get(app, "/admin/models").json()}[mid]
+    assert not m["ok"] and m["break_reason"] == "手动隔离"
+    conn = db.get(app.state.db_path)
+    try:
+        row = conn.execute("SELECT ok, break_reason FROM models WHERE id = ?",
+                           (mid,)).fetchone()
+        assert row["ok"] == 0 and row["break_reason"] == "手动隔离"
+    finally:
+        conn.close()
+    assert put(app, f"/admin/models/{mid}", {"ok": 1}).status_code == 200
+    assert {x["id"]: x for x in get(app, "/admin/models").json()}[mid]["ok"]
+    assert put(app, f"/admin/models/{mid}", {"ok": 2}).status_code == 400
+    assert put(app, f"/admin/models/{mid}", {"ok": True}).status_code == 400
+    assert put(app, f"/admin/models/{mid}", {"break_reason": 5}).status_code == 400

@@ -133,5 +133,15 @@ def record_success(conn, model_id: str) -> None:
     conn.execute("UPDATE models SET ok = 1, break_reason = NULL WHERE id = ?",
                  (model_id,))
 
+
+def reset_circuit(conn, model_id: str) -> None:
+    """人工复位（M6，audit Major）：清内存连续失败计数 + 恢复 ok=1 /
+    break_reason=NULL。原实现 ≥3 次失败后进程内永久隔离（被跳过的模型永远等不到
+    record_success），唯一恢复途径是重启进程，且重启后内存清零、DB 仍 ok=0——
+    展示与行为分裂。半开探测定时器仍留 M3，本函数是 M1 给出的管理出口。"""
+    _FAIL_COUNTS.pop(model_id, None)
+    conn.execute("UPDATE models SET ok = 1, break_reason = NULL WHERE id = ?",
+                 (model_id,))
+
 # 半开探测：5 分钟后发一次探测请求，成功则恢复（spec §8.3 末注释逐字）。
 # 本任务（M1 Task 6）只留注释占位：需要定时器，M3 再做定时探测。

@@ -60,7 +60,8 @@ from sr.engine import (Branch, Node, RouteDecision, TEMPLATES, evaluate,
                        rows_to_tree)
 from sr.health import Finding, run_checkup
 from sr.i18n import MESSAGES, detect_lang
-from sr.models import is_circuit_open, record_failure, record_success, resolve_backend
+from sr.models import (is_circuit_open, record_failure, record_success,
+                       reset_circuit, resolve_backend)
 from sr.tags import DEFAULT_CONF_THRESHOLDS, TAGS, conf_band, tag_all
 
 # 两协议适配器（§7.1 按路径判定 proto → 同构七件套）
@@ -2055,14 +2056,15 @@ def create_app(db_path: str, tagger: str = "heuristic",
     @app.put("/admin/models/{mid}")
     async def admin_update_model(mid: str, request: Request):
         """修改模型（§9：阶梯/启用/停用等）：白名单字段部分更新 + 审计；
-        未知字段 400、未知模型 404。"""
+        未知字段 400、未知模型 404。ok/break_reason 入白名单（M6）：管理员可
+        手动置熔断展示态——注意只写库，内存 _FAIL_COUNTS 请走 reset 端点清。"""
         try:
             body = await request.json()
         except Exception:
             return JSONResponse({"detail": "request body is not valid JSON"},
                                 status_code=400)
         allowed = {"upstream", "caps", "aliases", "step",
-                   "price_in", "price_out", "enabled"}
+                   "price_in", "price_out", "enabled", "ok", "break_reason"}
         if not isinstance(body, dict) or not body or set(body) - allowed:
             return JSONResponse(
                 {"detail": f"updatable fields: {sorted(allowed)}"}, status_code=400)
@@ -2081,6 +2083,16 @@ def create_app(db_path: str, tagger: str = "heuristic",
                               or isinstance(body[k], bool)):
                 return JSONResponse(
                     {"detail": f"{k} must be a number or null"}, status_code=400)
+        # M6：ok 只许 0/1（JSON true 是 int 子类，显式拒 bool）；break_reason
+        # 只许字符串或 null。
+        if "ok" in body and (not isinstance(body["ok"], int)
+                             or isinstance(body["ok"], bool)
+                             or body["ok"] not in (0, 1)):
+            return JSONResponse({"detail": "ok must be 0 or 1"}, status_code=400)
+        if "break_reason" in body and body["break_reason"] is not None \
+                and not isinstance(body["break_reason"], str):
+            return JSONResponse(
+                {"detail": "break_reason must be a string or null"}, status_code=400)
         conn = db.get(db_path)
         try:
             row = conn.execute("SELECT * FROM models WHERE id = ?", (mid,)).fetchone()
@@ -2104,6 +2116,28 @@ def create_app(db_path: str, tagger: str = "heuristic",
         finally:
             conn.close()
         return JSONResponse({"ok": True})
+
+    @app.post("/admin/models/{mid}/reset")
+    async def admin_reset_model(mid: str):
+        """熔断复位（M6，audit Major：原 ≥3 次失败后进程内永久隔离，唯一恢复
+        途径是重启进程）。清内存连续失败计数 + 恢复 models.ok=1 / break_reason=
+        NULL——展示与行为一并复位（半开探测定时器仍留 M3）；写 changes 审计；
+        模型不存在 404。"""
+        conn = db.get(db_path)
+        try:
+            row = conn.execute("SELECT ok, break_reason FROM models WHERE id = ?",
+                               (mid,)).fetchone()
+            if row is None:
+                return JSONResponse({"detail": f"model not found: {mid}"},
+                                    status_code=404)
+            before = {"ok": bool(row["ok"]), "break_reason": row["break_reason"]}
+            reset_circuit(conn, mid)
+            db.log_change(conn, _WRITE_ACTOR, "models", mid, before=before,
+                          after={"ok": True, "break_reason": None})
+            conn.commit()
+        finally:
+            conn.close()
+        return JSONResponse({"id": mid, "ok": True})
 
     @app.post("/admin/models/{mid}/test")
     async def admin_model_test(mid: str):
