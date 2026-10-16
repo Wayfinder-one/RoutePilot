@@ -91,7 +91,6 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   ok('分档 4 组已渲染', doc.querySelectorAll('#bandbox .band').length === 4);
   ok('把握度分档已渲染', doc.querySelectorAll('#confbox .dist .seg').length === 4);
   ok('模型页不再单列 SDK 差异面板', !doc.getElementById('prototable'));
-  ok('模型阶梯并入模型清单面板', !!doc.querySelector('#p-models .panel #ladderbox'));
 
   group('v7 降学习成本 · 表示层');
   ok('遥测条已移除', !doc.querySelector('.tele'));
@@ -255,8 +254,7 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   group('模型页');
   w.renderModels();
   ok('故障模型状态可辨', /故障/.test(doc.getElementById('modbody').textContent));
-  ok('模型阶梯 4 档（故障模型不入阶梯）', doc.querySelectorAll('#ladderbox .chip').length === 4,
-     '实际 ' + doc.querySelectorAll('#ladderbox .chip').length);
+  ok('模型页不再有模型阶梯区块', !doc.getElementById('ladderbox'));
   w.openAddModel();
   ok('接入表单已打开', !!doc.getElementById('mf-up'));
   w.mToggleCap('文字');
@@ -271,8 +269,6 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   w.mSave();
   ok('接入后清单 +1', doc.querySelectorAll('#modbody tr').length === 6,
      '实际 ' + doc.querySelectorAll('#modbody tr').length);
-  ok('阶梯同步 +1', doc.querySelectorAll('#ladderbox .chip').length === 5,
-     '实际 ' + doc.querySelectorAll('#ladderbox .chip').length);
 
   group('设置页 · 分档');
   // 第 2 组是「难度」，改它的第一个分界

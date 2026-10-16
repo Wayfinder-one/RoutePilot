@@ -1197,12 +1197,6 @@ table.tbl{width:100%;border-collapse:collapse;font-size:var(--fs-sm)}
         </table>
       </div>
     </div>
-
-    <div class="panel-hd" style="margin-top:var(--s5)">
-      <h2>模型阶梯</h2><span class="sub">按能力从低到高排序</span>
-    </div>
-    <div class="note" style="margin-bottom:var(--s4)">「升一档」取后一格，「换一个模型」取下一格。反馈解锁依赖此顺序；未配置时「答错了」退化为重新判断。</div>
-    <div id="ladderbox" class="chipset" style="gap:var(--s2)"></div>
   </div>
 </section>
 
@@ -2758,14 +2752,6 @@ function renderModels(){
         : `<span class="st" title="${m.breakReason}"><span class="d r"></span>故障</span>`}</td></tr>`).join('');
   const st = document.getElementById('mstat');
   if(st) st.textContent = `${MODELS.length} 个模型 · ${MODELS.filter(m => m.ok).length} 正常`;
-  const lb = document.getElementById('ladderbox');
-  if(lb){
-    const sorted = MODELS.filter(m => m.ok).slice().sort((a,b) => a.step - b.step);
-    lb.innerHTML = sorted.map((m,i) =>
-      `${i ? '<span class="and">→</span>' : ''}<span class="chip ${i === sorted.length-1 ? 'key' : ''}">
-        <span class="k">第 ${i} 档</span><span class="v mono">${m.id}</span>
-        <span class="op">${m.cap}</span></span>`).join('');
-  }
   applyI18n();
 }
 
