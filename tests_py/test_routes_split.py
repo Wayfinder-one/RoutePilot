@@ -1,6 +1,6 @@
 """D2/A1：admin 端点拆 APIRouter 后的**路由契约快照**（零行为变化）。
 
-基线 = 搬迁前 sr/server.py 的 33 条路由（AST 抽取）。本测试钉住：
+基线 = 搬迁前 sr/server.py 的 33 条路由 + audit step 3 新增 1 条（AST 抽取）。本测试钉住：
 `(method, path)` 集合与拆分前完全一致；且 sr/routes/* 不反向 import sr.server。
 """
 import pathlib
@@ -28,6 +28,7 @@ BASELINE: list[tuple[str, str]] = [
     ("POST", "/admin/tree/try"),
     ("POST", "/admin/tree/estimate"),
     ("GET", "/admin/tree/estimates"),
+    ("POST", "/admin/tree/estimates/backfill"),
     ("POST", "/admin/eval"),
     ("GET", "/admin/evals"),
     ("POST", "/admin/tree/nodes"),

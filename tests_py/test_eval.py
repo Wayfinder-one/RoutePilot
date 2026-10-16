@@ -102,3 +102,27 @@ def test_backfill_estimates_and_error(tmp_path):
     assert devs and devs[0]["node"] == "3"
     # 幂等：再跑不重复回填
     assert ev.backfill_estimates(conn, days=7) == 0
+
+
+def test_replay_excludes_non_tree_rows(tmp_path):
+    """audit step 3：replay 只统计**纯树决定**的行。
+
+    排除并计数：block/error/fallback（SQL 按 outcome）、预算行（requests.budget=1，
+    逐行落库）、sticky/unlocked（非新会话）、hit_branch 为空。
+    """
+    conn = _conn(tmp_path)
+    _seed_request(conn, "ok", "3.0", "qwen3-32b", CS_TAGS)          # 参与
+    _seed_request(conn, "blk", "1.0", "block", CS_TAGS)             # 拦截（outcome 改 block）
+    conn.execute("UPDATE requests SET outcome='block' WHERE id='blk'")
+    _seed_request(conn, "fb", "3.0", "qwen3-8b", CS_TAGS)           # 回退
+    conn.execute("UPDATE requests SET outcome='fallback' WHERE id='fb'")
+    _seed_request(conn, "bud", "3.0", "qwen3-8b", CS_TAGS)          # 预算改写
+    conn.execute("UPDATE requests SET budget=1 WHERE id='bud'")
+    _seed_request(conn, "sty", "3.0", "qwen3-32b", CS_TAGS, session_tag="sticky")
+    conn.commit()
+    rep = ev.replay_eval(conn, str(tmp_path / "t.db"), days=7)
+    assert rep.total == 1 and rep.matched == 1          # 只剩 ok 那行
+    assert rep.excluded.get("block/error/fallback") == 2
+    assert rep.excluded.get("budget") == 1
+    assert rep.excluded.get("sticky/unlocked") == 1
+    assert rep.to_json()["excluded"]["budget"] == 1     # 口径随报告一起出去

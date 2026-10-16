@@ -121,8 +121,11 @@ CREATE TABLE requests (
   answer_ms   REAL,                 -- 打标签耗时
   upstream_ms REAL,                 -- 上游耗时
   cost        REAL,                  -- 本次成本（USD）
-  tree_version INTEGER              -- 判定当时的 tree_version（M2）；与当前不符
+  tree_version INTEGER,             -- 判定当时的 tree_version（M2）；与当前不符
                                      -- = 分支归属可能已失效（新增节点会重编 idx）
+  budget      INTEGER DEFAULT 0      -- 该行是否被预算保护改写（audit step 3：replay
+                                     -- 口径要排除预算行，且不能靠「去向==budget_route」
+                                     -- 猜——那会连正常的廉价模型行一起排除）
 );
 
 CREATE TABLE tags (
@@ -162,7 +165,9 @@ CREATE TABLE estimates (
   node   TEXT NOT NULL,              -- 节点 idx 路径（如 "3"）
   params TEXT NOT NULL,              -- JSON: 入树的节点快照（条件 + 去向）
   est    TEXT NOT NULL,              -- JSON: 预估 {daily, ratio, from_fallback, from_other, cost_delta}
-  actual TEXT                        -- JSON: 复盘回填 {daily, cost_delta, reviewed_at}；NULL = 未复盘
+  actual TEXT,                       -- JSON: 复盘回填 {daily, cost_delta, reviewed_at}；NULL = 未复盘
+  tree_version INTEGER               -- 记录当时的树版本（audit step 3）：预估是基于
+                                     -- 某一版树算的，复盘/对比必须能对上版本
 );
 
 CREATE TABLE metric_counters (
@@ -320,6 +325,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
     if cols and "tree_version" not in cols:
         conn.execute("ALTER TABLE requests ADD COLUMN tree_version INTEGER")
+        conn.commit()
+    if cols and "budget" not in cols:          # audit step 3
+        conn.execute("ALTER TABLE requests ADD COLUMN budget INTEGER DEFAULT 0")
+        conn.commit()
+    ecols = {r[1] for r in conn.execute("PRAGMA table_info(estimates)")}
+    if ecols and "tree_version" not in ecols:  # audit step 3
+        conn.execute("ALTER TABLE estimates ADD COLUMN tree_version INTEGER")
         conn.commit()
     have = _existing_tables(conn)
     for tbl in sorted(_MIGRATABLE_TABLES - have):

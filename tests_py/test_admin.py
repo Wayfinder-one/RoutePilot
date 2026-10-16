@@ -416,8 +416,12 @@ def test_traffic_small_filter_empty_ladder_is_empty(app):
     assert get(app, "/admin/traffic?f=small").json()["rows"] == []
 
 def test_admin_eval_replay_and_recent(app):
-    """POST /admin/eval（replay）+ GET /admin/evals + sr_eval_route_match_rate（§11.4）。"""
-    post_blocked_request(app)                     # 一条 new 会话请求（有标签）
+    """POST /admin/eval（replay）+ GET /admin/evals + sr_eval_route_match_rate（§11.4）。
+
+    audit step 3 口径：replay 只统计**纯树决定**的行——block 行被排除，所以这里
+    用一条直插的、outcome='upstream' 的新会话行（带标签）驱动 replay。
+    """
+    _seed_request(app, hit_branch="3.0", confidence=0.75)
     r = post(app, "/admin/eval", {"source": "replay", "days": 7})
     assert r.status_code == 200, r.text
     rep = r.json()
@@ -440,8 +444,15 @@ def test_admin_estimates_backfill_and_gauge(app):
                  (est_ts, db._dump({"daily": 100, "cost_delta": 0})))
     conn.commit()
     conn.close()
+    # audit step 3：GET **不再**有副作用（旧实现读时惰性回填）——先证只读
     rows = get(app, "/admin/tree/estimates").json()
-    assert rows and rows[0]["actual"] is not None            # 已回填
+    assert rows and rows[0]["actual"] is None, rows
+    assert "tree_version" in rows[0]                          # 行里带树版本
+    # 显式回填端点才写库
+    rb = post(app, "/admin/tree/estimates/backfill")
+    assert rb.status_code == 200 and rb.json()["backfilled"] >= 1, rb.text
+    rows = get(app, "/admin/tree/estimates").json()
+    assert rows and rows[0]["actual"] is not None             # 已回填
     body = get(app, "/metrics").text
     samples = [l for l in body.splitlines()
                if l.startswith("sr_estimate_error") and not l.startswith("#")]

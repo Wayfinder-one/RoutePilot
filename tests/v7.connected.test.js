@@ -656,6 +656,77 @@ const pend = (ms) => new Promise(r => setTimeout(r, ms || 600));
   t('新增能力标签进入请求体 caps', Array.isArray(mBody.caps) && mBody.caps.indexOf('tool_use') >= 0,
     JSON.stringify(mBody.caps));
 
+  /* ════ H. B5：新建供应商时「测试」路径也必须绑到新供应商 ════ */
+  group('B5 · 新建供应商时测试路径不得静默绑旧供应商');
+  const H2 = makeDom({ routes: CONNECT_ROUTES });
+  await until(() => H2.window.SR_MODE === 'connected', 5000, 'connected (B5)');
+  const b5doc = H2.window.document, b5w = H2.window;
+  const setInput2 = (id, val) => {
+    const el = b5doc.getElementById(id); el.value = val;
+    el.dispatchEvent(new b5w.Event('input', { bubbles: true }));
+  };
+  b5w.openAddModel();
+  await pend(120);
+  b5w.mPickProv('local');                     // 先选中一个**已有**供应商
+  b5w.mNewProv();                             // 再切到「新建供应商」——旧实现此处会串
+  await pend(120);
+  setInput2('mf-pname', 'siliconflow2');
+  setInput2('mf-base', 'https://api.siliconflow.cn/v1');
+  setInput2('mf-keyenv', 'SILICONFLOW_API_KEY');
+  setInput2('mf-up', 'Qwen/Qwen3-32B');
+  b5w.mTest();                                // 走「测试」路径（B5 的漏点）
+  await until(() => H2.calls.some(c => c[0] === '/admin/models' && c[1].method === 'POST'),
+    5000, 'POST /admin/models (B5)');
+  const b5prov = H2.calls.filter(c => c[0] === '/admin/providers' && c[1].method === 'POST');
+  const b5model = H2.calls.find(c => c[0] === '/admin/models' && c[1].method === 'POST');
+  const b5body = b5model ? JSON.parse(b5model[1].body) : {};
+  t('测试路径先 POST /admin/providers（新供应商）',
+    b5prov.length > 0 && JSON.parse(b5prov[0][1].body).name === 'siliconflow2',
+    JSON.stringify(b5prov.map(c => JSON.parse(c[1].body).name)));
+  t('测试路径的模型 provider 指向新供应商（不为旧选择 local）',
+    b5body.provider === 'siliconflow2', JSON.stringify(b5body));
+
+  /* ════ I. audit step 4：add-provider 校验 + 供应商只读摘要 ════ */
+  group('audit step 4 · add-provider 校验与只读摘要');
+  const I2 = makeDom({ routes: CONNECT_ROUTES });
+  await until(() => I2.window.SR_MODE === 'connected', 5000, 'connected (step4)');
+  const idoc = I2.window.document, iw = I2.window;
+  const setI = (id, val) => {
+    const el = idoc.getElementById(id); el.value = val;
+    el.dispatchEvent(new iw.Event('input', { bubbles: true }));
+  };
+  iw.openAddModel();
+  await pend(120);
+  t('选中已有供应商 → 显示只读绑定摘要（含基址）',
+    !!idoc.getElementById('mf-provsum') &&
+    idoc.getElementById('mf-provsum').textContent.indexOf('http') >= 0,
+    idoc.getElementById('mf-provsum') ? idoc.getElementById('mf-provsum').textContent : '(无)');
+  iw.mNewProv();
+  await pend(120);
+  const providersBefore = I2.calls.filter(c => c[0] === '/admin/providers' && c[1].method === 'POST').length;
+  setI('mf-pname', 'Bad Name');                     // 非法：含空格与大写
+  setI('mf-base', 'api.example.com/v1');            // 非法：缺 scheme
+  setI('mf-up', 'Qwen/Qwen3-8B');
+  iw.mSave();
+  await pend(400);
+  const posts = I2.calls.filter(c => c[1].method === 'POST').map(c => c[0]).join(',');
+  const providersAfter = I2.calls.filter(c => c[0] === '/admin/providers' && c[1].method === 'POST').length;
+  const modelPosts = I2.calls.filter(c => c[0] === '/admin/models' && c[1].method === 'POST').length;
+  t('非法供应商名/基址 → 拒绝提交（providers/models 都不 POST）',
+    providersAfter === providersBefore && modelPosts === 0,
+    'providers ' + providersBefore + '→' + providersAfter + ' · models POST=' + modelPosts +
+    ' · 全部 POST: [' + posts + ']');
+  const tst = idoc.getElementById('toast');
+  t('拒绝原因提示到 toast', !!tst && /供应商名称|基址 URL/.test(tst.textContent || ''),
+    tst ? tst.textContent : '(无)');
+  iw.renderModelForm();                     // 摘要在重渲染时刷新（输入不回填 DOM）
+  await pend(80);
+  const sum2 = idoc.getElementById('mf-provsum');
+  t('新建态摘要显示已填内容（名称/基址）',
+    !!sum2 && sum2.textContent.indexOf('Bad Name') >= 0 &&
+    sum2.textContent.indexOf('api.example.com') >= 0,
+    sum2 ? sum2.textContent : '(无)');
+
   console.log('\n══ 结果 ══');
   console.log('通过 ' + pass + ' · 失败 ' + fail);
   if (fail) { console.log('\n失败项：'); bad.forEach(b => console.log('  · ' + b)); process.exit(1); }

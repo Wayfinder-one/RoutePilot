@@ -2773,6 +2773,34 @@ let mf = null;
 function mProvOptions(){
   return PROVIDERS.filter(p => p.name !== 'local' && p.name !== '本地');
 }
+/* audit step 4：供应商输入校验——**一处定义两处使用**（联网的 SRW_resolveProvider 与
+   演示态 mSave），避免「demo 能存、连线上报 500」这类不一致。返回错误文案或 null。 */
+function SRW_validateProvider(name, base){
+  const n = (name || '').trim();
+  if(!n) return '请填写供应商名称';
+  if(!/^[a-z0-9][a-z0-9._-]*$/.test(n))
+    return '供应商名称只允许小写字母/数字/点/下划线/连字符（须以字母或数字开头）';
+  if(n.length > 64) return '供应商名称过长（≤64）';
+  const b = (base || '').trim();
+  if(!b) return '请填写基址 URL';
+  if(!/^https?:\/\/[^\s]+$/i.test(b)) return '基址 URL 需以 http:// 或 https:// 开头';
+  return null;
+}
+/* audit step 4：供应商只读摘要——绑定前让用户看清「模型会被绑到哪个基址/密钥来源」 */
+function SRW_providerSummary(){
+  if(!mf) return '';
+  if(mf.newProv){
+    const proto = mf.proto === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容';
+    return (mf.provName.trim() || '（待填名称）') + ' · ' + proto + ' · ' +
+           (mf.base.trim() || '（待填基址）') + ' · ' +
+           (mf.keyEnv.trim() || '（无密钥来源）');
+  }
+  const p = PROVIDERS.filter(x => x.name === mf.prov)[0];
+  if(!p) return '';
+  const proto = p.proto === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容';
+  return p.name + ' · ' + proto + ' · ' + (p.base || '—') + ' · ' +
+         (p.keyEnv || '（无密钥来源）');
+}
 function newMf(){ return { proto:'openai', prov:(mProvOptions()[0] || {}).name || '',
   newProv:false, provName:'', base:'', keyEnv:'', upstream:'', caps:[],
   priceIn:'', priceOut:'', tested:false }; }
@@ -2793,8 +2821,8 @@ function mSave(){
   if(!mf.upstream.trim()) return toast('请填写上游模型名');
   let provName = mf.prov;
   if(mf.newProv){
-    if(!mf.provName.trim()) return toast('请填写供应商名称');
-    if(!mf.base.trim()) return toast('请填写基址 URL');
+    const bad = SRW_validateProvider(mf.provName, mf.base);   /* audit step 4：共用校验 */
+    if(bad) return toast(bad);
     provName = mf.provName.trim();
     if(!PROVIDERS.some(p => p.name === provName))
       PROVIDERS.push({ name: provName, base: mf.base.trim(), proto: mf.proto, ok: true });
@@ -2826,6 +2854,8 @@ function renderModelForm(){
             `<button class="${(!mf.newProv && mf.prov===p.name)?'on':''}" onclick="mPickProv('${SRW_jsAttr(p.name)}')">${SRW_esc(p.name)}</button>`).join('')}
           <button class="${mf.newProv?'on':''}" onclick="mNewProv()">＋ 新建供应商</button>
         </div>
+        ${SRW_providerSummary() ? `<div class="note" id="mf-provsum" style="margin-top:var(--s2)">
+          ${SRW_esc(I18N_ZH['ui.provider_summary'] || '绑定摘要（只读）')}：${SRW_esc(SRW_providerSummary())}</div>` : ''}
         ${mf.newProv ? `<div style="display:flex;flex-direction:column;gap:var(--s2);margin-top:var(--s3)">
           <label class="lb" for="mf-pname">供应商名称</label>
           <input type="text" id="mf-pname" placeholder="例如 siliconflow" value="${SRW_esc(mf.provName)}"
@@ -3999,7 +4029,8 @@ async function renderAllRemote(){
 function SRW_applyModels(){
   PROVIDERS.length = 0;
   SRW_DATA.providers.forEach(p => PROVIDERS.push(
-    { name: p.name, base: p.base_url, proto: p.proto, ok: !!p.ok }));
+    { name: p.name, base: p.base_url, proto: p.proto, ok: !!p.ok,
+      keyEnv: p.key_env || '' }));   /* audit step 4：摘要要显示密钥来源 */
   MODELS.length = 0;
   (SRW_DATA.models || []).forEach((m, i) => MODELS.push({
     id: m.id, prov: m.provider, proto: m.proto, upstream: m.upstream,
@@ -4457,6 +4488,26 @@ function SRW_putSetting(key, val, label, onFail){
     .catch(() => { if(onFail) onFail(); toast('设置保存失败'); });
 }
 
+/* B5（audit）：新建供应商的解析**集中一处**，所有联网路径（接入/测试）都必须先拿到
+   有效供应商名。旧实现只在「接入」里内联处理 newProv，而「测试」路径直接
+   `SRW_modelPayload()`（无参）→ 退回 `mf.prov`（上一次选择的供应商），于是
+   「＋新建供应商」时模型被**静默绑到错的供应商**。 */
+async function SRW_resolveProvider(){
+  if(!mf.newProv) return mf.prov;
+  const bad = SRW_validateProvider(mf.provName, mf.base);   /* audit step 4：共用校验 */
+  if(bad) throw new Error(bad);
+  const name = mf.provName.trim();
+  const rp = await fetch('/admin/providers', { method: 'POST', headers: SRW_JSON_HDR,
+    body: JSON.stringify({ name: name, proto: mf.proto,
+                           base_url: mf.base.trim(),
+                           key_env: mf.keyEnv.trim() || null }) });
+  if(!rp.ok){
+    const d = await rp.json().catch(() => ({}));
+    throw new Error(d.detail || ('HTTP ' + rp.status));
+  }
+  await SRW_refreshProviders();
+  return name;
+}
 /* 模型接入四步：POST /admin/models → POST /admin/models/{id}/test（逐步骤渲染） */
 function SRW_modelPayload(providerName){
   const id = mf.upstream.split('/').pop().toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 24) || 'model';
@@ -4470,22 +4521,7 @@ function SRW_modelPayload(providerName){
 async function SRW_mSaveRemote(){
   if(!mf.upstream.trim()) return toast('请填写上游模型名');
   try {
-    let provName = mf.prov;
-    if(mf.newProv){
-      /* 先建供应商（基址 URL + 密钥来源），再建模型——旧流程缺的正是这一步 */
-      if(!mf.provName.trim()) throw new Error('请填写供应商名称');
-      if(!mf.base.trim()) throw new Error('请填写基址 URL');
-      provName = mf.provName.trim();
-      const rp = await fetch('/admin/providers', { method: 'POST', headers: SRW_JSON_HDR,
-        body: JSON.stringify({ name: provName, proto: mf.proto,
-                               base_url: mf.base.trim(),
-                               key_env: mf.keyEnv.trim() || null }) });
-      if(!rp.ok){
-        const d = await rp.json().catch(() => ({}));
-        throw new Error(d.detail || ('HTTP ' + rp.status));
-      }
-      await SRW_refreshProviders();
-    }
+    const provName = await SRW_resolveProvider();   /* B5：集中解析（新建则先落库） */
     if(!mf.savedId){
       const payload = SRW_modelPayload(provName);
       const r = await fetch('/admin/models', { method: 'POST', headers: SRW_JSON_HDR,
@@ -4524,13 +4560,15 @@ async function SRW_mTestRemote(){
   try {
     if(!mf.upstream.trim()) return toast('请填写上游模型名');
     if(!mf.savedId){
+      const provName = await SRW_resolveProvider();  /* B5：测试路径同样先解析供应商 */
+      const payload = SRW_modelPayload(provName);
       const r = await fetch('/admin/models', { method: 'POST', headers: SRW_JSON_HDR,
-        body: JSON.stringify(SRW_modelPayload()) });
+        body: JSON.stringify(payload) });
       if(!r.ok){
         const d = await r.json().catch(() => ({}));
         throw new Error(d.detail || ('HTTP ' + r.status));
       }
-      mf.savedId = SRW_modelPayload().id;
+      mf.savedId = payload.id;
       await SRW_refreshModels();
     }
     const r = await fetch('/admin/models/' + encodeURIComponent(mf.savedId) + '/test',

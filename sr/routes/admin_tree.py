@@ -235,12 +235,13 @@ async def admin_tree_estimate(request: Request):
 async def admin_tree_estimates(request: Request, ):
     """预估列表（§11.4 复盘）：estimates 全行，actual NULL = 未复盘。
 
-    M3：读时惰性回填（ts 已满 7 天的未复盘行按真实流量算 actual，幂等）+ 置
-    sr_estimate_error gauge（最近一次复盘偏差）。"""
+    audit step 3：**读端点不再有副作用**——旧实现在 GET 里惰性 `backfill_estimates`
+    （GET 写库：审计说不清、并发下重复触发）。回填改为显式
+    `POST /admin/tree/estimates/backfill`（运维/定时器调用）。
+    行里带 `tree_version`：预估基于哪一版树算的，复盘对比时能对上版本。
+    """
     conn = db.get(request.app.state.db_path)
     try:
-        if eval_mod.backfill_estimates(conn):
-            conn.commit()
         rows = conn.execute("SELECT * FROM estimates "
                             "ORDER BY ts DESC, rowid DESC").fetchall()
         err = eval_mod.estimate_error(conn)
@@ -251,8 +252,28 @@ async def admin_tree_estimates(request: Request, ):
     return JSONResponse([{"id": r["id"], "ts": r["ts"], "node": r["node"],
                           "params": json.loads(r["params"]),
                           "est": json.loads(r["est"]),
+                          "tree_version": r["tree_version"],
                           "actual": json.loads(r["actual"]) if r["actual"]
                           else None} for r in rows])
+
+
+@router.post("/admin/tree/estimates/backfill")
+async def admin_tree_estimates_backfill(request: Request):
+    """显式回填预估复盘（§11.4）：ts 满 7 天的未复盘行按真实流量算 actual，幂等。
+
+    从 GET 挪出来的写路径（audit step 3）：返回本次回填行数 + 最新偏差 gauge。
+    """
+    conn = db.get(request.app.state.db_path)
+    try:
+        n = eval_mod.backfill_estimates(conn)
+        if n:
+            conn.commit()
+        err = eval_mod.estimate_error(conn)
+    finally:
+        conn.close()
+    if err is not None:
+        request.app.state.metrics.set("sr_estimate_error", err)
+    return JSONResponse({"backfilled": n, "estimate_error": err})
 
 @router.post("/admin/tree/nodes")
 async def admin_tree_add_node(request: Request):
@@ -307,10 +328,11 @@ async def admin_tree_add_node(request: Request):
                     {"detail": "estimate must be the object returned by "
                                "POST /admin/tree/estimate"}, status_code=400)
             conn.execute(
-                "INSERT INTO estimates (id, ts, node, params, est, actual) "
-                "VALUES (?, ?, ?, ?, ?, NULL)",
+                "INSERT INTO estimates (id, ts, node, params, est, actual, "
+                "tree_version) VALUES (?, ?, ?, ?, ?, NULL, ?)",
                 (uuid.uuid4().hex, db._now(), str(cand.idx),
-                 db._dump(body["node"]), db._dump(body["estimate"])))
+                 db._dump(body["node"]), db._dump(body["estimate"]),
+                 db.get_tree_version(conn)))
         db.log_change(conn, WRITE_ACTOR, "tree", str(cand.idx),
                       before={"version": old["version"], "nodes": old["nodes"]},
                       after={"pos": pos, "node": body.get("node")})

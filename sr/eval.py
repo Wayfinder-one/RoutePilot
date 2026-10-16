@@ -32,6 +32,8 @@ class EvalReport:
     branches: dict = field(default_factory=dict)   # 分支/期望 → {total, matched}
     mismatches: list = field(default_factory=list)
     ts: str = ""
+    # audit step 3：被排除的样本（口径透明，避免「一致率怎么变了」无法解释）
+    excluded: dict = field(default_factory=dict)   # 原因 → 条数
 
     @property
     def rate(self) -> float | None:
@@ -41,7 +43,7 @@ class EvalReport:
         return {"source": self.source, "days": self.days, "total": self.total,
                 "matched": self.matched, "rate": self.rate,
                 "branches": self.branches, "mismatches": self.mismatches,
-                "ts": self.ts}
+                "excluded": self.excluded, "ts": self.ts}
 
 
 def _conf_cuts(conn) -> list[float]:
@@ -74,24 +76,79 @@ def _signals_for(conn, rid: str) -> dict:
     return sig
 
 
+def _branch_by_path(nodes, hit_path):
+    """按 `evaluate` 的 hit_path（[node_idx, 分支序号]）取回 Branch 对象。
+
+    用于 replay 口径：判断「命中的分支配了比例试水」需要看 Branch 本身
+    （action.trial / 分支级 trial），不能只依赖 `decision.source`——试水是掷签的。
+    """
+    if not hit_path or len(hit_path) < 2:
+        return None
+    node_idx, ordinal = hit_path[0], hit_path[1]
+    for n in nodes:
+        if n.idx != node_idx:
+            continue
+        for i, b in enumerate(getattr(n, "branches", []) or []):
+            if i == ordinal:
+                return b
+    return None
+
+
 def replay_eval(conn, db_path: str, days: int = 7) -> EvalReport:
-    """历史回放评测（§11.4）：近 N 天**新会话**请求（有全量标签）重建信号包跑当前树，
-    与当时 records 的 hit_branch / routed_to 比对。"""
+    """历史回放评测（§11.4）：近 N 天**纯树决定**的请求（有全量标签）重建信号包跑当前树，
+    与当时 records 的 hit_branch / routed_to 比对。
+
+    口径修正（audit step 3）：旧实现把**所有** `session_tag='new'` 且 hit_branch 非空的行
+    都拿来比对，于是四类「非树决定」的行必然被判成不一致，把一致率系统性压低：
+
+    - `block` / `error`：安全拦截与错误行——不经过上游，也没有树去向可比；
+    - `fallback`：回退链命中（routed_to 是回退后的模型，不是树的决定）；
+    - `trial`：比例试水改道——**按命中分支是否配了 trial 判定**（确定性），
+      不能看 `evaluate` 的 source：试水是掷签的，重放时可能没掷中就误判成一致；
+    - 预算保护行：`_handle` 在 evaluate **之后**把模型改写成 `budget_route`；现已在
+      `requests.budget` 列**逐行落库**（audit step 3），这里直接按列排除——旧的做法是
+      「routed_to == 当前 budget_route」猜，会把正常的廉价模型行一起排除。
+
+    被排除的条数写进 `report.excluded`，一致率变化可解释。
+    """
     cutoff = (datetime.now().astimezone()
               - timedelta(days=days)).isoformat(timespec="seconds")
     nodes = rows_to_tree(conn.execute("SELECT * FROM tree ORDER BY idx").fetchall())
     cuts = _conf_cuts(conn)
+    excluded: dict = {}
+    for reason, where in (
+            ("block/error/fallback",
+             "COALESCE(outcome,'') IN ('block','error','fallback')"),
+            ("budget", "COALESCE(budget,0) = 1"),
+            ("sticky/unlocked", "session_tag IS NOT 'new'"),
+            ("no_branch", "hit_branch IS NULL")):
+        n = conn.execute(
+            f"SELECT COUNT(*) FROM requests WHERE ts >= ? AND {where}",
+            (cutoff,)).fetchone()[0]
+        if n:
+            excluded[reason] = n
     rows = conn.execute(
         "SELECT id, hit_branch, routed_to FROM requests "
         "WHERE ts >= ? AND session_tag = 'new' AND hit_branch IS NOT NULL "
+        "AND COALESCE(outcome, '') NOT IN ('block', 'error', 'fallback') "
+        "AND COALESCE(budget, 0) = 0 "
         "ORDER BY ts DESC", (cutoff,)).fetchall()
     report = EvalReport(source="replay", days=days, total=0, matched=0,
-                        ts=db._now())
+                        ts=db._now(), excluded=dict(excluded))
     for r in rows:
         signals = _signals_for(conn, r["id"])
         if not signals:
             continue
         decision = evaluate(nodes, signals, cuts)
+        if decision.kind != "route" or decision.source != "tree":
+            report.excluded["trial/other"] = \
+                report.excluded.get("trial/other", 0) + 1
+            continue                       # 试水掷中/防御分支等：不算树的决定
+        br = _branch_by_path(nodes, decision.hit_path)
+        if br is not None and (br.trial or (br.action or {}).get("trial")):
+            # 命中分支配了比例试水：当时去向可能是 trial.to，重放不可确定 → 排除
+            report.excluded["trial"] = report.excluded.get("trial", 0) + 1
+            continue
         now_branch = ".".join(map(str, decision.hit_path)) if decision.hit_path else None
         now_model = decision.model
         report.total += 1

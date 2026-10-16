@@ -154,6 +154,16 @@ _UI: list[tuple[str, str, str]] = [
     ("block_msg", "拦截消息", "Block Message"),
     ("block_msg_zh", "拦截消息（中文）", "Block Message (Chinese)"),
     ("block_msg_en", "拦截消息（英文）", "Block Message (English)"),
+    # audit step 4：模型接入 / 供应商表单的串（控制台 §9 引导第 4 步）
+    ("add_model", "接入模型", "Add Model"),
+    ("provider", "供应商", "Provider"),
+    ("new_provider", "新建供应商", "New Provider"),
+    ("provider_name", "供应商名称", "Provider Name"),
+    ("base_url", "基址 URL", "Base URL"),
+    ("key_env", "密钥来源（环境变量名；密钥本身不入库）",
+                "Key Source (env var name; the key itself is never stored)"),
+    ("upstream_model", "上游模型名", "Upstream Model"),
+    ("provider_summary", "绑定摘要（只读）", "Binding Summary (read-only)"),
 ]
 
 # block_msg 相关（§6.5 拦截消息；block.default = engine 种子树 _BLOCK_MSG 同文，
