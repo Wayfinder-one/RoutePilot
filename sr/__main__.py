@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -68,6 +69,10 @@ def _parser() -> argparse.ArgumentParser:
                    help="checkpoint 微批窗口（§4.3；0 = 不批，直接前向）")
     q.add_argument("--console", default=None, metavar="FILE",
                    help="GET / 托管的控制台 HTML（默认仓库根 console-v7.html）")
+    q.add_argument("--workers", type=int, default=1, metavar="N",
+                   help="uvicorn worker 数（默认 1）。>1 时走工厂模式，指标经 DB "
+                        "跨 worker 聚合；checkpoint 模式禁止 >1（每个 worker 各加载"
+                        "一份模型）")
 
     q = sub.add_parser("fake-upstream", help="故障注入假上游（§14.4 e2e 底座）")
     q.add_argument("--port", type=int, default=8123, help="监听端口（默认 8123）")
@@ -136,7 +141,32 @@ def _build_tagger(args):
 
 def _serve(args) -> int:
     """§12 serve 启动序列：--checkpoint 显式给定 → 内容校验（§2.3），通过建
-    CheckpointTagger，失败拒绝启动（§2.5/§15「校验失败不静默降级」）。"""
+    CheckpointTagger，失败拒绝启动（§2.5/§15「校验失败不静默降级」）。
+
+    A4/M3-10：``--workers N``（N>1）走 uvicorn 工厂模式（``sr.serveapp:build_app``，
+    配置经环境变量）；与 ``--checkpoint`` 互斥——每个 worker 会各加载一份模型，
+    显存成倍，直接拒绝启动（rc=2）。
+    """
+    workers = int(getattr(args, "workers", 1) or 1)
+    if workers > 1 and args.checkpoint is not None:
+        print("sr serve: --workers > 1 与 --checkpoint 不能同时使用"
+              "（每个 worker 会各加载一份模型，显存成倍）；"
+              "请用单 worker 或改为多进程外置", file=sys.stderr, flush=True)
+        return 2
+    if workers < 1:
+        print("sr serve: --workers 必须 ≥ 1", file=sys.stderr, flush=True)
+        return 2
+    if workers > 1:
+        conn = db.init_db(args.db)         # 父进程先确保库就绪（幂等）
+        conn.close()
+        os.environ["SR_DB"] = args.db
+        os.environ.pop("SR_CHECKPOINT", None)
+        if args.console:
+            os.environ["SR_CONSOLE"] = args.console
+        import uvicorn
+        uvicorn.run("sr.serveapp:build_app", factory=True,
+                    host=args.host, port=args.port, workers=workers)
+        return 0
     if args.checkpoint is not None:
         # 显式指定即用户认为它有效：目录/文件/标签清单任一不符 → 拒绝启动
         from sr.checkpoint import CheckpointError

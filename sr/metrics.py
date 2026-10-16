@@ -1,19 +1,27 @@
-"""§11.1 指标：内存计数器 + 手工 OpenMetrics 文本。
+"""§11.1 指标：SQLite 共享计数器 + 手工 OpenMetrics 文本。
 
 A1（audit §3）：自 sr/server.py 拆出（原「6) §11.1 指标」段）。依赖白名单无
 prometheus_client，禁新增依赖——裁定 6：手工拼 classic text。
 
-部署约束（M2 前置 7，audit A4）：Metrics 是**进程内**内存 dict（启动 backfill
-自 DB），uvicorn 多 worker 下 /metrics 抓到哪个 worker 就出哪份——总量既不准也不
-稳定。M1 部署口径 = **单 worker**（``sr serve`` 只调 ``uvicorn.run()``，不暴露
-``--workers``，即 uvicorn 默认单进程）。多进程聚合（multiprocess 模式或显式分片）
-留 M3；``_FAIL_COUNTS``（sr/models.py 熔断计数）同为进程级，受限一致。
+多进程口径（A4/M3-10，2026-10-16）：旧实现是**进程内**内存 dict，uvicorn 多 worker
+下 ``/metrics`` 抓到哪个 worker 就出哪份——总量既不准也不稳定。现改为 **DB 聚合**：
+``Metrics(db_path)`` 的 inc/observe/set 直接 UPSERT 到 ``metric_counters`` 表
+（spec §3.1），``render()`` 从表里聚合读——所有 worker 共享同一份计数，任一进程
+scrape 都得到全量。``Metrics()``（无 db_path）保留纯内存模式，供单测与无库场景使用。
+``sr serve --workers N``（N>1）走工厂模式（``sr/serveapp.py``）；checkpoint 模式禁止
+多 worker（每个 worker 会各加载一份模型 → 显存成倍），见 ``sr/__main__.py`` 拒绝逻辑。
+
+``_FAIL_COUNTS``（sr/models.py 熔断计数）仍是进程级，但 ``is_circuit_open`` 同时
+查询 DB 的 ``models.ok``——跨 worker 一致（任一 worker 熔断，其余 worker 同样跳过）。
 
 依赖方向：本模块 → sr.engine（RouteDecision，仅 _is_fallback 类型标注/判定用）。
 **不** import sr.server。
 """
 
 from __future__ import annotations
+
+import sqlite3
+import threading
 
 from sr.engine import RouteDecision
 
@@ -59,35 +67,96 @@ def _label_str(labels: tuple) -> str:
 
 
 class Metrics:
-    """§11.1 计数器（内存 dict；每 app 实例一份，app.state.metrics 隔离）。
+    """§11.1 计数器。
 
-    - counter：``inc(name, labels, n)``；
-    - summary（时延）：``observe(name, labels, seconds)`` 渲染为 ``_count/_sum``；
-    - gauge：``set(name, value, labels)``（评测/预估闭环的 setter，M3 接线）。
+    两种模式：
+
+    - ``Metrics()``：纯内存 dict（每 app 实例一份，测试互不串扰）；
+    - ``Metrics(db_path)``：**DB 聚合**——写入 UPSERT 到 ``metric_counters``，
+      读出按 (name, labels) 聚合，多 worker / 多实例共享同一份（A4/M3-10）。
+
+    counter：``inc(name, labels, n)``；summary（时延）：``observe(...)`` 渲染为
+    ``_count/_sum``；gauge：``set(name, value, labels)``。
     """
 
-    def __init__(self):
+    def __init__(self, db_path: str | None = None):
+        self.db_path = db_path
+        self._lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
         self.counters: dict[tuple, float] = {}
         self.summaries: dict[tuple, list] = {}     # key → [count, sum_seconds]
         self.gauges: dict[tuple, float] = {}
 
-    def inc(self, name: str, labels: dict | None = None, n: float = 1) -> None:
+    # ── DB 模式内部 ────────────────────────────────────────────────────────
+    @property
+    def db_mode(self) -> bool:
+        return self.db_path is not None
+
+    def _c(self) -> sqlite3.Connection:
+        """懒开共享连接（每进程一份；check_same_thread=False + 锁串行化）。"""
+        if self._conn is None:
+            conn = sqlite3.connect(self.db_path, check_same_thread=False,
+                                   isolation_level=None)   # autocommit
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._conn = conn
+        return self._conn
+
+    def _upsert(self, name: str, labels: dict | None, kind: str,
+                count: float, total: float = 0.0, *, add: bool,
+                conn: sqlite3.Connection | None = None) -> None:
+        add_count = "count+excluded.count" if add else "excluded.count"
+        add_sum = "sum+excluded.sum" if add else "excluded.sum"
+        sql = ("INSERT INTO metric_counters(name, labels, kind, count, sum) "
+               "VALUES(?,?,?,?,?) ON CONFLICT(name, labels, kind) DO UPDATE SET "
+               f"count={add_count}, sum={add_sum}")
+        args = (name, _label_str(_label_key(labels)), kind, count, total)
+        if conn is not None:
+            # 复用调用方（请求/端点）的连接：与请求写在**同一事务**里，
+            # 既不与它抢写锁（旧实现各自连接 → `database is locked`，
+            # 把 502 路径打成 500），也不额外开一次 commit。
+            conn.execute(sql, args)
+            return
+        with self._lock:
+            self._c().execute(sql, args)
+
+    # ── 写入 API（conn 可选：给了就并入调用方事务，A4/M3-10） ──────────────
+    def inc(self, name: str, labels: dict | None = None, n: float = 1,
+            conn=None) -> None:
+        if self.db_mode:
+            self._upsert(name, labels, "counter", n, add=True, conn=conn)
+            return
         key = (name, _label_key(labels))
         self.counters[key] = self.counters.get(key, 0) + n
 
-    def observe(self, name: str, labels: dict | None, seconds: float) -> None:
+    def observe(self, name: str, labels: dict | None, seconds: float,
+                conn=None) -> None:
+        if self.db_mode:
+            self._upsert(name, labels, "summary", 1, seconds, add=True, conn=conn)
+            return
         s = self.summaries.setdefault((name, _label_key(labels)), [0, 0.0])
         s[0] += 1
         s[1] += seconds
 
-    def set(self, name: str, value: float, labels: dict | None = None) -> None:
+    def set(self, name: str, value: float, labels: dict | None = None,
+            conn=None) -> None:
+        if self.db_mode:
+            self._upsert(name, labels, "gauge", value, add=False, conn=conn)
+            return
         self.gauges[(name, _label_key(labels))] = value
 
     def backfill_requests(self, conn) -> None:
         """启动 backfill：requests 表按 (proto, hit_branch, routed_to, outcome)
-        聚合灌入 sr_requests_total（裁定 6 只 backfill 此一族；hit_branch 为
-        NULL 的非树请求 route 记 "none"——运行期 live 路径用诊断头值，重启后
-        两口径对非树行不逐一对齐，记任务报告）。"""
+        聚合灌入 sr_requests_total。
+
+        幂等（A4/M3-10）：DB 模式下**已有本族样本则跳过**——多 worker 各自
+        ``create_app`` 时都会调用本方法，重复执行不得把计数翻倍。
+        """
+        if self.db_mode:
+            q = ("SELECT 1 FROM metric_counters WHERE name='sr_requests_total' "
+                 "LIMIT 1")
+            if conn.execute(q).fetchone() is not None:
+                return
         rows = conn.execute(
             "SELECT proto, hit_branch, routed_to, outcome, COUNT(*) n "
             "FROM requests GROUP BY proto, hit_branch, routed_to, outcome")
@@ -97,25 +166,43 @@ class Metrics:
                       "model": r["routed_to"] or "", "outcome": r["outcome"] or ""},
                      r["n"])
 
+    # ── 渲染 ───────────────────────────────────────────────────────────────
+    def _rows(self) -> list[tuple[str, str, str, float, float]]:
+        """DB 模式：读全量样本 (name, labels_str, kind, count, sum)，按名/标签排序。"""
+        with self._lock:
+            return [tuple(r) for r in self._c().execute(
+                "SELECT name, labels, kind, count, sum FROM metric_counters "
+                "ORDER BY name, labels")]
+
     def render(self) -> str:
         """§11.1 清单 → classic OpenMetrics 文本（HELP/TYPE 恒出，样本有则出）。"""
         lines: list[str] = []
+        if self.db_mode:
+            db_rows = self._rows()
+        else:
+            # 内存模式：统一成与 DB 同样的样本形状
+            db_rows = [
+                (n, _label_str(labels), "counter", v, 0.0)
+                for (n, labels), v in sorted(self.counters.items())]
+            db_rows += [
+                (n, _label_str(labels), "summary", c, s)
+                for (n, labels), (c, s) in sorted(self.summaries.items())]
+            db_rows += [
+                (n, _label_str(labels), "gauge", v, 0.0)
+                for (n, labels), v in sorted(self.gauges.items())]
         for name, typ, help_text in _METRIC_FAMILIES:
             lines.append(f"# HELP {name} {help_text}")
             lines.append(f"# TYPE {name} {typ}")
-            if typ == "counter":
-                for (n, labels), v in sorted(self.counters.items()):
-                    if n == name:
-                        lines.append(f"{name}{_label_str(labels)} {v:g}")
-            elif typ == "summary":
-                for (n, labels), (c, s) in sorted(self.summaries.items()):
-                    if n == name:
-                        lines.append(f"{name}_count{_label_str(labels)} {c}")
-                        lines.append(f"{name}_sum{_label_str(labels)} {s:.6f}")
-            else:
-                for (n, labels), v in sorted(self.gauges.items()):
-                    if n == name:
-                        lines.append(f"{name}{_label_str(labels)} {v:g}")
+            for n, labels_str, kind, count, total in db_rows:
+                if n != name:
+                    continue
+                if kind == "counter" and typ == "counter":
+                    lines.append(f"{name}{labels_str} {count:g}")
+                elif kind == "summary" and typ == "summary":
+                    lines.append(f"{name}_count{labels_str} {count:g}")
+                    lines.append(f"{name}_sum{labels_str} {total:.6f}")
+                elif kind == "gauge" and typ == "gauge":
+                    lines.append(f"{name}{labels_str} {count:g}")
         return "\n".join(lines) + "\n"
 
 
@@ -136,7 +223,8 @@ def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
                           routed_to: str | None, outcome: str,
                           session_tag: str, hit_branch: str | None,
                           primary: str | None = None, final: str | None = None,
-                          decision: RouteDecision | None = None) -> None:
+                          decision: RouteDecision | None = None,
+                          conn=None) -> None:
     """一次 /v1 请求的请求级计数（在 _log_request 的每个落账点调用）。
 
     - route 标签取诊断头同源值（树命中 = "N.M" 路径，否则 direct/sticky/
@@ -146,15 +234,17 @@ def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
       字符串 ``diag.get("x-sr-route") != "trial"`` 排除试水，而 source=trial 时该头
       是 "N.M"——恒真死代码；改按 decision.source 判定，不再依赖诊断头字符串）。
       判定与本函数外的 requests.outcome 共用 :func:`_is_fallback`（M1）。
+    - ``conn``：请求连接（DB 模式下并入请求事务，避免与请求写抢锁；A4/M3-10）。
     """
     route = diag.get("x-sr-route", "none")
     metrics.inc("sr_requests_total", {"proto": proto, "route": route,
-                                      "model": routed_to or "", "outcome": outcome})
+                                      "model": routed_to or "", "outcome": outcome},
+                conn=conn)
     if hit_branch:
-        metrics.inc("sr_route_hits_total", {"route": hit_branch})
+        metrics.inc("sr_route_hits_total", {"route": hit_branch}, conn=conn)
     if session_tag == "sticky":
-        metrics.inc("sr_session_sticky_total")
+        metrics.inc("sr_session_sticky_total", conn=conn)
     elif session_tag == "unlocked":
-        metrics.inc("sr_session_unlock_total")
+        metrics.inc("sr_session_unlock_total", conn=conn)
     if _is_fallback(primary, final, decision):
-        metrics.inc("sr_fallback_total", {"from": primary, "to": final})
+        metrics.inc("sr_fallback_total", {"from": primary, "to": final}, conn=conn)

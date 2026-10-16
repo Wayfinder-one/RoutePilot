@@ -105,7 +105,7 @@ async def _call_nonstream(conn, ir, decision: RouteDecision, settings: dict,
     max_retries = int(settings.get("max_retries") or 0)
     last: UpstreamError | None = None
     for cand in _chain(decision):
-        if is_circuit_open(cand):
+        if is_circuit_open(cand, conn):
             continue
         backend, payload = _outbound_payload_or_none(ir, cand, decision, conn)
         if backend is None:
@@ -133,16 +133,17 @@ async def _call_nonstream(conn, ir, decision: RouteDecision, settings: dict,
                 last = exc
                 if metrics is not None:
                     metrics.inc("sr_retry_total",
-                                {"model": cand, "status": str(exc.status or 0)})
-                    if is_circuit_open(cand):
-                        metrics.inc("sr_circuit_open_total", {"model": cand})
+                                {"model": cand, "status": str(exc.status or 0)},
+                                conn=conn)
+                    if is_circuit_open(cand, conn):
+                        metrics.inc("sr_circuit_open_total", {"model": cand}, conn=conn)
             except httpx.HTTPError as exc:
                 record_failure(conn, cand)
                 last = UpstreamError(502, f"upstream unreachable: {exc}", "api_error")
                 if metrics is not None:
-                    metrics.inc("sr_retry_total", {"model": cand, "status": "0"})
-                    if is_circuit_open(cand):
-                        metrics.inc("sr_circuit_open_total", {"model": cand})
+                    metrics.inc("sr_retry_total", {"model": cand, "status": "0"}, conn=conn)
+                    if is_circuit_open(cand, conn):
+                        metrics.inc("sr_circuit_open_total", {"model": cand}, conn=conn)
             finally:
                 await client.aclose()
     raise last or UpstreamError(502, "no upstream candidate available", "api_error")
@@ -162,12 +163,12 @@ async def _call_stream(conn, ir, decision: RouteDecision, settings: dict,
 
     def _fail(cand: str, status) -> None:
         if metrics is not None:
-            metrics.inc("sr_retry_total", {"model": cand, "status": str(status)})
-            if is_circuit_open(cand):
-                metrics.inc("sr_circuit_open_total", {"model": cand})
+            metrics.inc("sr_retry_total", {"model": cand, "status": str(status)}, conn=conn)
+            if is_circuit_open(cand, conn):
+                metrics.inc("sr_circuit_open_total", {"model": cand}, conn=conn)
 
     for cand in _chain(decision):
-        if is_circuit_open(cand):
+        if is_circuit_open(cand, conn):
             continue
         backend, payload = _outbound_payload_or_none(ir, cand, decision, conn)
         if backend is None:                 # M3/M4 同 _call_nonstream：换下一候选

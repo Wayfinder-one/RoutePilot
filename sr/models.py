@@ -124,22 +124,38 @@ _CIRCUIT_OPENED_AT: dict[str, float] = {}
 HALF_OPEN_AFTER_S = 300.0
 
 
-def is_circuit_open(model_id: str) -> bool:
-    """熔断是否打开：内存连续失败计数 ≥ 3 **且未过半开窗口**（spec §8.3）。
+def is_circuit_open(model_id: str, conn=None) -> bool:
+    """熔断是否打开（spec §8.3 + A4/M3-10 跨 worker 一致）。
 
-    M3：达到阈值后经过 HALF_OPEN_AFTER_S（默认 5 分钟）即「半开」——放行一次探测，
-    成功则 record_success 清零恢复，失败则再次打开。旧实现 ≥3 次即永久隔离（被跳过
-    的模型永远等不到 record_success），唯一出路是重启进程或人工 reset。
+    两级判定：
+
+    1. **本进程**有完整状态（连续失败计数 ≥3）：未过半开窗口 → 打开；过了窗口 →
+       放行一次探测（返回 False）。半开语义与 M3 一致。
+    2. 本进程**没有**状态时查 DB ``models.ok == 0``（另一 worker 打开的熔断，或本
+       进程重启后 DB 里仍记着隔离）：打开。DB 无打开时刻，故该路径不放行半开探测
+       ——宁可多隔离一次，也不误放。``conn`` 省略（None）时退化为纯进程内判定，
+       供单测与无库调用。
     """
     with _FAIL_LOCK:
-        if _FAIL_COUNTS.get(model_id, 0) < 3:
-            return False
-        opened = _CIRCUIT_OPENED_AT.get(model_id, 0.0)
-        return (time.monotonic() - opened) < HALF_OPEN_AFTER_S
+        if _FAIL_COUNTS.get(model_id, 0) >= 3:
+            opened = _CIRCUIT_OPENED_AT.get(model_id, 0.0)
+            if (time.monotonic() - opened) < HALF_OPEN_AFTER_S:
+                return True
+            return False                  # 半开：放行本次探测
+    if conn is not None:
+        row = conn.execute("SELECT ok FROM models WHERE id = ?",
+                           (model_id,)).fetchone()
+        if row is not None and row["ok"] == 0:
+            return True
+    return False
 
 
 def record_failure(conn, model_id: str) -> None:
-    """失败计数 +1；达 3 次写库 ok=0 + break_reason（spec §8.3 逐字）+ 记打开时刻。"""
+    """失败计数 +1；达 3 次写库 ok=0 + break_reason（spec §8.3 逐字）+ 记打开时刻。
+
+    打开熔断时**立即提交**该 UPDATE（A4/M3-10）：其它 worker 靠 DB 的 ok=0 得知
+    隔离状态，若等调用方后续提交，跨 worker 会有窗口期内继续打到坏模型。
+    """
     with _FAIL_LOCK:
         _FAIL_COUNTS[model_id] = _FAIL_COUNTS.get(model_id, 0) + 1
         if _FAIL_COUNTS[model_id] >= 3:
@@ -147,6 +163,7 @@ def record_failure(conn, model_id: str) -> None:
     if _FAIL_COUNTS[model_id] >= 3:
         conn.execute("UPDATE models SET ok = 0, break_reason = ? WHERE id = ?",
                      ("连续失败 · 自动熔断", model_id))
+        conn.commit()
 
 
 def record_success(conn, model_id: str) -> None:

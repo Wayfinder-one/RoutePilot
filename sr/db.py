@@ -165,6 +165,15 @@ CREATE TABLE estimates (
   actual TEXT                        -- JSON: 复盘回填 {daily, cost_delta, reviewed_at}；NULL = 未复盘
 );
 
+CREATE TABLE metric_counters (
+  name   TEXT NOT NULL,              -- §11.1 指标家族名（如 sr_requests_total）
+  labels TEXT NOT NULL DEFAULT '',   -- 规范化标签串（与 metrics._label_str 同源）
+  kind   TEXT NOT NULL,              -- counter | summary | gauge
+  count  REAL NOT NULL DEFAULT 0,    -- counter 计数 / summary 次数 / gauge 末值
+  sum    REAL NOT NULL DEFAULT 0,    -- summary 秒数合计（其余 kind 恒 0）
+  PRIMARY KEY (name, labels, kind)   -- 多 worker 聚合的共享键（A4/M3-10）
+);
+
 -- ── 索引（spec §3.2） ──
 CREATE INDEX idx_tags_rid ON tags(request_id);
 CREATE INDEX idx_req_ts ON requests(ts DESC);
@@ -209,11 +218,25 @@ _SEED_TAG_SETTINGS = [
 
 _SEED_CONF_SETTINGS = [0.30, 0.60, 0.85]  # 把握度切点（单行，id=1）
 
-# 建库后必须齐全的表（11 张，自 SCHEMA 提取——避免两处各写一份名单漂移）。
+# 建库后必须齐全的表（12 张，自 SCHEMA 提取——避免两处各写一份名单漂移）。
 # backlog：旧幂等探测只认 settings 表，指向「有 settings、缺其余表」的残缺/外来库时
 # 会误判为已初始化 → 后续查询裸 OperationalError。
 _REQUIRED_TABLES: frozenset[str] = frozenset(
     re.findall(r"CREATE TABLE\s+(\w+)", SCHEMA))
+
+# 可由 _migrate 在既有库上补建的表（A4/M3-10：metric_counters 是后加的跨进程指标
+# 聚合表）。旧库（11 张核心表）缺它不算「不完整」——init_db 直接补建，is_initialized
+# 也只按核心表判定，避免把合法旧库判死（CLI export/import 会拒绝启动）。
+_MIGRATABLE_TABLES: frozenset[str] = frozenset({"metric_counters"})
+_CORE_TABLES: frozenset[str] = _REQUIRED_TABLES - _MIGRATABLE_TABLES
+
+
+def _table_ddl(name: str) -> str:
+    """自 SCHEMA 抽出某张表的 CREATE TABLE 语句（迁移用，避免两处 DDL 漂移）。"""
+    m = re.search(rf"CREATE TABLE {name} \(.*?\n\);", SCHEMA, re.S)
+    if m is None:
+        raise KeyError(f"SCHEMA 中没有表 {name}")
+    return m.group(0)
 
 
 def _now() -> str:
@@ -242,7 +265,10 @@ def _existing_tables(conn: sqlite3.Connection) -> set[str]:
 
 
 def is_initialized(path: str) -> bool:
-    """库是否已完成 :func:`init_db` 建表（11 张表齐全）。不建文件、不建表。
+    """库是否已完成 :func:`init_db` 建表（**核心** 11 张表齐全）。不建文件、不建表。
+
+    ``_MIGRATABLE_TABLES``（metric_counters）不参与判定：本次升级前建的合法旧库
+    缺它但可用，``init_db`` 会补建（A4/M3-10）。
 
     backlog：``sr export`` / ``sr import`` 对未初始化库曾先静默建空文件、再在
     config 层裸 OperationalError——CLI 侧先用本函数判定，给出干净退出码。
@@ -253,7 +279,7 @@ def is_initialized(path: str) -> bool:
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            return _REQUIRED_TABLES <= _existing_tables(conn)
+            return _CORE_TABLES <= _existing_tables(conn)
         finally:
             conn.close()
     except sqlite3.Error:
@@ -261,17 +287,17 @@ def is_initialized(path: str) -> bool:
 
 
 def init_db(path: str) -> sqlite3.Connection:
-    """建 11 表 + 索引 + 默认 settings + 默认模板 balanced（含补种供应商/模型/分档）。
+    """建全部表 + 索引 + 默认 settings + 默认模板 balanced（含补种供应商/模型/分档）。
 
-    幂等：库内 11 张表齐全时原样返回连接，不重放种子。残缺库（部分表存在，
-    如外来库恰好有 settings）不静默续用——抛 RuntimeError 明确指出缺表，
-    避免后续查询在别处裸 OperationalError（backlog）。
+    幂等：库内表齐全时原样返回连接，不重放种子。残缺库（部分表存在，如外来库恰好
+    有 settings）不静默续用——抛 RuntimeError 明确指出缺表，避免后续查询在别处裸
+    OperationalError（backlog）。只缺 ``_MIGRATABLE_TABLES`` 的旧库直接补建后返回。
     """
     conn = get(path)
     have = _existing_tables(conn)
     missing = _REQUIRED_TABLES - have
-    if not missing:
-        _migrate(conn)                     # 已建库：补新增列（幂等）
+    if not missing or missing <= _MIGRATABLE_TABLES:
+        _migrate(conn)                     # 已建库：补新增列/可迁移新表（幂等）
         return conn
     if have & _REQUIRED_TABLES:            # 部分表在 → 库不完整，不冒然补建
         conn.close()
@@ -285,14 +311,19 @@ def init_db(path: str) -> sqlite3.Connection:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    """轻量 schema 迁移：给既有库补新增列（PRAGMA 探测 + ALTER，幂等）。
+    """轻量 schema 迁移：给既有库补新增列与可迁移新表（幂等）。
 
     M2：requests.tree_version（§3.1）是后加的列——旧库 CREATE TABLE 时没有它，
     必须 ALTER 补上，否则「记录当时 tree_version」的写侧 INSERT 会因缺列失败。
+    A4/M3-10：metric_counters 为后加表，按 :data:`_MIGRATABLE_TABLES` 补建。
     """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
     if cols and "tree_version" not in cols:
         conn.execute("ALTER TABLE requests ADD COLUMN tree_version INTEGER")
+        conn.commit()
+    have = _existing_tables(conn)
+    for tbl in sorted(_MIGRATABLE_TABLES - have):
+        conn.execute(_table_ddl(tbl))
         conn.commit()
 
 

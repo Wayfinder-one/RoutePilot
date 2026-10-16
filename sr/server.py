@@ -437,7 +437,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                 context_thresholds=ctx_thresholds))
             signals = tag_result.signals
             answer_ms = (time.monotonic() - t1) * 1000
-            metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0)
+            metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0,
+                                 conn=conn)
         else:
             # ── 5 查会话沿用（§4.4）──
             session_id = extract_session(
@@ -478,7 +479,8 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                 else:
                     signals = pre_signals         # 反馈探测前向的产物直接复用
                 answer_ms = (time.monotonic() - t1) * 1000
-                metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0)
+                metrics.observe("sr_answer_latency_seconds", {}, answer_ms / 1000.0,
+                                 conn=conn)
                 # ── 7 走分流树 → RouteDecision ──
                 decision = evaluate(nodes, signals, cuts)
 
@@ -508,14 +510,14 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to="block", outcome="block",
                                   session_tag=session_tag, hit_branch=hit_branch,
-                                  decision=decision)
+                                  decision=decision, conn=conn)
             conn.commit()
             return _error(proto, 403, message, "permission_error", "content_blocked",
                           diag)
 
         if not decision.model:
             # 防御性 fallback（无兜底的坏树，正常不可达）：x-sr-route=fallback + 502
-            metrics.inc("sr_no_match_total")
+            metrics.inc("sr_no_match_total", conn=conn)
             rid = _log_request(conn, proto=proto, asked=asked, hit_branch=hit_branch,
                                routed_to=None, session_id=session_id,
                                session_tag=session_tag, outcome="error", status=502,
@@ -525,7 +527,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
                                   session_tag=session_tag, hit_branch=hit_branch,
-                                  decision=decision)
+                                  decision=decision, conn=conn)
             conn.commit()
             return _error(proto, 502, "routing produced no model",
                           "api_error", "no_route", diag)
@@ -548,7 +550,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             if daily >= float(settings.get("budget_daily_limit_usd") or 10.0) \
                     * float(settings.get("budget_water") or 0.8):
                 decision.model = settings["budget_route"]
-                metrics.inc("sr_budget_triggered_total")
+                metrics.inc("sr_budget_triggered_total", conn=conn)
                 diag["x-sr-budget"] = "1"
 
         # ── 8–9 供应商解析 + 上游调用（候选链 + 重试 + 熔断 + 首包锁定） ──
@@ -571,7 +573,7 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
             _bump_request_metrics(metrics, proto=proto, diag=diag,
                                   routed_to=None, outcome="error",
                                   session_tag=session_tag, hit_branch=hit_branch,
-                                  decision=decision)
+                                  decision=decision, conn=conn)
             conn.commit()
             return _error(proto, exc.status or 502, exc.message,
                           exc.type if exc.type != "config_error" else "api_error",
@@ -598,12 +600,12 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: Tagger,
                            tree_version=tree_version)
         _store_tags(conn, rid, signals)
         metrics.observe("sr_upstream_latency_seconds", {"model": final_model},
-                        (upstream_ms or 0) / 1000.0)
+                        (upstream_ms or 0) / 1000.0, conn=conn)
         _bump_request_metrics(metrics, proto=proto, diag=diag,
                               routed_to=final_model, outcome=outcome,
                               session_tag=session_tag, hit_branch=hit_branch,
                               primary=decision.model, final=final_model,
-                              decision=decision)
+                              decision=decision, conn=conn)
         if mode == "tree" and session_id:
             # 树命中成功才写会话（直通 R2 不参与沿用；沿用轮 resolve_session 已记账）
             if session_tag == "new":
@@ -756,7 +758,7 @@ def create_app(db_path: str, tagger: Tagger,
     app = FastAPI(title="smart-router", docs_url=None, redoc_url=None)
     app.state.db_path = db_path
     app.state.tagger = tagger
-    metrics = Metrics()
+    metrics = Metrics(db_path)   # A4/M3-10：DB 聚合，跨 worker / app 实例共享
     conn = db.get(db_path)
     try:
         metrics.backfill_requests(conn)

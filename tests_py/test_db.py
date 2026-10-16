@@ -1,11 +1,12 @@
 import sr.db as db
 
-def test_init_creates_eleven_tables(tmp_path):
+def test_init_creates_twelve_tables(tmp_path):
     conn = db.init_db(str(tmp_path / "t.db"))
     names = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     assert {"providers","models","tree","tag_settings","conf_settings",
-            "settings","requests","tags","sessions","changes","estimates"} <= names
+            "settings","requests","tags","sessions","changes","estimates",
+            "metric_counters"} <= names
 
 def test_default_settings_present(tmp_path):
     conn = db.init_db(str(tmp_path / "t.db"))
