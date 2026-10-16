@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -106,6 +107,46 @@ class CheckpointFiles:
     head_specs: tuple
     checkpoint_dir: str
     model_path: str
+
+
+def _re_mech(value) -> str:
+    """§6.8 机械归一：小写 + 空白/连字符 → 下划线（连续分隔符并作一个）。"""
+    return re.sub(r"[\s\-]+", "_", str(value).strip().lower())
+
+
+# 检查点头的原始 label → 规范键（§6.8 别名；*不*做 ordered 档位转换——检查点
+# 头是 Linear(hidden, n_labels)，labels 是**离散标签**而非产品 ordered 档位）。
+_HEAD_LABEL_ALIASES: dict[str, dict[str, str]] = {
+    "fact_check": {"fact_check_needed": "needs_check",
+                   "no_fact_check_needed": "no_check"},
+    "modality": {"ar": "text", "diffusion": "image", "both": "text_image"},
+    "user_feedback": {"sat": "satisfied"},
+}
+
+
+def canonical_label(head: str, raw) -> str:
+    """检查点头的原始 label → 规范存储键（§6.8 机械归一 + 别名）。"""
+    v = _re_mech(raw)
+    return _HEAD_LABEL_ALIASES.get(head, {}).get(v, v)
+
+
+def build_tags_json(labels_by_head: dict, embedding_dim: int = 768) -> dict:
+    """训练侧标签注册表（``{head: (raw_label, …)}``）→ tags.json（§2.2）。
+
+    按 :data:`HEAD_SPECS` 顺序，label 经 :func:`canonical_label` 归一为规范键。
+    生成结果与 :func:`_validate_tags_json` 的期望一致——供训练侧未写出 tags.json
+    时离线补齐（§2.4 的训练侧待办）。
+    """
+    tags: dict = {}
+    for spec in HEAD_SPECS:
+        if spec.head == "embedding":
+            tags[spec.json_key] = {"type": "projection", "dim": int(embedding_dim)}
+            continue
+        raw = labels_by_head.get(spec.json_key, ())
+        tags[spec.json_key] = {"type": spec.product_kind,
+                               "labels": [canonical_label(spec.json_key, x)
+                                          for x in raw]}
+    return {"schema": 1, "tags": tags}
 
 
 def load_router_config(path: str | Path) -> RouterConfig:
@@ -263,8 +304,16 @@ class CheckpointTagger:
         if tokenizer_factory is not None:
             self.tokenizer = tokenizer_factory(cfg)
         else:
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
+            # 真实训练侧模型自带 tokenizer（from_pretrained 时建好）；否则按 base_model 取
+            self.tokenizer = getattr(self.model, "tokenizer", None)
+            if self.tokenizer is None:
+                from transformers import AutoTokenizer
+                self.tokenizer = AutoTokenizer.from_pretrained(cfg.base_model)
+        # §4.2-1：右 padding
+        try:
+            self.tokenizer.padding_side = "right"
+        except Exception:                                   # noqa: BLE001
+            pass
 
         self._batch_window_s = max(0, int(batch_window_ms)) / 1000.0
         self._warmup(warmup_samples or ["hello", "你好", "1+1=?", "写一段代码"])
@@ -272,14 +321,33 @@ class CheckpointTagger:
 
     @staticmethod
     def _default_model_factory():
-        """训练侧 RoutePilotModel（契约见模块头）；缺失则显式报错，不静默降级。"""
+        """真实训练侧模型工厂：返回 ``callable(cfg) -> model``。
+
+        优先 ``smart_router.modeling.router.SmartRouterModel``（本仓库约定的训练侧
+        权威实现，``from_pretrained`` 建 backbone + 头）；回退 ``routepilot.model``
+        （spec 文本里的旧包名）。都缺失则显式报错，不静默降级。
+        """
         try:
-            from routepilot.model import RoutePilotModel  # type: ignore
-            return RoutePilotModel
-        except Exception as exc:                    # noqa: BLE001
+            from smart_router.modeling.router import RouterConfig as TrainCfg
+            from smart_router.modeling.router import SmartRouterModel
+
+            def build(cfg):
+                train_cfg = TrainCfg(base_model=cfg.base_model,
+                                     max_length=cfg.max_length,
+                                     embedding_dim=cfg.embedding_dim,
+                                     dtype=cfg.dtype)
+                return SmartRouterModel.from_pretrained(train_cfg)
+            return build
+        except Exception:                                   # noqa: BLE001
+            pass
+        try:
+            from routepilot.model import RoutePilotModel      # type: ignore
+            return lambda cfg: RoutePilotModel(cfg)
+        except Exception as exc:                            # noqa: BLE001
             raise CheckpointError(
-                "找不到训练侧模型类 routepilot.model.RoutePilotModel——"
-                "请安装 smart-router-train，或经 model_factory 注入同契约模型") from exc
+                "找不到训练侧模型类（smart_router.modeling.router.SmartRouterModel "
+                "或 routepilot.model.RoutePilotModel）——请安装 smart-router-train "
+                "并把其 src 加入 PYTHONPATH，或经 model_factory 注入同契约模型") from exc
 
     def _warmup(self, samples: list[str]) -> None:
         """预热 4 条样本（§2.3-5）：断言输出形状与取值范围正常。"""
@@ -315,18 +383,32 @@ class CheckpointTagger:
                 out = self.model.forward(enc["input_ids"],
                                          attention_mask=enc.get("attention_mask"),
                                          with_embedding=True)
-        # 归一为 {head_kind: {name: list[list[float]]}} + embedding 列表
+
         def _tolist(t):
             return t.detach().float().cpu().tolist()
-        norm = {"classification": {}, "multilabel": {},
-                "embedding_head": _tolist(out["embedding_head"])}
+
+        # 归一为 {classification: {name: [[…]]}, multilabel: {name: [[…]]}, embedding_head: [[…]]}。
+        # 支持两种上游形状：
+        #  (a) 契约式嵌套 {classification_heads, multilabel_heads, embedding_head}
+        #      （spec §4.2-3 的写法，测试合成模型用）；
+        #  (b) 真训练侧 SmartRouterModel 的**扁平** dict {head_name: logits, "embedding": vec}。
+        norm = {"classification": {}, "multilabel": {}}
+        if isinstance(out, dict) and "classification_heads" in out:
+            cls_raw = out["classification_heads"]
+            ml_raw = out.get("multilabel_heads", {})
+            emb_raw = out.get("embedding_head", out.get("embedding"))
+        else:
+            cls_raw = {s.json_key: out[s.json_key]
+                       for s in self.files.head_specs if s.head == "classification"}
+            ml_raw = {s.json_key: out[s.json_key]
+                      for s in self.files.head_specs if s.head == "multilabel"}
+            emb_raw = out.get("embedding")
         for spec in self.files.head_specs:
             if spec.head == "classification":
-                norm["classification"][spec.json_key] = \
-                    _tolist(out["classification_heads"][spec.json_key])
+                norm["classification"][spec.json_key] = _tolist(cls_raw[spec.json_key])
             elif spec.head == "multilabel":
-                norm["multilabel"][spec.json_key] = \
-                    _tolist(out["multilabel_heads"][spec.json_key])
+                norm["multilabel"][spec.json_key] = _tolist(ml_raw[spec.json_key])
+        norm["embedding_head"] = _tolist(emb_raw)
         return norm
 
     def _signals_from_row(self, row: dict, req: TagRequest) -> tuple[dict, list[float]]:

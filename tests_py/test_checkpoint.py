@@ -110,6 +110,35 @@ def test_band_index_matches_conf_band_semantics():
     assert DEFAULT_BAND_THRESHOLDS["jailbreak"] == cuts
 
 
+def test_canonical_label_and_build_tags_json():
+    """M2：从训练侧标签注册表生成 tags.json（规范键 + 与 HEAD_SPECS 一致）。"""
+    from sr.checkpoint import (_validate_tags_json, build_tags_json,
+                               canonical_label)
+    from sr.tags import PII_KEYS
+    assert canonical_label("domain", "computer science") == "computer_science"
+    assert canonical_label("fact_check", "FACT_CHECK_NEEDED") == "needs_check"
+    assert canonical_label("fact_check", "no_fact_check_needed") == "no_check"
+    assert canonical_label("modality", "AR") == "text"
+    assert canonical_label("user_feedback", "SAT") == "satisfied"
+    assert canonical_label("pii", "CN_ID_CARD") == "cn_id_card"
+    assert canonical_label("complexity", "easy") == "easy"
+
+    labels = {
+        "domain": ("biology", "business", "chemistry", "computer science",
+                   "economics", "engineering", "health", "history", "law", "math",
+                   "other", "philosophy", "physics", "psychology"),
+        "jailbreak": ("benign", "jailbreak"),
+        "fact_check": ("no_fact_check_needed", "fact_check_needed"),
+        "user_feedback": ("SAT", "NEED_CLARIFICATION", "WRONG_ANSWER", "WANT_DIFFERENT"),
+        "modality": ("AR", "DIFFUSION", "BOTH"),
+        "complexity": ("easy", "hard"),
+        "pii": tuple(x.upper() for x in PII_KEYS),
+    }
+    tj = build_tags_json(labels, embedding_dim=768)
+    _validate_tags_json(tj)                     # 不抛 = 与 HEAD_SPECS 逐项一致
+    assert tj["tags"]["fact_check"]["labels"] == ["no_check", "needs_check"]
+
+
 def test_embedding_similarity_and_reask():
     vec = _l2_normalize([3.0, 4.0])
     assert vec == pytest.approx([0.6, 0.8])
