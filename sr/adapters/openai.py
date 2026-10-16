@@ -98,6 +98,10 @@ def to_upstream(ir: IR, model_upstream: str, think: str | None) -> dict:
 
     - system 还原为 ``messages[0].role='system'``（§7.3 请求体口径）；
     - params 缺失（None）不出现在出站体——缺失与显式 null 语义不同，不替上游做主；
+    - tools 原样透传（IR 契约，adapters/__init__.py:46；§7.2-2/§7.2-9）——**None
+      不出站**，与 params 同口径。B1（audit blocker）：旧实现从不引用 ir.tools，
+      而 parse 已把它排除出 extensions（known 集），OpenAI 客户端的 function
+      calling 请求因此到上游即残废（静默丢字段）；
     - think 值域外抛 ValueError 不静默兜底（对齐 §6.9「值空间外拒绝」口径）。
     """
     messages = list(ir.messages)
@@ -106,6 +110,8 @@ def to_upstream(ir: IR, model_upstream: str, think: str | None) -> dict:
     body: dict = {"model": model_upstream, "stream": ir.stream, "messages": messages}
     body.update({k: v for k, v in ir.params.items() if v is not None})
     body.update(ir.extensions)
+    if ir.tools is not None:                 # None 不出站（与 params 同口径）
+        body["tools"] = ir.tools
     if think is not None and think != "off":
         if think not in THINK_OPENAI:
             raise ValueError(f"unknown think: {think!r}")

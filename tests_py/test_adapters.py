@@ -35,6 +35,68 @@ def test_think_param_mapping():
     body = anthropic.to_upstream(anthropic.parse(AN_BODY), "m", "light")
     assert body["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B1（blocker）：OpenAI 出站丢弃 tools —— 双协议 tools 透传 + extensions 分流
+# 旧实现 openai.to_upstream 只组装 model/stream/messages + params + extensions，
+# 而 parse 把 "tools" 收进 IR.tools 并把它排除出 extensions → 「进得来、出不去」，
+# OpenAI 客户端的 function calling 请求到上游即残废（静默）。对照
+# anthropic.to_upstream 有 `if ir.tools is not None: body["tools"] = ir.tools`。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TOOLS_OAI = [{"type": "function", "function": {
+    "name": "get_weather",
+    "description": "查询指定城市的天气",
+    "parameters": {"type": "object",
+                   "properties": {"city": {"type": "string"}},
+                   "required": ["city"]}}}]
+# Anthropic 的 tools 形状不同（无 type:function 包装，带 input_schema）——逐字透传
+_TOOLS_AN = [{"name": "get_weather", "description": "查询指定城市的天气",
+              "input_schema": {"type": "object",
+                               "properties": {"city": {"type": "string"}},
+                               "required": ["city"]}}]
+
+
+def test_openai_tools_passthrough_verbatim():
+    """openai 带 tools 的请求 → 出站体含 tools 且**逐字相等**（IR 契约「原样透传」）。"""
+    body = openai.to_upstream(
+        openai.parse({**OA_BODY, "tools": _TOOLS_OAI, "tool_choice": "auto"}), "m", None)
+    assert body["tools"] == _TOOLS_OAI, body
+    # 伴随字段（tool_choice）本就在 known 集之外 → extensions 分流，照旧回放
+    assert body["tool_choice"] == "auto", body
+
+
+def test_openai_tools_none_not_sent():
+    """tools=None（客户端没带）→ 出站体不得出现该键（与 params 同口径：缺失不出站）。"""
+    body = openai.to_upstream(openai.parse(OA_BODY), "m", None)
+    assert "tools" not in body, body
+
+
+def test_anthropic_tools_passthrough_verbatim():
+    """anthropic 侧钉住现状不回归：tools 逐字透传、None 不出站。"""
+    body = anthropic.to_upstream(
+        anthropic.parse({**AN_BODY, "tools": _TOOLS_AN}), "m", None)
+    assert body["tools"] == _TOOLS_AN, body
+    assert "tools" not in anthropic.to_upstream(anthropic.parse(AN_BODY), "m", None)
+
+
+import pytest as _pytest                                        # noqa: E402
+
+
+@_pytest.mark.parametrize("key,value", [
+    ("tool_choice", "auto"),
+    ("tool_choice", {"type": "function", "function": {"name": "get_weather"}}),
+    ("parallel_tool_calls", False),
+])
+def test_openai_function_calling_companion_fields_roundtrip(key, value):
+    """function calling 伴随字段（tool_choice / parallel_tool_calls）在 known 集
+    之外 → parse 收进 extensions、to_upstream 原样回放（不得静默丢）。将来若有人
+    把这些键加进 known 集，本测试立即红——「被 parse 收下但不回放」的字段一次性
+    清干净（核对清单见 batch-B1-report.md）。"""
+    body = openai.to_upstream(openai.parse({**OA_BODY, "tools": _TOOLS_OAI,
+                                            key: value}), "m", None)
+    assert body[key] == value, body
+
 def test_response_model_rewrite():
     resp = {"model": "qwen3-32b-real", "choices": [{"message": {"content": "ok"}}]}
     out = openai.from_upstream(resp, model_asked="auto")

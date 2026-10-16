@@ -11,7 +11,7 @@ import pytest, copy
 import sr.db as db
 from sr.engine import rows_to_tree
 from sr.tags import TAGS
-from sr.health import run_checkup
+from sr.health import check_bad_ref, run_checkup
 
 # 测试替身：id 集合即可。必须覆盖 balanced 种子树引用的全部模型——否则 bad_ref
 # 会因「引用了不存在的模型」恒有 hard，new 的「正例不误报」断言就失去分辨力。
@@ -227,6 +227,16 @@ def _admin_put(app, path, json=None):
     return _asyncio.get_event_loop().run_until_complete(go())
 
 
+def _admin_post_raw(app, path, content, content_type="application/x-yaml"):
+    """原始文本 body（/admin/import 收 YAML 文本包，非 JSON）。"""
+    async def go():
+        async with _httpx.AsyncClient(transport=_httpx.ASGITransport(app=app),
+                                      base_url="http://t") as c:
+            return await c.post(path, content=content,
+                                headers={"Content-Type": content_type})
+    return _asyncio.get_event_loop().run_until_complete(go())
+
+
 def test_put_tree_non_list_or_not_body_422_zero_write(app):
     base = _admin_get(app, "/admin/tree").json()
     for cond in ([{"or": 5}], [{"not": 5}], [{"or": [5]}]):
@@ -241,3 +251,184 @@ def test_put_tree_non_list_or_not_body_422_zero_write(app):
     after = _admin_get(app, "/admin/tree").json()             # 整树零写入
     assert after["nodes"] == base["nodes"], "nodes 被改动"
     assert after["version"] == base["version"], "tree_version 被改动"
+
+
+# ── M3 / M4 / M5（audit Major）：route action 形状闸门（think / fallback / trial）──
+# M3：action.think 无值域闸门 → to_upstream 对值域外 think 抛 ValueError，_call_*
+#     只捕 UpstreamError/httpx.HTTPError → /v1 每条请求持久 500。
+# M4：action.fallback: null（`list(None)`）/ trial.ratio 非数值（`random() < str`）/
+#     trial.to 必填且引用的模型必须存在（缺 to 时 engine 产出 model=None →
+#     server 当 502 no_route，合法配置变永久 502）。
+# M5：_checkup_or_422 对 run_checkup 无 try/except——体检自身崩溃 = PUT 500。
+# 这些检查并入 check_bad_ref（§10 无独立「action 形状」项；与本模块既有的
+# 「子句引用了引擎无法求值的东西」同族），硬级。
+
+def test_health_rejects_malformed_trial_and_fallback_shapes(base_nodes):
+    """体检（主闸）必须把这些绕闸数据拦在落库前：trial.ratio 值域、trial.to 必填且
+    模型存在、fallback 必须是 list（null 非法）且元素为存在的模型 id、think 值域。"""
+    def hard(nodes):
+        return check_bad_ref(nodes, MODELS, TAGS, True)
+
+    b50 = next(b for n in base_nodes if n.idx == 5 for b in n.branches if b.idx == 50)
+    good = {"kind": "route", "model": "qwen3-8b", "fallback": ["qwen3-32b"],
+            "think": "light"}
+    b50.action = dict(good)
+    assert not hard(base_nodes), [f.to_json() for f in hard(base_nodes)]   # 正例
+
+    for bad in ({"ratio": "0.5", "to": "qwen3-32b"}, {"ratio": 1.5, "to": "qwen3-32b"},
+                {"ratio": -0.1, "to": "qwen3-32b"}, {"ratio": None, "to": "qwen3-32b"},
+                {"ratio": 0.5}, {"ratio": 0.5, "to": "ghost-model"},
+                {"ratio": 0.5, "to": None}, "not-a-dict"):
+        b50.action = {**good, "trial": bad}
+        assert hard(base_nodes), bad
+    b50.action = dict(good)
+    for bad in (None, "qwen3-32b", 7, [None], ["ghost-model"]):
+        b50.action = {**good, "fallback": bad}
+        assert hard(base_nodes), bad
+    for bad in ("crazy", 5, ["deep"], True):
+        b50.action = {**good, "think": bad}
+        assert hard(base_nodes), bad
+    b50.action = {**good, "think": None}
+    assert not hard(base_nodes), [f.to_json() for f in hard(base_nodes)]
+
+
+def test_health_shape_findings_are_hard_with_readable_messages(base_nodes):
+    """形状类 findings 一律 hard bad_ref + 双语可读 message（控制台首屏直指原因）。"""
+    b50 = next(b for n in base_nodes if n.idx == 5 for b in n.branches if b.idx == 50)
+    b50.action = {"kind": "route", "model": "qwen3-8b", "think": "crazy",
+                  "fallback": None, "trial": {"ratio": "0.5"}}
+    f = check_bad_ref(base_nodes, MODELS, TAGS, True)
+    assert f and all(x.level == "hard" and x.code == "bad_ref" for x in f), \
+        [x.to_json() for x in f]
+    assert all(x.message_zh and x.message_en for x in f)
+    text = " ".join(x.message_zh + x.message_en for x in f)
+    assert "think" in text and "fallback" in text and "trial" in text, text
+
+
+def test_run_checkup_does_not_crash_on_fallback_null(base_nodes):
+    """M5 同源：``run_checkup`` 收到 fallback: null / "x" / [null] 不得自身抛
+    TypeError（旧实现 refs 组装 `*act.get("fallback", [])` 直接崩）。"""
+    b50 = next(b for n in base_nodes if n.idx == 5 for b in n.branches if b.idx == 50)
+    for bad in (None, "x", [None]):
+        b50.action = {"kind": "route", "model": "qwen3-8b", "fallback": bad}
+        findings = run_checkup(base_nodes, MODELS, TAGS)      # 旧实现此处 TypeError
+        assert isinstance(findings, list) and findings
+        assert any(x.code == "bad_ref" and x.level == "hard" for x in findings), bad
+
+
+# ── M5（audit Major）：体检闸门自身崩溃不得变成 PUT 500 ────────────────────────
+# 旧实现 _checkup_or_422 对 run_checkup 无 try/except：体检内的任何异常都逃逸成
+# 500（真 uvicorn 下是 HTML/无信封）。修法：run_checkup 调用点加保护——体检内部
+# 异常降级为 hard finding code="checkup_error"（不掩盖问题：仍是 422 拦截）。
+
+def test_checkup_error_degrades_to_hard_finding_not_500(app, monkeypatch):
+    """run_checkup 抛异常 → PUT /admin/tree 回 422 + hard checkup_error（不是 500）。"""
+    import sr.server as server_mod
+    import sr.health as health_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("SENTINEL-CHECKUP-CRASH")
+
+    monkeypatch.setattr(health_mod, "run_checkup", _boom)
+    monkeypatch.setattr(server_mod, "run_checkup", _boom)
+    before = _admin_get(app, "/admin/tree").json()
+    r = _admin_put(app, "/admin/tree", before)
+    assert r.status_code == 422, (r.status_code, r.text)
+    f = r.json()["findings"]
+    assert f and f[0]["code"] == "checkup_error" and f[0]["level"] == "hard", r.text
+    assert "SENTINEL" not in r.text                      # 不回吐异常原文
+    after = _admin_get(app, "/admin/tree").json()
+    assert after == before
+
+
+def test_import_checkup_crash_422_not_500(app, monkeypatch):
+    """import 路径同样受保护（config.import_yaml 里也有 run_checkup 调用点）。"""
+    import sr.config as config_mod
+    import sr.server as server_mod
+    import sr.health as health_mod
+
+    def _boom(*a, **k):
+        raise RuntimeError("SENTINEL-CHECKUP-CRASH")
+
+    monkeypatch.setattr(health_mod, "run_checkup", _boom)
+    monkeypatch.setattr(server_mod, "run_checkup", _boom)
+    yml = _admin_get(app, "/admin/export").text
+    r = _admin_post_raw(app, "/admin/import", yml)
+    assert r.status_code == 422, (r.status_code, r.text)
+    assert r.json()["findings"][0]["code"] == "checkup_error", r.text
+    assert "SENTINEL" not in r.text
+
+
+# ── M5 端点级：PUT /admin/tree 的 fallback 三种畸形 → 422（绝不 500）且库零写入 ──
+
+def _route_action_of(t, node, branch, key):
+    return next(b for n in t["nodes"] if n["idx"] == node
+                for b in n["branches"] if b["idx"] == branch)[key]
+
+
+def test_put_tree_fallback_null_422_zero_write(app):
+    """旧实现：fallback 键在且值为 null → `*None` TypeError 逃出 run_checkup
+    （PUT 500）。现在必须是 422 + 可读 hard finding + 库零写入。"""
+    base = _admin_get(app, "/admin/tree").json()
+    for bad in (None, "x", [None]):
+        t = _admin_get(app, "/admin/tree").json()
+        _route_action_of(t, 9, 90, "action")["fallback"] = bad
+        r = _admin_put(app, "/admin/tree", t)
+        assert r.status_code == 422, (bad, r.status_code, r.text)
+        f = [x for x in r.json()["findings"] if x["code"] == "bad_ref"]
+        assert f and all(x["level"] == "hard" for x in f), (bad, r.text)
+        assert all(x["message"]["zh"] and x["message"]["en"] for x in f), bad
+    after = _admin_get(app, "/admin/tree").json()
+    assert after["nodes"] == base["nodes"] and after["version"] == base["version"]
+
+
+def test_put_tree_bad_think_422_zero_write(app):
+    """M3 端点级：think 值域外 → 422 + hard bad_ref（三条写路径之一）。"""
+    base = _admin_get(app, "/admin/tree").json()
+    t = _admin_get(app, "/admin/tree").json()
+    _route_action_of(t, 9, 90, "action")["think"] = "crazy"
+    r = _admin_put(app, "/admin/tree", t)
+    assert r.status_code == 422, (r.status_code, r.text)
+    assert any(x["code"] == "bad_ref" and x["level"] == "hard"
+               for x in r.json()["findings"]), r.text
+    after = _admin_get(app, "/admin/tree").json()
+    assert after["nodes"] == base["nodes"] and after["version"] == base["version"]
+
+
+def test_import_bad_think_422_zero_write(app):
+    """M3 写路径三（import）：坏 think 包 → 422 findings；树零写入。"""
+    import yaml
+    before = _admin_get(app, "/admin/tree").json()
+    data = yaml.safe_load(_admin_get(app, "/admin/export").text)
+    node9 = next(n for n in data["tree"]["nodes"] if n["idx"] == 9)
+    node9["branches"][0]["action"]["think"] = "crazy"
+    r = _admin_post_raw(app, "/admin/import",
+                        yaml.safe_dump(data, allow_unicode=True))
+    assert r.status_code == 422, (r.status_code, r.text)
+    assert any(f["code"] == "bad_ref" and f["level"] == "hard"
+               for f in r.json()["findings"]), r.text
+    assert _admin_get(app, "/admin/tree").json() == before
+
+
+def test_import_checkup_crash_config_layer_returns_findings(tmp_path):
+    """同一保护的模块契约：config.import_yaml 里 run_checkup 崩 → 回 findings
+    （不是异常逃逸）。"""
+    import sr.config as config_mod
+    import sr.server as server_mod
+
+    conn = db.init_db(str(tmp_path / "cfg-boom.db"))
+    try:
+        text = config_mod.export_yaml(conn)
+        orig = server_mod.run_checkup
+        # server.run_checkup_safe 查的是 server 模块全局名（不是 sr.health.run_checkup）
+        server_mod.run_checkup = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("SENTINEL-CHECKUP-CRASH"))
+        try:
+            findings = config_mod.import_yaml(conn, text)
+        finally:
+            server_mod.run_checkup = orig
+        assert isinstance(findings, list) and findings
+        assert findings[0]["code"] == "checkup_error"
+        assert "SENTINEL" not in str(findings)
+    finally:
+        conn.close()

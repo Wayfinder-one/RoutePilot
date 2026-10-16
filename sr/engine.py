@@ -328,30 +328,47 @@ def _atom(c, signals, cuts):
     §5.1 字面实现（values[0] / op 查表 / int 比较），每条 /v1 请求都会 500 且
     持久不复原。语义上「引擎无法求值的子句」按恒 False 处理（与未知标签
     ``sig is None`` 同口径），由体检/审计面板暴露问题，不在请求路径炸。
+
+    M4（audit Major）类型守卫：op 调用一律裹 :func:`_guard`——`gte/lte` 的
+    bound 非数值（``"2"`` / ``None``）会 `int >= str` TypeError，``contains``
+    遇到非容器信号值（int）会 `x in 1` TypeError。两类都按「无法求值 ⇒ False」
+    收口，与 can't-evaluate ⇒ False 同语义。
     """
     if not isinstance(c, dict):
         return False
     sig = signals.get(c.get("tag"))
     if sig is None:
         return False
-    v = sig["value"]
+    if not isinstance(sig, dict):                     # 非标准信号包：无法求值 ⇒ False
+        return False
+    v = sig.get("value")
     values = c.get("values")
     if not isinstance(values, list) or not values:
         return False
+
+    def num(x) -> bool:
+        """数值（bool 不算——Python 里它是 int 的子类）。"""
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+    def num_bound(x) -> bool:
+        """**整数**档位 bound：§5.1 gte/lte 只服务 ordered 标签的档位索引（int）。"""
+        return isinstance(x, int) and not isinstance(x, bool)
+
     ops = {
         "is":  lambda: v == values[0],
         "in":  lambda: v in values,
-        "gte": lambda: isinstance(v, int) and not isinstance(v, bool)
-        and v >= values[0],
-        "lte": lambda: isinstance(v, int) and not isinstance(v, bool)
-        and v <= values[0],
-        "contains": lambda: isinstance(v, (list, tuple))
+        "gte": lambda: num_bound(values[0]) and num(v) and v >= values[0],
+        "lte": lambda: num_bound(values[0]) and num(v) and v <= values[0],
+        "contains": lambda: isinstance(v, (list, tuple, set, str, dict))
         and any(x in v for x in values),
     }
     fn = ops.get(c.get("op"))
     if fn is None:
         return False
-    if not fn():
+    try:
+        if not fn():                                  # 无法求值 ⇒ False（不抛）
+            return False
+    except TypeError:
         return False
     if "conf_min" in c:                       # 把握度门槛：规则标签 confidence=None → 永不满足
         cm = c["conf_min"]
@@ -437,6 +454,9 @@ def _walk(nodes: list[Node], signals: dict, conf_thresholds):
 
     special 分支（起点会话沿用）恒视为 miss——沿用/解锁在进树前由 resolve_session
     处理（§4.4 流程：先查会话，再走树），树内节点 0 仅供控制台展示语义。
+
+    M4：action / trial 形状防御（:func:`_action_of`）——历史库或绕闸数据里的
+    ``action: null`` / 非 dict 不得让 ``action.get`` AttributeError 逃出。
     """
 
     def branch_hit(branch) -> bool:
@@ -456,7 +476,7 @@ def _walk(nodes: list[Node], signals: dict, conf_thresholds):
         for i, branch in enumerate(node.branches):
             if not branch_hit(branch):
                 continue
-            if branch.action.get("kind") == "special":
+            if _action_of(branch).get("kind") == "special":
                 continue                            # §4.4：沿用/解锁在进树前判定
             found = (i, branch)
             break
@@ -465,7 +485,7 @@ def _walk(nodes: list[Node], signals: dict, conf_thresholds):
                    "new_session" if node.kind == "sticky" else "no_match")
         else:
             i, branch = found
-            yield ("hit", node, i, branch.action, branch.trial)
+            yield ("hit", node, i, _action_of(branch), branch.trial)
             hit = True
 
 
@@ -476,6 +496,21 @@ def _defensive() -> RouteDecision:
     decision 不再为 None）；每次新建实例，避免调用方互相改到同一对象。
     """
     return RouteDecision(kind="route", model=None, source="fallback")
+
+
+_EMPTY_ACTION: dict = {"kind": "route"}
+
+
+def _action_of(branch) -> dict:
+    """分支 action 防御取值：非 dict（null / 标量）→ 空 route action（M4）。
+
+    历史库或绕闸数据里的 ``action: null`` 在旧实现让 ``action.get(...)``
+    AttributeError 逃出 evaluate（/v1 持久 500）；空 action 的 model 为 None，
+    由 server 的「routing produced no model」防御路径收口（502 no_route），
+    体检 bad_ref 仍是主闸。
+    """
+    action = branch.action
+    return action if isinstance(action, dict) else _EMPTY_ACTION
 
 
 def evaluate(nodes: list[Node], signals: dict, conf_thresholds) -> RouteDecision:
@@ -501,21 +536,53 @@ def _resolve(action: dict, trial: dict | None, hit_path: list[int]) -> RouteDeci
     - block → kind='block' + block_msg（model/think 为 None，回退链为空）。
     - special 不进入本函数（_walk 按恒 miss 跳过；沿用/解锁的 RouteDecision 由
       resolve_session 直接构造，不经树 resolve）。
+
+    M4（audit Major）形状防御——历史库/绕闸数据不得让本函数抛异常，也不得产出
+    ``model=None`` 的「合法配置变永久 502」：
+    - action 非 dict（null / 标量）→ 空 route action（model=None 由 server 收口）；
+    - action.fallback 非 list（null / 标量）→ 视为 ``[]``（声明：不是「按契约 false
+      跳过该分支」——分支已命中，去向模型仍应生效，只丢弃无法解释的回退链）；
+    - trial 非 dict → 无试水；
+    - trial.ratio 非数值（或不在 [0,1]）→ 不掷签（按正常去向，等价于未命中）；
+    - trial.to 非字符串或引用不存在的模型 → 忽略试水（走原 model）——旧实现产出
+      ``model=None, source='trial'``，server 当 502 no_route（体检 hard 拦保存为
+      主闸，此处只保证绕闸数据下仍可用）。
+    - 其余形状（未知模型等）如实透出：路由上游失败由 server 的错误信封负责，
+      引擎不替体检做决定。
     """
+    if not isinstance(action, dict):
+        action = _EMPTY_ACTION
     if trial is None:
         trial = action.get("trial")
     if action.get("kind") == "block":
         return RouteDecision(kind="block", model=None, source="tree", think=None,
                              fallbacks=[], block_msg=action.get("block_msg"),
                              hit_path=hit_path)
-    fallbacks = list(action.get("fallback", []))
-    if trial and random.random() < trial.get("ratio", 0):
-        return RouteDecision(kind="route", model=trial.get("to"), source="trial",
-                             think=action.get("think"), fallbacks=fallbacks,
-                             block_msg=None, hit_path=hit_path)
+    raw_fallback = action.get("fallback")
+    fallbacks = list(raw_fallback) if isinstance(raw_fallback, list) else []
+    if isinstance(trial, dict) and _trial_hit(trial):
+        to = trial.get("to")
+        if isinstance(to, str) and to:
+            return RouteDecision(kind="route", model=to, source="trial",
+                                 think=action.get("think"), fallbacks=fallbacks,
+                                 block_msg=None, hit_path=hit_path)
     return RouteDecision(kind="route", model=action.get("model"), source="tree",
                          think=action.get("think"), fallbacks=fallbacks,
                          block_msg=None, hit_path=hit_path)
+
+
+def _trial_hit(trial: dict) -> bool:
+    """试水掷签：``random.random() < ratio``；ratio 非数值或不在 [0,1] → 不掷签。
+
+    M4：旧实现 ``random.random() < trial.get("ratio", 0)`` 对字符串/null ratio
+    抛 TypeError（``'<' not supported between int and str``）。
+    """
+    ratio = trial.get("ratio", 0)
+    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
+        return False
+    if not 0 <= ratio <= 1:
+        return False
+    return random.random() < ratio
 
 
 # ─────────────────────────────────────────────────────────────────────────────

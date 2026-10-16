@@ -30,6 +30,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
 
+from sr.adapters import THINK_OPENAI
 from sr.engine import Branch, Node
 from sr.tags import TagDef
 
@@ -280,6 +281,25 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
     （库虽无写入，但错误码与语义都不对）；``{"or": [5]}`` 这类「臂非 dict」由
     :func:`atom` 的「条件子句不是对象」覆盖。
 
+    **action 形状闸门（M3/M4/M5，audit Major）**：§10 CHECKS 表同样没有「action
+    形状」检查项，三条写路径（PUT tree / POST nodes / import）都过本检查，故并入
+    此处同族 hard bad_ref——它们对应的都是「PUT 200 落库 → 每条 /v1 持久 500 或
+    永久 502」：
+
+    (e) ``think`` 必须 ∈ ``THINK_OPENAI``（off|light|deep，None = 未指定），
+        否则 ``to_upstream`` 抛 ValueError/TypeError（值域外 / 非字符串
+        unhashable）逃逸成兜底 500；
+    (f) ``fallback`` 键存在时必须是 list（``null`` **非法**：`*None` 让体检自己先倒，
+        且回退链无法解释；键缺失 = 无回退链，合法），元素必须是模型 id 字符串；
+        ``action`` 本身必须是对象；
+    (g) ``trial``（分支列优先，缺省回 action.trial）必须是对象；``ratio`` 必须是
+        [0,1] 内的数值；``to`` 必填且是模型 id——缺 ``to`` 时引擎产出
+        ``model=None, source='trial'``，server 当 502 no_route（合法配置变
+        永久 502）。
+
+    以上形状检查与「引用不存在的模型」共用同一 hard bad_ref code（同族），
+    控制台首屏直指拦截原因。
+
     **注意**：规则标签配 conf_min 仍归 :func:`check_conf_on_rule` 的 **warn**
     （§10 现状，I1 明确不连带改成 hard）——本函数只查 conf_min 的类型，不查
     标签 source。
@@ -388,18 +408,95 @@ def check_bad_ref(nodes: list[Node], models, tag_defs: dict[str, TagDef],
     for n, b in _iter_branches(nodes):
         clause_errors(b.cond, n, b)
         act = b.action
-        if act.get("kind") == "route":
-            refs = [act.get("model"), *act.get("fallback", [])]
-            trial = b.trial if b.trial is not None else act.get("trial")
-            if isinstance(trial, dict):
-                refs.append(trial.get("to"))
-            for m in refs:
-                if m not in models:
-                    findings.append(Finding(
-                        level, "bad_ref", n.idx, b.idx,
-                        f"{where(n, b)}：引用了不存在的模型 {m!r}",
-                        f"{where(n, b)}: references unknown model {m!r}",
-                        {"action": "fix_model"}))
+        if not isinstance(act, dict):              # 形状闸门（M4）：action 必须是对象
+            findings.append(Finding(
+                level, "bad_ref", n.idx, b.idx,
+                f"{where(n, b)}：action 必须是对象（当前 {act!r}）——引擎求值会崩溃",
+                f"{where(n, b)}: action must be an object (got {act!r}) — the "
+                f"engine would crash evaluating it",
+                {"action": "fix_action"}))
+            continue
+        if act.get("kind") != "route":
+            continue
+        # ── M3：think 值域（off | light | deep；None = 未指定）───────────────
+        # 值域外 / 非字符串 think 会在 to_upstream 抛 ValueError（值域外）或
+        # TypeError（非字符串 → dict 查表 unhashable），_call_* 只捕
+        # UpstreamError/httpx.HTTPError → 逃逸成兜底 500：PUT 200 落库后
+        # **每条** /v1 持久 500。值域取自 adapters 的 THINK_OPENAI（唯一权威表，
+        # 加新值只改一处）。
+        think = act.get("think")
+        if think is not None and (not isinstance(think, str)
+                                  or think not in THINK_OPENAI):
+            bad(n, b,
+                f"{where(n, b)}：think 值 {think!r} 非法"
+                f"（允许：{sorted(THINK_OPENAI)} 或未指定）——上游请求体会构造失败",
+                f"{where(n, b)}: invalid think value {think!r} "
+                f"(allowed: {sorted(THINK_OPENAI)} or unset) — building the "
+                f"upstream request body would fail")
+        # ── M4/M5：fallback 形状 + 引用 ──────────────────────────────────────
+        # 旧实现 refs = [model, *act.get("fallback", [])]：键在且值为 null 时默认值
+        # 不生效，`*None` 抛 TypeError 逃出 run_checkup（PUT /admin/tree 500）——
+        # 体检是给坏数据兜底的最后闸门，它自己不能先倒。
+        # 口径（与 M4 的引擎防御**不同层**，报告声明）：体检侧显式写出的
+        # ``fallback: null`` 是**非法形状**（键存在 = 明确给了回退链字段，null
+        # 无法解释回退链），hard 拦截；键不存在的 route action（种子树/控制台
+        # SRW_chipsToAction 就是这种形状）合法。引擎侧对 null 按 ``[]`` 防御——
+        # 闸门拦得住，历史库也要能跑。
+        if "fallback" not in act:
+            refs = [act.get("model")]
+        else:
+            fallback = act["fallback"]
+            if not isinstance(fallback, list):
+                bad(n, b,
+                    f"{where(n, b)}：fallback 必须是数组（当前 {fallback!r}）"
+                    f"——回退链无法解释（要清空回退链请省略该字段）",
+                    f"{where(n, b)}: fallback must be an array (got {fallback!r}) "
+                    f"— the fallback chain is uninterpretable (omit the field to "
+                    f"clear the chain)")
+                refs = [act.get("model")]
+            else:
+                refs = [act.get("model"), *fallback]
+                for m in fallback:
+                    if not isinstance(m, str) or not m:
+                        bad(n, b,
+                            f"{where(n, b)}：fallback 元素必须是模型 id 字符串"
+                            f"（当前 {m!r}）",
+                            f"{where(n, b)}: every fallback item must be a model "
+                            f"id string (got {m!r})")
+        # ── M4：trial 形状（ratio 数值 ∈[0,1]、to 必填字符串）——缺 to 时引擎
+        # 产出 model=None/source='trial'，server 当 502 no_route（合法配置变永久
+        # 502）。
+        trial = b.trial if b.trial is not None else act.get("trial")
+        if trial is not None:
+            if not isinstance(trial, dict):
+                bad(n, b,
+                    f"{where(n, b)}：trial 必须是对象或 null（当前 {trial!r}）",
+                    f"{where(n, b)}: trial must be an object or null (got {trial!r})")
+            else:
+                ratio = trial.get("ratio", 0)
+                if not isinstance(ratio, (int, float)) or isinstance(ratio, bool) \
+                        or not 0 <= ratio <= 1:
+                    bad(n, b,
+                        f"{where(n, b)}：trial.ratio 必须是 0–1 的数值（当前 "
+                        f"{ratio!r}）——试水掷签会崩溃",
+                        f"{where(n, b)}: trial.ratio must be a number in [0, 1] "
+                        f"(got {ratio!r}) — the trial coin flip would crash")
+                to = trial.get("to")
+                if not isinstance(to, str) or not to:
+                    bad(n, b,
+                        f"{where(n, b)}：trial.to 必填且必须是模型 id（当前 {to!r}）"
+                        f"——缺失时去向为空，请求会永久 502",
+                        f"{where(n, b)}: trial.to is required and must be a model "
+                        f"id (got {to!r}) — without it the request has no route "
+                        f"and would fail permanently")
+                refs.append(to)
+        for m in refs:
+            if m not in models:
+                findings.append(Finding(
+                    level, "bad_ref", n.idx, b.idx,
+                    f"{where(n, b)}：引用了不存在的模型 {m!r}",
+                    f"{where(n, b)}: references unknown model {m!r}",
+                    {"action": "fix_model"}))
     return findings
 
 

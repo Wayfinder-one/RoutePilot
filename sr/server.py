@@ -318,24 +318,51 @@ def _outbound_payload(ir, backend, think: str | None) -> dict:
     return payload
 
 
+def _outbound_payload_or_none(ir, cand, decision: RouteDecision, conn):
+    """候选 → (backend, payload)；配置面不可用时回 (None, UpstreamError)。
+
+    两处失败同族（都是「这个候选没法出站」，换下一候选）：
+    - ``resolve_backend`` 抛异常（KeyError / 环境变量缺失）：配置面问题；
+    - ``_outbound_payload`` 抛异常——M3/M4（audit Major）：值域外/非字符串 think
+      让 to_upstream 抛 ValueError/TypeError，坏 action 形状抛 KeyError。旧实现
+      只捕 UpstreamError/httpx.HTTPError → 逃逸成兜底 500，**每条**请求持久 500。
+
+    两种都按 §7 错误信封收口为 502 upstream_error（config_error 在 _handle 里
+    归一到 api_error），文案通用、不回吐 Python 异常原文（M-c）；原始异常只进
+    服务端日志。
+    """
+    try:
+        backend = resolve_backend(conn, cand)
+    except Exception as exc:              # KeyError / env 缺失：配置面问题
+        return None, UpstreamError(502, f"resolve {cand}: {exc}", "config_error")
+    try:
+        return backend, _outbound_payload(ir, backend, decision.think)
+    except Exception as exc:              # M3/M4：出站体构造失败（值域外 think 等）
+        logger.warning("outbound payload build failed for %s: %r", cand, exc)
+        return None, UpstreamError(502, "failed to build upstream request body",
+                                   "config_error")
+
+
 async def _call_nonstream(conn, ir, decision: RouteDecision, settings: dict,
                     metrics: Metrics | None = None):
     """非流式上游调用。返回 (backend, model_id, resp_json, upstream_ms)；
     全链失败抛最后一个 UpstreamError。每失败记 record_failure，成功记
     record_success（裁定 5）；is_circuit_open 的候选直接跳过。
     metrics 可选：每次尝试失败记 sr_retry_total{model,status}；失败后刚好
-    越过熔断阈值（本候选此后会被跳过，不会再进来）记 sr_circuit_open_total。"""
+    越过熔断阈值（本候选此后会被跳过，不会再进来）记 sr_circuit_open_total。
+
+    候选级配置失败（解析后端 / 构造出站体，含 M3/M4 的坏 action 形状）经
+    :func:`_outbound_payload_or_none` 统一换下一候选，不裸 500。
+    """
     max_retries = int(settings.get("max_retries") or 0)
     last: UpstreamError | None = None
     for cand in _chain(decision):
         if is_circuit_open(cand):
             continue
-        try:
-            backend = resolve_backend(conn, cand)
-        except Exception as exc:          # KeyError / env 缺失：配置面问题，换下一候选
-            last = UpstreamError(502, f"resolve {cand}: {exc}", "config_error")
+        backend, payload = _outbound_payload_or_none(ir, cand, decision, conn)
+        if backend is None:
+            last = payload
             continue
-        payload = _outbound_payload(ir, backend, decision.think)
         for _ in range(max_retries + 1):  # 每候选最多重试 max_retries 次（裁定 5）
             t0 = time.monotonic()
             client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
@@ -394,12 +421,10 @@ async def _call_stream(conn, ir, decision: RouteDecision, settings: dict,
     for cand in _chain(decision):
         if is_circuit_open(cand):
             continue
-        try:
-            backend = resolve_backend(conn, cand)
-        except Exception as exc:
-            last = UpstreamError(502, f"resolve {cand}: {exc}", "config_error")
+        backend, payload = _outbound_payload_or_none(ir, cand, decision, conn)
+        if backend is None:                 # M3/M4 同 _call_nonstream：换下一候选
+            last = payload
             continue
-        payload = _outbound_payload(ir, backend, decision.think)
         for _ in range(max_retries + 1):
             t0 = time.monotonic()
             client = httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=5.0))
@@ -704,6 +729,19 @@ class Metrics:
         return "\n".join(lines) + "\n"
 
 
+def _is_fallback(primary: str | None, final: str | None,
+                 decision: RouteDecision | None) -> bool:
+    """回退判定（M1 的**唯一**口径：最终去向 ≠ 决策主模型，试水不算回退）。
+
+    `outcome="fallback"` 的写侧（requests 行）与 `sr_fallback_total` 的指标侧
+    共用本函数——旧实现只有指标侧有这个判定，写侧恒 "upstream"，两处口径矛盾
+    （流量页 f=fallback 恒空）。试水（decision.source == 'trial'）改道不是回退
+    失败升级，排除（Task 10 折入项口径不变）。
+    """
+    return bool(final and primary and final != primary
+                and (decision is None or decision.source != "trial"))
+
+
 def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
                           routed_to: str | None, outcome: str,
                           session_tag: str, hit_branch: str | None,
@@ -717,6 +755,7 @@ def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
     - primary≠final 且非试水记 sr_fallback_total（Task 10 折入项：旧实现用诊断头
       字符串 ``diag.get("x-sr-route") != "trial"`` 排除试水，而 source=trial 时该头
       是 "N.M"——恒真死代码；改按 decision.source 判定，不再依赖诊断头字符串）。
+      判定与本函数外的 requests.outcome 共用 :func:`_is_fallback`（M1）。
     """
     route = diag.get("x-sr-route", "none")
     metrics.inc("sr_requests_total", {"proto": proto, "route": route,
@@ -727,8 +766,7 @@ def _bump_request_metrics(metrics: Metrics, *, proto: str, diag: dict,
         metrics.inc("sr_session_sticky_total")
     elif session_tag == "unlocked":
         metrics.inc("sr_session_unlock_total")
-    if final and primary and final != primary and \
-            (decision is None or decision.source != "trial"):
+    if _is_fallback(primary, final, decision):
         metrics.inc("sr_fallback_total", {"from": primary, "to": final})
 
 
@@ -1012,16 +1050,23 @@ async def _handle(proto: str, request: Request, db_path: str, tagger: str,
         # ── 11 requests + tags 入库（流式在首包锁定后、续传前落账；裁定 2/3） ──
         diag["x-sr-model"] = final_model
         diag["x-sr-upstream-model"] = backend.upstream_name
+        # M1（audit Major）：outcome 按「最终去向 != 决策主模型」写 "fallback"——
+        # 旧实现成功落账恒 "upstream"，而 _traffic_filter 按 outcome='fallback'
+        # 筛选（:784）→ GET /admin/traffic?f=fallback 恒空，流量页口径与
+        # sr_fallback_total 指标口径互相矛盾。判定**只此一处**（_is_fallback），
+        # 与 _bump_request_metrics 的 sr_fallback_total 同源。
+        outcome = "fallback" if _is_fallback(decision.model, final_model, decision) \
+            else "upstream"
         rid = _log_request(conn, proto=proto, asked=asked, hit_branch=hit_branch,
                            routed_to=final_model, session_id=session_id,
-                           session_tag=session_tag, outcome="upstream", status=200,
+                           session_tag=session_tag, outcome=outcome, status=200,
                            answer_ms=answer_ms, upstream_ms=upstream_ms,
                            cost=_cost_of(conn, final_model, None))
         _store_tags(conn, rid, signals)
         metrics.observe("sr_upstream_latency_seconds", {"model": final_model},
                         (upstream_ms or 0) / 1000.0)
         _bump_request_metrics(metrics, proto=proto, diag=diag,
-                              routed_to=final_model, outcome="upstream",
+                              routed_to=final_model, outcome=outcome,
                               session_tag=session_tag, hit_branch=hit_branch,
                               primary=decision.model, final=final_model,
                               decision=decision)
@@ -1232,11 +1277,42 @@ def _write_tree_rows(conn, nodes: list[Node]) -> None:
             _write_branch_rows(conn, n.idx, b)
 
 
+def run_checkup_safe(nodes: list[Node], models, tag_defs,
+                     hits: dict[str, int] | None = None) -> list:
+    """run_checkup 的**崩溃安全**入口（M5，audit Major）：体检内部异常降级为一条
+    hard finding（code="checkup_error"），绝不逃逸成 PUT /admin/tree 500。
+
+    体检是给坏数据兜底的最后闸门，它自己不能先倒——旧实现 `_checkup_or_422` 与
+    `config.import_yaml` 都对 `run_checkup` 无 try/except，体检里任何一个未预料的
+    TypeError（如 `fallback: null` 的 `*None`）都是 500（真 uvicorn 下 HTML/无信封）。
+    口径声明（二选一，本实现取前者）：**降级为 hard finding** → 仍按 422 拦截保存
+    （不放行、不掩盖：库零写入这一 fail-safe 行为不变），message 为通用文案 +
+    服务端日志留原始异常，不回吐 Python 异常原文。
+
+    正常路径零开销（同一函数对象转发）；三条写路径与 import 全部经此入口。
+    """
+    try:
+        return run_checkup(nodes, models, tag_defs, hits=hits)
+    except Exception as exc:                    # 体检自身崩溃：绝不变成 500
+        logger.exception("run_checkup crashed (degraded to hard finding): %r", exc)
+        return [Finding(
+            "hard", "checkup_error", None, None,
+            "体检内部错误：本次改动无法完成检查，已按硬错误拦截保存"
+            "（详细原因见服务端日志）",
+            "Internal checkup error: this change could not be validated and was "
+            "blocked as a hard error (see server logs for details)",
+            {"action": "retry_or_report"})]
+
+
 def _checkup_or_422(conn, nodes: list[Node]):
-    """保存前体检（§10 强制行为）：有 hard → 422 ``{"findings": […]}``（硬错误
+    """保存前体检（§10 强制行为）：有 hard → 422 ``{"findings": […]}}``（硬错误
     优先排序，控制台首屏直指拦截原因；全量 findings 由 /admin/tree/audit 提供）；
-    通过 → None。"""
-    findings = run_checkup(nodes, _models_set(conn), TAGS, hits=_hits_30d(conn))
+    通过 → None。
+
+    走 :func:`run_checkup_safe`：体检自身崩溃按 hard finding 降级（M5），
+    不得变成 PUT 500。
+    """
+    findings = run_checkup_safe(nodes, _models_set(conn), TAGS, hits=_hits_30d(conn))
     if any(f.level == "hard" for f in findings):
         ordered = sorted(findings, key=lambda f: f.level != "hard")
         return JSONResponse({"findings": [f.to_json() for f in ordered]},
@@ -1589,8 +1665,8 @@ def create_app(db_path: str, tagger: str = "heuristic",
         """体检当前树、不写库（§9）：findings 按 §10 CHECKS 顺序全量返回。"""
         conn = db.get(db_path)
         try:
-            findings = run_checkup(_load_tree(conn, db_path), _models_set(conn),
-                                   TAGS, hits=_hits_30d(conn))
+            findings = run_checkup_safe(_load_tree(conn, db_path), _models_set(conn),
+                                        TAGS, hits=_hits_30d(conn))
         finally:
             conn.close()
         return JSONResponse({"findings": [f.to_json() for f in findings]})

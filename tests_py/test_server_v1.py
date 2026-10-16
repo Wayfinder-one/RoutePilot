@@ -162,6 +162,34 @@ async def _get(app, path):
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         return await c.get(path)
 
+
+def _point_to(app, base_url: str) -> None:
+    """把 providers.base_url 指到指定假上游（各用例自选 8123/8124/8126）。"""
+    conn = db.get(app.state.db_path)
+    try:
+        conn.execute("UPDATE providers SET base_url = ?", (base_url,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _admin_get(app, path):
+    return asyncio.get_event_loop().run_until_complete(_get(app, path))
+
+
+def _admin_put(app, path, body):
+    return asyncio.get_event_loop().run_until_complete(_req(app, "PUT", path, body))
+
+
+def _admin_post(app, path, body):
+    return asyncio.get_event_loop().run_until_complete(_post(app, path, body))
+
+
+async def _req(app, method, path, body=None):
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        return await c.request(method, path, json=body)
+
 def test_route_openai_auto(app):
     r = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
         "model": "auto", "messages": [{"role": "user",
@@ -288,8 +316,195 @@ def test_fallback_on_500(app, tmp_path, _failing_upstream):
     assert r.json()["model"] == "auto"
     conn = db.get(str(tmp_path/"t.db"))
     row = conn.execute("SELECT * FROM requests ORDER BY rowid DESC").fetchone()
-    assert row["routed_to"] == "qwen3-8b" and row["outcome"] == "upstream"
+    # M1（audit Major）改动：回退链命中时 outcome 由恒 "upstream" 改判 "fallback"
+    # （判定 = final != decision.model，与 sr_fallback_total 同源）。既有断言更新，
+    # 见 batch-B1-report.md「既有测试是否更新」表。
+    assert row["routed_to"] == "qwen3-8b" and row["outcome"] == "fallback", dict(row)
     assert conn.execute("SELECT ok FROM models WHERE id='qwen3-32b'").fetchone()["ok"] == 0
+
+
+# ── M1（audit Major）：「outcome='fallback' 死链」写侧修 ──────────────────────────
+# 旧实现 _handle 成功落账恒 outcome="upstream"，而读侧 _traffic_filter 按
+# outcome='fallback' 筛选（server.py:784）→ GET /admin/traffic?f=fallback 恒空；
+# 指标侧 sr_fallback_total 却在计数（730-732）——流量页口径与指标口径互相矛盾。
+# 修法：按「最终去向 != 决策主模型」写 "fallback"（同一判定，不再写第二处 if）。
+
+def test_fallback_promotion_records_outcome_fallback(app, tmp_path, _failing_upstream):
+    """主模型失败、回退成功 → requests.outcome == "fallback"、routed_to = 回退模型、
+    GET /admin/traffic?f=fallback 能筛到该行、x-sr-model 为回退模型。"""
+    _point_to(app, "http://127.0.0.1:8124")
+    r = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
+        "model": "auto",
+        "messages": [{"role": "user", "content": "最新的股价是多少"}]}))  # b4-0: 32b+fallback 8b
+    assert r.status_code == 200, r.text
+    assert r.headers["x-sr-model"] == "qwen3-8b"          # 最终去向 = 回退模型
+    assert r.headers["x-sr-route"] == "4.0"               # 树命中路径不变
+
+    conn = db.get(str(tmp_path/"t.db"))
+    row = conn.execute("SELECT * FROM requests ORDER BY rowid DESC").fetchone()
+    assert row["routed_to"] == "qwen3-8b"
+    assert row["outcome"] == "fallback", dict(row)        # 旧实现恒 "upstream"
+    assert row["hit_branch"] == "4.0"                     # hit_branch 口径不变
+    conn.close()
+
+    rows = asyncio.get_event_loop().run_until_complete(
+        _get(app, "/admin/traffic?f=fallback")).json()["rows"]
+    assert any(x["id"] == row["id"] for x in rows), rows   # 快捷筛选能筛到（旧实现恒空）
+    assert all(x["outcome"] == "fallback" for x in rows)
+    # 同一判定驱动指标：sr_fallback_total 仍按 (from,to) 计数（口径与流量页一致）
+    m = asyncio.get_event_loop().run_until_complete(_get(app, "/metrics")).text
+    assert 'sr_fallback_total{from="qwen3-32b",to="qwen3-8b"}' in m, m
+
+
+def test_no_promotion_keeps_outcome_upstream(app, tmp_path):
+    """未回退（主模型成功）仍落 "upstream"：outcome 不得全站变成 fallback。"""
+    r = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
+        "model": "auto",
+        "messages": [{"role": "user", "content": "最新的股价是多少"}]}))
+    assert r.status_code == 200
+    conn = db.get(str(tmp_path/"t.db"))
+    row = conn.execute("SELECT * FROM requests ORDER BY rowid DESC").fetchone()
+    assert row["outcome"] == "upstream", dict(row)
+    conn.close()
+    rows = asyncio.get_event_loop().run_until_complete(
+        _get(app, "/admin/traffic?f=fallback")).json()["rows"]
+    assert rows == [], rows
+
+
+# ── M3（audit Major）：action.think 无值域闸门 → 每条请求持久 500 ──────────────
+# 写路径三条（PUT tree / POST nodes / import）都不校验 think；运行时
+# _outbound_payload → to_upstream 对值域外 think 抛 ValueError，而 _call_* 只捕
+# UpstreamError/httpx.HTTPError → 逃逸成兜底 500。修法：health 的 route action
+# 校验加 think ∈ {off, light, deep}（None 允许），hard；三条写路径同过体检。
+
+_GOOD_ROUTE_ACTION = {"kind": "route", "model": "qwen3-8b",
+                      "fallback": ["qwen3-32b"], "think": "light"}
+
+
+def _route_action(t):
+    """GET 树里节点 9 分支 90 的 route action（M3/M5 畸形用例的改动点）。"""
+    return next(b for n in t["nodes"] if n["idx"] == 9
+                for b in n["branches"] if b["idx"] == 90)["action"]
+
+
+def _put_tree_edit(app, mutate):
+    """GET 当前树 → 交给 mutate 改 → PUT 回写；返回 (响应, 改动前的树)。"""
+    t = _admin_get(app, "/admin/tree").json()
+    mutate(t)
+    return _admin_put(app, "/admin/tree", t), t
+
+
+def test_put_tree_rejects_out_of_domain_think_422_zero_write(app):
+    """PUT think:"crazy" → 422 + hard bad_ref（与现有 action 校验同族 code）+ 库零写入。"""
+    before = _admin_get(app, "/admin/tree").json()
+    r, _ = _put_tree_edit(
+        app, lambda t: _route_action(t).update({"think": "crazy"}))
+    assert r.status_code == 422, (r.status_code, r.text)
+    f = [x for x in r.json()["findings"] if x["code"] == "bad_ref"]
+    assert f and all(x["level"] == "hard" for x in f), r.text
+    assert "think" in f[0]["message"]["zh"], f[0]
+    after = _admin_get(app, "/admin/tree").json()
+    assert after["nodes"] == before["nodes"] and after["version"] == before["version"]
+
+
+def test_add_node_rejects_out_of_domain_think_422_zero_write(app):
+    """POST /admin/tree/nodes 同样受益（写路径二）：think 值域外 → 422，树不动。"""
+    before = _admin_get(app, "/admin/tree").json()
+    r = _admin_post(app, "/admin/tree/nodes", {"pos": 1, "node": {
+        "name": "坏 think", "kind": "normal",
+        "branches": [{"cond": [{"tag": "event", "op": "is", "values": ["incident"]}],
+                      "action": {"kind": "route", "model": "qwen3-8b",
+                                 "think": "crazy"}}]}})
+    assert r.status_code == 422, (r.status_code, r.text)
+    assert any(x["code"] == "bad_ref" and x["level"] == "hard"
+               for x in r.json()["findings"]), r.text
+    assert _admin_get(app, "/admin/tree").json() == before
+
+
+def test_legal_think_values_still_save(app):
+    """值域内三个值 + 未指定（无该键）都照旧保存 200（不得误伤）。"""
+    for think in ("off", "light", "deep", None):
+        t = _admin_get(app, "/admin/tree").json()
+        act = _route_action(t)
+        if think is None:
+            act.pop("think", None)
+        else:
+            act["think"] = think
+        assert _admin_put(app, "/admin/tree", t).status_code == 200, think
+
+
+def _bump_tree_version(conn) -> None:
+    """直改 tree 后抬版本，让 server 的树缓存重载（裁定 4：版本变了才重载）。"""
+    conn.execute("UPDATE settings SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) "
+                 "WHERE key = 'tree_version'")
+
+
+def _disable_non_fallback(app, tmp_path) -> None:
+    """停用 nodes 1-6 的全部分支行——保证唯一可达的去向是兜底节点 9。
+
+    文本打标结果（node 5 的 context/complexity 分支先命中）与断言语义无关，
+    必须先把「其它可达路径」清掉，坏 action 用例才真的是在测坏 action。
+    """
+    conn = db.get(str(tmp_path/"t.db"))
+    conn.execute("UPDATE tree SET enabled = 0 WHERE parent IN "
+                 "(SELECT idx FROM tree WHERE parent IS NULL) AND parent != 9")
+    _bump_tree_version(conn)
+    conn.commit()
+    conn.close()
+
+
+@pytest.mark.parametrize("bad_think", ["crazy", ["deep"], 5])
+def test_v1_no_500_when_bad_think_bypasses_gate(app, tmp_path, bad_think):
+    """历史坏数据绕闸：直接 UPDATE tree 行写坏 think → /v1 不得 500。
+
+    真 uvicorn 下裸 500 = HTML/无信封；修复后按 §7 错误信封回 502
+    upstream_error（序列化不出站体属上游调用失败面），且文案不回吐 Python 异常原文。
+    三种坏值覆盖两条抛点：字符串值域外 → ValueError；非字符串 → dict 查表
+    TypeError（unhashable）。
+    """
+    _disable_non_fallback(app, tmp_path)
+    conn = db.get(str(tmp_path/"t.db"))
+    conn.execute("UPDATE tree SET action = ? WHERE idx = 90 AND parent = 9",
+                 (json.dumps({"kind": "route", "model": "qwen3-8b",
+                              "think": bad_think}),))
+    _bump_tree_version(conn)
+    conn.commit()
+    conn.close()
+    r = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
+        "model": "auto", "messages": [{"role": "user", "content": "随便问一句"}]}))
+    assert r.status_code != 500, r.text
+    assert r.status_code == 502, (bad_think, r.status_code, r.text)
+    j = r.json()
+    assert j["error"]["type"] == "api_error" and j["error"]["code"] == "upstream_error"
+    assert "Traceback" not in r.text
+    assert "unknown think" not in r.text and "unhashable" not in r.text
+
+    # 流式同样不得裸 500（_call_stream 有第二处 _outbound_payload 调用）
+    rs = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
+        "model": "auto", "stream": True,
+        "messages": [{"role": "user", "content": "随便问一句"}]}))
+    assert rs.status_code == 502, (bad_think, rs.status_code, rs.text[:200])
+    assert "Traceback" not in rs.text
+
+
+# ── M4（audit Major）第 3 条 / M5 末端：绕闸坏 action 不得让 /v1 变 500 ────────
+# 破坏方式用「引擎侧必然可解析、但不能原样出站」的形状：think 非字符串会让
+# to_upstream 的 `think not in THINK_OPENAI` 抛 unhashable list。
+
+def test_v1_no_500_when_action_serialization_fails(app, tmp_path):
+    _disable_non_fallback(app, tmp_path)
+    conn = db.get(str(tmp_path/"t.db"))
+    conn.execute("UPDATE tree SET action = ? WHERE idx = 90 AND parent = 9",
+                 (json.dumps({"kind": "route", "model": "qwen3-8b",
+                              "think": ["deep"]}),))
+    _bump_tree_version(conn)
+    conn.commit()
+    conn.close()
+    r = asyncio.get_event_loop().run_until_complete(_post(app, "/v1/chat/completions", {
+        "model": "auto", "messages": [{"role": "user", "content": "随便问一句"}]}))
+    assert r.status_code == 502, (r.status_code, r.text)
+    assert r.json()["error"]["code"] == "upstream_error"
+    assert "Traceback" not in r.text
 
 def test_stream_midstream_no_fallback(app, tmp_path, _failing_upstream):
     """§7.5 流式红线：上游首包后切断——已锁定主模型，不重试、不换模型、不回退；

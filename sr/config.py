@@ -11,7 +11,8 @@
 - :func:`export_yaml` —— 只导可编辑配置（providers/models 的 ok/break_reason 是
   熔断运行态，不进配置包——Task 9 端点口径原样迁入）。
 - :func:`import_yaml` —— normalize 全量校验（四节结构 + 字段/值域/引用）+ 体检
-  run_checkup：hard 整包拒绝（返回 findings 列表，**不写库**）；过则单事务
+  run_checkup（经 ``server.run_checkup_safe``：体检自身崩溃降级为 hard finding，
+  不逃逸成 500，M5）：hard 整包拒绝（返回 findings 列表，**不写库**）；过则单事务
   UPSERT 写入 providers → models → settings → tree（不删既有行）+ 审计 + commit，
   返回 None。``actor`` 记 changes.actor（端点转调为 "admin"，CLI 为 "cli"）。
 - 结构/YAML/引用非法 raise ValueError（消息即 detail：HTTP 层转 400，CLI 退出码 2）。
@@ -32,7 +33,6 @@ import sqlite3
 import yaml
 
 import sr.db as db
-from sr.health import run_checkup
 from sr.tags import TAGS
 
 # 四节包必需节（缺任一 → ValueError "missing sections: …"，与原端点消息逐字一致）
@@ -158,7 +158,7 @@ def import_yaml(conn: sqlite3.Connection, text, *, actor: str = "admin"):
     settings_errs = _srv().validate_settings(settings, model_ids)
     if settings_errs:
         raise ValueError("invalid settings: " + "; ".join(settings_errs))
-    findings = run_checkup(nodes, {m: {} for m in model_ids}, TAGS)
+    findings = _srv().run_checkup_safe(nodes, {m: {} for m in model_ids}, TAGS)
     if any(f.level == "hard" for f in findings):
         ordered = sorted(findings, key=lambda f: f.level != "hard")
         return [f.to_json() for f in ordered]

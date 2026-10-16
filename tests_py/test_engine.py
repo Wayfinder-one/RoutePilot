@@ -7,7 +7,8 @@
 domain 置信度取档 1 中点 0.45；其余逐字未动。
 """
 
-from sr.engine import match, evaluate, evaluate_trace, rows_to_tree, TEMPLATES
+from sr.engine import (RouteDecision, match, evaluate, evaluate_trace,
+                       rows_to_tree, TEMPLATES)
 import sr.db as db
 
 SIG = {   # 一份「编程且难」的信号包（规范键/档位）
@@ -198,3 +199,99 @@ def test_match_non_list_or_not_bodies_are_false_not_crash():
     assert match([{"or": [legal]}], SIG, CUTS) is True
     assert match([{"not": {"tag": "jailbreak", "op": "gte", "values": [2]}}], SIG, CUTS) is True
 
+
+# ── M4（audit Major）：引擎「绝不抛异常」契约（engine.py:323 docstring）三个洞 ──
+# tests_py/test_engine.py:157-181 把「不抛」钉为契约，但用例没覆盖这些形状：
+# ① gte/lte 的 values[0] 非数值（"2"）→ int >= str TypeError；
+# ② action.fallback: null → list(None) TypeError；
+# ③ trial.ratio 为字符串/null → random() < str TypeError；trial 缺 to 时产出
+#    model=None, source='trial' → server 当 502 no_route（合法配置变永久 502）。
+# 闸门只挡 PUT 路径，挡不住绕闸/历史库数据——这正是该契约存在的意义。
+
+from sr.engine import _resolve                                  # noqa: E402
+
+
+def test_gte_lte_non_numeric_bound_is_false_not_crash():
+    """① values[0] 非数值：比较类 op 判 False（与「引擎无法求值 ⇒ False」同口径），
+    不得抛 int >= str TypeError。"""
+    assert match([{"tag": "complexity", "op": "gte", "values": ["2"]}], SIG, CUTS) is False
+    assert match([{"tag": "complexity", "op": "lte", "values": ["2"]}], SIG, CUTS) is False
+    assert match([{"tag": "complexity", "op": "gte", "values": [None]}], SIG, CUTS) is False
+    # 合法数值比较不误伤
+    assert match([{"tag": "complexity", "op": "gte", "values": [1]}], SIG, CUTS) is True
+    assert match([{"tag": "complexity", "op": "lte", "values": [0]}], SIG, CUTS) is False
+
+
+def test_contains_non_container_value_is_false_not_crash():
+    """① 的 contains 面：信号值非容器（int）时判 False，不得 `x in 1` TypeError。"""
+    sig = {**SIG, "keyword": {"value": 1}}          # keyword 正常是多标签（list）
+    assert match([{"tag": "keyword", "op": "contains", "values": ["x"]}], sig, CUTS) is False
+    assert match([{"tag": "keyword", "op": "contains", "values": ["x"]}], SIG, CUTS) is False
+
+
+def test_resolve_survives_malformed_action_and_trial(monkeypatch):
+    """②③ _resolve 对畸形 action/trial 不抛，且返回值必须是「可用的 RouteDecision」：
+    缺 to 的试水不得产出 model=None（否则 server 当 502 no_route——合法配置变永久
+    502），应忽略试水、走原 model。"""
+    monkeypatch.setattr("sr.engine.random.random", lambda: 0.5)
+    good = {"kind": "route", "model": "qwen3-32b", "fallback": ["qwen3-8b"]}
+    cases = [
+        # (名字, action, trial, 期望 fallbacks)
+        ("fallback-null", {**good, "fallback": None}, None, []),      # ② list(None)
+        ("fallback-non-list", {**good, "fallback": 7}, None, []),
+        ("ratio-str", good, {"ratio": "0.9", "to": "qwen3-8b"}, ["qwen3-8b"]),
+        ("ratio-null", good, {"ratio": None, "to": "qwen3-8b"}, ["qwen3-8b"]),
+        ("ratio-out-of-range", good, {"ratio": 5, "to": "qwen3-8b"}, ["qwen3-8b"]),
+        ("to-missing", good, {"ratio": 1.0}, ["qwen3-8b"]),           # ③ 试水缺 to
+        ("to-null", good, {"ratio": 1.0, "to": None}, ["qwen3-8b"]),
+        ("to-non-string", good, {"ratio": 1.0, "to": 7}, ["qwen3-8b"]),
+    ]
+    for name, action, trial, want_fallbacks in cases:
+        d = _resolve(action, trial, [3, 1])                     # 旧实现逐个 TypeError
+        assert isinstance(d, RouteDecision), name
+        assert d.kind == "route", name
+        assert d.model == "qwen3-32b", (name, d)                # 一律回落到原 action.model
+        assert d.hit_path == [3, 1], name
+        assert d.fallbacks == want_fallbacks, (name, d)
+
+
+def test_resolve_ignores_unknown_model_references_in_fallback_and_trial(monkeypatch):
+    """绕闸坏数据里的「不存在的模型」按透出处理（体检 hard 拦保存为主闸；引擎只
+    保证不抛、不产出 model=None）：fallback 链原样带上（上游解析失败由 server 的
+    错误信封负责），trial.to 是字符串就照掷签改道。"""
+    monkeypatch.setattr("sr.engine.random.random", lambda: 0.5)
+    d = _resolve({"kind": "route", "model": "qwen3-32b",
+                  "fallback": ["ghost-model"]}, None, [3, 1])
+    assert d.model == "qwen3-32b" and d.fallbacks == ["ghost-model"]
+    d2 = _resolve({"kind": "route", "model": "qwen3-32b"},
+                  {"ratio": 1.0, "to": "ghost-model"}, [3, 1])
+    assert d2.model == "ghost-model" and d2.source == "trial"
+
+
+def test_resolve_legal_trial_still_works(monkeypatch):
+    """正例不误伤：ratio 命中 + to 合法 → 仍改道 source='trial'。"""
+    monkeypatch.setattr("sr.engine.random.random", lambda: 0.1)
+    d = _resolve({"kind": "route", "model": "qwen3-32b",
+                  "fallback": ["qwen3-8b"]}, {"ratio": 0.5, "to": "qwen3-8b"}, [3, 1])
+    assert d.model == "qwen3-8b" and d.source == "trial"
+    assert d.fallbacks == ["qwen3-8b"]
+    monkeypatch.setattr("sr.engine.random.random", lambda: 0.9)   # 未命中 → 原 model
+    assert _resolve({"kind": "route", "model": "qwen3-32b"},
+                    {"ratio": 0.5, "to": "qwen3-8b"}, [3, 1]).source == "tree"
+
+
+def test_evaluate_never_raises_on_malformed_actions(tmp_path):
+    """端到端（真种子树）：把命中分支的 action 换成各种畸形形状 → evaluate 不抛，
+    且返回值是可用 RouteDecision（model 不为 None）。"""
+    conn = db.init_db(str(tmp_path / "t.db"))
+    base = rows_to_tree(conn.execute("SELECT * FROM tree ORDER BY idx").fetchall())
+    hit = next(b for n in base if n.idx == 5 for b in n.branches if b.idx == 50)
+    for bad in ({"kind": "route", "model": "qwen3-8b", "fallback": None},
+                {"kind": "route", "model": "qwen3-8b", "fallback": "qwen3-32b"},
+                {"kind": "route", "model": "qwen3-8b",
+                 "trial": {"ratio": "0.5", "to": "qwen3-32b"}}):
+        hit.action = bad
+        d = evaluate(base, SIG, CUTS)                  # 旧实现 TypeError 逃出
+        assert isinstance(d, RouteDecision) and d.model, bad
+        tr = evaluate_trace(base, SIG, CUTS)
+        assert isinstance(tr["decision"], RouteDecision), bad

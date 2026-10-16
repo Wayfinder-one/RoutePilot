@@ -64,9 +64,14 @@ def _api_keys(monkeypatch):
 
 
 def _serve(app, port: int):
-    """uvicorn 线程起真端口假上游，等就绪后交付，随 fixture 关停（同 test_server_v1）。"""
+    """uvicorn 线程起真端口假上游，等就绪后交付，随 fixture 关停（同 test_server_v1）。
+
+    uvicorn.Server 上没有指向 FastAPI app 的属性（3.x 实测 hasattr 为 False），
+    故显式挂 `server.app`——回显类 fixture 要读 app 状态里的捕获内容。
+    """
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
                                            log_level="warning"))
+    server.app = app
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.time() + 10
@@ -105,6 +110,56 @@ def _failing_upstream():
                           "total_tokens": 2}}
 
     yield from _serve(app, 8125)
+
+
+@pytest.fixture(scope="module")
+def _echo_upstream():
+    """回显式捕获假上游 8126：记录最后一次收到的请求体（B1 tools 全链路透传用）。
+
+    「上游收到了什么」是 B1 唯一的可观测面——router 丢弃 tools 时客户端只看到
+    上游少了个字段，无任何报错。
+    """
+    app = FastAPI(docs_url=None, redoc_url=None)
+    app.state.last = {}
+
+    async def _prep(request: Request) -> dict:
+        body = await request.json()
+        app.state.last = {"json": body, "path": request.url.path}
+        return body
+
+    @app.post("/chat/completions")
+    @app.post("/v1/chat/completions")
+    async def chat(request: Request):
+        body = await _prep(request)
+        return {"id": "chatcmpl-echo", "object": "chat.completion", "created": 0,
+                "model": body.get("model"),
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": "ok"},
+                             "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                          "total_tokens": 2}}
+
+    @app.post("/messages")
+    @app.post("/v1/messages")
+    async def messages(request: Request):
+        body = await _prep(request)
+        return {"id": "msg_echo", "type": "message", "role": "assistant",
+                "model": body.get("model"),
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1}}
+
+    yield from _serve(app, 8126)
+
+
+def _point_to(app, base_url: str) -> None:
+    """把本 app 的库中 providers.base_url 指到指定假上游（不关闭 app 的库连接）。"""
+    conn = sqlite3.connect(app.state.db_path)
+    try:
+        conn.execute("UPDATE providers SET base_url = ?", (base_url,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def _get(app, path, headers=None):
@@ -353,6 +408,41 @@ def test_model_test_endpoint_probe_sequence(app):
     r = post(app, "/admin/models/qwen3-8b/test", {})
     steps = r.json()["steps"]
     assert steps[0]["ok"] and steps[1]["name"] == "stream_first_byte"  # §9.4
+
+
+# ── B1（blocker）：双协议 tools 全链路透传（端到端，不只适配层） ────────────────
+# 适配层单测在 test_adapters.py；此处钉「客户端 → router → 上游请求体」全链路：
+# 旧实现路由链路上游收到的 body 里没有 tools，function calling 静默残废。
+
+_TOOLS_OAI = [{"type": "function", "function": {
+    "name": "get_weather",
+    "description": "查询指定城市的天气",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                   "required": ["city"]}}}]
+_TOOLS_AN = [{"name": "get_weather", "description": "查询指定城市的天气",
+              "input_schema": {"type": "object",
+                               "properties": {"city": {"type": "string"}},
+                               "required": ["city"]}}]
+
+
+@pytest.mark.parametrize("proto,path,tools,msg_body", [
+    ("openai", "/v1/chat/completions", _TOOLS_OAI,
+     {"model": "qwen3-8b", "messages": [{"role": "user", "content": "hi"}]}),
+    ("anthropic", "/v1/messages", _TOOLS_AN,
+     {"model": "qwen3-8b", "max_tokens": 16,
+      "messages": [{"role": "user", "content": "hi"}]}),
+])
+def test_tools_reach_upstream_request_body(app, _echo_upstream, proto, path, tools,
+                                           msg_body):
+    """双协议各一：客户端带 tools → 上游收到的请求体含 tools 且逐字相等。"""
+    _point_to(app, "http://127.0.0.1:8126")
+    r = post(app, path, {**msg_body, "tools": tools})
+    assert r.status_code == 200, r.text
+    got = _echo_upstream.app.state.last["json"]
+    assert got.get("tools") == tools, (proto, got)
+    # 客户端没带 tools → 出站体不得出现该键（缺失不出站，与 params 同口径）
+    post(app, path, dict(msg_body))
+    assert "tools" not in _echo_upstream.app.state.last["json"], proto
 
 
 # ── Task 10 折入项 + 补充测试（简报未覆盖的 Produces 接口，TDD 补齐） ───────────
