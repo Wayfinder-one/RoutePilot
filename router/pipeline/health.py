@@ -38,8 +38,36 @@ def _attainable_cap(rows) -> tuple[float, float]:
     return (sum_w - lost), sum_w
 
 
-def _rows_signature(branch) -> frozenset:
-    return frozenset((r.signal, r.value, r.weight) for r in branch.rows)
+def _rows_signature(branch) -> tuple:
+    """Duplicate-branch signature: identical rows AND identical threshold.
+
+    The design definition (section 8) is "weight rows identical and threshold
+    identical" — same rows with a different min_score is the legitimate
+    high-confidence / low-confidence two-tier pattern, so min_score is part of
+    the signature. conf_min is included so two gate branches that differ only
+    in their confidence threshold are not collapsed either.
+    """
+    rows = frozenset((r.signal, r.value, r.weight, r.conf_min)
+                     for r in branch.rows)
+    return (rows, branch.min_score)
+
+
+def _gate_exclusive_row_issue(node, branch) -> Issue | None:
+    """A gate branch ANDs its rows; two target values of the same single-valued
+    signal can never both match, so the branch is dead."""
+    targets: dict[str, set[str]] = {}
+    for r in branch.rows:
+        spec = SIGNALS.get(r.signal)
+        if spec is not None and not spec.multi:
+            targets.setdefault(r.signal, set()).add(r.value)
+    for signal, values in targets.items():
+        if len(values) > 1:
+            return Issue("gate_exclusive_rows",
+                         f"闸门分支内信号 {signal} 写了多个目标值，AND 语义下分支永假",
+                         f"Gate branch pins signal {signal} to multiple values; "
+                         f"with AND semantics the branch can never fire",
+                         node.id, branch.id)
+    return None
 
 
 def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
@@ -53,7 +81,7 @@ def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
                                 f"未知节点类型 {node.type}", f"Unknown node type {node.type}",
                                 node_id=node.id))
             continue
-        seen_signatures: set[frozenset] = set()
+        seen_signatures: set[tuple] = set()
         for b in node.branches:
             needs_model = node.type == "score" or b.action == "route"
             if needs_model and not b.model:
@@ -67,6 +95,10 @@ def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
                 if r.signal not in SIGNALS:
                     issues.append(Issue("unknown_signal", f"未知信号 {r.signal}",
                                         f"Unknown signal {r.signal}", node.id, b.id))
+            if node.type == "gate":
+                gate_issue = _gate_exclusive_row_issue(node, b)
+                if gate_issue is not None:
+                    issues.append(gate_issue)
             if node.type == "score":
                 cap, sum_w = _attainable_cap(b.rows)
                 if sum_w == 0:
@@ -85,6 +117,16 @@ def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
                                         "Identical to an earlier branch; never wins",
                                         node.id, b.id))
                 seen_signatures.add(sig)
+        if node.type == "gate":
+            # An empty-row gate branch always fires; anywhere but last it makes
+            # every following branch unreachable (design doc section 8).
+            for i, b in enumerate(node.branches):
+                if not b.rows and i < len(node.branches) - 1:
+                    issues.append(Issue("empty_branch_shadow",
+                                        "空条件分支不在末位，其后分支永不可达",
+                                        "An empty-row branch is not last; every "
+                                        "branch behind it is unreachable",
+                                        node.id, b.id))
     last = nodes[-1]
     if last.type != "gate" or not any(b.action == "route" and not b.rows
                                       and b.model for b in last.branches):

@@ -52,3 +52,31 @@ def test_dead_branch_exclusive_rows():
                               Row("complexity", "hard", weight=0.6)],
                model="med", min_score=0.9)])
     assert "dead_branch" in codes(check_pipeline([n, *ok_pipeline()], MODELS))
+
+
+def test_duplicate_allows_different_min_score():
+    # Same rows, different threshold = the legal high/low-confidence two-tier
+    # pattern; the signature must include min_score (audit ruling A).
+    n = Node(id="s", type="score", branches=[
+        Branch(id="b1", rows=[Row("domain", "health", weight=1.0)],
+               model="med", min_score=0.5),
+        Branch(id="b2", rows=[Row("domain", "health", weight=1.0)],
+               model="med", min_score=0.9)])
+    assert "duplicate_branch" not in codes(check_pipeline([n, *ok_pipeline()], MODELS))
+
+
+def test_gate_exclusive_rows_are_dead():
+    n = Node(id="g", type="gate", branches=[
+        Branch(id="b", rows=[Row("complexity", "easy"),
+                             Row("complexity", "hard")],
+               action="route", model="qwen3-8b")])
+    assert "gate_exclusive_rows" in codes(check_pipeline([n], MODELS))
+
+
+def test_empty_branch_must_be_last():
+    n = Node(id="g", type="gate", branches=[
+        Branch(id="b1", rows=[], action="route", model="qwen3-8b"),
+        Branch(id="b2", rows=[Row("domain", "health")],
+               action="route", model="med")])
+    assert "empty_branch_shadow" in codes(check_pipeline([n], MODELS))
+
