@@ -32,6 +32,11 @@ class Settings:
     judge_model: str = ""
     judge_api_key: str = ""
     signal_prompts: str = ""         # JSON prompt config path ('' = shipped default)
+    # JevTagger (ROUTER_TAGGER=jev): merged Open-Jev single model loaded in
+    # process; the question wording comes from an editable JSON config.
+    jev_model: str = ""              # merged model dir (ROUTER_JEV_MODEL)
+    signal_questions: str = ""       # JSON question config ('' = shipped default)
+    jev_max_length: int = 0          # 0 = use the model.json max_length
 
     @staticmethod
     def from_env() -> "Settings":
@@ -48,4 +53,7 @@ class Settings:
             judge_model=os.environ.get("ROUTER_JUDGE_MODEL", ""),
             judge_api_key=os.environ.get("ROUTER_JUDGE_API_KEY", ""),
             signal_prompts=os.environ.get("ROUTER_SIGNAL_PROMPTS", ""),
+            jev_model=os.environ.get("ROUTER_JEV_MODEL", ""),
+            signal_questions=os.environ.get("ROUTER_SIGNAL_QUESTIONS", ""),
+            jev_max_length=int(os.environ.get("ROUTER_JEV_MAX_LENGTH", "0")),
         )

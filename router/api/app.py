@@ -39,6 +39,16 @@ def _make_tagger(settings: Settings, kw_groups: dict):
             raise RuntimeError("ROUTER_TAGGER=checkpoint needs ROUTER_CHECKPOINT")
         return CheckpointTagger(settings.checkpoint_dir, device=settings.device,
                                 kw_groups=kw_groups)
+    if settings.tagger == "jev":
+        from router.signals.jev import JevTagger
+        if not settings.jev_model:
+            raise RuntimeError("ROUTER_TAGGER=jev needs ROUTER_JEV_MODEL")
+        return JevTagger(
+            settings.jev_model,
+            questions_path=settings.signal_questions or None,
+            device=settings.device or None,
+            max_length=settings.jev_max_length or None,
+            kw_groups=kw_groups)
     if settings.tagger == "prompt":
         from router.signals.prompt_judge import PromptJudgeTagger
         if not settings.judge_url or not settings.judge_model:

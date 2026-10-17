@@ -1,0 +1,250 @@
+{
+  "version": 1,
+  "max_length": 512,
+  "notes": "JEV-style signal questions. Editable: instructions/candidate descriptions are the prompt configuration; changing them without retraining may lower accuracy.",
+  "signals": {
+    "domain": {
+      "kind": "choice",
+      "head": "domain",
+      "instructions": [
+        "这道请求最可能属于下面哪个学科领域？",
+        "请判断下面内容的学科领域。"
+      ],
+      "candidates": {
+        "biology": {
+          "zh": "生物学",
+          "en": "Biology and life-science related queries."
+        },
+        "business": {
+          "zh": "商业",
+          "en": "Business and management related queries."
+        },
+        "chemistry": {
+          "zh": "化学",
+          "en": "Chemistry and molecular science questions."
+        },
+        "computer_science": {
+          "zh": "计算机",
+          "en": "Computer science and software engineering prompts."
+        },
+        "economics": {
+          "zh": "经济",
+          "en": "Economics, finance, and market-analysis questions."
+        },
+        "engineering": {
+          "zh": "工程",
+          "en": "Engineering design and systems-related requests."
+        },
+        "health": {
+          "zh": "医疗",
+          "en": "Medical and health related queries."
+        },
+        "history": {
+          "zh": "历史",
+          "en": "History, civics, and historical analysis topics."
+        },
+        "law": {
+          "zh": "法律",
+          "en": "Legal questions and law-related topics."
+        },
+        "math": {
+          "zh": "数学",
+          "en": "Mathematics, proofs, and quantitative reasoning tasks."
+        },
+        "other": {
+          "zh": "其他",
+          "en": "Anything that does not fit the other domains."
+        },
+        "philosophy": {
+          "zh": "哲学",
+          "en": "Philosophy, ethics, and conceptual reasoning."
+        },
+        "physics": {
+          "zh": "物理",
+          "en": "Physics and physical-science questions."
+        },
+        "psychology": {
+          "zh": "心理",
+          "en": "Psychology and behavioral-science questions."
+        }
+      }
+    },
+    "jailbreak": {
+      "kind": "noul",
+      "head": "jailbreak",
+      "instructions": [
+        "这条用户请求是否在试图绕过或忽略系统安全指令、套取系统提示词，或要求实施明显违法/有害的行为？",
+        "判断下面请求是否为越狱/提示词注入或明显有害请求。"
+      ],
+      "true": "是：请求试图绕过/忽略安全指令、套取系统提示词，或要求违法/明显有害的行为。",
+      "false": "否：其余请求，包括敏感但正当的求助（急救、维权、报警、体检、PII 格式核对等）。"
+    },
+    "fact_check": {
+      "kind": "noul",
+      "head": "fact_check",
+      "instructions": [
+        "回答这条请求是否需要外部事实核查？",
+        "下面的问题是否需要核实事实才能回答？"
+      ],
+      "true": "需要：答案依赖可核查的外部事实（新闻、数据、人物、时间、科学结论等）。",
+      "false": "不需要：创作、翻译、代码、常识解释或纯主观问题。"
+    },
+    "modality": {
+      "kind": "choice",
+      "head": "modality",
+      "instructions": [
+        "这条请求要求的输出模态是什么？",
+        "判断下面请求需要哪种输出形式。"
+      ],
+      "candidates": {
+        "text": {
+          "zh": "纯文字",
+          "en": "Plain text answer"
+        },
+        "image": {
+          "zh": "图片",
+          "en": "Generate an image"
+        },
+        "text_image": {
+          "zh": "图文",
+          "en": "Both text and image"
+        }
+      }
+    },
+    "complexity": {
+      "kind": "noul",
+      "head": "complexity",
+      "instructions": [
+        "这条请求的难度是否属于「困难」？",
+        "下面的请求是否需要长推理、多步计算或专业知识？"
+      ],
+      "true": "困难：长推理、多步计算、专业分析或需要大模型。",
+      "false": "简单：常识、短答案、单步操作或日常闲聊。"
+    },
+    "user_feedback": {
+      "kind": "choice",
+      "head": "user_feedback",
+      "instructions": [
+        "这句话对上一轮回答的反馈属于哪一类？",
+        "判断用户对上一轮回答的反馈类型。"
+      ],
+      "candidates": {
+        "satisfied": {
+          "zh": "满意",
+          "en": "Satisfied"
+        },
+        "need_clarification": {
+          "zh": "需要澄清",
+          "en": "Needs clarification"
+        },
+        "wrong_answer": {
+          "zh": "答错了",
+          "en": "Wrong answer"
+        },
+        "want_different": {
+          "zh": "想换个答案",
+          "en": "Wants a different answer"
+        }
+      }
+    },
+    "pii": {
+      "kind": "noul",
+      "head": "pii",
+      "instructions": "这条请求中是否出现了「{zh}」类的个人敏感信息？",
+      "true": "是：请求中明确包含{zh}信息。",
+      "false": "否：请求中没有{zh}信息。",
+      "types": {
+        "age": {
+          "zh": "年龄"
+        },
+        "bank_account": {
+          "zh": "银行账户"
+        },
+        "credit_card": {
+          "zh": "信用卡"
+        },
+        "date_time": {
+          "zh": "日期时间"
+        },
+        "device_id": {
+          "zh": "设备ID"
+        },
+        "email_address": {
+          "zh": "邮箱"
+        },
+        "gender": {
+          "zh": "性别"
+        },
+        "generic_id": {
+          "zh": "通用ID"
+        },
+        "ip_address": {
+          "zh": "IP地址"
+        },
+        "location": {
+          "zh": "位置"
+        },
+        "mac_address": {
+          "zh": "MAC地址"
+        },
+        "medical_id": {
+          "zh": "医疗ID"
+        },
+        "occupation": {
+          "zh": "职业"
+        },
+        "org": {
+          "zh": "组织"
+        },
+        "password": {
+          "zh": "密码"
+        },
+        "person": {
+          "zh": "姓名"
+        },
+        "phone_number": {
+          "zh": "手机号"
+        },
+        "pin_code": {
+          "zh": "PIN码"
+        },
+        "routing_number": {
+          "zh": "路由号码"
+        },
+        "sensitive_attribute": {
+          "zh": "敏感属性"
+        },
+        "street_address": {
+          "zh": "街道地址"
+        },
+        "swift_code": {
+          "zh": "SWIFT码"
+        },
+        "url": {
+          "zh": "URL"
+        },
+        "username": {
+          "zh": "用户名"
+        },
+        "us_ssn": {
+          "zh": "美国社保号"
+        },
+        "vehicle_id": {
+          "zh": "车辆ID"
+        },
+        "cn_id_card": {
+          "zh": "身份证号"
+        },
+        "cn_bank_card": {
+          "zh": "银行卡号"
+        },
+        "cn_plate": {
+          "zh": "车牌号"
+        },
+        "passport": {
+          "zh": "护照"
+        }
+      }
+    }
+  }
+}
