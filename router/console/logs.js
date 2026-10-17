@@ -73,9 +73,9 @@ function methodHtml(r) {
     const q = cfg ? (Array.isArray(cfg.instructions) ? cfg.instructions[0] : cfg.instructions) : '—';
     rows.push(methodRow(sigName(k), q, tf('logs.jev', { tmp: temp })));
   }
-  for (const [k, s] of Object.entries(pack)) {
-    if (s.is_rule) rows.push(methodRow(sigName(k), '—', t('logs.rule')));
-  }
+  const ruleNames = Object.entries(pack).filter(([k, s]) => s.is_rule).map(([k, s]) =>
+    sigName(k) + '=' + (Array.isArray(s.value) ? s.value.join(',') : s.value));
+  if (ruleNames.length) rows.push(methodRow(t('logs.rule'), ruleNames.join(' · '), 'c=1'));
   const { node, branch } = machine(r);
   const where = node ? `${esc(node.name)}${branch ? ' · ' + esc(branch.name) : ''}` : '—';
   return `<div class="log-detail">

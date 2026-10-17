@@ -489,7 +489,7 @@ function bindDockEvents() {
     markDirty(); renderAll();
   }));
   document.querySelectorAll('[data-selbranch]').forEach(el => el.addEventListener('click', () => {
-    sel = { kind: 'branch', id: el.dataset.selbranch }; renderAll();
+    sel = { kind: 'branch', id: el.dataset.selbranch }; dockTab = 'inspector'; renderAll();
   }));
   document.querySelectorAll('[data-movebranch]').forEach(el => el.addEventListener('click', () => {
     const [id, d] = el.dataset.movebranch.split('|');
@@ -552,9 +552,9 @@ function bindTree() {
     const addbr = e.target.closest('[data-addbr]');
     if (addbr) { e.stopPropagation(); addBranchTo(addbr.dataset.addbr); return; }
     const br = e.target.closest('[data-branch]');
-    if (br) { sel = { kind: 'branch', id: br.dataset.branch }; renderAll(); return; }
+    if (br) { sel = { kind: 'branch', id: br.dataset.branch }; dockTab = 'inspector'; renderAll(); return; }
     const head = e.target.closest('[data-node-head]');
-    if (head) { sel = { kind: 'node', id: head.dataset.nodeHead }; renderAll(); }
+    if (head) { sel = { kind: 'node', id: head.dataset.nodeHead }; dockTab = 'inspector'; renderAll(); }
   });
   wrap.addEventListener('dragstart', e => {
     const b = e.target.closest('[data-grip-branch]');
@@ -623,6 +623,7 @@ function addBranchTo(nodeId) {
   else { b.action = 'route'; b.model = MODELS[0]; b.min_score = 0.6; }
   n.branches.push(b);
   sel = { kind: 'branch', id: b.id };
+  dockTab = 'inspector';
   markDirty(); renderAll();
 }
 

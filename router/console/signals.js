@@ -32,7 +32,7 @@ function renderHeader() {
     ? '引擎 <b>' + esc(meta.name || '?') + '</b> · T ' + temp
     : 'engine <b>' + esc(meta.name || '?') + '</b> · T ' + temp);
   $('#dirtyPill').className = 'pill ' + (dirty ? 'warn' : 'ok');
-  $('#dirtyPill').textContent = dirty ? t('sig.changed') : t('common.saved');
+  $('#dirtyPill').textContent = dirty ? t('sig.changed') : t('pipe.clean');
   $('#sigCount').textContent = Object.keys(cfg.signals).length;
   const parts = [];
   parts.push(`${t('sig.temperature')} <b class="mono">${temp}</b>`);

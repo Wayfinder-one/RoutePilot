@@ -152,7 +152,7 @@ main.page{max-width:1600px;margin:0 auto;padding:0 22px 26px}
 .arrow{color:var(--text-3);font-family:var(--mono);font-size:11px}
 .act{display:inline-flex;align-items:center;gap:4px;margin-left:auto;font-size:11px;font-weight:650}
 .act.block{color:var(--red)} .act.route{color:var(--indigo)}
-.bmeta{flex:none;text-align:right;font-size:10.5px;color:var(--text-3);font-family:var(--mono);line-height:1.35;padding-top:2px}
+.bmeta{flex:none;text-align:right;font-size:10.5px;color:var(--text-3);font-family:var(--mono);line-height:1.35;padding-top:2px;white-space:nowrap;display:flex;flex-direction:column;align-items:flex-end;gap:1px}
 .bmeta b{display:block;color:var(--text-2);font-weight:600}
 .addbranch{display:flex;align-items:center;justify-content:center;gap:5px;margin:0 11px 11px 15px;border:1px dashed var(--line-2);background:transparent;border-radius:8px;padding:6px;font-size:12px;color:var(--text-3);width:calc(100% - 26px)}
 .addbranch:hover{border-color:var(--indigo);color:var(--indigo);background:var(--indigo-soft)}
@@ -262,7 +262,10 @@ main.page{max-width:1600px;margin:0 auto;padding:0 22px 26px}
 .cand-table input{width:100%;padding:3px 5px;font-size:12px}
 /* ── models page ────────────────────────────── */
 .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
-.list{width:100%;border-collapse:collapse;font-size:12px}
+.list{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
+.list td:first-child{width:150px}
+.list td:nth-child(2){width:41%}
+.list td:nth-child(3){width:19%}
 .list th{font-size:10.5px;text-align:left;color:var(--text-3);font-weight:600;padding:5px;border-bottom:1px solid var(--line)}
 .list td{padding:5px;border-bottom:1px solid var(--line);vertical-align:middle}
 .list td input{width:100%;padding:3px 5px;font-size:12px}
