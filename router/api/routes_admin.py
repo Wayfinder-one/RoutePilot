@@ -273,8 +273,10 @@ def get_overview(days: int = 14, conn: sqlite3.Connection = Depends(get_conn)):
                            ).fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
     buckets = [0] * CONF_BUCKETS
+    # model signals only: rule signals are deterministic (c == 1) and would
+    # swamp the distribution the dashboard exists to show (design 6).
     for (conf,) in conn.execute("SELECT confidence FROM request_signals "
-                                "WHERE confidence IS NOT NULL"):
+                                "WHERE confidence IS NOT NULL AND is_rule = 0"):
         buckets[min(CONF_BUCKETS - 1, int(float(conf) * CONF_BUCKETS))] += 1
     confidence = [{"lo": i / CONF_BUCKETS, "hi": (i + 1) / CONF_BUCKETS,
                    "count": c} for i, c in enumerate(buckets)]

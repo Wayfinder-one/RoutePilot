@@ -1,7 +1,11 @@
+import asyncio
+
+import httpx
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.config import Settings
+from router.store.db import connect
 
 
 def client(tmp_path):
@@ -111,6 +115,29 @@ def test_overview_has_confidence_and_evals(tmp_path):
     assert {"daily", "routes", "blocked", "total", "confidence", "evals"} <= set(body)
     assert len(body["confidence"]) == 5
     assert body["evals"] == []
+
+
+def test_confidence_histogram_counts_model_signals_only(tmp_path):
+    """Rule signals (c == 1) must not swamp the confidence dashboard."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(
+                         lambda r: httpx.Response(200, json={"choices": []})))
+    c = TestClient(app)
+    c.post("/v1/chat/completions",
+           json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
+    asyncio.run(app.state.requestlog.flush())
+    body = c.get("/admin/overview").json()
+    counted = sum(b["count"] for b in body["confidence"])
+    conn = connect(str(tmp_path / "t.db"))
+    model_signals = conn.execute(
+        "SELECT COUNT(*) FROM request_signals "
+        "WHERE confidence IS NOT NULL AND is_rule = 0").fetchone()[0]
+    rule_signals = conn.execute(
+        "SELECT COUNT(*) FROM request_signals WHERE is_rule = 1").fetchone()[0]
+    conn.close()
+    assert rule_signals > 0                    # the request did carry rule signals
+    assert counted == model_signals
+
 
 
 def test_try_reports_vec_dim(tmp_path):
