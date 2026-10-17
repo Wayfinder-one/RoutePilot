@@ -78,3 +78,42 @@ def test_put_provider_upserts_and_swaps_snapshot(tmp_path):
                and p["base_url"] == "http://example.internal:9/v1" for p in provs)
     assert app.state.backends["qwen3-8b"].url == \
         "http://example.internal:9/v1/chat/completions"
+
+
+def test_settings_roundtrip_and_reserved(tmp_path):
+    c = client(tmp_path)
+    r = c.put("/admin/settings", json={"default_note": "hello", "n": 3})
+    assert r.status_code == 200
+    assert r.json()["settings"]["default_note"] == "hello"
+    assert r.json()["settings"]["n"] == "3"
+    assert c.put("/admin/settings",
+                 json={"pipeline_version": "9"}).status_code == 422
+    assert c.put("/admin/settings", json={"_x": 1}).status_code == 422
+    assert c.put("/admin/settings", json={"bad": {}}).status_code == 422
+
+
+def test_changes_audit_trail(tmp_path):
+    c = client(tmp_path)
+    pipe = c.get("/admin/pipeline").json()
+    c.put("/admin/pipeline", json=pipe)
+    c.put("/admin/models/qwen3-8b", json={"upstream": "real"})
+    c.put("/admin/providers/local", json={"base_url": "http://x:1/v1"})
+    c.put("/admin/settings", json={"note": "n"})
+    changes = c.get("/admin/changes").json()["changes"]
+    kinds = {ch["kind"] for ch in changes}
+    assert {"pipeline", "model", "provider", "settings"} <= kinds
+    # newest first
+    assert changes[0]["kind"] == "settings"
+
+
+def test_overview_has_confidence_and_evals(tmp_path):
+    body = client(tmp_path).get("/admin/overview").json()
+    assert {"daily", "routes", "blocked", "total", "confidence", "evals"} <= set(body)
+    assert len(body["confidence"]) == 5
+    assert body["evals"] == []
+
+
+def test_try_reports_vec_dim(tmp_path):
+    body = client(tmp_path).post("/admin/try", json={"text": "你好"}).json()
+    assert body["vec_dim"] == 0            # heuristic has no embedding
+

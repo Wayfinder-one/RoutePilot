@@ -124,6 +124,10 @@ main{max-width:1180px;margin:20px auto;padding:0 20px}
 .kw-group input{border:1px solid var(--line2);border-radius:6px;padding:5px 8px;font-size:12.5px;font-family:var(--sans)}
 .kw-group .kw-name{width:150px;font-weight:600}
 .kw-group .kw-words{flex:1}
+.prov-group{display:flex;gap:8px;align-items:center}
+.prov-group input{border:1px solid var(--line2);border-radius:6px;padding:5px 8px;font-size:12.5px;font-family:var(--sans)}
+.prov-group .p-name{width:130px;font-weight:600}
+.prov-group .p-base,.prov-group .p-key{flex:1}
 table.list{width:100%;border-collapse:collapse;font-size:12.5px}
 table.list th{font-weight:600;color:var(--text3);text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
 table.list td{padding:5px 6px;border-bottom:1px solid var(--line)}

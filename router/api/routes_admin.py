@@ -1,8 +1,10 @@
-"""Admin API: pipeline CRUD, lexicon, model registry, signal registry.
+"""Admin API: pipeline, lexicon, models, providers, signals, try, settings,
+changes, eval and the overview aggregates.
 
-Every write that changes what the hot path reads also swaps the in-memory
-snapshot (pipeline / backends / keyword groups) so request handling never
-touches the database (design doc section 4.4).
+Every write that changes what the hot path reads swaps the in-memory snapshot
+(pipeline / backends / keyword groups) so request handling never touches the
+database (design doc section 4.4). Every configuration write is also appended to
+the ``changes`` audit trail (design 5.1).
 """
 
 from __future__ import annotations
@@ -15,20 +17,34 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn
+from router.api.sessions import read_last_vec
 from router.api.upstream import load_backends
+from router.evals import summarize
+from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
 from router.pipeline.model import node_from_dict, node_to_dict
 from router.signals.registry import SIGNALS
-from router.store.repositories import (KeywordRepo, ModelRepo, PipelineRepo,
-                                       ProviderRepo, SettingsRepo)
+from router.signals.tagger import TagRequest
+from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
+                                       ModelRepo, PipelineRepo, ProviderRepo,
+                                       RequestRepo, SettingsRepo)
 
 router = APIRouter()
+
+RESERVED_SETTINGS = {"pipeline_version"}
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _refresh_backends(request: Request, conn: sqlite3.Connection) -> None:
     request.app.state.backends = load_backends(conn)   # wholesale swap
 
 
+# --------------------------------------------------------------------------- #
+# Pipeline
+# --------------------------------------------------------------------------- #
 class PipelineIn(BaseModel):
     nodes: list[dict]
 
@@ -52,9 +68,15 @@ def put_pipeline(body: PipelineIn, request: Request,
         raise HTTPException(422, detail=[i.__dict__ for i in issues])
     PipelineRepo(conn).save(nodes)
     request.app.state.pipeline = nodes       # refresh the hot-path snapshot
+    ChangeRepo(conn).record(_now(), "pipeline",
+                            {"nodes": len(nodes),
+                             "version": SettingsRepo(conn).get("pipeline_version")})
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------- #
+# Keyword lexicon
+# --------------------------------------------------------------------------- #
 @router.get("/keyword-groups")
 def get_keyword_groups(conn: sqlite3.Connection = Depends(get_conn)):
     return {"groups": KeywordRepo(conn).groups()}
@@ -68,9 +90,13 @@ def put_keyword_groups(body: dict, request: Request,
         raise HTTPException(422, detail="groups must be an object")
     KeywordRepo(conn).save(groups)
     request.app.state.tagger.kw_groups = groups   # heuristic reads it live
+    ChangeRepo(conn).record(_now(), "keyword-groups", {"groups": len(groups)})
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------- #
+# Models & providers
+# --------------------------------------------------------------------------- #
 @router.get("/models")
 def get_models(conn: sqlite3.Connection = Depends(get_conn)):
     return {"models": ModelRepo(conn).list()}
@@ -91,6 +117,9 @@ def put_model(model_id: str, body: ModelIn, request: Request,
                                   provider=body.provider, profile=profile):
         raise HTTPException(404, detail=f"unknown model {model_id}")
     _refresh_backends(request, conn)
+    ChangeRepo(conn).record(_now(), "model",
+                            {"id": model_id, "upstream": body.upstream,
+                             "provider": body.provider, "profile": body.profile})
     return {"ok": True, "model": ModelRepo(conn).get(model_id)}
 
 
@@ -109,9 +138,15 @@ def put_provider(name: str, body: ProviderIn, request: Request,
                  conn: sqlite3.Connection = Depends(get_conn)):
     ProviderRepo(conn).upsert(name, body.base_url, body.key_env)
     _refresh_backends(request, conn)
+    ChangeRepo(conn).record(_now(), "provider",
+                            {"name": name, "base_url": body.base_url,
+                             "key_env": body.key_env})
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------- #
+# Signal registry
+# --------------------------------------------------------------------------- #
 @router.get("/signals")
 def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
     return {"signals": [s.__dict__ for s in SIGNALS.values()],
@@ -119,18 +154,108 @@ def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
             "keyword_groups": list(KeywordRepo(conn).groups())}
 
 
+# --------------------------------------------------------------------------- #
+# Try (calibration; never persisted)
+# --------------------------------------------------------------------------- #
 class TryIn(BaseModel):
     text: str
+    session: str | None = None
 
 
 @router.post("/try")
 async def try_pipeline(body: TryIn, request: Request):
-    from router.pipeline.engine import decision_to_dict, evaluate
-    from router.signals.tagger import TagRequest
-    result = await request.app.state.tagger.tag(TagRequest(text=body.text))
+    from router.pipeline.engine import decision_to_dict
+    result = await request.app.state.tagger.tag(TagRequest(
+        text=body.text, last_vec=read_last_vec(request, body.session)))
     decision, trace = evaluate(request.app.state.pipeline, result.signals)
-    return {"signals": result.signals,
+    return {"signals": result.signals, "vec_dim": len(result.vec or []),
             "decision": decision_to_dict(decision), "trace": trace}
+
+
+# --------------------------------------------------------------------------- #
+# Settings (M3) + change audit trail
+# --------------------------------------------------------------------------- #
+@router.get("/settings")
+def get_settings(conn: sqlite3.Connection = Depends(get_conn)):
+    return {"settings": SettingsRepo(conn).all()}
+
+
+@router.put("/settings")
+def put_settings(body: dict, request: Request,
+                 conn: sqlite3.Connection = Depends(get_conn)):
+    for key, value in body.items():
+        if (not isinstance(key, str) or not key or key.startswith("_")
+                or key in RESERVED_SETTINGS):
+            raise HTTPException(422, detail=f"reserved or invalid setting key {key!r}")
+        if not isinstance(value, (str, int, float, bool)):
+            raise HTTPException(422, detail=f"setting {key!r} must be a scalar")
+    for key, value in body.items():
+        SettingsRepo(conn).set(key, str(value))
+    ChangeRepo(conn).record(_now(), "settings", {"keys": sorted(body)})
+    return {"ok": True, "settings": SettingsRepo(conn).all()}
+
+
+@router.get("/changes")
+def get_changes(limit: int = 50, conn: sqlite3.Connection = Depends(get_conn)):
+    return {"changes": ChangeRepo(conn).list(limit)}
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation (M3)
+# --------------------------------------------------------------------------- #
+class EvalIn(BaseModel):
+    mode: str                       # 'replay' | 'labels'
+    days: int = 7
+    labels: list[dict] = []
+
+
+async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
+    nodes = request.app.state.pipeline
+    pairs: list[tuple] = []
+    mismatches: list[dict] = []
+    if body.mode == "replay":
+        since = (datetime.now().astimezone()
+                 - timedelta(days=body.days)).date().isoformat()
+        for r in RequestRepo(conn).replayable(since):
+            decision, _ = evaluate(nodes, r["signals"])
+            got = decision.model if decision.kind == "route" else None
+            pairs.append((r["model"], got))
+            if got != r["model"] and len(mismatches) < 100:
+                mismatches.append({"id": r["id"], "expect": r["model"], "got": got})
+        return pairs, mismatches, {"days": body.days}
+    if body.mode == "labels":
+        for case in body.labels:
+            text = str(case.get("text", ""))
+            expect = case.get("expect_model")
+            result = await request.app.state.tagger.tag(TagRequest(text=text))
+            decision, _ = evaluate(nodes, result.signals)
+            got = decision.model if decision.kind == "route" else None
+            pairs.append((expect, got))
+            if got != expect and len(mismatches) < 100:
+                mismatches.append({"text": text[:200], "expect": expect, "got": got})
+        return pairs, mismatches, {"labels": len(body.labels)}
+    raise HTTPException(422, detail="mode must be 'replay' or 'labels'")
+
+
+@router.post("/eval")
+async def post_eval(body: EvalIn, request: Request,
+                    conn: sqlite3.Connection = Depends(get_conn)):
+    pairs, mismatches, extra = await _eval_pairs(body, request, conn)
+    report = summarize(body.mode, pairs, mismatches, **extra)
+    EvalRepo(conn).save(_now(), body.mode, report["total"], report["matched"],
+                        report["rate"], report)
+    return report
+
+
+@router.get("/evals")
+def get_evals(limit: int = 3, conn: sqlite3.Connection = Depends(get_conn)):
+    return {"evals": EvalRepo(conn).recent(limit)}
+
+
+# --------------------------------------------------------------------------- #
+# Overview aggregates (M3: traffic + confidence distribution + recent evals)
+# --------------------------------------------------------------------------- #
+CONF_BUCKETS = 5
 
 
 @router.get("/overview")
@@ -147,4 +272,11 @@ def get_overview(days: int = 14, conn: sqlite3.Connection = Depends(get_conn)):
     blocked = conn.execute("SELECT COUNT(*) FROM requests WHERE decision = 'block'"
                            ).fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-    return {"daily": daily, "routes": routes, "blocked": blocked, "total": total}
+    buckets = [0] * CONF_BUCKETS
+    for (conf,) in conn.execute("SELECT confidence FROM request_signals "
+                                "WHERE confidence IS NOT NULL"):
+        buckets[min(CONF_BUCKETS - 1, int(float(conf) * CONF_BUCKETS))] += 1
+    confidence = [{"lo": i / CONF_BUCKETS, "hi": (i + 1) / CONF_BUCKETS,
+                   "count": c} for i, c in enumerate(buckets)]
+    return {"daily": daily, "routes": routes, "blocked": blocked, "total": total,
+            "confidence": confidence, "evals": EvalRepo(conn).recent(3)}

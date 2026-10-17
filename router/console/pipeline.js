@@ -10,6 +10,7 @@ let GROUP_COLOR = { safety: 'var(--g-safety)', domain: 'var(--g-domain)',
   difficulty: 'var(--g-cx)', context: 'var(--g-ctx)', session: 'var(--g-sess)',
   rule: 'var(--g-rule)' };
 let MODELS = [];
+let PROFILE = {};          // model id -> {domains:[...], tier}
 let KEYWORD_GROUPS = [];
 let nodes = [];
 
@@ -23,6 +24,7 @@ async function boot() {
   sigBody.signals.forEach(s => { SIG[s.key] = s; });
   KEYWORD_GROUPS = sigBody.keyword_groups;   // options for the keyword signal
   MODELS = modelBody.models.map(m => m.id);
+  modelBody.models.forEach(m => { PROFILE[m.id] = JSON.parse(m.profile || '{}'); });
   nodes = pipeBody.nodes.map(n => ({
     ...n,
     branches: (n.branches || []).map(b => ({
@@ -112,7 +114,8 @@ function branchHtml(node, branch) {
          <option value="route" ${branch.action === 'route' ? 'selected' : ''}>${t('pipe.route')}</option></select>
        ${branch.action === 'route' ? modelSel(branch) : `<span class="mut">${t('pipe.reject')}</span>`}`
     : `${modelSel(branch)}
-       <span class="wlab">${t('pipe.minscore')}</span><input type="range" min="0" max="1" step="0.05" value="${branch.min_score ?? 0.5}" data-br="${branch.id}" data-f="min_score"><span class="val" id="bv${branch.id}">${Number(branch.min_score ?? 0.5).toFixed(2)}</span>`;
+       <span class="wlab">${t('pipe.minscore')}</span><input type="range" min="0" max="1" step="0.05" value="${branch.min_score ?? 0.5}" data-br="${branch.id}" data-f="min_score"><span class="val" id="bv${branch.id}">${Number(branch.min_score ?? 0.5).toFixed(2)}</span>
+       <button class="btn sm" data-prefill="${branch.id}">${t('pipe.prefill')}</button>`;
   return `<div class="branch" data-branch="${branch.id}">
     <div class="branch-head">
       <input class="branch-name" value="${esc(branch.name)}" data-br="${branch.id}" data-f="name" placeholder="${t('pipe.branchname')}">
@@ -198,6 +201,14 @@ function bindNodeEvents() {
     const b = { id: uid(), name: '', rows: [] };
     if (n.type === 'gate') { b.action = 'route'; b.model = MODELS[0]; } else { b.model = MODELS[0]; b.min_score = 0.6; }
     n.branches.push(b); renderNodes();
+  }));
+  document.querySelectorAll('[data-prefill]').forEach(el => el.addEventListener('click', () => {
+    const { b } = findBr(el.dataset.prefill);
+    const domains = (PROFILE[b.model] || {}).domains || [];
+    if (!domains.length) { toast(t('pipe.noprofile')); return; }
+    const w = b.rows.length ? (b.rows[0].weight ?? 0.5) : 0.5;
+    b.rows = domains.map(d => ({ id: uid(), signal: 'domain', value: d, weight: w }));
+    renderNodes();
   }));
   document.querySelectorAll('[data-move]').forEach(el => el.addEventListener('click', () => {
     const [id, d] = el.dataset.move.split('|');
