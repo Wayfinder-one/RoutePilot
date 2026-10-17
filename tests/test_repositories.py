@@ -49,7 +49,10 @@ def test_checkpoint_calibration_is_higher_and_healthy(conn):
     from router.pipeline.health import check_pipeline
     seed_default(conn, "checkpoint")
     nodes = PipelineRepo(conn).load()
-    assert nodes[0].branches[0].rows[0].conf_min == 0.60
+    # 0.99 since the 2026-10-17 demo decision: the jailbreak head misfires on
+    # emergency wording, so the gate only fires at very high confidence
+    # (documented in CALIBRATIONS and the implementation record section 10-2)
+    assert nodes[0].branches[0].rows[0].conf_min == 0.99
     assert nodes[2].branches[0].min_score == 0.55
     assert nodes[2].branches[1].min_score == 0.45
     known = {m["id"] for m in ModelRepo(conn).list()}

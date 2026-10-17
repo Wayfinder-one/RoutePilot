@@ -22,6 +22,10 @@ class Settings:
     sessions: bool = False           # optional session store (last_vec for similarity)
     host: str = "127.0.0.1"
     port: int = 8400
+    # Static bearer token for the /admin API (design doc section 7). Empty =
+    # no auth (loopback/dev only); set ROUTER_ADMIN_TOKEN to require
+    # "Authorization: Bearer <token>" on every /admin* request.
+    admin_token: str = ""
 
     @staticmethod
     def from_env() -> "Settings":
@@ -33,4 +37,5 @@ class Settings:
             sessions=_flag("ROUTER_SESSIONS", False),
             host=os.environ.get("ROUTER_HOST", "127.0.0.1"),
             port=int(os.environ.get("ROUTER_PORT", "8400")),
+            admin_token=os.environ.get("ROUTER_ADMIN_TOKEN", ""),
         )

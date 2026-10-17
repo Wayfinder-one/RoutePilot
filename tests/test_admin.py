@@ -28,6 +28,29 @@ def test_put_pipeline_roundtrip_and_snapshot_refresh(tmp_path):
     assert again["nodes"][3]["branches"][0]["model"] == "qwen3-32b"
 
 
+def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
+    """Re-saving an unchanged pipeline (console smoke check, editor no-op) must
+    not bump pipeline_version or append an audit row (2026-10-17 review N3)."""
+    c = client(tmp_path)
+    before = c.get("/admin/pipeline").json()
+    changes_before = len(c.get("/admin/changes").json()["changes"])
+    r = c.put("/admin/pipeline", json=before)
+    assert r.status_code == 200
+    assert r.json()["changed"] is False
+    assert r.json()["version"] == before["version"]
+    after = c.get("/admin/pipeline").json()
+    assert after["version"] == before["version"]
+    assert len(c.get("/admin/changes").json()["changes"]) == changes_before
+
+    # a real edit still bumps the version and writes one audit row
+    after["nodes"][3]["branches"][0]["model"] = "qwen3-32b"
+    r = c.put("/admin/pipeline", json=after)
+    assert r.json()["changed"] is True
+    newer = c.get("/admin/pipeline").json()
+    assert int(newer["version"]) == int(before["version"]) + 1
+    assert len(c.get("/admin/changes").json()["changes"]) == changes_before + 1
+
+
 def test_put_pipeline_rejected_by_health(tmp_path):
     c = client(tmp_path)
     body = c.get("/admin/pipeline").json()
@@ -99,6 +122,7 @@ def test_settings_roundtrip_and_reserved(tmp_path):
 def test_changes_audit_trail(tmp_path):
     c = client(tmp_path)
     pipe = c.get("/admin/pipeline").json()
+    pipe["nodes"][3]["branches"][0]["model"] = "qwen3-32b"   # a real change
     c.put("/admin/pipeline", json=pipe)
     c.put("/admin/models/qwen3-8b", json={"upstream": "real"})
     c.put("/admin/providers/local", json={"base_url": "http://x:1/v1"})

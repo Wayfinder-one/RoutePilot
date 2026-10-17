@@ -1,12 +1,13 @@
 /* Models & settings page: editable model registry + provider list (M3 write
-   endpoints) + keyword-group editor. */
+   endpoints) + keyword-group editor + runtime settings + admin token. */
 async function boot() {
-  const [m, kw, prov] = await Promise.all([
+  const [m, kw, prov, set] = await Promise.all([
     api.get('/admin/models'), api.get('/admin/keyword-groups'),
-    api.get('/admin/providers')]);
+    api.get('/admin/providers'), api.get('/admin/settings')]);
   renderModels(m.models);
   renderProviders(prov.providers);
   renderKw(kw.groups);
+  renderSettings(set.settings || {});
 }
 
 /* ── models ──────────────────────────────────────────────────────────── */
@@ -103,6 +104,73 @@ function readGroups() {
   });
   return next;
 }
+
+/* ── runtime settings (/admin/settings; pipeline_version is read-only) ── */
+function settingsRows() {
+  return [...document.querySelectorAll('#settingsRows .set-row')];
+}
+
+function renderSettings(settings) {
+  const reserved = 'pipeline_version';
+  const rows = Object.entries(settings)
+    .filter(([k]) => k !== reserved)
+    .map(([k, v]) => `<div class="set-row">
+        <input class="s-key" value="${esc(k)}">
+        <input class="s-val" value="${esc(v)}">
+        <button class="btn sm" data-del-setting>${t('common.delete')}</button>
+      </div>`).join('');
+  const ver = settings[reserved]
+    ? `<div class="mut">${t('models.pipelineversion')}：${esc(settings[reserved])}</div>`
+    : '';
+  document.querySelector('#settingsRows').innerHTML = rows + ver;
+  document.querySelectorAll('[data-del-setting]').forEach(b =>
+    b.addEventListener('click', e => e.target.closest('.set-row').remove()));
+}
+
+function readSettings() {
+  const out = {};
+  for (const row of settingsRows()) {
+    const k = row.querySelector('.s-key').value.trim();
+    if (k) out[k] = row.querySelector('.s-val').value;
+  }
+  return out;
+}
+
+document.querySelector('#addSetting').addEventListener('click', () => {
+  const wrap = document.createElement('div');
+  wrap.className = 'set-row';
+  wrap.innerHTML = `<input class="s-key" placeholder="key">
+    <input class="s-val" placeholder="value">
+    <button class="btn sm" data-del-setting>${t('common.delete')}</button>`;
+  wrap.querySelector('[data-del-setting]').addEventListener('click', () => wrap.remove());
+  document.querySelector('#settingsRows').prepend(wrap);
+});
+
+document.querySelector('#saveSettings').addEventListener('click', async () => {
+  try {
+    // settings PUT is a merge: untouched keys are left alone
+    await api.put('/admin/settings', readSettings());
+    renderSettings((await api.get('/admin/settings')).settings || {});
+    toast(t('common.saved'));
+  } catch (e) {
+    toast('保存失败: ' + (Array.isArray(e.detail) ? JSON.stringify(e.detail) : e.detail || e.message));
+  }
+});
+
+/* ── admin token (browser-local; /admin auth when ROUTER_ADMIN_TOKEN is set) ─ */
+const tokenInput = document.querySelector('#adminToken');
+tokenInput.value = api.token();
+
+document.querySelector('#saveToken').addEventListener('click', () => {
+  api.setToken(tokenInput.value);
+  toast(api.token() ? t('common.saved') : t('models.cleartoken'));
+  boot();
+});
+document.querySelector('#clearToken').addEventListener('click', () => {
+  api.setToken('');
+  tokenInput.value = '';
+  toast(t('models.cleartoken'));
+});
 
 window.onLangChange = () => { boot(); };
 boot();

@@ -66,12 +66,19 @@ def put_pipeline(body: PipelineIn, request: Request,
     issues = check_pipeline(nodes, known)
     if issues:
         raise HTTPException(422, detail=[i.__dict__ for i in issues])
+    # No-op saves must not bump the version or append an audit row: the console
+    # smoke check re-saves the unchanged pipeline, and an editor save without
+    # edits should not look like a config change (2026-10-17 review N3).
+    current = [node_to_dict(n) for n in PipelineRepo(conn).load()]
+    if [node_to_dict(n) for n in nodes] == current:
+        return {"ok": True, "changed": False,
+                "version": SettingsRepo(conn).get("pipeline_version", "0")}
     PipelineRepo(conn).save(nodes)
     request.app.state.pipeline = nodes       # refresh the hot-path snapshot
+    version = SettingsRepo(conn).get("pipeline_version")
     ChangeRepo(conn).record(_now(), "pipeline",
-                            {"nodes": len(nodes),
-                             "version": SettingsRepo(conn).get("pipeline_version")})
-    return {"ok": True}
+                            {"nodes": len(nodes), "version": version})
+    return {"ok": True, "changed": True, "version": version}
 
 
 # --------------------------------------------------------------------------- #

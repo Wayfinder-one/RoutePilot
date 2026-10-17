@@ -14,3 +14,10 @@ def test_env_override(monkeypatch):
     s = Settings.from_env()
     assert s.db_path == "/tmp/x.db"
     assert s.port == 9000
+
+
+def test_admin_token_env(monkeypatch):
+    monkeypatch.setenv("ROUTER_ADMIN_TOKEN", "sekret")
+    assert Settings.from_env().admin_token == "sekret"
+    monkeypatch.delenv("ROUTER_ADMIN_TOKEN")
+    assert Settings.from_env().admin_token == ""
