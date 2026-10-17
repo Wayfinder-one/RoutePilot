@@ -38,9 +38,10 @@ def _make_tagger(settings: Settings, kw_groups: dict):
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None
                ) -> FastAPI:
+    calibration = "checkpoint" if settings.tagger == "checkpoint" else "heuristic"
     conn = connect(settings.db_path)
     migrate(conn)
-    seed_default(conn)
+    seed_default(conn, calibration)
     kw_groups = KeywordRepo(conn).groups()
     pipeline = PipelineRepo(conn).load()
     conn.close()

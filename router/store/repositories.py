@@ -32,35 +32,50 @@ DEFAULT_MODELS = [
 ]
 
 
-def default_pipeline() -> list[Node]:
-    # Thresholds are calibrated for the heuristic tagger's confidence cap (0.5,
-    # design doc section 3.5); M2 recalibrates them once the real checkpoint
-    # produces full-range confidences.
+# Seed thresholds per tagger mode.
+#
+# The heuristic tagger caps model-signal confidence at 0.5 (design 3.5), so its
+# calibration keeps thresholds below/around that cap. The checkpoint tagger
+# produces full-range confidences; the "checkpoint" numbers below come from
+# measuring the real checkpoint over 24 representative prompts (all signals:
+# p25=0.37 p50=0.68 p75=0.94; domain: p25=0.37 p50=0.57 p75=0.67; jailbreak:
+# p50=0.48 p75=0.87). min_score is set just under the domain p50 so a branch
+# fires only when both rows match with better-than-typical confidence.
+CALIBRATIONS = {
+    "heuristic": {"jailbreak": 0.45, "pii": 0.45, "keyword": 0.5,
+                  "medical_b": 0.45, "medical_s": 0.40, "cs": 0.45},
+    "checkpoint": {"jailbreak": 0.60, "pii": 0.60, "keyword": 0.5,
+                   "medical_b": 0.55, "medical_s": 0.45, "cs": 0.55},
+}
+
+
+def default_pipeline(calibration: str = "heuristic") -> list[Node]:
+    c = CALIBRATIONS[calibration]
     return [
         Node(id=_uid(), type="gate", name="① 安全闸", branches=[
             Branch(id=_uid(), name="拦越狱",
-                   rows=[Row("jailbreak", "jailbreak", conf_min=0.45)],
+                   rows=[Row("jailbreak", "jailbreak", conf_min=c["jailbreak"])],
                    action="block"),
             Branch(id=_uid(), name="拦身份证",
-                   rows=[Row("pii", "cn_id_card", conf_min=0.45)],
+                   rows=[Row("pii", "cn_id_card", conf_min=c["pii"])],
                    action="block"),
         ]),
         Node(id=_uid(), type="gate", name="② 关键词直达", branches=[
             Branch(id=_uid(), name="医疗急症",
-                   rows=[Row("keyword", "医疗急症", conf_min=0.5)],
+                   rows=[Row("keyword", "医疗急症", conf_min=c["keyword"])],
                    action="route", model="qwen3-8b-medical"),
         ]),
         Node(id=_uid(), type="score", name="③ 领域 × 难度 打分", branches=[
             Branch(id=_uid(), name="8B 医疗", model="qwen3-8b-medical",
-                   min_score=0.45,
+                   min_score=c["medical_b"],
                    rows=[Row("domain", "health", weight=0.5),
                          Row("complexity", "hard", weight=0.5)]),
             Branch(id=_uid(), name="0.6B 医疗", model="qwen3-0.6b-medical",
-                   min_score=0.40,
+                   min_score=c["medical_s"],
                    rows=[Row("domain", "health", weight=0.5),
                          Row("complexity", "easy", weight=0.5)]),
             Branch(id=_uid(), name="DeepSeek 编程", model="deepseek-v3",
-                   min_score=0.45,
+                   min_score=c["cs"],
                    rows=[Row("domain", "computer_science", weight=0.4),
                          Row("complexity", "hard", weight=0.6)]),
         ]),
@@ -71,7 +86,7 @@ def default_pipeline() -> list[Node]:
     ]
 
 
-def seed_default(conn: sqlite3.Connection) -> None:
+def seed_default(conn: sqlite3.Connection, calibration: str = "heuristic") -> None:
     if conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]:
         return                                  # idempotent: only seed an empty DB
     conn.execute("INSERT OR IGNORE INTO providers VALUES ('local', "
@@ -82,8 +97,9 @@ def seed_default(conn: sqlite3.Connection) -> None:
     for name, words in DEFAULT_KEYWORD_GROUPS.items():
         conn.execute("INSERT OR IGNORE INTO keyword_groups VALUES (?, ?)",
                      (name, json.dumps(words, ensure_ascii=False)))
-    PipelineRepo(conn).save(default_pipeline())
+    PipelineRepo(conn).save(default_pipeline(calibration))
     conn.commit()
+
 
 
 class PipelineRepo:

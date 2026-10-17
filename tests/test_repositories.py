@@ -43,3 +43,14 @@ def test_pipeline_roundtrip_types(conn):
     assert score.branches[0].min_score == 0.45
     gate = nodes[0]
     assert gate.branches[0].rows[0].conf_min == 0.45
+
+
+def test_checkpoint_calibration_is_higher_and_healthy(conn):
+    from router.pipeline.health import check_pipeline
+    seed_default(conn, "checkpoint")
+    nodes = PipelineRepo(conn).load()
+    assert nodes[0].branches[0].rows[0].conf_min == 0.60
+    assert nodes[2].branches[0].min_score == 0.55
+    assert nodes[2].branches[1].min_score == 0.45
+    known = {m["id"] for m in ModelRepo(conn).list()}
+    assert check_pipeline(nodes, known) == []
