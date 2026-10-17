@@ -2,8 +2,10 @@
 
 A pre-stage before the pipeline: within one session, keep the previous turn's
 model unless the user says it was wrong, in which case escalate a tier. Off by
-default (``settings.sessions``); when on it reads the session row once. The
-session writes happen in the async logger, so this stage is read-only.
+default (``settings.sessions``); when on it reads the session row once (this is
+the second of the two session reads on the hot path — ``sessions.py`` reads the
+previous embedding first). The session writes happen in the async logger, so
+this stage is read-only.
 
 Returned state is surfaced as the ``x-sr-session-state`` response header:
 ``sticky`` (reused last model), ``unlocked`` (escalated after wrong_answer) or

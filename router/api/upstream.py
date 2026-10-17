@@ -61,9 +61,16 @@ class CircuitBreaker:
     Process-local failure counts; when ``db_path`` is given (M4) the open state
     is also persisted to the ``breaker`` table so a second replica that has no
     local state still sees the quarantine. The first time a replica observes a
-    DB quarantine it latches it locally with ``opened_at = now`` so the local
-    half-open window can still self-heal (otherwise that replica would skip the
-    model forever).
+    DB quarantine it imports the DB's failure count and the DB's **original**
+    ``opened_at`` (translated onto its own monotonic clock), so the half-open
+    window is measured from when the circuit actually opened — not from when
+    this replica noticed it.
+
+    Consequence for the "conservative" framing: it is conservative only while
+    the DB quarantine is fresh. If the persisted row is older than
+    ``half_open_after``, the latching replica immediately allows the probe
+    (``is_open`` returns False), i.e. cross-replica quarantine does not by
+    itself preserve the full window (second-round audit F4).
     """
 
     def __init__(self, threshold: int = 3, half_open_after: float = 300.0,
@@ -122,7 +129,11 @@ class CircuitBreaker:
             if not row or row[0] < self.threshold:
                 return False
             opened_at = row[1] or time.time()
-            # latch locally so the half-open window applies to this replica too
+            # Latch the DB failure count and its ORIGINAL open time locally
+            # (time.time -> time.monotonic, preserving the elapsed window).
+            # A DB row that already outlived half_open_after returns False
+            # below: this replica probes immediately (audit F4 — not "never
+            # releases early", just conservative while the row is fresh).
             self._failures[model] = row[0]
             self._opened_at[model] = time.monotonic() - (time.time() - opened_at)
             return (time.time() - opened_at) < self.half_open_after

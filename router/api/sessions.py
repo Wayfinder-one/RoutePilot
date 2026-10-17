@@ -2,10 +2,11 @@
 
 Holds the previous turn's embedding so similarity/reask can fire. Default OFF
 (``settings.sessions``): with it off the hot path never touches the database.
-When ON, the request path performs exactly one read (the previous vector); the
-new vector is persisted asynchronously by the request logger's flush. This is
-the one sanctioned exception to the "routing never touches the DB" rule of
-section 4.4, and it is why the module is opt-in.
+When ON, the request path performs **two** reads: the previous vector (this
+module) and the session row for model continuation (``continuation.py``); the
+new vector/model are persisted asynchronously by the request logger's flush.
+This is the one sanctioned exception to the "routing never touches the DB"
+rule of section 4.4, and it is why the module is opt-in.
 """
 
 from __future__ import annotations

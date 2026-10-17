@@ -1,5 +1,6 @@
 """Heuristic tagger: degraded mode, no model. Lexicons are ported from the
-training repo (smart-router-train src/smart_router/signals.py upstream tables).
+training repo (smart-router-train / routepilot src/routepilot/signals_rules.py
+and signals.py upstream tables).
 All model-signal confidences are capped at 0.5 (design doc section 3.5): in
 degraded mode score nodes lose discrimination on purpose, keeping routing
 conservative. Rule signals come from signals/rules.py (deterministic => 1).

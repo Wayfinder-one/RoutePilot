@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "tags": {
+    "domain": {
+      "type": "choice",
+      "labels": [
+        "biology",
+        "business",
+        "chemistry",
+        "computer_science",
+        "economics",
+        "engineering",
+        "health",
+        "history",
+        "law",
+        "math",
+        "other",
+        "philosophy",
+        "physics",
+        "psychology"
+      ]
+    },
+    "jailbreak": {
+      "type": "noul",
+      "labels": [
+        "benign",
+        "jailbreak"
+      ]
+    },
+    "fact_check": {
+      "type": "noul",
+      "labels": [
+        "no_check",
+        "needs_check"
+      ]
+    },
+    "user_feedback": {
+      "type": "choice",
+      "labels": [
+        "satisfied",
+        "need_clarification",
+        "wrong_answer",
+        "want_different"
+      ]
+    },
+    "modality": {
+      "type": "choice",
+      "labels": [
+        "text",
+        "image",
+        "text_image"
+      ]
+    },
+    "complexity": {
+      "type": "ordered",
+      "labels": [
+        "easy",
+        "hard"
+      ]
+    },
+    "pii": {
+      "type": "multi",
+      "labels": [
+        "age",
+        "bank_account",
+        "credit_card",
+        "date_time",
+        "device_id",
+        "email_address",
+        "gender",
+        "generic_id",
+        "ip_address",
+        "location",
+        "mac_address",
+        "medical_id",
+        "occupation",
+        "org",
+        "password",
+        "person",
+        "phone_number",
+        "pin_code",
+        "routing_number",
+        "sensitive_attribute",
+        "street_address",
+        "swift_code",
+        "url",
+        "username",
+        "us_ssn",
+        "vehicle_id",
+        "cn_id_card",
+        "cn_bank_card",
+        "cn_plate",
+        "passport"
+      ]
+    },
+    "embedding": {
+      "type": "projection",
+      "dim": 768
+    }
+  }
+}

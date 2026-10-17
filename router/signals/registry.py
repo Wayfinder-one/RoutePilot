@@ -2,8 +2,11 @@
 
 Both the console palette and the pipeline evaluators derive from this
 registry. Adding a signal = one SignalSpec here plus tagger output.
-Label spaces follow the training repo (smart-router-train
-src/routepilot/signals.py) verbatim.
+Values are in the **product** canonical space. The training repo
+(smart-router-train / routepilot) uses raw spellings (``computer science``,
+``SAT``, ``AR``); the mapping into these keys lives in
+``signals/checkpoint.py::canonical_label`` and must stay in sync with
+``SIGNALS`` (``load_and_validate`` asserts the mapped tags.json value set).
 """
 
 from __future__ import annotations

@@ -2,7 +2,16 @@
 
 These run without torch. The torch-backed forward pass is exercised on the
 training host (tests/test_checkpoint_torch.py, skipped when torch is absent).
+The ``tags.json`` used as the fixture is the byte copy of the file the trained
+checkpoint serves on 76 (``/root/smart-router-train/checkpoints/quick/tags.json``,
+fetched 2026-10-17) committed as ``tests/fixtures/checkpoint_tags.json``. Its
+producer is ``scripts/export_checkpoint_tags.py`` (second-round audit F2), which
+regenerates it from the training repo's label spaces with the same canonical
+spellings.
 """
+
+import json
+from pathlib import Path
 
 import pytest
 
@@ -12,32 +21,12 @@ from router.signals.checkpoint import (CheckpointError, binary_entropy_confidenc
                                        l2_normalize, load_and_validate, sigmoid,
                                        softmax, similarity_signals)
 
-# The training repo's raw spellings (what tags.json actually contains on 76).
-PII_UPPER = ["AGE", "BANK_ACCOUNT", "CREDIT_CARD", "DATE_TIME", "DEVICE_ID",
-             "EMAIL_ADDRESS", "GENDER", "GENERIC_ID", "IP_ADDRESS", "LOCATION",
-             "MAC_ADDRESS", "MEDICAL_ID", "OCCUPATION", "ORG", "PASSWORD",
-             "PERSON", "PHONE_NUMBER", "PIN_CODE", "ROUTING_NUMBER",
-             "SENSITIVE_ATTRIBUTE", "STREET_ADDRESS", "SWIFT_CODE", "URL",
-             "USERNAME", "US_SSN", "VEHICLE_ID", "CN_ID_CARD", "CN_BANK_CARD",
-             "CN_PLATE", "PASSPORT"]
+FIXTURE_TAGS = Path(__file__).parent / "fixtures" / "checkpoint_tags.json"
 
 
 def training_tags() -> dict:
-    return {"schema": 1, "tags": {
-        "domain": {"type": "choice", "labels": [
-            "biology", "business", "chemistry", "computer science", "economics",
-            "engineering", "health", "history", "law", "math", "other",
-            "philosophy", "physics", "psychology"]},
-        "jailbreak": {"type": "noul", "labels": ["benign", "jailbreak"]},
-        "fact_check": {"type": "noul",
-                       "labels": ["no_fact_check_needed", "fact_check_needed"]},
-        "user_feedback": {"type": "choice", "labels": [
-            "SAT", "NEED_CLARIFICATION", "WRONG_ANSWER", "WANT_DIFFERENT"]},
-        "modality": {"type": "choice", "labels": ["AR", "DIFFUSION", "BOTH"]},
-        "complexity": {"type": "ordered", "labels": ["easy", "hard"]},
-        "pii": {"type": "multi", "labels": PII_UPPER},
-        "embedding": {"type": "projection", "dim": 768},
-    }}
+    """tags.json as shipped with the trained checkpoint (76), committed here."""
+    return json.loads(FIXTURE_TAGS.read_text(encoding="utf-8"))
 
 
 def make_checkpoint(tmp_path, tags=None) -> str:
@@ -46,7 +35,6 @@ def make_checkpoint(tmp_path, tags=None) -> str:
     (d / "router_config.json").write_text(
         '{"base_model": "models/x", "max_length": 256, "embedding_dim": 768}')
     (d / "model.pt").write_bytes(b"")
-    import json
     (d / "tags.json").write_text(json.dumps(tags or training_tags()))
     return str(d)
 

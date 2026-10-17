@@ -1,7 +1,8 @@
 """CheckpointTagger (M2): the RoutePilot checkpoint as a Tagger.
 
-One forward pass of ``SmartRouterModel`` (smart-router-train) yields every model
-signal plus a 768-d embedding. Three things this module exists for:
+One forward pass of ``RoutePilotModel`` (the routepilot training repo,
+formerly smart-router-train) yields every model signal plus a 768-d embedding.
+Three things this module exists for:
 
 1. **Label mapping layer** (design doc section 2.5). The registry value keys are
    product-canonical; the checkpoint's ``tags.json`` spellings differ
@@ -21,7 +22,10 @@ and all pure helpers work (and are unit-tested) without a GPU or torch.
 from __future__ import annotations
 
 import asyncio
+import functools
+import importlib
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -30,6 +34,17 @@ from pathlib import Path
 from router.signals.registry import SIGNALS
 from router.signals.rules import rule_signals
 from router.signals.tagger import TagRequest, TagResult
+
+logger = logging.getLogger(__name__)
+
+#: The training repo was renamed ``smart_router`` -> ``routepilot`` on
+#: 2026-10-14 (smart-router-train commit e9c0781) and the model class became
+#: ``RoutePilotModel``. We prefer the renamed package and keep the pre-rename
+#: name as an explicit fallback so a stale checkout still boots — but a stale
+#: checkout must never be *silently* mistaken for the real training repo.
+TRAIN_PACKAGE_CANDIDATES = ("routepilot", "smart_router")
+TRAIN_MODEL_CLASSES = {"routepilot": "RoutePilotModel",
+                       "smart_router": "SmartRouterModel"}
 
 
 class CheckpointError(Exception):
@@ -41,7 +56,7 @@ class CheckpointError(Exception):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class HeadSpec:
-    head: str            # tags.json key == SmartRouterModel head name
+    head: str            # tags.json key == RoutePilotModel head name
     signal: str | None   # product signal key; None for the embedding head
     kind: str            # 'classification' | 'multilabel' | 'embedding'
 
@@ -58,7 +73,7 @@ HEADS: tuple[HeadSpec, ...] = (
 )
 HEAD_KEYS = tuple(s.head for s in HEADS)
 
-# Training-repo alias table (mirrors smart_router.signals.LABEL_ALIASES). Kept
+# Training-repo alias table (mirrors routepilot.signals.LABEL_ALIASES). Kept
 # local so mapping works without the training package importable; the repo's
 # own normalize_label is consulted first when present.
 _TRAIN_ALIASES: dict[str, dict[str, str]] = {
@@ -80,17 +95,76 @@ _PRODUCT_ALIASES: dict[str, dict[str, str]] = {
 _MECH = re.compile(r"[\s\-]+")
 
 
+@functools.lru_cache(maxsize=1)
+def _train_signals_module():
+    """The importable training-repo ``signals`` module, or None.
+
+    Tries the renamed ``routepilot`` first, then the pre-rename
+    ``smart_router``. A miss is logged once at WARNING level (the audit found
+    the old code swallowed this ImportError and silently used the local
+    mirror forever); it is not fatal because three pieces of functionality do
+    not need it: pure validation, the label mapping's local mirror, and
+    heuristic mode.
+    """
+    tried = []
+    for package in TRAIN_PACKAGE_CANDIDATES:
+        try:
+            module = importlib.import_module(f"{package}.signals")
+        except Exception as exc:                        # noqa: BLE001
+            tried.append(f"{package}: {exc!r}")
+            continue
+        logger.info("label mapping reuses %s.signals.normalize_label", package)
+        return module
+    logger.warning(
+        "training signals package not importable (%s); label mapping falls "
+        "back to the local mirror of its alias table. Checkpoint mode itself "
+        "still needs the training model class and will fail loudly at startup.",
+        "; ".join(tried))
+    return None
+
+
 def _train_normalize_label(head: str, label) -> str:
     """Reuse the training repo's alias table when importable (design 2.5),
     then the local mirror (identical spellings) as the portable fallback."""
     text = str(label)
-    try:
-        from smart_router.signals import normalize_label  # type: ignore
-        text = str(normalize_label(head, text))
-    except Exception:                                     # noqa: BLE001
-        pass
+    module = _train_signals_module()
+    if module is not None:
+        try:
+            text = str(module.normalize_label(head, text))
+        except Exception as exc:                        # noqa: BLE001
+            logger.warning("training normalize_label(%r, %r) failed (%r); "
+                           "falling back to the local mirror", head, text, exc)
     return _TRAIN_ALIASES.get(head, {}).get(text, text)
 
+
+def import_train_model_class():
+    """Import the training model class; returns ``(class, qualified_name)``.
+
+    Prefers ``routepilot.modeling.router.RoutePilotModel`` (current training
+    repo) and falls back to ``smart_router.modeling.router.SmartRouterModel``
+    (pre-rename checkout). Raises :class:`CheckpointError` naming both when
+    neither is importable — checkpoint mode must never silently start without
+    the real model class.
+    """
+    tried = []
+    for package in TRAIN_PACKAGE_CANDIDATES:
+        qualified = f"{package}.modeling.router.{TRAIN_MODEL_CLASSES[package]}"
+        try:
+            module = importlib.import_module(f"{package}.modeling.router")
+            cls = getattr(module, TRAIN_MODEL_CLASSES[package])
+        except Exception as exc:                        # noqa: BLE001
+            tried.append(f"{qualified}: {exc!r}")
+            continue
+        if package != TRAIN_PACKAGE_CANDIDATES[0]:
+            logger.warning(
+                "using the pre-rename training package %r (%s); update the "
+                "training checkout to the renamed 'routepilot' package",
+                package, qualified)
+        return cls, qualified
+    raise CheckpointError(
+        "cannot import the training model class (checkpoint mode needs the "
+        "training repo's src/ on PYTHONPATH plus torch/transformers "
+        "installed). Tried: " + "; ".join(tried))
 
 
 def canonical_label(head: str, label) -> str:
@@ -254,9 +328,11 @@ class CheckpointTagger:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         if model_factory is not None:
             self.model = model_factory(files.checkpoint_dir, self.device)
+            self.model_binding = "injected"
         else:
-            self.model = self._default_model_factory()(files.checkpoint_dir,
-                                                       self.device)
+            build, self.model_binding = self._default_model_factory()
+            self.model = build(files.checkpoint_dir, self.device)
+        logger.info("checkpoint tagger bound to %s", self.model_binding)
         dtype = torch.bfloat16 if self.device.startswith("cuda") else torch.float32
         self.model.to(device=self.device, dtype=dtype)
         self.model.eval()
@@ -273,17 +349,13 @@ class CheckpointTagger:
 
     @staticmethod
     def _default_model_factory():
-        try:
-            from smart_router.modeling.router import SmartRouterModel
-        except Exception as exc:                        # noqa: BLE001
-            raise CheckpointError(
-                "cannot import smart_router.modeling.router.SmartRouterModel "
-                "(checkpoint mode needs the training package on PYTHONPATH and "
-                "torch/transformers installed)") from exc
+        cls, qualified = import_train_model_class()
 
         def build(checkpoint_dir, device):
-            return SmartRouterModel.load_checkpoint(checkpoint_dir, device=device)
-        return build
+            return cls.load_checkpoint(checkpoint_dir, device=device)
+        build.model_class = cls                           # for tests/diagnostics
+        build.qualified_name = qualified
+        return build, qualified
 
     # ── forward ────────────────────────────────────────────────────────────
     def _forward(self, texts: list[str]) -> dict:
@@ -301,7 +373,7 @@ class CheckpointTagger:
         if missing:
             raise CheckpointError(
                 f"checkpoint forward missing heads {missing}; expected the flat "
-                "dict from SmartRouterModel.forward")
+                "dict from RoutePilotModel.forward")
         return {k: out[k].detach().float().cpu() for k in HEAD_KEYS}
 
     def _warmup(self, samples: list[str]) -> None:
