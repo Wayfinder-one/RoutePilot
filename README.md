@@ -3,9 +3,10 @@
 LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之前，router 先算出一包路由信号
 （19 个：规则 + 学习型 + 会话），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
 
-当前线上（192.168.95.76:8400）使用 **JEV 主模型**作为信号引擎：一个 Open-Jev-2B 蒸馏模型
-在 router 进程内按 JEV 标准（context + typed questions + candidates → 候选概率）输出全部
-7 个模型信号，提示词/候选可配；RoutePilot checkpoint（Qwen3.5-0.8B 多头）作为可回退引擎保留。
+当前线上（192.168.95.76:8400）使用 **JEV 版主模型**作为信号引擎：**你训练的 Qwen3.5-0.8B
+RoutePilot checkpoint 的文本塔 + 新建 JEV 决策头**，在 router 进程内按 JEV 标准（context +
+typed questions + candidates → 候选概率）输出全部 7 个模型信号，提示词/候选可配；
+RoutePilot checkpoint（多头）作为可回退引擎保留，早前的 Open-Jev-2B 版本仅作对照（未部署）。
 
 ## 架构
 
@@ -14,7 +15,7 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
               │
               ├─ Tagger（二选一）
               │   ├─ checkpoint: RoutePilot-0.8B 一次前向 → 7 信号 + embedding
-              │   └─ jev:       Open-Jev-2B 按问题作答 → 候选概率（本仓库默认部署）
+              │   └─ jev:       Qwen3.5-0.8B JEV 头按问题作答 → 候选概率（默认部署）
               │   + 9 个确定性规则信号（signals/rules.py）
               │
               ├─ Pipeline（分流树：gate / score / route / block，存 SQLite，可热更新）
@@ -35,7 +36,7 @@ python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # JEV 模式（需要 torch/transformers/peft 与 merged 模型目录）
 ROUTER_TAGGER=jev \
-ROUTER_JEV_MODEL=/opt/smart-router-v2/models/jev_merged \
+ROUTER_JEV_MODEL=/opt/smart-router-v2/models/jev_merged_08b \
 ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 .venv/bin/python -m router
 ```
@@ -72,13 +73,13 @@ docs/             设计/实施/审核/部署记录（按约定不入库，见�
 
 | | RoutePilot checkpoint | JEV 主模型 |
 |---|---|---|
-| 模型 | Qwen3.5-0.8B 全参微调 + 8 头 | Qwen3.5-2B + LoRA + 标量决策头（Open-Jev-2B 蒸馏） |
+| 模型 | Qwen3.5-0.8B 全参微调 + 8 头 | 你的 Qwen3.5-0.8B checkpoint 文本塔 + JEV 决策头（LoRA 合并导出，1.73GB） |
 | 输入形态 | 用户请求，一次前向 | context + typed questions + candidates |
 | 可配性 | 固定 19 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
 | 信号 | 7 学习型 + embedding（similarity/reask）+ 规则 9 | 7 学习型（无 embedding）+ 规则 9 |
-| 延迟 | ~7 ms/text（batch） | ~0.35–0.45 s/请求（全部信号 54 候选 prompt） |
-| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii 弱 | domain .837/.821、jailbreak .851/.843、complexity .961/.964、fact_check .941、pii exact .475 |
-| 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged`（进程内，5.0GB GPU） |
+| 延迟 | ~7 ms/text（batch） | ~0.30–0.42 s/请求（全部信号 54 候选 prompt） |
+| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii 弱 | domain .840/.806、jailbreak .857/.835、complexity .951/.952、fact_check .913、pii exact .445（fact_check -4pt、PII 弱，见 docs） |
+| 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged_08b`（进程内，2.3GB GPU） |
 
 训练/数据/蒸馏代码与完整指标在子仓库 **RoutePilot-train**：
 `results/bilingual/README.md`、`results/jev_distill/README.md`、`docs/*/jev-distill.md`。
@@ -87,7 +88,7 @@ docs/             设计/实施/审核/部署记录（按约定不入库，见�
 
 ```bash
 # 76 上（已带 admin token / litestream / 模型目录）
-SR_TAGGER=jev SR_JEV_MODEL=/opt/smart-router-v2/models/jev_merged \
+SR_TAGGER=jev SR_JEV_MODEL=/opt/smart-router-v2/models/jev_merged_08b \
 SR_SIGNAL_QUESTIONS=/opt/smart-router-v2/configs/signal_questions.json \
 SR_ADMIN_TOKEN=... SR_PYTHON=/root/jev-2b/venv/bin/python \
 SR_DEVICE=cuda:0 bash scripts/deploy-76.sh
