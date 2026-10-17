@@ -39,6 +39,15 @@ def _make_tagger(settings: Settings, kw_groups: dict):
             raise RuntimeError("ROUTER_TAGGER=checkpoint needs ROUTER_CHECKPOINT")
         return CheckpointTagger(settings.checkpoint_dir, device=settings.device,
                                 kw_groups=kw_groups)
+    if settings.tagger == "prompt":
+        from router.signals.prompt_judge import PromptJudgeTagger
+        if not settings.judge_url or not settings.judge_model:
+            raise RuntimeError("ROUTER_TAGGER=prompt needs ROUTER_JUDGE_URL and "
+                               "ROUTER_JUDGE_MODEL")
+        return PromptJudgeTagger(
+            base_url=settings.judge_url, model=settings.judge_model,
+            api_key=settings.judge_api_key,
+            prompts_path=settings.signal_prompts or None, kw_groups=kw_groups)
     raise RuntimeError(f"unknown tagger {settings.tagger!r}")
 
 
@@ -63,7 +72,10 @@ def _install_admin_auth(app: FastAPI, token: str) -> None:
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None
                ) -> FastAPI:
-    calibration = "checkpoint" if settings.tagger == "checkpoint" else "heuristic"
+    # prompt mode also produces full-range model confidences => use the
+    # checkpoint calibration (same thresholds) until it has its own numbers
+    calibration = ("checkpoint" if settings.tagger in ("checkpoint", "prompt")
+                   else "heuristic")
     conn = connect(settings.db_path)
     migrate(conn)
     seed_default(conn, calibration)
@@ -82,6 +94,9 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         finally:
             await requestlog.close()
             await _app.state.http.aclose()
+            aclose = getattr(_app.state.tagger, "aclose", None)
+            if aclose is not None:
+                await aclose()
 
     app = FastAPI(title="Smart Router", lifespan=lifespan)
     app.state.settings = settings

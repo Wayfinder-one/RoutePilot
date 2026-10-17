@@ -26,6 +26,12 @@ class Settings:
     # no auth (loopback/dev only); set ROUTER_ADMIN_TOKEN to require
     # "Authorization: Bearer <token>" on every /admin* request.
     admin_token: str = ""
+    # PromptJudgeTagger (ROUTER_TAGGER=prompt): OpenAI-compatible chat endpoint
+    # used to judge all model signals from one configurable prompt.
+    judge_url: str = ""
+    judge_model: str = ""
+    judge_api_key: str = ""
+    signal_prompts: str = ""         # JSON prompt config path ('' = shipped default)
 
     @staticmethod
     def from_env() -> "Settings":
@@ -38,4 +44,8 @@ class Settings:
             host=os.environ.get("ROUTER_HOST", "127.0.0.1"),
             port=int(os.environ.get("ROUTER_PORT", "8400")),
             admin_token=os.environ.get("ROUTER_ADMIN_TOKEN", ""),
+            judge_url=os.environ.get("ROUTER_JUDGE_URL", ""),
+            judge_model=os.environ.get("ROUTER_JUDGE_MODEL", ""),
+            judge_api_key=os.environ.get("ROUTER_JUDGE_API_KEY", ""),
+            signal_prompts=os.environ.get("ROUTER_SIGNAL_PROMPTS", ""),
         )
