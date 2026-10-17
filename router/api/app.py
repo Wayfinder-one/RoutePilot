@@ -1,6 +1,7 @@
 """Application factory. The hot path reads only in-memory snapshots
-(app.state.pipeline / app.state.tagger.kw_groups); the database is touched
-on admin writes and by the async request logger, never during routing.
+(app.state.pipeline / app.state.backends / app.state.tagger.kw_groups); the
+database is touched on admin writes and by the async request logger, never
+during routing (design doc section 4.4).
 """
 
 from __future__ import annotations
@@ -42,13 +43,19 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
             yield
         finally:
             await requestlog.close()
+            await _app.state.http.aclose()
 
     app = FastAPI(title="Smart Router", lifespan=lifespan)
     app.state.settings = settings
     app.state.tagger = TAGGERS[settings.tagger](kw_groups=kw_groups)
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
     app.state.pipeline = pipeline            # in-memory snapshot (design 4.4)
-    from router.api.upstream import CircuitBreaker
+    from router.api.upstream import CircuitBreaker, load_backends
+    conn = connect(settings.db_path)
+    try:
+        app.state.backends = load_backends(conn)   # model_id -> Backend snapshot
+    finally:
+        conn.close()
     app.state.breaker = CircuitBreaker()
     app.state.requestlog = requestlog
 

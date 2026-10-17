@@ -138,6 +138,44 @@ class ModelRepo:
         return [dict(r) for r in
                 self.conn.execute("SELECT * FROM models ORDER BY id")]
 
+    def get(self, model_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM models WHERE id = ?",
+                                (model_id,)).fetchone()
+        return dict(row) if row else None
+
+    def update(self, model_id: str, *, upstream: str | None = None,
+               provider: str | None = None, profile: str | None = None) -> bool:
+        """Patch only the provided fields; False when the model is unknown."""
+        fields, values = [], []
+        for col, val in (("upstream", upstream), ("provider", provider),
+                         ("profile", profile)):
+            if val is not None:
+                fields.append(f"{col} = ?")
+                values.append(val)
+        if not fields:
+            return self.get(model_id) is not None
+        with self.conn:
+            cur = self.conn.execute(
+                f"UPDATE models SET {', '.join(fields)} WHERE id = ?",
+                (*values, model_id))
+        return cur.rowcount > 0
+
+
+class ProviderRepo:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def list(self) -> list[dict]:
+        return [dict(r) for r in
+                self.conn.execute("SELECT * FROM providers ORDER BY name")]
+
+    def upsert(self, name: str, base_url: str, key_env: str = "") -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO providers VALUES (?, ?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET base_url = excluded.base_url, "
+                "key_env = excluded.key_env", (name, base_url, key_env))
+
 
 class KeywordRepo:
     def __init__(self, conn: sqlite3.Connection):

@@ -1,5 +1,6 @@
-"""OpenAI-compatible entry: tag -> evaluate -> forward. The pipeline snapshot
-is in-memory (design 4.4); only the async request logger touches the DB.
+"""OpenAI-compatible entry: tag -> evaluate -> forward. The pipeline and the
+backend map are in-memory snapshots (design 4.4); routing never opens the
+database — only the async request logger touches it.
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ async def chat_completions(request: Request):
     tagger = request.app.state.tagger
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages)))
-    decision, trace = evaluate(request.app.state.pipeline, result.signals)
+    decision, _ = evaluate(request.app.state.pipeline, result.signals)
 
     request.app.state.requestlog.enqueue({
         "id": uuid.uuid4().hex,
@@ -61,15 +62,11 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=502,
                             content={"error": {"message": "no_route"}})
 
-    from router.store.db import connect
-    conn = connect(request.app.state.settings.db_path)
     try:
-        backend = resolve_backend(conn, decision.model)
+        backend = resolve_backend(request.app.state.backends, decision.model)
     except KeyError:
-        conn.close()
         return JSONResponse(status_code=502,
                             content={"error": {"message": "unknown_model"}})
-    conn.close()
 
     breaker = request.app.state.breaker
     if breaker.is_open(decision.model):

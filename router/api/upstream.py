@@ -1,5 +1,10 @@
 """Upstream resolution (models join providers) and the circuit breaker.
 
+Hot-path discipline (design doc section 4.4): routing must NOT touch the
+database. The app builds a `model_id -> Backend` snapshot at startup and
+rebuilds it wholesale whenever admin writes a model or a provider; the /v1
+handler only reads that in-memory snapshot.
+
 The breaker keeps per-model failure counts in process memory: three
 consecutive failures open the circuit; after half_open_after seconds one
 probe request is allowed through. Deliberately process-local for M1 —
@@ -22,19 +27,32 @@ class Backend:
     upstream_name: str
 
 
-def resolve_backend(conn: sqlite3.Connection, model_id: str) -> Backend:
-    model = conn.execute("SELECT * FROM models WHERE id = ?",
-                         (model_id,)).fetchone()
-    if model is None:
+def _headers_for(key_env: str) -> dict:
+    key = os.environ.get(key_env, "") if key_env else ""
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def load_backends(conn: sqlite3.Connection) -> dict[str, Backend]:
+    """Build the model_id -> Backend snapshot in one join.
+
+    A model whose provider row is missing is simply absent from the snapshot;
+    resolve_backend then raises KeyError and the /v1 handler answers 502.
+    """
+    rows = conn.execute(
+        "SELECT m.id AS id, m.upstream AS upstream, "
+        "       p.base_url AS base_url, p.key_env AS key_env "
+        "FROM models m JOIN providers p ON m.provider = p.name")
+    return {r["id"]: Backend(url=f"{r['base_url']}/chat/completions",
+                             headers=_headers_for(r["key_env"]),
+                             upstream_name=r["upstream"])
+            for r in rows}
+
+
+def resolve_backend(backends: dict[str, Backend], model_id: str) -> Backend:
+    """Read the in-memory snapshot; unknown model raises KeyError."""
+    if model_id not in backends:
         raise KeyError(model_id)
-    provider = conn.execute("SELECT * FROM providers WHERE name = ?",
-                            (model["provider"],)).fetchone()
-    if provider is None:
-        raise KeyError(model["provider"])
-    key = os.environ.get(provider["key_env"], "") if provider["key_env"] else ""
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    return Backend(url=f"{provider['base_url']}/chat/completions",
-                   headers=headers, upstream_name=model["upstream"])
+    return backends[model_id]
 
 
 class CircuitBreaker:
