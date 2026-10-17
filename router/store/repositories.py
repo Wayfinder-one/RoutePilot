@@ -325,6 +325,28 @@ class RequestRepo:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
+    def recent(self, limit: int = 20) -> list[dict]:
+        """Newest requests with their signal pack (console 'calculation log')."""
+        rows = self.conn.execute(
+            "SELECT id, ts, text, decision, model, node_id, branch_id, score, "
+            "latency_ms FROM requests ORDER BY ts DESC, id DESC LIMIT ?",
+            (limit,))
+        out = []
+        for r in rows:
+            pack = {}
+            for s in self.conn.execute(
+                    "SELECT signal, value, confidence, is_rule FROM request_signals "
+                    "WHERE request_id = ?", (r["id"],)):
+                try:
+                    value = json.loads(s["value"]) if s["value"] is not None else None
+                except ValueError:
+                    value = s["value"]
+                pack[s["signal"]] = {"value": value,
+                                     "confidence": s["confidence"],
+                                     "is_rule": bool(s["is_rule"])}
+            out.append({**dict(r), "signals": pack})
+        return out
+
     def replayable(self, since: str, limit: int = 5000) -> list[dict]:
         """Route decisions only (block/none carry no model to compare)."""
         rows = self.conn.execute(

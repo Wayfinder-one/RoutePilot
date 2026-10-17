@@ -162,6 +162,84 @@ def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 # --------------------------------------------------------------------------- #
+# JEV signal engine: tagger metadata, editable question config, calc log
+# --------------------------------------------------------------------------- #
+def _questions_path(request: Request) -> str:
+    from router.signals.jev import DEFAULT_QUESTIONS_PATH
+    settings = request.app.state.settings
+    return settings.signal_questions or str(DEFAULT_QUESTIONS_PATH)
+
+
+def _tagger_meta(request: Request) -> dict:
+    tagger = request.app.state.tagger
+    meta = {"name": getattr(tagger, "name", "?"),
+            "questions_path": _questions_path(request)}
+    for attr in ("model_dir", "temperature", "max_length"):
+        value = getattr(tagger, attr, None)
+        if value is not None:
+            meta[attr] = str(value) if attr == "model_dir" else value
+    return meta
+
+
+@router.get("/tagger")
+def get_tagger(request: Request):
+    """Which signal engine runs now (JEV model metadata for the console)."""
+    return {"tagger": _tagger_meta(request)}
+
+
+@router.get("/signal-questions")
+def get_signal_questions(request: Request):
+    from router.signals.jev import DEFAULT_QUESTIONS_PATH, load_question_config
+    path = _questions_path(request)
+    try:
+        cfg = load_question_config(path)
+    except Exception:                     # noqa: BLE001 - first boot / bad path
+        try:
+            cfg = load_question_config(DEFAULT_QUESTIONS_PATH)
+        except Exception as exc:          # noqa: BLE001
+            raise HTTPException(500, detail=f"cannot load question config: {exc}")
+    return {"config": cfg, "meta": _tagger_meta(request)}
+
+
+class SignalQuestionsIn(BaseModel):
+    config: dict
+
+
+@router.put("/signal-questions")
+def put_signal_questions(body: SignalQuestionsIn, request: Request,
+                         conn: sqlite3.Connection = Depends(get_conn)):
+    """Validate + persist the editable JEV questions and hot-apply them."""
+    from pathlib import Path
+
+    from router.signals.jev import JevTaggerError, validate_question_config
+    try:
+        cfg = validate_question_config(body.config)
+    except JevTaggerError as exc:
+        raise HTTPException(422, detail=str(exc))
+    path = Path(_questions_path(request))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                        encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(500, detail=f"cannot write question config: {exc}")
+    tagger = request.app.state.tagger
+    setter = getattr(tagger, "set_questions", None)
+    if setter is not None:
+        setter(cfg)                            # hot apply (JEV mode)
+    ChangeRepo(conn).record(_now(), "signal_questions", f"saved {path}")
+    return {"ok": True, "applied": setter is not None, "meta": _tagger_meta(request)}
+
+
+@router.get("/requests/recent")
+def recent_requests(limit: int = 20,
+                    conn: sqlite3.Connection = Depends(get_conn)):
+    """Newest persisted requests with their signal pack (calculation log)."""
+    limit = max(1, min(int(limit), 100))
+    return {"requests": RequestRepo(conn).recent(limit)}
+
+
+# --------------------------------------------------------------------------- #
 # Try (calibration; never persisted)
 # --------------------------------------------------------------------------- #
 class TryIn(BaseModel):

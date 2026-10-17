@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Router · 信号配置</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="shared.css">
+</head>
+<body data-page="signals">
+<div class="pagehead">
+  <div>
+    <div class="crumb" data-i18n="nav.signals"></div>
+    <h1><span data-i18n="nav.signals"></span><span class="sub" data-i18n="sig.sub"></span></h1>
+  </div>
+  <div class="headmeta">
+    <span class="pill" id="enginePill"></span>
+    <span class="pill" id="dirtyPill"></span>
+    <button class="btn sm" id="exportBtn" data-i18n="sig.export"></button>
+    <button class="btn sm" id="importBtn" data-i18n="sig.import"></button>
+    <button class="btn pri sm" id="saveBtn" data-i18n="sig.save"></button>
+  </div>
+</div>
+<main class="sig-layout">
+  <aside class="sig-list">
+    <div class="pal-head"><span class="t" data-i18n="sig.list"></span><span class="stat" id="sigCount"></span></div>
+    <div id="sigList"></div>
+    <div class="pal-hint" id="metaInfo" style="margin-top:10px"></div>
+  </aside>
+  <section class="sig-editor" id="editor"></section>
+</main>
+<input type="file" id="importFile" accept="application/json" style="display:none">
+<script src="i18n.js"></script>
+<script src="nav.js"></script>
+<script src="api.js"></script>
+<script src="signals.js"></script>
+</body>
+</html>

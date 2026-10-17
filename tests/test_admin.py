@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import httpx
 from fastapi.testclient import TestClient
@@ -168,3 +169,45 @@ def test_try_reports_vec_dim(tmp_path):
     body = client(tmp_path).post("/admin/try", json={"text": "你好"}).json()
     assert body["vec_dim"] == 0            # heuristic has no embedding
 
+
+
+def questions_client(tmp_path):
+    q = tmp_path / "questions.json"
+    return TestClient(create_app(Settings(db_path=str(tmp_path / "t.db"),
+                                          signal_questions=str(q)))), q
+
+
+def test_signal_questions_roundtrip_and_audit(tmp_path):
+    c, q = questions_client(tmp_path)
+    body = c.get("/admin/signal-questions").json()
+    assert body["config"]["signals"]["pii"]["types"]["cn_id_card"]["zh"] == "身份证号"
+    assert body["meta"]["questions_path"] == str(q)
+    cfg = body["config"]
+    cfg["signals"]["domain"]["instructions"] = ["请判断这段文本的学科门类。"]
+    changes_before = len(c.get("/admin/changes").json()["changes"])
+    r = c.put("/admin/signal-questions", json={"config": cfg})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    saved = json.loads(q.read_text(encoding="utf-8"))
+    assert saved["signals"]["domain"]["instructions"] == ["请判断这段文本的学科门类。"]
+    assert len(c.get("/admin/changes").json()["changes"]) == changes_before + 1
+    kinds = [ch["kind"] for ch in c.get("/admin/changes").json()["changes"]]
+    assert kinds[0] == "signal_questions"
+
+
+def test_signal_questions_rejects_invalid_config(tmp_path):
+    c, q = questions_client(tmp_path)
+    cfg = c.get("/admin/signal-questions").json()["config"]
+    cfg["signals"].pop("pii")
+    r = c.put("/admin/signal-questions", json={"config": cfg})
+    assert r.status_code == 422
+    assert not q.exists()                      # nothing written on validation failure
+
+
+def test_tagger_meta_and_recent_requests(tmp_path):
+    c = client(tmp_path)
+    tagger = c.get("/admin/tagger").json()["tagger"]
+    assert tagger["name"] == "heuristic"
+    assert tagger["questions_path"].endswith("signal_questions.json")
+    assert c.get("/admin/requests/recent").json() == {"requests": []}
+    assert c.get("/admin/requests/recent?limit=1000").status_code == 200

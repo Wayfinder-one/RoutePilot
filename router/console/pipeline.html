@@ -3,30 +3,60 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Router · 分流配置</title>
+<title>Smart Router · 分流树</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="shared.css">
 </head>
 <body data-page="pipeline">
-<div class="layout2">
-  <aside id="palette">
-    <div class="col-h" data-i18n="pipe.palette"></div>
+<div class="pagehead">
+  <div>
+    <div class="crumb" data-i18n="nav.pipeline"></div>
+    <h1><span data-i18n="nav.pipeline"></span><span class="sub" data-i18n="pipe.sub"></span></h1>
+  </div>
+  <div class="headmeta">
+    <span class="pill" id="taggerPill"></span>
+    <span class="pill" id="dirtyPill"></span>
+    <span class="pill" id="versionPill"></span>
+    <button class="btn pri sm" id="savePipeline" data-i18n="pipe.savelabel"></button>
+  </div>
+</div>
+<div class="health" id="health"></div>
+<div class="issues" id="issues"></div>
+<main class="workbench">
+  <aside class="palette">
+    <div class="pal-head"><span class="t" data-i18n="pipe.palette"></span><span class="stat" id="palCount"></span></div>
+    <div class="pal-search">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <input id="palSearch" placeholder="搜索信号…">
+    </div>
     <div id="palGroups"></div>
     <div class="pal-hint" data-i18n="pipe.palhint"></div>
   </aside>
-  <section id="pipeline">
-    <div class="col-h" data-i18n="pipe.pipeline"></div>
-    <div class="savebar">
-      <button class="btn pri" id="savePipeline" data-i18n="pipe.savelabel"></button>
-      <span class="mut" id="version"></span>
+  <section class="tree">
+    <div class="rail">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v4"/><rect x="6" y="7" width="12" height="5" rx="1.5"/><path d="M12 12v4"/><rect x="6" y="16" width="12" height="5" rx="1.5"/></svg>
+      <span data-i18n="pipe.rail"></span>
+      <span class="ln"></span>
+      <span class="mono" id="railVersion"></span>
     </div>
-    <div id="issues"></div>
     <div id="nodes"></div>
-    <div class="addrow">
+    <div class="addnode">
       <button class="btn" id="addGate" data-i18n="pipe.addgate"></button>
       <button class="btn" id="addScore" data-i18n="pipe.addscore"></button>
     </div>
   </section>
+  <aside class="dock">
+    <div class="tabs" id="dockTabs">
+      <button class="tab on" data-tab="try" data-i18n="pipe.tab.try"></button>
+      <button class="tab" data-tab="inspector" data-i18n="pipe.tab.inspector"></button>
+      <button class="tab" data-tab="changes" data-i18n="pipe.tab.changes"></button>
+    </div>
+    <div class="dockbody" id="dockbody"></div>
+  </aside>
+</main>
+<div class="kbdhint">
+  <span><kbd>⌘S</kbd> <span data-i18n="pipe.kbd.save"></span></span>
+  <span><kbd>⌘⏎</kbd> <span data-i18n="pipe.kbd.try"></span></span>
 </div>
 <script src="i18n.js"></script>
 <script src="nav.js"></script>

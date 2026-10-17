@@ -1,28 +1,47 @@
-/* Models & settings page: editable model registry + provider list (M3 write
-   endpoints) + keyword-group editor + runtime settings + admin token. */
+/* Models & settings page: model registry, providers, keyword lexicon, runtime
+   settings, admin token (browser-local) and the current signal engine card. */
+const $ = s => document.querySelector(s);
+
 async function boot() {
-  const [m, kw, prov, set] = await Promise.all([
+  const [m, kw, prov, set, tagBody] = await Promise.all([
     api.get('/admin/models'), api.get('/admin/keyword-groups'),
-    api.get('/admin/providers'), api.get('/admin/settings')]);
-  renderModels(m.models);
-  renderProviders(prov.providers);
-  renderKw(kw.groups);
+    api.get('/admin/providers'), api.get('/admin/settings'),
+    api.get('/admin/tagger').catch(() => ({ tagger: {} }))]);
+  renderEngine(tagBody.tagger || {});
+  renderModels(m.models || []);
+  renderProviders(prov.providers || []);
+  renderKw(kw.groups || {});
   renderSettings(set.settings || {});
+}
+
+/* ── current signal engine (read-only) ───────────────────────────────── */
+function renderEngine(tag) {
+  $('#enginePill').innerHTML = `<span class="dot" style="color:var(--indigo)"></span>` +
+    (LANG === 'zh' ? '引擎 <b>' + esc(tag.name || '?') + '</b>'
+      : 'engine <b>' + esc(tag.name || '?') + '</b>');
+  const temp = tag.temperature != null ? Number(tag.temperature).toFixed(2) : '—';
+  $('#engineCard').innerHTML = `<div class="col-h">${t('models.engine')}
+      <span class="pill indigo">${esc(tag.name || '?')}</span></div>
+    <div class="bar-row"><span class="bl">${t('sig.temperature')}</span><b class="mono">${temp}</b></div>
+    <div class="bar-row"><span class="bl">${t('sig.maxlen')}</span><b class="mono">${tag.max_length ?? '—'}</b></div>
+    <div class="bar-row"><span class="bl">${t('sig.model')}</span>
+      <span class="mono" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:330px" title="${esc(tag.model_dir || '')}">${esc(tag.model_dir || '—')}</span></div>
+    <div class="footnote">${t('models.engine.hint')} <a href="signals.html">${t('nav.signals')} →</a></div>`;
 }
 
 /* ── models ──────────────────────────────────────────────────────────── */
 function renderModels(models) {
-  document.querySelector('#modelTable').innerHTML =
-    `<tr><th>id</th><th>upstream</th><th>provider</th><th data-i18n="models.profile"></th></tr>` +
+  $('#modelTable').innerHTML =
+    `<tr><th>id</th><th>upstream</th><th>provider</th><th>${t('models.profile')}</th></tr>` +
     models.map(x => {
-      const p = JSON.parse(x.profile || '{}');
-      return `<tr><td class="v">${esc(x.id)}</td>
+      let p = {};
+      try { p = JSON.parse(x.profile || '{}'); } catch (e) { p = {}; }
+      return `<tr><td class="mono" style="font-size:11px">${esc(x.id)}</td>
         <td><input class="m-upstream" data-id="${esc(x.id)}" value="${esc(x.upstream)}"></td>
         <td><input class="m-provider" value="${esc(x.provider)}"></td>
-        <td class="mut">${(p.domains || []).join(', ') || '—'} · ${p.tier || '—'}</td></tr>`;
+        <td class="mut" style="font-size:11px">${esc((p.domains || []).join(', ') || '—')} · ${esc(p.tier || '—')}</td></tr>`;
     }).join('');
 }
-
 function readModels() {
   return [...document.querySelectorAll('#modelTable tr')].slice(1).map(tr => ({
     id: tr.querySelector('.m-upstream').dataset.id,
@@ -30,26 +49,23 @@ function readModels() {
     provider: tr.querySelector('.m-provider').value.trim(),
   }));
 }
-
-async function saveModels() {
+$('#saveModels').addEventListener('click', async () => {
   for (const m of readModels()) {
     await api.put(`/admin/models/${encodeURIComponent(m.id)}`,
       { upstream: m.upstream, provider: m.provider });
   }
   toast(t('common.saved'));
-}
-document.querySelector('#saveModels').addEventListener('click', saveModels);
+});
 
 /* ── providers ───────────────────────────────────────────────────────── */
 function renderProviders(providers) {
-  document.querySelector('#providers').innerHTML = providers.map(p =>
-    `<div class="prov-group card">
-      <input class="p-name" value="${esc(p.name)}">
+  $('#providers').innerHTML = providers.map(p =>
+    `<div class="prov-group">
+      <input class="p-name" value="${esc(p.name)}" placeholder="name" style="max-width:140px">
       <input class="p-base" value="${esc(p.base_url)}" placeholder="base_url">
-      <input class="p-key" value="${esc(p.key_env)}" placeholder="key_env">
-     </div>`).join('');
+      <input class="p-key" value="${esc(p.key_env)}" placeholder="key_env" style="max-width:170px">
+    </div>`).join('');
 }
-
 function readProviders() {
   return [...document.querySelectorAll('#providers .prov-group')].map(g => ({
     name: g.querySelector('.p-name').value.trim(),
@@ -57,41 +73,33 @@ function readProviders() {
     key_env: g.querySelector('.p-key').value.trim(),
   })).filter(p => p.name);
 }
-
-async function saveProviders() {
+$('#saveProviders').addEventListener('click', async () => {
   for (const p of readProviders()) {
     await api.put(`/admin/providers/${encodeURIComponent(p.name)}`,
       { base_url: p.base_url, key_env: p.key_env });
   }
   toast(t('common.saved'));
-}
-document.querySelector('#saveProviders').addEventListener('click', saveProviders);
-document.querySelector('#addProvider').addEventListener('click', () => {
+});
+$('#addProvider').addEventListener('click', () => {
   renderProviders([...readProviders(), { name: 'new', base_url: '', key_env: '' }]);
 });
 
 /* ── keyword lexicon ─────────────────────────────────────────────────── */
-let KW = {};
-
 function renderKw(groups) {
-  KW = groups;
-  document.querySelector('#kwGroups').innerHTML = Object.entries(groups).map(
-    ([name, words]) => `<div class="kw-group card">
-      <input class="kw-name" value="${esc(name)}">
-      <input class="kw-words" value="${esc(words.join(', '))}" placeholder="词1, 词2">
-      <button class="btn sm" data-del="${esc(name)}">${t('common.delete')}</button>
+  $('#kwGroups').innerHTML = Object.entries(groups).map(([name, words]) =>
+    `<div class="kw-group">
+      <input class="kw-name" value="${esc(name)}" style="max-width:120px">
+      <input class="kw-words" value="${esc((words || []).join(', '))}" placeholder="词1, 词2">
+      <button class="del" data-del="${esc(name)}" title="${t('common.delete')}">✕</button>
     </div>`).join('');
   document.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => {
-    delete groups[b.dataset.del]; renderKw(groups);
+    b.closest('.kw-group').remove();
   }));
-  document.querySelectorAll('.kw-name, .kw-words').forEach(el =>
-    el.addEventListener('change', () => { groups = readGroups(); KW = groups; }));
 }
-
-document.querySelector('#addGroup').addEventListener('click', () => {
+$('#addGroup').addEventListener('click', () => {
   const cur = readGroups(); cur['新组'] = []; renderKw(cur);
 });
-document.querySelector('#saveKw').addEventListener('click', async () => {
+$('#saveKw').addEventListener('click', async () => {
   await api.put('/admin/keyword-groups', { groups: readGroups() });
   toast(t('common.saved'));
 });
@@ -105,72 +113,60 @@ function readGroups() {
   return next;
 }
 
-/* ── runtime settings (/admin/settings; pipeline_version is read-only) ── */
-function settingsRows() {
-  return [...document.querySelectorAll('#settingsRows .set-row')];
-}
-
+/* ── runtime settings (/admin/settings; pipeline_version is read-only) ─ */
 function renderSettings(settings) {
-  const reserved = 'pipeline_version';
   const rows = Object.entries(settings)
-    .filter(([k]) => k !== reserved)
+    .filter(([k]) => k !== 'pipeline_version')
     .map(([k, v]) => `<div class="set-row">
-        <input class="s-key" value="${esc(k)}">
+        <input class="s-key" value="${esc(k)}" style="max-width:190px">
         <input class="s-val" value="${esc(v)}">
-        <button class="btn sm" data-del-setting>${t('common.delete')}</button>
+        <button class="del" data-del-setting title="${t('common.delete')}">✕</button>
       </div>`).join('');
-  const ver = settings[reserved]
-    ? `<div class="mut">${t('models.pipelineversion')}：${esc(settings[reserved])}</div>`
-    : '';
-  document.querySelector('#settingsRows').innerHTML = rows + ver;
+  const ver = settings.pipeline_version
+    ? `<div class="footnote">${t('models.pipelineversion')}：<b class="mono">${esc(settings.pipeline_version)}</b></div>` : '';
+  $('#settingsRows').innerHTML = rows + ver;
   document.querySelectorAll('[data-del-setting]').forEach(b =>
-    b.addEventListener('click', e => e.target.closest('.set-row').remove()));
+    b.addEventListener('click', () => b.closest('.set-row').remove()));
 }
-
 function readSettings() {
   const out = {};
-  for (const row of settingsRows()) {
+  document.querySelectorAll('#settingsRows .set-row').forEach(row => {
     const k = row.querySelector('.s-key').value.trim();
     if (k) out[k] = row.querySelector('.s-val').value;
-  }
+  });
   return out;
 }
-
-document.querySelector('#addSetting').addEventListener('click', () => {
+$('#addSetting').addEventListener('click', () => {
   const wrap = document.createElement('div');
   wrap.className = 'set-row';
-  wrap.innerHTML = `<input class="s-key" placeholder="key">
+  wrap.innerHTML = `<input class="s-key" placeholder="key" style="max-width:190px">
     <input class="s-val" placeholder="value">
-    <button class="btn sm" data-del-setting>${t('common.delete')}</button>`;
+    <button class="del" data-del-setting>✕</button>`;
   wrap.querySelector('[data-del-setting]').addEventListener('click', () => wrap.remove());
-  document.querySelector('#settingsRows').prepend(wrap);
+  $('#settingsRows').prepend(wrap);
 });
-
-document.querySelector('#saveSettings').addEventListener('click', async () => {
+$('#saveSettings').addEventListener('click', async () => {
   try {
-    // settings PUT is a merge: untouched keys are left alone
     await api.put('/admin/settings', readSettings());
     renderSettings((await api.get('/admin/settings')).settings || {});
     toast(t('common.saved'));
   } catch (e) {
-    toast('保存失败: ' + (Array.isArray(e.detail) ? JSON.stringify(e.detail) : e.detail || e.message));
+    toast('保存失败: ' + (Array.isArray(e.detail) ? JSON.stringify(e.detail) : (e.detail || e.message)));
   }
 });
 
-/* ── admin token (browser-local; /admin auth when ROUTER_ADMIN_TOKEN is set) ─ */
-const tokenInput = document.querySelector('#adminToken');
-tokenInput.value = api.token();
-
-document.querySelector('#saveToken').addEventListener('click', () => {
-  api.setToken(tokenInput.value);
+/* ── admin token ─────────────────────────────────────────────────────── */
+$('#adminToken').value = api.token();
+$('#saveToken').addEventListener('click', () => {
+  api.setToken($('#adminToken').value);
   toast(api.token() ? t('common.saved') : t('models.cleartoken'));
   boot();
 });
-document.querySelector('#clearToken').addEventListener('click', () => {
+$('#clearToken').addEventListener('click', () => {
   api.setToken('');
-  tokenInput.value = '';
+  $('#adminToken').value = '';
   toast(t('models.cleartoken'));
 });
 
-window.onLangChange = () => { boot(); };
+window.onLangChange = () => boot();
 boot();

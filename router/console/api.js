@@ -51,11 +51,27 @@ const api = {
   } catch (e) { /* ignore */ }
 })();
 
-/* Shared helpers used by every page (ported from the demo). */
-function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
-function fmt(x) { return x == null ? '—' : Number(x).toFixed(2); }
-function toast(msg) {
+/* Shared helpers used by every page. */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+function fmt(x) { return x == null || x === '' ? '—' : Number(x).toFixed(2); }
+function pct(x) { return x == null || x === '' ? '—' : Math.round(100 * Number(x)) + '%'; }
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) return String(ts).slice(11, 19) || String(ts);
+  return d.toLocaleTimeString([], { hour12: false }) +
+    (d.toDateString() === new Date().toDateString() ? '' : ' ' + d.toLocaleDateString());
+}
+function toast(msg, ms) {
   const d = document.createElement('div');
   d.className = 'toast'; d.textContent = msg;
-  document.body.appendChild(d); setTimeout(() => d.remove(), 2000);
+  document.body.appendChild(d); setTimeout(() => d.remove(), ms || 2200);
 }
+/* Group key -> CSS color variable (matches signals.css tokens). */
+const GROUP_COLOR = { safety: 'var(--g-safety)', domain: 'var(--g-domain)',
+  difficulty: 'var(--g-cx)', context: 'var(--g-ctx)', session: 'var(--g-sess)',
+  rule: 'var(--g-rule)' };
+function sigColor(group) { return GROUP_COLOR[group] || 'var(--g-rule)'; }

@@ -1,0 +1,268 @@
+/* Signal configuration page: edit the JEV question config
+   (/admin/signal-questions) — question wording, true/false meanings, choice
+   candidate descriptions, PII type names. Save validates on the server and
+   hot-applies to the running JevTagger. Also exposes the raw JSON for bulk
+   edits / import / export. */
+const $ = s => document.querySelector(s);
+
+let cfg = null;          // the editable config object
+let meta = {};
+let registry = {};       // /admin/signals specs (zh/en labels, values)
+let selected = 'domain';
+let dirty = false;
+let rawOpen = false;
+
+const sigName = k => (registry[k] ? (LANG === 'zh' ? registry[k].zh : registry[k].en) : k);
+const kindLabel = k => cfg.signals[k].kind === 'noul' ? t('sig.kind.noul') : t('sig.kind.choice');
+
+async function boot() {
+  const [qBody, sigBody] = await Promise.all([
+    api.get('/admin/signal-questions'),
+    api.get('/admin/signals'),
+  ]);
+  cfg = qBody.config;
+  meta = qBody.meta || {};
+  sigBody.signals.forEach(s => { registry[s.key] = s; });
+  renderAll();
+}
+
+function renderHeader() {
+  const temp = meta.temperature != null ? Number(meta.temperature).toFixed(2) : '—';
+  $('#enginePill').innerHTML = (LANG === 'zh'
+    ? '引擎 <b>' + esc(meta.name || '?') + '</b> · T ' + temp
+    : 'engine <b>' + esc(meta.name || '?') + '</b> · T ' + temp);
+  $('#dirtyPill').className = 'pill ' + (dirty ? 'warn' : 'ok');
+  $('#dirtyPill').textContent = dirty ? t('sig.changed') : t('common.saved');
+  $('#sigCount').textContent = Object.keys(cfg.signals).length;
+  const parts = [];
+  parts.push(`${t('sig.temperature')} <b class="mono">${temp}</b>`);
+  if (meta.max_length != null) parts.push(`${t('sig.maxlen')} <b class="mono">${meta.max_length}</b>`);
+  if (meta.questions_path) parts.push(`<span class="mono" title="${esc(meta.questions_path)}">${esc(String(meta.questions_path).split('/').pop())}</span>`);
+  $('#metaInfo').innerHTML = parts.join(' · ');
+}
+
+function renderList() {
+  $('#sigList').innerHTML = Object.keys(cfg.signals).map(k => {
+    const s = cfg.signals[k];
+    return `<div class="sig-item ${k === selected ? 'on' : ''}" data-sig="${esc(k)}">
+      <span class="k" style="background:${sigColor((registry[k] || {}).group)}"></span>
+      <span class="n">${esc(sigName(k))}</span>
+      <span class="b">${s.kind === 'noul' ? 'y/n' : 'choice'}</span>
+    </div>`;
+  }).join('');
+}
+
+function instrHtml(k, s) {
+  if (k === 'pii') return '';
+  const list = Array.isArray(s.instructions) ? s.instructions : [s.instructions || ''];
+  return `<div class="subcard"><div class="hd">${t('sig.instructions')}</div>
+    ${list.map((txt, i) => `<div class="instr-row">
+      <span class="mono mut" style="padding-top:9px">${i + 1}</span>
+      <textarea data-instr="${esc(k)}|${i}">${esc(txt)}</textarea>
+      <button class="del" data-del-instr="${esc(k)}|${i}" title="${t('common.delete')}">✕</button>
+    </div>`).join('')}
+    <button class="btn dashed sm" data-add-instr="${esc(k)}" style="width:100%;justify-content:center">${t('sig.addVariant')}</button>
+  </div>`;
+}
+
+function noulHtml(k, s) {
+  return `<div class="subcard"><div class="hd">${t('sig.true')} / ${t('sig.false')}</div>
+    <label class="field">${t('sig.true')}<textarea data-noul="${esc(k)}|true">${esc(s.true || '')}</textarea></label>
+    <label class="field" style="margin-top:6px">${t('sig.false')}<textarea data-noul="${esc(k)}|false">${esc(s.false || '')}</textarea></label>
+  </div>`;
+}
+
+function choiceHtml(k, s) {
+  const cands = s.candidates || {};
+  return `<div class="subcard"><div class="hd">${t('sig.candidates')}</div>
+    <table class="cand-table"><thead><tr><th>${t('sig.candKey')}</th><th>${t('sig.candZh')}</th><th>${t('sig.candEn')}</th></tr></thead><tbody>
+    ${Object.entries(cands).map(([key, val]) => {
+      const v = typeof val === 'object' && val !== null ? val : { zh: val, en: val };
+      return `<tr><td><span class="mono">${esc(key)}</span></td>
+        <td><input data-cand="${esc(k)}|${esc(key)}|zh" value="${esc(v.zh || '')}"></td>
+        <td><input data-cand="${esc(k)}|${esc(key)}|en" value="${esc(v.en || '')}"></td></tr>`;
+    }).join('')}</tbody></table></div>`;
+}
+
+function piiHtml(s) {
+  const types = s.types || {};
+  return `<div class="subcard"><div class="hd">${t('sig.piiTemplate')}</div>
+    <textarea style="width:100%;min-height:42px" data-pii="instructions">${esc(s.instructions || '')}</textarea>
+    <label class="field" style="margin-top:6px">${t('sig.piiTrue')}<textarea data-pii="true">${esc(s.true || '')}</textarea></label>
+    <label class="field" style="margin-top:6px">${t('sig.piiFalse')}<textarea data-pii="false">${esc(s.false || '')}</textarea></label>
+  </div>
+  <div class="subcard"><div class="hd">${t('sig.piiTypes')}</div>
+    <table class="cand-table"><thead><tr><th>${t('sig.candKey')}</th><th>${t('sig.typeFa')}</th></tr></thead><tbody>
+    ${Object.entries(types).map(([key, val]) => `<tr>
+      <td><span class="mono">${esc(key)}</span></td>
+      <td><input data-pii-type="${esc(key)}" value="${esc((val || {}).zh || '')}"></td></tr>`).join('')}
+    </tbody></table></div>`;
+}
+
+function previewHtml(k, s) {
+  const line = k === 'pii'
+    ? String(s.instructions || '').replace('{zh}', '身份证号')
+    : (Array.isArray(s.instructions) ? s.instructions[0] : s.instructions) || '';
+  if (k === 'pii') {
+    return `<div class="footnote">${t('sig.preview')}: ${esc(line)} · true=${esc(String(s.true || '').replace('{zh}', '身份证号'))}</div>`;
+  }
+  if (s.kind === 'noul') {
+    return `<div class="footnote">${t('sig.preview')}: ${esc(line)}<br>Yes: ${esc(s.true || '')}<br>No: ${esc(s.false || '')}</div>`;
+  }
+  const cands = Object.keys(s.candidates || {});
+  return `<div class="footnote">${t('sig.preview')}: ${esc(line)} (${cands.length} candidates: ${cands.slice(0, 6).map(esc).join(', ')}${cands.length > 6 ? '…' : ''})</div>`;
+}
+
+function rawHtml() {
+  if (!rawOpen) return '';
+  return `<div class="subcard" style="margin-top:12px">
+    <div class="hd">${t('sig.raw')} <span class="mut" style="font-weight:400">${t('sig.raw.hint')}</span></div>
+    <textarea class="json-editor" id="rawJson">${esc(JSON.stringify(cfg, null, 2))}</textarea>
+    <div class="insp-row" style="margin-top:6px">
+      <button class="btn sm" id="rawApply">${t('sig.raw.apply')}</button>
+      <button class="btn sm" id="rawClose">${t('common.cancel')}</button>
+    </div>
+  </div>`;
+}
+
+function renderEditor() {
+  const k = selected;
+  const s = cfg.signals[k];
+  const reg = registry[k] || {};
+  const head = `<div class="card">
+    <div class="insp-h">
+      <span class="type ${s.kind === 'noul' ? 'gate' : 'score'}">${kindLabel(k)}</span>
+      <span class="t">${esc(sigName(k))}</span>
+      <span class="mut">${esc(reg.en || '')}</span>
+      <span class="stat" style="margin-left:auto">${t('sig.values')}: ${s.kind === 'noul' ? 2 : Object.keys(s.candidates || {}).length}</span>
+    </div>
+    ${k === 'pii' ? piiHtml(s) : instrHtml(k, s)}
+    ${s.kind === 'noul' && k !== 'pii' ? noulHtml(k, s) : ''}
+    ${s.kind === 'choice' ? choiceHtml(k, s) : ''}
+    ${s.kind === 'noul' && k === 'pii' ? '' : ''}
+    ${previewHtml(k, s)}
+    <div class="footnote" style="margin-top:6px">${esc(JSON.stringify({ version: cfg.version, signals: Object.keys(cfg.signals).length }).replace(/"/g, ''))} ·
+      <button class="btn ghost sm" id="rawToggle">${t('sig.raw')} ${rawOpen ? '▲' : '▼'}</button></div>
+    ${rawHtml()}
+  </div>`;
+  $('#editor').innerHTML = head;
+  bindEditor();
+}
+
+function bindEditor() {
+  document.querySelectorAll('[data-instr]').forEach(el => el.addEventListener('input', () => {
+    const [k, i] = el.dataset.instr.split('|');
+    const list = cfg.signals[k].instructions;
+    list[+i] = el.value;
+    markDirty();
+  }));
+  document.querySelectorAll('[data-add-instr]').forEach(el => el.addEventListener('click', () => {
+    cfg.signals[el.dataset.addInstr].instructions.push('');
+    markDirty(); renderEditor();
+  }));
+  document.querySelectorAll('[data-del-instr]').forEach(el => el.addEventListener('click', () => {
+    const [k, i] = el.dataset.delInstr.split('|');
+    const list = cfg.signals[k].instructions;
+    if (list.length <= 1) { toast(t('sig.instructions')); return; }
+    list.splice(+i, 1);
+    markDirty(); renderEditor();
+  }));
+  document.querySelectorAll('[data-noul]').forEach(el => el.addEventListener('input', () => {
+    const [k, f] = el.dataset.noul.split('|');
+    cfg.signals[k][f] = el.value;
+    markDirty();
+  }));
+  document.querySelectorAll('[data-cand]').forEach(el => el.addEventListener('input', () => {
+    const [k, key, f] = el.dataset.cand.split('|');
+    const cands = cfg.signals[k].candidates;
+    if (typeof cands[key] !== 'object' || cands[key] === null) cands[key] = { zh: cands[key], en: cands[key] };
+    cands[key][f] = el.value;
+    markDirty();
+  }));
+  document.querySelectorAll('[data-pii]').forEach(el => el.addEventListener('input', () => {
+    cfg.signals.pii[el.dataset.pii] = el.value;
+    markDirty();
+  }));
+  document.querySelectorAll('[data-pii-type]').forEach(el => el.addEventListener('input', () => {
+    const t2 = cfg.signals.pii.types[el.dataset.piiType];
+    if (typeof t2 !== 'object' || t2 === null) cfg.signals.pii.types[el.dataset.piiType] = { zh: el.value };
+    else t2.zh = el.value;
+    markDirty();
+  }));
+  const tog = $('#rawToggle');
+  if (tog) tog.addEventListener('click', () => { rawOpen = !rawOpen; renderEditor(); });
+  const apply = $('#rawApply');
+  if (apply) apply.addEventListener('click', () => applyRaw());
+  const close = $('#rawClose');
+  if (close) close.addEventListener('click', () => { rawOpen = false; renderEditor(); });
+}
+
+function markDirty() { dirty = true; renderHeader(); }
+
+function applyRaw() {
+  try {
+    const parsed = JSON.parse($('#rawJson').value);
+    if (!parsed || typeof parsed !== 'object' || !parsed.signals) throw new Error('missing signals');
+    cfg = parsed;
+    rawOpen = false;
+    dirty = true;
+    renderAll();
+    toast(t('common.saved'));
+  } catch (err) {
+    toast(tf('sig.raw.invalid', { err: err.message }));
+  }
+}
+
+async function save() {
+  try {
+    const out = await api.put('/admin/signal-questions', { config: cfg });
+    dirty = false;
+    if (out.meta) meta = out.meta;
+    renderHeader();
+    toast(out.applied ? t('sig.savedLive') : t('sig.savedReload'));
+  } catch (e) {
+    toast((Array.isArray(e.detail) ? JSON.stringify(e.detail) : (e.detail || e.message)));
+  }
+}
+
+function exportJson() {
+  const blob = new Blob([JSON.stringify(cfg, null, 2) + '\n'], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'signal_questions.json';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+function renderAll() {
+  renderHeader(); renderList(); renderEditor();
+}
+
+$('#sigList').addEventListener('click', e => {
+  const item = e.target.closest('[data-sig]');
+  if (!item) return;
+  selected = item.dataset.sig;
+  renderList(); renderEditor();
+});
+$('#saveBtn').addEventListener('click', save);
+$('#exportBtn').addEventListener('click', exportJson);
+$('#importBtn').addEventListener('click', () => $('#importFile').click());
+$('#importFile').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => {
+    try {
+      const parsed = JSON.parse(reader.result);
+      if (!parsed || !parsed.signals) throw new Error('missing signals');
+      cfg = parsed; dirty = true; renderAll();
+      toast(t('sig.import'));
+    } catch (err) {
+      toast(tf('sig.raw.invalid', { err: err.message }));
+    }
+  };
+  reader.readAsText(file);
+  e.target.value = '';
+});
+window.onLangChange = () => renderAll();
+boot();

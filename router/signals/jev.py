@@ -93,13 +93,8 @@ def binary_entropy_confidence(p: float) -> float:
     return max(0.0, min(1.0, 1.0 - h2))
 
 
-def load_question_config(path: str | Path | None = None) -> dict:
-    """Load + validate the editable JEV question config."""
-    p = Path(path) if path else DEFAULT_QUESTIONS_PATH
-    try:
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise JevTaggerError(f"cannot read question config {p}: {exc}") from exc
+def validate_question_config(cfg) -> dict:
+    """Validate an in-memory question config (used by load and the admin PUT)."""
     if not isinstance(cfg, dict) or not isinstance(cfg.get("signals"), dict):
         raise JevTaggerError(f"question config {p} must have a 'signals' object")
     signals = cfg["signals"]
@@ -145,6 +140,16 @@ def load_question_config(path: str | Path | None = None) -> dict:
     if bad:
         raise JevTaggerError(f"pii: unknown types {bad}")
     return cfg
+
+
+def load_question_config(path: str | Path | None = None) -> dict:
+    """Load + validate the editable JEV question config file."""
+    p = Path(path) if path else DEFAULT_QUESTIONS_PATH
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise JevTaggerError(f"cannot read question config {p}: {exc}") from exc
+    return validate_question_config(cfg)
 
 
 def candidate_prompts(record: dict) -> list[str]:
@@ -217,6 +222,7 @@ class JevTagger:
                  device: str | None = None, max_length: int | None = None,
                  kw_groups: dict | None = None, model_factory=None,
                  warmup: bool = True):
+        self.question_path = str(questions_path or DEFAULT_QUESTIONS_PATH)
         self.questions = load_question_config(questions_path)
         self.kw_groups = kw_groups or {}
         self.model_dir = Path(model_dir)
@@ -262,6 +268,11 @@ class JevTagger:
         self.head.eval()
         if warmup:
             self._warmup()
+
+    def set_questions(self, cfg: dict) -> dict:
+        """Hot-apply an edited question config (validated before replacing)."""
+        self.questions = validate_question_config(cfg)
+        return self.questions
 
     # ── forward ────────────────────────────────────────────────────────────
     def _warmup(self) -> None:

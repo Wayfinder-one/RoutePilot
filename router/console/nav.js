@@ -1,11 +1,11 @@
-/* Shared top bar: brand, page nav, language toggle. */
+/* Shared top bar: brand, 5-page nav, language toggle. */
 (function () {
   const page = document.body.dataset.page;
   const bar = document.createElement('header');
   bar.className = 'top';
   bar.innerHTML =
-    `<div class="logo"><span class="mark">SR</span><span data-i18n="app.title"></span></div>
-     <nav>${['overview', 'pipeline', 'lab', 'models'].map(p =>
+    `<a class="brand" href="index.html"><span class="mark">SR</span><span data-i18n="app.title"></span></a>
+     <nav>${['overview', 'pipeline', 'logs', 'signals', 'models'].map(p =>
        `<a href="${p === 'overview' ? 'index' : p}.html"
            class="${p === page ? 'on' : ''}" data-i18n="nav.${p}"></a>`).join('')}</nav>
      <span class="spacer"></span>

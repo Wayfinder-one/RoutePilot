@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Router · 计算日志</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="shared.css">
+</head>
+<body data-page="logs">
+<div class="pagehead">
+  <div>
+    <div class="crumb" data-i18n="nav.logs"></div>
+    <h1><span data-i18n="nav.logs"></span><span class="sub" data-i18n="logs.sub"></span></h1>
+  </div>
+  <div class="headmeta">
+    <span class="pill" id="taggerPill"></span>
+    <button class="btn sm" id="refresh" data-i18n="logs.refresh"></button>
+  </div>
+</div>
+<main class="page">
+  <div class="logs-toolbar">
+    <label class="mut" style="font-size:12px" data-i18n="logs.limit"></label>
+    <select id="limit"><option value="20">20</option><option value="50">50</option></select>
+    <select id="filter">
+      <option value="all">全部 / all</option>
+      <option value="route">路由 / routed</option>
+      <option value="block">拦截 / blocked</option>
+    </select>
+    <span class="pill" id="countPill"></span>
+    <span class="spacer" style="flex:1"></span>
+    <span class="mut" style="font-size:11.5px" data-i18n="logs.click"></span>
+  </div>
+  <div id="list"></div>
+</main>
+<script src="i18n.js"></script>
+<script src="nav.js"></script>
+<script src="api.js"></script>
+<script src="logs.js"></script>
+</body>
+</html>
