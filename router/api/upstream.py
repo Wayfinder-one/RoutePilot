@@ -56,27 +56,91 @@ def resolve_backend(backends: dict[str, Backend], model_id: str) -> Backend:
 
 
 class CircuitBreaker:
-    def __init__(self, threshold: int = 3, half_open_after: float = 300.0):
+    """Per-model circuit breaker.
+
+    Process-local failure counts; when ``db_path`` is given (M4) the open state
+    is also persisted to the ``breaker`` table so a second replica that has no
+    local state still sees the quarantine. The first time a replica observes a
+    DB quarantine it latches it locally with ``opened_at = now`` so the local
+    half-open window can still self-heal (otherwise that replica would skip the
+    model forever).
+    """
+
+    def __init__(self, threshold: int = 3, half_open_after: float = 300.0,
+                 db_path: str | None = None):
         self.threshold = threshold
         self.half_open_after = half_open_after
+        self.db_path = db_path
         self._failures: dict[str, int] = {}
         self._opened_at: dict[str, float] = {}
         self._lock = threading.Lock()
 
+    # ── DB helpers (M4, only used when db_path is set) ──────────────────────
+    def _db_read(self, model: str):
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0,
+                                   check_same_thread=False)
+            try:
+                row = conn.execute(
+                    "SELECT failures, opened_at FROM breaker WHERE model = ?",
+                    (model,)).fetchone()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return None
+        return row
+
+    def _db_write(self, model: str, failures: int, opened_at: float | None) -> None:
+        import sqlite3
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=5.0,
+                                   check_same_thread=False)
+            try:
+                with conn:
+                    if failures <= 0:
+                        conn.execute("DELETE FROM breaker WHERE model = ?", (model,))
+                    else:
+                        conn.execute(
+                            "INSERT INTO breaker VALUES (?, ?, ?) "
+                            "ON CONFLICT(model) DO UPDATE SET failures = excluded.failures, "
+                            "opened_at = excluded.opened_at",
+                            (model, failures, opened_at))
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass                                   # breaker must never raise
+
     def is_open(self, model: str) -> bool:
         with self._lock:
-            if self._failures.get(model, 0) < self.threshold:
+            if self._failures.get(model, 0) >= self.threshold:
+                return (time.monotonic() - self._opened_at.get(model, 0.0)
+                        < self.half_open_after)
+            if not self.db_path:
                 return False
-            return (time.monotonic() - self._opened_at.get(model, 0.0)
-                    < self.half_open_after)
+            row = self._db_read(model)
+            if not row or row[0] < self.threshold:
+                return False
+            opened_at = row[1] or time.time()
+            # latch locally so the half-open window applies to this replica too
+            self._failures[model] = row[0]
+            self._opened_at[model] = time.monotonic() - (time.time() - opened_at)
+            return (time.time() - opened_at) < self.half_open_after
 
     def failure(self, model: str) -> None:
         with self._lock:
-            self._failures[model] = self._failures.get(model, 0) + 1
-            if self._failures[model] >= self.threshold:
-                self._opened_at.setdefault(model, time.monotonic())
+            count = self._failures.get(model, 0) + 1
+            self._failures[model] = count
+            if count >= self.threshold:
+                opened = self._opened_at.setdefault(model, time.monotonic())
+                if self.db_path:
+                    self._db_write(model, count, time.time() - (
+                        time.monotonic() - opened))
 
     def success(self, model: str) -> None:
         with self._lock:
             self._failures.pop(model, None)
             self._opened_at.pop(model, None)
+            if self.db_path:
+                self._db_write(model, 0, None)
+

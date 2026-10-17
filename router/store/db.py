@@ -57,6 +57,13 @@ MIGRATIONS = [
     CREATE INDEX idx_changes_ts ON changes(ts);
     CREATE INDEX idx_evals_ts ON evals(ts);
     """,
+    # v4 (M4): session continuation (last routed model) + cross-replica breaker.
+    """
+    ALTER TABLE sessions ADD COLUMN last_model TEXT;
+    CREATE TABLE breaker (
+        model TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
+        opened_at REAL);
+    """,
 ]
 
 

@@ -68,7 +68,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         app.state.backends = load_backends(conn)   # model_id -> Backend snapshot
     finally:
         conn.close()
-    app.state.breaker = CircuitBreaker()
+    app.state.breaker = CircuitBreaker(db_path=settings.db_path)
     app.state.requestlog = requestlog
 
     @app.get("/")

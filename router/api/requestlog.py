@@ -58,15 +58,20 @@ class RequestLogger:
                             (r["id"], key,
                              json.dumps(s.get("value"), ensure_ascii=False),
                              s.get("confidence"), int(bool(s.get("is_rule")))))
-                    # M2: the embedding that goes with this turn, for the next
-                    # turn's similarity/reask. Written here (async) so the hot
-                    # path only ever reads the previous vector.
-                    sid, vec = r.get("session_id"), r.get("vec")
-                    if sid and vec:
+                    # M2/M4: the embedding + routed model for this turn, so the
+                    # next turn's similarity/reask and continuation can use them.
+                    # Written here (async) so the hot path only ever reads.
+                    sid = r.get("session_id")
+                    vec, model = r.get("vec"), r.get("session_model")
+                    if sid and (vec or model):
                         conn.execute(
-                            "INSERT INTO sessions VALUES (?, ?, ?) "
+                            "INSERT INTO sessions "
+                            "(session_id, last_vec, updated, last_model) "
+                            "VALUES (?, ?, ?, ?) "
                             "ON CONFLICT(session_id) DO UPDATE SET "
-                            "last_vec = excluded.last_vec, updated = excluded.updated",
-                            (sid, json.dumps(vec), r["ts"]))
+                            "last_vec = COALESCE(excluded.last_vec, sessions.last_vec), "
+                            "last_model = COALESCE(excluded.last_model, sessions.last_model), "
+                            "updated = excluded.updated",
+                            (sid, json.dumps(vec) if vec else None, r["ts"], model))
         finally:
             conn.close()

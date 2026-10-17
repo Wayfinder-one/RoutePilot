@@ -213,31 +213,45 @@ class SettingsRepo:
 
 
 class SessionRepo:
-    """Per-session last-turn embedding (JSON list of floats)."""
+    """Per-session state: last-turn embedding + last routed model (M4)."""
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
+    def get(self, session_id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT last_vec, last_model FROM sessions WHERE session_id = ?",
+            (session_id,)).fetchone()
+        if not row:
+            return {"vec": None, "model": None}
+        vec = None
+        if row["last_vec"]:
+            try:
+                parsed = json.loads(row["last_vec"])
+                if isinstance(parsed, list):
+                    vec = [float(x) for x in parsed if isinstance(x, (int, float))]
+            except ValueError:
+                vec = None                     # corrupt row: behave as "no history"
+        return {"vec": vec, "model": row["last_model"]}
+
     def get_vec(self, session_id: str) -> list[float] | None:
-        row = self.conn.execute("SELECT last_vec FROM sessions WHERE session_id = ?",
-                                (session_id,)).fetchone()
-        if not row or not row["last_vec"]:
-            return None
-        try:
-            vec = json.loads(row["last_vec"])
-        except ValueError:
-            return None                       # corrupt row: behave as "no history"
-        if not isinstance(vec, list):
-            return None
-        return [float(x) for x in vec if isinstance(x, (int, float))]
+        return self.get(session_id)["vec"]
 
     def put_vec(self, session_id: str, vec: list[float], updated: str) -> None:
+        self.put(session_id, vec, None, updated)
+
+    def put(self, session_id: str, vec: list[float] | None, model: str | None,
+            updated: str) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO sessions VALUES (?, ?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET last_vec = excluded.last_vec, "
+                "INSERT INTO sessions (session_id, last_vec, updated, last_model) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "last_vec = COALESCE(excluded.last_vec, sessions.last_vec), "
+                "last_model = COALESCE(excluded.last_model, sessions.last_model), "
                 "updated = excluded.updated",
-                (session_id, json.dumps(vec), updated))
+                (session_id, json.dumps(vec) if vec else None, updated, model))
+
 
 
 class ChangeRepo:

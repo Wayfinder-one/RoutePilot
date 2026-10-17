@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from router.api.continuation import continuation
 from router.api.sessions import read_last_vec, session_id_from
 from router.api.upstream import resolve_backend
 from router.pipeline.engine import evaluate
@@ -47,7 +48,16 @@ async def chat_completions(request: Request):
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages),
         last_vec=read_last_vec(request, sid)))
-    decision, _ = evaluate(request.app.state.pipeline, result.signals)
+    # M4: the optional session pre-stage can short-circuit the pipeline (sticky
+    # or escalated). Tagging still happens so signals/replay data stay complete.
+    cont = continuation(request, sid)
+    if cont is not None:
+        decision, session_state = cont
+    else:
+        decision, _ = evaluate(request.app.state.pipeline, result.signals)
+        session_state = "new"
+    extra = ({"x-sr-session-state": session_state}
+             if request.app.state.settings.sessions else {})
 
     request.app.state.requestlog.enqueue({
         "id": uuid.uuid4().hex,
@@ -57,29 +67,30 @@ async def chat_completions(request: Request):
         "score": decision.score,
         "latency_ms": (time.monotonic() - started) * 1000,
         "signals": result.signals,
-        "session_id": sid, "vec": result.vec})
+        "session_id": sid, "vec": result.vec,
+        "session_model": decision.model if decision.kind == "route" else None})
 
     if decision.kind == "block":
-        return JSONResponse(status_code=403, content={
+        return JSONResponse(status_code=403, headers=extra, content={
             "error": {"message": BLOCK_MESSAGE, "code": "blocked_by_policy"}})
     if decision.kind != "route" or not decision.model:
-        return JSONResponse(status_code=502,
+        return JSONResponse(status_code=502, headers=extra,
                             content={"error": {"message": "no_route"}})
 
     try:
         backend = resolve_backend(request.app.state.backends, decision.model)
     except KeyError:
-        return JSONResponse(status_code=502,
+        return JSONResponse(status_code=502, headers=extra,
                             content={"error": {"message": "unknown_model"}})
 
     breaker = request.app.state.breaker
     if breaker.is_open(decision.model):
-        return JSONResponse(status_code=503, content={
+        return JSONResponse(status_code=503, headers=extra, content={
             "error": {"message": "model_circuit_open", "model": decision.model}})
 
     client: httpx.AsyncClient = request.app.state.http
     upstream_body = {**body, "model": backend.upstream_name}
-    headers = {"x-sr-model": decision.model}
+    headers = {"x-sr-model": decision.model, **extra}
     try:
         if body.get("stream"):
             return await _stream(client, backend, upstream_body, headers,
