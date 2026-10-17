@@ -14,6 +14,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from router.api.sessions import read_last_vec, session_id_from
 from router.api.upstream import resolve_backend
 from router.pipeline.engine import evaluate
 from router.signals.tagger import TagRequest
@@ -42,8 +43,10 @@ async def chat_completions(request: Request):
     messages = body.get("messages") or []
     text = _last_user_text(messages)
     tagger = request.app.state.tagger
+    sid = session_id_from(request)
     result = await tagger.tag(TagRequest(
-        text=text, headers=dict(request.headers), n_messages=len(messages)))
+        text=text, headers=dict(request.headers), n_messages=len(messages),
+        last_vec=read_last_vec(request, sid)))
     decision, _ = evaluate(request.app.state.pipeline, result.signals)
 
     request.app.state.requestlog.enqueue({
@@ -53,7 +56,8 @@ async def chat_completions(request: Request):
         "node_id": decision.node_id, "branch_id": decision.branch_id,
         "score": decision.score,
         "latency_ms": (time.monotonic() - started) * 1000,
-        "signals": result.signals})
+        "signals": result.signals,
+        "session_id": sid, "vec": result.vec})
 
     if decision.kind == "block":
         return JSONResponse(status_code=403, content={

@@ -206,3 +206,110 @@ class SettingsRepo:
         self.conn.execute(
             "INSERT INTO settings VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+    def all(self) -> dict[str, str]:
+        return {r["key"]: r["value"] for r in
+                self.conn.execute("SELECT key, value FROM settings ORDER BY key")}
+
+
+class SessionRepo:
+    """Per-session last-turn embedding (JSON list of floats)."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def get_vec(self, session_id: str) -> list[float] | None:
+        row = self.conn.execute("SELECT last_vec FROM sessions WHERE session_id = ?",
+                                (session_id,)).fetchone()
+        if not row or not row["last_vec"]:
+            return None
+        try:
+            vec = json.loads(row["last_vec"])
+        except ValueError:
+            return None                       # corrupt row: behave as "no history"
+        if not isinstance(vec, list):
+            return None
+        return [float(x) for x in vec if isinstance(x, (int, float))]
+
+    def put_vec(self, session_id: str, vec: list[float], updated: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO sessions VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET last_vec = excluded.last_vec, "
+                "updated = excluded.updated",
+                (session_id, json.dumps(vec), updated))
+
+
+class ChangeRepo:
+    """Configuration audit trail (design 5.1): every admin write lands here."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def record(self, ts: str, kind: str, detail: dict) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO changes (ts, kind, detail) VALUES (?, ?, ?)",
+                              (ts, kind, json.dumps(detail, ensure_ascii=False)))
+
+    def list(self, limit: int = 50) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, ts, kind, detail FROM changes ORDER BY id DESC LIMIT ?",
+            (limit,))
+        return [{**dict(r), "detail": json.loads(r["detail"])} for r in rows]
+
+
+class EvalRepo:
+    """Evaluation reports (design 8)."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def save(self, ts: str, mode: str, total: int, matched: int, rate: float,
+             report: dict) -> int:
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT INTO evals (ts, mode, total, matched, rate, report) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, mode, total, matched, rate,
+                 json.dumps(report, ensure_ascii=False)))
+        return int(cur.lastrowid)
+
+    def recent(self, limit: int = 3) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT id, ts, mode, total, matched, rate, report FROM evals "
+            "ORDER BY id DESC LIMIT ?", (limit,))
+        return [{**dict(r), "report": json.loads(r["report"])} for r in rows]
+
+
+class RequestRepo:
+    """Read side for replay evaluation: stored requests + their signal packs."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def replayable(self, since: str, limit: int = 5000) -> list[dict]:
+        """Route decisions only (block/none carry no model to compare)."""
+        rows = self.conn.execute(
+            "SELECT id, ts, text, model FROM requests "
+            "WHERE decision = 'route' AND model IS NOT NULL AND ts >= ? "
+            "ORDER BY ts DESC LIMIT ?", (since, limit))
+        out = []
+        for r in rows:
+            signals = self.conn.execute(
+                "SELECT signal, value, confidence, is_rule FROM request_signals "
+                "WHERE request_id = ?", (r["id"],))
+            pack = {}
+            for s in signals:
+                try:
+                    value = json.loads(s["value"]) if s["value"] is not None else None
+                except ValueError:
+                    value = s["value"]
+                pack[s["signal"]] = {"value": value,
+                                     "confidence": s["confidence"],
+                                     "is_rule": bool(s["is_rule"])}
+            if pack:
+                out.append({"id": r["id"], "ts": r["ts"], "model": r["model"],
+                            "signals": pack})
+        return out
+
+

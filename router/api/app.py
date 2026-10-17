@@ -21,7 +21,19 @@ from router.store.repositories import KeywordRepo, PipelineRepo, seed_default
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 
-TAGGERS = {"heuristic": HeuristicTagger}   # M2: 'checkpoint' -> CheckpointTagger
+
+def _make_tagger(settings: Settings, kw_groups: dict):
+    """Tagger registry (design 4.3). Imported lazily so torch is only touched
+    in checkpoint mode; an invalid checkpoint raises here and refuses startup."""
+    if settings.tagger == "heuristic":
+        return HeuristicTagger(kw_groups=kw_groups)
+    if settings.tagger == "checkpoint":
+        from router.signals.checkpoint import CheckpointTagger
+        if not settings.checkpoint_dir:
+            raise RuntimeError("ROUTER_TAGGER=checkpoint needs ROUTER_CHECKPOINT")
+        return CheckpointTagger(settings.checkpoint_dir, device=settings.device,
+                                kw_groups=kw_groups)
+    raise RuntimeError(f"unknown tagger {settings.tagger!r}")
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None
@@ -47,7 +59,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
 
     app = FastAPI(title="Smart Router", lifespan=lifespan)
     app.state.settings = settings
-    app.state.tagger = TAGGERS[settings.tagger](kw_groups=kw_groups)
+    app.state.tagger = _make_tagger(settings, kw_groups)
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
     app.state.pipeline = pipeline            # in-memory snapshot (design 4.4)
     from router.api.upstream import CircuitBreaker, load_backends

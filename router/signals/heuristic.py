@@ -1,15 +1,19 @@
 """Heuristic tagger: degraded mode, no model. Lexicons are ported from the
-training repo (smart-router-train src/routepilot/signals.py upstream tables).
+training repo (smart-router-train src/smart_router/signals.py upstream tables).
 All model-signal confidences are capped at 0.5 (design doc section 3.5): in
 degraded mode score nodes lose discrimination on purpose, keeping routing
-conservative. Rule signals are deterministic => confidence == 1.
+conservative. Rule signals come from signals/rules.py (deterministic => 1).
+
+HeuristicTagger only produces the 9 model signals heuristically and delegates
+the 8 rule signals to the shared rule path, which is also what the checkpoint
+tagger uses.
 """
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
 
+from router.signals.rules import CJK_RE, count_words, rule_signals
 from router.signals.tagger import TagRequest, TagResult
 
 DOM_KW = {
@@ -43,7 +47,6 @@ PII_RE = {
     "password": re.compile(r"(密码|口令|password|pwd)\s*[:：为是]", re.IGNORECASE),
 }
 IMG_KW = ["画", "海报", "图片", "插图", "配图", "draw", "image", "picture"]
-CJK_RE = re.compile(r"[一-鿿]")
 CAP = 0.5  # degraded-mode confidence cap
 
 
@@ -60,7 +63,8 @@ class HeuristicTagger:
     async def tag(self, req: TagRequest) -> TagResult:
         return TagResult(signals=self._tag(req))
 
-    def _tag(self, req: TagRequest) -> dict:
+    def _model_signals(self, req: TagRequest) -> dict:
+        """The 9 model signals, heuristically (confidence capped at 0.5)."""
         text, low = req.text, req.text.lower()
         s: dict = {}
         # domain: group with most keyword hits wins; confidence rises with hits
@@ -72,7 +76,7 @@ class HeuristicTagger:
         s["domain"] = _sig(dom, min(CAP, 0.3 + 0.1 * hits) if hits else None, False)
         # complexity: design-ish keywords or long text => hard
         hard_hits = sum(1 for w in HARD_KW if w.lower() in low)
-        words = len(CJK_RE.findall(text)) + len(CJK_RE.sub(" ", text).split())
+        words = count_words(text)
         hard = hard_hits > 0 or words > 200
         s["complexity"] = _sig("hard" if hard else "easy",
                                min(CAP, 0.3 + 0.1 * hard_hits) if hard else 0.4, False)
@@ -90,29 +94,14 @@ class HeuristicTagger:
         s["user_feedback"] = _sig(None, None, False)
         s["similarity"] = _sig(0, None, False)
         s["reask"] = _sig("no", None, False)
-        # rule signals (deterministic => c == 1)
-        s["keyword"] = _sig([g for g, ws in self.kw_groups.items()
-                             if any(w and w in text for w in ws)], 1.0, True)
-        body = re.sub(r"\s+", "", text)
-        s["language"] = _sig(
-            "zh" if body and len(CJK_RE.findall(body)) / len(body) >= 0.3 else "en",
-            1.0, True)
-        s["structure"] = _sig("code" if "```" in text else
-                              "multiline" if len(text.split("\n")) >= 3 else "plain",
-                              1.0, True)
-        s["context"] = _sig(3 if words >= 400 else 2 if words >= 100
-                            else 1 if words >= 20 else 0, 1.0, True)
-        s["turns"] = _sig(0 if req.n_messages <= 1 else 1 if req.n_messages < 10 else 2,
-                          1.0, True)
-        tenant = next((v for k, v in req.headers.items()
-                       if k.lower() == "x-sr-tenant" and v), "anonymous")
-        s["tenant"] = _sig(tenant, 1.0, True)
-        now = datetime.now().astimezone()
-        s["time_window"] = _sig("weekend" if now.weekday() >= 5 else
-                                "weekday_day" if 9 <= now.hour < 18 else "night",
-                                1.0, True)
-        s["event"] = _sig("incident" if re.search(r"故障|宕机|(?<!\d)500(?!\d)", text)
-                          else "payment_issue"
-                          if re.search(r"支付|扣款|退款|payment|refund", low) else "none",
-                          1.0, True)
         return s
+
+    def _tag(self, req: TagRequest) -> dict:
+        signals = self._model_signals(req)
+        signals.update(rule_signals(req.text, req.headers, req.n_messages,
+                                   self.kw_groups))
+        return signals
+
+
+# Re-exported for callers that imported the regex from here historically.
+__all__ = ["HeuristicTagger", "CJK_RE", "CAP"]

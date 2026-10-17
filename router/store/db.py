@@ -40,6 +40,23 @@ MIGRATIONS = [
     CREATE INDEX idx_requests_ts ON requests(ts);
     CREATE INDEX idx_reqsig_rid ON request_signals(request_id);
     """,
+    # v2 (M2): per-session last-turn embedding, for similarity/reask.
+    """
+    CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY, last_vec TEXT, updated TEXT NOT NULL);
+    """,
+    # v3 (M3): configuration audit trail + evaluation reports.
+    """
+    CREATE TABLE changes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+        kind TEXT NOT NULL, detail TEXT NOT NULL);
+    CREATE TABLE evals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+        mode TEXT NOT NULL, total INTEGER NOT NULL, matched INTEGER NOT NULL,
+        rate REAL NOT NULL, report TEXT NOT NULL);
+    CREATE INDEX idx_changes_ts ON changes(ts);
+    CREATE INDEX idx_evals_ts ON evals(ts);
+    """,
 ]
 
 

@@ -12,6 +12,13 @@ from router.signals.registry import SIGNALS
 
 
 def match_row(signal_key: str, target: str, signals: dict) -> tuple[int, float]:
+    """m/c for one row. Multi signals resolve confidence per matched value.
+
+    Design doc section 2.2: a multi signal (pii / keyword) may carry
+    ``conf_by_value``; when matching a target we prefer that value's confidence
+    and fall back to the scalar ``confidence``. A non-match keeps the scalar
+    confidence (so the caller can still see how confident the tagger was).
+    """
     spec = SIGNALS.get(signal_key)
     sig = signals.get(signal_key)
     if spec is None or not isinstance(sig, dict) or sig.get("value") is None:
@@ -24,4 +31,8 @@ def match_row(signal_key: str, target: str, signals: dict) -> tuple[int, float]:
     if spec.kind == "rule":
         return (1 if m else 0), 1.0
     conf = sig.get("confidence")
+    if m and spec.multi:
+        per_value = sig.get("conf_by_value")
+        if isinstance(per_value, dict):
+            conf = per_value.get(target, conf)
     return (1 if m else 0), float(conf) if isinstance(conf, (int, float)) else 0.0

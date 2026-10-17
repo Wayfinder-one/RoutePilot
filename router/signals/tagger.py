@@ -15,6 +15,7 @@ class TagRequest:
     text: str
     headers: dict = field(default_factory=dict)
     n_messages: int = 1
+    last_vec: list[float] | None = None   # previous turn embedding (similarity/reask)
 
 
 @dataclass
