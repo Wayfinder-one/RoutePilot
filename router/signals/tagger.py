@@ -7,7 +7,10 @@ model signals + embedding). Both implementations satisfy this protocol.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:                                # avoid a signals -> pipeline import
+    from router.pipeline.scope import SignalScope
 
 
 @dataclass
@@ -16,6 +19,12 @@ class TagRequest:
     headers: dict = field(default_factory=dict)
     n_messages: int = 1
     last_vec: list[float] | None = None   # previous turn embedding (similarity/reask)
+    #: Optional pipeline-derived trimming hint: the model signals and PII
+    #: subtypes this request can actually be matched on
+    #: (``router.pipeline.scope.compute_signal_scope``). ``None`` = compute the
+    #: complete pack — the default for /admin/try, the eval endpoints and every
+    #: tagger that does not implement trimming.
+    scope: "SignalScope | None" = None
 
 
 @dataclass

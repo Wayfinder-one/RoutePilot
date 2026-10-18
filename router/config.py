@@ -37,6 +37,10 @@ class Settings:
     jev_model: str = ""              # merged model dir (ROUTER_JEV_MODEL)
     signal_questions: str = ""       # JSON question config ('' = shipped default)
     jev_max_length: int = 0          # 0 = use the model.json max_length
+    # Pipeline-aware candidate trimming: score only the JEV questions the
+    # current pipeline tree can read (docs/pipeline-aware-trimming.md). The
+    # default is on; ROUTER_JEV_TRIM=0 restores the full pack.
+    jev_trim: bool = True
 
     @staticmethod
     def from_env() -> "Settings":
@@ -56,4 +60,5 @@ class Settings:
             jev_model=os.environ.get("ROUTER_JEV_MODEL", ""),
             signal_questions=os.environ.get("ROUTER_SIGNAL_QUESTIONS", ""),
             jev_max_length=int(os.environ.get("ROUTER_JEV_MAX_LENGTH", "0")),
+            jev_trim=_flag("ROUTER_JEV_TRIM", True),
         )

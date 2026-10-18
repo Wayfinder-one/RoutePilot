@@ -18,6 +18,7 @@ from router.api.continuation import continuation
 from router.api.sessions import read_last_vec, session_id_from
 from router.api.upstream import resolve_backend
 from router.pipeline.engine import evaluate
+from router.pipeline.scope import compute_signal_scope
 from router.signals.tagger import TagRequest
 
 router = APIRouter()
@@ -44,17 +45,26 @@ async def chat_completions(request: Request):
     messages = body.get("messages") or []
     text = _last_user_text(messages)
     tagger = request.app.state.tagger
+    # One snapshot for both the trimming hint and the decision: a concurrent
+    # PUT /admin/pipeline swaps the whole list atomically, and reading it twice
+    # could score the old tree but evaluate the new one.
+    nodes = request.app.state.pipeline
+    # Pipeline-aware trimming (docs/pipeline-aware-trimming.md): score only the
+    # JEV questions this tree can read. The tagger ignores the hint when it does
+    # not implement trimming (heuristic/checkpoint/prompt modes).
+    scope = (compute_signal_scope(nodes)
+             if request.app.state.settings.jev_trim else None)
     sid = session_id_from(request)
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages),
-        last_vec=read_last_vec(request, sid)))
+        last_vec=read_last_vec(request, sid), scope=scope))
     # M4: the optional session pre-stage can short-circuit the pipeline (sticky
     # or escalated). Tagging still happens so signals/replay data stay complete.
     cont = continuation(request, sid)
     if cont is not None:
         decision, session_state = cont
     else:
-        decision, _ = evaluate(request.app.state.pipeline, result.signals)
+        decision, _ = evaluate(nodes, result.signals)
         session_state = "new"
     extra = ({"x-sr-session-state": session_state}
              if request.app.state.settings.sessions else {})

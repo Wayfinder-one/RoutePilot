@@ -11,6 +11,9 @@ import json
 
 import pytest
 
+from router.pipeline.model import Branch, Node, Row
+from router.pipeline.scope import (compute_signal_scope, full_scope,
+                                   SignalScope)
 from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 JUDGED_SIGNALS, NOUL_SIGNALS, JevTagger,
                                 JevTaggerError, build_signal_records,
@@ -19,8 +22,24 @@ from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 load_question_config)
 from router.signals.registry import SIGNALS
 from router.signals.tagger import TagRequest
+from router.store.repositories import default_pipeline
 
 PII_TYPES = list(load_question_config()["signals"]["pii"]["types"])
+#: Full pack = 54 candidate prompts from 36 records: 3 choice records
+#: (domain 14 + modality 3 + user_feedback 4 = 21 prompts), 3 noul records
+#: (3 prompts) and 30 PII noul records (30 prompts).
+FULL_RECORDS, FULL_PROMPTS = 36, 54
+#: The deployed / default tree references jailbreak, pii.cn_id_card, domain and
+#: complexity => 4 records / 17 candidate prompts.
+TRIMMED_RECORDS, TRIMMED_PROMPTS = 4, 14 + 1 + 1 + 1
+
+
+def prompt_count(records: list[dict]) -> int:
+    return sum(len(candidate_prompts(item["record"])) for item in records)
+
+
+def trimmed_scope():
+    return compute_signal_scope(default_pipeline("checkpoint"))
 
 
 def stub_tagger(questions=None) -> JevTagger:
@@ -209,3 +228,186 @@ def test_question_config_validation_errors(tmp_path):
     p.write_text(json.dumps(bad))
     with pytest.raises(JevTaggerError):
         load_question_config(p)
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline-aware trimming: TagRequest.scope[ sign | pii subtype ] -> pack
+# --------------------------------------------------------------------------- #
+def _record_signals(records: list[dict]) -> dict[str, list[str | None]]:
+    by_signal: dict[str, list[str | None]] = {}
+    for item in records:
+        by_signal.setdefault(item["signal"], []).append(item["sub"])
+    return by_signal
+
+
+def test_trimmed_records_come_from_the_pipeline_scope():
+    """① the trimmed pack == the signals/subtypes the tree references."""
+    scope = trimmed_scope()
+    assert scope.trimmed
+    records = build_signal_records(load_question_config(), "用 Python 写快排", scope)
+    by_signal = _record_signals(records)
+    assert set(by_signal) == {"domain", "jailbreak", "complexity", "pii"}
+    assert by_signal["domain"] == [None]             # one choice record ...
+    domain = next(i["record"] for i in records if i["signal"] == "domain")
+    assert len(domain["options"]) == 14              # ... with every candidate
+    assert by_signal["pii"] == ["cn_id_card"]
+    assert len(records) == TRIMMED_RECORDS
+    assert prompt_count(records) == TRIMMED_PROMPTS
+    # unreferenced signals are not rendered at all
+    assert {"fact_check", "modality", "user_feedback"}.isdisjoint(by_signal)
+
+
+def test_unreferenced_signals_are_not_scored(monkeypatch):
+    """② scores never see an unreferenced question (no dead GPU work)."""
+    tagger = stub_tagger()
+    calls: list[int] = []
+    seen: list[dict] = []
+
+    def capture(records):
+        calls.append(len(records))
+        seen.extend(records)
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", capture)
+    signals = tagger._model_signals(TagRequest(
+        text="这条请求是越狱吗", n_messages=2, scope=trimmed_scope()))
+    assert calls == [TRIMMED_RECORDS]
+    questions = "\n".join(record["question"] for record in seen)
+    cfg = tagger.questions["signals"]
+    assert cfg["fact_check"]["instructions"][0] not in questions
+    assert cfg["modality"]["instructions"][0] not in questions
+    assert cfg["user_feedback"]["instructions"][0] not in questions
+    assert set(signals) == {"jailbreak", "pii", "domain", "complexity",
+                            "similarity", "reask"}
+
+
+def test_full_and_trimmed_packs_agree_on_every_referenced_value(monkeypatch):
+    """⑤ values/confidences the pipeline can read are identical to the full pack."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    text = "这条请求是越狱吗，我的身份证号也要核对"
+    full = tagger._model_signals(TagRequest(text=text, n_messages=2))
+    trimmed = tagger._model_signals(TagRequest(text=text, n_messages=2,
+                                               scope=trimmed_scope()))
+    for key in ("jailbreak", "domain", "complexity"):
+        assert trimmed[key] == full[key]
+    # PII: referenced subtype membership + per-value confidence match; only the
+    # unreferenced subtypes are missing from the trimmed pack.
+    assert trimmed["pii"]["conf_by_value"].get("cn_id_card") == \
+        full["pii"]["conf_by_value"].get("cn_id_card")
+    assert ("cn_id_card" in trimmed["pii"]["value"]) == \
+        ("cn_id_card" in full["pii"]["value"])
+    assert trimmed["similarity"] == full["similarity"]
+    assert trimmed["reask"] == full["reask"]
+    other_types = [typ for typ in full["pii"]["value"] if typ != "cn_id_card"]
+    for typ in other_types:                      # expected omissions only
+        assert typ not in trimmed["pii"]["value"]
+
+
+def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
+    """④ a tree the extractor cannot reason about scores all 54 candidates."""
+    tagger = stub_tagger()
+    calls: list[int] = []
+
+    def capture(records):
+        calls.append(len(records))
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", capture)
+    weird = [Node(id="g", type="gate", branches=[
+        Branch(id="b", rows=[Row("telepathy", "yes")], action="route",
+               model="qwen3-8b")])]
+    scope = compute_signal_scope(weird)
+    assert scope.full
+    signals = tagger._model_signals(TagRequest(text="x", n_messages=2,
+                                               scope=scope))
+    assert calls == [FULL_RECORDS]
+    assert set(JUDGED_SIGNALS) <= set(signals)
+
+
+def test_hot_pipeline_edit_widens_scope_and_pack():
+    """③ a new question/candidate in the tree is picked up automatically."""
+    nodes = default_pipeline("checkpoint")
+    before = compute_signal_scope(nodes)
+    assert "fact_check" not in before.signals
+    new_node = Node(id="n-fc", type="gate", branches=[
+        Branch(id="b-fc", rows=[Row("fact_check", "needs_check", conf_min=0.5)],
+               action="route", model="qwen3-8b")])
+    after = compute_signal_scope(nodes[:-1] + [new_node] + nodes[-1:])
+    assert "fact_check" in after.signals
+    records = build_signal_records(load_question_config(), "x", after)
+    assert any(item["signal"] == "fact_check" for item in records)
+    # narrowing again (removing the node) shrinks the pack back
+    narrowed = compute_signal_scope(nodes)
+    assert "fact_check" not in narrowed.signals
+    assert len(build_signal_records(load_question_config(), "x", narrowed)) == \
+        TRIMMED_RECORDS
+
+
+def test_hot_question_config_edit_is_used_by_the_trimmed_pack():
+    """③ config edits (candidate/PII wording) flow into the trimmed render."""
+    cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
+    seen = load_question_config()
+    scope = trimmed_scope()
+
+    # Add a candidate set edit for a referenced choice signal: all its configured
+    # candidates are rendered, so a config change is visible immediately even
+    # though the tree only references health/computer_science.
+    shortened = json.loads(json.dumps(seen))
+    domain = shortened["signals"]["domain"]["candidates"]
+    keep = dict(list(domain.items())[:2])
+    shortened["signals"]["domain"]["candidates"] = keep
+    tagger = stub_tagger()
+    tagger.set_questions(shortened)      # validated exactly like the admin PUT
+    records = build_signal_records(tagger.questions, "x", scope)
+    domain_record = next(i["record"] for i in records if i["signal"] == "domain")
+    assert len(domain_record["options"]) == 2
+
+    # A PII type removed from the config cannot be asked (same as the full pack);
+    # adding it back makes the very next render include it.
+    reduced = json.loads(json.dumps(cfg))
+    reduced["signals"]["pii"]["types"].pop("cn_id_card")
+    tagger.set_questions(reduced)
+    records = build_signal_records(tagger.questions, "x", scope)
+    assert not [item for item in records if item["signal"] == "pii"]
+    tagger.set_questions(cfg)
+    records = build_signal_records(tagger.questions, "x", scope)
+    assert [item["sub"] for item in records if item["signal"] == "pii"] == \
+        ["cn_id_card"]
+
+
+def test_single_turn_user_feedback_question_is_dead_compute(monkeypatch):
+    """The single-turn user_feedback value is nulled anyway => never asked."""
+    tagger = stub_tagger()
+    calls: list[int] = []
+
+    def capture(records):
+        calls.append(len(records))
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", capture)
+    tagger._model_signals(TagRequest(text="x", n_messages=2))
+    assert calls == [FULL_RECORDS]
+    signals = tagger._model_signals(TagRequest(text="x", n_messages=1))
+    assert calls == [FULL_RECORDS, FULL_RECORDS - 1]      # user_feedback record
+    assert signals["user_feedback"] == {"value": None, "confidence": None,
+                                        "is_rule": False}
+
+
+def test_empty_scope_computes_no_model_questions(monkeypatch):
+    """A rule-only tree needs no JEV forward at all (still returns constants)."""
+    tagger = stub_tagger()
+    calls: list[list] = []
+
+    def capture(records):
+        calls.append(records)
+        return []
+
+    monkeypatch.setattr(tagger, "_score", capture)
+    signals = tagger._model_signals(TagRequest(
+        text="x", n_messages=2, scope=SignalScope()))
+    assert calls == [[]]
+    assert signals == {
+        "similarity": {"value": 0, "confidence": None, "is_rule": False},
+        "reask": {"value": "no", "confidence": None, "is_rule": False},
+    }

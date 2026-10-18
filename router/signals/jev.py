@@ -23,6 +23,16 @@ console "signal config" page edits this file. The model tolerates reworded
 questions to a small degree (measured <=1pt on the probe variants); a fully
 new template should be validated offline first.
 
+**Pipeline-aware trimming** (``TagRequest.scope``): the routing tree only reads
+the signals that appear as rows, so the hot path passes a
+:class:`router.pipeline.scope.SignalScope` and this tagger renders/scores only
+the referenced questions and PII subtypes (``docs/pipeline-aware-trimming.md``).
+``scope=None`` keeps the old full-pack behavior (``/admin/try``, eval endpoints).
+Choice signals always keep all configured candidates: trimming candidate
+options would change the argmax/entropy of the signal. The scope only skips
+questions the tree cannot read, so every value the pipeline can observe is
+computed exactly as before.
+
 torch / transformers are imported lazily so config validation and the pure
 helpers stay testable without a GPU.
 """
@@ -34,11 +44,15 @@ import json
 import logging
 import math
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from router.signals.registry import SIGNALS
 from router.signals.pii_rules import merge_rule_pii
 from router.signals.rules import rule_signals
 from router.signals.tagger import TagRequest, TagResult
+
+if TYPE_CHECKING:                            # pure-helper module: no runtime import
+    from router.pipeline.scope import SignalScope
 
 logger = logging.getLogger(__name__)
 
@@ -163,11 +177,23 @@ def candidate_prompts(record: dict) -> list[str]:
             for option in record["options"]]
 
 
-def build_signal_records(cfg: dict, text: str) -> list[dict]:
-    """Compile one request into JEV records (one per signal / PII type)."""
+def build_signal_records(cfg: dict, text: str,
+                         scope: "SignalScope | None" = None) -> list[dict]:
+    """Compile one request into JEV records (one per signal / PII type).
+
+    ``scope=None`` builds the complete pack (the pre-trimming behavior).  A
+    pipeline-derived scope drops whole questions the tree cannot read and PII
+    subtypes that are not referenced; choice signals always keep every
+    configured candidate (the signal value/confidence must match the full pack).
+    """
     signals = cfg["signals"]
+    full = scope is None or scope.full
+    wanted = None if full else scope.signals
+    pii_wanted = None if full else scope.pii_types
     out: list[dict] = []
     for key in CHOICE_SIGNALS + NOUL_SIGNALS:
+        if wanted is not None and key not in wanted:
+            continue
         entry = signals[key]
         record = {"state": text, "kind": entry["kind"]}
         if entry["kind"] == "noul":
@@ -187,13 +213,16 @@ def build_signal_records(cfg: dict, text: str) -> list[dict]:
             record["answer_keys"] = keys
         out.append({"signal": key, "sub": None, "record": record})
     pii = signals["pii"]
-    for typ, meta in pii["types"].items():
-        record = {"state": text, "kind": "noul",
-                  "question": (pii["instructions"].format(zh=meta["zh"])
-                               + f"\nYes means: {pii['true'].format(zh=meta['zh'])}"
-                               + f"\nNo means: {pii['false'].format(zh=meta['zh'])}"),
-                  "options": ["no", "yes"], "answer_keys": ["false", "true"]}
-        out.append({"signal": "pii", "sub": typ, "record": record})
+    if wanted is None or "pii" in wanted:
+        for typ, meta in pii["types"].items():
+            if pii_wanted is not None and typ not in pii_wanted:
+                continue
+            record = {"state": text, "kind": "noul",
+                      "question": (pii["instructions"].format(zh=meta["zh"])
+                                   + f"\nYes means: {pii['true'].format(zh=meta['zh'])}"
+                                   + f"\nNo means: {pii['false'].format(zh=meta['zh'])}"),
+                      "options": ["no", "yes"], "answer_keys": ["false", "true"]}
+            out.append({"signal": "pii", "sub": typ, "record": record})
     return out
 
 
@@ -321,6 +350,8 @@ class JevTagger:
 
     def _score(self, records: list[dict]) -> list[list[float]]:
         """Independent candidate probabilities per record (temperature applied)."""
+        if not records:                       # trimmed scope may drop everything
+            return []
         enc, counts = self._shrink_to_fit(records)
         if int(enc["attention_mask"].sum().item()) <= self.max_tokens_per_forward:
             return self._score_encoded(enc, counts)
@@ -369,7 +400,17 @@ class JevTagger:
         return out
 
     def _model_signals(self, req: TagRequest) -> dict:
-        records = build_signal_records(self.questions, req.text)
+        scope = req.scope
+        if scope is not None and scope.trimmed:
+            logger.debug("jev trimmed pack: signals=%s pii=%s",
+                         sorted(scope.signals), sorted(scope.pii_types))
+        records = build_signal_records(self.questions, req.text, scope)
+        # user_feedback is unconditionally overridden to null for single-turn
+        # requests below (there is no previous turn), so its questions are dead
+        # compute. Both the full and the trimmed path skip them => same result.
+        if req.n_messages <= 1:
+            records = [item for item in records
+                       if item["signal"] != "user_feedback"]
         probs = self._score([item["record"] for item in records])
         by_key: dict[str, list[tuple[dict, list[float]]]] = {}
         for item, prob in zip(records, probs):
@@ -377,7 +418,10 @@ class JevTagger:
 
         signals: dict = {}
         for key in CHOICE_SIGNALS + NOUL_SIGNALS:
-            item, prob = by_key[key][0]
+            items = by_key.get(key)
+            if not items:                     # trimmed away by the pipeline scope
+                continue
+            item, prob = items[0]
             record = item["record"]
             if key in NOUL_VALUES:
                 positive, negative = NOUL_VALUES[key]
@@ -388,18 +432,22 @@ class JevTagger:
         if req.n_messages <= 1:
             signals["user_feedback"] = {"value": None, "confidence": None,
                                         "is_rule": False}
-        # PII: one noul question per type; hits are canonical type keys.
-        hits: list[str] = []
-        conf_by_value: dict[str, float] = {}
-        for item, prob in by_key["pii"]:
-            p_yes = prob[1]
-            if p_yes >= PII_HIT_THRESHOLD:
-                hits.append(item["sub"])
-                conf_by_value[item["sub"]] = binary_entropy_confidence(p_yes)
-        signals["pii"] = {
-            "value": sorted(hits),
-            "confidence": max(conf_by_value.values()) if conf_by_value else None,
-            "conf_by_value": conf_by_value, "is_rule": False}
+        # PII: one noul question per type; hits are canonical type keys.  With a
+        # trimmed scope only the referenced subtypes were asked; merge_rule_pii
+        # (in tag()) still unions the deterministic regex hits of every type.
+        pii_items = by_key.get("pii")
+        if pii_items is not None:
+            hits: list[str] = []
+            conf_by_value: dict[str, float] = {}
+            for item, prob in pii_items:
+                p_yes = prob[1]
+                if p_yes >= PII_HIT_THRESHOLD:
+                    hits.append(item["sub"])
+                    conf_by_value[item["sub"]] = binary_entropy_confidence(p_yes)
+            signals["pii"] = {
+                "value": sorted(hits),
+                "confidence": max(conf_by_value.values()) if conf_by_value else None,
+                "conf_by_value": conf_by_value, "is_rule": False}
         # No embedding head in this mode (documented limitation).
         signals["similarity"] = {"value": 0, "confidence": None, "is_rule": False}
         signals["reask"] = {"value": "no", "confidence": None, "is_rule": False}
