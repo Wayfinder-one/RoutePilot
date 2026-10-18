@@ -7,6 +7,8 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
 RoutePilot checkpoint 的文本塔 + 新建 JEV 决策头**，在 router 进程内按 JEV 标准（context +
 typed questions + candidates → 候选概率）输出全部 7 个模型信号，提示词/候选可配；
 RoutePilot checkpoint（多头）作为可回退引擎保留，早前的 Open-Jev-2B 版本仅作对照（未部署）。
+JEV 模型的 PII 另由**确定性正则安全网**兜底（身份证校验码 + Luhn + 手机/邮箱等，见
+`router/signals/pii_rules.py`），保证 pipeline 的 `pii` 闸门对 0.8B 模型也生效。
 
 ## 架构
 
@@ -36,7 +38,7 @@ python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # JEV 模式（需要 torch/transformers/peft 与 merged 模型目录）
 ROUTER_TAGGER=jev \
-ROUTER_JEV_MODEL=/opt/smart-router-v2/models/jev_merged_08b \
+ROUTER_JEV_MODEL=/opt/smart-router-v2/models/jev_merged_08b_r3 \
 ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 .venv/bin/python -m router
 ```
@@ -77,9 +79,9 @@ docs/             设计/实施/审核/部署记录（按约定不入库，见�
 | 输入形态 | 用户请求，一次前向 | context + typed questions + candidates |
 | 可配性 | 固定 19 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
 | 信号 | 7 学习型 + embedding（similarity/reask）+ 规则 9 | 7 学习型（无 embedding）+ 规则 9 |
-| 延迟 | ~7 ms/text（batch） | ~0.30–0.42 s/请求（全部信号 54 候选 prompt） |
-| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii 弱 | domain .840/.806、jailbreak .857/.835、complexity .951/.952、fact_check .913、pii exact .445（fact_check -4pt、PII 弱，见 docs） |
-| 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged_08b`（进程内，2.3GB GPU） |
+| 延迟 | ~7 ms/text（batch） | p50 ~0.33 s / p95 ~0.40 s 每请求（全部信号 54 候选 prompt） |
+| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii 弱 | domain .846/.836、jailbreak .847/.822、complexity .951/.957、fact_check .946、pii exact .640 / micro-F1 .763（PII 仍有漏，规则安全网兜底） |
+| 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged_08b_r3`（进程内，2.3GB GPU） |
 
 训练/数据/蒸馏代码与完整指标在子仓库 **RoutePilot-train**：
 `results/bilingual/README.md`、`results/jev_distill/README.md`、`docs/*/jev-distill.md`。
@@ -88,7 +90,7 @@ docs/             设计/实施/审核/部署记录（按约定不入库，见�
 
 ```bash
 # 76 上（已带 admin token / litestream / 模型目录）
-SR_TAGGER=jev SR_JEV_MODEL=/opt/smart-router-v2/models/jev_merged_08b \
+SR_TAGGER=jev SR_JEV_MODEL=/opt/smart-router-v2/models/jev_merged_08b_r3 \
 SR_SIGNAL_QUESTIONS=/opt/smart-router-v2/configs/signal_questions.json \
 SR_ADMIN_TOKEN=... SR_PYTHON=/root/jev-2b/venv/bin/python \
 SR_DEVICE=cuda:0 bash scripts/deploy-76.sh
@@ -99,7 +101,7 @@ SR_DEVICE=cuda:0 bash scripts/deploy-76.sh
 
 ## 文档（本地 `docs/`，按约定不入库）
 
-- `docs/部署到76.md` — 76 部署/验证/回滚（含 2026-10-17 JEV 第四轮上线记录）
+- `docs/部署到76.md` — 76 部署/验证/回滚（含 2026-10-17 JEV 上线与 2026-10-18 r3 + PII 安全网记录）
 - `docs/JEV-接入与部署记录-2026-10-17.md` — JEV 主模型接入的完整记录
 - `docs/Smart-Router-v2-实现与部署记录.md` — 实现、偏差清单、测试与部署证据
 - `docs/Smart-Router-v2-设计方案.md` / `实施计划` — 设计与计划基线
