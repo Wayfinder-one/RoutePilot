@@ -82,10 +82,15 @@ def _install_admin_auth(app: FastAPI, token: str) -> None:
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None
                ) -> FastAPI:
-    # prompt mode also produces full-range model confidences => use the
-    # checkpoint calibration (same thresholds) until it has its own numbers
-    calibration = ("checkpoint" if settings.tagger in ("checkpoint", "prompt")
-                   else "heuristic")
+    # Seed thresholds follow the tagger's confidence scale: JEV (r4b2, T=3.0)
+    # has its own calibrated set; checkpoint/prompt share the checkpoint numbers;
+    # heuristic caps confidences at 0.5 and keeps the low preset.
+    if settings.tagger == "jev":
+        calibration = "jev"
+    elif settings.tagger in ("checkpoint", "prompt"):
+        calibration = "checkpoint"
+    else:
+        calibration = "heuristic"
     conn = connect(settings.db_path)
     migrate(conn)
     seed_default(conn, calibration)

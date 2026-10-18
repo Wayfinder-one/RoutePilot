@@ -54,6 +54,13 @@ CALIBRATIONS = {
                   "medical_b": 0.45, "medical_s": 0.40, "cs": 0.45},
     "checkpoint": {"jailbreak": 0.99, "pii": 0.60, "keyword": 0.5,
                    "medical_b": 0.55, "medical_s": 0.45, "cs": 0.55},
+    # JEV r4b2 (T=3.0, deployed 2026-10-18).  The temperature change moves the
+    # confidence scale: jailbreak 0.35 (r3/T=1.4) -> 0.15 measured P .898 /
+    # R .759 on the en+zh test split (n=1074); pii cn_id_card keeps 0.30 because
+    # the deterministic rule layer guarantees the gate fires (rule hits use
+    # confidence 1.0).  Other thresholds are the deployed pipeline's.
+    "jev": {"jailbreak": 0.15, "pii": 0.30, "keyword": 0.5,
+            "medical_b": 0.55, "medical_s": 0.45, "cs": 0.55},
 }
 
 
