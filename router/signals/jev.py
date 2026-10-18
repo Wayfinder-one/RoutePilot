@@ -36,6 +36,7 @@ import math
 from pathlib import Path
 
 from router.signals.registry import SIGNALS
+from router.signals.pii_rules import merge_rule_pii
 from router.signals.rules import rule_signals
 from router.signals.tagger import TagRequest, TagResult
 
@@ -396,6 +397,7 @@ class JevTagger:
         signals, vec = await asyncio.to_thread(self._tag_row, req)
         signals.update(rule_signals(req.text, req.headers, req.n_messages,
                                     self.kw_groups))
+        merge_rule_pii(signals, req.text)
         return TagResult(signals=signals, vec=vec)
 
     async def aclose(self) -> None:

@@ -142,6 +142,26 @@ def test_single_turn_nulls_user_feedback(monkeypatch):
                                         "is_rule": False}
 
 
+def test_tag_merges_rule_pii_safety_net(monkeypatch):
+    """The deterministic PII rules fill in what the 0.8B model misses."""
+    tagger = stub_tagger()
+
+    def all_negative(records):
+        out = []
+        for record in records:
+            n = len(record["answer_keys"])
+            out.append([1.0 / n] * n if record["kind"] == "choice"
+                       else [0.9, 0.1])
+        return out
+
+    monkeypatch.setattr(tagger, "_score", all_negative)
+    result = asyncio.run(tagger.tag(TagRequest(
+        text="帮我核对身份证号 11010519491231002X 的信息", n_messages=1)))
+    pii = result.signals["pii"]
+    assert "cn_id_card" in pii["value"]
+    assert pii["conf_by_value"]["cn_id_card"] == 1.0
+
+
 def test_tag_merges_rule_signals(monkeypatch):
     tagger = stub_tagger()
     monkeypatch.setattr(tagger, "_score", probs_for)

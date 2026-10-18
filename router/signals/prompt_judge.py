@@ -29,6 +29,7 @@ from pathlib import Path
 import httpx
 
 from router.signals.registry import SIGNALS
+from router.signals.pii_rules import merge_rule_pii
 from router.signals.rules import rule_signals
 from router.signals.tagger import TagRequest, TagResult
 
@@ -283,6 +284,7 @@ class PromptJudgeTagger:
                                        "is_rule": False}
         judged.update(rule_signals(req.text, req.headers, req.n_messages,
                                    self.kw_groups))
+        merge_rule_pii(judged, req.text)
         # this mode has no embedding => report "no session history"
         judged["similarity"] = {"value": 0, "confidence": None, "is_rule": False}
         judged["reask"] = {"value": "no", "confidence": None, "is_rule": False}

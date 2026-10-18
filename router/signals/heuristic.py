@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import re
 
-from router.signals.rules import CJK_RE, count_words, rule_signals
+from router.signals.pii_rules import rule_pii_hits
+from router.signals.rules import (CJK_RE, count_words, rule_signals)
 from router.signals.tagger import TagRequest, TagResult
 
 DOM_KW = {
@@ -40,13 +41,6 @@ FACT_KW = ["最新", "新闻", "股价", "汇率", "靠谱", "真假"]
 JB_RE = re.compile(
     r"ignore (all |previous )?instructions|忽略(之前|所有|以上)?的?指令|越狱|jailbreak",
     re.IGNORECASE)
-PII_RE = {
-    "cn_id_card": re.compile(r"\d{17}[\dXx]"),
-    "phone_number": re.compile(r"1[3-9]\d{9}"),
-    "cn_bank_card": re.compile(r"(?<!\d)\d{16,19}(?!\d)"),
-    "email_address": re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"),
-    "password": re.compile(r"(密码|口令|password|pwd)\s*[:：为是]", re.IGNORECASE),
-}
 IMG_KW = ["画", "海报", "图片", "插图", "配图", "draw", "image", "picture"]
 CAP = 0.5  # degraded-mode confidence cap
 
@@ -89,7 +83,7 @@ class HeuristicTagger:
         img = any(w in low for w in IMG_KW)
         s["modality"] = _sig("image" if img else "text", 0.4 if img else None, False)
         # pii: per-type presence
-        pii = [k for k, r in PII_RE.items() if r.search(text)]
+        pii = rule_pii_hits(text)
         s["pii"] = _sig(pii, CAP if pii else None, False)
         # session signals: single-turn request has no history
         s["user_feedback"] = _sig(None, None, False)
