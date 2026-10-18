@@ -78,18 +78,24 @@ docs/             设计/实施/审核/部署记录（按约定不入库，见�
 | 输入形态 | 用户请求，一次前向 | context + typed questions + candidates |
 | 可配性 | 固定 19 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
 | 信号 | 7 学习型 + embedding（similarity/reask）+ 规则 9 | 7 学习型（无 embedding）+ 规则 9 |
-| 延迟 | ~7 ms/text（batch） | p50 ~0.33 s / p95 ~0.40 s 每请求（全部信号 54 候选 prompt） |
-| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii macro-F1 .17 | domain .846/.836、jailbreak .847/.822、complexity .951/.957、fact_check .946、pii exact .640 / micro-F1 .763 |
-| 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged_08b_r3`（进程内，2.3GB GPU） |
+| 延迟 | ~7 ms/text（batch） | 全量 54 候选 p50 **113 ms**；线上树裁剪到 4 信号/17 候选后 p50 **64 ms**（`_tag_row`，76 GPU） |
+| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii macro-F1 .17 | domain .810、jailbreak .874、complexity .964、fact_check .934、user_feedback .898、PII micro-F1 .874（r4b2，官方 JEV test .869） |
+| 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged_08b_r4b2`（T=3.0，进程内，2.7GB GPU；r3 目录保留可一行回滚） |
 
 **JEV 版 vs semantic-router（test，en）**
 
-| 信号 | JEV 版 | semantic-router |
+| 信号 | JEV 版（r4b2） | semantic-router |
 |---|---|---|
-| domain | 0.846 | 0.9423 |
-| jailbreak | 0.847 | 0.7267 |
-| fact_check | 0.946 | 0.8188 |
-| user_feedback | 0.960 | 0.1749 |
+| domain | 0.810 | 0.9423 |
+| jailbreak | 0.874 | 0.7267 |
+| fact_check | 0.934 | 0.8188 |
+| user_feedback | 0.898 | 0.1749 |
+
+**JEV 线上热路径裁剪（2026-10-18）**：`/v1` 按当前 pipeline 树只计算会被读取的问题
+（当前树 = jailbreak + pii.cn_id_card + domain + complexity，4 records / 17 candidates），
+`/admin/try` 与 eval 入口保持全量；`ROUTER_JEV_TRIM=0` 一键回退。r4b2 的 T=3.0 使置信度
+分布上移，线上 `jailbreak` 门限已由 0.35 重标到 **0.15**（P .898 / R .759，n=1074），
+PII 仍由确定性规则兜底。
 
 训练/数据/蒸馏代码与完整指标在子仓库 **RoutePilot-train**：
 `results/bilingual/README.md`、`results/jev_distill/README.md`、`docs/*/jev-distill.md`。
