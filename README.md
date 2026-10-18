@@ -7,8 +7,7 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
 RoutePilot checkpoint 的文本塔 + 新建 JEV 决策头**，在 router 进程内按 JEV 标准（context +
 typed questions + candidates → 候选概率）输出全部 7 个模型信号，提示词/候选可配；
 RoutePilot checkpoint（多头）作为可回退引擎保留，早前的 Open-Jev-2B 版本仅作对照（未部署）。
-JEV 模型的 PII 另由**确定性正则安全网**兜底（身份证校验码 + Luhn + 手机/邮箱等，见
-`router/signals/pii_rules.py`），保证 pipeline 的 `pii` 闸门对 0.8B 模型也生效。
+PII 信号另有确定性正则补充（`router/signals/pii_rules.py`）。
 
 ## 架构
 
@@ -80,8 +79,17 @@ docs/             设计/实施/审核/部署记录（按约定不入库，见�
 | 可配性 | 固定 19 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
 | 信号 | 7 学习型 + embedding（similarity/reask）+ 规则 9 | 7 学习型（无 embedding）+ 规则 9 |
 | 延迟 | ~7 ms/text（batch） | p50 ~0.33 s / p95 ~0.40 s 每请求（全部信号 54 候选 prompt） |
-| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii 弱 | domain .846/.836、jailbreak .847/.822、complexity .951/.957、fact_check .946、pii exact .640 / micro-F1 .763（PII 仍有漏，规则安全网兜底） |
+| 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii macro-F1 .17 | domain .846/.836、jailbreak .847/.822、complexity .951/.957、fact_check .946、pii exact .640 / micro-F1 .763 |
 | 部署位置 | 76 主机 checkpoint 目录 | `/opt/smart-router-v2/models/jev_merged_08b_r3`（进程内，2.3GB GPU） |
+
+**JEV 版 vs semantic-router（test，en）**
+
+| 信号 | JEV 版 | semantic-router |
+|---|---|---|
+| domain | 0.846 | 0.9423 |
+| jailbreak | 0.847 | 0.7267 |
+| fact_check | 0.946 | 0.8188 |
+| user_feedback | 0.960 | 0.1749 |
 
 训练/数据/蒸馏代码与完整指标在子仓库 **RoutePilot-train**：
 `results/bilingual/README.md`、`results/jev_distill/README.md`、`docs/*/jev-distill.md`。
