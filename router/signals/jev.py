@@ -308,13 +308,23 @@ class JevTagger:
         logger.warning("JEV input still too long after shrinking; token-truncated")
         return enc, counts
 
-    #: cap on candidate prompts per forward pass (keeps peak KV memory bounded
-    #: when a request is long: at most ``max_prompts_per_forward * max_length``
-    #: tokens are attended at once).
+    #: Fallback chunking for very long inputs: at most this many candidate
+    #: prompts per forward pass. The normal path (one signal pack) is ~54
+    #: prompts / ~4k tokens and is scored in a single forward: chunking it into
+    #: 4 sequential forwards cost ~4x the latency (measured on 76: 288ms -> ~70ms
+    #: for the 0.8B JEV model).
     max_prompts_per_forward = 16
+
+    #: Token budget for the single-forward fast path. Longer requests fall back
+    #: to chunked forwards so peak attention memory stays bounded.
+    max_tokens_per_forward = 12000
 
     def _score(self, records: list[dict]) -> list[list[float]]:
         """Independent candidate probabilities per record (temperature applied)."""
+        enc, counts = self._shrink_to_fit(records)
+        if int(enc["attention_mask"].sum().item()) <= self.max_tokens_per_forward:
+            return self._score_encoded(enc, counts)
+        # long request: fall back to bounded chunks (same math, more forwards)
         groups: list[list[dict]] = []
         current: list[dict] = []
         count = 0
@@ -329,12 +339,11 @@ class JevTagger:
             groups.append(current)
         out: list[list[float]] = []
         for group in groups:
-            out.extend(self._score_group(group))
+            out.extend(self._score_encoded(*self._shrink_to_fit(group)))
         return out
 
-    def _score_group(self, records: list[dict]) -> list[list[float]]:
+    def _score_encoded(self, enc, counts: list[int]) -> list[list[float]]:
         torch = self._torch
-        enc, counts = self._shrink_to_fit(records)
         enc = {k: v.to(self.device) for k, v in enc.items()}
         with torch.inference_mode():
             outputs = self.backbone(**enc, use_cache=False, return_dict=True)
@@ -342,14 +351,20 @@ class JevTagger:
             idx = torch.arange(len(lengths), device=self.device)
             hidden = outputs.last_hidden_state[idx, lengths - 1]
             scores = self.head(hidden.float()).squeeze(-1)
+            # One host copy, then decode on the CPU. Per-record GPU work here
+            # (slices/syncs for 36 records, 30 of them noul single-logit rows)
+            # cost ~100ms of driver sync latency on the 0.8B JEV path.
+            scores_cpu = scores.cpu().tolist()
+        temperature = max(self.temperature, 1e-6)
         out: list[list[float]] = []
         offset = 0
         for count in counts:
-            values = scores[offset:offset + count]
-            if count == 1:   # noul: fixed no-logit 0 plus the yes logit
-                values = torch.stack([torch.zeros_like(values[0]), values[0]])
-            probs = torch.softmax(values / max(self.temperature, 1e-6), dim=-1)
-            out.append([float(x) for x in probs.cpu().tolist()])
+            values = ([0.0, scores_cpu[offset]] if count == 1
+                      else scores_cpu[offset:offset + count])
+            top = max(values)
+            exps = [math.exp((value - top) / temperature) for value in values]
+            total = sum(exps)
+            out.append([value / total for value in exps])
             offset += count
         return out
 
