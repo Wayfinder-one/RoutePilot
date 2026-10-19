@@ -424,12 +424,16 @@ function toast(msg, undo) {
   }
 }
 
-/* ── mutations (all dirty + undoable) ────────────────────────────────── */
+/* ── mutations (undoable; dirty is content-based) ────────────────────── */
+let savedJson = null;            // server state as of boot / last save
+
+const currentJson = () => JSON.stringify(nodes.map(cleanNode));
 function markDirty() {
-  dirty = true;
+  // undo often restores the saved content exactly — compare, don't assume
+  dirty = savedJson == null || currentJson() !== savedJson;
   const dp = $('#dirtyPill');
-  dp.className = 'pill warn';
-  dp.textContent = t('pipe.dirty');
+  dp.className = 'pill ' + (dirty ? 'warn' : 'ok');
+  dp.textContent = dirty ? t('pipe.dirty') : t('pipe.clean');
 }
 
 function addNode(key) {
@@ -1366,6 +1370,7 @@ async function save() {
     showIssues([], '#issues');
     showIssues(out.warnings || [], '#warnings');
     version = String(out.version != null ? out.version : version);
+    savedJson = currentJson();      // baseline moves with the saved content
     dirty = false;
     renderHeader();
     toast(t('common.saved'));
@@ -1398,6 +1403,8 @@ async function boot() {
     }));
     version = String(pipeBody.version || '0');
     tagger = tagBody.tagger || {};
+    savedJson = currentJson();      // clean baseline: undo can return here
+    dirty = false;
     renderAll();
   } catch (e) {
     showIssues([{ zh: '加载失败: ' + (e.detail || e.message), en: 'load failed: ' + (e.detail || e.message) }], '#issues');
