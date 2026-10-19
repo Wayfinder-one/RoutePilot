@@ -348,7 +348,8 @@ function addChild(nodeId, signal, value) {
   if (!ref) return;
   const { station, node } = ref;
   const snapshot = JSON.parse(JSON.stringify(node));
-  if (node.kind === 'leaf') {
+  const becameFork = node.kind === 'leaf';
+  if (becameFork) {
     node.kind = 'fork';
     node.action = 'route';
     node.model = null;
@@ -361,7 +362,9 @@ function addChild(nodeId, signal, value) {
   markDirty();
   renderStation(station.id);
   flashNode(node.children[node.children.length - 1].id);
-  toast(tf('p6.toastChildAdded', { name: sigName(signal) }), () => {
+  toast(becameFork
+    ? tf('p6.leafBecameFork', { name: condText(node) })
+    : tf('p6.toastChildAdded', { name: sigName(signal) }), () => {
     const back = findNodeRef(nodeId);
     if (!back) return;
     Object.assign(back.node, snapshot);
@@ -1108,7 +1111,9 @@ function stepText(s) {
   const conf = (s.conf === 1.0 && s.conf_min == null)
     ? t('p4.deterministic')
     : pct(s.conf) + (s.conf_min != null ? ' ' + t('p4.confFloor') + Number(s.conf_min).toFixed(2) : '');
-  return `${sigName(s.signal)} = ${esc(valLabel(s.signal, s.value) || s.value)} · ${esc(conf)}${s.pass ? '' : ' · ' + t('p4.cut')}`;
+  const why = s.pass ? ''
+    : (s.m === 0 ? ' · ' + t('p6.notMatched') : ' · ' + t('p4.cut'));
+  return `${sigName(s.signal)} = ${esc(valLabel(s.signal, s.value) || s.value)} · ${esc(conf)}${why}`;
 }
 function renderTry() {
   const out = $('#simOut');
@@ -1139,7 +1144,11 @@ function renderTry() {
            <span class="mono">score ${Number(b.score).toFixed(2)} ≥ ${Number(b.min_score).toFixed(2)}</span>
            <span class="mono">${b.passed ? t('p6.passed') : t('p6.failed')}</span></div>`).join('')}</div>`;
     }
-    if (!body) body = `<div class="pstep cut">${esc(t('p4.noGroupMatch'))}</div>`;
+    if (!body) {
+      body = hit
+        ? `<div class="pstep">${esc(t('p6.traceUncondHit'))}</div>`
+        : `<div class="pstep cut">${esc(t('p6.traceNoMatch'))}</div>`;
+    }
     html += `<div class="pstep" style="align-items:flex-start;flex-direction:column">
         <div style="display:flex;gap:7px;align-items:center;width:100%">
           <span class="mono">${i + 1}</span><b>${esc(r.name || r.station_id)}</b>

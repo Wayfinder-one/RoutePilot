@@ -99,15 +99,23 @@ def _eval_node(station: Station, node: TreeNode, signals: dict,
         return _leaf_decision(station, node, signals, path, board)
 
     matched = []
+    failed_step = None      # first child whose condition did not match
+    failed_cut = None       # first child that matched but sat below its floor
     for child in node.children:
         ok, step, cut = _condition_ok(child, signals)
         if not ok:
-            if cut and "path" not in miss:
-                miss["path"] = path + [step]
+            if failed_step is None:
+                failed_step = step
+            if cut and failed_cut is None:
+                failed_cut = step
             continue
         child_path = path + [s for s in (step,) if s]
         matched.append((child, child_path))
     if not matched:
+        if "path" not in miss:
+            step = failed_cut or failed_step
+            if step is not None:
+                miss["path"] = path + [step]
         return None
 
     # Ordered traversal: the first matching child that yields a decision wins.
@@ -118,6 +126,13 @@ def _eval_node(station: Station, node: TreeNode, signals: dict,
         if d is not None:
             decisions.append(d)
     if not decisions:
+        # children matched but none produced a decision: keep the deepest
+        # failure (recorded by the recursion); otherwise show the first child
+        # that did not even match, so the console can point at it.
+        if "path" not in miss:
+            step = failed_cut or failed_step
+            if step is not None:
+                miss["path"] = path + [step]
         return None
     scored = [d for d in decisions if d.score is not None]
     if scored:
