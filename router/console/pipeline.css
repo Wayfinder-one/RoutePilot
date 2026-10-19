@@ -224,31 +224,9 @@ body[data-page="pipeline"] .headmeta{position:relative;z-index:1}
 .t4 .out.todo{color:var(--t4-ink-3);background:var(--t4-wash);border:1px dashed var(--t4-line-2)}
 .t4 .out:hover{filter:brightness(.985)}
 
-/* 分流节点：组标题 + 树形几何。竖脊四种位置 + 横肘，线必须闭合：
-   父横肘端点 = 子竖脊起点，同一 x 相交。 */
-.t4 .gbody{position:relative;margin-left:0;padding-left:16px}
-.t4 .tnode{position:relative}
-.t4 .tnode::before{
-  content:"";position:absolute;left:-16px;top:0;bottom:0;width:1px;background:var(--t4-line)
-}
-.t4 .tnode::after{
-  content:"";position:absolute;left:-16px;width:16px;height:1px;background:var(--t4-line)
-}
-.t4 .tnode.grp::after{top:17px}
-.t4 .tnode.leaf::after{top:22px}
-.t4 .gbody:not(.groot) > .tnode:first-child::before{top:-17px}
-.t4 .tnode:last-child::before{bottom:auto;height:17px}
-.t4 .tnode.leaf:last-child::before{bottom:auto;height:22px}
-.t4 .gbody:not(.groot) > .tnode:only-child::before{top:-17px;height:34px}
-.t4 .gbody:not(.groot) > .tnode.leaf:only-child::before{top:-17px;height:39px}
-.t4 .gbody.groot > .tnode:first-child::before{top:17px}
-.t4 .gbody.groot > .tnode.leaf:first-child::before{top:22px}
-.t4 .tnode.leaf{padding:4px 0}
-.t4 .tnode.leaf .branch{
-  border:1px solid var(--t4-line);border-radius:10px;background:#fff;
-  padding:9px 13px 9px 14px;min-height:44px
-}
-.t4 .tnode.leaf .branch:hover{border-color:var(--t4-line-2)}
+/* 旧「推导树」的组/节点样式已随模型重构删除（2026-10-19）：只保留显式树用到的
+   .ghead/.gdet 之类会在下面不再使用；这里整段清空以免残留的 ::before 高度规则
+   把新树形肘线撑成方块。 */
 .t4 .ghead{
   display:flex;align-items:center;gap:7px;height:34px;padding:0 10px 0 0;
   font-size:11.5px;border-radius:8px;transition:background .2s
