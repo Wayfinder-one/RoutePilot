@@ -1,7 +1,7 @@
 {
   "version": 1,
-  "max_length": 512,
-  "notes": "JEV-style signal questions. Editable: instructions/candidate descriptions are the prompt configuration; changing them without retraining may lower accuracy.",
+  "max_length": 1024,
+  "notes": "Canonical JEV questions for the deployed r4b3 model. Runtime renders only instructions[0] of each signal; r4b3 is calibrated on that canonical wording (trained on 3 variants; unseen rewordings drift up to ~5pt macro, user_feedback is the most wording-sensitive signal). Candidate order is free. max_length here is informational: the JevTagger uses model.json / ROUTER_JEV_MAX_LENGTH (1024).",
   "signals": {
     "domain": {
       "kind": "choice",

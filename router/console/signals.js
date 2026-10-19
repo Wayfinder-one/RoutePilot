@@ -60,7 +60,8 @@ function instrHtml(k, s) {
       <span class="mono mut" style="padding-top:9px">${i + 1}</span>
       <textarea data-instr="${esc(k)}|${i}">${esc(txt)}</textarea>
       <button class="del" data-del-instr="${esc(k)}|${i}" title="${t('common.delete')}">✕</button>
-    </div>`).join('')}
+    </div>
+    ${i === 0 ? `<div class="footnote" style="margin:-2px 0 8px 22px">${t('sig.instrLive')}</div>` : ''}`).join('')}
     <button class="btn dashed sm" data-add-instr="${esc(k)}" style="width:100%;justify-content:center">${t('sig.addVariant')}</button>
   </div>`;
 }
@@ -234,8 +235,16 @@ function exportJson() {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
+function renderWarn() {
+  const el = $('#canonicalWarn');
+  if (!el) return;
+  const show = meta.name === 'jev';
+  el.style.display = show ? '' : 'none';
+  if (show) el.textContent = t('sig.canonicalWarn');
+}
+
 function renderAll() {
-  renderHeader(); renderList(); renderEditor();
+  renderHeader(); renderWarn(); renderList(); renderEditor();
 }
 
 $('#sigList').addEventListener('click', e => {

@@ -5,7 +5,8 @@ JEV standard: a shared context (the user request) plus **typed questions**
 scored by one model that returns a probability per candidate — no text
 generation and no JSON parsing. The model is the merged single-model export
 produced by the training repo (``scripts/14_export_jev_merged.py``): the
-Open-Jev-2B backbone with its LoRA merged in plus the scalar decision head.
+Qwen3.5-0.8B backbone with its LoRA merged in plus the scalar decision head
+(deployed: r4b3, ``temperature.json`` = 3.0, ``model.json`` max_length 1024).
 
 This module keeps the same contracts as :class:`CheckpointTagger`:
 
@@ -19,9 +20,19 @@ This module keeps the same contracts as :class:`CheckpointTagger`:
 
 The question wording is a JSON config (``configs/signal_questions.json`` or
 ``ROUTER_SIGNAL_QUESTIONS``) that can be edited without code changes — the
-console "signal config" page edits this file. The model tolerates reworded
-questions to a small degree (measured <=1pt on the probe variants); a fully
-new template should be validated offline first.
+console "signal config" page edits this file. Only the **first** wording of a
+signal (``instructions[0]``) is rendered at runtime; the other list entries are
+kept as documentation of the training paraphrases and are not scored.
+
+**Use the canonical wording.** r4b3 was trained on three wording variants per
+question, but only the canonical one (training ``r4_questions.json`` variant
+``0``, byte-identical to this config's first entry) is the calibrated hot path:
+unseen rewordings drift by up to ~5pt macro and ``user_feedback`` is the most
+wording-sensitive signal (canonical .802 vs .945 reworded). Do not paraphrase
+``instructions[0]`` without re-running the eval (``results/jev_r4/README.md`` in
+the training repo). Candidate order is free; input length is capped by
+``model.json`` / ``ROUTER_JEV_MAX_LENGTH`` (1024) and longer requests have their
+context shrunk (last resort: token-truncated) instead of failing.
 
 **Pipeline-aware trimming** (``TagRequest.scope``): the routing tree only reads
 the signals that appear as rows, so the hot path passes a
