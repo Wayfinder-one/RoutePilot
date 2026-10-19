@@ -121,6 +121,8 @@ function renderHeader() {
   $('#taggerPill').innerHTML = LANG === 'zh'
     ? `引擎 <b>${esc(tagger.name || '?')}</b>`
     : `engine <b>${esc(tagger.name || '?')}</b>`;
+  $('#exportPipeline').title = t('p4.exportTitle');
+  $('#importPipeline').title = t('p4.importTitle');
   $('#taggerPill').title = tagger.model_dir || '';
   const dp = $('#dirtyPill');
   dp.className = 'pill ' + (dirty ? 'warn' : 'ok');
@@ -1364,6 +1366,91 @@ function showIssues(list, boxId) {
   }).join('');
 }
 
+/* ── export / import (config as code; SQLite stays the store of record) ── */
+function exportPipeline() {
+  const body = {
+    version,
+    exported_at: new Date().toISOString(),
+    nodes: nodes.map(cleanNode),
+  };
+  const blob = new Blob([JSON.stringify(body, null, 2) + '\n'],
+                        { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `pipeline-v${version}.json`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+  toast(tf('p4.exportOk', { name: a.download }));
+}
+
+/* Accept either {"nodes":[…]} (what export writes / GET returns) or a bare
+   node array. Shape errors name the offending node/branch so a hand-edited
+   file is easy to fix. The server still runs the full health check on save. */
+function normalizeImported(raw) {
+  const list = Array.isArray(raw) ? raw
+    : (raw && Array.isArray(raw.nodes) ? raw.nodes : null);
+  if (!list) throw new Error(t('p4.importNoNodes'));
+  const nodeIds = new Set();
+  const branchIds = new Set();
+  return list.map((n, i) => {
+    const where = t('p4.importRow') + ' #' + (i + 1);
+    if (!n || typeof n !== 'object') throw new Error(where);
+    if (!['gate', 'score', 'split'].includes(n.type))
+      throw new Error(where + ': type=' + n.type);
+    if (!Array.isArray(n.branches)) throw new Error(where + ': branches');
+    let id = String(n.id || nid('n'));
+    if (nodeIds.has(id)) throw new Error(where + ': duplicate id ' + id);
+    nodeIds.add(id);
+    return {
+      id, type: n.type, name: String(n.name || ''),
+      floor: n.type === 'split' && n.floor != null ? Number(n.floor) : null,
+      split_signal: n.type === 'split' ? (n.split_signal || null) : null,
+      branches: n.branches.map((b, j) => {
+        const bwhere = where + ' / ' + t('p4.importBranch') + ' #' + (j + 1);
+        if (!b || typeof b !== 'object') throw new Error(bwhere);
+        if (!Array.isArray(b.rows)) throw new Error(bwhere + ': rows');
+        let bid = String(b.id || nid('b'));
+        if (branchIds.has(bid)) throw new Error(bwhere + ': duplicate id ' + bid);
+        branchIds.add(bid);
+        return {
+          id: bid, name: String(b.name || ''),
+          action: b.action === 'block' ? 'block' : 'route',
+          model: b.model || null,
+          min_score: b.min_score != null ? Number(b.min_score) : null,
+          rows: b.rows.map((r, k) => {
+            if (!r || typeof r.signal !== 'string')
+              throw new Error(bwhere + ' / ' + t('p4.importCond') + ' #' + (k + 1));
+            return {
+              signal: r.signal,
+              value: r.value == null ? '' : String(r.value),
+              weight: r.weight != null ? Number(r.weight) : null,
+              conf_min: r.conf_min != null ? Number(r.conf_min) : null,
+            };
+          }),
+        };
+      }),
+    };
+  });
+}
+
+async function importPipeline(file) {
+  try {
+    const raw = JSON.parse(await file.text());
+    const imported = normalizeImported(raw);
+    if (!imported.length) throw new Error(t('p4.importEmpty'));
+    nodes.length = 0;
+    imported.forEach(n => nodes.push(n));
+    markDirty();               // baseline unchanged: save is still required
+    renderAll();               // whole-document replace is what import IS
+    toast(tf('p4.importOk', { n: imported.length }));
+  } catch (e) {
+    toast(tf('p4.importBad', { err: e.message }));
+  } finally {
+    $('#importFile').value = '';
+  }
+}
+
 async function save() {
   try {
     const out = await api.put('/admin/pipeline', { nodes: nodes.map(cleanNode) });
@@ -1422,6 +1509,12 @@ function renderAll() {
 
 /* ── wiring ──────────────────────────────────────────────────────────── */
 $('#savePipeline').addEventListener('click', save);
+$('#exportPipeline').addEventListener('click', exportPipeline);
+$('#importPipeline').addEventListener('click', () => $('#importFile').click());
+$('#importFile').addEventListener('change', e => {
+  const file = e.target.files && e.target.files[0];
+  if (file) importPipeline(file);
+});
 $('#openSim').addEventListener('click', openSim);
 $('#simClose').addEventListener('click', closeSim);
 $('#simMask').addEventListener('click', closeSim);
