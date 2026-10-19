@@ -159,16 +159,6 @@ function syncPalHint() {
   if (mode === 'pick' && pick.signal) {
     el.classList.add('active');
     el.textContent = tf('p4.hintPicked', { name: sigName(pick.signal) });
-  } else if (mode === 'pick' && pick.node) {
-    el.classList.add('active');
-    const n = findNode(pick.node) || {};
-    const path = n.type === 'split' ? firstPath(n) : [];
-    el.textContent = path.length
-      ? tf('p4.hintNewBranchAt', {
-          name: nodeName(n),
-          path: path.map(p => valLabel(p.signal, p.value) || t('p4.pending')).join(' → '),
-        })
-      : tf('p4.hintNewBranch', { name: nodeName(n) });
   } else if (mode === 'drag' && dragSig) {
     el.classList.add('active');
     el.textContent = tf('p4.hintDragging', { name: sigName(dragSig) });
@@ -665,7 +655,7 @@ function addBranchFrom(branchId) {
   else cloneBranch(node, branch, last.signal);
 }
 
-function createBranch(nodeId, signalKey) {
+function addBranchWithValue(nodeId, signalKey, value) {
   const node = findNode(nodeId);
   if (!node) return;
   const spec = sigSpec(signalKey);
@@ -674,14 +664,14 @@ function createBranch(nodeId, signalKey) {
     // new branches land at the end of the first path's last group
     firstPath(node).forEach(p => rows.push({ signal: p.signal, value: p.value }));
   }
-  // the picked signal may already be inherited from the path: re-target that
-  // row instead of appending a duplicate signal (keeps one row per signal)
+  // one row per signal: retarget an inherited signal instead of duplicating it
   const inherited = rows.find(r => r.signal === signalKey);
-  if (inherited) inherited.value = '';
-  else rows.push(newEmptyRow(node.type, signalKey));
+  if (inherited) inherited.value = value;
+  else rows.push({ signal: signalKey, value });
+  const label = isFreeSig(signalKey) ? String(value)
+    : (valLabel(signalKey, value) || sigName(signalKey));
   const b = {
-    id: nid('b'),
-    name: (LANG === 'zh' ? spec.zh : (spec.en || spec.zh)) + ' ' + t('p4.branchWord'),
+    id: nid('b'), name: label + ' ' + t('p4.branchWord'),
     action: 'route', model: MODELS[0] || '', rows,
   };
   if (node.type !== 'gate') b.min_score = 0.5;
@@ -691,7 +681,6 @@ function createBranch(nodeId, signalKey) {
   renderStation(node.id);
   syncPaletteUsed();
   flashBranch(b.id);
-  openRowEditor(b.id + ':' + rows.findIndex(r => r.signal === signalKey));
   toast(tf('p4.toastBranchAdded', { name: branchName(b) }), () => {
     node.branches = node.branches.filter(x => x.id !== b.id);
     markDirty();
@@ -805,20 +794,6 @@ function setPickSignal(key) {
   syncPickA11y();
   syncPaletteSelection();
   syncPalHint();
-}
-function setPickNode(nodeId) {
-  pick.node = nodeId;
-  mode = 'pick';
-  $('#flow').classList.add('picking');
-  setPalOpen(true);
-  syncPickA11y();
-  syncPaletteSelection();
-  syncPalHint();
-  const node = findNode(nodeId);
-  const path = node && node.type === 'split' ? firstPath(node) : [];
-  toast(path.length
-    ? tf('p4.toastPickSignalAt', { path: path.map(p => valLabel(p.signal, p.value) || t('p4.pending')).join(' → ') })
-    : t('p4.toastPickSignal'));
 }
 
 /* ── popovers ────────────────────────────────────────────────────────── */
@@ -1049,63 +1024,111 @@ function openLevelEditor(nodeId) {
 
 /* new split node: every enumerable signal is a candidate (§8.4) */
 function openNewNode() {
-  popTarget = { kind: 'new' };
-  renderNewNodeSignals();
-}
-
-/* Step 1: which signal roots this node. */
-function renderNewNodeSignals() {
-  const pop = $('#pop');
-  pop.hidden = false;
-  pop.innerHTML = `
-    <div class="pop-head">
-      <b>${esc(t('p4.newSplitNode'))}</b><span class="sub">${esc(t('p4.beforeFallback'))}</span>
-      <button class="pop-x" data-popclose aria-label="${esc(t('common.close'))}">
-        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
-      </button>
-    </div>
-    <p class="pop-label">${esc(t('p4.forkBy'))}</p>
-    <div class="pop-vals" id="nnSigs">
-      ${Object.values(SIG).filter(s => !isFreeSig(s.key)).map(s =>
-        `<button data-nn="${esc(s.key)}">${esc(sigName(s.key))}</button>`).join('')}
-    </div>
-    <div class="pop-foot"><span class="pop-note">${esc(t('p4.newNodeNote'))}</span></div>`;
-  placePop($('#flow').querySelector('[data-newnode]'), true);
-  $('#nnSigs').addEventListener('click', e => {
-    const b = e.target.closest('[data-nn]');
-    if (!b) return;
-    renderNewNodeValues(b.dataset.nn);
+  openPicker({
+    title: t('p4.newSplitNode'),
+    sub: t('p4.beforeFallback'),
+    anchor: () => $('#flow').querySelector('[data-newnode]'),
+    allowFree: false,
+    note: t('p4.newNodeNote'),
+    onPick: (key, value) => addNode(key, value),
   });
 }
 
-/* Step 2: pick the root value explicitly (e.g. 学科 = 医疗). */
-function renderNewNodeValues(key) {
-  const spec = sigSpec(key);
+/* «＋ 新分支» on a station: identical two-step picker (same signal registry),
+   then the branch is inserted under that node with the chosen value. */
+function openNewBranch(nodeId) {
+  const node = findNode(nodeId);
+  if (!node) return;
+  const path = node.type === 'split' ? firstPath(node) : [];
+  const note = path.length
+    ? tf('p4.newBranchLands', {
+        path: path.map(p => valLabel(p.signal, p.value) || t('p4.pending')).join(' → ') })
+    : t('p4.newNodeNote');
+  openPicker({
+    title: t('p4.newBranch'),
+    sub: nodeName(node),
+    anchor: () => $('#flow').querySelector(`[data-node="${CSS.escape(nodeId)}"] .st-add`),
+    allowFree: true,
+    note,
+    onPick: (key, value) => addBranchWithValue(nodeId, key, value),
+  });
+}
+
+/* Shared picker: step 1 signal, step 2 value (chips, or text for free-form
+   signals). Both "new split node" and "new branch" use it — one source. */
+function openPicker({ title, sub, anchor, allowFree, note, onPick }) {
   const pop = $('#pop');
-  pop.innerHTML = `
-    <div class="pop-head">
-      <b>${esc(tf('p4.pickRootValue', { sig: sigName(key) }))}</b>
-      <span class="sub">${esc(t('p4.newSplitNode'))}</span>
+  const anchorEl = () => anchor();
+  popTarget = { kind: 'picker', anchor: anchorEl };
+
+  function place() { placePop(anchorEl(), true); }
+  function head(titleText, subText) {
+    return `<div class="pop-head">
+      <b>${esc(titleText)}</b>${subText ? `<span class="sub">${esc(subText)}</span>` : ''}
       <button class="pop-x" data-popclose aria-label="${esc(t('common.close'))}">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
       </button>
-    </div>
-    <div class="pop-vals" id="nnVals">
-      ${(spec.values || []).map(([v, zh, en]) =>
-        `<button data-nv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
-    </div>
-    <div class="pop-foot">
-      <button class="pop-del" id="nnBack" style="color:var(--t4-ink-3)">← ${esc(t('p4.back'))}</button>
-      <span class="pop-note">${esc(t('p4.newNodeNote'))}</span>
     </div>`;
-  placePop($('#flow').querySelector('[data-newnode]'), true);
-  $('#nnVals').addEventListener('click', e => {
-    const b = e.target.closest('[data-nv]');
-    if (!b) return;
-    closePop();
-    addNode(key, b.dataset.nv);
-  });
-  $('#nnBack').addEventListener('click', renderNewNodeSignals);
+  }
+
+  function renderSignals() {
+    pop.hidden = false;
+    pop.innerHTML = `${head(title, sub)}
+      <p class="pop-label">${esc(t('p4.forkBy'))}</p>
+      <div class="pop-vals" id="pkSigs">
+        ${Object.values(SIG).filter(x => allowFree || !isFreeSig(x.key)).map(x =>
+          `<button data-pk="${esc(x.key)}">${esc(sigName(x.key))}</button>`).join('')}
+      </div>
+      <div class="pop-foot"><span class="pop-note">${esc(note)}</span></div>`;
+    place();
+    $('#pkSigs').addEventListener('click', e => {
+      const b = e.target.closest('[data-pk]');
+      if (b) renderValues(b.dataset.pk);
+    });
+  }
+
+  function renderValues(key) {
+    const spec = sigSpec(key);
+    const back = `<button class="pop-del" id="pkBack" style="color:var(--t4-ink-3)">← ${esc(t('p4.back'))}</button>`;
+    if (isFreeSig(key)) {
+      const list = key === 'keyword' && KEYWORD_GROUPS.length
+        ? `<datalist id="pkKw">${KEYWORD_GROUPS.map(g => `<option value="${esc(g)}">`).join('')}</datalist>` : '';
+      pop.innerHTML = `${head(tf('p4.pickRootValue', { sig: sigName(key) }), sub)}
+        <p class="pop-label">${esc(t('p4.value'))}</p>
+        <input class="pop-text" id="pkText" value="" list="${key === 'keyword' && KEYWORD_GROUPS.length ? 'pkKw' : ''}"
+               placeholder="${esc(t('p4.freePlaceholder'))}">${list}
+        <div class="pop-foot">${back}
+          <button class="pop-ok" id="pkOk">${esc(t('common.add'))}</button></div>`;
+      place();
+      const input = $('#pkText');
+      input.focus();
+      const submit = () => {
+        const v = input.value.trim();
+        if (!v) { input.focus(); return; }
+        closePop();
+        onPick(key, v);
+      };
+      input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+      $('#pkOk').addEventListener('click', submit);
+    } else {
+      pop.innerHTML = `${head(tf('p4.pickRootValue', { sig: sigName(key) }), sub)}
+        <div class="pop-vals" id="pkVals">
+          ${(spec.values || []).map(([v, zh, en]) =>
+            `<button data-pv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
+        </div>
+        <div class="pop-foot">${back}<span class="pop-note">${esc(note)}</span></div>`;
+      place();
+      $('#pkVals').addEventListener('click', e => {
+        const b = e.target.closest('[data-pv]');
+        if (!b) return;
+        closePop();
+        onPick(key, b.dataset.pv);
+      });
+    }
+    $('#pkBack').addEventListener('click', renderSignals);
+  }
+
+  renderSignals();
 }
 
 function popAnchor() {
@@ -1115,7 +1138,7 @@ function popAnchor() {
     const el = $('#flow').querySelector(`[data-node="${CSS.escape(popTarget.nid)}"] .ghead .floor, [data-node="${CSS.escape(popTarget.nid)}"] .ghead .gdet`);
     return el || $('#flow').querySelector(`[data-node="${CSS.escape(popTarget.nid)}"] .ghead`);
   }
-  if (popTarget.kind === 'new') return $('#flow').querySelector('[data-newnode]');
+  if (popTarget.kind === 'picker') return popTarget.anchor();
   return $('#flow').querySelector(`[data-branch="${CSS.escape(popTarget.bid)}"] .out`);
 }
 
@@ -1155,7 +1178,7 @@ function bindFlow() {
 
   flow.addEventListener('click', e => {
     const stAdd = e.target.closest('[data-addbranch]');
-    if (stAdd) { setPickNode(stAdd.dataset.addbranch); return; }
+    if (stAdd) { openNewBranch(stAdd.dataset.addbranch); return; }
     const delNode = e.target.closest('[data-delnode]');
     if (delNode) { deleteNode(delNode.dataset.delnode); return; }
     const addFrom = e.target.closest('[data-addbranchfrom]');
@@ -1325,7 +1348,6 @@ function bindPalette() {
     const sig = e.target.closest('.sig');
     if (!sig) return;
     const key = sig.dataset.sig;
-    if (pick.node) { createBranch(pick.node, key); return; }
     if (pick.signal === key) { setMode(null); return; }
     setPickSignal(key);
   });
