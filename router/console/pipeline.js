@@ -668,6 +668,13 @@ function addBranchWithValue(nodeId, signalKey, value) {
   const inherited = rows.find(r => r.signal === signalKey);
   if (inherited) inherited.value = value;
   else rows.push({ signal: signalKey, value });
+  // refuse an exact duplicate path: it would sit next to an identical branch
+  // and never win (health's split_dead_branch)
+  const sigOf = rows => JSON.stringify(rows.map(r => [r.signal, r.value]));
+  if (node.branches.some(x => sigOf(x.rows) === sigOf(rows))) {
+    toast(t('p4.branchDuplicate'));
+    return;
+  }
   const label = isFreeSig(signalKey) ? String(value)
     : (valLabel(signalKey, value) || sigName(signalKey));
   const b = {
@@ -1050,13 +1057,35 @@ function openNewBranch(nodeId) {
     anchor: () => $('#flow').querySelector(`[data-node="${CSS.escape(nodeId)}"] .st-add`),
     allowFree: true,
     note,
+    // a value already used at the same level would merge into that existing
+    // branch/group instead of creating a new one — hide it.
+    disabledValues: (signal) => {
+      if (node.type !== 'split') return new Set();
+      const idx = path.findIndex(p => p.signal === signal);
+      if (idx < 0) return new Set();               // new condition: nothing hidden
+      return valuesUsedAtLevel(node, signal, path.slice(0, idx));
+    },
     onPick: (key, value) => addBranchWithValue(nodeId, key, value),
   });
 }
 
+/* Values of one signal already occupied by branches sharing the same parent
+   path (the group a new branch would merge into). */
+function valuesUsedAtLevel(node, signal, parentPath) {
+  const used = new Set();
+  for (const b of node.branches) {
+    const sharesParent = parentPath.every(p =>
+      b.rows.some(r => r.signal === p.signal && r.value === p.value));
+    if (!sharesParent) continue;
+    const r = b.rows.find(x => x.signal === signal);
+    if (r && r.value) used.add(r.value);
+  }
+  return used;
+}
+
 /* Shared picker: step 1 signal, step 2 value (chips, or text for free-form
    signals). Both "new split node" and "new branch" use it — one source. */
-function openPicker({ title, sub, anchor, allowFree, note, onPick }) {
+function openPicker({ title, sub, anchor, allowFree, note, onPick, disabledValues }) {
   const pop = $('#pop');
   const anchorEl = () => anchor();
   popTarget = { kind: 'picker', anchor: anchorEl };
@@ -1111,14 +1140,19 @@ function openPicker({ title, sub, anchor, allowFree, note, onPick }) {
       input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
       $('#pkOk').addEventListener('click', submit);
     } else {
+      const hidden = disabledValues ? disabledValues(key) : new Set();
+      const allowed = (spec.values || []).filter(([v]) => !hidden.has(v));
+      const body = allowed.length
+        ? `<div class="pop-vals" id="pkVals">
+             ${allowed.map(([v, zh, en]) =>
+               `<button data-pv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
+           </div>`
+        : `<p class="pop-note" style="margin:2px 0 10px">${esc(tf('p4.noFreeValue', { sig: sigName(key) }))}</p>`;
       pop.innerHTML = `${head(tf('p4.pickRootValue', { sig: sigName(key) }), sub)}
-        <div class="pop-vals" id="pkVals">
-          ${(spec.values || []).map(([v, zh, en]) =>
-            `<button data-pv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
-        </div>
+        ${body}
         <div class="pop-foot">${back}<span class="pop-note">${esc(note)}</span></div>`;
       place();
-      $('#pkVals').addEventListener('click', e => {
+      if (allowed.length) $('#pkVals').addEventListener('click', e => {
         const b = e.target.closest('[data-pv]');
         if (!b) return;
         closePop();
