@@ -148,7 +148,7 @@ function conditionChip(n) {
   const conf = n.signal
     ? (isRuleSig(n.signal)
         ? `<button class="tn-conf det" data-cond="${esc(n.id)}">${esc(t('p4.deterministic'))}</button>`
-        : `<button class="tn-conf" data-cond="${esc(n.id)}">${esc(t('p4.confFloor'))}${(n.conf_min != null ? n.conf_min : 0.5).toFixed(2)}</button>`)
+        : `<button class="tn-conf" data-cond="${esc(n.id)}">${esc(t('p4.confFloor'))}${(n.conf_min != null ? n.conf_min : 0.7).toFixed(2)}</button>`)
     : '';
   return `<button class="tn-cond${n.signal ? '' : ' entry'}" data-cond="${esc(n.id)}">${esc(condText(n))}</button>${conf}`;
 }
@@ -336,7 +336,7 @@ function newNode(station, signal, value) {
   const action = defaultAction(station);
   return {
     id: nid('n'), signal, value: value == null ? '' : String(value),
-    conf_min: signal && !isRuleSig(signal) ? 0.5 : null,
+    conf_min: signal && !isRuleSig(signal) ? 0.7 : null,
     kind: 'leaf', action,
     model: action === 'route' ? (MODELS[0] || '') : null,
     min_score: null, weights: [], children: [],
@@ -464,7 +464,7 @@ function forkOnSignal(nodeId, signal) {
   const otherWeights = (node.weights || []).filter(w => w.signal !== signal);
   const makeChild = value => ({
     id: nid('n'), signal, value: value == null ? '' : String(value),
-    conf_min: isRuleSig(signal) ? null : 0.5, kind: 'leaf',
+    conf_min: isRuleSig(signal) ? null : 0.7, kind: 'leaf',
     action: node.action, model: node.model, min_score: node.min_score,
     weights: otherWeights.map(w => ({ ...w })), children: [],
   });
@@ -573,7 +573,7 @@ function openConditionEditor(nodeId) {
     ${node.signal && isRuleSig(node.signal)
       ? `<p class="pop-note">${esc(t('p4.ruleNote'))}</p>`
       : node.signal
-        ? rangeBlock('nc', t('p4.confMin'), node.conf_min != null ? node.conf_min : 0.5, 0.01, t('p4.confHint'))
+        ? rangeBlock('nc', t('p4.confMin'), node.conf_min != null ? node.conf_min : 0.7, 0.01, t('p4.confHint'))
         : `<p class="pop-note">${esc(t('p6.entryNote'))}</p>`}
     <div class="pop-foot">
       <span class="pop-note">${esc(t('p6.changeByRebuild'))}</span>

@@ -43,7 +43,7 @@ def test_station_roundtrip_tree(conn):
     assert subject.root.signal is None and subject.root.kind == "fork"
     health = subject.root.children[0]
     assert health.signal == "domain" and health.value == "health"
-    assert health.conf_min == 0.40      # heuristic calibration
+    assert health.conf_min == 0.70      # uniform default floor
     leaves = {leaf.value: leaf for leaf in health.children}
     assert leaves["hard"].model == "qwen3-8b-medical"
     assert leaves["easy"].model == "qwen3-0.6b-medical"
@@ -52,12 +52,19 @@ def test_station_roundtrip_tree(conn):
     assert fallback.root.model == "qwen3-8b"
 
 
-def test_checkpoint_calibration_is_higher_and_healthy(conn):
+def test_seeded_floors_are_uniform_and_healthy(conn):
     from router.pipeline.health import check_pipeline
-    seed_default(conn, "checkpoint")
+    seed_default(conn, "default")
     stations = StationRepo(conn).load()
-    safety = stations[0]
-    assert safety.root.children[0].conf_min == 0.99   # jailbreak (checkpoint)
+
+    def walk(node):
+        if node.signal is not None and node.conf_min is not None:
+            assert node.conf_min == 0.70, node.id
+        for child in node.children:
+            walk(child)
+
+    for station in stations:
+        walk(station.root)
     assert check_pipeline(stations, {m["id"] for m in ModelRepo(conn).list()}) == []
 
 

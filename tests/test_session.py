@@ -16,7 +16,9 @@ def ok_upstream(request):
 def make(tmp_path, sessions=True):
     app = create_app(Settings(db_path=str(tmp_path / "t.db"), sessions=sessions),
                      transport=httpx.MockTransport(ok_upstream))
-    return app, TestClient(app)
+    client = TestClient(app)
+    lower_floors(client)          # heuristic tagger confidences sit below 0.70
+    return app, client
 
 
 def chat(c, text, **headers):
@@ -26,6 +28,27 @@ def chat(c, text, **headers):
 
 
 MEDICAL = "我父亲病历上写着需要长期治疗，如何权衡方案？"
+
+
+def lower_floors(c, value=0.4):
+    """The seeded pipeline defaults every condition to a 0.70 confidence floor;
+    the heuristic test tagger caps confidence at 0.5, so routing tests lower the
+    floors explicitly (they test routing, not calibration)."""
+    pipe = c.get("/admin/pipeline").json()
+
+    def walk(node):
+        if node.get("conf_min") is not None:
+            node["conf_min"] = value
+        for child in node.get("children") or []:
+            walk(child)
+
+    for station in pipe["stations"]:
+        if station.get("root"):
+            walk(station["root"])
+    assert c.put("/admin/pipeline", json=pipe).status_code == 200
+    return c
+
+
 
 
 def test_sessions_off_no_state_header(tmp_path):

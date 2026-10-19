@@ -23,6 +23,26 @@ def chat(c, text):
 
 def test_eval_labels(tmp_path):
     c = client(tmp_path)
+
+def lower_floors(c, value=0.4):
+    """The seeded pipeline defaults every condition to a 0.70 confidence floor;
+    the heuristic test tagger caps confidence at 0.5, so routing tests lower the
+    floors explicitly (they test routing, not calibration)."""
+    pipe = c.get("/admin/pipeline").json()
+
+    def walk(node):
+        if node.get("conf_min") is not None:
+            node["conf_min"] = value
+        for child in node.get("children") or []:
+            walk(child)
+
+    for station in pipe["stations"]:
+        if station.get("root"):
+            walk(station["root"])
+    assert c.put("/admin/pipeline", json=pipe).status_code == 200
+    return c
+
+
     r = c.post("/admin/eval", json={"mode": "labels", "labels": [
         {"text": "今天天气怎么样", "expect_model": "qwen3-8b"},
         {"text": "我父亲病历上写着需要长期治疗，如何权衡方案？",

@@ -24,7 +24,7 @@ STATION_TYPES = ("gate", "score", "split")
 ACTIONS = ("block", "route")
 KINDS = ("leaf", "fork")
 
-DEFAULT_CONF_MIN = 0.50
+DEFAULT_CONF_MIN = 0.70
 DEFAULT_WEIGHT = 0.50
 DEFAULT_MIN_SCORE = 0.50
 
