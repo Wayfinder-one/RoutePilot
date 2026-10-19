@@ -223,6 +223,12 @@ function branchRow(node, b, opts = {}) {
   const empty = shown.length ? rows
     : (opts.omit ? `<span class="no-cond">${t('p4.hitRoute')}</span>`
                  : `<span class="no-cond">${t('p4.noCond')}</span>`);
+  // Tree editing model (2026-10-19): a split row becomes editable (+ / −) only
+  // once it already carries a child layer (>= 2 conditions, deepest one set),
+  // so the root node row starts bare. Flat gate/score rows always offer them.
+  const showActions = node.type === 'split'
+    ? (b.rows.length >= 2 && !!b.rows[b.rows.length - 1].value)
+    : true;
   return `<div class="branch" data-branch="${esc(b.id)}" style="--tone:${tone}">
       <span class="bname" title="${esc(branchName(b))}">${esc(branchName(b))}</span>
       <div class="conds">
@@ -233,15 +239,15 @@ function branchRow(node, b, opts = {}) {
       <div class="outcell">
         <button class="out ${b.model || b.action === 'block' ? outCls : 'todo'}" data-branchcfg="${esc(b.id)}"
                 title="${esc(t('p4.branchCfg'))}">${outTxt}</button>
-        ${b.rows.length ? `<button class="bact add" data-addbranchfrom="${esc(b.id)}"
-                title="${esc(tf('p4.addBranchFromTitle', { sig: sigName(b.rows[0].signal) }))}"
-                aria-label="${esc(tf('p4.addBranchFromNamed', { name: branchName(b), sig: sigName(b.rows[0].signal) }))}">
+        ${showActions && b.rows.length ? `<button class="bact add" data-addbranchfrom="${esc(b.id)}"
+                title="${esc(tf('p4.addBranchFromTitle', { sig: sigName(b.rows[b.rows.length - 1].signal) }))}"
+                aria-label="${esc(tf('p4.addBranchFromNamed', { name: branchName(b), sig: sigName(b.rows[b.rows.length - 1].signal) }))}">
           <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M5.5 2v7M2 5.5h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
         </button>` : ''}
-        ${isLastNode(node) && node.branches.length === 1 ? '' : `<button class="bact del" data-delbranch="${esc(b.id)}" title="${esc(t('p4.delBranch'))}"
+        ${showActions && !(isLastNode(node) && node.branches.length === 1) ? `<button class="bact del" data-delbranch="${esc(b.id)}" title="${esc(t('p4.delBranch'))}"
                 aria-label="${esc(tf('p4.delBranchNamed', { name: branchName(b) }))}">
           <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 5.5h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        </button>`}
+        </button>` : ''}
       </div>
     </div>`;
 }
@@ -443,15 +449,18 @@ function markDirty() {
   renderDirty();
 }
 
-function addNode(key) {
+function addNode(key, value) {
   const spec = sigSpec(key);
-  const vals = spec.values || [];
-  const seed = vals.length && vals.length <= 3 ? vals : vals.slice(0, 1);
-  const branches = seed.map(([v, zh, en]) => ({
-    id: nid('b'), name: LANG === 'zh' ? zh + ' ' + t('p4.branchWord') : (en || zh) + ' ' + t('p4.branchWord'),
+  // One root branch with the explicitly picked value: the node starts as a
+  // single path (no +/− until a child layer is dragged in).
+  const label = valLabel(key, value) || String(value);
+  const branches = [{
+    id: nid('b'),
+    name: LANG === 'zh' ? label + ' ' + t('p4.branchWord')
+                        : label + ' ' + t('p4.branchWord'),
     action: 'route', model: MODELS[0] || '', min_score: 0.5,
-    rows: [{ signal: key, value: v }],
-  }));
+    rows: [{ signal: key, value }],
+  }];
   const node = {
     id: nid('n'), type: 'split',
     name: (LANG === 'zh' ? spec.zh : (spec.en || spec.zh)) + ' ' + t('p4.typeSplit'),
@@ -645,13 +654,15 @@ function addBranchFrom(branchId) {
   const found = findBranch(branchId);
   if (!found) return;
   const { node, branch } = found;
-  const first = branch.rows[0];
-  if (!first || !first.signal) {
+  // the DEEPEST condition is the child node being edited: duplicating it and
+  // changing its value adds a sibling under the same parent (tree editing).
+  const last = branch.rows[branch.rows.length - 1];
+  if (!last || !last.signal) {
     toast(t('p4.addBranchNoSignal'));
     return;
   }
-  if (isFreeSig(first.signal)) cloneBranch(node, branch, first.signal, null);
-  else cloneBranch(node, branch, first.signal);
+  if (isFreeSig(last.signal)) cloneBranch(node, branch, last.signal, null);
+  else cloneBranch(node, branch, last.signal);
 }
 
 function createBranch(nodeId, signalKey) {
@@ -1039,6 +1050,11 @@ function openLevelEditor(nodeId) {
 /* new split node: every enumerable signal is a candidate (§8.4) */
 function openNewNode() {
   popTarget = { kind: 'new' };
+  renderNewNodeSignals();
+}
+
+/* Step 1: which signal roots this node. */
+function renderNewNodeSignals() {
   const pop = $('#pop');
   pop.hidden = false;
   pop.innerHTML = `
@@ -1058,10 +1074,38 @@ function openNewNode() {
   $('#nnSigs').addEventListener('click', e => {
     const b = e.target.closest('[data-nn]');
     if (!b) return;
-    const key = b.dataset.nn;
-    closePop();
-    addNode(key);
+    renderNewNodeValues(b.dataset.nn);
   });
+}
+
+/* Step 2: pick the root value explicitly (e.g. 学科 = 医疗). */
+function renderNewNodeValues(key) {
+  const spec = sigSpec(key);
+  const pop = $('#pop');
+  pop.innerHTML = `
+    <div class="pop-head">
+      <b>${esc(tf('p4.pickRootValue', { sig: sigName(key) }))}</b>
+      <span class="sub">${esc(t('p4.newSplitNode'))}</span>
+      <button class="pop-x" data-popclose aria-label="${esc(t('common.close'))}">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="pop-vals" id="nnVals">
+      ${(spec.values || []).map(([v, zh, en]) =>
+        `<button data-nv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
+    </div>
+    <div class="pop-foot">
+      <button class="pop-del" id="nnBack" style="color:var(--t4-ink-3)">← ${esc(t('p4.back'))}</button>
+      <span class="pop-note">${esc(t('p4.newNodeNote'))}</span>
+    </div>`;
+  placePop($('#flow').querySelector('[data-newnode]'), true);
+  $('#nnVals').addEventListener('click', e => {
+    const b = e.target.closest('[data-nv]');
+    if (!b) return;
+    closePop();
+    addNode(key, b.dataset.nv);
+  });
+  $('#nnBack').addEventListener('click', renderNewNodeSignals);
 }
 
 function popAnchor() {
