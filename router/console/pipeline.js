@@ -161,7 +161,14 @@ function syncPalHint() {
     el.textContent = tf('p4.hintPicked', { name: sigName(pick.signal) });
   } else if (mode === 'pick' && pick.node) {
     el.classList.add('active');
-    el.textContent = tf('p4.hintNewBranch', { name: nodeName(findNode(pick.node) || {}) });
+    const n = findNode(pick.node) || {};
+    const path = n.type === 'split' ? firstPath(n) : [];
+    el.textContent = path.length
+      ? tf('p4.hintNewBranchAt', {
+          name: nodeName(n),
+          path: path.map(p => valLabel(p.signal, p.value) || t('p4.pending')).join(' → '),
+        })
+      : tf('p4.hintNewBranch', { name: nodeName(n) });
   } else if (mode === 'drag' && dragSig) {
     el.classList.add('active');
     el.textContent = tf('p4.hintDragging', { name: sigName(dragSig) });
@@ -226,10 +233,15 @@ function branchRow(node, b, opts = {}) {
       <div class="outcell">
         <button class="out ${b.model || b.action === 'block' ? outCls : 'todo'}" data-branchcfg="${esc(b.id)}"
                 title="${esc(t('p4.branchCfg'))}">${outTxt}</button>
-        <button class="rowdel" data-delbranch="${esc(b.id)}" title="${esc(t('p4.delBranch'))}"
+        ${b.rows.length ? `<button class="bact add" data-addbranchfrom="${esc(b.id)}"
+                title="${esc(tf('p4.addBranchFromTitle', { sig: sigName(b.rows[0].signal) }))}"
+                aria-label="${esc(tf('p4.addBranchFromNamed', { name: branchName(b), sig: sigName(b.rows[0].signal) }))}">
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M5.5 2v7M2 5.5h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>` : ''}
+        ${isLastNode(node) && node.branches.length === 1 ? '' : `<button class="bact del" data-delbranch="${esc(b.id)}" title="${esc(t('p4.delBranch'))}"
                 aria-label="${esc(tf('p4.delBranchNamed', { name: branchName(b) }))}">
-          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-        </button>
+          <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 5.5h7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>`}
       </div>
     </div>`;
 }
@@ -568,7 +580,11 @@ function wouldDuplicate(node, clone) {
   return entries.some(e => e.branch !== clone && sig(e) === mineSig);
 }
 
-function cloneBranch(node, branch, signalKey) {
+/* Clone a branch for another value of one signal.
+   explicitValue: undefined = pick the first free value automatically;
+   null = leave the value 待选 (free-form signals, editor opens).
+   Used by palette drops (same signal) and by the row-level [+] button. */
+function cloneBranch(node, branch, signalKey, explicitValue) {
   const spec = sigSpec(signalKey);
   const cur = branch.rows.find(r => r.signal === signalKey);
   // siblings = branches in the group this branch belongs to (the clone keeps
@@ -581,17 +597,19 @@ function cloneBranch(node, branch, signalKey) {
   const vals = (spec.values || []).filter(([v]) => v !== cur.value && !taken.has(v));
   // Pick the first value whose clone would not be a dead duplicate under the
   // landing path (health's split_dead_branch); none left -> refuse and say why.
-  let pickVal = null;
-  for (const v of vals) {
-    const probe = {
-      id: '__probe__', name: '', action: branch.action, model: branch.model,
-      min_score: branch.min_score,
-      rows: branch.rows.map(r => r.signal === signalKey ? { ...r, value: v[0] } : { ...r }),
-    };
-    const trial = { ...node, branches: node.branches.concat([probe]) };
-    if (!wouldDuplicate(trial, probe)) { pickVal = v; break; }
+  let pickVal = explicitValue === null ? null : undefined;
+  if (explicitValue === undefined) {
+    for (const v of vals) {
+      const probe = {
+        id: '__probe__', name: '', action: branch.action, model: branch.model,
+        min_score: branch.min_score,
+        rows: branch.rows.map(r => r.signal === signalKey ? { ...r, value: v[0] } : { ...r }),
+      };
+      const trial = { ...node, branches: node.branches.concat([probe]) };
+      if (!wouldDuplicate(trial, probe)) { pickVal = v; break; }
+    }
   }
-  if (!pickVal) {
+  if (pickVal === undefined || (pickVal === null && explicitValue === undefined)) {
     toast(tf('p4.cloneNoValue', { name: sigName(signalKey) }));
     return;
   }
@@ -619,6 +637,23 @@ function cloneBranch(node, branch, signalKey) {
     });
 }
 
+/* Row-level [+]: derive a new branch from this row's FIRST condition signal
+   (SPEC-TREE-4 §8.4 extension requested on 2026-10-19). The clone keeps the
+   row's other conditions and only changes that signal's value, so the new
+   branch appears at the same tree level the row lives on. */
+function addBranchFrom(branchId) {
+  const found = findBranch(branchId);
+  if (!found) return;
+  const { node, branch } = found;
+  const first = branch.rows[0];
+  if (!first || !first.signal) {
+    toast(t('p4.addBranchNoSignal'));
+    return;
+  }
+  if (isFreeSig(first.signal)) cloneBranch(node, branch, first.signal, null);
+  else cloneBranch(node, branch, first.signal);
+}
+
 function createBranch(nodeId, signalKey) {
   const node = findNode(nodeId);
   if (!node) return;
@@ -628,7 +663,11 @@ function createBranch(nodeId, signalKey) {
     // new branches land at the end of the first path's last group
     firstPath(node).forEach(p => rows.push({ signal: p.signal, value: p.value }));
   }
-  rows.push(newEmptyRow(node.type, signalKey));
+  // the picked signal may already be inherited from the path: re-target that
+  // row instead of appending a duplicate signal (keeps one row per signal)
+  const inherited = rows.find(r => r.signal === signalKey);
+  if (inherited) inherited.value = '';
+  else rows.push(newEmptyRow(node.type, signalKey));
   const b = {
     id: nid('b'),
     name: (LANG === 'zh' ? spec.zh : (spec.en || spec.zh)) + ' ' + t('p4.branchWord'),
@@ -641,7 +680,7 @@ function createBranch(nodeId, signalKey) {
   renderStation(node.id);
   syncPaletteUsed();
   flashBranch(b.id);
-  openRowEditor(b.id + ':' + (rows.length - 1));
+  openRowEditor(b.id + ':' + rows.findIndex(r => r.signal === signalKey));
   toast(tf('p4.toastBranchAdded', { name: branchName(b) }), () => {
     node.branches = node.branches.filter(x => x.id !== b.id);
     markDirty();
@@ -764,7 +803,11 @@ function setPickNode(nodeId) {
   syncPickA11y();
   syncPaletteSelection();
   syncPalHint();
-  toast(t('p4.toastPickSignal'));
+  const node = findNode(nodeId);
+  const path = node && node.type === 'split' ? firstPath(node) : [];
+  toast(path.length
+    ? tf('p4.toastPickSignalAt', { path: path.map(p => valLabel(p.signal, p.value) || t('p4.pending')).join(' → ') })
+    : t('p4.toastPickSignal'));
 }
 
 /* ── popovers ────────────────────────────────────────────────────────── */
@@ -1071,6 +1114,8 @@ function bindFlow() {
     if (stAdd) { setPickNode(stAdd.dataset.addbranch); return; }
     const delNode = e.target.closest('[data-delnode]');
     if (delNode) { deleteNode(delNode.dataset.delnode); return; }
+    const addFrom = e.target.closest('[data-addbranchfrom]');
+    if (addFrom) { addBranchFrom(addFrom.dataset.addbranchfrom); return; }
     const del = e.target.closest('[data-delbranch]');
     if (del) { deleteBranch(del.dataset.delbranch); return; }
     const nn = e.target.closest('[data-newnode]');

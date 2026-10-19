@@ -557,3 +557,16 @@ body.sim-open .t4-sim-mask{opacity:1;pointer-events:auto}
   content:"";width:6px;height:6px;border-radius:50%;
   background:#fbbf24;box-shadow:0 0 0 2px rgba(251,191,36,.25);
 }
+
+/* 行内 + / −：从这一条分支派生分支 / 删除分支（2026-10-19 交互新增） */
+.t4 .outcell{display:flex;align-items:center;gap:2px}
+.t4 .outcell .out{margin-right:2px}
+.t4 .bact{
+  width:22px;height:22px;display:grid;place-items:center;flex:none;
+  border:1px solid transparent;border-radius:5px;background:none;color:#b6b5ad;
+  opacity:.5;padding:0;transition:opacity .2s,color .2s,background .2s,border-color .2s;
+}
+.t4 .branch:hover .bact,.t4 .branch:focus-within .bact,.t4 .bact:focus-visible{opacity:1}
+.t4 .bact:hover{background:var(--t4-accent-soft);border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
+.t4 .bact.del:hover{background:var(--t4-red-soft);border-color:var(--t4-red-line);color:var(--t4-red)}
+@media (hover:none){.t4 .bact{opacity:1}}
