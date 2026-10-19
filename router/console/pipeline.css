@@ -634,3 +634,24 @@ body.sim-open .t4-sim-mask{opacity:1;pointer-events:auto}
 .t4 .wrow .pr-num{width:64px;height:24px;flex:none}
 .t4 .wdel{width:22px;height:22px;border:0;border-radius:5px;background:none;color:#c3c2ba;flex:none}
 .t4 .wdel:hover{background:var(--t4-red-soft);color:var(--t4-red)}
+
+/* 叶子节点卡片皮肤（v6.1：恢复动作色条 + 卡片描边） */
+body.dragging{user-select:none}
+.t4 .tnode.leaf > .tnode-row{
+  position:relative;padding:9px 12px 9px 15px;background:#fff;
+  border:1px solid var(--t4-line);border-radius:10px;min-height:46px;
+  transition:border-color .15s,box-shadow .15s,background .15s;
+}
+.t4 .tnode.leaf > .tnode-row::before{
+  content:"";position:absolute;left:0;top:11px;height:22px;width:2.5px;
+  border-radius:0 2px 2px 0;background:var(--leaf-tone,var(--t4-accent));
+}
+.t4 .tnode.leaf:hover > .tnode-row{border-color:var(--t4-line-2)}
+.t4 .tnode.leaf.hot > .tnode-row{border-color:var(--t4-accent);box-shadow:0 0 0 3px var(--t4-accent-soft)}
+.t4 .tnode.fork > .tnode-row{padding:4px 2px;min-height:36px}
+.t4 .tnode.fork > .tnode-row .tn-cond{background:#fff}
+.t4 .tn-addw{
+  padding:2px 7px;border:1px dashed var(--t4-accent-line);border-radius:6px;background:none;
+  font-size:11px;font-weight:600;color:var(--t4-accent-deep);white-space:nowrap;
+}
+.t4 .tn-addw:hover{background:var(--t4-accent-soft);border-style:solid}

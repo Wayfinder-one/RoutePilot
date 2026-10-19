@@ -128,6 +128,9 @@ function syncPalHint() {
   if (dragSig) {
     el.classList.add('active');
     el.textContent = tf('p6.hintDragging', { name: sigName(dragSig) });
+  } else if (pickedSig) {
+    el.classList.add('active');
+    el.textContent = tf('p6.hintPicked', { name: sigName(pickedSig) });
   } else {
     el.classList.remove('active');
     el.innerHTML = esc(t('p6.hintDrag')) + '<br>' + esc(t('p6.hintAdd'));
@@ -180,17 +183,22 @@ function weightsHTML(n) {
 function nodeHTML(n, depth, station) {
   const isLeaf = n.kind === 'leaf';
   const rootLocked = depth === 0 && isFallback(station);   // fallback station: locked
+  const hasWeights = isLeaf && (n.weights || []).length > 0;
+  const tone = n.action === 'block' ? 'var(--t4-red)'
+    : (rootLocked ? 'var(--t4-slate)' : 'var(--t4-accent)');
   const children = isLeaf ? '' : `<div class="tnode-children">${
     (n.children || []).map(c => nodeHTML(c, depth + 1, station)).join('') ||
     `<div class="tn-empty">${esc(t('p6.noChildren'))}</div>`}</div>`;
-  return `<div class="tnode ${isLeaf ? 'leaf' : 'fork'}" data-node="${esc(n.id)}">
+  return `<div class="tnode ${isLeaf ? 'leaf' : 'fork'}" data-node="${esc(n.id)}"${isLeaf ? ` style="--leaf-tone:${tone}"` : ''}>
     <div class="tnode-row">
       ${conditionChip(n)}
       ${isLeaf ? outcomeChip(n) + weightsHTML(n) : ''}
       ${!isLeaf ? `<span class="tn-count">${(n.children || []).length} ${esc(t('p6.children'))}</span>` : ''}
       <span class="tn-actions">
-        <button class="bact add" data-nodeadd="${esc(n.id)}"
-          title="${esc(t('p6.addChild'))}" aria-label="${esc(tf('p6.addChildNamed', { name: condText(n) }))}">+</button>
+        ${isLeaf ? `<button class="tn-addw" data-nodeweight="${esc(n.id)}"
+          title="${esc(t('p6.addWeight'))}">＋ ${esc(t('p6.addWeight'))}</button>` : ''}
+        ${hasWeights ? '' : `<button class="bact add" data-nodeadd="${esc(n.id)}"
+          title="${esc(t('p6.addChild'))}" aria-label="${esc(tf('p6.addChildNamed', { name: condText(n) }))}">+</button>`}
         ${rootLocked ? '' : `<button class="bact del" data-nodedel="${esc(n.id)}"
           title="${esc(depth === 0 ? t('p6.delStation') : t('p6.delNode'))}"
           aria-label="${esc(tf(depth === 0 ? 'p6.delStationNamed' : 'p6.delNodeNamed', { name: condText(n) }))}">−</button>`}
@@ -792,16 +800,46 @@ function openChildPicker(nodeId) {
   });
 }
 
-function openValuePicker(signal, onPick) {
+function openValuePicker(signal, onPick, anchor) {
   openPicker({
     title: t('p6.addWeight'),
     sub: sigName(signal),
-    anchor: () => $('#palBody .sig[data-sig="' + CSS.escape(signal) + '"]'),
+    anchor: anchor || (() => $('#palBody .sig[data-sig="' + CSS.escape(signal) + '"]')),
     allowFree: true,
     preselect: signal,
     note: t('p6.weightNote'),
     onPick,
   });
+}
+
+/* explicit "＋加权" entry: same picker, but choose the signal first */
+function openAddWeightPicker(nodeId) {
+  const ref = findNodeRef(nodeId);
+  if (!ref) return;
+  if (ref.node.kind !== 'leaf') { toast(t('p6.forkNoWeights')); return; }
+  openPicker({
+    title: t('p6.addWeight'),
+    sub: condText(ref.node),
+    anchor: () => $(`[data-nodeweight="${CSS.escape(nodeId)}"]`),
+    allowFree: true,
+    note: t('p6.weightNote'),
+    onPick: (key, value) => addWeight(nodeId, key, value),
+  });
+}
+
+/* drop handler shared by pointer drag and click-to-pick */
+function handleSignalDrop(nodeId, signal) {
+  const ref = findNodeRef(nodeId);
+  if (!ref) return;
+  const node = ref.node;
+  if (node.kind !== 'leaf') { toast(t('p6.forkNoWeights')); return; }
+  if (node.signal === signal) { toast(t('p6.sameAsCondition')); return; }
+  if ((node.weights || []).some(w => w.signal === signal)) {
+    forkOnSignal(nodeId, signal);
+    return;
+  }
+  openValuePicker(signal, (key, value) => addWeight(nodeId, key, value),
+                  () => $(`[data-node="${CSS.escape(nodeId)}"]`));
 }
 
 /* station creation: type -> root (unconditional or condition -> value) */
@@ -874,34 +912,114 @@ function openStationPicker() {
 }
 
 /* ── drag & drop ─────────────────────────────────────────────────────── */
+/* ── pointer interactions (no native HTML5 DnD) ─────────────────────── */
+let pdrag = null;        // {kind:'signal'|'station', ...}
+let pickedSig = null;    // click-to-pick: select a signal, then click a leaf
+let suppressClick = false;
+
+function clearHot() { $$('.tnode.hot').forEach(el => el.classList.remove('hot')); }
+function clearDropIndicators() {
+  $$('.station.drop-before, .station.drop-after')
+    .forEach(el => el.classList.remove('drop-before', 'drop-after'));
+}
+function elementAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  return el && el.closest ? el : null;
+}
+
+function onPointerMove(ev) {
+  if (!pdrag) return;
+  const dx = ev.clientX - pdrag.startX, dy = ev.clientY - pdrag.startY;
+  if (!pdrag.active) {
+    if (Math.hypot(dx, dy) < 6) return;
+    pdrag.active = true;
+    suppressClick = true;
+    document.body.classList.add('dragging');
+    if (pdrag.kind === 'signal') {
+      const ghost = document.createElement('div');
+      ghost.className = 'drag-ghost';
+      ghost.textContent = sigName(pdrag.sig);
+      ghost.style.cssText = 'position:fixed;pointer-events:none;z-index:80;';
+      document.body.appendChild(ghost);
+      pdrag.ghost = ghost;
+      dragSig = pdrag.sig;
+      syncPalHint();
+    } else {
+      const el = $(`[data-station="${CSS.escape(pdrag.stationId)}"]`);
+      if (el) el.classList.add('moving');
+    }
+  }
+  if (pdrag.kind === 'signal') {
+    if (pdrag.ghost) {
+      pdrag.ghost.style.left = (ev.clientX + 14) + 'px';
+      pdrag.ghost.style.top = (ev.clientY + 10) + 'px';
+    }
+    clearHot();
+    const tn = elementAt(ev.clientX, ev.clientY)?.closest('.tnode');
+    if (tn) {
+      const ref = findNodeRef(tn.dataset.node);
+      if (ref && ref.node.kind === 'leaf') tn.classList.add('hot');
+    }
+    return;
+  }
+  clearDropIndicators();
+  const stEl = elementAt(ev.clientX, ev.clientY)?.closest('.station');
+  if (!stEl) return;
+  const r = stEl.getBoundingClientRect();
+  const before = ev.clientY < r.top + r.height / 2;
+  stEl.classList.add(before ? 'drop-before' : 'drop-after');
+  pdrag.target = { id: stEl.dataset.station, before };
+}
+
+function onPointerUp(ev) {
+  if (!pdrag) return;
+  const drag = pdrag;
+  pdrag = null;
+  document.body.classList.remove('dragging');
+  if (drag.ghost) drag.ghost.remove();
+  dragSig = null;
+  clearHot();
+  clearDropIndicators();
+  syncPalHint();
+  if (drag.kind === 'station') {
+    $$('.station.moving').forEach(el => el.classList.remove('moving'));
+    if (drag.active && drag.target) {
+      const idx = stations.findIndex(s => s.id === drag.target.id);
+      if (idx >= 0) moveStation(drag.stationId,
+                                drag.target.before ? idx : idx + 1);
+    }
+    return;
+  }
+  if (!drag.active) return;
+  const tn = elementAt(ev.clientX, ev.clientY)?.closest('.tnode');
+  if (tn) handleSignalDrop(tn.dataset.node, drag.sig);
+}
+
 function bindPalette() {
   const palBody = $('#palBody');
-  palBody.addEventListener('dragstart', e => {
+  palBody.addEventListener('mousedown', e => {
+    const sig = e.target.closest('.sig');
+    if (!sig || e.button !== 0) return;
+    e.preventDefault();                       // avoid text selection while dragging
+    pdrag = { kind: 'signal', sig: sig.dataset.sig,
+              startX: e.clientX, startY: e.clientY, active: false, ghost: null };
+  });
+  palBody.addEventListener('click', e => {
+    if (suppressClick) { suppressClick = false; return; }
     const sig = e.target.closest('.sig');
     if (!sig) return;
-    dragSig = sig.dataset.sig;
-    sig.classList.add('dragging');
+    const key = sig.dataset.sig;
+    pickedSig = pickedSig === key ? null : key;
+    syncPalettePicked();
     syncPalHint();
-    e.dataTransfer.effectAllowed = 'copy';
-    e.dataTransfer.setData('text/plain', dragSig);
-    const ghost = document.createElement('div');
-    ghost.className = 'drag-ghost';
-    ghost.textContent = sigName(dragSig);
-    ghost.style.cssText += 'position:fixed;top:-100px;left:-100px;';
-    document.body.appendChild(ghost);
-    e.dataTransfer.setDragImage(ghost, 24, 16);
-    setTimeout(() => ghost.remove(), 0);
-  });
-  palBody.addEventListener('dragend', () => {
-    const s = palBody.querySelector('.sig.dragging');
-    if (s) s.classList.remove('dragging');
-    dragSig = null;
-    syncPalHint();
-    $$('.tnode.hot').forEach(el => el.classList.remove('hot'));
   });
   palBody.addEventListener('scroll', syncPalFade, { passive: true });
   $('#palToggle').addEventListener('click', () =>
     setPalOpen($('#palette').classList.contains('closed')));
+}
+function syncPalettePicked() {
+  $$('#palBody .sig').forEach(el =>
+    el.setAttribute('aria-pressed', String(pickedSig === el.dataset.sig)));
 }
 function setPalOpen(open) {
   $('#palette').classList.toggle('closed', !open);
@@ -912,6 +1030,8 @@ function bindFlow() {
   const flow = $('#flow');
 
   flow.addEventListener('click', e => {
+    const addw = e.target.closest('[data-nodeweight]');
+    if (addw) { openAddWeightPicker(addw.dataset.nodeweight); return; }
     const add = e.target.closest('[data-nodeadd]');
     if (add) { openChildPicker(add.dataset.nodeadd); return; }
     const del = e.target.closest('[data-nodedel]');
@@ -930,90 +1050,29 @@ function bindFlow() {
     if (delStation) { deleteStation(delStation.dataset.delstation); return; }
     const newStation = e.target.closest('[data-newstation]');
     if (newStation) { openStationPicker(); return; }
+    // click-to-pick: with a signal selected, clicking a leaf places it
+    if (pickedSig && !e.target.closest('button')) {
+      const tn = e.target.closest('.tnode');
+      if (tn) {
+        const sig = pickedSig;
+        pickedSig = null;
+        syncPalettePicked();
+        syncPalHint();
+        handleSignalDrop(tn.dataset.node, sig);
+      }
+    }
   });
 
-  /* station reorder via the number badge; fallback locked last */
-  flow.addEventListener('dragstart', e => {
+  /* station reorder by dragging the number badge (fallback locked last) */
+  flow.addEventListener('mousedown', e => {
     const seq = e.target.closest('.seq');
-    if (!seq) return;
+    if (!seq || e.button !== 0) return;
     const id = seq.closest('.station').dataset.station;
-    if (id === stations[stations.length - 1].id) { e.preventDefault(); return; }
-    dragNodeId = id;
-    seq.closest('.station').classList.add('moving');
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/plain', 'station:' + id);
-  });
-  flow.addEventListener('dragend', () => {
-    if (!dragNodeId) return;
-    dragNodeId = null;
-    clearNodeDrop();
-    $$('.station.moving', flow).forEach(el => el.classList.remove('moving'));
-  });
-  flow.addEventListener('dragover', e => {
-    if (dragNodeId) {
-      const st = e.target.closest('.station');
-      if (!st) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      const r = st.getBoundingClientRect();
-      const before = e.clientY < r.top + r.height / 2;
-      if (!nodeDrop || nodeDrop.id !== st.dataset.station || nodeDrop.before !== before) {
-        clearNodeDrop();
-        st.classList.add(before ? 'drop-before' : 'drop-after');
-        nodeDrop = { id: st.dataset.station, before };
-      }
-      return;
-    }
-    if (!dragSig) return;
-    const tn = e.target.closest('.tnode');
-    if (!tn) return;
+    if (id === stations[stations.length - 1].id) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
-    $$('.tnode.hot').forEach(el => el.classList.remove('hot'));
-    tn.classList.add('hot');
+    pdrag = { kind: 'station', stationId: id,
+              startX: e.clientX, startY: e.clientY, active: false };
   });
-  flow.addEventListener('dragleave', e => {
-    if (!flow.contains(e.relatedTarget)) $$('.tnode.hot').forEach(el => el.classList.remove('hot'));
-  });
-  flow.addEventListener('drop', e => {
-    if (dragNodeId) {
-      e.preventDefault();
-      const id = dragNodeId, target = nodeDrop;
-      dragNodeId = null;
-      clearNodeDrop();
-      $$('.station.moving', flow).forEach(el => el.classList.remove('moving'));
-      if (target) {
-        const idx = stations.findIndex(s => s.id === target.id);
-        moveStation(id, target.before ? idx : idx + 1);
-      }
-      return;
-    }
-    if (!dragSig) return;
-    const tn = e.target.closest('.tnode');
-    if (!tn) return;
-    e.preventDefault();
-    const signal = dragSig;
-    const nodeId = tn.dataset.node;
-    dragSig = null;
-    $$('.tnode.hot').forEach(el => el.classList.remove('hot'));
-    syncPalHint();
-    const ref = findNodeRef(nodeId);
-    if (!ref) return;
-    const node = ref.node;
-    if (node.kind !== 'leaf') { toast(t('p6.forkNoWeights')); return; }
-    if (node.signal === signal) { toast(t('p6.sameAsCondition')); return; }
-    if ((node.weights || []).some(w => w.signal === signal)) {
-      forkOnSignal(nodeId, signal);
-      return;
-    }
-    openValuePicker(signal, (key, value) => addWeight(nodeId, key, value));
-  });
-
-  function clearNodeDrop() {
-    $$('.station.drop-before, .station.drop-after', flow)
-      .forEach(el => el.classList.remove('drop-before', 'drop-after'));
-    nodeDrop = null;
-  }
 
   flow.addEventListener('keydown', e => {
     const seq = e.target.closest('.seq');
@@ -1028,6 +1087,9 @@ function bindFlow() {
     }
   });
 }
+
+document.addEventListener('mousemove', onPointerMove);
+document.addEventListener('mouseup', onPointerUp);
 
 function moveStation(stationId, beforeIdx) {
   const from = stations.findIndex(s => s.id === stationId);
@@ -1315,6 +1377,7 @@ document.addEventListener('keydown', e => {
   else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); openSim(); runTry(); }
   else if (e.key === 'Escape') {
     if (!$('#pop').hidden) { closePop(); return; }
+    if (pickedSig) { pickedSig = null; syncPalettePicked(); syncPalHint(); return; }
     if (document.body.classList.contains('sim-open')) { closeSim(); return; }
   }
 });

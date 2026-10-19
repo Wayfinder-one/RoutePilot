@@ -148,6 +148,7 @@ const I18N = {
 
     /* ── explicit tree editor v6 ── */
     'p6.entry': '入口', 'p6.hintDrag': '拖信号到叶子节点：加加权条件；重复信号自动分叉',
+    'p6.addWeight': '加加权条件', 'p6.hintPicked': '已选「{name}」——点叶子节点放置，再点一次取消',
     'p6.hintAdd': '点节点上的 ＋ 添加子节点', 'p6.hintDragging': '正在拖「{name}」——放到叶子节点上',
     'p6.type.gate': '闸门', 'p6.type.score': '打分', 'p6.type.split': '分流',
     'p6.desc.gate': '按顺序匹配子节点，第一个命中的进入；叶子执行拦截或路由',
@@ -385,6 +386,7 @@ const I18N = {
 
     /* ── explicit tree editor v6 ── */
     'p6.entry': 'entry', 'p6.hintDrag': 'Drag a signal onto a leaf to add a weighted condition; a repeated signal auto-forks',
+    'p6.addWeight': 'Add weight', 'p6.hintPicked': '"{name}" picked — click a leaf to place it (click again to cancel)',
     'p6.hintAdd': 'Use ＋ on a node to add a child', 'p6.hintDragging': 'Dragging "{name}" — drop it on a leaf',
     'p6.type.gate': 'gate', 'p6.type.score': 'score', 'p6.type.split': 'split',
     'p6.desc.gate': 'Ordered children; the first match descends. Leaves block or route',

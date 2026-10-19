@@ -136,6 +136,15 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     def healthz():
         return {"ok": True}
 
+    # The console is plain static files; force revalidation so a redeploy can
+    # never leave a browser running stale JS against a new API (2026-10-19).
+    @app.middleware("http")
+    async def console_nocache(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/console/"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
     if CONSOLE_DIR.is_dir():
         app.mount("/console", StaticFiles(directory=CONSOLE_DIR, html=True),
                   name="console")
