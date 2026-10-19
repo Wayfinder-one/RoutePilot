@@ -90,6 +90,7 @@ function methodHtml(r) {
       <span class="mq">${r.latency_ms != null ? Math.round(r.latency_ms) + ' ms' : '—'}</span>
       <span class="mf">${t('logs.tagger')}: ${esc(meta.name || '—')}</span>
     </div>
+    ${treePathHtml(r)}
     ${rows.join('') || `<div class="mut" style="font-size:11.5px;padding:6px 0">${t('logs.nosignals')}</div>`}
   </div>`;
 }
@@ -98,6 +99,25 @@ function methodRow(name, question, formula) {
   return `<div class="method"><span class="mn">${esc(name)}</span>
     <span class="mq">${esc(question)}</span>
     <span class="mf">${esc(formula)}</span></div>`;
+}
+
+/* SPEC-TREE-4 §4.4: the split layer path of the deciding node, stored per
+   request as requests.tree_path and shown layer by layer here. */
+function treePathHtml(r) {
+  if (!r.tree_path) return '';
+  let steps;
+  try { steps = JSON.parse(r.tree_path); } catch (e) { return ''; }
+  if (!Array.isArray(steps) || !steps.length) return '';
+  const cells = steps.map(s => {
+    const conf = (s.conf === 1.0 && s.floor == null)
+      ? t('p4.deterministic')
+      : pct(s.conf) + (s.floor != null ? ` ≥${Number(s.floor).toFixed(2)}` : '');
+    const cls = s.pass ? '' : 'sc pii';
+    return `<span class="sc ${cls}"><b>${esc(sigName(s.signal))}</b> ${esc(valLabel(s.signal, s.value))} <span class="c">${esc(conf)}${s.pass ? '' : ' ·' + t('p4.cut')}</span></span>`;
+  });
+  return `<div class="method"><span class="mn">${esc(t('p4.treePath'))}</span>
+    <span class="mq" style="display:flex;gap:5px;flex-wrap:wrap">${cells.join('<span class="mf">→</span>')}</span>
+    <span class="mf">${esc(t('p4.splitNode'))}</span></div>`;
 }
 
 function rowHtml(r) {

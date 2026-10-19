@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from router.pipeline.model import NODE_TYPES, Node
+from router.pipeline.tree import (derive, is_rule_signal, leaf_paths,
+                                  level_keys, orphan_branches, remaining_rows)
 from router.signals.registry import SIGNALS
 
 
@@ -18,6 +20,76 @@ class Issue:
     en: str
     node_id: str = ""
     branch_id: str = ""
+    level: str = "hard"             # 'hard' rejects the save (422); 'warn' does not
+
+
+def _split_issues(node: Node) -> list[Issue]:
+    """SPEC-TREE-4 section 5: the five split-node checks.
+
+    The tree itself is derived (tree.derive); dead/orphan branches are read off
+    the derivation, so what health rejects is exactly what the engine would
+    never reach."""
+    issues: list[Issue] = []
+    if not node.branches:
+        issues.append(Issue("split_empty",
+                            "分流节点 0 条分支（惰性节点，永不决策）",
+                            "Split node has no branches; it never decides",
+                            node_id=node.id, level="warn"))
+        return issues
+
+    level = derive(node, node.branches, set())
+    keys = level_keys(level)
+
+    # split_dead_branch: same parent path + identical remaining rows (+ the
+    # same min_score, or the two-tier pattern would be legal) -> the later
+    # branch can never win, ties keep the earlier one. The path is part of the
+    # signature: identical leaves under DIFFERENT paths are the whole point of
+    # grouping, not duplicates.
+    seen: dict[tuple, str] = {}
+    for branch, path in leaf_paths(level):
+        used = {signal for signal, _value in path}
+        rest = remaining_rows(branch, used)
+        sig = (tuple(path),
+               frozenset((r.signal, r.value, r.weight) for r in rest),
+               branch.min_score)
+        if sig in seen:
+            issues.append(Issue("split_dead_branch",
+                                "同一父路径下与上方分支条件完全相同，恒被压制",
+                                "Identical to an earlier branch under the same "
+                                "path; never wins", node.id, branch.id))
+        else:
+            seen[sig] = branch.id
+
+    # split_orphan_value: a branch whose fork-key row carries an empty value
+    # lands in the 「待选」 bucket, which no request can ever enter.
+    for branch, path in orphan_branches(level):
+        key = next((k for k, v in path if v is None), "?")
+        issues.append(Issue("split_orphan_value",
+                            f"分组条件 {key} 的取值为空，落入「待选」组，永不可达，请补值",
+                            f"Fork key {key} has no value; the branch lands in "
+                            f"the unreachable pending group",
+                            node.id, branch.id))
+
+    # split_dead_min_score: zero remaining conditions -> min_score never read.
+    for branch, path in leaf_paths(level):
+        used = {signal for signal, _value in path}
+        if not remaining_rows(branch, used) and branch.min_score is not None:
+            issues.append(Issue("split_dead_min_score",
+                                "路径已完全确定（命中即路由），min_score 不再生效",
+                                "Path is fully determined (hit routes at once); "
+                                "min_score is ignored", node.id, branch.id,
+                                level="warn"))
+
+    # split_rule_floor: a floor that no layer can ever consult. A model-signal
+    # layer anywhere still reads the floor, so only an all-rule / keyless tree
+    # warns.
+    if node.floor is not None and not any(not is_rule_signal(k) for k in keys):
+        issues.append(Issue("split_rule_floor",
+                            "分组键全是规则信号（确定性），进组门槛不会生效",
+                            "Every fork key is a rule signal (deterministic); "
+                            "the entry floor never applies", node.id,
+                            level="warn"))
+    return issues
 
 
 def _attainable_cap(rows) -> tuple[float, float]:
@@ -83,7 +155,7 @@ def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
             continue
         seen_signatures: set[tuple] = set()
         for b in node.branches:
-            needs_model = node.type == "score" or b.action == "route"
+            needs_model = node.type in ("score", "split") or b.action == "route"
             if needs_model and not b.model:
                 issues.append(Issue("missing_model", "分支缺少去向模型",
                                     "Branch has no target model",
@@ -127,6 +199,13 @@ def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
                                         "An empty-row branch is not last; every "
                                         "branch behind it is unreachable",
                                         node.id, b.id))
+        if node.type == "split":
+            if node.floor is not None and not 0 <= node.floor <= 1:
+                issues.append(Issue("floor_out_of_range",
+                                    "进组门槛必须在 [0,1] 内",
+                                    "Entry floor must be within [0,1]",
+                                    node_id=node.id))
+            issues.extend(_split_issues(node))
     last = nodes[-1]
     if last.type != "gate" or not any(b.action == "route" and not b.rows
                                       and b.model for b in last.branches):

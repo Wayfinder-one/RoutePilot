@@ -11,9 +11,14 @@ from router.pipeline.matching import match_row
 from router.pipeline.model import Branch, Node
 
 
-def branch_score(branch: Branch, signals: dict) -> dict:
+def branch_score(branch: Branch, signals: dict, rows=None) -> dict:
+    """Weighted attainment over ``rows`` (defaults to the branch's own rows).
+
+    Split leaves are scored only on their remaining conditions (SPEC-TREE-4
+    section 4.2), so the split evaluator passes the subset explicitly.
+    """
     lines = []
-    for r in branch.rows:
+    for r in (branch.rows if rows is None else rows):
         m, c = match_row(r.signal, r.value, signals)
         w = r.weight or 0.0
         lines.append({"signal": r.signal, "value": r.value,

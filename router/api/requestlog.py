@@ -47,11 +47,13 @@ class RequestLogger:
             with conn:
                 for r in batch:
                     conn.execute(
-                        "INSERT OR REPLACE INTO requests VALUES "
-                        "(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT OR REPLACE INTO requests (id, ts, text, decision, "
+                        "model, node_id, branch_id, score, latency_ms, tree_path) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (r["id"], r["ts"], r["text"][:500], r["decision"],
                          r.get("model"), r.get("node_id"), r.get("branch_id"),
-                         r.get("score"), r.get("latency_ms")))
+                         r.get("score"), r.get("latency_ms"),
+                         r.get("tree_path")))
                     for key, s in (r.get("signals") or {}).items():
                         conn.execute(
                             "INSERT INTO request_signals VALUES (?, ?, ?, ?, ?)",

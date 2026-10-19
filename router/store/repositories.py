@@ -84,7 +84,7 @@ def default_pipeline(calibration: str = "heuristic") -> list[Node]:
                    rows=[Row("keyword", "医疗急症", conf_min=c["keyword"])],
                    action="route", model="qwen3-8b-medical"),
         ]),
-        Node(id=_uid(), type="score", name="③ 领域 × 难度 打分", branches=[
+        Node(id=_uid(), type="score", name="③ 领域 + 难度 打分", branches=[
             Branch(id=_uid(), name="8B 医疗", model="qwen3-8b-medical",
                    min_score=c["medical_b"],
                    rows=[Row("domain", "health", weight=0.5),
@@ -141,7 +141,9 @@ class PipelineRepo:
                                        action=b["action"], model=b["model"],
                                        min_score=b["min_score"]))
             nodes.append(Node(id=n["id"], type=n["type"], name=n["name"],
-                              branches=branches))
+                              branches=branches,
+                              floor=n["floor"],
+                              split_signal=n["split_signal"]))
         return nodes
 
     def save(self, nodes: list[Node]) -> None:
@@ -150,8 +152,10 @@ class PipelineRepo:
             self.conn.execute("DELETE FROM branches")
             self.conn.execute("DELETE FROM nodes")
             for ni, n in enumerate(nodes):
-                self.conn.execute("INSERT INTO nodes VALUES (?, ?, ?, ?)",
-                                  (n.id, ni, n.type, n.name))
+                self.conn.execute(
+                    "INSERT INTO nodes (id, ord, type, name, floor, split_signal) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (n.id, ni, n.type, n.name, n.floor, n.split_signal))
                 for bi, b in enumerate(n.branches):
                     self.conn.execute(
                         "INSERT INTO branches VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -340,8 +344,8 @@ class RequestRepo:
         """Newest requests with their signal pack (console 'calculation log')."""
         rows = self.conn.execute(
             "SELECT id, ts, text, decision, model, node_id, branch_id, score, "
-            "latency_ms FROM requests ORDER BY ts DESC, id DESC LIMIT ?",
-            (limit,))
+            "latency_ms, tree_path FROM requests ORDER BY ts DESC, id DESC "
+            "LIMIT ?", (limit,))
         out = []
         for r in rows:
             pack = {}

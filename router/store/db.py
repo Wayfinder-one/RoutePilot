@@ -64,6 +64,18 @@ MIGRATIONS = [
         model TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
         opened_at REAL);
     """,
+    # v5 (SPEC-TREE-4 §2.3): split nodes — nullable floor + root fork-key
+    # override. Old rows stay NULL, which deserializes to None on both sides,
+    # so there is no data migration.
+    """
+    ALTER TABLE nodes ADD COLUMN floor REAL;
+    ALTER TABLE nodes ADD COLUMN split_signal TEXT;
+    """,
+    # v6 (SPEC-TREE-4 §4.4): split layer path per request, for the console log
+    # detail. Nullable JSON text; NULL for gate/score decisions.
+    """
+    ALTER TABLE requests ADD COLUMN tree_path TEXT;
+    """,
 ]
 
 

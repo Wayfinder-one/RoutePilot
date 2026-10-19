@@ -11,8 +11,9 @@ from dataclasses import dataclass
 from router.pipeline.gates import eval_gate
 from router.pipeline.model import Node
 from router.pipeline.scoring import eval_score
+from router.pipeline.splits import eval_split
 
-EVALUATORS = {"gate": eval_gate, "score": eval_score}
+EVALUATORS = {"gate": eval_gate, "score": eval_score, "split": eval_split}
 
 
 @dataclass

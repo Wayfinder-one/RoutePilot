@@ -23,7 +23,7 @@ from router.evals import summarize
 from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
 from router.pipeline.model import node_from_dict, node_to_dict
-from router.signals.registry import SIGNALS
+from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
                                        ModelRepo, PipelineRepo, ProviderRepo,
@@ -64,21 +64,27 @@ def put_pipeline(body: PipelineIn, request: Request,
         raise HTTPException(422, detail=str(exc)) from exc
     known = {m["id"] for m in ModelRepo(conn).list()}
     issues = check_pipeline(nodes, known)
-    if issues:
-        raise HTTPException(422, detail=[i.__dict__ for i in issues])
+    # SPEC-TREE-4 §5: hard issues reject with 422 (pointing at node/branch);
+    # warn-level issues ride along in the response so the console can show
+    # them without blocking the save.
+    hard = [i for i in issues if i.level == "hard"]
+    warns = [i.__dict__ for i in issues if i.level != "hard"]
+    if hard:
+        raise HTTPException(422, detail=[i.__dict__ for i in hard])
     # No-op saves must not bump the version or append an audit row: the console
     # smoke check re-saves the unchanged pipeline, and an editor save without
     # edits should not look like a config change (2026-10-17 review N3).
     current = [node_to_dict(n) for n in PipelineRepo(conn).load()]
-    if [node_to_dict(n) for n in nodes] == current:
-        return {"ok": True, "changed": False,
+    changed = [node_to_dict(n) for n in nodes] != current
+    if not changed:
+        return {"ok": True, "changed": False, "warnings": warns,
                 "version": SettingsRepo(conn).get("pipeline_version", "0")}
     PipelineRepo(conn).save(nodes)
     request.app.state.pipeline = nodes       # refresh the hot-path snapshot
     version = SettingsRepo(conn).get("pipeline_version")
     ChangeRepo(conn).record(_now(), "pipeline",
                             {"nodes": len(nodes), "version": version})
-    return {"ok": True, "changed": True, "version": version}
+    return {"ok": True, "changed": True, "warnings": warns, "version": version}
 
 
 # --------------------------------------------------------------------------- #
@@ -156,8 +162,13 @@ def put_provider(name: str, body: ProviderIn, request: Request,
 # --------------------------------------------------------------------------- #
 @router.get("/signals")
 def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"signals": [s.__dict__ for s in SIGNALS.values()],
-            "groups": list({s.group for s in SIGNALS.values()}),
+    # kind ('model'|'rule') + free (values not enumerable) drive the console's
+    # fork-key candidates and the deterministic-vs-floor rendering (SPEC-TREE-4 §6).
+    # groups follow the registry's canonical order (a raw set() is arbitrary).
+    return {"signals": [{**s.__dict__, "free": not s.values}
+                        for s in SIGNALS.values()],
+            "groups": [g for g in GROUPS if any(s.group == g
+                                                for s in SIGNALS.values())],
             "keyword_groups": list(KeywordRepo(conn).groups())}
 
 
