@@ -628,8 +628,6 @@ body.dragging{user-select:none}
 .t4 .tnode.leaf.hot > .tnode-row{border-color:var(--t4-accent);box-shadow:0 0 0 3px var(--t4-accent-soft)}
 .t4 .tnode.fork > .tnode-row{padding:4px 2px;min-height:36px}
 .t4 .tnode.fork > .tnode-row .tn-cond{background:#fff}
-.t4 .tn-addw{
-  padding:2px 7px;border:1px dashed var(--t4-accent-line);border-radius:6px;background:none;
-  font-size:11px;font-weight:600;color:var(--t4-accent-deep);white-space:nowrap;
-}
-.t4 .tn-addw:hover{background:var(--t4-accent-soft);border-style:solid}
+
+/* 出口（直达/拦截 + 模型）与 +/− 一起靠右 */
+.t4 .tn-right{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}

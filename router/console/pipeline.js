@@ -128,9 +128,6 @@ function syncPalHint() {
   if (dragSig) {
     el.classList.add('active');
     el.textContent = tf('p6.hintDragging', { name: sigName(dragSig) });
-  } else if (pickedSig) {
-    el.classList.add('active');
-    el.textContent = tf('p6.hintPicked', { name: sigName(pickedSig) });
   } else {
     el.classList.remove('active');
     el.innerHTML = esc(t('p6.hintDrag')) + '<br>' + esc(t('p6.hintAdd'));
@@ -189,20 +186,21 @@ function nodeHTML(n, depth, station) {
   const children = isLeaf ? '' : `<div class="tnode-children">${
     (n.children || []).map(c => nodeHTML(c, depth + 1, station)).join('') ||
     `<div class="tn-empty">${esc(t('p6.noChildren'))}</div>`}</div>`;
-  return `<div class="tnode ${isLeaf ? 'leaf' : 'fork'}" data-node="${esc(n.id)}"${isLeaf ? ` style="--leaf-tone:${tone}"` : ''}>
-    <div class="tnode-row">
-      ${conditionChip(n)}
-      ${isLeaf ? outcomeChip(n) + weightsHTML(n) : ''}
-      ${!isLeaf ? `<span class="tn-count">${(n.children || []).length} ${esc(t('p6.children'))}</span>` : ''}
+  const right = `<span class="tn-right">
+      ${isLeaf ? outcomeChip(n) : ''}
       <span class="tn-actions">
-        ${isLeaf ? `<button class="tn-addw" data-nodeweight="${esc(n.id)}"
-          title="${esc(t('p6.addWeight'))}">＋ ${esc(t('p6.addWeight'))}</button>` : ''}
         ${hasWeights ? '' : `<button class="bact add" data-nodeadd="${esc(n.id)}"
           title="${esc(t('p6.addChild'))}" aria-label="${esc(tf('p6.addChildNamed', { name: condText(n) }))}">+</button>`}
         ${rootLocked ? '' : `<button class="bact del" data-nodedel="${esc(n.id)}"
           title="${esc(depth === 0 ? t('p6.delStation') : t('p6.delNode'))}"
           aria-label="${esc(tf(depth === 0 ? 'p6.delStationNamed' : 'p6.delNodeNamed', { name: condText(n) }))}">−</button>`}
       </span>
+    </span>`;
+  return `<div class="tnode ${isLeaf ? 'leaf' : 'fork'}" data-node="${esc(n.id)}"${isLeaf ? ` style="--leaf-tone:${tone}"` : ''}>
+    <div class="tnode-row">
+      ${conditionChip(n)}
+      ${isLeaf ? weightsHTML(n) : `<span class="tn-count">${(n.children || []).length} ${esc(t('p6.children'))}</span>`}
+      ${right}
     </div>
     ${children}
   </div>`;
@@ -812,21 +810,6 @@ function openValuePicker(signal, onPick, anchor) {
   });
 }
 
-/* explicit "＋加权" entry: same picker, but choose the signal first */
-function openAddWeightPicker(nodeId) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  if (ref.node.kind !== 'leaf') { toast(t('p6.forkNoWeights')); return; }
-  openPicker({
-    title: t('p6.addWeight'),
-    sub: condText(ref.node),
-    anchor: () => $(`[data-nodeweight="${CSS.escape(nodeId)}"]`),
-    allowFree: true,
-    note: t('p6.weightNote'),
-    onPick: (key, value) => addWeight(nodeId, key, value),
-  });
-}
-
 /* drop handler shared by pointer drag and click-to-pick */
 function handleSignalDrop(nodeId, signal) {
   const ref = findNodeRef(nodeId);
@@ -914,7 +897,6 @@ function openStationPicker() {
 /* ── drag & drop ─────────────────────────────────────────────────────── */
 /* ── pointer interactions (no native HTML5 DnD) ─────────────────────── */
 let pdrag = null;        // {kind:'signal'|'station', ...}
-let pickedSig = null;    // click-to-pick: select a signal, then click a leaf
 let suppressClick = false;
 
 function clearHot() { $$('.tnode.hot').forEach(el => el.classList.remove('hot')); }
@@ -1004,22 +986,9 @@ function bindPalette() {
     pdrag = { kind: 'signal', sig: sig.dataset.sig,
               startX: e.clientX, startY: e.clientY, active: false, ghost: null };
   });
-  palBody.addEventListener('click', e => {
-    if (suppressClick) { suppressClick = false; return; }
-    const sig = e.target.closest('.sig');
-    if (!sig) return;
-    const key = sig.dataset.sig;
-    pickedSig = pickedSig === key ? null : key;
-    syncPalettePicked();
-    syncPalHint();
-  });
   palBody.addEventListener('scroll', syncPalFade, { passive: true });
   $('#palToggle').addEventListener('click', () =>
     setPalOpen($('#palette').classList.contains('closed')));
-}
-function syncPalettePicked() {
-  $$('#palBody .sig').forEach(el =>
-    el.setAttribute('aria-pressed', String(pickedSig === el.dataset.sig)));
 }
 function setPalOpen(open) {
   $('#palette').classList.toggle('closed', !open);
@@ -1030,8 +999,6 @@ function bindFlow() {
   const flow = $('#flow');
 
   flow.addEventListener('click', e => {
-    const addw = e.target.closest('[data-nodeweight]');
-    if (addw) { openAddWeightPicker(addw.dataset.nodeweight); return; }
     const add = e.target.closest('[data-nodeadd]');
     if (add) { openChildPicker(add.dataset.nodeadd); return; }
     const del = e.target.closest('[data-nodedel]');
@@ -1050,17 +1017,6 @@ function bindFlow() {
     if (delStation) { deleteStation(delStation.dataset.delstation); return; }
     const newStation = e.target.closest('[data-newstation]');
     if (newStation) { openStationPicker(); return; }
-    // click-to-pick: with a signal selected, clicking a leaf places it
-    if (pickedSig && !e.target.closest('button')) {
-      const tn = e.target.closest('.tnode');
-      if (tn) {
-        const sig = pickedSig;
-        pickedSig = null;
-        syncPalettePicked();
-        syncPalHint();
-        handleSignalDrop(tn.dataset.node, sig);
-      }
-    }
   });
 
   /* station reorder by dragging the number badge (fallback locked last) */
@@ -1377,7 +1333,6 @@ document.addEventListener('keydown', e => {
   else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); openSim(); runTry(); }
   else if (e.key === 'Escape') {
     if (!$('#pop').hidden) { closePop(); return; }
-    if (pickedSig) { pickedSig = null; syncPalettePicked(); syncPalHint(); return; }
     if (document.body.classList.contains('sim-open')) { closeSim(); return; }
   }
 });
