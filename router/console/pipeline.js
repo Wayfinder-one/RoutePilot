@@ -116,24 +116,19 @@ const rowsUsed = () => {
   return used;
 };
 
-/* ── header / health strip ───────────────────────────────────────────── */
+/* ── header ──────────────────────────────────────────────────────────── */
+/* The page head is deliberately bare (no engine/sync/version pills, no
+   config-count strip): unsaved edits surface as a dot on the save button. */
+function renderDirty() {
+  const btn = $('#savePipeline');
+  if (!btn) return;
+  btn.classList.toggle('has-dirty', !!dirty);
+  btn.title = dirty ? t('pipe.dirty') : t('pipe.clean');
+}
 function renderHeader() {
-  $('#taggerPill').innerHTML = LANG === 'zh'
-    ? `引擎 <b>${esc(tagger.name || '?')}</b>`
-    : `engine <b>${esc(tagger.name || '?')}</b>`;
   $('#exportPipeline').title = t('p4.exportTitle');
   $('#importPipeline').title = t('p4.importTitle');
-  $('#taggerPill').title = tagger.model_dir || '';
-  const dp = $('#dirtyPill');
-  dp.className = 'pill ' + (dirty ? 'warn' : 'ok');
-  dp.textContent = dirty ? t('pipe.dirty') : t('pipe.clean');
-  $('#versionPill').innerHTML = `<b>v${esc(version)}</b><span class="live">${t('p4.published')}</span>`;
-  const branches = nodes.reduce((a, n) => a + (n.branches || []).length, 0);
-  const rows = nodes.reduce((a, n) => a + (n.branches || []).reduce((x, b) => x + b.rows.length, 0), 0);
-  $('#health').innerHTML =
-    `<span class="lead">${t('p4.healthLead')}</span>` +
-    `<span class="pill">${nodes.length} ${t('p4.nodes')} · ${branches} ${t('pipe.branches')} · ${rows} ${t('pipe.rows')}</span>` +
-    `<span class="pill">${t('pipe.hit')} → ${t('pipe.flow.stop')}</span>`;
+  renderDirty();
 }
 
 /* ── palette (rendered once; state is toggled, never rebuilt) ────────── */
@@ -433,9 +428,7 @@ const currentJson = () => JSON.stringify(nodes.map(cleanNode));
 function markDirty() {
   // undo often restores the saved content exactly — compare, don't assume
   dirty = savedJson == null || currentJson() !== savedJson;
-  const dp = $('#dirtyPill');
-  dp.className = 'pill ' + (dirty ? 'warn' : 'ok');
-  dp.textContent = dirty ? t('pipe.dirty') : t('pipe.clean');
+  renderDirty();
 }
 
 function addNode(key) {
@@ -1459,7 +1452,7 @@ async function save() {
     version = String(out.version != null ? out.version : version);
     savedJson = currentJson();      // baseline moves with the saved content
     dirty = false;
-    renderHeader();
+    renderDirty();
     toast(t('common.saved'));
   } catch (e) {
     if (Array.isArray(e.detail)) showIssues(e.detail, '#issues');

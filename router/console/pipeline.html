@@ -10,15 +10,13 @@
 </head>
 <body data-page="pipeline">
 
-<div class="pagehead">
-  <div>
-    <div class="crumb" data-i18n="nav.pipeline"></div>
-    <h1><span data-i18n="nav.pipeline"></span><span class="sub" data-i18n="p4.sub"></span></h1>
-  </div>
-  <div class="headmeta">
-    <span class="pill" id="taggerPill" title=""></span>
-    <span class="pill" id="dirtyPill"></span>
-    <span class="pill" id="versionPill"></span>
+<main class="t4">
+  <div class="pagehead">
+    <div>
+      <div class="crumb" data-i18n="nav.pipeline"></div>
+      <h1><span data-i18n="nav.pipeline"></span><span class="sub" data-i18n="p4.sub"></span></h1>
+    </div>
+    <div class="headmeta">
     <button class="btn" id="openSim" title="">
       <svg width="12" height="12" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M4 1.8 11 6.5 4 11.2V1.8Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
       <span data-i18n="p4.try"></span>
@@ -33,13 +31,11 @@
     </button>
     <input type="file" id="importFile" accept="application/json,.json" hidden>
     <button class="btn pri sm" id="savePipeline" data-i18n="pipe.savelabel"></button>
+    </div>
   </div>
-</div>
-<div class="health" id="health"></div>
-<div class="issues" id="issues"></div>
-<div class="issues warnstrip" id="warnings"></div>
+  <div class="issues" id="issues"></div>
+  <div class="issues warnstrip" id="warnings"></div>
 
-<main class="t4">
   <a class="skip" href="#flow" data-i18n="p4.skip"></a>
   <div class="workspace">
     <aside class="palette" id="palette" aria-label="信号库">

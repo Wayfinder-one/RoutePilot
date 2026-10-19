@@ -540,3 +540,20 @@ body.sim-open .t4-sim-mask{opacity:1;pointer-events:auto}
 @media (prefers-reduced-motion:reduce){
   .t4 *,.t4-sim *,.pop,.t4toast{animation-duration:.001ms!important;animation-delay:0ms!important;transition-duration:.001ms!important}
 }
+
+/* ============================================================
+   对齐：pagehead / issues 与工作区共用同一个 1400px 容器与同一条左基线
+   （共享样式里 .pagehead 是 1600px + 22px padding，和 1400px 的 .t4
+   差出一条边，视觉上标题与信号库左边缘对不齐）
+   ============================================================ */
+.t4 .pagehead{
+  max-width:none;margin:16px 0 20px;padding:0;
+  align-items:flex-end;justify-content:space-between;gap:24px;
+}
+.t4 .issues{max-width:none;margin:0 0 10px;padding:0}
+
+/* 未保存改动：保存按钮上的小圆点（替代被移除的同步 pill） */
+.t4 .btn.pri.has-dirty::after{
+  content:"";width:6px;height:6px;border-radius:50%;
+  background:#fbbf24;box-shadow:0 0 0 2px rgba(251,191,36,.25);
+}
