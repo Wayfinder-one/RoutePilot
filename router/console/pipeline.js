@@ -505,23 +505,96 @@ function addRow(branchId, signalKey) {
   syncPaletteUsed();
   flashBranch(branchId);
   openRowEditor(branchId + ':' + (branch.rows.length - 1));
-  toast(tf('p4.toastRowAdded', { name: branchName(branch) }), () => {
+  // On a split node a signal only becomes a layer when every branch of the
+  // group carries it; otherwise it stays a leaf condition. Say so, once.
+  const siblingsMissing = node.type === 'split' && !spec.multi
+    && node.branches.some(b => b.id !== branch.id
+         && !b.rows.some(r => r.signal === signalKey));
+  const msg = siblingsMissing
+    ? tf('p4.toastRowAddedNoFork', { name: branchName(branch), sig: sigName(signalKey) })
+    : tf('p4.toastRowAdded', { name: branchName(branch) });
+  toast(msg, () => {
     branch.rows = branch.rows.filter(r => r !== row);
     markDirty();
     renderStation(node.id); syncPaletteUsed(); closePop();
   });
 }
 
+/* The group (leaf bucket) a branch lives in, plus the ancestor path. Used to
+   scope "a value no sibling occupies" (SPEC-TREE-4 §8.1) to the group the
+   clone actually lands in — node-wide scoping would block the legitimate
+   single-branch-group case that grows the next layer. */
+function branchGroup(node, branch) {
+  let level = derive(node, node.branches, new Set());
+  const used = new Set();
+  while (level.groups) {
+    const key = level.key;
+    const row = branch.rows.find(r => r.signal === key);
+    const value = row ? ((row.value || '') || null) : null;
+    const g = level.groups.find(x => x.value === value) || level.groups[0];
+    used.add(key);
+    level = g.child;
+  }
+  return { leaves: level.leaves || [], used };
+}
+
+/* Leaf paths + remaining conditions, for the duplicate guard below. */
+function leafEntries(node) {
+  const out = [];
+  const walk = (level, path, used) => {
+    if (!level.groups) {
+      level.leaves.forEach(b => out.push({ branch: b, path, used }));
+      return;
+    }
+    const nextUsed = new Set(used); nextUsed.add(level.key);
+    for (const g of level.groups)
+      walk(g.child, path.concat([{ signal: level.key, value: g.value }]), nextUsed);
+  };
+  walk(derive(node, node.branches, new Set()), [], new Set());
+  return out;
+}
+
+function wouldDuplicate(node, clone) {
+  const entries = leafEntries(node);
+  const mine = entries.find(e => e.branch === clone);
+  if (!mine) return false;
+  const sig = e => JSON.stringify([
+    e.path,
+    e.branch.rows.filter(r => !e.used.has(r.signal))
+      .map(r => [r.signal, r.value, r.weight]),
+    e.branch.min_score,
+  ]);
+  const mineSig = sig(mine);
+  return entries.some(e => e.branch !== clone && sig(e) === mineSig);
+}
+
 function cloneBranch(node, branch, signalKey) {
   const spec = sigSpec(signalKey);
   const cur = branch.rows.find(r => r.signal === signalKey);
-  const taken = new Set(node.branches
+  // siblings = branches in the group this branch belongs to (the clone keeps
+  // that parent path, only this signal's value changes)
+  const group = branchGroup(node, branch);
+  const taken = new Set(group.leaves
     .filter(b => b.id !== branch.id)
     .map(b => (b.rows.find(r => r.signal === signalKey) || {}).value)
     .filter(Boolean));
-  const vals = spec.values || [];
-  const pickVal = vals.find(([v]) => v !== cur.value && !taken.has(v))
-    || vals.find(([v]) => v !== cur.value) || null;
+  const vals = (spec.values || []).filter(([v]) => v !== cur.value && !taken.has(v));
+  // Pick the first value whose clone would not be a dead duplicate under the
+  // landing path (health's split_dead_branch); none left -> refuse and say why.
+  let pickVal = null;
+  for (const v of vals) {
+    const probe = {
+      id: '__probe__', name: '', action: branch.action, model: branch.model,
+      min_score: branch.min_score,
+      rows: branch.rows.map(r => r.signal === signalKey ? { ...r, value: v[0] } : { ...r }),
+    };
+    const trial = { ...node, branches: node.branches.concat([probe]) };
+    if (!wouldDuplicate(trial, probe)) { pickVal = v; break; }
+  }
+  if (!pickVal) {
+    toast(tf('p4.cloneNoValue', { name: sigName(signalKey) }));
+    return;
+  }
   const copy = {
     id: nid('b'), name: LANG === 'zh'
       ? (pickVal ? pickVal[1] : spec.zh) + ' ' + t('p4.branchWord')
