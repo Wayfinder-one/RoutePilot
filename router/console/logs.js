@@ -6,7 +6,7 @@ const $ = s => document.querySelector(s);
 let requests = [];
 let questions = null;
 let meta = {};
-let pipeNodes = [];
+let pipeStations = [];
 let SIG = {};
 let filter = 'all';
 let openIds = new Set();
@@ -21,10 +21,20 @@ const valLabel = (k, v) => {
 const MODEL_ORDER = ['jailbreak', 'pii', 'domain', 'fact_check', 'modality',
   'complexity', 'user_feedback', 'similarity', 'reask'];
 
-function machine(name) {
-  const node = pipeNodes.find(n => n.id === name.node_id);
-  const branch = node ? (node.branches || []).find(b => b.id === name.branch_id) : null;
-  return { node, branch };
+function nodeText(n) {
+  if (!n) return '';
+  return n.signal ? `${sigName(n.signal)} = ${valLabel(n.signal, n.value) || n.value}` : '';
+}
+function machine(r) {
+  const station = pipeStations.find(st => st.id === r.node_id);
+  let leaf = null;
+  const walk = n => {
+    if (!n || leaf) return;
+    if (n.id === r.branch_id) { leaf = n; return; }
+    (n.children || []).forEach(walk);
+  };
+  if (station) walk(station.root);
+  return { node: station, branch: leaf ? { name: nodeText(leaf) } : null };
 }
 
 function decisionHtml(r) {
@@ -159,7 +169,7 @@ async function load() {
     // older server without /signal-questions meta: fall back to /tagger
     try { meta = (await api.get('/admin/tagger')).tagger || meta; } catch (e) { /* ignore */ }
   }
-  pipeNodes = pipeBody.nodes || [];
+  pipeStations = pipeBody.stations || [];
   sigBody.signals.forEach(s => { SIG[s.key] = s; });
   render();
 }

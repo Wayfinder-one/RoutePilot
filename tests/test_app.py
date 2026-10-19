@@ -21,4 +21,5 @@ def test_console_mounted(tmp_path):
 def test_pipeline_seeded(tmp_path):
     r = client(tmp_path).get("/admin/pipeline")
     assert r.status_code == 200
-    assert [n["type"] for n in r.json()["nodes"]] == ["gate", "gate", "score", "gate"]
+    assert [st["type"] for st in r.json()["stations"]] == \
+        ["gate", "gate", "split", "gate"]

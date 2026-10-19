@@ -20,8 +20,8 @@ PII 信号另有确定性正则补充（`router/signals/pii_rules.py`）。
               │   └─ jev:       Qwen3.5-0.8B JEV 头按问题作答 → 候选概率（默认部署）
               │   + 9 个确定性规则信号（signals/rules.py）
               │
-              ├─ Pipeline（分流树：gate / score / split（树形由分支推导，SPEC-TREE-4），
-              │            存 SQLite，可热更新）
+              ├─ Pipeline（分流树：每个站点一棵独立显式树，节点可增删、叶子可加权；
+              │            站点=gate/score/split，存 SQLite JSON，可热更新）
               ├─ Upstream（OpenAI 兼容推理后端 + 熔断）
               └─ RequestLog（信号/决策/trace/tree_path → SQLite；Litestream 复制）
 控制台（/console）：概览 / 分流树（信号库 + 树形编辑 + 试算侧滑）/ 计算日志 / 信号配置 / 模型与设置

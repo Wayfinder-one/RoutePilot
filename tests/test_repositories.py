@@ -1,9 +1,10 @@
 import pytest
 
-from router.pipeline.model import Node
+from router.pipeline.model import Station
 from router.store.db import connect, migrate
-from router.store.repositories import (KeywordRepo, ModelRepo, PipelineRepo,
-                                       SettingsRepo, seed_default)
+from router.store.repositories import (KeywordRepo, ModelRepo, SettingsRepo,
+                                       StationRepo, default_pipeline,
+                                       seed_default)
 
 
 @pytest.fixture
@@ -17,43 +18,51 @@ def conn(tmp_path):
 def test_seed_idempotent(conn):
     seed_default(conn)
     seed_default(conn)
-    nodes = PipelineRepo(conn).load()
-    assert [n.type for n in nodes] == ["gate", "gate", "score", "gate"]
+    stations = StationRepo(conn).load()
+    assert [s.type for s in stations] == ["gate", "gate", "split", "gate"]
     assert len(ModelRepo(conn).list()) == 5
     assert "医疗急症" in KeywordRepo(conn).groups()
 
 
-def test_pipeline_save_bumps_version(conn):
+def test_station_save_bumps_version(conn):
     seed_default(conn)
-    repo = PipelineRepo(conn)
+    repo = StationRepo(conn)
     v0 = SettingsRepo(conn).get("pipeline_version", "0")
-    nodes = repo.load()
-    nodes[0].name = "改名"
-    repo.save(nodes)
+    stations = repo.load()
+    stations[0].name = "改名"
+    repo.save(stations)
     assert SettingsRepo(conn).get("pipeline_version") != v0
     assert repo.load()[0].name == "改名"
 
 
-def test_pipeline_roundtrip_types(conn):
+def test_station_roundtrip_tree(conn):
     seed_default(conn)
-    nodes = PipelineRepo(conn).load()
-    score = nodes[2]
-    assert isinstance(score, Node)
-    assert score.branches[0].rows[0].weight == 0.5
-    assert score.branches[0].min_score == 0.45
-    gate = nodes[0]
-    assert gate.branches[0].rows[0].conf_min == 0.45
+    stations = StationRepo(conn).load()
+    subject = stations[2]
+    assert subject.type == "split"
+    assert subject.root.signal is None and subject.root.kind == "fork"
+    health = subject.root.children[0]
+    assert health.signal == "domain" and health.value == "health"
+    assert health.conf_min == 0.40      # heuristic calibration
+    leaves = {leaf.value: leaf for leaf in health.children}
+    assert leaves["hard"].model == "qwen3-8b-medical"
+    assert leaves["easy"].model == "qwen3-0.6b-medical"
+    fallback = stations[-1]
+    assert fallback.root.signal is None and fallback.root.action == "route"
+    assert fallback.root.model == "qwen3-8b"
 
 
 def test_checkpoint_calibration_is_higher_and_healthy(conn):
     from router.pipeline.health import check_pipeline
     seed_default(conn, "checkpoint")
-    nodes = PipelineRepo(conn).load()
-    # 0.99 since the 2026-10-17 demo decision: the jailbreak head misfires on
-    # emergency wording, so the gate only fires at very high confidence
-    # (documented in CALIBRATIONS and the implementation record section 10-2)
-    assert nodes[0].branches[0].rows[0].conf_min == 0.99
-    assert nodes[2].branches[0].min_score == 0.55
-    assert nodes[2].branches[1].min_score == 0.45
-    known = {m["id"] for m in ModelRepo(conn).list()}
-    assert check_pipeline(nodes, known) == []
+    stations = StationRepo(conn).load()
+    safety = stations[0]
+    assert safety.root.children[0].conf_min == 0.99   # jailbreak (checkpoint)
+    assert check_pipeline(stations, {m["id"] for m in ModelRepo(conn).list()}) == []
+
+
+def test_default_pipeline_types():
+    stations = default_pipeline("jev")
+    assert len(stations) == 4
+    assert isinstance(stations[0], Station)
+    assert stations[0].root.kind == "fork"

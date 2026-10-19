@@ -1,82 +1,112 @@
+"""Health checks for the explicit-tree model."""
+
 from router.pipeline.health import check_pipeline
-from router.pipeline.model import Branch, Node, Row
+from router.pipeline.model import Station, TreeNode, Weight
 
-MODELS = {"qwen3-8b", "med"}
+MODELS = {"qwen3-8b", "med", "qwen3-8b-medical", "qwen3-0.6b-medical",
+          "deepseek-v3"}
 
 
-def ok_pipeline():
-    return [Node(id="f", type="gate", branches=[
-        Branch(id="fb", rows=[], action="route", model="qwen3-8b")])]
+def node(nid, signal=None, value="", conf=None, kind="leaf", action="route",
+         model=None, min_score=None, weights=None, children=None):
+    return TreeNode(id=nid, signal=signal, value=value, conf_min=conf,
+                    kind=kind, action=action, model=model,
+                    min_score=min_score, weights=weights or [],
+                    children=children or [])
+
+
+def fallback():
+    return Station(id="f", type="gate", name="兜底",
+                   root=node("n4", signal=None, action="route", model="qwen3-8b"))
 
 
 def codes(issues):
     return {i.code for i in issues}
 
 
-def test_ok():
-    assert check_pipeline(ok_pipeline(), MODELS) == []
+def test_default_stations_are_healthy():
+    from router.store.repositories import default_pipeline
+    assert check_pipeline(default_pipeline("heuristic"), MODELS) == []
 
 
-def test_missing_fallback_and_empty():
+def test_empty_pipeline():
     assert "empty_pipeline" in codes(check_pipeline([], MODELS))
-    n = Node(id="g", type="gate", branches=[
-        Branch(id="b", rows=[Row("domain", "health", conf_min=0.5)],
-               action="route", model="qwen3-8b")])
-    assert "missing_fallback" in codes(check_pipeline([n], MODELS))
+
+
+def test_missing_fallback():
+    stations = [Station(id="s", type="gate", name="x",
+                        root=node("r", signal=None, kind="fork",
+                                  children=[node("c", "domain", "health", 0.5,
+                                                 model="med")]))]
+    assert "missing_fallback" in codes(check_pipeline(stations, MODELS))
+
+
+def test_unconditional_station_must_be_last():
+    stations = [
+        Station(id="a", type="gate", name="直达",
+                root=node("r", signal=None, action="route", model="med")),
+        fallback()]
+    assert "station_shadow" in codes(check_pipeline(stations, MODELS))
 
 
 def test_unknown_model_and_signal():
-    n = ok_pipeline()
-    n[0].branches[0].model = "nope"
-    n[0].branches.insert(0, Branch(id="b", rows=[Row("nope_sig", "x")],
-                                   action="route", model="qwen3-8b"))
-    got = codes(check_pipeline(n, MODELS))
-    assert {"unknown_model", "unknown_signal"} <= got
+    stations = [
+        Station(id="a", type="gate", name="x", root=node(
+            "r", signal=None, kind="fork", children=[
+                node("c", "telepathy", "yes", 0.5, model="nope")])),
+        fallback()]
+    got = codes(check_pipeline(stations, MODELS))
+    assert "unknown_signal" in got and "unknown_model" in got
 
 
-def test_zero_weight_and_duplicate():
-    row = Row("domain", "health", weight=0.0)
-    n = Node(id="s", type="score", branches=[
-        Branch(id="b1", rows=[row], model="med", min_score=0.5),
-        Branch(id="b2", rows=[Row("domain", "health", weight=0.0)],
-               model="med", min_score=0.5),
-    ])
-    got = codes(check_pipeline([n, *ok_pipeline()], MODELS))
-    assert "zero_weight" in got and "duplicate_branch" in got
+def test_missing_model_on_route_leaf():
+    stations = [Station(id="a", type="gate", name="x", root=node(
+        "r", signal=None, kind="fork",
+        children=[node("c", "domain", "health", 0.5)])), fallback()]
+    assert "missing_model" in codes(check_pipeline(stations, MODELS))
 
 
-def test_dead_branch_exclusive_rows():
-    # complexity can only equal one value: max attainable = 0.6/1.0 = 0.6 < 0.9
-    n = Node(id="s", type="score", branches=[
-        Branch(id="b1", rows=[Row("complexity", "easy", weight=0.4),
-                              Row("complexity", "hard", weight=0.6)],
-               model="med", min_score=0.9)])
-    assert "dead_branch" in codes(check_pipeline([n, *ok_pipeline()], MODELS))
+def test_leaf_and_fork_shape():
+    stations = [
+        Station(id="a", type="gate", name="x", root=node(
+            "r", signal=None, kind="fork", children=[
+                node("c", "domain", "health", 0.5, model="med",
+                     kind="fork")])),
+        fallback()]
+    got = codes(check_pipeline(stations, MODELS))
+    assert "empty_fork" in got
 
 
-def test_duplicate_allows_different_min_score():
-    # Same rows, different threshold = the legal high/low-confidence two-tier
-    # pattern; the signature must include min_score (audit ruling A).
-    n = Node(id="s", type="score", branches=[
-        Branch(id="b1", rows=[Row("domain", "health", weight=1.0)],
-               model="med", min_score=0.5),
-        Branch(id="b2", rows=[Row("domain", "health", weight=1.0)],
-               model="med", min_score=0.9)])
-    assert "duplicate_branch" not in codes(check_pipeline([n, *ok_pipeline()], MODELS))
+def test_rule_signal_floor_warns_only():
+    stations = [
+        Station(id="kw", type="gate", name="关键词", root=node(
+            "r", signal=None, kind="fork", children=[
+                node("c", "keyword", "医疗急症", 0.5, model="med")])),
+        fallback()]
+    issues = check_pipeline(stations, MODELS)
+    assert "rule_signal_floor" in codes(issues)
+    assert all(i.level == "warn" for i in issues if i.code == "rule_signal_floor")
 
 
-def test_gate_exclusive_rows_are_dead():
-    n = Node(id="g", type="gate", branches=[
-        Branch(id="b", rows=[Row("complexity", "easy"),
-                             Row("complexity", "hard")],
-               action="route", model="qwen3-8b")])
-    assert "gate_exclusive_rows" in codes(check_pipeline([n], MODELS))
+def test_weighted_leaf_without_min_score_warns():
+    stations = [
+        Station(id="a", type="score", name="x", root=node(
+            "r", signal=None, kind="fork", children=[
+                node("c", "domain", "health", 0.5, model="med",
+                     weights=[Weight("complexity", "hard", 0.5)])])),
+        fallback()]
+    issues = check_pipeline(stations, MODELS)
+    assert "missing_min_score" in codes(issues)
+    assert all(i.level == "warn" for i in issues
+               if i.code == "missing_min_score")
 
 
-def test_empty_branch_must_be_last():
-    n = Node(id="g", type="gate", branches=[
-        Branch(id="b1", rows=[], action="route", model="qwen3-8b"),
-        Branch(id="b2", rows=[Row("domain", "health")],
-               action="route", model="med")])
-    assert "empty_branch_shadow" in codes(check_pipeline([n], MODELS))
-
+def test_duplicate_conditions_warn():
+    stations = [Station(id="a", type="gate", name="x", root=node(
+        "r", signal=None, kind="fork", children=[
+            node("c1", "domain", "health", 0.5, model="med"),
+            node("c2", "domain", "health", 0.5, model="med")])), fallback()]
+    issues = check_pipeline(stations, MODELS)
+    assert "duplicate_condition" in codes(issues)
+    assert all(i.level == "warn" for i in issues
+               if i.code == "duplicate_condition")

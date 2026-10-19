@@ -1,15 +1,15 @@
-"""Pipeline health checks (design doc section 8). PUT /admin/pipeline runs
-these and rejects with 422 on any issue. Evaluators assume a healthy tree;
-this module is the gatekeeper that keeps the assumption true.
+"""Pipeline health checks for the explicit-tree model.
+
+PUT /admin/pipeline runs these and rejects hard issues with 422. Evaluators
+assume a healthy tree; this module keeps that assumption true.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from router.pipeline.model import NODE_TYPES, Node
-from router.pipeline.tree import (derive, is_rule_signal, leaf_paths,
-                                  level_keys, orphan_branches, remaining_rows)
+from router.pipeline.model import (ACTIONS, STATION_TYPES, Station, TreeNode,
+                                   Weight)
 from router.signals.registry import SIGNALS
 
 
@@ -18,199 +18,147 @@ class Issue:
     code: str
     zh: str
     en: str
+    station_id: str = ""
     node_id: str = ""
-    branch_id: str = ""
     level: str = "hard"             # 'hard' rejects the save (422); 'warn' does not
 
 
-def _split_issues(node: Node) -> list[Issue]:
-    """SPEC-TREE-4 section 5: the five split-node checks.
-
-    The tree itself is derived (tree.derive); dead/orphan branches are read off
-    the derivation, so what health rejects is exactly what the engine would
-    never reach."""
+def _check_weights(node: TreeNode, station: Station) -> list[Issue]:
     issues: list[Issue] = []
-    if not node.branches:
-        issues.append(Issue("split_empty",
-                            "分流节点 0 条分支（惰性节点，永不决策）",
-                            "Split node has no branches; it never decides",
-                            node_id=node.id, level="warn"))
-        return issues
-
-    level = derive(node, node.branches, set())
-    keys = level_keys(level)
-
-    # split_dead_branch: same parent path + identical remaining rows (+ the
-    # same min_score, or the two-tier pattern would be legal) -> the later
-    # branch can never win, ties keep the earlier one. The path is part of the
-    # signature: identical leaves under DIFFERENT paths are the whole point of
-    # grouping, not duplicates.
-    seen: dict[tuple, str] = {}
-    for branch, path in leaf_paths(level):
-        used = {signal for signal, _value in path}
-        rest = remaining_rows(branch, used)
-        sig = (tuple(path),
-               frozenset((r.signal, r.value, r.weight) for r in rest),
-               branch.min_score)
-        if sig in seen:
-            issues.append(Issue("split_dead_branch",
-                                "同一父路径下与上方分支条件完全相同，恒被压制",
-                                "Identical to an earlier branch under the same "
-                                "path; never wins", node.id, branch.id))
-        else:
-            seen[sig] = branch.id
-
-    # split_orphan_value: a branch whose fork-key row carries an empty value
-    # lands in the 「待选」 bucket, which no request can ever enter.
-    for branch, path in orphan_branches(level):
-        key = next((k for k, v in path if v is None), "?")
-        issues.append(Issue("split_orphan_value",
-                            f"分组条件 {key} 的取值为空，落入「待选」组，永不可达，请补值",
-                            f"Fork key {key} has no value; the branch lands in "
-                            f"the unreachable pending group",
-                            node.id, branch.id))
-
-    # split_dead_min_score: zero remaining conditions -> min_score never read.
-    for branch, path in leaf_paths(level):
-        used = {signal for signal, _value in path}
-        if not remaining_rows(branch, used) and branch.min_score is not None:
-            issues.append(Issue("split_dead_min_score",
-                                "路径已完全确定（命中即路由），min_score 不再生效",
-                                "Path is fully determined (hit routes at once); "
-                                "min_score is ignored", node.id, branch.id,
-                                level="warn"))
-
-    # split_rule_floor: a floor that no layer can ever consult. A model-signal
-    # layer anywhere still reads the floor, so only an all-rule / keyless tree
-    # warns.
-    if node.floor is not None and not any(not is_rule_signal(k) for k in keys):
-        issues.append(Issue("split_rule_floor",
-                            "分组键全是规则信号（确定性），进组门槛不会生效",
-                            "Every fork key is a rule signal (deterministic); "
-                            "the entry floor never applies", node.id,
-                            level="warn"))
+    seen: set[tuple[str, str]] = set()
+    for w in node.weights:
+        if w.signal not in SIGNALS:
+            issues.append(Issue("unknown_signal", f"未知信号 {w.signal}",
+                                f"Unknown signal {w.signal}",
+                                station.id, node.id))
+        elif (w.signal, w.value) in seen:
+            issues.append(Issue("duplicate_weight",
+                                "同一叶子重复添加了同一个信号条件",
+                                "The same signal condition appears twice on one leaf",
+                                station.id, node.id, level="warn"))
+        elif not w.value:
+            issues.append(Issue("weight_without_value",
+                                "加权条件缺少取值",
+                                "A weighted condition has no value",
+                                station.id, node.id))
+        seen.add((w.signal, w.value))
     return issues
 
 
-def _attainable_cap(rows) -> tuple[float, float]:
-    """Max attainable score for a score branch. A single-valued signal can
-    only match one target, so for signals written with multiple targets only
-    the heaviest row can count. Returns (cap, sum_w)."""
-    sum_w = sum(r.weight or 0.0 for r in rows)
-    by_signal: dict[str, dict[str, float]] = {}
-    for r in rows:
-        spec = SIGNALS.get(r.signal)
-        if spec is not None and not spec.multi:
-            by_signal.setdefault(r.signal, {})[r.value] = \
-                max(by_signal.get(r.signal, {}).get(r.value, 0.0), r.weight or 0.0)
-    lost = 0.0
-    for targets in by_signal.values():
-        if len(targets) > 1:
-            lost += sum(targets.values()) - max(targets.values())
-    return (sum_w - lost), sum_w
-
-
-def _rows_signature(branch) -> tuple:
-    """Duplicate-branch signature: identical rows AND identical threshold.
-
-    The design definition (section 8) is "weight rows identical and threshold
-    identical" — same rows with a different min_score is the legitimate
-    high-confidence / low-confidence two-tier pattern, so min_score is part of
-    the signature. conf_min is included so two gate branches that differ only
-    in their confidence threshold are not collapsed either.
-    """
-    rows = frozenset((r.signal, r.value, r.weight, r.conf_min)
-                     for r in branch.rows)
-    return (rows, branch.min_score)
-
-
-def _gate_exclusive_row_issue(node, branch) -> Issue | None:
-    """A gate branch ANDs its rows; two target values of the same single-valued
-    signal can never both match, so the branch is dead."""
-    targets: dict[str, set[str]] = {}
-    for r in branch.rows:
-        spec = SIGNALS.get(r.signal)
-        if spec is not None and not spec.multi:
-            targets.setdefault(r.signal, set()).add(r.value)
-    for signal, values in targets.items():
-        if len(values) > 1:
-            return Issue("gate_exclusive_rows",
-                         f"闸门分支内信号 {signal} 写了多个目标值，AND 语义下分支永假",
-                         f"Gate branch pins signal {signal} to multiple values; "
-                         f"with AND semantics the branch can never fire",
-                         node.id, branch.id)
-    return None
-
-
-def check_pipeline(nodes: list[Node], known_models: set[str]) -> list[Issue]:
+def _check_node(node: TreeNode, station: Station, known_models: set[str],
+                *, is_root: bool, siblings_seen: set[tuple]) -> list[Issue]:
     issues: list[Issue] = []
-    if not nodes:
+    # ---- condition ----
+    if node.signal is not None:
+        if node.signal not in SIGNALS:
+            issues.append(Issue("unknown_signal", f"未知信号 {node.signal}",
+                                f"Unknown signal {node.signal}",
+                                station.id, node.id))
+        if not node.value:
+            issues.append(Issue("missing_value", "条件节点缺少取值",
+                                "A condition node has no value",
+                                station.id, node.id))
+        spec = SIGNALS.get(node.signal)
+        if spec is not None and spec.kind == "rule" and node.conf_min is not None:
+            issues.append(Issue("rule_signal_floor",
+                                "规则信号是确定性的，置信门槛不会生效",
+                                "Rule signals are deterministic; the confidence "
+                                "floor never applies",
+                                station.id, node.id, level="warn"))
+        # same condition repeated among siblings -> later one never reached
+        key = (node.signal, node.value)
+        if key in siblings_seen:
+            issues.append(Issue("duplicate_condition",
+                                "同一父节点下重复的条件，后一条永远轮不到",
+                                "Duplicate condition under the same parent; the "
+                                "later one is unreachable",
+                                station.id, node.id, level="warn"))
+        siblings_seen.add(key)
+    else:
+        if not is_root:
+            issues.append(Issue("unconditional_child",
+                                "只有根节点可以无条件；子节点没有条件会吞掉后面的兄弟",
+                                "Only the root may be unconditional; an "
+                                "unconditional child shadows its siblings",
+                                station.id, node.id))
+    # ---- leaf / fork ----
+    if node.kind == "fork":
+        if not node.children:
+            issues.append(Issue("empty_fork", "分叉节点没有子节点",
+                                "Fork node has no children", station.id, node.id))
+        child_seen: set[tuple] = set()
+        for child in node.children:
+            issues.extend(_check_node(child, station, known_models,
+                                      is_root=False, siblings_seen=child_seen))
+    else:
+        if node.children:
+            issues.append(Issue("leaf_with_children", "终点节点不能再有子节点",
+                                "A leaf cannot have children", station.id, node.id))
+        if node.action not in ACTIONS:
+            issues.append(Issue("bad_action", f"非法动作 {node.action}",
+                                f"Invalid action {node.action}",
+                                station.id, node.id))
+        needs_model = node.action == "route"
+        if needs_model and not node.model:
+            issues.append(Issue("missing_model", "路由叶子没有配置模型",
+                                "Route leaf has no target model",
+                                station.id, node.id))
+        elif needs_model and node.model not in known_models:
+            issues.append(Issue("unknown_model", f"未知模型 {node.model}",
+                                f"Unknown model {node.model}",
+                                station.id, node.id))
+        if node.weights:
+            issues.extend(_check_weights(node, station))
+            if not any(w.weight > 0 for w in node.weights):
+                issues.append(Issue("zero_weight", "加权条件权重全为 0",
+                                    "All weights are zero", station.id, node.id))
+            if node.min_score is None:
+                issues.append(Issue("missing_min_score",
+                                    "加权叶子没有配置达成率门槛",
+                                    "Weighted leaf has no attainment floor",
+                                    station.id, node.id, level="warn"))
+    return issues
+
+
+def _is_unconditional_leaf(station: Station) -> bool:
+    root = station.root
+    return (root is not None and root.signal is None
+            and root.kind == "leaf" and not root.weights)
+
+
+def check_pipeline(stations: list[Station], known_models: set[str]) -> list[Issue]:
+    issues: list[Issue] = []
+    if not stations:
         issues.append(Issue("empty_pipeline", "管道为空", "Pipeline is empty"))
         return issues
-    for node in nodes:
-        if node.type not in NODE_TYPES:
-            issues.append(Issue("unknown_node_type",
-                                f"未知节点类型 {node.type}", f"Unknown node type {node.type}",
-                                node_id=node.id))
+    for station in stations:
+        if station.type not in STATION_TYPES:
+            issues.append(Issue("unknown_station_type",
+                                f"未知站点类型 {station.type}",
+                                f"Unknown station type {station.type}",
+                                station_id=station.id))
             continue
-        seen_signatures: set[tuple] = set()
-        for b in node.branches:
-            needs_model = node.type in ("score", "split") or b.action == "route"
-            if needs_model and not b.model:
-                issues.append(Issue("missing_model", "分支缺少去向模型",
-                                    "Branch has no target model",
-                                    node.id, b.id))
-            elif needs_model and b.model not in known_models:
-                issues.append(Issue("unknown_model", f"未知模型 {b.model}",
-                                    f"Unknown model {b.model}", node.id, b.id))
-            for r in b.rows:
-                if r.signal not in SIGNALS:
-                    issues.append(Issue("unknown_signal", f"未知信号 {r.signal}",
-                                        f"Unknown signal {r.signal}", node.id, b.id))
-            if node.type == "gate":
-                gate_issue = _gate_exclusive_row_issue(node, b)
-                if gate_issue is not None:
-                    issues.append(gate_issue)
-            if node.type == "score":
-                cap, sum_w = _attainable_cap(b.rows)
-                if sum_w == 0:
-                    issues.append(Issue("zero_weight", "分支权重全为 0",
-                                        "All weights are zero", node.id, b.id))
-                elif b.min_score is not None and cap / sum_w < b.min_score:
-                    issues.append(Issue("dead_branch",
-                                        "存在互斥行，理论最高分低于门槛分，分支恒不可达",
-                                        "Mutually exclusive rows cap the attainable score "
-                                        "below min_score; branch can never win",
-                                        node.id, b.id))
-                sig = _rows_signature(b)
-                if sig in seen_signatures:
-                    issues.append(Issue("duplicate_branch",
-                                        "与上方分支完全相同，恒被压制",
-                                        "Identical to an earlier branch; never wins",
-                                        node.id, b.id))
-                seen_signatures.add(sig)
-        if node.type == "gate":
-            # An empty-row gate branch always fires; anywhere but last it makes
-            # every following branch unreachable (design doc section 8).
-            for i, b in enumerate(node.branches):
-                if not b.rows and i < len(node.branches) - 1:
-                    issues.append(Issue("empty_branch_shadow",
-                                        "空条件分支不在末位，其后分支永不可达",
-                                        "An empty-row branch is not last; every "
-                                        "branch behind it is unreachable",
-                                        node.id, b.id))
-        if node.type == "split":
-            if node.floor is not None and not 0 <= node.floor <= 1:
-                issues.append(Issue("floor_out_of_range",
-                                    "进组门槛必须在 [0,1] 内",
-                                    "Entry floor must be within [0,1]",
-                                    node_id=node.id))
-            issues.extend(_split_issues(node))
-    last = nodes[-1]
-    if last.type != "gate" or not any(b.action == "route" and not b.rows
-                                      and b.model for b in last.branches):
-        issues.append(Issue("missing_fallback",
-                            "末节点必须是空条件的直达闸门（兜底）",
-                            "Last node must be a gate with an empty-row route branch "
-                            "(fallback)", node_id=last.id))
+        if station.root is None:
+            issues.append(Issue("empty_station", "站点没有任何节点",
+                                "Station has no nodes",
+                                station_id=station.id))
+            continue
+        issues.extend(_check_node(station.root, station, known_models,
+                                  is_root=True, siblings_seen=set()))
+    # An always-hit station anywhere but last shadows every following station.
+    for i, station in enumerate(stations[:-1]):
+        if _is_unconditional_leaf(station):
+            issues.append(Issue("station_shadow",
+                                "无条件直达的站点不在末位，后面的站点永远轮不到",
+                                "An unconditional hitting station is not last; "
+                                "every station after it is unreachable",
+                                station_id=station.id))
+    last = stations[-1]
+    if not _is_unconditional_leaf(last) or last.root.action != "route" \
+            or not last.root.model:
+        issues.append(Issue(
+            "missing_fallback",
+            "末站点必须是「无条件 → 命中路由」的兜底", 
+            "The last station must be an unconditional route leaf (fallback)",
+            station_id=last.id, node_id=last.root.id if last.root else ""))
     return issues

@@ -58,7 +58,7 @@ def test_eval_replay_detects_drift(tmp_path):
     chat(c, "今天天气怎么样")                            # -> qwen3-8b
     asyncio.run(app.state.requestlog.flush())
     pipe = c.get("/admin/pipeline").json()
-    pipe["nodes"][3]["branches"][0]["model"] = "qwen3-32b"   # change the fallback
+    pipe["stations"][3]["root"]["model"] = "qwen3-32b"        # change the fallback
     assert c.put("/admin/pipeline", json=pipe).status_code == 200
     body = c.post("/admin/eval", json={"mode": "replay", "days": 7}).json()
     assert body["total"] == 1 and body["matched"] == 0

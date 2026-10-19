@@ -48,11 +48,11 @@ async def chat_completions(request: Request):
     # One snapshot for both the trimming hint and the decision: a concurrent
     # PUT /admin/pipeline swaps the whole list atomically, and reading it twice
     # could score the old tree but evaluate the new one.
-    nodes = request.app.state.pipeline
+    stations = request.app.state.pipeline
     # Pipeline-aware trimming (docs/pipeline-aware-trimming.md): score only the
     # JEV questions this tree can read. The tagger ignores the hint when it does
     # not implement trimming (heuristic/checkpoint/prompt modes).
-    scope = (compute_signal_scope(nodes)
+    scope = (compute_signal_scope(stations)
              if request.app.state.settings.jev_trim else None)
     sid = session_id_from(request)
     result = await tagger.tag(TagRequest(
@@ -65,7 +65,7 @@ async def chat_completions(request: Request):
         decision, session_state = cont
         trace = []
     else:
-        decision, trace = evaluate(nodes, result.signals)
+        decision, trace = evaluate(stations, result.signals)
         session_state = "new"
     extra = ({"x-sr-session-state": session_state}
              if request.app.state.settings.sessions else {})
@@ -73,17 +73,16 @@ async def chat_completions(request: Request):
     # SPEC-TREE-4 §4.4: the split layer path of the deciding node, persisted for
     # the console log detail (requests.tree_path, nullable JSON text).
     tree_path = None
-    if decision.node_id:
-        entry = next((t for t in trace
-                      if t.get("node_id") == decision.node_id), None)
-        if entry and entry.get("type") == "split":
-            tree_path = json.dumps(entry.get("path") or [], ensure_ascii=False)
+    entry = next((t for t in trace
+                  if t.get("station_id") == decision.station_id), None)
+    if entry and entry.get("path"):
+        tree_path = json.dumps(entry["path"], ensure_ascii=False)
 
     request.app.state.requestlog.enqueue({
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "text": text, "decision": decision.kind, "model": decision.model,
-        "node_id": decision.node_id, "branch_id": decision.branch_id,
+        "node_id": decision.station_id, "branch_id": decision.node_id,
         "score": decision.score,
         "latency_ms": (time.monotonic() - started) * 1000,
         "tree_path": tree_path,

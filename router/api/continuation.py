@@ -66,9 +66,10 @@ def continuation(request: Request, session_id: str | None) -> tuple[Decision, st
             models = ModelRepo(conn).list()
             up = _pick_escalation(models, last_model)
             if up and up != last_model:
-                return (Decision(kind="route", model=up, node_id="session",
-                                 branch_id="unlocked"), "unlocked")
-        return (Decision(kind="route", model=last_model, node_id="session",
-                         branch_id="sticky"), "sticky")
+                return (Decision(kind="route", model=up,
+                                 station_id="session", node_id="unlocked"),
+                        "unlocked")
+        return (Decision(kind="route", model=last_model,
+                         station_id="session", node_id="sticky"), "sticky")
     finally:
         conn.close()

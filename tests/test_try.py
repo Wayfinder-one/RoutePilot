@@ -14,11 +14,11 @@ def test_try_medical_hard(tmp_path):
                                             "这种症状该怎么用药，如何权衡方案？"})
     body = r.json()
     assert body["decision"]["model"] == "qwen3-8b-medical"
-    board = body["trace"][2]["board"]
-    winner = [b for b in board if b["winner"]][0]
-    assert winner["name"] == "8B 医疗"
-    assert all({"signal", "w", "c", "m", "contrib"} <= set(l)
-               for l in winner["lines"])
+    entry = body["trace"][2]
+    assert entry["result"] == "hit"
+    assert [(p["signal"], p["value"], p["pass"]) for p in entry["path"]] == [
+        ("domain", "health", True), ("complexity", "hard", True)]
+    assert entry["board"] == []        # direct-hit tree leaves do not score
 
 
 def test_try_block_and_fallback(tmp_path):

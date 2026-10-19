@@ -1,50 +1,30 @@
-"""Score-node evaluator (design doc section 3.3).
+"""Leaf scoring for the explicit-tree pipeline.
 
-Branch score = sum(w*c*m) / sum(w): the weighted attainment rate, always in
-[0,1] because each term w*c*m <= w. The winning branch is the highest scorer
-at or above its min_score; ties keep branch order (deterministic, replayable).
+A leaf with weighted conditions scores
+``score = sum(w*c*m) / sum(w)`` — the weighted attainment rate, always in
+[0,1] because every term w*c*m <= w. ``passed`` requires at least one weight
+and ``score >= min_score`` (leaf-level, default 0). Leaves without weights are
+direct hits and never call this module.
 """
 
 from __future__ import annotations
 
 from router.pipeline.matching import match_row
-from router.pipeline.model import Branch, Node
+from router.pipeline.model import Weight
 
 
-def branch_score(branch: Branch, signals: dict, rows=None) -> dict:
-    """Weighted attainment over ``rows`` (defaults to the branch's own rows).
-
-    Split leaves are scored only on their remaining conditions (SPEC-TREE-4
-    section 4.2), so the split evaluator passes the subset explicitly.
-    """
+def leaf_score(weights: list[Weight], signals: dict,
+               min_score: float | None) -> dict:
     lines = []
-    for r in (branch.rows if rows is None else rows):
-        m, c = match_row(r.signal, r.value, signals)
-        w = r.weight or 0.0
-        lines.append({"signal": r.signal, "value": r.value,
-                      "w": w, "c": c, "m": m, "contrib": w * c * m})
-    sum_w = sum(l["w"] for l in lines)
-    total = sum(l["contrib"] for l in lines)
+    for w in weights:
+        m, c = match_row(w.signal, w.value, signals)
+        lines.append({"signal": w.signal, "value": w.value,
+                      "weight": w.weight, "c": c, "m": m,
+                      "contrib": w.weight * c * m})
+    sum_w = sum(line["weight"] for line in lines)
+    total = sum(line["contrib"] for line in lines)
     score = total / sum_w if sum_w > 0 else 0.0
-    min_score = branch.min_score if branch.min_score is not None else 0.0
-    return {"branch_id": branch.id, "name": branch.name, "model": branch.model,
-            "lines": lines, "sum_w": sum_w, "score": score,
-            "min_score": min_score,
-            "passed": sum_w > 0 and score >= min_score, "winner": False}
-
-
-def eval_score(node: Node, signals: dict) -> dict:
-    board = [branch_score(b, signals) for b in node.branches]
-    win = None
-    for bs in board:
-        if bs["passed"] and (win is None or bs["score"] > win["score"]):
-            win = bs                     # strictly greater => first wins ties
-    decision = None
-    if win is not None:
-        win["winner"] = True
-        decision = {"kind": "route", "model": win["model"], "node_id": node.id,
-                    "branch_id": win["branch_id"], "score": win["score"]}
-    return {"decision": decision,
-            "trace": {"node_id": node.id, "name": node.name, "type": "score",
-                      "result": "hit" if win else "miss",
-                      "branch": None, "board": board}}
+    floor = 0.0 if min_score is None else min_score
+    return {"lines": lines, "sum_w": sum_w, "score": score,
+            "min_score": floor,
+            "passed": sum_w > 0 and score >= floor}

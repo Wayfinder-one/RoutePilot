@@ -1,7 +1,8 @@
-"""Repositories: one per aggregate, plain SQL, no ORM. The pipeline is stored
-relationally (nodes/branches/branch_rows) and saved by wholesale replacement
-inside one transaction — pipeline edits are rare and small, and replacement
-keeps ordering and deletion trivially correct.
+"""Repositories: one per aggregate, plain SQL, no ORM.
+
+The pipeline (stations) is stored as one JSON document per station and saved by
+wholesale replacement inside one transaction — station edits are rare and small,
+and replacement keeps ordering and deletion trivially correct.
 """
 
 from __future__ import annotations
@@ -10,7 +11,8 @@ import json
 import sqlite3
 import uuid
 
-from router.pipeline.model import Branch, Node, Row
+from router.pipeline.model import Station, TreeNode, Weight, station_from_dict, \
+    station_to_dict
 
 
 def _uid() -> str:
@@ -68,45 +70,54 @@ CALIBRATIONS = {
 }
 
 
-def default_pipeline(calibration: str = "heuristic") -> list[Node]:
+def _leaf(node_id: str, signal: str | None, value: str,
+          conf_min: float | None, *, kind: str = "leaf",
+          action: str = "route", model: str | None = None,
+          min_score: float | None = None,
+          weights: list[Weight] | None = None,
+          children: list[TreeNode] | None = None) -> TreeNode:
+    return TreeNode(id=node_id, signal=signal, value=value, conf_min=conf_min,
+                    kind=kind, action=action, model=model,
+                    min_score=min_score, weights=weights or [],
+                    children=children or [])
+
+
+def default_pipeline(calibration: str = "heuristic") -> list[Station]:
+    """Four independent station trees: gate / keyword gate / subject fork / fallback."""
     c = CALIBRATIONS[calibration]
-    return [
-        Node(id=_uid(), type="gate", name="① 安全闸", branches=[
-            Branch(id=_uid(), name="拦越狱",
-                   rows=[Row("jailbreak", "jailbreak", conf_min=c["jailbreak"])],
-                   action="block"),
-            Branch(id=_uid(), name="拦身份证",
-                   rows=[Row("pii", "cn_id_card", conf_min=c["pii"])],
-                   action="block"),
-        ]),
-        Node(id=_uid(), type="gate", name="② 关键词直达", branches=[
-            Branch(id=_uid(), name="医疗急症",
-                   rows=[Row("keyword", "医疗急症", conf_min=c["keyword"])],
-                   action="route", model="qwen3-8b-medical"),
-        ]),
-        Node(id=_uid(), type="score", name="③ 领域 + 难度 打分", branches=[
-            Branch(id=_uid(), name="8B 医疗", model="qwen3-8b-medical",
-                   min_score=c["medical_b"],
-                   rows=[Row("domain", "health", weight=0.5),
-                         Row("complexity", "hard", weight=0.5)]),
-            Branch(id=_uid(), name="0.6B 医疗", model="qwen3-0.6b-medical",
-                   min_score=c["medical_s"],
-                   rows=[Row("domain", "health", weight=0.5),
-                         Row("complexity", "easy", weight=0.5)]),
-            Branch(id=_uid(), name="DeepSeek 编程", model="deepseek-v3",
-                   min_score=c["cs"],
-                   rows=[Row("domain", "computer_science", weight=0.4),
-                         Row("complexity", "hard", weight=0.6)]),
-        ]),
-        Node(id=_uid(), type="gate", name="④ 兜底", branches=[
-            Branch(id=_uid(), name="默认", rows=[], action="route",
-                   model="qwen3-8b"),
-        ]),
-    ]
+    safety = Station(id=_uid(), type="gate", name="① 安全闸", root=_leaf(
+        "n1", None, "", None, kind="fork", children=[
+            _leaf("n1a", "jailbreak", "jailbreak", c["jailbreak"],
+                  action="block"),
+            _leaf("n1b", "pii", "cn_id_card", c["pii"], action="block"),
+        ]))
+    keyword = Station(id=_uid(), type="gate", name="② 关键词直达", root=_leaf(
+        "n2", None, "", None, kind="fork", children=[
+            _leaf("n2a", "keyword", "医疗急症", None,   # rule signal: no floor
+                  action="route", model="qwen3-8b-medical"),
+        ]))
+    subject = Station(id=_uid(), type="split", name="③ 学科 → 难度", root=_leaf(
+        "n3", None, "", None, kind="fork", children=[
+            _leaf("n3a", "domain", "health", c["medical_s"], kind="fork",
+                  children=[
+                      _leaf("n3a1", "complexity", "hard", c["medical_b"],
+                            action="route", model="qwen3-8b-medical"),
+                      _leaf("n3a2", "complexity", "easy", c["medical_s"],
+                            action="route", model="qwen3-0.6b-medical"),
+                  ]),
+            _leaf("n3b", "domain", "computer_science", c["cs"], kind="fork",
+                  children=[
+                      _leaf("n3b1", "complexity", "hard", c["cs"],
+                            action="route", model="deepseek-v3"),
+                  ]),
+        ]))
+    fallback = Station(id=_uid(), type="gate", name="④ 兜底", root=_leaf(
+        "n4", None, "", None, action="route", model="qwen3-8b"))
+    return [safety, keyword, subject, fallback]
 
 
 def seed_default(conn: sqlite3.Connection, calibration: str = "heuristic") -> None:
-    if conn.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]:
+    if conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0]:
         return                                  # idempotent: only seed an empty DB
     conn.execute("INSERT OR IGNORE INTO providers VALUES ('local', "
                  "'http://127.0.0.1:9000', '')")
@@ -116,55 +127,27 @@ def seed_default(conn: sqlite3.Connection, calibration: str = "heuristic") -> No
     for name, words in DEFAULT_KEYWORD_GROUPS.items():
         conn.execute("INSERT OR IGNORE INTO keyword_groups VALUES (?, ?)",
                      (name, json.dumps(words, ensure_ascii=False)))
-    PipelineRepo(conn).save(default_pipeline(calibration))
+    StationRepo(conn).save(default_pipeline(calibration))
     conn.commit()
 
 
-
-class PipelineRepo:
+class StationRepo:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
-    def load(self) -> list[Node]:
-        nodes = []
-        for n in self.conn.execute("SELECT * FROM nodes ORDER BY ord"):
-            branches = []
-            for b in self.conn.execute(
-                    "SELECT * FROM branches WHERE node_id = ? ORDER BY ord",
-                    (n["id"],)):
-                rows = [Row(signal=r["signal"], value=r["value"],
-                            weight=r["weight"], conf_min=r["conf_min"])
-                        for r in self.conn.execute(
-                            "SELECT * FROM branch_rows WHERE branch_id = ? "
-                            "ORDER BY ord", (b["id"],))]
-                branches.append(Branch(id=b["id"], name=b["name"], rows=rows,
-                                       action=b["action"], model=b["model"],
-                                       min_score=b["min_score"]))
-            nodes.append(Node(id=n["id"], type=n["type"], name=n["name"],
-                              branches=branches,
-                              floor=n["floor"],
-                              split_signal=n["split_signal"]))
-        return nodes
+    def load(self) -> list[Station]:
+        return [station_from_dict(json.loads(r["tree"]))
+                for r in self.conn.execute("SELECT tree FROM stations ORDER BY ord")]
 
-    def save(self, nodes: list[Node]) -> None:
+    def save(self, stations: list[Station]) -> None:
         with self.conn:                          # one transaction: replace all
-            self.conn.execute("DELETE FROM branch_rows")
-            self.conn.execute("DELETE FROM branches")
-            self.conn.execute("DELETE FROM nodes")
-            for ni, n in enumerate(nodes):
+            self.conn.execute("DELETE FROM stations")
+            for si, station in enumerate(stations):
                 self.conn.execute(
-                    "INSERT INTO nodes (id, ord, type, name, floor, split_signal) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (n.id, ni, n.type, n.name, n.floor, n.split_signal))
-                for bi, b in enumerate(n.branches):
-                    self.conn.execute(
-                        "INSERT INTO branches VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (b.id, n.id, bi, b.name, b.action, b.model, b.min_score))
-                    for ri, r in enumerate(b.rows):
-                        self.conn.execute(
-                            "INSERT INTO branch_rows VALUES (?, ?, ?, ?, ?, ?, ?)",
-                            (_uid(), b.id, ri, r.signal, r.value,
-                             r.weight, r.conf_min))
+                    "INSERT INTO stations (id, ord, type, name, tree) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (station.id, si, station.type, station.name,
+                     json.dumps(station_to_dict(station), ensure_ascii=False)))
             v = int(SettingsRepo(self.conn).get("pipeline_version", "0")) + 1
             SettingsRepo(self.conn).set("pipeline_version", str(v))
 

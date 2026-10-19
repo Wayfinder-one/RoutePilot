@@ -67,18 +67,22 @@ def test_hot_pipeline_edit_changes_the_scope(tmp_path, monkeypatch):
     assert "fact_check" not in fake.requests[-1].scope.signals
 
     pipe = client.get("/admin/pipeline").json()
-    pipe["nodes"].insert(len(pipe["nodes"]) - 1, {
-        "id": "n-fc", "type": "gate", "name": "需核实",
-        "branches": [{"id": "b-fc", "name": "fact", "action": "route",
-                      "model": "qwen3-8b",
-                      "rows": [{"signal": "fact_check", "value": "needs_check",
-                                "conf_min": 0.5}]}]})
+    pipe["stations"].insert(len(pipe["stations"]) - 1, {
+        "id": "st-fc", "type": "gate", "name": "需核实",
+        "root": {"id": "n-fc", "signal": None, "value": "", "conf_min": None,
+                 "kind": "fork", "action": "route", "model": None,
+                 "min_score": None, "weights": [], "children": [
+                     {"id": "c-fc", "signal": "fact_check",
+                      "value": "needs_check", "conf_min": 0.5,
+                      "kind": "leaf", "action": "route",
+                      "model": "qwen3-8b", "min_score": None,
+                      "weights": [], "children": []}]}})
     assert client.put("/admin/pipeline", json=pipe).status_code == 200
     assert _chat(client).status_code == 200
     assert "fact_check" in fake.requests[-1].scope.signals
 
     back = client.get("/admin/pipeline").json()
-    back["nodes"] = [n for n in back["nodes"] if n["id"] != "n-fc"]
+    back["stations"] = [st for st in back["stations"] if st["id"] != "st-fc"]
     assert client.put("/admin/pipeline", json=back).status_code == 200
     assert _chat(client).status_code == 200
     assert "fact_check" not in fake.requests[-1].scope.signals
@@ -93,17 +97,22 @@ def test_trimming_can_be_disabled_with_the_setting(tmp_path, monkeypatch):
 def test_rule_only_pipeline_needs_no_model_questions(tmp_path, monkeypatch):
     """A tree that only reads rule signals yields an empty (but trimmed) scope."""
     client, fake = _make_client(tmp_path, monkeypatch)
-    nodes = [
-        {"id": "g-kw", "type": "gate", "name": "关键词",
-         "branches": [{"id": "b-kw", "name": "急诊", "action": "route",
-                       "model": "qwen3-8b",
-                       "rows": [{"signal": "keyword", "value": "医疗急症",
-                                 "conf_min": 0.5}]}]},
-        {"id": "g-fb", "type": "gate", "name": "兜底",
-         "branches": [{"id": "b-fb", "name": "默认", "action": "route",
-                       "model": "qwen3-8b", "rows": []}]},
+    stations = [
+        {"id": "st-kw", "type": "gate", "name": "关键词",
+         "root": {"id": "n-kw", "signal": None, "value": "",
+                  "conf_min": None, "kind": "fork", "action": "route",
+                  "model": None, "min_score": None, "weights": [],
+                  "children": [{"id": "c-kw", "signal": "keyword",
+                                "value": "医疗急症", "conf_min": None,
+                                "kind": "leaf", "action": "route",
+                                "model": "qwen3-8b", "min_score": None,
+                                "weights": [], "children": []}]}},
+        {"id": "st-fb", "type": "gate", "name": "兜底",
+         "root": {"id": "n-fb", "signal": None, "value": "", "conf_min": None,
+                  "kind": "leaf", "action": "route", "model": "qwen3-8b",
+                  "min_score": None, "weights": [], "children": []}},
     ]
-    assert client.put("/admin/pipeline", json={"nodes": nodes}).status_code == 200
+    assert client.put("/admin/pipeline", json={"stations": stations}).status_code == 200
     assert _chat(client).status_code == 200
     scope = fake.requests[-1].scope
     assert scope is not None and scope.trimmed

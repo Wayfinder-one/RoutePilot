@@ -570,3 +570,67 @@ body.sim-open .t4-sim-mask{opacity:1;pointer-events:auto}
 .t4 .bact:hover{background:var(--t4-accent-soft);border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
 .t4 .bact.del:hover{background:var(--t4-red-soft);border-color:var(--t4-red-line);color:var(--t4-red)}
 @media (hover:none){.t4 .bact{opacity:1}}
+
+/* ============================================================
+   显式树编辑器（2026-10-19 重构）：站点 = 独立树，节点显式增删
+   ============================================================ */
+.t4 .tree-box{
+  margin-top:9px;background:#fff;border:1px solid var(--t4-line);
+  border-radius:12px;box-shadow:var(--t4-sh-1);padding:8px 14px 10px;
+}
+.t4 .tnode{position:relative;padding:2px 0}
+.t4 .tnode::before,.t4 .tnode::after{display:none}   /* kill old derived-tree lines */
+.t4 .tnode-children{
+  position:relative;margin-left:10px;padding-left:20px;padding-top:2px;padding-bottom:2px;
+}
+.t4 .tnode-children::before{
+  content:"";position:absolute;left:0;top:-2px;bottom:14px;width:1px;background:var(--t4-line);
+}
+.t4 .tnode-children > .tnode::before{
+  content:"";display:block;position:absolute;left:-20px;top:19px;width:20px;height:1px;
+  background:var(--t4-line);
+}
+.t4 .tnode-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;min-height:38px;padding:3px 2px}
+.t4 .tn-cond{
+  padding:3px 9px;border:1px solid var(--t4-line-2);border-radius:7px;background:var(--t4-wash);
+  font-size:12.5px;font-weight:600;color:var(--t4-ink);white-space:nowrap;
+}
+.t4 .tn-cond.entry{border-style:dashed;color:var(--t4-ink-3);font-weight:500}
+.t4 .tn-cond:hover{border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
+.t4 .tn-conf{
+  padding:2px 8px;border:1px solid var(--t4-line);border-radius:99px;background:#fff;
+  font-family:var(--mono);font-size:10.5px;color:var(--t4-ink-3);white-space:nowrap;
+}
+.t4 .tn-conf:hover{border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
+.t4 .tn-conf.det{color:var(--t4-ink-3)}
+.t4 .tn-out{
+  display:inline-flex;align-items:center;gap:6px;padding:3px 9px;
+  border:1px solid transparent;border-radius:6px;font-size:11.5px;font-weight:600;white-space:nowrap;
+}
+.t4 .tn-out code{font-family:var(--mono);font-size:11px;font-weight:600}
+.t4 .tn-out.block{color:var(--t4-red);background:var(--t4-red-soft);border-color:var(--t4-red-line)}
+.t4 .tn-out.route{color:var(--t4-accent-deep);background:var(--t4-accent-soft);border-color:var(--t4-accent-line)}
+.t4 .tn-out.todo{color:var(--t4-ink-3);background:var(--t4-wash);border:1px dashed var(--t4-line-2)}
+.t4 .tn-weights{display:inline-flex;align-items:center;gap:5px;flex-wrap:wrap}
+.t4 .tn-weight{
+  padding:2px 7px;border:1px solid var(--t4-line);border-radius:6px;background:var(--t4-wash);
+  font-size:11.5px;color:var(--t4-ink-2);white-space:nowrap;
+}
+.t4 .tn-weight:hover{border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
+.t4 .tn-weight .sp{color:#b6b5ad}
+.t4 .tn-weight .w{font-family:var(--mono);font-size:10px;color:var(--t4-ink-3);padding-left:5px;border-left:1px solid var(--t4-line);margin-left:2px}
+.t4 .tn-min{font-family:var(--mono);font-size:10.5px;color:var(--t4-ink-3)}
+.t4 .tn-hit{font-size:11.5px;color:var(--t4-ink-3)}
+.t4 .tn-count{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--t4-ink-3)}
+.t4 .tn-actions{margin-left:auto;display:flex;gap:2px;flex:none}
+.t4 .tnode.fork > .tnode-row .tn-actions{margin-left:auto}
+.t4 .tn-empty{padding:10px 4px;font-size:11.5px;color:var(--t4-ink-3)}
+.t4 .tnode.is-new{animation:flash 1s var(--t4-ease)}
+.t4 .tnode.hot{background:var(--t4-accent-soft);box-shadow:inset 0 0 0 2px var(--t4-accent);border-radius:8px}
+/* leaf editor weight rows */
+.t4 .wlist{display:flex;flex-direction:column;gap:4px;margin-bottom:10px}
+.t4 .wrow{display:flex;align-items:center;gap:6px}
+.t4 .wrow .wname{flex:1;font-size:11.5px;color:var(--t4-ink-2);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.t4 .wrow .pr-num{width:64px;height:24px;flex:none}
+.t4 .wdel{width:22px;height:22px;border:0;border-radius:5px;background:none;color:#c3c2ba;flex:none}
+.t4 .wdel:hover{background:var(--t4-red-soft);color:var(--t4-red)}

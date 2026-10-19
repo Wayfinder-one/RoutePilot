@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from router.pipeline.model import Branch, Node, Row
+from router.pipeline.model import Station, TreeNode
 from router.pipeline.scope import (compute_signal_scope, full_scope,
                                    SignalScope)
 from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
@@ -314,9 +314,10 @@ def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
         return probs_for(records)
 
     monkeypatch.setattr(tagger, "_score", capture)
-    weird = [Node(id="g", type="gate", branches=[
-        Branch(id="b", rows=[Row("telepathy", "yes")], action="route",
-               model="qwen3-8b")])]
+    weird = [Station(id="s", type="gate", name="怪", root=TreeNode(
+        id="g", signal=None, kind="fork", children=[
+            TreeNode(id="b", signal="telepathy", value="yes", kind="leaf",
+                     action="route", model="qwen3-8b")]))]
     scope = compute_signal_scope(weird)
     assert scope.full
     signals = tagger._model_signals(TagRequest(text="x", n_messages=2,
@@ -327,18 +328,20 @@ def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
 
 def test_hot_pipeline_edit_widens_scope_and_pack():
     """③ a new question/candidate in the tree is picked up automatically."""
-    nodes = default_pipeline("checkpoint")
-    before = compute_signal_scope(nodes)
+    stations = default_pipeline("checkpoint")
+    before = compute_signal_scope(stations)
     assert "fact_check" not in before.signals
-    new_node = Node(id="n-fc", type="gate", branches=[
-        Branch(id="b-fc", rows=[Row("fact_check", "needs_check", conf_min=0.5)],
-               action="route", model="qwen3-8b")])
-    after = compute_signal_scope(nodes[:-1] + [new_node] + nodes[-1:])
+    new_station = Station(id="st-fc", type="gate", name="需核实", root=TreeNode(
+        id="n-fc", signal=None, kind="fork", children=[
+            TreeNode(id="c-fc", signal="fact_check", value="needs_check",
+                     conf_min=0.5, kind="leaf", action="route",
+                     model="qwen3-8b")]))
+    after = compute_signal_scope(stations[:-1] + [new_station] + stations[-1:])
     assert "fact_check" in after.signals
     records = build_signal_records(load_question_config(), "x", after)
     assert any(item["signal"] == "fact_check" for item in records)
-    # narrowing again (removing the node) shrinks the pack back
-    narrowed = compute_signal_scope(nodes)
+    # narrowing again (removing the station) shrinks the pack back
+    narrowed = compute_signal_scope(stations)
     assert "fact_check" not in narrowed.signals
     assert len(build_signal_records(load_question_config(), "x", narrowed)) == \
         TRIMMED_RECORDS

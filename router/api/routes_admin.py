@@ -22,12 +22,12 @@ from router.api.upstream import load_backends
 from router.evals import summarize
 from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
-from router.pipeline.model import node_from_dict, node_to_dict
+from router.pipeline.model import station_from_dict, station_to_dict
 from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
-                                       ModelRepo, PipelineRepo, ProviderRepo,
-                                       RequestRepo, SettingsRepo)
+                                       ModelRepo, ProviderRepo, RequestRepo,
+                                       SettingsRepo, StationRepo)
 
 router = APIRouter()
 
@@ -46,27 +46,30 @@ def _refresh_backends(request: Request, conn: sqlite3.Connection) -> None:
 # Pipeline
 # --------------------------------------------------------------------------- #
 class PipelineIn(BaseModel):
-    nodes: list[dict]
+    # `stations` is the current shape; `nodes` is accepted for one release so
+    # an older console build cannot 422 on a save. Exactly one wins.
+    stations: list[dict] | None = None
+    nodes: list[dict] | None = None
 
 
 @router.get("/pipeline")
 def get_pipeline(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"nodes": [node_to_dict(n) for n in PipelineRepo(conn).load()],
+    return {"stations": [station_to_dict(s) for s in StationRepo(conn).load()],
             "version": SettingsRepo(conn).get("pipeline_version", "0")}
 
 
 @router.put("/pipeline")
 def put_pipeline(body: PipelineIn, request: Request,
                  conn: sqlite3.Connection = Depends(get_conn)):
+    payload = body.stations if body.stations is not None else (body.nodes or [])
     try:
-        nodes = [node_from_dict(n) for n in body.nodes]
+        stations = [station_from_dict(d) for d in payload]
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     known = {m["id"] for m in ModelRepo(conn).list()}
-    issues = check_pipeline(nodes, known)
-    # SPEC-TREE-4 §5: hard issues reject with 422 (pointing at node/branch);
-    # warn-level issues ride along in the response so the console can show
-    # them without blocking the save.
+    issues = check_pipeline(stations, known)
+    # hard issues reject with 422 (pointing at station/node); warn-level issues
+    # ride along in the response so the console can show them without blocking.
     hard = [i for i in issues if i.level == "hard"]
     warns = [i.__dict__ for i in issues if i.level != "hard"]
     if hard:
@@ -74,16 +77,16 @@ def put_pipeline(body: PipelineIn, request: Request,
     # No-op saves must not bump the version or append an audit row: the console
     # smoke check re-saves the unchanged pipeline, and an editor save without
     # edits should not look like a config change (2026-10-17 review N3).
-    current = [node_to_dict(n) for n in PipelineRepo(conn).load()]
-    changed = [node_to_dict(n) for n in nodes] != current
+    current = [station_to_dict(s) for s in StationRepo(conn).load()]
+    changed = [station_to_dict(s) for s in stations] != current
     if not changed:
         return {"ok": True, "changed": False, "warnings": warns,
                 "version": SettingsRepo(conn).get("pipeline_version", "0")}
-    PipelineRepo(conn).save(nodes)
-    request.app.state.pipeline = nodes       # refresh the hot-path snapshot
+    StationRepo(conn).save(stations)
+    request.app.state.pipeline = stations       # refresh the hot-path snapshot
     version = SettingsRepo(conn).get("pipeline_version")
     ChangeRepo(conn).record(_now(), "pipeline",
-                            {"nodes": len(nodes), "version": version})
+                            {"stations": len(stations), "version": version})
     return {"ok": True, "changed": True, "warnings": warns, "version": version}
 
 

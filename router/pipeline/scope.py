@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from router.pipeline.model import Node
+from router.pipeline.model import Station, TreeNode
 from router.signals.registry import SIGNALS
 
 
@@ -65,7 +65,7 @@ def full_scope(reason: str = "full pack requested") -> SignalScope:
                        reason=reason)
 
 
-def compute_signal_scope(nodes: list[Node] | None) -> SignalScope:
+def compute_signal_scope(stations: list[Station] | None) -> SignalScope:
     """Collect the model questions the pipeline tree may read for any request.
 
     Pure function over the in-memory snapshot: no config/database access, no
@@ -73,34 +73,58 @@ def compute_signal_scope(nodes: list[Node] | None) -> SignalScope:
     ``TagRequest.scope`` (``router/api/routes_v1.py``).
     """
     try:
-        nodes = list(nodes or ())
-    except TypeError:                         # defensive: not a node sequence
-        return full_scope("pipeline snapshot is not a node list")
-    if not nodes:
+        stations = list(stations or ())
+    except TypeError:                         # defensive: not a station sequence
+        return full_scope("pipeline snapshot is not a station list")
+    if not stations:
         return full_scope("empty pipeline")
 
     signals: set[str] = set()
     pii_types: set[str] = set()
-    for node in nodes:
-        for branch in node.branches:
-            for row in branch.rows:
-                spec = SIGNALS.get(row.signal)
-                if spec is None:
-                    # The evaluator treats an unknown signal as a miss; but a
-                    # stale/hand-edited tree is a signal that our assumptions
-                    # no longer hold, so pay the full pack.
-                    return full_scope(f"unknown signal {row.signal!r}")
-                if spec.kind != "model":
-                    continue                  # rule signals: local + cheap
-                if spec.multi:
-                    if row.signal != "pii":
-                        return full_scope(
-                            f"model multi-signal {row.signal!r} is not trimmable")
-                    allowed = {value[0] for value in spec.values}
-                    if str(row.value) not in allowed:
-                        return full_scope(f"unknown pii subtype {row.value!r}")
-                    pii_types.add(str(row.value))
-                signals.add(row.signal)
+
+    def visit(condition: tuple[str, str] | None) -> str | None:
+        """Collect one (signal, value); returns an error reason or None."""
+        if condition is None:
+            return None
+        signal_key, target = condition
+        spec = SIGNALS.get(signal_key)
+        if spec is None:
+            # The evaluator treats an unknown signal as a miss; but a stale or
+            # hand-edited tree means our assumptions no longer hold, so pay the
+            # full pack.
+            return f"unknown signal {signal_key!r}"
+        if spec.kind != "model":
+            return None                       # rule signals: local + cheap
+        if spec.multi:
+            if signal_key != "pii":
+                return f"model multi-signal {signal_key!r} is not trimmable"
+            allowed = {value[0] for value in spec.values}
+            if str(target) not in allowed:
+                return f"unknown pii subtype {target!r}"
+            pii_types.add(str(target))
+        signals.add(signal_key)
+        return None
+
+    def walk(node: TreeNode) -> str | None:
+        reason = visit((node.signal, node.value) if node.signal else None)
+        if reason:
+            return reason
+        for weight in node.weights:
+            reason = visit((weight.signal, weight.value))
+            if reason:
+                return reason
+        for child in node.children:
+            reason = walk(child)
+            if reason:
+                return reason
+        return None
+
+    for station in stations:
+        if station.root is None:
+            continue
+        reason = walk(station.root)
+        if reason:
+            return full_scope(reason)
     return SignalScope(signals=frozenset(signals),
                        pii_types=frozenset(pii_types), full=False,
                        reason="pipeline references")

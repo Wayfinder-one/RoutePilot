@@ -76,6 +76,15 @@ MIGRATIONS = [
     """
     ALTER TABLE requests ADD COLUMN tree_path TEXT;
     """,
+    # v7 (2026-10-19): explicit-tree pipeline. Each station is one JSON document
+    # (ordered tree); the old nodes/branches/branch_rows tables are left in
+    # place but no longer read or written.
+    """
+    CREATE TABLE stations (
+        id TEXT PRIMARY KEY, ord INTEGER NOT NULL,
+        type TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+        tree TEXT NOT NULL);
+    """,
 ]
 
 

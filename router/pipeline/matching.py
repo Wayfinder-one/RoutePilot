@@ -11,6 +11,12 @@ from __future__ import annotations
 from router.signals.registry import SIGNALS
 
 
+def is_rule_signal(signal_key: str) -> bool:
+    """Rule signals come straight from request attributes (c == 1.0)."""
+    spec = SIGNALS.get(signal_key)
+    return spec is not None and spec.kind == "rule"
+
+
 def match_row(signal_key: str, target: str, signals: dict) -> tuple[int, float]:
     """m/c for one row. Multi signals resolve confidence per matched value.
 

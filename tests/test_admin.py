@@ -15,18 +15,22 @@ def client(tmp_path):
 
 def test_get_pipeline(tmp_path):
     body = client(tmp_path).get("/admin/pipeline").json()
-    assert body["nodes"][2]["type"] == "score"
-    assert body["nodes"][2]["branches"][0]["min_score"] == 0.45
+    assert [s["type"] for s in body["stations"]] == ["gate", "gate", "split", "gate"]
+    subject = body["stations"][2]
+    assert subject["root"]["kind"] == "fork"
+    health = subject["root"]["children"][0]
+    assert health["signal"] == "domain" and health["value"] == "health"
+    assert [c["value"] for c in health["children"]] == ["hard", "easy"]
 
 
 def test_put_pipeline_roundtrip_and_snapshot_refresh(tmp_path):
     c = client(tmp_path)
     body = c.get("/admin/pipeline").json()
-    body["nodes"][3]["branches"][0]["model"] = "qwen3-32b"
+    body["stations"][3]["root"]["model"] = "qwen3-32b"
     r = c.put("/admin/pipeline", json=body)
     assert r.status_code == 200
     again = c.get("/admin/pipeline").json()
-    assert again["nodes"][3]["branches"][0]["model"] == "qwen3-32b"
+    assert again["stations"][3]["root"]["model"] == "qwen3-32b"
 
 
 def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
@@ -44,7 +48,7 @@ def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
     assert len(c.get("/admin/changes").json()["changes"]) == changes_before
 
     # a real edit still bumps the version and writes one audit row
-    after["nodes"][3]["branches"][0]["model"] = "qwen3-32b"
+    after["stations"][3]["root"]["model"] = "qwen3-32b"
     r = c.put("/admin/pipeline", json=after)
     assert r.json()["changed"] is True
     newer = c.get("/admin/pipeline").json()
@@ -55,7 +59,7 @@ def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
 def test_put_pipeline_rejected_by_health(tmp_path):
     c = client(tmp_path)
     body = c.get("/admin/pipeline").json()
-    body["nodes"] = body["nodes"][:1]          # drop the fallback node
+    body["stations"] = body["stations"][:1]    # drop the fallback station
     r = c.put("/admin/pipeline", json=body)
     assert r.status_code == 422
     assert any(i["code"] == "missing_fallback" for i in r.json()["detail"])
@@ -123,7 +127,7 @@ def test_settings_roundtrip_and_reserved(tmp_path):
 def test_changes_audit_trail(tmp_path):
     c = client(tmp_path)
     pipe = c.get("/admin/pipeline").json()
-    pipe["nodes"][3]["branches"][0]["model"] = "qwen3-32b"   # a real change
+    pipe["stations"][3]["root"]["model"] = "qwen3-32b"        # a real change
     c.put("/admin/pipeline", json=pipe)
     c.put("/admin/models/qwen3-8b", json={"upstream": "real"})
     c.put("/admin/providers/local", json={"base_url": "http://x:1/v1"})
