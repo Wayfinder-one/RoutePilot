@@ -16,13 +16,15 @@ const sigName = k => (registry[k] ? (LANG === 'zh' ? registry[k].zh : registry[k
 const kindLabel = k => cfg.signals[k].kind === 'noul' ? t('sig.kind.noul') : t('sig.kind.choice');
 
 async function boot() {
-  const [qBody, sigBody] = await Promise.all([
+  const [qBody, sigBody, kwBody] = await Promise.all([
     api.get('/admin/signal-questions'),
     api.get('/admin/signals'),
+    api.get('/admin/keyword-groups'),
   ]);
   cfg = qBody.config;
   meta = qBody.meta || {};
   sigBody.signals.forEach(s => { registry[s.key] = s; });
+  renderKw(kwBody.groups || {});
   renderAll();
 }
 
@@ -275,3 +277,38 @@ $('#importFile').addEventListener('change', e => {
 });
 window.onLangChange = () => renderAll();
 boot();
+
+/* ── keyword lexicon (rule signal "keyword" vocabulary) ──────────────── */
+function renderKw(groups) {
+  $('#kwGroups').innerHTML = Object.entries(groups).map(([name, words]) =>
+    `<div class="kw-group">
+      <input class="kw-name" value="${esc(name)}" style="max-width:120px">
+      <input class="kw-words" value="${esc((words || []).join(', '))}" placeholder="${esc(t('sig.kw.placeholder'))}">
+      <button class="del" data-del-group title="${t('common.delete')}">✕</button>
+    </div>`).join('');
+  document.querySelectorAll('[data-del-group]').forEach(b => b.addEventListener('click', () => {
+    b.closest('.kw-group').remove();
+  }));
+}
+function readGroups() {
+  const next = {};
+  document.querySelectorAll('#kwGroups .kw-group').forEach(g => {
+    const name = g.querySelector('.kw-name').value.trim();
+    if (name) next[name] = g.querySelector('.kw-words').value
+      .split(',').map(w => w.trim()).filter(Boolean);
+  });
+  return next;
+}
+$('#addGroup').addEventListener('click', () => {
+  const cur = readGroups();
+  cur['新组'] = [];
+  renderKw(cur);
+});
+$('#saveKw').addEventListener('click', async () => {
+  try {
+    await api.put('/admin/keyword-groups', { groups: readGroups() });
+    toast(t('common.saved'));
+  } catch (e) {
+    toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
+  }
+});

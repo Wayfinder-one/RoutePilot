@@ -1,16 +1,16 @@
-/* Models & settings page: model registry, providers, keyword lexicon, runtime
-   settings, admin token (browser-local) and the current signal engine card. */
+/* Models & settings page: model registry, providers, runtime settings, admin
+   token (browser-local) and the current signal engine card. The keyword
+   lexicon moved to the signal configuration page (2026-10-19). */
 const $ = s => document.querySelector(s);
 
 async function boot() {
-  const [m, kw, prov, set, tagBody] = await Promise.all([
-    api.get('/admin/models'), api.get('/admin/keyword-groups'),
+  const [m, prov, set, tagBody] = await Promise.all([
+    api.get('/admin/models'),
     api.get('/admin/providers'), api.get('/admin/settings'),
     api.get('/admin/tagger').catch(() => ({ tagger: {} }))]);
   renderEngine(tagBody.tagger || {});
   renderModels(m.models || []);
   renderProviders(prov.providers || []);
-  renderKw(kw.groups || {});
   renderSettings(set.settings || {});
 }
 
@@ -83,35 +83,6 @@ $('#saveProviders').addEventListener('click', async () => {
 $('#addProvider').addEventListener('click', () => {
   renderProviders([...readProviders(), { name: 'new', base_url: '', key_env: '' }]);
 });
-
-/* ── keyword lexicon ─────────────────────────────────────────────────── */
-function renderKw(groups) {
-  $('#kwGroups').innerHTML = Object.entries(groups).map(([name, words]) =>
-    `<div class="kw-group">
-      <input class="kw-name" value="${esc(name)}" style="max-width:120px">
-      <input class="kw-words" value="${esc((words || []).join(', '))}" placeholder="词1, 词2">
-      <button class="del" data-del="${esc(name)}" title="${t('common.delete')}">✕</button>
-    </div>`).join('');
-  document.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', () => {
-    b.closest('.kw-group').remove();
-  }));
-}
-$('#addGroup').addEventListener('click', () => {
-  const cur = readGroups(); cur['新组'] = []; renderKw(cur);
-});
-$('#saveKw').addEventListener('click', async () => {
-  await api.put('/admin/keyword-groups', { groups: readGroups() });
-  toast(t('common.saved'));
-});
-function readGroups() {
-  const next = {};
-  document.querySelectorAll('#kwGroups .kw-group').forEach(g => {
-    const name = g.querySelector('.kw-name').value.trim();
-    if (name) next[name] = g.querySelector('.kw-words').value
-      .split(',').map(w => w.trim()).filter(Boolean);
-  });
-  return next;
-}
 
 /* ── runtime settings (/admin/settings; pipeline_version is read-only) ─ */
 function renderSettings(settings) {

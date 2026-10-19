@@ -290,3 +290,7 @@ main.page{max-width:1600px;margin:0 auto;padding:0 22px 26px}
   .palette,.dock{position:static}
   .sig-layout,.settings-grid,.grid2{grid-template-columns:1fr}
 }
+
+/* 信号配置页底部的关键词词表（跨两栏，2026-10-19 从模型与设置迁入） */
+.sig-layout .kw-card{grid-column:1/-1}
+.sig-layout .kw-card .footnote{margin:-2px 0 9px}
