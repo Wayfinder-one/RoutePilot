@@ -121,17 +121,6 @@ function renderPalette() {
     </section>`;
   }).join('');
   $('#palCount').textContent = Object.keys(SIG).length + (LANG === 'zh' ? ' 个' : '');
-  syncPalHint();
-}
-function syncPalHint() {
-  const el = $('#palHint');
-  if (dragSig) {
-    el.classList.add('active');
-    el.textContent = tf('p6.hintDragging', { name: sigName(dragSig) });
-  } else {
-    el.classList.remove('active');
-    el.innerHTML = esc(t('p6.hintDrag')) + '<br>' + esc(t('p6.hintAdd'));
-  }
 }
 function syncPalFade() {
   const body = $('#palBody');
@@ -928,7 +917,6 @@ function onPointerMove(ev) {
       document.body.appendChild(ghost);
       pdrag.ghost = ghost;
       dragSig = pdrag.sig;
-      syncPalHint();
     } else {
       const el = $(`[data-station="${CSS.escape(pdrag.stationId)}"]`);
       if (el) el.classList.add('moving');
@@ -965,7 +953,6 @@ function onPointerUp(ev) {
   dragSig = null;
   clearHot();
   clearDropIndicators();
-  syncPalHint();
   if (drag.kind === 'station') {
     $$('.station.moving').forEach(el => el.classList.remove('moving'));
     if (drag.active && drag.target) {
@@ -1104,7 +1091,8 @@ function renderSimText() {
     t('p4.exMedical'), t('p4.exCode'), t('p4.exJail'), t('p4.exFact'),
   ].map(x => `<button type="button">${esc(x)}</button>`).join('');
   if (!lastTry) {
-    $('#simOut').innerHTML = `<b>${esc(t('p4.simEmptyTitle'))}</b>${esc(t('p4.simEmptyBody'))}`;
+    $('#simOut').innerHTML = dirtyWarning() +
+      `<b>${esc(t('p4.simEmptyTitle'))}</b>${esc(t('p4.simEmptyBody'))}`;
   }
 }
 function stepText(s) {
@@ -1114,6 +1102,10 @@ function stepText(s) {
   const why = s.pass ? ''
     : (s.m === 0 ? ' · ' + t('p6.notMatched') : ' · ' + t('p4.cut'));
   return `${sigName(s.signal)} = ${esc(valLabel(s.signal, s.value) || s.value)} · ${esc(conf)}${why}`;
+}
+function dirtyWarning() {
+  return isDirty()
+    ? `<div class="sim-warn">⚠ ${esc(t('p6.dirtyTry'))}</div>` : '';
 }
 function renderTry() {
   const out = $('#simOut');
@@ -1126,7 +1118,7 @@ function renderTry() {
     : d.kind === 'route' ? '→ ' + (d.model || '—')
       : t('pipe.try.finalnone');
   const station = d.station_id ? findStation(d.station_id) : null;
-  let html = `<div class="final ${cls}">
+  let html = dirtyWarning() + `<div class="final ${cls}">
       <div><div class="m">${esc(label)}</div>
       <div class="via">${esc(station ? station.name : '')}${d.score != null ? ' · score ' + Number(d.score).toFixed(2) : ''}</div></div>
       <span class="badge">${esc(badge)}</span></div>`;
