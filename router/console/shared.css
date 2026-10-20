@@ -228,7 +228,10 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .kbdhint kbd{font-family:var(--mono);border:1px solid var(--line-2);border-bottom-width:2px;border-radius:4px;padding:0 4px;background:#fff;font-size:10px}
 /* ── logs page ───────────────────────────────── */
 .logs-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-.log-row{background:var(--panel);border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow);margin-bottom:8px;overflow:hidden}
+.log-row{background:var(--panel);border:1px solid var(--line);border-radius:11px;box-shadow:var(--shadow);margin-bottom:8px;overflow:hidden;transition:opacity .15s,border-color .15s}
+.log-row.open{border-color:var(--indigo-line);box-shadow:var(--shadow-lg)}
+#list.has-open .log-row:not(.open){opacity:.55}
+#list.has-open .log-row:not(.open):hover{opacity:1}
 .log-head{display:flex;align-items:center;gap:10px;padding:9px 12px;cursor:pointer}
 .log-head:hover{background:var(--panel-2)}
 .log-time{font-family:var(--mono);font-size:10.5px;color:var(--text-3);flex:none}
@@ -244,7 +247,7 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .sc b{color:var(--text);font-weight:650}
 .sc .c{font-family:var(--mono);font-size:10px;color:var(--text-3)}
 .sc.pii{background:var(--amber-soft);border-color:var(--amber-line)}
-.log-detail{border-top:1px dashed var(--line);padding:10px 12px;background:var(--panel-2);display:none}
+.log-detail{margin:2px 12px 12px;padding:11px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;display:none}
 .log-row.open .log-detail{display:block}
 .method{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid var(--line);font-size:11.5px}
 .method:last-child{border-bottom:0}

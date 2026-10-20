@@ -207,8 +207,7 @@ function signalPanelHtml(r) {
   </div>`;
 }
 function legacyHtml(r) {
-  return `<div class="flow-legacy">${esc(t('logs.oldLog'))}</div>
-    <div class="log-detail" style="border-top:0;padding:0;background:transparent">${methodRowsHtml(r)}</div>`;
+  return `<div class="flow-legacy">${esc(t('logs.oldLog'))}</div>${methodRowsHtml(r)}`;
 }
 /* Session continuation short-circuits the pipeline (trace=[] by design): show a
    session banner, never the "old log" fallback. */
@@ -245,6 +244,7 @@ function render() {
   $('#taggerPill').innerHTML = `<span class="dot" style="color:var(--indigo)"></span>` +
     (LANG === 'zh' ? '引擎 <b>' + esc(meta.name || '?') + '</b>' : 'engine <b>' + esc(meta.name || '?') + '</b>');
   $('#list').innerHTML = shown.map(rowHtml).join('') || `<div class="empty">${t('logs.empty')}</div>`;
+  $('#list').classList.toggle('has-open', openIds.size > 0);
 }
 
 async function load() {
