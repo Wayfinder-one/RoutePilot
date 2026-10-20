@@ -32,9 +32,6 @@ async function boot() {
 
 function renderHeader() {
   const temp = meta.temperature != null ? Number(meta.temperature).toFixed(2) : '—';
-  $('#enginePill').innerHTML = (LANG === 'zh'
-    ? '引擎 <b>' + esc(meta.name || '?') + '</b> · T ' + temp
-    : 'engine <b>' + esc(meta.name || '?') + '</b> · T ' + temp);
   $('#dirtyPill').className = 'pill ' + (dirty ? 'warn' : 'ok');
   $('#dirtyPill').textContent = dirty ? t('sig.changed') : t('pipe.clean');
   $('#sigCount').textContent = Object.keys(cfg.signals).length;
