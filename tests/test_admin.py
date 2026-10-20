@@ -236,3 +236,22 @@ def test_time_periods_roundtrip(tmp_path):
                 {"periods": [{"name": "dup", "days": [1], "start": "08:00", "end": "09:00"},
                              {"name": "dup", "days": [2], "start": "08:00", "end": "09:00"}]}):
         assert c.put("/admin/time-periods", json=bad).status_code == 422
+
+
+def test_recent_requests_carry_trace_and_session_state(tmp_path):
+    """The console renders the decision trace: it must ride on the record."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(
+                         lambda r: httpx.Response(200, json={"choices": []})))
+    c = TestClient(app)
+    c.post("/v1/chat/completions",
+           json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
+    recent = c.get("/admin/requests/recent").json()["requests"]
+    assert recent, "ring should hold the request"
+    rec = recent[0]
+    assert rec["session_state"] == "new"
+    assert isinstance(rec["trace"], list) and rec["trace"]
+    stations = [t["result"] for t in rec["trace"]]
+    assert "hit" in stations                      # the walker stopped on a hit
+    hit = next(t for t in rec["trace"] if t["result"] == "hit")
+    assert hit["path"] is not None                # path/board keys exist

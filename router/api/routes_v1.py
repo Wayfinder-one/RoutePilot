@@ -70,14 +70,6 @@ async def chat_completions(request: Request):
     extra = ({"x-sr-session-state": session_state}
              if request.app.state.settings.sessions else {})
 
-    # SPEC-TREE-4 §4.4: the split layer path of the deciding node, persisted for
-    # the console log detail (requests.tree_path, nullable JSON text).
-    tree_path = None
-    entry = next((t for t in trace
-                  if t.get("station_id") == decision.station_id), None)
-    if entry and entry.get("path"):
-        tree_path = json.dumps(entry["path"], ensure_ascii=False)
-
     request.app.state.requestlog.enqueue({
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -85,7 +77,7 @@ async def chat_completions(request: Request):
         "node_id": decision.station_id, "branch_id": decision.node_id,
         "score": decision.score,
         "latency_ms": (time.monotonic() - started) * 1000,
-        "tree_path": tree_path,
+        "trace": trace, "session_state": session_state,
         "signals": result.signals,
         "session_id": sid, "vec": result.vec,
         "session_model": decision.model if decision.kind == "route" else None})
