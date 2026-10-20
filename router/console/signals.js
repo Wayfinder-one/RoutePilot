@@ -58,13 +58,7 @@ function instrHtml(k, s) {
   if (k === 'pii') return '';
   const list = Array.isArray(s.instructions) ? s.instructions : [s.instructions || ''];
   return `<div class="subcard"><div class="hd">${t('sig.instructions')}</div>
-    ${list.map((txt, i) => `<div class="instr-row">
-      <span class="mono mut" style="padding-top:9px">${i + 1}</span>
-      <textarea data-instr="${esc(k)}|${i}">${esc(txt)}</textarea>
-      <button class="del" data-del-instr="${esc(k)}|${i}" title="${t('common.delete')}">✕</button>
-    </div>
-    ${i === 0 ? `<div class="footnote" style="margin:-2px 0 8px 22px">${t('sig.instrLive')}</div>` : ''}`).join('')}
-    <button class="btn dashed sm" data-add-instr="${esc(k)}" style="width:100%;justify-content:center">${t('sig.addVariant')}</button>
+    <textarea data-instr="${esc(k)}|0">${esc(list[0] || '')}</textarea>
   </div>`;
 }
 
@@ -154,21 +148,9 @@ function renderEditor() {
 
 function bindEditor() {
   document.querySelectorAll('[data-instr]').forEach(el => el.addEventListener('input', () => {
-    const [k, i] = el.dataset.instr.split('|');
-    const list = cfg.signals[k].instructions;
-    list[+i] = el.value;
+    const [k] = el.dataset.instr.split('|');
+    cfg.signals[k].instructions = [el.value];
     markDirty();
-  }));
-  document.querySelectorAll('[data-add-instr]').forEach(el => el.addEventListener('click', () => {
-    cfg.signals[el.dataset.addInstr].instructions.push('');
-    markDirty(); renderEditor();
-  }));
-  document.querySelectorAll('[data-del-instr]').forEach(el => el.addEventListener('click', () => {
-    const [k, i] = el.dataset.delInstr.split('|');
-    const list = cfg.signals[k].instructions;
-    if (list.length <= 1) { toast(t('sig.instructions')); return; }
-    list.splice(+i, 1);
-    markDirty(); renderEditor();
   }));
   document.querySelectorAll('[data-noul]').forEach(el => el.addEventListener('input', () => {
     const [k, f] = el.dataset.noul.split('|');
@@ -237,16 +219,8 @@ function exportJson() {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-function renderWarn() {
-  const el = $('#canonicalWarn');
-  if (!el) return;
-  const show = meta.name === 'jev';
-  el.style.display = show ? '' : 'none';
-  if (show) el.textContent = t('sig.canonicalWarn');
-}
-
 function renderAll() {
-  renderHeader(); renderWarn(); renderList(); renderEditor();
+  renderHeader(); renderList(); renderEditor();
 }
 
 $('#sigList').addEventListener('click', e => {
