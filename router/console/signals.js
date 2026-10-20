@@ -9,6 +9,8 @@ let cfg = null;          // the editable config object
 let meta = {};
 let registry = {};       // /admin/signals specs (zh/en labels, values)
 let selected = 'domain';
+const KW = '__keyword_lexicon__';   // pseudo entry in the signal list
+let kwGroups = {};
 let dirty = false;
 let rawOpen = false;
 
@@ -24,7 +26,7 @@ async function boot() {
   cfg = qBody.config;
   meta = qBody.meta || {};
   sigBody.signals.forEach(s => { registry[s.key] = s; });
-  renderKw(kwBody.groups || {});
+  kwGroups = kwBody.groups || {};
   renderAll();
 }
 
@@ -44,14 +46,20 @@ function renderHeader() {
 }
 
 function renderList() {
-  $('#sigList').innerHTML = Object.keys(cfg.signals).map(k => {
+  const items = Object.keys(cfg.signals).map(k => {
     const s = cfg.signals[k];
     return `<div class="sig-item ${k === selected ? 'on' : ''}" data-sig="${esc(k)}">
       <span class="k" style="background:${sigColor((registry[k] || {}).group)}"></span>
       <span class="n">${esc(sigName(k))}</span>
       <span class="b">${s.kind === 'noul' ? 'y/n' : 'choice'}</span>
     </div>`;
-  }).join('');
+  });
+  items.push(`<div class="sig-item ${selected === KW ? 'on' : ''}" data-sig="${KW}">
+      <span class="k" style="background:#8a8a84"></span>
+      <span class="n">${esc(t('sig.kw.short'))}</span>
+      <span class="b">rule</span>
+    </div>`);
+  $('#sigList').innerHTML = items.join('');
 }
 
 function instrHtml(k, s) {
@@ -123,6 +131,7 @@ function rawHtml() {
 }
 
 function renderEditor() {
+  if (selected === KW) { renderKwEditor(); return; }
   const k = selected;
   const s = cfg.signals[k];
   const reg = registry[k] || {};
@@ -253,36 +262,56 @@ window.onLangChange = () => renderAll();
 boot();
 
 /* ── keyword lexicon (rule signal "keyword" vocabulary) ──────────────── */
-function renderKw(groups) {
-  $('#kwGroups').innerHTML = Object.entries(groups).map(([name, words]) =>
-    `<div class="kw-group">
+function renderKwEditor() {
+  const rows = Object.entries(kwGroups).map(([name, words]) => `
+    <div class="kw-group">
       <input class="kw-name" value="${esc(name)}" style="max-width:120px">
       <input class="kw-words" value="${esc((words || []).join(', '))}" placeholder="${esc(t('sig.kw.placeholder'))}">
       <button class="del" data-del-group title="${t('common.delete')}">✕</button>
     </div>`).join('');
-  document.querySelectorAll('[data-del-group]').forEach(b => b.addEventListener('click', () => {
-    b.closest('.kw-group').remove();
-  }));
-}
-function readGroups() {
-  const next = {};
-  document.querySelectorAll('#kwGroups .kw-group').forEach(g => {
-    const name = g.querySelector('.kw-name').value.trim();
-    if (name) next[name] = g.querySelector('.kw-words').value
-      .split(',').map(w => w.trim()).filter(Boolean);
+  $('#editor').innerHTML = `<div class="card">
+    <div class="insp-h">
+      <span class="type gate">${esc(t('sig.kw.ruletype'))}</span>
+      <span class="t">${esc(t('sig.kw.short'))}</span>
+      <span class="mut">keyword</span>
+      <span class="stat" style="margin-left:auto">${Object.keys(kwGroups).length} ${esc(t('sig.kw.groupsUnit'))}</span>
+    </div>
+    <div class="subcard">
+      <div class="hd">${esc(t('sig.kw.groupsTitle'))}</div>
+      <div class="footnote" style="margin:-2px 0 9px">${esc(t('sig.kw.hint'))}</div>
+      <div id="kwGroups">${rows}</div>
+      <div class="addrow" style="margin-top:8px">
+        <button class="btn sm" id="addGroup">${esc(t('sig.addgroup'))}</button>
+        <button class="btn pri sm" id="saveKw">${esc(t('sig.savekw'))}</button>
+      </div>
+    </div>
+  </div>`;
+  $('#editor').querySelectorAll('[data-del-group]').forEach(b =>
+    b.addEventListener('click', () => b.closest('.kw-group').remove()));
+  $('#addGroup').addEventListener('click', () => {
+    const row = document.createElement('div');
+    row.className = 'kw-group';
+    row.innerHTML = `<input class="kw-name" value="" style="max-width:120px">
+      <input class="kw-words" value="" placeholder="${esc(t('sig.kw.placeholder'))}">
+      <button class="del" data-del-group title="${t('common.delete')}">✕</button>`;
+    row.querySelector('[data-del-group]').addEventListener('click', () => row.remove());
+    $('#kwGroups').appendChild(row);
+    row.querySelector('.kw-name').focus();
   });
-  return next;
+  $('#saveKw').addEventListener('click', async () => {
+    const next = {};
+    document.querySelectorAll('#kwGroups .kw-group').forEach(g => {
+      const name = g.querySelector('.kw-name').value.trim();
+      if (name) next[name] = g.querySelector('.kw-words').value
+        .split(',').map(w => w.trim()).filter(Boolean);
+    });
+    try {
+      await api.put('/admin/keyword-groups', { groups: next });
+      kwGroups = next;
+      renderKwEditor();
+      toast(t('common.saved'));
+    } catch (e) {
+      toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
+    }
+  });
 }
-$('#addGroup').addEventListener('click', () => {
-  const cur = readGroups();
-  cur['新组'] = [];
-  renderKw(cur);
-});
-$('#saveKw').addEventListener('click', async () => {
-  try {
-    await api.put('/admin/keyword-groups', { groups: readGroups() });
-    toast(t('common.saved'));
-  } catch (e) {
-    toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
-  }
-});
