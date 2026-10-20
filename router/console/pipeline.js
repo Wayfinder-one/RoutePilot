@@ -109,7 +109,12 @@ function renderPalette() {
       <h3>${esc(groupName(g))}<span class="rl"></span></h3>
       <div class="chips">${items.map(s =>
         `<button class="sig" data-sig="${esc(s.key)}" draggable="true"
-                 title="${esc(t('p4.sigTitle'))}">${esc(sigName(s.key))}</button>`).join('')}</div>
+                 title="${esc(t('p4.sigTitle'))}">
+           <svg class="grip" width="7" height="11" viewBox="0 0 7 11" fill="currentColor" aria-hidden="true">
+             <circle cx="1.5" cy="1.5" r="1.2"/><circle cx="5.5" cy="1.5" r="1.2"/>
+             <circle cx="1.5" cy="5.5" r="1.2"/><circle cx="5.5" cy="5.5" r="1.2"/>
+             <circle cx="1.5" cy="9.5" r="1.2"/><circle cx="5.5" cy="9.5" r="1.2"/>
+           </svg>${esc(sigName(s.key))}</button>`).join('')}</div>
     </section>`;
   }).join('');
   $('#palCount').textContent = Object.keys(SIG).length + (LANG === 'zh' ? ' 个' : '');

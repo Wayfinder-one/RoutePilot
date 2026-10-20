@@ -87,16 +87,23 @@ body[data-page="pipeline"] .headmeta{position:relative;z-index:1}
   font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--t4-ink-3);
 }
 .t4 .grp h3 span.rl{flex:1;height:1px;background:var(--t4-line)}
-/* 信号库 = 纯拖拽来源：圆角小方块，不标记是否已用 */
-.t4 .grp .chips{display:flex;flex-wrap:wrap;gap:5px}
+/* 信号库 = 纯拖拽来源：像「筹码」一样的圆角小块，把手 + 悬浮感表达可拖 */
+.t4 .grp .chips{display:flex;flex-wrap:wrap;gap:6px}
 .t4 .sig{
-  display:inline-flex;align-items:center;padding:4px 10px;
+  display:inline-flex;align-items:center;gap:6px;padding:4px 10px 4px 8px;
   border:1px solid var(--t4-line);border-radius:8px;background:#fff;
   font-size:12px;line-height:1.25;color:var(--t4-ink-2);white-space:nowrap;
-  cursor:grab;transition:background .15s,border-color .15s,color .15s,transform .1s;
+  cursor:grab;box-shadow:0 1px 0 var(--t4-line);
+  transition:background .15s,border-color .15s,color .15s,transform .12s,box-shadow .12s;
 }
-.t4 .sig:hover{background:var(--t4-accent-soft);border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
-.t4 .sig:active{cursor:grabbing;transform:scale(.97)}
+.t4 .sig .grip{flex:none;color:#c9c8c0;transition:color .15s}
+.t4 .sig:hover{
+  background:var(--t4-accent-soft);border-color:var(--t4-accent-line);
+  color:var(--t4-accent-deep);transform:translateY(-1px);
+  box-shadow:0 3px 8px rgba(35,38,47,.12);
+}
+.t4 .sig:hover .grip{color:var(--t4-accent)}
+.t4 .sig:active{cursor:grabbing;transform:translateY(0) scale(.97);box-shadow:0 1px 2px rgba(35,38,47,.14)}
 .t4 .sig.dragging{opacity:.4}
 
 /* ── 分流树：主轴贯穿，站点编号挂在主干上 ───────────── */
