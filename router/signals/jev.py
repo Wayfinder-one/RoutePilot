@@ -6,7 +6,7 @@ scored by one model that returns a probability per candidate — no text
 generation and no JSON parsing. The model is the merged single-model export
 produced by the training repo (``scripts/14_export_jev_merged.py``): the
 Qwen3.5-0.8B backbone with its LoRA merged in plus the scalar decision head
-(deployed: r4b3, ``temperature.json`` = 3.0, ``model.json`` max_length 1024).
+(deployed: r4b3, ``temperature.json`` = 3.45, ``model.json`` max_length 1024).
 
 This module keeps the same contracts as :class:`CheckpointTagger`:
 
