@@ -96,8 +96,14 @@ function stationTrack(r) {
     const hit = st.result === 'hit';
     const step = hit ? null : lastStep(st);
     let detail = '';
+    let scorecard = '';
     if (hit) {
       detail = `<span class="flow-tag win">★ ${esc(t('logs.hit'))}</span>`;
+    } else if ((st.board || []).length) {
+      // weighted leaf matched every condition but score < min_score: the last
+      // path step says pass=true, so name the real reason and show the board
+      detail = `<span class="flow-tag cut">${esc(t('logs.belowMinScore'))}</span>`;
+      scorecard = `<div class="flow-sec"><div class="flow-h">${esc(t('logs.scorecard'))}</div>${boardBlocksHtml(st.board)}</div>`;
     } else if (step) {
       const cut = step.m === 1 && !step.pass;
       detail = `<span class="flow-tag${cut ? ' cut' : ''}">${esc(cut ? t('logs.belowFloor') : t('logs.notMatched'))}</span>
@@ -108,7 +114,7 @@ function stationTrack(r) {
     }
     return `<div class="flow-ststep ${hit ? 'hit' : 'miss'}">
       <span class="flow-idx mono">${i + 1}</span>
-      <b class="flow-nm">${esc(st.name || st.station_id || '')}</b>${detail}</div>`;
+      <b class="flow-nm">${esc(st.name || st.station_id || '')}</b>${detail}${scorecard}</div>`;
   }).join('');
   return `<div class="flow-track">${rows}</div>`;
 }
@@ -124,11 +130,8 @@ function pathHtml(r) {
   return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.path'))}</div>
     <div class="flow-paths">${steps}</div></div>`;
 }
-function boardHtml(r) {
-  const hit = (Array.isArray(r.trace) ? r.trace : []).find(st => st.result === 'hit');
-  const board = hit && Array.isArray(hit.board) ? hit.board : [];
-  if (!board.length) return '';
-  const blocks = board.map(b => {
+function boardBlocksHtml(board) {
+  return (board || []).map(b => {
     const pctW = Math.round(100 * Math.max(0, Math.min(1, Number(b.score) || 0)));
     const tick = b.min_score != null
       ? `<u class="tick" style="left:${Math.round(100 * Math.min(1, Number(b.min_score)))}%"></u>` : '';
@@ -148,7 +151,12 @@ function boardHtml(r) {
       <table class="flow-lines"><tr><th>${t('logs.sig')}</th><th>w</th><th>c</th><th>m</th><th>w·c·m</th></tr>${lines}</table>
     </div>`;
   }).join('');
-  return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.scorecard'))}</div>${blocks}</div>`;
+}
+function boardHtml(r) {
+  const hit = (Array.isArray(r.trace) ? r.trace : []).find(st => st.result === 'hit');
+  const board = hit && Array.isArray(hit.board) ? hit.board : [];
+  if (!board.length) return '';
+  return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.scorecard'))}</div>${boardBlocksHtml(board)}</div>`;
 }
 function methodRowsHtml(r) {
   const pack = r.signals || {};

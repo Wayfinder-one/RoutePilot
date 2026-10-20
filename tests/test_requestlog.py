@@ -29,11 +29,14 @@ def record(i, **kw):
 def test_flush_writes_slim_rows_without_signals(tmp_path):
     """Detail (text/signals) must never reach the database."""
     log = make_log(tmp_path)
-    log.enqueue(record(1))
+    log.enqueue(record(1, tree_path='{"spoiler": true}'))
     asyncio.run(log.flush())
     conn = connect(log.settings.db_path)
     assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
-    assert conn.execute("SELECT text FROM requests").fetchone()[0] == ""
+    row = conn.execute("SELECT text, tree_path, decision, model FROM requests").fetchone()
+    assert row["text"] == ""
+    assert row["tree_path"] is None
+    assert row["decision"] == "route" and row["model"] == "qwen3-8b"
     assert conn.execute("SELECT COUNT(*) FROM request_signals").fetchone()[0] == 0
     conn.close()
 

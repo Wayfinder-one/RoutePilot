@@ -252,3 +252,21 @@ def test_recent_requests_carry_trace_and_session_state(tmp_path):
     assert "hit" in stations                      # the walker stopped on a hit
     hit = next(t for t in rec["trace"] if t["result"] == "hit")
     assert hit["path"] is not None                # path/board keys exist
+
+
+def test_block_decision_also_records_trace(tmp_path):
+    """Blocks are logged with their trace too: moving enqueue after the block
+    return would silently drop them from the console."""
+    c = client(tmp_path)
+    pipe = c.get("/admin/pipeline").json()
+    pipe["stations"][0]["root"]["children"].append(
+        {"id": "n1z", "signal": "language", "value": "zh", "conf_min": None,
+         "kind": "leaf", "action": "block", "model": None, "min_score": None,
+         "weights": [], "children": []})
+    assert c.put("/admin/pipeline", json=pipe).status_code == 200
+    r = c.post("/v1/chat/completions",
+               json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
+    assert r.status_code == 403
+    rec = c.get("/admin/requests/recent").json()["requests"][0]
+    assert rec["decision"] == "block"
+    assert isinstance(rec["trace"], list) and rec["trace"]
