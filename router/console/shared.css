@@ -305,10 +305,14 @@ main.page{max-width:1600px;margin:0 auto;padding:0 22px 26px}
 .tp-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap}
 .tp-row .tp-name{flex:0 1 130px}
 .tp-row input[type="time"]{width:104px;font-size:12px;padding:4px 6px}
-.tp-days{display:inline-flex;gap:3px}
+/* 时段词表的星期开关：未选中 = 白底深字，选中 = 靛蓝填充白字（两页可用，
+   不依赖 pipeline.css 的 --t4-* 变量） */
+.tp-days{display:inline-flex;gap:4px}
 .tp-day{
-  width:22px;height:22px;border:1px solid var(--t4-line);border-radius:6px;
-  background:#fff;color:var(--t4-ink-3);font-size:11px;line-height:1;
+  width:26px;height:24px;border:1px solid var(--line-2);border-radius:7px;
+  background:var(--panel);color:var(--text-2);font-size:12px;font-weight:600;line-height:1;
+  cursor:pointer;transition:background .15s,border-color .15s,color .15s;
 }
-.tp-day.on{background:var(--t4-accent);border-color:var(--t4-accent);color:#fff}
-.tp-day:hover{border-color:var(--t4-accent-line)}
+.tp-day:hover{border-color:var(--indigo-line);color:var(--indigo)}
+.tp-day.on{background:var(--indigo);border-color:var(--indigo);color:#fff}
+.tp-day.on:hover{background:var(--indigo);color:#fff}

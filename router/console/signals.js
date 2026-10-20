@@ -335,8 +335,8 @@ function renderTwEditor() {
     <div class="tp-row" data-tp-row="${i}">
       <input class="tp-name" data-tp-name value="${esc(tp.name)}" placeholder="${esc(t('sig.tw.name'))}" style="max-width:110px">
       <span class="tp-days">${dows.map((d, di) =>
-        `<button type="button" class="tp-day${tp.days.includes(di) ? ' on' : ''}"
-                 data-tp-day title="${esc(d)}">${esc(d[0])}</button>`).join('')}</span>
+        `<button type="button" class="tp-day${tp.days.includes(di) ? ' on' : ''}" aria-pressed="${tp.days.includes(di)}"
+                 data-tp-day title="${esc(d)}">${esc(d)}</button>`).join('')}</span>
       <input type="time" data-tp-start value="${esc(tp.start)}">
       <span class="mut">–</span>
       <input type="time" data-tp-end value="${esc(tp.end)}">
@@ -363,7 +363,10 @@ function renderTwEditor() {
   const root = $('#editor');
   root.querySelectorAll('.tp-row').forEach(row => {
     row.querySelectorAll('.tp-day').forEach(btn =>
-      btn.addEventListener('click', () => btn.classList.toggle('on')));
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('on');
+        btn.setAttribute('aria-pressed', String(btn.classList.contains('on')));
+      }));
     row.querySelector('[data-del-tp]').addEventListener('click', () => row.remove());
   });
   $('#addTp').addEventListener('click', () => {
@@ -372,14 +375,17 @@ function renderTwEditor() {
     row.innerHTML = `
       <input class="tp-name" data-tp-name value="" placeholder="${esc(t('sig.tw.name'))}" style="max-width:110px">
       <span class="tp-days">${dows.map((d, di) =>
-        `<button type="button" class="tp-day${di <= 4 ? ' on' : ''}"
-                 data-tp-day title="${esc(d)}">${esc(d[0])}</button>`).join('')}</span>
+        `<button type="button" class="tp-day${di <= 4 ? ' on' : ''}" aria-pressed="${di <= 4}"
+                 data-tp-day title="${esc(d)}">${esc(d)}</button>`).join('')}</span>
       <input type="time" data-tp-start value="09:00">
       <span class="mut">–</span>
       <input type="time" data-tp-end value="18:00">
       <button class="del" data-del-tp title="${t('common.delete')}">✕</button>`;
     row.querySelectorAll('.tp-day').forEach(btn =>
-      btn.addEventListener('click', () => btn.classList.toggle('on')));
+      btn.addEventListener('click', () => {
+        btn.classList.toggle('on');
+        btn.setAttribute('aria-pressed', String(btn.classList.contains('on')));
+      }));
     row.querySelector('[data-del-tp]').addEventListener('click', () => row.remove());
     $('#tpRows').appendChild(row);
     row.querySelector('.tp-name').focus();
