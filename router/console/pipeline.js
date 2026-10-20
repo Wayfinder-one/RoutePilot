@@ -907,7 +907,8 @@ function onPointerMove(ev) {
       ghost.className = 'drag-ghost';
       ghost.textContent = sigName(pdrag.sig);
       ghost.style.cssText = 'position:fixed;pointer-events:none;z-index:80;';
-      document.body.appendChild(ghost);
+      // append inside .t4 so the drag-ghost styles and CSS variables apply
+      ($('.t4') || document.body).appendChild(ghost);
       pdrag.ghost = ghost;
       dragSig = pdrag.sig;
     } else {
