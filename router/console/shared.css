@@ -211,6 +211,15 @@ main.page{max-width:1600px;margin:0 auto;padding:0 22px 26px}
 .insp-row{display:flex;align-items:center;gap:5px;margin-bottom:6px}
 .insp-row select,.insp-row input{font-size:12px;padding:4px 6px}
 .insp-row .grow{flex:1;min-width:60px}
+/* 行内删除按钮（时段/词表/设置行通用）：无框灰叉，悬停红色浅底 */
+button.del{
+  width:24px;height:24px;flex:none;display:inline-flex;align-items:center;justify-content:center;
+  border:0;background:transparent;border-radius:6px;color:var(--text-3);
+  font-size:12px;line-height:1;cursor:pointer;padding:0;
+  transition:background .15s,color .15s;
+}
+button.del:hover{color:var(--red);background:var(--red-soft)}
+button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px}
 .insp-row .del{border:0;background:transparent;color:var(--text-3);cursor:pointer;padding:2px 4px;border-radius:4px}
 .insp-row .del:hover{color:var(--red);background:var(--red-soft)}
 .insp-row .grip{cursor:grab;color:var(--text-3);font-size:12px;user-select:none;padding:0 2px}
