@@ -98,26 +98,18 @@ function renderHeader() {
   $('#importPipeline').title = t('p4.importTitle');
   renderDirty();
 }
-function markDirty() { renderDirty(); syncPaletteUsed(); }
+function markDirty() { renderDirty(); }
 
 /* ── palette ─────────────────────────────────────────────────────────── */
 function renderPalette() {
-  const used = usedSignals();
   $('#palBody').innerHTML = GROUPS.map(g => {
     const items = Object.values(SIG).filter(s => s.group === g);
     if (!items.length) return '';
     return `<section class="grp">
       <h3>${esc(groupName(g))}<span class="rl"></span></h3>
-      ${items.map(s => `
-        <button class="sig${used.has(s.key) ? ' used' : ''}" data-sig="${esc(s.key)}" draggable="true"
-                aria-pressed="false" title="${esc(t('p4.sigTitle'))}">
-          <i class="dot"></i><span class="n">${esc(sigName(s.key))}</span>
-          <svg class="grip" width="9" height="9" viewBox="0 0 9 9" fill="currentColor" aria-hidden="true">
-            <circle cx="3" cy="2" r="1"/><circle cx="6" cy="2" r="1"/>
-            <circle cx="3" cy="4.5" r="1"/><circle cx="6" cy="4.5" r="1"/>
-            <circle cx="3" cy="7" r="1"/><circle cx="6" cy="7" r="1"/>
-          </svg>
-        </button>`).join('')}
+      <div class="chips">${items.map(s =>
+        `<button class="sig" data-sig="${esc(s.key)}" draggable="true"
+                 title="${esc(t('p4.sigTitle'))}">${esc(sigName(s.key))}</button>`).join('')}</div>
     </section>`;
   }).join('');
   $('#palCount').textContent = Object.keys(SIG).length + (LANG === 'zh' ? ' 个' : '');
@@ -126,10 +118,6 @@ function syncPalFade() {
   const body = $('#palBody');
   body.classList.toggle('more',
     body.scrollHeight - body.scrollTop - body.clientHeight > 2);
-}
-function syncPaletteUsed() {
-  const used = usedSignals();
-  $$('#palBody .sig').forEach(el => el.classList.toggle('used', used.has(el.dataset.sig)));
 }
 
 /* ── tree rendering ──────────────────────────────────────────────────── */
@@ -1307,7 +1295,6 @@ function renderAll() {
   renderTree();
   syncFlowChrome();
   syncPalFade();
-  syncPaletteUsed();
 }
 
 /* ── wiring ──────────────────────────────────────────────────────────── */

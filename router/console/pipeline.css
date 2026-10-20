@@ -87,33 +87,17 @@ body[data-page="pipeline"] .headmeta{position:relative;z-index:1}
   font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--t4-ink-3);
 }
 .t4 .grp h3 span.rl{flex:1;height:1px;background:var(--t4-line)}
+/* 信号库 = 纯拖拽来源：圆角小方块，不标记是否已用 */
+.t4 .grp .chips{display:flex;flex-wrap:wrap;gap:5px}
 .t4 .sig{
-  display:flex;align-items:center;gap:8px;width:100%;height:32px;padding:0 8px;
-  border:1px solid transparent;border-radius:7px;background:none;
-  font-size:12.5px;color:var(--t4-ink-2);text-align:left;
-  cursor:grab;transition:background .2s,border-color .2s,color .2s;
+  display:inline-flex;align-items:center;padding:4px 10px;
+  border:1px solid var(--t4-line);border-radius:8px;background:#fff;
+  font-size:12px;line-height:1.25;color:var(--t4-ink-2);white-space:nowrap;
+  cursor:grab;transition:background .15s,border-color .15s,color .15s,transform .1s;
 }
-.t4 .sig:hover{background:var(--t4-wash);border-color:var(--t4-line);color:var(--t4-ink)}
-.t4 .sig:active{cursor:grabbing}
-.t4 .sig .dot{width:6px;height:6px;border-radius:50%;background:#cfcec7;flex:none;transition:background .2s}
-.t4 .sig.used .dot{background:var(--t4-accent)}
-.t4 .sig .n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.t4 .sig .grip{opacity:0;color:var(--t4-line-2);transition:opacity .2s;flex:none}
-.t4 .sig:hover .grip{opacity:1}
-.t4 .sig[aria-pressed="true"]{
-  background:var(--t4-accent-soft);border-color:var(--t4-accent-line);
-  color:var(--t4-accent-deep);font-weight:600;
-}
-.t4 .sig[aria-pressed="true"] .dot{background:var(--t4-accent)}
+.t4 .sig:hover{background:var(--t4-accent-soft);border-color:var(--t4-accent-line);color:var(--t4-accent-deep)}
+.t4 .sig:active{cursor:grabbing;transform:scale(.97)}
 .t4 .sig.dragging{opacity:.4}
-.t4 .pal-foot{
-  display:flex;align-items:center;gap:14px;padding:7px 15px;
-  border-top:1px solid var(--t4-line);background:var(--t4-wash);
-  font-size:10.5px;color:var(--t4-ink-3)
-}
-.t4 .pal-foot .lg{display:inline-flex;align-items:center;gap:5px}
-.t4 .pal-foot i{width:5px;height:5px;border-radius:50%;background:#cfcec7}
-.t4 .pal-foot i.used{background:var(--t4-accent)}
 
 /* ── 分流树：主轴贯穿，站点编号挂在主干上 ───────────── */
 .t4 .flow{display:flex;flex-direction:column;min-width:0}
@@ -631,3 +615,9 @@ body.dragging{user-select:none}
 
 /* 出口（直达/拦截 + 模型）与 +/− 一起靠右 */
 .t4 .tn-right{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}
+
+/* 试算面板的「未保存改动」提示 */
+.t4-sim .sim-warn{
+  border:1px solid #efdcae;background:#fdf6e7;color:#8a6116;
+  border-radius:8px;padding:7px 10px;font-size:11.5px;line-height:1.5;margin-bottom:10px;
+}
