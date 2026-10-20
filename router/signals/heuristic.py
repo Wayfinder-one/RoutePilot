@@ -54,7 +54,7 @@ class HeuristicTagger:
 
     def __init__(self, kw_groups: dict | None = None):
         self.kw_groups = kw_groups or {}   # replaced wholesale on lexicon update
-        self.time_rules = {}                 # replaced wholesale on rule update
+        self.time_periods = {}               # replaced wholesale on rule update
 
     async def tag(self, req: TagRequest) -> TagResult:
         return TagResult(signals=self._tag(req))
@@ -95,7 +95,7 @@ class HeuristicTagger:
     def _tag(self, req: TagRequest) -> dict:
         signals = self._model_signals(req)
         signals.update(rule_signals(req.text, req.headers, req.n_messages,
-                                   self.kw_groups, time_rules=self.time_rules))
+                                   self.kw_groups, time_periods=self.time_periods))
         return signals
 
 

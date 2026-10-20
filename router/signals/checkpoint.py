@@ -323,7 +323,7 @@ class CheckpointTagger:
         files = load_and_validate(checkpoint_dir)      # pure check before torch
         self.files = files
         self.kw_groups = kw_groups or {}
-        self.time_rules = {}                 # replaced wholesale on rule update
+        self.time_periods = {}               # replaced wholesale on rule update
         import torch                                    # lazy: checkpoint only
 
         self._torch = torch
@@ -427,7 +427,7 @@ class CheckpointTagger:
     async def tag(self, req: TagRequest) -> TagResult:
         signals, vec = await asyncio.to_thread(self._tag_row, req)
         signals.update(rule_signals(req.text, req.headers, req.n_messages,
-                                    self.kw_groups, time_rules=self.time_rules))
+                                    self.kw_groups, time_periods=self.time_periods))
         merge_rule_pii(signals, req.text)
         return TagResult(signals=signals, vec=vec)
 

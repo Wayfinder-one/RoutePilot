@@ -217,23 +217,22 @@ def test_tagger_meta_and_recent_requests(tmp_path):
     assert c.get("/admin/requests/recent?limit=1000").status_code == 200
 
 
-def test_time_window_config_roundtrip(tmp_path):
+def test_time_periods_roundtrip(tmp_path):
     c = client(tmp_path)
-    resp = c.get("/admin/time-window").json()
-    assert "now" in resp                      # server clock exposed for the console
-    assert resp["rules"] == {"day_start": 9, "night_start": 18, "weekend_days": [5, 6]}
+    resp = c.get("/admin/time-periods").json()
+    assert "now" in resp
+    assert [p["name"] for p in resp["periods"]] == ["白天", "夜间", "周末"]
 
-    r = c.put("/admin/time-window",
-              json={"rules": {"day_start": 8, "night_start": 22,
-                              "weekend_days": [6]}})
-    assert r.status_code == 200
-    assert c.get("/admin/time-window").json()["rules"] == {
-        "day_start": 8, "night_start": 22, "weekend_days": [6]}
-    # persisted (new client sees the same row)
-    c2 = client(tmp_path)
-    assert c2.get("/admin/time-window").json()["rules"]["night_start"] == 22
+    custom = [{"name": "夜班", "days": [0, 1, 2, 3, 4, 5, 6],
+               "start": "22:00", "end": "06:00"}]
+    assert c.put("/admin/time-periods", json={"periods": custom}).status_code == 200
+    assert c.get("/admin/time-periods").json()["periods"] == custom
+    # persisted for a fresh client
+    assert client(tmp_path).get("/admin/time-periods").json()["periods"] == custom
 
-    for bad in ({"day_start": 20, "night_start": 8, "weekend_days": [5, 6]},   # start >= night
-                {"day_start": 9, "night_start": 18, "weekend_days": [7]},      # weekday out of range
-                {"day_start": "nine", "night_start": 18, "weekend_days": [6]}):
-        assert c.put("/admin/time-window", json={"rules": bad}).status_code == 422
+    for bad in ({"periods": [{"name": "", "days": [1], "start": "08:00", "end": "09:00"}]},
+                {"periods": [{"name": "x", "days": [7], "start": "08:00", "end": "09:00"}]},
+                {"periods": [{"name": "x", "days": [1], "start": "8点", "end": "09:00"}]},
+                {"periods": [{"name": "dup", "days": [1], "start": "08:00", "end": "09:00"},
+                             {"name": "dup", "days": [2], "start": "08:00", "end": "09:00"}]}):
+        assert c.put("/admin/time-periods", json=bad).status_code == 422

@@ -209,39 +209,40 @@ class SettingsRepo:
                 self.conn.execute("SELECT key, value FROM settings ORDER BY key")}
 
 
-class TimeWindowRepo:
-    """时段规则：白天/夜间起止小时与周末定义（settings 表 JSON，键 time_window_rules）。
+class TimePeriodRepo:
+    """时段词表：命名的时间段（关键词词表的时间版）。
 
-    weekend_days 用 Python weekday 数字（周一=0）。命中优先级：周末 > 白天 > 夜间。"""
+    每行 {name, days: [0..6]（周一=0）, start: "HH:MM", end: "HH:MM"}；
+    start > end 表示跨午夜，start == end 表示全天。请求时刻命中了哪些时段，
+    time_window 信号的取值就是哪些名字（列表，与 keyword 词表同语义）。"""
 
-    KEY = "time_window_rules"
-    DEFAULTS = {"day_start": 9, "night_start": 18, "weekend_days": [5, 6]}
+    SEED_KEY = "time_periods_seeded"
+    DEFAULTS = [
+        {"name": "白天", "days": [0, 1, 2, 3, 4], "start": "09:00", "end": "18:00"},
+        {"name": "夜间", "days": [0, 1, 2, 3, 4, 5, 6], "start": "18:00", "end": "09:00"},
+        {"name": "周末", "days": [5, 6], "start": "00:00", "end": "00:00"},   # 全天
+    ]
 
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
-    def load(self) -> dict:
-        row = self.conn.execute("SELECT value FROM settings WHERE key = ?",
-                                (self.KEY,)).fetchone()
-        cfg = dict(self.DEFAULTS)
-        if row and row["value"]:
-            try:
-                cfg.update(json.loads(row["value"]))
-            except (ValueError, TypeError):
-                pass
-        try:
-            cfg["day_start"] = min(23, max(0, int(cfg.get("day_start", 9))))
-            cfg["night_start"] = min(24, max(1, int(cfg.get("night_start", 18))))
-        except (TypeError, ValueError):
-            cfg["day_start"], cfg["night_start"] = 9, 18
-        cfg["weekend_days"] = sorted({int(d) for d in cfg.get("weekend_days", [])
-                                      if int(d) in range(7)})
-        if cfg["day_start"] >= cfg["night_start"]:
-            cfg["day_start"], cfg["night_start"] = 9, 18
-        return cfg
+    def load(self) -> list[dict]:
+        # first run on an existing DB: seed the three classic periods once
+        if SettingsRepo(self.conn).get(self.SEED_KEY) is None:
+            self.save(self.DEFAULTS, seed=True)
+        return [{"name": r["name"],
+                 "days": [int(d) for d in json.loads(r["days"])],
+                 "start": r["start"], "end": r["end"]}
+                for r in self.conn.execute(
+                    "SELECT * FROM time_periods ORDER BY rowid")]
 
-    def save(self, cfg: dict) -> None:
-        SettingsRepo(self.conn).set(self.KEY, json.dumps(cfg))
+    def save(self, periods: list[dict], seed: bool = False) -> None:
+        self.conn.execute("DELETE FROM time_periods")
+        for p in periods:
+            self.conn.execute("INSERT OR REPLACE INTO time_periods VALUES (?, ?, ?, ?)",
+                              (p["name"], json.dumps(p.get("days") or []),
+                               p["start"], p["end"]))
+        SettingsRepo(self.conn).set(self.SEED_KEY, "1")
         self.conn.commit()
 
 

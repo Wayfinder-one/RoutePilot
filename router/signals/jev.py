@@ -266,7 +266,7 @@ class JevTagger:
         self.question_path = str(questions_path or DEFAULT_QUESTIONS_PATH)
         self.questions = load_question_config(questions_path)
         self.kw_groups = kw_groups or {}
-        self.time_rules = {}                 # replaced wholesale on rule update
+        self.time_periods = {}               # replaced wholesale on rule update
         self.model_dir = Path(model_dir)
         meta_path = self.model_dir / "model.json"
         if not meta_path.is_file():
@@ -471,7 +471,7 @@ class JevTagger:
     async def tag(self, req: TagRequest) -> TagResult:
         signals, vec = await asyncio.to_thread(self._tag_row, req)
         signals.update(rule_signals(req.text, req.headers, req.n_messages,
-                                    self.kw_groups, time_rules=self.time_rules))
+                                    self.kw_groups, time_periods=self.time_periods))
         merge_rule_pii(signals, req.text)
         return TagResult(signals=signals, vec=vec)
 

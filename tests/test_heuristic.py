@@ -36,22 +36,20 @@ def test_safety():
     assert "cn_id_card" in s2["pii"]["value"]
 
 
-def test_time_window_rules_configurable():
+def test_time_window_periods_configurable():
     from datetime import datetime
     from router.signals.rules import rule_signals
-    tue07 = datetime(2026, 10, 20, 7, 0)    # Tuesday 07:00
-    tue09 = datetime(2026, 10, 20, 9, 0)    # Tuesday 09:00
-    tue21 = datetime(2026, 10, 20, 21, 0)   # Tuesday 21:00
-    sat12 = datetime(2026, 10, 24, 12, 0)   # Saturday
-    rules = {"day_start": 8, "night_start": 20, "weekend_days": [6]}
-    val = lambda d: rule_signals("hi", {}, 1, now=d, time_rules=rules)[
+    periods = [
+        {"name": "工作时段", "days": [0, 1, 2, 3, 4], "start": "08:00", "end": "20:00"},
+        {"name": "夜间", "days": [0, 1, 2, 3, 4, 5, 6], "start": "20:00", "end": "08:00"},
+        {"name": "周末", "days": [5, 6], "start": "00:00", "end": "00:00"},
+    ]
+    val = lambda d: rule_signals("hi", {}, 1, now=d, time_periods=periods)[
         "time_window"]["value"]
-    assert val(tue07) == "night"
-    assert val(tue09) == "weekday_day"
-    assert val(tue21) == "night"
-    assert val(sat12) == "weekday_day"          # Sunday-only weekend: Saturday is a workday
-    sunday = datetime(2026, 10, 25, 12, 0)
-    assert val(sunday) == "weekend"
-    # defaults keep the original behaviour
-    dflt = lambda d: rule_signals("hi", {}, 1, now=d)["time_window"]["value"]
-    assert dflt(tue09) == "weekday_day" and dflt(sat12) == "weekend"
+    assert val(datetime(2026, 10, 20, 7, 0)) == ["夜间"]            # Tue 07:00 (wrap)
+    assert val(datetime(2026, 10, 20, 9, 0)) == ["工作时段"]         # Tue 09:00
+    assert val(datetime(2026, 10, 20, 21, 0)) == ["夜间"]            # Tue 21:00
+    assert val(datetime(2026, 10, 24, 12, 0)) == ["周末"]            # Saturday noon
+    assert val(datetime(2026, 10, 25, 21, 0)) == ["夜间", "周末"]     # Sunday 21:00: both
+    # no config -> empty value (no period matches)
+    assert rule_signals("hi", {}, 1)["time_window"]["value"] == []

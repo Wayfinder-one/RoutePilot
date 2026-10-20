@@ -10,6 +10,7 @@ the ``changes`` audit trail (design 5.1).
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -26,7 +27,7 @@ from router.pipeline.model import station_from_dict, station_to_dict
 from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
-                                        TimeWindowRepo,
+                                        TimePeriodRepo,
                                        ModelRepo, ProviderRepo, RequestRepo,
                                        SettingsRepo, StationRepo)
 
@@ -111,41 +112,41 @@ def put_keyword_groups(body: dict, request: Request,
     return {"ok": True}
 
 
-@router.get("/time-window")
-def get_time_window(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"rules": TimeWindowRepo(conn).load(),
+@router.get("/time-periods")
+def get_time_periods(conn: sqlite3.Connection = Depends(get_conn)):
+    return {"periods": TimePeriodRepo(conn).load(),
             "now": _now()}   # server clock: the time_window rule judges by it
 
 
-@router.put("/time-window")
-def put_time_window(body: dict, request: Request,
-                    conn: sqlite3.Connection = Depends(get_conn)):
-    rules = body.get("rules")
-    if not isinstance(rules, dict):
-        raise HTTPException(422, detail="rules must be an object")
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
-    def _hour(v, default):
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            raise HTTPException(422, detail=f"invalid hour: {v!r}")
-    day_start = _hour(rules.get("day_start", 9), 9)
-    night_start = _hour(rules.get("night_start", 18), 18)
-    days = rules.get("weekend_days", [5, 6])
-    if (not isinstance(days, list)
-            or not all(isinstance(d, int) and 0 <= d <= 6 for d in days)
-            or len(set(days)) != len(days)):
-        raise HTTPException(422, detail="weekend_days must be unique ints 0-6 (Mon=0)")
-    if not (0 <= day_start < night_start <= 24):
-        raise HTTPException(422, detail="need 0 <= day_start < night_start <= 24")
-    clean = {"day_start": day_start, "night_start": night_start,
-             "weekend_days": sorted(days)}
-    TimeWindowRepo(conn).save(clean)
+
+@router.put("/time-periods")
+def put_time_periods(body: dict, request: Request,
+                     conn: sqlite3.Connection = Depends(get_conn)):
+    periods = body.get("periods")
+    if not isinstance(periods, list):
+        raise HTTPException(422, detail="periods must be a list")
+    seen = set()
+    for p in periods:
+        if (not isinstance(p, dict) or not str(p.get("name", "")).strip()
+                or p["name"] in seen):
+            raise HTTPException(422, detail="period names must be non-empty and unique")
+        seen.add(p["name"])
+        days = p.get("days")
+        if (not isinstance(days, list) or not days
+                or not all(isinstance(d, int) and 0 <= d <= 6 for d in days)):
+            raise HTTPException(422,
+                                detail=f"{p['name']}: days must be ints 0-6 (Mon=0)")
+        for k in ("start", "end"):
+            if not isinstance(p.get(k), str) or not _TIME_RE.match(p[k]):
+                raise HTTPException(422, detail=f"{p['name']}: {k} must be HH:MM")
+    TimePeriodRepo(conn).save(periods)
     tagger = getattr(request.app.state, "tagger", None)
     if tagger is not None:
-        tagger.time_rules = clean
-    ChangeRepo(conn).record(_now(), "time-window", clean)
-    return {"ok": True, "rules": clean}
+        tagger.time_periods = periods
+    ChangeRepo(conn).record(_now(), "time-periods", {"periods": len(periods)})
+    return {"ok": True, "periods": periods}
 
 
 
@@ -211,7 +212,9 @@ def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
                         for s in SIGNALS.values()],
             "groups": [g for g in GROUPS if any(s.group == g
                                                 for s in SIGNALS.values())],
-            "keyword_groups": list(KeywordRepo(conn).groups())}
+            "keyword_groups": list(KeywordRepo(conn).groups()),
+            "time_periods": [p["name"] for p in TimePeriodRepo(conn).load()],
+            "now": _now()}
 
 
 # --------------------------------------------------------------------------- #

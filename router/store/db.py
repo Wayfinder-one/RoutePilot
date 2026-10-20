@@ -85,6 +85,13 @@ MIGRATIONS = [
         type TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
         tree TEXT NOT NULL);
     """,
+    # v8 (2026-10-20): named time periods for the time_window rule signal
+    # (keyword-lexicon style: the signal value is the list of matching names).
+    """
+    CREATE TABLE time_periods (
+        name TEXT PRIMARY KEY, days TEXT NOT NULL,
+        start TEXT NOT NULL, end TEXT NOT NULL);
+    """,
 ]
 
 

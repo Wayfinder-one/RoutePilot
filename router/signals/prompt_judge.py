@@ -208,7 +208,7 @@ class PromptJudgeTagger:
         self.system_prompt = build_system_prompt(self.config)
         self.model = model
         self.kw_groups = kw_groups or {}
-        self.time_rules = {}                 # replaced wholesale on rule update
+        self.time_periods = {}               # replaced wholesale on rule update
         judge = self.config.get("judge") or {}
         self.temperature = float(judge.get("temperature", 0))
         self.max_tokens = int(judge.get("max_tokens", 1200))
@@ -284,7 +284,7 @@ class PromptJudgeTagger:
             judged["user_feedback"] = {"value": None, "confidence": None,
                                        "is_rule": False}
         judged.update(rule_signals(req.text, req.headers, req.n_messages,
-                                   self.kw_groups, time_rules=self.time_rules))
+                                   self.kw_groups, time_periods=self.time_periods))
         merge_rule_pii(judged, req.text)
         # this mode has no embedding => report "no session history"
         judged["similarity"] = {"value": 0, "confidence": None, "is_rule": False}

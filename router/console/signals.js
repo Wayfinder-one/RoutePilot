@@ -10,9 +10,9 @@ let meta = {};
 let registry = {};       // /admin/signals specs (zh/en labels, values)
 let selected = 'domain';
 const KW = '__keyword_lexicon__';   // pseudo entry in the signal list
-const TW = '__time_rules__';        // pseudo entry: time-window rules
+const TW = '__time_rules__';        // pseudo entry: time period lexicon
 let kwGroups = {};
-let timeRules = { day_start: 9, night_start: 18, weekend_days: [5, 6] };
+let timePeriods = [];
 let serverOffsetMs = 0;              // server clock - browser clock
 let clockTimer = null;
 let dirty = false;
@@ -26,9 +26,9 @@ async function boot() {
     api.get('/admin/signal-questions'),
     api.get('/admin/signals'),
     api.get('/admin/keyword-groups'),
-    api.get('/admin/time-window'),
+    api.get('/admin/time-periods'),
   ]);
-  timeRules = twBody.rules || timeRules;
+  timePeriods = twBody.periods || [];
   if (twBody.now) serverOffsetMs = new Date(twBody.now).getTime() - Date.now();
   startServerClock();
   cfg = qBody.config;
@@ -328,56 +328,78 @@ function renderKwEditor() {
 }
 
 
-/* ── time-window rules (rule signal "time_window") ───────────────────── */
+/* ── time period lexicon (rule signal "time_window") ─────────────────── */
 function renderTwEditor() {
   const dows = t('sig.tw.dows').split(',');
-  const boxes = dows.map((name, i) => `
-    <label class="tw-dow" data-dow="${i}">
-      <input type="checkbox" data-tw-dow="${i}"
-             ${timeRules.weekend_days.includes(i) ? 'checked' : ''}>${esc(name)}</label>`).join('');
+  const rows = timePeriods.map((tp, i) => `
+    <div class="tp-row" data-tp-row="${i}">
+      <input class="tp-name" data-tp-name value="${esc(tp.name)}" placeholder="${esc(t('sig.tw.name'))}" style="max-width:110px">
+      <span class="tp-days">${dows.map((d, di) =>
+        `<button type="button" class="tp-day${tp.days.includes(di) ? ' on' : ''}"
+                 data-tp-day title="${esc(d)}">${esc(d[0])}</button>`).join('')}</span>
+      <input type="time" data-tp-start value="${esc(tp.start)}">
+      <span class="mut">–</span>
+      <input type="time" data-tp-end value="${esc(tp.end)}">
+      <button class="del" data-del-tp title="${t('common.delete')}">✕</button>
+    </div>`).join('');
   $('#editor').innerHTML = `<div class="card">
     <div class="insp-h">
       <span class="type gate">${esc(t('sig.kw.ruletype'))}</span>
       <span class="t">${esc(t('sig.tw.short'))}</span>
       <span class="mut">time_window</span>
-      <span class="stat" style="margin-left:auto">${timeRules.day_start}:00 – ${timeRules.night_start}:00</span>
+      <span class="stat" style="margin-left:auto">${timePeriods.length} ${esc(t('sig.kw.groupsUnit'))}</span>
     </div>
     <div class="subcard">
-      <div class="hd">${esc(t('sig.tw.dayNight'))}</div>
-      <div class="tw-row">
-        <label class="field">${esc(t('sig.tw.dayStart'))}
-          <input type="number" min="0" max="23" step="1" data-tw-num="day_start"
-                 value="${timeRules.day_start}" style="max-width:90px"></label>
-        <label class="field">${esc(t('sig.tw.nightStart'))}
-          <input type="number" min="1" max="24" step="1" data-tw-num="night_start"
-                 value="${timeRules.night_start}" style="max-width:90px"></label>
+      <div class="hd">${esc(t('sig.tw.groupsTitle'))}</div>
+      <div class="footnote" style="margin:-2px 0 9px">${esc(t('sig.tw.hint'))}</div>
+      <div id="tpRows">${rows}</div>
+      <div class="addrow" style="margin-top:8px">
+        <button class="btn sm" id="addTp">${esc(t('sig.tw.add'))}</button>
+        <button class="btn pri sm" id="saveTw">${esc(t('sig.tw.save'))}</button>
       </div>
-      <div class="footnote" style="margin:-2px 0 0">${esc(t('sig.tw.hint'))}</div>
-    </div>
-    <div class="subcard">
-      <div class="hd">${esc(t('sig.tw.weekend'))}</div>
-      <div class="tw-dows">${boxes}</div>
-      <div class="footnote" id="twCurrent" style="margin:8px 0 0"></div>
-    </div>
-    <div class="addrow" style="margin-top:8px">
-      <button class="btn pri sm" id="saveTw">${esc(t('sig.tw.save'))}</button>
+      <div class="footnote" id="twCurrent" style="margin-top:8px"></div>
     </div>
   </div>`;
+  const root = $('#editor');
+  root.querySelectorAll('.tp-row').forEach(row => {
+    row.querySelectorAll('.tp-day').forEach(btn =>
+      btn.addEventListener('click', () => btn.classList.toggle('on')));
+    row.querySelector('[data-del-tp]').addEventListener('click', () => row.remove());
+  });
+  $('#addTp').addEventListener('click', () => {
+    const row = document.createElement('div');
+    row.className = 'tp-row';
+    row.innerHTML = `
+      <input class="tp-name" data-tp-name value="" placeholder="${esc(t('sig.tw.name'))}" style="max-width:110px">
+      <span class="tp-days">${dows.map((d, di) =>
+        `<button type="button" class="tp-day${di <= 4 ? ' on' : ''}"
+                 data-tp-day title="${esc(d)}">${esc(d[0])}</button>`).join('')}</span>
+      <input type="time" data-tp-start value="09:00">
+      <span class="mut">–</span>
+      <input type="time" data-tp-end value="18:00">
+      <button class="del" data-del-tp title="${t('common.delete')}">✕</button>`;
+    row.querySelectorAll('.tp-day').forEach(btn =>
+      btn.addEventListener('click', () => btn.classList.toggle('on')));
+    row.querySelector('[data-del-tp]').addEventListener('click', () => row.remove());
+    $('#tpRows').appendChild(row);
+    row.querySelector('.tp-name').focus();
+  });
   $('#saveTw').addEventListener('click', async () => {
-    const day = Number($('[data-tw-num="day_start"]').value);
-    const night = Number($('[data-tw-num="night_start"]').value);
-    const days = [...document.querySelectorAll('[data-tw-dow]:checked')]
-      .map(el => Number(el.dataset.twDow));
-    if (!(Number.isInteger(day) && day >= 0 && day <= 23)
-        || !(Number.isInteger(night) && night >= 1 && night <= 24)
-        || day >= night) {
-      toast(t('sig.tw.invalid'));
-      return;
-    }
-    const rules = { day_start: day, night_start: night, weekend_days: days };
+    const periods = [];
+    let bad = false;
+    document.querySelectorAll('#tpRows .tp-row').forEach(row => {
+      const name = row.querySelector('[data-tp-name]').value.trim();
+      const days = [...row.querySelectorAll('.tp-day.on')]
+        .map(b => Number(b.dataset.tpDay));
+      const start = row.querySelector('[data-tp-start]').value;
+      const end = row.querySelector('[data-tp-end]').value;
+      if (!name || !days.length || !start || !end) { bad = true; return; }
+      periods.push({ name, days: [...new Set(days)].sort((a, b) => a - b), start, end });
+    });
+    if (bad || !periods.length) { toast(t('sig.tw.invalid')); return; }
     try {
-      await api.put('/admin/time-window', { rules });
-      timeRules = rules;
+      const out = await api.put('/admin/time-periods', { periods });
+      timePeriods = out.periods || periods;
       renderTwEditor();
       toast(t('common.saved'));
     } catch (e) {
@@ -386,15 +408,28 @@ function renderTwEditor() {
   });
 }
 
-
 /* ── server clock (the time_window rule judges by server time) ───────── */
 function serverNow() { return new Date(Date.now() + serverOffsetMs); }
 function twPeriod(d) {
   const wd = (d.getDay() + 6) % 7;                 // Python weekday: Mon=0
-  if (timeRules.weekend_days.includes(wd)) return ['weekend', t('p4.twValue.weekend')];
-  if (d.getHours() >= timeRules.day_start && d.getHours() < timeRules.night_start)
-    return ['weekday_day', t('p4.twValue.day')];
-  return ['night', t('p4.twValue.night')];
+  if (timePeriods.some(p => p.days.includes(wd)
+        && periodCovers(p, d))) return ['weekend', t('p4.twValue.weekend')];
+  for (const p of timePeriods) {
+    if (!p.days.includes(wd)) continue;
+    if (periodCovers(p, d)) {
+      if (p.name === t('p4.twValue.day')) return ['weekday_day', t('p4.twValue.day')];
+      if (p.name === t('p4.twValue.night')) return ['night', t('p4.twValue.night')];
+    }
+  }
+  return null;
+}
+function periodCovers(p, d) {
+  const minutes = d.getHours() * 60 + d.getMinutes();
+  const hm = s => { const [h, m] = String(s).split(':').map(Number); return h * 60 + (m || 0); };
+  const a = hm(p.start), b = hm(p.end);
+  if (a === b) return true;
+  if (a < b) return a <= minutes && minutes < b;
+  return minutes >= a || minutes < b;
 }
 function fmtServerTime(d) {
   const p2 = n => String(n).padStart(2, '0');
@@ -404,14 +439,16 @@ function startServerClock() {
   if (clockTimer) clearInterval(clockTimer);
   const tick = () => {
     const el = $('#serverClock');
-    if (!el) return;
-    const d = serverNow();
-    el.textContent = `${t('sig.clock')} ${fmtServerTime(d)}`;
-    const cur = $('#twCurrent');
-    if (cur) {
-      const [key, label] = twPeriod(d);
-      cur.innerHTML = `${esc(t('sig.tw.current'))}<b>${esc(label)}</b>` +
-        `<span class="mono mut" style="margin-left:8px">${esc(key)}</span>`;
+    if (el) {
+      const d = serverNow();
+      el.textContent = `${t('sig.clock')} ${fmtServerTime(d)}`;
+      const cur = $('#twCurrent');
+      if (cur) {
+        const hit = twPeriod(d);
+        cur.textContent = hit
+          ? `${t('sig.tw.current')}${hit[1]} (${hit[0]})`
+          : `${t('sig.tw.current')}—`;
+      }
     }
   };
   tick();

@@ -97,8 +97,7 @@ _SPECS = (
     SignalSpec("keyword", "关键词", "Keyword", "rule", "rule", multi=True),  # values = lexicon groups, dynamic
     SignalSpec("tenant", "身份", "Tenant", "rule", "rule"),                  # header value, free-form
     SignalSpec("time_window", "时段", "Time Window", "rule", "rule",
-               values=(("weekday_day", "白天", "Day"), ("night", "夜间", "Night"),
-                       ("weekend", "周末", "Weekend"))),
+               multi=True),  # values = named time periods, dynamic
     SignalSpec("event", "事件", "Event", "rule", "rule",
                values=(("incident", "故障", "Incident"),
                        ("payment_issue", "支付问题", "Payment Issue"),

@@ -23,7 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from router.config import Settings
 from router.signals.heuristic import HeuristicTagger
 from router.store.db import connect, migrate
-from router.store.repositories import KeywordRepo, StationRepo, TimeWindowRepo, seed_default
+from router.store.repositories import (
+    KeywordRepo, StationRepo, TimePeriodRepo, seed_default)
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 
@@ -95,7 +96,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     migrate(conn)
     seed_default(conn, calibration)
     kw_groups = KeywordRepo(conn).groups()
-    time_rules = TimeWindowRepo(conn).load()
+    time_periods = TimePeriodRepo(conn).load()
     pipeline = StationRepo(conn).load()
     conn.close()
 
@@ -117,7 +118,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app = FastAPI(title="Smart Router", lifespan=lifespan)
     app.state.settings = settings
     app.state.tagger = _make_tagger(settings, kw_groups)
-    app.state.tagger.time_rules = time_rules
+    app.state.tagger.time_periods = time_periods
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
     app.state.pipeline = pipeline            # in-memory snapshot (design 4.4)
     from router.api.upstream import CircuitBreaker, load_backends

@@ -27,6 +27,9 @@ const $$ = (s, r = document) => Array.from((r || document).querySelectorAll(s));
 let SIG = {};                  // key -> {key,zh,en,group,kind,multi,free,values:[[k,zh,en]]}
 let GROUPS = [];
 let KEYWORD_GROUPS = [];
+let TIME_PERIODS = [];
+let serverOffsetMs = 0;
+let clockTimer = null;
 let MODELS = [];
 let stations = [];             // API shape: [{id,type,name,root}]
 let version = '0';
@@ -718,11 +721,13 @@ function openPicker({ title, sub, anchor, allowFree, note, onPick, disabledValue
     const spec = sigSpec(key);
     const back = `<button class="pop-del" id="pkBack" style="color:var(--t4-ink-3)">← ${esc(t('p4.back'))}</button>`;
     if (isFreeSig(key)) {
-      const list = key === 'keyword' && KEYWORD_GROUPS.length
-        ? `<datalist id="pkKw">${KEYWORD_GROUPS.map(g => `<option value="${esc(g)}">`).join('')}</datalist>` : '';
+      const options = key === 'keyword' ? KEYWORD_GROUPS
+        : key === 'time_window' ? TIME_PERIODS : [];
+      const list = options.length
+        ? `<datalist id="pkOpts">${options.map(g => `<option value="${esc(g)}">`).join('')}</datalist>` : '';
       pop.innerHTML = `${popHead(tf('p4.pickRootValue', { sig: sigName(key) }), sub)}
         <p class="pop-label">${esc(t('p4.value'))}</p>
-        <input class="pop-text" id="pkText" value="" list="${key === 'keyword' && KEYWORD_GROUPS.length ? 'pkKw' : ''}"
+        <input class="pop-text" id="pkText" value="" list="${options.length ? 'pkOpts' : ''}"
                placeholder="${esc(t('p4.freePlaceholder'))}">${list}
         <div class="pop-foot">${back}
           <button class="pop-ok" id="pkOk">${esc(t('common.add'))}</button></div>`;
@@ -1262,6 +1267,9 @@ async function boot() {
         Array.isArray(v) ? v : [v.key, v.zh, v.en]) };
     });
     KEYWORD_GROUPS = sigBody.keyword_groups || [];
+    TIME_PERIODS = sigBody.time_periods || [];
+    if (sigBody.now) serverOffsetMs = new Date(sigBody.now).getTime() - Date.now();
+    startServerClock();
     MODELS = (modelBody.models || []).map(m => m.id);
     stations = pipeBody.stations || [];
     version = String(pipeBody.version || '0');
@@ -1314,6 +1322,23 @@ window.addEventListener('resize', () => {
     placePop(popTarget.anchor(), true);
   }
 });
+/* ── server clock (time_window judges by server time) ────────────────── */
+function serverNow() { return new Date(Date.now() + serverOffsetMs); }
+function fmtServerTime(d) {
+  const p2 = n => String(n).padStart(2, '0');
+  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+}
+function startServerClock() {
+  if (clockTimer) clearInterval(clockTimer);
+  const tick = () => {
+    const el = $('#serverClockPill');
+    if (!el) return;
+    el.innerHTML = `${esc(t('p4.serverClock'))} <b>${esc(fmtServerTime(serverNow()))}</b>`;
+  };
+  tick();
+  clockTimer = setInterval(tick, 1000);
+}
+
 window.onLangChange = () => {
   renderAll();
   renderSimText();
