@@ -83,7 +83,6 @@ function usedSignals() {
   return used;
 }
 const isFallback = st => stations.length && st.id === stations[stations.length - 1].id;
-const stationTypeLabel = tp => t('p6.type.' + tp);
 
 /* ── header / dirty ──────────────────────────────────────────────────── */
 function isDirty() { return savedJson == null || JSON.stringify(stations) !== savedJson; }
@@ -195,8 +194,6 @@ function stationHTML(st, i, last) {
       <div class="st-body">
         <div class="st-head">
           <h2>${esc(st.name)}</h2>
-          <span class="ty">${esc(stationTypeLabel(st.type))}</span>
-          <p class="st-desc">${esc(t('p6.desc.' + st.type))}</p>
           ${last ? '' : `<button class="st-del" data-delstation="${esc(st.id)}" title="${esc(t('p6.delStation'))}"
                 aria-label="${esc(tf('p6.delStationNamed', { name: st.name }))}">
               <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -311,16 +308,12 @@ function toast(msg, undo) {
 }
 
 /* ── node mutations ──────────────────────────────────────────────────── */
-function defaultAction(station) {
-  return station.type === 'gate' ? 'block' : 'route';
-}
 function newNode(station, signal, value) {
-  const action = defaultAction(station);
   return {
     id: nid('n'), signal, value: value == null ? '' : String(value),
     conf_min: signal && !isRuleSig(signal) ? 0.7 : null,
-    kind: 'leaf', action,
-    model: action === 'route' ? (MODELS[0] || '') : null,
+    kind: 'leaf', action: 'route',
+    model: MODELS[0] || '',
     min_score: null, weights: [], children: [],
   };
 }
@@ -391,8 +384,9 @@ function deleteStation(stationId) {
   });
 }
 
-function addStation(type, signal, value) {
-  const body = { id: nid('st'), type, name: `${stationTypeLabel(type)} ${stations.length}`, root: null };
+function addStation(signal, value) {
+  const body = { id: nid('st'), type: 'split',
+                 name: `${t('p6.stationName')} ${stations.length}`, root: null };
   if (signal === null) {
     body.root = { id: nid('n'), signal: null, value: '', conf_min: null,
                   kind: 'fork', action: 'route', model: null, min_score: null,
@@ -810,37 +804,24 @@ function handleSignalDrop(nodeId, signal) {
                   () => $(`[data-node="${CSS.escape(nodeId)}"]`));
 }
 
-/* station creation: type -> root (unconditional or condition -> value) */
+/* station creation: pick the root condition (or an unconditional entry);
+   stations are no longer classified by type (2026-10-20) */
 function openStationPicker() {
   popTarget = { kind: 'picker' };
   const pop = $('#pop');
-  function renderTypes() {
+  function renderRoots() {
     pop.hidden = false;
     pop.innerHTML = `${popHead(t('p6.newStation'), t('p6.stationNote'))}
-      <p class="pop-label">${esc(t('p6.stationType'))}</p>
-      <div class="pop-vals" id="stTypes">
-        ${['gate', 'split', 'score'].map(tp =>
-          `<button data-stype="${tp}">${esc(stationTypeLabel(tp))}</button>`).join('')}
-      </div>
-      <div class="pop-foot"><span class="pop-note">${esc(t('p6.stationNote'))}</span></div>`;
-    placePop(anchorOf('[data-newstation]'), true);
-    $('#stTypes').addEventListener('click', e => {
-      const b = e.target.closest('[data-stype]');
-      if (b) renderRoots(b.dataset.stype);
-    });
-  }
-  function renderRoots(type) {
-    pop.innerHTML = `${popHead(t('p6.newStation'), stationTypeLabel(type))}
       <p class="pop-label">${esc(t('p6.rootCondition'))}</p>
       <div class="pop-vals" id="stRoots">
         <button data-uncond="1">${esc(t('p6.unconditional'))}</button>
         ${Object.values(SIG).map(x =>
           `<button data-pk="${esc(x.key)}">${esc(sigName(x.key))}</button>`).join('')}
       </div>
-      <div class="pop-foot"><button class="pop-del" id="stBack" style="color:var(--t4-ink-3)">← ${esc(t('p4.back'))}</button></div>`;
+      <div class="pop-foot"><span class="pop-note">${esc(t('p6.stationNote'))}</span></div>`;
     placePop(anchorOf('[data-newstation]'), true);
     $('#stRoots').addEventListener('click', e => {
-      if (e.target.closest('[data-uncond]')) { closePop(); addStation(type, null, ''); return; }
+      if (e.target.closest('[data-uncond]')) { closePop(); addStation(null, ''); return; }
       const b = e.target.closest('[data-pk]');
       if (!b) return;
       const key = b.dataset.pk;
@@ -855,7 +836,7 @@ function openStationPicker() {
           const v = $('#stText').value.trim();
           if (!v) { $('#stText').focus(); return; }
           closePop();
-          addStation(type, key, v);
+          addStation(key, v);
         };
         $('#stText').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
         $('#stOk').addEventListener('click', submit);
@@ -871,15 +852,13 @@ function openStationPicker() {
         const v = e.target.closest('[data-pv]');
         if (!v) return;
         closePop();
-        addStation(type, key, v.dataset.pv);
+        addStation(key, v.dataset.pv);
       });
     });
-    $('#stBack').addEventListener('click', renderTypes);
   }
-  renderTypes();
+  renderRoots();
 }
 
-/* ── drag & drop ─────────────────────────────────────────────────────── */
 /* ── pointer interactions (no native HTML5 DnD) ─────────────────────── */
 let pdrag = null;        // {kind:'signal'|'station', ...}
 let suppressClick = false;
