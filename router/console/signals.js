@@ -13,6 +13,8 @@ const KW = '__keyword_lexicon__';   // pseudo entry in the signal list
 const TW = '__time_rules__';        // pseudo entry: time-window rules
 let kwGroups = {};
 let timeRules = { day_start: 9, night_start: 18, weekend_days: [5, 6] };
+let serverOffsetMs = 0;              // server clock - browser clock
+let clockTimer = null;
 let dirty = false;
 let rawOpen = false;
 
@@ -27,6 +29,8 @@ async function boot() {
     api.get('/admin/time-window'),
   ]);
   timeRules = twBody.rules || timeRules;
+  if (twBody.now) serverOffsetMs = new Date(twBody.now).getTime() - Date.now();
+  startServerClock();
   cfg = qBody.config;
   meta = qBody.meta || {};
   sigBody.signals.forEach(s => { registry[s.key] = s; });
@@ -353,6 +357,7 @@ function renderTwEditor() {
     <div class="subcard">
       <div class="hd">${esc(t('sig.tw.weekend'))}</div>
       <div class="tw-dows">${boxes}</div>
+      <div class="footnote" id="twCurrent" style="margin:8px 0 0"></div>
     </div>
     <div class="addrow" style="margin-top:8px">
       <button class="btn pri sm" id="saveTw">${esc(t('sig.tw.save'))}</button>
@@ -379,4 +384,36 @@ function renderTwEditor() {
       toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
     }
   });
+}
+
+
+/* ── server clock (the time_window rule judges by server time) ───────── */
+function serverNow() { return new Date(Date.now() + serverOffsetMs); }
+function twPeriod(d) {
+  const wd = (d.getDay() + 6) % 7;                 // Python weekday: Mon=0
+  if (timeRules.weekend_days.includes(wd)) return ['weekend', t('p4.twValue.weekend')];
+  if (d.getHours() >= timeRules.day_start && d.getHours() < timeRules.night_start)
+    return ['weekday_day', t('p4.twValue.day')];
+  return ['night', t('p4.twValue.night')];
+}
+function fmtServerTime(d) {
+  const p2 = n => String(n).padStart(2, '0');
+  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+}
+function startServerClock() {
+  if (clockTimer) clearInterval(clockTimer);
+  const tick = () => {
+    const el = $('#serverClock');
+    if (!el) return;
+    const d = serverNow();
+    el.textContent = `${t('sig.clock')} ${fmtServerTime(d)}`;
+    const cur = $('#twCurrent');
+    if (cur) {
+      const [key, label] = twPeriod(d);
+      cur.innerHTML = `${esc(t('sig.tw.current'))}<b>${esc(label)}</b>` +
+        `<span class="mono mut" style="margin-left:8px">${esc(key)}</span>`;
+    }
+  };
+  tick();
+  clockTimer = setInterval(tick, 1000);
 }

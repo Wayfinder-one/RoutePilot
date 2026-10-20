@@ -219,8 +219,9 @@ def test_tagger_meta_and_recent_requests(tmp_path):
 
 def test_time_window_config_roundtrip(tmp_path):
     c = client(tmp_path)
-    body = c.get("/admin/time-window").json()["rules"]
-    assert body == {"day_start": 9, "night_start": 18, "weekend_days": [5, 6]}
+    resp = c.get("/admin/time-window").json()
+    assert "now" in resp                      # server clock exposed for the console
+    assert resp["rules"] == {"day_start": 9, "night_start": 18, "weekend_days": [5, 6]}
 
     r = c.put("/admin/time-window",
               json={"rules": {"day_start": 8, "night_start": 22,

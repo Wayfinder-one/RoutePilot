@@ -113,7 +113,8 @@ def put_keyword_groups(body: dict, request: Request,
 
 @router.get("/time-window")
 def get_time_window(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"rules": TimeWindowRepo(conn).load()}
+    return {"rules": TimeWindowRepo(conn).load(),
+            "now": _now()}   # server clock: the time_window rule judges by it
 
 
 @router.put("/time-window")
