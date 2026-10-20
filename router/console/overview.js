@@ -3,21 +3,14 @@
 const $ = s => document.querySelector(s);
 
 async function boot() {
-  const [o, tagBody, pipe] = await Promise.all([
+  const [o, tagBody] = await Promise.all([
     api.get('/admin/overview'),
     api.get('/admin/tagger').catch(() => ({ tagger: {} })),
-    api.get('/admin/pipeline').catch(() => ({ version: '0' })),
   ]);
   const tag = tagBody.tagger || {};
   const rate = o.total ? Math.round(100 * o.blocked / o.total) : 0;
   const dailyAvg = o.daily.length
     ? Math.round(o.daily.reduce((a, d) => a + d.count, 0) / o.daily.length) : 0;
-
-  $('#enginePill').innerHTML = `<span class="dot" style="color:var(--indigo)"></span>` +
-    (LANG === 'zh' ? '引擎 <b>' + esc(tag.name || '?') + '</b>'
-      : 'engine <b>' + esc(tag.name || '?') + '</b>');
-  $('#versionPill').innerHTML = (LANG === 'zh' ? '管道 <b class="mono">v' : 'pipeline <b class="mono">v') +
-    esc(pipe.version || '0') + '</b>';
 
   const cards = [
     ['ov.total', o.total], ['ov.blocked', o.blocked],
