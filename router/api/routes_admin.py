@@ -28,7 +28,7 @@ from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
                                         TimePeriodRepo,
-                                       ModelRepo, ProviderRepo, RequestRepo,
+                                       ModelRepo, ProviderRepo,
                                        SettingsRepo, StationRepo)
 
 router = APIRouter()
@@ -288,7 +288,7 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
 
 
 @router.get("/requests/recent")
-def recent_requests(request: Request, limit: int = 20):
+async def recent_requests(request: Request, limit: int = 20):
     """Newest requests from the in-memory ring (console 'calculation log').
     Detail is never persisted: the ring keeps the last 20 requests only."""
     return {"requests": request.app.state.requestlog.recent_requests(limit)}
@@ -356,13 +356,13 @@ async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
     if body.mode == "replay":
         since = (datetime.now().astimezone()
                  - timedelta(days=body.days)).date().isoformat()
-        for r in RequestRepo(conn).replayable(since):
+        for r in request.app.state.requestlog.replayable(since):
             decision, _ = evaluate(nodes, r["signals"])
             got = decision.model if decision.kind == "route" else None
             pairs.append((r["model"], got))
             if got != r["model"] and len(mismatches) < 100:
                 mismatches.append({"id": r["id"], "expect": r["model"], "got": got})
-        return pairs, mismatches, {"days": body.days}
+        return pairs, mismatches, {"days": body.days, "source": "memory"}
     if body.mode == "labels":
         for case in body.labels:
             text = str(case.get("text", ""))

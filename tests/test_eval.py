@@ -68,6 +68,7 @@ def test_eval_replay_from_logged_requests(tmp_path):
     body = c.post("/admin/eval", json={"mode": "replay", "days": 7}).json()
     assert body["total"] == 2 and body["matched"] == 2
     assert body["mode"] == "replay"
+    assert body["source"] == "memory"          # samples come from the ring
 
 
 def test_eval_replay_detects_drift(tmp_path):

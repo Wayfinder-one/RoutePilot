@@ -1,8 +1,9 @@
 """Evaluation (M3, design doc section 8): replay and labeled-set reports.
 
-Replay rebuilds the signal pack from ``request_signals`` and re-runs the current
-pipeline against the destination recorded at the time. Labeled sets tag a jsonl
-of ``{text, expect_model}`` and compare. Both funnel into :func:`summarize`,
+Replay rebuilds the signal pack from the in-memory request ring (the console
+never persists request detail) and re-runs the current pipeline against the
+destination recorded at the time. Labeled sets tag a jsonl of
+``{text, expect_model}`` and compare. Both funnel into :func:`summarize`,
 which produces the accuracy, a confusion matrix and the mismatching samples.
 """
 
