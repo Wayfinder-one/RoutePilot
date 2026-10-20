@@ -34,3 +34,24 @@ def test_safety():
     assert s["jailbreak"]["value"] == "jailbreak"
     s2 = tag("我的身份证是110101199003077758")
     assert "cn_id_card" in s2["pii"]["value"]
+
+
+def test_time_window_rules_configurable():
+    from datetime import datetime
+    from router.signals.rules import rule_signals
+    tue07 = datetime(2026, 10, 20, 7, 0)    # Tuesday 07:00
+    tue09 = datetime(2026, 10, 20, 9, 0)    # Tuesday 09:00
+    tue21 = datetime(2026, 10, 20, 21, 0)   # Tuesday 21:00
+    sat12 = datetime(2026, 10, 24, 12, 0)   # Saturday
+    rules = {"day_start": 8, "night_start": 20, "weekend_days": [6]}
+    val = lambda d: rule_signals("hi", {}, 1, now=d, time_rules=rules)[
+        "time_window"]["value"]
+    assert val(tue07) == "night"
+    assert val(tue09) == "weekday_day"
+    assert val(tue21) == "night"
+    assert val(sat12) == "weekday_day"          # Sunday-only weekend: Saturday is a workday
+    sunday = datetime(2026, 10, 25, 12, 0)
+    assert val(sunday) == "weekend"
+    # defaults keep the original behaviour
+    dflt = lambda d: rule_signals("hi", {}, 1, now=d)["time_window"]["value"]
+    assert dflt(tue09) == "weekday_day" and dflt(sat12) == "weekend"

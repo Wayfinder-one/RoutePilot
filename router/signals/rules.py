@@ -25,8 +25,13 @@ def count_words(text: str) -> int:
 
 def rule_signals(text: str, headers: dict, n_messages: int,
                  kw_groups: dict | None = None,
-                 now: datetime | None = None) -> dict:
-    """Produce the 8 deterministic signals; each {value, confidence=1, is_rule}."""
+                 now: datetime | None = None,
+                 time_rules: dict | None = None) -> dict:
+    """Produce the 8 deterministic signals; each {value, confidence=1, is_rule}.
+
+    ``time_rules`` configures the time_window signal: ``day_start`` /
+    ``night_start`` hours and ``weekend_days`` (Python weekday numbers,
+    Mon=0). Priority: weekend > day > night."""
     kw_groups = kw_groups or {}
     words = count_words(text)
 
@@ -35,6 +40,10 @@ def rule_signals(text: str, headers: dict, n_messages: int,
 
     body = re.sub(r"\s+", "", text)
     now = now or datetime.now().astimezone()
+    tw = time_rules or {}
+    day_start = int(tw.get("day_start", 9))
+    night_start = int(tw.get("night_start", 18))
+    weekend_days = set(tw.get("weekend_days") or [5, 6])
     tenant = next((v for k, v in headers.items()
                    if k.lower() == "x-sr-tenant" and v), "anonymous")
     return {
@@ -48,8 +57,9 @@ def rule_signals(text: str, headers: dict, n_messages: int,
                        else 1 if words >= 20 else 0),
         "turns": sig(0 if n_messages <= 1 else 1 if n_messages < 10 else 2),
         "tenant": sig(tenant),
-        "time_window": sig("weekend" if now.weekday() >= 5 else
-                           "weekday_day" if 9 <= now.hour < 18 else "night"),
+        "time_window": sig("weekend" if now.weekday() in weekend_days else
+                           "weekday_day" if day_start <= now.hour < night_start
+                           else "night"),
         "event": sig("incident" if _INCIDENT_RE.search(text) else
                      "payment_issue" if _PAYMENT_RE.search(text) else "none"),
     }

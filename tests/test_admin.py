@@ -215,3 +215,24 @@ def test_tagger_meta_and_recent_requests(tmp_path):
     assert tagger["questions_path"].endswith("signal_questions.json")
     assert c.get("/admin/requests/recent").json() == {"requests": []}
     assert c.get("/admin/requests/recent?limit=1000").status_code == 200
+
+
+def test_time_window_config_roundtrip(tmp_path):
+    c = client(tmp_path)
+    body = c.get("/admin/time-window").json()["rules"]
+    assert body == {"day_start": 9, "night_start": 18, "weekend_days": [5, 6]}
+
+    r = c.put("/admin/time-window",
+              json={"rules": {"day_start": 8, "night_start": 22,
+                              "weekend_days": [6]}})
+    assert r.status_code == 200
+    assert c.get("/admin/time-window").json()["rules"] == {
+        "day_start": 8, "night_start": 22, "weekend_days": [6]}
+    # persisted (new client sees the same row)
+    c2 = client(tmp_path)
+    assert c2.get("/admin/time-window").json()["rules"]["night_start"] == 22
+
+    for bad in ({"day_start": 20, "night_start": 8, "weekend_days": [5, 6]},   # start >= night
+                {"day_start": 9, "night_start": 18, "weekend_days": [7]},      # weekday out of range
+                {"day_start": "nine", "night_start": 18, "weekend_days": [6]}):
+        assert c.put("/admin/time-window", json={"rules": bad}).status_code == 422

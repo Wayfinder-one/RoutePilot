@@ -10,7 +10,9 @@ let meta = {};
 let registry = {};       // /admin/signals specs (zh/en labels, values)
 let selected = 'domain';
 const KW = '__keyword_lexicon__';   // pseudo entry in the signal list
+const TW = '__time_rules__';        // pseudo entry: time-window rules
 let kwGroups = {};
+let timeRules = { day_start: 9, night_start: 18, weekend_days: [5, 6] };
 let dirty = false;
 let rawOpen = false;
 
@@ -18,11 +20,13 @@ const sigName = k => (registry[k] ? (LANG === 'zh' ? registry[k].zh : registry[k
 const kindLabel = k => cfg.signals[k].kind === 'noul' ? t('sig.kind.noul') : t('sig.kind.choice');
 
 async function boot() {
-  const [qBody, sigBody, kwBody] = await Promise.all([
+  const [qBody, sigBody, kwBody, twBody] = await Promise.all([
     api.get('/admin/signal-questions'),
     api.get('/admin/signals'),
     api.get('/admin/keyword-groups'),
+    api.get('/admin/time-window'),
   ]);
+  timeRules = twBody.rules || timeRules;
   cfg = qBody.config;
   meta = qBody.meta || {};
   sigBody.signals.forEach(s => { registry[s.key] = s; });
@@ -54,6 +58,11 @@ function renderList() {
   items.push(`<div class="sig-item ${selected === KW ? 'on' : ''}" data-sig="${KW}">
       <span class="k" style="background:#8a8a84"></span>
       <span class="n">${esc(t('sig.kw.short'))}</span>
+      <span class="b">rule</span>
+    </div>`);
+  items.push(`<div class="sig-item ${selected === TW ? 'on' : ''}" data-sig="${TW}">
+      <span class="k" style="background:#4a7d6b"></span>
+      <span class="n">${esc(t('sig.tw.short'))}</span>
       <span class="b">rule</span>
     </div>`);
   $('#sigList').innerHTML = items.join('');
@@ -129,6 +138,7 @@ function rawHtml() {
 
 function renderEditor() {
   if (selected === KW) { renderKwEditor(); return; }
+  if (selected === TW) { renderTwEditor(); return; }
   const k = selected;
   const s = cfg.signals[k];
   const reg = registry[k] || {};
@@ -306,6 +316,64 @@ function renderKwEditor() {
       await api.put('/admin/keyword-groups', { groups: next });
       kwGroups = next;
       renderKwEditor();
+      toast(t('common.saved'));
+    } catch (e) {
+      toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
+    }
+  });
+}
+
+
+/* ── time-window rules (rule signal "time_window") ───────────────────── */
+function renderTwEditor() {
+  const dows = t('sig.tw.dows').split(',');
+  const boxes = dows.map((name, i) => `
+    <label class="tw-dow" data-dow="${i}">
+      <input type="checkbox" data-tw-dow="${i}"
+             ${timeRules.weekend_days.includes(i) ? 'checked' : ''}>${esc(name)}</label>`).join('');
+  $('#editor').innerHTML = `<div class="card">
+    <div class="insp-h">
+      <span class="type gate">${esc(t('sig.kw.ruletype'))}</span>
+      <span class="t">${esc(t('sig.tw.short'))}</span>
+      <span class="mut">time_window</span>
+      <span class="stat" style="margin-left:auto">${timeRules.day_start}:00 – ${timeRules.night_start}:00</span>
+    </div>
+    <div class="subcard">
+      <div class="hd">${esc(t('sig.tw.dayNight'))}</div>
+      <div class="tw-row">
+        <label class="field">${esc(t('sig.tw.dayStart'))}
+          <input type="number" min="0" max="23" step="1" data-tw-num="day_start"
+                 value="${timeRules.day_start}" style="max-width:90px"></label>
+        <label class="field">${esc(t('sig.tw.nightStart'))}
+          <input type="number" min="1" max="24" step="1" data-tw-num="night_start"
+                 value="${timeRules.night_start}" style="max-width:90px"></label>
+      </div>
+      <div class="footnote" style="margin:-2px 0 0">${esc(t('sig.tw.hint'))}</div>
+    </div>
+    <div class="subcard">
+      <div class="hd">${esc(t('sig.tw.weekend'))}</div>
+      <div class="tw-dows">${boxes}</div>
+    </div>
+    <div class="addrow" style="margin-top:8px">
+      <button class="btn pri sm" id="saveTw">${esc(t('sig.tw.save'))}</button>
+    </div>
+  </div>`;
+  $('#saveTw').addEventListener('click', async () => {
+    const day = Number($('[data-tw-num="day_start"]').value);
+    const night = Number($('[data-tw-num="night_start"]').value);
+    const days = [...document.querySelectorAll('[data-tw-dow]:checked')]
+      .map(el => Number(el.dataset.twDow));
+    if (!(Number.isInteger(day) && day >= 0 && day <= 23)
+        || !(Number.isInteger(night) && night >= 1 && night <= 24)
+        || day >= night) {
+      toast(t('sig.tw.invalid'));
+      return;
+    }
+    const rules = { day_start: day, night_start: night, weekend_days: days };
+    try {
+      await api.put('/admin/time-window', { rules });
+      timeRules = rules;
+      renderTwEditor();
       toast(t('common.saved'));
     } catch (e) {
       toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));

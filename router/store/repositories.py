@@ -209,6 +209,42 @@ class SettingsRepo:
                 self.conn.execute("SELECT key, value FROM settings ORDER BY key")}
 
 
+class TimeWindowRepo:
+    """时段规则：白天/夜间起止小时与周末定义（settings 表 JSON，键 time_window_rules）。
+
+    weekend_days 用 Python weekday 数字（周一=0）。命中优先级：周末 > 白天 > 夜间。"""
+
+    KEY = "time_window_rules"
+    DEFAULTS = {"day_start": 9, "night_start": 18, "weekend_days": [5, 6]}
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def load(self) -> dict:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?",
+                                (self.KEY,)).fetchone()
+        cfg = dict(self.DEFAULTS)
+        if row and row["value"]:
+            try:
+                cfg.update(json.loads(row["value"]))
+            except (ValueError, TypeError):
+                pass
+        try:
+            cfg["day_start"] = min(23, max(0, int(cfg.get("day_start", 9))))
+            cfg["night_start"] = min(24, max(1, int(cfg.get("night_start", 18))))
+        except (TypeError, ValueError):
+            cfg["day_start"], cfg["night_start"] = 9, 18
+        cfg["weekend_days"] = sorted({int(d) for d in cfg.get("weekend_days", [])
+                                      if int(d) in range(7)})
+        if cfg["day_start"] >= cfg["night_start"]:
+            cfg["day_start"], cfg["night_start"] = 9, 18
+        return cfg
+
+    def save(self, cfg: dict) -> None:
+        SettingsRepo(self.conn).set(self.KEY, json.dumps(cfg))
+        self.conn.commit()
+
+
 class SessionRepo:
     """Per-session state: last-turn embedding + last routed model (M4)."""
 

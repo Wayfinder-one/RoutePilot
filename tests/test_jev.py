@@ -49,6 +49,7 @@ def stub_tagger(questions=None) -> JevTagger:
     tagger.temperature = 1.0
     tagger.max_length = 1024
     tagger.kw_groups = {}
+    tagger.time_rules = {}
     return tagger
 
 

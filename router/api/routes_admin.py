@@ -26,6 +26,7 @@ from router.pipeline.model import station_from_dict, station_to_dict
 from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
+                                        TimeWindowRepo,
                                        ModelRepo, ProviderRepo, RequestRepo,
                                        SettingsRepo, StationRepo)
 
@@ -108,6 +109,43 @@ def put_keyword_groups(body: dict, request: Request,
     request.app.state.tagger.kw_groups = groups   # heuristic reads it live
     ChangeRepo(conn).record(_now(), "keyword-groups", {"groups": len(groups)})
     return {"ok": True}
+
+
+@router.get("/time-window")
+def get_time_window(conn: sqlite3.Connection = Depends(get_conn)):
+    return {"rules": TimeWindowRepo(conn).load()}
+
+
+@router.put("/time-window")
+def put_time_window(body: dict, request: Request,
+                    conn: sqlite3.Connection = Depends(get_conn)):
+    rules = body.get("rules")
+    if not isinstance(rules, dict):
+        raise HTTPException(422, detail="rules must be an object")
+
+    def _hour(v, default):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            raise HTTPException(422, detail=f"invalid hour: {v!r}")
+    day_start = _hour(rules.get("day_start", 9), 9)
+    night_start = _hour(rules.get("night_start", 18), 18)
+    days = rules.get("weekend_days", [5, 6])
+    if (not isinstance(days, list)
+            or not all(isinstance(d, int) and 0 <= d <= 6 for d in days)
+            or len(set(days)) != len(days)):
+        raise HTTPException(422, detail="weekend_days must be unique ints 0-6 (Mon=0)")
+    if not (0 <= day_start < night_start <= 24):
+        raise HTTPException(422, detail="need 0 <= day_start < night_start <= 24")
+    clean = {"day_start": day_start, "night_start": night_start,
+             "weekend_days": sorted(days)}
+    TimeWindowRepo(conn).save(clean)
+    tagger = getattr(request.app.state, "tagger", None)
+    if tagger is not None:
+        tagger.time_rules = clean
+    ChangeRepo(conn).record(_now(), "time-window", clean)
+    return {"ok": True, "rules": clean}
+
 
 
 # --------------------------------------------------------------------------- #
