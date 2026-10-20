@@ -395,11 +395,9 @@ def get_evals(limit: int = 3, conn: sqlite3.Connection = Depends(get_conn)):
 # --------------------------------------------------------------------------- #
 # Overview aggregates (M3: traffic + confidence distribution + recent evals)
 # --------------------------------------------------------------------------- #
-CONF_BUCKETS = 5
-
-
 @router.get("/overview")
-def get_overview(days: int = 14, conn: sqlite3.Connection = Depends(get_conn)):
+def get_overview(request: Request, days: int = 14,
+                 conn: sqlite3.Connection = Depends(get_conn)):
     # requests.ts is stored in local time with an offset; compare against a
     # local-date cutoff (date('now') would be UTC and skew the window).
     cutoff = (datetime.now().astimezone() - timedelta(days=days)).date().isoformat()
@@ -412,13 +410,10 @@ def get_overview(days: int = 14, conn: sqlite3.Connection = Depends(get_conn)):
     blocked = conn.execute("SELECT COUNT(*) FROM requests WHERE decision = 'block'"
                            ).fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-    buckets = [0] * CONF_BUCKETS
-    # model signals only: rule signals are deterministic (c == 1) and would
-    # swamp the distribution the dashboard exists to show (design 6).
-    for (conf,) in conn.execute("SELECT confidence FROM request_signals "
-                                "WHERE confidence IS NOT NULL AND is_rule = 0"):
-        buckets[min(CONF_BUCKETS - 1, int(float(conf) * CONF_BUCKETS))] += 1
-    confidence = [{"lo": i / CONF_BUCKETS, "hi": (i + 1) / CONF_BUCKETS,
-                   "count": c} for i, c in enumerate(buckets)]
+    # confidence distribution is memory-only (detail is not persisted) and
+    # resets on restart — the console labels it "since restart".
+    logger = request.app.state.requestlog
     return {"daily": daily, "routes": routes, "blocked": blocked, "total": total,
-            "confidence": confidence, "evals": EvalRepo(conn).recent(3)}
+            "confidence": logger.confidence_histogram(),
+            "confidence_since": logger.started_at,
+            "evals": EvalRepo(conn).recent(3)}

@@ -45,6 +45,8 @@ async function boot() {
      <div class="scorebar"><i style="width:${Math.round(100 * c.count / maxConf)}%"></i></div>
      <span class="confv">${c.count}</span></div>`).join('') ||
     `<div class="empty">${t('ov.empty')}</div>`;
+  $('#confSince').textContent = o.confidence_since
+    ? ' · ' + tf('ov.since', { ts: fmtTime(o.confidence_since) }) : '';
 
   $('#evals').innerHTML = (o.evals || []).map(e =>
     `<div class="bar-row"><span class="bl">${esc(tf('ov.evalrow', {
