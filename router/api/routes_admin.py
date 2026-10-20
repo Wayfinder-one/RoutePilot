@@ -288,11 +288,10 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
 
 
 @router.get("/requests/recent")
-def recent_requests(limit: int = 20,
-                    conn: sqlite3.Connection = Depends(get_conn)):
-    """Newest persisted requests with their signal pack (calculation log)."""
-    limit = max(1, min(int(limit), 100))
-    return {"requests": RequestRepo(conn).recent(limit)}
+def recent_requests(request: Request, limit: int = 20):
+    """Newest requests from the in-memory ring (console 'calculation log').
+    Detail is never persisted: the ring keeps the last 20 requests only."""
+    return {"requests": request.app.state.requestlog.recent_requests(limit)}
 
 
 # --------------------------------------------------------------------------- #
