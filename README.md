@@ -80,7 +80,7 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 |---|---|---|
 | 模型 | Qwen3.5-0.8B 全参微调 + 8 头 | Qwen3.5-0.8B + JEV 决策头（LoRA 合并导出） |
 | 输入形态 | 用户请求，一次前向 | context + typed questions + candidates |
-| 可配性 | 固定 19 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
+| 可配性 | 固定 15 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
 | 信号 | 7 学习型 + 规则 8 | 7 学习型 + 规则 8 |
 | 延迟 | ~7 ms/text（batch） | 全量 54 候选 p50 113 ms；按树裁剪后 p50 64 ms；decision 实测 64–73 ms |
 | 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii macro-F1 .17 | domain .810、jailbreak .877、complexity .948、fact_check .948、user_feedback .802、PII micro-F1 .889 |
