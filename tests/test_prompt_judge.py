@@ -98,7 +98,7 @@ def test_tag_returns_full_pack_with_rule_signals_and_no_embedding():
     t = tagger(lambda req: chat_response(json.dumps(VALID)))
     result = tag(t)
     signals = result.signals
-    assert set(signals) == set(SIGNALS) - {"similarity", "reask"}  # session signals removed
+    assert set(signals) == set(SIGNALS)
     assert signals["domain"] == {"value": "computer_science",
                                  "confidence": 0.9, "is_rule": False}
     assert signals["pii"]["value"] == ["cn_id_card", "password"]

@@ -86,11 +86,9 @@ _SPECS = (
     SignalSpec("structure", "结构", "Structure", "context", "rule",
                values=(("code", "代码", "Code"), ("multiline", "多行", "Multiline"),
                        ("plain", "纯文本", "Plain"))),
-    SignalSpec("similarity", "相似度", "Similarity", "session", "model",
-               values=(("2", "很高", "High"), ("1", "一般", "Medium"),
-                       ("0", "很低", "Low"))),
-    SignalSpec("reask", "重复提问", "Re-ask", "session", "model",
-               values=(("yes", "是", "Yes"), ("no", "否", "No"))),
+    # similarity/reask were removed 2026-10-21 together with the session store
+    # (they needed a per-conversation previous turn; see
+    # docs/superpowers/specs/2026-10-21-remove-session-stickiness.md).
     SignalSpec("user_feedback", "上轮反馈", "Last Feedback", "session", "model",
                values=(("satisfied", "满意", "Satisfied"),
                        ("need_clarification", "需澄清", "Need Clarification"),

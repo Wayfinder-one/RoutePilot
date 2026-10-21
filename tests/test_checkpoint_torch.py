@@ -75,7 +75,7 @@ def tag(tagger, req):
 def test_full_pack_and_canonical_values(tmp_path):
     tagger, _ = build(tmp_path)
     s = tag(tagger, TagRequest(text="hello"))
-    assert set(s) == set(SIGNALS) - {"similarity", "reask"}  # session signals removed
+    assert set(s) == set(SIGNALS)
     assert s["domain"]["value"] == "biology"
     assert s["complexity"]["value"] == "easy"
     assert s["jailbreak"]["value"] == "benign"

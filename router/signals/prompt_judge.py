@@ -34,12 +34,9 @@ from router.signals.tagger import TagRequest, TagResult
 
 logger = logging.getLogger(__name__)
 
-#: Model signals judged by the prompt. similarity/reask stay excluded here even
-#: though the registry still declares them — those session signals were removed
-#: 2026-10-21 and their registry specs go away in the follow-up task.
+#: Model signals judged by the prompt.
 JUDGED_SIGNALS: tuple[str, ...] = tuple(
-    key for key, spec in SIGNALS.items()
-    if spec.kind == "model" and key not in ("similarity", "reask"))
+    key for key, spec in SIGNALS.items() if spec.kind == "model")
 
 #: Shipped default prompt config (edit the JSON, not this module).
 DEFAULT_PROMPTS_PATH = (Path(__file__).resolve().parent.parent.parent

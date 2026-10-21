@@ -2,7 +2,7 @@ from router.signals.registry import GROUPS, SIGNALS
 
 
 def test_registry_shape():
-    assert len(SIGNALS) == 17
+    assert len(SIGNALS) == 15
     assert set(GROUPS) == {"safety", "domain", "difficulty",
                            "context", "session", "rule"}
     for spec in SIGNALS.values():

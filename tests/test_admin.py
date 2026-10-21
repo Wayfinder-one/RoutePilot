@@ -65,7 +65,7 @@ def test_put_pipeline_rejected_by_health(tmp_path):
 
 def test_signals_endpoint_includes_keyword_groups(tmp_path):
     body = client(tmp_path).get("/admin/signals").json()
-    assert len(body["signals"]) == 17
+    assert len(body["signals"]) == 15
     assert "医疗急症" in body["keyword_groups"]
 
 
