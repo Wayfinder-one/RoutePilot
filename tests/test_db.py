@@ -9,9 +9,10 @@ def test_migrate_idempotent_and_wal(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"stations", "nodes", "branches", "branch_rows", "models", "providers",
             "keyword_groups", "settings", "requests",
-            "sessions", "changes", "evals",
+            "changes", "evals",
             "schema_migrations"} <= tables
     assert "request_signals" not in tables      # v10 dropped the dead table
+    assert "sessions" not in tables      # v11 dropped it
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     conn.close()
 
@@ -33,7 +34,8 @@ def test_migrate_upgrades_a_v1_database(tmp_path):
     migrate(conn)
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {"sessions", "changes", "evals"} <= tables
+    assert {"changes", "evals"} <= tables
+    assert "sessions" not in tables      # v11 dropped it
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] \
         == len(MIGRATIONS)
     conn.close()

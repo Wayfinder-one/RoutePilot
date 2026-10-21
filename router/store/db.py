@@ -109,6 +109,11 @@ MIGRATIONS = [
     DROP TABLE IF EXISTS request_signals;
     DROP INDEX IF EXISTS idx_reqsig_rid;
     """,
+    # v11 (2026-10-21): session store removed — routing judges every request
+    # independently (docs/superpowers/specs/2026-10-21-remove-session-stickiness.md).
+    """
+    DROP TABLE IF EXISTS sessions;
+    """,
 ]
 
 
