@@ -1,6 +1,7 @@
 """OpenAI-compatible entry: tag -> evaluate -> forward. The pipeline and the
 backend map are in-memory snapshots (design 4.4); routing never opens the
-database — only the async request logger touches it.
+database — only the async request logger (and the breaker's low-rate sync)
+touches it.
 """
 
 from __future__ import annotations
@@ -15,8 +16,6 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from router.api.continuation import continuation
-from router.api.sessions import read_last_vec, session_id_from
 from router.api.upstream import resolve_backend
 from router.pipeline.engine import evaluate
 from router.pipeline.scope import compute_signal_scope
@@ -58,25 +57,14 @@ async def chat_completions(request: Request):
     # not implement trimming (heuristic/checkpoint/prompt modes).
     scope = (compute_signal_scope(stations)
              if request.app.state.settings.jev_trim else None)
-    sid = session_id_from(request)
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages),
-        last_vec=read_last_vec(request, sid), scope=scope))
-    # M4: the optional session pre-stage picks the model (sticky or escalated)
-    # but must never bypass the safety gates (2026-10-21 audit P0 2.1).
-    # evaluate() always runs; a block decision wins, and continuation only
-    # replaces a route/none outcome. Blocked requests therefore keep the full
-    # pipeline trace in the request log, and the continuation DB read is
-    # skipped entirely for them.
+        scope=scope))
+    # Every request is judged on its own: tag -> pipeline decision. There is
+    # no session state (2026-10-21: session stickiness removed — vanilla
+    # clients carry no reliable conversation identity; see
+    # docs/superpowers/specs/2026-10-21-remove-session-stickiness.md).
     decision, trace = evaluate(stations, result.signals)
-    session_state = "new"
-    if decision.kind != "block":
-        cont = continuation(request, sid)
-        if cont is not None:
-            decision, session_state = cont
-            trace = []
-    extra = ({"x-sr-session-state": session_state}
-             if request.app.state.settings.sessions else {})
 
     # ---- upstream body + reasoning injection (§6) -------------------------
     # decision.reasoning is None -> FULL passthrough: only `model` is replaced,
@@ -117,28 +105,25 @@ async def chat_completions(request: Request):
         "reasoning": reasoning_level,
         "reasoning_warning": reasoning_warning,
         "latency_ms": (time.monotonic() - started) * 1000,
-        "trace": trace, "session_state": session_state,
-        "signals": result.signals,
-        "session_id": sid, "vec": result.vec,
-        "session_model": decision.model if decision.kind == "route" else None})
+        "trace": trace, "signals": result.signals})
 
     if decision.kind == "block":
-        return JSONResponse(status_code=403, headers=extra, content={
+        return JSONResponse(status_code=403, content={
             "error": {"message": BLOCK_MESSAGE, "code": "blocked_by_policy"}})
     if decision.kind != "route" or not decision.model:
-        return JSONResponse(status_code=502, headers=extra,
+        return JSONResponse(status_code=502,
                             content={"error": {"message": "no_route"}})
     if backend is None:
-        return JSONResponse(status_code=502, headers=extra,
+        return JSONResponse(status_code=502,
                             content={"error": {"message": "unknown_model"}})
 
     breaker = request.app.state.breaker
     if breaker.is_open(decision.model):
-        return JSONResponse(status_code=503, headers=extra, content={
+        return JSONResponse(status_code=503, content={
             "error": {"message": "model_circuit_open", "model": decision.model}})
 
     client: httpx.AsyncClient = request.app.state.http
-    headers = {"x-sr-model": decision.model, **extra}
+    headers = {"x-sr-model": decision.model}
     if reasoning_warning:
         headers["x-sr-reasoning-warning"] = reasoning_warning
     elif reasoning_level is not None:
