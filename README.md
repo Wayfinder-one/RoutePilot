@@ -156,6 +156,6 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（459 passed, 6 skipped）。
+- 单元/集成：`pytest`（461 passed, 6 skipped）。
 - 控制台冒烟：`BASE=http://<host>:<port> ADMIN_TOKEN=<token> node scripts/console_check.js`
   （覆盖五个页面、模型目录/添加模型弹窗/推理声明编辑器、分流树叶推理下拉与日志徽章）。
