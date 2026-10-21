@@ -20,7 +20,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn
-from router.api.sessions import read_last_vec
 from router.api.upstream import load_backends
 from router.evals import summarize
 from router.pipeline.engine import evaluate
@@ -611,7 +610,7 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
 async def recent_requests(request: Request, limit: int = 20):
     """Newest requests from the in-memory ring (console 'calculation log').
     Detail is never persisted: the ring keeps the last 20 requests only."""
-    drop = ("vec", "session_model")     # unused by the console; vec is 768 floats
+    drop = ("vec",)     # unused by the console; vec is 768 floats
     out = [{k: v for k, v in r.items() if k not in drop}
            for r in request.app.state.requestlog.recent_requests(limit)]
     return {"requests": out}
@@ -622,14 +621,12 @@ async def recent_requests(request: Request, limit: int = 20):
 # --------------------------------------------------------------------------- #
 class TryIn(BaseModel):
     text: str
-    session: str | None = None
 
 
 @router.post("/try")
 async def try_pipeline(body: TryIn, request: Request):
     from router.pipeline.engine import decision_to_dict
-    result = await request.app.state.tagger.tag(TagRequest(
-        text=body.text, last_vec=read_last_vec(request, body.session)))
+    result = await request.app.state.tagger.tag(TagRequest(text=body.text))
     decision, trace = evaluate(request.app.state.pipeline, result.signals)
     return {"signals": result.signals, "vec_dim": len(result.vec or []),
             "decision": decision_to_dict(decision), "trace": trace}
