@@ -101,3 +101,19 @@ def test_routing_does_not_need_the_database(tmp_path):
     c = TestClient(app)
     assert chat(c, "今天天气怎么样").status_code == 200
 
+
+def test_legacy_session_headers_do_not_affect_routing(tmp_path):
+    """Spec §7.3: the removed session headers are ignored end to end — same
+    routed model as a plain request, and no x-sr-session-state response header."""
+    c = lower_floors(make_client(tmp_path, ok_upstream))
+    text = "我父亲病历上写着需要长期治疗，如何权衡方案？"
+    plain = chat(c, text)
+    legacy = c.post("/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": text}]},
+                    headers={"x-sr-session": "legacy-1",
+                             "x-sr-feedback": "wrong_answer"})
+    assert plain.status_code == legacy.status_code == 200
+    assert plain.headers["x-sr-model"] == legacy.headers["x-sr-model"] == "qwen3-8b-medical"
+    assert "x-sr-session-state" not in plain.headers
+    assert "x-sr-session-state" not in legacy.headers
+

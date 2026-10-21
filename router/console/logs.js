@@ -5,7 +5,7 @@
 const $ = s => document.querySelector(s);
 
 const MODEL_ORDER = ['jailbreak', 'pii', 'domain', 'fact_check', 'modality',
-  'complexity', 'user_feedback', 'similarity', 'reask'];
+  'complexity', 'user_feedback'];
 
 let requests = [];
 let questions = null;
@@ -173,10 +173,6 @@ function methodRowsHtml(r) {
   for (const k of MODEL_ORDER) {
     const s = pack[k];
     if (!s) continue;
-    if (k === 'similarity' || k === 'reask') {
-      rows.push(methodRow(sigName(k), t('logs.similarity'), 'no-embedding'));
-      continue;
-    }
     const cfg = questions && questions.signals && questions.signals[k];
     if (k === 'pii') {
       const q = cfg && cfg.instructions ? cfg.instructions : '—';

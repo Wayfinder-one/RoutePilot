@@ -171,6 +171,13 @@ def test_try_reports_vec_dim(tmp_path):
     assert body["vec_dim"] == 0            # heuristic has no embedding
 
 
+def test_try_ignores_removed_session_field(tmp_path):
+    """Spec §7.4: pydantic ignores the removed `session` field (extra fields
+    are allowed), so old clients keep getting 200 instead of a 422."""
+    r = client(tmp_path).post("/admin/try",
+                              json={"text": "你好", "session": "legacy-1"})
+    assert r.status_code == 200
+
 
 def questions_client(tmp_path):
     q = tmp_path / "questions.json"

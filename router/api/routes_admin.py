@@ -610,10 +610,7 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
 async def recent_requests(request: Request, limit: int = 20):
     """Newest requests from the in-memory ring (console 'calculation log').
     Detail is never persisted: the ring keeps the last 20 requests only."""
-    drop = ("vec",)     # unused by the console; vec is 768 floats
-    out = [{k: v for k, v in r.items() if k not in drop}
-           for r in request.app.state.requestlog.recent_requests(limit)]
-    return {"requests": out}
+    return {"requests": request.app.state.requestlog.recent_requests(limit)}
 
 
 # --------------------------------------------------------------------------- #
