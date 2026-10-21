@@ -1,7 +1,8 @@
 """Optional session continuation (M4, design doc section 3.7).
 
-A pre-stage before the pipeline: within one session, keep the previous turn's
-model unless the user says it was wrong, in which case escalate a tier. Off by
+A model-selection stage over the pipeline result: within one session, keep the
+previous turn's model unless the user says it was wrong, in which case escalate
+a tier. It runs only when no station blocked (safety gates always win). Off by
 default (``settings.sessions``); when on it reads the session row once (this is
 the second of the two session reads on the hot path — ``sessions.py`` reads the
 previous embedding first). The session writes happen in the async logger, so
@@ -50,7 +51,12 @@ def _pick_escalation(models: list[dict], last_model: str | None) -> str | None:
 
 
 def continuation(request: Request, session_id: str | None) -> tuple[Decision, str] | None:
-    """(Decision, state) to short-circuit the pipeline, or None to run it."""
+    """(Decision, state) to replace a non-block pipeline outcome, or None.
+
+    The caller (``routes_v1``) evaluates the pipeline first and only applies
+    this continuation when no station blocked: session stickiness may choose
+    the model, it may never overrule a safety gate (2026-10-21 audit P0 2.1).
+    """
     if not request.app.state.settings.sessions or not session_id:
         return None
     from router.store.db import connect

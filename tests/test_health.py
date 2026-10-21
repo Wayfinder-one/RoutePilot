@@ -8,11 +8,12 @@ MODELS = {"qwen3-8b", "med", "qwen3-8b-medical", "qwen3-0.6b-medical",
 
 
 def node(nid, signal=None, value="", conf=None, kind="leaf", action="route",
-         model=None, min_score=None, weights=None, children=None):
+         model=None, min_score=None, weights=None, children=None,
+         reasoning=None):
     return TreeNode(id=nid, signal=signal, value=value, conf_min=conf,
                     kind=kind, action=action, model=model,
                     min_score=min_score, weights=weights or [],
-                    children=children or [])
+                    children=children or [], reasoning=reasoning)
 
 
 def fallback():
@@ -110,3 +111,76 @@ def test_duplicate_conditions_warn():
     assert "duplicate_condition" in codes(issues)
     assert all(i.level == "warn" for i in issues
                if i.code == "duplicate_condition")
+
+
+# --------------------------------------------------------------------------- #
+# §3.3: 分树叶子的推理选择（model_reasoning 传入时才校验）
+# --------------------------------------------------------------------------- #
+DECLARED = {"declared": True, "supported": True, "format": "openai",
+            "efforts": [{"id": "off", "wire": None},
+                        {"id": "high", "wire": "high"}],
+            "default": None, "supports_reasoning_effort": True}
+
+
+def reasoning_station(reasoning, *, action="route", model="qwen3-8b"):
+    return Station(id="a", type="gate", name="x", root=node(
+        "r", signal=None, kind="fork", children=[
+            node("c", "domain", "health", 0.5, action=action, model=model,
+                 reasoning=reasoning)]))
+
+
+def test_reasoning_levels_are_optional_for_old_callers():
+    """Old callers pass only known_models: reasoning is not validated (compat)."""
+    stations = [reasoning_station("high"), fallback()]
+    assert codes(check_pipeline(stations, MODELS)) == set()
+
+
+def test_reasoning_without_route_is_hard():
+    stations = [reasoning_station("off", action="block", model=None), fallback()]
+    issues = check_pipeline(stations, MODELS, {"qwen3-8b": DECLARED})
+    hit = [i for i in issues if i.code == "reasoning_without_route"]
+    assert hit and hit[0].level == "hard"
+    assert hit[0].model == "" and hit[0].reasoning == "off"
+
+
+def test_reasoning_unsupported_when_model_undeclared():
+    stations = [reasoning_station("high"), fallback()]
+    for capability in (None, {"declared": False, "supported": None,
+                              "format": "openai", "efforts": [],
+                              "default": None},
+                       {"declared": True, "supported": False,
+                        "format": "openai", "efforts": [], "default": None}):
+        issues = check_pipeline(stations, MODELS, {"qwen3-8b": capability})
+        hit = [i for i in issues if i.code == "reasoning_unsupported"]
+        assert hit and hit[0].level == "hard"
+        assert hit[0].model == "qwen3-8b" and hit[0].reasoning == "high"
+
+
+def test_reasoning_unsupported_when_level_not_declared():
+    stations = [reasoning_station("max"), fallback()]
+    issues = check_pipeline(stations, MODELS, {"qwen3-8b": DECLARED})
+    hit = [i for i in issues if i.code == "reasoning_unsupported"]
+    assert hit and hit[0].reasoning == "max" and hit[0].model == "qwen3-8b"
+
+
+def test_reasoning_declared_level_is_healthy():
+    for level in ("off", "high"):
+        stations = [reasoning_station(level), fallback()]
+        assert check_pipeline(stations, MODELS, {"qwen3-8b": DECLARED}) == []
+
+
+def test_reasoning_check_ignores_unknown_model():
+    """A bogus model is already flagged by unknown_model; don't double-report."""
+    stations = [reasoning_station("high", model="nope"), fallback()]
+    issues = check_pipeline(stations, MODELS, {"nope": None})
+    got = codes(issues)
+    assert "unknown_model" in got
+    assert "reasoning_unsupported" not in got
+
+
+def test_pipeline_with_reasoning_is_healthy_via_default_models():
+    """The seeded pipeline has no reasoning selected; adding the map keeps it green."""
+    from router.store.repositories import default_pipeline
+    stations = default_pipeline("heuristic")
+    assert check_pipeline(stations, MODELS) == []
+    assert check_pipeline(stations, MODELS, {}) == []

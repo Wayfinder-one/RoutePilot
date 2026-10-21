@@ -1,0 +1,515 @@
+"""Admin API: model catalog, model CRUD, provider CRUD (key tri-state),
+fetch-models (MockTransport), pipeline reasoning health, v9 migration.
+"""
+
+import json
+import sqlite3
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from router.api.app import create_app
+from router.api.upstream import load_backends
+from router.config import Settings
+from router.reasoning import FORMAT_IDS, LEVELS
+from router.store.db import MIGRATIONS, connect, migrate
+from router.store.repositories import seed_default
+
+OPENAI_REASONING = {"reasoning": {
+    "efforts": {"off": None, "low": "low", "high": "high"},
+    "default": "high"}}
+
+
+def make_app(tmp_path, handler=None):
+    transport = httpx.MockTransport(handler) if handler is not None else None
+    return create_app(Settings(db_path=str(tmp_path / "t.db")),
+                      transport=transport)
+
+
+@pytest.fixture
+def app(tmp_path):
+    return make_app(tmp_path)
+
+
+@pytest.fixture
+def client(app):
+    return TestClient(app)
+
+
+# --------------------------------------------------------------------------- #
+# 预置目录
+# --------------------------------------------------------------------------- #
+def test_model_catalog_shape(client):
+    body = client.get("/admin/model-catalog").json()
+    assert body["providers"], "presets must not be empty"
+    assert body["levels"] == list(LEVELS)
+    assert [f["id"] for f in body["formats"]] == list(FORMAT_IDS)
+    for fmt in body["formats"]:
+        assert fmt["zh"] and fmt["en"]
+    for provider in body["providers"]:
+        assert {"id", "name", "base_url", "key_env", "reasoning_format",
+                "key_env_present", "models"} <= set(provider)
+        assert provider["reasoning_format"] in FORMAT_IDS
+        assert isinstance(provider["key_env_present"], bool)
+        assert provider["models"]
+        for model in provider["models"]:
+            assert {"id", "name", "context_window", "max_tokens", "tier",
+                    "domains", "profile", "reasoning"} <= set(model)
+            reasoning = model["reasoning"]
+            assert {"declared", "supported", "format", "efforts",
+                    "default"} <= set(reasoning)
+            # every preset declaration must be legal (and thus declared/supported)
+            if model["profile"].get("reasoning") not in (None, False):
+                assert reasoning["declared"] is True
+                assert reasoning["supported"] is True
+                assert reasoning["format"] in FORMAT_IDS
+
+
+def test_catalog_key_env_present_reflects_server_env(client, monkeypatch):
+    providers = client.get("/admin/model-catalog").json()["providers"]
+    provider = next(p for p in providers if p["key_env"])
+    monkeypatch.setenv(provider["key_env"], "x")
+    again = {p["id"]: p for p in
+             client.get("/admin/model-catalog").json()["providers"]}
+    assert again[provider["id"]]["key_env_present"] is True
+    monkeypatch.delenv(provider["key_env"])
+    cleared = {p["id"]: p for p in
+               client.get("/admin/model-catalog").json()["providers"]}
+    assert cleared[provider["id"]]["key_env_present"] is False
+
+
+# --------------------------------------------------------------------------- #
+# GET /admin/models
+# --------------------------------------------------------------------------- #
+def test_get_models_carries_normalized_reasoning(client):
+    models = {m["id"]: m for m in client.get("/admin/models").json()["models"]}
+    # seeded models declare nothing -> console renders 未声明
+    for model in models.values():
+        assert {"declared", "supported", "format", "efforts",
+                "default"} <= set(model["reasoning"])
+    undeclared = models["qwen3-8b"]["reasoning"]
+    assert undeclared == {"declared": False, "supported": None,
+                          "format": "openai", "efforts": [], "default": None}
+
+
+def test_get_models_reports_illegal_old_declaration_with_error(tmp_path):
+    path = str(tmp_path / "t.db")
+    make_app(tmp_path)
+    conn = connect(path)
+    with conn:
+        conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                     (json.dumps({"reasoning": {"format": "nope",
+                                                "efforts": {"high": "high"}}}),))
+    conn.close()
+    models = {m["id"]: m
+              for m in TestClient(make_app(tmp_path)).get(
+                  "/admin/models").json()["models"]}
+    reasoning = models["qwen3-8b"]["reasoning"]
+    assert reasoning["declared"] is False
+    assert reasoning["supported"] is None
+    assert reasoning["error"]
+
+
+# --------------------------------------------------------------------------- #
+# POST /admin/models
+# --------------------------------------------------------------------------- #
+def test_create_model_and_swap_backend_snapshot(client, app):
+    r = client.post("/admin/models", json={
+        "id": "my-model", "upstream": "upstream-v1", "provider": "local",
+        "profile": OPENAI_REASONING})
+    assert r.status_code == 201, r.text
+    model = r.json()["model"]
+    assert model["id"] == "my-model" and model["upstream"] == "upstream-v1"
+    assert model["reasoning"]["declared"] is True
+    assert model["reasoning"]["format"] == "openai"
+    assert client.get("/admin/models").json()["models"]
+    backend = app.state.backends["my-model"]
+    assert backend.upstream_name == "upstream-v1"
+    assert backend.provider == "local"
+    assert backend.reasoning["efforts"] == [
+        {"id": "off", "wire": None}, {"id": "low", "wire": "low"},
+        {"id": "high", "wire": "high"}]
+    # audit row
+    changes = client.get("/admin/changes").json()["changes"]
+    assert changes[0]["kind"] == "model"
+    assert changes[0]["detail"]["action"] == "create"
+
+
+def test_create_model_duplicate_is_409(client):
+    body = {"id": "dup", "upstream": "u", "provider": "local"}
+    assert client.post("/admin/models", json=body).status_code == 201
+    assert client.post("/admin/models", json=body).status_code == 409
+
+
+@pytest.mark.parametrize("body", [
+    {"id": "", "upstream": "u", "provider": "local"},
+    {"id": "-bad", "upstream": "u", "provider": "local"},
+    {"id": "has space", "upstream": "u", "provider": "local"},
+    {"id": "a" * 65, "upstream": "u", "provider": "local"},
+    {"id": "ok", "upstream": "", "provider": "local"},
+    {"id": "ok", "upstream": "a\nb", "provider": "local"},
+    {"id": "ok", "upstream": "x" * 201, "provider": "local"},
+    {"id": "ok", "upstream": "u", "provider": "nope"},
+    {"id": "ok", "upstream": "u"},
+])
+def test_create_model_validation_422(client, body):
+    assert client.post("/admin/models", json=body).status_code == 422
+
+
+@pytest.mark.parametrize("profile", [
+    {"reasoning": {"format": "openai", "efforts": {"high": None}}},
+    {"reasoning": {"format": "nope", "efforts": {"high": "high"}}},
+    {"reasoning": {"efforts": {"off": None}}},
+    {"reasoning": {"efforts": {"high": "high"}, "default": "max"}},
+    {"reasoning": {"format": "qwen", "efforts": {"on": None},
+                   "supports_reasoning_effort": True}},
+    "not-a-json-object",
+])
+def test_create_model_rejects_illegal_profile(client, profile):
+    r = client.post("/admin/models", json={
+        "id": "bad-profile", "upstream": "u", "provider": "local",
+        "profile": profile})
+    assert r.status_code == 422
+    assert client.get("/admin/models").json()["models"]
+    assert "bad-profile" not in {m["id"] for m in
+                                client.get("/admin/models").json()["models"]}
+
+
+def test_create_model_inherits_provider_reasoning_format(client, app):
+    r = client.put("/admin/providers/local", json={
+        "base_url": "http://127.0.0.1:9000", "reasoning_format": "deepseek"})
+    assert r.status_code == 200
+    # a null wire is only legal for non-needs_wire formats like deepseek
+    r = client.post("/admin/models", json={
+        "id": "deep-model", "upstream": "u", "provider": "local",
+        "profile": {"reasoning": {"efforts": {"off": None, "high": None}}}})
+    assert r.status_code == 201, r.text
+    assert r.json()["model"]["reasoning"]["format"] == "deepseek"
+    assert app.state.backends["deep-model"].reasoning["format"] == "deepseek"
+
+
+# --------------------------------------------------------------------------- #
+# PUT / DELETE models
+# --------------------------------------------------------------------------- #
+def test_put_model_validates_profile_and_keeps_old_one_on_error(client):
+    good = client.put("/admin/models/qwen3-8b",
+                      json={"profile": OPENAI_REASONING})
+    assert good.status_code == 200
+    before = good.json()["model"]["profile"]
+    bad = client.put("/admin/models/qwen3-8b", json={"profile": {
+        "reasoning": {"format": "openai", "efforts": {"high": None}}}})
+    assert bad.status_code == 422
+    assert client.get("/admin/models").json()["models"]
+    after = {m["id"]: m for m in
+             client.get("/admin/models").json()["models"]}["qwen3-8b"]
+    assert after["profile"] == before
+
+
+def test_put_model_accepts_json_string_profile_and_unknown_is_404(client):
+    payload = json.dumps({"reasoning": {
+        "efforts": {"off": None, "high": "high"}}})
+    assert client.put("/admin/models/qwen3-8b",
+                      json={"profile": payload}).status_code == 200
+    model = {m["id"]: m for m in
+             client.get("/admin/models").json()["models"]}["qwen3-8b"]
+    assert model["reasoning"]["declared"] is True
+    assert client.put("/admin/models/nope", json={"upstream": "x"}).status_code == 404
+
+
+def test_delete_model_referenced_409_then_ok(client):
+    r = client.delete("/admin/models/qwen3-8b")     # seeded fallback references it
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert detail["references"]
+    assert detail["references"][0]["station"] and detail["references"][0]["node"]
+    assert "qwen3-8b" in {m["id"] for m in
+                          client.get("/admin/models").json()["models"]}
+    assert client.delete("/admin/models/nope").status_code == 404
+    # unreferenced model deletes fine
+    assert client.post("/admin/models", json={
+        "id": "free", "upstream": "u", "provider": "local"}).status_code == 201
+    assert client.delete("/admin/models/free").status_code == 200
+    assert "free" not in {m["id"] for m in
+                          client.get("/admin/models").json()["models"]}
+
+
+# --------------------------------------------------------------------------- #
+# Providers: key tri-state / key_source / never returning the secret
+# --------------------------------------------------------------------------- #
+def test_provider_key_tristate_and_headers(client, app):
+    base = {"base_url": "http://127.0.0.1:9000"}
+    r = client.put("/admin/providers/local", json={**base, "api_key": "sk-secret-1"})
+    assert r.status_code == 200
+    assert r.json()["provider"]["key_present"] is True
+    assert r.json()["provider"]["key_source"] == "stored"
+    assert "sk-secret-1" not in r.text
+    assert app.state.backends["qwen3-8b"].headers["Authorization"] == \
+        "Bearer sk-secret-1"
+
+    # omitted -> kept
+    r = client.put("/admin/providers/local", json=base)
+    assert r.json()["provider"]["key_present"] is True
+    assert r.json()["provider"]["key_source"] == "stored"
+    assert client.get("/admin/providers").text.count("sk-secret-1") == 0
+    assert app.state.backends["qwen3-8b"].headers["Authorization"] == \
+        "Bearer sk-secret-1"
+
+    # "" -> cleared
+    r = client.put("/admin/providers/local", json={**base, "api_key": ""})
+    provider = r.json()["provider"]
+    assert provider["key_present"] is False
+    assert provider["key_source"] == "none"
+    assert "Authorization" not in app.state.backends["qwen3-8b"].headers
+
+
+def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
+    monkeypatch.setenv("SR_TEST_KEY", "env-secret")
+    r = client.put("/admin/providers/envprov", json={
+        "base_url": "http://e/v1", "key_env": "SR_TEST_KEY"})
+    assert r.status_code == 200
+    assert r.json()["provider"]["key_source"] == "env"
+    assert r.json()["provider"]["key_present"] is True
+    assert client.post("/admin/models", json={
+        "id": "env-model", "upstream": "u",
+        "provider": "envprov"}).status_code == 201
+    assert app.state.backends["env-model"].headers["Authorization"] == \
+        "Bearer env-secret"
+    # a stored key wins over the environment (contract §5.3)
+    client.put("/admin/providers/envprov", json={
+        "base_url": "http://e/v1", "api_key": "stored-secret"})
+    assert app.state.backends["env-model"].headers["Authorization"] == \
+        "Bearer stored-secret"
+    # clearing the stored key falls back to the env
+    client.put("/admin/providers/envprov", json={
+        "base_url": "http://e/v1", "api_key": ""})
+    assert app.state.backends["env-model"].headers["Authorization"] == \
+        "Bearer env-secret"
+
+
+def test_put_provider_validation_and_audit(client):
+    bad = [
+        {"base_url": ""},
+        {"base_url": "http://x/v1", "reasoning_format": "nope"},
+        {"base_url": "http://x/v1", "key_env": "bad env"},
+        {"base_url": "http://x/v1", "key_env": "1NO"},
+    ]
+    for body in bad:
+        assert client.put("/admin/providers/local", json=body).status_code == 422
+    assert client.put("/admin/providers/-bad",
+                      json={"base_url": "http://x/v1"}).status_code == 422
+    r = client.put("/admin/providers/local", json={
+        "base_url": "http://x/v1", "reasoning_format": "deepseek",
+        "api_key": "sk-super-secret"})
+    assert r.status_code == 200
+    changes = client.get("/admin/changes")
+    assert "sk-super-secret" not in changes.text
+    row = changes.json()["changes"][0]
+    assert row["kind"] == "provider"
+    assert row["detail"]["api_key"] == "set"
+    provider = {p["name"]: p for p in
+                client.get("/admin/providers").json()["providers"]}["local"]
+    assert provider["reasoning_format"] == "deepseek"
+    assert "api_key" not in provider
+
+
+def test_delete_provider_409_when_referenced_and_ok_after(client):
+    r = client.delete("/admin/providers/local")
+    assert r.status_code == 409
+    assert r.json()["detail"]["models"]
+    assert client.delete("/admin/providers/nope").status_code == 404
+    assert client.put("/admin/providers/tmp-prov", json={
+        "base_url": "http://tmp/v1"}).status_code == 200
+    assert client.post("/admin/models", json={
+        "id": "tmp-model", "upstream": "u",
+        "provider": "tmp-prov"}).status_code == 201
+    assert client.delete("/admin/providers/tmp-prov").status_code == 409
+    assert client.delete("/admin/models/tmp-model").status_code == 200
+    assert client.delete("/admin/providers/tmp-prov").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# POST /admin/fetch-models
+# --------------------------------------------------------------------------- #
+def test_fetch_models_uses_provider_credentials_and_mock_transport(tmp_path):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["timeout"] = request.extensions.get("timeout")
+        return httpx.Response(200, json={"data": [
+            {"id": "m1", "name": "Model One"}, {"id": "m2"}]})
+
+    client = TestClient(make_app(tmp_path, handler))
+    client.put("/admin/providers/local", json={
+        "base_url": "http://127.0.0.1:9000", "api_key": "sk-provider"})
+    r = client.post("/admin/fetch-models", json={"provider": "local"})
+    assert r.status_code == 200
+    assert r.json() == {"endpoint": "http://127.0.0.1:9000/models",
+                        "models": [{"id": "m1", "name": "Model One"},
+                                   {"id": "m2", "name": "m2"}]}
+    assert seen["auth"] == "Bearer sk-provider"
+    assert seen["timeout"]["read"] == 10.0          # contract: 10s timeout
+    # body credentials win over the stored ones; trailing slash is normalised
+    r = client.post("/admin/fetch-models", json={
+        "base_url": "https://api.example.com/v1/", "api_key": "sk-body"})
+    assert r.json()["endpoint"] == "https://api.example.com/v1/models"
+    assert seen["auth"] == "Bearer sk-body"
+
+
+def test_fetch_models_body_key_env(tmp_path, monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"data": []})
+
+    client = TestClient(make_app(tmp_path, handler))
+    monkeypatch.setenv("SR_FETCH_KEY", "env-fetch")
+    r = client.post("/admin/fetch-models", json={
+        "base_url": "https://x/v1", "key_env": "SR_FETCH_KEY"})
+    assert r.status_code == 200 and r.json()["models"] == []
+    assert seen["auth"] == "Bearer env-fetch"
+
+
+@pytest.mark.parametrize("handler,status", [
+    (lambda request: httpx.Response(500, json={"error": "boom"}), 502),
+    (lambda request: httpx.Response(200, text="not json"), 502),
+    (lambda request: httpx.Response(200, json={"unexpected": True}), 502),
+    (lambda request: httpx.Response(200, json=[]), 200),
+])
+def test_fetch_models_failure_modes(tmp_path, handler, status):
+    client = TestClient(make_app(tmp_path, handler))
+    r = client.post("/admin/fetch-models",
+                    json={"base_url": "https://x/v1"})
+    assert r.status_code == status
+    if status == 502:
+        assert r.json()["detail"]
+
+
+def test_fetch_models_connection_error_is_502(tmp_path):
+    def handler(request):
+        raise httpx.ConnectError("boom", request=request)
+
+    client = TestClient(make_app(tmp_path, handler))
+    r = client.post("/admin/fetch-models", json={"base_url": "https://x/v1"})
+    assert r.status_code == 502
+    assert "boom" in r.json()["detail"]
+
+
+def test_fetch_models_request_validation(client):
+    assert client.post("/admin/fetch-models", json={}).status_code == 422
+    assert client.post("/admin/fetch-models",
+                       json={"provider": "nope"}).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 分树推理选择：序列化 + 健康检查（§3.3）
+# --------------------------------------------------------------------------- #
+def test_pipeline_nodes_always_serialize_reasoning(client):
+    def walk(node):
+        assert "reasoning" in node
+        assert node["reasoning"] is None
+        for child in node.get("children") or []:
+            walk(child)
+
+    for station in client.get("/admin/pipeline").json()["stations"]:
+        if station["root"] is not None:
+            walk(station["root"])
+
+
+def test_pipeline_reasoning_health_hard_checks(client):
+    # 1) target model declares nothing -> unsupported
+    pipe = client.get("/admin/pipeline").json()
+    pipe["stations"][3]["root"]["reasoning"] = "high"
+    r = client.put("/admin/pipeline", json=pipe)
+    assert r.status_code == 422
+    issues = [i for i in r.json()["detail"]
+              if i["code"] == "reasoning_unsupported"]
+    assert issues and issues[0]["model"] == "qwen3-8b"
+    assert issues[0]["reasoning"] == "high"
+    assert issues[0]["level"] == "hard"
+
+    # 2) declare the capability -> save succeeds
+    assert client.put("/admin/models/qwen3-8b", json={
+        "profile": OPENAI_REASONING}).status_code == 200
+    assert client.put("/admin/pipeline", json=pipe).status_code == 200
+    saved = client.get("/admin/pipeline").json()["stations"][3]["root"]
+    assert saved["reasoning"] == "high"
+
+    # 3) a level outside the declaration is rejected too
+    pipe["stations"][3]["root"]["reasoning"] = "max"
+    r = client.put("/admin/pipeline", json=pipe)
+    assert r.status_code == 422
+    assert any(i["code"] == "reasoning_unsupported" and i["reasoning"] == "max"
+               for i in r.json()["detail"])
+
+    # 4) reasoning is route-only: a block leaf may not select a level
+    pipe["stations"][3]["root"]["reasoning"] = None
+    pipe["stations"][0]["root"]["children"][0]["reasoning"] = "off"
+    r = client.put("/admin/pipeline", json=pipe)
+    assert r.status_code == 422
+    assert any(i["code"] == "reasoning_without_route"
+               for i in r.json()["detail"])
+
+
+def test_pipeline_rejects_unknown_reasoning_level_on_parse(client):
+    pipe = client.get("/admin/pipeline").json()
+    pipe["stations"][3]["root"]["reasoning"] = "auto"
+    r = client.put("/admin/pipeline", json=pipe)
+    assert r.status_code == 422
+    assert "reasoning" in str(r.json()["detail"])
+
+
+# --------------------------------------------------------------------------- #
+# v9 迁移：老库平滑升级
+# --------------------------------------------------------------------------- #
+def test_v9_migration_upgrades_old_provider_table(tmp_path):
+    path = str(tmp_path / "old.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+    for index, sql in enumerate(MIGRATIONS[:8], start=1):
+        conn.executescript(sql)
+        conn.execute("INSERT INTO schema_migrations VALUES (?)", (index,))
+    conn.execute("INSERT INTO providers (name, base_url, key_env) "
+                 "VALUES ('local', 'http://127.0.0.1:9000', 'LOCAL_KEY')")
+    conn.execute("INSERT INTO models VALUES ('old-model', 'old-up', 'local', ?)",
+                 (json.dumps({"domains": []}),))
+    conn.commit()
+    conn.close()
+
+    conn = connect(path)
+    migrate(conn)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(providers)")}
+    assert {"reasoning_format", "api_key"} <= columns
+    row = conn.execute("SELECT reasoning_format, api_key FROM providers").fetchone()
+    assert tuple(row) == ("openai", "")
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] == len(MIGRATIONS)
+    seed_default(conn)                 # explicit column lists must still work
+    backends = load_backends(conn)
+    assert backends["old-model"].reasoning is None
+    assert backends["old-model"].provider == "local"
+    assert backends["old-model"].url == \
+        "http://127.0.0.1:9000/chat/completions"
+    conn.close()
+
+
+def test_old_illegal_declaration_does_not_break_startup(tmp_path):
+    path = str(tmp_path / "t.db")
+    make_app(tmp_path)
+    conn = connect(path)
+    with conn:
+        conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                     (json.dumps({"reasoning": {
+                         "format": "nope", "efforts": {"high": "high"}}}),))
+        conn.execute("DELETE FROM providers WHERE name = 'local'")
+    conn.close()
+    # a missing provider and an illegal declaration must both be tolerated
+    app = make_app(tmp_path)
+    assert app.state.backends == {}
+    client = TestClient(app)
+    models = {m["id"]: m for m in client.get("/admin/models").json()["models"]}
+    assert models["qwen3-8b"]["reasoning"]["declared"] is False
+    assert models["qwen3-8b"]["reasoning"]["error"]

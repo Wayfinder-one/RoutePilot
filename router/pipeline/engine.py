@@ -33,11 +33,13 @@ class Decision:
     node_id: str = ""               # leaf node id
     score: float | None = None
     path: list | None = None        # matched condition steps
+    #: 叶子声明的推理档位（§3.3）：None = 完全透传；'off'/档位 id = 强制注入。
+    reasoning: str | None = None
 
 
 def decision_to_dict(d: Decision) -> dict:
     return {"kind": d.kind, "model": d.model, "station_id": d.station_id,
-            "node_id": d.node_id, "score": d.score}
+            "node_id": d.node_id, "score": d.score, "reasoning": d.reasoning}
 
 
 def _floor(node: TreeNode) -> float:
@@ -77,7 +79,7 @@ def _leaf_decision(station: Station, leaf: TreeNode, signals: dict,
         return Decision(kind=kind,
                         model=None if kind == "block" else leaf.model,
                         station_id=station.id, node_id=leaf.id,
-                        path=list(path))
+                        path=list(path), reasoning=leaf.reasoning)
     result = leaf_score(leaf.weights, signals, leaf.min_score)
     result.update({"node_id": leaf.id, "winner": False})
     board.append(result)
@@ -86,7 +88,8 @@ def _leaf_decision(station: Station, leaf: TreeNode, signals: dict,
     return Decision(kind="block" if leaf.action == "block" else "route",
                     model=None if leaf.action == "block" else leaf.model,
                     station_id=station.id, node_id=leaf.id,
-                    score=result["score"], path=list(path))
+                    score=result["score"], path=list(path),
+                    reasoning=leaf.reasoning)
 
 
 def _eval_node(station: Station, node: TreeNode, signals: dict,

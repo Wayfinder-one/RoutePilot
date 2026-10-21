@@ -8,9 +8,12 @@ derived `split` model):
             kind: leaf|fork, action, model, min_score, weights[], children[]}
 
 A node is either a LEAF (terminal: direct hit, or weighted scoring with
-``weights`` + ``min_score``) or a FORK (ordered children; the first child whose
-condition matches is followed). Children are ordered and may use different
-signals — they are independent branches, not grouped by value.
+``weights`` + ``min_score``) or a FORK (ordered children; the first child that
+produces a decision wins — when several matching children end in weighted
+leaves, the highest score wins, and direct-hit leaves keep their order; see
+``engine.py::_eval_node`` for the exact semantics, audit P2 4.1). Children are
+ordered and may use different signals — they are independent branches, not
+grouped by value.
 
 This module is the trust boundary: anything malformed raises ValueError and the
 API layer turns it into a 422. Nothing downstream re-validates shape.
@@ -19,6 +22,8 @@ API layer turns it into a 422. Nothing downstream re-validates shape.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+from router.reasoning import LEVELS
 
 STATION_TYPES = ("gate", "score", "split")
 ACTIONS = ("block", "route")
@@ -49,6 +54,8 @@ class TreeNode:
     min_score: float | None = None   # leaf with weights: attainment floor
     weights: list[Weight] = field(default_factory=list)
     children: list[TreeNode] = field(default_factory=list)
+    #: 推理档位选择（§3.3）：None = 透传（默认）；'off' / LEVELS 之一 = 强制。
+    reasoning: str | None = None
 
 
 @dataclass
@@ -84,6 +91,10 @@ def node_from_dict(d: dict) -> TreeNode:
     action = d.get("action", "route")
     if action not in ACTIONS:
         raise ValueError(f"node action must be in {ACTIONS}: {d!r}")
+    reasoning = d.get("reasoning")
+    if reasoning is not None and reasoning not in LEVELS:
+        raise ValueError(
+            f"node reasoning must be null or one of {LEVELS}: {reasoning!r}")
     conf = d.get("conf_min")
     min_score = d.get("min_score")
     children = [node_from_dict(c) for c in d.get("children") or []]
@@ -99,7 +110,7 @@ def node_from_dict(d: dict) -> TreeNode:
         conf_min=None if conf is None else _unit(conf, "conf_min"),
         kind=kind, action=action, model=d.get("model"),
         min_score=None if min_score is None else _unit(min_score, "min_score"),
-        weights=weights, children=children)
+        weights=weights, children=children, reasoning=reasoning)
 
 
 def node_to_dict(n: TreeNode) -> dict:
@@ -108,7 +119,9 @@ def node_to_dict(n: TreeNode) -> dict:
             "action": n.action, "model": n.model, "min_score": n.min_score,
             "weights": [{"signal": w.signal, "value": w.value,
                          "weight": w.weight} for w in n.weights],
-            "children": [node_to_dict(c) for c in n.children]}
+            "children": [node_to_dict(c) for c in n.children],
+            # 始终输出（旧控制台忽略）：null = 完全透传
+            "reasoning": n.reasoning}
 
 
 def station_from_dict(d: dict) -> Station:

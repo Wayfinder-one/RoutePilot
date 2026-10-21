@@ -1,5 +1,7 @@
 """Leaf scoring formula (weighted attainment)."""
 
+import pytest
+
 from router.pipeline.model import Weight
 from router.pipeline.scoring import leaf_score
 
@@ -33,3 +35,21 @@ def test_lines_carry_c_and_m():
     lines = {line["signal"]: line for line in out["lines"]}
     assert lines["domain"]["m"] == 1 and abs(lines["domain"]["c"] - 0.9) < 1e-9
     assert lines["complexity"]["m"] == 0
+
+
+def test_unset_min_score_defaults_to_half():
+    """2026-10-21 audit P1 3.2: min_score=None used to fall back to a 0.0
+    floor, letting a weighted leaf pass with zero attainment. It now falls
+    back to DEFAULT_MIN_SCORE (0.5), matching the console editor default."""
+    from router.pipeline.model import DEFAULT_MIN_SCORE
+
+    assert DEFAULT_MIN_SCORE == 0.5
+    # no weighted condition matches -> attainment 0 -> must fail the 0.5 floor
+    out = leaf_score([Weight("complexity", "easy", 1.0)],
+                     {"domain": SIG["domain"]}, None)
+    assert out["score"] == 0.0 and out["min_score"] == 0.5
+    assert out["passed"] is False
+    # 0.9 attainment clears the default floor
+    out2 = leaf_score([Weight("domain", "health", 1.0)], SIG, None)
+    assert out2["score"] == pytest.approx(0.9)
+    assert out2["passed"] is True

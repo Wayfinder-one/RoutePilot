@@ -369,3 +369,142 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .tp-day:hover{border-color:var(--indigo-line);color:var(--indigo)}
 .tp-day.on{background:var(--indigo);border-color:var(--indigo);color:#fff}
 .tp-day.on:hover{background:var(--indigo);color:#fff}
+
+/* ══ models page: registry / provider cards (2026-10-21 rewrite) ═══════ */
+.push-right{margin-left:auto}
+.btn.danger{color:var(--red)}
+.btn.danger:hover{border-color:var(--red-line);background:var(--red-soft)}
+.btn.danger.armed{background:var(--red);border-color:var(--red);color:#fff}
+.empty-cell{padding:18px 6px;text-align:center;color:var(--text-3);font-size:12px}
+
+#modelTable{table-layout:auto}
+#modelTable th{font-size:10.5px;text-align:left;color:var(--text-3);font-weight:600;padding:5px;border-bottom:1px solid var(--line)}
+#modelTable td{padding:6px 5px;border-bottom:1px solid var(--line);vertical-align:middle}
+#modelTable td:first-child{width:170px}
+#modelTable td:nth-child(2){width:24%}
+#modelTable td:nth-child(3){width:15%}
+#modelTable td:nth-child(4){width:36%}
+#modelTable .th-actions{text-align:right}
+#modelTable .row-actions{white-space:nowrap;text-align:right}
+#modelTable .row-actions .btn{margin-left:4px;font-weight:550}
+#modelTable tr:hover td{background:var(--panel-2)}
+
+/* reasoning capability badges */
+.rbadges{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;vertical-align:middle}
+.rbadge{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--line);background:var(--panel-2);
+  color:var(--text-2);border-radius:99px;padding:1px 7px;font-size:10.5px;font-weight:600;white-space:nowrap}
+.rbadge.unset{color:var(--text-3);border-style:dashed;background:transparent}
+.rbadge.off{background:var(--amber-soft);border-color:var(--amber-line);color:var(--amber)}
+.rbadge.on{background:var(--indigo-soft);border-color:var(--indigo-line);color:var(--indigo)}
+.rbadge.on.def{border-color:var(--indigo);font-weight:750}
+.rbadge.fmt{background:#fff;border-color:var(--line-2);color:var(--text-2);font-family:var(--mono);font-size:10px}
+.rdot{width:5px;height:5px;border-radius:99px;background:currentColor;display:inline-block;flex:none}
+
+/* provider key-state badges + cards */
+.keybadge{display:inline-flex;align-items:center;border-radius:99px;padding:1px 7px;font-size:10.5px;font-weight:650;
+  border:1px solid var(--line);white-space:nowrap}
+.keybadge.ok{background:var(--green-soft);border-color:var(--green-line);color:var(--green)}
+.keybadge.env{background:var(--amber-soft);border-color:var(--amber-line);color:var(--amber)}
+.keybadge.none{background:var(--panel-2);color:var(--text-3)}
+.prov-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
+.prov-card{border:1px solid var(--line);border-radius:10px;background:var(--panel-2);padding:10px 12px;
+  display:flex;flex-direction:column;gap:6px}
+.prov-card .pc-head{display:flex;align-items:center;gap:8px}
+.prov-card .pc-head b{font-size:13px;letter-spacing:-.01em}
+.prov-card .pc-head .rbadge{margin-left:auto}
+.prov-card .pc-base{font-size:10.5px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.prov-card .pc-meta{display:flex;align-items:center;gap:7px;font-size:10.5px;flex-wrap:wrap}
+.prov-card .pc-actions{display:flex;gap:6px;margin-top:2px}
+.prov-card .pc-actions .btn{padding:3px 8px;font-size:11.5px}
+
+/* ══ modals (model / provider editors) ════════════════════════════════ */
+body.modal-open{overflow:hidden}
+.modal{position:fixed;inset:0;z-index:90;background:rgba(17,24,39,.42);display:flex;align-items:flex-start;
+  justify-content:center;padding:5vh 16px 4vh;overflow:auto}
+.modal[hidden]{display:none}
+.modal-card{width:min(800px,100%);background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  box-shadow:var(--shadow-lg);display:flex;flex-direction:column;max-height:90vh}
+.modal-h{display:flex;align-items:center;gap:10px;padding:13px 16px 10px;border-bottom:1px solid var(--line)}
+.modal-h b{font-size:14.5px;font-weight:750;letter-spacing:-.01em}
+.modal-x{margin-left:auto;border:0;background:transparent;color:var(--text-3);width:26px;height:26px;
+  border-radius:7px;display:grid;place-items:center;font-size:13px;line-height:1}
+.modal-x:hover{background:var(--panel-2);color:var(--text)}
+.mtabs{display:flex;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--line);background:var(--panel-2)}
+.mtabs[hidden]{display:none}
+.mtab{border:0;background:transparent;padding:7px 12px 9px;font-size:12.5px;color:var(--text-2);
+  font-weight:600;border-radius:7px 7px 0 0}
+.mtab:hover{color:var(--text)}
+.mtab.on{color:var(--indigo);background:var(--panel);box-shadow:0 -2px 0 var(--indigo) inset;font-weight:700}
+.modal-body{padding:13px 16px;overflow:auto;flex:1;min-height:120px}
+.modal-foot{display:flex;align-items:center;gap:8px;padding:11px 16px;border-top:1px solid var(--line);
+  background:var(--panel-2);border-radius:0 0 14px 14px}
+.modal-msg{margin-right:auto;font-size:11.5px;color:var(--text-3);max-width:62%;line-height:1.45}
+.modal-msg.bad{color:var(--red)}
+.modal-msg.ok{color:var(--green)}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px 12px;margin-bottom:10px}
+.form-grid > .field{min-width:0}
+.field > small{font-size:10.5px;color:var(--text-3);font-weight:500;line-height:1.5}
+.field input,.field select{width:100%}
+.notice{border-radius:9px;padding:8px 10px;font-size:11.5px;line-height:1.55;margin-bottom:10px}
+.notice.warn{background:var(--amber-soft);border:1px solid var(--amber-line);color:var(--amber)}
+.notice.bad{background:var(--red-soft);border:1px solid var(--red-line);color:var(--red)}
+.hint{font-size:10.5px;color:var(--text-3);line-height:1.55;margin-bottom:8px}
+.keyline{display:flex;align-items:center;gap:8px;margin:2px 0 9px;font-size:11px;flex-wrap:wrap}
+.checkline{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-2);cursor:pointer}
+.col-h.sm{font-size:11px;margin:10px 0 6px}
+.linkbtn{border:0;background:transparent;color:var(--indigo);font-size:11.5px;padding:0;font-weight:600;cursor:pointer}
+.linkbtn:hover{text-decoration:underline}
+.fetch-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.inline-form{border:1px dashed var(--line-2);border-radius:10px;padding:10px 12px;margin:2px 0 10px;background:var(--panel-2)}
+.inline-form[hidden]{display:none}
+
+/* preset multi-select model list */
+.preset-models{display:flex;flex-direction:column;gap:6px;max-height:34vh;overflow:auto;padding-right:2px}
+.preset-model{border:1px solid var(--line);border-radius:9px;background:var(--panel-2);padding:7px 9px}
+.pm-l{display:flex;align-items:center;gap:8px;cursor:pointer;flex-wrap:wrap}
+.pm-l input[type=checkbox]{width:auto}
+.pm-name{font-weight:650;font-size:12.5px}
+.pm-up{font-size:10.5px;color:var(--text-3)}
+.pm-idslot{display:flex;align-items:center;gap:8px;margin-top:7px;padding-left:24px;flex-wrap:wrap}
+.pm-idslot[hidden]{display:none}
+.pm-idslot .field{flex:0 1 260px;min-width:170px}
+.pm-slot-hint{font-size:10.5px}
+.pm-conflict{font-size:10.5px;color:var(--red);font-weight:650}
+.pm-conflict[hidden]{display:none}
+
+/* reasoning declaration editor */
+.reason-editor{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:10px 0;background:var(--panel-2)}
+.reason-editor .col-h.sm{margin-top:0}
+.reason-detail[hidden]{display:none}
+.rl-table{display:flex;flex-direction:column;gap:4px}
+.rl-row{display:flex;align-items:center;gap:9px;padding:3px 6px;border-radius:7px;background:#fff;border:1px solid var(--line)}
+.rl-row.on{border-color:var(--indigo-line);background:var(--indigo-soft)}
+.rl-check{display:flex;align-items:center;gap:6px;flex:0 0 190px;cursor:pointer;font-size:12px}
+.rl-check input{width:auto}
+.rl-check .rl-name{font-weight:600}
+.rl-check .mono{font-size:10px;color:var(--text-3)}
+.rl-wire{flex:1;min-width:120px;font-size:11.5px;padding:3px 6px}
+.rl-wire:disabled{opacity:.5;background:var(--panel-2)}
+.rl-wire.req{border-color:var(--red-line)}
+.adv{border-top:1px dashed var(--line);margin-top:10px;padding-top:8px}
+.adv summary{cursor:pointer;font-size:11.5px;color:var(--text-2);font-weight:650;margin-bottom:8px}
+@media (max-width:640px){
+  .form-grid{grid-template-columns:1fr}
+  .modal{padding:2vh 8px}
+}
+
+/* pipeline leaf editor: reasoning picker + leaf chip effort tag (2026-10-21) */
+.t4 .tn-out .tn-reason{margin-left:3px;font-size:10px;font-weight:600;color:var(--t4-accent-deep);opacity:.85}
+.t4 .tn-out .tn-reason.auto{display:none}
+.t4 .pop select#lfReasoning{
+  width:100%;height:32px;padding:0 7px;margin-bottom:6px;
+  border:1px solid var(--t4-line-2);border-radius:7px;background:#fff;
+  font:inherit;font-size:12.5px;color:var(--t4-ink)
+}
+.t4 .pop select#lfReasoning:focus{border-color:var(--t4-accent);box-shadow:0 0 0 3px var(--t4-accent-soft);outline:none}
+.t4 .pop select#lfReasoning.is-off{opacity:.6;cursor:not-allowed;background:var(--t4-wash)}
+.t4 .pop .pop-note.bad{color:var(--t4-red)}
+
+/* calc log: reasoning badge on the decision row (2026-10-21) */
+.dec.reason{background:var(--panel-2);color:var(--text-2);border:1px solid var(--line);font-weight:600}
+.dec.warn{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber-line);font-weight:600}

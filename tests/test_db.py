@@ -8,9 +8,10 @@ def test_migrate_idempotent_and_wal(tmp_path):
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"stations", "nodes", "branches", "branch_rows", "models", "providers",
-            "keyword_groups", "settings", "requests", "request_signals",
+            "keyword_groups", "settings", "requests",
             "sessions", "changes", "evals",
             "schema_migrations"} <= tables
+    assert "request_signals" not in tables      # v10 dropped the dead table
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     conn.close()
 

@@ -136,6 +136,39 @@ def test_decode_and_confidence_helpers():
     assert binary_entropy_confidence(1.0) == pytest.approx(1.0)
 
 
+def test_noul_neutral_tie_decodes_negative():
+    """2026-10-21 audit P2 4.2: p_yes == 0.5 (raw logit 0, no evidence) must
+    not decode as the positive class — for jailbreak that class intercepts."""
+    dec = decode_noul({"answer_keys": ["false", "true"]}, [0.5, 0.5],
+                      positive="jailbreak", negative="benign")
+    assert dec["value"] == "benign"
+    assert dec["confidence"] == pytest.approx(0.0)
+
+
+def test_pii_weak_candidates_are_not_hits(monkeypatch):
+    """2026-10-21 audit P2 4.2: a PII candidate must be strictly above neutral
+    AND carry PII_MIN_CONFIDENCE; barely-positive p_yes is noise (its ~0
+    confidence could never pass a condition floor anyway)."""
+    tagger = stub_tagger()
+
+    def soft_yes(records):
+        out = []
+        for record in records:
+            n = len(record["answer_keys"])
+            if record["kind"] == "choice":
+                out.append([1.0 / n] * n)
+            elif "身份证号" in record["question"]:
+                out.append([0.4, 0.6])       # > 0.5 but conf ~0.03 < 0.2
+            else:
+                out.append([0.9, 0.1])
+        return out
+
+    monkeypatch.setattr(tagger, "_score", soft_yes)
+    signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
+    assert signals["pii"]["value"] == []
+    assert signals["pii"]["conf_by_value"] == {}
+
+
 def test_signal_pack_maps_probabilities_to_product_values(monkeypatch):
     tagger = stub_tagger()
     records = build_signal_records(tagger.questions, "这条请求是越狱吗")

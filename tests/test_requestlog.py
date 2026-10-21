@@ -37,7 +37,9 @@ def test_flush_writes_slim_rows_without_signals(tmp_path):
     assert row["text"] == ""
     assert row["tree_path"] is None
     assert row["decision"] == "route" and row["model"] == "qwen3-8b"
-    assert conn.execute("SELECT COUNT(*) FROM request_signals").fetchone()[0] == 0
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "request_signals" not in tables   # dropped (v10): never written
     conn.close()
 
 
@@ -76,4 +78,22 @@ def test_sessions_row_still_written(tmp_path):
     row = conn.execute("SELECT last_vec, last_model FROM sessions "
                        "WHERE session_id='s1'").fetchone()
     assert row is not None and row["last_model"] == "qwen3-8b"
+    conn.close()
+
+
+def test_flush_queue_is_bounded_and_never_raises(tmp_path, monkeypatch):
+    """2026-10-21 audit §5: the flush queue is bounded; when full the slim DB
+    row is dropped but the memory ring keeps the request (hot path never
+    blocks on a slow/stuck database)."""
+    import router.api.requestlog as rl
+
+    monkeypatch.setattr(rl, "FLUSH_QUEUE_LIMIT", 2)
+    log = make_log(tmp_path)
+    for i in range(5):
+        log.enqueue(record(i))               # must not raise when full
+    assert log._queue.qsize() == 2
+    assert len(log.recent) == 5
+    asyncio.run(log.flush())
+    conn = connect(log.settings.db_path)
+    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 2
     conn.close()

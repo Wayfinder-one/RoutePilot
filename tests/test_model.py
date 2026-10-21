@@ -18,14 +18,15 @@ def sample_node() -> dict:
                  {"id": "n1a1", "signal": "complexity", "value": "hard",
                   "conf_min": 0.7, "kind": "leaf", "action": "route",
                   "model": "qwen3-8b-medical", "min_score": None,
-                  "weights": [], "children": []},
+                  "weights": [], "children": [], "reasoning": None},
                  {"id": "n1a2", "signal": "complexity", "value": "easy",
                   "conf_min": None, "kind": "leaf", "action": "route",
                   "model": "qwen3-0.6b-medical", "min_score": 0.4,
                   "weights": [{"signal": "domain", "value": "health",
-                               "weight": 0.5}], "children": []},
-             ]},
-        ],
+                               "weight": 0.5}], "children": [],
+                  "reasoning": None},
+             ], "reasoning": None},
+        ], "reasoning": None,
     }
 
 
@@ -74,7 +75,8 @@ def test_shape_validation():
 def test_unconditional_leaf_is_legal():
     d = {"id": "f", "signal": None, "value": "", "conf_min": None,
          "kind": "leaf", "action": "route", "model": "qwen3-8b",
-         "min_score": None, "weights": [], "children": []}
+         "min_score": None, "weights": [], "children": [],
+         "reasoning": None}
     n = node_from_dict(d)
     assert n.signal is None and n.kind == "leaf"
     assert node_to_dict(n) == d

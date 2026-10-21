@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from router.pipeline.model import (ACTIONS, STATION_TYPES, Station, TreeNode,
                                    Weight)
+from router.reasoning import level_label
 from router.signals.registry import SIGNALS
 
 
@@ -21,6 +22,9 @@ class Issue:
     station_id: str = ""
     node_id: str = ""
     level: str = "hard"             # 'hard' rejects the save (422); 'warn' does not
+    #: reasoning_unsupported 的定位信息（§3.3：「detail 里带模型与档位」）
+    model: str = ""
+    reasoning: str = ""
 
 
 def _check_weights(node: TreeNode, station: Station) -> list[Issue]:
@@ -46,7 +50,9 @@ def _check_weights(node: TreeNode, station: Station) -> list[Issue]:
 
 
 def _check_node(node: TreeNode, station: Station, known_models: set[str],
-                *, is_root: bool, siblings_seen: set[tuple]) -> list[Issue]:
+                *, is_root: bool, siblings_seen: set[tuple],
+                model_reasoning: dict[str, dict | None] | None = None
+                ) -> list[Issue]:
     issues: list[Issue] = []
     # ---- condition ----
     if node.signal is not None:
@@ -89,7 +95,8 @@ def _check_node(node: TreeNode, station: Station, known_models: set[str],
         child_seen: set[tuple] = set()
         for child in node.children:
             issues.extend(_check_node(child, station, known_models,
-                                      is_root=False, siblings_seen=child_seen))
+                                      is_root=False, siblings_seen=child_seen,
+                                      model_reasoning=model_reasoning))
     else:
         if node.children:
             issues.append(Issue("leaf_with_children", "终点节点不能再有子节点",
@@ -107,17 +114,58 @@ def _check_node(node: TreeNode, station: Station, known_models: set[str],
             issues.append(Issue("unknown_model", f"未知模型 {node.model}",
                                 f"Unknown model {node.model}",
                                 station.id, node.id))
+        if model_reasoning is not None and node.reasoning is not None:
+            issues.extend(_check_reasoning(node, station, known_models,
+                                           model_reasoning))
         if node.weights:
             issues.extend(_check_weights(node, station))
             if not any(w.weight > 0 for w in node.weights):
                 issues.append(Issue("zero_weight", "加权条件权重全为 0",
                                     "All weights are zero", station.id, node.id))
             if node.min_score is None:
-                issues.append(Issue("missing_min_score",
-                                    "加权叶子没有配置达成率门槛",
-                                    "Weighted leaf has no attainment floor",
-                                    station.id, node.id, level="warn"))
+                issues.append(Issue(
+                    "missing_min_score",
+                    "加权叶子没有配置达成率门槛（未配置时按默认 0.50 计）",
+                    "Weighted leaf has no attainment floor "
+                    "(defaults to 0.50 when unset)",
+                    station.id, node.id, level="warn"))
     return issues
+
+
+def _check_reasoning(node: TreeNode, station: Station, known_models: set[str],
+                     model_reasoning: dict[str, dict | None]) -> list[Issue]:
+    """§3.3：分树叶子的推理选择硬校验（只在调用方传了 model_reasoning 时执行）。"""
+    if node.action != "route":
+        return [Issue("reasoning_without_route",
+                      "推理档位只能配置在「路由」叶子上",
+                      "Reasoning can only be set on a route leaf",
+                      station.id, node.id, model=node.model or "",
+                      reasoning=node.reasoning)]
+    if not node.model or node.model not in known_models:
+        return []                       # unknown/resolvable model: other checks own it
+    capability = model_reasoning.get(node.model)
+    levels: list[str] = []
+    if isinstance(capability, dict) and capability.get("declared") \
+            and capability.get("supported"):
+        levels = [e["id"] for e in capability.get("efforts") or []
+                  if isinstance(e, dict) and "id" in e]
+    if not levels:
+        return [Issue("reasoning_unsupported",
+                      f"模型 {node.model} 未声明/不支持推理，不能选择推理档位",
+                      f"Model {node.model} does not declare reasoning support",
+                      station.id, node.id, model=node.model,
+                      reasoning=node.reasoning)]
+    if node.reasoning not in levels:
+        return [Issue("reasoning_unsupported",
+                      f"模型 {node.model} 未声明档位 "
+                      f"{level_label(node.reasoning)}（{node.reasoning}）；"
+                      f"可选：{', '.join(levels)}",
+                      f"Model {node.model} does not declare the "
+                      f"{node.reasoning!r} reasoning level; "
+                      f"declared: {', '.join(levels)}",
+                      station.id, node.id, model=node.model,
+                      reasoning=node.reasoning)]
+    return []
 
 
 def _is_unconditional_leaf(station: Station) -> bool:
@@ -126,7 +174,17 @@ def _is_unconditional_leaf(station: Station) -> bool:
             and root.kind == "leaf" and not root.weights)
 
 
-def check_pipeline(stations: list[Station], known_models: set[str]) -> list[Issue]:
+def check_pipeline(stations: list[Station], known_models: set[str],
+                   model_reasoning: dict[str, dict | None] | None = None
+                   ) -> list[Issue]:
+    """Health-check a pipeline.
+
+    ``model_reasoning`` is optional (old callers/tests pass only the known model
+    ids): when None the reasoning rules of §3.3 are skipped entirely, so the
+    previous behaviour is preserved. When given, it maps model_id to the
+    normalized reasoning object (``router.reasoning.normalize_reasoning``
+    output, or None when undeclared).
+    """
     issues: list[Issue] = []
     if not stations:
         issues.append(Issue("empty_pipeline", "管道为空", "Pipeline is empty"))
@@ -144,7 +202,8 @@ def check_pipeline(stations: list[Station], known_models: set[str]) -> list[Issu
                                 station_id=station.id))
             continue
         issues.extend(_check_node(station.root, station, known_models,
-                                  is_root=True, siblings_seen=set()))
+                                  is_root=True, siblings_seen=set(),
+                                  model_reasoning=model_reasoning))
     # An always-hit station anywhere but last shadows every following station.
     for i, station in enumerate(stations[:-1]):
         if _is_unconditional_leaf(station):

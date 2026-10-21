@@ -29,9 +29,19 @@ const lastStep = st => {
 };
 
 /* ---------- header row ---------- */
+const reasonLabel = lvl => t('reason.' + lvl);
+function reasonBadge(r) {
+  if (!r.reasoning) return '';
+  return `<span class="dec reason">· ${esc(t('logs.reasoning'))} ${esc(reasonLabel(r.reasoning))}</span>`;
+}
+function reasoningWarn(r) {
+  if (!r.reasoning_warning) return '';
+  return `<span class="dec warn" title="${esc(t('logs.reasoningWarn'))}">⚠ ${esc(t('logs.reasoning'))}</span>`;
+}
 function decisionHtml(r) {
   if (r.decision === 'block') return `<span class="dec block">✕ ${t('logs.blocked')}</span>`;
-  if (r.decision === 'route') return `<span class="dec route">→ ${esc(r.model || '?')}</span>`;
+  if (r.decision === 'route')
+    return `<span class="dec route">→ ${esc(r.model || '?')}</span>${reasonBadge(r)}${reasoningWarn(r)}`;
   return `<span class="dec none">${t('logs.none')}</span>`;
 }
 function sessionHtml(r) {
@@ -81,12 +91,16 @@ function condText(s) {
 function bannerHtml(r) {
   const kind = r.decision === 'block' ? 'block' : (r.decision === 'route' ? 'route' : 'none');
   const label = r.decision === 'block' ? '✕ ' + t('logs.blocked')
-    : r.decision === 'route' ? '→ ' + (r.model || '—') : t('logs.none');
+    : r.decision === 'route'
+      ? '→ ' + (r.model || '—') + (r.reasoning ? ' · ' + reasonLabel(r.reasoning) : '')
+      : t('logs.none');
   const via = stationName(r.node_id);
   const score = r.score != null ? ' · ' + t('logs.score') + ' ' + fmt(r.score) : '';
+  const warn = r.reasoning_warning
+    ? ` <span class="flow-tag cut" title="${esc(t('logs.reasoningWarn'))}">⚠ ${esc(t('logs.reasoning'))}</span>` : '';
   return `<div class="flow-banner ${kind}">
     <span class="flow-m">${esc(label)}</span>
-    <span class="flow-via">${via ? esc(t('logs.via') + ' ' + via) + score : ''}</span>
+    <span class="flow-via">${via ? esc(t('logs.via') + ' ' + via) + score : ''}${warn}</span>
     <span class="flow-id mono">${esc(r.id || '')}</span></div>`;
 }
 function stationTrack(r) {

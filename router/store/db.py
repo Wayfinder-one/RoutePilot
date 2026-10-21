@@ -92,6 +92,23 @@ MIGRATIONS = [
         name TEXT PRIMARY KEY, days TEXT NOT NULL,
         start TEXT NOT NULL, end TEXT NOT NULL);
     """,
+    # v9 (2026-10-21): model catalog + per-model reasoning capability.
+    # providers.reasoning_format = protocol dialect default (see
+    # docs/模型目录与推理配置-2026-10-21.md §4); a model's profile.reasoning.format
+    # wins over it. providers.api_key stores the console-entered key in plain
+    # text (local/enterprise console behind the /admin bearer token); GET
+    # endpoints only ever expose key_present/key_source, never the value.
+    # Both defaults keep old rows behaviourally unchanged.
+    """
+    ALTER TABLE providers ADD COLUMN reasoning_format TEXT NOT NULL DEFAULT 'openai';
+    ALTER TABLE providers ADD COLUMN api_key TEXT NOT NULL DEFAULT '';
+    """,
+    # v10 (2026-10-21, audit §5): request_signals was created in v1 but never
+    # written (signal detail lives in the memory ring); drop the dead table.
+    """
+    DROP TABLE IF EXISTS request_signals;
+    DROP INDEX IF EXISTS idx_reqsig_rid;
+    """,
 ]
 
 

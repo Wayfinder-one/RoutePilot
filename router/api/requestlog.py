@@ -26,12 +26,16 @@ from router.store.db import connect
 FLUSH_SECONDS = 2.0
 RECENT_LIMIT = 20          # console promise: the last 20 requests, memory only
 CONF_BUCKETS = 5           # overview confidence histogram resolution
+#: Bounded flush queue (audit §5): a slow/stuck DB must not grow memory without
+#: backpressure. When full, the slim DB row is dropped — the memory ring (the
+#: console log page and replay) still holds the request.
+FLUSH_QUEUE_LIMIT = 10000
 
 
 class RequestLogger:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=FLUSH_QUEUE_LIMIT)
         self._task: asyncio.Task | None = None
         # complete records (text/signals/trace): newest last, never persisted
         self.recent: deque = deque(maxlen=RECENT_LIMIT)
@@ -46,7 +50,10 @@ class RequestLogger:
             if conf is not None and not s.get("is_rule"):
                 i = min(CONF_BUCKETS - 1, int(float(conf) * CONF_BUCKETS))
                 self._conf_buckets[i] += 1
-        self._queue.put_nowait(record)
+        try:
+            self._queue.put_nowait(record)
+        except asyncio.QueueFull:
+            pass                                   # ring keeps it, DB row dropped
 
     def recent_requests(self, limit: int = RECENT_LIMIT) -> list[dict]:
         """Newest first, capped at the ring size (console log page)."""

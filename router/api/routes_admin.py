@@ -10,10 +10,12 @@ the ``changes`` audit trail (design 5.1).
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from datetime import datetime, timedelta
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
@@ -24,16 +26,25 @@ from router.evals import summarize
 from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
 from router.pipeline.model import station_from_dict, station_to_dict
+from router.presets import PROVIDER_PRESETS
+from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
+                              normalize_reasoning, validate_model_profile)
 from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
                                         TimePeriodRepo,
                                        ModelRepo, ProviderRepo,
-                                       SettingsRepo, StationRepo)
+                                       SettingsRepo, StationRepo,
+                                       model_ids_using_provider,
+                                       model_references)
 
 router = APIRouter()
 
 RESERVED_SETTINGS = {"pipeline_version"}
+
+#: 模型位 / 提供方名：写进分流树、URL 路径与 OpenAI body，保守字符集。
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _now() -> str:
@@ -68,8 +79,16 @@ def put_pipeline(body: PipelineIn, request: Request,
         stations = [station_from_dict(d) for d in payload]
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
-    known = {m["id"] for m in ModelRepo(conn).list()}
-    issues = check_pipeline(stations, known)
+    models = ModelRepo(conn).list()
+    known = {m["id"] for m in models}
+    formats = _provider_formats(conn)
+    # §3.3: a leaf that selects a reasoning level must target a model that
+    # declares it; the map is only passed here so old callers keep working.
+    model_reasoning = {
+        m["id"]: normalize_reasoning(_parse_profile_text(m.get("profile")),
+                                     formats.get(m["provider"], "openai"))
+        for m in models}
+    issues = check_pipeline(stations, known, model_reasoning)
     # hard issues reject with 422 (pointing at station/node); warn-level issues
     # ride along in the response so the console can show them without blocking.
     hard = [i for i in issues if i.level == "hard"]
@@ -151,11 +170,125 @@ def put_time_periods(body: dict, request: Request,
 
 
 # --------------------------------------------------------------------------- #
-# Models & providers
+# Models & providers (catalog §3/§5)
 # --------------------------------------------------------------------------- #
+def _has_control_chars(value: str) -> bool:
+    return any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+
+
+def _clean_text(value, field: str, *, max_len: int) -> str:
+    """Trimmed, non-empty, bounded, control-char-free string or 422."""
+    if not isinstance(value, str):
+        raise HTTPException(422, detail=f"{field} 必须是字符串")
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(422, detail=f"{field} 不能为空")
+    if len(cleaned) > max_len:
+        raise HTTPException(422, detail=f"{field} 不能超过 {max_len} 字符")
+    if _has_control_chars(cleaned):
+        raise HTTPException(422, detail=f"{field} 不能包含控制字符")
+    return cleaned
+
+
+def _clean_base_url(value) -> str:
+    cleaned = _clean_text(value, "base_url", max_len=500)
+    return cleaned[:-1] if cleaned.endswith("/") else cleaned
+
+
+def _provider_formats(conn: sqlite3.Connection) -> dict[str, str]:
+    """provider name -> reasoning_format（模型级 format 缺省时生效）。"""
+    return {p["name"]: (p.get("reasoning_format") or "openai")
+            for p in ProviderRepo(conn).list()}
+
+
+def _parse_profile_text(text: str | None) -> dict:
+    """models.profile JSON text -> dict; empty/broken JSON behaves as undeclared."""
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _undeclared_reasoning(provider_format: str) -> dict:
+    """§3.2 shape for "missing declaration" (console renders 未声明 from it)."""
+    return {"declared": False, "supported": None,
+            "format": provider_format if provider_format in FORMATS else "openai",
+            "efforts": [], "default": None}
+
+
+def _public_model(row: dict, provider_format: str) -> dict:
+    normalized = normalize_reasoning(_parse_profile_text(row.get("profile")),
+                                     provider_format)
+    return {**row,
+            "reasoning": normalized or _undeclared_reasoning(provider_format)}
+
+
+def _validated_profile(raw: dict | str | None,
+                       provider_format: str) -> str | None:
+    """POST/PUT profile 入参（dict 或 JSON 文本）→ 校验后的 JSON 文本。"""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            raise HTTPException(422, detail=f"profile 不是合法 JSON: {exc}") from exc
+    else:
+        parsed = raw
+    if not isinstance(parsed, dict):
+        raise HTTPException(422, detail="profile 必须是 JSON 对象")
+    try:
+        validated = validate_model_profile(parsed, provider_format)
+    except ReasoningError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    return json.dumps(validated, ensure_ascii=False)
+
+
+@router.get("/model-catalog")
+def get_model_catalog():
+    """内置提供方 / 预置模型目录（§5.1）；纯声明数据 + 归一化推理能力。"""
+    providers = []
+    for preset in PROVIDER_PRESETS:
+        fmt = preset.get("reasoning_format") or "openai"
+        models = []
+        for model in preset.get("models") or ():
+            profile = model.get("profile") or {}
+            normalized = normalize_reasoning(profile, fmt)
+            models.append({
+                "id": model["id"],
+                "name": model.get("name") or model["id"],
+                "context_window": model.get("context_window"),
+                "max_tokens": model.get("max_tokens"),
+                "tier": model.get("tier"),
+                "domains": model.get("domains") or [],
+                "profile": profile,
+                "reasoning": normalized or _undeclared_reasoning(fmt),
+            })
+        key_env = preset.get("key_env") or ""
+        providers.append({
+            "id": preset["id"],
+            "name": preset.get("name") or preset["id"],
+            "base_url": preset["base_url"],
+            "key_env": key_env,
+            "reasoning_format": fmt,
+            # the server is the only side that can see its own environment
+            "key_env_present": bool(key_env and os.environ.get(key_env)),
+            "models": models,
+        })
+    return {"providers": providers,
+            "formats": [{"id": spec.id, "zh": spec.zh, "en": spec.en}
+                        for spec in FORMATS.values()],
+            "levels": list(LEVELS)}
+
+
 @router.get("/models")
 def get_models(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"models": ModelRepo(conn).list()}
+    formats = _provider_formats(conn)
+    return {"models": [_public_model(row, formats.get(row["provider"], "openai"))
+                       for row in ModelRepo(conn).list()]}
 
 
 class ModelIn(BaseModel):
@@ -164,40 +297,227 @@ class ModelIn(BaseModel):
     profile: str | dict | None = None
 
 
+class ModelCreateIn(ModelIn):
+    id: str
+
+
+@router.post("/models", status_code=201)
+def post_model(body: ModelCreateIn, request: Request,
+               conn: sqlite3.Connection = Depends(get_conn)):
+    model_id = body.id.strip()
+    if not _ID_RE.match(model_id):
+        raise HTTPException(
+            422, detail="id 必须匹配 ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    upstream = _clean_text(body.upstream, "upstream", max_len=200)
+    if body.provider is None:
+        raise HTTPException(422, detail="provider 不能为空")
+    provider = _clean_text(body.provider, "provider", max_len=64)
+    provider_row = ProviderRepo(conn).get(provider)
+    if provider_row is None:
+        raise HTTPException(422, detail=f"unknown provider {provider}")
+    profile = _validated_profile(body.profile,
+                                 provider_row.get("reasoning_format") or "openai")
+    if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
+        raise HTTPException(409, detail=f"model {model_id} 已存在")
+    _refresh_backends(request, conn)
+    ChangeRepo(conn).record(_now(), "model", {
+        "action": "create", "id": model_id, "upstream": upstream,
+        "provider": provider, "profile": body.profile})
+    row = ModelRepo(conn).get(model_id)
+    return {"ok": True, "model": _public_model(
+        row, provider_row.get("reasoning_format") or "openai")}
+
+
 @router.put("/models/{model_id}")
 def put_model(model_id: str, body: ModelIn, request: Request,
               conn: sqlite3.Connection = Depends(get_conn)):
-    profile = (json.dumps(body.profile, ensure_ascii=False)
-               if isinstance(body.profile, dict) else body.profile)
-    if not ModelRepo(conn).update(model_id, upstream=body.upstream,
-                                  provider=body.provider, profile=profile):
+    existing = ModelRepo(conn).get(model_id)
+    if existing is None:
         raise HTTPException(404, detail=f"unknown model {model_id}")
+    upstream = (_clean_text(body.upstream, "upstream", max_len=200)
+                if body.upstream is not None else None)
+    provider = (_clean_text(body.provider, "provider", max_len=64)
+                if body.provider is not None else None)
+    profile = None
+    if body.profile is not None:
+        formats = _provider_formats(conn)
+        effective = provider if provider is not None else existing["provider"]
+        profile = _validated_profile(body.profile,
+                                     formats.get(effective, "openai"))
+    ModelRepo(conn).update(model_id, upstream=upstream, provider=provider,
+                           profile=profile)
+    _refresh_backends(request, conn)
+    ChangeRepo(conn).record(_now(), "model", {
+        "action": "update", "id": model_id, "upstream": body.upstream,
+        "provider": body.provider, "profile": body.profile})
+    row = ModelRepo(conn).get(model_id)
+    return {"ok": True, "model": _public_model(
+        row, _provider_formats(conn).get(row["provider"], "openai"))}
+
+
+@router.delete("/models/{model_id}")
+def delete_model(model_id: str, request: Request,
+                 conn: sqlite3.Connection = Depends(get_conn)):
+    if ModelRepo(conn).get(model_id) is None:
+        raise HTTPException(404, detail=f"unknown model {model_id}")
+    refs = model_references(StationRepo(conn).load(), model_id)
+    if refs:
+        raise HTTPException(409, detail={
+            "message": f"model {model_id} 被分流树引用，先解除引用再删除",
+            "references": refs})
+    ModelRepo(conn).delete(model_id)
     _refresh_backends(request, conn)
     ChangeRepo(conn).record(_now(), "model",
-                            {"id": model_id, "upstream": body.upstream,
-                             "provider": body.provider, "profile": body.profile})
-    return {"ok": True, "model": ModelRepo(conn).get(model_id)}
+                            {"action": "delete", "id": model_id})
+    return {"ok": True, "deleted": model_id}
+
+
+def _public_provider(row: dict) -> dict:
+    """§5.3 shape: key state only — the stored api_key never leaves the server."""
+    key_env = row.get("key_env") or ""
+    api_key = row.get("api_key") or ""
+    env_present = bool(key_env) and bool(os.environ.get(key_env))
+    if api_key:
+        source = "stored"
+    elif env_present:
+        source = "env"
+    else:
+        source = "none"
+    return {"name": row["name"], "base_url": row["base_url"],
+            "key_env": key_env,
+            "reasoning_format": row.get("reasoning_format") or "openai",
+            "key_present": source != "none", "key_source": source}
 
 
 @router.get("/providers")
 def get_providers(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"providers": ProviderRepo(conn).list()}
+    return {"providers": [_public_provider(row)
+                          for row in ProviderRepo(conn).list()]}
 
 
 class ProviderIn(BaseModel):
     base_url: str
-    key_env: str = ""
+    #: None = 保持；"" = 不用环境变量；非空 = 新环境变量名
+    key_env: str | None = None
+    #: None = 保持；合法值见 FORMAT_IDS
+    reasoning_format: str | None = None
+    #: 三态：None = 保持；"" = 清除；非空 = 写入（明文存库，永不回显）
+    api_key: str | None = None
 
 
 @router.put("/providers/{name}")
 def put_provider(name: str, body: ProviderIn, request: Request,
                  conn: sqlite3.Connection = Depends(get_conn)):
-    ProviderRepo(conn).upsert(name, body.base_url, body.key_env)
+    if not _ID_RE.match(name):
+        raise HTTPException(
+            422, detail="name 必须匹配 ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    base_url = _clean_base_url(body.base_url)
+    key_env = None
+    if body.key_env is not None:
+        key_env = body.key_env.strip()
+        if key_env and not _ENV_RE.match(key_env):
+            raise HTTPException(
+                422, detail="key_env 必须是合法的环境变量名（或空字符串）")
+    reasoning_format = None
+    if body.reasoning_format is not None:
+        if body.reasoning_format not in FORMAT_IDS:
+            raise HTTPException(
+                422, detail=f"reasoning_format 必须是 {', '.join(FORMAT_IDS)} 之一")
+        reasoning_format = body.reasoning_format
+    api_key = body.api_key
+    if api_key is not None:
+        api_key = api_key.strip()
+    existing = ProviderRepo(conn).get(name)
+    ProviderRepo(conn).upsert(name, base_url, key_env=key_env,
+                              reasoning_format=reasoning_format,
+                              api_key=api_key)
+    _refresh_backends(request, conn)
+    # Never put the secret itself in the audit trail (/admin/changes is a GET).
+    audit = {
+        "action": "upsert", "name": name, "base_url": base_url,
+        "key_env": key_env if key_env is not None
+        else (existing or {}).get("key_env", ""),
+        "reasoning_format": reasoning_format if reasoning_format is not None
+        else (existing or {}).get("reasoning_format", "openai"),
+        "api_key": "unchanged" if api_key is None
+        else ("cleared" if api_key == "" else "set"),
+    }
+    ChangeRepo(conn).record(_now(), "provider", audit)
+    row = ProviderRepo(conn).get(name)
+    return {"ok": True, "provider": _public_provider(row)}
+
+
+@router.delete("/providers/{name}")
+def delete_provider(name: str, request: Request,
+                    conn: sqlite3.Connection = Depends(get_conn)):
+    if ProviderRepo(conn).get(name) is None:
+        raise HTTPException(404, detail=f"unknown provider {name}")
+    used_by = model_ids_using_provider(conn, name)
+    if used_by:
+        raise HTTPException(409, detail={
+            "message": f"provider {name} 被模型引用，先把这些模型改到别的提供方",
+            "models": used_by})
+    ProviderRepo(conn).delete(name)
     _refresh_backends(request, conn)
     ChangeRepo(conn).record(_now(), "provider",
-                            {"name": name, "base_url": body.base_url,
-                             "key_env": body.key_env})
-    return {"ok": True}
+                            {"action": "delete", "name": name})
+    return {"ok": True, "deleted": name}
+
+
+class FetchModelsIn(BaseModel):
+    provider: str | None = None
+    base_url: str | None = None
+    key_env: str | None = None
+    api_key: str | None = None
+
+
+@router.post("/fetch-models")
+async def fetch_models(body: FetchModelsIn, request: Request,
+                       conn: sqlite3.Connection = Depends(get_conn)):
+    """Read a provider's GET {base_url}/models without persisting anything (§5.4)."""
+    stored_key = ""
+    key_env = ""
+    if body.provider:
+        provider_row = ProviderRepo(conn).get(body.provider)
+        if provider_row is None:
+            raise HTTPException(404, detail=f"unknown provider {body.provider}")
+        base_url = (provider_row["base_url"] or "").rstrip("/")
+        stored_key = provider_row.get("api_key") or ""
+        key_env = (body.key_env if body.key_env is not None
+                   else (provider_row.get("key_env") or ""))
+    elif body.base_url:
+        base_url = _clean_base_url(body.base_url)
+        key_env = body.key_env or ""
+    else:
+        raise HTTPException(422, detail="provider 或 base_url 至少提供一个")
+    api_key = body.api_key
+    if api_key is not None:
+        api_key = api_key.strip()
+    # credential order (§5.4): body.api_key -> stored key -> env(key_env)
+    key = api_key or stored_key or (os.environ.get(key_env, "") if key_env else "")
+    endpoint = f"{base_url}/models"
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    client: httpx.AsyncClient = request.app.state.http
+    try:
+        resp = await client.get(endpoint, headers=headers, timeout=10.0)
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, detail=f"无法连接上游 {endpoint}: {exc}") from exc
+    if resp.status_code >= 400:
+        snippet = (resp.text or "")[:300]
+        raise HTTPException(
+            502, detail=f"上游 {endpoint} 返回 HTTP {resp.status_code}: {snippet}")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise HTTPException(502, detail=f"上游 /models 不是 JSON: {exc}") from exc
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise HTTPException(502, detail="上游 /models 响应缺少 data 数组")
+    models = [{"id": item["id"],
+               "name": item.get("name") or item["id"]}
+              for item in items
+              if isinstance(item, dict) and isinstance(item.get("id"), str)]
+    return {"endpoint": endpoint, "models": models}
 
 
 # --------------------------------------------------------------------------- #

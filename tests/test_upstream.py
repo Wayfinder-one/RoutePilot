@@ -155,3 +155,149 @@ def test_latched_replica_keeps_window_while_db_row_is_fresh(tmp_path):
     b = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
     assert b.is_open("m") is True
     assert b.is_open("m") is True       # stays open on repeated checks
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-21 audit P0 2.2 / P2 4.3: failure() must re-arm the open clock, and
+# the DB sync is low-rate with writes only on state changes.
+# --------------------------------------------------------------------------- #
+def test_failed_probe_rearms_the_circuit():
+    """P0 2.2: after the half-open window a failed probe must close the circuit
+    again. The old setdefault kept the ORIGINAL opened_at, so one elapsed
+    window permanently disarmed the breaker (in memory AND via a latched DB
+    row)."""
+    import time
+
+    cb = CircuitBreaker(threshold=3, half_open_after=0.05)
+    cb.failure("m"); cb.failure("m"); cb.failure("m")
+    assert cb.is_open("m") is True
+    time.sleep(0.06)
+    assert cb.is_open("m") is False              # window elapsed -> probe
+    cb.failure("m")                              # probe failed
+    assert cb.is_open("m") is True               # circuit re-armed
+
+
+def test_stale_db_row_cannot_disarm_later_failures(tmp_path):
+    """P0 2.2 repro: latching an hours-old DB quarantine, then failing again,
+    must re-open the circuit from now (and refresh the DB row)."""
+    import time
+
+    db = _breaker_db(tmp_path)
+    conn = connect(db)
+    conn.execute("INSERT INTO breaker (model, failures, opened_at) "
+                 "VALUES ('m', 3, ?)", (time.time() - 1000.0,))
+    conn.commit()
+    conn.close()
+
+    cb = CircuitBreaker(threshold=3, half_open_after=60.0, db_path=db)
+    assert cb.is_open("m") is False              # stale row -> probe allowed
+    for _ in range(5):
+        cb.failure("m")
+        assert cb.is_open("m") is True           # stays re-armed
+    assert abs(_db_opened_at(db, "m") - time.time()) < 5.0
+
+
+def test_db_reads_are_rate_limited_per_model(tmp_path, monkeypatch):
+    """P2 4.3: is_open hits the DB at most once per db_sync_seconds per model."""
+    db = _breaker_db(tmp_path)
+    cb = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db,
+                        db_sync_seconds=30.0)
+    calls = []
+    original = cb._db_read
+
+    def counting(model):
+        calls.append(model)
+        return original(model)
+
+    monkeypatch.setattr(cb, "_db_read", counting)
+    for _ in range(3):
+        cb.is_open("m")
+    assert len(calls) == 1                       # first check only
+    cb._db_read_at["m"] = 0.0                    # pretend the window elapsed
+    cb.is_open("m")
+    assert len(calls) == 2
+
+
+def test_healthy_requests_never_write_the_breaker_table(tmp_path, monkeypatch):
+    """P2 4.3: success() without local failure state must not open the DB."""
+    db = _breaker_db(tmp_path)
+    cb = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
+    writes = []
+    monkeypatch.setattr(cb, "_db_write",
+                        lambda *a: writes.append(a))
+    cb.is_open("m")                              # reads once, no row
+    cb.success("m")
+    assert writes == []
+
+
+# --------------------------------------------------------------------------- #
+# v9: reasoning capability + stored-key priority in the backend snapshot
+# --------------------------------------------------------------------------- #
+def test_load_backends_carries_reasoning_and_provider(tmp_path):
+    import json
+
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+    seed_default(conn)
+    conn.execute("UPDATE providers SET reasoning_format = 'deepseek' "
+                 "WHERE name = 'local'")
+    conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                 (json.dumps({"domains": [], "reasoning": {
+                     "efforts": {"off": None, "high": None}}}),))
+    conn.commit()
+    backends = load_backends(conn)
+    backend = backends["qwen3-8b"]
+    assert backend.provider == "local"
+    assert backend.reasoning["declared"] is True
+    assert backend.reasoning["format"] == "deepseek"
+    assert backend.reasoning["efforts"] == [{"id": "off", "wire": None},
+                                            {"id": "high", "wire": None}]
+    assert backends["qwen3-32b"].reasoning is None      # undeclared -> passthrough
+    conn.close()
+
+
+def test_load_backends_ignores_corrupt_or_illegal_declarations(tmp_path):
+    import json
+
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+    seed_default(conn)
+    conn.execute("UPDATE models SET profile = 'not-json' WHERE id = 'qwen3-8b'")
+    conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-32b'",
+                 (json.dumps({"reasoning": {"format": "nope",
+                                            "efforts": {"high": "high"}}}),))
+    conn.execute("UPDATE models SET profile = ? WHERE id = 'deepseek-v3'",
+                 (json.dumps({"reasoning": False}),))
+    conn.commit()
+    backends = load_backends(conn)
+    assert backends["qwen3-8b"].reasoning is None      # corrupt JSON tolerated
+    assert backends["qwen3-32b"].reasoning is None     # illegal declaration tolerated
+    assert backends["deepseek-v3"].reasoning is None   # explicit "unsupported"
+    conn.close()
+
+
+def test_load_backends_stored_api_key_wins_over_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCAL_KEY", "env-secret")
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+    seed_default(conn)
+    conn.execute("UPDATE providers SET key_env = 'LOCAL_KEY' WHERE name = 'local'")
+    conn.commit()
+    # env only
+    assert load_backends(conn)["qwen3-8b"].headers["Authorization"] == \
+        "Bearer env-secret"
+    # stored key wins
+    conn.execute("UPDATE providers SET api_key = 'stored-secret' WHERE name = 'local'")
+    conn.commit()
+    assert load_backends(conn)["qwen3-8b"].headers["Authorization"] == \
+        "Bearer stored-secret"
+    # clearing the stored key falls back to the env
+    conn.execute("UPDATE providers SET api_key = '' WHERE name = 'local'")
+    conn.commit()
+    assert load_backends(conn)["qwen3-8b"].headers["Authorization"] == \
+        "Bearer env-secret"
+    # no key at all -> no Authorization header
+    conn.execute("UPDATE providers SET key_env = '' WHERE name = 'local'")
+    conn.commit()
+    assert "Authorization" not in load_backends(conn)["qwen3-8b"].headers
+    conn.close()

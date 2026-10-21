@@ -6,8 +6,10 @@
                action, model, min_score, weights[], children[]}
 
    A LEAF is terminal: direct hit (命中路由) or weighted scoring (weight chips +
-   达成率门槛). A FORK holds ordered children; the first child whose condition
-   matches is followed. Children are independent branches.
+   达成率门槛). A FORK holds ordered children; the first child that produces a
+   decision wins — when several matching children end in weighted leaves, the
+   highest score wins (direct-hit leaves keep their order). Children are
+   independent branches.
 
    Editing model:
    - a station is created by picking a type and a root condition (or an
@@ -31,6 +33,7 @@ let TIME_PERIODS = [];
 let serverOffsetMs = 0;
 let clockTimer = null;
 let MODELS = [];
+let MODEL_INFO = {};           // id -> normalized reasoning object (§3.2)
 let stations = [];             // API shape: [{id,type,name,root}]
 let version = '0';
 let tagger = {};
@@ -60,6 +63,18 @@ const groupName = g => t('group.' + g);
 const condText = n => n.signal
   ? `${sigName(n.signal)} = ${valLabel(n.signal, n.value) || n.value}`
   : t('p6.entry');
+
+/* ── model reasoning capability (docs §3.2) ──────────────────────────── */
+const FALLBACK_REASON = { declared: false, supported: null, format: null,
+  efforts: [], default: null };
+const modelReasoning = id => MODEL_INFO[id] || FALLBACK_REASON;
+const modelEfforts = id => {
+  const r = modelReasoning(id);
+  if (!r || !r.declared || r.supported === false) return [];
+  return Array.isArray(r.efforts) ? r.efforts : [];
+};
+const reasonName = lvl => t('reason.' + lvl);
+const reasonSuffix = n => (n && n.reasoning ? ' · ' + reasonName(n.reasoning) : '');
 
 /* ── tree helpers ────────────────────────────────────────────────────── */
 const findStation = id => stations.find(s => s.id === id);
@@ -141,8 +156,10 @@ function outcomeChip(n) {
   if (n.action === 'block') {
     return `<button class="tn-out block" data-out="${esc(n.id)}">${esc(t('pipe.block'))}</button>`;
   }
+  const rl = reasonSuffix(n);
   const text = n.model
-    ? esc(t('pipe.route')) + '<code>' + esc(n.model) + '</code>'
+    ? esc(t('pipe.route')) + '<code>' + esc(n.model) + '</code>' +
+      (rl ? `<span class="tn-reason${n.reasoning ? '' : ' auto'}">${esc(rl)}</span>` : '')
     : esc(t('p4.noModel'));
   return `<button class="tn-out ${n.model ? 'route' : 'todo'}" data-out="${esc(n.id)}">${text}</button>`;
 }
@@ -317,6 +334,7 @@ function newNode(station, signal, value) {
     conf_min: signal && !isRuleSig(signal) ? 0.7 : null,
     kind: 'leaf', action: 'route',
     model: MODELS[0] || '',
+    reasoning: null,
     min_score: null, weights: [], children: [],
   };
 }
@@ -331,6 +349,7 @@ function addChild(nodeId, signal, value) {
     node.kind = 'fork';
     node.action = 'route';
     node.model = null;
+    node.reasoning = null;
     node.min_score = null;
     node.weights = [];
     node.children = [newNode(station, signal, value)];
@@ -392,8 +411,8 @@ function addStation(signal, value) {
                  name: `${t('p6.stationName')} ${stations.length}`, root: null };
   if (signal === null) {
     body.root = { id: nid('n'), signal: null, value: '', conf_min: null,
-                  kind: 'fork', action: 'route', model: null, min_score: null,
-                  weights: [], children: [] };
+                  kind: 'fork', action: 'route', model: null, reasoning: null,
+                  min_score: null, weights: [], children: [] };
   } else {
     body.root = newNode(body, signal, value);
   }
@@ -447,7 +466,8 @@ function forkOnSignal(nodeId, signal) {
   const makeChild = value => ({
     id: nid('n'), signal, value: value == null ? '' : String(value),
     conf_min: isRuleSig(signal) ? null : 0.7, kind: 'leaf',
-    action: node.action, model: node.model, min_score: node.min_score,
+    action: node.action, model: node.model, reasoning: node.reasoning || null,
+    min_score: node.min_score,
     weights: otherWeights.map(w => ({ ...w })), children: [],
   });
   const children = used.map(makeChild);
@@ -458,6 +478,7 @@ function forkOnSignal(nodeId, signal) {
   node.children = children;
   node.action = 'route';
   node.model = null;
+  node.reasoning = null;
   node.min_score = null;
   markDirty();
   renderStation(station.id);
@@ -574,6 +595,30 @@ function openConditionEditor(nodeId) {
   });
 }
 
+/* leaf reasoning picker: only the efforts declared by the target model */
+function reasoningEditorHTML(node) {
+  const r = modelReasoning(node.model);
+  const efforts = modelEfforts(node.model);
+  const known = !!MODEL_INFO[node.model];
+  const current = node.reasoning || '';
+  const stale = !!current && !efforts.some(e => e.id === current);
+  const auto = `<option value="">${esc(t('reason.auto'))}</option>`;
+  const opts = auto + efforts.map(e => {
+    const def = e.id === r.default;
+    return `<option value="${esc(e.id)}"${e.id === current ? ' selected' : ''}>` +
+      `${esc(reasonName(e.id))}${def ? ' · ' + esc(t('models.reason.defaultMark')) : ''}</option>`;
+  }).join('') + (stale ? `<option value="${esc(current)}" selected>${esc(reasonName(current))} ⚠</option>` : '');
+  const disabled = !efforts.length && !stale;
+  let note;
+  if (stale) note = t('pipe.reasoning.stale');
+  else if (!efforts.length) note = known ? t('pipe.reasoning.disabled') : t('pipe.reasoning.unknown');
+  else note = t('pipe.reasoning.tip') +
+    (r.default ? ' · ' + tf('pipe.reasoning.default', { level: reasonName(r.default) }) : '');
+  return `<select class="pop-select${disabled ? ' is-off' : ''}" id="lfReasoning"${disabled ? ' disabled' : ''}>${opts}</select>
+    <p class="pop-note${stale ? ' bad' : ''}" id="lfReasonNote">${esc(note)}</p>
+    ${r.error ? `<p class="pop-note bad">${esc(tf('models.reason.error', { err: r.error }))}</p>` : ''}`;
+}
+
 /* leaf editor: action / model / min_score / weights */
 function openLeafEditor(nodeId) {
   const ref = findNodeRef(nodeId);
@@ -599,7 +644,9 @@ function openLeafEditor(nodeId) {
     ${node.action !== 'block' ? `
       <p class="pop-label">${esc(t('p4.model'))}</p>
       <input class="pop-text" id="lfModel" list="lfModels" value="${esc(node.model || '')}" placeholder="qwen3-8b">
-      <datalist id="lfModels">${MODELS.map(m => `<option value="${esc(m)}">`).join('')}</datalist>` : ''}
+      <datalist id="lfModels">${MODELS.map(m => `<option value="${esc(m)}">`).join('')}</datalist>
+      <p class="pop-label">${esc(t('pipe.reasoning'))}</p>
+      ${reasoningEditorHTML(node)}` : ''}
     ${(node.weights && node.weights.length) ? `
       <p class="pop-label">${esc(t('p6.weights'))}</p>
       <div class="wlist" id="lfWeights">${weightRows}</div>
@@ -614,7 +661,8 @@ function openLeafEditor(nodeId) {
     const b = e.target.closest('[data-act]');
     if (!b) return;
     node.action = b.dataset.act;
-    if (node.action === 'route' && !node.model) node.model = MODELS[0] || '';
+    if (node.action === 'block') node.reasoning = null;
+    else if (!node.model) node.model = MODELS[0] || '';
     markDirty();
     renderStation(station.id);
     openLeafEditor(nodeId);
@@ -622,8 +670,24 @@ function openLeafEditor(nodeId) {
   const modelInput = $('#lfModel');
   if (modelInput) modelInput.addEventListener('change', e => {
     node.model = e.target.value.trim() || null;
+    /* the model's declared default effort is preselected *explicitly* (visible
+       in the UI); undeclared/unsupported models fall back to passthrough */
+    const r = modelReasoning(node.model);
+    const efforts = modelEfforts(node.model);
+    const def = r && r.declared && r.supported !== false && r.default &&
+      efforts.some(x => x.id === r.default) ? r.default : null;
+    node.reasoning = def;
     markDirty();
     renderStation(station.id);
+    openLeafEditor(nodeId);
+  });
+  const reasonSelect = $('#lfReasoning');
+  if (reasonSelect) reasonSelect.addEventListener('change', e => {
+    node.reasoning = e.target.value || null;
+    markDirty();
+    renderStation(station.id);
+    const note = $('#lfReasonNote');
+    if (note) note.classList.toggle('bad', false);
   });
   if (node.weights && node.weights.length) {
     wireRange('lfMin', {
@@ -1093,7 +1157,8 @@ function renderTry() {
   const badge = d.kind === 'route' ? t('pipe.try.finalhit')
     : d.kind === 'block' ? t('pipe.try.finalblock') : t('pipe.try.finalnone');
   const label = d.kind === 'block' ? '✕ ' + t('pipe.try.finalblock')
-    : d.kind === 'route' ? '→ ' + (d.model || '—')
+    : d.kind === 'route'
+      ? '→ ' + (d.model || '—') + (d.reasoning ? ' · ' + reasonName(d.reasoning) : '')
       : t('pipe.try.finalnone');
   const station = d.station_id ? findStation(d.station_id) : null;
   let html = dirtyWarning() + `<div class="final ${cls}">
@@ -1182,6 +1247,7 @@ function normalizeImported(raw) {
       conf_min: n.conf_min != null ? Number(n.conf_min) : null,
       kind, action: n.action === 'block' ? 'block' : 'route',
       model: n.model || null,
+      reasoning: n.reasoning == null || n.reasoning === '' ? null : String(n.reasoning),
       min_score: n.min_score != null ? Number(n.min_score) : null,
       weights: (n.weights || []).map(w => ({
         signal: String(w.signal), value: String(w.value ?? ''),
@@ -1270,7 +1336,13 @@ async function boot() {
     TIME_PERIODS = sigBody.time_periods || [];
     if (sigBody.now) serverOffsetMs = new Date(sigBody.now).getTime() - Date.now();
     startServerClock();
-    MODELS = (modelBody.models || []).map(m => m.id);
+    const modelRows = modelBody.models || [];
+    MODELS = modelRows.map(m => m.id);
+    MODEL_INFO = {};
+    modelRows.forEach(m => {
+      MODEL_INFO[m.id] = (m.reasoning && typeof m.reasoning === 'object')
+        ? m.reasoning : { ...FALLBACK_REASON };
+    });
     stations = pipeBody.stations || [];
     version = String(pipeBody.version || '0');
     tagger = tagBody.tagger || {};

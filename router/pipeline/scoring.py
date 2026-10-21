@@ -3,14 +3,16 @@
 A leaf with weighted conditions scores
 ``score = sum(w*c*m) / sum(w)`` — the weighted attainment rate, always in
 [0,1] because every term w*c*m <= w. ``passed`` requires at least one weight
-and ``score >= min_score`` (leaf-level, default 0). Leaves without weights are
-direct hits and never call this module.
+and ``score >= min_score`` (leaf-level; unconfigured leaves fall back to
+``DEFAULT_MIN_SCORE`` = 0.5, matching the console's editor default — audit
+P1 3.2: the old 0.0 fallback let a weighted leaf pass with zero attainment).
+Leaves without weights are direct hits and never call this module.
 """
 
 from __future__ import annotations
 
 from router.pipeline.matching import match_row
-from router.pipeline.model import Weight
+from router.pipeline.model import DEFAULT_MIN_SCORE, Weight
 
 
 def leaf_score(weights: list[Weight], signals: dict,
@@ -24,7 +26,7 @@ def leaf_score(weights: list[Weight], signals: dict,
     sum_w = sum(line["weight"] for line in lines)
     total = sum(line["contrib"] for line in lines)
     score = total / sum_w if sum_w > 0 else 0.0
-    floor = 0.0 if min_score is None else min_score
+    floor = DEFAULT_MIN_SCORE if min_score is None else min_score
     return {"lines": lines, "sum_w": sum_w, "score": score,
             "min_score": floor,
             "passed": sum_w > 0 and score >= floor}

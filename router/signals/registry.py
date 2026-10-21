@@ -78,12 +78,14 @@ _SPECS = (
     SignalSpec("turns", "轮次", "Turns", "context", "rule",
                values=(("0", "首轮", "First"), ("1", "多轮", "Multi"),
                        ("2", "长对话", "Long"))),
+    # language: the rule path (signals/rules.py) only ever emits zh/en — the
+    # old "other" value was unreachable dead palette weight (audit §5).
     SignalSpec("language", "语言", "Language", "context", "rule",
-               values=(("zh", "中文", "Chinese"), ("en", "英文", "English"),
-                       ("other", "其他", "Other"))),
+               values=(("zh", "中文", "Chinese"), ("en", "英文", "English"))),
+    # structure: the rule path only emits code/multiline/plain (no "json").
     SignalSpec("structure", "结构", "Structure", "context", "rule",
-               values=(("code", "代码", "Code"), ("json", "JSON", "JSON"),
-                       ("multiline", "多行", "Multiline"), ("plain", "纯文本", "Plain"))),
+               values=(("code", "代码", "Code"), ("multiline", "多行", "Multiline"),
+                       ("plain", "纯文本", "Plain"))),
     SignalSpec("similarity", "相似度", "Similarity", "session", "model",
                values=(("2", "很高", "High"), ("1", "一般", "Medium"),
                        ("0", "很低", "Low"))),

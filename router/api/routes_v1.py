@@ -6,6 +6,7 @@ database — only the async request logger touches it.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from datetime import datetime
@@ -19,9 +20,12 @@ from router.api.sessions import read_last_vec, session_id_from
 from router.api.upstream import resolve_backend
 from router.pipeline.engine import evaluate
 from router.pipeline.scope import compute_signal_scope
+from router.reasoning import ReasoningError, apply_reasoning
 from router.signals.tagger import TagRequest
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 BLOCK_MESSAGE = {"zh": "请求被安全策略拦截", "en": "Blocked by safety policy"}
 
@@ -58,17 +62,51 @@ async def chat_completions(request: Request):
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages),
         last_vec=read_last_vec(request, sid), scope=scope))
-    # M4: the optional session pre-stage can short-circuit the pipeline (sticky
-    # or escalated). Tagging still happens so signals/replay data stay complete.
-    cont = continuation(request, sid)
-    if cont is not None:
-        decision, session_state = cont
-        trace = []
-    else:
-        decision, trace = evaluate(stations, result.signals)
-        session_state = "new"
+    # M4: the optional session pre-stage picks the model (sticky or escalated)
+    # but must never bypass the safety gates (2026-10-21 audit P0 2.1).
+    # evaluate() always runs; a block decision wins, and continuation only
+    # replaces a route/none outcome. Blocked requests therefore keep the full
+    # pipeline trace in the request log, and the continuation DB read is
+    # skipped entirely for them.
+    decision, trace = evaluate(stations, result.signals)
+    session_state = "new"
+    if decision.kind != "block":
+        cont = continuation(request, sid)
+        if cont is not None:
+            decision, session_state = cont
+            trace = []
     extra = ({"x-sr-session-state": session_state}
              if request.app.state.settings.sessions else {})
+
+    # ---- upstream body + reasoning injection (§6) -------------------------
+    # decision.reasoning is None -> FULL passthrough: only `model` is replaced,
+    # client reasoning fields are neither injected nor stripped. A configured
+    # level that the current capability snapshot cannot honour (concurrent
+    # config edit) degrades to passthrough + a warning header instead of
+    # failing the user's request.
+    backend = None
+    upstream_body = None
+    reasoning_level = decision.reasoning
+    reasoning_warning = None
+    if decision.kind == "route" and decision.model:
+        try:
+            backend = resolve_backend(request.app.state.backends, decision.model)
+        except KeyError:
+            backend = None
+        if backend is not None:
+            base_body = {**body, "model": backend.upstream_name}
+            if reasoning_level is None:
+                upstream_body = base_body
+            else:
+                try:
+                    upstream_body = apply_reasoning(
+                        base_body, backend.reasoning, reasoning_level)
+                except ReasoningError as exc:
+                    reasoning_warning = "unsupported"
+                    upstream_body = base_body
+                    logger.warning(
+                        "reasoning fallback model=%s level=%s: %s",
+                        decision.model, reasoning_level, exc)
 
     request.app.state.requestlog.enqueue({
         "id": uuid.uuid4().hex,
@@ -76,6 +114,8 @@ async def chat_completions(request: Request):
         "text": text, "decision": decision.kind, "model": decision.model,
         "node_id": decision.station_id, "branch_id": decision.node_id,
         "score": decision.score,
+        "reasoning": reasoning_level,
+        "reasoning_warning": reasoning_warning,
         "latency_ms": (time.monotonic() - started) * 1000,
         "trace": trace, "session_state": session_state,
         "signals": result.signals,
@@ -88,10 +128,7 @@ async def chat_completions(request: Request):
     if decision.kind != "route" or not decision.model:
         return JSONResponse(status_code=502, headers=extra,
                             content={"error": {"message": "no_route"}})
-
-    try:
-        backend = resolve_backend(request.app.state.backends, decision.model)
-    except KeyError:
+    if backend is None:
         return JSONResponse(status_code=502, headers=extra,
                             content={"error": {"message": "unknown_model"}})
 
@@ -101,8 +138,11 @@ async def chat_completions(request: Request):
             "error": {"message": "model_circuit_open", "model": decision.model}})
 
     client: httpx.AsyncClient = request.app.state.http
-    upstream_body = {**body, "model": backend.upstream_name}
     headers = {"x-sr-model": decision.model, **extra}
+    if reasoning_warning:
+        headers["x-sr-reasoning-warning"] = reasoning_warning
+    elif reasoning_level is not None:
+        headers["x-sr-reasoning"] = reasoning_level
     try:
         if body.get("stream"):
             return await _stream(client, backend, upstream_body, headers,

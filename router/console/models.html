@@ -18,26 +18,23 @@
   </div>
 </div>
 <main class="page">
-  <div class="settings-grid">
-    <div class="card">
-      <div class="col-h" data-i18n="models.models"></div>
-      <table class="list" id="modelTable"></table>
-      <div class="addrow" style="margin-top:8px">
-        <button class="btn pri sm" id="saveModels" data-i18n="models.savemodels"></button>
-      </div>
+  <div class="card" id="registryCard">
+    <div class="col-h">
+      <span data-i18n="models.models"></span>
+      <span class="mut" id="modelCount"></span>
+      <button class="btn pri sm push-right" id="addModel" data-i18n="models.addmodel"></button>
     </div>
-    <div class="card" id="engineCard"></div>
+    <table class="list" id="modelTable"></table>
+    <div class="footnote" data-i18n="models.registryHint"></div>
   </div>
 
-  <div class="settings-grid" style="margin-top:12px">
-    <div class="card">
-      <div class="col-h" data-i18n="models.providers"></div>
-      <div id="providers"></div>
-      <div class="addrow" style="margin-top:8px">
-        <button class="btn sm" id="addProvider" data-i18n="models.addprovider"></button>
-        <button class="btn pri sm" id="saveProviders" data-i18n="models.saveproviders"></button>
-      </div>
+  <div class="card" id="providersCard">
+    <div class="col-h">
+      <span data-i18n="models.providers"></span>
+      <span class="mut" id="provCount"></span>
+      <button class="btn sm push-right" id="addProvider" data-i18n="models.addprovider"></button>
     </div>
+    <div class="prov-grid" id="providers"></div>
   </div>
 
   <div class="settings-grid" style="margin-top:12px">
@@ -56,10 +53,49 @@
         <button class="btn pri sm" id="saveToken" data-i18n="models.savetoken"></button>
         <button class="btn sm" id="clearToken" data-i18n="models.cleartoken"></button>
       </div>
-      <div class="footnote">/admin 与 console 的所有请求都会带上该令牌；只保存在本浏览器。</div>
+      <div class="footnote" data-i18n="models.tokenHint"></div>
     </div>
   </div>
+
+  <div class="card" id="engineCard"></div>
 </main>
+
+<!-- 添加 / 编辑模型：预置目录（多选）与自定义两种路径 -->
+<div class="modal" id="modelModal" hidden role="dialog" aria-modal="true" aria-labelledby="modelModalTitle">
+  <div class="modal-card">
+    <div class="modal-h">
+      <b id="modelModalTitle"></b>
+      <button class="modal-x" data-close="modelModal" data-i18n-aria="common.close" aria-label="关闭">✕</button>
+    </div>
+    <div class="mtabs" id="modelTabs">
+      <button class="mtab on" data-tab="preset" data-i18n="models.tab.preset"></button>
+      <button class="mtab" data-tab="custom" data-i18n="models.tab.custom"></button>
+    </div>
+    <div class="modal-body" id="modelModalBody"></div>
+    <div class="modal-foot">
+      <span class="modal-msg" id="modelModalMsg"></span>
+      <button class="btn" data-close="modelModal" data-i18n="common.cancel"></button>
+      <button class="btn pri" id="modelModalSave" data-i18n="models.save"></button>
+    </div>
+  </div>
+</div>
+
+<!-- 添加 / 编辑提供方 -->
+<div class="modal" id="provModal" hidden role="dialog" aria-modal="true" aria-labelledby="provModalTitle">
+  <div class="modal-card" style="width:min(560px,100%)">
+    <div class="modal-h">
+      <b id="provModalTitle"></b>
+      <button class="modal-x" data-close="provModal" data-i18n-aria="common.close" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body" id="provModalBody"></div>
+    <div class="modal-foot">
+      <span class="modal-msg" id="provModalMsg"></span>
+      <button class="btn" data-close="provModal" data-i18n="common.cancel"></button>
+      <button class="btn pri" id="provModalSave" data-i18n="models.saveproviders"></button>
+    </div>
+  </div>
+</div>
+
 <script src="i18n.js"></script>
 <script src="nav.js"></script>
 <script src="api.js"></script>

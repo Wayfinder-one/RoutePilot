@@ -94,13 +94,18 @@ def default_pipeline(calibration: str = "default") -> list[Station]:
 def seed_default(conn: sqlite3.Connection, calibration: str = "heuristic") -> None:
     if conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0]:
         return                                  # idempotent: only seed an empty DB
-    conn.execute("INSERT OR IGNORE INTO providers VALUES ('local', "
-                 "'http://127.0.0.1:9000', '')")
+    # Explicit column lists: v9 widened `providers` (reasoning_format/api_key),
+    # so a bare `VALUES (...)` would break on the new table width.
+    conn.execute("INSERT OR IGNORE INTO providers "
+                 "(name, base_url, key_env, reasoning_format, api_key) "
+                 "VALUES ('local', 'http://127.0.0.1:9000', '', 'openai', '')")
     for mid, upstream, provider, profile in DEFAULT_MODELS:
-        conn.execute("INSERT OR IGNORE INTO models VALUES (?, ?, ?, ?)",
+        conn.execute("INSERT OR IGNORE INTO models "
+                     "(id, upstream, provider, profile) VALUES (?, ?, ?, ?)",
                      (mid, upstream, provider, json.dumps(profile)))
     for name, words in DEFAULT_KEYWORD_GROUPS.items():
-        conn.execute("INSERT OR IGNORE INTO keyword_groups VALUES (?, ?)",
+        conn.execute("INSERT OR IGNORE INTO keyword_groups (name, words) "
+                     "VALUES (?, ?)",
                      (name, json.dumps(words, ensure_ascii=False)))
     StationRepo(conn).save(default_pipeline(calibration))
     conn.commit()
@@ -140,6 +145,22 @@ class ModelRepo:
                                 (model_id,)).fetchone()
         return dict(row) if row else None
 
+    def create(self, model_id: str, upstream: str, provider: str,
+               profile: str = "{}") -> bool:
+        """Insert one model row; False when the id already exists (409 at API)."""
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO models (id, upstream, provider, profile) "
+                "VALUES (?, ?, ?, ?)",
+                (model_id, upstream, provider, profile))
+        return cur.rowcount > 0
+
+    def delete(self, model_id: str) -> bool:
+        with self.conn:
+            cur = self.conn.execute("DELETE FROM models WHERE id = ?",
+                                    (model_id,))
+        return cur.rowcount > 0
+
     def update(self, model_id: str, *, upstream: str | None = None,
                provider: str | None = None, profile: str | None = None) -> bool:
         """Patch only the provided fields; False when the model is unknown."""
@@ -158,6 +179,31 @@ class ModelRepo:
         return cur.rowcount > 0
 
 
+def model_references(stations: list[Station], model_id: str) -> list[dict]:
+    """分树里引用 ``model_id`` 的路由叶子：``[{station, node}]``（删除前 409 用）。"""
+    refs: list[dict] = []
+
+    def walk(station: Station, node: TreeNode) -> None:
+        if (node.kind == "leaf" and node.action == "route"
+                and node.model == model_id):
+            refs.append({"station": station.id, "node": node.id})
+        for child in node.children:
+            walk(station, child)
+
+    for station in stations:
+        if station.root is not None:
+            walk(station, station.root)
+    return refs
+
+
+def model_ids_using_provider(conn: sqlite3.Connection,
+                             provider_name: str) -> list[str]:
+    """引用该提供方的模型 id（删除提供方前 409 用）。"""
+    return [r["id"] for r in conn.execute(
+        "SELECT id FROM models WHERE provider = ? ORDER BY id",
+        (provider_name,))]
+
+
 class ProviderRepo:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
@@ -166,12 +212,38 @@ class ProviderRepo:
         return [dict(r) for r in
                 self.conn.execute("SELECT * FROM providers ORDER BY name")]
 
-    def upsert(self, name: str, base_url: str, key_env: str = "") -> None:
+    def get(self, name: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM providers WHERE name = ?",
+                                (name,)).fetchone()
+        return dict(row) if row else None
+
+    def upsert(self, name: str, base_url: str, *, key_env: str | None = None,
+               reasoning_format: str | None = None,
+               api_key: str | None = None) -> None:
+        """Insert-or-update. ``None`` = 保持现有值（新行用默认：''/openai/''）。"""
+        existing = self.get(name)
+        new_key_env = (existing or {}).get("key_env", "") \
+            if key_env is None else key_env
+        new_fmt = (existing or {}).get("reasoning_format", "openai") \
+            if reasoning_format is None else reasoning_format
+        new_api_key = (existing or {}).get("api_key", "") \
+            if api_key is None else api_key
         with self.conn:
             self.conn.execute(
-                "INSERT INTO providers VALUES (?, ?, ?) "
+                "INSERT INTO providers "
+                "(name, base_url, key_env, reasoning_format, api_key) "
+                "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET base_url = excluded.base_url, "
-                "key_env = excluded.key_env", (name, base_url, key_env))
+                "key_env = excluded.key_env, "
+                "reasoning_format = excluded.reasoning_format, "
+                "api_key = excluded.api_key",
+                (name, base_url, new_key_env, new_fmt, new_api_key))
+
+    def delete(self, name: str) -> bool:
+        with self.conn:
+            cur = self.conn.execute("DELETE FROM providers WHERE name = ?",
+                                    (name,))
+        return cur.rowcount > 0
 
 
 class KeywordRepo:

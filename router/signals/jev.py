@@ -32,7 +32,8 @@ wording-sensitive signal (canonical .802 vs .945 reworded). Do not paraphrase
 ``instructions[0]`` without re-running the eval (``results/jev_r4/README.md`` in
 the training repo). Candidate order is free; input length is capped by
 ``model.json`` / ``ROUTER_JEV_MAX_LENGTH`` (1024) and longer requests have their
-context shrunk (last resort: token-truncated) instead of failing.
+context shrunk (last resort: left-truncated, which keeps the question/options
+tail) instead of failing.
 
 **Pipeline-aware trimming** (``TagRequest.scope``): the routing tree only reads
 the signals that appear as rows, so the hot path passes a
@@ -84,8 +85,12 @@ NOUL_VALUES: dict[str, tuple[str, str]] = {
     "fact_check": ("needs_check", "no_check"),
     "complexity": ("hard", "easy"),
 }
-#: PII: hits are written as a sorted list of canonical types.
+#: PII: hits are written as a sorted list of canonical types. A candidate must
+#: be strictly above 0.5 (a perfectly neutral output, raw logit 0 → p_yes 0.5,
+#: is not evidence) AND carry at least this much binary-entropy confidence
+#: (audit P2 4.2). Regex hits from ``merge_rule_pii`` enter at confidence 1.0.
 PII_HIT_THRESHOLD = 0.5
+PII_MIN_CONFIDENCE = 0.2
 
 
 class JevTaggerError(Exception):
@@ -218,6 +223,11 @@ def build_signal_records(cfg: dict, text: str,
             candidates = entry["candidates"]
             keys = list(candidates)
             record["question"] = entry["instructions"][0]
+            # Option labels intentionally render the zh form regardless of the
+            # request language: the deployed model was calibrated on this
+            # exact rendering, and rewording drifts accuracy (see the
+            # canonical-wording note in the module docstring). The en labels
+            # in the config are for the console palette/display only.
             record["options"] = [
                 f"{key}: {value.get('zh') if isinstance(value, dict) else value}"
                 for key, value in candidates.items()]
@@ -247,7 +257,9 @@ def decode_choice(record: dict, probs: list[float]) -> dict:
 def decode_noul(record: dict, probs: list[float], *, positive: str,
                 negative: str) -> dict:
     p_yes = probs[1]
-    return {"value": positive if p_yes >= 0.5 else negative,
+    # Strictly greater: at p_yes == 0.5 the model has no evidence either way,
+    # and the positive class is the intercepting one for jailbreak (P2 4.2).
+    return {"value": positive if p_yes > 0.5 else negative,
             "confidence": entropy_confidence(probs), "is_rule": False}
 
 
@@ -295,6 +307,11 @@ class JevTagger:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
             self.model_binding = f"merged:{self.model_dir}"
         self.tokenizer.padding_side = "right"
+        # candidate_prompts puts the shared context FIRST and the question +
+        # Yes/No options LAST, so the final token-truncation fallback must keep
+        # the tail: the HF default 'right' side would cut the question off and
+        # score a context-only prompt (audit P1 3.1).
+        self.tokenizer.truncation_side = "left"
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.backbone = getattr(self.model, "model", self.model).language_model
@@ -346,7 +363,8 @@ class JevTagger:
         prompts, counts = self._render(records)
         enc = self.tokenizer(prompts, padding=True, truncation=True,
                              max_length=self.max_length, return_tensors="pt")
-        logger.warning("JEV input still too long after shrinking; token-truncated")
+        logger.warning("JEV input still too long after shrinking; "
+                       "left-truncated (question/options kept)")
         return enc, counts
 
     #: Fallback chunking for very long inputs: at most this many candidate
@@ -453,9 +471,14 @@ class JevTagger:
             conf_by_value: dict[str, float] = {}
             for item, prob in pii_items:
                 p_yes = prob[1]
-                if p_yes >= PII_HIT_THRESHOLD:
+                conf = binary_entropy_confidence(p_yes)
+                # Strictly above neutral AND confident enough to matter
+                # (P2 4.2): a barely-positive p_yes records noise, and the
+                # signal-level conf it produces (≈0) can never pass a
+                # condition floor anyway.
+                if p_yes > PII_HIT_THRESHOLD and conf >= PII_MIN_CONFIDENCE:
                     hits.append(item["sub"])
-                    conf_by_value[item["sub"]] = binary_entropy_confidence(p_yes)
+                    conf_by_value[item["sub"]] = conf
             signals["pii"] = {
                 "value": sorted(hits),
                 "confidence": max(conf_by_value.values()) if conf_by_value else None,
