@@ -19,7 +19,7 @@ from router.pipeline.matching import match_row
 from router.signals.checkpoint import (CheckpointError, binary_entropy_confidence,
                                        canonical_label, entropy_confidence,
                                        l2_normalize, load_and_validate, sigmoid,
-                                       softmax, similarity_signals)
+                                       softmax)
 
 FIXTURE_TAGS = Path(__file__).parent / "fixtures" / "checkpoint_tags.json"
 
@@ -76,21 +76,9 @@ def test_binary_entropy_confidence():
     assert 0.0 < binary_entropy_confidence(0.9) < 1.0
 
 
-def test_l2_normalize_and_similarity_bands():
+def test_l2_normalize():
     v = l2_normalize([3.0, 4.0])
     assert v == pytest.approx([0.6, 0.8])
-    assert similarity_signals(v, None)[0]["value"] == 0        # no history
-    assert similarity_signals(v, v)[0]["value"] == 2           # cos = 1
-    assert similarity_signals(v, v)[1]["value"] == "yes"
-    # orthogonal => cos 0 => band 0, clamp keeps it >= 0
-    sim, reask = similarity_signals([1.0, 0.0], [0.0, 1.0])
-    assert sim["value"] == 0 and sim["confidence"] == 0.0
-    assert reask["value"] == "no"
-
-
-def test_similarity_clamps_negative_cosine():
-    sim, _ = similarity_signals([1.0, 0.0], [-1.0, 0.0])   # cos = -1
-    assert sim["confidence"] == 0.0                         # clamped to [0,1]
 
 
 def test_match_row_prefers_conf_by_value_for_multi():

@@ -98,14 +98,14 @@ def test_tag_returns_full_pack_with_rule_signals_and_no_embedding():
     t = tagger(lambda req: chat_response(json.dumps(VALID)))
     result = tag(t)
     signals = result.signals
-    assert set(signals) == set(SIGNALS)                  # all 17 signals
+    assert set(signals) == set(SIGNALS) - {"similarity", "reask"}  # session signals removed
     assert signals["domain"] == {"value": "computer_science",
                                  "confidence": 0.9, "is_rule": False}
     assert signals["pii"]["value"] == ["cn_id_card", "password"]
     assert signals["pii"]["conf_by_value"]["password"] == pytest.approx(0.8)
     assert signals["language"]["is_rule"] is True        # rules still local
     assert signals["user_feedback"]["value"] is None     # single turn
-    assert signals["similarity"]["value"] == 0 and result.vec is None
+    assert result.vec is None
     assert t.stats["calls"] == 1 and t.stats["errors"] == 0
     assert t.stats["prompt_tokens"] == 100
 

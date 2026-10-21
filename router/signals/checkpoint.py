@@ -12,8 +12,9 @@ Three things this module exists for:
    fallback. We reuse the training repo's ``normalize_label`` when importable.
 2. **Confidence** ``c = 1 - H(p) / log K`` for classification heads; per-type
    binary entropy for pii, written to ``conf_by_value`` (design section 2.2/2.3).
-3. **Embedding** -> ``similarity`` (3 bands) / ``reask`` against ``last_vec``,
-   cosine clamped to [0,1] so the score bound in section 3.3 holds.
+3. **Embedding** — the embedding head output is exposed as ``TagResult.vec``
+   only (the similarity/reask signals were removed 2026-10-21); it is still
+   passed through ``l2_normalize`` for the /admin/try display.
 
 torch / transformers and the training package are imported lazily: validation
 and all pure helpers work (and are unit-tested) without a GPU or torch.
@@ -290,25 +291,6 @@ def l2_normalize(vec: list[float]) -> list[float]:
     return [v / norm for v in vec]
 
 
-def similarity_signals(vec: list[float], last_vec: list[float] | None
-                       ) -> tuple[dict, dict]:
-    """Embedding cosine -> similarity (0/1/2) and reask (yes/no).
-
-    Cosine is clamped to [0,1] (design 2.3): a negative cosine would produce a
-    negative confidence and break the score bound in 3.3.
-    """
-    if not last_vec:
-        return ({"value": 0, "confidence": None, "is_rule": False},
-                {"value": "no", "confidence": None, "is_rule": False})
-    dim = min(len(vec), len(last_vec))
-    cos = sum(vec[i] * last_vec[i] for i in range(dim))
-    cos = max(0.0, min(1.0, cos))
-    band = 0 if cos < 0.55 else (1 if cos < 0.85 else 2)
-    return ({"value": band, "confidence": cos, "is_rule": False},
-            {"value": "yes" if cos >= 0.85 else "no", "confidence": cos,
-             "is_rule": False})
-
-
 # --------------------------------------------------------------------------- #
 # Tagger
 # --------------------------------------------------------------------------- #
@@ -420,8 +402,6 @@ class CheckpointTagger:
             signals["user_feedback"] = {"value": None, "confidence": None,
                                         "is_rule": False}
         vec = l2_normalize([float(x) for x in out_row["embedding"]])
-        sim, reask = similarity_signals(vec, req.last_vec)
-        signals["similarity"], signals["reask"] = sim, reask
         return signals, vec
 
     async def tag(self, req: TagRequest) -> TagResult:

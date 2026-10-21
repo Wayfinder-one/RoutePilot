@@ -75,7 +75,7 @@ def tag(tagger, req):
 def test_full_pack_and_canonical_values(tmp_path):
     tagger, _ = build(tmp_path)
     s = tag(tagger, TagRequest(text="hello"))
-    assert set(s) == set(SIGNALS)
+    assert set(s) == set(SIGNALS) - {"similarity", "reask"}  # session signals removed
     assert s["domain"]["value"] == "biology"
     assert s["complexity"]["value"] == "easy"
     assert s["jailbreak"]["value"] == "benign"
@@ -83,7 +83,6 @@ def test_full_pack_and_canonical_values(tmp_path):
     assert s["modality"]["value"] == "text"
     assert s["pii"]["value"] == []
     assert s["user_feedback"]["value"] is None            # single turn
-    assert s["similarity"]["value"] == 0 and s["reask"]["value"] == "no"
     assert s["domain"]["confidence"] > 0.5                # a real, uncapped conf
     assert s["language"]["is_rule"] is True
 
@@ -99,15 +98,6 @@ def test_pii_conf_by_value(tmp_path):
     assert s["pii"]["value"] == ["cn_id_card"]
     assert s["pii"]["conf_by_value"]["cn_id_card"] > 0.9
     assert s["pii"]["confidence"] == s["pii"]["conf_by_value"]["cn_id_card"]
-
-
-def test_similarity_uses_last_vec(tmp_path):
-    tagger, _ = build(tmp_path)
-    first = asyncio.run(tagger.tag(TagRequest(text="hello")))
-    assert first.vec is not None
-    s = tag(tagger, TagRequest(text="hello", last_vec=first.vec))
-    assert s["similarity"]["value"] == 2                  # identical embedding
-    assert s["reask"]["value"] == "yes"
 
 
 def test_validation_blocks_mismatched_checkpoint(tmp_path):

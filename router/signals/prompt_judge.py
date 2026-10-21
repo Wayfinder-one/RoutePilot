@@ -9,9 +9,8 @@ OpenAI-compatible chat endpoint, and parses one JSON answer:
                  "pii": {"values": [...], "conf_by_value": {...}}}}
 
 Rule signals are still computed locally (``signals/rules.py``), exactly as in
-the checkpoint tagger. Session signals (``similarity``/``reask``) need an
-embedding, which this mode does not produce, so they are reported as "no
-history" (0 / "no", confidence None) — a documented limitation of the mode.
+the checkpoint tagger. (The session signals ``similarity``/``reask`` were
+removed 2026-10-21; this mode never had an embedding head anyway.)
 
 The prompt config is JSON (``configs/signal_prompts.json`` by default, or
 ``ROUTER_SIGNAL_PROMPTS``). Allowed value keys come from the signal registry
@@ -35,8 +34,9 @@ from router.signals.tagger import TagRequest, TagResult
 
 logger = logging.getLogger(__name__)
 
-#: Model signals judged by the prompt (the two session/embedding signals are
-#: not judged: they need the previous-turn embedding).
+#: Model signals judged by the prompt. similarity/reask stay excluded here even
+#: though the registry still declares them — those session signals were removed
+#: 2026-10-21 and their registry specs go away in the follow-up task.
 JUDGED_SIGNALS: tuple[str, ...] = tuple(
     key for key, spec in SIGNALS.items()
     if spec.kind == "model" and key not in ("similarity", "reask"))
@@ -286,7 +286,4 @@ class PromptJudgeTagger:
         judged.update(rule_signals(req.text, req.headers, req.n_messages,
                                    self.kw_groups, time_periods=self.time_periods))
         merge_rule_pii(judged, req.text)
-        # this mode has no embedding => report "no session history"
-        judged["similarity"] = {"value": 0, "confidence": None, "is_rule": False}
-        judged["reask"] = {"value": "no", "confidence": None, "is_rule": False}
         return TagResult(signals=judged, vec=None)

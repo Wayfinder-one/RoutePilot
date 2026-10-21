@@ -86,10 +86,9 @@ class HeuristicTagger:
         # pii: per-type presence
         pii = rule_pii_hits(text)
         s["pii"] = _sig(pii, CAP if pii else None, False)
-        # session signals: single-turn request has no history
+        # user_feedback is judged from this request's own content (no session
+        # state; similarity/reask signals were removed 2026-10-21)
         s["user_feedback"] = _sig(None, None, False)
-        s["similarity"] = _sig(0, None, False)
-        s["reask"] = _sig("no", None, False)
         return s
 
     def _tag(self, req: TagRequest) -> dict:

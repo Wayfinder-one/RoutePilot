@@ -18,7 +18,6 @@ class TagRequest:
     text: str
     headers: dict = field(default_factory=dict)
     n_messages: int = 1
-    last_vec: list[float] | None = None   # previous turn embedding (similarity/reask)
     #: Optional pipeline-derived trimming hint: the model signals and PII
     #: subtypes this request can actually be matched on
     #: (``router.pipeline.scope.compute_signal_scope``). ``None`` = compute the

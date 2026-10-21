@@ -14,8 +14,8 @@ This module keeps the same contracts as :class:`CheckpointTagger`:
   ``text_image``, ``satisfied`` ...);
 * confidence is ``1 - H(p)/log K`` for choices and binary entropy for the
   per-type PII probabilities, so downstream score/gate semantics are unchanged;
-* rule signals are computed locally, ``similarity``/``reask`` are "no history"
-  (this mode has no embedding head — a documented limitation);
+* rule signals are computed locally; ``similarity``/``reask`` signals no longer
+  exist (session feature removed 2026-10-21);
 * ``user_feedback`` is null for single-turn requests.
 
 The question wording is a JSON config (``configs/signal_questions.json`` or
@@ -483,9 +483,6 @@ class JevTagger:
                 "value": sorted(hits),
                 "confidence": max(conf_by_value.values()) if conf_by_value else None,
                 "conf_by_value": conf_by_value, "is_rule": False}
-        # No embedding head in this mode (documented limitation).
-        signals["similarity"] = {"value": 0, "confidence": None, "is_rule": False}
-        signals["reask"] = {"value": "no", "confidence": None, "is_rule": False}
         return signals
 
     def _tag_row(self, req: TagRequest) -> tuple[dict, None]:

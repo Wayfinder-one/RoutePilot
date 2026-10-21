@@ -182,8 +182,6 @@ def test_signal_pack_maps_probabilities_to_product_values(monkeypatch):
     assert signals["user_feedback"]["value"] == "want_different"
     assert signals["pii"]["value"] == ["cn_id_card"]
     assert "cn_id_card" in signals["pii"]["conf_by_value"]
-    assert signals["similarity"]["value"] == 0
-    assert signals["reask"]["value"] == "no"
 
 
 def test_single_turn_nulls_user_feedback(monkeypatch):
@@ -311,8 +309,7 @@ def test_unreferenced_signals_are_not_scored(monkeypatch):
     assert cfg["fact_check"]["instructions"][0] not in questions
     assert cfg["modality"]["instructions"][0] not in questions
     assert cfg["user_feedback"]["instructions"][0] not in questions
-    assert set(signals) == {"jailbreak", "pii", "domain", "complexity",
-                            "similarity", "reask"}
+    assert set(signals) == {"jailbreak", "pii", "domain", "complexity"}
 
 
 def test_full_and_trimmed_packs_agree_on_every_referenced_value(monkeypatch):
@@ -331,8 +328,6 @@ def test_full_and_trimmed_packs_agree_on_every_referenced_value(monkeypatch):
         full["pii"]["conf_by_value"].get("cn_id_card")
     assert ("cn_id_card" in trimmed["pii"]["value"]) == \
         ("cn_id_card" in full["pii"]["value"])
-    assert trimmed["similarity"] == full["similarity"]
-    assert trimmed["reask"] == full["reask"]
     other_types = [typ for typ in full["pii"]["value"] if typ != "cn_id_card"]
     for typ in other_types:                      # expected omissions only
         assert typ not in trimmed["pii"]["value"]
@@ -444,7 +439,4 @@ def test_empty_scope_computes_no_model_questions(monkeypatch):
     signals = tagger._model_signals(TagRequest(
         text="x", n_messages=2, scope=SignalScope()))
     assert calls == [[]]
-    assert signals == {
-        "similarity": {"value": 0, "confidence": None, "is_rule": False},
-        "reask": {"value": "no", "confidence": None, "is_rule": False},
-    }
+    assert signals == {}
