@@ -204,7 +204,7 @@ const I18N = {
     'logs.belowMinScore': '加权分数未过门槛',
     'logs.path': '判分路径', 'logs.scorecard': '计分卡', 'logs.total': '合计',
     'logs.passed': '通过', 'logs.failed': '未过门槛', 'logs.winner': '最高分',
-    'logs.via': '经', 'logs.sticky': '会话沿用', 'logs.unlocked': '会话升档',
+    'logs.via': '经',
     'logs.oldLog': '旧日志：未存决策轨迹', 'logs.sig': '信号',
     'logs.deterministic': '确定性',
     /* ── signals config ── */
@@ -549,7 +549,7 @@ const I18N = {
     'logs.belowMinScore': 'weighted score below min_score',
     'logs.path': 'Decision path', 'logs.scorecard': 'Scorecard', 'logs.total': 'total',
     'logs.passed': 'pass', 'logs.failed': 'below min_score', 'logs.winner': 'winner',
-    'logs.via': 'via', 'logs.sticky': 'session sticky', 'logs.unlocked': 'session unlocked',
+    'logs.via': 'via',
     'logs.oldLog': 'Old log: decision trace was not kept', 'logs.sig': 'signal',
     'logs.deterministic': 'deterministic',
     /* ── signals config ── */

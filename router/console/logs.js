@@ -44,12 +44,6 @@ function decisionHtml(r) {
     return `<span class="dec route">→ ${esc(r.model || '?')}</span>${reasonBadge(r)}${reasoningWarn(r)}`;
   return `<span class="dec none">${t('logs.none')}</span>`;
 }
-function sessionHtml(r) {
-  if (r.session_state === 'sticky') return `<span class="dec none">${t('logs.sticky')}</span>`;
-  if (r.session_state === 'unlocked') return `<span class="dec none">${t('logs.unlocked')}</span>`;
-  return '';
-}
-
 function traceChips(r) {
   const trace = Array.isArray(r.trace) ? r.trace : [];
   const pack = r.signals || {};
@@ -223,27 +217,17 @@ function signalPanelHtml(r) {
 function legacyHtml(r) {
   return `<div class="flow-legacy">${esc(t('logs.oldLog'))}</div>${methodRowsHtml(r)}`;
 }
-/* Session continuation short-circuits the pipeline (trace=[] by design): show a
-   session banner, never the "old log" fallback. */
-function sessionBannerHtml(r) {
-  const sticky = r.session_state === 'sticky';
-  return `<div class="flow-banner route"><span class="flow-m">${esc(sticky ? t('logs.sticky') : t('logs.unlocked'))}</span>
-    <span class="flow-via">${esc(t('logs.via') + ' ' + (r.model || '—'))}</span>
-    <span class="flow-id mono">${esc(r.id || '')}</span></div>`;
-}
-
 function rowHtml(r) {
   const open = openIds.has(r.id);
   const text = String(r.text || '').replace(/\s+/g, ' ');
   const trace = Array.isArray(r.trace) ? r.trace : null;
-  const session = r.session_state === 'sticky' || r.session_state === 'unlocked';
   const detail = trace && trace.length
     ? bannerHtml(r) + stationTrack(r) + pathHtml(r) + boardHtml(r) + signalPanelHtml(r)
-    : (session ? sessionBannerHtml(r) + signalPanelHtml(r) : legacyHtml(r));
+    : legacyHtml(r);
   return `<article class="log-row ${open ? 'open' : ''}" data-id="${esc(r.id)}">
     <div class="log-head">
       <span class="log-time">${esc(fmtTime(r.ts))}</span>
-      ${decisionHtml(r)}${sessionHtml(r)}
+      ${decisionHtml(r)}
       <span class="log-text" title="${esc(text)}">${esc(text.length > 90 ? text.slice(0, 90) + '…' : text)}</span>
       <span class="log-lat">${r.latency_ms != null ? Math.round(r.latency_ms) + 'ms' : '—'}</span>
     </div>
