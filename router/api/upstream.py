@@ -116,7 +116,7 @@ class CircuitBreaker:
       per ``db_sync_seconds`` per model, and ``success()`` writes only when
       this replica actually held failure state. Healthy requests therefore
       open zero DB connections in steady state (design 4.4 exception list:
-      sessions + this rare breaker sync).
+      this rare low-rate breaker sync).
     """
 
     #: Minimum interval between two DB reads for the same model (P2 4.3).

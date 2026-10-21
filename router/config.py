@@ -19,7 +19,6 @@ class Settings:
     tagger: str = "heuristic"        # 'heuristic' | 'checkpoint'
     checkpoint_dir: str = ""
     device: str = ""                 # checkpoint device; '' = auto (cuda if available)
-    sessions: bool = False           # optional session store (last_vec for similarity)
     host: str = "127.0.0.1"
     port: int = 8400
     # Static bearer token for the /admin API (design doc section 7). Empty =
@@ -49,7 +48,6 @@ class Settings:
             tagger=os.environ.get("ROUTER_TAGGER", "heuristic"),
             checkpoint_dir=os.environ.get("ROUTER_CHECKPOINT", ""),
             device=os.environ.get("ROUTER_DEVICE", ""),
-            sessions=_flag("ROUTER_SESSIONS", False),
             host=os.environ.get("ROUTER_HOST", "127.0.0.1"),
             port=int(os.environ.get("ROUTER_PORT", "8400")),
             admin_token=os.environ.get("ROUTER_ADMIN_TOKEN", ""),
