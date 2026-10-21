@@ -68,19 +68,6 @@ def test_replayable_only_route_decisions(tmp_path):
     assert log.replayable("2027-01-01") == []
 
 
-def test_sessions_row_still_written(tmp_path):
-    """Similarity / continuation read this next turn: it is not 'log' data."""
-    log = make_log(tmp_path)
-    log.enqueue(record(1, session_id="s1", vec=[0.1, 0.2],
-                       session_model="qwen3-8b"))
-    asyncio.run(log.flush())
-    conn = connect(log.settings.db_path)
-    row = conn.execute("SELECT last_vec, last_model FROM sessions "
-                       "WHERE session_id='s1'").fetchone()
-    assert row is not None and row["last_model"] == "qwen3-8b"
-    conn.close()
-
-
 def test_flush_queue_is_bounded_and_never_raises(tmp_path, monkeypatch):
     """2026-10-21 audit §5: the flush queue is bounded; when full the slim DB
     row is dropped but the memory ring keeps the request (hot path never

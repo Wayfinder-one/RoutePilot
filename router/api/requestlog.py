@@ -5,8 +5,7 @@ flushes them. Per-request detail (text, signal pack, decision trace) is NOT
 persisted — it lives only in a bounded in-memory ring (RECENT_LIMIT) that the
 console "calculation log" page and replay evaluation read from. The database
 keeps one slim row per request (no text, no signals) so the overview's traffic
-aggregates survive restarts; the session write-through below must stay because
-similarity/reask and session continuation read it on the next turn.
+aggregates survive restarts.
 
 Single-process only: `python -m router` runs one uvicorn process, so the ring is
 the whole picture. Running multiple workers would split the ring per process and
@@ -16,7 +15,6 @@ the console page would show only a fraction of the traffic.
 from __future__ import annotations
 
 import asyncio
-import json
 from collections import deque
 from datetime import datetime
 
@@ -78,7 +76,7 @@ class RequestLogger:
                  "count": self._conf_buckets[i]}
                 for i in range(CONF_BUCKETS)]
 
-    # ── DB flush: slim rows + the session write-through only ────────────────
+    # ── DB flush: slim rows only ─────────────────────────────────────────────
     async def start(self) -> None:
         self._task = asyncio.create_task(self._loop())
 
@@ -110,20 +108,5 @@ class RequestLogger:
                         (r["id"], r["ts"], "", r["decision"], r.get("model"),
                          r.get("node_id"), r.get("branch_id"), r.get("score"),
                          r.get("latency_ms")))
-                    # M2/M4: embedding + routed model for the next turn's
-                    # similarity/reask and continuation. Async write, hot path
-                    # only ever reads it.
-                    sid = r.get("session_id")
-                    vec, model = r.get("vec"), r.get("session_model")
-                    if sid and (vec or model):
-                        conn.execute(
-                            "INSERT INTO sessions "
-                            "(session_id, last_vec, updated, last_model) "
-                            "VALUES (?, ?, ?, ?) "
-                            "ON CONFLICT(session_id) DO UPDATE SET "
-                            "last_vec = COALESCE(excluded.last_vec, sessions.last_vec), "
-                            "last_model = COALESCE(excluded.last_model, sessions.last_model), "
-                            "updated = excluded.updated",
-                            (sid, json.dumps(vec) if vec else None, r["ts"], model))
         finally:
             conn.close()
