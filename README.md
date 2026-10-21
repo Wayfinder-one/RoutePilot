@@ -1,7 +1,7 @@
 # Smart Router v2
 
 LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之前，router 先算出一包路由信号
-（17 个：9 个模型信号 + 8 个规则信号），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
+（15 个：7 个模型信号 + 8 个规则信号），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
 
 默认推荐 **JEV 版主模型** 作为信号引擎：**Qwen3.5-0.8B 底座 + JEV 标量决策头**（LoRA 合并
 导出），在 router 进程内按 JEV 标准（context + typed questions + candidates → 候选概率）输出
@@ -14,7 +14,7 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
 用户请求 ──▶ FastAPI (/v1/chat/completions)
               │
               ├─ Tagger（二选一）
-              │   ├─ checkpoint: RoutePilot-0.8B 一次前向 → 7 信号 + embedding
+              │   ├─ checkpoint: RoutePilot-0.8B 一次前向 → 7 信号
               │   └─ jev:       Qwen3.5-0.8B JEV 头按问题作答 → 候选概率（推荐）
               │   + 8 个确定性规则信号（signals/rules.py）
               │
@@ -56,7 +56,7 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 | `ROUTER_JEV_TRIM` | 设为 `0` 关闭 /v1 按树裁剪问题的热路径优化 |
 | `ROUTER_DEVICE` | 模型设备（如 `cuda:0`） |
 | `ROUTER_ADMIN_TOKEN` | `/admin*` 的 Bearer token（控制台会提示输入） |
-| `ROUTER_DB` / `ROUTER_HOST` / `ROUTER_PORT` / `ROUTER_SESSIONS` | DB 路径 / 监听地址 / 端口 / 会话信号 |
+| `ROUTER_DB` / `ROUTER_HOST` / `ROUTER_PORT` | DB 路径 / 监听地址 / 端口 |
 
 ## 目录
 
@@ -81,7 +81,7 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 | 模型 | Qwen3.5-0.8B 全参微调 + 8 头 | Qwen3.5-0.8B + JEV 决策头（LoRA 合并导出） |
 | 输入形态 | 用户请求，一次前向 | context + typed questions + candidates |
 | 可配性 | 固定 19 信号（权重内） | 问题/候选/真值定义 JSON 可配 |
-| 信号 | 7 学习型 + embedding（similarity/reask）+ 规则 8 | 7 学习型（无 embedding）+ 规则 8 |
+| 信号 | 7 学习型 + 规则 8 | 7 学习型 + 规则 8 |
 | 延迟 | ~7 ms/text（batch） | 全量 54 候选 p50 113 ms；按树裁剪后 p50 64 ms；decision 实测 64–73 ms |
 | 准确率（test） | domain .83/.82、jailbreak .85/.82、complexity .96、fact_check .95、pii macro-F1 .17 | domain .810、jailbreak .877、complexity .948、fact_check .948、user_feedback .802、PII micro-F1 .889 |
 
