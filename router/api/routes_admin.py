@@ -10,6 +10,7 @@ the ``changes`` audit trail (design 5.1).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -39,6 +40,8 @@ from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
 
 router = APIRouter()
 
+logger = logging.getLogger(__name__)
+
 RESERVED_SETTINGS = {"pipeline_version"}
 
 #: 模型位 / 提供方名：写进分流树、URL 路径与 OpenAI body，保守字符集。
@@ -58,10 +61,10 @@ def _refresh_backends(request: Request, conn: sqlite3.Connection) -> None:
 # Pipeline
 # --------------------------------------------------------------------------- #
 class PipelineIn(BaseModel):
-    # `stations` is the current shape; `nodes` is accepted for one release so
-    # an older console build cannot 422 on a save. Exactly one wins.
-    stations: list[dict] | None = None
-    nodes: list[dict] | None = None
+    #: The current shape. The old ``nodes`` key (the pre-2026-09 tree model)
+    #: was accepted for one release and is gone now: a request without
+    #: ``stations`` is a 422, never a silent "empty the tree".
+    stations: list[dict]
 
 
 @router.get("/pipeline")
@@ -73,7 +76,7 @@ def get_pipeline(conn: sqlite3.Connection = Depends(get_conn)):
 @router.put("/pipeline")
 def put_pipeline(body: PipelineIn, request: Request,
                  conn: sqlite3.Connection = Depends(get_conn)):
-    payload = body.stations if body.stations is not None else (body.nodes or [])
+    payload = body.stations
     try:
         stations = [station_from_dict(d) for d in payload]
     except ValueError as exc:
@@ -200,6 +203,14 @@ def _provider_formats(conn: sqlite3.Connection) -> dict[str, str]:
             for p in ProviderRepo(conn).list()}
 
 
+def _require_provider(conn: sqlite3.Connection, name: str) -> dict:
+    """存在性校验：provider 不存在 → 422（否则模型会从后端快照里消失）。"""
+    row = ProviderRepo(conn).get(name)
+    if row is None:
+        raise HTTPException(422, detail=f"unknown provider {name}")
+    return row
+
+
 def _parse_profile_text(text: str | None) -> dict:
     """models.profile JSON text -> dict; empty/broken JSON behaves as undeclared."""
     if not text:
@@ -278,7 +289,11 @@ def get_model_catalog():
             "models": models,
         })
     return {"providers": providers,
-            "formats": [{"id": spec.id, "zh": spec.zh, "en": spec.en}
+            # needs_wire / supports_sre come from the server's FormatSpec, so
+            # the console never mirrors the backend's protocol table.
+            "formats": [{"id": spec.id, "zh": spec.zh, "en": spec.en,
+                         "needs_wire": spec.needs_wire,
+                         "supports_sre": spec.supports_sre}
                         for spec in FORMATS.values()],
             "levels": list(LEVELS)}
 
@@ -311,9 +326,7 @@ def post_model(body: ModelCreateIn, request: Request,
     if body.provider is None:
         raise HTTPException(422, detail="provider 不能为空")
     provider = _clean_text(body.provider, "provider", max_len=64)
-    provider_row = ProviderRepo(conn).get(provider)
-    if provider_row is None:
-        raise HTTPException(422, detail=f"unknown provider {provider}")
+    provider_row = _require_provider(conn, provider)
     profile = _validated_profile(body.profile,
                                  provider_row.get("reasoning_format") or "openai")
     if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
@@ -337,6 +350,10 @@ def put_model(model_id: str, body: ModelIn, request: Request,
                 if body.upstream is not None else None)
     provider = (_clean_text(body.provider, "provider", max_len=64)
                 if body.provider is not None else None)
+    if provider is not None:
+        # A model whose provider does not exist disappears from the backend
+        # snapshot (the JOIN drops it) and every routed request 502s.
+        _require_provider(conn, provider)
     profile = None
     if body.profile is not None:
         formats = _provider_formats(conn)
@@ -591,17 +608,27 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
         cfg = validate_question_config(body.config)
     except JevTaggerError as exc:
         raise HTTPException(422, detail=str(exc))
+    tagger = request.app.state.tagger
+    setter = getattr(tagger, "set_questions", None)
+    previous = getattr(tagger, "questions", None)
+    # Apply in memory FIRST (atomic replace), then persist: the running
+    # tagger must never serve a config that is not on disk yet.
+    if setter is not None:
+        setter(cfg)                            # hot apply (JEV mode)
     path = Path(_questions_path(request))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8")
     except OSError as exc:
+        # The write failed: roll the in-memory config back so memory and disk
+        # stay in the same state.
+        if setter is not None and previous is not None:
+            try:
+                setter(previous)
+            except JevTaggerError:
+                logger.exception("cannot roll back the in-memory question config")
         raise HTTPException(500, detail=f"cannot write question config: {exc}")
-    tagger = request.app.state.tagger
-    setter = getattr(tagger, "set_questions", None)
-    if setter is not None:
-        setter(cfg)                            # hot apply (JEV mode)
     ChangeRepo(conn).record(_now(), "signal_questions", f"saved {path}")
     return {"ok": True, "applied": setter is not None, "meta": _tagger_meta(request)}
 
@@ -626,6 +653,9 @@ async def try_pipeline(body: TryIn, request: Request):
     result = await request.app.state.tagger.tag(TagRequest(text=body.text))
     decision, trace = evaluate(request.app.state.pipeline, result.signals)
     return {"signals": result.signals, "vec_dim": len(result.vec or []),
+            # Model-input window (JEV only): tokens read vs. original, so the
+            # calibration UI can show when a long paste was head-truncated.
+            "input": result.input or {},
             "decision": decision_to_dict(decision), "trace": trace}
 
 
@@ -646,9 +676,12 @@ def put_settings(body: dict, request: Request,
             raise HTTPException(422, detail=f"reserved or invalid setting key {key!r}")
         if not isinstance(value, (str, int, float, bool)):
             raise HTTPException(422, detail=f"setting {key!r} must be a scalar")
-    for key, value in body.items():
-        SettingsRepo(conn).set(key, str(value))
-    ChangeRepo(conn).record(_now(), "settings", {"keys": sorted(body)})
+    # One transaction for the whole write: the settings must not depend on a
+    # later (unrelated) write to be persisted.
+    with conn:
+        for key, value in body.items():
+            SettingsRepo(conn).set(key, str(value))
+        ChangeRepo(conn).record(_now(), "settings", {"keys": sorted(body)})
     return {"ok": True, "settings": SettingsRepo(conn).all()}
 
 
@@ -660,24 +693,30 @@ def get_changes(limit: int = 50, conn: sqlite3.Connection = Depends(get_conn)):
 # --------------------------------------------------------------------------- #
 # Evaluation (M3)
 # --------------------------------------------------------------------------- #
+#: How many mismatches an evaluation report lists (the console shows them).
+MAX_MISMATCHES = 100
+#: How many evaluation reports the overview and /admin/evals show.
+EVAL_REPORTS = 3
+
+
 class EvalIn(BaseModel):
     mode: str                       # 'replay' | 'labels'
     days: int = 7
     labels: list[dict] = []
 
 
-async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
-    nodes = request.app.state.pipeline
+async def _eval_pairs(body: EvalIn, request: Request):
+    stations = request.app.state.pipeline
     pairs: list[tuple] = []
     mismatches: list[dict] = []
     if body.mode == "replay":
         since = (datetime.now().astimezone()
                  - timedelta(days=body.days)).date().isoformat()
         for r in request.app.state.requestlog.replayable(since):
-            decision, _ = evaluate(nodes, r["signals"])
+            decision, _ = evaluate(stations, r["signals"])
             got = decision.model if decision.kind == "route" else None
             pairs.append((r["model"], got))
-            if got != r["model"] and len(mismatches) < 100:
+            if got != r["model"] and len(mismatches) < MAX_MISMATCHES:
                 mismatches.append({"id": r["id"], "expect": r["model"], "got": got})
         return pairs, mismatches, {"days": body.days, "source": "memory"}
     if body.mode == "labels":
@@ -685,10 +724,10 @@ async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
             text = str(case.get("text", ""))
             expect = case.get("expect_model")
             result = await request.app.state.tagger.tag(TagRequest(text=text))
-            decision, _ = evaluate(nodes, result.signals)
+            decision, _ = evaluate(stations, result.signals)
             got = decision.model if decision.kind == "route" else None
             pairs.append((expect, got))
-            if got != expect and len(mismatches) < 100:
+            if got != expect and len(mismatches) < MAX_MISMATCHES:
                 mismatches.append({"text": text[:200], "expect": expect, "got": got})
         return pairs, mismatches, {"labels": len(body.labels)}
     raise HTTPException(422, detail="mode must be 'replay' or 'labels'")
@@ -697,7 +736,7 @@ async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
 @router.post("/eval")
 async def post_eval(body: EvalIn, request: Request,
                     conn: sqlite3.Connection = Depends(get_conn)):
-    pairs, mismatches, extra = await _eval_pairs(body, request, conn)
+    pairs, mismatches, extra = await _eval_pairs(body, request)
     report = summarize(body.mode, pairs, mismatches, **extra)
     EvalRepo(conn).save(_now(), body.mode, report["total"], report["matched"],
                         report["rate"], report)
@@ -705,7 +744,7 @@ async def post_eval(body: EvalIn, request: Request,
 
 
 @router.get("/evals")
-def get_evals(limit: int = 3, conn: sqlite3.Connection = Depends(get_conn)):
+def get_evals(limit: int = EVAL_REPORTS, conn: sqlite3.Connection = Depends(get_conn)):
     return {"evals": EvalRepo(conn).recent(limit)}
 
 
@@ -729,8 +768,8 @@ def get_overview(request: Request, days: int = 14,
     total = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
     # confidence distribution is memory-only (detail is not persisted) and
     # resets on restart — the console labels it "since restart".
-    logger = request.app.state.requestlog
+    requestlog = request.app.state.requestlog
     return {"daily": daily, "routes": routes, "blocked": blocked, "total": total,
-            "confidence": logger.confidence_histogram(),
-            "confidence_since": logger.started_at,
-            "evals": EvalRepo(conn).recent(3)}
+            "confidence": requestlog.confidence_histogram(),
+            "confidence_since": requestlog.started_at,
+            "evals": EvalRepo(conn).recent(EVAL_REPORTS)}

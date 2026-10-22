@@ -54,7 +54,7 @@ def test_station_roundtrip_tree(conn):
 
 def test_seeded_floors_are_uniform_and_healthy(conn):
     from router.pipeline.health import check_pipeline
-    seed_default(conn, "default")
+    seed_default(conn)
     stations = StationRepo(conn).load()
 
     def walk(node):
@@ -69,7 +69,7 @@ def test_seeded_floors_are_uniform_and_healthy(conn):
 
 
 def test_default_pipeline_types():
-    stations = default_pipeline("jev")
+    stations = default_pipeline()
     assert len(stations) == 4
     assert isinstance(stations[0], Station)
     assert stations[0].root.kind == "fork"

@@ -13,7 +13,7 @@ def test_load_backends_and_resolve(tmp_path, monkeypatch):
     conn.execute("UPDATE providers SET key_env = 'LOCAL_KEY' WHERE name = 'local'")
     backends = load_backends(conn)
     b = resolve_backend(backends, "qwen3-8b")
-    assert b.url == "http://127.0.0.1:9000/chat/completions"
+    assert b.url == "http://127.0.0.1:8000/v1/chat/completions"
     assert b.headers["Authorization"] == "Bearer secret"
     assert b.upstream_name == "qwen3-8b"
     with pytest.raises(KeyError):

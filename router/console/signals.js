@@ -7,18 +7,14 @@ const $ = s => document.querySelector(s);
 
 let cfg = null;          // the editable config object
 let meta = {};
-let registry = {};       // /admin/signals specs (zh/en labels, values)
 let selected = 'domain';
 const KW = '__keyword_lexicon__';   // pseudo entry in the signal list
 const TW = '__time_rules__';        // pseudo entry: time period lexicon
 let kwGroups = {};
 let timePeriods = [];
-let serverOffsetMs = 0;              // server clock - browser clock
-let clockTimer = null;
 let dirty = false;
 let rawOpen = false;
 
-const sigName = k => (registry[k] ? (LANG === 'zh' ? registry[k].zh : registry[k].en) : k);
 const kindLabel = k => cfg.signals[k].kind === 'noul' ? t('sig.kind.noul') : t('sig.kind.choice');
 
 async function boot() {
@@ -29,11 +25,11 @@ async function boot() {
     api.get('/admin/time-periods'),
   ]);
   timePeriods = twBody.periods || [];
-  if (twBody.now) serverOffsetMs = new Date(twBody.now).getTime() - Date.now();
+  setServerOffset(twBody.now);
   startServerClock();
   cfg = qBody.config;
   meta = qBody.meta || {};
-  sigBody.signals.forEach(s => { registry[s.key] = s; });
+  setSignalRegistry(sigBody.signals);
   kwGroups = kwBody.groups || {};
   renderAll();
 }
@@ -54,7 +50,7 @@ function renderList() {
   const items = Object.keys(cfg.signals).map(k => {
     const s = cfg.signals[k];
     return `<div class="sig-item ${k === selected ? 'on' : ''}" data-sig="${esc(k)}">
-      <span class="k" style="background:${sigColor((registry[k] || {}).group)}"></span>
+      <span class="k" style="background:${sigColor((SIGNAL_REGISTRY[k] || {}).group)}"></span>
       <span class="n">${esc(sigName(k))}</span>
       <span class="b">${s.kind === 'noul' ? 'y/n' : 'choice'}</span>
     </div>`;
@@ -73,10 +69,11 @@ function renderList() {
 }
 
 function instrHtml(k, s) {
-  if (k === 'pii') return '';
+  // Only the first wording is rendered at runtime; the others are kept in the
+  // file as documentation (see the JEV module docstring).
   const list = Array.isArray(s.instructions) ? s.instructions : [s.instructions || ''];
   return `<div class="subcard"><div class="hd">${t('sig.instructions')}</div>
-    <textarea data-instr="${esc(k)}|0">${esc(list[0] || '')}</textarea>
+    <textarea data-instr="${esc(k)}">${esc(list[0] || '')}</textarea>
   </div>`;
 }
 
@@ -145,7 +142,7 @@ function renderEditor() {
   if (selected === TW) { renderTwEditor(); return; }
   const k = selected;
   const s = cfg.signals[k];
-  const reg = registry[k] || {};
+  const reg = SIGNAL_REGISTRY[k] || {};
   const head = `<div class="card">
     <div class="insp-h">
       <span class="type ${s.kind === 'noul' ? 'gate' : 'score'}">${kindLabel(k)}</span>
@@ -156,7 +153,6 @@ function renderEditor() {
     ${k === 'pii' ? piiHtml(s) : instrHtml(k, s)}
     ${s.kind === 'noul' && k !== 'pii' ? noulHtml(k, s) : ''}
     ${s.kind === 'choice' ? choiceHtml(k, s) : ''}
-    ${s.kind === 'noul' && k === 'pii' ? '' : ''}
     ${previewHtml(k, s)}
     <div class="footnote" style="margin-top:6px">${esc(JSON.stringify({ version: cfg.version, signals: Object.keys(cfg.signals).length }).replace(/"/g, ''))} ·
       <button class="btn ghost sm" id="rawToggle">${t('sig.raw')} ${rawOpen ? '▲' : '▼'}</button></div>
@@ -168,8 +164,7 @@ function renderEditor() {
 
 function bindEditor() {
   document.querySelectorAll('[data-instr]').forEach(el => el.addEventListener('input', () => {
-    const [k] = el.dataset.instr.split('|');
-    cfg.signals[k].instructions = [el.value];
+    cfg.signals[el.dataset.instr].instructions = [el.value];
     markDirty();
   }));
   document.querySelectorAll('[data-noul]').forEach(el => el.addEventListener('input', () => {
@@ -415,19 +410,13 @@ function renderTwEditor() {
 }
 
 /* ── server clock (the time_window rule judges by server time) ───────── */
-function serverNow() { return new Date(Date.now() + serverOffsetMs); }
+/* The time_window signal's value IS the list of covering period names (the
+   page hint says so), so the indicator shows the configured names — not a
+   hardcoded weekday/weekend guess. */
 function twPeriod(d) {
   const wd = (d.getDay() + 6) % 7;                 // Python weekday: Mon=0
-  if (timePeriods.some(p => p.days.includes(wd)
-        && periodCovers(p, d))) return ['weekend', t('p4.twValue.weekend')];
-  for (const p of timePeriods) {
-    if (!p.days.includes(wd)) continue;
-    if (periodCovers(p, d)) {
-      if (p.name === t('p4.twValue.day')) return ['weekday_day', t('p4.twValue.day')];
-      if (p.name === t('p4.twValue.night')) return ['night', t('p4.twValue.night')];
-    }
-  }
-  return null;
+  const hit = timePeriods.filter(p => p.days.includes(wd) && periodCovers(p, d));
+  return hit.length ? [hit[0].name, hit.map(p => p.name).join(', ')] : null;
 }
 function periodCovers(p, d) {
   const minutes = d.getHours() * 60 + d.getMinutes();
@@ -437,26 +426,18 @@ function periodCovers(p, d) {
   if (a < b) return a <= minutes && minutes < b;
   return minutes >= a || minutes < b;
 }
-function fmtServerTime(d) {
-  const p2 = n => String(n).padStart(2, '0');
-  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-}
 function startServerClock() {
-  if (clockTimer) clearInterval(clockTimer);
-  const tick = () => {
+  startServerClockTick(() => {
     const el = $('#serverClock');
-    if (el) {
-      const d = serverNow();
-      el.textContent = `${t('sig.clock')} ${fmtServerTime(d)}`;
-      const cur = $('#twCurrent');
-      if (cur) {
-        const hit = twPeriod(d);
-        cur.textContent = hit
-          ? `${t('sig.tw.current')}${hit[1]} (${hit[0]})`
-          : `${t('sig.tw.current')}—`;
-      }
+    if (!el) return;
+    const d = serverNow();
+    el.textContent = `${t('sig.clock')} ${fmtServerTime(d)}`;
+    const cur = $('#twCurrent');
+    if (cur) {
+      const hit = twPeriod(d);
+      cur.textContent = hit
+        ? `${t('sig.tw.current')}${hit[1]} (${hit[0]})`
+        : `${t('sig.tw.current')}—`;
     }
-  };
-  tick();
-  clockTimer = setInterval(tick, 1000);
+  });
 }

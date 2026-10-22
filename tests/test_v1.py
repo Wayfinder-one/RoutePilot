@@ -66,6 +66,27 @@ def test_upstream_failure_502_and_breaker(tmp_path):
     assert chat(c, "今天天气怎么样").status_code == 503
 
 
+def test_streaming_upstream_4xx_is_not_a_200_sse(tmp_path):
+    """An upstream rejection must reach the client as its own status code,
+    not as an empty 200 event stream."""
+    def bad(request):
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+    c = lower_floors(make_client(tmp_path, bad))
+    r = chat(c, "今天天气怎么样", stream=True)
+    assert r.status_code == 400
+    assert "text/event-stream" not in r.headers.get("content-type", "")
+    assert r.json()["error"]["message"] == "bad request"
+
+
+def test_streaming_upstream_5xx_is_502(tmp_path):
+    def bad(request):
+        return httpx.Response(500, json={"error": "boom"})
+    c = make_client(tmp_path, bad)
+    r = chat(c, "今天天气怎么样", stream=True)
+    assert r.status_code == 502
+    assert r.json()["error"]["message"] == "upstream_error"
+
+
 def test_admin_model_write_is_used_by_next_request(tmp_path):
     """The write endpoint swaps the in-memory backend snapshot (design 4.4)."""
     import json
@@ -82,6 +103,38 @@ def test_admin_model_write_is_used_by_next_request(tmp_path):
                  json={"upstream": "swapped-model"}).status_code == 200
     assert chat(c, "今天天气怎么样").status_code == 200
     assert seen["body"]["model"] == "swapped-model"
+
+
+def test_malformed_body_is_400_not_500(tmp_path):
+    """Entry defense: a broken request body is the client's mistake."""
+    c = make_client(tmp_path, ok_upstream)
+    r = c.post("/v1/chat/completions", content=b"{not json",
+               headers={"content-type": "application/json"})
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == "invalid_json"
+
+
+def test_non_object_body_is_400(tmp_path):
+    c = make_client(tmp_path, ok_upstream)
+    r = c.post("/v1/chat/completions", json=["hello"])
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == "body_must_be_object"
+
+
+def test_messages_must_be_a_list(tmp_path):
+    c = make_client(tmp_path, ok_upstream)
+    r = c.post("/v1/chat/completions", json={"messages": "hello"})
+    assert r.status_code == 400
+    assert r.json()["error"]["message"] == "messages_must_be_list"
+
+
+def test_oversized_body_is_rejected(tmp_path):
+    c = make_client(tmp_path, ok_upstream)
+    r = c.post("/v1/chat/completions", content=b"x" * 32,
+               headers={"content-type": "application/json",
+                        "content-length": str(64 * 1024 * 1024)})
+    assert r.status_code == 413
+    assert r.json()["error"]["message"] == "request_too_large"
 
 
 def test_routing_does_not_need_the_database(tmp_path):
@@ -117,3 +170,34 @@ def test_legacy_session_headers_do_not_affect_routing(tmp_path):
     assert "x-sr-session-state" not in plain.headers
     assert "x-sr-session-state" not in legacy.headers
 
+
+class _WindowTagger:
+    """Wraps a tagger and reports a model-input window (what JEV does)."""
+
+    def __init__(self, inner, window):
+        self.inner = inner
+        self.window = window
+        self.name = getattr(inner, "name", "windowed")
+
+    async def tag(self, req):
+        result = await self.inner.tag(req)
+        result.input = dict(self.window)
+        return result
+
+    async def aclose(self):
+        await self.inner.aclose()
+
+
+def test_request_log_exposes_the_model_input_window(tmp_path):
+    """PII report P0: truncation must be visible downstream, not silent."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    window = {"input_tokens": 5000, "input_visible_tokens": 1024,
+              "input_truncated": True}
+    app.state.tagger = _WindowTagger(app.state.tagger, window)
+    c = TestClient(app)
+    assert chat(c, "今天天气怎么样").status_code == 200
+    record = app.state.requestlog.recent_requests(1)[0]
+    assert record["input_tokens"] == 5000
+    assert record["input_visible_tokens"] == 1024
+    assert record["input_truncated"] is True

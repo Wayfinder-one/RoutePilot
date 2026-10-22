@@ -27,7 +27,7 @@ def codes(issues):
 
 def test_default_stations_are_healthy():
     from router.store.repositories import default_pipeline
-    assert check_pipeline(default_pipeline("heuristic"), MODELS) == []
+    assert check_pipeline(default_pipeline(), MODELS) == []
 
 
 def test_empty_pipeline():
@@ -113,6 +113,62 @@ def test_duplicate_conditions_warn():
                if i.code == "duplicate_condition")
 
 
+def test_duplicate_node_id_is_hard():
+    """Two nodes with the same id in one tree: the console would edit the
+    wrong node, so the save must be rejected."""
+    stations = [Station(id="a", type="gate", name="x", root=node(
+        "r", signal=None, kind="fork", children=[
+            node("dup", "domain", "health", 0.5, model="med"),
+            node("dup", "complexity", "hard", 0.5, model="med")])), fallback()]
+    issues = check_pipeline(stations, MODELS)
+    hit = [i for i in issues if i.code == "duplicate_node_id"]
+    assert hit and hit[0].level == "hard"
+
+
+def test_duplicate_station_id_is_hard():
+    stations = [
+        Station(id="dup", type="gate", name="a", root=node(
+            "r1", signal=None, kind="fork", children=[
+                node("c", "domain", "health", 0.5, model="med")])),
+        Station(id="dup", type="gate", name="b", root=node(
+            "r2", "complexity", "hard", 0.5, model="med")),
+        fallback()]
+    issues = check_pipeline(stations, MODELS)
+    hit = [i for i in issues if i.code == "duplicate_station_id"]
+    assert hit and hit[0].level == "hard"
+
+
+def test_ignored_fields_warn_only():
+    """Fields that are set but can never take effect are warnings, not errors:
+    the tree still runs, the console tells the operator what is ignored."""
+    stations = [
+        Station(id="a", type="gate", name="x", root=node(
+            "r", None, "", 0.5, kind="fork", model="med",
+            min_score=0.5, action="block", children=[
+                node("c", "domain", "health", 0.5, action="block",
+                     model="med", min_score=0.5)])),
+        fallback()]
+    issues = check_pipeline(stations, MODELS)
+    ignored = [i for i in issues if i.code == "ignored_field"]
+    fields = {i.field for i in ignored}
+    assert {"conf_min", "model", "action", "min_score"} <= fields
+    assert all(i.level == "warn" for i in ignored)
+    assert not [i for i in issues if i.level == "hard"]
+
+
+def test_min_score_on_a_leaf_without_weights_warns():
+    stations = [
+        Station(id="a", type="gate", name="x", root=node(
+            "r", signal=None, kind="fork", children=[
+                node("c", "domain", "health", 0.5, model="med",
+                     min_score=0.5)])),
+        fallback()]
+    issues = check_pipeline(stations, MODELS)
+    hit = [i for i in issues if i.code == "ignored_field"
+           and i.field == "min_score"]
+    assert hit and hit[0].level == "warn"
+
+
 # --------------------------------------------------------------------------- #
 # §3.3: 分树叶子的推理选择（model_reasoning 传入时才校验）
 # --------------------------------------------------------------------------- #
@@ -181,6 +237,6 @@ def test_reasoning_check_ignores_unknown_model():
 def test_pipeline_with_reasoning_is_healthy_via_default_models():
     """The seeded pipeline has no reasoning selected; adding the map keeps it green."""
     from router.store.repositories import default_pipeline
-    stations = default_pipeline("heuristic")
+    stations = default_pipeline()
     assert check_pipeline(stations, MODELS) == []
     assert check_pipeline(stations, MODELS, {}) == []

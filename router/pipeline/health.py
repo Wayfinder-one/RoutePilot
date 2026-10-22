@@ -25,6 +25,15 @@ class Issue:
     #: reasoning_unsupported 的定位信息（§3.3：「detail 里带模型与档位」）
     model: str = ""
     reasoning: str = ""
+    #: ignored_field 指出「配了但不会生效」的字段名
+    field: str = ""
+
+
+def _ignored_field(node: TreeNode, station: Station, field: str,
+                   zh: str, en: str) -> Issue:
+    """A field that is set but can never take effect (warn, never blocks)."""
+    return Issue("ignored_field", zh, en, station.id, node.id, level="warn",
+                 field=field)
 
 
 def _check_weights(node: TreeNode, station: Station) -> list[Issue]:
@@ -49,11 +58,35 @@ def _check_weights(node: TreeNode, station: Station) -> list[Issue]:
     return issues
 
 
+def _check_node_ids(node: TreeNode, station: Station) -> list[Issue]:
+    """Node ids must be unique inside one station tree.
+
+    The console addresses nodes by id (drag & drop, the condition editor),
+    so a duplicate id silently edits the wrong node.
+    """
+    issues: list[Issue] = []
+    seen: set[str] = set()
+
+    def walk(n: TreeNode) -> None:
+        if n.id in seen:
+            issues.append(Issue("duplicate_node_id",
+                                f"节点 id 重复：{n.id}",
+                                f"Duplicate node id: {n.id}",
+                                station.id, n.id))
+        seen.add(n.id)
+        for child in n.children:
+            walk(child)
+
+    walk(node)
+    return issues
+
+
 def _check_node(node: TreeNode, station: Station, known_models: set[str],
                 *, is_root: bool, siblings_seen: set[tuple],
                 model_reasoning: dict[str, dict | None] | None = None
                 ) -> list[Issue]:
     issues: list[Issue] = []
+    issues.extend(_check_node_ids(node, station))
     # ---- condition ----
     if node.signal is not None:
         if node.signal not in SIGNALS:
@@ -87,11 +120,32 @@ def _check_node(node: TreeNode, station: Station, known_models: set[str],
                                 "Only the root may be unconditional; an "
                                 "unconditional child shadows its siblings",
                                 station.id, node.id))
+        if node.conf_min is not None:
+            issues.append(_ignored_field(
+                node, station, "conf_min",
+                "无条件节点的置信门槛不会生效",
+                "The confidence floor of an unconditional node never applies"))
     # ---- leaf / fork ----
     if node.kind == "fork":
         if not node.children:
             issues.append(Issue("empty_fork", "分叉节点没有子节点",
                                 "Fork node has no children", station.id, node.id))
+        if node.model:
+            issues.append(_ignored_field(
+                node, station, "model",
+                "分叉节点的模型不会生效（只有叶子能路由）",
+                "The model of a fork node never applies (only leaves route)"))
+        if node.action != "route":
+            issues.append(_ignored_field(
+                node, station, "action",
+                "分叉节点的动作不会生效（只有叶子能拦截/路由）",
+                "The action of a fork node never applies (only leaves "
+                "block or route)"))
+        if node.min_score is not None:
+            issues.append(_ignored_field(
+                node, station, "min_score",
+                "分叉节点的达成率门槛不会生效",
+                "The attainment floor of a fork node never applies"))
         child_seen: set[tuple] = set()
         for child in node.children:
             issues.extend(_check_node(child, station, known_models,
@@ -114,6 +168,12 @@ def _check_node(node: TreeNode, station: Station, known_models: set[str],
             issues.append(Issue("unknown_model", f"未知模型 {node.model}",
                                 f"Unknown model {node.model}",
                                 station.id, node.id))
+        if node.action == "block" and node.model:
+            issues.append(_ignored_field(
+                node, station, "model",
+                "拦截叶子的模型不会生效（拦截不需要上游模型）",
+                "The model of a blocking leaf never applies (blocking "
+                "needs no upstream model)"))
         if model_reasoning is not None and node.reasoning is not None:
             issues.extend(_check_reasoning(node, station, known_models,
                                            model_reasoning))
@@ -129,6 +189,12 @@ def _check_node(node: TreeNode, station: Station, known_models: set[str],
                     "Weighted leaf has no attainment floor "
                     "(defaults to 0.50 when unset)",
                     station.id, node.id, level="warn"))
+        elif node.min_score is not None:
+            issues.append(_ignored_field(
+                node, station, "min_score",
+                "没有加权条件的叶子不会使用达成率门槛",
+                "A leaf without weighted conditions never uses the "
+                "attainment floor"))
     return issues
 
 
@@ -189,7 +255,14 @@ def check_pipeline(stations: list[Station], known_models: set[str],
     if not stations:
         issues.append(Issue("empty_pipeline", "管道为空", "Pipeline is empty"))
         return issues
+    seen_station_ids: set[str] = set()
     for station in stations:
+        if station.id in seen_station_ids:
+            issues.append(Issue("duplicate_station_id",
+                                f"站点 id 重复：{station.id}",
+                                f"Duplicate station id: {station.id}",
+                                station_id=station.id))
+        seen_station_ids.add(station.id)
         if station.type not in STATION_TYPES:
             issues.append(Issue("unknown_station_type",
                                 f"未知站点类型 {station.type}",

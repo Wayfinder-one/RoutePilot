@@ -1005,3 +1005,7 @@ def get_preset(provider_id: str) -> dict | None:
         if preset["id"] == provider_id:
             return preset
     return None
+
+
+#: id -> 预置（同一份数据的索引；播种与控制台读的是同一处定义）。
+PRESET_BY_ID: dict[str, dict] = {p["id"]: p for p in PROVIDER_PRESETS}

@@ -40,6 +40,8 @@ def test_try_medical_hard(tmp_path):
     assert [(p["signal"], p["value"], p["pass"]) for p in entry["path"]] == [
         ("domain", "health", True), ("complexity", "hard", True)]
     assert entry["board"] == []        # direct-hit tree leaves do not score
+    # heuristic tagger reads the whole text -> no window measured
+    assert body["input"] == {}
 
 
 def test_try_block_and_fallback(tmp_path):

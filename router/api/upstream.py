@@ -137,7 +137,6 @@ class CircuitBreaker:
 
     # ── DB helpers (M4, only used when db_path is set) ──────────────────────
     def _db_read(self, model: str):
-        import sqlite3
         try:
             conn = sqlite3.connect(self.db_path, timeout=5.0,
                                    check_same_thread=False)
@@ -152,7 +151,6 @@ class CircuitBreaker:
         return row
 
     def _db_write(self, model: str, failures: int, opened_at: float | None) -> None:
-        import sqlite3
         try:
             conn = sqlite3.connect(self.db_path, timeout=5.0,
                                    check_same_thread=False)

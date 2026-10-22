@@ -5,8 +5,8 @@ All model-signal confidences are capped at 0.5 (design doc section 3.5): in
 degraded mode score nodes lose discrimination on purpose, keeping routing
 conservative. Rule signals come from signals/rules.py (deterministic => 1).
 
-HeuristicTagger only produces the 9 model signals heuristically and delegates
-the 8 rule signals to the shared rule path, which is also what the checkpoint
+HeuristicTagger only produces the 7 model signals heuristically and delegates
+the rule signals to the shared rule path, which is also what the checkpoint
 tagger uses.
 """
 
@@ -99,4 +99,4 @@ class HeuristicTagger:
 
 
 # Re-exported for callers that imported the regex from here historically.
-__all__ = ["HeuristicTagger", "CJK_RE", "CAP"]
+__all__ = ["HeuristicTagger"]

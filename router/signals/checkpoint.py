@@ -32,6 +32,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from router.signals._math import (binary_entropy_confidence, entropy_confidence,
+                                 l2_normalize, pii_hits, softmax)
 from router.signals.registry import SIGNALS
 from router.signals.pii_rules import merge_rule_pii
 from router.signals.rules import rule_signals
@@ -255,40 +257,10 @@ def load_and_validate(checkpoint_dir: str | Path) -> CheckpointFiles:
 
 
 # --------------------------------------------------------------------------- #
-# Pure numerics
+# Pure numerics (shared with the other taggers — see router/signals/_math.py)
 # --------------------------------------------------------------------------- #
-def softmax(logits: list[float]) -> list[float]:
-    m = max(logits)
-    exps = [math.exp(x - m) for x in logits]
-    total = sum(exps)
-    return [e / total for e in exps]
-
-
 def sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
-
-
-def entropy_confidence(probs: list[float]) -> float:
-    """1 - H(p) / log K, clamped to [0,1] (K <= 1 => 1.0)."""
-    k = len(probs)
-    if k <= 1:
-        return 1.0
-    h = -sum(p * math.log(p) for p in probs if p > 0)
-    return max(0.0, min(1.0, 1.0 - h / math.log(k)))
-
-
-def binary_entropy_confidence(p: float) -> float:
-    """1 - H2(p) / log 2 for a per-type presence probability."""
-    p = max(0.0, min(1.0, p))
-    if p <= 0.0 or p >= 1.0:
-        return 1.0
-    h2 = -(p * math.log(p) + (1 - p) * math.log(1 - p)) / math.log(2)
-    return max(0.0, min(1.0, 1.0 - h2))
-
-
-def l2_normalize(vec: list[float]) -> list[float]:
-    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-    return [v / norm for v in vec]
 
 
 # --------------------------------------------------------------------------- #
@@ -390,9 +362,8 @@ class CheckpointTagger:
             else:  # multilabel (pii): per-type binary entropy confidence
                 labels = self.files.labels[spec.head]
                 probs = [sigmoid(float(x)) for x in row]
-                hits = [labels[i] for i, p in enumerate(probs) if p >= 0.5]
-                conf_by_value = {labels[i]: binary_entropy_confidence(probs[i])
-                                 for i in range(len(labels)) if probs[i] >= 0.5}
+                # the same hit rule as the other taggers (router/signals/_math.py)
+                hits, conf_by_value = pii_hits(probs, labels)
                 signals[spec.signal] = {
                     "value": hits,
                     "confidence": max(conf_by_value.values()) if conf_by_value else None,

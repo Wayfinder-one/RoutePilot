@@ -34,7 +34,7 @@ def fallback():
 
 
 def test_default_pipeline_scope_is_exactly_the_referenced_model_signals():
-    stations = default_pipeline("checkpoint")
+    stations = default_pipeline()
     scope = compute_signal_scope(stations)
 
     def collect(node, out):

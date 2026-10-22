@@ -15,11 +15,14 @@ the console page would show only a fraction of the traffic.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from datetime import datetime
 
 from router.config import Settings
 from router.store.db import connect
+
+logger = logging.getLogger(__name__)
 
 FLUSH_SECONDS = 2.0
 RECENT_LIMIT = 20          # console promise: the last 20 requests, memory only
@@ -83,12 +86,23 @@ class RequestLogger:
     async def close(self) -> None:
         if self._task:
             self._task.cancel()
-        await self.flush()
+        # A failing DB must not turn shutdown into an exception: the batch is
+        # already in the memory ring, so log it and let the service stop.
+        try:
+            await self.flush()
+        except Exception:                     # noqa: BLE001 - never fail shutdown
+            logger.exception("requestlog final flush failed; batch dropped")
 
     async def _loop(self) -> None:
         while True:
             await asyncio.sleep(FLUSH_SECONDS)
-            await self.flush()
+            # One DB error must not kill the flush task: a dead task means the
+            # slim `requests` rows stop being written forever (the memory ring
+            # still holds the detail, but the traffic aggregates die with it).
+            try:
+                await self.flush()
+            except Exception:                 # noqa: BLE001 - keep the task alive
+                logger.exception("requestlog flush failed; batch dropped")
 
     async def flush(self) -> None:
         batch = []
@@ -103,10 +117,10 @@ class RequestLogger:
                     # slim row only — text/signals/trace stay in the memory ring
                     conn.execute(
                         "INSERT OR REPLACE INTO requests (id, ts, text, decision, "
-                        "model, node_id, branch_id, score, latency_ms) "
+                        "model, station_id, leaf_id, score, latency_ms) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (r["id"], r["ts"], "", r["decision"], r.get("model"),
-                         r.get("node_id"), r.get("branch_id"), r.get("score"),
+                         r.get("station_id"), r.get("leaf_id"), r.get("score"),
                          r.get("latency_ms")))
         finally:
             conn.close()

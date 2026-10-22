@@ -17,16 +17,12 @@
 const $ = s => document.querySelector(s);
 const $$ = (s, root = document) => Array.from((root || document).querySelectorAll(s));
 
-/* ── static protocol knowledge (mirror of router/reasoning.py §4) ─────── */
+/* ── static protocol knowledge ───────────────────────────────────────── */
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const LEVELS = ['off', 'on', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
-const FORMAT_IDS = ['openai', 'deepseek', 'qwen', 'qwen-chat-template',
-  'openrouter', 'zai', 'together', 'string-thinking', 'ant-ling'];
-const NEEDS_WIRE = new Set(['openai', 'openrouter', 'string-thinking', 'ant-ling']);
-const SRE_FORMATS = new Set(['openai', 'deepseek', 'zai', 'together']);
-
-const FALLBACK_REASON = { declared: false, supported: null, format: null,
-  efforts: [], default: null };
+/* The protocol table (formats, needs_wire, supports_sre) comes from the
+   server: GET /admin/model-catalog -> formats[]. The console never mirrors
+   router/reasoning.py, so a new backend dialect shows up here by itself. */
 
 /* Upstream preset ids may contain '/' (e.g. 'openai/gpt-5.6-luna') but model
    slot ids may not; the preset tab normalizes them and dedupes against the
@@ -80,9 +76,20 @@ function reasonDesc(id) {
   return t('reason.format.' + id) === 'reason.format.' + id ? '' : t('reason.format.' + id);
 }
 function formatIds() {
-  const fromCatalog = STATE.formats.map(f => f.id);
-  const list = fromCatalog.length ? fromCatalog : FORMAT_IDS;
-  return list.filter(id => FORMAT_IDS.includes(id));
+  return STATE.formats.map(f => f.id);
+}
+function formatSpec(id) {
+  return STATE.formats.find(f => f.id === id) || null;
+}
+/* does this dialect need a protocol spelling for every non-off level? */
+function formatNeedsWire(id) {
+  const spec = formatSpec(id);
+  return !!(spec && spec.needs_wire);
+}
+/* does this dialect use the supports_reasoning_effort switch? */
+function formatSupportsSre(id) {
+  const spec = formatSpec(id);
+  return !!(spec && spec.supports_sre);
 }
 function providerFormat(name) {
   const p = STATE.providers.find(x => x.name === name);
@@ -92,14 +99,12 @@ function normReason(ri) {
   if (!ri || typeof ri !== 'object') return { ...FALLBACK_REASON };
   return ri;
 }
-function reasoningOf(modelId) {
-  const m = STATE.models.find(x => x.id === modelId);
-  return m ? normReason(m.reasoning) : null;
-}
 function profileOf(model) {
   const raw = model && model.profile;
   if (!raw) return {};
   if (typeof raw === 'object') return { ...raw };
+  // The server stores models.profile as a JSON *text* column, so it arrives
+  // as a string. TODO(remove after the server returns an object).
   try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
 }
 function modelIds() { return new Set(STATE.models.map(m => m.id)); }
@@ -241,7 +246,8 @@ async function deleteModel(id) {
 
 /* ── providers ───────────────────────────────────────────────────────── */
 function keyBadge(p) {
-  const source = p.key_source || (p.key_present === true ? 'stored' : 'none');
+  // The server always sends key_source ('stored' | 'env' | 'none').
+  const source = p.key_source || 'none';
   if (source === 'stored') return `<span class="keybadge ok">${esc(t('models.key.stored'))}</span>`;
   if (source === 'env') return `<span class="keybadge env">${esc(t('models.key.env'))}</span>`;
   return `<span class="keybadge none">${esc(t('models.key.none'))}</span>`;
@@ -565,7 +571,7 @@ function reasonEditorBody() {
   const rm = rmState();
   const followFmt = providerFormat(currentCustomProvider());
   const eff = effectiveRmFormat();
-  const needsWire = NEEDS_WIRE.has(eff);
+  const needsWire = formatNeedsWire(eff);
   const levelRows = LEVELS.map(id => {
     const on = rm.checked.has(id);
     const wire = rm.wires[id] != null ? rm.wires[id] : '';
@@ -602,7 +608,7 @@ function reasonEditorBody() {
     <div class="reason-detail"${rm.mode === 'yes' ? '' : ' hidden'}>
       <div class="col-h sm">${esc(t('models.reason.levels'))}</div>
       <div class="rl-table" id="rmLevels">${levelRows}</div>
-      <label class="checkline" id="rmSreLine"${SRE_FORMATS.has(eff) ? '' : ' hidden'}>
+      <label class="checkline" id="rmSreLine"${formatSupportsSre(eff) ? '' : ' hidden'}>
         <input type="checkbox" id="rmSre"${rm.sre ? ' checked' : ''}> ${esc(t('models.reason.sre'))}</label>
     </div>
   </div>`;
@@ -612,7 +618,7 @@ function reasonEditorBody() {
 function syncReasonEditor() {
   const rm = rmState();
   const eff = effectiveRmFormat();
-  const needsWire = NEEDS_WIRE.has(eff);
+  const needsWire = formatNeedsWire(eff);
   const mode = $('#rmMode');
   if (mode) rm.mode = mode.value;
   const fmt = $('#rmFormat');
@@ -626,7 +632,7 @@ function syncReasonEditor() {
     if (el) el.disabled = rm.mode !== 'yes';
   });
   const sreLine = $('#rmSreLine');
-  if (sreLine) sreLine.hidden = !SRE_FORMATS.has(eff);
+  if (sreLine) sreLine.hidden = !formatSupportsSre(eff);
   $$('#rmLevels .rl-row').forEach(row => {
     const id = row.dataset.level;
     row.classList.toggle('on', rm.checked.has(id));
@@ -651,7 +657,7 @@ function syncReasonEditor() {
 function reasonFromEditor() {
   const rm = rmState();
   const eff = effectiveRmFormat();
-  const needsWire = NEEDS_WIRE.has(eff);
+  const needsWire = formatNeedsWire(eff);
   if (rm.mode === 'omit') return { kind: 'omit' };
   if (rm.mode === 'no') return { kind: 'false' };
   const efforts = {};
@@ -668,7 +674,7 @@ function reasonFromEditor() {
   const reasoning = { efforts };
   if (rm.format) reasoning.format = rm.format;
   if (rm.def && rm.checked.has(rm.def)) reasoning.default = rm.def;
-  if (SRE_FORMATS.has(eff)) reasoning.supports_reasoning_effort = !!rm.sre;
+  if (formatSupportsSre(eff)) reasoning.supports_reasoning_effort = !!rm.sre;
   return { kind: 'object', value: reasoning };
 }
 
@@ -1048,6 +1054,9 @@ $('#modelModalBody').addEventListener('input', e => {
     return;
   }
   if (el.dataset.wire) { rmState().wires[el.dataset.wire] = el.value; return; }
+  // Custom tab: write every keystroke back into the draft, so a tab or
+  // language switch can rebuild the DOM without losing half-typed input.
+  if (modal.tab === 'custom') captureCustom();
 });
 $('#modelModalBody').addEventListener('click', e => {
   const tgt = e.target;
@@ -1088,7 +1097,10 @@ $('#provModalBody').addEventListener('change', e => {
   if (el.id === 'pvClearKey') { captureProvModal(); return; }
 });
 $('#provModalBody').addEventListener('input', e => {
-  if (e.target.id === 'pvKey' && provModal) provModal.keyValue = e.target.value;
+  if (!provModal) return;
+  // Keep the provider draft in sync with every keystroke: the language switch
+  // rebuilds this modal, so unsaved input must live in the state, not the DOM.
+  captureProvModal();
 });
 $('#provModalBody').addEventListener('click', e => {
   if (e.target.closest('#pvDelete')) deleteProvInModal();
@@ -1157,6 +1169,11 @@ $('#clearToken').addEventListener('click', () => {
 });
 
 window.onLangChange = () => {
+  // Capture the open modals BEFORE re-rendering: the language switch rebuilds
+  // their DOM, so unsaved input would be lost (the capture/restore patches
+  // keep the draft, not the DOM).
+  if (modal && modal.tab === 'custom') captureCustom();
+  if (provModal) captureProvModal();
   renderEngine(STATE.tagger);
   renderModels();
   renderProviders();

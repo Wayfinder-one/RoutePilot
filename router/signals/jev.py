@@ -30,10 +30,21 @@ question, but only the canonical one (training ``r4_questions.json`` variant
 unseen rewordings drift by up to ~5pt macro and ``user_feedback`` is the most
 wording-sensitive signal (canonical .802 vs .945 reworded). Do not paraphrase
 ``instructions[0]`` without re-running the eval (``results/jev_r4/README.md`` in
-the training repo). Candidate order is free; input length is capped by
-``model.json`` / ``ROUTER_JEV_MAX_LENGTH`` (1024) and longer requests have their
-context shrunk (last resort: left-truncated, which keeps the question/options
-tail) instead of failing.
+the training repo). Candidate order is free.
+
+**Input window (2026-10-21).** The model signals read only the **first
+``max_length`` tokens of the request text** (deployed: 1024), tokenizer-exact
+head truncation. There is no 8-round context shrink any more: long requests are
+cropped once instead of paying tens of seconds of re-tokenization (200K input
+measured 46-48 s, ``docs/jev-pii-200k/REPORT.md`` §4.6), and the window is
+explicit instead of "the head that happens to survive". The rendered question
+template adds 47-120 tokens on top, so the prompt cap is ``max_length +
+PROMPT_OVERHEAD_SLACK``; the canonical config therefore never loses its
+question. Only a question config edited far beyond that slack falls back to
+tokenizer left-truncation (question/options tail kept). The deterministic rule
+signals (``rule_signals`` / ``merge_rule_pii``) still scan the **full** text —
+they are the only layer that still sees long requests. The truncation facts are
+reported through ``TagResult.input`` and land in the console calculation log.
 
 **Pipeline-aware trimming** (``TagRequest.scope``): the routing tree only reads
 the signals that appear as rows, so the hot path passes a
@@ -58,6 +69,9 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from router.signals._math import (PII_HIT_THRESHOLD, PII_MIN_CONFIDENCE,
+                                 binary_entropy_confidence, entropy_confidence,
+                                 pii_hits)
 from router.signals.registry import SIGNALS
 from router.signals.pii_rules import merge_rule_pii
 from router.signals.rules import rule_signals
@@ -85,12 +99,19 @@ NOUL_VALUES: dict[str, tuple[str, str]] = {
     "fact_check": ("needs_check", "no_check"),
     "complexity": ("hard", "easy"),
 }
-#: PII: hits are written as a sorted list of canonical types. A candidate must
-#: be strictly above 0.5 (a perfectly neutral output, raw logit 0 → p_yes 0.5,
-#: is not evidence) AND carry at least this much binary-entropy confidence
-#: (audit P2 4.2). Regex hits from ``merge_rule_pii`` enter at confidence 1.0.
-PII_HIT_THRESHOLD = 0.5
-PII_MIN_CONFIDENCE = 0.2
+#: PII: hits are written as a sorted list of canonical types. The hit rule
+#: (probability strictly above the threshold + a minimum binary-entropy
+#: confidence) is shared with the other taggers — see
+#: ``router.signals._math.pii_hits``. Regex hits from ``merge_rule_pii``
+#: enter at confidence 1.0.
+
+#: Extra tokens the rendered question template may add on top of the context
+#: window. The deployed pack (54 candidate prompts, canonical wording) measures
+#: 47-120 tokens of template overhead with the Qwen3.5 tokenizer (2026-10-21),
+#: so this margin keeps every canonical prompt whole. Only an admin-edited
+#: question config much longer than this can reach the prompt cap; that
+#: fallback left-truncates so the question/options tail survives (audit P1 3.1).
+PROMPT_OVERHEAD_SLACK = 160
 
 
 class JevTaggerError(Exception):
@@ -100,34 +121,44 @@ class JevTaggerError(Exception):
 # --------------------------------------------------------------------------- #
 # Pure helpers (unit-tested without torch)
 # --------------------------------------------------------------------------- #
-def softmax(values) -> list[float]:
-    m = max(values)
-    exps = [math.exp(v - m) for v in values]
-    total = sum(exps)
-    return [e / total for e in exps]
+def head_window(text: str, tokenizer, cap: int) -> tuple[str, dict]:
+    """Keep the first ``cap`` tokenizer tokens of ``text`` (head truncation).
 
+    The model-input policy is "the first ``max_length`` tokens of the request
+    text", so this keeps the beginning and drops the tail. ``decode`` of a
+    truncated id list can end on a partial byte (U+FFFD) or re-encode one token
+    longer; both cases are trimmed until the retained text re-encodes to at most
+    ``cap`` tokens. The text is returned unchanged when it already fits.
 
-def entropy_confidence(probs: list[float]) -> float:
-    """1 - H(p)/log K, clamped to [0,1] (same as CheckpointTagger)."""
-    k = len(probs)
-    if k <= 1:
-        return 1.0
-    h = -sum(p * math.log(p) for p in probs if p > 0)
-    return max(0.0, min(1.0, 1.0 - h / math.log(k)))
-
-
-def binary_entropy_confidence(p: float) -> float:
-    p = max(0.0, min(1.0, p))
-    if p <= 0.0 or p >= 1.0:
-        return 1.0
-    h2 = -(p * math.log(p) + (1 - p) * math.log(1 - p)) / math.log(2)
-    return max(0.0, min(1.0, 1.0 - h2))
+    Returns ``(text, stats)`` with ``stats`` carrying the keys written to the
+    request log: ``input_tokens`` (original), ``input_visible_tokens`` (scored)
+    and ``input_truncated``.
+    """
+    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    total = len(ids)
+    if total <= cap:
+        return text, {"input_tokens": total, "input_visible_tokens": total,
+                      "input_truncated": False}
+    cut = cap
+    while cut > 0:
+        head = tokenizer.decode(ids[:cut], skip_special_tokens=False)
+        if head.endswith("\ufffd"):       # cut landed inside a multi-byte char
+            cut -= 1
+            continue
+        used = len(tokenizer(head, add_special_tokens=False)["input_ids"])
+        if used <= cap:
+            return head, {"input_tokens": total,
+                          "input_visible_tokens": used,
+                          "input_truncated": True}
+        cut -= max(1, used - cap)
+    return "", {"input_tokens": total, "input_visible_tokens": 0,
+                "input_truncated": True}
 
 
 def validate_question_config(cfg) -> dict:
     """Validate an in-memory question config (used by load and the admin PUT)."""
     if not isinstance(cfg, dict) or not isinstance(cfg.get("signals"), dict):
-        raise JevTaggerError(f"question config {p} must have a 'signals' object")
+        raise JevTaggerError("question config must have a 'signals' object")
     signals = cfg["signals"]
     missing = [k for k in JUDGED_SIGNALS if k not in signals]
     if missing:
@@ -163,6 +194,13 @@ def validate_question_config(cfg) -> dict:
     pii = signals["pii"]
     if not isinstance(pii.get("instructions"), str) or "{zh}" not in pii["instructions"]:
         raise JevTaggerError("pii: instructions must be a string containing '{zh}'")
+    # The pii branch validates like the noul branch: a missing/blank true or
+    # false used to blow up at request time (KeyError in build_signal_records)
+    # instead of at save time.
+    for field in ("true", "false"):
+        value = pii.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise JevTaggerError(f"pii: {field} must be a non-empty string")
     types = pii.get("types")
     if not isinstance(types, dict) or not types:
         raise JevTaggerError("pii: types must be a non-empty object")
@@ -290,6 +328,13 @@ class JevTagger:
         self.temperature = (json.loads(temp_path.read_text())["temperature"]
                             if temp_path.is_file() else 1.0)
         self.max_length = int(max_length or self.meta.get("max_length") or 1024)
+        #: Context window for the model signals: only the first ``max_length``
+        #: tokens of the request text are scored. The rendered question template
+        #: sits on top of the window, so the prompt cap is relaxed by
+        #: PROMPT_OVERHEAD_SLACK instead of shrinking the context to fit (the
+        #: old shrink accidentally read only the document head; see the module
+        #: docstring).
+        self.prompt_max_length = self.max_length + PROMPT_OVERHEAD_SLACK
 
         import torch
         self._torch = torch
@@ -310,7 +355,9 @@ class JevTagger:
         # candidate_prompts puts the shared context FIRST and the question +
         # Yes/No options LAST, so the final token-truncation fallback must keep
         # the tail: the HF default 'right' side would cut the question off and
-        # score a context-only prompt (audit P1 3.1).
+        # score a context-only prompt (audit P1 3.1). The fallback is only
+        # reachable with an edited question config longer than
+        # PROMPT_OVERHEAD_SLACK — the input window itself already fits.
         self.tokenizer.truncation_side = "left"
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -348,44 +395,53 @@ class JevTagger:
                     add_generation_prompt=True, enable_thinking=False))
         return prompts, counts
 
-    def _shrink_to_fit(self, records: list[dict]) -> tuple[dict, list[int]]:
-        """Shorten the shared context until the rendered prompts fit."""
-        for _ in range(8):
-            prompts, counts = self._render(records)
-            enc = self.tokenizer(prompts, padding=True, truncation=False,
-                                 return_tensors="pt")
-            lengths = enc["attention_mask"].sum(-1)
-            if int(lengths.max().item()) <= self.max_length:
-                return enc, counts
-            for record in records:
-                state = str(record["state"])
-                record["state"] = state[:max(200, int(len(state) * 0.7))]
+    def _context_window(self, text: str) -> tuple[str, dict]:
+        """Head-truncate the request text to the model's context window."""
+        window_text, window = head_window(text, self.tokenizer, self.max_length)
+        if window["input_truncated"]:
+            logger.debug("jev input truncated: tokens=%d visible=%d",
+                         window["input_tokens"], window["input_visible_tokens"])
+        return window_text, window
+
+    def _encode(self, records: list[dict]) -> tuple[dict, list[int]]:
+        """Render + tokenize the candidate prompts in one pass (no shrinking).
+
+        The shared context already fits ``max_length`` tokens, so only a
+        question config edited far past PROMPT_OVERHEAD_SLACK can exceed
+        ``prompt_max_length``; that fallback left-truncates so the
+        question/options tail survives (audit P1 3.1).
+        """
         prompts, counts = self._render(records)
-        enc = self.tokenizer(prompts, padding=True, truncation=True,
-                             max_length=self.max_length, return_tensors="pt")
-        logger.warning("JEV input still too long after shrinking; "
-                       "left-truncated (question/options kept)")
+        enc = self.tokenizer(prompts, padding=True, truncation=False,
+                             return_tensors="pt")
+        longest = int(enc["attention_mask"].sum(-1).max().item())
+        if longest > self.prompt_max_length:
+            logger.warning("JEV prompt exceeds cap %d after input truncation; "
+                           "left-truncated (question/options kept)",
+                           self.prompt_max_length)
+            enc = self.tokenizer(prompts, padding=True, truncation=True,
+                                 max_length=self.prompt_max_length,
+                                 return_tensors="pt")
         return enc, counts
 
-    #: Fallback chunking for very long inputs: at most this many candidate
-    #: prompts per forward pass. The normal path (one signal pack) is ~54
-    #: prompts / ~4k tokens and is scored in a single forward: chunking it into
-    #: 4 sequential forwards cost ~4x the latency (measured on 76: 288ms -> ~70ms
-    #: for the 0.8B JEV model).
+    #: Fallback chunking for long inputs: at most this many candidate prompts
+    #: per forward pass. A full pack with 1024-token contexts is ~54 prompts /
+    #: ~60k tokens, so the single-forward fast path is only taken for short
+    #: requests; chunking bounds peak attention memory and is math-neutral.
     max_prompts_per_forward = 16
 
-    #: Token budget for the single-forward fast path. Longer requests fall back
-    #: to chunked forwards so peak attention memory stays bounded.
+    #: Token budget for the single-forward fast path. Longer input falls back to
+    #: chunked forwards so peak attention memory stays bounded.
     max_tokens_per_forward = 12000
 
     def _score(self, records: list[dict]) -> list[list[float]]:
         """Independent candidate probabilities per record (temperature applied)."""
         if not records:                       # trimmed scope may drop everything
             return []
-        enc, counts = self._shrink_to_fit(records)
+        enc, counts = self._encode(records)
         if int(enc["attention_mask"].sum().item()) <= self.max_tokens_per_forward:
             return self._score_encoded(enc, counts)
-        # long request: fall back to bounded chunks (same math, more forwards)
+        # long input: fall back to bounded chunks (same math, more forwards)
         groups: list[list[dict]] = []
         current: list[dict] = []
         count = 0
@@ -400,7 +456,7 @@ class JevTagger:
             groups.append(current)
         out: list[list[float]] = []
         for group in groups:
-            out.extend(self._score_encoded(*self._shrink_to_fit(group)))
+            out.extend(self._score_encoded(*self._encode(group)))
         return out
 
     def _score_encoded(self, enc, counts: list[int]) -> list[list[float]]:
@@ -429,12 +485,17 @@ class JevTagger:
             offset += count
         return out
 
-    def _model_signals(self, req: TagRequest) -> dict:
+    def _model_signals(self, req: TagRequest, *,
+                       text: str | None = None) -> dict:
         scope = req.scope
         if scope is not None and scope.trimmed:
             logger.debug("jev trimmed pack: signals=%s pii=%s",
                          sorted(scope.signals), sorted(scope.pii_types))
-        records = build_signal_records(self.questions, req.text, scope)
+        # ``text`` is the head-truncated context window from _tag_row; direct
+        # callers (unit tests, bench scripts) default to the request text.
+        records = build_signal_records(self.questions,
+                                       req.text if text is None else text,
+                                       scope)
         # user_feedback is unconditionally overridden to null for single-turn
         # requests below (there is no previous turn), so its questions are dead
         # compute. Both the full and the trimmed path skip them => same result.
@@ -467,33 +528,30 @@ class JevTagger:
         # (in tag()) still unions the deterministic regex hits of every type.
         pii_items = by_key.get("pii")
         if pii_items is not None:
-            hits: list[str] = []
-            conf_by_value: dict[str, float] = {}
-            for item, prob in pii_items:
-                p_yes = prob[1]
-                conf = binary_entropy_confidence(p_yes)
-                # Strictly above neutral AND confident enough to matter
-                # (P2 4.2): a barely-positive p_yes records noise, and the
-                # signal-level conf it produces (≈0) can never pass a
-                # condition floor anyway.
-                if p_yes > PII_HIT_THRESHOLD and conf >= PII_MIN_CONFIDENCE:
-                    hits.append(item["sub"])
-                    conf_by_value[item["sub"]] = conf
+            labels = [item["sub"] for item, _ in pii_items]
+            p_yes_per_type = [prob[1] for _, prob in pii_items]
+            hits, conf_by_value = pii_hits(p_yes_per_type, labels)
             signals["pii"] = {
-                "value": sorted(hits),
+                "value": hits,
                 "confidence": max(conf_by_value.values()) if conf_by_value else None,
                 "conf_by_value": conf_by_value, "is_rule": False}
         return signals
 
-    def _tag_row(self, req: TagRequest) -> tuple[dict, None]:
-        return self._model_signals(req), None
+    def _tag_row(self, req: TagRequest) -> tuple[dict, None, dict]:
+        # Model signals read the head-truncated window only; tag() still runs
+        # the rule signals over the full text (long-request safety net).
+        text, window = self._context_window(req.text)
+        return self._model_signals(req, text=text), None, window
 
     async def tag(self, req: TagRequest) -> TagResult:
-        signals, vec = await asyncio.to_thread(self._tag_row, req)
+        signals, vec, window = await asyncio.to_thread(self._tag_row, req)
+        # Rule signals keep the FULL request text even though the model only
+        # reads the head window: pii_rules is the only layer that still sees
+        # long requests (docs/jev-pii-200k/REPORT.md §5.4).
         signals.update(rule_signals(req.text, req.headers, req.n_messages,
                                     self.kw_groups, time_periods=self.time_periods))
         merge_rule_pii(signals, req.text)
-        return TagResult(signals=signals, vec=vec)
+        return TagResult(signals=signals, vec=vec, input=window)
 
     async def aclose(self) -> None:
         self.model = None

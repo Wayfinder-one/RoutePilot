@@ -29,6 +29,11 @@ logger = logging.getLogger(__name__)
 BLOCK_MESSAGE = {"zh": "请求被安全策略拦截", "en": "Blocked by safety policy"}
 
 
+#: Upper bound for a request body (10 MiB). The router reads the body into
+#: memory; a bigger one is rejected instead of being buffered.
+MAX_BODY_BYTES = 10 * 1024 * 1024
+
+
 def _last_user_text(messages: list) -> str:
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -44,8 +49,26 @@ def _last_user_text(messages: list) -> str:
 @router.post("/chat/completions")
 async def chat_completions(request: Request):
     started = time.monotonic()
-    body = await request.json()
-    messages = body.get("messages") or []
+    # Entry defense: a malformed body is the client's mistake (400), not a
+    # server error (500).
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
+        return JSONResponse(status_code=413,
+                            content={"error": {"message": "request_too_large"}})
+    try:
+        body = await request.json()
+    except Exception:                     # noqa: BLE001 - any decode error
+        return JSONResponse(status_code=400,
+                            content={"error": {"message": "invalid_json"}})
+    if not isinstance(body, dict):
+        return JSONResponse(status_code=400,
+                            content={"error": {"message": "body_must_be_object"}})
+    messages = body.get("messages")
+    if messages is None:
+        messages = []
+    if not isinstance(messages, list):
+        return JSONResponse(status_code=400,
+                            content={"error": {"message": "messages_must_be_list"}})
     text = _last_user_text(messages)
     tagger = request.app.state.tagger
     # One snapshot for both the trimming hint and the decision: a concurrent
@@ -96,14 +119,22 @@ async def chat_completions(request: Request):
                         "reasoning fallback model=%s level=%s: %s",
                         decision.model, reasoning_level, exc)
 
+    # Input window actually scored by the model signals (JEV head-truncates the
+    # request text; heuristic/checkpoint read the full text and report {}).
+    window = result.input or {}
     request.app.state.requestlog.enqueue({
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "text": text, "decision": decision.kind, "model": decision.model,
-        "node_id": decision.station_id, "branch_id": decision.node_id,
+        "station_id": decision.station_id, "leaf_id": decision.node_id,
         "score": decision.score,
         "reasoning": reasoning_level,
         "reasoning_warning": reasoning_warning,
+        # Truncation must be visible downstream (PII report P0): the model only
+        # reads the first N tokens of the request text.
+        "input_tokens": window.get("input_tokens"),
+        "input_visible_tokens": window.get("input_visible_tokens"),
+        "input_truncated": bool(window.get("input_truncated", False)),
         "latency_ms": (time.monotonic() - started) * 1000,
         "trace": trace, "signals": result.signals})
 
@@ -154,14 +185,34 @@ async def chat_completions(request: Request):
 
 
 async def _stream(client, backend, body, headers, breaker, model):
+    # Streaming has its own timeout policy: the global 60s read timeout would
+    # cut a slow-but-alive stream (a thinking model can pause for a minute
+    # before its first token). Connect/write stay bounded; the read timeout is
+    # unlimited.
     req = client.build_request("POST", backend.url, json=body,
-                               headers=backend.headers)
+                               headers=backend.headers,
+                               timeout=httpx.Timeout(60.0, read=None))
     resp = await client.send(req, stream=True)
-    if resp.status_code >= 500:
+    if resp.status_code >= 400:
+        # An upstream rejection is not a stream: read the error body and answer
+        # with its status code, exactly like the non-streaming path. Reporting
+        # it as a 200 SSE would hand the client an empty event stream instead
+        # of the real error (e.g. 400 "model not found").
+        raw = await resp.aread()
         await resp.aclose()
-        breaker.failure(model)
-        return JSONResponse(status_code=502,
-                            content={"error": {"message": "upstream_error"}},
+        if resp.status_code >= 500:
+            breaker.failure(model)
+            return JSONResponse(status_code=502,
+                                content={"error": {"message": "upstream_error"}},
+                                headers=headers)
+        # 4xx: the upstream rejected the request. It is neither a model
+        # failure (no breaker.failure) nor proof of health (no breaker.success:
+        # the counter must survive so an open circuit stays open).
+        try:
+            content = json.loads(raw)
+        except (ValueError, TypeError):
+            content = {"raw": raw.decode("utf-8", "replace")}
+        return JSONResponse(status_code=resp.status_code, content=content,
                             headers=headers)
     breaker.success(model)
 

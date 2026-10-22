@@ -217,6 +217,22 @@ def test_put_model_accepts_json_string_profile_and_unknown_is_404(client):
     assert client.put("/admin/models/nope", json={"upstream": "x"}).status_code == 404
 
 
+def test_put_model_rejects_unknown_provider(client, app):
+    """A model whose provider does not exist drops out of the backend
+    snapshot (the JOIN misses it) and every routed request 502s — so the
+    write must be rejected and the model must stay routable."""
+    r = client.put("/admin/models/qwen3-8b", json={"provider": "ghost"})
+    assert r.status_code == 422
+    model = {m["id"]: m for m in
+             client.get("/admin/models").json()["models"]}["qwen3-8b"]
+    assert model["provider"] == "local"
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert "qwen3-8b" in load_backends(conn)
+    finally:
+        conn.close()
+
+
 def test_delete_model_referenced_409_then_ok(client):
     r = client.delete("/admin/models/qwen3-8b")     # seeded fallback references it
     assert r.status_code == 409

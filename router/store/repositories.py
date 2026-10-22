@@ -3,6 +3,10 @@
 The pipeline (stations) is stored as one JSON document per station and saved by
 wholesale replacement inside one transaction — station edits are rare and small,
 and replacement keeps ordering and deletion trivially correct.
+
+Transaction convention: a repository never commits on its own; the caller
+wraps a whole write in ``with conn:`` (one transaction per request). The
+exceptions are documented at the method that breaks the rule.
 """
 
 from __future__ import annotations
@@ -13,6 +17,11 @@ import uuid
 
 from router.pipeline.model import Station, TreeNode, Weight, station_from_dict, \
     station_to_dict
+from router.presets import PRESET_BY_ID
+
+#: Default confidence floor of a model-signal condition (2026-10-19 product
+#: decision). Rule signals are deterministic and carry no floor.
+CONF = 0.70
 
 
 def _uid() -> str:
@@ -34,15 +43,7 @@ DEFAULT_MODELS = [
 ]
 
 
-# Seed thresholds per tagger mode.
-#
-# Every condition's confidence floor defaults to 0.70 (2026-10-19 product
-# decision). Rule signals are deterministic and carry no floor. Calibration
-# presets were dropped; all taggers share the same defaults.
-CALIBRATIONS = {"default": {}}
-
-
-def _leaf(node_id: str, signal: str | None, value: str,
+def _node(node_id: str, signal: str | None, value: str,
           conf_min: float | None, *, kind: str = "leaf",
           action: str = "route", model: str | None = None,
           min_score: float | None = None,
@@ -54,51 +55,59 @@ def _leaf(node_id: str, signal: str | None, value: str,
                     children=children or [])
 
 
-def default_pipeline(calibration: str = "default") -> list[Station]:
+def default_pipeline() -> list[Station]:
     """Four independent station trees: gate / keyword gate / subject fork / fallback.
 
-    All model-signal conditions default to a 0.70 confidence floor; the
-    ``calibration`` argument is kept for API compatibility."""
-    c = {"conf": 0.70}
-    safety = Station(id=_uid(), type="gate", name="① 安全闸", root=_leaf(
+    All model-signal conditions default to a 0.70 confidence floor."""
+    safety = Station(id=_uid(), type="gate", name="① 安全闸", root=_node(
         "n1", None, "", None, kind="fork", children=[
-            _leaf("n1a", "jailbreak", "jailbreak", c["conf"],
+            _node("n1a", "jailbreak", "jailbreak", CONF,
                   action="block"),
-            _leaf("n1b", "pii", "cn_id_card", c["conf"], action="block"),
+            _node("n1b", "pii", "cn_id_card", CONF, action="block"),
         ]))
-    keyword = Station(id=_uid(), type="gate", name="② 关键词直达", root=_leaf(
+    keyword = Station(id=_uid(), type="gate", name="② 关键词直达", root=_node(
         "n2", None, "", None, kind="fork", children=[
-            _leaf("n2a", "keyword", "医疗急症", None,   # rule signal: no floor
+            _node("n2a", "keyword", "医疗急症", None,   # rule signal: no floor
                   action="route", model="qwen3-8b-medical"),
         ]))
-    subject = Station(id=_uid(), type="split", name="③ 学科 → 难度", root=_leaf(
+    subject = Station(id=_uid(), type="split", name="③ 学科 → 难度", root=_node(
         "n3", None, "", None, kind="fork", children=[
-            _leaf("n3a", "domain", "health", c["conf"], kind="fork",
+            _node("n3a", "domain", "health", CONF, kind="fork",
                   children=[
-                      _leaf("n3a1", "complexity", "hard", c["conf"],
+                      _node("n3a1", "complexity", "hard", CONF,
                             action="route", model="qwen3-8b-medical"),
-                      _leaf("n3a2", "complexity", "easy", c["conf"],
+                      _node("n3a2", "complexity", "easy", CONF,
                             action="route", model="qwen3-0.6b-medical"),
                   ]),
-            _leaf("n3b", "domain", "computer_science", c["conf"], kind="fork",
+            _node("n3b", "domain", "computer_science", CONF, kind="fork",
                   children=[
-                      _leaf("n3b1", "complexity", "hard", c["conf"],
+                      _node("n3b1", "complexity", "hard", CONF,
                             action="route", model="deepseek-v3"),
                   ]),
         ]))
-    fallback = Station(id=_uid(), type="gate", name="④ 兜底", root=_leaf(
+    fallback = Station(id=_uid(), type="gate", name="④ 兜底", root=_node(
         "n4", None, "", None, action="route", model="qwen3-8b"))
     return [safety, keyword, subject, fallback]
 
 
-def seed_default(conn: sqlite3.Connection, calibration: str = "heuristic") -> None:
+def seed_default(conn: sqlite3.Connection) -> None:
+    """Seed an empty database (idempotent).
+
+    The local provider's base url comes from the preset catalog
+    (``router.presets``), so the seeded provider and the console's preset
+    point at the same place.
+    """
+    TimePeriodRepo(conn).seed_defaults()
     if conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0]:
         return                                  # idempotent: only seed an empty DB
+    local = PRESET_BY_ID["local"]
     # Explicit column lists: v9 widened `providers` (reasoning_format/api_key),
     # so a bare `VALUES (...)` would break on the new table width.
     conn.execute("INSERT OR IGNORE INTO providers "
                  "(name, base_url, key_env, reasoning_format, api_key) "
-                 "VALUES ('local', 'http://127.0.0.1:9000', '', 'openai', '')")
+                 "VALUES ('local', ?, ?, ?, ?)",
+                 (local["base_url"], local.get("key_env") or "",
+                  local.get("reasoning_format") or "openai", ""))
     for mid, upstream, provider, profile in DEFAULT_MODELS:
         conn.execute("INSERT OR IGNORE INTO models "
                      "(id, upstream, provider, profile) VALUES (?, ?, ?, ?)",
@@ -107,7 +116,7 @@ def seed_default(conn: sqlite3.Connection, calibration: str = "heuristic") -> No
         conn.execute("INSERT OR IGNORE INTO keyword_groups (name, words) "
                      "VALUES (?, ?)",
                      (name, json.dumps(words, ensure_ascii=False)))
-    StationRepo(conn).save(default_pipeline(calibration))
+    StationRepo(conn).save(default_pipeline())
     conn.commit()
 
 
@@ -263,6 +272,8 @@ class KeywordRepo:
 
 
 class SettingsRepo:
+    """Runtime settings (key/value)."""
+
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
@@ -272,6 +283,9 @@ class SettingsRepo:
         return row["value"] if row else default
 
     def set(self, key: str, value: str) -> None:
+        """Write one setting. Does NOT commit: the caller wraps the whole
+        write in ``with conn:`` (a setting must not depend on a later,
+        unrelated write to be persisted)."""
         self.conn.execute(
             "INSERT INTO settings VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
@@ -288,7 +302,6 @@ class TimePeriodRepo:
     start > end 表示跨午夜，start == end 表示全天。请求时刻命中了哪些时段，
     time_window 信号的取值就是哪些名字（列表，与 keyword 词表同语义）。"""
 
-    SEED_KEY = "time_periods_seeded"
     DEFAULTS = [
         {"name": "白天", "days": [0, 1, 2, 3, 4], "start": "09:00", "end": "18:00"},
         {"name": "夜间", "days": [0, 1, 2, 3, 4, 5, 6], "start": "18:00", "end": "09:00"},
@@ -299,23 +312,28 @@ class TimePeriodRepo:
         self.conn = conn
 
     def load(self) -> list[dict]:
-        # first run on an existing DB: seed the three classic periods once
-        if SettingsRepo(self.conn).get(self.SEED_KEY) is None:
-            self.save(self.DEFAULTS, seed=True)
+        """Read the period table. Never writes (a GET must not mutate)."""
         return [{"name": r["name"],
                  "days": [int(d) for d in json.loads(r["days"])],
                  "start": r["start"], "end": r["end"]}
                 for r in self.conn.execute(
                     "SELECT * FROM time_periods ORDER BY rowid")]
 
-    def save(self, periods: list[dict], seed: bool = False) -> None:
-        self.conn.execute("DELETE FROM time_periods")
-        for p in periods:
-            self.conn.execute("INSERT OR REPLACE INTO time_periods VALUES (?, ?, ?, ?)",
-                              (p["name"], json.dumps(p.get("days") or []),
-                               p["start"], p["end"]))
-        SettingsRepo(self.conn).set(self.SEED_KEY, "1")
-        self.conn.commit()
+    def seed_defaults(self) -> None:
+        """First-run seeding (called by ``seed_default``); a no-op when the
+        table already holds periods."""
+        if self.conn.execute(
+                "SELECT COUNT(*) FROM time_periods").fetchone()[0]:
+            return
+        self.save(self.DEFAULTS)
+
+    def save(self, periods: list[dict]) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM time_periods")
+            for p in periods:
+                self.conn.execute("INSERT OR REPLACE INTO time_periods VALUES (?, ?, ?, ?)",
+                                  (p["name"], json.dumps(p.get("days") or []),
+                                   p["start"], p["end"]))
 
 
 class ChangeRepo:

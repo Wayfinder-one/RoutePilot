@@ -26,12 +26,9 @@ const $ = (s, r = document) => (r || document).querySelector(s);
 const $$ = (s, r = document) => Array.from((r || document).querySelectorAll(s));
 
 /* ── state ───────────────────────────────────────────────────────────── */
-let SIG = {};                  // key -> {key,zh,en,group,kind,multi,free,values:[[k,zh,en]]}
 let GROUPS = [];
 let KEYWORD_GROUPS = [];
 let TIME_PERIODS = [];
-let serverOffsetMs = 0;
-let clockTimer = null;
 let MODELS = [];
 let MODEL_INFO = {};           // id -> normalized reasoning object (§3.2)
 let stations = [];             // API shape: [{id,type,name,root}]
@@ -46,27 +43,18 @@ let uid = 0;
 let savedJson = null;
 const nid = p => (p || 'x') + Date.now().toString(36) + (++uid).toString(36);
 
-/* ── i18n / signal helpers ───────────────────────────────────────────── */
-const sigSpec = k => SIG[k] || { key: k, zh: k, en: k, group: 'rule', kind: 'model', values: [] };
-const sigName = k => (LANG === 'zh' ? sigSpec(k).zh : (sigSpec(k).en || sigSpec(k).zh)) || k;
-const isRuleSig = k => (sigSpec(k).kind || 'model') === 'rule';
-const isFreeSig = k => sigSpec(k).free !== undefined
-  ? !!sigSpec(k).free
-  : !(sigSpec(k).values || []).length;
-const valLabel = (k, v) => {
-  if (v == null || v === '') return '';
-  const hit = (sigSpec(k).values || []).find(x => String(x[0]) === String(v));
-  if (!hit) return String(v);
-  return LANG === 'zh' ? hit[1] : (hit[2] || hit[1]);
-};
+/* ── editor defaults (mirror router/pipeline/model.py) ───────────────── */
+const DEFAULT_CONF_MIN = 0.70;      // condition confidence floor
+const DEFAULT_WEIGHT = 0.50;        // weight of a dragged-in condition
+const DEFAULT_MIN_SCORE = 0.50;     // attainment floor of a weighted leaf
+
+/* ── i18n / signal helpers (shared.js) ───────────────────────────────── */
 const groupName = g => t('group.' + g);
 const condText = n => n.signal
   ? `${sigName(n.signal)} = ${valLabel(n.signal, n.value) || n.value}`
   : t('p6.entry');
 
 /* ── model reasoning capability (docs §3.2) ──────────────────────────── */
-const FALLBACK_REASON = { declared: false, supported: null, format: null,
-  efforts: [], default: null };
 const modelReasoning = id => MODEL_INFO[id] || FALLBACK_REASON;
 const modelEfforts = id => {
   const r = modelReasoning(id);
@@ -120,7 +108,7 @@ function markDirty() { renderDirty(); }
 /* ── palette ─────────────────────────────────────────────────────────── */
 function renderPalette() {
   $('#palBody').innerHTML = GROUPS.map(g => {
-    const items = Object.values(SIG).filter(s => s.group === g);
+    const items = Object.values(SIGNAL_REGISTRY).filter(s => s.group === g);
     if (!items.length) return '';
     return `<section class="grp">
       <h3>${esc(groupName(g))}<span class="rl"></span></h3>
@@ -134,7 +122,7 @@ function renderPalette() {
            </svg>${esc(sigName(s.key))}</button>`).join('')}</div>
     </section>`;
   }).join('');
-  $('#palCount').textContent = Object.keys(SIG).length + (LANG === 'zh' ? ' 个' : '');
+  $('#palCount').textContent = Object.keys(SIGNAL_REGISTRY).length + (LANG === 'zh' ? ' 个' : '');
 }
 function syncPalFade() {
   const body = $('#palBody');
@@ -147,7 +135,7 @@ function conditionChip(n) {
   const conf = n.signal
     ? (isRuleSig(n.signal)
         ? `<button class="tn-conf det" data-cond="${esc(n.id)}">${esc(t('p4.deterministic'))}</button>`
-        : `<button class="tn-conf" data-cond="${esc(n.id)}">${esc(t('p4.confFloor'))}${(n.conf_min != null ? n.conf_min : 0.7).toFixed(2)}</button>`)
+        : `<button class="tn-conf" data-cond="${esc(n.id)}">${esc(t('p4.confFloor'))}${(n.conf_min != null ? n.conf_min : DEFAULT_CONF_MIN).toFixed(2)}</button>`)
     : '';
   return `<button class="tn-cond${n.signal ? '' : ' entry'}" data-cond="${esc(n.id)}">${esc(condText(n))}</button>${conf}`;
 }
@@ -313,7 +301,7 @@ function flashNode(id) {
 
 /* ── toast ───────────────────────────────────────────────────────────── */
 let toastTimer = null;
-function toast(msg, undo) {
+function toastUndo(msg, undo) {
   const el = $('#t4toast');
   el.innerHTML = `<span>${esc(msg)}</span>${undo ? '<button type="button">' + esc(t('p4.undo')) + '</button>' : ''}`;
   el.classList.add('show');
@@ -331,7 +319,7 @@ function toast(msg, undo) {
 function newNode(station, signal, value) {
   return {
     id: nid('n'), signal, value: value == null ? '' : String(value),
-    conf_min: signal && !isRuleSig(signal) ? 0.7 : null,
+    conf_min: signal && !isRuleSig(signal) ? DEFAULT_CONF_MIN : null,
     kind: 'leaf', action: 'route',
     model: MODELS[0] || '',
     reasoning: null,
@@ -359,7 +347,7 @@ function addChild(nodeId, signal, value) {
   markDirty();
   renderStation(station.id);
   flashNode(node.children[node.children.length - 1].id);
-  toast(becameFork
+  toastUndo(becameFork
     ? tf('p6.leafBecameFork', { name: condText(node) })
     : tf('p6.toastChildAdded', { name: sigName(signal) }), () => {
     const back = findNodeRef(nodeId);
@@ -380,7 +368,7 @@ function deleteNode(nodeId) {
   const snapshot = parent.children.splice(index, 1)[0];
   markDirty();
   renderStation(station.id);
-  toast(tf('p6.toastNodeDeleted', { name: condText(snapshot) }), () => {
+  toastUndo(tf('p6.toastNodeDeleted', { name: condText(snapshot) }), () => {
     const back = findNodeRef(parent.id);
     if (!back) return;
     back.node.children.splice(index, 0, snapshot);
@@ -393,13 +381,13 @@ function deleteStation(stationId) {
   const idx = stations.findIndex(s => s.id === stationId);
   if (idx < 0) return;
   if (idx === stations.length - 1) {
-    toast(t('p6.toastNoDeleteFallback'));
+    toastUndo(t('p6.toastNoDeleteFallback'));
     return;
   }
   const [st] = stations.splice(idx, 1);
   markDirty();
   removeStationEl(stationId);
-  toast(tf('p6.toastStationDeleted', { name: st.name }), () => {
+  toastUndo(tf('p6.toastStationDeleted', { name: st.name }), () => {
     stations.splice(idx, 0, st);
     markDirty();
     insertStationEl(st, idx);
@@ -419,7 +407,7 @@ function addStation(signal, value) {
   stations.splice(Math.max(0, stations.length - 1), 0, body);
   markDirty();
   insertStationEl(body, stations.length - 2);
-  toast(tf('p6.toastStationAdded', { name: body.name }), () => {
+  toastUndo(tf('p6.toastStationAdded', { name: body.name }), () => {
     const i = stations.findIndex(s => s.id === body.id);
     if (i >= 0) { stations.splice(i, 1); markDirty(); removeStationEl(body.id); }
   });
@@ -430,18 +418,18 @@ function addWeight(nodeId, signal, value) {
   const ref = findNodeRef(nodeId);
   if (!ref) return;
   const { station, node } = ref;
-  if (node.kind !== 'leaf') { toast(t('p6.forkNoWeights')); return; }
-  if (node.signal === signal) { toast(t('p6.sameAsCondition')); return; }
+  if (node.kind !== 'leaf') { toastUndo(t('p6.forkNoWeights')); return; }
+  if (node.signal === signal) { toastUndo(t('p6.sameAsCondition')); return; }
   if ((node.weights || []).some(w => w.signal === signal && w.value === value)) {
-    toast(t('p6.duplicateWeight'));
+    toastUndo(t('p6.duplicateWeight'));
     return;
   }
-  const added = { signal, value, weight: 0.5 };
+  const added = { signal, value, weight: DEFAULT_WEIGHT };
   node.weights.push(added);
-  if (node.min_score == null) node.min_score = 0.5;
+  if (node.min_score == null) node.min_score = DEFAULT_MIN_SCORE;
   markDirty();
   renderStation(station.id);
-  toast(tf('p6.toastWeightAdded', { name: sigName(signal) }), () => {
+  toastUndo(tf('p6.toastWeightAdded', { name: sigName(signal) }), () => {
     const back = findNodeRef(nodeId);
     if (!back) return;
     back.node.weights = back.node.weights.filter(w => w !== added);
@@ -456,7 +444,7 @@ function forkOnSignal(nodeId, signal) {
   const ref = findNodeRef(nodeId);
   if (!ref) return;
   const { station, node } = ref;
-  if (node.signal === signal) { toast(t('p6.sameAsCondition')); return; }
+  if (node.signal === signal) { toastUndo(t('p6.sameAsCondition')); return; }
   const spec = sigSpec(signal);
   const used = [...new Set((node.weights || [])
     .filter(w => w.signal === signal).map(w => w.value))];
@@ -465,7 +453,7 @@ function forkOnSignal(nodeId, signal) {
   const otherWeights = (node.weights || []).filter(w => w.signal !== signal);
   const makeChild = value => ({
     id: nid('n'), signal, value: value == null ? '' : String(value),
-    conf_min: isRuleSig(signal) ? null : 0.7, kind: 'leaf',
+    conf_min: isRuleSig(signal) ? null : DEFAULT_CONF_MIN, kind: 'leaf',
     action: node.action, model: node.model, reasoning: node.reasoning || null,
     min_score: node.min_score,
     weights: otherWeights.map(w => ({ ...w })), children: [],
@@ -483,7 +471,7 @@ function forkOnSignal(nodeId, signal) {
   markDirty();
   renderStation(station.id);
   children.forEach(c => flashNode(c.id));
-  toast(tf('p6.toastForked', { name: sigName(signal), n: children.length }), () => {
+  toastUndo(tf('p6.toastForked', { name: sigName(signal), n: children.length }), () => {
     const back = findNodeRef(nodeId);
     if (!back) return;
     Object.assign(back.node, snapshot);
@@ -576,7 +564,7 @@ function openConditionEditor(nodeId) {
     ${node.signal && isRuleSig(node.signal)
       ? `<p class="pop-note">${esc(t('p4.ruleNote'))}</p>`
       : node.signal
-        ? rangeBlock('nc', t('p4.confMin'), node.conf_min != null ? node.conf_min : 0.7, 0.01, t('p4.confHint'))
+        ? rangeBlock('nc', t('p4.confMin'), node.conf_min != null ? node.conf_min : DEFAULT_CONF_MIN, 0.01, t('p4.confHint'))
         : `<p class="pop-note">${esc(t('p6.entryNote'))}</p>`}
     <div class="pop-foot">
       <span class="pop-note">${esc(t('p6.changeByRebuild'))}</span>
@@ -586,10 +574,11 @@ function openConditionEditor(nodeId) {
   if (node.signal && !isRuleSig(node.signal)) wireRange('nc', {
     onInput(v) {
       node.conf_min = v;
-      const el = anchorOf(`[data-cond="${CSS.escape(nodeId)}"]`);
-      if (el) el.textContent = t('p4.confFloor') + v.toFixed(2);
-      const conf = el && el.parentElement.querySelector('.tn-conf');
-      if (conf) conf.textContent = t('p4.confFloor') + v.toFixed(2);
+      // Only the confidence chip carries the floor text. The condition button
+      // shares the data-cond attribute, so writing to it would erase the
+      // condition label ("学科 = 医疗" -> "门槛 0.70").
+      const chip = $('#flow').querySelector(`.tn-conf[data-cond="${CSS.escape(nodeId)}"]`);
+      if (chip) chip.textContent = t('p4.confFloor') + v.toFixed(2);
     },
     onCommit() { markDirty(); renderStation(station.id); placePop(anchorOf(`[data-cond="${CSS.escape(nodeId)}"]`)); }
   });
@@ -650,7 +639,7 @@ function openLeafEditor(nodeId) {
     ${(node.weights && node.weights.length) ? `
       <p class="pop-label">${esc(t('p6.weights'))}</p>
       <div class="wlist" id="lfWeights">${weightRows}</div>
-      ${rangeBlock('lfMin', t('p4.minScore'), node.min_score != null ? node.min_score : 0.5, 0.05, t('p4.minScoreHint'))}
+      ${rangeBlock('lfMin', t('p4.minScore'), node.min_score != null ? node.min_score : DEFAULT_MIN_SCORE, 0.05, t('p4.minScoreHint'))}
     ` : `<p class="pop-note">${esc(t('p6.noWeightsNote'))}</p>`}
     <div class="pop-foot">
       <button class="pop-del" data-popdelnode="${esc(nodeId)}">${esc(t('p6.delNode'))}</button>
@@ -769,7 +758,7 @@ function openPicker({ title, sub, anchor, allowFree, note, onPick, disabledValue
     pop.innerHTML = `${popHead(title, sub)}
       <p class="pop-label">${esc(t('p6.pickSignal'))}</p>
       <div class="pop-vals" id="pkSigs">
-        ${Object.values(SIG).filter(x => allowFree || !isFreeSig(x.key)).map(x =>
+        ${Object.values(SIGNAL_REGISTRY).filter(x => allowFree || !isFreeSig(x.key)).map(x =>
           `<button data-pk="${esc(x.key)}">${esc(sigName(x.key))}</button>`).join('')}
       </div>
       <div class="pop-foot"><span class="pop-note">${esc(note || '')}</span></div>`;
@@ -863,8 +852,8 @@ function handleSignalDrop(nodeId, signal) {
   const ref = findNodeRef(nodeId);
   if (!ref) return;
   const node = ref.node;
-  if (node.kind !== 'leaf') { toast(t('p6.forkNoWeights')); return; }
-  if (node.signal === signal) { toast(t('p6.sameAsCondition')); return; }
+  if (node.kind !== 'leaf') { toastUndo(t('p6.forkNoWeights')); return; }
+  if (node.signal === signal) { toastUndo(t('p6.sameAsCondition')); return; }
   if ((node.weights || []).some(w => w.signal === signal)) {
     forkOnSignal(nodeId, signal);
     return;
@@ -884,7 +873,7 @@ function openStationPicker() {
       <p class="pop-label">${esc(t('p6.rootCondition'))}</p>
       <div class="pop-vals" id="stRoots">
         <button data-uncond="1">${esc(t('p6.unconditional'))}</button>
-        ${Object.values(SIG).map(x =>
+        ${Object.values(SIGNAL_REGISTRY).map(x =>
           `<button data-pk="${esc(x.key)}">${esc(sigName(x.key))}</button>`).join('')}
       </div>
       <div class="pop-foot"><span class="pop-note">${esc(t('p6.stationNote'))}</span></div>`;
@@ -930,7 +919,6 @@ function openStationPicker() {
 
 /* ── pointer interactions (no native HTML5 DnD) ─────────────────────── */
 let pdrag = null;        // {kind:'signal'|'station', ...}
-let suppressClick = false;
 
 function clearHot() { $$('.tnode.hot').forEach(el => el.classList.remove('hot')); }
 function clearDropIndicators() {
@@ -948,7 +936,6 @@ function onPointerMove(ev) {
   if (!pdrag.active) {
     if (Math.hypot(dx, dy) < 6) return;
     pdrag.active = true;
-    suppressClick = true;
     document.body.classList.add('dragging');
     if (pdrag.kind === 'signal') {
       const ghost = document.createElement('div');
@@ -1091,7 +1078,7 @@ function moveStation(stationId, beforeIdx) {
   stations.splice(to, 0, st);
   markDirty();
   reorderFlowDOM();
-  toast(tf('p4.toastMoved', { name: st.name, n: to + 1 }), () => {
+  toastUndo(tf('p4.toastMoved', { name: st.name, n: to + 1 }), () => {
     const byId = new Map(stations.map(s => [s.id, s]));
     stations.length = 0;
     snapshot.forEach(id => stations.push(byId.get(id)));
@@ -1231,7 +1218,7 @@ function exportPipeline() {
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
-  toast(tf('p4.exportOk', { name: a.download }));
+  toastUndo(tf('p4.exportOk', { name: a.download }));
 }
 
 function normalizeImported(raw) {
@@ -1251,7 +1238,7 @@ function normalizeImported(raw) {
       min_score: n.min_score != null ? Number(n.min_score) : null,
       weights: (n.weights || []).map(w => ({
         signal: String(w.signal), value: String(w.value ?? ''),
-        weight: w.weight != null ? Number(w.weight) : 0.5,
+        weight: w.weight != null ? Number(w.weight) : DEFAULT_WEIGHT,
       })),
       children: [],
     };
@@ -1284,9 +1271,9 @@ async function importPipeline(file) {
     stations = imported;
     markDirty();
     renderAll();
-    toast(tf('p4.importOk', { n: imported.length }));
+    toastUndo(tf('p4.importOk', { n: imported.length }));
   } catch (e) {
-    toast(tf('p4.importBad', { err: e.message }));
+    toastUndo(tf('p4.importBad', { err: e.message }));
   } finally {
     $('#importFile').value = '';
   }
@@ -1310,10 +1297,10 @@ async function save() {
     version = String(out.version != null ? out.version : version);
     savedJson = JSON.stringify(stations);
     renderHeader();
-    toast(t('common.saved'));
+    toastUndo(t('common.saved'));
   } catch (e) {
     if (Array.isArray(e.detail)) showIssues(e.detail, '#issues');
-    else toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
+    else toastUndo((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
   }
 }
 
@@ -1328,13 +1315,10 @@ async function boot() {
     GROUPS = sigBody.groups && sigBody.groups.length
       ? sigBody.groups
       : ['safety', 'domain', 'difficulty', 'context', 'session', 'rule'];
-    (sigBody.signals || []).forEach(s => {
-      SIG[s.key] = { ...s, values: (s.values || []).map(v =>
-        Array.isArray(v) ? v : [v.key, v.zh, v.en]) };
-    });
+    setSignalRegistry(sigBody.signals);
     KEYWORD_GROUPS = sigBody.keyword_groups || [];
     TIME_PERIODS = sigBody.time_periods || [];
-    if (sigBody.now) serverOffsetMs = new Date(sigBody.now).getTime() - Date.now();
+    setServerOffset(sigBody.now);
     startServerClock();
     const modelRows = modelBody.models || [];
     MODELS = modelRows.map(m => m.id);
@@ -1395,20 +1379,12 @@ window.addEventListener('resize', () => {
   }
 });
 /* ── server clock (time_window judges by server time) ────────────────── */
-function serverNow() { return new Date(Date.now() + serverOffsetMs); }
-function fmtServerTime(d) {
-  const p2 = n => String(n).padStart(2, '0');
-  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
-}
 function startServerClock() {
-  if (clockTimer) clearInterval(clockTimer);
-  const tick = () => {
+  startServerClockTick(() => {
     const el = $('#serverClockPill');
     if (!el) return;
     el.innerHTML = `${esc(t('p4.serverClock'))} <b>${esc(fmtServerTime(serverNow()))}</b>`;
-  };
-  tick();
-  clockTimer = setInterval(tick, 1000);
+  });
 }
 
 window.onLangChange = () => {

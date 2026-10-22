@@ -114,6 +114,24 @@ MIGRATIONS = [
     """
     DROP TABLE IF EXISTS sessions;
     """,
+    # v12 (2026-10-22): the requests row is slim and its column names now
+    # match what they hold: `node_id` held the STATION id and `branch_id` the
+    # LEAF id (the old nodes/branches tables are long gone). The dead
+    # `tree_path` column is dropped with the rebuild (the calculation log
+    # became memory-only in 2026-10-20).
+    """
+    CREATE TABLE requests_v12 (
+        id TEXT PRIMARY KEY, ts TEXT NOT NULL, text TEXT NOT NULL,
+        decision TEXT NOT NULL, model TEXT, station_id TEXT, leaf_id TEXT,
+        score REAL, latency_ms REAL);
+    INSERT INTO requests_v12
+        (id, ts, text, decision, model, station_id, leaf_id, score, latency_ms)
+        SELECT id, ts, text, decision, model, node_id, branch_id, score,
+               latency_ms FROM requests;
+    DROP TABLE requests;
+    ALTER TABLE requests_v12 RENAME TO requests;
+    CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
+    """,
 ]
 
 
@@ -122,21 +140,63 @@ def connect(path: str) -> sqlite3.Connection:
     # generator (and its teardown) across different threadpool threads. Every
     # connection is request-scoped and never used concurrently, so relaxing the
     # thread check is safe; WAL + busy_timeout handle cross-connection writers.
+    # The timeout argument IS the busy timeout (how long a writer waits for a
+    # lock) — no second PRAGMA needed.
     conn = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 10000")
-    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
+def _statements(script: str):
+    """Split a migration script into complete SQL statements.
+
+    ``sqlite3.complete_statement`` knows about string literals and comments,
+    so a ';' inside a string does not split the statement.
+    """
+    buf = ""
+    for line in script.splitlines():
+        buf += line + "\n"
+        if sqlite3.complete_statement(buf):
+            stmt = buf.strip()
+            if stmt:
+                yield stmt
+            buf = ""
+    tail = buf.strip()
+    if tail:
+        yield tail
+
+
 def migrate(conn: sqlite3.Connection) -> None:
+    """Apply pending migrations; each one is atomic.
+
+    A migration and its ``schema_migrations`` row are written in the SAME
+    transaction: a script that fails half-way leaves the database untouched
+    (no half-applied DDL, no version row), so the next start retries it
+    cleanly instead of failing on "duplicate column".
+    """
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations "
                  "(version INTEGER PRIMARY KEY)")
-    applied = conn.execute("SELECT COALESCE(MAX(version), 0) "
-                           "FROM schema_migrations").fetchone()[0]
-    for i, sql in enumerate(MIGRATIONS, start=1):
-        if i > applied:
-            conn.executescript(sql)
-            conn.execute("INSERT INTO schema_migrations (version) VALUES (?)", (i,))
-    conn.commit()
+    applied = int(conn.execute("SELECT COALESCE(MAX(version), 0) "
+                                "FROM schema_migrations").fetchone()[0])
+    previous_isolation = conn.isolation_level
+    conn.isolation_level = None          # explicit transaction control
+    try:
+        for i, sql in enumerate(MIGRATIONS, start=1):
+            if i <= applied:
+                continue
+            try:
+                conn.execute("BEGIN")
+                for stmt in _statements(sql):
+                    conn.execute(stmt)
+                conn.execute("INSERT INTO schema_migrations (version) "
+                             "VALUES (?)", (i,))
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+    finally:
+        conn.isolation_level = previous_isolation

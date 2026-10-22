@@ -4,8 +4,8 @@ A leaf with weighted conditions scores
 ``score = sum(w*c*m) / sum(w)`` — the weighted attainment rate, always in
 [0,1] because every term w*c*m <= w. ``passed`` requires at least one weight
 and ``score >= min_score`` (leaf-level; unconfigured leaves fall back to
-``DEFAULT_MIN_SCORE`` = 0.5, matching the console's editor default — audit
-P1 3.2: the old 0.0 fallback let a weighted leaf pass with zero attainment).
+``DEFAULT_MIN_SCORE`` = 0.5, matching the console's editor default — a 0.0
+fallback would let a weighted leaf pass with zero attainment).
 Leaves without weights are direct hits and never call this module.
 """
 

@@ -12,6 +12,7 @@ browser; ``/healthz``, ``/v1`` and the static console are not gated.
 from __future__ import annotations
 
 import hmac
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -21,12 +22,15 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.config import Settings
+from router.pipeline.health import check_pipeline
 from router.signals.heuristic import HeuristicTagger
 from router.store.db import connect, migrate
 from router.store.repositories import (
-    KeywordRepo, StationRepo, TimePeriodRepo, seed_default)
+    KeywordRepo, ModelRepo, StationRepo, TimePeriodRepo, seed_default)
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
+
+logger = logging.getLogger(__name__)
 
 
 def _make_tagger(settings: Settings, kw_groups: dict):
@@ -83,23 +87,32 @@ def _install_admin_auth(app: FastAPI, token: str) -> None:
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None
                ) -> FastAPI:
-    # Seed thresholds follow the tagger's confidence scale: JEV (r4b3, T=3.45
-    # per temperature.json) has its own calibrated set; checkpoint/prompt share
-    # the checkpoint numbers; heuristic caps confidences at 0.5 and keeps the
-    # low preset.
-    if settings.tagger == "jev":
-        calibration = "jev"
-    elif settings.tagger in ("checkpoint", "prompt"):
-        calibration = "checkpoint"
-    else:
-        calibration = "heuristic"
     conn = connect(settings.db_path)
     migrate(conn)
-    seed_default(conn, calibration)
+    seed_default(conn)
     kw_groups = KeywordRepo(conn).groups()
     time_periods = TimePeriodRepo(conn).load()
     pipeline = StationRepo(conn).load()
+    known_models = {m["id"] for m in ModelRepo(conn).list()}
     conn.close()
+
+    # A tree that the engine cannot execute must not reach the hot path: the
+    # console would happily save it, but every request would then 502 or pick
+    # a wrong branch. Refuse to start instead (the operator fixes the DB and
+    # restarts). Warnings are logged, they do not block the boot.
+    issues = check_pipeline(pipeline, known_models)
+    hard = [i for i in issues if i.level == "hard"]
+    if hard:
+        for issue in hard:
+            logger.error("pipeline health: %s (%s) station=%s node=%s",
+                         issue.en, issue.code, issue.station_id, issue.node_id)
+        raise RuntimeError(
+            "refusing to start: the stored pipeline has "
+            f"{len(hard)} hard issue(s): "
+            + ", ".join(sorted({i.code for i in hard})))
+    for issue in issues:
+        logger.warning("pipeline health: %s (%s) station=%s node=%s",
+                       issue.en, issue.code, issue.station_id, issue.node_id)
 
     from router.api.requestlog import RequestLogger
     requestlog = RequestLogger(settings)

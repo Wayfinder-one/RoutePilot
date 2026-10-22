@@ -1,3 +1,5 @@
+import pytest
+
 from router.store.db import connect, migrate
 
 
@@ -38,4 +40,40 @@ def test_migrate_upgrades_a_v1_database(tmp_path):
     assert "sessions" not in tables      # v11 dropped it
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] \
         == len(MIGRATIONS)
+    conn.close()
+
+
+def test_a_failing_migration_leaves_the_database_untouched(tmp_path, monkeypatch):
+    """Migration + version row are one transaction: a script that fails half
+    way is rolled back entirely, so the next start retries it cleanly
+    (no half-applied DDL, no "duplicate column")."""
+    import sqlite3
+
+    import router.store.db as db
+
+    original = list(db.MIGRATIONS)
+    good = "CREATE TABLE ok_table (id TEXT PRIMARY KEY);"
+    broken = ("CREATE TABLE half_table (id TEXT PRIMARY KEY);\n"
+              "CREATE TABLE half_table (id TEXT PRIMARY KEY);")   # duplicate
+    monkeypatch.setattr(db, "MIGRATIONS", original + [good, broken])
+
+    path = str(tmp_path / "t.db")
+    conn = connect(path)
+    with pytest.raises(sqlite3.OperationalError):
+        migrate(conn)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "half_table" not in tables          # rolled back with the rest
+    version = conn.execute(
+        "SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+    assert version == len(original) + 1        # only the good one was recorded
+    conn.close()
+
+    # the fixed script applies cleanly on the next start
+    monkeypatch.setattr(db, "MIGRATIONS", original + [good])
+    conn = connect(path)
+    migrate(conn)
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "ok_table" in tables
     conn.close()

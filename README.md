@@ -44,6 +44,15 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 .venv/bin/python -m router
 ```
 
+### 启动即体检
+
+服务启动时会用库里的分流树跑一次健康检查（`router/pipeline/health.py`）：
+
+- **硬错误**（未知信号/未知模型、节点或站点 id 重复、缺兜底…）→ **拒绝启动**并打印问题，
+  避免「树跑不起来」变成线上 502；
+- **警告**（配了但不会生效的字段：无权重叶的 `min_score`、fork 的 `model/action/min_score`、
+  无条件节点的 `conf_min`、拦截叶的 `model`）→ 记录日志，控制台保存时也会回显。
+
 ### 关键环境变量
 
 | 变量 | 作用 |
@@ -105,13 +114,27 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 - 运行期只渲染 `configs/signal_questions.json` 里每条信号的**第 1 条问法**；模型按标准问法
   校准，改写措辞前请先复评（`user_feedback` 对措辞最敏感）。
 - 候选顺序不敏感。
-- 输入上限 1024 token：超长先收缩上下文、最后才 token 截断（左截断，保留尾部的问题与选项），不报错。
+- **输入窗口 = 最后一条 user 消息的前 1024 token**（`max_length`，按 tokenizer 精确头截断）：
+  超长请求只裁一次并保留开头，不再做 8 轮上下文收缩/左截断（200K 输入：截断 0.67s、
+  全量打标 2.0s；旧 stock shrink 46–48s）。问题模板另占 47–120 token，prompt 上限相应放宽为
+  `max_length + 160`，标准问法不会被截。规则信号（`pii_rules` 等确定性正则）仍扫**全文**，
+  是长请求的兜底；裁剪事实进计算日志（`input_tokens` / `input_visible_tokens` /
+  `input_truncated`，见 `/admin/requests/recent`）。
 - 采样温度由模型目录的 `temperature.json` 自动加载（`softmax(logits / T)`）。
 
 ## 热路径裁剪
 
 `/v1` 会按当前 pipeline 树只计算会被读取的信号问题（`ROUTER_JEV_TRIM=0` 一键关闭）；
 `/admin/try` 与 eval 入口始终全量打标，便于试算与回归。
+
+## `/v1` 入口约定
+
+- 请求体必须是 JSON 对象、`messages` 必须是数组：畸形请求回 **400**（不是 500）；
+  请求体超过 **10 MB** 回 **413**。
+- 上游返回 **4xx** 时按原状态码与错误体透传给客户端（流式与非流式一致），
+  不再包装成 200 SSE；只有 5xx / 网络错误才计入熔断失败。
+- 流式请求的读超时单独放开（`httpx.Timeout(60.0, read=None)`）：思考型模型首个 token
+  可能超过 60s，不应被全局超时截断。
 
 ## 模型目录与推理配置
 
@@ -156,6 +179,8 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（461 passed, 6 skipped）。
+- 单元/集成：`pytest`（491 passed, 6 skipped）。
+- i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
+  `scripts/i18n_prune_i18n.py` 负责批量删除）。
 - 控制台冒烟：`BASE=http://<host>:<port> ADMIN_TOKEN=<token> node scripts/console_check.js`
   （覆盖五个页面、模型目录/添加模型弹窗/推理声明编辑器、分流树叶推理下拉与日志徽章）。

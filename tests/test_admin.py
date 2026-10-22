@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.config import Settings
+from router.store.db import connect
 
 
 def client(tmp_path):
@@ -171,14 +172,6 @@ def test_try_reports_vec_dim(tmp_path):
     assert body["vec_dim"] == 0            # heuristic has no embedding
 
 
-def test_try_ignores_removed_session_field(tmp_path):
-    """Spec §7.4: pydantic ignores the removed `session` field (extra fields
-    are allowed), so old clients keep getting 200 instead of a 422."""
-    r = client(tmp_path).post("/admin/try",
-                              json={"text": "你好", "session": "legacy-1"})
-    assert r.status_code == 200
-
-
 def questions_client(tmp_path):
     q = tmp_path / "questions.json"
     return TestClient(create_app(Settings(db_path=str(tmp_path / "t.db"),
@@ -210,6 +203,62 @@ def test_signal_questions_rejects_invalid_config(tmp_path):
     r = c.put("/admin/signal-questions", json={"config": cfg})
     assert r.status_code == 422
     assert not q.exists()                      # nothing written on validation failure
+
+
+def test_signal_questions_without_signals_object_is_422(tmp_path):
+    """A config without a 'signals' object must be a clean 422 (the old code
+    raised NameError there and the admin PUT answered 500)."""
+    c, q = questions_client(tmp_path)
+    r = c.put("/admin/signal-questions", json={"config": {"foo": 1}})
+    assert r.status_code == 422
+    assert "signals" in str(r.json()["detail"])
+    assert not q.exists()
+
+
+def test_signal_questions_rolls_the_memory_back_when_the_write_fails(tmp_path,
+                                                                     monkeypatch):
+    """The in-memory config is applied first; a failed disk write must roll it
+    back, so memory and disk stay in the same state."""
+    import pathlib
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db"),
+                              signal_questions=str(tmp_path / "questions.json")))
+    c = TestClient(app)
+    original = c.get("/admin/signal-questions").json()["config"]
+    app.state.tagger.questions = original
+    applied = []
+
+    def fake_set(cfg):
+        app.state.tagger.questions = cfg
+        applied.append(cfg)
+
+    app.state.tagger.set_questions = fake_set
+
+    def boom(self, *args, **kwargs):
+        raise OSError("disk is full")
+
+    monkeypatch.setattr(pathlib.Path, "write_text", boom)
+    r = c.put("/admin/signal-questions", json={"config": original})
+    assert r.status_code == 500
+    assert applied == [original, original]      # applied, then rolled back
+    assert app.state.tagger.questions == original
+
+
+def test_put_settings_persists_without_the_audit_call(tmp_path, monkeypatch):
+    """A setting must not depend on a later, unrelated write to be persisted
+    (the whole write is one transaction now)."""
+    import router.api.routes_admin as routes_admin
+
+    monkeypatch.setattr(routes_admin.ChangeRepo, "record",
+                        lambda self, ts, kind, detail: None)
+    c = client(tmp_path)
+    assert c.put("/admin/settings", json={"foo": "bar"}).status_code == 200
+    conn = connect(str(tmp_path / "t.db"))
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'foo'").fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row["value"] == "bar"
 
 
 def test_tagger_meta_and_recent_requests(tmp_path):

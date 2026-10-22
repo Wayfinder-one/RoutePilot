@@ -11,17 +11,9 @@ let requests = [];
 let questions = null;
 let meta = {};
 let stations = [];
-let SIG = {};
 let filter = 'all';
 const openIds = new Set();
 
-const sigSpec = k => SIG[k] || { zh: k, en: k, values: [] };
-const sigName = k => (LANG === 'zh' ? sigSpec(k).zh : sigSpec(k).en) || k;
-const valLabel = (k, v) => {
-  const vals = sigSpec(k).values || [];
-  const hit = vals.find(x => String(x[0]) === String(v));
-  return hit ? (LANG === 'zh' ? hit[1] : (hit[2] || hit[1])) : String(v ?? '');
-};
 const stationName = id => (stations.find(s => s.id === id) || {}).name || '';
 const lastStep = st => {
   const path = Array.isArray(st.path) ? st.path : [];
@@ -37,6 +29,15 @@ function reasonBadge(r) {
 function reasoningWarn(r) {
   if (!r.reasoning_warning) return '';
   return `<span class="dec warn" title="${esc(t('logs.reasoningWarn'))}">⚠ ${esc(t('logs.reasoning'))}</span>`;
+}
+/* Model-input window (JEV head-truncation): show it, because the model judged
+   only the first N tokens of the request text while the log keeps the full text. */
+function inputTruncBadge(r) {
+  if (!r.input_truncated) return '';
+  const vis = r.input_visible_tokens != null ? r.input_visible_tokens : '?';
+  const tot = r.input_tokens != null ? r.input_tokens : '?';
+  const tip = t('logs.truncatedTip').replace('{vis}', vis).replace('{tot}', tot);
+  return `<span class="dec warn" title="${esc(tip)}">✂ ${esc(t('logs.truncated'))} ${vis}/${tot}</span>`;
 }
 function decisionHtml(r) {
   if (r.decision === 'block') return `<span class="dec block">✕ ${t('logs.blocked')}</span>`;
@@ -88,7 +89,7 @@ function bannerHtml(r) {
     : r.decision === 'route'
       ? '→ ' + (r.model || '—') + (r.reasoning ? ' · ' + reasonLabel(r.reasoning) : '')
       : t('logs.none');
-  const via = stationName(r.node_id);
+  const via = stationName(r.station_id);
   const score = r.score != null ? ' · ' + t('logs.score') + ' ' + fmt(r.score) : '';
   const warn = r.reasoning_warning
     ? ` <span class="flow-tag cut" title="${esc(t('logs.reasoningWarn'))}">⚠ ${esc(t('logs.reasoning'))}</span>` : '';
@@ -210,20 +211,20 @@ function signalPanelHtml(r) {
     <details class="flow-how"><summary>${esc(t('logs.method'))}</summary>${methodRowsHtml(r)}</details>
   </div>`;
 }
-function legacyHtml(r) {
-  return `<div class="flow-legacy">${esc(t('logs.oldLog'))}</div>${methodRowsHtml(r)}`;
-}
 function rowHtml(r) {
   const open = openIds.has(r.id);
   const text = String(r.text || '').replace(/\s+/g, ' ');
   const trace = Array.isArray(r.trace) ? r.trace : null;
+  // The ring is memory-only and every enqueued record carries a trace; the
+  // fallback only keeps a malformed record from rendering an empty panel.
   const detail = trace && trace.length
     ? bannerHtml(r) + stationTrack(r) + pathHtml(r) + boardHtml(r) + signalPanelHtml(r)
-    : legacyHtml(r);
+    : bannerHtml(r) + methodRowsHtml(r);
   return `<article class="log-row ${open ? 'open' : ''}" data-id="${esc(r.id)}">
     <div class="log-head">
       <span class="log-time">${esc(fmtTime(r.ts))}</span>
       ${decisionHtml(r)}
+      ${inputTruncBadge(r)}
       <span class="log-text" title="${esc(text)}">${esc(text.length > 90 ? text.slice(0, 90) + '…' : text)}</span>
       <span class="log-lat">${r.latency_ms != null ? Math.round(r.latency_ms) + 'ms' : '—'}</span>
     </div>
@@ -255,7 +256,7 @@ async function load() {
     try { meta = (await api.get('/admin/tagger')).tagger || meta; } catch (e) { /* ignore */ }
   }
   stations = pipeBody.stations || [];
-  sigBody.signals.forEach(s => { SIG[s.key] = s; });
+  setSignalRegistry(sigBody.signals);
   render();
 }
 

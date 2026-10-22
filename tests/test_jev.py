@@ -15,11 +15,13 @@ from router.pipeline.model import Station, TreeNode
 from router.pipeline.scope import (compute_signal_scope, full_scope,
                                    SignalScope)
 from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
-                                JUDGED_SIGNALS, NOUL_SIGNALS, JevTagger,
+                                JUDGED_SIGNALS, NOUL_SIGNALS,
+                                PROMPT_OVERHEAD_SLACK, JevTagger,
                                 JevTaggerError, build_signal_records,
                                 candidate_prompts, decode_choice, decode_noul,
                                 entropy_confidence, binary_entropy_confidence,
-                                load_question_config)
+                                head_window, load_question_config,
+                                validate_question_config)
 from router.signals.registry import SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import default_pipeline
@@ -34,20 +36,78 @@ FULL_RECORDS, FULL_PROMPTS = 36, 54
 TRIMMED_RECORDS, TRIMMED_PROMPTS = 4, 14 + 1 + 1 + 1
 
 
+class _FakeNumber:
+    """The tiny tensor API ``_encode``/``_score`` touch (sum/max/item)."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def max(self):
+        return self
+
+    def item(self):
+        return self.value
+
+
+class _FakeMask:
+    def __init__(self, lengths):
+        self.lengths = lengths
+
+    def sum(self, dim=None):
+        if dim in (-1, 1):
+            return _FakeNumber(max(self.lengths))
+        return _FakeNumber(sum(self.lengths))
+
+
+class FakeTokenizer:
+    """Char-level stand-in for the Qwen tokenizer (tests run without torch).
+
+    One character is one token (``ord`` id), so a cap of N tokens is N
+    characters and ``decode`` is the exact inverse. The batch call returns the
+    two shapes ``_score``/``_encode`` need; ``apply_chat_template`` renders the
+    prompt content 1:1, so template overhead is just the question text here.
+    """
+
+    padding_side = "right"
+    truncation_side = "right"
+    pad_token_id = 0
+    pad_token = "<pad>"
+    eos_token = "<eos>"
+
+    def __call__(self, text, add_special_tokens=True, padding=False,
+                 truncation=False, max_length=None, return_tensors=None):
+        if isinstance(text, str):
+            return {"input_ids": [ord(c) for c in text]}
+        rows = [[ord(c) for c in prompt] for prompt in text]
+        if truncation and max_length is not None:
+            rows = [row[:max_length] for row in rows]
+        return {"input_ids": rows,
+                "attention_mask": _FakeMask([len(row) for row in rows])}
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(chr(i) for i in ids)
+
+    def apply_chat_template(self, messages, tokenize=False,
+                            add_generation_prompt=True, enable_thinking=False):
+        return "".join(message["content"] for message in messages)
+
+
 def prompt_count(records: list[dict]) -> int:
     return sum(len(candidate_prompts(item["record"])) for item in records)
 
 
 def trimmed_scope():
-    return compute_signal_scope(default_pipeline("checkpoint"))
+    return compute_signal_scope(default_pipeline())
 
 
-def stub_tagger(questions=None) -> JevTagger:
+def stub_tagger(questions=None, tokenizer=None) -> JevTagger:
     """A JevTagger without torch/model: config + a stubbed scorer."""
     tagger = object.__new__(JevTagger)
     tagger.questions = questions or load_question_config()
     tagger.temperature = 1.0
     tagger.max_length = 1024
+    tagger.prompt_max_length = tagger.max_length + PROMPT_OVERHEAD_SLACK
+    tagger.tokenizer = tokenizer or FakeTokenizer()
     tagger.kw_groups = {}
     tagger.time_periods = {}
     return tagger
@@ -226,6 +286,108 @@ def test_tag_merges_rule_signals(monkeypatch):
     assert result.signals["structure"]["is_rule"] is True
 
 
+# --------------------------------------------------------------------------- #
+# Input window (2026-10-21): first max_length tokens of the request text only
+# --------------------------------------------------------------------------- #
+def test_head_window_keeps_the_head_tokens():
+    tok = FakeTokenizer()
+    text = "".join(chr(0x4E00 + i) for i in range(3000))
+    head, stats = head_window(text, tok, 1024)
+    assert head == text[:1024]
+    assert stats == {"input_tokens": 3000, "input_visible_tokens": 1024,
+                     "input_truncated": True}
+
+
+def test_head_window_leaves_short_text_untouched():
+    tok = FakeTokenizer()
+    text = "你好，帮我写快排"
+    head, stats = head_window(text, tok, 1024)
+    assert head == text
+    assert stats == {"input_tokens": len(text),
+                     "input_visible_tokens": len(text),
+                     "input_truncated": False}
+
+
+def test_head_window_repairs_reencode_and_partial_char():
+    class Expanding(FakeTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "x" * (len(ids) + 3)       # decode grows after re-encoding
+
+    head, stats = head_window("a" * 100, Expanding(), 10)
+    assert len(head) <= 10
+    assert stats["input_visible_tokens"] <= 10
+
+    class PartialChar(FakeTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            out = "".join(chr(i) for i in ids)
+            return out + "\ufffd" if ids and ids[-1] % 2 else out
+
+    text = "".join(chr(i) for i in range(0, 100))
+    head, stats = head_window(text, PartialChar(), 10)
+    assert "\ufffd" not in head             # cut only between whole chars
+    assert stats["input_visible_tokens"] <= 10
+
+
+def test_model_signals_score_the_head_window(monkeypatch):
+    tagger = stub_tagger()
+    tagger.max_length = 16
+    seen: list[dict] = []
+
+    def capture(records):
+        seen.extend(records)
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", capture)
+    tagger._tag_row(TagRequest(text="a" * 100, n_messages=1))
+    assert seen and {record["state"] for record in seen} == {"a" * 16}
+
+
+def test_tag_exposes_window_and_keeps_rules_on_full_text(monkeypatch):
+    """PII rules are the long-request safety net: they scan text beyond the
+    model window even though the model signals only read the head."""
+    tagger = stub_tagger()
+    tagger.max_length = 16
+    monkeypatch.setattr(tagger, "_score", lambda records: probs_for(records))
+    text = "a" * 64 + " 联系我 someone@example.com"
+    result = asyncio.run(tagger.tag(TagRequest(text=text, n_messages=1)))
+    assert result.input == {"input_tokens": len(text),
+                            "input_visible_tokens": 16,
+                            "input_truncated": True}
+    # the model window cut the address off; the deterministic rule still sees it
+    assert "email_address" in result.signals["pii"]["value"]
+    assert result.signals["pii"]["conf_by_value"]["email_address"] == 1.0
+
+
+def test_encode_keeps_the_whole_prompt_without_shrinking(monkeypatch):
+    """The old 8-round 0.7x context shrink is gone: one encode, full context."""
+    tagger = stub_tagger()
+    tagger.max_length = 16
+    # The char-level fake tokenizer counts the Chinese question 1:1, so give it
+    # a prompt cap wide enough that the canonical wording never hits the
+    # defensive left-truncation fallback (the real tokenizer measures 120 tokens
+    # of template overhead, well inside PROMPT_OVERHEAD_SLACK).
+    tagger.prompt_max_length = 16 + 1024
+    captured: list[tuple[dict, list[int]]] = []
+
+    def capture(enc, counts):
+        captured.append((enc, counts))
+        return []
+
+    monkeypatch.setattr(tagger, "_score_encoded", capture)
+    records = build_signal_records(tagger.questions, "x" * 16)
+    jailbreak = [item["record"] for item in records
+                 if item["signal"] == "jailbreak"]
+    assert tagger._score(jailbreak) == []
+    enc, counts = captured[0]
+    assert counts == [1]
+    # The fake renderer keeps the 16-char context verbatim; the old shrink
+    # would have shortened it to fit max_length=16 (context + template > 16).
+    assert enc["attention_mask"].lengths == [
+        len(candidate_prompts(jailbreak[0])[0])]
+    assert enc["attention_mask"].lengths[0] > tagger.max_length
+    assert "x" * 16 in candidate_prompts(jailbreak[0])[0]
+
+
 def test_question_config_edits_are_used(tmp_path):
     cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
     cfg["signals"]["domain"]["instructions"] = ["请判断这段文本的学科门类。"]
@@ -260,6 +422,29 @@ def test_question_config_validation_errors(tmp_path):
     p.write_text(json.dumps(bad))
     with pytest.raises(JevTaggerError):
         load_question_config(p)
+
+
+def test_config_without_signals_object_raises_jev_error():
+    """A config without a 'signals' object must be a clean 422, not a
+    NameError (the old message interpolated an undefined variable)."""
+    with pytest.raises(JevTaggerError) as exc:
+        validate_question_config({"foo": 1})
+    assert "signals" in str(exc.value)
+
+
+def test_pii_true_false_must_be_non_empty_strings():
+    """The pii branch validates like the noul branch: missing/blank
+    true/false used to blow up at request time (KeyError), not at save time."""
+    cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
+    bad = json.loads(json.dumps(cfg))
+    bad["signals"]["pii"].pop("true")
+    with pytest.raises(JevTaggerError):
+        validate_question_config(bad)
+
+    bad = json.loads(json.dumps(cfg))
+    bad["signals"]["pii"]["false"] = "   "
+    with pytest.raises(JevTaggerError):
+        validate_question_config(bad)
 
 
 # --------------------------------------------------------------------------- #
@@ -357,7 +542,7 @@ def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
 
 def test_hot_pipeline_edit_widens_scope_and_pack():
     """③ a new question/candidate in the tree is picked up automatically."""
-    stations = default_pipeline("checkpoint")
+    stations = default_pipeline()
     before = compute_signal_scope(stations)
     assert "fact_check" not in before.signals
     new_station = Station(id="st-fc", type="gate", name="需核实", root=TreeNode(

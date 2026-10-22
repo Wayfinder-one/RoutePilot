@@ -30,6 +30,11 @@ class TagRequest:
 class TagResult:
     signals: dict                     # {key: {"value", "confidence", "is_rule"}}
     vec: list[float] | None = None    # embedding head output (M2; heuristic: None)
+    #: Model-input window actually scored by the tagger, for the request log:
+    #: ``{"input_tokens", "input_visible_tokens", "input_truncated"}``. Empty
+    #: when the tagger reads the whole text (heuristic/checkpoint/prompt) or
+    #: does not measure tokens.
+    input: dict = field(default_factory=dict)
 
 
 class Tagger(Protocol):

@@ -11,7 +11,7 @@ A node is either a LEAF (terminal: direct hit, or weighted scoring with
 ``weights`` + ``min_score``) or a FORK (ordered children; the first child that
 produces a decision wins — when several matching children end in weighted
 leaves, the highest score wins, and direct-hit leaves keep their order; see
-``engine.py::_eval_node`` for the exact semantics, audit P2 4.1). Children are
+``engine.py::_eval_node`` for the exact semantics). Children are
 ordered and may use different signals — they are independent branches, not
 grouped by value.
 
