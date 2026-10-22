@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sqlite3
+import uuid
 from datetime import datetime, timedelta
 
 import httpx
@@ -21,7 +22,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn
-from router.api.upstream import load_backends
+from router.api.upstream import load_backends, model_reasoning_from_db, \
+    parse_profile_text
 from router.evals import summarize
 from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
@@ -83,13 +85,10 @@ def put_pipeline(body: PipelineIn, request: Request,
         raise HTTPException(422, detail=str(exc)) from exc
     models = ModelRepo(conn).list()
     known = {m["id"] for m in models}
-    formats = _provider_formats(conn)
     # §3.3: a leaf that selects a reasoning level must target a model that
-    # declares it; the map is only passed here so old callers keep working.
-    model_reasoning = {
-        m["id"]: normalize_reasoning(_parse_profile_text(m.get("profile")),
-                                     formats.get(m["provider"], "openai"))
-        for m in models}
+    # declares it; the map comes from the same source as the startup check
+    # (``model_reasoning_from_db``), so a boot and a save always agree.
+    model_reasoning = model_reasoning_from_db(conn)
     issues = check_pipeline(stations, known, model_reasoning)
     # hard issues reject with 422 (pointing at station/node); warn-level issues
     # ride along in the response so the console can show them without blocking.
@@ -211,17 +210,6 @@ def _require_provider(conn: sqlite3.Connection, name: str) -> dict:
     return row
 
 
-def _parse_profile_text(text: str | None) -> dict:
-    """models.profile JSON text -> dict; empty/broken JSON behaves as undeclared."""
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _undeclared_reasoning(provider_format: str) -> dict:
     """§3.2 shape for "missing declaration" (console renders 未声明 from it)."""
     return {"declared": False, "supported": None,
@@ -230,7 +218,7 @@ def _undeclared_reasoning(provider_format: str) -> dict:
 
 
 def _public_model(row: dict, provider_format: str) -> dict:
-    normalized = normalize_reasoning(_parse_profile_text(row.get("profile")),
+    normalized = normalize_reasoning(parse_profile_text(row.get("profile")),
                                      provider_format)
     return {**row,
             "reasoning": normalized or _undeclared_reasoning(provider_format)}
@@ -583,6 +571,7 @@ def get_tagger(request: Request):
 def get_signal_questions(request: Request):
     from router.signals.jev import DEFAULT_QUESTIONS_PATH, load_question_config
     path = _questions_path(request)
+    warning = None
     try:
         cfg = load_question_config(path)
     except Exception:                     # noqa: BLE001 - first boot / bad path
@@ -590,7 +579,16 @@ def get_signal_questions(request: Request):
             cfg = load_question_config(DEFAULT_QUESTIONS_PATH)
         except Exception as exc:          # noqa: BLE001
             raise HTTPException(500, detail=f"cannot load question config: {exc}")
-    return {"config": cfg, "meta": _tagger_meta(request)}
+        # Failing silently left the console editing the built-in defaults while
+        # the running tagger (or the disk) had another config: surface the
+        # fallback so the operator can fix the path/file.
+        warning = (f"configured question file {path} is unreadable; the "
+                   "built-in defaults are served instead — the running "
+                   "tagger and the editor may disagree until it is fixed")
+    body: dict = {"config": cfg, "meta": _tagger_meta(request)}
+    if warning:
+        body["warning"] = warning
+    return body
 
 
 class SignalQuestionsIn(BaseModel):
@@ -618,8 +616,18 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
     path = Path(_questions_path(request))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
-                        encoding="utf-8")
+        # Atomic write: a half-written file would be unparseable JSON at the
+        # next boot. Named *.tmp in the same directory (rename stays atomic
+        # on one filesystem), then os.replace over the real target.
+        tmp = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n",
+                           encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():                   # only on a failed write/replace
+                tmp.unlink(missing_ok=True)
     except OSError as exc:
         # The write failed: roll the in-memory config back so memory and disk
         # stay in the same state.

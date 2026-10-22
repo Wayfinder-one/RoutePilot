@@ -208,6 +208,23 @@ def validate_question_config(cfg) -> dict:
     bad = sorted(set(types) - allowed_pii)
     if bad:
         raise JevTaggerError(f"pii: unknown types {bad}")
+    # Request time renders every template as `template.format(zh=<type zh>)`
+    # (build_signal_records): a type entry without a usable 'zh' is a KeyError
+    # per request, and a {name} other than {zh} in a template blows up the same
+    # way. All three templates exist by this point (checked above).
+    for typ, meta in types.items():
+        zh = meta.get("zh") if isinstance(meta, dict) else None
+        if not isinstance(zh, str) or not zh.strip():
+            raise JevTaggerError(
+                f"pii types.{typ}: 'zh' must be a non-empty string")
+        for name in ("instructions", "true", "false"):
+            try:
+                pii[name].format(zh=zh)
+            except (KeyError, ValueError, IndexError) as exc:
+                raise JevTaggerError(
+                    f"pii {name}: template is not renderable for "
+                    f"types.{typ} (zh={zh!r}): "
+                    f"{exc.__class__.__name__}: {exc}") from exc
     return cfg
 
 

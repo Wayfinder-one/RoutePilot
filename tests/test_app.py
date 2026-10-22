@@ -49,3 +49,56 @@ def test_startup_refuses_an_unhealthy_stored_tree(tmp_path):
     with pytest.raises(RuntimeError) as exc:
         create_app(Settings(db_path=db))
     assert "unknown_signal" in str(exc.value)
+
+
+def test_startup_judges_reasoning_written_straight_into_the_db(tmp_path):
+    """The startup check builds the same §3.3 capability map as PUT
+    /admin/pipeline: a leaf that names an undeclared reasoning level must be
+    caught at boot when it bypassed the save-time 422 (direct DB edit /
+    older version), not only be caught when it came through the API."""
+    from router.reasoning import ReasoningError, validate_model_profile
+    from router.store.repositories import StationRepo
+
+    db = str(tmp_path / "t.db")
+    conn = connect(db)
+    migrate(conn)
+    seed_default(conn)
+    # the fallback model declares only the "low" effort (openai format)
+    try:
+        profile = validate_model_profile(
+            {"reasoning": {"efforts": {"low": "low"}, "default": "low"}},
+            "openai")
+    except ReasoningError:                       # must never happen
+        pytest.fail("test profile itself is invalid")
+    conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                 (json.dumps(profile, ensure_ascii=False),))
+    stations = StationRepo(conn).load()
+    leaf = stations[3].root                      # fallback station leaf
+    leaf.reasoning = "high"                      # not in the declared efforts
+    StationRepo(conn).save(stations)
+    conn.close()
+    with pytest.raises(RuntimeError) as exc:
+        create_app(Settings(db_path=db))
+    assert "reasoning_unsupported" in str(exc.value)
+
+
+def test_startup_accepts_a_declared_reasoning_level(tmp_path):
+    """The boot-time map must not over-block: a leaf reasoning level the model
+    does declare must leave the startup path free."""
+    from router.reasoning import validate_model_profile
+    from router.store.repositories import StationRepo
+
+    db = str(tmp_path / "t.db")
+    conn = connect(db)
+    migrate(conn)
+    seed_default(conn)
+    profile = validate_model_profile(
+        {"reasoning": {"efforts": {"low": "low", "high": "high"},
+                       "default": "low"}}, "openai")
+    conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                 (json.dumps(profile, ensure_ascii=False),))
+    stations = StationRepo(conn).load()
+    stations[3].root.reasoning = "high"          # declared -> legal
+    StationRepo(conn).save(stations)
+    conn.close()
+    create_app(Settings(db_path=db))             # must not raise

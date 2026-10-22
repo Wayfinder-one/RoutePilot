@@ -4,9 +4,12 @@ The pipeline (stations) is stored as one JSON document per station and saved by
 wholesale replacement inside one transaction — station edits are rare and small,
 and replacement keeps ordering and deletion trivially correct.
 
-Transaction convention: a repository never commits on its own; the caller
-wraps a whole write in ``with conn:`` (one transaction per request). The
-exceptions are documented at the method that breaks the rule.
+Transaction convention: every write method owns its transaction — ``with
+self.conn:`` inside the method commits before it returns. The one deliberate
+exception is ``SettingsRepo.set``, which never commits (callers bind it into a
+larger write). A composer may also hold an outer ``with conn:`` itself — e.g.
+``put_settings`` — and an inner ``with self.conn:`` then commits the composed
+transaction; that is by design, not a bug.
 """
 
 from __future__ import annotations
@@ -320,12 +323,21 @@ class TimePeriodRepo:
                     "SELECT * FROM time_periods ORDER BY rowid")]
 
     def seed_defaults(self) -> None:
-        """First-run seeding (called by ``seed_default``); a no-op when the
-        table already holds periods."""
-        if self.conn.execute(
-                "SELECT COUNT(*) FROM time_periods").fetchone()[0]:
+        """Seed the default periods exactly once per database lifetime.
+
+        An empty table also results from a deliberate ``PUT /time-periods []
+        (user emptied the table)``: resurrecting the defaults on the next
+        restart would silently undo that delete (2026-10-22 review). A marker
+        in ``settings`` therefore decides, not the table state.
+        """
+        settings = SettingsRepo(self.conn)
+        if settings.get("time_periods_seeded"):
             return
-        self.save(self.DEFAULTS)
+        if not self.conn.execute(
+                "SELECT COUNT(*) FROM time_periods").fetchone()[0]:
+            self.save(self.DEFAULTS)     # self-commits (save owns its transaction)
+        with self.conn:
+            settings.set("time_periods_seeded", "1")
 
     def save(self, periods: list[dict]) -> None:
         with self.conn:

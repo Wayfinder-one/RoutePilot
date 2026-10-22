@@ -86,7 +86,6 @@ def _check_node(node: TreeNode, station: Station, known_models: set[str],
                 model_reasoning: dict[str, dict | None] | None = None
                 ) -> list[Issue]:
     issues: list[Issue] = []
-    issues.extend(_check_node_ids(node, station))
     # ---- condition ----
     if node.signal is not None:
         if node.signal not in SIGNALS:
@@ -274,9 +273,13 @@ def check_pipeline(stations: list[Station], known_models: set[str],
                                 "Station has no nodes",
                                 station_id=station.id))
             continue
+        # id uniqueness is checked once per whole tree, outside the recursive
+        # walk: inside _check_node every ancestor would re-visit the same
+        # subtree and report one nested duplicate pair once per ancestor.
         issues.extend(_check_node(station.root, station, known_models,
                                   is_root=True, siblings_seen=set(),
                                   model_reasoning=model_reasoning))
+        issues.extend(_check_node_ids(station.root, station))
     # An always-hit station anywhere but last shadows every following station.
     for i, station in enumerate(stations[:-1]):
         if _is_unconditional_leaf(station):

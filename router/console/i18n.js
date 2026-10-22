@@ -127,6 +127,7 @@ const I18N = {
     /* ── signals config ── */
     'sig.sub': 'JEV 标准：一个问题 + 候选 → 概率；改完保存，运行中的模型热生效',
     'sig.temperature': '温度', 'sig.maxlen': '最大长度',
+    'sig.q.fallback': '问法文件不可读，已回退内置默认（可能不一致）',
     'sig.model': '模型目录',
     'sig.list': '信号问题', 'sig.instructions': '问题措辞（第 1 条为运行期标准问法；其余仅存档）',
 'sig.true': 'true 的含义', 'sig.false': 'false 的含义',
@@ -380,6 +381,7 @@ const I18N = {
     /* ── signals config ── */
     'sig.sub': 'JEV standard: one question + candidates → probabilities. Save applies hot to the running model.',
     'sig.temperature': 'Temperature', 'sig.maxlen': 'Max length',
+    'sig.q.fallback': 'Question file unreadable; serving built-in defaults (may differ)',
     'sig.model': 'Model dir',
     'sig.list': 'Signal questions', 'sig.instructions': 'Question wording (entry 1 is the runtime canonical question; others are kept for reference)',
     'sig.true': 'What "true" means', 'sig.false': 'What "false" means',

@@ -7,6 +7,7 @@ const $ = s => document.querySelector(s);
 
 let cfg = null;          // the editable config object
 let meta = {};
+let qWarning = null;     // server fell back to built-in defaults (bad file)
 let selected = 'domain';
 const KW = '__keyword_lexicon__';   // pseudo entry in the signal list
 const TW = '__time_rules__';        // pseudo entry: time period lexicon
@@ -29,6 +30,7 @@ async function boot() {
   startServerClock();
   cfg = qBody.config;
   meta = qBody.meta || {};
+  qWarning = qBody.warning || null;
   setSignalRegistry(sigBody.signals);
   kwGroups = kwBody.groups || {};
   renderAll();
@@ -43,6 +45,7 @@ function renderHeader() {
   parts.push(`${t('sig.temperature')} <b class="mono">${temp}</b>`);
   if (meta.max_length != null) parts.push(`${t('sig.maxlen')} <b class="mono">${meta.max_length}</b>`);
   if (meta.questions_path) parts.push(`<span class="mono" title="${esc(meta.questions_path)}">${esc(String(meta.questions_path).split('/').pop())}</span>`);
+  if (qWarning) parts.push(`<span class="pill warn" title="${esc(qWarning)}">⚠ ${esc(t('sig.q.fallback'))}</span>`);
   $('#metaInfo').innerHTML = parts.join(' · ');
 }
 

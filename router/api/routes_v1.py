@@ -55,8 +55,19 @@ async def chat_completions(request: Request):
     if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
         return JSONResponse(status_code=413,
                             content={"error": {"message": "request_too_large"}})
+    # A chunked transfer declares no content-length, so the gate above passes
+    # for it by design (the value "None" is unknown until read): count the
+    # bytes while streaming them off the wire and stop at the cap. A body is
+    # never buffered past MAX_BODY_BYTES regardless of what the headers claim.
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413,
+                                content={"error": {"message":
+                                                   "request_too_large"}})
     try:
-        body = await request.json()
+        body = json.loads(bytes(buf))        # same contract as request.json()
     except Exception:                     # noqa: BLE001 - any decode error
         return JSONResponse(status_code=400,
                             content={"error": {"message": "invalid_json"}})
@@ -175,7 +186,13 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=502,
                             content={"error": {"message": "upstream_error"}},
                             headers=headers)
-    breaker.success(decision.model)
+    if resp.status_code < 400:
+        # Same contract as the streaming path (_stream): a 4xx is
+        # request-specific — neither a model failure nor proof of health — so
+        # it must not clear the failure counter (an already open circuit must
+        # not be closed by an error response; a half-open probe needs a real
+        # 2xx to recover).
+        breaker.success(decision.model)
     try:
         content = resp.json()
     except json.JSONDecodeError:

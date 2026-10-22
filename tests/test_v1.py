@@ -1,3 +1,5 @@
+import json
+
 import httpx
 from fastapi.testclient import TestClient
 
@@ -135,6 +137,52 @@ def test_oversized_body_is_rejected(tmp_path):
                         "content-length": str(64 * 1024 * 1024)})
     assert r.status_code == 413
     assert r.json()["error"]["message"] == "request_too_large"
+
+
+def test_oversized_chunked_body_is_rejected(tmp_path, monkeypatch):
+    """A chunked transfer declares no content-length; the read side must
+    enforce the cap, not trust the header (2026-10-22 review)."""
+    from router.api import routes_v1
+    monkeypatch.setattr(routes_v1, "MAX_BODY_BYTES", 32)
+    c = make_client(tmp_path, ok_upstream)
+    payload = b"x" * 40                       # two chunks, none over the cap
+    r = c.post("/v1/chat/completions",
+               content=(payload[0:20], payload[20:]),
+               headers={"content-type": "application/json"})
+    assert r.status_code == 413
+    assert r.json()["error"]["message"] == "request_too_large"
+
+
+def test_chunked_body_within_the_cap_still_routes(tmp_path, monkeypatch):
+    """The streaming cap must not reject a legal chunked request."""
+    from router.api import routes_v1
+    monkeypatch.setattr(routes_v1, "MAX_BODY_BYTES", 1024)
+    c = lower_floors(make_client(tmp_path, ok_upstream))
+    body = json.dumps({"messages": [{"role": "user",
+                                     "content": "今天天气怎么样"}]}).encode()
+    r = c.post("/v1/chat/completions",
+               content=(body[0:10], body[10:]),
+               headers={"content-type": "application/json"})
+    assert r.status_code == 200
+
+
+def test_upstream_4xx_does_not_clear_the_breaker(tmp_path):
+    """4xx is request-specific: it must neither count as a failure nor reset
+    the consecutive-failure counter — the same contract as the streaming path.
+    Two real failures + a 4xx + one more failure must open the circuit."""
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(400 if calls["n"] == 3 else 500,
+                              json={"error": "boom"})
+
+    c = make_client(tmp_path, handler)
+    assert chat(c, "今天天气怎么样").status_code == 502   # failure 1
+    assert chat(c, "今天天气怎么样").status_code == 502   # failure 2
+    assert chat(c, "今天天气怎么样").status_code == 400   # 4xx: passthrough, no reset
+    assert chat(c, "今天天气怎么样").status_code == 502   # failure 3 -> open
+    assert chat(c, "今天天气怎么样").status_code == 503   # circuit open
 
 
 def test_routing_does_not_need_the_database(tmp_path):

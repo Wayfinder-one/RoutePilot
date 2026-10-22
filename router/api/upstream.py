@@ -88,6 +88,34 @@ def resolve_backend(backends: dict[str, Backend], model_id: str) -> Backend:
     return backends[model_id]
 
 
+def parse_profile_text(text: str | None) -> dict:
+    """models.profile JSON text -> dict; empty/broken JSON behaves as undeclared."""
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
+    """model_id -> normalized reasoning capability (§3.3 parchment).
+
+    Same source for both consumers that must never disagree about a model's
+    declared levels: ``PUT /admin/pipeline`` validation and the startup check
+    (``create_app``); a reasoning declaration written straight into the DB
+    (bypassing the API) must still be judged identically at boot.
+    """
+    rows = conn.execute(
+        "SELECT m.id AS id, m.profile AS profile, "
+        "       p.reasoning_format AS reasoning_format "
+        "FROM models m LEFT JOIN providers p ON m.provider = p.name")
+    return {r["id"]: normalize_reasoning(parse_profile_text(r["profile"]),
+                                         r["reasoning_format"] or "openai")
+            for r in rows}
+
+
 class CircuitBreaker:
     """Per-model circuit breaker.
 

@@ -125,6 +125,21 @@ def test_duplicate_node_id_is_hard():
     assert hit and hit[0].level == "hard"
 
 
+def test_nested_duplicate_node_id_reports_once():
+    """The id walk must stay out of the recursive _check_node: a duplicate pair
+    nested below depth 1 used to be reported once per ancestor, i.e. once per
+    re-visit of the same subtree."""
+    stations = [Station(id="a", type="gate", name="x", root=node(
+        "r", signal=None, kind="fork", children=[
+            node("fork", "domain", "health", 0.5, kind="fork", children=[
+                node("dup", "domain", "health", 0.5, model="med"),
+                node("dup", "complexity", "hard", 0.5, model="med")])])),
+        fallback()]
+    hits = [i for i in check_pipeline(stations, MODELS)
+            if i.code == "duplicate_node_id"]
+    assert len(hits) == 1
+
+
 def test_duplicate_station_id_is_hard():
     stations = [
         Station(id="dup", type="gate", name="a", root=node(

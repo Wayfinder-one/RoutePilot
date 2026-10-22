@@ -447,6 +447,42 @@ def test_pii_true_false_must_be_non_empty_strings():
         validate_question_config(bad)
 
 
+def test_pii_types_need_a_usable_zh_label():
+    """build_signal_records renders `template.format(zh=meta['zh'])`: a type
+    entry without a usable zh is a KeyError on every request that scopes pii —
+    rejected at save time instead (2026-10-22 review)."""
+    cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
+    bad = json.loads(json.dumps(cfg))
+    bad["signals"]["pii"]["types"]["phone_number"].pop("zh")
+    with pytest.raises(JevTaggerError) as exc:
+        validate_question_config(bad)
+    assert "phone_number" in str(exc.value)
+
+    bad = json.loads(json.dumps(cfg))
+    bad["signals"]["pii"]["types"]["phone_number"] = {"zh": ""}
+    with pytest.raises(JevTaggerError):
+        validate_question_config(bad)
+
+
+def test_pii_templates_must_render_with_zh():
+    """A {name} other than {zh} in the pii templates is a request-time KeyError:
+    render all three templates against the type's zh at save time."""
+    cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
+    bad = json.loads(json.dumps(cfg))
+    bad["signals"]["pii"]["instructions"] = \
+        "判断文本是否包含：{zh} 或 {oops}"
+    bad["signals"]["pii"]["true"] = "是的，包含{zh}"
+    bad["signals"]["pii"]["false"] = "否"
+    with pytest.raises(JevTaggerError) as exc:
+        validate_question_config(bad)
+    assert "oops" in str(exc.value)
+
+    bad = json.loads(json.dumps(cfg))
+    bad["signals"]["pii"]["true"] = "包含：{broken"
+    with pytest.raises(JevTaggerError):
+        validate_question_config(bad)
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline-aware trimming: TagRequest.scope[ sign | pii subtype ] -> pack
 # --------------------------------------------------------------------------- #

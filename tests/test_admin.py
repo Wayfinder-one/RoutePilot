@@ -218,7 +218,9 @@ def test_signal_questions_without_signals_object_is_422(tmp_path):
 def test_signal_questions_rolls_the_memory_back_when_the_write_fails(tmp_path,
                                                                      monkeypatch):
     """The in-memory config is applied first; a failed disk write must roll it
-    back, so memory and disk stay in the same state."""
+    back, so memory and disk stay in the same state. The PUT carries a
+    *modified* config so a rollback to the wrong object cannot pass the
+    assertion (2026-10-22 review)."""
     import pathlib
 
     app = create_app(Settings(db_path=str(tmp_path / "t.db"),
@@ -226,6 +228,8 @@ def test_signal_questions_rolls_the_memory_back_when_the_write_fails(tmp_path,
     c = TestClient(app)
     original = c.get("/admin/signal-questions").json()["config"]
     app.state.tagger.questions = original
+    modified = json.loads(json.dumps(original))
+    modified["signals"]["pii"]["true"] = "是的，包含{zh}"
     applied = []
 
     def fake_set(cfg):
@@ -238,10 +242,41 @@ def test_signal_questions_rolls_the_memory_back_when_the_write_fails(tmp_path,
         raise OSError("disk is full")
 
     monkeypatch.setattr(pathlib.Path, "write_text", boom)
-    r = c.put("/admin/signal-questions", json={"config": original})
+    r = c.put("/admin/signal-questions", json={"config": modified})
     assert r.status_code == 500
-    assert applied == [original, original]      # applied, then rolled back
+    assert applied == [modified, original]      # applied, then rolled back
     assert app.state.tagger.questions == original
+    assert not (tmp_path / "questions.json").exists()   # nothing written
+
+
+def test_signal_questions_write_is_atomic_and_leaves_no_tmp(tmp_path,
+                                                            monkeypatch):
+    """The config file lands via named tmp + os.replace: a crashed half-write
+    must never become the working config, and a failed save leaves no .tmp
+    litter (2026-10-22 review)."""
+    import pathlib
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db"),
+                               signal_questions=str(tmp_path / "questions.json")))
+    c = TestClient(app)
+    cfg = c.get("/admin/signal-questions").json()["config"]
+    cfg["signals"]["pii"]["true"] = "是的，包含{zh}"
+    target = tmp_path / "questions.json"
+    r = c.put("/admin/signal-questions", json={"config": cfg})
+    assert r.status_code == 200
+    assert json.loads(target.read_text(encoding="utf-8"))["signals"]["pii"] \
+        ["true"] == "是的，包含{zh}"
+    assert not list(tmp_path.glob("*.tmp"))     # renamed away, no litter
+
+    def boom(self, *args, **kwargs):
+        raise OSError("disk is full")
+
+    monkeypatch.setattr(pathlib.Path, "write_text", boom)
+    r = c.put("/admin/signal-questions", json={"config": cfg})
+    assert r.status_code == 500
+    assert not list(tmp_path.glob("*.tmp"))     # cleaned up on failure
+    assert json.loads(target.read_text(encoding="utf-8"))["signals"]["pii"] \
+        ["true"] == "是的，包含{zh}"             # config file untouched
 
 
 def test_put_settings_persists_without_the_audit_call(tmp_path, monkeypatch):
@@ -289,6 +324,37 @@ def test_time_periods_roundtrip(tmp_path):
                 {"periods": [{"name": "dup", "days": [1], "start": "08:00", "end": "09:00"},
                              {"name": "dup", "days": [2], "start": "08:00", "end": "09:00"}]}):
         assert c.put("/admin/time-periods", json=bad).status_code == 422
+
+
+def test_emptied_time_periods_survive_restart(tmp_path):
+    """PUT [] is a deliberate delete; the next boot must not resurrect the
+    seeded defaults — seeding is marker-driven, not table-state-driven."""
+    c = client(tmp_path)
+    assert c.put("/admin/time-periods", json={"periods": []}).status_code == 200
+    assert client(tmp_path).get("/admin/time-periods").json()["periods"] == []
+
+
+def test_signal_questions_unreadable_config_falls_back_with_warning(tmp_path):
+    """A broken/missing configured question file silently served the built-in
+    defaults: the console edited one config while the running tagger used
+    another. The fallback must be visible in the response (2026-10-22)."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db"),
+                               signal_questions=str(tmp_path / "gone.json")))
+    c = TestClient(app)
+    body = c.get("/admin/signal-questions").json()
+    assert body["config"]["signals"]          # defaults are served ...
+    assert "unreadable" in body["warning"]    # ... and the fallback is loud
+    assert "gone.json" in body["warning"]
+
+
+def test_signal_questions_no_warning_when_the_file_reads(tmp_path):
+    app = create_app(Settings(db_path=str(tmp_path / "t.db"),
+                               signal_questions=str(tmp_path / "questions.json")))
+    c = TestClient(app)
+    cfg = c.get("/admin/signal-questions").json()["config"]   # defaults
+    assert c.put("/admin/signal-questions",
+                 json={"config": cfg}).status_code == 200     # writes the file
+    assert "warning" not in c.get("/admin/signal-questions").json()
 
 
 def test_recent_requests_carry_trace(tmp_path):

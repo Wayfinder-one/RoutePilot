@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.config import Settings
+from router.api.upstream import model_reasoning_from_db
 from router.pipeline.health import check_pipeline
 from router.signals.heuristic import HeuristicTagger
 from router.store.db import connect, migrate
@@ -94,13 +95,18 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     time_periods = TimePeriodRepo(conn).load()
     pipeline = StationRepo(conn).load()
     known_models = {m["id"] for m in ModelRepo(conn).list()}
+    # Same §3.3 map as PUT /admin/pipeline (single source). A leaf that names
+    # a reasoning level the model does not declare is rejected at save time —
+    # and pipelines written straight into the database (migrations, older
+    # versions, a manual edit) must be judged by the same rule here.
+    model_reasoning = model_reasoning_from_db(conn)
     conn.close()
 
     # A tree that the engine cannot execute must not reach the hot path: the
     # console would happily save it, but every request would then 502 or pick
     # a wrong branch. Refuse to start instead (the operator fixes the DB and
     # restarts). Warnings are logged, they do not block the boot.
-    issues = check_pipeline(pipeline, known_models)
+    issues = check_pipeline(pipeline, known_models, model_reasoning)
     hard = [i for i in issues if i.level == "hard"]
     if hard:
         for issue in hard:
