@@ -37,6 +37,11 @@ class TagResult:
     #: Empty when the tagger reads the whole text (heuristic/checkpoint) or does
     #: not measure input size. The prompt judge fills it with character counts
     #: (it never tokenizes); JEV fills it with token counts.
+    #: When the opt-in long-text PII chunking actually runs (JEV only), the same
+    #: dict additionally carries ``chunk_segments`` (planned segments),
+    #: ``chunk_scored_segments``, ``chunk_prompt_tokens`` (all segment prompts)
+    #: and ``chunk_strategy``; with chunking off (the default) or a short
+    #: request those keys are absent, so pre-chunk consumers see no change.
     input: dict = field(default_factory=dict)
     #: sha256 (canonical JSON) of the question config the model signals were
     #: rendered from. JEV only; captured at ``tag()`` entry so a hot config

@@ -81,16 +81,35 @@ _CHECKED = ("cn_id_card", "cn_bank_card")
 _TYPES = tuple(t for t in PII_RULES if t not in _CHECKED)
 
 
-def rule_pii_hits(text: str) -> list[str]:
-    """Return the sorted canonical PII types whose deterministic pattern hits."""
+def rule_pii_spans(text: str) -> list[tuple[str, int, int]]:
+    """Return deterministic ``(type, start_char, end_char)`` hits over the text.
+
+    Unlike :func:`rule_pii_hits` (which only reports the type set) this keeps
+    every occurrence and its character offsets, so long-text chunk planning can
+    place a segment around a real rule hit (``plan_pii_segments``). Patterns
+    that are self-validating (``cn_id_card`` checksum, ``cn_bank_card`` Luhn)
+    only report matches that pass validation; the rest are pure regex hits.
+    Sorted by ``(start, end, type)`` so the output is deterministic.
+    """
     if not text:
         return []
-    hits = {t for t in _TYPES if PII_RULES[t].search(text)}
-    if any(_valid_cn_id(m.group(0)) for m in PII_RULES["cn_id_card"].finditer(text)):
-        hits.add("cn_id_card")
-    if any(_luhn(m.group(0)) for m in PII_RULES["cn_bank_card"].finditer(text)):
-        hits.add("cn_bank_card")
-    return sorted(hits)
+    spans: list[tuple[str, int, int]] = []
+    for typ in _TYPES:
+        for match in PII_RULES[typ].finditer(text):
+            spans.append((typ, match.start(), match.end()))
+    for match in PII_RULES["cn_id_card"].finditer(text):
+        if _valid_cn_id(match.group(0)):
+            spans.append(("cn_id_card", match.start(), match.end()))
+    for match in PII_RULES["cn_bank_card"].finditer(text):
+        if _luhn(match.group(0)):
+            spans.append(("cn_bank_card", match.start(), match.end()))
+    spans.sort(key=lambda item: (item[1], item[2], item[0]))
+    return spans
+
+
+def rule_pii_hits(text: str) -> list[str]:
+    """Return the sorted canonical PII types whose deterministic pattern hits."""
+    return sorted({typ for typ, _, _ in rule_pii_spans(text)})
 
 
 def merge_rule_pii(signals: dict, text: str) -> dict:
@@ -121,4 +140,5 @@ def merge_rule_pii(signals: dict, text: str) -> dict:
     return signals
 
 
-__all__ = ["PII_RULES", "rule_pii_hits", "merge_rule_pii"]
+__all__ = ["PII_RULES", "rule_pii_hits", "rule_pii_spans",
+           "merge_rule_pii"]

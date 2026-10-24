@@ -28,7 +28,8 @@ from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 load_question_config, parse_window,
                                 questions_sha256, validate_question_config,
                                 window_text, chat_template_sha256,
-                                model_file_hashes, sha256_file, sha256_files)
+                                model_file_hashes, sha256_file, sha256_files,
+                                load_chunk_calibration)
 from router.signals.registry import SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import default_pipeline
@@ -186,7 +187,8 @@ def trimmed_scope():
 
 
 def stub_tagger(questions=None, tokenizer=None, max_length=1024,
-                window=None) -> JevTagger:
+                window=None, chunk_segments=0, chunk_size=512,
+                chunk_agg="noisy_or", chunk_calibration=None) -> JevTagger:
     """A JevTagger without torch/model: config + a stubbed scorer."""
     tagger = object.__new__(JevTagger)
     tagger.questions = questions or load_question_config()
@@ -203,6 +205,14 @@ def stub_tagger(questions=None, tokenizer=None, max_length=1024,
     tagger.tokenizer = tokenizer or FakeTokenizer()
     tagger.kw_groups = {}
     tagger.time_periods = {}
+    # Chunking defaults to off, exactly like the real constructor.
+    tagger.chunk_segments = chunk_segments
+    tagger.chunk_size = chunk_size
+    tagger.chunk_agg = chunk_agg
+    tagger.chunk_enabled = chunk_segments > 0
+    tagger.chunk_overlap = 0.25
+    tagger.chunk_calibration, tagger._chunk_calib_desc = \
+        load_chunk_calibration(chunk_calibration)
     return tagger
 
 
@@ -1069,7 +1079,8 @@ def test_info_reports_model_identity_and_question_fingerprint():
     assert set(info) == {
         "engine", "model_dir", "model_name", "temperature", "max_length",
         "window", "questions_sha256", "head_sha256", "tokenizer_sha256",
-        "chat_template_sha256", "weights_sha256"}
+        "chat_template_sha256", "weights_sha256", "chunk_segments",
+        "chunk_size", "chunk_agg", "chunk_overlap", "chunk_calibration"}
     # the stub's model dir does not exist -> artifact hashes are null
     assert info["head_sha256"] is None
     assert info["tokenizer_sha256"] is None
@@ -1085,6 +1096,25 @@ def test_info_reports_model_identity_and_question_fingerprint():
         tagger.questions, sort_keys=True, ensure_ascii=False,
         separators=(",", ":")).encode("utf-8")).hexdigest()
     assert info["questions_sha256"] == expected
+
+
+def test_default_tagger_records_chunking_as_off():
+    """Chunking is opt-in: the default version map records it as off so a
+    replay can tell that the single-window path was used."""
+    tagger = stub_tagger()
+    assert tagger.chunk_enabled is False
+    info = tagger.info()
+    assert info["chunk_segments"] == 0
+    assert info["chunk_size"] == 512
+    assert info["chunk_agg"] == "off"
+    assert info["chunk_overlap"] == 0.25
+    assert info["chunk_calibration"] == "none"
+
+    enabled = stub_tagger(chunk_segments=4, chunk_agg="logsumexp")
+    info = enabled.info()
+    assert info["chunk_segments"] == 4
+    assert info["chunk_agg"] == "logsumexp"
+    assert enabled.chunk_enabled is True
 
 
 def test_info_question_fingerprint_follows_a_hot_config_edit():

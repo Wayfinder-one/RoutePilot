@@ -44,6 +44,14 @@ class Settings:
     # both ends (docs/JEV-改进-实施计划-2026-10-24.md §2.1). Validated at
     # startup by router.signals.jev.parse_window.
     jev_window: str = ""
+    # Long-text PII chunking (2026-10-24 P2-A, opt-in). 0 = off (default:
+    # behavior identical to the single-window tagger). >0 = score the PII
+    # multi-signal on that many planned token segments for requests longer than
+    # max_length (head + tail + rule-span windows + uniform fillers).
+    jev_chunk_segments: int = 0          # ROUTER_JEV_CHUNK_SEGMENTS
+    jev_chunk_size: int = 512            # ROUTER_JEV_CHUNK_SIZE (<= max_length)
+    jev_chunk_agg: str = "noisy_or"      # ROUTER_JEV_CHUNK_AGG (noisy_or|logsumexp|max)
+    jev_chunk_calibration: str = ""      # ROUTER_JEV_CHUNK_CALIBRATION (JSON path)
     # Pipeline-aware candidate trimming: score only the JEV questions the
     # current pipeline tree can read (docs/pipeline-aware-trimming.md). The
     # default is on; ROUTER_JEV_TRIM=0 restores the full pack.
@@ -67,5 +75,10 @@ class Settings:
             signal_questions=os.environ.get("ROUTER_SIGNAL_QUESTIONS", ""),
             jev_max_length=int(os.environ.get("ROUTER_JEV_MAX_LENGTH", "0")),
             jev_window=os.environ.get("ROUTER_JEV_WINDOW", ""),
+            jev_chunk_segments=int(os.environ.get("ROUTER_JEV_CHUNK_SEGMENTS", "0")),
+            jev_chunk_size=int(os.environ.get("ROUTER_JEV_CHUNK_SIZE", "512")),
+            jev_chunk_agg=os.environ.get("ROUTER_JEV_CHUNK_AGG", "noisy_or"),
+            jev_chunk_calibration=os.environ.get(
+                "ROUTER_JEV_CHUNK_CALIBRATION", ""),
             jev_trim=_flag("ROUTER_JEV_TRIM", True),
         )

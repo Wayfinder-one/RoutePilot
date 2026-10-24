@@ -73,6 +73,20 @@ that still sees long requests. The truncation facts (including the
 ``input_window`` spec) are reported through ``TagResult.input`` and land in the
 console calculation log.
 
+**Long-text PII chunking (2026-10-24 P2-A, opt-in).** For requests longer than
+``max_length`` the head/tail window structurally cannot see the middle of the
+text, so the **PII multi-signal** can optionally be scored on a small set of
+planned segments instead of the window (``chunk_segments > 0``, default off):
+one head segment, one tail segment, segments around full-text regex hits
+(``pii_rules.rule_pii_spans``) and uniformly spaced fillers, with a fixed 25%
+overlap. Each segment asks only the PII subtypes the pipeline scope can read;
+per-type segment probabilities are combined with :func:`aggregate_presence`
+(``noisy_or`` by default, optional ``logsumexp``/``max``) into request-level
+``model_p_by_type``, and the normal PII hit rule + rule merge then apply
+unchanged (P1-A evidence contract). The other six signals always keep the
+single-window path. With chunking disabled (or a short request) the signals and
+``TagResult.input`` are byte-identical to the pre-chunk behavior.
+
 **Pipeline-aware trimming** (``TagRequest.scope``): the routing tree only reads
 the signals that appear as rows, so the hot path passes a
 :class:`router.pipeline.scope.SignalScope` and this tagger renders/scores only
@@ -101,7 +115,8 @@ from router.signals._math import (PII_HIT_THRESHOLD, PII_MIN_CONFIDENCE,
                                  binary_entropy_confidence, entropy_confidence,
                                  pii_hits)
 from router.signals.registry import SIGNALS
-from router.signals.pii_rules import merge_rule_pii, rule_pii_hits
+from router.signals.pii_rules import (merge_rule_pii, rule_pii_hits,
+                                    rule_pii_spans)
 from router.signals.rules import rule_signals
 from router.signals.tagger import TagRequest, TagResult
 
@@ -411,6 +426,259 @@ def head_window(text: str, tokenizer, cap: int) -> tuple[str, dict]:
     return window_text(text, tokenizer, cap, cap, 0)
 
 
+# --------------------------------------------------------------------------- #
+# Long-text PII chunking (2026-10-24 P2-A)
+# --------------------------------------------------------------------------- #
+#: Fixed overlap between planned PII segments (fraction of the segment size).
+CHUNK_OVERLAP = 0.25
+#: Supported request-level presence aggregators. ``max`` is a control arm only:
+#: taking the per-segment maximum after the p>.5 rule under-counts the evidence
+#: of a type that appears in several segments.
+CHUNK_AGGS = ("noisy_or", "logsumexp", "max")
+
+
+def _sigmoid(value: float) -> float:
+    """Numerically stable logistic function."""
+    if value >= 0:
+        z = math.exp(-value)
+        return 1.0 / (1.0 + z)
+    z = math.exp(value)
+    return z / (1.0 + z)
+
+
+def _clamp01(value: float) -> float:
+    return min(1.0, max(0.0, float(value)))
+
+
+def _logit(prob: float, eps: float = 1e-6) -> float:
+    p = min(1.0 - eps, max(eps, _clamp01(prob)))
+    return math.log(p / (1.0 - p))
+
+
+def aggregate_presence(segment_probs, method: str = "noisy_or", *,
+                       bias: float = 0.0, scale: float = 1.0) -> float:
+    """Combine per-segment presence probabilities into a request-level p.
+
+    ``segment_probs`` are the model's ``p_yes`` for ONE PII type on each scored
+    segment. A PII type is presence-like ("does the request contain it"), so
+    the segment evidence must be combined before the request-level p>.5 hit
+    rule is applied -- taking ``max`` after the per-segment threshold would
+    throw away multi-segment evidence.
+
+    * ``noisy_or`` (default): ``1 - prod(1 - p_i)``;
+    * ``logsumexp``: ``sigmoid(scale * (logsumexp(logit(p_i)) - log(n)) + bias)``;
+    * ``max``: ``max(p_i)`` -- control arm only.
+
+    ``bias``/``scale`` are the offline calibration for this type (``scale`` is
+    only used inside the ``logsumexp`` formula; ``noisy_or``/``max`` apply them
+    as a logit-space calibration after aggregation). With the defaults the
+    function is the identity calibration.
+    """
+    probs = [_clamp01(p) for p in segment_probs]
+    if not probs:
+        return 0.0
+    n = len(probs)
+    if method == "noisy_or":
+        p = 1.0 - math.prod(1.0 - value for value in probs)
+        if bias == 0.0 and scale == 1.0:
+            return _clamp01(p)
+        return _sigmoid(scale * _logit(p) + bias)
+    if method == "max":
+        p = max(probs)
+        if bias == 0.0 and scale == 1.0:
+            return _clamp01(p)
+        return _sigmoid(scale * _logit(p) + bias)
+    if method == "logsumexp":
+        logits = [_logit(value) for value in probs]
+        top = max(logits)
+        lse = top + math.log(sum(math.exp(value - top) for value in logits))
+        return _sigmoid(scale * (lse - math.log(n)) + bias)
+    raise ValueError(f"unknown presence aggregation {method!r}; "
+                     f"choose from {CHUNK_AGGS}")
+
+
+def _char_positions_to_token_indices(tokenizer, text: str, positions) -> list[int]:
+    """Map char offsets to token indices, deterministic and tokenizer-exact.
+
+    Fast tokenizers expose ``offset_mapping`` so the whole text is tokenized
+    once; slow/test tokenizers fall back to tokenizing the prefix up to each
+    position (exact, but O(positions * text) -- fine for the handful of regex
+    hits that reach this helper).
+    """
+    positions = [max(0, min(int(pos), len(text))) for pos in positions]
+    if not positions:
+        return []
+    try:
+        enc = tokenizer(text, add_special_tokens=False,
+                        return_offsets_mapping=True)
+        offsets = enc.get("offset_mapping") if isinstance(enc, dict) else None
+        if offsets is not None:
+            pairs = [(int(pair[0]), int(pair[1])) for pair in offsets]
+            unique = sorted(set(positions))
+            mapping: dict[int, int] = {}
+            index = 0
+            for pos in unique:
+                while index < len(pairs) and pairs[index][1] <= pos:
+                    index += 1
+                mapping[pos] = index
+            return [mapping[pos] for pos in positions]
+    except (TypeError, ValueError, KeyError):
+        pass                                 # fall back to prefix tokenization
+    return [len(tokenizer(text[:pos], add_special_tokens=False)["input_ids"])
+            for pos in positions]
+
+
+def _clamp_segment(start: int, size: int, total: int) -> tuple[int, int]:
+    start = max(0, min(int(start), max(0, total - int(size))))
+    return start, min(total, start + int(size))
+
+
+def plan_pii_segments(text: str, tokenizer, *, size: int, max_segments: int,
+                      rule_spans=None, ids=None) -> list[dict]:
+    """Plan the token segments for long-text PII scoring.
+
+    Returns an ordered, de-duplicated list within the ``max_segments`` budget:
+    ``[{"start", "end", "reason"}]`` with **token** offsets (``end`` excluded)
+    into the full-text ids. Sources, in priority order:
+
+    * head segment (``reason="head"``) and tail segment (``reason="tail"``);
+    * one window around each ``pii_rules.rule_pii_spans`` hit
+      (``reason="rule:<type>"``; char spans are mapped to tokens);
+    * uniformly spaced fillers until the budget is used (``reason="uniform"``).
+
+    Segments do not exceed ``size`` tokens and near-identical windows (more than
+    75% of a window overlapping an already planned one) are dropped; the fixed
+    :data:`CHUNK_OVERLAP` (25%) is the intended overlap of neighbouring windows.
+    ``rule_spans``/``ids`` may be supplied to avoid recomputation. Empty text
+    returns ``[]``. Output is sorted by ``(start, end)`` and deterministic.
+    """
+    if size <= 0 or max_segments <= 0:
+        return []
+    text = text or ""
+    if ids is None:
+        ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    ids = list(ids)
+    total = len(ids)
+    if total <= 0:
+        return []
+    window = min(int(size), total)
+    if rule_spans is None:
+        rule_spans = rule_pii_spans(text)
+
+    #: A candidate that overlaps an already planned window by more than
+    #: ``1 - CHUNK_OVERLAP`` is a near-duplicate (the intended overlap between
+    #: neighbouring windows is CHUNK_OVERLAP = 25%); drop it to keep the budget
+    #: for genuinely new text.
+    duplicate_overlap = (1.0 - CHUNK_OVERLAP) * window
+
+    def accepted_ok(candidate: dict, kept: list[dict]) -> bool:
+        for segment in kept:
+            overlap = (min(candidate["end"], segment["end"])
+                       - max(candidate["start"], segment["start"]))
+            if overlap > duplicate_overlap:
+                return False
+        return True
+
+    planned: list[dict] = []
+    head = {"start": 0, "end": window, "reason": "head"}
+    planned.append(head)
+    if max_segments >= 2:
+        tail_start = max(0, total - window)
+        tail = {"start": tail_start, "end": total, "reason": "tail"}
+        if tail["start"] != head["start"]:
+            planned.append(tail)
+
+    if rule_spans and len(planned) < max_segments:
+        positions = []
+        for _typ, start_char, end_char in rule_spans:
+            positions.extend((start_char, end_char))
+        token_pos = _char_positions_to_token_indices(tokenizer, text, positions)
+        candidates = []
+        for index, (typ, _start_char, _end_char) in enumerate(rule_spans):
+            tok_start = token_pos[2 * index]
+            tok_end = token_pos[2 * index + 1]
+            center = (tok_start + tok_end) // 2
+            start, end = _clamp_segment(center - window // 2, window, total)
+            candidates.append({"start": start, "end": end,
+                               "reason": f"rule:{typ}"})
+        candidates.sort(key=lambda item: (item["start"], item["end"],
+                                          item["reason"]))
+        for candidate in candidates:
+            if len(planned) >= max_segments:
+                break
+            if candidate["start"] >= candidate["end"]:
+                continue
+            if accepted_ok(candidate, planned):
+                planned.append(candidate)
+
+    remaining = max_segments - len(planned)
+    if remaining > 0 and total > window:
+        # More candidates than slots: a near-duplicate can be skipped and the
+        # next uniformly spaced window still gets a chance.
+        tries = max(remaining * 2, remaining + 2)
+        for slot in range(tries):
+            center = int(total * (slot + 0.5) / tries)
+            start, end = _clamp_segment(center - window // 2, window, total)
+            candidate = {"start": start, "end": end, "reason": "uniform"}
+            if candidate["start"] >= candidate["end"]:
+                continue
+            if accepted_ok(candidate, planned):
+                planned.append(candidate)
+                if len(planned) >= max_segments:
+                    break
+
+    planned.sort(key=lambda item: (item["start"], item["end"], item["reason"]))
+    return planned[:max_segments]
+
+
+def load_chunk_calibration(source) -> tuple[dict, str]:
+    """Load the optional per-type PII presence calibration.
+
+    Format: JSON object mapping a canonical PII type to
+    ``{"bias": float, "scale": float}`` (both optional, defaults 0.0/1.0). The
+    reserved key ``"*"`` is a fallback applied to every type that has no explicit
+    entry. ``source`` may be ``None``/``""``/``{}`` (no calibration), an
+    in-memory dict, or a JSON file path. Returns ``(mapping, description)`` where
+    the description goes into ``info()``/``tagger_info``. Invalid input raises
+    :class:`JevTaggerError` so a bad ``ROUTER_JEV_CHUNK_CALIBRATION`` refuses
+    startup.
+    """
+    if source is None or source == "" or source == {}:
+        return {}, "none"
+    if isinstance(source, dict):
+        data = dict(source)
+        description = "inline"
+    elif isinstance(source, (str, Path)):
+        path = Path(source)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise JevTaggerError(
+                f"cannot read chunk calibration {path}: {exc}") from exc
+        description = str(path)
+    else:
+        raise JevTaggerError(
+            f"chunk calibration must be dict/JSON path/None, got {type(source)!r}")
+    if not isinstance(data, dict):
+        raise JevTaggerError("chunk calibration must be a JSON object")
+    calibration: dict[str, dict] = {}
+    for typ, entry in data.items():
+        if not isinstance(entry, dict):
+            raise JevTaggerError(
+                f"chunk calibration for {typ!r} must be an object")
+        try:
+            bias = float(entry.get("bias", 0.0))
+            scale = float(entry.get("scale", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise JevTaggerError(
+                f"chunk calibration for {typ!r} has non-numeric bias/scale") from exc
+        if not (math.isfinite(bias) and math.isfinite(scale)):
+            raise JevTaggerError(
+                f"chunk calibration for {typ!r} must be finite")
+        calibration[str(typ)] = {"bias": bias, "scale": scale}
+    return calibration, description
+
+
 def validate_question_config(cfg) -> dict:
     """Validate an in-memory question config (used by load and the admin PUT)."""
     if not isinstance(cfg, dict) or not isinstance(cfg.get("signals"), dict):
@@ -653,7 +921,10 @@ class JevTagger:
 
     def __init__(self, model_dir: str | Path, *, questions_path: str | Path | None = None,
                  device: str | None = None, max_length: int | None = None,
-                 window: str | None = None, kw_groups: dict | None = None,
+                 window: str | None = None,
+                 chunk_segments: int = 0, chunk_size: int = 512,
+                 chunk_agg: str = "noisy_or", chunk_calibration=None,
+                 kw_groups: dict | None = None,
                  model_factory=None, warmup: bool = True):
         self.question_path = str(questions_path or DEFAULT_QUESTIONS_PATH)
         self.questions = load_question_config(questions_path)
@@ -684,6 +955,29 @@ class JevTagger:
                 else default_window_spec(self.max_length))
         self.window = parse_window(spec, self.max_length)
         self.window_spec = f"{self.window[0]}:{self.window[1]}"
+        #: Long-text PII chunking (2026-10-24 P2-A, opt-in). Only the PII
+        #: multi-signal is chunked; the other six signals keep the single
+        #: window. ``chunk_segments=0`` (default) disables the whole path so
+        #: signals and TagResult.input stay byte-identical to the old behavior.
+        self.chunk_segments = int(chunk_segments)
+        if self.chunk_segments < 0:
+            raise JevTaggerError("chunk_segments must be >= 0")
+        self.chunk_size = int(chunk_size)
+        if self.chunk_size <= 0:
+            raise JevTaggerError("chunk_size must be > 0")
+        # Only validate against max_length when the feature is actually on: a
+        # deployment that disables chunking must not fail on an unused size.
+        if self.chunk_segments > 0 and self.chunk_size > self.max_length:
+            raise JevTaggerError(
+                f"chunk_size {self.chunk_size} > max_length {self.max_length}")
+        self.chunk_agg = str(chunk_agg).strip()
+        if self.chunk_agg not in CHUNK_AGGS:
+            raise JevTaggerError(
+                f"chunk_agg must be one of {CHUNK_AGGS}, got {chunk_agg!r}")
+        self.chunk_enabled = self.chunk_segments > 0
+        self.chunk_overlap = CHUNK_OVERLAP
+        self.chunk_calibration, self._chunk_calib_desc = \
+            load_chunk_calibration(chunk_calibration)
         #: The rendered question template sits on top of the context window, so
         #: the prompt cap is relaxed by PROMPT_OVERHEAD_SLACK instead of
         #: shrinking the context to fit (the old shrink accidentally read only
@@ -761,6 +1055,16 @@ class JevTagger:
         info.update(model_file_hashes(self.model_dir))
         info["chat_template_sha256"] = chat_template_sha256(
             getattr(self, "tokenizer", None), self.model_dir)
+        # Long-text PII chunking config is part of the frozen version map even
+        # when disabled (chunk_agg "off"), so a replay knows whether the same
+        # request would have been chunked. getattr keeps object.__new__ stubs
+        # (unit tests) working without the full constructor.
+        info["chunk_segments"] = int(getattr(self, "chunk_segments", 0))
+        info["chunk_size"] = int(getattr(self, "chunk_size", 512))
+        info["chunk_agg"] = (getattr(self, "chunk_agg", "noisy_or")
+                             if getattr(self, "chunk_enabled", False) else "off")
+        info["chunk_overlap"] = CHUNK_OVERLAP
+        info["chunk_calibration"] = getattr(self, "_chunk_calib_desc", "none")
         return info
 
     def _static_info(self) -> dict:
@@ -898,29 +1202,17 @@ class JevTagger:
             offset += count
         return out
 
-    def _model_signals(self, req: TagRequest, *,
-                       text: str | None = None,
-                       questions: dict | None = None) -> dict:
-        scope = req.scope
-        if scope is not None and scope.trimmed:
-            logger.debug("jev trimmed pack: signals=%s pii=%s",
-                         sorted(scope.signals), sorted(scope.pii_types))
-        # ``questions`` is the config object tag() captured at its entry (hot
-        # config edits must not desync the pack from its fingerprint); direct
-        # callers (unit tests, bench scripts) default to the current attribute.
-        # ``text`` is the windowed context from _tag_row; direct callers
-        # default to the un-windowed request text.
-        cfg = questions if questions is not None else self.questions
-        records = build_signal_records(cfg,
-                                       req.text if text is None else text,
-                                       scope)
-        # user_feedback is unconditionally overridden to null for single-turn
-        # requests below (there is no previous turn), so its questions are dead
-        # compute. Both the full and the trimmed path skip them => same result.
-        if req.n_messages <= 1:
-            records = [item for item in records
-                       if item["signal"] != "user_feedback"]
-        probs = self._score([item["record"] for item in records])
+    def _decode_signal_pack(self, records: list[dict],
+                            probs: list[list[float]],
+                            req: TagRequest) -> dict:
+        """Decode scored records into the signal pack (shared by both paths).
+
+        The window path and the long-text chunk path both score a list of JEV
+        records (each with one candidate distribution) and decode them with the
+        exact same rules: choice argmax + entropy confidence, noul strict >.5,
+        PII hit rule and P1-A model evidence. Keeping this in one place is what
+        makes the chunk off/on short-text paths byte-identical.
+        """
         by_key: dict[str, list[tuple[dict, list[float]]]] = {}
         for item, prob in zip(records, probs):
             by_key.setdefault(item["signal"], []).append((item, prob))
@@ -965,12 +1257,152 @@ class JevTagger:
             }
         return signals
 
+    def _model_signals(self, req: TagRequest, *,
+                       text: str | None = None,
+                       questions: dict | None = None) -> dict:
+        scope = req.scope
+        if scope is not None and scope.trimmed:
+            logger.debug("jev trimmed pack: signals=%s pii=%s",
+                         sorted(scope.signals), sorted(scope.pii_types))
+        # ``questions`` is the config object tag() captured at its entry (hot
+        # config edits must not desync the pack from its fingerprint); direct
+        # callers (unit tests, bench scripts) default to the current attribute.
+        # ``text`` is the windowed context from _tag_row; direct callers
+        # default to the un-windowed request text.
+        cfg = questions if questions is not None else self.questions
+        records = build_signal_records(cfg,
+                                       req.text if text is None else text,
+                                       scope)
+        # user_feedback is unconditionally overridden to null for single-turn
+        # requests below (there is no previous turn), so its questions are dead
+        # compute. Both the full and the trimmed path skip them => same result.
+        if req.n_messages <= 1:
+            records = [item for item in records
+                       if item["signal"] != "user_feedback"]
+        probs = self._score([item["record"] for item in records])
+        return self._decode_signal_pack(records, probs, req)
+
+    # ── long-text PII chunking (opt-in) ─────────────────────────────────────
+    @staticmethod
+    def _pii_in_scope(scope) -> bool:
+        """True when the scope asks for the PII signal at all."""
+        return scope is None or scope.full or "pii" in scope.signals
+
+    def _chunk_applies(self, req: TagRequest, window: dict) -> bool:
+        """Chunking only for enabled PII + a request longer than the window."""
+        return (self.chunk_enabled
+                and int(window.get("input_tokens") or 0) > self.max_length
+                and self._pii_in_scope(req.scope))
+
+    def _segment_text(self, ids: list[int], start: int, end: int) -> str:
+        """Decode one planned token segment (boundary U+FFFD trimmed)."""
+        text = self.tokenizer.decode(ids[start:end], skip_special_tokens=False)
+        return text.strip("\ufffd")
+
+    def _chunk_prompt_tokens(self, records: list[dict]) -> int:
+        """Exact prompt-token cost of the segment scoring (all types x segments)."""
+        if not records:
+            return 0
+        prompts, _counts = self._render(records)
+        return sum(len(self.tokenizer(prompt, add_special_tokens=True)["input_ids"])
+                   for prompt in prompts)
+
+    def _aggregate_type_probability(self, typ: str,
+                                    segment_probs: list[float]) -> float:
+        """Request-level presence probability for one PII type (with calibration)."""
+        fallback = self.chunk_calibration.get("*") or {}
+        config = self.chunk_calibration.get(typ) or fallback
+        return aggregate_presence(
+            segment_probs, method=self.chunk_agg,
+            bias=float(config.get("bias", 0.0)),
+            scale=float(config.get("scale", 1.0)))
+
+    def _model_signals_chunked(self, req: TagRequest, *, text: str,
+                               questions: dict | None = None
+                               ) -> tuple[dict, dict]:
+        """Windowed signals for the other six signals + chunked PII.
+
+        Only the PII multi-signal takes the chunk path: domain/complexity/... are
+        not presence-like (their aggregation semantics would be wrong), so they
+        keep the configured head/tail window. Each segment asks only the PII
+        subtypes the pipeline scope references; per-type segment probabilities
+        are aggregated into the request-level ``model_p_by_type`` and then run
+        through the unchanged request-level hit rule and P1-A evidence contract.
+        """
+        cfg = questions if questions is not None else self.questions
+        scope = req.scope
+        records = build_signal_records(cfg, text, scope)
+        non_pii = [item for item in records if item["signal"] != "pii"]
+        pii_items = [item for item in records if item["signal"] == "pii"]
+        if req.n_messages <= 1:
+            non_pii = [item for item in non_pii
+                       if item["signal"] != "user_feedback"]
+        window_probs = self._score([item["record"] for item in non_pii])
+        signals = self._decode_signal_pack(non_pii, window_probs, req)
+        if not pii_items:                     # defensive: caller checked the scope
+            return signals, {}
+
+        ids = self.tokenizer(req.text, add_special_tokens=False)["input_ids"]
+        segments = plan_pii_segments(req.text, self.tokenizer,
+                                     size=self.chunk_size,
+                                     max_segments=self.chunk_segments,
+                                     ids=ids)
+        if not segments:                      # empty/undecodable text
+            return signals, {}
+        labels = [item["sub"] for item in pii_items]
+        segment_texts = [self._segment_text(ids, segment["start"],
+                                            segment["end"])
+                         for segment in segments]
+        staged_records: list[dict] = []
+        for segment_text in segment_texts:
+            for item in pii_items:
+                record = dict(item["record"])
+                record["state"] = segment_text
+                staged_records.append(record)
+        segment_probs = self._score(staged_records)
+        per_type: dict[str, list[float]] = {label: [] for label in labels}
+        offset = 0
+        for _segment_text in segment_texts:
+            for item in pii_items:
+                per_type[item["sub"]].append(float(segment_probs[offset][1]))
+                offset += 1
+
+        aggregated = [self._aggregate_type_probability(label, per_type[label])
+                      for label in labels]
+        hits, conf_by_value = pii_hits(aggregated, labels)
+        signals["pii"] = {
+            "value": hits,
+            "confidence": max(conf_by_value.values()) if conf_by_value else None,
+            "conf_by_value": conf_by_value, "is_rule": False,
+            # Request-level aggregated presence probabilities, P1-A contract:
+            # the model evidence map, never overwritten by the regex rules.
+            "model_p_by_type": dict(zip(labels, aggregated)),
+            "model_hits": list(hits),
+        }
+        stats = {
+            "chunk_segments": len(segments),
+            "chunk_scored_segments": len(segment_texts),
+            "chunk_prompt_tokens": self._chunk_prompt_tokens(staged_records),
+            "chunk_strategy": "head+tail+rule+uniform:" + self.chunk_agg,
+        }
+        logger.debug("jev pii chunked: segments=%d types=%d prompt_tokens=%d",
+                     len(segments), len(labels), stats["chunk_prompt_tokens"])
+        return signals, stats
+
     def _tag_row(self, req: TagRequest,
                  questions: dict | None = None) -> tuple[dict, None, dict]:
         # Model signals read the configured window only; tag() still runs the
-        # rule signals over the full text (long-request safety net).
+        # rule signals over the full text (long-request safety net). With the
+        # opt-in long-text PII chunking on, only PII is additionally scored on
+        # planned segments; everything else stays on the single-window path.
         text, window = self._context_window(req.text)
-        return self._model_signals(req, text=text, questions=questions), None, window
+        if self._chunk_applies(req, window):
+            signals, chunk_stats = self._model_signals_chunked(
+                req, text=text, questions=questions)
+            window.update(chunk_stats)
+        else:
+            signals = self._model_signals(req, text=text, questions=questions)
+        return signals, None, window
 
     async def tag(self, req: TagRequest) -> TagResult:
         # Frozen snapshot (2026-10-24 P1-A): capture the question-config object

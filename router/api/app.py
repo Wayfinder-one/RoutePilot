@@ -60,6 +60,11 @@ def _make_tagger(settings: Settings, kw_groups: dict):
             # head-only "<max_length>:0" window instead of failing on a literal
             # default when ROUTER_JEV_MAX_LENGTH is customized.
             window=settings.jev_window or None,
+            # Long-text PII chunking (0 = off, the default: behavior unchanged).
+            chunk_segments=settings.jev_chunk_segments,
+            chunk_size=settings.jev_chunk_size,
+            chunk_agg=settings.jev_chunk_agg,
+            chunk_calibration=settings.jev_chunk_calibration or None,
             kw_groups=kw_groups)
     if settings.tagger == "prompt":
         from router.signals.prompt_judge import PromptJudgeTagger
