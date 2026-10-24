@@ -63,6 +63,7 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 | `ROUTER_JEV_MODEL` | merged JEV 单模型目录 |
 | `ROUTER_SIGNAL_QUESTIONS` | JEV 问题配置 JSON（问题措辞/候选/真值定义，可编辑） |
 | `ROUTER_JEV_MAX_LENGTH` | JEV 输入上限（默认取 model.json） |
+| `ROUTER_JEV_CHUNK_SEGMENTS` | 长文 PII 分块（0=off 默认；4/8 为实验值）；配合 `ROUTER_JEV_CHUNK_SIZE`(512)、`ROUTER_JEV_CHUNK_AGG`(noisy_or)、`ROUTER_JEV_CHUNK_CALIBRATION`（默认全关，行为不变） |
 | `ROUTER_JEV_WINDOW` | JEV 输入窗口 `<head>:<tail>`（token 数，默认未配置 = 旧行为 `<max_length>:0` 纯 head；如 `256:768` / `0:1024` / `512:512`；短文本逐字不变） |
 | `ROUTER_JEV_TRIM` | 设为 `0` 关闭 /v1 按树裁剪问题的热路径优化 |
 | `ROUTER_DEVICE` | 模型设备（如 `cuda:0`） |
@@ -195,7 +196,7 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（706 passed, 6 skipped）。
+- 单元/集成：`pytest`（764 passed, 6 skipped）。
 - 离线 JEV 评估：`scripts/jev_dump_scores.py`（官方 test 集 raw 分布 dump，需模型）、
   `scripts/jev_calibrate.py`（coverage-risk / AURC / ECE / 各门槛 block recall 报告，纯 CPU）、
   `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）、
