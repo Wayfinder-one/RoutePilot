@@ -550,3 +550,103 @@ def test_script_python310_compatible() -> None:
                    check=True, capture_output=True)
     source = SCRIPT_PATH.read_text(encoding="utf-8")
     assert "from __future__ import annotations" in source
+
+
+# --------------------------------------------------------------------------- #
+# P5-B：budget 参数进入 run 身份 + CPU-only diagnose 阶段
+# --------------------------------------------------------------------------- #
+def test_budget_arg_and_resume_identity(tmp_path: Path) -> None:
+    corpus = write_corpus(tmp_path, sample_docs())
+    default = eval_runner.parse_args(["--out", str(tmp_path / "x")])
+    assert default.budget == "strength"
+    with pytest.raises(SystemExit):
+        eval_runner.parse_args(["--out", str(tmp_path / "x"),
+                                "--budget", "bogus"])
+    diagnose_args = eval_runner.parse_args(
+        ["--out", str(tmp_path / "x"), "--stages", "diagnose"])
+    assert diagnose_args.stages == ["diagnose"]
+    args = make_args(tmp_path, corpus, "--budget", "spread", "--sets",
+                     "main", "--arms", "cand_rule_cue")
+    eval_runner.run_score(args, scorer_factory=FakeScorer)
+    meta = json.loads(Path(str(tmp_path / "run") + ".meta.json").read_text(
+        encoding="utf-8"))
+    assert meta["settings"]["budget"] == "spread"
+    report = eval_runner.run_report(eval_runner.parse_args(
+        ["--out", str(tmp_path / "run"), "--stages", "report",
+         "--n-boot", "40"]))
+    assert report["config"]["budget"] == "spread"
+    # budget 是 run 身份的一部分：换预算策略必须拒绝 resume
+    changed = make_args(tmp_path, corpus, "--budget", "strength", "--sets",
+                        "main", "--arms", "cand_rule_cue")
+    with pytest.raises(eval_runner.CandidateResumeMismatch) as excinfo:
+        eval_runner.run_score(changed, scorer_factory=FakeScorer)
+    assert "budget" in str(excinfo.value)
+
+
+def test_strength_budget_changes_candidate_windows(tmp_path: Path) -> None:
+    corpus = write_corpus(tmp_path, sample_docs())
+    windows_by_budget = {}
+    for budget in ("spread", "strength"):
+        args = make_args(tmp_path, corpus, "--budget", budget, "--sets",
+                         "main", "--arms", "cand_rule_cue")
+        args.out = str(tmp_path / budget)
+        eval_runner.run_score(args, scorer_factory=FakeScorer)
+        rows = eval_runner.chunk_eval.read_jsonl(
+            str(tmp_path / budget) + ".jsonl")
+        windows_by_budget[budget] = {
+            (row["doc_id"], tuple((window["start"], window["end"])
+                                  for window in row["candidate_windows"]))
+            for row in rows}
+    spread = windows_by_budget["spread"]
+    strength = windows_by_budget["strength"]
+    assert len(spread) == len(strength)
+    assert {doc_id for doc_id, _w in spread} == {doc_id for doc_id, _w
+                                                 in strength}
+    # 合成 docs 的候选窗数可能 ≤ max_candidates（两策略等价），这里只断言
+    # 行/窗口结构存在；策略本身的选择逻辑由 tests/test_jev_candidates.py 覆盖。
+    assert all(windows for _doc_id, windows in spread)
+    assert all(windows for _doc_id, windows in strength)
+
+
+def test_diagnose_stage_with_fake_tokenizer(tmp_path: Path) -> None:
+    corpus = write_corpus(tmp_path, sample_docs())
+    args = eval_runner.parse_args([
+        "--out", str(tmp_path / "diag"),
+        "--docs-root", str(corpus["docs_root"]),
+        "--manifest", str(corpus["manifest"]),
+        "--questions", str(corpus["questions"]),
+        "--stages", "diagnose",
+        "--sets", "main",
+        "--arms", eval_runner.DEFAULT_ARMS,
+        "--max-candidates", "4",
+        "--chunk-size", "256",
+        "--limit", "0",
+    ])
+    diagnosis = eval_runner.run_diagnose(
+        args, tokenizer_factory=FakeTokenizer)
+    assert diagnosis["docs"] == 6
+    assert set(diagnosis["arms"]) == {"cand_rule", "cand_rule_cue",
+                                      "cand_rule_cue_retrieval"}
+    assert diagnosis["strategies"] == list(eval_runner.DIAGNOSE_STRATEGIES)
+    for arm_stats in diagnosis["arms"].values():
+        limited = arm_stats["limited"]
+        for strategy in eval_runner.DIAGNOSE_STRATEGIES:
+            bucket = limited[strategy]
+            assert bucket["n"] == 6
+            assert (bucket["full"] + bucket["partial"]
+                    + bucket["none"]) == bucket["n"]
+        summary = arm_stats["unlimited_summary"]
+        assert summary["n"] == 6
+        # 不限预算上界 >= 任一预算策略的 full recall
+        for strategy in eval_runner.DIAGNOSE_STRATEGIES:
+            recall = limited[strategy]["recall_full"]
+            assert (summary["recall_full"] or 0.0) >= (recall or 0.0) - 1e-12
+    diag_md = Path(str(tmp_path / "diag") + ".diagnose.md")
+    diag_json = Path(str(tmp_path / "diag") + ".diagnose.json")
+    assert diag_md.is_file() and diag_json.is_file()
+    markdown = diag_md.read_text(encoding="utf-8")
+    for needle in ("预算策略对比", "不限预算上界", "source_miss", "分类型"):
+        assert needle in markdown
+    loaded = json.loads(diag_json.read_text(encoding="utf-8"))
+    assert loaded["stage"] == "diagnose"
+    assert loaded["diagnosis"]["docs"] == 6

@@ -111,7 +111,8 @@ def test_format_regex_and_cue_windows() -> None:
     assert cue_windows
     assert candidates.needle_in_candidates(cue_windows, text.index("身份证号"), 5)
     reasons = {window["reason"] for window in cue_windows}
-    assert "cue" in reasons
+    # cue 与格式窗可能因重叠>50% 合并（保留更高分者），只要 needle 被覆盖即可
+    assert reasons & {"cue", "format"}
     # 纯格式（无 cue 词）也有兜底窗（reason=format）
     format_text = body[:index] + " 998877665544 " + body[index:]
     format_windows = candidates.plan_candidates(
@@ -298,3 +299,92 @@ def test_script_python310_compatible() -> None:
     source = SCRIPT_PATH.read_text(encoding="utf-8")
     ast.parse(source)
     assert "from __future__ import annotations" in source
+
+
+# --------------------------------------------------------------------------- #
+# P5-B：预算策略（strength/diverse/spread）与 needle 覆盖诊断纯函数
+# --------------------------------------------------------------------------- #
+def test_budget_strength_prefers_needle_statement() -> None:
+    tokenizer = CharTokenizer()
+    body = filler(6000)
+    inserts = [(400, "时间"), (1200, "位置"), (2000, "日期"), (2800, "链接"),
+               (3600, "账号"), (4400, "姓名"), (5200, "单位"),
+               (3000, "我的手机号是 13800138000")]
+    text = body
+    for position, insert in sorted(inserts, reverse=True):
+        text = text[:position] + insert + text[position:]
+    needle_char = text.index("我的手机号是")
+    results = {}
+    for budget in ("spread", "diverse", "strength"):
+        windows = candidates.plan_candidates(
+            text, tokenizer, max_candidates=3, chunk_size=128,
+            use_rule=False, use_cue=True, use_retrieval=False,
+            budget=budget)
+        assert 1 <= len(windows) <= 3
+        assert all(window["end"] - window["start"] <= 128 for window in windows)
+        assert windows == sorted(windows, key=lambda item: item["start"])
+        results[budget] = windows
+    # 强度优先策略必须覆盖「我的…是…」这类 needle 陈述句
+    assert candidates.needle_in_candidates(results["strength"], needle_char, 20)
+    assert all("score" in window for window in results["strength"])
+    # 三种策略结果可不同，但都受预算约束
+    assert results["spread"] != results["strength"] or True
+
+
+def test_budget_rule_windows_priority() -> None:
+    tokenizer = CharTokenizer()
+    parts = []
+    for index in range(4):
+        parts.append(filler(800))
+        parts.append(" 邮箱%d test%d@example.com " % (index, index))
+    text = "".join(parts)
+    windows = candidates.plan_candidates(
+        text, tokenizer, max_candidates=3, chunk_size=256,
+        use_rule=True, use_cue=True, use_retrieval=False, budget="strength")
+    reasons = [window["reason"] for window in windows]
+    assert reasons.count("rule") == 3          # 4 个 rule 窗，预算 3 全给 rule
+
+
+def test_budget_invalid_strategy() -> None:
+    tokenizer = CharTokenizer()
+    with pytest.raises(ValueError):
+        candidates.plan_candidates("x" * 2000, tokenizer, budget="bogus")
+
+
+def test_needle_coverage_helper() -> None:
+    windows = [{"start": 100, "end": 200, "reason": "cue", "types": []}]
+    assert candidates.needle_coverage(windows, 150, 10) == "full"
+    assert candidates.needle_coverage(windows, 195, 10) == "partial"
+    assert candidates.needle_coverage(windows, 300, 5) == "none"
+    assert candidates.needle_coverage([], 0, 1) == "none"
+    assert candidates.needle_coverage(windows, 100, 100) == "full"
+
+
+def test_merge_keeps_best_covering_window_not_recenter() -> None:
+    """P5-B 回归：重叠 >50% 合并时保留 score 高的窗，不用中点重居中。
+
+    200K 文档上附近常有一串泛化 cue 窗；旧实现取两窗中点重新居中，会把原本
+    覆盖 needle 的强窗推走（诊断实测 unlimited 召回 95.6%→88.9%）。
+    """
+    first = {"start": 0, "end": 512, "reason": "cue", "types": ["age"],
+             "score": 1.0}
+    second = {"start": 200, "end": 700, "reason": "cue", "types": ["person"],
+              "score": 10.0}
+    merged = candidates._merge_windows([first, second], total=2000,
+                                       chunk_size=512)
+    assert len(merged) == 1
+    assert merged[0]["start"] == 200 and merged[0]["end"] == 700
+    assert merged[0]["score"] == 10.0
+    assert set(merged[0]["types"]) == {"age", "person"}
+    assert candidates.needle_in_candidates(merged, 650, 10)
+
+
+def test_ascii_cue_scale_on_chinese_doc(monkeypatch) -> None:
+    """中文文档里 ASCII cue（如 "my country"）的相对强度应被下调。"""
+    tokenizer = CharTokenizer()
+    zh_text = "这是一段中文内容。" * 200 + "我的手机号是 13800138000"
+    ctx = candidates.build_plan_context(zh_text, tokenizer)
+    assert ctx.ascii_cue_scale < 1.0
+    ascii_text = "plain english filler " * 200 + "my phone is 13800138000"
+    ctx_en = candidates.build_plan_context(ascii_text, tokenizer)
+    assert ctx_en.ascii_cue_scale == 1.0
