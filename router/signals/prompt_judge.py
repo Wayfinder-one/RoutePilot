@@ -1,5 +1,8 @@
 """PromptJudgeTagger: one LLM call judges all model signals from a prompt.
 
+EXPERIMENTAL: this path never went through production-grade calibration; keep
+it as a fallback / research alternative, not as the serving default.
+
 Feasibility alternative to :class:`router.signals.checkpoint.CheckpointTagger`.
 Instead of eight trained heads (a single forward pass), this tagger sends the
 user request plus a **configurable prompt** — one question per signal — to an
@@ -23,6 +26,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from pathlib import Path
 
 import httpx
@@ -41,6 +45,10 @@ JUDGED_SIGNALS: tuple[str, ...] = tuple(
 #: Shipped default prompt config (edit the JSON, not this module).
 DEFAULT_PROMPTS_PATH = (Path(__file__).resolve().parent.parent.parent
                         / "configs" / "signal_prompts.json")
+
+#: Character cap on the judge input (this path has no tokenizer, so no token
+#: precision); rule signals and rule PII still see the full request text.
+MAX_INPUT_CHARS = 8000
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.S | re.I)
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
@@ -217,9 +225,11 @@ class PromptJudgeTagger:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"), headers=headers,
             timeout=timeout, transport=transport)
-        #: counters for diagnostics / the feasibility report
+        #: counters for diagnostics / the feasibility report; latency_ms is
+        #: bounded so a long-lived tagger does not grow it without limit
         self.stats = {"calls": 0, "errors": 0, "retries": 0,
-                      "latency_ms": [], "prompt_tokens": 0, "completion_tokens": 0}
+                      "latency_ms": deque(maxlen=200),
+                      "prompt_tokens": 0, "completion_tokens": 0}
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -247,7 +257,6 @@ class PromptJudgeTagger:
             resp.raise_for_status()
             data = resp.json()
         except (httpx.HTTPError, ValueError) as exc:
-            self.stats["errors"] += 1
             raise PromptJudgeError(f"judge call failed: {exc!r}") from exc
         finally:
             self.stats["latency_ms"].append((time.monotonic() - started) * 1000)
@@ -257,22 +266,29 @@ class PromptJudgeTagger:
         try:
             return data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
-            self.stats["errors"] += 1
             raise PromptJudgeError(f"unexpected judge response: {data!r}") from exc
 
     async def tag(self, req: TagRequest) -> TagResult:
         """One judge call for all model signals + local rule signals."""
+        text = req.text[:MAX_INPUT_CHARS]
+        # same keys as the JEV token window, but the counts are characters
+        # (this path never tokenizes) — the console badge reads vis/total
+        input_window = {"input_tokens": len(req.text),
+                        "input_visible_tokens": len(text),
+                        "input_truncated": len(text) < len(req.text)}
         judged: dict | None = None
         last_error: Exception | None = None
         for attempt in range(2):                    # one repair retry
             try:
-                judged = parse_output(await self._chat(req.text))
+                judged = parse_output(await self._chat(text))
                 break
             except PromptJudgeError as exc:
                 last_error = exc
                 if attempt == 0:
                     self.stats["retries"] += 1
                     continue
+                # errors counts failed tag() calls only; _chat/parse failures
+                # all funnel here, so one failed request counts once
                 self.stats["errors"] += 1
         if judged is None:
             raise PromptJudgeError(f"judge output unusable after retry: {last_error}")
@@ -283,4 +299,4 @@ class PromptJudgeTagger:
         judged.update(rule_signals(req.text, req.headers, req.n_messages,
                                    self.kw_groups, time_periods=self.time_periods))
         merge_rule_pii(judged, req.text)
-        return TagResult(signals=judged, vec=None)
+        return TagResult(signals=judged, vec=None, input=input_window)

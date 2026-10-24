@@ -14,7 +14,8 @@ def client(tmp_path):
 
 def test_get_pipeline(tmp_path):
     body = client(tmp_path).get("/admin/pipeline").json()
-    assert [s["type"] for s in body["stations"]] == ["gate", "gate", "split", "gate"]
+    assert [s["name"] for s in body["stations"]] == \
+        ["① 安全闸", "② 关键词直达", "③ 学科 → 难度", "④ 兜底"]
     subject = body["stations"][2]
     assert subject["root"]["kind"] == "fork"
     health = subject["root"]["children"][0]

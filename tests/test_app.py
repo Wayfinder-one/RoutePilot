@@ -26,8 +26,8 @@ def test_console_mounted(tmp_path):
 def test_pipeline_seeded(tmp_path):
     r = client(tmp_path).get("/admin/pipeline")
     assert r.status_code == 200
-    assert [st["type"] for st in r.json()["stations"]] == \
-        ["gate", "gate", "split", "gate"]
+    assert [st["name"] for st in r.json()["stations"]] == \
+        ["① 安全闸", "② 关键词直达", "③ 学科 → 难度", "④ 兜底"]
 
 
 def test_startup_refuses_an_unhealthy_stored_tree(tmp_path):
@@ -38,7 +38,7 @@ def test_startup_refuses_an_unhealthy_stored_tree(tmp_path):
     migrate(conn)
     seed_default(conn)
     conn.execute("UPDATE stations SET tree = ? WHERE ord = 0",
-                 (json.dumps({"id": "s1", "type": "gate", "name": "坏树",
+                 (json.dumps({"id": "s1", "name": "坏树",
                               "root": {"id": "r", "signal": "telepathy",
                                        "value": "yes", "conf_min": 0.5,
                                        "kind": "leaf", "action": "route",

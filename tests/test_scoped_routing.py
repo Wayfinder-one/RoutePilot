@@ -68,7 +68,7 @@ def test_hot_pipeline_edit_changes_the_scope(tmp_path, monkeypatch):
 
     pipe = client.get("/admin/pipeline").json()
     pipe["stations"].insert(len(pipe["stations"]) - 1, {
-        "id": "st-fc", "type": "gate", "name": "需核实",
+        "id": "st-fc", "name": "需核实",
         "root": {"id": "n-fc", "signal": None, "value": "", "conf_min": None,
                  "kind": "fork", "action": "route", "model": None,
                  "min_score": None, "weights": [], "children": [
@@ -98,7 +98,7 @@ def test_rule_only_pipeline_needs_no_model_questions(tmp_path, monkeypatch):
     """A tree that only reads rule signals yields an empty (but trimmed) scope."""
     client, fake = _make_client(tmp_path, monkeypatch)
     stations = [
-        {"id": "st-kw", "type": "gate", "name": "关键词",
+        {"id": "st-kw", "name": "关键词",
          "root": {"id": "n-kw", "signal": None, "value": "",
                   "conf_min": None, "kind": "fork", "action": "route",
                   "model": None, "min_score": None, "weights": [],
@@ -107,7 +107,7 @@ def test_rule_only_pipeline_needs_no_model_questions(tmp_path, monkeypatch):
                                 "kind": "leaf", "action": "route",
                                 "model": "qwen3-8b", "min_score": None,
                                 "weights": [], "children": []}]}},
-        {"id": "st-fb", "type": "gate", "name": "兜底",
+        {"id": "st-fb", "name": "兜底",
          "root": {"id": "n-fb", "signal": None, "value": "", "conf_min": None,
                   "kind": "leaf", "action": "route", "model": "qwen3-8b",
                   "min_score": None, "weights": [], "children": []}},

@@ -31,10 +31,9 @@ def sample_node() -> dict:
 
 
 def test_station_roundtrip():
-    d = {"id": "s1", "type": "split", "name": "学科 → 难度",
+    d = {"id": "s1", "name": "学科 → 难度",
          "root": sample_node()}
     st = station_from_dict(d)
-    assert st.type == "split"
     assert st.root.kind == "fork" and len(st.root.children) == 1
     leaf = st.root.children[0].children[1]
     assert leaf.min_score == 0.4 and leaf.weights[0].weight == 0.5
@@ -50,8 +49,6 @@ def test_leaf_with_weights_roundtrip():
 
 
 def test_shape_validation():
-    with pytest.raises(ValueError):
-        station_from_dict({"id": "s", "type": "wat", "root": None})
     with pytest.raises(ValueError):
         node_from_dict({"id": "n", "kind": "fork", "children": []})
     with pytest.raises(ValueError):

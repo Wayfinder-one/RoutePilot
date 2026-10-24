@@ -441,14 +441,12 @@ class JevTagger:
                                  return_tensors="pt")
         return enc, counts
 
-    #: Fallback chunking for long inputs: at most this many candidate prompts
-    #: per forward pass. A full pack with 1024-token contexts is ~54 prompts /
-    #: ~60k tokens, so the single-forward fast path is only taken for short
-    #: requests; chunking bounds peak attention memory and is math-neutral.
-    max_prompts_per_forward = 16
-
-    #: Token budget for the single-forward fast path. Longer input falls back to
-    #: chunked forwards so peak attention memory stays bounded.
+    #: Token budget per forward pass. A full pack with 1024-token contexts is
+    #: ~54 prompts / ~60k tokens, so the single-forward fast path is only taken
+    #: for short requests; longer input is sliced into budgeted chunks of the
+    #: already-encoded rows so peak attention memory stays bounded. The split is
+    #: math-neutral: the softmax is per prompt and padding aligns within a
+    #: forward, so chunk rows score exactly as in one big pass.
     max_tokens_per_forward = 12000
 
     def _score(self, records: list[dict]) -> list[list[float]]:
@@ -456,24 +454,26 @@ class JevTagger:
         if not records:                       # trimmed scope may drop everything
             return []
         enc, counts = self._encode(records)
-        if int(enc["attention_mask"].sum().item()) <= self.max_tokens_per_forward:
+        lengths = enc["attention_mask"].sum(-1).tolist()
+        if sum(lengths) <= self.max_tokens_per_forward:
             return self._score_encoded(enc, counts)
-        # long input: fall back to bounded chunks (same math, more forwards)
-        groups: list[list[dict]] = []
-        current: list[dict] = []
-        count = 0
-        for record in records:
-            n = 1 if record["kind"] == "noul" else len(record["options"])
-            if current and count + n > self.max_prompts_per_forward:
-                groups.append(current)
-                current, count = [], 0
-            current.append(record)
-            count += n
-        if current:
-            groups.append(current)
+        # Over budget: slice the encoded rows into token-budgeted chunks —
+        # re-encoding each chunk would tokenize the long input a second time.
+        # Records stay atomic (a choice softmax needs every candidate score),
+        # so a single record bigger than the budget scores alone.
         out: list[list[float]] = []
-        for group in groups:
-            out.extend(self._score_encoded(*self._encode(group)))
+        first_rec = first_row = tokens = row = 0
+        for i, n in enumerate(counts):
+            record_tokens = sum(lengths[row:row + n])
+            if i > first_rec and tokens + record_tokens > self.max_tokens_per_forward:
+                out.extend(self._score_encoded(
+                    {k: v[first_row:row] for k, v in enc.items()},
+                    counts[first_rec:i]))
+                first_rec, first_row, tokens = i, row, 0
+            tokens += record_tokens
+            row += n
+        out.extend(self._score_encoded(
+            {k: v[first_row:row] for k, v in enc.items()}, counts[first_rec:]))
         return out
 
     def _score_encoded(self, enc, counts: list[int]) -> list[list[float]]:

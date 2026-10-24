@@ -59,21 +59,21 @@ def _node(node_id: str, signal: str | None, value: str,
 
 
 def default_pipeline() -> list[Station]:
-    """Four independent station trees: gate / keyword gate / subject fork / fallback.
+    """Four independent station trees: ① 安全闸 / ② 关键词直达 / ③ 学科 → 难度 / ④ 兜底.
 
     All model-signal conditions default to a 0.70 confidence floor."""
-    safety = Station(id=_uid(), type="gate", name="① 安全闸", root=_node(
+    safety = Station(id=_uid(), name="① 安全闸", root=_node(
         "n1", None, "", None, kind="fork", children=[
             _node("n1a", "jailbreak", "jailbreak", CONF,
                   action="block"),
             _node("n1b", "pii", "cn_id_card", CONF, action="block"),
         ]))
-    keyword = Station(id=_uid(), type="gate", name="② 关键词直达", root=_node(
+    keyword = Station(id=_uid(), name="② 关键词直达", root=_node(
         "n2", None, "", None, kind="fork", children=[
             _node("n2a", "keyword", "医疗急症", None,   # rule signal: no floor
                   action="route", model="qwen3-8b-medical"),
         ]))
-    subject = Station(id=_uid(), type="split", name="③ 学科 → 难度", root=_node(
+    subject = Station(id=_uid(), name="③ 学科 → 难度", root=_node(
         "n3", None, "", None, kind="fork", children=[
             _node("n3a", "domain", "health", CONF, kind="fork",
                   children=[
@@ -88,7 +88,7 @@ def default_pipeline() -> list[Station]:
                             action="route", model="deepseek-v3"),
                   ]),
         ]))
-    fallback = Station(id=_uid(), type="gate", name="④ 兜底", root=_node(
+    fallback = Station(id=_uid(), name="④ 兜底", root=_node(
         "n4", None, "", None, action="route", model="qwen3-8b"))
     return [safety, keyword, subject, fallback]
 
@@ -136,9 +136,9 @@ class StationRepo:
             self.conn.execute("DELETE FROM stations")
             for si, station in enumerate(stations):
                 self.conn.execute(
-                    "INSERT INTO stations (id, ord, type, name, tree) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (station.id, si, station.type, station.name,
+                    "INSERT INTO stations (id, ord, name, tree) "
+                    "VALUES (?, ?, ?, ?)",
+                    (station.id, si, station.name,
                      json.dumps(station_to_dict(station), ensure_ascii=False)))
             v = int(SettingsRepo(self.conn).get("pipeline_version", "0")) + 1
             SettingsRepo(self.conn).set("pipeline_version", str(v))

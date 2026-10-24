@@ -32,8 +32,9 @@ class TagResult:
     vec: list[float] | None = None    # embedding head output (M2; heuristic: None)
     #: Model-input window actually scored by the tagger, for the request log:
     #: ``{"input_tokens", "input_visible_tokens", "input_truncated"}``. Empty
-    #: when the tagger reads the whole text (heuristic/checkpoint/prompt) or
-    #: does not measure tokens.
+    #: when the tagger reads the whole text (heuristic/checkpoint) or does not
+    #: measure input size. The prompt judge fills it with character counts (it
+    #: never tokenizes); JEV fills it with token counts.
     input: dict = field(default_factory=dict)
 
 

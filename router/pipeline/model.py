@@ -3,17 +3,17 @@
 Each station is an independent ordered tree (2026-10-19 rewrite, replacing the
 derived `split` model):
 
-  Station {id, type: gate|score|split, name, root}
+  Station {id, name, root}
   TreeNode {id, condition(signal, value, conf_min) | unconditional,
             kind: leaf|fork, action, model, min_score, weights[], children[]}
 
 A node is either a LEAF (terminal: direct hit, or weighted scoring with
-``weights`` + ``min_score``) or a FORK (ordered children; the first child that
-produces a decision wins — when several matching children end in weighted
-leaves, the highest score wins, and direct-hit leaves keep their order; see
-``engine.py::_eval_node`` for the exact semantics). Children are
-ordered and may use different signals — they are independent branches, not
-grouped by value.
+``weights`` + ``min_score``) or a FORK (ordered children: a direct-hit
+decision wins in child order; weighted leaves compete by score only when no
+matched child yields a direct hit — scores bubble up through forks but never
+past a direct hit; see ``engine.py::_eval_node`` for the exact semantics).
+Children are ordered and may use different signals — they are independent
+branches, not grouped by value.
 
 This module is the trust boundary: anything malformed raises ValueError and the
 API layer turns it into a 422. Nothing downstream re-validates shape.
@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 
 from router.reasoning import LEVELS
 
-STATION_TYPES = ("gate", "score", "split")
 ACTIONS = ("block", "route")
 KINDS = ("leaf", "fork")
 
@@ -61,7 +60,6 @@ class TreeNode:
 @dataclass
 class Station:
     id: str
-    type: str = "split"              # 'gate' | 'score' | 'split' (defaults only)
     name: str = ""
     root: TreeNode | None = None
 
@@ -127,13 +125,10 @@ def node_to_dict(n: TreeNode) -> dict:
 def station_from_dict(d: dict) -> Station:
     if not isinstance(d, dict) or not isinstance(d.get("id"), str):
         raise ValueError(f"station must be an object with an id: {d!r}")
-    if d.get("type") not in STATION_TYPES:
-        raise ValueError(f"station type must be in {STATION_TYPES}: {d!r}")
     root = node_from_dict(d["root"]) if d.get("root") is not None else None
-    return Station(id=d["id"], type=d["type"], name=str(d.get("name", "")),
-                   root=root)
+    return Station(id=d["id"], name=str(d.get("name", "")), root=root)
 
 
 def station_to_dict(s: Station) -> dict:
-    return {"id": s.id, "type": s.type, "name": s.name,
+    return {"id": s.id, "name": s.name,
             "root": node_to_dict(s.root) if s.root is not None else None}

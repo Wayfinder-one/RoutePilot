@@ -7,9 +7,10 @@ Inside a station, walk the explicit tree:
   signals; rule signals are deterministic and skip the confidence floor);
 * a LEAF is terminal — without weights it hits directly (route/block), with
   weights it is scored and must reach ``min_score``;
-* a FORK tries its ordered children and follows the first one that produces a
-  decision. When several matching children end in weighted leaves, the highest
-  score wins (siblings under the same parent compete).
+* a FORK evaluates its matched children in order: a direct-hit decision wins
+  in child order; only when no matched child yields one do the weighted
+  leaves compete, highest score first. Scores bubble up through forks but
+  never past a direct hit at any level.
 
 Evaluators are pure functions; the trace carries the matched path plus the
 scored-leaf board for the console.
@@ -121,8 +122,9 @@ def _eval_node(station: Station, node: TreeNode, signals: dict,
                 miss["path"] = path + [step]
         return None
 
-    # Ordered traversal: the first matching child that yields a decision wins.
-    # Weighted leaves under the same parent compete by score instead.
+    # A direct-hit decision (route/block leaf) wins in child order; only when
+    # no matched child yields one do the weighted leaves compete by score.
+    # Scores bubble up through forks but never past a direct hit.
     decisions = []
     for child, child_path in matched:
         d = _eval_node(station, child, signals, child_path, board, miss)
@@ -137,10 +139,10 @@ def _eval_node(station: Station, node: TreeNode, signals: dict,
             if step is not None:
                 miss["path"] = path + [step]
         return None
-    scored = [d for d in decisions if d.score is not None]
-    if scored:
-        return max(scored, key=lambda d: d.score)   # ties keep the earlier
-    return decisions[0]
+    direct = [d for d in decisions if d.score is None]
+    if direct:
+        return direct[0]                        # child order decides
+    return max(decisions, key=lambda d: d.score)  # ties keep the earlier
 
 
 def _eval_station(station: Station, signals: dict) -> tuple[Decision | None, dict]:
@@ -150,14 +152,14 @@ def _eval_station(station: Station, signals: dict) -> tuple[Decision | None, dic
     root = station.root
     if root is None:
         return None, {"station_id": station.id, "name": station.name,
-                      "type": station.type, "result": "miss",
+                      "result": "miss",
                       "path": [], "board": []}
     ok, step, cut = _condition_ok(root, signals)
     if step is not None:
         path.append(step)
     if not ok:
         return None, {"station_id": station.id, "name": station.name,
-                      "type": station.type, "result": "miss",
+                      "result": "miss",
                       "path": path, "board": []}
     decision = _eval_node(station, root, signals, path, board, miss)
     if decision is not None:
@@ -167,7 +169,6 @@ def _eval_station(station: Station, signals: dict) -> tuple[Decision | None, dic
                 entry["winner"] = True
     miss_path = miss.get("path") if not decision else None
     return decision, {"station_id": station.id, "name": station.name,
-                      "type": station.type,
                       "result": "hit" if decision else "miss",
                       "path": decision.path if decision else (miss_path or path),
                       "board": board}

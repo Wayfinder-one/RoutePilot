@@ -19,7 +19,8 @@ def test_seed_idempotent(conn):
     seed_default(conn)
     seed_default(conn)
     stations = StationRepo(conn).load()
-    assert [s.type for s in stations] == ["gate", "gate", "split", "gate"]
+    assert [s.name for s in stations] == \
+        ["① 安全闸", "② 关键词直达", "③ 学科 → 难度", "④ 兜底"]
     assert len(ModelRepo(conn).list()) == 5
     assert "医疗急症" in KeywordRepo(conn).groups()
 
@@ -39,7 +40,7 @@ def test_station_roundtrip_tree(conn):
     seed_default(conn)
     stations = StationRepo(conn).load()
     subject = stations[2]
-    assert subject.type == "split"
+    assert subject.name == "③ 学科 → 难度"
     assert subject.root.signal is None and subject.root.kind == "fork"
     health = subject.root.children[0]
     assert health.signal == "domain" and health.value == "health"
@@ -68,7 +69,7 @@ def test_seeded_floors_are_uniform_and_healthy(conn):
     assert check_pipeline(stations, {m["id"] for m in ModelRepo(conn).list()}) == []
 
 
-def test_default_pipeline_types():
+def test_default_pipeline_shape():
     stations = default_pipeline()
     assert len(stations) == 4
     assert isinstance(stations[0], Station)

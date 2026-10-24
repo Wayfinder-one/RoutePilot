@@ -8,8 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from router.pipeline.model import (ACTIONS, STATION_TYPES, Station, TreeNode,
-                                   Weight)
+from router.pipeline.model import ACTIONS, Station, TreeNode, Weight
 from router.reasoning import level_label
 from router.signals.registry import SIGNALS
 
@@ -262,12 +261,6 @@ def check_pipeline(stations: list[Station], known_models: set[str],
                                 f"Duplicate station id: {station.id}",
                                 station_id=station.id))
         seen_station_ids.add(station.id)
-        if station.type not in STATION_TYPES:
-            issues.append(Issue("unknown_station_type",
-                                f"未知站点类型 {station.type}",
-                                f"Unknown station type {station.type}",
-                                station_id=station.id))
-            continue
         if station.root is None:
             issues.append(Issue("empty_station", "站点没有任何节点",
                                 "Station has no nodes",

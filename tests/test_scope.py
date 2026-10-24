@@ -22,13 +22,13 @@ def cond(nid, signal, value, kind="leaf", conf=0.5, model="qwen3-8b",
 
 
 def entry(children):
-    return Station(id="s", type="gate", name="s",
+    return Station(id="s", name="s",
                    root=TreeNode(id="r", signal=None, kind="fork",
                                  children=children))
 
 
 def fallback():
-    return Station(id="f", type="gate", name="f",
+    return Station(id="f", name="f",
                    root=TreeNode(id="fr", signal=None, action="route",
                                  model="qwen3-8b"))
 

@@ -133,6 +133,15 @@ class CircuitBreaker:
     (``is_open`` returns False), i.e. cross-replica quarantine does not by
     itself preserve the full window (second-round audit F4).
 
+    Half-open is a TRUE single-probe state: once the window has elapsed,
+    ``is_open`` admits exactly one probe per model (tracked in ``_probe_at``)
+    and keeps returning True for every concurrent request until the probe
+    concludes — ``success()``/``failure()`` clear the marker, and a failed
+    probe also re-arms ``opened_at`` so the circuit closes again. A probe that
+    never reports back would otherwise lock the circuit forever, so after
+    ``probe_timeout`` (slightly above the 60s upstream request timeout) the
+    next caller becomes a replacement probe.
+
     DB discipline (2026-10-21 audit P0 2.2 / P2 4.3):
 
     * ``failure()`` re-arms the clock on EVERY failure at/above the threshold
@@ -150,6 +159,10 @@ class CircuitBreaker:
     #: Minimum interval between two DB reads for the same model (P2 4.3).
     db_sync_seconds: float = 30.0
 
+    #: Max lifetime of a half-open probe; slightly above the 60s upstream
+    #: request timeout so a wedged probe cannot lock the circuit forever.
+    probe_timeout: float = 65.0
+
     def __init__(self, threshold: int = 3, half_open_after: float = 300.0,
                  db_path: str | None = None,
                  db_sync_seconds: float | None = None):
@@ -161,7 +174,16 @@ class CircuitBreaker:
         self._failures: dict[str, int] = {}
         self._opened_at: dict[str, float] = {}
         self._db_read_at: dict[str, float] = {}   # last quarantine check
+        self._probe_at: dict[str, float] = {}     # in-flight half-open probe
         self._lock = threading.Lock()
+
+    def _admit_probe(self, model: str, now: float) -> bool:
+        """Half-open gate: True if THIS request may proceed as the probe."""
+        probe_at = self._probe_at.get(model)
+        if probe_at is not None and now - probe_at < self.probe_timeout:
+            return False
+        self._probe_at[model] = now
+        return True
 
     # ── DB helpers (M4, only used when db_path is set) ──────────────────────
     def _db_read(self, model: str):
@@ -200,8 +222,12 @@ class CircuitBreaker:
     def is_open(self, model: str) -> bool:
         with self._lock:
             if self._failures.get(model, 0) >= self.threshold:
-                return (time.monotonic() - self._opened_at.get(model, 0.0)
-                        < self.half_open_after)
+                now = time.monotonic()
+                if now - self._opened_at.get(model, 0.0) < self.half_open_after:
+                    return True
+                # Window elapsed: admit one probe, keep blocking the rest so a
+                # recovering upstream is not flooded the instant it wakes up.
+                return not self._admit_probe(model, now)
             if not self.db_path:
                 return False
             # Rate-limited sync (P2 4.3): the local latch and the last check
@@ -217,12 +243,15 @@ class CircuitBreaker:
             opened_at = row[1] or time.time()
             # Latch the DB failure count and its ORIGINAL open time locally
             # (time.time -> time.monotonic, preserving the elapsed window).
-            # A DB row that already outlived half_open_after returns False
-            # below: this replica probes immediately (audit F4 — not "never
-            # releases early", just conservative while the row is fresh).
+            # A DB row that already outlived half_open_after falls into the
+            # probe gate below: this replica probes immediately (audit F4 —
+            # not "never releases early", just conservative while the row is
+            # fresh).
             self._failures[model] = row[0]
-            self._opened_at[model] = time.monotonic() - (time.time() - opened_at)
-            return (time.time() - opened_at) < self.half_open_after
+            self._opened_at[model] = now - (time.time() - opened_at)
+            if (time.time() - opened_at) < self.half_open_after:
+                return True
+            return not self._admit_probe(model, now)
 
     def failure(self, model: str) -> None:
         with self._lock:
@@ -235,6 +264,7 @@ class CircuitBreaker:
                 # open time, so after one half_open window is_open stayed
                 # False forever and the circuit never blocked again (P0 2.2).
                 self._opened_at[model] = time.monotonic()
+                self._probe_at.pop(model, None)
                 if self.db_path:
                     self._db_write(model, count, time.time())
 
@@ -246,6 +276,7 @@ class CircuitBreaker:
             had_state = model in self._failures or model in self._opened_at
             self._failures.pop(model, None)
             self._opened_at.pop(model, None)
+            self._probe_at.pop(model, None)
             if self.db_path and had_state:
                 self._db_write(model, 0, None)
 

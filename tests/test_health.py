@@ -17,7 +17,7 @@ def node(nid, signal=None, value="", conf=None, kind="leaf", action="route",
 
 
 def fallback():
-    return Station(id="f", type="gate", name="兜底",
+    return Station(id="f", name="兜底",
                    root=node("n4", signal=None, action="route", model="qwen3-8b"))
 
 
@@ -35,7 +35,7 @@ def test_empty_pipeline():
 
 
 def test_missing_fallback():
-    stations = [Station(id="s", type="gate", name="x",
+    stations = [Station(id="s", name="x",
                         root=node("r", signal=None, kind="fork",
                                   children=[node("c", "domain", "health", 0.5,
                                                  model="med")]))]
@@ -44,7 +44,7 @@ def test_missing_fallback():
 
 def test_unconditional_station_must_be_last():
     stations = [
-        Station(id="a", type="gate", name="直达",
+        Station(id="a", name="直达",
                 root=node("r", signal=None, action="route", model="med")),
         fallback()]
     assert "station_shadow" in codes(check_pipeline(stations, MODELS))
@@ -52,7 +52,7 @@ def test_unconditional_station_must_be_last():
 
 def test_unknown_model_and_signal():
     stations = [
-        Station(id="a", type="gate", name="x", root=node(
+        Station(id="a", name="x", root=node(
             "r", signal=None, kind="fork", children=[
                 node("c", "telepathy", "yes", 0.5, model="nope")])),
         fallback()]
@@ -61,7 +61,7 @@ def test_unknown_model_and_signal():
 
 
 def test_missing_model_on_route_leaf():
-    stations = [Station(id="a", type="gate", name="x", root=node(
+    stations = [Station(id="a", name="x", root=node(
         "r", signal=None, kind="fork",
         children=[node("c", "domain", "health", 0.5)])), fallback()]
     assert "missing_model" in codes(check_pipeline(stations, MODELS))
@@ -69,7 +69,7 @@ def test_missing_model_on_route_leaf():
 
 def test_leaf_and_fork_shape():
     stations = [
-        Station(id="a", type="gate", name="x", root=node(
+        Station(id="a", name="x", root=node(
             "r", signal=None, kind="fork", children=[
                 node("c", "domain", "health", 0.5, model="med",
                      kind="fork")])),
@@ -80,7 +80,7 @@ def test_leaf_and_fork_shape():
 
 def test_rule_signal_floor_warns_only():
     stations = [
-        Station(id="kw", type="gate", name="关键词", root=node(
+        Station(id="kw", name="关键词", root=node(
             "r", signal=None, kind="fork", children=[
                 node("c", "keyword", "医疗急症", 0.5, model="med")])),
         fallback()]
@@ -91,7 +91,7 @@ def test_rule_signal_floor_warns_only():
 
 def test_weighted_leaf_without_min_score_warns():
     stations = [
-        Station(id="a", type="score", name="x", root=node(
+        Station(id="a", name="x", root=node(
             "r", signal=None, kind="fork", children=[
                 node("c", "domain", "health", 0.5, model="med",
                      weights=[Weight("complexity", "hard", 0.5)])])),
@@ -103,7 +103,7 @@ def test_weighted_leaf_without_min_score_warns():
 
 
 def test_duplicate_conditions_warn():
-    stations = [Station(id="a", type="gate", name="x", root=node(
+    stations = [Station(id="a", name="x", root=node(
         "r", signal=None, kind="fork", children=[
             node("c1", "domain", "health", 0.5, model="med"),
             node("c2", "domain", "health", 0.5, model="med")])), fallback()]
@@ -116,7 +116,7 @@ def test_duplicate_conditions_warn():
 def test_duplicate_node_id_is_hard():
     """Two nodes with the same id in one tree: the console would edit the
     wrong node, so the save must be rejected."""
-    stations = [Station(id="a", type="gate", name="x", root=node(
+    stations = [Station(id="a", name="x", root=node(
         "r", signal=None, kind="fork", children=[
             node("dup", "domain", "health", 0.5, model="med"),
             node("dup", "complexity", "hard", 0.5, model="med")])), fallback()]
@@ -129,7 +129,7 @@ def test_nested_duplicate_node_id_reports_once():
     """The id walk must stay out of the recursive _check_node: a duplicate pair
     nested below depth 1 used to be reported once per ancestor, i.e. once per
     re-visit of the same subtree."""
-    stations = [Station(id="a", type="gate", name="x", root=node(
+    stations = [Station(id="a", name="x", root=node(
         "r", signal=None, kind="fork", children=[
             node("fork", "domain", "health", 0.5, kind="fork", children=[
                 node("dup", "domain", "health", 0.5, model="med"),
@@ -142,10 +142,10 @@ def test_nested_duplicate_node_id_reports_once():
 
 def test_duplicate_station_id_is_hard():
     stations = [
-        Station(id="dup", type="gate", name="a", root=node(
+        Station(id="dup", name="a", root=node(
             "r1", signal=None, kind="fork", children=[
                 node("c", "domain", "health", 0.5, model="med")])),
-        Station(id="dup", type="gate", name="b", root=node(
+        Station(id="dup", name="b", root=node(
             "r2", "complexity", "hard", 0.5, model="med")),
         fallback()]
     issues = check_pipeline(stations, MODELS)
@@ -157,7 +157,7 @@ def test_ignored_fields_warn_only():
     """Fields that are set but can never take effect are warnings, not errors:
     the tree still runs, the console tells the operator what is ignored."""
     stations = [
-        Station(id="a", type="gate", name="x", root=node(
+        Station(id="a", name="x", root=node(
             "r", None, "", 0.5, kind="fork", model="med",
             min_score=0.5, action="block", children=[
                 node("c", "domain", "health", 0.5, action="block",
@@ -173,7 +173,7 @@ def test_ignored_fields_warn_only():
 
 def test_min_score_on_a_leaf_without_weights_warns():
     stations = [
-        Station(id="a", type="gate", name="x", root=node(
+        Station(id="a", name="x", root=node(
             "r", signal=None, kind="fork", children=[
                 node("c", "domain", "health", 0.5, model="med",
                      min_score=0.5)])),
@@ -194,7 +194,7 @@ DECLARED = {"declared": True, "supported": True, "format": "openai",
 
 
 def reasoning_station(reasoning, *, action="route", model="qwen3-8b"):
-    return Station(id="a", type="gate", name="x", root=node(
+    return Station(id="a", name="x", root=node(
         "r", signal=None, kind="fork", children=[
             node("c", "domain", "health", 0.5, action=action, model=model,
                  reasoning=reasoning)]))

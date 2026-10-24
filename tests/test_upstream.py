@@ -177,6 +177,57 @@ def test_failed_probe_rearms_the_circuit():
     assert cb.is_open("m") is True               # circuit re-armed
 
 
+# --------------------------------------------------------------------------- #
+# P3-29: half-open admits a TRUE single probe — concurrent requests stay
+# blocked until the probe concludes (success/failure) or times out.
+# --------------------------------------------------------------------------- #
+def _open_circuit(cb, model="m", failures=3):
+    for _ in range(failures):
+        cb.failure(model)
+
+
+def test_half_open_admits_exactly_one_probe():
+    cb = CircuitBreaker(threshold=3, half_open_after=300.0)
+    _open_circuit(cb)
+    assert cb.is_open("m") is True
+    cb._opened_at["m"] -= 400.0                  # window elapsed
+    results = [cb.is_open("m") for _ in range(5)]
+    assert results == [False, True, True, True, True]
+
+
+def test_probe_success_fully_recovers():
+    cb = CircuitBreaker(threshold=3, half_open_after=300.0)
+    _open_circuit(cb)
+    cb._opened_at["m"] -= 400.0
+    assert cb.is_open("m") is False              # probe admitted
+    cb.success("m")
+    assert cb.is_open("m") is False
+    assert cb.is_open("m") is False              # recovered, not more probes
+
+
+def test_failed_probe_recloses_and_retimes_window():
+    import time
+
+    cb = CircuitBreaker(threshold=3, half_open_after=300.0)
+    _open_circuit(cb)
+    cb._opened_at["m"] -= 400.0
+    assert cb.is_open("m") is False              # probe admitted
+    cb.failure("m")                              # probe failed
+    assert cb.is_open("m") is True               # re-closed ...
+    assert time.monotonic() - cb._opened_at["m"] < 1.0   # ... window re-timed
+
+
+def test_timed_out_probe_allows_a_replacement():
+    cb = CircuitBreaker(threshold=3, half_open_after=300.0)
+    _open_circuit(cb)
+    cb._opened_at["m"] -= 400.0
+    assert cb.is_open("m") is False              # first probe
+    assert cb.is_open("m") is True               # still in flight
+    cb._probe_at["m"] -= cb.probe_timeout + 1.0  # probe wedged past timeout
+    assert cb.is_open("m") is False              # replacement probe admitted
+    assert cb.is_open("m") is True
+
+
 def test_stale_db_row_cannot_disarm_later_failures(tmp_path):
     """P0 2.2 repro: latching an hours-old DB quarantine, then failing again,
     must re-open the circuit from now (and refresh the DB row)."""

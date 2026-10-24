@@ -132,6 +132,12 @@ MIGRATIONS = [
     ALTER TABLE requests_v12 RENAME TO requests;
     CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
     """,
+    # v13 (2026-10-23): stations.type (gate/score/split) carried no engine
+    # semantics and the console never rendered it — pure dead weight, dropped
+    # like v10/v11 dropped the other dead tables.
+    """
+    ALTER TABLE stations DROP COLUMN type;
+    """,
 ]
 
 

@@ -13,9 +13,9 @@ import pytest
 
 from router.signals.registry import SIGNALS
 from router.signals.prompt_judge import (DEFAULT_PROMPTS_PATH, JUDGED_SIGNALS,
-                                         PromptJudgeError, PromptJudgeTagger,
-                                         build_system_prompt, load_prompt_config,
-                                         parse_output)
+                                         MAX_INPUT_CHARS, PromptJudgeError,
+                                         PromptJudgeTagger, build_system_prompt,
+                                         load_prompt_config, parse_output)
 from router.signals.tagger import TagRequest
 
 VALID = {"signals": {
@@ -137,4 +137,39 @@ def test_tag_raises_after_unusable_output():
     t = tagger(lambda req: chat_response("not json at all"))
     with pytest.raises(PromptJudgeError):
         tag(t)
+    assert t.stats["errors"] == 1
+
+
+def test_tag_truncates_judge_input_and_reports_char_window():
+    seen = []
+
+    def handler(req):
+        seen.append(json.loads(req.content)["messages"][1]["content"])
+        return chat_response(json.dumps(VALID))
+
+    t = tagger(handler)
+    long_text = "写代码" * 3000                     # 9000 chars
+    result = tag(t, text=long_text)
+    assert seen[0] == long_text[:MAX_INPUT_CHARS]
+    # the JEV key names, but counts are characters on this path
+    assert result.input == {"input_tokens": len(long_text),
+                            "input_visible_tokens": MAX_INPUT_CHARS,
+                            "input_truncated": True}
+    # rules still see the full text (context bucket by word count)
+    assert result.signals["context"]["value"] == 3
+
+
+def test_tag_short_input_is_not_marked_truncated():
+    t = tagger(lambda req: chat_response(json.dumps(VALID)))
+    result = tag(t)
+    assert result.input == {"input_tokens": len("用 Python 写快速排序"),
+                            "input_visible_tokens": len("用 Python 写快速排序"),
+                            "input_truncated": False}
+
+
+def test_failed_request_counts_one_error():
+    t = tagger(lambda req: httpx.Response(500, json={"error": "boom"}))
+    with pytest.raises(PromptJudgeError):
+        tag(t)
+    assert t.stats["calls"] == 2 and t.stats["retries"] == 1
     assert t.stats["errors"] == 1

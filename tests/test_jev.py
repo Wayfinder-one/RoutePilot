@@ -8,6 +8,7 @@ the deployment probe is done on the GPU host.
 
 import asyncio
 import json
+import math
 
 import pytest
 
@@ -49,13 +50,32 @@ class _FakeNumber:
         return self.value
 
 
+class _FakeVector:
+    """Per-row lengths tensor: ``tolist`` feeds the token budgeting in
+    ``_score``, ``max().item()`` the prompt-cap check in ``_encode``."""
+
+    def __init__(self, values):
+        self.values = values
+
+    def max(self):
+        return _FakeNumber(max(self.values))
+
+    def tolist(self):
+        return list(self.values)
+
+
 class _FakeMask:
     def __init__(self, lengths):
         self.lengths = lengths
 
+    def __getitem__(self, item):
+        # _score row-slices the encoded batch into budgeted chunks
+        lengths = self.lengths[item]
+        return _FakeMask(lengths if isinstance(lengths, list) else [lengths])
+
     def sum(self, dim=None):
         if dim in (-1, 1):
-            return _FakeNumber(max(self.lengths))
+            return _FakeVector(self.lengths)
         return _FakeNumber(sum(self.lengths))
 
 
@@ -388,6 +408,62 @@ def test_encode_keeps_the_whole_prompt_without_shrinking(monkeypatch):
     assert "x" * 16 in candidate_prompts(jailbreak[0])[0]
 
 
+def test_token_budget_chunking_matches_the_single_forward(monkeypatch):
+    """P3-30: over-budget packs are sliced into token-budgeted chunks of the
+    already-encoded rows. The softmax is per prompt and padding aligns within
+    a forward, so chunked scoring must equal one big pass exactly — and the
+    long input is tokenized once, not once per chunk."""
+    tagger = stub_tagger()
+    records = [item["record"] for item in
+               build_signal_records(tagger.questions, "上下文" * 100)]
+
+    def fake_forward(enc, counts):
+        # one deterministic logit per prompt row, then the real softmax shape
+        out, offset = [], 0
+        for count in counts:
+            values = [(sum(enc["input_ids"][offset + j]) % 997) / 997.0
+                      for j in range(count)]
+            if count == 1:
+                values = [0.0, values[0]]
+            top = max(values)
+            exps = [math.exp(v - top) for v in values]
+            total = sum(exps)
+            out.append([v / total for v in exps])
+            offset += count
+        return out
+
+    forwards: list[tuple[dict, list[int]]] = []
+
+    def recording_forward(enc, counts):
+        forwards.append((enc, counts))
+        return fake_forward(enc, counts)
+
+    encodes: list[int] = []
+    real_encode = tagger._encode
+
+    def spy_encode(recs):
+        encodes.append(len(recs))
+        return real_encode(recs)
+
+    monkeypatch.setattr(tagger, "_score_encoded", recording_forward)
+    monkeypatch.setattr(tagger, "_encode", spy_encode)
+
+    tagger.max_tokens_per_forward = 10 ** 9
+    single = tagger._score(records)
+    assert len(forwards) == 1 and encodes == [len(records)]
+
+    forwards.clear()
+    encodes.clear()
+    tagger.max_tokens_per_forward = 4000      # this pack renders ~19k tokens
+    chunked = tagger._score(records)
+    assert chunked == single
+    assert len(forwards) > 1                  # the budget actually chunked
+    assert encodes == [len(records)]          # one tokenization, rows reused
+    for enc, counts in forwards:
+        if len(counts) > 1:                   # multi-record chunks fit the budget
+            assert sum(len(row) for row in enc["input_ids"]) <= 4000
+
+
 def test_question_config_edits_are_used(tmp_path):
     cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
     cfg["signals"]["domain"]["instructions"] = ["请判断这段文本的学科门类。"]
@@ -564,7 +640,7 @@ def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
         return probs_for(records)
 
     monkeypatch.setattr(tagger, "_score", capture)
-    weird = [Station(id="s", type="gate", name="怪", root=TreeNode(
+    weird = [Station(id="s", name="怪", root=TreeNode(
         id="g", signal=None, kind="fork", children=[
             TreeNode(id="b", signal="telepathy", value="yes", kind="leaf",
                      action="route", model="qwen3-8b")]))]
@@ -581,7 +657,7 @@ def test_hot_pipeline_edit_widens_scope_and_pack():
     stations = default_pipeline()
     before = compute_signal_scope(stations)
     assert "fact_check" not in before.signals
-    new_station = Station(id="st-fc", type="gate", name="需核实", root=TreeNode(
+    new_station = Station(id="st-fc", name="需核实", root=TreeNode(
         id="n-fc", signal=None, kind="fork", children=[
             TreeNode(id="c-fc", signal="fact_check", value="needs_check",
                      conf_min=0.5, kind="leaf", action="route",

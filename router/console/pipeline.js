@@ -1,7 +1,7 @@
 /* Routing-tree console — explicit-tree editor (2026-10-19 rewrite).
 
    Each station is an independent ordered tree:
-     Station {id, type: gate|score|split, name, root}
+     Station {id, name, root}
      TreeNode {id, signal?, value, conf_min, kind: leaf|fork,
                action, model, min_score, weights[], children[]}
 
@@ -12,7 +12,7 @@
    independent branches.
 
    Editing model:
-   - a station is created by picking a type and a root condition (or an
+   - a station is created by picking a root condition (or an
      unconditional entry); the root's condition value is not editable in place
    - [+] on any node opens the same signal→value picker and adds a CHILD node
    - [−] deletes a node and its subtree (undo toast); the root's [−] deletes
@@ -31,7 +31,7 @@ let KEYWORD_GROUPS = [];
 let TIME_PERIODS = [];
 let MODELS = [];
 let MODEL_INFO = {};           // id -> normalized reasoning object (§3.2)
-let stations = [];             // API shape: [{id,type,name,root}]
+let stations = [];             // API shape: [{id,name,root}]
 let version = '0';
 let tagger = {};
 let lastTry = null;
@@ -395,7 +395,7 @@ function deleteStation(stationId) {
 }
 
 function addStation(signal, value) {
-  const body = { id: nid('st'), type: 'split',
+  const body = { id: nid('st'),
                  name: `${t('p6.stationName')} ${stations.length}`, root: null };
   if (signal === null) {
     body.root = { id: nid('n'), signal: null, value: '', conf_min: null,
@@ -862,8 +862,7 @@ function handleSignalDrop(nodeId, signal) {
                   () => $(`[data-node="${CSS.escape(nodeId)}"]`));
 }
 
-/* station creation: pick the root condition (or an unconditional entry);
-   stations are no longer classified by type (2026-10-20) */
+/* station creation: pick the root condition (or an unconditional entry) */
 function openStationPicker() {
   popTarget = { kind: 'picker' };
   const pop = $('#pop');
@@ -1253,11 +1252,9 @@ function normalizeImported(raw) {
   return list.map((st, i) => {
     const where = t('p4.importRow') + ' #' + (i + 1);
     if (!st || typeof st !== 'object') throw new Error(where);
-    if (!['gate', 'score', 'split'].includes(st.type))
-      throw new Error(where + ': type=' + st.type);
     return {
       id: String(st.id || nid('st')),
-      type: st.type, name: String(st.name || ''),
+      name: String(st.name || ''),
       root: st.root ? normNode(st.root, where + '/root') : null,
     };
   });

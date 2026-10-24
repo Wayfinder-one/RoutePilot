@@ -17,13 +17,13 @@ def node(nid, signal=None, value="", conf=None, kind="leaf", action="route",
 
 
 def fallback():
-    return Station(id="f", type="gate", name="兜底", root=node(
+    return Station(id="f", name="兜底", root=node(
         "n4", signal=None, action="route", model="qwen3-8b"))
 
 
 def subject_station():
     """③ 学科 → 难度: unconditional entry -> 学科 forks -> 难度 leaves."""
-    return Station(id="s3", type="split", name="学科 → 难度", root=node(
+    return Station(id="s3", name="学科 → 难度", root=node(
         "n3", signal=None, kind="fork", children=[
             node("n3a", "domain", "health", 0.7, kind="fork", children=[
                 node("n3a1", "complexity", "hard", 0.7,
@@ -60,7 +60,7 @@ def test_confidence_floor_records_the_cut():
 
 
 def test_rule_signal_skips_the_floor():
-    station = Station(id="kw", type="gate", name="关键词", root=node(
+    station = Station(id="kw", name="关键词", root=node(
         "n2", signal=None, kind="fork", children=[
             node("n2a", "keyword", "医疗急症", 0.5,
                  model="qwen3-8b-medical")]))
@@ -72,7 +72,7 @@ def test_rule_signal_skips_the_floor():
 
 
 def test_direct_hit_leaf_and_block_action():
-    st = Station(id="s", type="gate", name="闸", root=node(
+    st = Station(id="s", name="闸", root=node(
         "r", signal=None, kind="fork", children=[
             node("blk", "jailbreak", "jailbreak", 0.3, action="block"),
             node("ok", "jailbreak", "benign", 0.3,
@@ -84,7 +84,7 @@ def test_direct_hit_leaf_and_block_action():
 
 
 def test_weighted_leaf_scores_and_min_score():
-    st = Station(id="s", type="score", name="打分", root=node(
+    st = Station(id="s", name="打分", root=node(
         "r", signal=None, kind="fork", children=[
             node("l", "domain", "health", 0.5, model="med", min_score=0.6,
                  weights=[Weight("complexity", "hard", 0.5),
@@ -107,7 +107,7 @@ def test_weighted_leaf_scores_and_min_score():
 
 
 def test_sibling_weighted_leaves_compete_by_score():
-    st = Station(id="s", type="score", name="竞争", root=node(
+    st = Station(id="s", name="竞争", root=node(
         "r", signal=None, kind="fork", children=[
             node("low", "domain", "health", 0.5, model="m-low", min_score=0.1,
                  weights=[Weight("domain", "health", 1.0)]),
@@ -121,8 +121,37 @@ def test_sibling_weighted_leaves_compete_by_score():
     assert d.model == "m-high"                  # higher score wins
 
 
+def test_direct_hit_beats_a_weighted_sibling_regardless_of_order():
+    """A direct hit is an explicit rule; weighted leaves only compete when no
+    matched child yields one (2026-10-23: was max-score-always-wins)."""
+    st = Station(id="s", name="顺序", root=node(
+        "r", signal=None, kind="fork", children=[
+            node("w", "domain", "health", 0.5, model="m-weighted",
+                 min_score=0.1, weights=[Weight("domain", "health", 1.0)]),
+            node("d", "jailbreak", "benign", 0.5, model="m-direct")]))
+    signals = {"domain": sig("health", 0.99),   # weighted score 0.99 ...
+               "jailbreak": sig("benign", 0.9)}
+    d, _ = evaluate([st, fallback()], signals)
+    assert (d.model, d.node_id) == ("m-direct", "d")   # ... still loses
+
+
+def test_a_bubbled_score_never_passes_a_direct_hit():
+    """A weighted leaf deep in one subtree must not outscore a direct hit in
+    a sibling subtree (the old max-score rule let it bubble past)."""
+    st = Station(id="s", name="冒泡", root=node(
+        "r", signal=None, kind="fork", children=[
+            node("sub", "domain", "health", 0.5, kind="fork", children=[
+                node("w", "complexity", "hard", 0.5, model="m-weighted",
+                     min_score=0.1,
+                     weights=[Weight("complexity", "hard", 1.0)])]),
+            node("d", "domain", "health", 0.5, model="m-direct")]))
+    signals = {"domain": sig("health", 0.9), "complexity": sig("hard", 0.99)}
+    d, _ = evaluate([st, fallback()], signals)
+    assert (d.model, d.node_id) == ("m-direct", "d")
+
+
 def test_station_order_and_fallback():
-    first = Station(id="a", type="gate", name="一", root=node(
+    first = Station(id="a", name="一", root=node(
         "r", signal=None, kind="fork", children=[
             node("x", "domain", "math", 0.5, model="m1")]))
     d, tr = evaluate([first, fallback()], {"domain": sig("health", 0.9)})
@@ -131,7 +160,7 @@ def test_station_order_and_fallback():
 
 
 def test_no_fallback_is_none_not_exception():
-    d, _ = evaluate([Station(id="s", type="gate", name="x",
+    d, _ = evaluate([Station(id="s", name="x",
                             root=node("r", signal=None, kind="fork",
                                       children=[node("c", "domain", "health",
                                                      0.5, model="m")]))], {})
