@@ -717,6 +717,14 @@ def _fake_jev_tagger(monkeypatch):
     tagger.kw_groups = {}
     tagger.time_periods = {}
     tagger.device = "cpu"
+    # Long-text PII chunking is off by default (P2-A contract); the fake tagger
+    # bypasses __init__, so mirror the disabled attributes explicitly.
+    tagger.chunk_segments = 0
+    tagger.chunk_size = 512
+    tagger.chunk_agg = "noisy_or"
+    tagger.chunk_enabled = False
+    tagger.chunk_calibration = {}
+    tagger._chunk_calib_desc = "none"
     tagger._original_score_calls = 0
 
     from router.signals.jev import candidate_prompts
@@ -970,3 +978,298 @@ def test_matrix_main_production_scoring_mode(tmp_path, monkeypatch):
     meta = json.loads((tmp_path / "matrix_prod.jsonl.meta.json").read_text())
     assert meta["scoring"] == "production"
     assert meta["production_check"] is None
+    # Real tag() path: warm-up was paid once for the padded scenario family and
+    # the latency definition is recorded so the report's p50/p95 is interpretable.
+    warmup = meta["production"]["warmup"]
+    assert warmup["count"] == 1
+    assert warmup["events"][0]["scenario"] == "padded"
+    assert warmup["events"][0]["instances"] >= 1
+    assert "tag() wall time" in meta["production"]["latency_definition"]
+    assert meta["production"]["compile_note"]
+
+
+# --------------------------------------------------------------------------- #
+# P2-B: fixed-vs-production compare mode
+# --------------------------------------------------------------------------- #
+def test_parse_compare_scoring_validates_the_pair():
+    assert matrix.parse_compare_scoring(None) is None
+    assert matrix.parse_compare_scoring("") is None
+    assert matrix.parse_compare_scoring("fixed,production") == (
+        "fixed", "production")
+    assert matrix.parse_compare_scoring("production,fixed") == (
+        "fixed", "production")
+    for bad in ("fixed", "fixed,production,extra", "fixed,max"):
+        with pytest.raises(SystemExit):
+            matrix.parse_compare_scoring(bad)
+
+
+def test_select_conditions_filters_by_label_and_rejects_unknown():
+    plan = matrix.condition_plan(True, ["tail"], ["/tmp/clean_b0.txt"])
+    assert [entry["label"] for entry in plan] == ["natural", "padded4k"]
+    assert [entry["label"] for entry in matrix.select_conditions(plan, None)] == [
+        "natural", "padded4k"]
+    assert [entry["label"] for entry in matrix.select_conditions(
+        plan, "padded4k")] == ["padded4k"]
+    with pytest.raises(SystemExit):
+        matrix.select_conditions(plan, "padded4k_middle")
+    # An empty filter string means "no filter", not "select nothing".
+    assert len(matrix.select_conditions(plan, "")) == 2
+
+
+def _compare_instance(*, sha, row_id, fixed_actions, production_actions,
+                      fixed_p=0.9, production_p=0.8, fixed_ms=10.0,
+                      production_ms=50.0, signals_extra=None):
+    fixed_signals = {"jailbreak": {"p_yes": fixed_p, "confidence": 0.5,
+                                   "value": "jailbreak", "is_rule": False}}
+    production_signals = {"jailbreak": {"p_yes": production_p,
+                                        "confidence": 0.4,
+                                        "value": "jailbreak",
+                                        "is_rule": False}}
+    if signals_extra:
+        fixed_signals.update(signals_extra)
+        production_signals.update(signals_extra)
+    rows = [{"id": row_id, "signal": "jailbreak", "sub": None, "kind": "noul",
+             "gold": 1, "gold_value": None, "state": "x"}]
+    fixed = {"sha256": sha, "rows": rows, "signals": fixed_signals,
+             "rule_hits": [], "actions": fixed_actions, "score_ms": fixed_ms}
+    production = {"sha256": sha, "rows": rows,
+                  "signals": production_signals, "rule_hits": [],
+                  "actions": production_actions, "score_ms": production_ms}
+    return fixed, production
+
+
+def test_build_compare_rows_pairs_by_id_and_reports_delta():
+    fixed, production = _compare_instance(
+        sha="s1", row_id="r1",
+        fixed_actions={"0.3": {"kind": "route", "model": "cheap"}},
+        production_actions={"0.3": {"kind": "block", "model": None}},
+        fixed_p=0.9, production_p=0.75, fixed_ms=10.0, production_ms=42.0)
+    rows = matrix.build_compare_rows([fixed], [production],
+                                     condition="padded4k", arm="1024:0",
+                                     floors=[0.3])
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["id"] == "r1" and row["instance_sha256"] == "s1"
+    assert row["fixed"]["actions"]["0.3"]["kind"] == "route"
+    assert row["production"]["actions"]["0.3"]["kind"] == "block"
+    assert row["delta"]["own_signal_abs"] == pytest.approx(0.15)
+    assert row["delta"]["by_signal"]["jailbreak"] == pytest.approx(0.15)
+    # Pairing must be exactly one-to-one: any drift is a hard error.
+    with pytest.raises(RuntimeError):
+        matrix.build_compare_rows([fixed], [production], condition="c",
+                                  arm="a", floors=[0.3])[0:0] or \
+            matrix.build_compare_rows(
+                [fixed], [dict(production, sha256="other")],
+                condition="c", arm="a", floors=[0.3])
+    with pytest.raises(RuntimeError):
+        matrix.build_compare_rows([fixed], [], condition="c", arm="a",
+                                  floors=[0.3])
+
+
+def _compare_row(*, row_id, flip, fixed_kind="route",
+                 fixed_model="cheap", production_kind="block",
+                 production_model=None, production_ms=50.0,
+                 instance="s1", own_delta=0.1):
+    fixed_action = {"kind": fixed_kind, "model": fixed_model}
+    production_action = {"kind": production_kind, "model": production_model}
+    if not flip:
+        fixed_action = dict(production_action)
+    return {
+        "schema": 1, "condition": "padded4k", "arm": "1024:0",
+        "id": row_id, "signal": "jailbreak", "sub": None, "lang": "en",
+        "kind": "noul", "gold": 1, "gold_value": None,
+        "instance_sha256": instance,
+        "fixed": {"p_yes": 0.9, "score_ms": 10.0,
+                  "actions": {"0.3": fixed_action, "0.6": fixed_action}},
+        "production": {"p_yes": 0.8, "score_ms": production_ms,
+                       "actions": {"0.3": production_action,
+                                   "0.6": production_action}},
+        "delta": {"own_signal_abs": own_delta,
+                  "by_signal": {"jailbreak": own_delta}},
+    }
+
+
+def test_report_compare_section_aggregates_flips_and_latency():
+    compare_rows = [
+        _compare_row(row_id="r1", flip=True, production_ms=40.0,
+                     instance="s1", own_delta=0.2),
+        _compare_row(row_id="r2", flip=False, production_ms=60.0,
+                     instance="s2", own_delta=0.0),
+        _compare_row(row_id="r3", flip=True, production_ms=80.0,
+                     instance="s3", own_delta=0.4),
+    ]
+    payload = _report([], floors=[0.3, 0.6], compare_rows=compare_rows,
+                      compare_inputs=["/tmp/x.compare.jsonl"])
+    compare = payload["compare"]
+    assert compare["n_rows"] == 3 and compare["n_groups"] == 1
+    entry = compare["groups"]["padded4k"]["1024:0"]
+    floor = entry["floors"]["0.3"]
+    assert floor["n"] == 3 and floor["flips"] == 2
+    assert floor["flip_rate"] == pytest.approx(2 / 3)
+    assert floor["flip_rate_ci"][0] <= floor["flip_rate"] <= floor["flip_rate_ci"][1]
+    assert floor["transitions"]["route:cheap -> block"] == 2
+    # floor .6 flips on the same rows (the helper flips both floors for them)
+    assert entry["floors"]["0.6"]["flips"] == 2
+    # production latency is a real p50/p95 with CIs from the metrics library
+    latency = entry["production_latency"]
+    assert latency["n"] == 3
+    assert latency["p50"] == 60.0
+    # linear-interpolated p95 of [40, 60, 80] = 60 + 0.9 * 20 = 78
+    assert latency["p95"] == pytest.approx(78.0)
+    assert latency["p50_ci"][0] <= latency["p50_ci"][1]
+    # |Δp_yes| over unique texts
+    delta = entry["p_yes_delta"]
+    assert delta["n"] == 3
+    assert delta["max_abs"] == pytest.approx(0.4)
+    assert delta["mean_abs"] == pytest.approx(0.2)
+    markdown = report.render_markdown(payload)
+    assert "## 10. 生产路径复核（全量对比）" in markdown
+    assert "flip rate" in markdown
+    assert "p50" in markdown
+    # No hardcoded numbers: a different data set yields a different rate.
+    changed = _report([], floors=[0.3], compare_rows=[
+        _compare_row(row_id="r1", flip=False, instance="s1")])
+    assert changed["compare"]["groups"]["padded4k"]["1024:0"][
+        "floors"]["0.3"]["flip_rate"] == 0.0
+
+
+def test_report_cli_auto_detects_compare_sidecar(tmp_path):
+    rows = [_make_row(p_yes=0.9)]
+    input_path = _write_jsonl(tmp_path / "matrix.jsonl", rows)
+    _write_jsonl(tmp_path / "matrix.jsonl.compare.jsonl",
+                 [_compare_row(row_id="r1", flip=True)])
+    out_md = tmp_path / "report.md"
+    out_json = tmp_path / "report.json"
+    code = report.main(["--input", str(input_path),
+                        "--out-md", str(out_md),
+                        "--out-json", str(out_json),
+                        "--bootstrap", "50"])
+    assert code == 0
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["compare"] is not None
+    assert payload["compare"]["n_rows"] == 1
+    assert "## 10. 生产路径复核（全量对比）" in out_md.read_text(encoding="utf-8")
+    # Explicit --compare-input wins over the sibling auto-detection.
+    other = _write_jsonl(tmp_path / "other.compare.jsonl",
+                         [_compare_row(row_id="r1", flip=False),
+                          _compare_row(row_id="r2", flip=True)])
+    code = report.main(["--input", str(input_path),
+                        "--compare-input", str(other),
+                        "--out-md", str(out_md),
+                        "--out-json", str(out_json),
+                        "--bootstrap", "50"])
+    assert code == 0
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["compare"]["n_rows"] == 2
+
+
+def test_matrix_main_compare_mode_pairs_rows_end_to_end(tmp_path, monkeypatch):
+    eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
+    filler_path = tmp_path / "clean_b0.txt"
+    filler_path.write_text(" ".join(["filler"] * 20), encoding="utf-8")
+    from router.pipeline.model import station_to_dict
+    pipeline_path = tmp_path / "pipeline.json"
+    pipeline_path.write_text(json.dumps(
+        [station_to_dict(station) for station in _demo_stations()]))
+    tagger = _fake_jev_tagger(monkeypatch)
+    monkeypatch.setattr(matrix, "_load_tagger", lambda args: tagger)
+    # Fixed pass: p_yes = 0.5 everywhere -> no block.  Production pass: the fake
+    # backbone returns p_yes = 0.8 (conf ~0.278) -> block only at floor .15.
+    monkeypatch.setattr(
+        matrix, "score_prompts_fixed",
+        lambda tagger, prompts, batch=48: ([0.0] * len(prompts),
+                                           [1.0] * len(prompts)))
+    out = tmp_path / "compare_matrix.jsonl"
+    code = matrix.main([
+        "--eval", str(eval_path), "--out", str(out),
+        "--filler", str(filler_path),
+        "--pipeline-json", str(pipeline_path),
+        "--windows", "1024:0",
+        "--positions", "tail",
+        "--conditions", "natural,padded4k",
+        "--floors", "0.15,0.30",
+        "--quota", "10", "--pii-target", "10",
+        "--compare-scoring", "fixed,production",
+    ])
+    assert code == 0
+    compare_path = tmp_path / "compare_matrix.jsonl.compare.jsonl"
+    assert compare_path.exists()
+    compare_rows = [json.loads(line) for line in
+                    compare_path.read_text().splitlines() if line]
+    main_rows = [json.loads(line) for line in out.read_text().splitlines()
+                 if line]
+    assert {row["condition"] for row in compare_rows} == {"natural", "padded4k"}
+    # Pairing: every fixed output row has exactly one compare row, same id.
+    fixed_ids = {(row["condition"], row["arm"], row["id"]) for row in main_rows}
+    compare_ids = {(row["condition"], row["arm"], row["id"])
+                   for row in compare_rows}
+    assert fixed_ids == compare_ids
+    for row in compare_rows:
+        assert set(row["fixed"]["actions"]) == {"0.15", "0.3"}
+        assert set(row["production"]["actions"]) == {"0.15", "0.3"}
+    meta = json.loads((tmp_path / "compare_matrix.jsonl.meta.json").read_text())
+    assert meta["scoring"] == "compare"
+    assert meta["compare"]["rows"] == len(compare_rows)
+    # One warm-up per scenario family: natural shapes and padded equal-length
+    # shapes are warmed before their measured rows.
+    warmup = meta["production"]["warmup"]
+    assert warmup["count"] == 2
+    assert [event["scenario"] for event in warmup["events"]] == [
+        "natural", "padded"]
+    assert all(event["instances"] >= 1 for event in warmup["events"])
+    assert meta["conditions"] == ["natural", "padded4k"]
+    # Report §10 is generated automatically with the flip table.
+    md = (tmp_path / "compare_matrix.jsonl.report.md").read_text()
+    assert "## 10. 生产路径复核（全量对比）" in md
+    payload = json.loads(
+        (tmp_path / "compare_matrix.jsonl.report.json").read_text())
+    floor = payload["compare"]["groups"]["padded4k"]["1024:0"]["floors"]
+    # Production p_yes=0.8 (conf ~0.278) makes the jailbreak condition match on
+    # every row (full signal pack) at floor .15; at .30 it misses again.
+    assert floor["0.15"]["flips"] == len(compare_rows) // 2
+    assert floor["0.3"]["flips"] == 0
+
+
+def test_matrix_main_conditions_filter_end_to_end(tmp_path, monkeypatch):
+    eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
+    filler_path = tmp_path / "clean_b0.txt"
+    filler_path.write_text(" ".join(["filler"] * 20), encoding="utf-8")
+    from router.pipeline.model import station_to_dict
+    pipeline_path = tmp_path / "pipeline.json"
+    pipeline_path.write_text(json.dumps(
+        [station_to_dict(station) for station in _demo_stations()]))
+    tagger = _fake_jev_tagger(monkeypatch)
+    monkeypatch.setattr(matrix, "_load_tagger", lambda args: tagger)
+    monkeypatch.setattr(
+        matrix, "score_prompts_fixed",
+        lambda tagger, prompts, batch=48: ([0.0] * len(prompts),
+                                           [1.0] * len(prompts)))
+    out = tmp_path / "filtered.jsonl"
+    code = matrix.main([
+        "--eval", str(eval_path), "--out", str(out),
+        "--filler", str(filler_path),
+        "--pipeline-json", str(pipeline_path),
+        "--windows", "1024:0",
+        "--conditions", "padded4k",
+        "--floors", "0.15",
+        "--quota", "10", "--pii-target", "10",
+    ])
+    assert code == 0
+    rows = [json.loads(line) for line in out.read_text().splitlines() if line]
+    assert rows and {row["condition"] for row in rows} == {"padded4k"}
+    meta = json.loads((tmp_path / "filtered.jsonl.meta.json").read_text())
+    assert meta["conditions"] == ["padded4k"]
+
+
+def test_matrix_rejects_conflicting_verification_modes(tmp_path, monkeypatch):
+    eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
+    filler_path = tmp_path / "clean_b0.txt"
+    filler_path.write_text("x", encoding="utf-8")
+    base = ["--eval", str(eval_path), "--out", str(tmp_path / "o.jsonl"),
+            "--filler", str(filler_path)]
+    with pytest.raises(SystemExit):
+        matrix.main(base + ["--compare-scoring", "fixed,production",
+                            "--production-sample", "5"])
+    with pytest.raises(SystemExit):
+        matrix.main(base + ["--compare-scoring", "fixed,production",
+                            "--scoring", "production"])
