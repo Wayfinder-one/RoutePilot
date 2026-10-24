@@ -23,7 +23,7 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
               ├─ Upstream（OpenAI 兼容推理后端 + 熔断；按路由叶选择的推理档位
               │            注入各家协议字段：reasoning_effort / thinking / enable_thinking…）
               └─ RequestLog（决策摘要 → SQLite requests slim 行 + request_ledger
-                             动作—结果账本；信号/trace 只在内存 ring）
+                             动作—结果账本（outcome_state/revisions）；信号/trace 只在内存 ring）
 控制台（/console）：概览 / 分流树（信号库 + 树形编辑 + 试算侧滑）/ 计算日志 /
                     信号配置 / 模型与设置（内置模型目录 + 提供方 + 推理声明）
 ```
@@ -132,6 +132,17 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 `/v1` 会按当前 pipeline 树只计算会被读取的信号问题（`ROUTER_JEV_TRIM=0` 一键关闭）；
 `/admin/try` 与 eval 入口始终全量打标，便于试算与回归。
 
+## 决策快照、账本终态与 config revision（2026-10-24 P1）
+
+- 每个请求只读一份不可变 `RoutingSnapshot`（pipeline/backends/版本/revision）；打标期间的热更新
+  不会让路由与账本错配。pipeline/questions 以 canonical content + sha256 写入 `config_revisions`
+  （append-only，旧 revision 可回放）；账本记录 `pipeline_revision / questions_revision /
+  backends_revision` 与 `TagResult` 的实际评分配置指纹。
+- 流式请求终态 `outcome_state ∈ completed / upstream_error / client_disconnected / cancelled /
+  incomplete`，结果更新恰好一次；`GET /admin/requests/stats` 暴露 ring/队列与
+  dropped_rows / dropped_updates / partial_rows / ledger_write_failures。
+- `app.state.pipeline / backends` 仅作为管理端兼容别名；hot path 只读 snapshot。
+
 ## `/v1` 入口约定
 
 - 请求体必须是 JSON 对象、`messages` 必须是数组：畸形请求回 **400**（不是 500）；
@@ -184,7 +195,7 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（587 passed, 6 skipped）。
+- 单元/集成：`pytest`（706 passed, 6 skipped）。
 - 离线 JEV 评估：`scripts/jev_dump_scores.py`（官方 test 集 raw 分布 dump，需模型）、
   `scripts/jev_calibrate.py`（coverage-risk / AURC / ECE / 各门槛 block recall 报告，纯 CPU）、
   `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）、
