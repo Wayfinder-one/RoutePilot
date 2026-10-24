@@ -36,6 +36,14 @@ class Settings:
     jev_model: str = ""              # merged model dir (ROUTER_JEV_MODEL)
     signal_questions: str = ""       # JSON question config ('' = shipped default)
     jev_max_length: int = 0          # 0 = use the model.json max_length
+    # JEV input window "<head>:<tail>" in tokenizer tokens (ROUTER_JEV_WINDOW).
+    # "" = not configured: JevTagger derives the legacy head-only window
+    # "<max_length>:0" ("1024:0" for the deployed model), so a custom
+    # ROUTER_JEV_MAX_LENGTH keeps the old behavior without also setting the
+    # window. Explicit arms: "0:1024" = tail-only; "256:768"/"512:512" keep
+    # both ends (docs/JEV-改进-实施计划-2026-10-24.md §2.1). Validated at
+    # startup by router.signals.jev.parse_window.
+    jev_window: str = ""
     # Pipeline-aware candidate trimming: score only the JEV questions the
     # current pipeline tree can read (docs/pipeline-aware-trimming.md). The
     # default is on; ROUTER_JEV_TRIM=0 restores the full pack.
@@ -58,5 +66,6 @@ class Settings:
             jev_model=os.environ.get("ROUTER_JEV_MODEL", ""),
             signal_questions=os.environ.get("ROUTER_SIGNAL_QUESTIONS", ""),
             jev_max_length=int(os.environ.get("ROUTER_JEV_MAX_LENGTH", "0")),
+            jev_window=os.environ.get("ROUTER_JEV_WINDOW", ""),
             jev_trim=_flag("ROUTER_JEV_TRIM", True),
         )

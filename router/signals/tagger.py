@@ -31,10 +31,12 @@ class TagResult:
     signals: dict                     # {key: {"value", "confidence", "is_rule"}}
     vec: list[float] | None = None    # embedding head output (M2; heuristic: None)
     #: Model-input window actually scored by the tagger, for the request log:
-    #: ``{"input_tokens", "input_visible_tokens", "input_truncated"}``. Empty
-    #: when the tagger reads the whole text (heuristic/checkpoint) or does not
-    #: measure input size. The prompt judge fills it with character counts (it
-    #: never tokenizes); JEV fills it with token counts.
+    #: ``{"input_tokens", "input_visible_tokens", "input_truncated",
+    #: "input_window"}``. ``input_window`` is the ``"<head>:<tail>"`` token
+    #: window spec (JEV only, e.g. ``"256:768"``; other taggers omit the key).
+    #: Empty when the tagger reads the whole text (heuristic/checkpoint) or does
+    #: not measure input size. The prompt judge fills it with character counts
+    #: (it never tokenizes); JEV fills it with token counts.
     input: dict = field(default_factory=dict)
 
 

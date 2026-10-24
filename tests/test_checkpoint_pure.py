@@ -65,8 +65,10 @@ def test_softmax_and_entropy_confidence():
     assert entropy_confidence([0.5, 0.5]) == pytest.approx(0.0)
     # uniform 4-way is also 0 (K is accounted for)
     assert entropy_confidence([0.25] * 4) == pytest.approx(0.0)
-    # single label => 1.0 by convention
-    assert entropy_confidence([1.0]) == 1.0
+    # single label => 0.0: K <= 1 has no candidate distribution = no evidence
+    # (shared helper semantics changed 2026-10-24, plan item 1.2). Deployed
+    # checkpoint heads are all K >= 2, so their behavior is unchanged.
+    assert entropy_confidence([1.0]) == 0.0
 
 
 def test_binary_entropy_confidence():

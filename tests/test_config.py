@@ -21,3 +21,13 @@ def test_admin_token_env(monkeypatch):
     assert Settings.from_env().admin_token == "sekret"
     monkeypatch.delenv("ROUTER_ADMIN_TOKEN")
     assert Settings.from_env().admin_token == ""
+
+
+def test_jev_window_default_and_env(monkeypatch):
+    """Plan item 2: ROUTER_JEV_WINDOW overrides the window; unset stays empty so
+    JevTagger derives the legacy head-only "<max_length>:0" spec (deployed
+    "1024:0"), keeping a custom ROUTER_JEV_MAX_LENGTH on the old behavior."""
+    monkeypatch.delenv("ROUTER_JEV_WINDOW", raising=False)
+    assert Settings.from_env().jev_window == ""
+    monkeypatch.setenv("ROUTER_JEV_WINDOW", "256:768")
+    assert Settings.from_env().jev_window == "256:768"

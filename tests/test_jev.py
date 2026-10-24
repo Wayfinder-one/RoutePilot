@@ -7,8 +7,11 @@ the deployment probe is done on the GPU host.
 """
 
 import asyncio
+import hashlib
 import json
 import math
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -17,12 +20,14 @@ from router.pipeline.scope import (compute_signal_scope, full_scope,
                                    SignalScope)
 from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 JUDGED_SIGNALS, NOUL_SIGNALS,
-                                PROMPT_OVERHEAD_SLACK, JevTagger,
-                                JevTaggerError, build_signal_records,
+                                PROMPT_OVERHEAD_SLACK, WINDOW_MARKER,
+                                JevTagger, JevTaggerError, build_signal_records,
                                 candidate_prompts, decode_choice, decode_noul,
-                                entropy_confidence, binary_entropy_confidence,
-                                head_window, load_question_config,
-                                validate_question_config)
+                                default_window_spec, entropy_confidence,
+                                binary_entropy_confidence, head_window,
+                                load_question_config, parse_window,
+                                questions_sha256, validate_question_config,
+                                window_text)
 from router.signals.registry import SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import default_pipeline
@@ -116,16 +121,83 @@ def prompt_count(records: list[dict]) -> int:
     return sum(len(candidate_prompts(item["record"])) for item in records)
 
 
+#: Minimal torch stand-in so the REAL JevTagger.__init__ can run without torch:
+#: only ``cuda.is_available`` is touched before the injected model/tokenizer.
+class _FakeTorch:
+    class cuda:
+        @staticmethod
+        def is_available():
+            return False
+
+
+class _FakeConfig:
+    def __init__(self):
+        self.use_cache = True
+        self.hidden_size = 8
+
+
+class _FakeBackbone:
+    def __init__(self):
+        self.config = _FakeConfig()
+
+    def eval(self):
+        return self
+
+
+class _FakeBackboneHolder:
+    def __init__(self):
+        self.language_model = _FakeBackbone()
+
+
+class _FakeModel:
+    def __init__(self):
+        self.model = _FakeBackboneHolder()
+
+
+class _FakeHead:
+    def eval(self):
+        return self
+
+
+def _write_jev_model_dir(tmp_path, max_length=1024) -> Path:
+    """model.json + head.pt so the real __init__ passes its file checks."""
+    d = tmp_path / f"jev-model-{len(list(tmp_path.iterdir()))}"
+    d.mkdir()
+    (d / "model.json").write_text(json.dumps({"max_length": max_length}))
+    (d / "head.pt").write_bytes(b"")
+    return d
+
+
+def real_tagger(tmp_path, monkeypatch, *, model_max_length=1024, **kwargs):
+    """A JevTagger built by the REAL __init__ with an injected fake model."""
+    monkeypatch.setitem(sys.modules, "torch", _FakeTorch)
+    model_dir = _write_jev_model_dir(tmp_path, model_max_length)
+
+    def factory(_model_dir, _device):
+        return _FakeModel(), FakeTokenizer(), _FakeHead()
+
+    return JevTagger(str(model_dir), model_factory=factory, warmup=False,
+                     **kwargs)
+
+
 def trimmed_scope():
     return compute_signal_scope(default_pipeline())
 
 
-def stub_tagger(questions=None, tokenizer=None) -> JevTagger:
+def stub_tagger(questions=None, tokenizer=None, max_length=1024,
+                window=None) -> JevTagger:
     """A JevTagger without torch/model: config + a stubbed scorer."""
     tagger = object.__new__(JevTagger)
     tagger.questions = questions or load_question_config()
     tagger.temperature = 1.0
-    tagger.max_length = 1024
+    tagger.model_dir = Path("/models/jev-test")
+    tagger.max_length = max_length
+    # None mirrors a production tagger built with ROUTER_JEV_WINDOW unset: the
+    # real __init__ derives the legacy head-only "<max_length>:0" window, so a
+    # shrunk max_length stub gets the matching spec.
+    tagger.window_spec = (window if window is not None
+                          else default_window_spec(max_length))
+    tagger.window = parse_window(tagger.window_spec, max_length)
     tagger.prompt_max_length = tagger.max_length + PROMPT_OVERHEAD_SLACK
     tagger.tokenizer = tokenizer or FakeTokenizer()
     tagger.kw_groups = {}
@@ -223,6 +295,35 @@ def test_noul_neutral_tie_decodes_negative():
                       positive="jailbreak", negative="benign")
     assert dec["value"] == "benign"
     assert dec["confidence"] == pytest.approx(0.0)
+    assert dec["p_yes"] == pytest.approx(0.5)
+    assert dec["margin"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Full distributions (2026-10-24 item 1.1: record-only extra keys)
+# --------------------------------------------------------------------------- #
+def test_choice_decode_records_the_full_distribution():
+    probs = [0.05, 0.1, 0.4, 0.45]
+    dec = decode_choice({"answer_keys": ["a", "b", "c", "d"]}, probs)
+    # decision keys unchanged
+    assert dec["value"] == "d"
+    assert dec["confidence"] == pytest.approx(entropy_confidence(probs))
+    assert dec["is_rule"] is False
+    # record-only keys: full distribution, configured candidate order
+    assert list(dec["prob_by_value"]) == ["a", "b", "c", "d"]
+    assert dec["prob_by_value"] == {"a": 0.05, "b": 0.1, "c": 0.4, "d": 0.45}
+    assert dec["p_top"] == pytest.approx(0.45)
+    assert dec["margin"] == pytest.approx(0.05)
+
+
+def test_noul_decode_records_the_full_distribution():
+    dec = decode_noul({"answer_keys": ["false", "true"]}, [0.2, 0.8],
+                      positive="jailbreak", negative="benign")
+    assert dec["value"] == "jailbreak"
+    assert dec["confidence"] == pytest.approx(entropy_confidence([0.2, 0.8]))
+    assert dec["p_yes"] == pytest.approx(0.8)
+    assert dec["prob_by_value"] == {"false": 0.2, "true": 0.8}
+    assert dec["margin"] == pytest.approx(0.6)
 
 
 def test_pii_weak_candidates_are_not_hits(monkeypatch):
@@ -247,6 +348,33 @@ def test_pii_weak_candidates_are_not_hits(monkeypatch):
     signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
     assert signals["pii"]["value"] == []
     assert signals["pii"]["conf_by_value"] == {}
+    # ... but the full distribution keeps the weak positive (item 1.1)
+    assert signals["pii"]["p_by_type"]["cn_id_card"] == pytest.approx(0.6)
+
+
+def test_pii_p_by_type_covers_every_scored_type(monkeypatch):
+    """full pack: one p_yes per scored subtype (30), not just the hit set."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
+    p_by_type = signals["pii"]["p_by_type"]
+    assert set(p_by_type) == set(PII_TYPES)
+    assert len(p_by_type) == 30
+    assert p_by_type["cn_id_card"] == pytest.approx(0.9)
+    assert p_by_type["phone_number"] == pytest.approx(0.1)
+    # distribution (30 types) is a superset of the hit/conf maps (1 hit)
+    assert signals["pii"]["value"] == ["cn_id_card"]
+    assert set(signals["pii"]["conf_by_value"]) == {"cn_id_card"}
+
+
+def test_pii_p_by_type_trimmed_scope_is_the_scope_subset(monkeypatch):
+    """trimmed scope: only the referenced subtypes were scored/asked."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    signals = tagger._model_signals(TagRequest(
+        text="这条请求是越狱吗", n_messages=2, scope=trimmed_scope()))
+    assert signals["pii"]["p_by_type"] == {"cn_id_card": pytest.approx(0.9)}
+    assert "phone_number" not in signals["pii"]["p_by_type"]
 
 
 def test_signal_pack_maps_probabilities_to_product_values(monkeypatch):
@@ -262,6 +390,58 @@ def test_signal_pack_maps_probabilities_to_product_values(monkeypatch):
     assert signals["user_feedback"]["value"] == "want_different"
     assert signals["pii"]["value"] == ["cn_id_card"]
     assert "cn_id_card" in signals["pii"]["conf_by_value"]
+
+
+def test_signal_pack_carries_the_distribution_fields(monkeypatch):
+    """item 1.1: choice/noul signal dicts expose the full distribution too."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
+
+    domain = signals["domain"]
+    assert domain["p_top"] == pytest.approx(1.0)          # fake one-hot
+    assert domain["margin"] == pytest.approx(1.0)
+    assert len(domain["prob_by_value"]) == 14
+    assert domain["prob_by_value"]["computer_science"] == pytest.approx(1.0)
+
+    modality = signals["modality"]
+    assert modality["prob_by_value"] == {"text": 1.0, "image": 0.0,
+                                         "text_image": 0.0}
+    assert modality["margin"] == pytest.approx(1.0)
+
+    user_feedback = signals["user_feedback"]
+    assert list(user_feedback["prob_by_value"].values()) == [0.1, 0.2, 0.3, 0.4]
+    assert user_feedback["p_top"] == pytest.approx(0.4)
+    assert user_feedback["margin"] == pytest.approx(0.1)
+
+    for key, (p_no, p_yes) in (("jailbreak", (0.2, 0.8)),
+                               ("complexity", (0.1, 0.9)),
+                               ("fact_check", (0.9, 0.1))):
+        sig = signals[key]
+        assert sig["p_yes"] == pytest.approx(p_yes)
+        assert sig["prob_by_value"] == {"false": p_no, "true": p_yes}
+        assert sig["margin"] == pytest.approx(abs(p_yes - p_no))
+
+
+def test_decision_fields_keep_the_pre_distribution_semantics(monkeypatch):
+    """item 1.1: new keys are additive — value/confidence are bit-identical.
+
+    Recompute the old formulas from the same stubbed probabilities and compare.
+    """
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
+    # choice: argmax over the configured candidate keys + entropy confidence
+    assert signals["user_feedback"]["value"] == "want_different"
+    uf = [0.1, 0.2, 0.3, 0.4]
+    h = -sum(p * math.log(p) for p in uf)
+    assert signals["user_feedback"]["confidence"] == pytest.approx(
+        1.0 - h / math.log(4))
+    # noul: strictly > 0.5 decodes positive, binary entropy confidence
+    assert signals["jailbreak"]["value"] == "jailbreak"
+    assert signals["fact_check"]["value"] == "no_check"
+    assert signals["jailbreak"]["confidence"] == pytest.approx(
+        entropy_confidence([0.2, 0.8]))
 
 
 def test_single_turn_nulls_user_feedback(monkeypatch):
@@ -291,6 +471,28 @@ def test_tag_merges_rule_pii_safety_net(monkeypatch):
     pii = result.signals["pii"]
     assert "cn_id_card" in pii["value"]
     assert pii["conf_by_value"]["cn_id_card"] == 1.0
+    # the rule hit also enters the full distribution at 1.0; every other scored
+    # type keeps the model's p_yes (0.1) — p_by_type and conf_by_value are
+    # different maps (distribution vs per-hit decision confidence)
+    assert set(pii["p_by_type"]) == set(PII_TYPES)
+    assert pii["p_by_type"]["cn_id_card"] == 1.0
+    assert pii["p_by_type"]["phone_number"] == pytest.approx(0.1)
+    assert set(pii["conf_by_value"]) == {"cn_id_card"}
+
+
+def test_rule_pii_hits_are_recorded_even_when_pii_is_not_scored(monkeypatch):
+    """A trimmed-away pii question still gets its deterministic hits in
+    p_by_type (the map is created by the merge), so a replay can tell which
+    type's probability entered the decision."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", lambda records: [])
+    result = asyncio.run(tagger.tag(TagRequest(
+        text="帮我核对身份证号 11010519491231002X", n_messages=2,
+        scope=SignalScope())))
+    pii = result.signals["pii"]
+    assert pii["value"] == ["cn_id_card"]
+    assert pii["conf_by_value"] == {"cn_id_card": 1.0}
+    assert pii["p_by_type"] == {"cn_id_card": 1.0}
 
 
 def test_tag_merges_rule_signals(monkeypatch):
@@ -307,7 +509,7 @@ def test_tag_merges_rule_signals(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# Input window (2026-10-21): first max_length tokens of the request text only
+# Input window (2026-10-21 head-only; configurable head/tail 2026-10-24)
 # --------------------------------------------------------------------------- #
 def test_head_window_keeps_the_head_tokens():
     tok = FakeTokenizer()
@@ -315,7 +517,7 @@ def test_head_window_keeps_the_head_tokens():
     head, stats = head_window(text, tok, 1024)
     assert head == text[:1024]
     assert stats == {"input_tokens": 3000, "input_visible_tokens": 1024,
-                     "input_truncated": True}
+                     "input_truncated": True, "input_window": "1024:0"}
 
 
 def test_head_window_leaves_short_text_untouched():
@@ -325,7 +527,7 @@ def test_head_window_leaves_short_text_untouched():
     assert head == text
     assert stats == {"input_tokens": len(text),
                      "input_visible_tokens": len(text),
-                     "input_truncated": False}
+                     "input_truncated": False, "input_window": "1024:0"}
 
 
 def test_head_window_repairs_reencode_and_partial_char():
@@ -348,9 +550,202 @@ def test_head_window_repairs_reencode_and_partial_char():
     assert stats["input_visible_tokens"] <= 10
 
 
+# --------------------------------------------------------------------------- #
+# Configurable head/tail window (2026-10-24 item 2, env ROUTER_JEV_WINDOW)
+# --------------------------------------------------------------------------- #
+def test_default_window_spec_and_marker_match_the_4k_simulation():
+    """No window configured = legacy head-only at max_length (deployed 1024:0)."""
+    assert default_window_spec(1024) == "1024:0"
+    assert default_window_spec(512) == "512:0"
+    assert WINDOW_MARKER == "\n\n[...]\n\n"
+
+
+def test_constructor_window_none_derives_the_legacy_head_only_spec(tmp_path,
+                                                                  monkeypatch):
+    """Follow-up to task-2, through the REAL __init__: a custom max_length with
+    ROUTER_JEV_WINDOW unset (window=None) keeps the legacy head-only window and
+    never fails startup on the literal 1024 default."""
+    tagger = real_tagger(tmp_path, monkeypatch)      # model.json max_length=1024
+    assert tagger.max_length == 1024
+    assert tagger.window_spec == "1024:0"
+    assert tagger.window == (1024, 0)
+    assert tagger.info()["window"] == "1024:0"
+
+    tagger = real_tagger(tmp_path, monkeypatch, max_length=512)
+    assert tagger.max_length == 512
+    assert tagger.window_spec == "512:0"
+    assert tagger.window == (512, 0)
+    assert tagger.info()["window"] == "512:0"
+    text = "".join(chr(0x4E00 + i) for i in range(1000))
+    windowed, stats = tagger._context_window(text)
+    old_text, old_stats = head_window(text, tagger.tokenizer, 512)
+    assert windowed == old_text                    # == old head_window(512)
+    for key in ("input_tokens", "input_visible_tokens", "input_truncated"):
+        assert stats[key] == old_stats[key]
+    assert stats["input_window"] == "512:0"
+
+    # an explicit window still wins over the legacy default
+    tagger = real_tagger(tmp_path, monkeypatch, window="256:768")
+    assert tagger.window_spec == "256:768" and tagger.window == (256, 768)
+    assert tagger.info()["window"] == "256:768"
+
+    # an invalid explicit spec refuses startup (JevTaggerError)
+    with pytest.raises(JevTaggerError):
+        real_tagger(tmp_path, monkeypatch, window="0:0")
+
+
+def test_parse_window_accepts_valid_specs():
+    assert parse_window("1024:0", 1024) == (1024, 0)
+    assert parse_window("0:1024", 1024) == (0, 1024)
+    assert parse_window("256:768", 1024) == (256, 768)
+    assert parse_window("512:512", 1024) == (512, 512)
+    # head+tail is a cap, not a quota: a smaller sum is a valid window
+    assert parse_window("100:200", 1024) == (100, 200)
+    assert parse_window(" 64: 128 ", 1024) == (64, 128)
+
+
+@pytest.mark.parametrize("spec", ["", "1024", "1024:0:0", "a:1", "1:b",
+                                  "1.5:2", "-1:1024", "1024:-1", "0:0",
+                                  "1025:0", "600:600"])
+def test_parse_window_rejects_invalid_specs(spec):
+    """A bad ROUTER_JEV_WINDOW must refuse startup (JevTaggerError), never
+    silently score a different window than the operator configured."""
+    with pytest.raises(JevTaggerError):
+        parse_window(spec, 1024)
+
+
+def test_window_text_short_text_is_verbatim_for_every_window():
+    """Texts that already fit max_length are arm-independent (plan §2.2a)."""
+    tok = FakeTokenizer()
+    text = "你好，帮我写快排"
+    for head, tail in ((1024, 0), (0, 1024), (256, 768), (512, 512)):
+        windowed, stats = window_text(text, tok, 1024, head, tail)
+        assert windowed == text
+        assert stats == {"input_tokens": len(text),
+                         "input_visible_tokens": len(text),
+                         "input_truncated": False,
+                         "input_window": f"{head}:{tail}"}
+
+
+def test_window_text_head_only_matches_old_head_window():
+    """The 5000-token default arm is byte-identical to the old head_window."""
+    tok = FakeTokenizer()
+    text = "".join(chr(0x4E00 + i) for i in range(5000))
+    windowed, stats = window_text(text, tok, 1024, 1024, 0)
+    old_text, old_stats = head_window(text, tok, 1024)
+    assert windowed == old_text == text[:1024]
+    for key in ("input_tokens", "input_visible_tokens", "input_truncated"):
+        assert stats[key] == old_stats[key]
+    assert stats["input_window"] == "1024:0"
+    assert head_window(text, tok, 1024)[1]["input_window"] == "1024:0"
+
+
+def test_window_text_tail_only_keeps_the_tail_without_a_marker():
+    tok = FakeTokenizer()
+    text = "".join(chr(0x4E00 + i) for i in range(3000))
+    windowed, stats = window_text(text, tok, 1024, 0, 1024)
+    assert windowed == text[-1024:]
+    assert WINDOW_MARKER not in windowed
+    assert stats["input_visible_tokens"] == 1024
+    assert stats["input_truncated"] is True
+    assert stats["input_window"] == "0:1024"
+
+
+def test_window_text_mixed_keeps_head_and_tail_with_the_4k_marker():
+    tok = FakeTokenizer()
+    text = "".join(chr(0x4E00 + i) for i in range(3000))
+    windowed, stats = window_text(text, tok, 1024, 256, 768)
+    assert windowed == text[:256] + WINDOW_MARKER + text[-768:]
+    assert stats["input_visible_tokens"] == 256 + 768
+    assert stats["input_truncated"] is True
+    assert stats["input_window"] == "256:768"
+
+
+@pytest.mark.parametrize("head,tail", [(1024, 0), (0, 1024), (256, 768),
+                                       (512, 512)])
+def test_window_text_arms_are_ufffd_free_and_within_budget(head, tail):
+    tok = FakeTokenizer()
+    text = "".join(chr(0x4E00 + i) for i in range(3000))
+    windowed, stats = window_text(text, tok, 1024, head, tail)
+    assert "\ufffd" not in windowed
+    content = windowed.replace(WINDOW_MARKER, "")
+    assert len(tok(content)["input_ids"]) <= head + tail
+    assert stats["input_visible_tokens"] <= head + tail
+    assert stats["input_window"] == f"{head}:{tail}"
+
+
+def test_window_text_repairs_partial_chars_at_both_ends():
+    text = "".join(chr(i) for i in range(2, 101))     # 99 tokens, even ends
+
+    class PartialEnds(FakeTokenizer):
+        """decode reports a partial byte when a cut boundary is an odd id."""
+        def decode(self, ids, skip_special_tokens=False):
+            out = "".join(chr(i) for i in ids)
+            if ids and ids[0] % 2:
+                out = "\ufffd" + out
+            if ids and ids[-1] % 2:
+                out += "\ufffd"
+            return out
+
+    head, stats = window_text(text, PartialEnds(), 10, 10, 0)
+    assert "\ufffd" not in head and stats["input_visible_tokens"] <= 10
+    tail, stats = window_text(text, PartialEnds(), 10, 0, 10)
+    assert "\ufffd" not in tail and stats["input_visible_tokens"] <= 10
+    mixed, stats = window_text(text, PartialEnds(), 16, 10, 6)
+    assert "\ufffd" not in mixed
+    assert WINDOW_MARKER in mixed
+    assert stats["input_visible_tokens"] <= 16
+
+
+def test_window_text_mixed_trims_when_the_join_overshoots_the_budget():
+    """Re-encoding the joined content can cost an extra token: the loop trims
+    (head from its tail, tail from its head) until it fits head+tail."""
+    class JoinExpanding(FakeTokenizer):
+        """Re-encoding a medium-length string costs one extra token, so the
+        head+tail concatenation can exceed head+tail even when each side fits."""
+        def __call__(self, text, add_special_tokens=True, padding=False,
+                     truncation=False, max_length=None, return_tensors=None):
+            if isinstance(text, str):
+                ids = [ord(c) for c in text]
+                if 8 < len(ids) <= 20:        # the "join" is 10 chars long
+                    ids = ids + [0]
+                return {"input_ids": ids}
+            return super().__call__(text, add_special_tokens=add_special_tokens,
+                                    padding=padding, truncation=truncation,
+                                    max_length=max_length,
+                                    return_tensors=return_tensors)
+
+    tok = JoinExpanding()
+    windowed, stats = window_text("a" * 100, tok, 10, 4, 6)
+    # head 4 + tail 6 re-encode to 11 > 10 -> one tail token dropped
+    assert windowed == "aaaa" + WINDOW_MARKER + "aaaaa"
+    assert stats["input_visible_tokens"] <= 10
+
+
+def test_tagger_context_window_uses_the_configured_spec(monkeypatch):
+    tagger = stub_tagger(window="256:768")
+    assert tagger.window == (256, 768)
+    assert tagger.info()["window"] == "256:768"
+    text = "".join(chr(0x4E00 + i) for i in range(3000))
+    seen: list[dict] = []
+
+    def capture(records):
+        seen.extend(records)
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", capture)
+    result = asyncio.run(tagger.tag(TagRequest(text=text, n_messages=1)))
+    expected = text[:256] + WINDOW_MARKER + text[-768:]
+    assert seen and {record["state"] for record in seen} == {expected}
+    # TagResult.input carries the window spec next to the three old keys
+    assert result.input == {"input_tokens": 3000,
+                            "input_visible_tokens": 1024,
+                            "input_truncated": True,
+                            "input_window": "256:768"}
+
+
 def test_model_signals_score_the_head_window(monkeypatch):
-    tagger = stub_tagger()
-    tagger.max_length = 16
+    tagger = stub_tagger(max_length=16)
     seen: list[dict] = []
 
     def capture(records):
@@ -364,15 +759,15 @@ def test_model_signals_score_the_head_window(monkeypatch):
 
 def test_tag_exposes_window_and_keeps_rules_on_full_text(monkeypatch):
     """PII rules are the long-request safety net: they scan text beyond the
-    model window even though the model signals only read the head."""
-    tagger = stub_tagger()
-    tagger.max_length = 16
+    model window even though the model signals only read the window."""
+    tagger = stub_tagger(max_length=16)
     monkeypatch.setattr(tagger, "_score", lambda records: probs_for(records))
     text = "a" * 64 + " 联系我 someone@example.com"
     result = asyncio.run(tagger.tag(TagRequest(text=text, n_messages=1)))
     assert result.input == {"input_tokens": len(text),
                             "input_visible_tokens": 16,
-                            "input_truncated": True}
+                            "input_truncated": True,
+                            "input_window": "16:0"}
     # the model window cut the address off; the deterministic rule still sees it
     assert "email_address" in result.signals["pii"]["value"]
     assert result.signals["pii"]["conf_by_value"]["email_address"] == 1.0
@@ -380,8 +775,7 @@ def test_tag_exposes_window_and_keeps_rules_on_full_text(monkeypatch):
 
 def test_encode_keeps_the_whole_prompt_without_shrinking(monkeypatch):
     """The old 8-round 0.7x context shrink is gone: one encode, full context."""
-    tagger = stub_tagger()
-    tagger.max_length = 16
+    tagger = stub_tagger(max_length=16)
     # The char-level fake tokenizer counts the Chinese question 1:1, so give it
     # a prompt cap wide enough that the canonical wording never hits the
     # defensive left-truncation fallback (the real tokenizer measures 120 tokens
@@ -500,6 +894,21 @@ def test_question_config_validation_errors(tmp_path):
         load_question_config(p)
 
 
+def test_choice_signal_requires_at_least_two_candidates():
+    """item 1.2: K=1 has no distribution (forced argmax, confidence 0.0), so
+    the config validator rejects it at save/startup (admin PUT => 422)."""
+    cfg = json.loads(DEFAULT_QUESTIONS_PATH.read_text(encoding="utf-8"))
+    for key in CHOICE_SIGNALS:
+        bad = json.loads(json.dumps(cfg))
+        candidates = bad["signals"][key]["candidates"]
+        only = list(candidates)[0]
+        bad["signals"][key]["candidates"] = {only: candidates[only]}
+        with pytest.raises(JevTaggerError) as exc:
+            validate_question_config(bad)
+        assert key in str(exc.value)
+        assert "2" in str(exc.value)
+
+
 def test_config_without_signals_object_raises_jev_error():
     """A config without a 'signals' object must be a clean 422, not a
     NameError (the old message interpolated an undefined variable)."""
@@ -557,6 +966,55 @@ def test_pii_templates_must_render_with_zh():
     bad["signals"]["pii"]["true"] = "包含：{broken"
     with pytest.raises(JevTaggerError):
         validate_question_config(bad)
+
+
+# --------------------------------------------------------------------------- #
+# Version info for the ledger (2026-10-24 item 1.3)
+# --------------------------------------------------------------------------- #
+def test_questions_sha256_is_canonical_and_wording_sensitive():
+    cfg = load_question_config()
+    digest = questions_sha256(cfg)
+    assert len(digest) == 64 and set(digest) <= set("0123456789abcdef")
+    # canonical JSON: nested key order / formatting does not change the digest
+    reordered = json.loads(json.dumps(cfg))
+    types = reordered["signals"]["pii"]["types"]
+    reordered["signals"]["pii"]["types"] = dict(reversed(list(types.items())))
+    assert questions_sha256(reordered) == digest
+    assert questions_sha256(json.loads(json.dumps(cfg, indent=2))) == digest
+    # any wording / candidate edit does change it
+    edited = json.loads(json.dumps(cfg))
+    edited["signals"]["jailbreak"]["instructions"][0] += "？"
+    assert questions_sha256(edited) != digest
+
+
+def test_info_reports_model_identity_and_question_fingerprint():
+    tagger = stub_tagger()
+    tagger.model_dir = Path("/models/jev-r4b3")
+    tagger.temperature = 3.45
+    info = tagger.info()
+    assert set(info) == {"engine", "model_dir", "model_name", "temperature",
+                         "max_length", "window", "questions_sha256"}
+    assert info["engine"] == "jev"
+    assert info["model_dir"] == str(Path("/models/jev-r4b3").resolve())
+    assert info["model_name"] == "jev-r4b3"
+    assert info["temperature"] == 3.45
+    assert info["max_length"] == 1024
+    assert info["window"] == "1024:0"
+    expected = hashlib.sha256(json.dumps(
+        tagger.questions, sort_keys=True, ensure_ascii=False,
+        separators=(",", ":")).encode("utf-8")).hexdigest()
+    assert info["questions_sha256"] == expected
+
+
+def test_info_question_fingerprint_follows_a_hot_config_edit():
+    tagger = stub_tagger()
+    tagger.model_dir = Path("/models/jev-r4b3")
+    before = tagger.info()["questions_sha256"]
+    edited = json.loads(json.dumps(tagger.questions))
+    edited["signals"]["jailbreak"]["instructions"][0] += "？"
+    tagger.set_questions(edited)
+    assert tagger.info()["questions_sha256"] != before
+    assert tagger.info()["questions_sha256"] == questions_sha256(edited)
 
 
 # --------------------------------------------------------------------------- #
@@ -623,6 +1081,8 @@ def test_full_and_trimmed_packs_agree_on_every_referenced_value(monkeypatch):
     # unreferenced subtypes are missing from the trimmed pack.
     assert trimmed["pii"]["conf_by_value"].get("cn_id_card") == \
         full["pii"]["conf_by_value"].get("cn_id_card")
+    assert trimmed["pii"]["p_by_type"] == {
+        "cn_id_card": full["pii"]["p_by_type"]["cn_id_card"]}
     assert ("cn_id_card" in trimmed["pii"]["value"]) == \
         ("cn_id_card" in full["pii"]["value"])
     other_types = [typ for typ in full["pii"]["value"] if typ != "cn_id_card"]

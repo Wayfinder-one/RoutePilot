@@ -54,6 +54,10 @@ def _make_tagger(settings: Settings, kw_groups: dict):
             questions_path=settings.signal_questions or None,
             device=settings.device or None,
             max_length=settings.jev_max_length or None,
+            # "" = ROUTER_JEV_WINDOW unset: JevTagger derives the legacy
+            # head-only "<max_length>:0" window instead of failing on a literal
+            # default when ROUTER_JEV_MAX_LENGTH is customized.
+            window=settings.jev_window or None,
             kw_groups=kw_groups)
     if settings.tagger == "prompt":
         from router.signals.prompt_judge import PromptJudgeTagger

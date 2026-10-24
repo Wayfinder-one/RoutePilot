@@ -5,6 +5,8 @@ values for the same model output — otherwise the safety gate behaves
 differently depending on which engine is deployed.
 """
 
+import math
+
 import pytest
 
 from router.signals import checkpoint as cp
@@ -31,7 +33,19 @@ def test_softmax_and_entropy_confidence():
     assert entropy_confidence([1.0, 0.0]) == pytest.approx(1.0)
     assert entropy_confidence([0.5, 0.5]) == pytest.approx(0.0)
     assert entropy_confidence([0.25] * 4) == pytest.approx(0.0)
-    assert entropy_confidence([1.0]) == 1.0
+    # K <= 1 = no candidate distribution = no evidence (2026-10-24 item 1.2;
+    # used to report 1.0 "full confidence"). K >= 2 is unchanged.
+    assert entropy_confidence([1.0]) == 0.0
+
+
+def test_entropy_confidence_has_no_evidence_for_a_single_candidate():
+    """K=1 must never look fully confident: the choice value is forced, so a
+    confidence floor would otherwise pass on a degenerate distribution."""
+    assert entropy_confidence([]) == 0.0
+    assert entropy_confidence([1.0]) == 0.0
+    # K >= 2 keeps the exact old formula (this is the deployed path)
+    assert entropy_confidence([0.7, 0.3]) == pytest.approx(
+        1.0 - (-(0.7 * math.log(0.7) + 0.3 * math.log(0.3))) / math.log(2))
 
 
 def test_pii_hit_rule():

@@ -37,10 +37,18 @@ def softmax(logits) -> list[float]:
 
 
 def entropy_confidence(probs: list[float]) -> float:
-    """1 - H(p)/log K, clamped to [0,1] (K <= 1 => 1.0)."""
+    """1 - H(p)/log K, clamped to [0,1].
+
+    ``K <= 1`` returns **0.0**: a choice signal with fewer than two candidates
+    has no distribution to compare, so it carries no confidence evidence. The
+    old 1.0 convention let a misconfigured (single-candidate) choice pass any
+    confidence floor; the question-config validator now rejects K < 2 and this
+    helper reports "no evidence" for anything that still reaches it. K >= 2 is
+    unchanged bit-for-bit (checkpoint heads / JEV choices).
+    """
     k = len(probs)
     if k <= 1:
-        return 1.0
+        return 0.0
     h = -sum(p * math.log(p) for p in probs if p > 0)
     return max(0.0, min(1.0, 1.0 - h / math.log(k)))
 
