@@ -59,6 +59,25 @@ def _refresh_backends(request: Request, conn: sqlite3.Connection) -> None:
     request.app.state.backends = load_backends(conn)   # wholesale swap
 
 
+def _sync_ledger_pipeline_version(request: Request, version: str | None) -> None:
+    """Hot-sync the action—result ledger's cached pipeline version.
+
+    ``RequestLogger`` reads ``settings.pipeline_version`` once at startup so the
+    /v1 hot path never queries the database (JEV plan §3.1). ``PUT
+    /admin/pipeline`` is the only writer that bumps the version, so refreshing
+    the cache here keeps subsequent ledger rows honest without a restart — and
+    without adding a DB read to routing. Best effort: a bare test app without a
+    logger, or a malformed stored value, leaves the cache untouched.
+    """
+    requestlog = getattr(request.app.state, "requestlog", None)
+    if requestlog is None:
+        return
+    try:
+        requestlog.pipeline_version = int(version)      # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline
 # --------------------------------------------------------------------------- #
@@ -107,6 +126,9 @@ def put_pipeline(body: PipelineIn, request: Request,
     StationRepo(conn).save(stations)
     request.app.state.pipeline = stations       # refresh the hot-path snapshot
     version = SettingsRepo(conn).get("pipeline_version")
+    # The save bumped settings.pipeline_version: refresh the ledger cache so
+    # requests decided under the new tree are recorded with its version.
+    _sync_ledger_pipeline_version(request, version)
     ChangeRepo(conn).record(_now(), "pipeline",
                             {"stations": len(stations), "version": version})
     return {"ok": True, "changed": True, "warnings": warns, "version": version}

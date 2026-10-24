@@ -11,11 +11,74 @@ def test_migrate_idempotent_and_wal(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"stations", "nodes", "branches", "branch_rows", "models", "providers",
             "keyword_groups", "settings", "requests",
-            "changes", "evals",
+            "changes", "evals", "request_ledger",
             "schema_migrations"} <= tables
     assert "request_signals" not in tables      # v10 dropped the dead table
     assert "sessions" not in tables      # v11 dropped it
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    conn.close()
+
+
+def test_migration_14_creates_the_action_result_ledger(tmp_path):
+    """JEV plan §3.1: v14 adds request_ledger and leaves `requests` alone.
+
+    The ledger is the iteration's deliberate addition (the 2026-10-20 decision
+    to keep `requests` slim stands): one row per request with action, outcome
+    and version metadata, and NO text/signals/PII columns.
+    """
+    from router.store.db import MIGRATIONS
+
+    path = str(tmp_path / "t.db")
+    conn = connect(path)
+    migrate(conn)
+    migrate(conn)                      # idempotent: re-running applies nothing
+
+    ledger_columns = [r[1] for r in conn.execute(
+        "PRAGMA table_info(request_ledger)")]
+    assert ledger_columns == [
+        "id", "ts", "decision", "model", "station_id", "leaf_id", "score",
+        "reasoning", "upstream_model", "upstream_status", "prompt_tokens",
+        "completion_tokens", "total_tokens", "routing_ms", "upstream_ms",
+        "ttft_ms", "total_ms", "jev_engine", "jev_model", "jev_window",
+        "jev_temperature", "questions_sha256", "pipeline_version",
+        "error_class"]
+    assert not {"text", "signals", "trace"} & set(ledger_columns)
+
+    # v14 must NOT alter the slim contract of the existing requests table.
+    assert [r[1] for r in conn.execute("PRAGMA table_info(requests)")] == [
+        "id", "ts", "text", "decision", "model", "station_id", "leaf_id",
+        "score", "latency_ms"]
+
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] == len(MIGRATIONS)
+    conn.close()
+
+
+def test_migration_14_upgrades_a_v13_database(tmp_path):
+    """An existing database (v13) gains the ledger without touching old rows."""
+    import sqlite3
+
+    from router.store.db import MIGRATIONS
+
+    path = str(tmp_path / "v13.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
+    for i, script in enumerate(MIGRATIONS[:13], start=1):
+        conn.executescript(script)
+        conn.execute("INSERT INTO schema_migrations VALUES (?)", (i,))
+    conn.execute("INSERT INTO requests (id, ts, text, decision, model, "
+                 "station_id, leaf_id, score, latency_ms) "
+                 "VALUES ('old', '2026-10-01T10:00:00', '', 'route', "
+                 "'qwen3-8b', NULL, NULL, NULL, 1.0)")
+    conn.commit()
+    conn.close()
+
+    conn = connect(path)
+    migrate(conn)
+    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0] == 0
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] == len(MIGRATIONS)
     conn.close()
 
 

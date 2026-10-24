@@ -2,7 +2,7 @@ import asyncio
 import logging
 import sqlite3
 
-from router.api.requestlog import RECENT_LIMIT, RequestLogger
+from router.api.requestlog import LEDGER_COLUMNS, RECENT_LIMIT, RequestLogger
 from router.config import Settings
 from router.store.db import connect, migrate
 
@@ -26,6 +26,25 @@ def record(i, **kw):
                                     "is_rule": True}}}
     rec.update(kw)
     return rec
+
+
+def outcome(**kw):
+    """The fields routes_v1 fills in after the response is known (§3.1)."""
+    fields = {"upstream_model": "upstream-qwen3-8b", "upstream_status": 200,
+              "upstream_ms": 5.0, "ttft_ms": None, "total_ms": 20.0,
+              "error_class": None, "prompt_tokens": 11,
+              "completion_tokens": 7, "total_tokens": 18}
+    fields.update(kw)
+    return fields
+
+
+def ledger_rows(log):
+    conn = connect(log.settings.db_path)
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM request_ledger ORDER BY rowid")]
+    finally:
+        conn.close()
 
 
 def test_flush_writes_slim_rows_without_signals(tmp_path):
@@ -127,3 +146,106 @@ def test_flush_task_survives_a_db_error(tmp_path, monkeypatch, caplog):
     rows = [r["id"] for r in conn.execute("SELECT id FROM requests")]
     conn.close()
     assert rows == ["r2"]                     # the dropped batch, then the next one
+
+
+# ── action—result ledger (JEV plan §3.1) ────────────────────────────────────
+def test_flush_writes_half_row_then_replaces_it_with_the_outcome(tmp_path):
+    """The flush may land between the decision and the response (2s period):
+    the ledger row exists as a half row (outcome columns NULL) and the later
+    result event overwrites it by id — never a duplicate row."""
+    log = make_log(tmp_path)
+    rec = record(1)
+    log.enqueue(rec)
+    asyncio.run(log.flush())
+
+    rows = ledger_rows(log)
+    assert len(rows) == 1
+    half = rows[0]
+    assert half["decision"] == "route" and half["model"] == "qwen3-8b"
+    assert half["routing_ms"] is None      # outcome-only columns are still NULL
+    assert half["upstream_status"] is None and half["error_class"] is None
+    assert half["prompt_tokens"] is None and half["total_ms"] is None
+
+    rec.update(outcome())
+    log.enqueue_result(rec)
+    asyncio.run(log.flush())
+
+    rows = ledger_rows(log)
+    assert len(rows) == 1                  # same id, INSERT OR REPLACE
+    row = rows[0]
+    assert row["upstream_model"] == "upstream-qwen3-8b"
+    assert row["upstream_status"] == 200 and row["error_class"] is None
+    assert (row["prompt_tokens"], row["completion_tokens"],
+            row["total_tokens"]) == (11, 7, 18)
+    assert row["upstream_ms"] == 5.0 and row["total_ms"] == 20.0
+    # The slim requests row keeps its original semantics (one row, no detail).
+    conn = connect(log.settings.db_path)
+    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
+    conn.close()
+
+
+def test_result_update_does_not_duplicate_ring_or_histogram(tmp_path):
+    """The outcome event only reaches the flush queue: the request is already
+    in the ring and its model signals are already counted exactly once."""
+    log = make_log(tmp_path)
+    rec = record(1)
+    log.enqueue(rec)
+    before = [b["count"] for b in log.confidence_histogram()]
+    rec.update(outcome())
+    log.enqueue_result(rec)
+    assert list(log.recent) == [rec]                 # not appended twice
+    assert [b["count"] for b in log.confidence_histogram()] == before
+    assert log._queue.qsize() == 2                   # half row + update
+    asyncio.run(log.flush())
+    assert len(ledger_rows(log)) == 1
+
+
+def test_ledger_holds_no_text_signals_or_trace(tmp_path):
+    """Privacy constraint survives the ledger: only action/result/version
+    columns are written; the request text, signals and trace stay memory-only."""
+    log = make_log(tmp_path)
+    rec = record(1, text="我的身份证号是 110101199001011234",
+                 trace=[{"spoiler": True}])
+    log.enqueue(rec)
+    rec.update(outcome())
+    log.enqueue_result(rec)
+    asyncio.run(log.flush())
+
+    conn = connect(log.settings.db_path)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(request_ledger)")]
+    conn.close()
+    assert columns == list(LEDGER_COLUMNS)
+    assert not {"text", "signals", "trace"} & set(columns)
+    row = ledger_rows(log)[0]
+    dumped = " ".join(str(v) for v in row.values() if v is not None)
+    assert "110101199001011234" not in dumped
+    assert "你好" not in dumped
+    assert "spoiler" not in dumped
+
+
+def test_pipeline_version_is_read_once_at_startup(tmp_path):
+    """The hot path must not query the DB: the version is cached when the
+    logger is built (that is the app startup read the ledger plan asks for)."""
+    settings = Settings(db_path=str(tmp_path / "t.db"))
+    conn = connect(settings.db_path)
+    migrate(conn)
+    conn.execute("INSERT INTO settings VALUES ('pipeline_version', '7')")
+    conn.commit()
+    conn.close()
+    assert RequestLogger(settings).pipeline_version == 7
+
+
+def test_missing_or_non_numeric_pipeline_version_is_null(tmp_path):
+    settings = Settings(db_path=str(tmp_path / "t.db"))
+    conn = connect(settings.db_path)
+    migrate(conn)
+    assert RequestLogger(settings).pipeline_version is None   # migrated only
+    conn.execute("INSERT INTO settings VALUES ('pipeline_version', 'v-next')")
+    conn.commit()
+    conn.close()
+    assert RequestLogger(settings).pipeline_version is None   # unparsable -> NULL
+    log = make_log(tmp_path)
+    log.enqueue(record(1))
+    log.enqueue_result(record(1))
+    asyncio.run(log.flush())
+    assert ledger_rows(log)[0]["pipeline_version"] is None

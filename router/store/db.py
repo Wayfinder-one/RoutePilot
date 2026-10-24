@@ -138,6 +138,28 @@ MIGRATIONS = [
     """
     ALTER TABLE stations DROP COLUMN type;
     """,
+    # v14 (2026-10-24, JEV plan §3.1): action—result ledger. The slim
+    # `requests` row is written BEFORE the upstream call and stays as is; this
+    # table is the iteration's answer to "which decision produced which
+    # outcome/version" — one row per request, the response outcome written
+    # over the half row by id (INSERT OR REPLACE). Deliberately NO request
+    # text, signals, PII or decision trace (privacy constraint from
+    # docs/计算日志重设计-2026-10-20.md survives): only action/result/version
+    # metadata. `jev_*`/`questions_sha256`/`jev_window` come from the tagger's
+    # info() and stay NULL for taggers that do not implement it. `jev_window`
+    # is the input window actually used (e.g. "1024:0") so the ledger can be
+    # split by window during the head/tail A/B rollout.
+    """
+    CREATE TABLE request_ledger (
+        id TEXT PRIMARY KEY, ts TEXT NOT NULL, decision TEXT NOT NULL,
+        model TEXT, station_id TEXT, leaf_id TEXT, score REAL, reasoning TEXT,
+        upstream_model TEXT, upstream_status INTEGER,
+        prompt_tokens INTEGER, completion_tokens INTEGER, total_tokens INTEGER,
+        routing_ms REAL, upstream_ms REAL, ttft_ms REAL, total_ms REAL,
+        jev_engine TEXT, jev_model TEXT, jev_window TEXT, jev_temperature REAL,
+        questions_sha256 TEXT, pipeline_version INTEGER, error_class TEXT);
+    CREATE INDEX idx_request_ledger_ts ON request_ledger(ts);
+    """,
 ]
 
 

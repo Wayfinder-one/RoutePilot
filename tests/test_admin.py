@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -54,6 +55,75 @@ def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
     newer = c.get("/admin/pipeline").json()
     assert int(newer["version"]) == int(before["version"]) + 1
     assert len(c.get("/admin/changes").json()["changes"]) == changes_before + 1
+
+
+def test_put_pipeline_hot_syncs_the_ledger_version(tmp_path):
+    """C2: the pipeline write is the only version bump; the ledger cache
+    follows in the same process (no restart) and the next /v1 request records
+    the new version — without adding a DB read to the hot path."""
+    def ok(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok))
+    c = TestClient(app)
+    before = app.state.requestlog.pipeline_version
+    assert isinstance(before, int)
+
+    body = c.get("/admin/pipeline").json()
+    body["stations"][3]["root"]["model"] = "qwen3-32b"
+    r = c.put("/admin/pipeline", json=body)
+    assert r.status_code == 200 and r.json()["changed"] is True
+    new_version = int(r.json()["version"])
+    assert new_version == before + 1
+    assert app.state.requestlog.pipeline_version == new_version   # hot-synced
+
+    r = c.post("/v1/chat/completions",
+               json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
+    assert r.status_code == 200
+    record = app.state.requestlog.recent_requests(1)[0]
+    assert record["pipeline_version"] == new_version
+    asyncio.run(app.state.requestlog.flush())
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        row = conn.execute("SELECT pipeline_version FROM request_ledger "
+                           "WHERE id = ?", (record["id"],)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row["pipeline_version"] == new_version
+
+
+def test_ledger_version_sync_tolerates_missing_logger_and_bad_values():
+    """Best effort: a bare app (no requestlog) or a malformed stored value
+    must not fail the admin write or clobber the cache."""
+    from types import SimpleNamespace
+
+    from router.api.routes_admin import _sync_ledger_pipeline_version
+    state = SimpleNamespace(requestlog=SimpleNamespace(pipeline_version=3))
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    _sync_ledger_pipeline_version(request, "not-a-number")   # ignored
+    assert state.requestlog.pipeline_version == 3
+    _sync_ledger_pipeline_version(request, None)             # ignored
+    assert state.requestlog.pipeline_version == 3
+    _sync_ledger_pipeline_version(request, "4")              # applied
+    assert state.requestlog.pipeline_version == 4
+
+    # an app without a logger (bare/heuristic harness) must not raise
+    bare = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    _sync_ledger_pipeline_version(bare, "5")
+
+
+def test_put_pipeline_noop_leaves_the_ledger_version_alone(tmp_path):
+    """No bump -> no sync: a no-op save must not disturb the ledger cache."""
+    c = client(tmp_path)
+    app = c.app
+    before = app.state.requestlog.pipeline_version
+    body = c.get("/admin/pipeline").json()
+    r = c.put("/admin/pipeline", json=body)
+    assert r.json()["changed"] is False
+    assert app.state.requestlog.pipeline_version == before
 
 
 def test_put_pipeline_rejected_by_health(tmp_path):
