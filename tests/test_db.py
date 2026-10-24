@@ -19,7 +19,7 @@ def test_migrate_idempotent_and_wal(tmp_path):
     conn.close()
 
 
-def test_migrations_14_15_create_the_action_result_ledger(tmp_path):
+def test_migrations_14_15_16_create_the_action_result_ledger(tmp_path):
     """JEV plan §3.1 + P1-B/C: v14 adds request_ledger, v15 appends provenance/
     terminal-state columns and config_revisions; `requests` stays slim.
 
@@ -47,7 +47,10 @@ def test_migrations_14_15_create_the_action_result_ledger(tmp_path):
         # v15 (JEV P1-B/C)
         "pipeline_revision", "questions_revision", "backends_revision",
         "outcome_state", "experiment_arm", "quality_score",
-        "quality_evaluator", "usage_observed"]
+        "quality_evaluator", "usage_observed",
+        # v16 (JEV P2-A/D): chunked long-input attribution
+        "jev_chunk", "input_chunk_mode", "input_chunk_segments",
+        "input_chunk_prompt_tokens"]
     assert not {"text", "signals", "trace"} & set(ledger_columns)
 
     # v14 must NOT alter the slim contract of the existing requests table.
@@ -116,6 +119,38 @@ def test_migration_15_adds_config_revisions_and_keeps_v14_rows(tmp_path):
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "config_revisions" in tables
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] == len(MIGRATIONS)
+    conn.close()
+
+
+def test_migration_16_adds_chunk_columns_and_keeps_v15_rows(tmp_path):
+    """v16 is additive: historical ledger rows stay readable and just report
+    NULL chunk attribution; re-running the migration is a no-op."""
+    import sqlite3
+
+    from router.store.db import MIGRATIONS
+
+    path = str(tmp_path / "v15.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
+    for i, script in enumerate(MIGRATIONS[:15], start=1):
+        conn.executescript(script)
+        conn.execute("INSERT INTO schema_migrations VALUES (?)", (i,))
+    conn.execute("INSERT INTO request_ledger (id, ts, decision, pipeline_revision) "
+                 "VALUES ('old', '2026-10-01T10:00:00', 'route', 'sha-old')")
+    conn.commit()
+    conn.close()
+
+    conn = connect(path)
+    migrate(conn)
+    migrate(conn)                            # idempotent on v16 too
+    row = conn.execute("SELECT * FROM request_ledger WHERE id='old'").fetchone()
+    assert row["pipeline_revision"] == "sha-old"     # v15 data intact
+    assert row["jev_chunk"] is None
+    assert row["input_chunk_mode"] is None
+    assert row["input_chunk_segments"] is None
+    assert row["input_chunk_prompt_tokens"] is None
     assert conn.execute("SELECT MAX(version) FROM schema_migrations"
                         ).fetchone()[0] == len(MIGRATIONS)
     conn.close()

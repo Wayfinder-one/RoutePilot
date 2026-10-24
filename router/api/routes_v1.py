@@ -84,15 +84,78 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
+def _as_int(value) -> int | None:
+    """int-or-NULL coercion for optional contract integers (bool is not int)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _chunk_summary(info: dict) -> str | None:
+    """Human-readable chunk-config digest for the ledger (P2-D).
+
+    Built from the tagger's frozen ``tagger_info`` keys (P2-A contract):
+    ``"8x512/noisy_or"`` = 8 planned segments of 512 tokens aggregated with
+    noisy-or; plain ``"off"`` when the tagger reports chunking disabled; NULL
+    when it reports nothing (non-JEV taggers).
+    """
+    agg = info.get("chunk_agg")
+    segments = info.get("chunk_segments")
+    size = info.get("chunk_size")
+    if str(agg) == "off" or str(segments) == "off":
+        return "off"
+    seg_int = _as_int(segments)
+    size_int = _as_int(size)
+    if seg_int is None and size_int is None and agg is None:
+        return None
+    if seg_int is not None and size_int is not None:
+        shape = f"{seg_int}x{size_int}"
+    elif seg_int is not None:
+        shape = f"{seg_int}seg"
+    elif size_int is not None:
+        shape = f"{size_int}tok"
+    else:
+        shape = ""
+    parts = [part for part in (shape, None if agg is None else str(agg))
+             if part]
+    return "/".join(parts) or None
+
+
+def _chunk_fields(result, info: dict) -> dict:
+    """Chunked-input attribution columns (migration v16).
+
+    Tolerant reads of the optional P2-A contract (``TagResult.input`` plus the
+    frozen ``tagger_info``): old taggers or chunking-off requests leave NULLs —
+    a ledger row must never fail because a tagger does not implement chunking.
+
+    ``input_chunk_segments`` records the segments that were ACTUALLY scored
+    (``chunk_scored_segments``), because the column feeds online cost
+    attribution — how much work this request really caused. The planned
+    segment count is recoverable from the mode/config side, so it is only a
+    fallback when the tagger reports no actual count (older/mid-rollout packs).
+    """
+    window = getattr(result, "input", None)
+    window = window if isinstance(window, dict) else {}
+    mode = window.get("chunk_strategy")
+    planned = _as_int(window.get("chunk_segments"))
+    scored = _as_int(window.get("chunk_scored_segments"))
+    return {
+        "jev_chunk": _chunk_summary(info),
+        "input_chunk_mode": mode if isinstance(mode, str) else None,
+        "input_chunk_segments": scored if scored is not None else planned,
+        "input_chunk_prompt_tokens": _as_int(
+            window.get("chunk_prompt_tokens")),
+    }
+
+
 def _tagger_fingerprint(result) -> dict:
-    """Ledger version columns from the tagger's per-tag fingerprint (P1-A).
+    """Ledger version/attribution columns from the per-tag fingerprint (P1-A).
 
     ``TagResult.questions_sha256`` is captured by the tagger at tag() start and
     ``TagResult.tagger_info`` is its frozen ``info()`` snapshot — both describe
     the model/question pack that actually scored THIS request, so no tagger
     state is re-read after the response (which would race a hot edit). Taggers
     that do not provide them (heuristic/checkpoint/prompt) leave the columns
-    NULL.
+    NULL. The v16 chunk columns (P2-A/D) ride on the same two objects.
+
     """
     info = getattr(result, "tagger_info", None)
     if not isinstance(info, dict):
@@ -108,6 +171,8 @@ def _tagger_fingerprint(result) -> dict:
         "jev_model": info.get("model_name") or info.get("model_dir"),
         "jev_window": info.get("window"),
         "jev_temperature": info.get("temperature"),
+        # v16 chunked-input attribution (NULL for non-chunking taggers)
+        **_chunk_fields(result, info),
     }
 
 

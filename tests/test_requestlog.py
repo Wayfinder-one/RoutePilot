@@ -174,6 +174,11 @@ def test_flush_writes_half_row_then_replaces_it_with_the_outcome(tmp_path):
     assert half["outcome_state"] == "incomplete"   # no terminal state yet
     assert half["usage_observed"] == 0
     assert half["pipeline_revision"] == "p" * 64
+    # v16 chunk columns are NULL when the tagger reports no chunking.
+    assert half["jev_chunk"] is None
+    assert half["input_chunk_mode"] is None
+    assert half["input_chunk_segments"] is None
+    assert half["input_chunk_prompt_tokens"] is None
     assert log.partial_rows == 1                   # one half row flushed
 
     rec.update(outcome())
@@ -226,6 +231,8 @@ def test_ledger_holds_no_text_signals_or_trace(tmp_path):
     columns = [r[1] for r in conn.execute("PRAGMA table_info(request_ledger)")]
     conn.close()
     assert columns == list(LEDGER_COLUMNS)
+    assert {"jev_chunk", "input_chunk_mode", "input_chunk_segments",
+            "input_chunk_prompt_tokens"} <= set(columns)     # v16
     assert not {"text", "signals", "trace"} & set(columns)
     row = ledger_rows(log)[0]
     dumped = " ".join(str(v) for v in row.values() if v is not None)
@@ -298,3 +305,26 @@ def test_ledger_write_failure_is_counted_and_does_not_drop_the_batch(
     assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 3
     conn.close()
     assert log.stats()["ledger_write_failures"] == 3
+
+
+def test_flush_writes_chunk_attribution_columns(tmp_path):
+    """v16: the four chunk columns are copied from the ring record; a tagger
+    that does not report them leaves NULL (no exception)."""
+    log = make_log(tmp_path)
+    log.enqueue(record(1, jev_chunk="8x512/noisy_or",
+                       input_chunk_mode="head+tail+rule+uniform",
+                       input_chunk_segments=8,
+                       input_chunk_prompt_tokens=1234))
+    log.enqueue(record(2))                       # old/non-chunking tagger
+    asyncio.run(log.flush())
+
+    rows = {r["id"]: r for r in ledger_rows(log)}
+    chunked = rows["r1"]
+    assert chunked["jev_chunk"] == "8x512/noisy_or"
+    assert chunked["input_chunk_mode"] == "head+tail+rule+uniform"
+    assert chunked["input_chunk_segments"] == 8
+    assert chunked["input_chunk_prompt_tokens"] == 1234
+    plain = rows["r2"]
+    assert plain["jev_chunk"] is None and plain["input_chunk_mode"] is None
+    assert plain["input_chunk_segments"] is None
+    assert plain["input_chunk_prompt_tokens"] is None

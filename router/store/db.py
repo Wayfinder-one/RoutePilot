@@ -187,6 +187,19 @@ MIGRATIONS = [
     ALTER TABLE request_ledger ADD COLUMN quality_evaluator TEXT;
     ALTER TABLE request_ledger ADD COLUMN usage_observed INTEGER;
     """,
+    # v16 (2026-10-24, JEV third round P2-A/D): chunked long-input attribution.
+    # The tagger's opt-in long-text PII chunking is invisible otherwise: these
+    # four columns record WHICH chunk configuration was in effect at the tagger
+    # (``jev_chunk`` summary from TagResult.tagger_info) and what the input
+    # actually went through (mode/planned segments/prompt tokens from
+    # TagResult.input). All NULL for taggers/requests that do not chunk; the
+    # historical v15 rows stay readable (new columns default NULL).
+    """
+    ALTER TABLE request_ledger ADD COLUMN jev_chunk TEXT;
+    ALTER TABLE request_ledger ADD COLUMN input_chunk_mode TEXT;
+    ALTER TABLE request_ledger ADD COLUMN input_chunk_segments INTEGER;
+    ALTER TABLE request_ledger ADD COLUMN input_chunk_prompt_tokens INTEGER;
+    """,
 ]
 
 

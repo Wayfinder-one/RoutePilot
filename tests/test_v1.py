@@ -315,6 +315,11 @@ def test_ledger_success_path_records_action_outcome_and_versions(tmp_path):
     assert row["quality_score"] is None and row["quality_evaluator"] is None
     assert row["jev_engine"] is None and row["questions_sha256"] is None
     assert row["jev_window"] is None                       # non-JEV tagger
+    # v16: no chunking reported -> all chunk attribution columns are NULL.
+    assert row["jev_chunk"] is None
+    assert row["input_chunk_mode"] is None
+    assert row["input_chunk_segments"] is None
+    assert row["input_chunk_prompt_tokens"] is None
     # The snapshot's pipeline revision is resolvable from config_revisions.
     from router.pipeline.snapshot import canonical_json, sha256_text
     conn = connect(app.state.settings.db_path)
@@ -566,16 +571,20 @@ def test_ledger_streaming_client_4xx(tmp_path):
 
 # ── version columns + /admin/requests/recent contract ─────────────────────
 class _FingerprintTagger:
-    """Mimics signals-dev's P1-A contract: the TagResult (not a live tagger
-    read) carries the questions sha + the frozen info() snapshot."""
+    """Mimics signals-dev's contracts: the TagResult (not a live tagger read)
+    carries the questions sha, the frozen info() snapshot and — when chunking is
+    configured — the P2-A chunk keys in both places."""
 
     name = "jev-fake"
 
     def __init__(self, inner, questions_sha: str = "abc123",
-                 window: str = "1024:0"):
+                 window: str = "1024:0", input_extra: dict | None = None,
+                 info_extra: dict | None = None):
         self.inner = inner
         self.questions_sha = questions_sha
         self.window = window
+        self.input_extra = input_extra or {}
+        self.info_extra = info_extra or {}
 
     async def tag(self, req):
         result = await self.inner.tag(req)
@@ -584,7 +593,10 @@ class _FingerprintTagger:
             "engine": "jev", "model_dir": "/srv/jev-routepilot",
             "model_name": "jev-routepilot", "temperature": 3.45,
             "max_length": 1024, "window": self.window,
-            "questions_sha256": self.questions_sha}
+            "questions_sha256": self.questions_sha,
+            **self.info_extra}
+        if self.input_extra:
+            result.input = {**(result.input or {}), **self.input_extra}
         return result
 
 
@@ -621,6 +633,91 @@ def test_ledger_records_the_jev_window_for_window_ab_split(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["jev_window"] == "256:768"
     assert row["jev_engine"] == "jev"
+
+
+def test_ledger_records_chunked_input_attribution(tmp_path):
+    """P2-D: the four v16 columns come from TagResult.input + tagger_info; the
+    ledger can tell which chunk configuration an input actually went through."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    app.state.tagger = _FingerprintTagger(
+        app.state.tagger,
+        input_extra={"chunk_strategy": "head+tail+rule+uniform",
+                     "chunk_segments": 8, "chunk_scored_segments": 7,
+                     "chunk_prompt_tokens": 1234},
+        info_extra={"chunk_segments": 8, "chunk_size": 512,
+                    "chunk_agg": "noisy_or"})
+    c = TestClient(app)
+    assert chat(c, "今天天气怎么样").status_code == 200
+    _flush(app)
+
+    rec = _last_record(app)
+    row = _ledger_row(app, rec["id"])
+    assert row["jev_chunk"] == "8x512/noisy_or"
+    assert row["input_chunk_mode"] == "head+tail+rule+uniform"
+    # Cost attribution column: the ACTUAL scored count (7), not the planned 8.
+    assert row["input_chunk_segments"] == 7
+    assert row["input_chunk_prompt_tokens"] == 1234
+    # The same attribution rides on the in-memory ring record (console view).
+    assert rec["jev_chunk"] == "8x512/noisy_or"
+    assert rec["input_chunk_mode"] == "head+tail+rule+uniform"
+
+
+def test_chunk_segments_prefers_scored_then_falls_back_to_planned():
+    """P2-D cost attribution: the column is what was ACTUALLY scored; a tagger
+    without an actual count falls back to the planned segments; old taggers
+    report NULL (never an error)."""
+    from types import SimpleNamespace
+
+    from router.api.routes_v1 import _chunk_fields
+
+    def segments(input_keys: dict):
+        return _chunk_fields(SimpleNamespace(input=input_keys),
+                             {})["input_chunk_segments"]
+
+    assert segments({"chunk_segments": 8, "chunk_scored_segments": 3}) == 3
+    assert segments({"chunk_segments": 8}) == 8          # fallback: planned
+    assert segments({}) is None                          # not reported -> NULL
+
+
+def test_ledger_chunk_off_is_recorded_as_off(tmp_path):
+    """Chunking implemented but disabled: the summary says "off", the
+    per-request input keys are absent -> NULL (not an error)."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    app.state.tagger = _FingerprintTagger(
+        app.state.tagger,
+        info_extra={"chunk_segments": "off", "chunk_size": "off",
+                    "chunk_agg": "off"})
+    c = TestClient(app)
+    assert chat(c, "今天天气怎么样").status_code == 200
+    _flush(app)
+
+    row = _ledger_row(app, _last_record(app)["id"])
+    assert row["jev_chunk"] == "off"
+    assert row["input_chunk_mode"] is None
+    assert row["input_chunk_segments"] is None
+    assert row["input_chunk_prompt_tokens"] is None
+
+
+def test_ledger_tolerates_partial_chunk_contract(tmp_path):
+    """Old/mid-rollout taggers may expose only some chunk keys: missing ones
+    are NULL (or a partial summary), never an exception."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    app.state.tagger = _FingerprintTagger(
+        app.state.tagger,
+        input_extra={"chunk_strategy": "off"},       # only the mode
+        info_extra={"chunk_agg": "max"})             # only the aggregation
+    c = TestClient(app)
+    assert chat(c, "今天天气怎么样").status_code == 200
+    _flush(app)
+
+    row = _ledger_row(app, _last_record(app)["id"])
+    assert row["jev_chunk"] == "max"
+    assert row["input_chunk_mode"] == "off"
+    assert row["input_chunk_segments"] is None
+    assert row["input_chunk_prompt_tokens"] is None
 
 
 def test_recent_requests_keeps_its_contract_and_carries_the_outcome(tmp_path):

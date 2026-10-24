@@ -58,7 +58,10 @@ LEDGER_COLUMNS = (
     # v15 (JEV P1-B/C): provenance + terminal state + attribution
     "pipeline_revision", "questions_revision", "backends_revision",
     "outcome_state", "experiment_arm", "quality_score", "quality_evaluator",
-    "usage_observed")
+    "usage_observed",
+    # v16 (JEV P2-A/D): chunked long-input attribution
+    "jev_chunk", "input_chunk_mode", "input_chunk_segments",
+    "input_chunk_prompt_tokens")
 
 _SLIM_INSERT = (
     "INSERT OR REPLACE INTO requests (id, ts, text, decision, model, "
