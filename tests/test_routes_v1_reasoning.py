@@ -260,6 +260,7 @@ def test_model_without_any_declaration_and_leaf_level(tmp_path):
     """A stale tree selecting a level for an undeclared model must not 5xx."""
     _app, client, _seen = make_app(tmp_path, ok_upstream)
     # write the tree directly into the DB, bypassing health check validation
+    from router.pipeline.snapshot import install_snapshot, load_snapshot
     from router.store.db import connect
     from router.store.repositories import StationRepo
 
@@ -270,9 +271,13 @@ def test_model_without_any_declaration_and_leaf_level(tmp_path):
         stations = StationRepo(conn).load()
         stations[-1].root.reasoning = "high"
         StationRepo(conn).save(stations)
+        # P1-B: the hot path reads the immutable snapshot, so publish the tree
+        # the test wrote straight into the DB (bypassing admin validation).
+        install_snapshot(
+            client.app,
+            load_snapshot(conn, jev_trim=client.app.state.settings.jev_trim))
     finally:
         conn.close()
-    client.app.state.pipeline = stations
     r = chat(client)
     assert r.status_code == 200
     assert r.headers["x-sr-reasoning-warning"] == "unsupported"

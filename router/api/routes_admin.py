@@ -1,10 +1,11 @@
 """Admin API: pipeline, lexicon, models, providers, signals, try, settings,
 changes, eval and the overview aggregates.
 
-Every write that changes what the hot path reads swaps the in-memory snapshot
-(pipeline / backends / keyword groups) so request handling never touches the
-database (design doc section 4.4). Every configuration write is also appended to
-the ``changes`` audit trail (design 5.1).
+Every write that changes what the hot path reads rebuilds and publishes the
+immutable ``app.state.snapshot`` in ONE assignment (JEV P1-B) so request
+handling never touches the database (design doc section 4.4). Every
+configuration write is also appended to the ``changes`` audit trail
+(design 5.1).
 """
 
 from __future__ import annotations
@@ -22,12 +23,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn
-from router.api.upstream import load_backends, model_reasoning_from_db, \
-    parse_profile_text
+from router.api.upstream import model_reasoning_from_db, parse_profile_text
 from router.evals import summarize
 from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
 from router.pipeline.model import station_from_dict, station_to_dict
+from router.pipeline.snapshot import install_snapshot, load_snapshot
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
                               normalize_reasoning, validate_model_profile)
@@ -37,6 +38,7 @@ from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
                                         TimePeriodRepo,
                                        ModelRepo, ProviderRepo,
                                        SettingsRepo, StationRepo,
+                                       ensure_questions_revision,
                                        model_ids_using_provider,
                                        model_references)
 
@@ -44,7 +46,8 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
-RESERVED_SETTINGS = {"pipeline_version"}
+RESERVED_SETTINGS = {"pipeline_version", "pipeline_revision",
+                    "questions_revision"}
 
 #: 模型位 / 提供方名：写进分流树、URL 路径与 OpenAI body，保守字符集。
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -55,27 +58,15 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _refresh_backends(request: Request, conn: sqlite3.Connection) -> None:
-    request.app.state.backends = load_backends(conn)   # wholesale swap
+def _refresh_snapshot(request: Request, conn: sqlite3.Connection) -> None:
+    """Rebuild + publish the routing snapshot after an admin write.
 
-
-def _sync_ledger_pipeline_version(request: Request, version: str | None) -> None:
-    """Hot-sync the action—result ledger's cached pipeline version.
-
-    ``RequestLogger`` reads ``settings.pipeline_version`` once at startup so the
-    /v1 hot path never queries the database (JEV plan §3.1). ``PUT
-    /admin/pipeline`` is the only writer that bumps the version, so refreshing
-    the cache here keeps subsequent ledger rows honest without a restart — and
-    without adding a DB read to routing. Best effort: a bare test app without a
-    logger, or a malformed stored value, leaves the cache untouched.
+    This is the ONLY way a pipeline/model/provider write may update the hot
+    path (JEV P1-B): one assignment to ``app.state.snapshot``; the legacy
+    pipeline/backends aliases are refreshed inside ``install_snapshot``.
     """
-    requestlog = getattr(request.app.state, "requestlog", None)
-    if requestlog is None:
-        return
-    try:
-        requestlog.pipeline_version = int(version)      # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return
+    install_snapshot(request.app,
+                     load_snapshot(conn, jev_trim=request.app.state.settings.jev_trim))
 
 
 # --------------------------------------------------------------------------- #
@@ -121,17 +112,20 @@ def put_pipeline(body: PipelineIn, request: Request,
     current = [station_to_dict(s) for s in StationRepo(conn).load()]
     changed = [station_to_dict(s) for s in stations] != current
     if not changed:
+        settings = SettingsRepo(conn)
         return {"ok": True, "changed": False, "warnings": warns,
-                "version": SettingsRepo(conn).get("pipeline_version", "0")}
-    StationRepo(conn).save(stations)
-    request.app.state.pipeline = stations       # refresh the hot-path snapshot
+                "version": settings.get("pipeline_version", "0"),
+                "revision": settings.get("pipeline_revision")}
+    revision = StationRepo(conn).save(stations)   # tree + version + revision
+    # Publish the new immutable snapshot (one assignment) so the next request
+    # evaluates AND ledgers the same tree; in-flight requests keep the old one.
+    _refresh_snapshot(request, conn)
     version = SettingsRepo(conn).get("pipeline_version")
-    # The save bumped settings.pipeline_version: refresh the ledger cache so
-    # requests decided under the new tree are recorded with its version.
-    _sync_ledger_pipeline_version(request, version)
     ChangeRepo(conn).record(_now(), "pipeline",
-                            {"stations": len(stations), "version": version})
-    return {"ok": True, "changed": True, "warnings": warns, "version": version}
+                            {"stations": len(stations), "version": version,
+                             "revision": revision})
+    return {"ok": True, "changed": True, "warnings": warns,
+            "version": version, "revision": revision}
 
 
 # --------------------------------------------------------------------------- #
@@ -341,7 +335,7 @@ def post_model(body: ModelCreateIn, request: Request,
                                  provider_row.get("reasoning_format") or "openai")
     if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
         raise HTTPException(409, detail=f"model {model_id} 已存在")
-    _refresh_backends(request, conn)
+    _refresh_snapshot(request, conn)
     ChangeRepo(conn).record(_now(), "model", {
         "action": "create", "id": model_id, "upstream": upstream,
         "provider": provider, "profile": body.profile})
@@ -372,7 +366,7 @@ def put_model(model_id: str, body: ModelIn, request: Request,
                                      formats.get(effective, "openai"))
     ModelRepo(conn).update(model_id, upstream=upstream, provider=provider,
                            profile=profile)
-    _refresh_backends(request, conn)
+    _refresh_snapshot(request, conn)
     ChangeRepo(conn).record(_now(), "model", {
         "action": "update", "id": model_id, "upstream": body.upstream,
         "provider": body.provider, "profile": body.profile})
@@ -392,7 +386,7 @@ def delete_model(model_id: str, request: Request,
             "message": f"model {model_id} 被分流树引用，先解除引用再删除",
             "references": refs})
     ModelRepo(conn).delete(model_id)
-    _refresh_backends(request, conn)
+    _refresh_snapshot(request, conn)
     ChangeRepo(conn).record(_now(), "model",
                             {"action": "delete", "id": model_id})
     return {"ok": True, "deleted": model_id}
@@ -457,7 +451,7 @@ def put_provider(name: str, body: ProviderIn, request: Request,
     ProviderRepo(conn).upsert(name, base_url, key_env=key_env,
                               reasoning_format=reasoning_format,
                               api_key=api_key)
-    _refresh_backends(request, conn)
+    _refresh_snapshot(request, conn)
     # Never put the secret itself in the audit trail (/admin/changes is a GET).
     audit = {
         "action": "upsert", "name": name, "base_url": base_url,
@@ -484,7 +478,7 @@ def delete_provider(name: str, request: Request,
             "message": f"provider {name} 被模型引用，先把这些模型改到别的提供方",
             "models": used_by})
     ProviderRepo(conn).delete(name)
-    _refresh_backends(request, conn)
+    _refresh_snapshot(request, conn)
     ChangeRepo(conn).record(_now(), "provider",
                             {"action": "delete", "name": name})
     return {"ok": True, "deleted": name}
@@ -659,8 +653,14 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
             except JevTaggerError:
                 logger.exception("cannot roll back the in-memory question config")
         raise HTTPException(500, detail=f"cannot write question config: {exc}")
-    ChangeRepo(conn).record(_now(), "signal_questions", f"saved {path}")
-    return {"ok": True, "applied": setter is not None, "meta": _tagger_meta(request)}
+    # v15: persist the canonical config revision. The ledger records the
+    # sha captured by the tagger at tag() start, so a request that raced this
+    # save still resolves to the content it actually scored.
+    revision = ensure_questions_revision(conn, cfg)
+    ChangeRepo(conn).record(_now(), "signal_questions",
+                            {"path": str(path), "revision": revision})
+    return {"ok": True, "applied": setter is not None,
+            "revision": revision, "meta": _tagger_meta(request)}
 
 
 @router.get("/requests/recent")
@@ -668,6 +668,12 @@ async def recent_requests(request: Request, limit: int = 20):
     """Newest requests from the in-memory ring (console 'calculation log').
     Detail is never persisted: the ring keeps the last 20 requests only."""
     return {"requests": request.app.state.requestlog.recent_requests(limit)}
+
+
+@router.get("/requests/stats")
+def request_stats(request: Request):
+    """Ledger/ring health (JEV P1-C §3): drop counters are never silent."""
+    return request.app.state.requestlog.stats()
 
 
 # --------------------------------------------------------------------------- #
@@ -680,8 +686,9 @@ class TryIn(BaseModel):
 @router.post("/try")
 async def try_pipeline(body: TryIn, request: Request):
     from router.pipeline.engine import decision_to_dict
+    snapshot = request.app.state.snapshot
     result = await request.app.state.tagger.tag(TagRequest(text=body.text))
-    decision, trace = evaluate(request.app.state.pipeline, result.signals)
+    decision, trace = evaluate(snapshot.stations, result.signals)
     return {"signals": result.signals, "vec_dim": len(result.vec or []),
             # Model-input window (JEV only): tokens read vs. original, so the
             # calibration UI can show when a long paste was head-truncated.
@@ -736,7 +743,7 @@ class EvalIn(BaseModel):
 
 
 async def _eval_pairs(body: EvalIn, request: Request):
-    stations = request.app.state.pipeline
+    stations = request.app.state.snapshot.stations
     pairs: list[tuple] = []
     mismatches: list[dict] = []
     if body.mode == "replay":

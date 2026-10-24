@@ -11,9 +11,15 @@ keeps two slim rows per request, both without text/signals:
 * ``request_ledger`` — the 2026-10-24 action—result ledger (JEV plan §3.1): the
   same record is mutated **in place** once the response is known and enqueued a
   second time, and the flush writes it with ``INSERT OR REPLACE`` on ``id``.
-  A flush that lands between the two events leaves the half row (outcome
-  columns NULL); the next flush overwrites it. Only action/result/version
-  metadata is stored — never the request text, signals/PII or the trace.
+  A flush that lands between the two events leaves a half row
+  (``outcome_state = 'incomplete'``); the next flush overwrites it. Only
+  action/result/version metadata is stored — never the request text,
+  signals/PII or the trace.
+
+Backpressure and failures are counted, never silent (JEV P1-C §3): queue-full
+drops of the half row / of the outcome update, ledger rows left in the
+``incomplete`` terminal state, per-row ledger write failures and whole-batch
+DB connection failures are exposed by :meth:`RequestLogger.stats`.
 
 Single-process only: `python -m router` runs one uvicorn process, so the ring is
 the whole picture. Running multiple workers would split the ring per process and
@@ -48,7 +54,11 @@ LEDGER_COLUMNS = (
     "reasoning", "upstream_model", "upstream_status", "prompt_tokens",
     "completion_tokens", "total_tokens", "routing_ms", "upstream_ms",
     "ttft_ms", "total_ms", "jev_engine", "jev_model", "jev_window",
-    "jev_temperature", "questions_sha256", "pipeline_version", "error_class")
+    "jev_temperature", "questions_sha256", "pipeline_version", "error_class",
+    # v15 (JEV P1-B/C): provenance + terminal state + attribution
+    "pipeline_revision", "questions_revision", "backends_revision",
+    "outcome_state", "experiment_arm", "quality_score", "quality_evaluator",
+    "usage_observed")
 
 _SLIM_INSERT = (
     "INSERT OR REPLACE INTO requests (id, ts, text, decision, model, "
@@ -60,39 +70,6 @@ _LEDGER_INSERT = (
     + ", ".join("?" for _ in LEDGER_COLUMNS) + ")")
 
 
-def _load_pipeline_version(db_path: str) -> int | None:
-    """Read ``settings.pipeline_version`` once, when the logger is built.
-
-    ``RequestLogger`` is constructed during ``create_app``, so this is the app
-    startup read the ledger plan asks for: the hot path never opens the
-    database (design 4.4) — every ledger row copies this cached value. A
-    database without the settings row (unit tests migrate but do not seed) or
-    with a non-numeric value yields NULL instead of failing the boot.
-
-    A runtime pipeline edit does not wait for a restart: ``PUT
-    /admin/pipeline`` (the only bumping write path) hot-syncs this cache right
-    after it saves — see ``routes_admin._sync_ledger_pipeline_version`` — so
-    the request path still never queries the database.
-    """
-    try:
-        conn = connect(db_path)
-    except sqlite3.Error:
-        return None
-    try:
-        row = conn.execute("SELECT value FROM settings WHERE key = ?",
-                           ("pipeline_version",)).fetchone()
-    except sqlite3.Error:
-        return None
-    finally:
-        conn.close()
-    if row is None:
-        return None
-    try:
-        return int(row["value"])
-    except (TypeError, ValueError):
-        return None
-
-
 class RequestLogger:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -102,8 +79,15 @@ class RequestLogger:
         self.recent: deque = deque(maxlen=RECENT_LIMIT)
         self._conf_buckets = [0] * CONF_BUCKETS
         self.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        #: Cached settings.pipeline_version (see _load_pipeline_version).
-        self.pipeline_version = _load_pipeline_version(settings.db_path)
+        # ── drop counters (JEV P1-C §3): never lose rows silently ───────────
+        #: half rows (``enqueue``) dropped because the flush queue was full
+        self.dropped_rows = 0
+        #: outcome updates (``enqueue_result``) dropped for the same reason
+        self.dropped_updates = 0
+        #: ledger rows whose last write still had outcome_state='incomplete'
+        self.partial_rows = 0
+        #: per-row DB write failures while flushing the batch
+        self.ledger_write_failures = 0
 
     # ── memory ring (hot path: synchronous, no I/O) ──────────────────────────
     def enqueue(self, record: dict) -> None:
@@ -116,7 +100,7 @@ class RequestLogger:
         try:
             self._queue.put_nowait(record)
         except asyncio.QueueFull:
-            pass                                   # ring keeps it, DB row dropped
+            self.dropped_rows += 1                 # ring keeps it, DB row dropped
 
     def enqueue_result(self, record: dict) -> None:
         """Queue the outcome update for an already-logged record.
@@ -133,7 +117,7 @@ class RequestLogger:
         try:
             self._queue.put_nowait(record)
         except asyncio.QueueFull:
-            pass                      # half row stays; ring still has the outcome
+            self.dropped_updates += 1  # half row stays; ring still has the outcome
 
     def recent_requests(self, limit: int = RECENT_LIMIT) -> list[dict]:
         """Newest first, capped at the ring size (console log page)."""
@@ -157,6 +141,20 @@ class RequestLogger:
         return [{"lo": i / CONF_BUCKETS, "hi": (i + 1) / CONF_BUCKETS,
                  "count": self._conf_buckets[i]}
                 for i in range(CONF_BUCKETS)]
+
+    def stats(self) -> dict:
+        """Ring/queue/ledger health for GET /admin/requests/stats (P1-C)."""
+        return {
+            "started_at": self.started_at,
+            "ring_size": len(self.recent),
+            "ring_limit": RECENT_LIMIT,
+            "queue_size": self._queue.qsize(),
+            "queue_limit": FLUSH_QUEUE_LIMIT,
+            "dropped_rows": self.dropped_rows,
+            "dropped_updates": self.dropped_updates,
+            "partial_rows": self.partial_rows,
+            "ledger_write_failures": self.ledger_write_failures,
+        }
 
     # ── DB flush: slim rows only ─────────────────────────────────────────────
     async def start(self) -> None:
@@ -189,7 +187,16 @@ class RequestLogger:
             batch.append(self._queue.get_nowait())
         if not batch:
             return
-        conn = connect(self.settings.db_path)
+        try:
+            conn = connect(self.settings.db_path)
+        except sqlite3.Error:
+            # The whole batch is lost: count it (the ring keeps the detail).
+            self.ledger_write_failures += len(batch)
+            raise
+        # ids whose LAST write in this batch is still a half row (the same batch
+        # often carries the half row followed by its outcome update; REPLACE
+        # overwrites it, so only the rows left incomplete are counted).
+        incomplete: set[str] = set()
         try:
             with conn:
                 for r in batch:
@@ -197,17 +204,31 @@ class RequestLogger:
                     # The result-update event repeats the identical row (all its
                     # inputs are decision-time values), so the upsert is a no-op
                     # there and the original semantics are untouched.
-                    conn.execute(
-                        _SLIM_INSERT,
-                        (r["id"], r["ts"], "", r["decision"], r.get("model"),
-                         r.get("station_id"), r.get("leaf_id"), r.get("score"),
-                         r.get("latency_ms")))
-                    # action—result ledger: same id, first the half row (outcome
-                    # columns NULL), later the in-place outcome update replaces
-                    # it. Only LEDGER_COLUMNS are selected, so no text/signals
-                    # can ever leak into the ledger even though the ring record
-                    # carries them.
-                    conn.execute(_LEDGER_INSERT,
-                                 tuple(r.get(c) for c in LEDGER_COLUMNS))
+                    try:
+                        conn.execute(
+                            _SLIM_INSERT,
+                            (r["id"], r["ts"], "", r["decision"],
+                             r.get("model"), r.get("station_id"),
+                             r.get("leaf_id"), r.get("score"),
+                             r.get("latency_ms")))
+                        # action—result ledger: same id, first the half row
+                        # (outcome_state='incomplete'), later the in-place
+                        # outcome update replaces it. Only LEDGER_COLUMNS are
+                        # selected, so no text/signals can ever leak into the
+                        # ledger even though the ring record carries them.
+                        conn.execute(_LEDGER_INSERT,
+                                     tuple(r.get(c) for c in LEDGER_COLUMNS))
+                    except sqlite3.Error:
+                        # A single bad row must not drop the rest of the batch,
+                        # and it must not be silent (P1-C: counter + log).
+                        self.ledger_write_failures += 1
+                        logger.exception("ledger row write failed id=%s",
+                                         r.get("id"))
+                        continue
+                    if r.get("outcome_state") == "incomplete":
+                        incomplete.add(r["id"])
+                    else:
+                        incomplete.discard(r["id"])
         finally:
             conn.close()
+        self.partial_rows += len(incomplete)

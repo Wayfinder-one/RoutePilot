@@ -11,7 +11,7 @@ def test_migrate_idempotent_and_wal(tmp_path):
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"stations", "nodes", "branches", "branch_rows", "models", "providers",
             "keyword_groups", "settings", "requests",
-            "changes", "evals", "request_ledger",
+            "changes", "evals", "request_ledger", "config_revisions",
             "schema_migrations"} <= tables
     assert "request_signals" not in tables      # v10 dropped the dead table
     assert "sessions" not in tables      # v11 dropped it
@@ -19,8 +19,9 @@ def test_migrate_idempotent_and_wal(tmp_path):
     conn.close()
 
 
-def test_migration_14_creates_the_action_result_ledger(tmp_path):
-    """JEV plan §3.1: v14 adds request_ledger and leaves `requests` alone.
+def test_migrations_14_15_create_the_action_result_ledger(tmp_path):
+    """JEV plan §3.1 + P1-B/C: v14 adds request_ledger, v15 appends provenance/
+    terminal-state columns and config_revisions; `requests` stays slim.
 
     The ledger is the iteration's deliberate addition (the 2026-10-20 decision
     to keep `requests` slim stands): one row per request with action, outcome
@@ -36,12 +37,17 @@ def test_migration_14_creates_the_action_result_ledger(tmp_path):
     ledger_columns = [r[1] for r in conn.execute(
         "PRAGMA table_info(request_ledger)")]
     assert ledger_columns == [
+        # v14
         "id", "ts", "decision", "model", "station_id", "leaf_id", "score",
         "reasoning", "upstream_model", "upstream_status", "prompt_tokens",
         "completion_tokens", "total_tokens", "routing_ms", "upstream_ms",
         "ttft_ms", "total_ms", "jev_engine", "jev_model", "jev_window",
         "jev_temperature", "questions_sha256", "pipeline_version",
-        "error_class"]
+        "error_class",
+        # v15 (JEV P1-B/C)
+        "pipeline_revision", "questions_revision", "backends_revision",
+        "outcome_state", "experiment_arm", "quality_score",
+        "quality_evaluator", "usage_observed"]
     assert not {"text", "signals", "trace"} & set(ledger_columns)
 
     # v14 must NOT alter the slim contract of the existing requests table.
@@ -77,8 +83,72 @@ def test_migration_14_upgrades_a_v13_database(tmp_path):
     migrate(conn)
     assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM request_ledger").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 0
     assert conn.execute("SELECT MAX(version) FROM schema_migrations"
                         ).fetchone()[0] == len(MIGRATIONS)
+    conn.close()
+
+
+def test_migration_15_adds_config_revisions_and_keeps_v14_rows(tmp_path):
+    """v15 is additive: existing v14 ledger rows gain NULL provenance columns."""
+    import sqlite3
+
+    from router.store.db import MIGRATIONS
+
+    path = str(tmp_path / "v14.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
+    for i, script in enumerate(MIGRATIONS[:14], start=1):
+        conn.executescript(script)
+        conn.execute("INSERT INTO schema_migrations VALUES (?)", (i,))
+    conn.execute("INSERT INTO request_ledger (id, ts, decision) "
+                 "VALUES ('old', '2026-10-01T10:00:00', 'route')")
+    conn.commit()
+    conn.close()
+
+    conn = connect(path)
+    migrate(conn)
+    migrate(conn)                           # idempotent on v15 too
+    ledger = conn.execute("SELECT * FROM request_ledger WHERE id='old'").fetchone()
+    assert ledger["outcome_state"] is None  # pre-v15 row, no invented terminal
+    assert ledger["pipeline_revision"] is None
+    assert ledger["usage_observed"] is None
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "config_revisions" in tables
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] == len(MIGRATIONS)
+    conn.close()
+
+
+def test_config_revisions_are_append_only_and_deduped(tmp_path):
+    """UNIQUE(kind, sha256): re-recording identical content keeps the original
+    row (history is never rewritten); a different content adds a new row."""
+    from router.store.repositories import ConfigRevisionRepo
+
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+    repo = ConfigRevisionRepo(conn)
+
+    sha_a = repo.record("pipeline", '{"stations":[]}')
+    assert sha_a == repo.record("pipeline", '{"stations":[]}')   # dedup
+    sha_b = repo.record("pipeline", '{"stations":[1]}')
+    assert sha_a != sha_b
+    assert repo.get("pipeline", sha_a)["content"] == '{"stations":[]}'
+    assert repo.latest("pipeline")["sha256"] == sha_b
+    # kind is part of the identity: the same content under another kind is a
+    # separate revision row.
+    repo.record("questions", '{"stations":[]}')
+    assert conn.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 3
+    conn.close()
+
+
+def test_config_revisions_columns(tmp_path):
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+    assert [r[1] for r in conn.execute(
+        "PRAGMA table_info(config_revisions)")] == [
+        "id", "kind", "sha256", "content", "created_at"]
     conn.close()
 
 

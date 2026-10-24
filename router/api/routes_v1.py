@@ -1,20 +1,28 @@
-"""OpenAI-compatible entry: tag -> evaluate -> forward. The pipeline and the
-backend map are in-memory snapshots (design 4.4); routing never opens the
-database — only the async request logger (and the breaker's low-rate sync)
-touches it.
+"""OpenAI-compatible entry: tag -> evaluate -> forward.
 
-Every request that reaches a routing decision also lands one ``request_ledger``
-row (JEV plan §3.1): the record enqueued before the upstream call is the half
-row (action only); after the response is known its outcome fields are filled in
-place and a second flush event overwrites the row by id. That is how 200 vs
-upstream 500 become distinguishable, and how the ledger records the real
-upstream status (the client still sees the mapped 502), the upstream model,
-token usage, routing/upstream/TTFT/total durations, the error class, and the
-pipeline/tagger versions. No request text, signals or PII reach the ledger.
+JEV P1-B: a request reads the immutable ``app.state.snapshot`` ONCE at entry
+and uses that same snapshot for the trimming scope, the decision and every
+ledger version field. A concurrent ``PUT /admin/pipeline`` / model write
+publishes a new snapshot with one assignment; the in-flight request keeps the
+old one, so the ledger revision always describes the configuration that
+actually produced the decision (previously the tree was read before tagging
+and the versions after, which could disagree).
+
+JEV P1-C: each request finishes in exactly one terminal state, recorded in
+``request_ledger.outcome_state`` by an exactly-once recorder:
+``completed / upstream_error / client_disconnected / cancelled / incomplete``.
+The streaming relay reports ``completed`` only when the upstream iterator is
+exhausted normally; GeneratorExit (client went away) and CancelledError are
+classified separately and re-raised, never swallowed.
+
+The ledger record is enqueued before the upstream call (the half row) and
+mutated in place once the response is known; the flush overwrites the row by
+id. No request text, signals or PII reach the ledger.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -47,6 +55,22 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 #: buffer without bound while we merely look for optional usage data.
 MAX_SSE_LINE_BYTES = 1024 * 1024
 
+# ── terminal states (JEV P1-C §3) ───────────────────────────────────────────
+OUTCOME_COMPLETED = "completed"
+OUTCOME_UPSTREAM_ERROR = "upstream_error"
+OUTCOME_CLIENT_DISCONNECTED = "client_disconnected"
+OUTCOME_CANCELLED = "cancelled"
+OUTCOME_INCOMPLETE = "incomplete"
+OUTCOME_STATES = (OUTCOME_COMPLETED, OUTCOME_UPSTREAM_ERROR,
+                  OUTCOME_CLIENT_DISCONNECTED, OUTCOME_CANCELLED,
+                  OUTCOME_INCOMPLETE)
+
+#: Optional experiment/arm attribution supplied by the caller (window A/B,
+#: cheap-vs-strong rollouts, ...). Kept small and opaque: the ledger only
+#: groups by it.
+EXPERIMENT_ARM_HEADER = "x-sr-experiment-arm"
+MAX_EXPERIMENT_ARM = 64
+
 
 def _last_user_text(messages: list) -> str:
     for msg in reversed(messages):
@@ -60,46 +84,53 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
-def _tagger_info(tagger) -> dict:
-    """``tagger.info()`` (JEV plan §1.3) read per request, guarded.
+def _tagger_fingerprint(result) -> dict:
+    """Ledger version columns from the tagger's per-tag fingerprint (P1-A).
 
-    Taggers without the optional interface (heuristic/checkpoint/prompt) yield
-    ``{}``: the ledger's ``jev_*``/``questions_sha256`` columns stay NULL. The
-    call is cheap by contract (a dict of versions, not model work) and is NOT
-    cached on purpose: a hot question-config edit must change
-    ``questions_sha256`` on the next request. Reproducibility metadata must
-    never break a request, so any failure degrades to ``{}``.
+    ``TagResult.questions_sha256`` is captured by the tagger at tag() start and
+    ``TagResult.tagger_info`` is its frozen ``info()`` snapshot — both describe
+    the model/question pack that actually scored THIS request, so no tagger
+    state is re-read after the response (which would race a hot edit). Taggers
+    that do not provide them (heuristic/checkpoint/prompt) leave the columns
+    NULL.
     """
-    info = getattr(tagger, "info", None)
-    if not callable(info):
-        return {}
-    try:
-        meta = info()
-    except Exception:                      # noqa: BLE001 - metadata only
-        logger.warning("tagger.info() failed; ledger version fields are null",
-                       exc_info=True)
-        return {}
-    return meta if isinstance(meta, dict) else {}
-
-
-def _version_fields(request) -> dict:
-    """The ledger's reproduction columns (pipeline + JEV question/model versions).
-
-    ``pipeline_version`` is the settings value cached by the ``RequestLogger``
-    (read at startup, hot-synced by the admin pipeline write; the hot path must
-    not query the DB); the rest comes from the tagger's optional ``info()``.
-    ``jev_window`` is the input window actually scored (JEV plan §2.1), so
-    window A/B traffic can be split by ledger rows.
-    """
-    info = _tagger_info(request.app.state.tagger)
+    info = getattr(result, "tagger_info", None)
+    if not isinstance(info, dict):
+        info = {}
+    question_sha = getattr(result, "questions_sha256", None)
+    if question_sha is None:                   # tolerate info-only taggers
+        question_sha = info.get("questions_sha256")
     return {
-        "pipeline_version": request.app.state.requestlog.pipeline_version,
+        # v15 provenance column + v14 compatibility column (same canonical sha)
+        "questions_revision": question_sha,
+        "questions_sha256": question_sha,
         "jev_engine": info.get("engine"),
         "jev_model": info.get("model_name") or info.get("model_dir"),
         "jev_window": info.get("window"),
         "jev_temperature": info.get("temperature"),
-        "questions_sha256": info.get("questions_sha256"),
     }
+
+
+def _version_fields(snapshot, result) -> dict:
+    """Reproduction columns: the snapshot's revisions + the tagger fingerprint.
+
+    Nothing is read from app.state/tagger here beyond the already-materialized
+    TagResult (P1-B: no post-tagging re-read, no request-time DB access).
+    """
+    return {
+        "pipeline_version": snapshot.pipeline_version,
+        "pipeline_revision": snapshot.pipeline_revision,
+        "backends_revision": snapshot.backends_revision,
+        **_tagger_fingerprint(result),
+    }
+
+
+def _experiment_arm(request: Request) -> str | None:
+    arm = request.headers.get(EXPERIMENT_ARM_HEADER)
+    if not arm:
+        return None
+    arm = arm.strip()[:MAX_EXPERIMENT_ARM]
+    return arm or None
 
 
 def _usage_fields(usage) -> dict:
@@ -114,30 +145,64 @@ def _usage_fields(usage) -> dict:
     return fields
 
 
-def _record_outcome(requestlog, record: dict, started: float, *,
-                    error_class: str | None,
-                    upstream_model: str | None = None,
-                    upstream_status: int | None = None,
-                    upstream_ms: float | None = None,
-                    ttft_ms: float | None = None,
-                    usage: dict | None = None) -> None:
-    """Fill the outcome into the ring record and queue the ledger update.
+async def _is_disconnected(request) -> bool:
+    """Client-disconnect probe used by the streaming relay (P1-C)."""
+    if request is None:
+        return False
+    try:
+        return bool(await request.is_disconnected())
+    except BaseException:                      # noqa: BLE001 - never break the relay
+        return False
 
-    Called exactly once on every exit path (block / no route / unknown model /
-    circuit open / upstream error / success / stream end). The ring holds this
-    same dict, so the console log sees the outcome; the flush replaces the half
-    row on the ``id`` primary key.
+
+class _OutcomeRecorder:
+    """Exactly-once terminal update for one request_ledger record (P1-C §3).
+
+    Every exit path calls :meth:`finish`; the first call wins and the guard
+    makes a duplicate (double-finally, aborted stream, handler + relay racing)
+    a no-op instead of a second queued update. The ring dict and the flush
+    event are the same object, so the console and the ledger agree.
     """
-    record.update({
-        "upstream_model": upstream_model,
-        "upstream_status": upstream_status,
-        "upstream_ms": upstream_ms,
-        "ttft_ms": ttft_ms,
-        "total_ms": (time.monotonic() - started) * 1000.0,
-        "error_class": error_class,
-        **_usage_fields(usage),
-    })
-    requestlog.enqueue_result(record)
+
+    __slots__ = ("requestlog", "record", "started", "_done")
+
+    def __init__(self, requestlog, record: dict, started: float):
+        self.requestlog = requestlog
+        self.record = record
+        self.started = started
+        self._done = False
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    def finish(self, *, outcome_state: str,
+               error_class: str | None = None,
+               upstream_model: str | None = None,
+               upstream_status: int | None = None,
+               upstream_ms: float | None = None,
+               ttft_ms: float | None = None,
+               usage: dict | None = None) -> bool:
+        if outcome_state not in OUTCOME_STATES:
+            raise ValueError(f"unknown outcome_state {outcome_state!r}")
+        if self._done:
+            return False
+        self._done = True
+        tokens = _usage_fields(usage)
+        observed = any(value is not None for value in tokens.values())
+        self.record.update({
+            "upstream_model": upstream_model,
+            "upstream_status": upstream_status,
+            "upstream_ms": upstream_ms,
+            "ttft_ms": ttft_ms,
+            "total_ms": (time.monotonic() - self.started) * 1000.0,
+            "error_class": error_class,
+            "outcome_state": outcome_state,
+            "usage_observed": 1 if observed else 0,
+            **tokens,
+        })
+        self.requestlog.enqueue_result(self.record)
+        return True
 
 
 class _SseUsage:
@@ -223,18 +288,20 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=400,
                             content={"error": {"message": "messages_must_be_list"}})
     text = _last_user_text(messages)
+    # JEV P1-B: ONE snapshot for the whole request — trimming scope, decision,
+    # backend resolution and ledger provenance all come from this object. A
+    # concurrent admin write replaces app.state.snapshot atomically; this
+    # request keeps the configuration it started with.
+    snapshot = request.app.state.snapshot
+    tagger = request.app.state.tagger
+    requestlog = request.app.state.requestlog
     # Ledger `routing_ms`: from the fully read body to the finished decision.
     routing_started = time.monotonic()
-    tagger = request.app.state.tagger
-    # One snapshot for both the trimming hint and the decision: a concurrent
-    # PUT /admin/pipeline swaps the whole list atomically, and reading it twice
-    # could score the old tree but evaluate the new one.
-    stations = request.app.state.pipeline
     # Pipeline-aware trimming (docs/pipeline-aware-trimming.md): score only the
     # JEV questions this tree can read. The tagger ignores the hint when it does
     # not implement trimming (heuristic/checkpoint/prompt modes).
-    scope = (compute_signal_scope(stations)
-             if request.app.state.settings.jev_trim else None)
+    scope = (compute_signal_scope(snapshot.stations)
+             if snapshot.jev_trim else None)
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages),
         scope=scope))
@@ -242,7 +309,7 @@ async def chat_completions(request: Request):
     # no session state (2026-10-21: session stickiness removed — vanilla
     # clients carry no reliable conversation identity; see
     # docs/superpowers/specs/2026-10-21-remove-session-stickiness.md).
-    decision, trace = evaluate(stations, result.signals)
+    decision, trace = evaluate(snapshot.stations, result.signals)
     routing_ms = (time.monotonic() - routing_started) * 1000.0
 
     # ---- upstream body + reasoning injection (§6) -------------------------
@@ -257,7 +324,7 @@ async def chat_completions(request: Request):
     reasoning_warning = None
     if decision.kind == "route" and decision.model:
         try:
-            backend = resolve_backend(request.app.state.backends, decision.model)
+            backend = resolve_backend(snapshot.backends, decision.model)
         except KeyError:
             backend = None
         if backend is not None:
@@ -278,11 +345,10 @@ async def chat_completions(request: Request):
     # Input window actually scored by the model signals (JEV head-truncates the
     # request text; heuristic/checkpoint read the full text and report {}).
     window = result.input or {}
-    requestlog = request.app.state.requestlog
     # The record is enqueued BEFORE the upstream call (the requests half row is
     # written as soon as the decision is known) and mutated in place once the
-    # outcome is known — see _record_outcome. Detail (text/signals/trace) stays
-    # memory-only: the ledger flush selects only action/outcome/version columns.
+    # outcome is known — see _OutcomeRecorder. Detail (text/signals/trace)
+    # stays memory-only: the ledger flush selects only metadata columns.
     record = {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -298,38 +364,43 @@ async def chat_completions(request: Request):
         "input_truncated": bool(window.get("input_truncated", False)),
         "latency_ms": (time.monotonic() - started) * 1000,
         "trace": trace, "signals": result.signals,
-        # Ledger metadata known already at decision time (design §3.1).
+        # Ledger metadata known already at decision time (design §3.1/P1-B).
         "routing_ms": routing_ms,
-        **_version_fields(request),
-        # Outcome placeholders (filled in place by _record_outcome once the
-        # response is known). Keeping the keys from the start gives the console
-        # a stable record shape even while a stream is still running.
+        **_version_fields(snapshot, result),
+        "experiment_arm": _experiment_arm(request),
+        # Outcome placeholders (filled exactly once by the recorder).
         "upstream_model": None, "upstream_status": None,
         "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
         "upstream_ms": None, "ttft_ms": None, "total_ms": None,
         "error_class": None,
+        "outcome_state": OUTCOME_INCOMPLETE,
+        "quality_score": None, "quality_evaluator": None,
+        "usage_observed": 0,
     }
     requestlog.enqueue(record)
+    outcome = _OutcomeRecorder(requestlog, record, started)
 
     if decision.kind == "block":
-        _record_outcome(requestlog, record, started, error_class=None)
+        # A decision that never calls an upstream is a COMPLETED request (the
+        # action outcome — block — is what the caller received).
+        outcome.finish(outcome_state=OUTCOME_COMPLETED)
         return JSONResponse(status_code=403, content={
             "error": {"message": BLOCK_MESSAGE, "code": "blocked_by_policy"}})
     if decision.kind != "route" or not decision.model:
-        _record_outcome(requestlog, record, started, error_class="no_route")
+        outcome.finish(outcome_state=OUTCOME_COMPLETED, error_class="no_route")
         return JSONResponse(status_code=502,
                             content={"error": {"message": "no_route"}})
     if backend is None:
-        _record_outcome(requestlog, record, started,
-                        error_class="unknown_model")
+        outcome.finish(outcome_state=OUTCOME_COMPLETED,
+                       error_class="unknown_model")
         return JSONResponse(status_code=502,
                             content={"error": {"message": "unknown_model"}})
 
     breaker = request.app.state.breaker
     if breaker.is_open(decision.model):
-        _record_outcome(requestlog, record, started,
-                        error_class="circuit_open",
-                        upstream_model=backend.upstream_name)
+        outcome.finish(outcome_state=OUTCOME_COMPLETED,
+                       error_class="circuit_open",
+                       upstream_model=backend.upstream_name)
         return JSONResponse(status_code=503, content={
             "error": {"message": "model_circuit_open", "model": decision.model}})
 
@@ -343,16 +414,16 @@ async def chat_completions(request: Request):
     try:
         if body.get("stream"):
             return await _stream(client, backend, upstream_body, headers,
-                                 breaker, decision.model, record=record,
-                                 requestlog=requestlog, started=started)
+                                 breaker, decision.model, outcome=outcome,
+                                 request=request, started=started)
         resp = await client.post(backend.url, json=upstream_body,
                                  headers=backend.headers)
     except httpx.HTTPError:
         breaker.failure(decision.model)
-        _record_outcome(requestlog, record, started,
-                        error_class="upstream_error",
-                        upstream_model=backend.upstream_name,
-                        upstream_ms=(time.monotonic() - upstream_started) * 1000.0)
+        outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
+                       error_class="upstream_error",
+                       upstream_model=backend.upstream_name,
+                       upstream_ms=(time.monotonic() - upstream_started) * 1000.0)
         return JSONResponse(status_code=502,
                             content={"error": {"message": "upstream_error"}},
                             headers=headers)
@@ -361,11 +432,11 @@ async def chat_completions(request: Request):
         breaker.failure(decision.model)
         # The ledger keeps the REAL upstream status; the client keeps seeing the
         # mapped 502 (external contract unchanged).
-        _record_outcome(requestlog, record, started,
-                        error_class="upstream_error",
-                        upstream_model=backend.upstream_name,
-                        upstream_status=resp.status_code,
-                        upstream_ms=upstream_ms)
+        outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
+                       error_class="upstream_error",
+                       upstream_model=backend.upstream_name,
+                       upstream_status=resp.status_code,
+                       upstream_ms=upstream_ms)
         return JSONResponse(status_code=502,
                             content={"error": {"message": "upstream_error"}},
                             headers=headers)
@@ -380,18 +451,80 @@ async def chat_completions(request: Request):
         content = resp.json()
     except json.JSONDecodeError:
         content = {"raw": resp.text}
-    _record_outcome(requestlog, record, started,
-                    error_class=None if resp.status_code < 400 else "client_4xx",
-                    upstream_model=backend.upstream_name,
-                    upstream_status=resp.status_code,
-                    upstream_ms=upstream_ms,
-                    usage=content.get("usage") if isinstance(content, dict) else None)
+    outcome.finish(
+        outcome_state=OUTCOME_COMPLETED,
+        error_class=None if resp.status_code < 400 else "client_4xx",
+        upstream_model=backend.upstream_name,
+        upstream_status=resp.status_code,
+        upstream_ms=upstream_ms,
+        usage=content.get("usage") if isinstance(content, dict) else None)
     return JSONResponse(status_code=resp.status_code, content=content,
                         headers=headers)
 
 
+def _relay(resp, *, outcome, request, backend, upstream_started: float,
+           upstream_ms: float):
+    """The real SSE relay: classify the terminal state, then finalize once.
+
+    Returned as an async generator so the streaming tests can drive every
+    terminal path (normal EOF, upstream exception, client disconnect before the
+    first chunk, mid-stream disconnect via ``aclose()``, cancellation) without
+    a network stack. ``GeneratorExit``/``CancelledError`` are re-raised: the
+    disconnect/cancel must propagate, only the ledger classification differs.
+    """
+    async def generator():
+        usage_sniffer = _SseUsage()
+        first_chunk_at: float | None = None
+        state = OUTCOME_INCOMPLETE
+        try:
+            # A client that already went away before the first chunk: nothing
+            # will be sent, so the request is a disconnect, not a completion.
+            if await _is_disconnected(request):
+                state = OUTCOME_CLIENT_DISCONNECTED
+                return
+            async for chunk in resp.aiter_raw():
+                if first_chunk_at is None:       # TTFT: first byte of the body
+                    first_chunk_at = time.monotonic()
+                usage_sniffer.feed(chunk)
+                yield chunk
+            # Only a normally exhausted upstream iterator is "completed".
+            state = OUTCOME_COMPLETED
+        except GeneratorExit:
+            # The consumer closed us (client disconnected / response aborted).
+            state = OUTCOME_CLIENT_DISCONNECTED
+            raise
+        except asyncio.CancelledError:
+            # Task cancellation; a concurrent detected disconnect is still a
+            # disconnect. Re-raise so the cancellation is never swallowed.
+            state = (OUTCOME_CLIENT_DISCONNECTED
+                     if await _is_disconnected(request) else OUTCOME_CANCELLED)
+            raise
+        except Exception:                        # noqa: BLE001 - upstream/transport
+            state = OUTCOME_UPSTREAM_ERROR
+            raise
+        finally:
+            try:
+                await resp.aclose()
+            except Exception:                    # noqa: BLE001 - close is best effort
+                logger.warning("upstream stream close failed", exc_info=True)
+            ttft_ms = (None if first_chunk_at is None
+                       else (first_chunk_at - upstream_started) * 1000.0)
+            usage_sniffer.finish()               # trailing line without '\n'
+            outcome.finish(
+                outcome_state=state,
+                error_class=("upstream_error"
+                             if state == OUTCOME_UPSTREAM_ERROR else None),
+                upstream_model=backend.upstream_name,
+                upstream_status=resp.status_code,
+                upstream_ms=upstream_ms,
+                ttft_ms=ttft_ms,
+                usage=usage_sniffer.usage)
+
+    return generator()
+
+
 async def _stream(client, backend, body, headers, breaker, model, *,
-                  record, requestlog, started):
+                  outcome, request, started):
     # Streaming has its own timeout policy: the global 60s read timeout would
     # cut a slow-but-alive stream (a thinking model can pause for a minute
     # before its first token). Connect/write stay bounded; the read timeout is
@@ -413,11 +546,11 @@ async def _stream(client, backend, body, headers, breaker, model, *,
         await resp.aclose()
         if resp.status_code >= 500:
             breaker.failure(model)
-            _record_outcome(requestlog, record, started,
-                            error_class="upstream_error",
-                            upstream_model=backend.upstream_name,
-                            upstream_status=resp.status_code,
-                            upstream_ms=upstream_ms)
+            outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
+                           error_class="upstream_error",
+                           upstream_model=backend.upstream_name,
+                           upstream_status=resp.status_code,
+                           upstream_ms=upstream_ms)
             return JSONResponse(status_code=502,
                                 content={"error": {"message": "upstream_error"}},
                                 headers=headers)
@@ -428,44 +561,15 @@ async def _stream(client, backend, body, headers, breaker, model, *,
             content = json.loads(raw)
         except (ValueError, TypeError):
             content = {"raw": raw.decode("utf-8", "replace")}
-        _record_outcome(requestlog, record, started,
-                        error_class="client_4xx",
-                        upstream_model=backend.upstream_name,
-                        upstream_status=resp.status_code,
-                        upstream_ms=upstream_ms)
+        outcome.finish(outcome_state=OUTCOME_COMPLETED,
+                       error_class="client_4xx",
+                       upstream_model=backend.upstream_name,
+                       upstream_status=resp.status_code,
+                       upstream_ms=upstream_ms)
         return JSONResponse(status_code=resp.status_code, content=content,
                             headers=headers)
     breaker.success(model)
-
-    async def relay():
-        usage_sniffer = _SseUsage()
-        first_chunk_at: float | None = None
-        error_class: str | None = None
-        try:
-            async for chunk in resp.aiter_raw():
-                if first_chunk_at is None:       # TTFT: first byte of the body
-                    first_chunk_at = time.monotonic()
-                usage_sniffer.feed(chunk)
-                yield chunk
-        except Exception:                        # noqa: BLE001 - mid-stream break
-            error_class = "upstream_error"
-            raise
-        finally:
-            try:
-                await resp.aclose()
-            except Exception:                    # noqa: BLE001 - close is best effort
-                logger.warning("upstream stream close failed", exc_info=True)
-            ttft_ms = (None if first_chunk_at is None
-                       else (first_chunk_at - upstream_started) * 1000.0)
-            usage_sniffer.finish()               # trailing line without '\n'
-            # Stream end: the ledger row (and the ring) get the full outcome.
-            _record_outcome(requestlog, record, started,
-                            error_class=error_class,
-                            upstream_model=backend.upstream_name,
-                            upstream_status=resp.status_code,
-                            upstream_ms=upstream_ms,
-                            ttft_ms=ttft_ms,
-                            usage=usage_sniffer.usage)
-
-    return StreamingResponse(relay(), media_type="text/event-stream",
-                             headers=headers)
+    return StreamingResponse(
+        _relay(resp, outcome=outcome, request=request, backend=backend,
+               upstream_started=upstream_started, upstream_ms=upstream_ms),
+        media_type="text/event-stream", headers=headers)

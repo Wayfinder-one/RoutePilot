@@ -57,73 +57,170 @@ def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
     assert len(c.get("/admin/changes").json()["changes"]) == changes_before + 1
 
 
-def test_put_pipeline_hot_syncs_the_ledger_version(tmp_path):
-    """C2: the pipeline write is the only version bump; the ledger cache
-    follows in the same process (no restart) and the next /v1 request records
-    the new version — without adding a DB read to the hot path."""
-    def ok(request):
-        return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
+def _ok(request):
+    return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
 
+
+def test_put_pipeline_publishes_a_new_snapshot_and_ledger_revision(tmp_path):
+    """P1-B: the admin write swaps the immutable snapshot (one assignment) and
+    the next request routes + ledgers with the NEW revision, no restart."""
     app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=httpx.MockTransport(ok))
+                     transport=httpx.MockTransport(_ok))
     c = TestClient(app)
-    before = app.state.requestlog.pipeline_version
-    assert isinstance(before, int)
+    before = app.state.snapshot
 
     body = c.get("/admin/pipeline").json()
     body["stations"][3]["root"]["model"] = "qwen3-32b"
     r = c.put("/admin/pipeline", json=body)
     assert r.status_code == 200 and r.json()["changed"] is True
-    new_version = int(r.json()["version"])
-    assert new_version == before + 1
-    assert app.state.requestlog.pipeline_version == new_version   # hot-synced
+    after = app.state.snapshot
+    assert after is not before
+    assert after.pipeline_version == before.pipeline_version + 1
+    assert after.pipeline_revision != before.pipeline_revision
+    assert r.json()["revision"] == after.pipeline_revision
 
     r = c.post("/v1/chat/completions",
                json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
     assert r.status_code == 200
     record = app.state.requestlog.recent_requests(1)[0]
-    assert record["pipeline_version"] == new_version
+    assert record["model"] == "qwen3-32b"
+    assert record["pipeline_revision"] == after.pipeline_revision
+    assert record["pipeline_version"] == after.pipeline_version
     asyncio.run(app.state.requestlog.flush())
 
     conn = connect(app.state.settings.db_path)
     try:
-        row = conn.execute("SELECT pipeline_version FROM request_ledger "
-                           "WHERE id = ?", (record["id"],)).fetchone()
+        row = conn.execute("SELECT pipeline_version, pipeline_revision "
+                           "FROM request_ledger WHERE id = ?",
+                           (record["id"],)).fetchone()
     finally:
         conn.close()
-    assert row is not None and row["pipeline_version"] == new_version
+    assert row is not None and row["pipeline_revision"] == after.pipeline_revision
 
 
-def test_ledger_version_sync_tolerates_missing_logger_and_bad_values():
-    """Best effort: a bare app (no requestlog) or a malformed stored value
-    must not fail the admin write or clobber the cache."""
-    from types import SimpleNamespace
-
-    from router.api.routes_admin import _sync_ledger_pipeline_version
-    state = SimpleNamespace(requestlog=SimpleNamespace(pipeline_version=3))
-    request = SimpleNamespace(app=SimpleNamespace(state=state))
-
-    _sync_ledger_pipeline_version(request, "not-a-number")   # ignored
-    assert state.requestlog.pipeline_version == 3
-    _sync_ledger_pipeline_version(request, None)             # ignored
-    assert state.requestlog.pipeline_version == 3
-    _sync_ledger_pipeline_version(request, "4")              # applied
-    assert state.requestlog.pipeline_version == 4
-
-    # an app without a logger (bare/heuristic harness) must not raise
-    bare = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
-    _sync_ledger_pipeline_version(bare, "5")
-
-
-def test_put_pipeline_noop_leaves_the_ledger_version_alone(tmp_path):
-    """No bump -> no sync: a no-op save must not disturb the ledger cache."""
-    c = client(tmp_path)
-    app = c.app
-    before = app.state.requestlog.pipeline_version
+def test_put_pipeline_noop_keeps_the_snapshot_and_revision(tmp_path):
+    """No content change -> no new snapshot, no bump, no new revision row."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")))
+    c = TestClient(app)
+    before = app.state.snapshot
     body = c.get("/admin/pipeline").json()
     r = c.put("/admin/pipeline", json=body)
     assert r.json()["changed"] is False
-    assert app.state.requestlog.pipeline_version == before
+    assert app.state.snapshot is before
+    assert app.state.snapshot.pipeline_revision == before.pipeline_revision
+
+
+def test_startup_records_the_current_pipeline_revision(tmp_path):
+    """v15 backfill: a fresh boot stores the served tree in config_revisions
+    and settings.pipeline_revision, so even the first ledger row is replayable."""
+    from router.pipeline.snapshot import canonical_json, sha256_text
+    from router.store.repositories import ConfigRevisionRepo, SettingsRepo
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")))
+    snapshot = app.state.snapshot
+    conn = connect(app.state.settings.db_path)
+    try:
+        revision = ConfigRevisionRepo(conn).get("pipeline",
+                                                snapshot.pipeline_revision)
+        stored_setting = SettingsRepo(conn).get("pipeline_revision")
+    finally:
+        conn.close()
+    assert revision is not None
+    assert stored_setting == snapshot.pipeline_revision
+    content = revision["content"]
+    assert canonical_json(json.loads(content)) == content
+    assert sha256_text(content) == snapshot.pipeline_revision
+
+
+def test_pipeline_history_is_append_only_and_replayable(tmp_path):
+    """Each save appends a revision; older content is kept and round-trips back
+    to stations with the same sha (the offline replay contract)."""
+    from router.pipeline.model import station_from_dict
+    from router.pipeline.snapshot import pipeline_revision_of
+
+    c = client(tmp_path)
+    pipe = c.get("/admin/pipeline").json()
+    first = c.put("/admin/pipeline", json={
+        **pipe, "stations": pipe["stations"]}).json()
+    # (no-op save above returns the current revision)
+    body = c.get("/admin/pipeline").json()
+    body["stations"][3]["root"]["model"] = "qwen3-32b"
+    second = c.put("/admin/pipeline", json=body).json()
+    assert second["changed"] is True
+
+    conn = connect(str(tmp_path / "t.db"))
+    try:
+        rows = {r["sha256"]: r["content"] for r in conn.execute(
+            "SELECT sha256, content FROM config_revisions WHERE kind='pipeline'")}
+    finally:
+        conn.close()
+    assert first["revision"] in rows and second["revision"] in rows
+    assert len(rows) >= 2
+    content = rows[second["revision"]]
+    stations = [station_from_dict(d)
+                for d in json.loads(content)["stations"]]
+    assert pipeline_revision_of(stations) == second["revision"]
+
+
+def test_put_signal_questions_records_a_canonical_revision(tmp_path):
+    """Questions saves append a kind='questions' canonical revision; resaving
+    the same config is deduped (old revisions stay replayable)."""
+    from router.pipeline.snapshot import canonical_json, sha256_text
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db"),
+                              signal_questions=str(tmp_path / "q.json")))
+    c = TestClient(app)
+    cfg = c.get("/admin/signal-questions").json()["config"]
+    r = c.put("/admin/signal-questions", json={"config": cfg})
+    assert r.status_code == 200
+    revision = r.json()["revision"]
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        content = conn.execute(
+            "SELECT content FROM config_revisions WHERE kind='questions' "
+            "AND sha256=?", (revision,)).fetchone()["content"]
+        count = conn.execute("SELECT COUNT(*) FROM config_revisions "
+                             "WHERE kind='questions'").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1
+    assert canonical_json(json.loads(content)) == content
+    assert sha256_text(content) == revision
+
+    # Resaving the identical config does not grow the history.
+    again = c.put("/admin/signal-questions", json={"config": cfg})
+    assert again.json()["revision"] == revision
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM config_revisions "
+                            "WHERE kind='questions'").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_requests_stats_endpoint(tmp_path):
+    """P1-C: ring/queue/drop/ledger-failure counters are exposed."""
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(_ok))
+    c = TestClient(app)
+    body = c.get("/admin/requests/stats").json()
+    assert {"started_at", "ring_size", "ring_limit", "queue_size",
+            "queue_limit", "dropped_rows", "dropped_updates", "partial_rows",
+            "ledger_write_failures"} <= set(body)
+    assert body["ring_size"] == 0 and body["dropped_rows"] == 0
+    assert body["queue_limit"] > 0
+
+    assert c.post("/v1/chat/completions",
+                  json={"messages": [{"role": "user", "content": "今天天气怎么样"}]}
+                  ).status_code == 200
+    body = c.get("/admin/requests/stats").json()
+    assert body["ring_size"] == 1
+    assert body["queue_size"] == 2          # action event + outcome update
+    asyncio.run(app.state.requestlog.flush())
+    body = c.get("/admin/requests/stats").json()
+    assert body["queue_size"] == 0
+    assert body["ledger_write_failures"] == 0
 
 
 def test_put_pipeline_rejected_by_health(tmp_path):

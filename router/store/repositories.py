@@ -17,14 +17,37 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from datetime import datetime
 
 from router.pipeline.model import Station, TreeNode, Weight, station_from_dict, \
     station_to_dict
+from router.pipeline.snapshot import (REVISION_PIPELINE, REVISION_QUESTIONS,
+                                      canonical_json, pipeline_content,
+                                      sha256_text)
 from router.presets import PRESET_BY_ID
 
 #: Default confidence floor of a model-signal condition (2026-10-19 product
 #: decision). Rule signals are deterministic and carry no floor.
 CONF = 0.70
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def record_revision(conn: sqlite3.Connection, kind: str, content: str) -> str:
+    """Append-only content-addressed revision insert; returns its sha.
+
+    Does NOT open a transaction (the caller owns one): ``UNIQUE(kind, sha256)``
+    plus ``INSERT OR IGNORE`` means re-saving identical content keeps the
+    original row/id and never rewrites history.
+    """
+    sha = sha256_text(content)
+    conn.execute(
+        "INSERT OR IGNORE INTO config_revisions "
+        "(kind, sha256, content, created_at) VALUES (?, ?, ?, ?)",
+        (kind, sha, content, _now_iso()))
+    return sha
 
 
 def _uid() -> str:
@@ -131,7 +154,17 @@ class StationRepo:
         return [station_from_dict(json.loads(r["tree"]))
                 for r in self.conn.execute("SELECT tree FROM stations ORDER BY ord")]
 
-    def save(self, stations: list[Station]) -> None:
+    def save(self, stations: list[Station]) -> str:
+        """Replace the whole pipeline, bump its version and record the revision.
+
+        One transaction: the stations rows, the version bump, the canonical
+        ``config_revisions`` content and ``settings.pipeline_revision`` are
+        committed together (a crash can never leave a tree whose revision is
+        unknown). Old revisions are never deleted — replay can load them.
+
+        Returns the canonical content sha (``pipeline_revision``).
+        """
+        content = pipeline_content(stations)
         with self.conn:                          # one transaction: replace all
             self.conn.execute("DELETE FROM stations")
             for si, station in enumerate(stations):
@@ -142,6 +175,57 @@ class StationRepo:
                      json.dumps(station_to_dict(station), ensure_ascii=False)))
             v = int(SettingsRepo(self.conn).get("pipeline_version", "0")) + 1
             SettingsRepo(self.conn).set("pipeline_version", str(v))
+            revision = record_revision(self.conn, REVISION_PIPELINE, content)
+            SettingsRepo(self.conn).set("pipeline_revision", revision)
+        return revision
+
+
+def ensure_pipeline_revision(conn: sqlite3.Connection,
+                             stations: list[Station]) -> str:
+    """Backfill the content revision for the CURRENT tree (idempotent).
+
+    Needed on the first boot after migration v15 (stations predate the
+    revisions table) and harmless afterwards: identical content maps to the
+    same sha, so the original revision row is kept.
+    """
+    content = pipeline_content(stations)
+    with conn:
+        revision = record_revision(conn, REVISION_PIPELINE, content)
+        SettingsRepo(conn).set("pipeline_revision", revision)
+    return revision
+
+
+def ensure_questions_revision(conn: sqlite3.Connection, cfg: dict) -> str:
+    """Record the canonical questions config revision (idempotent)."""
+    content = canonical_json(cfg)
+    with conn:
+        revision = record_revision(conn, REVISION_QUESTIONS, content)
+        SettingsRepo(conn).set("questions_revision", revision)
+    return revision
+
+
+class ConfigRevisionRepo:
+    """Append-only canonical config history (migration v15)."""
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def record(self, kind: str, content: str) -> str:
+        with self.conn:
+            return record_revision(self.conn, kind, content)
+
+    def get(self, kind: str, sha256: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, kind, sha256, content, created_at FROM config_revisions "
+            "WHERE kind = ? AND sha256 = ?", (kind, sha256)).fetchone()
+        return dict(row) if row else None
+
+    def latest(self, kind: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT id, kind, sha256, content, created_at FROM config_revisions "
+            "WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
+        return dict(row) if row else None
+
 
 
 class ModelRepo:

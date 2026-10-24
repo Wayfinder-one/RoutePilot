@@ -1,7 +1,7 @@
-"""Application factory. The hot path reads only in-memory snapshots
-(app.state.pipeline / app.state.backends / app.state.tagger.kw_groups); the
-database is touched on admin writes and by the async request logger, never
-during routing (design doc section 4.4).
+"""Application factory. The hot path reads only the immutable in-memory
+``app.state.snapshot`` (RoutingSnapshot: stations/backends/revisions/jev_trim)
+plus the tagger object; the database is touched on admin writes and by the
+async request logger, never during routing (design doc section 4.4).
 
 Optional /admin auth (design doc section 7): with ``ROUTER_ADMIN_TOKEN`` set,
 every ``/admin*`` request must carry ``Authorization: Bearer <token>``. The
@@ -24,10 +24,12 @@ from fastapi.staticfiles import StaticFiles
 from router.config import Settings
 from router.api.upstream import model_reasoning_from_db
 from router.pipeline.health import check_pipeline
+from router.pipeline.snapshot import install_snapshot, load_snapshot
 from router.signals.heuristic import HeuristicTagger
 from router.store.db import connect, migrate
 from router.store.repositories import (
-    KeywordRepo, ModelRepo, StationRepo, TimePeriodRepo, seed_default)
+    KeywordRepo, ModelRepo, StationRepo, TimePeriodRepo,
+    ensure_pipeline_revision, ensure_questions_revision, seed_default)
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 
@@ -104,6 +106,10 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     # and pipelines written straight into the database (migrations, older
     # versions, a manual edit) must be judged by the same rule here.
     model_reasoning = model_reasoning_from_db(conn)
+    # v15: the tree that is about to serve traffic must be resolvable from
+    # config_revisions (first boot after the migration: stations predate the
+    # table). Identical content maps to the same sha, so this is idempotent.
+    ensure_pipeline_revision(conn, pipeline)
     conn.close()
 
     # A tree that the engine cannot execute must not reach the hot path: the
@@ -127,6 +133,21 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     from router.api.requestlog import RequestLogger
     requestlog = RequestLogger(settings)
 
+    tagger = _make_tagger(settings, kw_groups)
+    tagger.time_periods = time_periods
+    # Build the immutable snapshot ONCE at startup (P1-B): the pipeline, the
+    # backend map, the revisions and the trimming switch a request may read.
+    conn = connect(settings.db_path)
+    try:
+        # v15: record the questions config the tagger booted with, so the
+        # very first ledger rows can be replayed from config_revisions.
+        questions_cfg = getattr(tagger, "questions", None)
+        if isinstance(questions_cfg, dict):
+            ensure_questions_revision(conn, questions_cfg)
+        snapshot = load_snapshot(conn, jev_trim=settings.jev_trim)
+    finally:
+        conn.close()
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         await requestlog.start()
@@ -140,17 +161,13 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
                 await aclose()
 
     app = FastAPI(title="Smart Router", lifespan=lifespan)
+    from router.api.upstream import CircuitBreaker
     app.state.settings = settings
-    app.state.tagger = _make_tagger(settings, kw_groups)
-    app.state.tagger.time_periods = time_periods
+    app.state.tagger = tagger
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
-    app.state.pipeline = pipeline            # in-memory snapshot (design 4.4)
-    from router.api.upstream import CircuitBreaker, load_backends
-    conn = connect(settings.db_path)
-    try:
-        app.state.backends = load_backends(conn)   # model_id -> Backend snapshot
-    finally:
-        conn.close()
+    # One assignment publishes the whole configuration to the hot path; the
+    # legacy pipeline/backends aliases are refreshed inside install_snapshot.
+    install_snapshot(app, snapshot)
     app.state.breaker = CircuitBreaker(db_path=settings.db_path)
     app.state.requestlog = requestlog
     _install_admin_auth(app, settings.admin_token)

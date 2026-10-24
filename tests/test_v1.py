@@ -1,11 +1,14 @@
 import asyncio
 import json
+import time
 
 import httpx
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.config import Settings
+from router.pipeline.snapshot import build_snapshot, install_snapshot
+from router.signals.tagger import TagResult
 from router.store.db import connect
 
 
@@ -300,10 +303,30 @@ def test_ledger_success_path_records_action_outcome_and_versions(tmp_path):
     assert row["routing_ms"] >= 0 and row["upstream_ms"] >= 0
     assert row["total_ms"] >= 0
     assert row["ttft_ms"] is None                          # streaming-only
-    assert row["pipeline_version"] == app.state.requestlog.pipeline_version
+    snapshot = app.state.snapshot
+    assert row["pipeline_version"] == snapshot.pipeline_version
     assert isinstance(row["pipeline_version"], int)
+    assert row["pipeline_revision"] == snapshot.pipeline_revision
+    assert row["backends_revision"] == snapshot.backends_revision
+    assert row["questions_revision"] is None                # non-JEV tagger
+    assert row["outcome_state"] == "completed"
+    assert row["usage_observed"] == 1                       # usage was observed
+    assert row["experiment_arm"] is None
+    assert row["quality_score"] is None and row["quality_evaluator"] is None
     assert row["jev_engine"] is None and row["questions_sha256"] is None
     assert row["jev_window"] is None                       # non-JEV tagger
+    # The snapshot's pipeline revision is resolvable from config_revisions.
+    from router.pipeline.snapshot import canonical_json, sha256_text
+    conn = connect(app.state.settings.db_path)
+    try:
+        revision = conn.execute(
+            "SELECT content FROM config_revisions WHERE kind='pipeline' "
+            "AND sha256 = ?", (snapshot.pipeline_revision,)).fetchone()
+    finally:
+        conn.close()
+    assert revision is not None
+    assert sha256_text(revision["content"]) == snapshot.pipeline_revision
+    assert canonical_json(json.loads(revision["content"])) == revision["content"]
 
     # Privacy: the request text never reaches the ledger; the requests row is
     # still the slim (text='') row written by the same flush.
@@ -332,6 +355,8 @@ def test_ledger_4xx_keeps_the_real_upstream_status(tmp_path):
     assert row["upstream_model"] == "qwen3-8b"
     assert row["upstream_status"] == 400
     assert row["error_class"] == "client_4xx"
+    assert row["outcome_state"] == "completed"      # response delivered
+    assert row["usage_observed"] == 0
     assert row["prompt_tokens"] is None
 
 
@@ -349,6 +374,7 @@ def test_ledger_5xx_records_the_real_status_while_the_client_gets_502(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["upstream_status"] == 500                   # real status in ledger
     assert row["error_class"] == "upstream_error"
+    assert row["outcome_state"] == "upstream_error"
     assert row["upstream_model"] == "qwen3-8b"
 
 
@@ -387,6 +413,7 @@ def test_ledger_block_path_has_no_upstream_fields(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["decision"] == "block"
     assert row["model"] is None and row["error_class"] is None
+    assert row["outcome_state"] == "completed"
     for column in ("upstream_model", "upstream_status", "upstream_ms",
                    "ttft_ms", "prompt_tokens", "completion_tokens",
                    "total_tokens"):
@@ -397,7 +424,11 @@ def test_ledger_block_path_has_no_upstream_fields(tmp_path):
 def test_ledger_no_route_path(tmp_path):
     app = create_app(Settings(db_path=str(tmp_path / "t.db")),
                      transport=httpx.MockTransport(ok_upstream))
-    app.state.pipeline = app.state.pipeline[:3]            # drop the fallback
+    current = app.state.snapshot
+    install_snapshot(app, build_snapshot(
+        stations=current.stations[:3],                   # drop the fallback
+        backends=current.backends, pipeline_version=current.pipeline_version,
+        jev_trim=current.jev_trim))
     c = TestClient(app)
     r = chat(c, "今天天气怎么样")
     assert r.status_code == 502
@@ -406,13 +437,19 @@ def test_ledger_no_route_path(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["decision"] == "none"
     assert row["error_class"] == "no_route"
+    assert row["outcome_state"] == "completed"
     assert row["upstream_model"] is None and row["upstream_status"] is None
 
 
 def test_ledger_unknown_model_path(tmp_path):
     app = create_app(Settings(db_path=str(tmp_path / "t.db")),
                      transport=httpx.MockTransport(ok_upstream))
-    app.state.pipeline[-1].root.model = "ghost-model"      # leaf -> absent backend
+    current = app.state.snapshot
+    stations = list(current.stations)
+    stations[-1].root.model = "ghost-model"          # leaf -> absent backend
+    install_snapshot(app, build_snapshot(
+        stations=stations, backends=current.backends,
+        pipeline_version=current.pipeline_version, jev_trim=current.jev_trim))
     c = TestClient(app)
     r = chat(c, "今天天气怎么样")
     assert r.status_code == 502
@@ -421,6 +458,7 @@ def test_ledger_unknown_model_path(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["decision"] == "route" and row["model"] == "ghost-model"
     assert row["error_class"] == "unknown_model"
+    assert row["outcome_state"] == "completed"
     assert row["upstream_model"] is None and row["upstream_status"] is None
 
 
@@ -488,6 +526,8 @@ def test_ledger_streaming_records_ttft_total_and_usage(tmp_path):
     assert row["total_ms"] >= row["ttft_ms"] >= 0
     assert (row["prompt_tokens"], row["completion_tokens"],
             row["total_tokens"]) == (9, 4, 13)
+    assert row["outcome_state"] == "completed"   # upstream exhausted normally
+    assert row["usage_observed"] == 1
 
 
 def test_ledger_streaming_without_usage_leaves_tokens_null(tmp_path):
@@ -504,6 +544,8 @@ def test_ledger_streaming_without_usage_leaves_tokens_null(tmp_path):
     assert row["ttft_ms"] is not None                      # TTFT still recorded
     assert row["prompt_tokens"] is None
     assert row["completion_tokens"] is None and row["total_tokens"] is None
+    assert row["outcome_state"] == "completed"
+    assert row["usage_observed"] == 0                      # no usage chunk
 
 
 def test_ledger_streaming_client_4xx(tmp_path):
@@ -519,32 +561,39 @@ def test_ledger_streaming_client_4xx(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["upstream_status"] == 400 and row["error_class"] == "client_4xx"
     assert row["ttft_ms"] is None
+    assert row["outcome_state"] == "completed"
 
 
 # ── version columns + /admin/requests/recent contract ─────────────────────
-class _InfoTagger:
-    """Plan §1.3 contract: only taggers implementing info() fill the columns."""
+class _FingerprintTagger:
+    """Mimics signals-dev's P1-A contract: the TagResult (not a live tagger
+    read) carries the questions sha + the frozen info() snapshot."""
 
     name = "jev-fake"
 
-    def __init__(self, inner, window: str = "1024:0"):
+    def __init__(self, inner, questions_sha: str = "abc123",
+                 window: str = "1024:0"):
         self.inner = inner
+        self.questions_sha = questions_sha
         self.window = window
 
     async def tag(self, req):
-        return await self.inner.tag(req)
+        result = await self.inner.tag(req)
+        result.questions_sha256 = self.questions_sha
+        result.tagger_info = {
+            "engine": "jev", "model_dir": "/srv/jev-routepilot",
+            "model_name": "jev-routepilot", "temperature": 3.45,
+            "max_length": 1024, "window": self.window,
+            "questions_sha256": self.questions_sha}
+        return result
 
-    def info(self):
-        return {"engine": "jev", "model_dir": "/srv/jev-routepilot",
-                "model_name": "jev-routepilot", "temperature": 3.45,
-                "max_length": 1024, "window": self.window,
-                "questions_sha256": "abc123"}
 
-
-def test_ledger_records_tagger_info_and_pipeline_version(tmp_path):
+def test_ledger_records_the_tagresult_fingerprint(tmp_path):
+    """P1-B: the ledger versions come from the TagResult fingerprint captured
+    at tag() start — not from a post-response `tagger.info()` re-read."""
     app = create_app(Settings(db_path=str(tmp_path / "t.db")),
                      transport=httpx.MockTransport(ok_upstream))
-    app.state.tagger = _InfoTagger(app.state.tagger)
+    app.state.tagger = _FingerprintTagger(app.state.tagger)
     c = TestClient(app)
     assert chat(c, "今天天气怎么样").status_code == 200
     _flush(app)
@@ -555,15 +604,16 @@ def test_ledger_records_tagger_info_and_pipeline_version(tmp_path):
     assert row["jev_window"] == "1024:0"       # the window actually scored
     assert row["jev_temperature"] == 3.45
     assert row["questions_sha256"] == "abc123"
-    assert row["pipeline_version"] == app.state.requestlog.pipeline_version
+    assert row["questions_revision"] == "abc123"
+    assert row["pipeline_version"] == app.state.snapshot.pipeline_version
 
 
 def test_ledger_records_the_jev_window_for_window_ab_split(tmp_path):
-    """Window A/B attribution: the ledger row carries info().window verbatim, so
-    traffic can be grouped by window without replaying the request."""
+    """Window A/B attribution: the ledger row carries the TagResult window
+    verbatim, so traffic can be grouped by window offline."""
     app = create_app(Settings(db_path=str(tmp_path / "t.db")),
                      transport=httpx.MockTransport(ok_upstream))
-    app.state.tagger = _InfoTagger(app.state.tagger, window="256:768")
+    app.state.tagger = _FingerprintTagger(app.state.tagger, window="256:768")
     c = TestClient(app)
     assert chat(c, "今天天气怎么样").status_code == 200
     _flush(app)
@@ -624,6 +674,7 @@ def test_ledger_streaming_5xx_keeps_real_status(tmp_path):
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["upstream_status"] == 500           # real status in ledger
     assert row["error_class"] == "upstream_error"
+    assert row["outcome_state"] == "upstream_error"
     assert row["ttft_ms"] is None                  # no body ever streamed
 
 
@@ -641,6 +692,464 @@ def test_ledger_upstream_transport_error(tmp_path):
     _flush(app)
     row = _ledger_row(app, _last_record(app)["id"])
     assert row["error_class"] == "upstream_error"
+    assert row["outcome_state"] == "upstream_error"
     assert row["upstream_status"] is None
     assert row["upstream_model"] == "qwen3-8b"
     assert row["upstream_ms"] is not None and row["prompt_tokens"] is None
+
+
+# ── P1-B: immutable snapshot semantics ─────────────────────────────────────
+def test_hot_path_reads_the_snapshot_not_the_legacy_aliases(tmp_path):
+    """Only app.state.snapshot feeds /v1; mutating the compatibility aliases
+    (pipeline/backends) must not change what a request is judged on."""
+    from router.pipeline.model import station_from_dict
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    c = TestClient(app)
+    blocker = station_from_dict({
+        "id": "alias", "name": "alias-blocks-everything",
+        "root": {"id": "a1", "signal": None, "value": "", "kind": "leaf",
+                 "action": "block", "model": None}})
+    app.state.pipeline = [blocker]             # legacy alias only
+    app.state.backends = {}
+    r = chat(c, "今天天气怎么样")
+    assert r.status_code == 200                # snapshot still routes normally
+    assert r.headers["x-sr-model"] == "qwen3-8b"
+
+
+def test_snapshot_is_frozen_and_backends_are_read_only(tmp_path):
+    import dataclasses
+
+    import pytest
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")))
+    snapshot = app.state.snapshot
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.pipeline_version = 99
+    with pytest.raises(TypeError):
+        snapshot.backends["evil"] = object()   # MappingProxyType
+
+
+def test_admin_pipeline_write_replaces_the_snapshot_and_the_ledger_revision(tmp_path):
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    c = TestClient(app)
+    before = app.state.snapshot
+    pipe = c.get("/admin/pipeline").json()
+    pipe["stations"][3]["root"]["model"] = "qwen3-32b"
+    r = c.put("/admin/pipeline", json=pipe)
+    assert r.status_code == 200 and r.json()["changed"] is True
+
+    after = app.state.snapshot
+    assert after is not before                      # a NEW object, atomic swap
+    assert after.pipeline_version == before.pipeline_version + 1
+    assert after.pipeline_revision != before.pipeline_revision
+    assert r.json()["revision"] == after.pipeline_revision
+
+    # The next request routes + ledgers with the new snapshot.
+    assert chat(c, "今天天气怎么样").status_code == 200
+    _flush(app)
+    rec = _last_record(app)
+    assert rec["model"] == "qwen3-32b"
+    assert rec["pipeline_revision"] == after.pipeline_revision
+    assert rec["pipeline_version"] == after.pipeline_version
+
+    # History is append-only: the old revision is still replayable.
+    from router.pipeline.snapshot import sha256_text
+    conn = connect(app.state.settings.db_path)
+    try:
+        rows = {row["sha256"]: row["content"] for row in conn.execute(
+            "SELECT sha256, content FROM config_revisions WHERE kind='pipeline'")}
+    finally:
+        conn.close()
+    assert {before.pipeline_revision, after.pipeline_revision} <= set(rows)
+    assert sha256_text(rows[before.pipeline_revision]) == before.pipeline_revision
+
+
+def test_model_write_rebuilds_the_snapshot_backends(tmp_path):
+    seen = {}
+
+    def capture(request):
+        seen["model"] = json.loads(request.content or b"{}").get("model")
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(capture))
+    c = TestClient(app)
+    before = app.state.snapshot
+    assert c.put("/admin/models/qwen3-8b",
+                 json={"upstream": "real-model"}).status_code == 200
+    after = app.state.snapshot
+    assert after is not before
+    assert after.backends["qwen3-8b"].upstream_name == "real-model"
+    assert after.backends_revision != before.backends_revision
+    assert app.state.backends is after.backends      # compatibility alias synced
+
+    assert chat(c, "今天天气怎么样").status_code == 200
+    assert seen["model"] == "real-model"
+    _flush(app)
+    rec = _last_record(app)
+    assert rec["upstream_model"] == "real-model"
+    assert rec["backends_revision"] == after.backends_revision
+
+
+def test_ledger_records_the_experiment_arm_header(tmp_path):
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    c = TestClient(app)
+    r = c.post("/v1/chat/completions",
+               json={"messages": [{"role": "user", "content": "今天天气怎么样"}]},
+               headers={"x-sr-experiment-arm": "window-256:768"})
+    assert r.status_code == 200
+    _flush(app)
+    row = _ledger_row(app, _last_record(app)["id"])
+    assert row["experiment_arm"] == "window-256:768"
+
+
+# ── P1-C: terminal states driven through the REAL relay ────────────────────
+class _FakeUpstream:
+    status_code = 200
+
+    def __init__(self, chunks=(), error=None):
+        self.chunks = list(chunks)
+        self.error = error
+        self.closed = False
+
+    async def aiter_raw(self):
+        for chunk in self.chunks:
+            yield chunk
+        if self.error is not None:
+            raise self.error
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _DisconnectProbe:
+    def __init__(self, disconnected: bool = False):
+        self.disconnected = disconnected
+        self.calls = 0
+
+    async def is_disconnected(self):
+        self.calls += 1
+        return self.disconnected
+
+
+def _relay_harness(tmp_path, *, chunks=(), error=None, disconnected=False):
+    from router.api.routes_v1 import _OutcomeRecorder, _relay
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    log = app.state.requestlog
+    backend = app.state.snapshot.backends["qwen3-8b"]
+    record = {"id": "relay-1", "ts": "2026-10-24T12:00:00",
+              "decision": "route", "model": "qwen3-8b",
+              "outcome_state": "incomplete", "usage_observed": 0,
+              "upstream_model": None, "upstream_status": None,
+              "upstream_ms": None, "ttft_ms": None, "total_ms": None,
+              "error_class": None, "prompt_tokens": None,
+              "completion_tokens": None, "total_tokens": None}
+    recorder = _OutcomeRecorder(log, record, time.monotonic())
+    resp = _FakeUpstream(chunks, error)
+    gen = _relay(resp, outcome=recorder,
+                 request=_DisconnectProbe(disconnected), backend=backend,
+                 upstream_started=time.monotonic(), upstream_ms=1.0)
+    return app, log, record, resp, gen
+
+
+def test_relay_normal_eof_is_completed(tmp_path):
+    async def scenario():
+        _app, log, record, resp, gen = _relay_harness(
+            tmp_path, chunks=_SSE_WITHOUT_USAGE)
+        seen = [chunk async for chunk in gen]
+        return seen, log, record, resp
+
+    seen, log, record, resp = asyncio.run(scenario())
+    assert b"".join(seen) == b"".join(_SSE_WITHOUT_USAGE)   # bytes untouched
+    assert record["outcome_state"] == "completed"
+    assert record["error_class"] is None
+    assert record["ttft_ms"] is not None and record["upstream_status"] == 200
+    assert resp.closed
+    assert log._queue.qsize() == 1              # exactly one outcome event
+
+
+def test_relay_upstream_exception_is_upstream_error(tmp_path):
+    import pytest
+
+    async def scenario():
+        _app, _log, record, _resp, gen = _relay_harness(
+            tmp_path, chunks=[b"data: x\n\n"], error=httpx.ReadError("boom"))
+        got = []
+        with pytest.raises(httpx.ReadError):
+            async for chunk in gen:
+                got.append(chunk)
+        return got, record
+
+    got, record = asyncio.run(scenario())
+    assert got == [b"data: x\n\n"]              # the error is re-raised
+    assert record["outcome_state"] == "upstream_error"
+    assert record["error_class"] == "upstream_error"
+
+
+def test_relay_disconnect_before_first_chunk_is_client_disconnected(tmp_path):
+    async def scenario():
+        _app, _log, record, resp, gen = _relay_harness(
+            tmp_path, chunks=_SSE_WITHOUT_USAGE, disconnected=True)
+        seen = [chunk async for chunk in gen]
+        return seen, record, resp
+
+    seen, record, resp = asyncio.run(scenario())
+    assert seen == []                           # nothing streamed
+    assert record["outcome_state"] == "client_disconnected"
+    assert record["ttft_ms"] is None
+    assert resp.closed
+
+
+def test_relay_mid_stream_disconnect_is_client_disconnected(tmp_path):
+    async def scenario():
+        _app, _log, record, resp, gen = _relay_harness(
+            tmp_path, chunks=_SSE_WITHOUT_USAGE)
+        first = await gen.__anext__()
+        await gen.aclose()                      # GeneratorExit at the yield
+        return first, record, resp
+
+    first, record, resp = asyncio.run(scenario())
+    assert first
+    assert record["outcome_state"] == "client_disconnected"
+    assert record["ttft_ms"] is not None
+    assert resp.closed
+
+
+class _BlockingUpstream:
+    status_code = 200
+
+    def __init__(self):
+        self.started = asyncio.Event()
+        self.closed = False
+
+    async def aiter_raw(self):
+        self.started.set()
+        await asyncio.Event().wait()            # never yields a chunk
+        yield b""                               # pragma: no cover
+
+    async def aclose(self):
+        self.closed = True
+
+
+def test_relay_cancellation_is_cancelled_and_reraised(tmp_path):
+    import pytest
+
+    from router.api.routes_v1 import _OutcomeRecorder, _relay
+
+    async def scenario():
+        app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                         transport=httpx.MockTransport(ok_upstream))
+        backend = app.state.snapshot.backends["qwen3-8b"]
+        record = {"id": "cancel-1", "ts": "2026-10-24T12:00:00",
+                  "outcome_state": "incomplete", "usage_observed": 0}
+        recorder = _OutcomeRecorder(app.state.requestlog, record,
+                                    time.monotonic())
+        resp = _BlockingUpstream()
+        gen = _relay(resp, outcome=recorder, request=_DisconnectProbe(False),
+                     backend=backend, upstream_started=time.monotonic(),
+                     upstream_ms=1.0)
+        task = asyncio.create_task(gen.__anext__())
+        await asyncio.wait_for(resp.started.wait(), 2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task                          # cancellation is re-raised
+        return record
+
+    record = asyncio.run(scenario())
+    assert record["outcome_state"] == "cancelled"
+    assert record["error_class"] is None
+
+
+def test_relay_completion_with_a_full_queue_counts_the_dropped_update(
+        tmp_path, monkeypatch):
+    """P1-C: a full flush queue must not lose the ring outcome, and the drop is
+    counted by the logger (never silent)."""
+    import router.api.requestlog as rl
+
+    monkeypatch.setattr(rl, "FLUSH_QUEUE_LIMIT", 1)
+
+    async def scenario():
+        _app, log, record, _resp, gen = _relay_harness(tmp_path)
+        log._queue.put_nowait({"id": "filler"})  # queue is now full
+        [chunk async for chunk in gen]
+        return log, record
+
+    log, record = asyncio.run(scenario())
+    assert record["outcome_state"] == "completed"   # ring updated regardless
+    assert log.dropped_updates == 1
+    assert log._queue.qsize() == 1                  # only the filler survived
+
+
+def test_outcome_recorder_finalizes_exactly_once(tmp_path):
+    import pytest
+
+    from router.api.routes_v1 import _OutcomeRecorder
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    log = app.state.requestlog
+    record = {"id": "once-1", "outcome_state": "incomplete"}
+    recorder = _OutcomeRecorder(log, record, time.monotonic())
+    assert recorder.finish(outcome_state="completed") is True
+    assert recorder.done is True
+    queued = log._queue.qsize()
+    assert recorder.finish(outcome_state="upstream_error") is False
+    assert log._queue.qsize() == queued             # no second update event
+    assert record["outcome_state"] == "completed"   # first terminal state wins
+
+    with pytest.raises(ValueError):
+        _OutcomeRecorder(log, {}, time.monotonic()).finish(
+            outcome_state="not-a-state")
+
+
+# ── P1-B/C: config revisions under a concurrent admin edit ─────────────────
+class _PausingTagger:
+    """Slow fake tagger: pauses INSIDE tag() so an admin write can land while
+    the request is still being scored (reproduces the P1 race)."""
+
+    name = "pausing"
+
+    def __init__(self, inner, questions=None):
+        self.inner = inner
+        self.questions = questions
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.captured_sha = None
+
+    def set_questions(self, cfg):
+        self.questions = cfg
+
+    async def tag(self, req):
+        from router.pipeline.snapshot import canonical_json, sha256_text
+        captured = self.questions
+        self.captured_sha = (sha256_text(canonical_json(captured))
+                             if captured is not None else None)
+        self.entered.set()
+        await self.release.wait()               # admin write lands here
+        result = await self.inner.tag(req)
+        result.questions_sha256 = self.captured_sha
+        result.tagger_info = {
+            "engine": "jev", "model_name": "jev-pausing",
+            "window": "1024:0", "temperature": 3.45,
+            "questions_sha256": self.captured_sha}
+        return result
+
+
+def _async_client(app):
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                             base_url="http://test")
+
+
+def _config_revision_content(app, kind, sha):
+    conn = connect(app.state.settings.db_path)
+    try:
+        row = conn.execute(
+            "SELECT content FROM config_revisions WHERE kind=? AND sha256=?",
+            (kind, sha)).fetchone()
+        return row["content"] if row else None
+    finally:
+        conn.close()
+
+
+def test_concurrent_pipeline_edit_keeps_the_snapshot_revision(tmp_path):
+    """PUT /admin/pipeline while a request is still tagging: the request keeps
+    the snapshot it started with, and the ledger records THAT revision."""
+    from router.pipeline.snapshot import sha256_text
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
+                     transport=httpx.MockTransport(ok_upstream))
+    tagger = _PausingTagger(app.state.tagger)
+    app.state.tagger = tagger
+    client = _async_client(app)
+
+    async def scenario():
+        old = app.state.snapshot
+        await client.__aenter__()
+        task = asyncio.create_task(client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "今天天气怎么样"}]}))
+        await asyncio.wait_for(tagger.entered.wait(), 5.0)
+
+        pipe = (await client.get("/admin/pipeline")).json()
+        pipe["stations"][3]["root"]["model"] = "qwen3-32b"
+        put = await client.put("/admin/pipeline", json=pipe)
+        assert put.status_code == 200 and put.json()["changed"] is True
+        new = app.state.snapshot
+        assert new.pipeline_revision != old.pipeline_revision
+
+        tagger.release.set()
+        response = await asyncio.wait_for(task, 5.0)
+        assert response.status_code == 200
+        assert response.headers["x-sr-model"] == "qwen3-8b"   # OLD tree won
+        await app.state.requestlog.flush()
+        await client.__aexit__(None, None, None)
+        return old, new, app.state.requestlog.recent_requests(1)[0]
+
+    old, new, record = asyncio.run(scenario())
+    assert record["model"] == "qwen3-8b"                 # evaluated old tree
+    assert record["pipeline_revision"] == old.pipeline_revision
+    assert record["pipeline_version"] == old.pipeline_version
+    assert record["pipeline_revision"] != new.pipeline_revision
+    # The scored revision is replayable from config_revisions.
+    content = _config_revision_content(app, "pipeline", old.pipeline_revision)
+    assert content is not None
+    assert sha256_text(content) == old.pipeline_revision
+
+
+def test_concurrent_questions_edit_keeps_the_tagresult_revision(tmp_path):
+    """PUT /admin/signal-questions while tagging: the ledger records the
+    questions sha captured at tag() start, not the post-edit config."""
+    from router.pipeline.snapshot import sha256_text
+
+    app = create_app(Settings(db_path=str(tmp_path / "t.db"),
+                              signal_questions=str(tmp_path / "q.json")),
+                     transport=httpx.MockTransport(ok_upstream))
+    tagger = _PausingTagger(app.state.tagger)
+    app.state.tagger = tagger
+    client = _async_client(app)
+
+    async def scenario():
+        await client.__aenter__()
+        cfg_a = (await client.get("/admin/signal-questions")).json()["config"]
+        put_a = await client.put("/admin/signal-questions", json={"config": cfg_a})
+        assert put_a.status_code == 200
+        sha_a = put_a.json()["revision"]
+        assert tagger.questions is not None
+
+        task = asyncio.create_task(client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "今天天气怎么样"}]}))
+        await asyncio.wait_for(tagger.entered.wait(), 5.0)
+        assert tagger.captured_sha == sha_a
+
+        cfg_b = json.loads(json.dumps(cfg_a))
+        cfg_b["signals"]["domain"]["instructions"][0] += "（v2）"
+        put_b = await client.put("/admin/signal-questions",
+                                 json={"config": cfg_b})
+        assert put_b.status_code == 200
+        sha_b = put_b.json()["revision"]
+        assert sha_b != sha_a
+
+        tagger.release.set()
+        response = await asyncio.wait_for(task, 5.0)
+        assert response.status_code == 200
+        await app.state.requestlog.flush()
+        await client.__aexit__(None, None, None)
+        return sha_a, sha_b, app.state.requestlog.recent_requests(1)[0]
+
+    sha_a, sha_b, record = asyncio.run(scenario())
+    assert record["questions_revision"] == sha_a
+    assert record["questions_sha256"] == sha_a
+    assert record["questions_revision"] != sha_b
+    # Both revisions are replayable; the scored one re-hashes to its sha.
+    content_a = _config_revision_content(app, "questions", sha_a)
+    content_b = _config_revision_content(app, "questions", sha_b)
+    assert content_a is not None and content_b is not None
+    assert sha256_text(content_a) == sha_a
+    assert sha256_text(content_b) == sha_b

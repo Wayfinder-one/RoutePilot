@@ -160,6 +160,33 @@ MIGRATIONS = [
         questions_sha256 TEXT, pipeline_version INTEGER, error_class TEXT);
     CREATE INDEX idx_request_ledger_ts ON request_ledger(ts);
     """,
+    # v15 (2026-10-24, JEV P1-B/C): immutable-config revisions + ledger
+    # provenance/terminal-state columns. v14 stays published as-is; the new
+    # columns are appended with ALTER. `config_revisions` is append-only
+    # (UNIQUE(kind, sha256) dedupes a re-save of identical content): every
+    # pipeline/questions save stores its canonical content + sha forever, so a
+    # ledger row's *_revision can be looked up and re-hashed offline. Ledger
+    # additions: the three revisions that produced the decision, the terminal
+    # outcome state (completed/upstream_error/client_disconnected/cancelled/
+    # incomplete), experiment attribution and quality/usage-coverage fields.
+    """
+    CREATE TABLE config_revisions (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(kind, sha256));
+    CREATE INDEX idx_config_revisions_kind ON config_revisions(kind, id);
+    ALTER TABLE request_ledger ADD COLUMN pipeline_revision TEXT;
+    ALTER TABLE request_ledger ADD COLUMN questions_revision TEXT;
+    ALTER TABLE request_ledger ADD COLUMN backends_revision TEXT;
+    ALTER TABLE request_ledger ADD COLUMN outcome_state TEXT;
+    ALTER TABLE request_ledger ADD COLUMN experiment_arm TEXT;
+    ALTER TABLE request_ledger ADD COLUMN quality_score REAL;
+    ALTER TABLE request_ledger ADD COLUMN quality_evaluator TEXT;
+    ALTER TABLE request_ledger ADD COLUMN usage_observed INTEGER;
+    """,
 ]
 
 

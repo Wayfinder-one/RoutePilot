@@ -20,6 +20,11 @@ def record(i, **kw):
     rec = {"id": f"r{i}", "ts": "2026-10-16T10:00:00", "text": "你好",
            "decision": "route", "model": "qwen3-8b", "station_id": "s",
            "leaf_id": "n", "score": None, "latency_ms": 12.0,
+           "pipeline_revision": "p" * 64, "backends_revision": "b" * 64,
+           "questions_revision": None, "pipeline_version": 1,
+           "experiment_arm": None, "quality_score": None,
+           "quality_evaluator": None, "usage_observed": 0,
+           "outcome_state": "incomplete",
            "signals": {"domain": {"value": "other", "confidence": 0.4,
                                   "is_rule": False},
                        "language": {"value": "zh", "confidence": 1.0,
@@ -29,11 +34,12 @@ def record(i, **kw):
 
 
 def outcome(**kw):
-    """The fields routes_v1 fills in after the response is known (§3.1)."""
+    """The fields routes_v1 fills in after the response is known (§3.1/P1-C)."""
     fields = {"upstream_model": "upstream-qwen3-8b", "upstream_status": 200,
               "upstream_ms": 5.0, "ttft_ms": None, "total_ms": 20.0,
               "error_class": None, "prompt_tokens": 11,
-              "completion_tokens": 7, "total_tokens": 18}
+              "completion_tokens": 7, "total_tokens": 18,
+              "outcome_state": "completed", "usage_observed": 1}
     fields.update(kw)
     return fields
 
@@ -165,6 +171,10 @@ def test_flush_writes_half_row_then_replaces_it_with_the_outcome(tmp_path):
     assert half["routing_ms"] is None      # outcome-only columns are still NULL
     assert half["upstream_status"] is None and half["error_class"] is None
     assert half["prompt_tokens"] is None and half["total_ms"] is None
+    assert half["outcome_state"] == "incomplete"   # no terminal state yet
+    assert half["usage_observed"] == 0
+    assert half["pipeline_revision"] == "p" * 64
+    assert log.partial_rows == 1                   # one half row flushed
 
     rec.update(outcome())
     log.enqueue_result(rec)
@@ -178,6 +188,7 @@ def test_flush_writes_half_row_then_replaces_it_with_the_outcome(tmp_path):
     assert (row["prompt_tokens"], row["completion_tokens"],
             row["total_tokens"]) == (11, 7, 18)
     assert row["upstream_ms"] == 5.0 and row["total_ms"] == 20.0
+    assert row["outcome_state"] == "completed" and row["usage_observed"] == 1
     # The slim requests row keeps its original semantics (one row, no detail).
     conn = connect(log.settings.db_path)
     assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
@@ -223,29 +234,67 @@ def test_ledger_holds_no_text_signals_or_trace(tmp_path):
     assert "spoiler" not in dumped
 
 
-def test_pipeline_version_is_read_once_at_startup(tmp_path):
-    """The hot path must not query the DB: the version is cached when the
-    logger is built (that is the app startup read the ledger plan asks for)."""
-    settings = Settings(db_path=str(tmp_path / "t.db"))
-    conn = connect(settings.db_path)
-    migrate(conn)
-    conn.execute("INSERT INTO settings VALUES ('pipeline_version', '7')")
-    conn.commit()
-    conn.close()
-    assert RequestLogger(settings).pipeline_version == 7
-
-
-def test_missing_or_non_numeric_pipeline_version_is_null(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "t.db"))
-    conn = connect(settings.db_path)
-    migrate(conn)
-    assert RequestLogger(settings).pipeline_version is None   # migrated only
-    conn.execute("INSERT INTO settings VALUES ('pipeline_version', 'v-next')")
-    conn.commit()
-    conn.close()
-    assert RequestLogger(settings).pipeline_version is None   # unparsable -> NULL
+def test_partial_rows_counts_only_rows_left_incomplete(tmp_path):
+    """A batch that carries a half row AND its outcome update is not partial:
+    only rows whose last write in the batch is still 'incomplete' count."""
     log = make_log(tmp_path)
-    log.enqueue(record(1))
-    log.enqueue_result(record(1))
+    rec = record(1)
+    log.enqueue(rec)
+    rec.update(outcome())                       # same batch: half + completed
+    log.enqueue_result(rec)
     asyncio.run(log.flush())
-    assert ledger_rows(log)[0]["pipeline_version"] is None
+    assert log.partial_rows == 0
+    assert ledger_rows(log)[0]["outcome_state"] == "completed"
+
+    log.enqueue(record(2))                      # a lone half row
+    asyncio.run(log.flush())
+    assert log.partial_rows == 1
+    assert ledger_rows(log)[1]["outcome_state"] == "incomplete"
+
+
+def test_drop_counters_are_never_silent(tmp_path, monkeypatch):
+    """P1-C §3: queue-full drops of the half row and of the outcome update are
+    counted and exposed (the ring still holds the request detail)."""
+    import router.api.requestlog as rl
+
+    monkeypatch.setattr(rl, "FLUSH_QUEUE_LIMIT", 1)
+    log = make_log(tmp_path)
+    rec = record(1)
+    log.enqueue(rec)                            # fills the queue
+    log.enqueue(record(2))                      # dropped half row
+    rec.update(outcome())
+    log.enqueue_result(rec)                     # dropped outcome update
+    assert log.dropped_rows == 1
+    assert log.dropped_updates == 1
+    assert len(log.recent) == 2                 # detail is still in the ring
+
+    stats = log.stats()
+    assert {"started_at", "ring_size", "ring_limit", "queue_size",
+            "queue_limit", "dropped_rows", "dropped_updates", "partial_rows",
+            "ledger_write_failures"} <= set(stats)
+    assert stats["dropped_rows"] == 1 and stats["dropped_updates"] == 1
+    assert stats["queue_size"] == 1 and stats["ring_size"] == 2
+
+
+def test_ledger_write_failure_is_counted_and_does_not_drop_the_batch(
+        tmp_path, monkeypatch, caplog):
+    """P1-C §3: one bad ledger row must not silently lose the whole batch —
+    it is counted (and logged), the remaining rows still commit."""
+    import router.api.requestlog as rl
+
+    monkeypatch.setattr(rl, "_LEDGER_INSERT",
+                        "INSERT INTO table_that_does_not_exist VALUES (1)")
+    log = make_log(tmp_path)
+    for i in range(3):
+        log.enqueue(record(i))
+    with caplog.at_level(logging.ERROR, logger="router.api.requestlog"):
+        asyncio.run(log.flush())
+
+    assert log.ledger_write_failures == 3
+    assert "ledger row write failed" in caplog.text
+    conn = connect(log.settings.db_path)
+    # The slim requests rows are written before the ledger statement, so a
+    # ledger failure does not lose the traffic aggregate either.
+    assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 3
+    conn.close()
+    assert log.stats()["ledger_write_failures"] == 3
