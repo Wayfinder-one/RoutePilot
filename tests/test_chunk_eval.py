@@ -526,9 +526,11 @@ def test_report_metrics_and_structure(tmp_path: Path) -> None:
         assert clean["raw"]["fpr"] == 0.0
     # 校准：window 臂 p10 全 0.05 → degenerate；chunk 臂有 0.9 → 非 degenerate
     assert head["calibration"]["degenerate"] is True
+    assert head["calibration"]["degenerate_reason"] == "raw_hits_zero"
     assert head["calibration"]["available"] is True
     assert chunk["calibration"]["available"] is True
     assert chunk["calibration"]["degenerate"] is False
+    assert chunk["calibration"]["degenerate_reason"] is None
     assert chunk["calibration"]["bias"] is not None
     assert chunk["calibration"]["tau"] is not None
     # 非劣/分类指标结构（eval_metrics.Confusion.as_dict + ECE/AURC）
@@ -635,6 +637,42 @@ def test_report_calibration_must_match_score(tmp_path: Path) -> None:
         ["--out", str(tmp_path / "run"), "--stages", "report",
          "--calibration", "p10-fullpack", "--n-boot", "60"])
     assert runner.run_report(matched)["config"]["calibration"] == "p10-fullpack"
+
+
+def test_fullpack_degenerate_reason_no_threshold_satisfies_fpr(
+        tmp_path: Path) -> None:
+    """FPR 约束下没有 recall>0 可用阈值 → no_threshold_satisfies_fpr（文案修）。"""
+    corpus = write_corpus(tmp_path, sample_docs())
+    args = make_args(tmp_path, corpus, "--sets", "main",
+                     "--arms", "head1024",
+                     "--calibration", "p10-fullpack")
+    runner.run_score(args, tagger_factory=make_factory(
+        corpus["docs_by_id"], default_p_fn))
+    raw_path = Path(str(tmp_path / "run") + ".jsonl")
+    rows = runner.read_jsonl(raw_path)
+    for row in rows:
+        if not runner.is_p10_doc({"group": row["group"],
+                                  "needles": row["needles"]}):
+            continue
+        needle_types = {needle["type"] for needle in row["needles"]}
+        probs = row["calibration_fullpack"]["probs"]
+        for typ in list(probs):
+            probs[typ] = 0.2 if typ in needle_types else 0.9
+    with raw_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    report_args = runner.parse_args(
+        ["--out", str(tmp_path / "run"), "--stages", "report",
+         "--calibration", "p10-fullpack", "--cal-target-fpr", "0.01",
+         "--n-boot", "60"])
+    report = runner.run_report(report_args)
+    calibration = report["arms"]["head1024"]["calibration"]
+    assert calibration["degenerate"] is True
+    assert calibration["degenerate_reason"] == "no_threshold_satisfies_fpr"
+    summary = (tmp_path / "run.report.md").read_text(encoding="utf-8")
+    assert "no_threshold_satisfies_fpr" in summary
+    assert any("no_threshold_satisfies_fpr" in bullet
+               for bullet in report["conclusions"])
 
 
 def test_fullpack_report_requires_fullpack_score(tmp_path: Path) -> None:
