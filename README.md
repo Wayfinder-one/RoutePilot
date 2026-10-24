@@ -184,10 +184,11 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（586 passed, 6 skipped）。
+- 单元/集成：`pytest`（587 passed, 6 skipped）。
 - 离线 JEV 评估：`scripts/jev_dump_scores.py`（官方 test 集 raw 分布 dump，需模型）、
   `scripts/jev_calibrate.py`（coverage-risk / AURC / ECE / 各门槛 block recall 报告，纯 CPU）、
-  `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）。
+  `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）、
+  `scripts/cheap_sufficient_mvp.py`（GSM8K 上便宜档 C vs 强档 S 的 cheap_sufficient 离线实验，需两个模型）。
 - i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
   `scripts/i18n_prune_i18n.py` 负责批量删除）。
 - 控制台冒烟：`BASE=http://<host>:<port> ADMIN_TOKEN=<token> node scripts/console_check.js`
