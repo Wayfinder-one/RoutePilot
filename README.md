@@ -22,7 +22,8 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
               │            存 SQLite JSON，可热更新）
               ├─ Upstream（OpenAI 兼容推理后端 + 熔断；按路由叶选择的推理档位
               │            注入各家协议字段：reasoning_effort / thinking / enable_thinking…）
-              └─ RequestLog（决策摘要 → SQLite；信号/trace 只在内存 ring）
+              └─ RequestLog（决策摘要 → SQLite requests slim 行 + request_ledger
+                             动作—结果账本；信号/trace 只在内存 ring）
 控制台（/console）：概览 / 分流树（信号库 + 树形编辑 + 试算侧滑）/ 计算日志 /
                     信号配置 / 模型与设置（内置模型目录 + 提供方 + 推理声明）
 ```
@@ -62,6 +63,7 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 | `ROUTER_JEV_MODEL` | merged JEV 单模型目录 |
 | `ROUTER_SIGNAL_QUESTIONS` | JEV 问题配置 JSON（问题措辞/候选/真值定义，可编辑） |
 | `ROUTER_JEV_MAX_LENGTH` | JEV 输入上限（默认取 model.json） |
+| `ROUTER_JEV_WINDOW` | JEV 输入窗口 `<head>:<tail>`（token 数，默认未配置 = 旧行为 `<max_length>:0` 纯 head；如 `256:768` / `0:1024` / `512:512`；短文本逐字不变） |
 | `ROUTER_JEV_TRIM` | 设为 `0` 关闭 /v1 按树裁剪问题的热路径优化 |
 | `ROUTER_DEVICE` | 模型设备（如 `cuda:0`） |
 | `ROUTER_ADMIN_TOKEN` | `/admin*` 的 Bearer token（控制台会提示输入） |
@@ -114,12 +116,15 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 - 运行期只渲染 `configs/signal_questions.json` 里每条信号的**第 1 条问法**；模型按标准问法
   校准，改写措辞前请先复评（`user_feedback` 对措辞最敏感）。
 - 候选顺序不敏感。
-- **输入窗口 = 最后一条 user 消息的前 1024 token**（`max_length`，按 tokenizer 精确头截断）：
-  超长请求只裁一次并保留开头，不再做 8 轮上下文收缩/左截断（200K 输入：截断 0.67s、
-  全量打标 2.0s；旧 stock shrink 46–48s）。问题模板另占 47–120 token，prompt 上限相应放宽为
-  `max_length + 160`，标准问法不会被截。规则信号（`pii_rules` 等确定性正则）仍扫**全文**，
-  是长请求的兜底；裁剪事实进计算日志（`input_tokens` / `input_visible_tokens` /
-  `input_truncated`，见 `/admin/requests/recent`）。
+- **输入窗口 = 最后一条 user 消息的 tokenizer 窗口**：默认 `1024:0`（`ROUTER_JEV_WINDOW`
+  未配置时 = `max_length:0`，即旧的纯 head 截断，行为逐字不变）；超长请求只裁一次，
+  不再做 8 轮上下文收缩/左截断（200K 输入：截断 0.67s、全量打标 2.0s；旧 stock shrink 46–48s）。
+  窗口可配成 `256:768` / `512:512`（head+tail，用 `\n\n[...]\n\n` 连接，应对"长文末尾才是真正指令"）
+  或 `0:1024`（纯 tail）；短文本（≤ max_length token）任何配置下都逐字不裁剪。
+  问题模板另占 47–120 token，prompt 上限相应放宽为 `max_length + 160`，标准问法不会被截。
+  规则信号（`pii_rules` 等确定性正则）仍扫**全文**，是长请求的兜底；窗口事实进计算日志
+  （`input_tokens` / `input_visible_tokens` / `input_truncated` / `input_window`，见
+  `/admin/requests/recent`）与动作—结果账本（`request_ledger.jev_window`）。
 - 采样温度由模型目录的 `temperature.json` 自动加载（`softmax(logits / T)`）。
 
 ## 热路径裁剪
@@ -179,7 +184,10 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（491 passed, 6 skipped）。
+- 单元/集成：`pytest`（586 passed, 6 skipped）。
+- 离线 JEV 评估：`scripts/jev_dump_scores.py`（官方 test 集 raw 分布 dump，需模型）、
+  `scripts/jev_calibrate.py`（coverage-risk / AURC / ECE / 各门槛 block recall 报告，纯 CPU）、
+  `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）。
 - i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
   `scripts/i18n_prune_i18n.py` 负责批量删除）。
 - 控制台冒烟：`BASE=http://<host>:<port> ADMIN_TOKEN=<token> node scripts/console_check.js`

@@ -214,6 +214,24 @@ def test_analyse_and_render_end_to_end(tmp_path):
     assert "jailbreak" in markdown and "argmax acc" in markdown
 
 
+def test_temperature_softmax_matches_production_formula():
+    """The fixed-shape scorer must divide the exponentiated logits (not the
+    raw ones) — the 2026-10-24 bug that made dump confidences all 1.0."""
+    out = common.temperature_softmax([0.0, 8.3581], 3.4500204)
+    assert sum(out) == pytest.approx(1.0)
+    assert out[0] < out[1]
+    assert out[1] == pytest.approx(0.9182, abs=1e-3)
+    # A higher temperature flattens the distribution.
+    flat = common.temperature_softmax([0.0, 8.3581], 1e6)
+    assert flat[0] == pytest.approx(0.5, abs=1e-4)
+    # Choice: the softmax-normalised list has K entries and is a distribution.
+    choice = common.temperature_softmax([12.0, 3.0, -4.0], 3.45)
+    assert len(choice) == 3 and sum(choice) == pytest.approx(1.0)
+    assert choice[0] > choice[1] > choice[2]
+    # Degenerate single candidate: the binary noul convention is [0, logit].
+    assert common.temperature_softmax([0.0, 0.0], 3.45) == [0.5, 0.5]
+
+
 def test_dump_rowwise_with_fake_tagger(tmp_path, monkeypatch):
     """dump_rowwise works against the tagger's pure helper surface (no torch)."""
     from router.signals.jev import JevTagger
