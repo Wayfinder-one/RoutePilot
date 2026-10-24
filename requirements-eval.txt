@@ -1,0 +1,26 @@
+# 离线评估依赖（cheap_sufficient / JEV 离线脚本）
+
+与**服务运行时依赖**（`requirements.txt`）和 **checkpoint 运行时依赖**
+（`requirements-ml.txt`）分离：这些包只在离线评估的个别阶段用到，不装也能跑
+服务、`pytest` 基线与大部分 CPU 逻辑。
+
+```bash
+# 只在需要跑 data / learned-analyze 阶段时安装
+pip install -r requirements-eval.txt
+```
+
+| 包 | 用在哪 | 不装也能做什么 |
+|---|---|---|
+| `datasets` | `cheap_eval.cli` 的 `data` 阶段（GSM8K 采样） | 已有 `data.jsonl` 时不用；76 上已缓存 |
+| `scikit-learn` | `learned` 分类器（StandardScaler + LogisticRegression + Platt 校准）、AUC | `--classifier-mode prior` 的 CPU 冒烟、全部纯指标/划分/报告 |
+| `numpy` | scikit-learn 的数值依赖（显式声明） | 同上 |
+
+说明：
+
+* 纯指标（混淆矩阵 / F1 / FPR / FDR / bootstrap CI / ECE）复用
+  `router/eval_metrics.py`，只依赖标准库，**不需要 numpy**。
+* 本地开发 `.venv`（无 numpy/scipy/sklearn/torch）仍可跑
+  `python -m pytest tests/test_cheap_eval.py`；`--classifier-mode prior` 可在
+  无 eval 依赖的机器上把 analyze 流程完整跑通（结果会标注 constant-prior）。
+* C 生成阶段另需 torch/transformers（见 `requirements-ml.txt`）；
+  S/真实候选阶段只用标准库 `urllib`，不需要 `requests`。
