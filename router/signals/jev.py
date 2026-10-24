@@ -15,11 +15,20 @@ This module keeps the same contracts as :class:`CheckpointTagger`:
 * confidence is ``1 - H(p)/log K`` for choices and binary entropy for the
   per-type PII probabilities, so downstream score/gate semantics are unchanged;
 * the decode dicts additionally carry the **full probability distribution**
-  (``prob_by_value`` / ``p_top`` / ``margin`` for choice and noul,
-  ``p_by_type`` for PII) for offline calibration and replay (2026-10-24 item
-  1). These keys are record-only: matching/engine never read them, and the
-  existing ``value``/``confidence``/``is_rule`` values are bit-identical;
-  ``JevTagger.info()`` fingerprints the loaded model + question config;
+  (``prob_by_value`` / ``p_top`` / ``margin`` for choice and noul) for offline
+  calibration and replay. For PII the **model evidence is kept separate from
+  the regex rules** (2026-10-24 P1-A): ``model_p_by_type`` is the raw model
+  softmax per scored subtype and is never overwritten by a rule, ``model_hits``
+  is the pure-model hit list, ``rule_hits`` is the full-text regex hit list,
+  while ``value`` / ``confidence`` / ``conf_by_value`` / ``is_rule`` stay the
+  merged *effective* decision signal (rules enter at confidence 1.0). These
+  keys are record-only: matching/engine never read them;
+* ``TagResult`` carries a frozen version snapshot captured at ``tag()`` entry:
+  ``questions_sha256`` (canonical JSON of the config actually used to render
+  the scored pack) and ``tagger_info`` (``JevTagger.info()``: model/window +
+  head/tokenizer/chat-template/weights content hashes). A hot question-config
+  edit or a later ``info()`` call can therefore never desync a request's
+  ledger row from the pack that was scored;
 * rule signals are computed locally; ``similarity``/``reask`` signals no longer
   exist (session feature removed 2026-10-21);
 * ``user_feedback`` is null for single-turn requests.
@@ -153,6 +162,87 @@ def questions_sha256(questions) -> str:
     canonical = json.dumps(questions, sort_keys=True, ensure_ascii=False,
                            separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+#: Files hashed into ``JevTagger.info()`` / ``TagResult.tagger_info``. They are
+#: content versions of the *frozen* model artifacts, so a ledger/replay can pin
+#: the exact deployed export. Computed once at startup (weights are streamed in
+#: 1 MiB chunks: the deployed file is ~1.7 GB and hashing costs ~1-2 s).
+HEAD_FILE = "head.pt"
+#: Tokenizer vocabulary: the fast tokenizer JSON is canonical; the
+#: sentencepiece model is the fallback for older exports.
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer.model")
+#: Fallback chat-template file when ``tokenizer.chat_template`` is not set.
+CHAT_TEMPLATE_FILE = "chat_template.jinja"
+
+
+def sha256_file(path) -> str | None:
+    """Streaming sha256 hex digest of one file (``None`` if it is missing)."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    digest = hashlib.sha256()
+    with p.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_files(paths) -> str | None:
+    """Streaming sha256 over model weight files (``None`` if none exist).
+
+    A single file is hashed as plain file content (so it equals
+    ``sha256sum <file>``); multiple shards are hashed in the given order with
+    ``<name>\0<content>`` per shard so the shard layout is part of the digest.
+    """
+    files = [Path(p) for p in paths]
+    files = [p for p in files if p.is_file()]
+    if not files:
+        return None
+    if len(files) == 1:
+        return sha256_file(files[0])
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def model_file_hashes(model_dir) -> dict:
+    """Content hashes of the deployed model files (``None`` when absent).
+
+    Returns ``head_sha256`` (``head.pt``), ``tokenizer_sha256`` (the first
+    existing file of ``TOKENIZER_FILES``) and ``weights_sha256`` (sorted
+    ``*.safetensors``, falling back to ``*.bin``; streamed, see
+    :func:`sha256_files`).
+    """
+    d = Path(model_dir)
+    weights = sorted(d.glob("*.safetensors"))
+    if not weights:
+        weights = sorted(d.glob("*.bin"))
+    tokenizer_file = next(
+        (d / name for name in TOKENIZER_FILES if (d / name).is_file()), None)
+    return {
+        "head_sha256": sha256_file(d / HEAD_FILE),
+        "tokenizer_sha256": sha256_file(tokenizer_file) if tokenizer_file else None,
+        "weights_sha256": sha256_files(weights),
+    }
+
+
+def chat_template_sha256(tokenizer, model_dir) -> str | None:
+    """sha256 of the *effective* chat template (tokenizer string, file fallback).
+
+    The template string is what transformers renders prompts with, so its hash
+    is the meaningful version; ``chat_template.jinja`` is only used when the
+    tokenizer does not expose a template (e.g. a test fake).
+    """
+    template = getattr(tokenizer, "chat_template", None) if tokenizer is not None else None
+    if isinstance(template, str) and template:
+        return hashlib.sha256(template.encode("utf-8")).hexdigest()
+    return sha256_file(Path(model_dir) / CHAT_TEMPLATE_FILE)
 
 
 #: Separator between the head and tail slices when both are kept. Must match
@@ -520,35 +610,36 @@ def decode_noul(record: dict, probs: list[float], *, positive: str,
             "margin": abs(p_yes - p_no)}
 
 
-def fill_rule_pii_probabilities(signals: dict, text: str, *,
-                                scored_p_by_type: dict | None = None) -> dict:
-    """Attach ``signals['pii']['p_by_type']`` after ``merge_rule_pii``.
+def attach_pii_evidence(signals: dict, text: str, *,
+                        model_p_by_type: dict | None = None,
+                        model_hits: list[str] | None = None) -> dict:
+    """Attach the three-way PII evidence to ``signals['pii']`` after the merge.
 
-    ``merge_rule_pii`` rebuilds ``signals['pii']`` with the decision keys only
-    (``value``/``confidence``/``conf_by_value``/``is_rule``), dropping the
-    model distribution, so ``tag()`` snapshots the scored ``p_by_type`` first
-    and passes it in here. The rule hits (deterministic) are then added at
-    **1.0**, the same convention ``conf_by_value`` uses for them.
+    ``pii_rules.merge_rule_pii`` rebuilds ``signals['pii']`` with the effective
+    decision keys only (``value``/``confidence``/``conf_by_value``/``is_rule``),
+    so ``tag()`` captures the model evidence before the merge and passes it in
+    here. The three evidence fields are independent and must never be collapsed
+    (2026-10-24 P1-A review):
 
-    ``p_by_type`` and ``conf_by_value`` answer different questions and must not
-    be conflated: ``p_by_type`` = the full distribution over every scored
-    subtype (plus the deterministic 1.0 overrides for regex hits), while
-    ``conf_by_value`` = the decision confidence per *hit* (binary entropy for
-    model hits, 1.0 for rule hits). Types in ``p_by_type`` are therefore a
-    superset of the hit types and of ``conf_by_value`` keys: weak positives
-    stay in the distribution even though they are not a hit.
+    * ``model_p_by_type`` -- raw model softmax ``p_yes`` per **scored** subtype
+      (full pack = 30; trimmed scope = scope subset). Rules never overwrite it,
+      so a probability of 0.1 stays 0.1 even when the regex hits that type;
+    * ``model_hits`` -- the pure-model hit list (``p > PII_HIT_THRESHOLD`` and
+      ``binary_entropy_confidence >= PII_MIN_CONFIDENCE``);
+    * ``rule_hits`` -- deterministic regex hits over the **full** request text
+      (even when a trimmed scope did not score ``pii`` at all).
 
-    A trimmed scope may not score ``pii`` at all; if a rule fires anyway the
-    map is created with just the rule hits, so a replay sees every type whose
-    probability effectively participated in the decision.
+    The effective ``value``/``conf_by_value``/``is_rule`` (union of model hits
+    and rule hits, rules at confidence 1.0) are left exactly as
+    ``merge_rule_pii`` derived them; consumers that only route/block keep
+    reading those. Offline PII reports use the separate layers above.
     """
     pii = signals.get("pii")
     if not isinstance(pii, dict):
         return signals
-    p_by_type = dict(scored_p_by_type or {})
-    for typ in rule_pii_hits(text):
-        p_by_type[typ] = 1.0
-    pii["p_by_type"] = p_by_type
+    pii["model_p_by_type"] = dict(model_p_by_type or {})
+    pii["model_hits"] = list(model_hits or [])
+    pii["rule_hits"] = rule_pii_hits(text)
     return signals
 
 
@@ -636,6 +727,12 @@ class JevTagger:
                                                  weights_only=True))
         self.backbone.eval()
         self.head.eval()
+        #: Frozen content-version snapshot: model/window metadata + head /
+        #: tokenizer / chat-template / weights hashes. Hashed ONCE here (the
+        #: weights file is ~1.7 GB and is streamed), cached for info() and for
+        #: the per-request TagResult.tagger_info snapshot; nothing re-reads the
+        #: tagger or the files after scoring.
+        self._static_info_cache = self._compute_static_info()
         if warmup:
             self._warmup()
 
@@ -644,25 +741,54 @@ class JevTagger:
         self.questions = validate_question_config(cfg)
         return self.questions
 
+    def _compute_static_info(self) -> dict:
+        """Artifact versions that only change when the model export changes.
+
+        Computed once at startup (the weights hash streams ~1.7 GB) and then
+        reused: ``questions_sha256`` stays per-call because the question config
+        is hot-editable, while these keys are frozen. Missing files hash to
+        ``None`` so unit-test fakes keep working.
+        """
+        model_dir = Path(self.model_dir).resolve()
+        info = {
+            "engine": "jev",
+            "model_dir": str(model_dir),
+            "model_name": model_dir.name,
+            "temperature": float(self.temperature),
+            "max_length": int(self.max_length),
+            "window": self.window_spec,
+        }
+        info.update(model_file_hashes(self.model_dir))
+        info["chat_template_sha256"] = chat_template_sha256(
+            getattr(self, "tokenizer", None), self.model_dir)
+        return info
+
+    def _static_info(self) -> dict:
+        """The cached static snapshot (lazily built for object.__new__ stubs)."""
+        cached = getattr(self, "_static_info_cache", None)
+        if cached is None:                  # unit tests build taggers via __new__
+            cached = self._compute_static_info()
+            self._static_info_cache = cached
+        return cached
+
+    def _info_for(self, questions) -> dict:
+        """info() against one captured config object (never re-reads the tagger)."""
+        return {**self._static_info(),
+                "questions_sha256": questions_sha256(questions)}
+
     def info(self) -> dict:
         """Version/fingerprint of the loaded signal pack (ledger replay).
 
         Consumers must probe with ``getattr(tagger, "info", None)``: only the
-        JEV tagger implements this (plan 1.3). ``questions_sha256`` hashes the
-        in-memory validated config, so a hot config edit changes it on the
-        next request; ``model_dir`` is absolute, so a ledger row can be matched
-        to the deployed export; ``window`` is the effective ``<head>:<tail>``
-        spec (``"<max_length>:0"`` when no window is configured — ``"1024:0"``
-        for the deployed model) so a replay reproduces the input window.
+        JEV tagger implements this. The static artifact hashes
+        (``head_sha256``/``tokenizer_sha256``/``chat_template_sha256``/
+        ``weights_sha256``) and model/window metadata are computed once at
+        startup; ``questions_sha256`` hashes the **current** in-memory config,
+        so a hot edit changes that key on the next request. The request path
+        must use ``TagResult.questions_sha256``/``TagResult.tagger_info``
+        (captured at tag() entry) instead of calling info() after a response.
         """
-        model_dir = Path(self.model_dir).resolve()
-        return {"engine": "jev",
-                "model_dir": str(model_dir),
-                "model_name": model_dir.name,
-                "temperature": float(self.temperature),
-                "max_length": int(self.max_length),
-                "window": self.window_spec,
-                "questions_sha256": questions_sha256(self.questions)}
+        return self._info_for(self.questions)
 
     # ── forward ────────────────────────────────────────────────────────────
     def _warmup(self) -> None:
@@ -773,14 +899,19 @@ class JevTagger:
         return out
 
     def _model_signals(self, req: TagRequest, *,
-                       text: str | None = None) -> dict:
+                       text: str | None = None,
+                       questions: dict | None = None) -> dict:
         scope = req.scope
         if scope is not None and scope.trimmed:
             logger.debug("jev trimmed pack: signals=%s pii=%s",
                          sorted(scope.signals), sorted(scope.pii_types))
-        # ``text`` is the windowed context from _tag_row; direct callers (unit
-        # tests, bench scripts) default to the un-windowed request text.
-        records = build_signal_records(self.questions,
+        # ``questions`` is the config object tag() captured at its entry (hot
+        # config edits must not desync the pack from its fingerprint); direct
+        # callers (unit tests, bench scripts) default to the current attribute.
+        # ``text`` is the windowed context from _tag_row; direct callers
+        # default to the un-windowed request text.
+        cfg = questions if questions is not None else self.questions
+        records = build_signal_records(cfg,
                                        req.text if text is None else text,
                                        scope)
         # user_feedback is unconditionally overridden to null for single-turn
@@ -810,9 +941,13 @@ class JevTagger:
         if req.n_messages <= 1:
             signals["user_feedback"] = {"value": None, "confidence": None,
                                         "is_rule": False}
-        # PII: one noul question per type; hits are canonical type keys.  With a
+        # PII: one noul question per type; hits are canonical type keys. With a
         # trimmed scope only the referenced subtypes were asked; merge_rule_pii
         # (in tag()) still unions the deterministic regex hits of every type.
+        # The model evidence below is pure-model and is re-attached unchanged
+        # after the merge (attach_pii_evidence); value/conf_by_value/is_rule
+        # here are pre-merge model values that merge_rule_pii derives the
+        # effective decision signal from.
         pii_items = by_key.get("pii")
         if pii_items is not None:
             labels = [item["sub"] for item, _ in pii_items]
@@ -822,39 +957,52 @@ class JevTagger:
                 "value": hits,
                 "confidence": max(conf_by_value.values()) if conf_by_value else None,
                 "conf_by_value": conf_by_value, "is_rule": False,
-                # Full model distribution over **every scored subtype** (full
-                # pack = 30, trimmed scope = scope subset), not just the hits:
-                # weak positives are absent from value/conf_by_value but stay
-                # here for calibration. Rule hits are added in tag() at 1.0
-                # (fill_rule_pii_probabilities) — see the semantics note there.
-                "p_by_type": dict(zip(labels, p_yes_per_type))}
+                # Model-only evidence (2026-10-24 P1-A): the raw softmax over
+                # every scored subtype (full pack = 30, trimmed = scope subset)
+                # and the pure-model hit list. THE RULES NEVER OVERWRITE THESE.
+                "model_p_by_type": dict(zip(labels, p_yes_per_type)),
+                "model_hits": list(hits),
+            }
         return signals
 
-    def _tag_row(self, req: TagRequest) -> tuple[dict, None, dict]:
+    def _tag_row(self, req: TagRequest,
+                 questions: dict | None = None) -> tuple[dict, None, dict]:
         # Model signals read the configured window only; tag() still runs the
         # rule signals over the full text (long-request safety net).
         text, window = self._context_window(req.text)
-        return self._model_signals(req, text=text), None, window
+        return self._model_signals(req, text=text, questions=questions), None, window
 
     async def tag(self, req: TagRequest) -> TagResult:
-        signals, vec, window = await asyncio.to_thread(self._tag_row, req)
+        # Frozen snapshot (2026-10-24 P1-A): capture the question-config object
+        # and the version map BEFORE the (slow) scoring starts. A concurrent
+        # PUT /admin/signal-questions may swap self.questions while tag() runs;
+        # the scored pack and the ledger fingerprint must describe the SAME
+        # config, so both use the captured object -- never a post-hoc re-read.
+        questions = self.questions
+        tagger_info = self._info_for(questions)
+        signals, vec, window = await asyncio.to_thread(
+            self._tag_row, req, questions)
         # Rule signals keep the FULL request text even though the model only
         # reads the window: pii_rules is the only layer that still sees long
         # requests (docs/jev-pii-200k/REPORT.md §5.4).
         signals.update(rule_signals(req.text, req.headers, req.n_messages,
                                     self.kw_groups, time_periods=self.time_periods))
-        # merge_rule_pii rebuilds signals["pii"] with the decision keys only, so
-        # snapshot the model distribution (if pii was scored) across the merge.
+        # merge_rule_pii rebuilds signals["pii"] with the effective decision
+        # keys only; capture the pure-model evidence across the merge so the
+        # rules can never overwrite the model probabilities.
         pii_sig = signals.get("pii")
-        scored_p_by_type = (dict(pii_sig.get("p_by_type") or {})
-                            if isinstance(pii_sig, dict) else None)
+        model_p_by_type: dict = {}
+        model_hits: list[str] = []
+        if isinstance(pii_sig, dict):
+            model_p_by_type = dict(pii_sig.get("model_p_by_type") or {})
+            model_hits = list(pii_sig.get("model_hits") or [])
         merge_rule_pii(signals, req.text)
-        # The full-distribution field is JEV-only: re-attach it and record the
-        # deterministic regex hits at p=1.0 (merge_rule_pii itself stays shared
-        # with the checkpoint tagger and only touches value/conf_by_value).
-        fill_rule_pii_probabilities(signals, req.text,
-                                    scored_p_by_type=scored_p_by_type)
-        return TagResult(signals=signals, vec=vec, input=window)
+        attach_pii_evidence(signals, req.text,
+                            model_p_by_type=model_p_by_type,
+                            model_hits=model_hits)
+        return TagResult(signals=signals, vec=vec, input=window,
+                         questions_sha256=tagger_info["questions_sha256"],
+                         tagger_info=tagger_info)
 
     async def aclose(self) -> None:
         self.model = None

@@ -27,7 +27,8 @@ from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 binary_entropy_confidence, head_window,
                                 load_question_config, parse_window,
                                 questions_sha256, validate_question_config,
-                                window_text)
+                                window_text, chat_template_sha256,
+                                model_file_hashes, sha256_file, sha256_files)
 from router.signals.registry import SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import default_pipeline
@@ -348,33 +349,46 @@ def test_pii_weak_candidates_are_not_hits(monkeypatch):
     signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
     assert signals["pii"]["value"] == []
     assert signals["pii"]["conf_by_value"] == {}
-    # ... but the full distribution keeps the weak positive (item 1.1)
-    assert signals["pii"]["p_by_type"]["cn_id_card"] == pytest.approx(0.6)
+    # ... the pure-model distribution keeps the weak positive, but it is not a
+    # model hit (2026-10-24 P1-A evidence split)
+    assert signals["pii"]["model_p_by_type"]["cn_id_card"] == pytest.approx(0.6)
+    assert signals["pii"]["model_hits"] == []
 
 
-def test_pii_p_by_type_covers_every_scored_type(monkeypatch):
-    """full pack: one p_yes per scored subtype (30), not just the hit set."""
+def test_pii_model_evidence_covers_every_scored_type(monkeypatch):
+    """full pack: one model p_yes per scored subtype (30); hits stay separate."""
     tagger = stub_tagger()
     monkeypatch.setattr(tagger, "_score", probs_for)
     signals = tagger._model_signals(TagRequest(text="x", n_messages=2))
-    p_by_type = signals["pii"]["p_by_type"]
-    assert set(p_by_type) == set(PII_TYPES)
-    assert len(p_by_type) == 30
-    assert p_by_type["cn_id_card"] == pytest.approx(0.9)
-    assert p_by_type["phone_number"] == pytest.approx(0.1)
-    # distribution (30 types) is a superset of the hit/conf maps (1 hit)
-    assert signals["pii"]["value"] == ["cn_id_card"]
-    assert set(signals["pii"]["conf_by_value"]) == {"cn_id_card"}
+    pii = signals["pii"]
+    assert set(pii["model_p_by_type"]) == set(PII_TYPES)
+    assert len(pii["model_p_by_type"]) == 30
+    assert pii["model_p_by_type"]["cn_id_card"] == pytest.approx(0.9)
+    assert pii["model_p_by_type"]["phone_number"] == pytest.approx(0.1)
+    assert pii["model_hits"] == ["cn_id_card"]
+    # pre-merge decision value/conf are the pure-model ones; rule evidence is
+    # attached by tag() (here we call _model_signals directly)
+    assert pii["value"] == ["cn_id_card"]
+    assert set(pii["conf_by_value"]) == {"cn_id_card"}
 
 
-def test_pii_p_by_type_trimmed_scope_is_the_scope_subset(monkeypatch):
-    """trimmed scope: only the referenced subtypes were scored/asked."""
+def test_pii_trimmed_scope_keeps_model_subset_and_full_text_rule_hits(
+        monkeypatch):
+    """trimmed scope: model evidence only for scored subtypes, but the regex
+    layer still scans the FULL text — the scope must never drop rule evidence."""
     tagger = stub_tagger()
     monkeypatch.setattr(tagger, "_score", probs_for)
-    signals = tagger._model_signals(TagRequest(
-        text="这条请求是越狱吗", n_messages=2, scope=trimmed_scope()))
-    assert signals["pii"]["p_by_type"] == {"cn_id_card": pytest.approx(0.9)}
-    assert "phone_number" not in signals["pii"]["p_by_type"]
+    text = ("联系我 someone@example.com，密码: abc123，"
+            "身份证号 11010519491231002X")
+    result = asyncio.run(tagger.tag(TagRequest(
+        text=text, n_messages=2, scope=trimmed_scope())))
+    pii = result.signals["pii"]
+    assert pii["model_p_by_type"] == {"cn_id_card": pytest.approx(0.9)}
+    assert set(pii["model_hits"]) <= {"cn_id_card"}
+    assert {"email_address", "password"}.issubset(set(pii["rule_hits"]))
+    assert "cn_id_card" in pii["rule_hits"]      # valid checksum ID
+    assert {"cn_id_card", "email_address", "password"} <= set(pii["value"])
+    assert pii["conf_by_value"]["email_address"] == 1.0
 
 
 def test_signal_pack_maps_probabilities_to_product_values(monkeypatch):
@@ -469,21 +483,37 @@ def test_tag_merges_rule_pii_safety_net(monkeypatch):
     result = asyncio.run(tagger.tag(TagRequest(
         text="帮我核对身份证号 11010519491231002X 的信息", n_messages=1)))
     pii = result.signals["pii"]
-    assert "cn_id_card" in pii["value"]
+    # effective decision signal: model (empty here) unioned with the rule hit
+    assert pii["value"] == ["cn_id_card"]
     assert pii["conf_by_value"]["cn_id_card"] == 1.0
-    # the rule hit also enters the full distribution at 1.0; every other scored
-    # type keeps the model's p_yes (0.1) — p_by_type and conf_by_value are
-    # different maps (distribution vs per-hit decision confidence)
-    assert set(pii["p_by_type"]) == set(PII_TYPES)
-    assert pii["p_by_type"]["cn_id_card"] == 1.0
-    assert pii["p_by_type"]["phone_number"] == pytest.approx(0.1)
+    assert pii["is_rule"] is True                # only the rule contributed
+    # P1-A: the rule NEVER rewrites the model evidence...
+    assert set(pii["model_p_by_type"]) == set(PII_TYPES)
+    assert pii["model_p_by_type"]["cn_id_card"] == pytest.approx(0.1)
+    assert pii["model_p_by_type"]["phone_number"] == pytest.approx(0.1)
+    assert pii["model_hits"] == []
+    assert pii["rule_hits"] == ["cn_id_card"]
     assert set(pii["conf_by_value"]) == {"cn_id_card"}
 
 
+def test_pii_overlap_keeps_the_raw_model_probability(monkeypatch):
+    """overlap: both layers hit cn_id_card; the effective confidence is the
+    rule's 1.0 but model_p_by_type keeps the raw softmax (never 1.0)."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    result = asyncio.run(tagger.tag(TagRequest(
+        text="帮我核对身份证号 11010519491231002X", n_messages=1)))
+    pii = result.signals["pii"]
+    assert pii["model_hits"] == ["cn_id_card"]
+    assert pii["rule_hits"] == ["cn_id_card"]
+    assert pii["model_p_by_type"]["cn_id_card"] == pytest.approx(0.9)
+    assert pii["conf_by_value"]["cn_id_card"] == 1.0
+    assert pii["is_rule"] is False
+
+
 def test_rule_pii_hits_are_recorded_even_when_pii_is_not_scored(monkeypatch):
-    """A trimmed-away pii question still gets its deterministic hits in
-    p_by_type (the map is created by the merge), so a replay can tell which
-    type's probability entered the decision."""
+    """A trimmed-away pii question still gets its deterministic hits; the model
+    evidence stays empty (scope did not score pii) — the layers never mix."""
     tagger = stub_tagger()
     monkeypatch.setattr(tagger, "_score", lambda records: [])
     result = asyncio.run(tagger.tag(TagRequest(
@@ -492,7 +522,51 @@ def test_rule_pii_hits_are_recorded_even_when_pii_is_not_scored(monkeypatch):
     pii = result.signals["pii"]
     assert pii["value"] == ["cn_id_card"]
     assert pii["conf_by_value"] == {"cn_id_card": 1.0}
-    assert pii["p_by_type"] == {"cn_id_card": 1.0}
+    assert pii["is_rule"] is True
+    assert pii["model_p_by_type"] == {}
+    assert pii["model_hits"] == []
+    assert pii["rule_hits"] == ["cn_id_card"]
+
+
+def test_merge_rule_pii_does_not_touch_model_probabilities(monkeypatch):
+    """A1 acceptance: the model probability map is bit-identical before/after
+    merge_rule_pii, for the full and the trimmed pack."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    text = "帮我核对身份证号 11010519491231002X，请联系 someone@example.com"
+    for scope in (None, trimmed_scope()):
+        req = TagRequest(text=text, n_messages=1, scope=scope)
+        pre = tagger._model_signals(req)["pii"]
+        post = asyncio.run(tagger.tag(req)).signals["pii"]
+        assert post["model_p_by_type"] == pre["model_p_by_type"]   # 逐位
+        assert post["model_hits"] == pre["model_hits"]
+        assert set(post["rule_hits"]) >= {"cn_id_card", "email_address"}
+
+
+def test_pii_three_layers_have_different_confusion_matrices():
+    """A1 acceptance: model / rule / union are independent layers and their
+    confusion matrices differ on the same gold set."""
+    from router.eval_metrics import Confusion
+
+    # (gold present, model p_yes, regex hit)
+    cases = [
+        (True, 0.90, True),    # T1 overlap: both hit
+        (True, 0.10, True),    # T2 model miss + rule hit
+        (False, 0.10, True),   # T3 rule false positive (model correctly no)
+        (True, 0.10, False),   # T4 both miss
+        (False, 0.10, False),  # T5 true negative
+        (True, 0.90, False),   # T6 model-only hit
+    ]
+    gold = [case[0] for case in cases]
+    model = Confusion.from_predictions(gold, [p > 0.5 for _, p, _ in cases])
+    rule = Confusion.from_predictions(gold, [r for _, _, r in cases])
+    union = Confusion.from_predictions(
+        gold, [p > 0.5 or r for _, p, r in cases])
+    assert (model.tp, model.fp, model.tn, model.fn) == (2, 0, 2, 2)
+    assert (rule.tp, rule.fp, rule.tn, rule.fn) == (2, 1, 1, 2)
+    assert (union.tp, union.fp, union.tn, union.fn) == (3, 1, 1, 1)
+    assert model.fpr == 0.0 and rule.fpr == pytest.approx(0.5)
+    assert union.recall > model.recall and union.fdr > model.fdr
 
 
 def test_tag_merges_rule_signals(monkeypatch):
@@ -992,8 +1066,15 @@ def test_info_reports_model_identity_and_question_fingerprint():
     tagger.model_dir = Path("/models/jev-r4b3")
     tagger.temperature = 3.45
     info = tagger.info()
-    assert set(info) == {"engine", "model_dir", "model_name", "temperature",
-                         "max_length", "window", "questions_sha256"}
+    assert set(info) == {
+        "engine", "model_dir", "model_name", "temperature", "max_length",
+        "window", "questions_sha256", "head_sha256", "tokenizer_sha256",
+        "chat_template_sha256", "weights_sha256"}
+    # the stub's model dir does not exist -> artifact hashes are null
+    assert info["head_sha256"] is None
+    assert info["tokenizer_sha256"] is None
+    assert info["chat_template_sha256"] is None
+    assert info["weights_sha256"] is None
     assert info["engine"] == "jev"
     assert info["model_dir"] == str(Path("/models/jev-r4b3").resolve())
     assert info["model_name"] == "jev-r4b3"
@@ -1014,6 +1095,106 @@ def test_info_question_fingerprint_follows_a_hot_config_edit():
     edited["signals"]["jailbreak"]["instructions"][0] += "？"
     tagger.set_questions(edited)
     assert tagger.info()["questions_sha256"] != before
+    assert tagger.info()["questions_sha256"] == questions_sha256(edited)
+
+
+def test_model_artifact_hash_helpers(tmp_path):
+    """A1: head/tokenizer/weights/chat-template content hashes (streamed)."""
+    head = tmp_path / "head.pt"
+    head.write_bytes(b"head-bytes")
+    weights = tmp_path / "model.safetensors"
+    weights.write_bytes(b"w" * 1000)
+    (tmp_path / "tokenizer.json").write_text('{"vocab": 1}', encoding="utf-8")
+    hashes = model_file_hashes(tmp_path)
+    assert hashes["head_sha256"] == hashlib.sha256(b"head-bytes").hexdigest()
+    assert hashes["tokenizer_sha256"] == hashlib.sha256(
+        '{"vocab": 1}'.encode()).hexdigest()
+    assert hashes["weights_sha256"] == hashlib.sha256(b"w" * 1000).hexdigest()
+    assert sha256_file(tmp_path / "missing.bin") is None
+    assert sha256_files([]) is None
+    # multiple weight shards: names are part of the digest (layout pinned) and
+    # the result differs from hashing only the concatenated bytes
+    (tmp_path / "model-00001.safetensors").write_bytes(b"a")
+    shard_dir = tmp_path / "sharded"
+    shard_dir.mkdir()
+    (shard_dir / "model-00001.safetensors").write_bytes(b"a")
+    (shard_dir / "model-00002.safetensors").write_bytes(b"b")
+    import hashlib as _hashlib
+    multi = sha256_files(sorted(shard_dir.glob("*.safetensors")))
+    assert multi == sha256_files([shard_dir / "model-00001.safetensors",
+                                  shard_dir / "model-00002.safetensors"])
+    assert multi != _hashlib.sha256(b"ab").hexdigest()
+    assert model_file_hashes(shard_dir)["weights_sha256"] == multi
+
+    class _Tok:
+        chat_template = "{{ messages }}"
+
+    assert chat_template_sha256(_Tok(), tmp_path) == hashlib.sha256(
+        b"{{ messages }}").hexdigest()
+    (tmp_path / "chat_template.jinja").write_text("file-template", encoding="utf-8")
+
+    class _NoTemplate:
+        pass
+
+    assert chat_template_sha256(_NoTemplate(), tmp_path) == hashlib.sha256(
+        b"file-template").hexdigest()
+
+
+def test_real_constructor_info_carries_artifact_hashes(tmp_path, monkeypatch):
+    tagger = real_tagger(tmp_path, monkeypatch)
+    info = tagger.info()
+    # real_tagger writes an (empty) head.pt and no tokenizer/weights/template
+    assert info["head_sha256"] == hashlib.sha256(b"").hexdigest()
+    assert info["weights_sha256"] is None
+    assert info["tokenizer_sha256"] is None
+    assert info["chat_template_sha256"] is None
+
+
+def test_non_jev_taggers_leave_the_snapshot_fields_empty():
+    """B1 contract: heuristic/checkpoint/prompt taggers keep None/{} so the
+    ledger can store NULL without special-casing the tagger type."""
+    from router.signals.heuristic import HeuristicTagger
+
+    result = asyncio.run(HeuristicTagger().tag(
+        TagRequest(text="你好", n_messages=1)))
+    assert result.questions_sha256 is None
+    assert result.tagger_info == {}
+
+
+def test_tag_result_carries_the_scoring_snapshot(monkeypatch):
+    """A1: tag() snapshots questions_sha256 + tagger_info at entry."""
+    tagger = stub_tagger()
+    monkeypatch.setattr(tagger, "_score", probs_for)
+    result = asyncio.run(tagger.tag(TagRequest(text="x", n_messages=1)))
+    assert result.questions_sha256 == questions_sha256(tagger.questions)
+    assert result.tagger_info["questions_sha256"] == result.questions_sha256
+    assert result.tagger_info["engine"] == "jev"
+    assert "model_name" in result.tagger_info and "window" in result.tagger_info
+
+
+def test_tag_freezes_the_questions_config_during_a_hot_update(monkeypatch):
+    """A1: a hot PUT that lands while scoring must not desync the pack from its
+    fingerprint — tag() uses the config object captured at entry."""
+    tagger = stub_tagger()
+    cfg_before = tagger.questions
+    edited = json.loads(json.dumps(cfg_before))
+    domain = edited["signals"]["domain"]["candidates"]
+    edited["signals"]["domain"]["candidates"] = dict(list(domain.items())[:2])
+    seen: list[list[dict]] = []
+
+    def score(records):
+        seen.append(records)
+        tagger.set_questions(edited)          # hot config PUT mid-scoring
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", score)
+    result = asyncio.run(tagger.tag(TagRequest(text="x", n_messages=1)))
+    # the rendered pack still has all 14 domain candidates (captured config)
+    assert len(seen) == 1
+    assert any(record["kind"] == "choice" and len(record["answer_keys"]) == 14
+               for record in seen[0])
+    assert result.questions_sha256 == questions_sha256(cfg_before)
+    # the tagger itself did hot-swap; a later info() reflects the new config
     assert tagger.info()["questions_sha256"] == questions_sha256(edited)
 
 
@@ -1081,8 +1262,8 @@ def test_full_and_trimmed_packs_agree_on_every_referenced_value(monkeypatch):
     # unreferenced subtypes are missing from the trimmed pack.
     assert trimmed["pii"]["conf_by_value"].get("cn_id_card") == \
         full["pii"]["conf_by_value"].get("cn_id_card")
-    assert trimmed["pii"]["p_by_type"] == {
-        "cn_id_card": full["pii"]["p_by_type"]["cn_id_card"]}
+    assert trimmed["pii"]["model_p_by_type"] == {
+        "cn_id_card": full["pii"]["model_p_by_type"]["cn_id_card"]}
     assert ("cn_id_card" in trimmed["pii"]["value"]) == \
         ("cn_id_card" in full["pii"]["value"])
     other_types = [typ for typ in full["pii"]["value"] if typ != "cn_id_card"]

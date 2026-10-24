@@ -38,6 +38,17 @@ class TagResult:
     #: not measure input size. The prompt judge fills it with character counts
     #: (it never tokenizes); JEV fills it with token counts.
     input: dict = field(default_factory=dict)
+    #: sha256 (canonical JSON) of the question config the model signals were
+    #: rendered from. JEV only; captured at ``tag()`` entry so a hot config
+    #: edit mid-request cannot desync the fingerprint from the scored pack.
+    #: ``None`` for taggers without an editable question config.
+    questions_sha256: str | None = None
+    #: Frozen version snapshot of the tagger taken at ``tag()`` entry (JEV:
+    #: ``JevTagger.info()`` -- engine/model/window + head/tokenizer/
+    #: chat-template/weights content hashes). The request path must use this
+    #: instead of re-reading the tagger after the response. Empty for taggers
+    #: that do not implement ``info()``.
+    tagger_info: dict = field(default_factory=dict)
 
 
 class Tagger(Protocol):
