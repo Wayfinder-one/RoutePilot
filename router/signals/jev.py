@@ -1535,12 +1535,24 @@ class JevTagger:
             raise JevTaggerError(str(exc)) from exc
 
     async def tag(self, req: TagRequest) -> TagResult:
+        """Tag with the request's fixed questions, else the current config.
+
+        The routing runtime passes the questions captured in the immutable
+        ``RoutingSnapshot`` (``req.questions``, design §8.2) so an in-flight
+        request keeps the exact question pack/fingerprint it started with even
+        if ``PUT /admin/signal-questions`` swaps ``self.questions``. Callers
+        without a snapshot (unit tests, bench scripts) keep the historical
+        behaviour: the tagger's current config.
+        """
         # Frozen snapshot (2026-10-24 P1-A): capture the question-config object
-        # and the version map BEFORE the (slow) scoring starts. A concurrent
-        # PUT /admin/signal-questions may swap self.questions while tag() runs;
-        # the scored pack and the ledger fingerprint must describe the SAME
-        # config, so both use the captured object -- never a post-hoc re-read.
-        questions = self.questions
+        # BEFORE the slow scoring starts. The scored pack and the ledger
+        # fingerprint must describe the SAME config -- never a post-hoc re-read.
+        questions = req.questions if req.questions is not None \
+            else self.questions
+        return await self._tag_with_questions(req, questions)
+
+    async def _tag_with_questions(self, req: TagRequest,
+                                  questions: dict) -> TagResult:
         tagger_info = self._info_for(questions)
         # Capability-routing provenance is per request (the pack is passed in
         # from the immutable snapshot), unlike the model/question fingerprints.

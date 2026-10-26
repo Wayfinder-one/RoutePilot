@@ -20,7 +20,7 @@ class TagRequest:
     n_messages: int = 1
     #: Optional pipeline-derived trimming hint: the model signals and PII
     #: subtypes this request can actually be matched on
-    #: (``router.pipeline.scope.compute_signal_scope``). ``None`` = compute the
+    #: (``router.pipeline.scope.compute_tree_scope``). ``None`` = compute the
     #: complete pack — the default for /admin/try, the eval endpoints and every
     #: tagger that does not implement trimming.
     scope: "SignalScope | None" = None
@@ -32,6 +32,13 @@ class TagRequest:
     #: Passed per request from the immutable snapshot so a mid-flight config
     #: write cannot desync the decision from its fingerprint.
     capability: dict | None = None
+    #: Fixed signal-question config for this request, captured in the immutable
+    #: routing snapshot (``RoutingSnapshot.questions``, thawed to a plain dict).
+    #: ``None`` = use the tagger's current config — the historical behaviour for
+    #: tests/bench scripts and taggers without an editable question config. The
+    #: routing runtime always passes the snapshot's object, so an in-flight
+    #: request keeps the question pack it started with (design §8.2).
+    questions: dict | None = None
 
 
 @dataclass

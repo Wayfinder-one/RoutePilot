@@ -15,9 +15,8 @@ from pathlib import Path
 
 import pytest
 
-from router.pipeline.model import Station, TreeNode
-from router.pipeline.scope import (compute_signal_scope, full_scope,
-                                   SignalScope)
+from router.pipeline.scope import SignalScope, compute_tree_scope
+from router.pipeline.tree import Branch, Route, Weight, When
 from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 JUDGED_SIGNALS, NOUL_SIGNALS,
                                 PROMPT_OVERHEAD_SLACK, WINDOW_MARKER,
@@ -32,7 +31,6 @@ from router.signals.jev import (CHOICE_SIGNALS, DEFAULT_QUESTIONS_PATH,
                                 load_chunk_calibration)
 from router.signals.registry import SIGNALS
 from router.signals.tagger import TagRequest
-from router.store.repositories import default_pipeline
 
 PII_TYPES = list(load_question_config()["signals"]["pii"]["types"])
 #: Full pack = 54 candidate prompts from 36 records: 3 choice records
@@ -182,8 +180,29 @@ def real_tagger(tmp_path, monkeypatch, *, model_max_length=1024, **kwargs):
                      **kwargs)
 
 
+def deployed_root():
+    """The deployed tree's signal references (unified tree, no Station layer).
+
+    jailbreak (model), pii.cn_id_card (model multi, trimmed per subtype),
+    domain (model) and complexity (model, weighted) -> the historical
+    4-record / 17-prompt trimmed pack.
+    """
+    return Branch(
+        id="root",
+        children=(
+            Route("jb", "qwen3-8b", when=When("jailbreak", "jailbreak")),
+            Route("id", "qwen3-8b",
+                  when=When("pii", "cn_id_card", op="contains")),
+            Route("domain", "qwen3-8b", when=When("domain", "health")),
+            Route("complexity", "qwen3-8b",
+                  weights=(Weight("complexity", "hard", 0.5),),
+                  min_score=0.5),
+        ),
+        otherwise=Route("fallback", "qwen3-8b"))
+
+
 def trimmed_scope():
-    return compute_signal_scope(default_pipeline())
+    return compute_tree_scope(deployed_root())
 
 
 def stub_tagger(questions=None, tokenizer=None, max_length=1024,
@@ -1228,6 +1247,61 @@ def test_tag_freezes_the_questions_config_during_a_hot_update(monkeypatch):
     assert tagger.info()["questions_sha256"] == questions_sha256(edited)
 
 
+def _fixed_questions(marker: str) -> dict:
+    """A questions config distinguishable from the default by rendered wording."""
+    cfg = json.loads(json.dumps(load_question_config()))
+    cfg["signals"]["jailbreak"]["instructions"][0] = f"{marker} 越狱问题"
+    return cfg
+
+
+def test_request_fixed_questions_drive_the_pack_and_fingerprint(monkeypatch):
+    """Task 8: the runtime passes the snapshot's questions; request questions
+    win over ``self.questions`` for rendering, ``_info_for`` and the sha."""
+    default_cfg = load_question_config()
+    fixed = _fixed_questions("B-VERSION")
+    assert questions_sha256(fixed) != questions_sha256(default_cfg)
+    tagger = stub_tagger(questions=default_cfg)
+    seen: list[list[dict]] = []
+
+    def score(records):
+        seen.append(records)
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", score)
+    result = asyncio.run(tagger.tag(TagRequest(
+        text="x", n_messages=1, questions=fixed)))
+    rendered = json.dumps(seen[0], ensure_ascii=False)
+    assert "B-VERSION" in rendered                      # pack from the request
+    assert result.questions_sha256 == questions_sha256(fixed)
+    assert result.tagger_info["questions_sha256"] == questions_sha256(fixed)
+    assert tagger.questions == default_cfg              # default untouched
+
+
+def test_request_fixed_questions_are_frozen_during_a_hot_update(monkeypatch):
+    """An in-flight request keeps its snapshot questions even if a hot config
+    PUT lands while the (slow) scoring runs."""
+    default_cfg = load_question_config()
+    fixed = _fixed_questions("B-VERSION")
+    later = _fixed_questions("A2-VERSION")
+    tagger = stub_tagger(questions=default_cfg)
+    seen: list[list[dict]] = []
+
+    def score(records):
+        seen.append(records)
+        tagger.set_questions(later)            # hot config PUT mid-scoring
+        return probs_for(records)
+
+    monkeypatch.setattr(tagger, "_score", score)
+    result = asyncio.run(tagger.tag(TagRequest(
+        text="x", n_messages=1, questions=fixed)))
+    rendered = json.dumps(seen[0], ensure_ascii=False)
+    assert "B-VERSION" in rendered
+    assert "A2-VERSION" not in rendered
+    assert result.questions_sha256 == questions_sha256(fixed)
+    # the hot swap still applies to later requests
+    assert tagger.info()["questions_sha256"] == questions_sha256(later)
+
+
 # --------------------------------------------------------------------------- #
 # Pipeline-aware trimming: TagRequest.scope[ sign | pii subtype ] -> pack
 # --------------------------------------------------------------------------- #
@@ -1311,11 +1385,9 @@ def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
         return probs_for(records)
 
     monkeypatch.setattr(tagger, "_score", capture)
-    weird = [Station(id="s", name="怪", root=TreeNode(
-        id="g", signal=None, kind="fork", children=[
-            TreeNode(id="b", signal="telepathy", value="yes", kind="leaf",
-                     action="route", model="qwen3-8b")]))]
-    scope = compute_signal_scope(weird)
+    weird = Branch(id="g", children=(
+        Route("b", "qwen3-8b", when=When("telepathy", "yes")),))
+    scope = compute_tree_scope(weird)
     assert scope.full
     signals = tagger._model_signals(TagRequest(text="x", n_messages=2,
                                                scope=scope))
@@ -1325,20 +1397,21 @@ def test_unknown_reference_falls_back_to_the_full_pack(monkeypatch):
 
 def test_hot_pipeline_edit_widens_scope_and_pack():
     """③ a new question/candidate in the tree is picked up automatically."""
-    stations = default_pipeline()
-    before = compute_signal_scope(stations)
+    base = deployed_root()
+    before = compute_tree_scope(base)
     assert "fact_check" not in before.signals
-    new_station = Station(id="st-fc", name="需核实", root=TreeNode(
-        id="n-fc", signal=None, kind="fork", children=[
-            TreeNode(id="c-fc", signal="fact_check", value="needs_check",
-                     conf_min=0.5, kind="leaf", action="route",
-                     model="qwen3-8b")]))
-    after = compute_signal_scope(stations[:-1] + [new_station] + stations[-1:])
+    widened = Branch(
+        id="root",
+        children=base.children[:1]
+        + (Route("fc", "qwen3-8b", when=When("fact_check", "needs_check")),)
+        + base.children[1:],
+        otherwise=base.otherwise)
+    after = compute_tree_scope(widened)
     assert "fact_check" in after.signals
     records = build_signal_records(load_question_config(), "x", after)
     assert any(item["signal"] == "fact_check" for item in records)
-    # narrowing again (removing the station) shrinks the pack back
-    narrowed = compute_signal_scope(stations)
+    # narrowing again (removing the branch) shrinks the pack back
+    narrowed = compute_tree_scope(base)
     assert "fact_check" not in narrowed.signals
     assert len(build_signal_records(load_question_config(), "x", narrowed)) == \
         TRIMMED_RECORDS
