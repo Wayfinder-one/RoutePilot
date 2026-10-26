@@ -29,6 +29,8 @@ in memory they stay ``NLOption`` with ``text=''`` and an auto-built
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -419,3 +421,24 @@ def tree_to_dict(tree: RoutingTree) -> dict:
             "root": node_to_dict(tree.root),
             "tree_revision": tree.tree_revision,
             "updated_at": tree.updated_at}
+
+
+def tree_revision_of(root: Node) -> str:
+    """Canonical content revision of a tree root (design doc §8.2).
+
+    ``tree_revision`` covers the tree structure and every behaviour field
+    (``when``, instructions, candidate keys/order/thresholds, model references,
+    branch descriptions, reasoning, weights, ``otherwise``) and NOT the
+    envelope (id/name/enabled/updated_at). The canonical text is UTF-8 JSON
+    with ``ensure_ascii=False``, sorted keys and compact separators; arrays
+    keep their configuration order — candidate order is behaviour and must
+    never be re-sorted by compilation, import/export or logging.
+
+    ``node_to_dict`` is canonical (serialising the parsed tree twice is
+    identical), so this text is also what the store persists as
+    ``config_revisions(kind='tree')`` content: the revision can be re-hashed
+    offline from the stored content.
+    """
+    content = json.dumps(node_to_dict(root), sort_keys=True,
+                         ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()

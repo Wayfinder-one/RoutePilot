@@ -235,6 +235,32 @@ MIGRATIONS = [
     """
     ALTER TABLE request_ledger ADD COLUMN capability_revision TEXT;
     """,
+    # v19 (2026-10-26, unified routing tree): one routing document becomes the
+    # runtime input, replacing the four independent station trees (the old
+    # routes configuration tables stay in place but are no longer read — no
+    # data migration, historical request rows survive). The partial unique
+    # index puts the single-active invariant in the schema itself (spec §7.1),
+    # and the nullable provenance columns let a requests/request_ledger row
+    # name the tree revision and effective snapshot that routed it (spec §8.2).
+    # A new database starts with NO tree: the all-disabled state is legal and
+    # the runtime answers 503 no_active_tree until an operator enables one.
+    """
+    CREATE TABLE routing_trees (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+        root TEXT NOT NULL,
+        tree_revision TEXT NOT NULL,
+        updated_at TEXT NOT NULL);
+    CREATE UNIQUE INDEX idx_routing_trees_single_enabled
+        ON routing_trees(enabled) WHERE enabled = 1;
+    CREATE INDEX idx_routing_trees_updated ON routing_trees(updated_at, id);
+    ALTER TABLE requests ADD COLUMN tree_id TEXT;
+    ALTER TABLE requests ADD COLUMN terminal_node_id TEXT;
+    ALTER TABLE request_ledger ADD COLUMN tree_id TEXT;
+    ALTER TABLE request_ledger ADD COLUMN tree_revision TEXT;
+    ALTER TABLE request_ledger ADD COLUMN snapshot_revision TEXT;
+    """,
 ]
 
 

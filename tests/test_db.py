@@ -12,7 +12,7 @@ def test_migrate_idempotent_and_wal(tmp_path):
     assert {"stations", "nodes", "branches", "branch_rows", "models", "providers",
             "keyword_groups", "settings", "requests",
             "changes", "evals", "request_ledger", "config_revisions",
-            "schema_migrations"} <= tables
+            "routing_trees", "schema_migrations"} <= tables
     assert "request_signals" not in tables      # v10 dropped the dead table
     assert "sessions" not in tables      # v11 dropped it
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
@@ -52,13 +52,18 @@ def test_migrations_14_15_16_create_the_action_result_ledger(tmp_path):
         "jev_chunk", "input_chunk_mode", "input_chunk_segments",
         "input_chunk_prompt_tokens",
         # v18 (2026-10-26): capability-routing pack revision
-        "capability_revision"]
+        "capability_revision",
+        # v19 (2026-10-26): unified routing tree provenance
+        "tree_id", "tree_revision", "snapshot_revision"]
     assert not {"text", "signals", "trace"} & set(ledger_columns)
 
-    # v14 must NOT alter the slim contract of the existing requests table.
+    # v14 must NOT alter the slim contract of the existing requests table
+    # (v19 only appends the two nullable tree-provenance columns).
     assert [r[1] for r in conn.execute("PRAGMA table_info(requests)")] == [
         "id", "ts", "text", "decision", "model", "station_id", "leaf_id",
-        "score", "latency_ms"]
+        "score", "latency_ms",
+        # v19 (2026-10-26): unified routing tree provenance
+        "tree_id", "terminal_node_id"]
 
     assert conn.execute("SELECT MAX(version) FROM schema_migrations"
                         ).fetchone()[0] == len(MIGRATIONS)
@@ -246,4 +251,151 @@ def test_a_failing_migration_leaves_the_database_untouched(tmp_path, monkeypatch
     tables = {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
     assert "ok_table" in tables
+    conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# v19 (2026-10-26): unified routing tree — one active routing document replaces
+# the four independent station trees. Additive migration only (spec §7, §8).
+# --------------------------------------------------------------------------- #
+def test_migration_19_fresh_database_adds_routing_trees(tmp_path):
+    """A fresh database gets routing_trees plus the per-request tree provenance
+    columns. No tree is created or enabled implicitly: an all-disabled database
+    is a legal state (spec §7.1), so the runtime returns 503 no_active_tree
+    until an operator enables one."""
+    from router.store.db import MIGRATIONS
+
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "routing_trees" in tables
+    assert [r[1] for r in conn.execute(
+        "PRAGMA table_info(routing_trees)")] == [
+        "id", "name", "enabled", "root", "tree_revision", "updated_at"]
+    # enabled defaults to 0 (new trees are created closed) and is constrained
+    # to the boolean domain at the column level.
+    enabled_col = next(r for r in conn.execute("PRAGMA table_info(routing_trees)")
+                       if r[1] == "enabled")
+    assert enabled_col[3] == 1                # NOT NULL
+    assert str(enabled_col[4]).strip("'\"") == "0"   # DEFAULT 0
+    assert [r[1] for r in conn.execute("PRAGMA table_info(requests)")] == [
+        "id", "ts", "text", "decision", "model", "station_id", "leaf_id",
+        "score", "latency_ms", "tree_id", "terminal_node_id"]
+    assert [r[1] for r in conn.execute(
+        "PRAGMA table_info(request_ledger)")][-3:] == [
+        "tree_id", "tree_revision", "snapshot_revision"]
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' "
+        "AND tbl_name='routing_trees'")}
+    assert {"idx_routing_trees_single_enabled",
+            "idx_routing_trees_updated"} <= indexes
+
+    # the migration does not seed or activate a default tree
+    assert conn.execute("SELECT COUNT(*) FROM routing_trees").fetchone()[0] == 0
+    versions = {r[0] for r in conn.execute("SELECT version FROM schema_migrations")}
+    assert 19 in versions                     # v19 itself is recorded
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
+                        ).fetchone()[0] == len(MIGRATIONS)
+    conn.close()
+
+
+def test_migration_19_upgrades_a_v18_database_and_keeps_history(tmp_path):
+    """The upgrade path from a real v18 database: historical requests and
+    request_ledger rows survive, the new columns exist and read back NULL for
+    old rows (no invented tree attribution), and re-running is a no-op."""
+    import sqlite3
+
+    from router.store.db import MIGRATIONS
+
+    path = str(tmp_path / "v18.db")
+    conn = sqlite3.connect(path)
+    conn.executescript("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);")
+    for i, script in enumerate(MIGRATIONS[:18], start=1):
+        conn.executescript(script)
+        conn.execute("INSERT INTO schema_migrations VALUES (?)", (i,))
+    conn.execute(
+        "INSERT INTO requests (id, ts, text, decision, model, station_id, "
+        "leaf_id, score, latency_ms) VALUES ('old-request', "
+        "'2026-10-20T10:00:00', '', 'route', 'qwen3-8b', 's1', 'n1', 0.9, 12.5)")
+    conn.execute(
+        "INSERT INTO request_ledger (id, ts, decision, model) "
+        "VALUES ('old-ledger', '2026-10-20T10:00:00', 'route', 'qwen3-8b')")
+    conn.commit()
+    conn.close()
+
+    conn = connect(path)
+    migrate(conn)
+    migrate(conn)                             # idempotent on v19 too
+
+    assert [r[1] for r in conn.execute("PRAGMA table_info(requests)")][-2:] == [
+        "tree_id", "terminal_node_id"]
+    assert [r[1] for r in conn.execute(
+        "PRAGMA table_info(request_ledger)")][-3:] == [
+        "tree_id", "tree_revision", "snapshot_revision"]
+    assert "routing_trees" in {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+    request = conn.execute("SELECT * FROM requests WHERE id='old-request'"
+                           ).fetchone()
+    assert request["model"] == "qwen3-8b" and request["station_id"] == "s1"
+    assert request["tree_id"] is None
+    assert request["terminal_node_id"] is None
+    ledger = conn.execute("SELECT * FROM request_ledger WHERE id='old-ledger'"
+                          ).fetchone()
+    assert ledger["model"] == "qwen3-8b"
+    assert ledger["tree_id"] is None
+    assert ledger["tree_revision"] is None
+    assert ledger["snapshot_revision"] is None
+    assert 19 in {r[0] for r in conn.execute(
+        "SELECT version FROM schema_migrations")}
+    conn.close()
+
+
+def test_migration_19_column_constraints_enforce_single_enabled_tree(tmp_path):
+    """The single-active invariant lives in the schema (spec §7.1), not only in
+    application code: the partial unique index rejects a second enabled row,
+    CHECK(enabled IN (0,1)) rejects non-boolean values, and omitted enabled
+    defaults to a closed tree."""
+    import sqlite3
+
+    conn = connect(str(tmp_path / "t.db"))
+    migrate(conn)
+
+    def add(tree_id, enabled=None):
+        if enabled is None:
+            conn.execute(
+                "INSERT INTO routing_trees (id, name, root, tree_revision, "
+                "updated_at) VALUES (?, ?, '{}', ?, ?)",
+                (tree_id, tree_id, "sha-" + tree_id, "2026-10-26T00:00:00"))
+        else:
+            conn.execute(
+                "INSERT INTO routing_trees (id, name, enabled, root, "
+                "tree_revision, updated_at) VALUES (?, ?, ?, '{}', ?, ?)",
+                (tree_id, tree_id, enabled, "sha-" + tree_id,
+                 "2026-10-26T00:00:00"))
+        conn.commit()
+
+    add("t1")                                 # omitted enabled: closed by default
+    assert conn.execute("SELECT enabled FROM routing_trees WHERE id='t1'"
+                        ).fetchone()[0] == 0
+    add("t2", 0)                              # several closed trees are legal
+    add("t3", 1)                              # the first enabled tree is legal
+    with pytest.raises(sqlite3.IntegrityError):
+        add("t4", 1)                          # second enabled row: unique index
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        add("t5", 2)                          # CHECK(enabled IN (0, 1))
+    conn.rollback()
+    with pytest.raises(sqlite3.IntegrityError):
+        # tree_revision/updated_at are NOT NULL: content has no silent default
+        conn.execute("INSERT INTO routing_trees (id, name, root, updated_at) "
+                     "VALUES ('t6', 't6', '{}', '2026-10-26T00:00:00')")
+    conn.rollback()
+
+    assert conn.execute("SELECT COUNT(*) FROM routing_trees").fetchone()[0] == 3
+    assert conn.execute(
+        "SELECT COUNT(*) FROM routing_trees WHERE enabled = 1"
+    ).fetchone()[0] == 1
     conn.close()
