@@ -62,7 +62,7 @@ def mixed_tree() -> RoutingTree:
         ), otherwise=route("pii-fallback", "qwen3-8b")),
         when=When(signal="pii", op="contains", value="email_address"))
     office_hours = route("office-hours", "qwen3-8b",
-                         when=When(signal="time_window", op="eq",
+                         when=When(signal="time_window", op="contains",
                                    value="work_hours"))
     weighted = Route(
         id="complex-route", model="qwen3-32b",
