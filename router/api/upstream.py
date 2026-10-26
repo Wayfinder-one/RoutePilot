@@ -99,21 +99,41 @@ def parse_profile_text(text: str | None) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
-    """model_id -> normalized reasoning capability (§3.3 parchment).
+def reasoning_map_for_rows(conn: sqlite3.Connection,
+                           rows) -> dict[str, dict | None]:
+    """model_id -> normalized reasoning for a model-catalog row set.
 
-    Same source for both consumers that must never disagree about a model's
-    declared levels: ``PUT /admin/pipeline`` validation and the startup check
-    (``create_app``); a reasoning declaration written straight into the DB
-    (bypassing the API) must still be judged identically at boot.
+    ``rows`` are catalog dicts (``id``/``profile``/``provider``) and may be a
+    **prospective** snapshot that is not stored yet (a pending POST/PUT
+    /admin/models).  The provider ``reasoning_format`` comes from the providers
+    table (missing provider -> ``"openai"``), exactly like
+    :func:`load_backends`/:func:`model_reasoning_from_db`: one rule for boot,
+    hot-path backends and admin-write validation, so a write can never be
+    accepted by the API and rejected by the next startup.
     """
-    rows = conn.execute(
-        "SELECT m.id AS id, m.profile AS profile, "
-        "       p.reasoning_format AS reasoning_format "
-        "FROM models m LEFT JOIN providers p ON m.provider = p.name")
-    return {r["id"]: normalize_reasoning(parse_profile_text(r["profile"]),
-                                         r["reasoning_format"] or "openai")
-            for r in rows}
+    formats = {row["name"]: (row["reasoning_format"] or "openai")
+               for row in conn.execute(
+                   "SELECT name, reasoning_format FROM providers")}
+    return {
+        row["id"]: normalize_reasoning(
+            parse_profile_text(row.get("profile")),
+            formats.get(row.get("provider"), "openai"))
+        for row in rows}
+
+
+def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
+    """model_id -> normalized reasoning capability of the CURRENT catalog.
+
+    Same source for every consumer that must never disagree about a model's
+    declared levels (startup check, ``/admin/trees`` enable validation):
+    rows written straight into the DB (bypassing the API) are judged by the
+    same rule as rows coming through the API.
+    """
+    rows = [{"id": row["id"], "profile": row["profile"],
+             "provider": row["provider"]}
+            for row in conn.execute(
+                "SELECT id, profile, provider FROM models")]
+    return reasoning_map_for_rows(conn, rows)
 
 
 class CircuitBreaker:

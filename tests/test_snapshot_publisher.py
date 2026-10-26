@@ -1,11 +1,13 @@
 """SnapshotPublisher: serialise config writes with their publication.
 
-Task 9 Step 2 (2026-10-26).  The publisher is a *pipeline-layer* helper: tests
-assemble a bare ``FastAPI()`` app and a real SQLite DB instead of going through
-``create_app`` (which is mid-refactor until Task 9 Step 6).  ``install_snapshot``
-alone is a single atomic assignment; the publisher's job is to make "mutation +
-assembly + revision + publish" one locked critical section, so a concurrent
-write can never leave the hot path on a snapshot the database no longer has.
+``create_app`` installs one publisher (``app.state.publisher``) and every admin
+write publishes through it; the hot path only ever sees the single
+``app.state.snapshot`` assignment.  These tests exercise the publisher in
+isolation with a bare ``FastAPI()`` app + real SQLite DB (no full app factory),
+which keeps the lock semantics observable.  ``install_snapshot`` alone is a
+single atomic assignment; the publisher's job is to make "mutation + assembly +
+revision + publish" one locked critical section, so a concurrent write can never
+leave the hot path on a snapshot the database no longer has.
 
 Also pins the audit half of the same atomicity contract: ``ChangeRepo.record``
 must JOIN an outer transaction (``_tx``) instead of committing it early, so a

@@ -43,7 +43,7 @@ from collections.abc import Mapping
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from router.api.deps import get_conn
-from router.api.upstream import model_reasoning_from_db
+from router.api.upstream import model_reasoning_from_db, reasoning_map_for_rows
 from router.pipeline.evaluator import Hit
 from router.pipeline.tree import RoutingTree, tree_from_dict, tree_to_dict
 from router.pipeline.validation import (
@@ -168,17 +168,28 @@ def build_enable_context(conn: sqlite3.Connection, *, runner_available: bool,
                          models: list[dict] | None = None,
                          capabilities: Mapping[str, str] | None = None
                          ) -> EnableContext:
-    """Full runtime-readiness context for the current / prospective catalog."""
+    """Full runtime-readiness context for the current / PROSPECTIVE catalog.
+
+    ``models`` (and ``capabilities``) may describe a catalog that is not stored
+    yet — a pending model write.  In that case the reasoning map must be built
+    from those SAME prospective rows, not from the stored DB: otherwise a write
+    removing a reasoning level the active tree references would be accepted
+    (old DB map still says it is declared) while the next startup, reading the
+    real rows, refuses to boot (audit I-1: "save accepted / restart rejected").
+    """
     from router.pipeline.snapshot import load_capabilities
 
+    prospective = models is not None
     if models is None:
         models = ModelRepo(conn).list()
     if capabilities is None:
         capabilities = load_capabilities(conn)
+    model_reasoning = (reasoning_map_for_rows(conn, models) if prospective
+                       else model_reasoning_from_db(conn))
     return EnableContext(
         known_models={row["id"] for row in models},
         capabilities=dict(capabilities),
-        model_reasoning=model_reasoning_from_db(conn),
+        model_reasoning=model_reasoning,
         decision_runner_available=bool(runner_available))
 
 
@@ -200,10 +211,13 @@ def capability_write_issues(conn: sqlite3.Connection, request: Request,
                             models: list[dict]) -> list[Issue]:
     """Hard issues a prospective model-catalog write would introduce.
 
-    A model write is not a tree save, but removing/renaming a capability the
-    ACTIVE tree's direct-model candidates reference would make the effective
-    tree uncompilable.  Compile-check the active tree against the prospective
-    catalog and reject the write instead of letting the hot path degrade.
+    A model write is not a tree save, so the active tree is re-checked against
+    the prospective catalog here: removing/renaming a capability, a reasoning
+    level or a model that the ACTIVE tree references would otherwise be
+    accepted now and break the hot path (degraded reasoning) or the next
+    startup (``reasoning_unsupported`` / ``unknown_model``).  Uses the
+    prospective rows for capabilities AND reasoning, i.e. the same rules boot
+    applies; a closed/incomplete tree is not affected (no active tree -> []).
     """
     from router.decision.catalog import capability_of_model
 

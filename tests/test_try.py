@@ -99,18 +99,20 @@ def test_try_medical_hard_returns_the_unified_outcome_and_trace(tmp_path):
     assert isinstance(body["tagger_info"], dict)
     assert body["signal_ms"] >= 0 and body["decision_ms"] >= 0
 
-    # Unified trace: every FAILED condition in walk order, then the terminal
-    # hit.  (A passing ``when`` gate produces no separate event -- the evaluator
-    # records entered nodes implicitly through the hit/subtree it produces.)
+    # Unified trace: every evaluated condition in walk order (failed gates and
+    # the entering gates, design §10 "entered/skipped"), then the terminal hit.
     assert [event["event"] for event in body["trace"]] == [
-        "condition", "condition", "condition", "hit"]
+        "condition", "condition", "condition", "condition", "condition", "hit"]
     assert condition_pairs(body) == [
         ("jailbreak", "jailbreak", False),
         ("pii", "cn_id_card", False),
         ("keyword", "医疗急症", False),
+        ("domain", "health", True),
+        ("complexity", "hard", True),
     ]
-    assert all(event["pass"] is False for event in body["trace"]
-               if event["event"] == "condition")
+    assert [event["pass"] for event in body["trace"]
+            if event["event"] == "condition"] == [
+                False, False, False, True, True]
     hit = events(body, "hit")
     assert len(hit) == 1 and hit[0]["node_id"] == "health-hard"
     assert body["signals"]["domain"]["value"] == "health"
@@ -132,8 +134,12 @@ def test_try_block_and_fallback(tmp_path):
     assert blocked["outcome"]["kind"] == "block"
     assert blocked["outcome"]["model"] is None
     assert blocked["outcome"]["node_id"] == "safety-jailbreak"
-    # A directly entered terminal records only its hit event.
-    assert [event["event"] for event in blocked["trace"]] == ["hit"]
+    # The first child is entered through its passing gate (condition + hit).
+    assert [event["event"] for event in blocked["trace"]] == [
+        "condition", "hit"]
+    assert blocked["trace"][0]["node_id"] == "safety-jailbreak"
+    assert blocked["trace"][0]["pass"] is True
+    assert blocked["trace"][1]["node_id"] == "safety-jailbreak"
 
     fallback = post_try(h.client, "closed-default", TEXT_WEATHER)
     assert fallback["outcome"]["kind"] == "route"

@@ -364,6 +364,71 @@ def test_rule_signal_ignores_the_confidence_floor():
     assert isinstance(result, Hit) and result.model == "m1"
 
 
+# ── trace: passing `when` gates are recorded (design §10 entered/skipped) ──
+def test_passing_when_is_traced_before_the_hit():
+    root = Route(id="root", model="m1",
+                 when=When("domain", "math", conf_min=0.4))
+    result, _ = evaluate(root, [], {"domain": signal("math", 0.9)})
+    assert isinstance(result, Hit) and result.model == "m1"
+    assert [event["event"] for event in result.trace] == ["condition", "hit"]
+    assert result.trace[0] == {
+        "node_id": "root", "event": "condition", "signal": "domain",
+        "op": "eq", "value": "math", "m": 1, "conf": 0.9, "conf_min": 0.4,
+        "pass": True, "reason": None}
+    assert result.trace[1]["node_id"] == "root"
+    assert result.trace[1]["event"] == "hit"
+
+
+def test_passing_branch_child_condition_is_traced_before_its_hit():
+    root = Branch(id="root", children=(
+        Route(id="child", model="m1",
+              when=When("domain", "math", conf_min=0.4)),
+        Route(id="later", model="m2"),
+    ), otherwise=Route(id="fallback", model="m0"))
+    result, _ = evaluate(root, [], {"domain": signal("math", 0.9)})
+    assert isinstance(result, Hit) and result.model == "m1"
+    assert [event["event"] for event in result.trace] == ["condition", "hit"]
+    assert result.trace[0]["node_id"] == "child"
+    assert result.trace[0]["pass"] is True
+    assert result.trace[1]["node_id"] == "child"
+    assert result.trace[1]["event"] == "hit"
+
+
+def test_passing_when_on_a_container_node_is_traced_once():
+    root = Branch(id="root", when=When("domain", "math", conf_min=0.4),
+                  children=(Route(id="child", model="m1"),
+                            Route(id="later", model="m2")))
+    result, _ = evaluate(root, [], {"domain": signal("math", 0.9)})
+    assert isinstance(result, Hit) and result.model == "m1"
+    assert [event["event"] for event in result.trace] == ["condition", "hit"]
+    assert result.trace[0]["node_id"] == "root"
+    assert result.trace[0]["pass"] is True
+
+
+def test_passing_when_on_an_nl_node_precedes_the_nl_call_event():
+    root = nl("root", (model_option("root", "a", "m1"),
+                       model_option("root", "b", "m2")),
+              when=When("domain", "math", conf_min=0.4))
+    result, _ = evaluate(
+        root, [ChoiceResult(probabilities={"a": 1.0, "b": 0.0})],
+        {"domain": signal("math", 0.9)})
+    assert isinstance(result, Hit) and result.model == "m1"
+    assert [event["event"] for event in result.trace] == [
+        "condition", "nl_choice", "hit"]
+    assert result.trace[0]["node_id"] == "root"
+    assert result.trace[0]["pass"] is True
+
+
+def test_failing_when_trace_stays_a_single_condition_event():
+    root = Route(id="root", model="m1",
+                 when=When("domain", "math", conf_min=0.9))
+    result, _ = evaluate(root, [], {"domain": signal("math", 0.5)})
+    assert isinstance(result, Miss) and result.reason == "below_confidence"
+    assert [event["event"] for event in result.trace] == ["condition"]
+    assert result.trace[0]["pass"] is False
+    assert result.trace[0]["reason"] == "below_confidence"
+
+
 # ── strict signal reader ────────────────────────────────────────────────────
 def test_prepared_signal_reader_is_strict():
     reader = PreparedSignalReader({"domain": {"value": "math",

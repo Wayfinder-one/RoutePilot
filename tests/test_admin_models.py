@@ -465,3 +465,98 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
     models = {m["id"]: m for m in client.get("/admin/models").json()["models"]}
     assert models["qwen3-8b"]["reasoning"]["declared"] is False
     assert models["qwen3-8b"]["reasoning"]["error"]
+
+
+# --------------------------------------------------------------------------- #
+# fix-wave 1 / I-1: model writes are judged against the PROSPECTIVE catalog
+# --------------------------------------------------------------------------- #
+def _reasoning_tree_root(level="high"):
+    return {"id": "root", "type": "route", "model": "qwen3-8b",
+            "reasoning": level}
+
+
+def _declare_high(client):
+    r = client.put("/admin/models/qwen3-8b", json={"profile": OPENAI_REASONING})
+    assert r.status_code == 200, r.text
+
+
+def _declare_low_only(client):
+    """A declaration that no longer declares the tree's 'high' level."""
+    return client.put("/admin/models/qwen3-8b", json={"profile": {
+        "reasoning": {"efforts": {"off": None, "low": "low"},
+                      "default": "low"}}})
+
+
+def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
+    created = client.post("/admin/trees", json={
+        "id": tree_id, "name": "Reasoning", "root": _reasoning_tree_root()})
+    assert created.status_code == 201, created.text
+    enabled = client.post(f"/admin/trees/{tree_id}/enable")
+    assert enabled.status_code == 200, enabled.text
+    return created.json()["tree"]
+
+
+def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
+    """I-1: the health check must judge the write with the PROSPECTIVE rows.
+
+    Removing a level the ACTIVE tree references is rejected instead of being
+    accepted (which used to make the next startup refuse to boot).
+    """
+    _declare_high(client)
+    _activate_reasoning_tree(client)
+    before = {m["id"]: m["profile"] for m in
+              client.get("/admin/models").json()["models"]}
+
+    r = _declare_low_only(client)
+    assert r.status_code == 422, r.text
+    issues = r.json()["detail"]
+    assert any(issue["code"] == "reasoning_unsupported"
+               and issue["node_id"] == "root" for issue in issues), issues
+    after = {m["id"]: m["profile"] for m in
+             client.get("/admin/models").json()["models"]}
+    assert after["qwen3-8b"] == before["qwen3-8b"]   # rejected write, DB intact
+
+
+def test_model_write_ignores_reasoning_of_a_closed_tree(client):
+    """Only the ACTIVE tree gates model writes: a closed draft does not, and
+    disabling the active tree lifts the constraint again."""
+    _declare_high(client)
+    created = client.post("/admin/trees", json={
+        "id": "draft-tree", "name": "Draft",
+        "root": _reasoning_tree_root()})
+    assert created.status_code == 201, created.text
+    # No ACTIVE tree: the write cannot break the hot path or the next boot.
+    assert _declare_low_only(client).status_code == 200
+
+    # Same write against a formerly-active but now DISABLED tree is accepted.
+    _declare_high(client)
+    _activate_reasoning_tree(client, tree_id="disabled-tree")
+    assert client.post("/admin/trees/disabled-tree/disable").status_code == 200
+    assert _declare_low_only(client).status_code == 200
+
+
+def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
+    _declare_high(client)
+    _activate_reasoning_tree(client)
+    r = client.put("/admin/models/qwen3-8b", json={"profile": {
+        "reasoning": {"efforts": {"off": None, "high": "high"},
+                      "default": "high"}}})
+    assert r.status_code == 200, r.text
+    model = next(m for m in client.get("/admin/models").json()["models"]
+                 if m["id"] == "qwen3-8b")
+    assert model["reasoning"]["declared"] is True
+    assert [entry["id"] for entry in model["reasoning"]["efforts"]] == [
+        "off", "high"]
+
+
+def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
+    """The old bug: the write was accepted but the next boot refused.  After
+    the 422 the SAME database must still boot with its active reasoning tree."""
+    app = make_app(tmp_path)
+    client = TestClient(app)
+    _declare_high(client)
+    _activate_reasoning_tree(client)
+    assert _declare_low_only(client).status_code == 422
+
+    restarted = make_app(tmp_path)           # create_app on the same DB file
+    assert restarted.state.snapshot.tree_id == "reasoning-tree"

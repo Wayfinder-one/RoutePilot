@@ -194,8 +194,9 @@ def create_app(settings: Settings, *,
 
     Boot sequence (Task 9 Step 6):
 
-    1. migrate + seed the catalogs (models/providers/keywords/time-periods —
-       the retired station rows are written by the legacy seed but never read);
+    1. migrate + seed the catalog data only (models/providers/keywords/time
+       periods); a fresh database gets NO routing tree — all trees start
+       disabled and that is a legal state;
     2. build the tagger and the DecisionRunner adapter (``decision_runner`` is
        the approved test seam);
     3. assemble + publish the immutable snapshot from the DB — NO active tree is
@@ -211,8 +212,8 @@ def create_app(settings: Settings, *,
 
     conn = connect(settings.db_path)
     migrate(conn)
-    seed_default(conn)        # models/providers/keywords/time-periods (Task 11
-    #                            removes the legacy station seeding)
+    seed_default(conn)        # catalog only (models/providers/keywords/periods);
+    #                           never a routing tree — enabling is explicit
     if settings.user_auth:
         UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
     kw_groups = KeywordRepo(conn).groups()

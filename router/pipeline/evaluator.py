@@ -38,7 +38,10 @@ doc §10's (``condition_false`` / ``below_confidence`` / ``nl_low_probability``
 plus ``below_min_score`` / ``no_hit`` for the signal side):
 
 * ``condition`` — a ``when`` check: signal/op/value, ``m``, ``conf``,
-  ``conf_min``, ``pass`` and the failure ``reason``.
+  ``conf_min``, ``pass`` and (on failure only) the ``reason``.  A **passing**
+  gate is recorded too, prepended to the node's own events, so the trace shows
+  which conditions admitted the path (design §10 "entered / skipped"); a
+  failing gate is the node's whole result (a one-event ``Miss``).
 * ``hit`` / ``miss`` — a terminal node: kind/model/reasoning/score; a weighted
   terminal also carries ``min_score`` and the ``leaf_score`` ``lines``.
 * ``nl_choice`` — one per real runner call (``nl_call=True``): ordered
@@ -133,14 +136,23 @@ class TreeEvaluator:
     async def _eval_node(self, node: Node, context: EvalContext) -> EvalResult:
         entered, step = self._eval_when(node, context)
         if not entered:
+            # A failed gate is the whole evaluation of this node: one event.
             return Miss(step["reason"], (step,))
         if isinstance(node, (Route, Block)):
-            return self._eval_terminal(node, context)
-        if isinstance(node, Branch):
-            return await self._eval_branch(node, context)
-        if isinstance(node, NLChoice):
-            return await self._eval_nl_choice(node, context)
-        raise TypeError(f"not a routing tree node: {node!r}")
+            result = self._eval_terminal(node, context)
+        elif isinstance(node, Branch):
+            result = await self._eval_branch(node, context)
+        elif isinstance(node, NLChoice):
+            result = await self._eval_nl_choice(node, context)
+        else:
+            raise TypeError(f"not a routing tree node: {node!r}")
+        if step is not None:
+            # design §10 records the nodes that were entered: a passing ``when``
+            # emits its condition event BEFORE the node's own events, so a trace
+            # shows which gates admitted the path (the terminal hit alone does
+            # not carry the parent's condition evidence).
+            result = replace(result, trace=(step,) + result.trace)
+        return result
 
     # ── when: entering a node ─────────────────────────────────────────────
     def _eval_when(self, node: Node,
@@ -150,6 +162,9 @@ class TreeEvaluator:
         A node without ``when`` is always entered and emits no event.  A model
         signal must both match and clear ``conf_min`` (default
         :data:`DEFAULT_CONF_MIN`); rule signals ignore the confidence floor.
+        The caller (:meth:`_eval_node`) decides where the step lands in the
+        result trace: failed gates become the node's one-event ``Miss``, passing
+        gates are prepended before the node's own events.
         """
         when = node.when
         if when is None:

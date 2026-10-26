@@ -442,4 +442,3 @@ class SnapshotPublisher:
             ensure_snapshot_revision(conn, snapshot)
             install_snapshot(self.app, snapshot)
             return snapshot
-
