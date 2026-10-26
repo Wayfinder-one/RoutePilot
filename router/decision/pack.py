@@ -24,14 +24,12 @@ import hashlib
 import json
 
 from router.decision.capability import (DEFAULT_INSTRUCTIONS, DEFAULT_MIN_MARGIN,
-                                        DEFAULT_MIN_PROB, MAX_CAPABILITY_CHARS,
-                                        MAX_INSTRUCTIONS_CHARS)
+                                        DEFAULT_MIN_PROB, MAX_INSTRUCTIONS_CHARS)
+from router.decision.catalog import (CapabilityPackError, capability_of_model,
+                                     normalize_capability)
 
 #: Signal key produced by the tagger (``router/signals/registry.py``).
 CAPABILITY_SIGNAL = "capability_route"
-
-#: Model profile key holding the natural-language capability description.
-PROFILE_KEY = "capability"
 
 #: Settings keys (models.settings key/value table).
 SETTING_INSTRUCTIONS = "capability_instructions"
@@ -41,22 +39,11 @@ SETTING_FALLBACK = "capability_fallback_model"
 POLICY_SETTINGS = (SETTING_INSTRUCTIONS, SETTING_MIN_PROB,
                    SETTING_MIN_MARGIN, SETTING_FALLBACK)
 
-
-class CapabilityPackError(ValueError):
-    """The capability description / policy is malformed."""
-
-
-def normalize_capability(value) -> str:
-    """Validate one model's ``profile.capability`` text ('' = unset)."""
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        raise CapabilityPackError("profile.capability 必须是字符串")
-    text = value.strip()
-    if len(text) > MAX_CAPABILITY_CHARS:
-        raise CapabilityPackError(
-            f"profile.capability 超过 {MAX_CAPABILITY_CHARS} 字符")
-    return text
+# ``normalize_capability`` / ``capability_of_model`` (and the
+# ``CapabilityPackError`` they raise) now live in ``router.decision.catalog``;
+# they are imported above and stay re-exported here for existing
+# ``router.decision.pack`` callers until the cleanup task deletes this
+# forwarding module (2026-10-26 unified routing tree, Task 1).
 
 
 def normalize_instructions(value) -> str:
@@ -83,33 +70,6 @@ def _unit(value, name: str, default: float) -> float:
     if not 0.0 <= number <= 1.0:
         raise CapabilityPackError(f"{name} 必须在 [0,1] 之间")
     return number
-
-
-def _profile_of(row: dict) -> dict:
-    """Tolerant ``models.profile`` read (JSON text column or a dict)."""
-    raw = row.get("profile")
-    if isinstance(raw, dict):
-        return raw
-    if not isinstance(raw, str) or not raw.strip():
-        return {}
-    try:
-        value = json.loads(raw)
-    except ValueError:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def capability_of_model(row: dict) -> str:
-    """The model's validated capability text, or '' when unset/invalid.
-
-    Invalid stored values are skipped (not raised): the catalog is user data and
-    a bad row must not break every request; the model simply does not become a
-    capability candidate until fixed.  API writes validate strictly.
-    """
-    try:
-        return normalize_capability(_profile_of(row).get(PROFILE_KEY))
-    except CapabilityPackError:
-        return ""
 
 
 def build_pack(models: list[dict], settings: dict | None = None) -> dict:

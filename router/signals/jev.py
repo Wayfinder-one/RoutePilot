@@ -111,6 +111,8 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from router.decision.choice import (ChoiceError, build_choice_record,
+                                    decode_choice as decode_choice_result)
 from router.decision.pack import CAPABILITY_SIGNAL
 from router.signals._math import (PII_HIT_THRESHOLD, PII_MIN_CONFIDENCE,
                                  binary_entropy_confidence, entropy_confidence,
@@ -1515,31 +1517,22 @@ class JevTagger:
         signals, the PII merge or any tagger state — callers can run it on the
         hot path next to ``tag()``.
 
-        Returns ``{"probabilities": {model: p}, "ranking": [{model, p}...],
+        Thin adapter only: the request window and the forward pass are the
+        tagger's, while record construction and decoding live in the pure
+        :mod:`router.decision.choice` helpers. Returns
+        ``{"probabilities": {model: p}, "ranking": [{model, p}...],
         "input": <window info>, "temperature": T}``. Raises ``JevTaggerError``
         for a malformed candidate map (a caller that wants fail-open must
         catch it; see :func:`router.decision.capability.score_with_tagger`).
         """
-        if not isinstance(instructions, str) or not instructions.strip():
-            raise JevTaggerError("choice instructions must be a nonempty string")
-        if not isinstance(candidates, dict) or not 2 <= len(candidates) <= 255:
-            raise JevTaggerError("choice needs 2..255 candidates")
-        keys = list(candidates)
-        for key, value in candidates.items():
-            if not isinstance(key, str) or not isinstance(value, str):
-                raise JevTaggerError(
-                    "choice candidates must map model ids to description strings")
         windowed, window = self._context_window(state)
-        record = {"state": windowed, "kind": "choice",
-                  "question": instructions,
-                  "options": [f"{key}: {candidates[key]}" for key in keys],
-                  "answer_keys": keys}
-        probs = self._score([record])[0]
-        ranking = sorted(
-            ({"model": key, "p": float(prob)} for key, prob in zip(keys, probs)),
-            key=lambda row: row["p"], reverse=True)
-        return {"probabilities": dict(zip(keys, probs)), "ranking": ranking,
-                "input": window, "temperature": self.temperature}
+        try:
+            record = build_choice_record(windowed, instructions, candidates)
+            probs = self._score([record])[0]
+            return decode_choice_result(record, probs, window,
+                                        self.temperature)
+        except ChoiceError as exc:
+            raise JevTaggerError(str(exc)) from exc
 
     async def tag(self, req: TagRequest) -> TagResult:
         # Frozen snapshot (2026-10-24 P1-A): capture the question-config object
