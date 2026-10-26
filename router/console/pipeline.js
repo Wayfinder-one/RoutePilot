@@ -70,24 +70,35 @@ function localIssue(code, message) {
 }
 
 /* ── chrome: issues / warnings / dirty / revisions ───────────────────── */
-function renderIssues(list) {
+/* Validation findings are rendered with their machine `code` (so
+   missing_fallback / signal_value_unavailable stay distinguishable), both
+   languages, the tree they belong to and a node locator (review P2). */
+function issueLineHtml(item, level, contextLabel) {
+  const data = item && typeof item === "object" ? item : {zh: String(item || "")};
+  const code = data.code ? `<code class="iv-code">${esc(data.code)}</code> ` : "";
+  const zh = data.zh ? `<span class="iv-zh">${esc(data.zh)}</span>` : "";
+  const en = data.en && data.en !== data.zh
+    ? ` <span class="iv-en">${esc(data.en)}</span>` : "";
+  const context = contextLabel
+    ? `<span class="iv-tree">「${esc(contextLabel)}」</span> ` : "";
+  const nodeId = data.node_id ? String(data.node_id) : "";
+  const locate = nodeId
+    ? ` <button type="button" class="iv-locate" data-issue-node="${esc(nodeId)}">${esc(nodeId)}</button>`
+    : "";
+  return `<div class="iv ${level}">• ${context}${code}${zh}${en}${locate}</div>`;
+}
+function renderIssues(list, contextLabel) {
   const box = $("#issues");
   if (!box) return;
   const items = Array.isArray(list) ? list : [];
-  box.innerHTML = items.map(item => {
-    const nodeId = item && item.node_id ? item.node_id : "";
-    const locate = nodeId
-      ? `<button type="button" class="iv-locate" data-issue-node="${esc(nodeId)}">${esc(nodeId)}</button>`
-      : "";
-    const level = item && item.level === "warn" ? "warn" : "hard";
-    return `<div class="iv ${level}">• ${esc(issueText(item))}${locate}</div>`;
-  }).join("");
+  box.innerHTML = items.map(item =>
+    issueLineHtml(item, item && item.level === "warn" ? "warn" : "hard", contextLabel)).join("");
 }
 function renderWarnings(list) {
   const box = $("#warnings");
   if (!box) return;
   const items = Array.isArray(list) ? list : [];
-  box.innerHTML = items.map(item => `<div class="iv warn">• ${esc(issueText(item))}</div>`).join("");
+  box.innerHTML = items.map(item => issueLineHtml(item, "warn", null)).join("");
   box.classList.toggle("show", items.length > 0);
 }
 function renderChrome() {
@@ -246,7 +257,7 @@ function showPopIssues(list) {
   if (!box) return;
   const issues = Array.isArray(list) ? list : [];
   box.innerHTML = issues.map(item =>
-    `<div class="iv ${item.level === "warn" ? "warn" : "hard"}">• ${esc(issueText(item))}</div>`).join("");
+    issueLineHtml(item, item && item.level === "warn" ? "warn" : "hard", null)).join("");
   box.classList.toggle("show", issues.length > 0);
   if (popContext && popContext.anchor) placePop(popContext.anchor);
   else placePop(popContext && popContext.nodeId ? $("#pop") : null);
@@ -283,8 +294,10 @@ function refreshFormModelBits(formEl) {
   modelSelect.addEventListener("change", () => {
     const reasoning = formEl.querySelector('[data-field="node.reasoning"]');
     if (reasoning) {
+      /* a stale effort from the previous model must not be carried over; the
+         validator rejects undeclared efforts on apply (P3) */
       reasoning.innerHTML = SRTreeEditor.reasoningOptionsHTML(
-        modelSelect.value, modelsById(), reasoning.value);
+        modelSelect.value, modelsById(), null);
     }
     const preview = formEl.querySelector(".rt-cap-preview");
     if (preview) {
@@ -294,6 +307,21 @@ function refreshFormModelBits(formEl) {
       if (capability.missing) preview.setAttribute("data-missing", capability.missing);
       else preview.removeAttribute("data-missing");
     }
+  });
+}
+function bindOptionFormModelBits(scope) {
+  $$("[data-option-form]", scope).forEach(form => {
+    const modelSelect = form.querySelector('[data-option-field="model"]');
+    if (!modelSelect || modelSelect.dataset.boundModels === "1") return;
+    modelSelect.dataset.boundModels = "1";
+    modelSelect.addEventListener("change", () => {
+      const reasoning = form.querySelector('[data-option-field="reasoning"]');
+      if (reasoning) {
+        reasoning.innerHTML = SRTreeEditor.reasoningOptionsHTML(
+          modelSelect.value, modelsById(), null);
+      }
+      if (popContext && popContext.anchor) placePop(popContext.anchor);
+    });
   });
 }
 function bindWhenForm(scope) {
@@ -341,6 +369,7 @@ function bindWeightRowSignals(scope) {
 }
 function bindNodeForm(formEl, nodeId, context) {
   refreshFormModelBits(formEl);
+  bindOptionFormModelBits(formEl);
   bindWhenForm(formEl);
   bindWeightRowSignals(formEl);
   formEl.addEventListener("click", event => {
@@ -450,12 +479,13 @@ function openOptionEditor(parentId, optionKey) {
   const option = parent.options[index];
   const kind = option.child != null ? "child" : "model";
   const anchor = () => $("#treeRoot").querySelector(
-    `[data-rt-action="edit-option"][data-option-key="${CSS.escape(optionKey)}"]`) ||
-    nodeAnchorFn(parentId)();
+    `[data-rt-action="edit-option"][data-node-id="${CSS.escape(parentId)}"]` +
+    `[data-option-key="${CSS.escape(optionKey)}"]`) || nodeAnchorFn(parentId)();
   const html = popHead(tr("pipeline.editOptionTitle"), `${parent.id} · ${optionKey}`) +
     SRTreeEditor.optionFormHTML({option: option, kind: kind, modelsById: modelsById(), index: index}) +
     popFoot(t("common.save"));
   const pop = openPop(html, anchor(), {kind: "option", nodeId: parentId, optionKey: optionKey, anchor: anchor});
+  bindOptionFormModelBits(pop);
   pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
     const formEl = pop.querySelector("[data-option-form]");
     const values = SRTreeEditor.readOptionForm(formEl);
@@ -478,7 +508,8 @@ function openWeightEditor(nodeId, index) {
   if (!ref || !Array.isArray(ref.node.weights) || !ref.node.weights[index]) return;
   const weight = ref.node.weights[index];
   const anchor = () => $("#treeRoot").querySelector(
-    `[data-rt-action="edit-weight"][data-weight-index="${index}"]`) || nodeAnchorFn(nodeId)();
+    `[data-rt-action="edit-weight"][data-node-id="${CSS.escape(nodeId)}"]` +
+    `[data-weight-index="${index}"]`) || nodeAnchorFn(nodeId)();
   const html = popHead(tr("pipeline.editWeightTitle"), ref.node.id) +
     SRTreeEditor.weightRowHTML({weight: weight, signals: SIGNALS, index: index}) +
     popFoot(t("common.save"));
@@ -671,13 +702,22 @@ function removeOtherwise(parentId) {
   removeWithUndo(SRTreeModel.updateNode(draft, parentId, () => result.node),
     tr("pipeline.otherwiseRemoved"));
 }
+function focusMoveButton(nodeId, direction) {
+  const button = $("#treeRoot").querySelector(
+    `[data-rt-action="move-node"][data-node-id="${CSS.escape(nodeId)}"]` +
+    `[data-direction="${direction}"]`);
+  if (button) button.focus();
+}
 function moveNodeBy(nodeId, delta) {
   const draft = currentDraft();
   const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
   if (!ref || ref.edgeKind === "root" || ref.edgeKind === "otherwise") return;
+  const direction = delta < 0 ? -1 : 1;
   const next = SRDnd.applyMove(draft, {nodeId: nodeId, targetIndex: ref.index + delta});
-  if (JSON.stringify(next) === JSON.stringify(draft)) return;
-  commitDraft(next);
+  /* the view is rebuilt from the draft: put focus back on the same move button
+     so repeated Alt+Arrow presses keep working (review Minor 3) */
+  if (JSON.stringify(next) !== JSON.stringify(draft)) commitDraft(next);
+  focusMoveButton(nodeId, direction);
 }
 
 /* ── signal drops: only explicit when / weights zones ────────────────── */
@@ -820,6 +860,8 @@ function selectTree(treeId) {
   try { SRTreeStore.select(treeId); }
   catch (err) { toastUndo(errText(err)); return; }
   closePop();
+  renderIssues([]);
+  renderWarnings([]);
   renderAll();
 }
 function treeIdFromName(name) {
@@ -904,10 +946,15 @@ async function treeAction(action, treeId) {
     else if (action === "disable") { await SRTreeStore.disable(treeId); toastUndo(tr("pipeline.treeDisabled")); }
   } catch (err) {
     const issues = issueList(err);
-    if (issues) renderIssues(issues);
+    const tree = SRTreeStore.tree(treeId);
+    const label = tree ? (tree.name || tree.id) : treeId;
+    if (issues) renderIssues(issues, label);
+    else renderIssues([localIssue("enable", errText(err))], label);
     toastUndo(errText(err));
     return;
   }
+  renderIssues([]);
+  renderWarnings([]);
   renderAll();
 }
 
@@ -949,15 +996,25 @@ function exportTree() {
 async function importTree(file) {
   try {
     const parsed = JSON.parse(await file.text());
-    const payload = parsed && typeof parsed === "object" ? parsed : {};
-    if (payload.format && payload.format !== "sr-routing-tree") {
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
       throw new Error(tr("pipeline.importBadFormat"));
     }
-    const rawRoot = payload.root != null ? payload.root
-      : (payload.id && payload.type ? payload : null);
-    if (!rawRoot) throw new Error(tr("pipeline.importEmpty"));
-    const root = SRTreeModel.normalizeNode(rawRoot, {root: true, otherwise: false});
-    commitDraft(root, {toast: tr("pipeline.importOk")});
+    /* only our own versioned envelope is accepted; unknown extra fields are
+       surfaced instead of silently dropped (review Minor 9) */
+    if (parsed.format !== "sr-routing-tree") {
+      throw new Error(tr("pipeline.importBadFormat"));
+    }
+    if (Number(parsed.version) !== 1) {
+      throw new Error(tr("pipeline.importBadVersion", {version: parsed.version}));
+    }
+    if (parsed.root == null) throw new Error(tr("pipeline.importEmpty"));
+    const unknownFields = Object.keys(parsed)
+      .filter(key => ["format", "version", "name", "root"].indexOf(key) < 0);
+    const root = SRTreeModel.normalizeNode(parsed.root, {root: true, otherwise: false});
+    const extra = unknownFields.length
+      ? " · " + tr("pipeline.importUnknownFields", {fields: unknownFields.join(", ")})
+      : "";
+    commitDraft(root, {toast: tr("pipeline.importOk") + extra});
     renderWarnings([]);
   } catch (err) {
     toastUndo(tr("pipeline.importBad", {err: errText(err)}));

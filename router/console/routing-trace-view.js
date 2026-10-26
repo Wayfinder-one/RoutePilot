@@ -423,7 +423,7 @@ const SRTraceView = (function () {
   function enteredBody(event) {
     const kind = entryKindLabel(event.kind);
     return `<div class="rtt-event-body">` +
-      `<span class="mut">${esc(kind || "—")}</span></div>`;
+      `<span class="mut">${escHTML(kind || "—")}</span></div>`;
   }
 
   function otherwiseBody(event) {

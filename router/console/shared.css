@@ -245,6 +245,8 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .sc b{color:var(--text);font-weight:650}
 .sc .c{font-family:var(--mono);font-size:10px;color:var(--text-3)}
 .sc.pii{background:var(--amber-soft);border-color:var(--amber-line)}
+.log-error{display:flex;flex-direction:column;align-items:center;gap:6px;padding:22px 10px}
+.log-error .btn{margin-top:4px}
 .log-detail{margin:2px 12px 12px;padding:11px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;display:none}
 .log-row.open .log-detail{display:block}
 /* ── calculation log: shared routing trace (SRTraceView) ──────────────

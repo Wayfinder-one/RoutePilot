@@ -171,8 +171,30 @@ const SRTreeModel = (function () {
       copy.children = node.children.map(child => updateNode(child, id, updater));
     }
     if (node.type === "nl_choice") {
-      copy.options = node.options.map(option => option.child
-        ? {...option, child: updateNode(option.child, id, updater)} : {...option});
+      copy.options = node.options.map(option => {
+        if (option.child) {
+          return {...option, child: updateNode(option.child, id, updater)};
+        }
+        /* Direct `model` candidates have no stored node: walk exposes the
+           auto-built route `<nl_id>/options/<key>`. An update targeting that
+           synthetic id maps back onto the candidate's model/reasoning instead
+           of silently no-oping (review Minor 1). */
+        const syntheticId = `${node.id}/options/${option.key}`;
+        if (syntheticId !== id) return {...option};
+        const updated = updater({
+          id: syntheticId, type: "route", model: option.model,
+          reasoning: option.reasoning ?? null, weights: [],
+        });
+        if (updated != null && (updated.type != null && updated.type !== "route")) {
+          throw new Error("a direct model candidate must stay a route node");
+        }
+        const next = {...option};
+        if (updated) {
+          if (updated.model != null) next.model = updated.model;
+          next.reasoning = updated.reasoning ?? null;
+        }
+        return next;
+      });
     }
     if (node.otherwise) copy.otherwise = updateNode(node.otherwise, id, updater);
     return copy;

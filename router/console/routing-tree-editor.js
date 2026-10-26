@@ -63,6 +63,7 @@ const SRTreeEditor = (function () {
     "tree.branchNote": "普通分支没有专属字段；子节点与 otherwise 在树中增删。",
     "tree.childTargetNote": "子分支的节点内容在树中展开编辑，这里只配置候选 key 与说明。",
     "tree.noSignal": "未设置条件",
+    "tree.whenUnknownSignal": "(未知 signal: {signal})",
   };
   function tr(key, vars) {
     let text = FALLBACK[key] != null ? FALLBACK[key] : key;
@@ -154,7 +155,13 @@ const SRTreeEditor = (function () {
     const when = opts.when || null;
     const op = when ? (when.op || opForSignal(opts.signals, when.signal)) : "eq";
     const signals = signalList(opts.signals);
+    const signalKeys = new Set(signals.map(specRow => specRow.key));
+    const unknownSignal = when && when.signal && !signalKeys.has(when.signal)
+      ? optionTag(when.signal,
+        tr("tree.whenUnknownSignal", {signal: when.signal}), when.signal)
+      : "";
     const signalOptions = optionTag("", tr("tree.noSignal"), when ? when.signal : "") +
+      unknownSignal +
       signals.map(specRow => optionTag(specRow.key, sigLabel(specRow.key),
         when ? when.signal : "")).join("");
     const confFloor = spec && !isRuleSignal(spec)
@@ -291,6 +298,32 @@ const SRTreeEditor = (function () {
     }
     return html;
   }
+  /* Reasoning is a hard model declaration rule (backend parity): a model that
+     declares no efforts only accepts passthrough (null); a declaring model only
+     accepts its declared effort ids. Used by BOTH the route-node form and the
+     direct-model candidates so the two paths cannot drift (review P3). */
+  function reasoningProblem(modelId, reasoning, modelsById) {
+    if (reasoning == null || reasoning === "") return null;
+    if (!modelsById) return null;
+    const row = modelRowOf(modelsById, modelId);
+    if (!row) {
+      return {code: "unknown_model", zh: "模型目录中不存在：" + modelId,
+              en: "Unknown model: " + modelId};
+    }
+    const efforts = reasoningEfforts(modelsById, modelId);
+    if (!efforts.length) {
+      return {code: "invalid_reasoning",
+              zh: "模型 " + modelId + " 未声明推理档位，只能使用透传",
+              en: "Model " + modelId + " declares no reasoning efforts; use passthrough"};
+    }
+    if (!efforts.some(effort => String(effort.id) === String(reasoning))) {
+      return {code: "invalid_reasoning",
+              zh: "模型未声明该推理档位：" + reasoning,
+              en: "The model does not declare this reasoning effort: " + reasoning};
+    }
+    return null;
+  }
+
   function capabilityOf(modelsById, modelId) {
     const row = modelRowOf(modelsById, modelId);
     if (!row) return {text: "", missing: "model"};
@@ -488,11 +521,13 @@ const SRTreeEditor = (function () {
         issues.push(issue("unknown_model", "", "模型目录中不存在：" + model,
           "Unknown model: " + model));
       }
+      const reasoning = input.reasoning == null || input.reasoning === ""
+        ? null : String(input.reasoning);
+      const problem = reasoningProblem(model, reasoning, opts.modelsById);
+      if (problem) issues.push(issue(problem.code, "", problem.zh, problem.en));
       if (hardIssues(issues)) return {option: currentOption, issues: issues};
       return {
-        option: {key: key, model: model,
-                 reasoning: input.reasoning == null || input.reasoning === ""
-                   ? null : String(input.reasoning)},
+        option: {key: key, model: model, reasoning: reasoning},
         issues: issues,
       };
     }
@@ -650,13 +685,8 @@ const SRTreeEditor = (function () {
       if (input.reasoning !== undefined) {
         const reasoning = input.reasoning == null || input.reasoning === ""
           ? null : String(input.reasoning);
-        const efforts = reasoningEfforts(opts.modelsById, next.model);
-        if (reasoning && efforts.length &&
-            !efforts.some(effort => String(effort.id) === reasoning)) {
-          issues.push(issue("invalid_reasoning", next.id,
-            "模型未声明该推理档位：" + reasoning,
-            "The model does not declare this reasoning effort: " + reasoning));
-        }
+        const problem = reasoningProblem(next.model, reasoning, opts.modelsById);
+        if (problem) issues.push(issue(problem.code, next.id, problem.zh, problem.en));
         next = Object.assign({}, next, {reasoning: reasoning});
       }
     }
@@ -933,6 +963,7 @@ const SRTreeEditor = (function () {
     readWeightRow: readWeightRow,
     addWeight: addWeight,
     reasoningOptionsHTML: reasoningOptionsHTML,
+    reasoningProblem: reasoningProblem,
     readFormValues: readFormValues,
     emptyNode: emptyNode,
     emptyOption: emptyOption,

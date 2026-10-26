@@ -291,6 +291,9 @@ const SRTreeStore = (function () {
   function setDraft(treeId, root) {
     const meta = requireTree(treeId);
     const next = normalizeRoot(root, meta.id);
+    /* duplicate node ids / candidate keys must fail BEFORE the draft is
+       replaced, so a bad import cannot clear the current draft (Minor 2). */
+    validateRoot(next, meta.id);
     state.draftsById.set(meta.id, next);
     if (!state.savedById.has(meta.id)) state.savedById.set(meta.id, modelNs().clone(next));
     markDirty(meta.id);
@@ -308,6 +311,9 @@ const SRTreeStore = (function () {
        (spec §7.1) and the backend rejects it on the generic update. */
     const body = {name: meta.name, root: root};
     const res = await apiClient().put(treePath(meta.id), body);
+    /* A save of the ACTIVE tree republishes the online snapshot: absorb the
+       response revision so the pill/store stop showing the stale one (P1). */
+    absorbRevision(res);
     const savedTree = unwrapTree(res);
     const savedRoot = savedTree && savedTree.root != null
       ? normalizeRoot(savedTree.root, meta.id) : root;
@@ -319,6 +325,7 @@ const SRTreeStore = (function () {
       tree: meta,
       root: state.savedById.get(meta.id),
       warnings: res && Array.isArray(res.warnings) ? res.warnings : [],
+      snapshot_revision: snapshotRevision,
       raw: res,
     };
   }

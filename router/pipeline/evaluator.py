@@ -38,7 +38,8 @@ doc §10's (``condition_false`` / ``below_confidence`` / ``nl_low_probability``
 plus ``below_min_score`` / ``no_hit`` for the signal side):
 
 * ``entered`` — a ``branch``/``nl_choice`` node was entered (recorded before its
-  own ``condition``/child events; emitted even without a ``when``).
+  own ``condition``/child events; emitted even without a ``when``; carries the
+  container ``kind`` so the console can render it).
 * ``condition`` — a ``when`` check: signal/op/value, ``m``, ``conf``,
   ``conf_min``, ``pass`` and (on failure only) the ``reason``.  A **passing**
   gate is recorded too, prepended to the node's own events, so the trace shows
@@ -161,7 +162,10 @@ class TreeEvaluator:
         if isinstance(node, (Branch, NLChoice)):
             # design §10: entering a container is visible even when it has no
             # ``when``; order = entered, [condition], child events, terminal.
-            prefix.append({"node_id": node.id, "event": "entered"})
+            # ``kind`` lets the console render branch vs nl_choice containers.
+            prefix.append({"node_id": node.id, "event": "entered",
+                           "kind": "branch" if isinstance(node, Branch)
+                           else "nl_choice"})
         if step is not None:
             # a passing ``when`` records the gate that admitted this path
             # (before the node's own events, after its `entered` event).

@@ -1,8 +1,8 @@
 /* Models & settings page (2026-10-21 rewrite).
 
    Sections: model registry (id / upstream / provider / reasoning / capability
-   description / actions), provider catalog cards, runtime settings, admin
-   token (browser-local) and the read-only current signal engine card.
+   description / actions), provider catalog cards, runtime settings and the
+   read-only current signal engine card.
 
    The natural-language capability description is part of the model profile
    (profile.capability) and is shown in the registry. It is the text source for
@@ -1165,7 +1165,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && closeTopModal()) e.preventDefault();
 });
 
-/* ── settings / admin token ─────────────────────────────────────────── */
+/* ── runtime settings ────────────────────────────────────────────────── */
 $('#addSetting').addEventListener('click', () => {
   const wrap = document.createElement('div');
   wrap.className = 'set-row';

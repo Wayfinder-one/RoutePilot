@@ -139,7 +139,8 @@ def test_try_block_and_fallback(tmp_path):
     # The root branch is entered, then the first child through its passing gate.
     assert [event["event"] for event in blocked["trace"]] == [
         "entered", "condition", "hit"]
-    assert blocked["trace"][0] == {"node_id": "root", "event": "entered"}
+    assert blocked["trace"][0] == {"node_id": "root",
+                                    "event": "entered", "kind": "branch"}
     assert blocked["trace"][1]["node_id"] == "safety-jailbreak"
     assert blocked["trace"][1]["pass"] is True
     assert blocked["trace"][2]["node_id"] == "safety-jailbreak"

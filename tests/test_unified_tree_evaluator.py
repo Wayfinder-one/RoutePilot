@@ -391,7 +391,8 @@ def test_passing_branch_child_condition_is_traced_before_its_hit():
     assert isinstance(result, Hit) and result.model == "m1"
     assert [event["event"] for event in result.trace] == [
         "entered", "condition", "hit"]
-    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[0] == {"node_id": "root", "event": "entered",
+                               "kind": "branch"}
     assert result.trace[1]["node_id"] == "child"
     assert result.trace[1]["pass"] is True
     assert result.trace[2]["node_id"] == "child"
@@ -406,7 +407,8 @@ def test_passing_when_on_a_container_node_is_traced_once():
     assert isinstance(result, Hit) and result.model == "m1"
     assert [event["event"] for event in result.trace] == [
         "entered", "condition", "hit"]
-    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[0] == {"node_id": "root", "event": "entered",
+                               "kind": "branch"}
     assert result.trace[1]["node_id"] == "root"
     assert result.trace[1]["pass"] is True
 
@@ -421,7 +423,8 @@ def test_passing_when_on_an_nl_node_precedes_the_nl_call_event():
     assert isinstance(result, Hit) and result.model == "m1"
     assert [event["event"] for event in result.trace] == [
         "entered", "condition", "nl_choice", "hit"]
-    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[0] == {"node_id": "root", "event": "entered",
+                               "kind": "nl_choice"}
     assert result.trace[1]["node_id"] == "root"
     assert result.trace[1]["pass"] is True
 
@@ -442,7 +445,8 @@ def test_container_entered_event_is_traced_before_its_children():
     result, _ = evaluate(root, [])
     assert isinstance(result, Hit) and result.model == "m1"
     assert [event["event"] for event in result.trace] == ["entered", "hit"]
-    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[0] == {"node_id": "root", "event": "entered",
+                               "kind": "branch"}
 
 
 def test_nested_container_entered_events_keep_the_parent_first():
@@ -453,6 +457,8 @@ def test_nested_container_entered_events_keep_the_parent_first():
         "entered", "entered", "hit"]
     assert [event["node_id"] for event in result.trace[:2]] == [
         "root", "inner"]
+    assert [event["kind"] for event in result.trace[:2]] == [
+        "branch", "branch"]
 
 
 def test_nl_container_entered_event_precedes_its_call():
@@ -461,7 +467,8 @@ def test_nl_container_entered_event_precedes_its_call():
                                                            "b": 0.0})])
     assert [event["event"] for event in result.trace] == [
         "entered", "nl_choice", "hit"]
-    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[0] == {"node_id": "root", "event": "entered",
+                               "kind": "nl_choice"}
 
 
 def test_direct_hit_marks_discarded_weighted_hits_superseded():

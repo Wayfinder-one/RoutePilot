@@ -138,17 +138,34 @@ function render() {
   renderOpenTraces();
 }
 
+function loadErrorHtml(err) {
+  const message = typeof apiErrText === 'function' ? apiErrText(err)
+    : String((err && err.message) || err);
+  return `<div class="empty log-error">
+      <b>${esc(t('logs.loadFail'))}</b>
+      <div class="mut">${esc(message)}</div>
+      <button type="button" class="btn sm" id="logsRetry">${esc(t('logs.retry'))}</button>
+    </div>`;
+}
 async function load() {
-  const [reqBody, tagBody, sigBody] = await Promise.all([
-    api.get('/admin/requests/recent'),
-    api.get('/admin/tagger').catch(() => ({ tagger: {} })),
-    api.get('/admin/signals'),
-  ]);
-  requests = reqBody.requests || [];
-  meta = (tagBody && tagBody.tagger) || meta || {};
-  setSignalRegistry(sigBody.signals);
-  await ensureTrees();               // cached after the first page load
-  render();
+  try {
+    const [reqBody, tagBody, sigBody] = await Promise.all([
+      api.get('/admin/requests/recent'),
+      api.get('/admin/tagger').catch(() => ({ tagger: {} })),
+      api.get('/admin/signals'),
+    ]);
+    requests = reqBody.requests || [];
+    meta = (tagBody && tagBody.tagger) || meta || {};
+    setSignalRegistry(sigBody.signals);
+    await ensureTrees();             // cached after the first page load
+    render();
+  } catch (err) {
+    $('#countPill').textContent = '—';
+    $('#list').classList.remove('has-open');
+    $('#list').innerHTML = loadErrorHtml(err);
+    const retry = $('#logsRetry');
+    if (retry) retry.addEventListener('click', () => { load(); });
+  }
 }
 
 $('#refresh').addEventListener('click', () => load());
