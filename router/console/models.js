@@ -1156,18 +1156,6 @@ $('#saveSettings').addEventListener('click', async () => {
     toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + errText(e));
   }
 });
-$('#adminToken').value = api.token();
-$('#saveToken').addEventListener('click', () => {
-  api.setToken($('#adminToken').value);
-  toast(api.token() ? t('common.saved') : t('models.cleartoken'));
-  boot();
-});
-$('#clearToken').addEventListener('click', () => {
-  api.setToken('');
-  $('#adminToken').value = '';
-  toast(t('models.cleartoken'));
-});
-
 window.onLangChange = () => {
   // Capture the open modals BEFORE re-rendering: the language switch rebuilds
   // their DOM, so unsaved input would be lost (the capture/restore patches

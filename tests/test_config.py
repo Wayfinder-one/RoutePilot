@@ -16,11 +16,12 @@ def test_env_override(monkeypatch):
     assert s.port == 9000
 
 
-def test_admin_token_env(monkeypatch):
-    monkeypatch.setenv("ROUTER_ADMIN_TOKEN", "sekret")
-    assert Settings.from_env().admin_token == "sekret"
-    monkeypatch.delenv("ROUTER_ADMIN_TOKEN")
-    assert Settings.from_env().admin_token == ""
+def test_static_admin_token_removed(monkeypatch):
+    """2026-10-26: ROUTER_ADMIN_TOKEN 已移除，Settings 不再有该字段。"""
+    assert not hasattr(Settings(), "admin_token")
+    monkeypatch.setenv("ROUTER_ADMIN_TOKEN", "sekret")     # 旧 env 被忽略
+    s = Settings.from_env()
+    assert not hasattr(s, "admin_token")
 
 
 def test_user_auth_default_asymmetry(monkeypatch):

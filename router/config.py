@@ -21,10 +21,6 @@ class Settings:
     device: str = ""                 # checkpoint device; '' = auto (cuda if available)
     host: str = "127.0.0.1"
     port: int = 8400
-    # Static bearer token for the /admin API (design doc section 7). Empty =
-    # no auth (loopback/dev only); set ROUTER_ADMIN_TOKEN to require
-    # "Authorization: Bearer <token>" on every /admin* request.
-    admin_token: str = ""
     # PromptJudgeTagger (ROUTER_TAGGER=prompt): OpenAI-compatible chat endpoint
     # used to judge all model signals from one configurable prompt.
     judge_url: str = ""
@@ -59,13 +55,15 @@ class Settings:
     # Console accounts (2026-10-26 user management, design doc §6). NOTE the
     # deliberate asymmetry between the two defaults:
     #   * dataclass default False — tests and code that build Settings(...)
-    #     without this field keep the pre-2026-10-26 behavior (static token
-    #     only), so existing deployments/tests do not suddenly need a login;
+    #     without this field keep the pre-2026-10-26 behavior (/admin open),
+    #     so existing deployments/tests do not suddenly need a login;
     #   * from_env() default True — a service started from the environment
     #     (production, systemd unit, deploy script) DOES require login by
-    #     default, because the empty admin_token case used to leave /admin
-    #     open to the network. ROUTER_USER_AUTH=0 explicitly restores the old
-    #     open behavior for local dev/scripts.
+    #     default, because an open /admin used to be reachable on the network.
+    #     ROUTER_USER_AUTH=0 explicitly restores the open behavior for dev.
+    # The static ROUTER_ADMIN_TOKEN was removed on 2026-10-26: scripts now log
+    # in with ROUTER_ADMIN_EMAIL/ROUTER_ADMIN_PASSWORD and reuse the session
+    # token (see scripts/configure_upstream.py).
     # The default admin account is seeded once into an empty users table only.
     user_auth: bool = False
     admin_email: str = "admin@test.com"
@@ -81,7 +79,6 @@ class Settings:
             device=os.environ.get("ROUTER_DEVICE", ""),
             host=os.environ.get("ROUTER_HOST", "127.0.0.1"),
             port=int(os.environ.get("ROUTER_PORT", "8400")),
-            admin_token=os.environ.get("ROUTER_ADMIN_TOKEN", ""),
             judge_url=os.environ.get("ROUTER_JUDGE_URL", ""),
             judge_model=os.environ.get("ROUTER_JUDGE_MODEL", ""),
             judge_api_key=os.environ.get("ROUTER_JUDGE_API_KEY", ""),

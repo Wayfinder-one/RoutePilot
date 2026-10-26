@@ -159,14 +159,12 @@ const I18N = {
     'sig.addgroup': '+ 词表组', 'sig.savekw': '保存词表',
     'sig.kw.placeholder': '词1, 词2',
     /* ── models & settings ── */
-    'models.sub': '模型目录、提供方、推理声明、系统设置与管理令牌',
+    'models.sub': '模型目录、提供方、推理声明与系统设置',
     'models.providers': '提供方',
     'models.saveproviders': '保存提供方',
     'models.addprovider': '+ 添加提供方',
     'models.settings': '系统设置', 'models.addsetting': '+ 设置项',
     'models.savesettings': '保存设置', 'models.pipelineversion': '管道版本',
-    'models.authtoken': '管理令牌（/admin 鉴权）',
-    'models.savetoken': '保存到本浏览器', 'models.cleartoken': '清除令牌',
     'models.engine': '当前信号引擎', 'models.engine.hint': '在「信号配置」页编辑 JEV 问题；此页只读。',
     'models.models': '模型注册表',
     /* ── models: catalog / registry / reasoning (2026-10-21) ── */
@@ -231,7 +229,6 @@ const I18N = {
     'models.reason.unset': '未声明',
     'models.reason.unsupported': '不支持', 'models.reason.defaultMark': '默认',
     'models.reason.error': '声明无效：{err}',
-    'models.tokenHint': '/admin 与 console 的所有请求都会带上该令牌；只保存在本浏览器。',
     /* ── reasoning efforts / protocol formats ── */
     'reason.auto': '透传（不指定）',
     'reason.off': '关闭', 'reason.on': '开启', 'reason.minimal': '最低', 'reason.low': '低',
@@ -459,14 +456,12 @@ const I18N = {
     'sig.addgroup': '+ Group', 'sig.savekw': 'Save lexicon',
     'sig.kw.placeholder': 'word1, word2',
     /* ── models ── */
-    'models.sub': 'Model catalog, providers, reasoning declarations, settings and admin token',
+    'models.sub': 'Model catalog, providers, reasoning declarations and settings',
     'models.providers': 'Providers',
     'models.saveproviders': 'Save provider',
     'models.addprovider': '+ Add provider',
     'models.settings': 'Settings', 'models.addsetting': '+ Setting',
     'models.savesettings': 'Save settings', 'models.pipelineversion': 'Pipeline version',
-    'models.authtoken': 'Admin token (/admin auth)',
-    'models.savetoken': 'Save to this browser', 'models.cleartoken': 'Clear token',
     'models.engine': 'Current signal engine', 'models.engine.hint': 'Edit JEV questions on the Signal Config page; this card is read-only.',
     'models.models': 'Model registry',
     /* ── models: catalog / registry / reasoning (2026-10-21) ── */
@@ -531,7 +526,6 @@ const I18N = {
     'models.reason.unset': 'undeclared',
     'models.reason.unsupported': 'not supported', 'models.reason.defaultMark': 'default',
     'models.reason.error': 'Invalid declaration: {err}',
-    'models.tokenHint': 'Every /admin and console request carries this token; it is stored only in this browser.',
     /* ── reasoning efforts / protocol formats ── */
     'reason.auto': 'Passthrough (unset)',
     'reason.off': 'Off', 'reason.on': 'On', 'reason.minimal': 'Minimal', 'reason.low': 'Low',

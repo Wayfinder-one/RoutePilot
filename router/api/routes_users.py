@@ -1,7 +1,7 @@
 """Console accounts: login/logout/me + user management (design doc §4).
 
-鉴权本身在 ``router.api.app._install_admin_auth``（静态 token 或登录会话）里
-完成；这里的路由只负责登录/登出/改密与用户 CRUD，并保证：
+鉴权本身在 ``router.api.app._install_admin_auth``（登录会话）里完成；这里的
+路由只负责登录/登出/改密与用户 CRUD，并保证：
 
 * 任何响应都不含 ``password_hash``/salt（spec §4「响应不含 password_hash」）；
 * 所有用户写操作（创建/更新/重置密码/删除）追加 ``changes`` 审计，
@@ -31,8 +31,8 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
-#: 没有中间件时（user_auth=False 且未配静态 token 的旧开放模式）的身份：
-#: 与静态 token 一样按服务账号 super admin 处理（spec §7 最后一条）。
+#: 没有中间件时（user_auth=False 的旧开放模式）的身份：按服务账号 super admin
+#: 处理（spec §7 最后一条）。
 SERVICE_USER = {"id": None, "email": None, "role": "admin",
                 "service": True, "expires_at": None}
 
@@ -159,7 +159,7 @@ def login(payload: LoginIn, request: Request,
 
 @router.post("/logout")
 def logout(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    """Revoke the current session token. 静态 token 没有会话行，直接 no-op。"""
+    """Revoke the current session token. 旧开放模式没有会话行，直接 no-op。"""
     user = _current_user(request)
     token = _bearer(request)
     if token and not user.get("service"):

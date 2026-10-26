@@ -232,13 +232,10 @@ def test_update_and_delete(conn):
 # --------------------------------------------------------------------------- #
 # Task 2：/admin 鉴权中间件 + 登录 / 用户管理 API
 # --------------------------------------------------------------------------- #
-SERVICE = {"Authorization": "Bearer sekret"}
-
-
 def api_client(tmp_path, *, name="api.db", user_auth=True, **overrides):
-    """TestClient with user auth on + the static service token configured."""
+    """TestClient with the login-based /admin gate (user_auth=True by default)."""
     settings = Settings(db_path=str(tmp_path / name), user_auth=user_auth,
-                        admin_token="sekret", **overrides)
+                        **overrides)
     return TestClient(create_app(settings))
 
 
@@ -252,9 +249,14 @@ def login(c, email="admin@test.com", password="1qaz@WSX"):
     return r.json()["token"]
 
 
+def admin_headers(c):
+    """登录一次拿会话 token（静态 token 已移除；测试库每次新会话无所谓）。"""
+    return bearer(login(c))
+
+
 def create_user(c, email, password="password-1", role="viewer"):
     r = c.post("/admin/users", json={"email": email, "password": password,
-                                     "role": role}, headers=SERVICE)
+                                     "role": role}, headers=admin_headers(c))
     assert r.status_code == 201, r.text
     return r.json()["user"]
 
@@ -318,7 +320,7 @@ def test_disabled_user_login_401(tmp_path):
     assert c.get("/admin/me", headers=bearer(token)).status_code == 200
     # 停用后：登录 401，已签发的会话立即失效
     assert c.put(f"/admin/users/{viewer['id']}", json={"status": "disabled"},
-                 headers=SERVICE).status_code == 200
+                 headers=admin_headers(c)).status_code == 200
     assert c.get("/admin/me", headers=bearer(token)).status_code == 401
     r = c.post("/admin/login", json={"email": "viewer@test.com",
                                      "password": "viewer-pass-1"})
@@ -328,29 +330,34 @@ def test_disabled_user_login_401(tmp_path):
 
 def test_login_updates_last_login(tmp_path):
     c = api_client(tmp_path)
-    users = c.get("/admin/users", headers=SERVICE).json()["users"]
-    assert len(users) == 1 and users[0]["last_login_at"] is None
+    db = c.app.state.settings.db_path
+
+    def last_login():
+        conn = connect(db)
+        try:
+            return conn.execute(
+                "SELECT last_login_at FROM users WHERE email = ?",
+                ("admin@test.com",)).fetchone()[0]
+        finally:
+            conn.close()
+
+    assert last_login() is None
     login(c)
-    users = c.get("/admin/users", headers=SERVICE).json()["users"]
-    assert users[0]["last_login_at"] is not None
+    assert last_login() is not None
 
 
-def test_static_token_still_works_with_user_auth_on(tmp_path):
+def test_static_admin_token_is_gone(tmp_path):
+    """2026-10-26: 静态 ROUTER_ADMIN_TOKEN 已移除 —— Bearer 只能是登录会话。"""
     c = api_client(tmp_path)
-    # 脚本/部署沿用静态 token：完全不受登录影响
-    assert c.get("/admin/models", headers=SERVICE).status_code == 200
-    assert c.put("/admin/settings", json={"a": "b"},
-                 headers=SERVICE).status_code == 200
-    assert c.get("/admin/users", headers=SERVICE).status_code == 200
-    assert c.post("/admin/logout", headers=SERVICE).json() == {"ok": True}
-    me = c.get("/admin/me", headers=SERVICE)
-    assert me.status_code == 200
-    assert me.json() == {"id": None, "email": None, "role": "admin",
-                         "expires_at": None, "service": True}
-    # 不带凭据：401（默认开启用户体系后 /admin 不再裸奔）
-    assert c.get("/admin/users").status_code == 401
+    assert not hasattr(c.app.state.settings, "admin_token")
+    # 旧静态 token 的字面值不再被接受
     assert c.get("/admin/models",
+                 headers={"Authorization": "Bearer sekret"}).status_code == 401
+    assert c.get("/admin/users",
                  headers={"Authorization": "Bearer wrong"}).status_code == 401
+    # 不带凭据 401；登录会话可以访问
+    assert c.get("/admin/users").status_code == 401
+    assert c.get("/admin/users", headers=admin_headers(c)).status_code == 200
 
 
 def test_viewer_can_get_pipeline_but_not_put(tmp_path):
@@ -397,7 +404,7 @@ def test_viewer_cannot_touch_users_api(tmp_path):
         assert r.json() == {"detail": "forbidden: admin role required"}
     # 自己没有被降级/删除
     by_email = {u["email"]: u for u in c.get("/admin/users",
-                                             headers=SERVICE).json()["users"]}
+                                             headers=admin_headers(c)).json()["users"]}
     assert by_email["viewer@test.com"]["role"] == "viewer"
 
 
@@ -486,18 +493,18 @@ def test_create_user_duplicate_email_409_case_insensitive(tmp_path):
     for email in ("dup@test.com", "DUP@TEST.COM", "  dup@test.com  "):
         r = c.post("/admin/users", json={"email": email,
                                          "password": "password-1",
-                                         "role": "viewer"}, headers=SERVICE)
+                                         "role": "viewer"}, headers=admin_headers(c))
         assert r.status_code == 409, email
         assert r.json() == {"detail": "email already exists"}
     # 与 seed 管理员冲突也是 409
     r = c.post("/admin/users", json={"email": "ADMIN@test.com",
                                      "password": "password-1"},
-               headers=SERVICE)
+               headers=admin_headers(c))
     assert r.status_code == 409
     # 改名撞已有邮箱同样是 409
     other = create_user(c, "other@test.com")
     r = c.put(f"/admin/users/{other['id']}", json={"email": "dup@test.com"},
-              headers=SERVICE)
+              headers=admin_headers(c))
     assert r.status_code == 409
     assert r.json() == {"detail": "email already exists"}
 
@@ -513,44 +520,60 @@ def test_cannot_delete_self(tmp_path):
 
 
 def test_cannot_delete_last_active_admin(tmp_path):
-    c = api_client(tmp_path)
-    only_admin = c.get("/admin/users", headers=SERVICE).json()["users"][0]
-    r = c.delete(f"/admin/users/{only_admin['id']}", headers=SERVICE)
+    """DB 层的「不能删最后一个 active admin」守卫：用开放模式（user_auth=False）
+    的请求方验证 —— 它没有 user row，self 检查不适用，能真正打到 last-admin 分支。
+    （会话模式下 actor 自己就是一个 admin：删别人时至少还有 2 个 active admin，
+    最后一个只能是自己，会先被 "cannot delete yourself" 拦住。）"""
+    c = TestClient(create_app(Settings(db_path=str(tmp_path / "last.db"),
+                                        user_auth=False)))
+    admin = c.post("/admin/users", json={"email": "solo@test.com",
+                                         "password": "solo-pass-1",
+                                         "role": "admin"}).json()["user"]
+    r = c.delete(f"/admin/users/{admin['id']}")
     assert r.status_code == 400
     assert r.json() == {"detail": "cannot delete the last active admin"}
-    assert len(c.get("/admin/users", headers=SERVICE).json()["users"]) == 1
-    # 两个 active admin 时允许删一个；删到只剩一个后又拦住
-    second = create_user(c, "second@test.com", "second-pass-1", "admin")
-    assert c.delete(f"/admin/users/{only_admin['id']}",
-                    headers=SERVICE).status_code == 200
-    r = c.delete(f"/admin/users/{second['id']}", headers=SERVICE)
+    # 加第二个 active admin 后允许删一个；再删最后一个又拦住
+    second = c.post("/admin/users", json={"email": "second@test.com",
+                                          "password": "second-pass-1",
+                                          "role": "admin"}).json()["user"]
+    assert c.delete(f"/admin/users/{admin['id']}").status_code == 200
+    r = c.delete(f"/admin/users/{second['id']}")
     assert r.status_code == 400
     assert r.json() == {"detail": "cannot delete the last active admin"}
 
 
 def test_cannot_demote_or_disable_last_admin(tmp_path):
     c = api_client(tmp_path)
-    only_admin = c.get("/admin/users", headers=SERVICE).json()["users"][0]
+    admin = bearer(login(c))                 # 当前会话就是 seed admin
+    me = c.get("/admin/me", headers=admin).json()
     for payload in ({"role": "viewer"}, {"status": "disabled"},
                     {"role": "viewer", "status": "disabled"}):
-        r = c.put(f"/admin/users/{only_admin['id']}", json=payload,
-                  headers=SERVICE)
+        r = c.put(f"/admin/users/{me['id']}", json=payload, headers=admin)
         assert r.status_code == 400, payload
         assert r.json() == {"detail": "cannot demote or disable the last "
                                       "active admin"}
-    unchanged = c.get("/admin/users", headers=SERVICE).json()["users"][0]
+    unchanged = c.get("/admin/users", headers=admin).json()["users"][0]
     assert unchanged["role"] == "admin" and unchanged["status"] == "active"
-    # 有了第二个 active admin 就可以降级/停用其一
-    second = create_user(c, "second@test.com", "second-pass-1", "admin")
-    assert c.put(f"/admin/users/{only_admin['id']}", json={"role": "viewer"},
-                 headers=SERVICE).status_code == 200
-    r = c.put(f"/admin/users/{second['id']}", json={"status": "disabled"},
-              headers=SERVICE)
+    # 有了第二个 active admin 后：second 可以把 seed admin 降级/停用；
+    # 最后 second 再降自己 → 又被 last-admin 拦住。
+    create_user(c, "second@test.com", "second-pass-1", "admin")
+    second = bearer(login(c, "second@test.com", "second-pass-1"))
+    assert c.put(f"/admin/users/{me['id']}", json={"role": "viewer"},
+                 headers=second).status_code == 200
+    # seed admin 现在是 viewer：它的旧会话写权限也随之消失（角色每次现查）
+    assert c.put("/admin/settings", json={"a": "b"},
+                 headers=admin).status_code == 403
+    assert c.put(f"/admin/users/{me['id']}", json={"status": "disabled"},
+                 headers=second).status_code == 200
+    me2 = c.get("/admin/me", headers=second).json()
+    r = c.put(f"/admin/users/{me2['id']}", json={"role": "viewer"},
+              headers=second)
     assert r.status_code == 400
-    # 非降级/停用的更新（改邮箱、重复设置同值）不受影响
-    assert c.put(f"/admin/users/{second['id']}",
+    assert r.json() == {"detail": "cannot demote or disable the last active admin"}
+    # 非降级/停用的更新（重复设置同值）不受影响
+    assert c.put(f"/admin/users/{me2['id']}",
                  json={"role": "admin", "status": "active"},
-                 headers=SERVICE).status_code == 200
+                 headers=second).status_code == 200
 
 
 def test_password_change_revokes_old_session(tmp_path):
@@ -567,17 +590,13 @@ def test_password_change_revokes_old_session(tmp_path):
                                         "password": "1qaz@WSX"}
                   ).status_code == 401
     t3 = login(c, "admin@test.com", "brand-new-1")
-    # 旧密码错 → 400；短密码 → 422；service token → 400
+    # 旧密码错 → 400；短密码 → 422
     assert c.post("/admin/me/password",
                   json={"old_password": "wrong", "new_password": "another-1"},
                   headers=bearer(t3)).status_code == 400
     assert c.post("/admin/me/password",
                   json={"old_password": "brand-new-1", "new_password": "short"},
                   headers=bearer(t3)).status_code == 422
-    r = c.post("/admin/me/password",
-               json={"old_password": "x", "new_password": "another-1"},
-               headers=SERVICE)
-    assert r.status_code == 400
     # 会话还在：失败的改密不应该吊销任何东西
     assert c.get("/admin/me", headers=bearer(t3)).status_code == 200
 
@@ -629,8 +648,8 @@ def test_responses_never_contain_password_hash(tmp_path):
     responses.append(c.post(f"/admin/users/{uid}/password",
                             json={"new_password": "resp-secret-2"},
                             headers=headers))
-    responses.append(c.get("/admin/users", headers=SERVICE))
-    responses.append(c.get("/admin/changes", headers=SERVICE))
+    responses.append(c.get("/admin/users", headers=admin_headers(c)))
+    responses.append(c.get("/admin/changes", headers=admin_headers(c)))
     responses.append(c.post("/admin/logout", headers=headers))
     for response in responses:
         body = response.text
@@ -643,8 +662,7 @@ def test_responses_never_contain_password_hash(tmp_path):
 def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
     """ROUTER_USER_AUTH=0 + 空 token = 2026-10-26 之前的行为：/admin 完全开放。"""
     db = str(tmp_path / "legacy.db")
-    c = TestClient(create_app(Settings(db_path=db, user_auth=False,
-                                       admin_token="")))
+    c = TestClient(create_app(Settings(db_path=db, user_auth=False)))
     assert c.get("/admin/models").status_code == 200
     assert c.put("/admin/settings", json={"a": "b"}).status_code == 200
     assert c.get("/admin/users").json() == {"users": []}
@@ -662,8 +680,8 @@ def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
     finally:
         conn.close()
 
-    # 0 + 静态 token：退回只认静态 token 的旧行为（会话不存在）
+    # 开放模式不看 Authorization 头（静态 token 已移除，也没有会话概念）
     c2 = TestClient(create_app(Settings(db_path=str(tmp_path / "legacy2.db"),
-                                        user_auth=False, admin_token="sekret")))
-    assert c2.get("/admin/models").status_code == 401
-    assert c2.get("/admin/models", headers=SERVICE).status_code == 200
+                                        user_auth=False)))
+    assert c2.get("/admin/models",
+                  headers={"Authorization": "Bearer whatever"}).status_code == 200
