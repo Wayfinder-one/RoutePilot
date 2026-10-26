@@ -2,11 +2,12 @@
 
    Auth: the console signs in with email + password (POST /admin/login) and
    keeps the opaque session token in this browser's localStorage
-   ("sr_admin_token"). A ?token=... query parameter is still accepted once
-   (static ROUTER_ADMIN_TOKEN for scripts / shared demo links), stored and
-   stripped from the URL. On a 401 the session is gone: clear the token and
-   bounce to login.html?next=<this page>; the login page itself never bounces
-   (login.js shows the error instead). */
+   ("sr_admin_token"). The static ROUTER_ADMIN_TOKEN was removed on 2026-10-26.
+   A ?token=... query parameter is still accepted once — useful to hand an
+   existing session token to a script/demo browser — then stripped from the
+   URL. On a 401 the session is gone: clear the token and bounce to
+   login.html?next=<this page>; the login page itself never bounces (login.js
+   shows the error instead). */
 const api = {
   TOKEN_KEY: 'sr_admin_token',
   _bouncing: false,

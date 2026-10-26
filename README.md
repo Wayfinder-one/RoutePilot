@@ -73,8 +73,7 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 | `ROUTER_JEV_WINDOW` | JEV 输入窗口 `<head>:<tail>`（token 数，默认未配置 = 旧行为 `<max_length>:0` 纯 head；如 `256:768` / `0:1024` / `512:512`；短文本逐字不变） |
 | `ROUTER_JEV_TRIM` | 设为 `0` 关闭 /v1 按树裁剪问题的热路径优化 |
 | `ROUTER_DEVICE` | 模型设备（如 `cuda:0`） |
-| `ROUTER_ADMIN_TOKEN` | 静态服务 token：带上即视为 super admin 访问全部 `/admin*`（脚本/部署用；控制台用登录会话，不需要它） |
-| `ROUTER_USER_AUTH` | 控制台账号体系（默认 `1`）。`0` = 退回旧行为：只认静态 token，空 token 时 `/admin` 完全开放（本地 dev） |
+| `ROUTER_USER_AUTH` | 控制台账号体系（默认 `1`）。`0` = 退回旧行为：`/admin` 完全开放（仅本地 dev） |
 | `ROUTER_ADMIN_EMAIL` | 首次启动 seed 的管理员邮箱（默认 `admin@test.com`；users 表非空不覆盖） |
 | `ROUTER_ADMIN_PASSWORD` | 首次启动 seed 的管理员密码（默认 `1qaz@WSX`；**上线后请立刻在「用户管理」改掉**） |
 | `ROUTER_SESSION_TTL_HOURS` | 登录会话有效期（默认 `168` 小时） |
@@ -225,7 +224,6 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 ROUTER_TAGGER=jev \
 ROUTER_JEV_MODEL=/path/to/jev_merged_model \
 ROUTER_SIGNAL_QUESTIONS=/path/to/signal_questions.json \
-ROUTER_ADMIN_TOKEN=<random-token> \
 ROUTER_DEVICE=cuda:0 \
 ROUTER_HOST=0.0.0.0 \
 python -m router
@@ -233,39 +231,41 @@ python -m router
 
 首次启动（users 表为空）会 seed 一个默认管理员：`admin@test.com` / `1qaz@WSX`
 （`ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` 可覆盖）。控制台入口
-`http://<host>:<port>/console/login.html`；登录会话与静态 `ROUTER_ADMIN_TOKEN`
-二选一都能访问 `/admin*`。
+`http://<host>:<port>/console/login.html`；`/admin*` 需要登录会话。
+**静态 `ROUTER_ADMIN_TOKEN` 已于 2026-10-26 移除**——脚本改为用
+`POST /admin/login` 换会话 token（`scripts/configure_upstream.py` 等已内置）。
 
 `scripts/` 内附部署与上游配置脚本模板，可按目标环境改写。
 
 ## 账号与鉴权
 
-- **登录**：控制台打开即跳 `login.html`，邮箱 + 密码登录；token 存浏览器
-  localStorage（`sr_admin_token`），过期或服务端重启吊销后自动跳回登录页。
-  也可用 `?token=<静态 token>` 一次性注入（共享演示链接/脚本后门）。
+- **登录**：控制台打开即跳 `login.html`，邮箱 + 密码登录；会话 token 存浏览器
+  localStorage（`sr_admin_token`），TTL 默认 168 小时，过期或服务端吊销后自动跳回
+  登录页。`?token=<session token>` 可用于把已有会话一次性注入浏览器（演示/自动化）。
 - **角色**：`admin` = 全部 `/admin` 读写 + 用户管理；`viewer` = `/admin` 只读
-  （写操作 403、用户管理页 403）。角色在启动时写入的用户表里维护，登录后生效。
+  （写操作 403、用户管理页 403）。角色在用户表里维护，每次请求现查（改角色立即生效）。
 - **用户管理**（`/console/users.html`，仅 admin）：新建/改邮箱/改角色/停用/
   重置密码/删除；不能删除自己，不能删除或降级最后一个 active admin。
   所有写操作进 `changes` 审计（只有 metadata，绝不含密码或哈希）。
-- **静态 token**：`ROUTER_ADMIN_TOKEN` 非空时始终有效，视为 super admin
-  （部署脚本 `deploy-76.sh`、`scripts/configure_upstream.py`、`console_check.js`
-  都走它，不依赖登录）。
+- **脚本/CI 怎么认证**：先去 `POST /admin/login`（默认管理员或其他 admin 账号）拿
+  `token`，后续请求带 `Authorization: Bearer <token>`；`deploy-76.sh`、`configure_upstream.py`、
+  `apply_default_pipeline.py` 已按这个方式改造（账号用 `SR_ADMIN_EMAIL` /
+  `SR_ADMIN_PASSWORD`，默认是 seed 的 admin@test.com）。**改过默认密码后要在部署 env 里
+  同步，否则脚本登录会失败。**
 - **密码存储**：标准库 `hashlib.scrypt`（n=2^14, r=8, p=1，16 字节随机盐）；
   会话 token 只存 sha256，DB 泄露不等于会话泄露。登录失败统一 401（不泄露
   账号是否存在），失败写 logger（邮箱 + 来源 IP）。
-- **关掉账号体系**：`ROUTER_USER_AUTH=0` → 回到 2026-10-26 之前的行为
-  （只认静态 token；空 token = `/admin` 开放，仅限本地 dev）。
+- **关掉账号体系**：`ROUTER_USER_AUTH=0` → `/admin` 完全开放（无鉴权），仅限本地 dev。
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（831 passed, 8 skipped；skip 均为缺 GPU/模型/可选依赖的用例）。
+- 单元/集成：`pytest`（873 passed, 7 skipped；skip 均为缺 GPU/模型/可选依赖的用例）。
 - 离线 JEV 评估：`scripts/jev_dump_scores.py`（官方 test 集 raw 分布 dump，需模型）、
   `scripts/jev_calibrate.py`（coverage-risk / AURC / ECE / 各门槛 block recall 报告，纯 CPU）、
   `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）、
   `scripts/cheap_sufficient_mvp.py`（GSM8K 上便宜档 C vs 强档 S 的 cheap_sufficient 离线实验，需两个模型）。
 - i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
   `scripts/i18n_prune_i18n.py` 负责批量删除）。
-- 控制台冒烟：`BASE=http://<host>:<port> ADMIN_TOKEN=<token> node scripts/console_check.js`
+- 控制台冒烟：`BASE=http://<host>:<port> LOGIN_EMAIL=<admin> LOGIN_PASSWORD=<pass> node scripts/console_check.js`
   （覆盖七个页面（含登录页/用户管理页/能力路由页）、模型目录/添加模型弹窗/推理声明编辑器、
-  能力说明列与能力策略保存、分流树叶推理下拉与日志徽章；不带 `ADMIN_TOKEN` 时会先走一次真实登录流程）。
+  能力说明列与能力策略保存、分流树叶推理下拉与日志徽章；脚本先用账号登录换会话 token 再做检查）。
