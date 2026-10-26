@@ -1,34 +1,48 @@
 """热路径（§6）：推理注入 / 完全透传 / 竞态降级 / 响应头 / ring 记录。
 
-上游用 httpx.MockTransport 捕获真实请求体，覆盖 9 种 format 的注入与 off 语义。
+Migrated from the four-station pipeline to the unified routing tree:
+
+* the old ``set_leaf_reasoning`` helper edited the fallback Station leaf through
+  ``GET/PUT /admin/pipeline``; the unified tree keeps that leaf as the root
+  branch's explicit ``otherwise`` route, so the helper now saves the ACTIVE tree
+  with that route's ``reasoning`` field set (saving the active tree republishes
+  the immutable snapshot);
+* the routing fixture is the helper's ``default_signal_tree`` (equivalent to the
+  old seeded pipeline: safety block -> keyword -> subject -> fallback) instead
+  of a globally seeded pipeline with lowered confidence floors.  ``TEXT`` has no
+  matching condition, so it reaches the fallback route (qwen3-8b) exactly like
+  before;
+* upstream body capture, the response headers (``x-sr-model`` /
+  ``x-sr-reasoning`` / ``x-sr-reasoning-warning``) and the ring record contract
+  are unchanged (design §8.1: the upstream forwarding boundary is stable).
 """
+
+from __future__ import annotations
 
 import json
 
 import httpx
 import pytest
-from fastapi.testclient import TestClient
 
-from router.api.app import create_app
-from router.config import Settings
+from router.pipeline.snapshot import install_snapshot  # noqa: F401  (seam doc)
+from router.pipeline.tree import tree_from_dict, tree_revision_of
+from router.store.db import connect
+from tests.unified_tree_helpers import (
+    activate_default_tree,
+    default_signal_tree,
+    make_app,
+    ok_upstream,
+    set_active_fallback_reasoning,
+)
 
-TEXT = "今天天气怎么样"     # no seeded condition matches -> fallback routes to qwen3-8b
+TEXT = "今天天气怎么样"     # no condition matches -> fallback route -> qwen3-8b
 
 
-def make_app(tmp_path, handler=None):
-    seen = {"requests": []}
-
-    def capture(request):
-        seen["requests"].append({
-            "url": str(request.url),
-            "body": json.loads(request.content or b"{}"),
-            "headers": dict(request.headers)})
-        return handler(request)
-
-    transport = httpx.MockTransport(capture)
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=transport)
-    return app, TestClient(app), seen
+def make_harness(tmp_path, *, transport=None, handler=None):
+    """App + client + captured upstream requests (see unified_tree_helpers)."""
+    return make_app(tmp_path,
+                    handler if handler is not None else ok_upstream,
+                    transport=transport)
 
 
 class _Chunks(httpx.AsyncByteStream):
@@ -51,26 +65,61 @@ class _StreamingTransport(httpx.AsyncBaseTransport):
                               stream=_Chunks())
 
 
-def ok_upstream(request):
-    return httpx.Response(200, json={"choices": [
-        {"message": {"role": "assistant", "content": "hi"}}]})
-
-
 def declare(client, reasoning, *, provider_format=None, model="qwen3-8b"):
     if provider_format is not None:
         r = client.put("/admin/providers/local", json={
             "base_url": "http://127.0.0.1:9000",
             "reasoning_format": provider_format})
         assert r.status_code == 200, r.text
-    r = client.put(f"/admin/models/{model}", json={"profile": {"reasoning": reasoning}})
+    r = client.put(f"/admin/models/{model}",
+                   json={"profile": {"reasoning": reasoning}})
     assert r.status_code == 200, r.text
 
 
-def set_leaf_reasoning(client, level, station_index=-1):
-    pipe = client.get("/admin/pipeline").json()
-    pipe["stations"][station_index]["root"]["reasoning"] = level
-    r = client.put("/admin/pipeline", json=pipe)
-    assert r.status_code == 200, r.text
+def set_leaf_reasoning(client, level):
+    """Set the fallback ("otherwise") route's reasoning level on the active tree.
+
+    The unified-tree replacement of the old Station-leaf helper: the active tree
+    is saved back through ``PUT /admin/trees/{id}``, which republishes the
+    snapshot with the new route reasoning.
+    """
+    set_active_fallback_reasoning(client, level)
+
+
+def insert_active_tree(app, root, tree_id="stale-tree"):
+    """Publish an ACTIVE tree straight from the DB, bypassing /admin validation.
+
+    Reproduces a stale/manual configuration (older version, a direct DB edit):
+    the enable-time health check would reject it today, so the hot path itself
+    must degrade gracefully.  This is the equivalent of the old test's
+    "concurrent admin edit" seam now that admin writes are health-checked.
+    """
+    tree = tree_from_dict({"id": tree_id, "name": "Stale tree",
+                           "enabled": True, "root": root})
+    conn = connect(app.state.settings.db_path)
+    try:
+        conn.execute(
+            "INSERT INTO routing_trees (id, name, enabled, root, tree_revision, "
+            "updated_at) VALUES (?, ?, 1, ?, ?, ?)",
+            (tree.id, tree.name, json.dumps(root, ensure_ascii=False),
+             tree_revision_of(tree.root), "2026-10-26T00:00:00+08:00"))
+        conn.commit()
+        app.state.publisher.refresh(conn)
+    finally:
+        conn.close()
+    assert app.state.snapshot.tree_id == tree_id
+
+
+def rewrite_model_profile(app, model, profile):
+    """Direct DB edit of the model catalog + publish (bypasses write validation)."""
+    conn = connect(app.state.settings.db_path)
+    try:
+        conn.execute("UPDATE models SET profile=? WHERE id=?",
+                     (json.dumps(profile), model))
+        conn.commit()
+        app.state.publisher.refresh(conn)
+    finally:
+        conn.close()
 
 
 def chat(client, **body):
@@ -79,11 +128,18 @@ def chat(client, **body):
                              **body})
 
 
+def ring_record(client):
+    """Newest in-memory ring record (the console/replay view of the request)."""
+    return client.get("/admin/requests/recent").json()["requests"][0]
+
+
 # --------------------------------------------------------------------------- #
 # null（默认）= 完全透传：不注入、不剥离
 # --------------------------------------------------------------------------- #
 def test_null_reasoning_is_full_passthrough(tmp_path):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)              # fallback reasoning stays null
     declare(client, {"efforts": {"off": None, "high": "high"}})
     client_reasoning = {
         "reasoning_effort": "client-effort",
@@ -97,10 +153,10 @@ def test_null_reasoning_is_full_passthrough(tmp_path):
     assert r.headers["x-sr-model"] == "qwen3-8b"
     assert "x-sr-reasoning" not in r.headers
     assert "x-sr-reasoning-warning" not in r.headers
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     for key, value in client_reasoning.items():
         assert sent[key] == value, key      # untouched: not stripped, not injected
-    ring = client.get("/admin/requests/recent").json()["requests"][0]
+    ring = ring_record(client)
     assert ring["reasoning"] is None
     assert ring["reasoning_warning"] is None
 
@@ -132,7 +188,9 @@ FORMAT_CASES = [
 
 @pytest.mark.parametrize("fmt,efforts,level,expected", FORMAT_CASES)
 def test_injection_per_format(tmp_path, fmt, efforts, level, expected):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)
     declare(client, {"format": fmt, "efforts": efforts})
     set_leaf_reasoning(client, level)
     client_junk = {
@@ -146,7 +204,7 @@ def test_injection_per_format(tmp_path, fmt, efforts, level, expected):
     assert r.status_code == 200, r.text
     assert r.headers["x-sr-reasoning"] == level
     assert "x-sr-reasoning-warning" not in r.headers
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     assert sent["model"] == "qwen3-8b"
     for key, value in expected.items():
         assert sent[key] == value, (fmt, key)
@@ -156,9 +214,12 @@ def test_injection_per_format(tmp_path, fmt, efforts, level, expected):
             assert key not in sent, (fmt, key)
     if fmt != "qwen-chat-template":
         assert sent["chat_template_kwargs"] == {"keep": 1}
-    ring = client.get("/admin/requests/recent").json()["requests"][0]
+    ring = ring_record(client)
     assert ring["reasoning"] == level
     assert ring["reasoning_warning"] is None
+    # the record names the unified-tree provenance the decision used
+    assert ring["tree_id"] == "default-tree"
+    assert ring["tree_revision"] == h.app.state.snapshot.tree_revision
 
 
 OFF_CASES = [
@@ -181,14 +242,16 @@ OFF_CASES = [
 
 @pytest.mark.parametrize("fmt,efforts,expected", OFF_CASES)
 def test_off_level_per_format(tmp_path, fmt, efforts, expected):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)
     declare(client, {"format": fmt, "efforts": efforts})
     set_leaf_reasoning(client, "off")
     r = chat(client, reasoning_effort="client", thinking="client",
              enable_thinking=True)
     assert r.status_code == 200, r.text
     assert r.headers["x-sr-reasoning"] == "off"
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     for key, value in expected.items():
         assert sent[key] == value, (fmt, key)
     for key in ("reasoning_effort", "reasoning", "thinking", "enable_thinking"):
@@ -197,24 +260,28 @@ def test_off_level_per_format(tmp_path, fmt, efforts, expected):
 
 
 def test_model_level_format_wins_over_provider(tmp_path):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)
     # provider says deepseek, the model overrides to qwen
     declare(client, {"format": "qwen", "efforts": {"off": None, "on": None}},
             provider_format="deepseek")
     set_leaf_reasoning(client, "on")
     assert chat(client).status_code == 200
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     assert sent["enable_thinking"] is True
     assert "thinking" not in sent
 
 
 def test_model_without_format_inherits_provider_format(tmp_path):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)
     declare(client, {"efforts": {"off": None, "high": None}},
             provider_format="deepseek")
     set_leaf_reasoning(client, "high")
     assert chat(client).status_code == 200
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     assert sent["thinking"] == {"type": "enabled"}
     assert sent["reasoning_effort"] == "high"       # null wire -> level id
 
@@ -223,65 +290,64 @@ def test_model_without_format_inherits_provider_format(tmp_path):
 # 竞态降级：配置落后于声明 -> 透传 + warning，请求不失败
 # --------------------------------------------------------------------------- #
 def test_level_removed_from_declaration_degrades_to_passthrough(tmp_path):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    """Behavior preserved: a tree that selects a level the CURRENT model catalog
+    no longer declares degrades to passthrough + warning, it never fails the
+    user's request.  The stale configuration is published directly from the DB
+    (the /admin model write now health-checks the active tree and would reject
+    the inconsistent catalog)."""
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)
     declare(client, {"efforts": {"off": None, "high": "high"}})
     set_leaf_reasoning(client, "high")
-    # concurrent admin edit: the model now only declares low, the tree still says high
-    assert client.put("/admin/models/qwen3-8b", json={"profile": {
-        "reasoning": {"efforts": {"off": None, "low": "low"}}}}).status_code == 200
+    # the catalog now only declares low while the active tree still says high
+    rewrite_model_profile(h.app, "qwen3-8b",
+                          {"reasoning": {"efforts": {"off": None, "low": "low"}}})
     r = chat(client, reasoning_effort="client-effort")
     assert r.status_code == 200
     assert r.headers["x-sr-reasoning-warning"] == "unsupported"
     assert "x-sr-reasoning" not in r.headers
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     assert sent["reasoning_effort"] == "client-effort"   # passthrough, not stripped
-    ring = client.get("/admin/requests/recent").json()["requests"][0]
+    ring = ring_record(client)
     assert ring["reasoning"] == "high"
     assert ring["reasoning_warning"] == "unsupported"
 
 
 def test_capability_removed_degrades_to_passthrough(tmp_path):
-    _app, client, seen = make_app(tmp_path, ok_upstream)
+    """Behavior preserved: an explicitly unsupported declaration (False) also
+    degrades to passthrough + warning instead of a 5xx."""
+    h = make_harness(tmp_path)
+    client = h.client
+    activate_default_tree(client)
     declare(client, {"efforts": {"off": None, "high": "high"}})
     set_leaf_reasoning(client, "high")
-    # explicitly unsupported now (e.g. provider switch / profile edit)
-    assert client.put("/admin/models/qwen3-8b",
-                      json={"profile": {"reasoning": False}}).status_code == 200
+    rewrite_model_profile(h.app, "qwen3-8b", {"reasoning": False})
     r = chat(client, thinking={"type": "enabled"})
     assert r.status_code == 200
     assert r.headers["x-sr-reasoning-warning"] == "unsupported"
-    sent = seen["requests"][-1]["body"]
+    sent = h.requests[-1]["body"]
     assert sent["thinking"] == {"type": "enabled"}        # untouched
-    ring = client.get("/admin/requests/recent").json()["requests"][0]
+    ring = ring_record(client)
     assert ring["reasoning_warning"] == "unsupported"
 
 
 def test_model_without_any_declaration_and_leaf_level(tmp_path):
     """A stale tree selecting a level for an undeclared model must not 5xx."""
-    _app, client, _seen = make_app(tmp_path, ok_upstream)
-    # write the tree directly into the DB, bypassing health check validation
-    from router.pipeline.snapshot import install_snapshot, load_snapshot
-    from router.store.db import connect
-    from router.store.repositories import StationRepo
+    h = make_harness(tmp_path)
+    client = h.client
+    root = default_signal_tree()
+    root["otherwise"]["reasoning"] = "high"
+    insert_active_tree(h.app, root, tree_id="bypass-tree")
 
-    pipe = client.get("/admin/pipeline").json()
-    station = pipe["stations"][-1]
-    conn = connect(client.app.state.settings.db_path)
-    try:
-        stations = StationRepo(conn).load()
-        stations[-1].root.reasoning = "high"
-        StationRepo(conn).save(stations)
-        # P1-B: the hot path reads the immutable snapshot, so publish the tree
-        # the test wrote straight into the DB (bypassing admin validation).
-        install_snapshot(
-            client.app,
-            load_snapshot(conn, jev_trim=client.app.state.settings.jev_trim))
-    finally:
-        conn.close()
     r = chat(client)
     assert r.status_code == 200
+    assert r.headers["x-sr-model"] == "qwen3-8b"
     assert r.headers["x-sr-reasoning-warning"] == "unsupported"
-    assert station["root"]["reasoning"] is None     # untouched GET payload
+    assert "x-sr-reasoning" not in r.headers
+    ring = ring_record(client)
+    assert ring["reasoning"] == "high"
+    assert ring["reasoning_warning"] == "unsupported"
 
 
 # --------------------------------------------------------------------------- #
@@ -289,9 +355,9 @@ def test_model_without_any_declaration_and_leaf_level(tmp_path):
 # --------------------------------------------------------------------------- #
 def test_streaming_request_injects_reasoning(tmp_path):
     transport = _StreamingTransport()
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=transport)
-    client = TestClient(app)
+    h = make_harness(tmp_path, transport=transport)
+    client = h.client
+    activate_default_tree(client)
     declare(client, {"efforts": {"off": None, "high": "high"}})
     set_leaf_reasoning(client, "high")
     r = chat(client, stream=True)

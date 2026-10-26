@@ -7,159 +7,23 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.config import Settings
 from router.store.db import connect
+from tests.unified_tree_helpers import activate_default_tree, activate_tree, \
+    make_app as make_tree_app
 
 
 def client(tmp_path):
     return TestClient(create_app(Settings(db_path=str(tmp_path / "t.db"))))
 
 
-def test_get_pipeline(tmp_path):
-    body = client(tmp_path).get("/admin/pipeline").json()
-    assert [s["name"] for s in body["stations"]] == \
-        ["① 安全闸", "② 关键词直达", "③ 学科 → 难度", "④ 兜底"]
-    subject = body["stations"][2]
-    assert subject["root"]["kind"] == "fork"
-    health = subject["root"]["children"][0]
-    assert health["signal"] == "domain" and health["value"] == "health"
-    assert [c["value"] for c in health["children"]] == ["hard", "easy"]
-
-
-def test_put_pipeline_roundtrip_and_snapshot_refresh(tmp_path):
-    c = client(tmp_path)
-    body = c.get("/admin/pipeline").json()
-    body["stations"][3]["root"]["model"] = "qwen3-32b"
-    r = c.put("/admin/pipeline", json=body)
-    assert r.status_code == 200
-    again = c.get("/admin/pipeline").json()
-    assert again["stations"][3]["root"]["model"] == "qwen3-32b"
-
-
-def test_put_pipeline_noop_does_not_bump_version_or_audit(tmp_path):
-    """Re-saving an unchanged pipeline (console smoke check, editor no-op) must
-    not bump pipeline_version or append an audit row (2026-10-17 review N3)."""
-    c = client(tmp_path)
-    before = c.get("/admin/pipeline").json()
-    changes_before = len(c.get("/admin/changes").json()["changes"])
-    r = c.put("/admin/pipeline", json=before)
-    assert r.status_code == 200
-    assert r.json()["changed"] is False
-    assert r.json()["version"] == before["version"]
-    after = c.get("/admin/pipeline").json()
-    assert after["version"] == before["version"]
-    assert len(c.get("/admin/changes").json()["changes"]) == changes_before
-
-    # a real edit still bumps the version and writes one audit row
-    after["stations"][3]["root"]["model"] = "qwen3-32b"
-    r = c.put("/admin/pipeline", json=after)
-    assert r.json()["changed"] is True
-    newer = c.get("/admin/pipeline").json()
-    assert int(newer["version"]) == int(before["version"]) + 1
-    assert len(c.get("/admin/changes").json()["changes"]) == changes_before + 1
+def routed(tmp_path, handler=None):
+    """App with the default unified tree active (the old seeded fixture)."""
+    h = make_tree_app(tmp_path, handler)
+    activate_default_tree(h.client)
+    return h
 
 
 def _ok(request):
     return httpx.Response(200, json={"choices": [{"message": {"content": "hi"}}]})
-
-
-def test_put_pipeline_publishes_a_new_snapshot_and_ledger_revision(tmp_path):
-    """P1-B: the admin write swaps the immutable snapshot (one assignment) and
-    the next request routes + ledgers with the NEW revision, no restart."""
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=httpx.MockTransport(_ok))
-    c = TestClient(app)
-    before = app.state.snapshot
-
-    body = c.get("/admin/pipeline").json()
-    body["stations"][3]["root"]["model"] = "qwen3-32b"
-    r = c.put("/admin/pipeline", json=body)
-    assert r.status_code == 200 and r.json()["changed"] is True
-    after = app.state.snapshot
-    assert after is not before
-    assert after.pipeline_version == before.pipeline_version + 1
-    assert after.pipeline_revision != before.pipeline_revision
-    assert r.json()["revision"] == after.pipeline_revision
-
-    r = c.post("/v1/chat/completions",
-               json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
-    assert r.status_code == 200
-    record = app.state.requestlog.recent_requests(1)[0]
-    assert record["model"] == "qwen3-32b"
-    assert record["pipeline_revision"] == after.pipeline_revision
-    assert record["pipeline_version"] == after.pipeline_version
-    asyncio.run(app.state.requestlog.flush())
-
-    conn = connect(app.state.settings.db_path)
-    try:
-        row = conn.execute("SELECT pipeline_version, pipeline_revision "
-                           "FROM request_ledger WHERE id = ?",
-                           (record["id"],)).fetchone()
-    finally:
-        conn.close()
-    assert row is not None and row["pipeline_revision"] == after.pipeline_revision
-
-
-def test_put_pipeline_noop_keeps_the_snapshot_and_revision(tmp_path):
-    """No content change -> no new snapshot, no bump, no new revision row."""
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")))
-    c = TestClient(app)
-    before = app.state.snapshot
-    body = c.get("/admin/pipeline").json()
-    r = c.put("/admin/pipeline", json=body)
-    assert r.json()["changed"] is False
-    assert app.state.snapshot is before
-    assert app.state.snapshot.pipeline_revision == before.pipeline_revision
-
-
-def test_startup_records_the_current_pipeline_revision(tmp_path):
-    """v15 backfill: a fresh boot stores the served tree in config_revisions
-    and settings.pipeline_revision, so even the first ledger row is replayable."""
-    from router.pipeline.snapshot import canonical_json, sha256_text
-    from router.store.repositories import ConfigRevisionRepo, SettingsRepo
-
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")))
-    snapshot = app.state.snapshot
-    conn = connect(app.state.settings.db_path)
-    try:
-        revision = ConfigRevisionRepo(conn).get("pipeline",
-                                                snapshot.pipeline_revision)
-        stored_setting = SettingsRepo(conn).get("pipeline_revision")
-    finally:
-        conn.close()
-    assert revision is not None
-    assert stored_setting == snapshot.pipeline_revision
-    content = revision["content"]
-    assert canonical_json(json.loads(content)) == content
-    assert sha256_text(content) == snapshot.pipeline_revision
-
-
-def test_pipeline_history_is_append_only_and_replayable(tmp_path):
-    """Each save appends a revision; older content is kept and round-trips back
-    to stations with the same sha (the offline replay contract)."""
-    from router.pipeline.model import station_from_dict
-    from router.pipeline.snapshot import pipeline_revision_of
-
-    c = client(tmp_path)
-    pipe = c.get("/admin/pipeline").json()
-    first = c.put("/admin/pipeline", json={
-        **pipe, "stations": pipe["stations"]}).json()
-    # (no-op save above returns the current revision)
-    body = c.get("/admin/pipeline").json()
-    body["stations"][3]["root"]["model"] = "qwen3-32b"
-    second = c.put("/admin/pipeline", json=body).json()
-    assert second["changed"] is True
-
-    conn = connect(str(tmp_path / "t.db"))
-    try:
-        rows = {r["sha256"]: r["content"] for r in conn.execute(
-            "SELECT sha256, content FROM config_revisions WHERE kind='pipeline'")}
-    finally:
-        conn.close()
-    assert first["revision"] in rows and second["revision"] in rows
-    assert len(rows) >= 2
-    content = rows[second["revision"]]
-    stations = [station_from_dict(d)
-                for d in json.loads(content)["stations"]]
-    assert pipeline_revision_of(stations) == second["revision"]
 
 
 def test_put_signal_questions_records_a_canonical_revision(tmp_path):
@@ -201,9 +65,8 @@ def test_put_signal_questions_records_a_canonical_revision(tmp_path):
 
 def test_requests_stats_endpoint(tmp_path):
     """P1-C: ring/queue/drop/ledger-failure counters are exposed."""
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=httpx.MockTransport(_ok))
-    c = TestClient(app)
+    h = routed(tmp_path, _ok)
+    app, c = h.app, h.client
     body = c.get("/admin/requests/stats").json()
     assert {"started_at", "ring_size", "ring_limit", "queue_size",
             "queue_limit", "dropped_rows", "dropped_updates", "partial_rows",
@@ -221,15 +84,6 @@ def test_requests_stats_endpoint(tmp_path):
     body = c.get("/admin/requests/stats").json()
     assert body["queue_size"] == 0
     assert body["ledger_write_failures"] == 0
-
-
-def test_put_pipeline_rejected_by_health(tmp_path):
-    c = client(tmp_path)
-    body = c.get("/admin/pipeline").json()
-    body["stations"] = body["stations"][:1]    # drop the fallback station
-    r = c.put("/admin/pipeline", json=body)
-    assert r.status_code == 422
-    assert any(i["code"] == "missing_fallback" for i in r.json()["detail"])
 
 
 def test_signals_endpoint_includes_keyword_groups(tmp_path):
@@ -251,13 +105,13 @@ def test_overview(tmp_path):
 
 def test_put_model_updates_and_swaps_snapshot(tmp_path):
     app = create_app(Settings(db_path=str(tmp_path / "t.db")))
-    assert app.state.backends["qwen3-8b"].upstream_name == "qwen3-8b"
+    assert app.state.snapshot.backends["qwen3-8b"].upstream_name == "qwen3-8b"
     c = TestClient(app)
     r = c.put("/admin/models/qwen3-8b", json={"upstream": "real-model"})
     assert r.status_code == 200
     assert r.json()["model"]["upstream"] == "real-model"
     # in-memory backend snapshot was swapped wholesale (design 4.4)
-    assert app.state.backends["qwen3-8b"].upstream_name == "real-model"
+    assert app.state.snapshot.backends["qwen3-8b"].upstream_name == "real-model"
 
 
 def test_put_model_unknown_is_404(tmp_path):
@@ -281,7 +135,7 @@ def test_put_provider_upserts_and_swaps_snapshot(tmp_path):
     provs = c.get("/admin/providers").json()["providers"]
     assert any(p["name"] == "local"
                and p["base_url"] == "http://example.internal:9/v1" for p in provs)
-    assert app.state.backends["qwen3-8b"].url == \
+    assert app.state.snapshot.backends["qwen3-8b"].url == \
         "http://example.internal:9/v1/chat/completions"
 
 
@@ -298,16 +152,13 @@ def test_settings_roundtrip_and_reserved(tmp_path):
 
 
 def test_changes_audit_trail(tmp_path):
-    c = client(tmp_path)
-    pipe = c.get("/admin/pipeline").json()
-    pipe["stations"][3]["root"]["model"] = "qwen3-32b"        # a real change
-    c.put("/admin/pipeline", json=pipe)
+    c = routed(tmp_path).client        # activate = create + enable audit rows
     c.put("/admin/models/qwen3-8b", json={"upstream": "real"})
     c.put("/admin/providers/local", json={"base_url": "http://x:1/v1"})
     c.put("/admin/settings", json={"note": "n"})
     changes = c.get("/admin/changes").json()["changes"]
     kinds = {ch["kind"] for ch in changes}
-    assert {"pipeline", "model", "provider", "settings"} <= kinds
+    assert {"tree", "model", "provider", "settings"} <= kinds
     # newest first
     assert changes[0]["kind"] == "settings"
 
@@ -324,10 +175,8 @@ def test_overview_has_confidence_and_evals(tmp_path):
 def test_confidence_histogram_counts_model_signals_only(tmp_path):
     """Rule signals (c == 1) must not swamp the confidence dashboard, and the
     histogram is counted in memory: no request_signals rows exist any more."""
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=httpx.MockTransport(
-                         lambda r: httpx.Response(200, json={"choices": []})))
-    c = TestClient(app)
+    h = routed(tmp_path, lambda r: httpx.Response(200, json={"choices": []}))
+    app, c = h.app, h.client
     c.post("/v1/chat/completions",
            json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
     body = c.get("/admin/overview").json()
@@ -339,11 +188,6 @@ def test_confidence_histogram_counts_model_signals_only(tmp_path):
     assert rule_signals                       # the request did carry rule signals
     assert counted == len(model_signals)
 
-
-
-def test_try_reports_vec_dim(tmp_path):
-    body = client(tmp_path).post("/admin/try", json={"text": "你好"}).json()
-    assert body["vec_dim"] == 0            # heuristic has no embedding
 
 
 def questions_client(tmp_path):
@@ -533,35 +377,34 @@ def test_signal_questions_no_warning_when_the_file_reads(tmp_path):
 
 def test_recent_requests_carry_trace(tmp_path):
     """The console renders the decision trace: it must ride on the record."""
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")),
-                     transport=httpx.MockTransport(
-                         lambda r: httpx.Response(200, json={"choices": []})))
-    c = TestClient(app)
-    c.post("/v1/chat/completions",
-           json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
-    recent = c.get("/admin/requests/recent").json()["requests"]
+    h = routed(tmp_path, lambda r: httpx.Response(200, json={"choices": []}))
+    h.client.post("/v1/chat/completions",
+                  json={"messages": [{"role": "user",
+                                      "content": "今天天气怎么样"}]})
+    recent = h.client.get("/admin/requests/recent").json()["requests"]
     assert recent, "ring should hold the request"
     rec = recent[0]
     assert isinstance(rec["trace"], list) and rec["trace"]
-    stations = [t["result"] for t in rec["trace"]]
-    assert "hit" in stations                      # the walker stopped on a hit
-    hit = next(t for t in rec["trace"] if t["result"] == "hit")
-    assert hit["path"] is not None                # path/board keys exist
+    # unified events: condition/false checks then the terminal hit
+    hits = [event for event in rec["trace"] if event.get("event") == "hit"]
+    assert hits, "the walker stopped on a hit"
+    assert hits[-1]["node_id"] and hits[-1]["kind"] == "route"
 
 
 def test_block_decision_also_records_trace(tmp_path):
     """Blocks are logged with their trace too: moving enqueue after the block
     return would silently drop them from the console."""
-    c = client(tmp_path)
-    pipe = c.get("/admin/pipeline").json()
-    pipe["stations"][0]["root"]["children"].append(
-        {"id": "n1z", "signal": "language", "value": "zh", "conf_min": None,
-         "kind": "leaf", "action": "block", "model": None, "min_score": None,
-         "weights": [], "children": []})
-    assert c.put("/admin/pipeline", json=pipe).status_code == 200
-    r = c.post("/v1/chat/completions",
-               json={"messages": [{"role": "user", "content": "今天天气怎么样"}]})
+    from router.pipeline.tree import Block
+
+    h = make_tree_app(tmp_path)
+    activate_tree(h.client, "Block all", Block(id="root"))
+    r = h.client.post("/v1/chat/completions",
+                      json={"messages": [{"role": "user",
+                                          "content": "今天天气怎么样"}]})
     assert r.status_code == 403
-    rec = c.get("/admin/requests/recent").json()["requests"][0]
+    rec = h.client.get("/admin/requests/recent").json()["requests"][0]
     assert rec["decision"] == "block"
+    assert rec["terminal_node_id"] == "root"
     assert isinstance(rec["trace"], list) and rec["trace"]
+    assert any(event.get("event") == "hit" and event.get("kind") == "block"
+               for event in rec["trace"])

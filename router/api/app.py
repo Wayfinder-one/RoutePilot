@@ -1,7 +1,11 @@
-"""Application factory. The hot path reads only the immutable in-memory
-``app.state.snapshot`` (RoutingSnapshot: stations/backends/revisions/jev_trim)
-plus the tagger object; the database is touched on admin writes and by the
-async request logger, never during routing (design doc section 4.4).
+"""Application factory for the unified routing tree (design §6/§8).
+
+The hot path reads only the immutable in-memory ``app.state.snapshot``
+(compiled tree/backends/questions/decision evidence/revisions), the shared
+``app.state.runtime`` and the tagger object; the database is touched on admin
+writes (through ``app.state.publisher``) and by the async request logger, never
+during routing (design doc section 4.4).  No active tree is a legal state: the
+app boots and ``/v1`` answers 503 ``no_active_tree``.
 
 /admin auth (design doc section 7, user management 2026-10-26): every
 ``/admin*`` request must carry a console login session
@@ -24,18 +28,13 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.config import Settings
-from router.api.upstream import model_reasoning_from_db
-from router.decision.pack import CAPABILITY_SIGNAL, build_pack
-from router.pipeline.health import check_pipeline
-from router.pipeline.scope import compute_signal_scope
-from router.pipeline.snapshot import (ensure_capability_revision,
-                                      install_snapshot, load_snapshot)
+from router.pipeline.runtime import RoutingRuntime
+from router.pipeline.snapshot import SnapshotPublisher
 from router.signals.heuristic import HeuristicTagger
 from router.store.db import connect, migrate
-from router.store.repositories import (
-    KeywordRepo, ModelRepo, SessionRepo, SettingsRepo, StationRepo,
-    TimePeriodRepo, UserRepo, ensure_pipeline_revision,
-    ensure_questions_revision, seed_default)
+from router.store.repositories import (KeywordRepo, SessionRepo, TimePeriodRepo,
+                                       UserRepo, ensure_questions_revision,
+                                       seed_default)
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 
@@ -82,6 +81,19 @@ def _make_tagger(settings: Settings, kw_groups: dict):
             api_key=settings.judge_api_key,
             prompts_path=settings.signal_prompts or None, kw_groups=kw_groups)
     raise RuntimeError(f"unknown tagger {settings.tagger!r}")
+
+
+def _make_decision_runner(settings: Settings, tagger):
+    """DecisionRunner adapter for ``nl_choice`` nodes (Task 8/9).
+
+    Only the JEV mode has a decision model that can answer the ordered-candidate
+    question; every other mode returns None and an ``nl_choice`` tree cannot be
+    enabled (the enable-time health check reports ``decision_runner_unavailable``).
+    """
+    if settings.tagger == "jev":
+        from router.decision.jev_runner import JevDecisionRunner
+        return JevDecisionRunner(tagger)
+    return None
 
 
 def _admin_path(path: str) -> bool:
@@ -175,85 +187,43 @@ def _install_admin_auth(app: FastAPI, settings: Settings) -> None:
         return _unauthorized()
 
 
-def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None
-               ) -> FastAPI:
+def create_app(settings: Settings, *,
+               transport: httpx.BaseTransport | None = None,
+               decision_runner=None) -> FastAPI:
+    """Assemble the app around ONE immutable snapshot + the shared runtime.
+
+    Boot sequence (Task 9 Step 6):
+
+    1. migrate + seed the catalogs (models/providers/keywords/time-periods —
+       the retired station rows are written by the legacy seed but never read);
+    2. build the tagger and the DecisionRunner adapter (``decision_runner`` is
+       the approved test seam);
+    3. assemble + publish the immutable snapshot from the DB — NO active tree is
+       a legal state (the hot path answers 503 ``no_active_tree``);
+    4. validate ONLY the active tree with the full enable health check
+       (``RuntimeError`` refuses startup); closed drafts are not inspected.
+
+    The hot path reads ``app.state.snapshot`` (one assignment) and
+    ``app.state.runtime``; the database is touched only by admin writes and the
+    async request logger.
+    """
+    from router.api.requestlog import RequestLogger
+
     conn = connect(settings.db_path)
     migrate(conn)
-    seed_default(conn)
+    seed_default(conn)        # models/providers/keywords/time-periods (Task 11
+    #                            removes the legacy station seeding)
     if settings.user_auth:
-        # 只有开启用户体系时才创建默认管理员（空表才行，幂等）；关闭时连
-        # 哈希都不算——scrypt 是 0.3s 量级的成本，不该为不用的账号付。
         UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
     kw_groups = KeywordRepo(conn).groups()
     time_periods = TimePeriodRepo(conn).load()
-    pipeline = StationRepo(conn).load()
-    known_models = {m["id"] for m in ModelRepo(conn).list()}
-    # Same §3.3 map as PUT /admin/pipeline (single source). A leaf that names
-    # a reasoning level the model does not declare is rejected at save time —
-    # and pipelines written straight into the database (migrations, older
-    # versions, a manual edit) must be judged by the same rule here.
-    model_reasoning = model_reasoning_from_db(conn)
-    # Capability routing (2026-10-26): the candidate set comes from the model
-    # catalog (profile.capability) + the global policy settings. Build it here
-    # so the startup health check rejects a tree referencing models that cannot
-    # ever be selected.
-    capability_pack = build_pack(ModelRepo(conn).list(),
-                                 SettingsRepo(conn).all())
-    capability_candidates = set(capability_pack["candidates"])
-    # v15: the tree that is about to serve traffic must be resolvable from
-    # config_revisions (first boot after the migration: stations predate the
-    # table). Identical content maps to the same sha, so this is idempotent.
-    ensure_pipeline_revision(conn, pipeline)
-    ensure_capability_revision(conn, capability_pack)
     conn.close()
-
-    # A tree that the engine cannot execute must not reach the hot path: the
-    # console would happily save it, but every request would then 502 or pick
-    # a wrong branch. Refuse to start instead (the operator fixes the DB and
-    # restarts). Warnings are logged, they do not block the boot.
-    issues = check_pipeline(pipeline, known_models, model_reasoning,
-                            capability_candidates=capability_candidates)
-    hard = [i for i in issues if i.level == "hard"]
-    if hard:
-        for issue in hard:
-            logger.error("pipeline health: %s (%s) station=%s node=%s",
-                         issue.en, issue.code, issue.station_id, issue.node_id)
-        raise RuntimeError(
-            "refusing to start: the stored pipeline has "
-            f"{len(hard)} hard issue(s): "
-            + ", ".join(sorted({i.code for i in hard})))
-    for issue in issues:
-        logger.warning("pipeline health: %s (%s) station=%s node=%s",
-                       issue.en, issue.code, issue.station_id, issue.node_id)
-
-    from router.api.requestlog import RequestLogger
-    requestlog = RequestLogger(settings)
 
     tagger = _make_tagger(settings, kw_groups)
     tagger.time_periods = time_periods
-    # The capability signal is produced by the JEV decision model only; a
-    # heuristic/checkpoint/prompt tagger cannot answer it, so a tree that reads
-    # it would silently fall through to its fallback station forever. Refuse to
-    # start instead of routing every such request to the fallback.
-    if CAPABILITY_SIGNAL in compute_signal_scope(pipeline).signals \
-            and getattr(tagger, "name", "") != "jev":
-        raise RuntimeError(
-            f"refusing to start: the stored pipeline reads "
-            f"{CAPABILITY_SIGNAL!r} but ROUTER_TAGGER={settings.tagger!r} "
-            "cannot produce it (use ROUTER_TAGGER=jev)")
-    # Build the immutable snapshot ONCE at startup (P1-B): the pipeline, the
-    # backend map, the revisions and the trimming switch a request may read.
-    conn = connect(settings.db_path)
-    try:
-        # v15: record the questions config the tagger booted with, so the
-        # very first ledger rows can be replayed from config_revisions.
-        questions_cfg = getattr(tagger, "questions", None)
-        if isinstance(questions_cfg, dict):
-            ensure_questions_revision(conn, questions_cfg)
-        snapshot = load_snapshot(conn, jev_trim=settings.jev_trim)
-        ensure_capability_revision(conn, snapshot.capability)
-    finally:
-        conn.close()
+    runner = (decision_runner if decision_runner is not None
+              else _make_decision_runner(settings, tagger))
+    requestlog = RequestLogger(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -269,14 +239,43 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
 
     app = FastAPI(title="Smart Router", lifespan=lifespan)
     from router.api.upstream import CircuitBreaker
+
     app.state.settings = settings
     app.state.tagger = tagger
+    app.state.runner = runner
+    app.state.runtime = RoutingRuntime(tagger, runner)
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
-    # One assignment publishes the whole configuration to the hot path; the
-    # legacy pipeline/backends aliases are refreshed inside install_snapshot.
-    install_snapshot(app, snapshot)
     app.state.breaker = CircuitBreaker(db_path=settings.db_path)
     app.state.requestlog = requestlog
+    publisher = SnapshotPublisher(app, runner=runner, jev_trim=settings.jev_trim)
+    app.state.publisher = publisher
+
+    # Boot: record the questions config the tagger started with (first boot
+    # after v15 has no recorded revision yet), validate the ACTIVE tree, then
+    # publish the initial snapshot (app.state.snapshot is None before this).
+    from router.api.routes_trees import active_tree, enable_issues, hard_issues
+
+    conn = connect(settings.db_path)
+    try:
+        questions_cfg = getattr(tagger, "questions", None)
+        if isinstance(questions_cfg, dict):
+            ensure_questions_revision(conn, questions_cfg)
+        active = active_tree(conn)
+        if active is not None:
+            issues = hard_issues(enable_issues(
+                conn, active, runner_available=runner is not None))
+            if issues:
+                for issue in issues:
+                    logger.error("active tree health: %s (%s) node=%s",
+                                 issue.en, issue.code, issue.node_id)
+                raise RuntimeError(
+                    "refusing to start: the active routing tree has "
+                    f"{len(issues)} hard issue(s): "
+                    + ", ".join(sorted({issue.code for issue in issues})))
+        publisher.refresh(conn)
+    finally:
+        conn.close()
+
     _install_admin_auth(app, settings)
 
     @app.get("/")
@@ -301,9 +300,11 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
                   name="console")
 
     from router.api.routes_admin import router as admin_router
+    from router.api.routes_trees import router as trees_router
     from router.api.routes_users import router as users_router
     from router.api.routes_v1 import router as v1_router
     app.include_router(admin_router, prefix="/admin")
+    app.include_router(trees_router, prefix="/admin")
     # 登录/登出/me 与用户 CRUD 共享 /admin 前缀（契约按设计 doc §4）
     app.include_router(users_router, prefix="/admin")
     app.include_router(v1_router, prefix="/v1")

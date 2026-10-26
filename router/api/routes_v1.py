@@ -1,12 +1,13 @@
-"""OpenAI-compatible entry: tag -> evaluate -> forward.
+"""OpenAI-compatible entry into the unified routing tree (Task 9 Step 6).
 
-JEV P1-B: a request reads the immutable ``app.state.snapshot`` ONCE at entry
-and uses that same snapshot for the trimming scope, the decision and every
-ledger version field. A concurrent ``PUT /admin/pipeline`` / model write
-publishes a new snapshot with one assignment; the in-flight request keeps the
-old one, so the ledger revision always describes the configuration that
-actually produced the decision (previously the tree was read before tagging
-and the versions after, which could disagree).
+A request reads the immutable ``app.state.snapshot`` ONCE at entry and runs it
+through the SHARED ``app.state.runtime`` (the same flow ``/admin/try`` and eval
+replay use). A concurrent tree/model write publishes a new snapshot with one
+assignment; an in-flight request keeps the old one, so the ledger's tree and
+snapshot revisions always describe the configuration that produced the
+decision. Failure semantics: no active tree / signal preparation failure are
+503 before any upstream work; a healthy-shape snapshot that still misses is an
+invariant violation (503), never a silent default model.
 
 JEV P1-C: each request finishes in exactly one terminal state, recorded in
 ``request_ledger.outcome_state`` by an exactly-once recorder:
@@ -34,10 +35,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from router.api.upstream import resolve_backend
-from router.pipeline.engine import evaluate
-from router.pipeline.scope import compute_signal_scope
+from router.pipeline.errors import NoActiveTreeError, SignalPreparationError
+from router.pipeline.evaluator import Hit
+from router.pipeline.runtime import RoutingRuntime, RuntimeRequest
 from router.reasoning import ReasoningError, apply_reasoning
-from router.signals.tagger import TagRequest
 
 router = APIRouter()
 
@@ -177,18 +178,50 @@ def _tagger_fingerprint(result) -> dict:
 
 
 def _version_fields(snapshot, result) -> dict:
-    """Reproduction columns: the snapshot's revisions + the tagger fingerprint.
+    """Reproduction columns: the request's tree/snapshot revisions + tagger.
 
     Nothing is read from app.state/tagger here beyond the already-materialized
-    TagResult (P1-B: no post-tagging re-read, no request-time DB access).
+    RoutingResult (P1-B: no post-tagging re-read, no request-time DB access).
+    The retired station/pipeline/capability columns stay NULL for new rows
+    (migration v19 keeps them for historical rows only).
     """
     return {
-        "pipeline_version": snapshot.pipeline_version,
-        "pipeline_revision": snapshot.pipeline_revision,
+        "tree_id": snapshot.tree_id,
+        "tree_revision": snapshot.tree_revision,
+        "snapshot_revision": snapshot.snapshot_revision,
         "backends_revision": snapshot.backends_revision,
-        "capability_revision": snapshot.capability_revision,
         **_tagger_fingerprint(result),
     }
+
+
+def _error(message: str, status_code: int) -> JSONResponse:
+    """The compact error body shared by the routing failure semantics."""
+    return JSONResponse(status_code=status_code,
+                        content={"error": {"message": message}})
+
+
+def prepare_upstream_request(body: dict, backend, reasoning_level):
+    """Pure upstream-body builder: model replacement + reasoning injection.
+
+    ``reasoning_level is None`` -> FULL passthrough: only ``model`` is replaced,
+    client reasoning fields are neither injected nor stripped. A configured
+    level the CURRENT snapshot's backend cannot honour (concurrent capability
+    edit) degrades to passthrough + an "unsupported" warning header instead of
+    failing the user's request (external contract unchanged).
+
+    Returns ``(upstream_body, reasoning_warning)`` with warning None or
+    ``"unsupported"``. Kept pure so the representation is pinned by tests.
+    """
+    base_body = {**body, "model": backend.upstream_name}
+    if reasoning_level is None:
+        return base_body, None
+    try:
+        return (apply_reasoning(base_body, backend.reasoning, reasoning_level),
+                None)
+    except ReasoningError as exc:
+        logger.warning("reasoning fallback model=%s level=%s: %s",
+                       backend.upstream_name, reasoning_level, exc)
+        return base_body, "unsupported"
 
 
 def _experiment_arm(request: Request) -> str | None:
@@ -354,59 +387,44 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=400,
                             content={"error": {"message": "messages_must_be_list"}})
     text = _last_user_text(messages)
-    # JEV P1-B: ONE snapshot for the whole request — trimming scope, decision,
+
+    # ONE snapshot for the whole request: signal trimming, tree evaluation,
     # backend resolution and ledger provenance all come from this object. A
     # concurrent admin write replaces app.state.snapshot atomically; this
     # request keeps the configuration it started with.
     snapshot = request.app.state.snapshot
-    tagger = request.app.state.tagger
+    runtime: RoutingRuntime = request.app.state.runtime
     requestlog = request.app.state.requestlog
     # Ledger `routing_ms`: from the fully read body to the finished decision.
     routing_started = time.monotonic()
-    # Pipeline-aware trimming (docs/pipeline-aware-trimming.md): score only the
-    # JEV questions this tree can read. The tagger ignores the hint when it does
-    # not implement trimming (heuristic/checkpoint/prompt modes).
-    scope = (compute_signal_scope(snapshot.stations)
-             if snapshot.jev_trim else None)
-    result = await tagger.tag(TagRequest(
-        text=text, headers=dict(request.headers), n_messages=len(messages),
-        scope=scope, capability=snapshot.capability))
-    # Every request is judged on its own: tag -> pipeline decision. There is
-    # no session state (2026-10-21: session stickiness removed — vanilla
-    # clients carry no reliable conversation identity; see
-    # docs/superpowers/specs/2026-10-21-remove-session-stickiness.md).
-    decision, trace = evaluate(snapshot.stations, result.signals)
+    try:
+        result = await runtime.route(
+            snapshot,
+            RuntimeRequest(text=text, headers=dict(request.headers),
+                           n_messages=len(messages)))
+    except NoActiveTreeError:
+        # All trees closed is a legal configuration state (design §7.1): fail
+        # BEFORE tagging, the decision model or any upstream call.
+        return _error("no_active_tree", 503)
+    except SignalPreparationError:
+        # Infrastructure failure is NOT a normal branch Miss and must never
+        # degrade to a default model (design §6.4).
+        return _error("signal_preparation_failed", 503)
     routing_ms = (time.monotonic() - routing_started) * 1000.0
 
-    # ---- upstream body + reasoning injection (§6) -------------------------
-    # decision.reasoning is None -> FULL passthrough: only `model` is replaced,
-    # client reasoning fields are neither injected nor stripped. A configured
-    # level that the current capability snapshot cannot honour (concurrent
-    # config edit) degrades to passthrough + a warning header instead of
-    # failing the user's request.
+    hit = result.outcome if isinstance(result.outcome, Hit) else None
+    reasoning_level = hit.reasoning if hit is not None else None
     backend = None
     upstream_body = None
-    reasoning_level = decision.reasoning
     reasoning_warning = None
-    if decision.kind == "route" and decision.model:
+    if hit is not None and hit.kind == "route" and hit.model:
         try:
-            backend = resolve_backend(snapshot.backends, decision.model)
+            backend = resolve_backend(snapshot.backends, hit.model)
         except KeyError:
             backend = None
         if backend is not None:
-            base_body = {**body, "model": backend.upstream_name}
-            if reasoning_level is None:
-                upstream_body = base_body
-            else:
-                try:
-                    upstream_body = apply_reasoning(
-                        base_body, backend.reasoning, reasoning_level)
-                except ReasoningError as exc:
-                    reasoning_warning = "unsupported"
-                    upstream_body = base_body
-                    logger.warning(
-                        "reasoning fallback model=%s level=%s: %s",
-                        decision.model, reasoning_level, exc)
+            upstream_body, reasoning_warning = prepare_upstream_request(
+                body, backend, reasoning_level)
 
     # Input window actually scored by the model signals (JEV head-truncates the
     # request text; heuristic/checkpoint read the full text and report {}).
@@ -418,9 +436,11 @@ async def chat_completions(request: Request):
     record = {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "text": text, "decision": decision.kind, "model": decision.model,
-        "station_id": decision.station_id, "leaf_id": decision.node_id,
-        "score": decision.score,
+        "text": text,
+        "decision": hit.kind if hit is not None else "none",
+        "model": hit.model if hit is not None else None,
+        "terminal_node_id": hit.node_id if hit is not None else None,
+        "score": hit.score if hit is not None else None,
         "reasoning": reasoning_level,
         "reasoning_warning": reasoning_warning,
         # Truncation must be visible downstream (PII report P0): the model only
@@ -429,9 +449,13 @@ async def chat_completions(request: Request):
         "input_visible_tokens": window.get("input_visible_tokens"),
         "input_truncated": bool(window.get("input_truncated", False)),
         "latency_ms": (time.monotonic() - started) * 1000,
-        "trace": trace, "signals": result.signals,
-        # Ledger metadata known already at decision time (design §3.1/P1-B).
+        "trace": list(result.trace), "signals": result.signals,
+        # Routing timing evidence (ring only; the v19 ledger has no such cols).
         "routing_ms": routing_ms,
+        "signal_ms": result.signal_ms,
+        "decision_ms": result.decision_ms,
+        "nl_calls": result.nl_calls,
+        # Ledger metadata known already at decision time (design §3.1/P1-B).
         **_version_fields(snapshot, result),
         "experiment_arm": _experiment_arm(request),
         # Outcome placeholders (filled exactly once by the recorder).
@@ -446,32 +470,39 @@ async def chat_completions(request: Request):
     requestlog.enqueue(record)
     outcome = _OutcomeRecorder(requestlog, record, started)
 
-    if decision.kind == "block":
+    if hit is None:
+        # A healthy active tree has a guaranteed fallback (enable-time check),
+        # so a Miss on the hot path is an invariant violation: answer 503 and
+        # keep the COMPLETE trace in the ring instead of silently routing a
+        # default model.
+        outcome.finish(outcome_state=OUTCOME_COMPLETED,
+                       error_class="routing_invariant_violation")
+        return _error("routing_invariant_violation", 503)
+    if hit.kind == "block":
         # A decision that never calls an upstream is a COMPLETED request (the
         # action outcome — block — is what the caller received).
         outcome.finish(outcome_state=OUTCOME_COMPLETED)
         return JSONResponse(status_code=403, content={
             "error": {"message": BLOCK_MESSAGE, "code": "blocked_by_policy"}})
-    if decision.kind != "route" or not decision.model:
+    if not hit.model:
         outcome.finish(outcome_state=OUTCOME_COMPLETED, error_class="no_route")
-        return JSONResponse(status_code=502,
-                            content={"error": {"message": "no_route"}})
+        return _error("no_route", 502)
     if backend is None:
         outcome.finish(outcome_state=OUTCOME_COMPLETED,
                        error_class="unknown_model")
-        return JSONResponse(status_code=502,
-                            content={"error": {"message": "unknown_model"}})
+        return _error("unknown_model", 502)
 
+    model = hit.model
     breaker = request.app.state.breaker
-    if breaker.is_open(decision.model):
+    if breaker.is_open(model):
         outcome.finish(outcome_state=OUTCOME_COMPLETED,
                        error_class="circuit_open",
                        upstream_model=backend.upstream_name)
         return JSONResponse(status_code=503, content={
-            "error": {"message": "model_circuit_open", "model": decision.model}})
+            "error": {"message": "model_circuit_open", "model": model}})
 
     client: httpx.AsyncClient = request.app.state.http
-    headers = {"x-sr-model": decision.model}
+    headers = {"x-sr-model": model}
     if reasoning_warning:
         headers["x-sr-reasoning-warning"] = reasoning_warning
     elif reasoning_level is not None:
@@ -480,12 +511,12 @@ async def chat_completions(request: Request):
     try:
         if body.get("stream"):
             return await _stream(client, backend, upstream_body, headers,
-                                 breaker, decision.model, outcome=outcome,
+                                 breaker, model, outcome=outcome,
                                  request=request, started=started)
         resp = await client.post(backend.url, json=upstream_body,
                                  headers=backend.headers)
     except httpx.HTTPError:
-        breaker.failure(decision.model)
+        breaker.failure(model)
         outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
                        error_class="upstream_error",
                        upstream_model=backend.upstream_name,
@@ -495,7 +526,7 @@ async def chat_completions(request: Request):
                             headers=headers)
     upstream_ms = (time.monotonic() - upstream_started) * 1000.0
     if resp.status_code >= 500:
-        breaker.failure(decision.model)
+        breaker.failure(model)
         # The ledger keeps the REAL upstream status; the client keeps seeing the
         # mapped 502 (external contract unchanged).
         outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
@@ -512,7 +543,7 @@ async def chat_completions(request: Request):
         # it must not clear the failure counter (an already open circuit must
         # not be closed by an error response; a half-open probe needs a real
         # 2xx to recover).
-        breaker.success(decision.model)
+        breaker.success(model)
     try:
         content = resp.json()
     except json.JSONDecodeError:

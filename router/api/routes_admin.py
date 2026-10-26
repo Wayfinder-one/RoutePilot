@@ -23,28 +23,24 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn
-from router.api.upstream import model_reasoning_from_db, parse_profile_text
+from router.api.routes_trees import capability_write_issues
+from router.api.upstream import parse_profile_text
 from router.evals import summarize
-from router.pipeline.engine import evaluate
-from router.pipeline.health import check_pipeline
-from router.pipeline.model import station_from_dict, station_to_dict
+from router.pipeline.engine import evaluate     # Task 10 rewires eval replay
 from router.decision.pack import (CAPABILITY_SIGNAL, POLICY_SETTINGS,
                                   SETTING_FALLBACK, SETTING_INSTRUCTIONS,
                                   SETTING_MIN_MARGIN, SETTING_MIN_PROB,
-                                  CapabilityPackError, build_pack,
+                                  CapabilityPackError,
                                   capability_of_model, normalize_capability,
-                                  normalize_instructions, pack_revision)
-from router.pipeline.snapshot import (ensure_capability_revision,
-                                      install_snapshot, load_snapshot)
+                                  normalize_instructions)
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
                               normalize_reasoning, validate_model_profile)
 from router.signals.registry import GROUPS, SIGNALS
 from router.signals.tagger import TagRequest
 from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
-                                        TimePeriodRepo,
-                                       ModelRepo, ProviderRepo,
-                                       SettingsRepo, StationRepo,
+                                       ModelRepo, ProviderRepo, SettingsRepo,
+                                       StationRepo, TimePeriodRepo,
                                        ensure_questions_revision,
                                        model_ids_using_provider,
                                        model_references)
@@ -65,81 +61,17 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _refresh_snapshot(request: Request, conn: sqlite3.Connection) -> None:
+def _publish_snapshot(request: Request, conn: sqlite3.Connection) -> None:
     """Rebuild + publish the routing snapshot after an admin write.
 
-    This is the ONLY way a pipeline/model/provider write may update the hot
-    path (JEV P1-B): one assignment to ``app.state.snapshot``; the legacy
-    pipeline/backends aliases are refreshed inside ``install_snapshot``.
-    The capability pack is content-addressed too: its revision is appended to
-    ``config_revisions`` so capability-routed ledger rows can be replayed.
+    The publisher holds the cross-write publication lock, rebuilds from ONE
+    database state (active tree compiled with the current model catalog,
+    questions, backends and runner evidence), appends the append-only
+    ``config_revisions(kind='snapshot')`` row and publishes with ONE assignment.
+    Callers must already hold ``request.app.state.publisher.locked()`` so their
+    mutation and this refresh form a single critical section.
     """
-    snapshot = load_snapshot(conn, jev_trim=request.app.state.settings.jev_trim)
-    ensure_capability_revision(conn, snapshot.capability)
-    install_snapshot(request.app, snapshot)
-
-
-# --------------------------------------------------------------------------- #
-# Pipeline
-# --------------------------------------------------------------------------- #
-class PipelineIn(BaseModel):
-    #: The current shape. The old ``nodes`` key (the pre-2026-09 tree model)
-    #: was accepted for one release and is gone now: a request without
-    #: ``stations`` is a 422, never a silent "empty the tree".
-    stations: list[dict]
-
-
-@router.get("/pipeline")
-def get_pipeline(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"stations": [station_to_dict(s) for s in StationRepo(conn).load()],
-            "version": SettingsRepo(conn).get("pipeline_version", "0")}
-
-
-@router.put("/pipeline")
-def put_pipeline(body: PipelineIn, request: Request,
-                 conn: sqlite3.Connection = Depends(get_conn)):
-    payload = body.stations
-    try:
-        stations = [station_from_dict(d) for d in payload]
-    except ValueError as exc:
-        raise HTTPException(422, detail=str(exc)) from exc
-    models = ModelRepo(conn).list()
-    known = {m["id"] for m in models}
-    # §3.3: a leaf that selects a reasoning level must target a model that
-    # declares it; the map comes from the same source as the startup check
-    # (``model_reasoning_from_db``), so a boot and a save always agree.
-    model_reasoning = model_reasoning_from_db(conn)
-    capability_candidates = {
-        model_id for model_id, capability in build_pack(
-            models, SettingsRepo(conn).all())["candidates"].items()}
-    issues = check_pipeline(stations, known, model_reasoning,
-                            capability_candidates=capability_candidates)
-    # hard issues reject with 422 (pointing at station/node); warn-level issues
-    # ride along in the response so the console can show them without blocking.
-    hard = [i for i in issues if i.level == "hard"]
-    warns = [i.__dict__ for i in issues if i.level != "hard"]
-    if hard:
-        raise HTTPException(422, detail=[i.__dict__ for i in hard])
-    # No-op saves must not bump the version or append an audit row: the console
-    # smoke check re-saves the unchanged pipeline, and an editor save without
-    # edits should not look like a config change (2026-10-17 review N3).
-    current = [station_to_dict(s) for s in StationRepo(conn).load()]
-    changed = [station_to_dict(s) for s in stations] != current
-    if not changed:
-        settings = SettingsRepo(conn)
-        return {"ok": True, "changed": False, "warnings": warns,
-                "version": settings.get("pipeline_version", "0"),
-                "revision": settings.get("pipeline_revision")}
-    revision = StationRepo(conn).save(stations)   # tree + version + revision
-    # Publish the new immutable snapshot (one assignment) so the next request
-    # evaluates AND ledgers the same tree; in-flight requests keep the old one.
-    _refresh_snapshot(request, conn)
-    version = SettingsRepo(conn).get("pipeline_version")
-    ChangeRepo(conn).record(_now(), "pipeline",
-                            {"stations": len(stations), "version": version,
-                             "revision": revision})
-    return {"ok": True, "changed": True, "warnings": warns,
-            "version": version, "revision": revision}
+    request.app.state.publisher.refresh(conn)
 
 
 # --------------------------------------------------------------------------- #
@@ -357,26 +289,6 @@ def _model_rows_with_profile(models: list[dict], model_id: str,
             for row in models]
 
 
-def _capability_write_issues(conn: sqlite3.Connection,
-                             models: list[dict]) -> list[dict]:
-    """Hard pipeline issues a capability-catalog write would introduce.
-
-    Removing/renaming a model's ``profile.capability`` can break a saved tree
-    whose ``capability_route`` rows name it. Model writes are not full pipeline
-    saves, so run the same health rule here and reject the write (422) instead
-    of letting the branch silently degrade to the fallback station.
-    """
-    stations = StationRepo(conn).load()
-    candidates = {row["id"] for row in models
-                  if capability_of_model(row)}
-    issues = check_pipeline(stations, {row["id"] for row in models},
-                            model_reasoning_from_db(conn),
-                            capability_candidates=candidates)
-    blocked = {"capability_unconfigured", "unknown_capability_model"}
-    return [i.__dict__ for i in issues if i.level == "hard"
-            and i.code in blocked]
-
-
 @router.post("/models", status_code=201)
 def post_model(body: ModelCreateIn, request: Request,
                conn: sqlite3.Connection = Depends(get_conn)):
@@ -391,17 +303,21 @@ def post_model(body: ModelCreateIn, request: Request,
     provider_row = _require_provider(conn, provider)
     profile = _validated_profile(body.profile,
                                  provider_row.get("reasoning_format") or "openai")
-    models_after = _model_rows_with_profile(ModelRepo(conn).list(),
-                                            model_id, profile)
-    blocked = _capability_write_issues(conn, models_after)
-    if blocked:
-        raise HTTPException(422, detail=blocked)
-    if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
-        raise HTTPException(409, detail=f"model {model_id} 已存在")
-    _refresh_snapshot(request, conn)
-    ChangeRepo(conn).record(_now(), "model", {
-        "action": "create", "id": model_id, "upstream": upstream,
-        "provider": provider, "profile": body.profile})
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        models_after = _model_rows_with_profile(ModelRepo(conn).list(),
+                                                model_id, profile)
+        blocked = capability_write_issues(conn, request, models_after)
+        if blocked:
+            raise HTTPException(
+                422, detail=[dict(issue.__dict__) for issue in blocked])
+        if not ModelRepo(conn).create(model_id, upstream, provider,
+                                      profile or "{}"):
+            raise HTTPException(409, detail=f"model {model_id} 已存在")
+        ChangeRepo(conn).record(_now(), "model", {
+            "action": "create", "id": model_id, "upstream": upstream,
+            "provider": provider, "profile": body.profile})
+        _publish_snapshot(request, conn)
     row = ModelRepo(conn).get(model_id)
     return {"ok": True, "model": _public_model(
         row, provider_row.get("reasoning_format") or "openai")}
@@ -422,22 +338,27 @@ def put_model(model_id: str, body: ModelIn, request: Request,
         # snapshot (the JOIN drops it) and every routed request 502s.
         _require_provider(conn, provider)
     profile = None
+    formats = _provider_formats(conn)
+    effective = provider if provider is not None else existing["provider"]
     if body.profile is not None:
-        formats = _provider_formats(conn)
-        effective = provider if provider is not None else existing["provider"]
         profile = _validated_profile(body.profile,
                                      formats.get(effective, "openai"))
-        blocked = _capability_write_issues(
-            conn, _model_rows_with_profile(ModelRepo(conn).list(),
-                                           model_id, profile))
-        if blocked:
-            raise HTTPException(422, detail=blocked)
-    ModelRepo(conn).update(model_id, upstream=upstream, provider=provider,
-                           profile=profile)
-    _refresh_snapshot(request, conn)
-    ChangeRepo(conn).record(_now(), "model", {
-        "action": "update", "id": model_id, "upstream": body.upstream,
-        "provider": body.provider, "profile": body.profile})
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        if profile is not None:
+            blocked = capability_write_issues(
+                conn, request,
+                _model_rows_with_profile(ModelRepo(conn).list(),
+                                         model_id, profile))
+            if blocked:
+                raise HTTPException(
+                    422, detail=[dict(issue.__dict__) for issue in blocked])
+        ModelRepo(conn).update(model_id, upstream=upstream, provider=provider,
+                               profile=profile)
+        ChangeRepo(conn).record(_now(), "model", {
+            "action": "update", "id": model_id, "upstream": body.upstream,
+            "provider": body.provider, "profile": body.profile})
+        _publish_snapshot(request, conn)
     row = ModelRepo(conn).get(model_id)
     return {"ok": True, "model": _public_model(
         row, _provider_formats(conn).get(row["provider"], "openai"))}
@@ -453,10 +374,12 @@ def delete_model(model_id: str, request: Request,
         raise HTTPException(409, detail={
             "message": f"model {model_id} 被分流树引用，先解除引用再删除",
             "references": refs})
-    ModelRepo(conn).delete(model_id)
-    _refresh_snapshot(request, conn)
-    ChangeRepo(conn).record(_now(), "model",
-                            {"action": "delete", "id": model_id})
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        ModelRepo(conn).delete(model_id)
+        ChangeRepo(conn).record(_now(), "model",
+                                {"action": "delete", "id": model_id})
+        _publish_snapshot(request, conn)
     return {"ok": True, "deleted": model_id}
 
 
@@ -516,21 +439,26 @@ def put_provider(name: str, body: ProviderIn, request: Request,
     if api_key is not None:
         api_key = api_key.strip()
     existing = ProviderRepo(conn).get(name)
-    ProviderRepo(conn).upsert(name, base_url, key_env=key_env,
-                              reasoning_format=reasoning_format,
-                              api_key=api_key)
-    _refresh_snapshot(request, conn)
-    # Never put the secret itself in the audit trail (/admin/changes is a GET).
-    audit = {
-        "action": "upsert", "name": name, "base_url": base_url,
-        "key_env": key_env if key_env is not None
-        else (existing or {}).get("key_env", ""),
-        "reasoning_format": reasoning_format if reasoning_format is not None
-        else (existing or {}).get("reasoning_format", "openai"),
-        "api_key": "unchanged" if api_key is None
-        else ("cleared" if api_key == "" else "set"),
-    }
-    ChangeRepo(conn).record(_now(), "provider", audit)
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        ProviderRepo(conn).upsert(name, base_url, key_env=key_env,
+                                  reasoning_format=reasoning_format,
+                                  api_key=api_key)
+        # Never put the secret itself in the audit trail (/admin/changes is a GET).
+        audit = {
+            "action": "upsert", "name": name, "base_url": base_url,
+            "key_env": key_env if key_env is not None
+            else (existing or {}).get("key_env", ""),
+            "reasoning_format": reasoning_format if reasoning_format is not None
+            else (existing or {}).get("reasoning_format", "openai"),
+            "api_key": "unchanged" if api_key is None
+            else ("cleared" if api_key == "" else "set"),
+        }
+        ChangeRepo(conn).record(_now(), "provider", audit)
+        # A provider key/url change is invisible to backends_revision (secrets
+        # are never hashed), so the runtime backend map MUST be refreshed from
+        # the DB — never skip the publish by comparing revisions.
+        _publish_snapshot(request, conn)
     row = ProviderRepo(conn).get(name)
     return {"ok": True, "provider": _public_provider(row)}
 
@@ -545,10 +473,12 @@ def delete_provider(name: str, request: Request,
         raise HTTPException(409, detail={
             "message": f"provider {name} 被模型引用，先把这些模型改到别的提供方",
             "models": used_by})
-    ProviderRepo(conn).delete(name)
-    _refresh_snapshot(request, conn)
-    ChangeRepo(conn).record(_now(), "provider",
-                            {"action": "delete", "name": name})
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        ProviderRepo(conn).delete(name)
+        ChangeRepo(conn).record(_now(), "provider",
+                                {"action": "delete", "name": name})
+        _publish_snapshot(request, conn)
     return {"ok": True, "deleted": name}
 
 
@@ -618,12 +548,12 @@ def get_signals(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     # groups follow the registry's canonical order (a raw set() is arbitrary).
     #
     # capability_route has *dynamic* values (the model ids that declare a
-    # profile.capability description). They are injected here from the current
-    # snapshot pack so the tree editor gets a real model dropdown; when no
-    # model declares a description the signal stays free-form (and saving a
-    # tree that references it is rejected by the health check).
-    capability_candidates = list(
-        (request.app.state.snapshot.capability.get("candidates") or {}))
+    # profile.capability description). They are read from the model catalog so
+    # the tree editor gets a real model dropdown; when no model declares a
+    # description the signal stays free-form (and enabling a tree that
+    # references it is rejected by the enable health check).
+    capability_candidates = [row["id"] for row in ModelRepo(conn).list()
+                             if capability_of_model(row)]
     payload = []
     for spec in SIGNALS.values():
         row = {**spec.__dict__, "free": not spec.values}
@@ -694,30 +624,53 @@ class SignalQuestionsIn(BaseModel):
     config: dict
 
 
-@router.put("/signal-questions")
-def put_signal_questions(body: SignalQuestionsIn, request: Request,
-                         conn: sqlite3.Connection = Depends(get_conn)):
-    """Validate + persist the editable JEV questions and hot-apply them."""
-    from pathlib import Path
-
+def validate_questions(raw: dict) -> dict:
+    """Step 1: validate the editable questions config (422 on bad input)."""
     from router.signals.jev import JevTaggerError, validate_question_config
     try:
-        cfg = validate_question_config(body.config)
+        return validate_question_config(raw)
     except JevTaggerError as exc:
-        raise HTTPException(422, detail=str(exc))
-    tagger = request.app.state.tagger
+        raise HTTPException(422, detail=str(exc)) from exc
+
+
+def apply_questions(tagger, cfg: dict):
+    """Step 2: hot-apply the config in memory; returns the previous for rollback."""
     setter = getattr(tagger, "set_questions", None)
     previous = getattr(tagger, "questions", None)
-    # Apply in memory FIRST (atomic replace), then persist: the running
-    # tagger must never serve a config that is not on disk yet.
     if setter is not None:
-        setter(cfg)                            # hot apply (JEV mode)
+        setter(cfg)                            # atomic replace (JEV mode)
+    return previous
+
+
+def rollback_questions(tagger, previous) -> None:
+    """Undo :func:`apply_questions` (persistence failed: memory must match disk)."""
+    setter = getattr(tagger, "set_questions", None)
+    if setter is None or previous is None:
+        return
+    try:
+        setter(previous)
+    except Exception:                          # noqa: BLE001 - best effort rollback
+        logger.exception("cannot roll back the in-memory question config")
+
+
+class _QuestionPersistError(RuntimeError):
+    """The questions config could not be written to disk."""
+
+
+def persist_questions(request: Request, conn: sqlite3.Connection,
+                      cfg: dict) -> tuple[str, str]:
+    """Step 3: atomic file write + canonical revision + audit row.
+
+    A half-written file would be unparseable JSON at the next boot: write a
+    ``*.tmp`` sibling and ``os.replace`` over the target (atomic on one
+    filesystem).  The revision row is appended through ``ensure_questions_revision``
+    so a racing request still resolves to the config it actually scored.
+    """
+    from pathlib import Path
+
     path = Path(_questions_path(request))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Atomic write: a half-written file would be unparseable JSON at the
-        # next boot. Named *.tmp in the same directory (rename stays atomic
-        # on one filesystem), then os.replace over the real target.
         tmp = path.with_name(
             f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
         try:
@@ -728,21 +681,43 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
             if tmp.exists():                   # only on a failed write/replace
                 tmp.unlink(missing_ok=True)
     except OSError as exc:
-        # The write failed: roll the in-memory config back so memory and disk
-        # stay in the same state.
-        if setter is not None and previous is not None:
-            try:
-                setter(previous)
-            except JevTaggerError:
-                logger.exception("cannot roll back the in-memory question config")
-        raise HTTPException(500, detail=f"cannot write question config: {exc}")
-    # v15: persist the canonical config revision. The ledger records the
-    # sha captured by the tagger at tag() start, so a request that raced this
-    # save still resolves to the content it actually scored.
+        raise _QuestionPersistError(str(exc)) from exc
     revision = ensure_questions_revision(conn, cfg)
     ChangeRepo(conn).record(_now(), "signal_questions",
                             {"path": str(path), "revision": revision})
-    return {"ok": True, "applied": setter is not None,
+    return str(path), revision
+
+
+def publish_questions(request: Request, conn: sqlite3.Connection,
+                      cfg: dict) -> None:
+    """Step 4: publish a snapshot whose questions are the just-saved config."""
+    request.app.state.publisher.refresh(conn, questions=cfg)
+
+
+@router.put("/signal-questions")
+def put_signal_questions(body: SignalQuestionsIn, request: Request,
+                         conn: sqlite3.Connection = Depends(get_conn)):
+    """Validate + persist the editable JEV questions and hot-apply them.
+
+    The whole write runs inside the publisher lock: the running tagger, the
+    on-disk file, the recorded revision and the published snapshot change as
+    ONE critical section.  A persistence failure rolls the in-memory config
+    back and publishes nothing (memory and disk must agree).
+    """
+    cfg = validate_questions(body.config)
+    tagger = request.app.state.tagger
+    publisher = request.app.state.publisher
+    applied = getattr(tagger, "set_questions", None) is not None
+    with publisher.locked():
+        previous = apply_questions(tagger, cfg)
+        try:
+            _path, revision = persist_questions(request, conn, cfg)
+        except _QuestionPersistError as exc:
+            rollback_questions(tagger, previous)
+            raise HTTPException(
+                500, detail=f"cannot write question config: {exc}") from exc
+        publish_questions(request, conn, cfg)
+    return {"ok": True, "applied": applied,
             "revision": revision, "meta": _tagger_meta(request)}
 
 
@@ -757,39 +732,6 @@ async def recent_requests(request: Request, limit: int = 20):
 def request_stats(request: Request):
     """Ledger/ring health (JEV P1-C §3): drop counters are never silent."""
     return request.app.state.requestlog.stats()
-
-
-# --------------------------------------------------------------------------- #
-# Try (calibration; never persisted)
-# --------------------------------------------------------------------------- #
-class TryIn(BaseModel):
-    text: str
-
-
-@router.post("/try")
-async def try_pipeline(body: TryIn, request: Request):
-    from router.pipeline.engine import decision_to_dict
-    snapshot = request.app.state.snapshot
-    result = await request.app.state.tagger.tag(
-        TagRequest(text=body.text, capability=snapshot.capability))
-    decision, trace = evaluate(snapshot.stations, result.signals)
-    capability_signal = result.signals.get("capability_route") or {}
-    return {"signals": result.signals, "vec_dim": len(result.vec or []),
-            # Model-input window (JEV only): tokens read vs. original, so the
-            # calibration UI can show when a long paste was head-truncated.
-            "input": result.input or {},
-            "capability": {
-                "configured": bool(snapshot.capability.get("candidates")),
-                "fingerprint": snapshot.capability.get("fingerprint") or "",
-                "fallback_model": snapshot.capability.get("fallback_model"),
-                "selected": capability_signal.get("value"),
-                "top_model": capability_signal.get("top_model"),
-                "p_top": capability_signal.get("p_top"),
-                "margin": capability_signal.get("margin"),
-                "fallback_used": capability_signal.get("fallback_used"),
-                "reason": capability_signal.get("reason"),
-            },
-            "decision": decision_to_dict(decision), "trace": trace}
 
 
 # --------------------------------------------------------------------------- #
@@ -830,25 +772,27 @@ class CapabilityPolicyIn(BaseModel):
 
 
 def _capability_payload(request: Request, conn: sqlite3.Connection) -> dict:
-    snapshot = request.app.state.snapshot
-    pack = snapshot.capability
+    # The global capability pack is retired (the unified tree handles NL
+    # routing); the model catalog remains the single source of descriptions,
+    # and the (soon-to-be-removed) policy settings are read back as-is.
+    settings = SettingsRepo(conn)
     models = ModelRepo(conn).list()
     upstream = {m["id"]: m.get("upstream") or m["id"] for m in models}
     declared = {m["id"]: capability_of_model(m) for m in models}
     candidates = [
         {"id": model_id, "capability": capability,
          "upstream": upstream.get(model_id), "name": upstream.get(model_id)}
-        for model_id, capability in sorted((pack.get("candidates") or {}).items())
+        for model_id, capability in sorted(declared.items()) if capability
     ]
     return {
         "configured": bool(candidates),
         "enabled_engine": getattr(request.app.state.tagger, "name", ""),
-        "fingerprint": pack.get("fingerprint") or "",
-        "revision": snapshot.capability_revision,
-        "instructions": pack.get("instructions"),
-        "min_prob": pack.get("min_prob"),
-        "min_margin": pack.get("min_margin"),
-        "fallback_model": pack.get("fallback_model"),
+        "fingerprint": "",
+        "revision": settings.get("capability_revision") or "",
+        "instructions": settings.get(SETTING_INSTRUCTIONS),
+        "min_prob": settings.get(SETTING_MIN_PROB),
+        "min_margin": settings.get(SETTING_MIN_MARGIN),
+        "fallback_model": settings.get(SETTING_FALLBACK),
         "candidates": candidates,
         "missing": [{"id": model_id, "upstream": upstream.get(model_id)}
                     for model_id, capability in sorted(declared.items())
@@ -895,12 +839,15 @@ def put_capability(body: CapabilityPolicyIn, request: Request,
         policy[SETTING_FALLBACK] = fallback
     if not policy:
         raise HTTPException(422, detail="no policy field supplied")
-    with conn:
-        for key, value in policy.items():
-            SettingsRepo(conn).set(key, value)
-        ChangeRepo(conn).record(_now(), "capability",
-                                {"action": "policy", "keys": sorted(policy)})
-    _refresh_snapshot(request, conn)
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        with conn:                             # settings + audit commit together
+            for key, value in policy.items():
+                SettingsRepo(conn).set(key, value)
+            ChangeRepo(conn).record(_now(), "capability",
+                                    {"action": "policy",
+                                     "keys": sorted(policy)})
+        _publish_snapshot(request, conn)
     payload = _capability_payload(request, conn)
     return {"ok": True, **payload}
 

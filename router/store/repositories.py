@@ -457,7 +457,14 @@ class ChangeRepo:
         self.conn = conn
 
     def record(self, ts: str, kind: str, detail: dict) -> None:
-        with self.conn:
+        """Append one audit row, joining a caller's transaction if there is one.
+
+        Task 9 Step 3: the audit row must be committed together with the
+        configuration write it describes.  ``with self.conn:`` would commit an
+        outer ``write_transaction`` early (leaving an orphan audit row when the
+        configuration write rolls back), so writes compose through ``_tx``.
+        """
+        with _tx(self.conn):
             self.conn.execute("INSERT INTO changes (ts, kind, detail) VALUES (?, ?, ?)",
                               (ts, kind, json.dumps(detail, ensure_ascii=False)))
 

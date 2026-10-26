@@ -1,5 +1,9 @@
 """Admin API: model catalog, model CRUD, provider CRUD (key tri-state),
-fetch-models (MockTransport), pipeline reasoning health, v9 migration.
+fetch-models (MockTransport), v9 migration.  Reasoning-profile validation is
+still covered here through the model CRUD endpoints; the retired
+/admin/pipeline reasoning health tests were removed with that endpoint
+(equivalent coverage: tests/test_unified_tree_validation.py and
+tests/test_routing_trees_admin.py).
 """
 
 import json
@@ -124,7 +128,7 @@ def test_create_model_and_swap_backend_snapshot(client, app):
     assert model["reasoning"]["declared"] is True
     assert model["reasoning"]["format"] == "openai"
     assert client.get("/admin/models").json()["models"]
-    backend = app.state.backends["my-model"]
+    backend = app.state.snapshot.backends["my-model"]
     assert backend.upstream_name == "upstream-v1"
     assert backend.provider == "local"
     assert backend.reasoning["efforts"] == [
@@ -186,7 +190,7 @@ def test_create_model_inherits_provider_reasoning_format(client, app):
         "profile": {"reasoning": {"efforts": {"off": None, "high": None}}}})
     assert r.status_code == 201, r.text
     assert r.json()["model"]["reasoning"]["format"] == "deepseek"
-    assert app.state.backends["deep-model"].reasoning["format"] == "deepseek"
+    assert app.state.snapshot.backends["deep-model"].reasoning["format"] == "deepseek"
 
 
 # --------------------------------------------------------------------------- #
@@ -260,7 +264,7 @@ def test_provider_key_tristate_and_headers(client, app):
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert "sk-secret-1" not in r.text
-    assert app.state.backends["qwen3-8b"].headers["Authorization"] == \
+    assert app.state.snapshot.backends["qwen3-8b"].headers["Authorization"] == \
         "Bearer sk-secret-1"
 
     # omitted -> kept
@@ -268,7 +272,7 @@ def test_provider_key_tristate_and_headers(client, app):
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert client.get("/admin/providers").text.count("sk-secret-1") == 0
-    assert app.state.backends["qwen3-8b"].headers["Authorization"] == \
+    assert app.state.snapshot.backends["qwen3-8b"].headers["Authorization"] == \
         "Bearer sk-secret-1"
 
     # "" -> cleared
@@ -276,7 +280,7 @@ def test_provider_key_tristate_and_headers(client, app):
     provider = r.json()["provider"]
     assert provider["key_present"] is False
     assert provider["key_source"] == "none"
-    assert "Authorization" not in app.state.backends["qwen3-8b"].headers
+    assert "Authorization" not in app.state.snapshot.backends["qwen3-8b"].headers
 
 
 def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
@@ -289,17 +293,17 @@ def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
     assert client.post("/admin/models", json={
         "id": "env-model", "upstream": "u",
         "provider": "envprov"}).status_code == 201
-    assert app.state.backends["env-model"].headers["Authorization"] == \
+    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
     # a stored key wins over the environment (contract §5.3)
     client.put("/admin/providers/envprov", json={
         "base_url": "http://e/v1", "api_key": "stored-secret"})
-    assert app.state.backends["env-model"].headers["Authorization"] == \
+    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer stored-secret"
     # clearing the stored key falls back to the env
     client.put("/admin/providers/envprov", json={
         "base_url": "http://e/v1", "api_key": ""})
-    assert app.state.backends["env-model"].headers["Authorization"] == \
+    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
 
 
@@ -420,98 +424,6 @@ def test_fetch_models_request_validation(client):
                        json={"provider": "nope"}).status_code == 404
 
 
-# --------------------------------------------------------------------------- #
-# 分树推理选择：序列化 + 健康检查（§3.3）
-# --------------------------------------------------------------------------- #
-def test_pipeline_nodes_always_serialize_reasoning(client):
-    def walk(node):
-        assert "reasoning" in node
-        assert node["reasoning"] is None
-        for child in node.get("children") or []:
-            walk(child)
-
-    for station in client.get("/admin/pipeline").json()["stations"]:
-        if station["root"] is not None:
-            walk(station["root"])
-
-
-def test_pipeline_reasoning_health_hard_checks(client):
-    # 1) target model declares nothing -> unsupported
-    pipe = client.get("/admin/pipeline").json()
-    pipe["stations"][3]["root"]["reasoning"] = "high"
-    r = client.put("/admin/pipeline", json=pipe)
-    assert r.status_code == 422
-    issues = [i for i in r.json()["detail"]
-              if i["code"] == "reasoning_unsupported"]
-    assert issues and issues[0]["model"] == "qwen3-8b"
-    assert issues[0]["reasoning"] == "high"
-    assert issues[0]["level"] == "hard"
-
-    # 2) declare the capability -> save succeeds
-    assert client.put("/admin/models/qwen3-8b", json={
-        "profile": OPENAI_REASONING}).status_code == 200
-    assert client.put("/admin/pipeline", json=pipe).status_code == 200
-    saved = client.get("/admin/pipeline").json()["stations"][3]["root"]
-    assert saved["reasoning"] == "high"
-
-    # 3) a level outside the declaration is rejected too
-    pipe["stations"][3]["root"]["reasoning"] = "max"
-    r = client.put("/admin/pipeline", json=pipe)
-    assert r.status_code == 422
-    assert any(i["code"] == "reasoning_unsupported" and i["reasoning"] == "max"
-               for i in r.json()["detail"])
-
-    # 4) reasoning is route-only: a block leaf may not select a level
-    pipe["stations"][3]["root"]["reasoning"] = None
-    pipe["stations"][0]["root"]["children"][0]["reasoning"] = "off"
-    r = client.put("/admin/pipeline", json=pipe)
-    assert r.status_code == 422
-    assert any(i["code"] == "reasoning_without_route"
-               for i in r.json()["detail"])
-
-
-def test_pipeline_rejects_unknown_reasoning_level_on_parse(client):
-    pipe = client.get("/admin/pipeline").json()
-    pipe["stations"][3]["root"]["reasoning"] = "auto"
-    r = client.put("/admin/pipeline", json=pipe)
-    assert r.status_code == 422
-    assert "reasoning" in str(r.json()["detail"])
-
-
-# --------------------------------------------------------------------------- #
-# v9 迁移：老库平滑升级
-# --------------------------------------------------------------------------- #
-def test_v9_migration_upgrades_old_provider_table(tmp_path):
-    path = str(tmp_path / "old.db")
-    conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
-    for index, sql in enumerate(MIGRATIONS[:8], start=1):
-        conn.executescript(sql)
-        conn.execute("INSERT INTO schema_migrations VALUES (?)", (index,))
-    conn.execute("INSERT INTO providers (name, base_url, key_env) "
-                 "VALUES ('local', 'http://127.0.0.1:9000', 'LOCAL_KEY')")
-    conn.execute("INSERT INTO models VALUES ('old-model', 'old-up', 'local', ?)",
-                 (json.dumps({"domains": []}),))
-    conn.commit()
-    conn.close()
-
-    conn = connect(path)
-    migrate(conn)
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(providers)")}
-    assert {"reasoning_format", "api_key"} <= columns
-    row = conn.execute("SELECT reasoning_format, api_key FROM providers").fetchone()
-    assert tuple(row) == ("openai", "")
-    assert conn.execute("SELECT MAX(version) FROM schema_migrations"
-                        ).fetchone()[0] == len(MIGRATIONS)
-    seed_default(conn)                 # explicit column lists must still work
-    backends = load_backends(conn)
-    assert backends["old-model"].reasoning is None
-    assert backends["old-model"].provider == "local"
-    assert backends["old-model"].url == \
-        "http://127.0.0.1:9000/chat/completions"
-    conn.close()
-
-
 def test_old_illegal_declaration_does_not_break_startup(tmp_path):
     path = str(tmp_path / "t.db")
     make_app(tmp_path)
@@ -524,7 +436,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
     conn.close()
     # a missing provider and an illegal declaration must both be tolerated
     app = make_app(tmp_path)
-    assert app.state.backends == {}
+    assert app.state.snapshot.backends == {}
     client = TestClient(app)
     models = {m["id"]: m for m in client.get("/admin/models").json()["models"]}
     assert models["qwen3-8b"]["reasoning"]["declared"] is False

@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -387,3 +389,77 @@ def install_snapshot(app: "FastAPI", snapshot: RoutingSnapshot) -> None:
     every reader goes through ``app.state.snapshot``.
     """
     app.state.snapshot = snapshot
+
+
+class SnapshotPublisher:
+    """Serialise configuration writes with the snapshot publication they imply.
+
+    ``install_snapshot`` alone is atomic, but one admin write is really two
+    steps: mutate the store, then assemble+publish the snapshot that mutation
+    implies.  Two concurrent writes can commit ``A`` then ``B`` while
+    publishing ``B`` then ``A`` — the hot path then serves a stale snapshot
+    whose configuration is no longer in the database.  The fix is to hold
+    :meth:`locked` across the WHOLE mutation+refresh section::
+
+        with publisher.locked():
+            with write_transaction(conn):
+                ... mutation + audit ...
+            publisher.refresh(conn)
+
+    The lock is a ``threading.RLock`` because the admin endpoints are sync
+    functions executed in FastAPI's threadpool, and because :meth:`refresh`
+    takes the same lock itself (a caller that already holds :meth:`locked`
+    simply re-enters).  ``refresh`` additionally keeps assembly, revision
+    recording and the single publish assignment together, so a reader can
+    never observe a half-published snapshot.
+    """
+
+    def __init__(self, app: "FastAPI", *, runner=None, jev_trim: bool = True,
+                 questions: Mapping | None = None) -> None:
+        self.app = app
+        #: Optional fallback DecisionRunner.  ``app.state.runner`` wins when
+        #: present (the app factory installs it once at startup).
+        self._runner = runner
+        self._jev_trim = bool(jev_trim)
+        #: Boot-time questions override (before ``settings.questions_revision``
+        #: has been recorded); ``None`` = read the recorded config from the DB.
+        self._questions = questions
+        self._lock = threading.RLock()
+
+    # ── critical section ──────────────────────────────────────────────────
+    @contextmanager
+    def locked(self):
+        """Hold the publication lock across one configuration write."""
+        with self._lock:
+            yield self
+
+    # ── assembly + publish ────────────────────────────────────────────────
+    def decision_info(self) -> dict:
+        """DecisionRunner version evidence; one uniform rule everywhere.
+
+        ``runner.info() if runner is not None else {}`` — the same shape is
+        used at boot, on every publish and for ``/admin/try`` snapshots, so
+        ``snapshot_revision`` is comparable across all three.
+        """
+        runner = getattr(self.app.state, "runner", self._runner)
+        return runner.info() if runner is not None else {}
+
+    def refresh(self, conn: "sqlite3.Connection", *,
+                questions: Mapping | None = None) -> RoutingSnapshot:
+        """Assemble from the current DB state, record the revision, publish.
+
+        Assembly (active tree → compile → ``build_snapshot``), the append-only
+        ``config_revisions(kind='snapshot')`` row and the ONE publish
+        assignment happen under the lock, so the published snapshot always
+        corresponds to one consistent database state.
+        """
+        with self._lock:
+            effective_questions = self._questions if questions is None else questions
+            snapshot = load_snapshot(
+                conn, jev_trim=self._jev_trim,
+                decision_info=self.decision_info(),
+                questions=effective_questions)
+            ensure_snapshot_revision(conn, snapshot)
+            install_snapshot(self.app, snapshot)
+            return snapshot
+
