@@ -6,15 +6,18 @@ persisted — it lives only in a bounded in-memory ring (RECENT_LIMIT) that the
 console "calculation log" page and replay evaluation read from. The database
 keeps two slim rows per request, both without text/signals:
 
-* ``requests``  — the original 9-column action row (decision/model/score/
-  latency), written from the record enqueued BEFORE the upstream call;
+* ``requests``  — the slim action row (decision/model/score/latency) plus the
+  unified-tree provenance (``tree_id``/``terminal_node_id``, v19), written from
+  the record enqueued BEFORE the upstream call; request text is never stored;
 * ``request_ledger`` — the 2026-10-24 action—result ledger (JEV plan §3.1): the
   same record is mutated **in place** once the response is known and enqueued a
   second time, and the flush writes it with ``INSERT OR REPLACE`` on ``id``.
   A flush that lands between the two events leaves a half row
   (``outcome_state = 'incomplete'``); the next flush overwrites it. Only
   action/result/version metadata is stored — never the request text,
-  signals/PII or the trace.
+  signals/PII or the trace. v19 appends ``tree_id``/``tree_revision``/
+  ``snapshot_revision``; the retired station/pipeline/capability columns stay
+  declared (and NULL for new rows) so historical rows remain readable.
 
 Backpressure and failures are counted, never silent (JEV P1-C §3): queue-full
 drops of the half row / of the outcome update, ledger rows left in the
@@ -49,6 +52,9 @@ FLUSH_QUEUE_LIMIT = 10000
 
 #: request_ledger columns (migration 14). The ledger deliberately holds no
 #: text/signals/trace — only the action, the outcome and the version metadata.
+#: The station/pipeline/capability columns are kept for HISTORICAL rows only;
+#: unified-tree records (v19) fill tree_id/tree_revision/snapshot_revision and
+#: leave the retired ones NULL.
 LEDGER_COLUMNS = (
     "id", "ts", "decision", "model", "station_id", "leaf_id", "score",
     "reasoning", "upstream_model", "upstream_status", "prompt_tokens",
@@ -64,16 +70,45 @@ LEDGER_COLUMNS = (
     "input_chunk_prompt_tokens",
     # v18 (2026-10-26): capability-routing pack revision (''
     # when no capability routing is configured)
-    "capability_revision")
+    "capability_revision",
+    # v19 (2026-10-26, unified routing tree): which tree/snapshot produced the
+    # decision; NULL on rows from the retired station pipeline.
+    "tree_id", "tree_revision", "snapshot_revision")
 
+#: The eleven explicit ``requests`` target columns. ``text`` is always written
+#: as an empty string: the request text is memory-only (design §4.4/privacy).
 _SLIM_INSERT = (
     "INSERT OR REPLACE INTO requests (id, ts, text, decision, model, "
-    "station_id, leaf_id, score, latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    "station_id, leaf_id, score, latency_ms, tree_id, terminal_node_id) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 
 _LEDGER_INSERT = (
     "INSERT OR REPLACE INTO request_ledger ("
     + ", ".join(LEDGER_COLUMNS) + ") VALUES ("
     + ", ".join("?" for _ in LEDGER_COLUMNS) + ")")
+
+
+def slim_values(record: dict) -> tuple:
+    """One ``requests`` row in :data:`_SLIM_INSERT` column order.
+
+    The text column is unconditionally empty: detail lives in the memory ring
+    only. ``station_id``/``leaf_id`` are read for backwards compatibility with
+    older callers and stay NULL for unified-tree records.
+    """
+    return (
+        record["id"], record["ts"], "", record["decision"],
+        record.get("model"), record.get("station_id"), record.get("leaf_id"),
+        record.get("score"), record.get("latency_ms"),
+        record.get("tree_id"), record.get("terminal_node_id"))
+
+
+def ledger_values(record: dict) -> tuple:
+    """One ``request_ledger`` row: every column in :data:`LEDGER_COLUMNS` order.
+
+    A key the record does not carry is written as NULL — the retired pipeline/
+    capability/station columns are therefore NULL for new unified-tree records.
+    """
+    return tuple(record.get(column) for column in LEDGER_COLUMNS)
 
 
 class RequestLogger:
@@ -211,19 +246,17 @@ class RequestLogger:
                     # inputs are decision-time values), so the upsert is a no-op
                     # there and the original semantics are untouched.
                     try:
-                        conn.execute(
-                            _SLIM_INSERT,
-                            (r["id"], r["ts"], "", r["decision"],
-                             r.get("model"), r.get("station_id"),
-                             r.get("leaf_id"), r.get("score"),
-                             r.get("latency_ms")))
+                        # Both rows come from pure row-value builders: the
+                        # insert column list and the value tuple can never
+                        # drift apart, and the privacy contract (no text/
+                        # signals/trace) is enforced at the boundary.
+                        conn.execute(_SLIM_INSERT, slim_values(r))
                         # action—result ledger: same id, first the half row
                         # (outcome_state='incomplete'), later the in-place
                         # outcome update replaces it. Only LEDGER_COLUMNS are
                         # selected, so no text/signals can ever leak into the
                         # ledger even though the ring record carries them.
-                        conn.execute(_LEDGER_INSERT,
-                                     tuple(r.get(c) for c in LEDGER_COLUMNS))
+                        conn.execute(_LEDGER_INSERT, ledger_values(r))
                     except sqlite3.Error:
                         # A single bad row must not drop the rest of the batch,
                         # and it must not be silent (P1-C: counter + log).

@@ -16,12 +16,19 @@ def make_log(tmp_path):
 
 
 def record(i, **kw):
-    """One logged request; the ring keeps `signals` (detail is memory-only)."""
+    """One logged request in the unified-tree shape (v19).
+
+    The ring keeps `signals`/`trace` (detail is memory-only); the DB rows get
+    ``tree_id``/``terminal_node_id`` and the ledger also
+    ``tree_revision``/``snapshot_revision``.  The legacy station/pipeline/
+    capability keys are deliberately absent: new records leave those
+    history-only columns NULL.
+    """
     rec = {"id": f"r{i}", "ts": "2026-10-16T10:00:00", "text": "你好",
-           "decision": "route", "model": "qwen3-8b", "station_id": "s",
-           "leaf_id": "n", "score": None, "latency_ms": 12.0,
-           "pipeline_revision": "p" * 64, "backends_revision": "b" * 64,
-           "questions_revision": None, "pipeline_version": 1,
+           "decision": "route", "model": "qwen3-8b", "score": None,
+           "latency_ms": 12.0,
+           "tree_id": "tree-a", "terminal_node_id": "leaf-1",
+           "tree_revision": "t" * 64, "snapshot_revision": "s" * 64,
            "experiment_arm": None, "quality_score": None,
            "quality_evaluator": None, "usage_observed": 0,
            "outcome_state": "incomplete",
@@ -54,17 +61,21 @@ def ledger_rows(log):
 
 
 def test_flush_writes_slim_rows_without_signals(tmp_path):
-    """Detail (text/signals) must never reach the database."""
+    """Detail (text/signals) must never reach the database; the slim row now
+    carries the unified-tree provenance instead of the retired station ids."""
     log = make_log(tmp_path)
     log.enqueue(record(1, tree_path='{"spoiler": true}'))
     asyncio.run(log.flush())
     conn = connect(log.settings.db_path)
     assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 1
-    row = conn.execute("SELECT text, decision, model, station_id, leaf_id "
-                        "FROM requests").fetchone()
+    row = conn.execute("SELECT text, decision, model, station_id, leaf_id, "
+                       "tree_id, terminal_node_id FROM requests").fetchone()
     assert row["text"] == ""
     assert row["decision"] == "route" and row["model"] == "qwen3-8b"
-    assert row["station_id"] == "s" and row["leaf_id"] == "n"
+    assert row["tree_id"] == "tree-a"
+    assert row["terminal_node_id"] == "leaf-1"
+    # legacy columns are history-only: new records leave them NULL
+    assert row["station_id"] is None and row["leaf_id"] is None
     columns = {r[1] for r in conn.execute("PRAGMA table_info(requests)")}
     assert "tree_path" not in columns      # v12 dropped the dead column
     assert "node_id" not in columns and "branch_id" not in columns
@@ -173,7 +184,13 @@ def test_flush_writes_half_row_then_replaces_it_with_the_outcome(tmp_path):
     assert half["prompt_tokens"] is None and half["total_ms"] is None
     assert half["outcome_state"] == "incomplete"   # no terminal state yet
     assert half["usage_observed"] == 0
-    assert half["pipeline_revision"] == "p" * 64
+    assert half["tree_id"] == "tree-a"
+    assert half["tree_revision"] == "t" * 64
+    assert half["snapshot_revision"] == "s" * 64
+    # the station/pipeline/capability columns are history-only (NULL for new
+    # unified-tree records: their provenance lived in the retired pipeline)
+    assert half["pipeline_revision"] is None
+    assert half["capability_revision"] is None
     # v16 chunk columns are NULL when the tagger reports no chunking.
     assert half["jev_chunk"] is None
     assert half["input_chunk_mode"] is None
@@ -217,11 +234,13 @@ def test_result_update_does_not_duplicate_ring_or_histogram(tmp_path):
 
 
 def test_ledger_holds_no_text_signals_or_trace(tmp_path):
-    """Privacy constraint survives the ledger: only action/result/version
+    """Privacy constraint survives the ledger: only action/result/tree-version
     columns are written; the request text, signals and trace stay memory-only."""
     log = make_log(tmp_path)
     rec = record(1, text="我的身份证号是 110101199001011234",
-                 trace=[{"spoiler": True}])
+                 trace=[{"spoiler": "TRACE-SECRET"}],
+                 signals={"pii": {"value": ["cn_id_card"], "confidence": 0.9,
+                                  "is_rule": False}})
     log.enqueue(rec)
     rec.update(outcome())
     log.enqueue_result(rec)
@@ -230,15 +249,21 @@ def test_ledger_holds_no_text_signals_or_trace(tmp_path):
     conn = connect(log.settings.db_path)
     columns = [r[1] for r in conn.execute("PRAGMA table_info(request_ledger)")]
     conn.close()
+    # LEDGER_COLUMNS mirrors the v14→v19 table exactly (the old station/
+    # pipeline/capability columns stay readable for history; v19 appends the
+    # unified-tree provenance).
     assert columns == list(LEDGER_COLUMNS)
-    assert {"jev_chunk", "input_chunk_mode", "input_chunk_segments",
-            "input_chunk_prompt_tokens"} <= set(columns)     # v16
+    assert columns[-3:] == ["tree_id", "tree_revision", "snapshot_revision"]
     assert not {"text", "signals", "trace"} & set(columns)
     row = ledger_rows(log)[0]
+    assert row["tree_id"] == "tree-a"
+    assert row["tree_revision"] == "t" * 64
+    assert row["snapshot_revision"] == "s" * 64
     dumped = " ".join(str(v) for v in row.values() if v is not None)
     assert "110101199001011234" not in dumped
-    assert "你好" not in dumped
-    assert "spoiler" not in dumped
+    assert "我的身份证号" not in dumped
+    assert "cn_id_card" not in dumped
+    assert "TRACE-SECRET" not in dumped
 
 
 def test_partial_rows_counts_only_rows_left_incomplete(tmp_path):
@@ -328,3 +353,102 @@ def test_flush_writes_chunk_attribution_columns(tmp_path):
     assert plain["jev_chunk"] is None and plain["input_chunk_mode"] is None
     assert plain["input_chunk_segments"] is None
     assert plain["input_chunk_prompt_tokens"] is None
+
+
+# ── v19 unified-tree provenance: pure row-value builders + flush wiring ─────
+def test_slim_values_are_the_eleven_explicit_columns():
+    """The slim INSERT names its 11 target columns explicitly and the builder
+    returns exactly those values in that order; text is always empty."""
+    from router.api.requestlog import _SLIM_INSERT, slim_values
+
+    columns = ["id", "ts", "text", "decision", "model", "station_id",
+               "leaf_id", "score", "latency_ms", "tree_id", "terminal_node_id"]
+    sql = _SLIM_INSERT
+    assert sql[sql.index("(") + 1:sql.index(")")].replace(" ", "").split(",") \
+        == columns
+    assert sql.count("?") == len(columns)
+
+    values = slim_values(record(7))
+    assert len(values) == len(columns)
+    assert values[0] == "r7" and values[1] == "2026-10-16T10:00:00"
+    assert values[2] == ""                    # request text never persists
+    assert values[3] == "route" and values[4] == "qwen3-8b"
+    assert values[5:9] == (None, None, None, 12.0)   # legacy ids + score
+    assert values[9:] == ("tree-a", "leaf-1")
+
+
+def test_ledger_values_follow_the_declared_columns():
+    """LEDGER_COLUMNS keeps the v14→v19 history columns and appends the tree
+    provenance; the builder yields one value per column in that exact order."""
+    from router.api.requestlog import _LEDGER_INSERT, ledger_values
+
+    columns = list(LEDGER_COLUMNS)
+    assert columns[-3:] == ["tree_id", "tree_revision", "snapshot_revision"]
+    # history-only columns stay declared so old rows remain readable
+    assert {"station_id", "leaf_id", "pipeline_version", "pipeline_revision",
+            "backends_revision", "capability_revision"} <= set(columns)
+    sql = _LEDGER_INSERT
+    assert sql[sql.index("(") + 1:sql.index(")")].replace(" ", "").split(",") \
+        == columns
+
+    values = ledger_values(record(3))
+    assert len(values) == len(columns)
+    index = {column: position for position, column in enumerate(columns)}
+    assert values[index["tree_id"]] == "tree-a"
+    assert values[index["tree_revision"]] == "t" * 64
+    assert values[index["snapshot_revision"]] == "s" * 64
+    assert values[index["decision"]] == "route"
+    assert values[index["model"]] == "qwen3-8b"
+    for legacy in ("station_id", "leaf_id", "pipeline_version",
+                   "pipeline_revision", "backends_revision",
+                   "capability_revision"):
+        assert values[index[legacy]] is None, legacy
+
+
+def test_flush_records_tree_provenance_and_nulls_legacy_columns(tmp_path):
+    """v19 record shape: the slim row carries tree_id/terminal_node_id and the
+    ledger carries tree_id/tree_revision/snapshot_revision, while the retired
+    station/pipeline/capability columns stay NULL for new rows (they are read
+    back for history only). Privacy is unchanged: no raw text/signals/trace in
+    any column of either row."""
+    log = make_log(tmp_path)
+    rec = record(1, text="我的身份证号是 110101199001011234",
+                 trace=[{"spoiler": "TRACE-SECRET"}],
+                 signals={"pii": {"value": ["cn_id_card"], "confidence": 0.9,
+                                  "is_rule": False}})
+    log.enqueue(rec)
+    rec.update(outcome())
+    log.enqueue_result(rec)
+    asyncio.run(log.flush())
+
+    conn = connect(log.settings.db_path)
+    try:
+        slim = conn.execute("SELECT * FROM requests WHERE id = 'r1'").fetchone()
+        ledger = conn.execute(
+            "SELECT * FROM request_ledger WHERE id = 'r1'").fetchone()
+    finally:
+        conn.close()
+
+    assert slim is not None and ledger is not None
+    assert slim["tree_id"] == "tree-a"
+    assert slim["terminal_node_id"] == "leaf-1"
+    assert slim["text"] == ""
+    assert ledger["tree_id"] == "tree-a"
+    assert ledger["tree_revision"] == "t" * 64
+    assert ledger["snapshot_revision"] == "s" * 64
+    assert ledger["decision"] == "route" and ledger["model"] == "qwen3-8b"
+
+    # legacy provenance columns are history-only for unified-tree records
+    for legacy in ("station_id", "leaf_id", "pipeline_version",
+                   "pipeline_revision", "backends_revision",
+                   "capability_revision"):
+        assert ledger[legacy] is None, legacy
+    assert slim["station_id"] is None and slim["leaf_id"] is None
+
+    for row in (slim, ledger):
+        dumped = " ".join(str(value) for value in tuple(row)
+                          if value is not None)
+        assert "110101199001011234" not in dumped
+        assert "我的身份证号" not in dumped
+        assert "cn_id_card" not in dumped
+        assert "TRACE-SECRET" not in dumped
