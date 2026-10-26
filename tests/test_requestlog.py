@@ -106,7 +106,16 @@ def test_replayable_only_route_decisions(tmp_path):
     log = make_log(tmp_path)
     log.enqueue(record(1))
     log.enqueue(record(2, decision="block", model=None))
-    assert [r["id"] for r in log.replayable("2026-01-01")] == ["r1"]
+    rows = log.replayable("2026-01-01")
+    assert [r["id"] for r in rows] == ["r1"]
+    # Text-based replay inputs are returned; the retired signals shortcut is not
+    # (a replay re-tags the original text instead of trusting a stored pack).
+    assert rows[0]["text"] == "你好"
+    assert rows[0]["model"] == "qwen3-8b"
+    assert rows[0]["tree_id"] == "tree-a"
+    assert rows[0]["snapshot_revision"] == "s" * 64
+    assert rows[0]["headers"] is None          # this fixture predates Task 10
+    assert "signals" not in rows[0]
     assert log.replayable("2027-01-01") == []
 
 

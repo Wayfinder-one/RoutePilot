@@ -26,7 +26,11 @@ from router.api.deps import get_conn
 from router.api.routes_trees import capability_write_issues
 from router.api.upstream import parse_profile_text
 from router.evals import summarize
-from router.pipeline.engine import evaluate     # Task 10 rewires eval replay
+from router.pipeline.errors import NoActiveTreeError, SignalPreparationError
+from router.pipeline.evaluator import Hit
+from router.pipeline.runtime import RuntimeRequest
+from router.pipeline.snapshot import (REVISION_SNAPSHOT, canonical_json,
+                                      sha256_text, snapshot_from_content)
 from router.decision.pack import (CAPABILITY_SIGNAL, POLICY_SETTINGS,
                                   SETTING_FALLBACK, SETTING_INSTRUCTIONS,
                                   SETTING_MIN_MARGIN, SETTING_MIN_PROB,
@@ -37,10 +41,10 @@ from router.presets import PROVIDER_PRESETS
 from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
                               normalize_reasoning, validate_model_profile)
 from router.signals.registry import GROUPS, SIGNALS
-from router.signals.tagger import TagRequest
-from router.store.repositories import (ChangeRepo, EvalRepo, KeywordRepo,
-                                       ModelRepo, ProviderRepo, SettingsRepo,
-                                       StationRepo, TimePeriodRepo,
+from router.store.repositories import (ChangeRepo, ConfigRevisionRepo,
+                                       EvalRepo, KeywordRepo, ModelRepo,
+                                       ProviderRepo, SettingsRepo, StationRepo,
+                                       TimePeriodRepo,
                                        ensure_questions_revision,
                                        model_ids_using_provider,
                                        model_references)
@@ -872,40 +876,184 @@ class EvalIn(BaseModel):
     labels: list[dict] = []
 
 
-async def _eval_pairs(body: EvalIn, request: Request):
-    stations = request.app.state.snapshot.stations
-    pairs: list[tuple] = []
-    mismatches: list[dict] = []
+def _hit_model(outcome) -> str | None:
+    """Evaluation expectation: a route Hit's model; Miss/block has no model."""
+    if isinstance(outcome, Hit) and outcome.kind == "route":
+        return outcome.model
+    return None
+
+
+def _current_tagger_info(request: Request) -> dict:
+    """Current tagger fingerprint (only taggers implementing info() have one)."""
+    tagger = request.app.state.tagger
+    info = getattr(tagger, "info", None)
+    return dict(info()) if callable(info) else {}
+
+
+def _current_decision_revision(request: Request) -> str:
+    """The DecisionRunner evidence hash — same rule as build_snapshot."""
+    runner = getattr(request.app.state, "runner", None)
+    info = dict(runner.info()) if runner is not None else {}
+    return "" if not info else sha256_text(canonical_json(info))
+
+
+def _replay_snapshot(conn: sqlite3.Connection, revision):
+    """Restore the historical effective snapshot (never today's tree).
+
+    Returns ``(snapshot, None)`` or ``(None, reason)``.  The content is read
+    from the append-only ``config_revisions(kind='snapshot')`` store, so a
+    replay uses the compiled tree/candidates/questions that actually produced
+    the recorded decision.
+    """
+    if not revision:
+        return None, "missing_snapshot_revision"
+    row = ConfigRevisionRepo(conn).get(REVISION_SNAPSHOT, revision)
+    if row is None:
+        return None, "missing_snapshot_content"
+    try:
+        return snapshot_from_content(row["content"]), None
+    except (ValueError, TypeError):
+        return None, "invalid_snapshot_content"
+
+
+def _replay_blocker(record: dict, conn: sqlite3.Connection, *,
+                    tagger_info: dict, decision_revision: str) -> str | None:
+    """Concrete reason a ring record cannot be replayed (None = replayable).
+
+    Checked in order: the original request inputs -> the historical snapshot
+    pointer/content -> the model fingerprints.  Nothing is defaulted: a record
+    missing the text, the headers/n_messages actually used, or the revision
+    content is listed in ``non_replayable`` instead of being replayed with
+    fabricated inputs or today's configuration.
+    """
+    text = record.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return "missing_text"
+    if not isinstance(record.get("headers"), dict):
+        return "missing_request_headers"
+    n_messages = record.get("n_messages")
+    if isinstance(n_messages, bool) or not isinstance(n_messages, int):
+        return "missing_request_n_messages"
+    snapshot, reason = _replay_snapshot(conn, record.get("snapshot_revision"))
+    if snapshot is None:
+        return reason
+    recorded_tagger = record.get("tagger_info")
+    if not isinstance(recorded_tagger, dict):
+        return "missing_tagger_evidence"      # pre-Task-10 ring record
+    if recorded_tagger != tagger_info:
+        return "tagger_model_mismatch"
+    if snapshot.decision_revision != decision_revision:
+        return "decision_runner_mismatch"
+    return None
+
+
+def _replay_case(record: dict) -> dict:
+    """Record-only fields of one replay case (no text: replay never persists it)."""
+    return {"id": record.get("id"), "ts": record.get("ts"),
+            "expect": record.get("model"), "got": None,
+            "tree_id": record.get("tree_id"),
+            "tree_revision": record.get("tree_revision"),
+            "snapshot_revision": record.get("snapshot_revision")}
+
+
+async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
+    """Run one evaluation: labels re-routes the caller's texts, replay restores
+    the historical snapshot and re-routes the recorded original inputs.
+
+    Both use the SAME ``app.state.runtime`` as ``/v1``: no separate routing
+    logic, no stored-signal shortcut.  A case that cannot be replayed is listed
+    in ``non_replayable`` with a concrete reason and is NOT part of the
+    accuracy denominator.
+    """
+    runtime = request.app.state.runtime
+
+    if body.mode == "labels":
+        snapshot = request.app.state.snapshot
+        pairs: list[tuple] = []
+        mismatches: list[dict] = []
+        cases: list[dict] = []
+        for index, raw in enumerate(body.labels):
+            case = raw if isinstance(raw, dict) else {}
+            text = str(case.get("text") or "")
+            expect = case.get("expect_model")
+            case_id = str(case.get("id") or f"label-{index}")
+            got = None
+            reason = None
+            try:
+                result = await runtime.route(snapshot,
+                                             RuntimeRequest(text=text))
+                got = _hit_model(result.outcome)
+            except NoActiveTreeError:
+                reason = "no_active_tree"
+            except SignalPreparationError:
+                reason = "signal_preparation_failed"
+            entry = {"id": case_id, "text": text, "expect": expect,
+                     "got": got, "tree_id": snapshot.tree_id,
+                     "tree_revision": snapshot.tree_revision,
+                     "snapshot_revision": snapshot.snapshot_revision}
+            if reason is not None:
+                entry["reason"] = reason
+            cases.append(entry)
+            pairs.append((expect, got))
+            if got != expect and len(mismatches) < MAX_MISMATCHES:
+                mismatches.append({"id": case_id, "text": text[:200],
+                                   "expect": expect, "got": got})
+        return pairs, mismatches, {"labels": len(body.labels), "cases": cases}
+
     if body.mode == "replay":
         since = (datetime.now().astimezone()
                  - timedelta(days=body.days)).date().isoformat()
-        for r in request.app.state.requestlog.replayable(since):
-            decision, _ = evaluate(stations, r["signals"])
-            got = decision.model if decision.kind == "route" else None
-            pairs.append((r["model"], got))
-            if got != r["model"] and len(mismatches) < MAX_MISMATCHES:
-                mismatches.append({"id": r["id"], "expect": r["model"], "got": got})
-        return pairs, mismatches, {"days": body.days, "source": "memory"}
-    if body.mode == "labels":
-        for case in body.labels:
-            text = str(case.get("text", ""))
-            expect = case.get("expect_model")
-            result = await request.app.state.tagger.tag(
-                TagRequest(text=text,
-                           capability=request.app.state.snapshot.capability))
-            decision, _ = evaluate(stations, result.signals)
-            got = decision.model if decision.kind == "route" else None
-            pairs.append((expect, got))
-            if got != expect and len(mismatches) < MAX_MISMATCHES:
-                mismatches.append({"text": text[:200], "expect": expect, "got": got})
-        return pairs, mismatches, {"labels": len(body.labels)}
+        tagger_info = _current_tagger_info(request)
+        decision_revision = _current_decision_revision(request)
+        pairs = []
+        mismatches = []
+        cases = []
+        non_replayable: list[dict] = []
+        for record in request.app.state.requestlog.replayable(since):
+            entry = _replay_case(record)
+            reason = _replay_blocker(record, conn, tagger_info=tagger_info,
+                                     decision_revision=decision_revision)
+            snapshot = None
+            if reason is None:
+                snapshot, reason = _replay_snapshot(
+                    conn, record["snapshot_revision"])
+            if reason is not None:
+                entry.update({"got": None, "replayable": False,
+                              "reason": reason})
+                cases.append(entry)
+                non_replayable.append(entry)
+                continue
+            try:
+                result = await runtime.route(snapshot, RuntimeRequest(
+                    text=record["text"], headers=dict(record["headers"]),
+                    n_messages=record["n_messages"]))
+                got = _hit_model(result.outcome)
+            except (NoActiveTreeError, SignalPreparationError) as exc:
+                entry.update({"got": None, "replayable": False,
+                              "reason": f"replay_error:{type(exc).__name__}"})
+                cases.append(entry)
+                non_replayable.append(entry)
+                continue
+            entry.update({"got": got, "replayable": True,
+                          "tree_id": snapshot.tree_id,
+                          "tree_revision": snapshot.tree_revision,
+                          "snapshot_revision": snapshot.snapshot_revision})
+            cases.append(entry)
+            pairs.append((entry["expect"], got))
+            if got != entry["expect"] and len(mismatches) < MAX_MISMATCHES:
+                mismatches.append({"id": entry["id"],
+                                   "expect": entry["expect"], "got": got})
+        return pairs, mismatches, {"days": body.days, "source": "memory",
+                                   "cases": cases,
+                                   "non_replayable": non_replayable}
+
     raise HTTPException(422, detail="mode must be 'replay' or 'labels'")
 
 
 @router.post("/eval")
 async def post_eval(body: EvalIn, request: Request,
                     conn: sqlite3.Connection = Depends(get_conn)):
-    pairs, mismatches, extra = await _eval_pairs(body, request)
+    pairs, mismatches, extra = await _eval_pairs(body, request, conn)
     report = summarize(body.mode, pairs, mismatches, **extra)
     EvalRepo(conn).save(_now(), body.mode, report["total"], report["matched"],
                         report["rate"], report)

@@ -165,17 +165,35 @@ class RequestLogger:
         return list(reversed(self.recent))[:max(0, limit)]
 
     def replayable(self, since: str) -> list[dict]:
-        """Route decisions in the ring whose local date prefix >= ``since``."""
+        """Route decisions in the ring (local date prefix >= ``since``) that a
+        text-based replay can attempt.
+
+        Returns exactly the inputs replay needs: the recorded original request
+        (text/headers/n_messages), the recorded expectation (model) and the
+        historical snapshot pointer (snapshot/tree revisions) plus the tagger
+        evidence.  The retired replay reused the recorded ``signals``; that is
+        deliberately NOT returned: a replay must re-tag the original text and
+        never trust a stored signal pack.  A field that is absent from the ring
+        record is returned as None so the caller can classify ``non_replayable``
+        with a concrete reason instead of inventing an empty value.
+        """
         out = []
         for r in self.recent:
             if r.get("decision") != "route" or not r.get("model"):
                 continue
-            if not (r.get("signals") or {}):
-                continue
             if str(r.get("ts", ""))[:10] < since:
                 continue
-            out.append({"id": r["id"], "ts": r["ts"], "model": r["model"],
-                        "signals": r["signals"]})
+            out.append({
+                "id": r["id"], "ts": r.get("ts", ""),
+                "model": r.get("model"),
+                "text": r.get("text"),
+                "headers": r.get("headers"),
+                "n_messages": r.get("n_messages"),
+                "tree_id": r.get("tree_id"),
+                "tree_revision": r.get("tree_revision"),
+                "snapshot_revision": r.get("snapshot_revision"),
+                "tagger_info": r.get("tagger_info"),
+            })
         return out
 
     def confidence_histogram(self) -> list[dict]:

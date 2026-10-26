@@ -360,21 +360,31 @@ def test_static_admin_token_is_gone(tmp_path):
     assert c.get("/admin/users", headers=admin_headers(c)).status_code == 200
 
 
-def test_viewer_can_get_pipeline_but_not_put(tmp_path):
+def test_viewer_can_read_trees_but_not_write(tmp_path):
+    """viewer 门（Task 9 起）：树列表只读放行；树管理/启停等写操作 403。"""
     c = api_client(tmp_path)
     create_user(c, "viewer@test.com", "viewer-pass-1", "viewer")
     headers = bearer(login(c, "viewer@test.com", "viewer-pass-1"))
     # 只读面照常
-    assert c.get("/admin/pipeline", headers=headers).status_code == 200
+    assert c.get("/admin/trees", headers=headers).status_code == 200
     assert c.get("/admin/models", headers=headers).status_code == 200
-    # 非白名单写操作 → 403
+    # 非白名单写操作 → 403（含统一树管理与启停）
+    tree_root = {"id": "r", "type": "route", "model": "qwen3-8b"}
     for method, path, payload in (
-            ("put", "/admin/pipeline", {"stations": []}),
+            ("post", "/admin/trees", {"name": "t", "root": tree_root}),
+            ("put", "/admin/trees/tree-a", {"name": "t", "root": tree_root}),
+            ("post", "/admin/trees/tree-a/copy",
+             {"id": "tree-b", "name": "b"}),
+            ("post", "/admin/trees/tree-a/enable", None),
+            ("post", "/admin/trees/tree-a/disable", None),
+            ("post", "/admin/try", {"tree_id": "tree-a", "text": "hello"}),
             ("put", "/admin/settings", {"a": "b"}),
             ("post", "/admin/models", {"id": "m1", "upstream": "u",
-                                       "provider": "p"}),
-            ("post", "/admin/try", {"text": "hello"})):
-        r = getattr(c, method)(path, json=payload, headers=headers)
+                                       "provider": "p"})):
+        kwargs = {"headers": headers}
+        if payload is not None:
+            kwargs["json"] = payload
+        r = getattr(c, method)(path, **kwargs)
         assert r.status_code == 403, (method, path)
         assert r.json() == {"detail": "forbidden: admin role required"}
     # 白名单：查自己/登出可用（logout 会吊销会话，放最后）

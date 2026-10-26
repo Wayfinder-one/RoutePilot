@@ -437,6 +437,14 @@ async def chat_completions(request: Request):
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "text": text,
+        # Replay inputs (Task 10 Step 4). Only the request header the rule
+        # signals actually read is kept — the ring is served verbatim by
+        # /admin/requests/recent, so Authorization and every other header must
+        # never enter it. Missing tenant = {} -> rule_signals falls back to
+        # "anonymous", exactly like the online path.
+        "headers": {k: v for k, v in request.headers.items()
+                    if k.lower() == "x-sr-tenant"},
+        "n_messages": len(messages),
         "decision": hit.kind if hit is not None else "none",
         "model": hit.model if hit is not None else None,
         "terminal_node_id": hit.node_id if hit is not None else None,
@@ -457,6 +465,9 @@ async def chat_completions(request: Request):
         "nl_calls": result.nl_calls,
         # Ledger metadata known already at decision time (design §3.1/P1-B).
         **_version_fields(snapshot, result),
+        # Frozen tagger version evidence (ring only): the replay fingerprint a
+        # historical row is compared against before it may be re-run.
+        "tagger_info": dict(result.tagger_info or {}),
         "experiment_arm": _experiment_arm(request),
         # Outcome placeholders (filled exactly once by the recorder).
         "upstream_model": None, "upstream_status": None,
