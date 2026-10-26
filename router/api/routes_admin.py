@@ -31,30 +31,30 @@ from router.pipeline.evaluator import Hit
 from router.pipeline.runtime import RuntimeRequest
 from router.pipeline.snapshot import (REVISION_SNAPSHOT, canonical_json,
                                       sha256_text, snapshot_from_content)
-from router.decision.pack import (CAPABILITY_SIGNAL, POLICY_SETTINGS,
-                                  SETTING_FALLBACK, SETTING_INSTRUCTIONS,
-                                  SETTING_MIN_MARGIN, SETTING_MIN_PROB,
-                                  CapabilityPackError,
-                                  capability_of_model, normalize_capability,
-                                  normalize_instructions)
+from router.decision.catalog import (CapabilityPackError, capability_of_model,
+                                     normalize_capability)
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
                               normalize_reasoning, validate_model_profile)
 from router.signals.registry import GROUPS, SIGNALS
 from router.store.repositories import (ChangeRepo, ConfigRevisionRepo,
                                        EvalRepo, KeywordRepo, ModelRepo,
-                                       ProviderRepo, SettingsRepo, StationRepo,
+                                       ProviderRepo, SettingsRepo,
                                        TimePeriodRepo,
                                        ensure_questions_revision,
                                        model_ids_using_provider,
                                        model_references)
+from router.store.routing_trees import RoutingTreeRepo
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+#: settings owned by the system (the console may not write them).  The retired
+#: capability policy keys disappeared with the capability endpoints; the legacy
+#: pipeline keys stay reserved so an old client cannot resurrect dead state.
 RESERVED_SETTINGS = {"pipeline_version", "pipeline_revision",
-                    "questions_revision", *POLICY_SETTINGS}
+                     "questions_revision"}
 
 #: 模型位 / 提供方名：写进分流树、URL 路径与 OpenAI body，保守字符集。
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -373,10 +373,10 @@ def delete_model(model_id: str, request: Request,
                  conn: sqlite3.Connection = Depends(get_conn)):
     if ModelRepo(conn).get(model_id) is None:
         raise HTTPException(404, detail=f"unknown model {model_id}")
-    refs = model_references(StationRepo(conn).load(), model_id)
+    refs = model_references(RoutingTreeRepo(conn).list(), model_id)
     if refs:
         raise HTTPException(409, detail={
-            "message": f"model {model_id} 被分流树引用，先解除引用再删除",
+            "message": f"model {model_id} 被路由树引用，先解除引用再删除",
             "references": refs})
     publisher = request.app.state.publisher
     with publisher.locked():
@@ -546,26 +546,15 @@ async def fetch_models(body: FetchModelsIn, request: Request,
 # Signal registry
 # --------------------------------------------------------------------------- #
 @router.get("/signals")
-def get_signals(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
     # kind ('model'|'rule') + free (values not enumerable) drive the console's
     # fork-key candidates and the deterministic-vs-floor rendering (SPEC-TREE-4 §6).
     # groups follow the registry's canonical order (a raw set() is arbitrary).
-    #
-    # capability_route has *dynamic* values (the model ids that declare a
-    # profile.capability description). They are read from the model catalog so
-    # the tree editor gets a real model dropdown; when no model declares a
-    # description the signal stays free-form (and enabling a tree that
-    # references it is rejected by the enable health check).
-    capability_candidates = [row["id"] for row in ModelRepo(conn).list()
-                             if capability_of_model(row)]
-    payload = []
-    for spec in SIGNALS.values():
-        row = {**spec.__dict__, "free": not spec.values}
-        if spec.key == CAPABILITY_SIGNAL:
-            row["values"] = [(model_id, model_id, model_id)
-                             for model_id in capability_candidates]
-            row["free"] = not capability_candidates
-        payload.append(row)
+    # The retired capability-routing signal and its dynamic model-id values are
+    # gone with the capability endpoints; every remaining signal is a plain
+    # registry entry (rule signals carry keyword/time-period dynamic values).
+    payload = [{**spec.__dict__, "free": not spec.values}
+               for spec in SIGNALS.values()]
     return {"signals": payload,
             "groups": [g for g in GROUPS if any(s.group == g
                                                 for s in SIGNALS.values())],
@@ -762,98 +751,6 @@ def put_settings(body: dict, request: Request,
             SettingsRepo(conn).set(key, str(value))
         ChangeRepo(conn).record(_now(), "settings", {"keys": sorted(body)})
     return {"ok": True, "settings": SettingsRepo(conn).all()}
-
-
-# --------------------------------------------------------------------------- #
-# Natural-language capability routing (2026-10-26)
-# --------------------------------------------------------------------------- #
-class CapabilityPolicyIn(BaseModel):
-    """Global policy of the capability-routing signal (descriptions live on models)."""
-    instructions: str | None = None
-    min_prob: float | None = None
-    min_margin: float | None = None
-    fallback_model: str | None = None
-
-
-def _capability_payload(request: Request, conn: sqlite3.Connection) -> dict:
-    # The global capability pack is retired (the unified tree handles NL
-    # routing); the model catalog remains the single source of descriptions,
-    # and the (soon-to-be-removed) policy settings are read back as-is.
-    settings = SettingsRepo(conn)
-    models = ModelRepo(conn).list()
-    upstream = {m["id"]: m.get("upstream") or m["id"] for m in models}
-    declared = {m["id"]: capability_of_model(m) for m in models}
-    candidates = [
-        {"id": model_id, "capability": capability,
-         "upstream": upstream.get(model_id), "name": upstream.get(model_id)}
-        for model_id, capability in sorted(declared.items()) if capability
-    ]
-    return {
-        "configured": bool(candidates),
-        "enabled_engine": getattr(request.app.state.tagger, "name", ""),
-        "fingerprint": "",
-        "revision": settings.get("capability_revision") or "",
-        "instructions": settings.get(SETTING_INSTRUCTIONS),
-        "min_prob": settings.get(SETTING_MIN_PROB),
-        "min_margin": settings.get(SETTING_MIN_MARGIN),
-        "fallback_model": settings.get(SETTING_FALLBACK),
-        "candidates": candidates,
-        "missing": [{"id": model_id, "upstream": upstream.get(model_id)}
-                    for model_id, capability in sorted(declared.items())
-                    if not capability],
-        "models": [{"id": model_id, "upstream": upstream.get(model_id)}
-                   for model_id in sorted(upstream)],
-    }
-
-
-@router.get("/capability")
-def get_capability(request: Request,
-                   conn: sqlite3.Connection = Depends(get_conn)):
-    """Editing surface for the capability signal: policy + candidate summary.
-
-    The per-model description itself is a model-catalog field
-    (``profile.capability``), edited through POST/PUT /admin/models; this view
-    shows which models are candidates and which still miss a description.
-    """
-    return _capability_payload(request, conn)
-
-
-@router.put("/capability")
-def put_capability(body: CapabilityPolicyIn, request: Request,
-                   conn: sqlite3.Connection = Depends(get_conn)):
-    """Update the global capability policy (instructions / gates / fallback)."""
-    policy: dict[str, str] = {}
-    if body.instructions is not None:
-        try:
-            policy[SETTING_INSTRUCTIONS] = normalize_instructions(body.instructions)
-        except CapabilityPackError as exc:
-            raise HTTPException(422, detail=str(exc)) from exc
-    for name, value, key in (("min_prob", body.min_prob, SETTING_MIN_PROB),
-                             ("min_margin", body.min_margin, SETTING_MIN_MARGIN)):
-        if value is None:
-            continue
-        if (not isinstance(value, (int, float)) or isinstance(value, bool)
-                or not 0.0 <= float(value) <= 1.0):
-            raise HTTPException(422, detail=f"{name} 必须是 [0,1] 的数字")
-        policy[key] = str(float(value))
-    if body.fallback_model is not None:
-        fallback = body.fallback_model.strip()
-        if fallback and ModelRepo(conn).get(fallback) is None:
-            raise HTTPException(422, detail=f"unknown fallback model {fallback!r}")
-        policy[SETTING_FALLBACK] = fallback
-    if not policy:
-        raise HTTPException(422, detail="no policy field supplied")
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        with conn:                             # settings + audit commit together
-            for key, value in policy.items():
-                SettingsRepo(conn).set(key, value)
-            ChangeRepo(conn).record(_now(), "capability",
-                                    {"action": "policy",
-                                     "keys": sorted(policy)})
-        _publish_snapshot(request, conn)
-    payload = _capability_payload(request, conn)
-    return {"ok": True, **payload}
 
 
 @router.get("/changes")

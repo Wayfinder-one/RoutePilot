@@ -58,10 +58,8 @@ if TYPE_CHECKING:                                # pragma: no cover - typing onl
 #: ``config_revisions.kind`` of one effective snapshot document (design §8.2).
 REVISION_SNAPSHOT = "snapshot"
 
-#: Legacy Station-era revision kinds: ``router.store.repositories`` still imports
-#: them for the old pipeline document until the StationRepo removal task retires
-#: that bridge (Task 11).  Do not extend these.
-REVISION_PIPELINE = "pipeline"
+#: ``config_revisions.kind`` of the editable JEV signal-question config
+#: (``router.store.repositories.ensure_questions_revision`` appends it).
 REVISION_QUESTIONS = "questions"
 
 
@@ -126,24 +124,6 @@ def backends_document(backends: Mapping[str, "Backend"]) -> list[dict]:
 
 def backends_revision_of(backends: Mapping[str, "Backend"]) -> str:
     return sha256_text(canonical_json(backends_document(backends)))
-
-
-# --------------------------------------------------------------------------
-# Legacy Station document bridge (removed with the StationRepo task)
-# --------------------------------------------------------------------------
-def pipeline_document(stations) -> dict:
-    """Canonical Station document (what GET /admin/pipeline calls `stations`)."""
-    from router.pipeline.model import station_to_dict
-
-    return {"stations": [station_to_dict(station) for station in stations]}
-
-
-def pipeline_content(stations) -> str:
-    return canonical_json(pipeline_document(stations))
-
-
-def pipeline_revision_of(stations) -> str:
-    return sha256_text(pipeline_content(stations))
 
 
 # --------------------------------------------------------------------------

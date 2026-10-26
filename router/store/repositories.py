@@ -1,8 +1,8 @@
 """Repositories: one per aggregate, plain SQL, no ORM.
 
-The pipeline (stations) is stored as one JSON document per station and saved by
-wholesale replacement inside one transaction — station edits are rare and small,
-and replacement keeps ordering and deletion trivially correct.
+The unified routing trees live in :mod:`router.store.routing_trees` (one JSON
+document per tree, content-addressed revision); this module owns the catalog
+(models/providers), questions revisions, audit and user/session aggregates.
 
 Transaction convention: every write method owns its transaction — ``with
 self.conn:`` inside the method commits before it returns. The one deliberate
@@ -21,20 +21,24 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from router import auth
-from router.pipeline.model import Station, TreeNode, Weight, station_from_dict, \
-    station_to_dict
-from router.pipeline.snapshot import (REVISION_PIPELINE, REVISION_QUESTIONS,
-                                      canonical_json, pipeline_content,
+from router.pipeline.snapshot import (REVISION_QUESTIONS, canonical_json,
                                       sha256_text)
+from router.pipeline.tree import (NLChoice, Route, RoutingTree,
+                                  tree_revision_of, walk_nodes)
 from router.presets import PRESET_BY_ID
-
-#: Default confidence floor of a model-signal condition (2026-10-19 product
-#: decision). Rule signals are deterministic and carry no floor.
-CONF = 0.70
 
 
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _uid() -> str:
+    """Short random id for server-generated aggregate ids (e.g. tree ids).
+
+    Lives in the store layer so API layers never invent an id format; callers
+    import it explicitly (``router.api.routes_trees``).
+    """
+    return uuid.uuid4().hex[:12]
 
 
 def record_revision(conn: sqlite3.Connection, kind: str, content: str) -> str:
@@ -52,10 +56,6 @@ def record_revision(conn: sqlite3.Connection, kind: str, content: str) -> str:
     return sha
 
 
-def _uid() -> str:
-    return uuid.uuid4().hex[:12]
-
-
 DEFAULT_KEYWORD_GROUPS = {"医疗急症": ["急救", "急诊", "救护车", "晕倒"],
                           "账单": ["发票", "报销", "账单"]}
 
@@ -71,63 +71,20 @@ DEFAULT_MODELS = [
 ]
 
 
-def _node(node_id: str, signal: str | None, value: str,
-          conf_min: float | None, *, kind: str = "leaf",
-          action: str = "route", model: str | None = None,
-          min_score: float | None = None,
-          weights: list[Weight] | None = None,
-          children: list[TreeNode] | None = None) -> TreeNode:
-    return TreeNode(id=node_id, signal=signal, value=value, conf_min=conf_min,
-                    kind=kind, action=action, model=model,
-                    min_score=min_score, weights=weights or [],
-                    children=children or [])
-
-
-def default_pipeline() -> list[Station]:
-    """Four independent station trees: ① 安全闸 / ② 关键词直达 / ③ 学科 → 难度 / ④ 兜底.
-
-    All model-signal conditions default to a 0.70 confidence floor."""
-    safety = Station(id=_uid(), name="① 安全闸", root=_node(
-        "n1", None, "", None, kind="fork", children=[
-            _node("n1a", "jailbreak", "jailbreak", CONF,
-                  action="block"),
-            _node("n1b", "pii", "cn_id_card", CONF, action="block"),
-        ]))
-    keyword = Station(id=_uid(), name="② 关键词直达", root=_node(
-        "n2", None, "", None, kind="fork", children=[
-            _node("n2a", "keyword", "医疗急症", None,   # rule signal: no floor
-                  action="route", model="qwen3-8b-medical"),
-        ]))
-    subject = Station(id=_uid(), name="③ 学科 → 难度", root=_node(
-        "n3", None, "", None, kind="fork", children=[
-            _node("n3a", "domain", "health", CONF, kind="fork",
-                  children=[
-                      _node("n3a1", "complexity", "hard", CONF,
-                            action="route", model="qwen3-8b-medical"),
-                      _node("n3a2", "complexity", "easy", CONF,
-                            action="route", model="qwen3-0.6b-medical"),
-                  ]),
-            _node("n3b", "domain", "computer_science", CONF, kind="fork",
-                  children=[
-                      _node("n3b1", "complexity", "hard", CONF,
-                            action="route", model="deepseek-v3"),
-                  ]),
-        ]))
-    fallback = Station(id=_uid(), name="④ 兜底", root=_node(
-        "n4", None, "", None, action="route", model="qwen3-8b"))
-    return [safety, keyword, subject, fallback]
-
-
 def seed_default(conn: sqlite3.Connection) -> None:
-    """Seed an empty database (idempotent).
+    """Seed the catalog/provider/keyword/period data (idempotent).
 
     The local provider's base url comes from the preset catalog
     (``router.presets``), so the seeded provider and the console's preset
-    point at the same place.
+    point at the same place.  A fresh database gets **no routing tree**: all
+    trees start disabled, and an empty routing setup is a legal state that
+    ``/v1`` answers with ``503 no_active_tree`` — enabling/creating one is an
+    explicit ``/admin/trees`` operation, never an implicit seed.
     """
     TimePeriodRepo(conn).seed_defaults()
-    if conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0]:
-        return                                  # idempotent: only seed an empty DB
+    settings = SettingsRepo(conn)
+    if settings.get("catalog_seeded"):
+        return                          # seed the catalog exactly once per DB
     local = PRESET_BY_ID["local"]
     # Explicit column lists: v9 widened `providers` (reasoning_format/api_key),
     # so a bare `VALUES (...)` would break on the new table width.
@@ -144,57 +101,9 @@ def seed_default(conn: sqlite3.Connection) -> None:
         conn.execute("INSERT OR IGNORE INTO keyword_groups (name, words) "
                      "VALUES (?, ?)",
                      (name, json.dumps(words, ensure_ascii=False)))
-    StationRepo(conn).save(default_pipeline())
-    conn.commit()
-
-
-class StationRepo:
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
-
-    def load(self) -> list[Station]:
-        return [station_from_dict(json.loads(r["tree"]))
-                for r in self.conn.execute("SELECT tree FROM stations ORDER BY ord")]
-
-    def save(self, stations: list[Station]) -> str:
-        """Replace the whole pipeline, bump its version and record the revision.
-
-        One transaction: the stations rows, the version bump, the canonical
-        ``config_revisions`` content and ``settings.pipeline_revision`` are
-        committed together (a crash can never leave a tree whose revision is
-        unknown). Old revisions are never deleted — replay can load them.
-
-        Returns the canonical content sha (``pipeline_revision``).
-        """
-        content = pipeline_content(stations)
-        with self.conn:                          # one transaction: replace all
-            self.conn.execute("DELETE FROM stations")
-            for si, station in enumerate(stations):
-                self.conn.execute(
-                    "INSERT INTO stations (id, ord, name, tree) "
-                    "VALUES (?, ?, ?, ?)",
-                    (station.id, si, station.name,
-                     json.dumps(station_to_dict(station), ensure_ascii=False)))
-            v = int(SettingsRepo(self.conn).get("pipeline_version", "0")) + 1
-            SettingsRepo(self.conn).set("pipeline_version", str(v))
-            revision = record_revision(self.conn, REVISION_PIPELINE, content)
-            SettingsRepo(self.conn).set("pipeline_revision", revision)
-        return revision
-
-
-def ensure_pipeline_revision(conn: sqlite3.Connection,
-                             stations: list[Station]) -> str:
-    """Backfill the content revision for the CURRENT tree (idempotent).
-
-    Needed on the first boot after migration v15 (stations predate the
-    revisions table) and harmless afterwards: identical content maps to the
-    same sha, so the original revision row is kept.
-    """
-    content = pipeline_content(stations)
     with conn:
-        revision = record_revision(conn, REVISION_PIPELINE, content)
-        SettingsRepo(conn).set("pipeline_revision", revision)
-    return revision
+        settings.set("catalog_seeded", "1")
+    conn.commit()
 
 
 def ensure_questions_revision(conn: sqlite3.Connection, cfg: dict) -> str:
@@ -277,36 +186,35 @@ class ModelRepo:
         return cur.rowcount > 0
 
 
-def model_references(stations: list[Station], model_id: str) -> list[dict]:
-    """分树里引用 ``model_id`` 的节点：``[{station, node, via}]``（删除前 409 用）。
+def model_references(trees: list[RoutingTree], model_id: str) -> list[dict]:
+    """Nodes of the saved routing trees that reference ``model_id``.
 
-    Two reference kinds (2026-10-26): a route leaf targeting the model
-    (``via="target"``) and a ``capability_route`` row/weight naming it as a
-    candidate (``via="capability"``) — deleting a capability candidate would
-    otherwise leave a dead branch that silently falls through.
+    Deletion guard for ``DELETE /admin/models/{id}`` (409 while referenced).
+    One entry per real model reference, across **every** saved tree:
+
+    * ``via="route"`` — a terminal route targets the model, including the
+      auto-built route of a direct natural-language ``model`` candidate;
+    * ``via="nl_option"`` — that direct candidate itself, carrying the visible
+      ``nl_choice`` node id and candidate key so the console can point at it.
+
+    A condition/weight value that merely *spells* the model id is not a
+    reference: the retired ``capability_route`` signal matching is gone.
     """
     refs: list[dict] = []
-
-    def walk(station: Station, node: TreeNode) -> None:
-        if (node.kind == "leaf" and node.action == "route"
-                and node.model == model_id):
-            refs.append({"station": station.id, "node": node.id,
-                         "via": "target"})
-        if (node.signal == "capability_route"
-                and str(node.value) == model_id):
-            refs.append({"station": station.id, "node": node.id,
-                         "via": "capability"})
-        for weight in node.weights:
-            if weight.signal == "capability_route" \
-                    and str(weight.value) == model_id:
-                refs.append({"station": station.id, "node": node.id,
-                             "via": "capability"})
-        for child in node.children:
-            walk(station, child)
-
-    for station in stations:
-        if station.root is not None:
-            walk(station, station.root)
+    for tree in trees:
+        revision = tree.tree_revision or tree_revision_of(tree.root)
+        for node in walk_nodes(tree.root):
+            if isinstance(node, Route) and node.model == model_id:
+                refs.append({"tree_id": tree.id, "tree_revision": revision,
+                             "node_id": node.id, "via": "route"})
+            elif isinstance(node, NLChoice):
+                for option in node.options:
+                    if option.capability_model == model_id:
+                        refs.append({
+                            "tree_id": tree.id, "tree_revision": revision,
+                            "node_id": option.target.id, "via": "nl_option",
+                            "nl_node_id": node.id,
+                            "option_key": option.key})
     return refs
 
 

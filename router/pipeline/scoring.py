@@ -1,4 +1,4 @@
-"""Leaf scoring for the explicit-tree pipeline.
+"""Leaf scoring for the unified routing tree.
 
 A leaf with weighted conditions scores
 ``score = sum(w*c*m) / sum(w)`` — the weighted attainment rate, always in
@@ -12,7 +12,12 @@ Leaves without weights are direct hits and never call this module.
 from __future__ import annotations
 
 from router.pipeline.matching import match_row
-from router.pipeline.model import DEFAULT_MIN_SCORE, Weight
+from router.pipeline.tree import Weight
+
+#: Fallback attainment floor when a weighted terminal does not configure
+#: ``min_score`` (matches the console editor default; a 0.0 floor would let a
+#: weighted leaf pass with zero attainment).  Owned here with the formula.
+DEFAULT_MIN_SCORE = 0.50
 
 
 def leaf_score(weights: list[Weight], signals: dict,

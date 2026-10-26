@@ -98,8 +98,9 @@ def test_tag_returns_full_pack_with_rule_signals_and_no_embedding():
     t = tagger(lambda req: chat_response(json.dumps(VALID)))
     result = tag(t)
     signals = result.signals
-    # capability_route comes from the JEV decision model, not from this judge.
-    assert set(signals) == set(SIGNALS) - {"capability_route"}
+    # every registered signal is judged/produced by this tagger now
+    assert set(signals) == set(SIGNALS) == set(JUDGED_SIGNALS) | {
+        spec.key for spec in SIGNALS.values() if spec.kind == "rule"}
     assert signals["domain"] == {"value": "computer_science",
                                  "confidence": 0.9, "is_rule": False}
     assert signals["pii"]["value"] == ["cn_id_card", "password"]

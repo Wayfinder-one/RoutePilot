@@ -2,8 +2,8 @@
 
 import pytest
 
-from router.pipeline.model import Weight
-from router.pipeline.scoring import leaf_score
+from router.pipeline.scoring import DEFAULT_MIN_SCORE, leaf_score
+from router.pipeline.tree import Weight
 
 SIG = {"domain": {"value": "health", "confidence": 0.9, "is_rule": False},
        "complexity": {"value": "hard", "confidence": 0.8, "is_rule": False}}
@@ -41,8 +41,6 @@ def test_unset_min_score_defaults_to_half():
     """2026-10-21 audit P1 3.2: min_score=None used to fall back to a 0.0
     floor, letting a weighted leaf pass with zero attainment. It now falls
     back to DEFAULT_MIN_SCORE (0.5), matching the console editor default."""
-    from router.pipeline.model import DEFAULT_MIN_SCORE
-
     assert DEFAULT_MIN_SCORE == 0.5
     # no weighted condition matches -> attainment 0 -> must fail the 0.5 floor
     out = leaf_score([Weight("complexity", "easy", 1.0)],

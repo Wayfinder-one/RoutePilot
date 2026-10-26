@@ -1,10 +1,19 @@
+"""Store-layer smoke tests: idempotent seeding + the model-reference guard.
+
+The old Station pipeline repository is gone (2026-10-26 unified routing tree);
+trees live in ``router.store.routing_trees``.  ``seed_default`` only seeds the
+catalog/provider/keyword/period data — a fresh database has **no** routing tree
+until an operator creates and enables one through ``/admin/trees``.
+"""
+
 import pytest
 
-from router.pipeline.model import Station
+from router.pipeline.tree import (Branch, NLChoice, NLOption, Route,
+                                  RoutingTree, When)
 from router.store.db import connect, migrate
-from router.store.repositories import (KeywordRepo, ModelRepo, SettingsRepo,
-                                       StationRepo, default_pipeline,
-                                       seed_default)
+from router.store.repositories import (KeywordRepo, ModelRepo,
+                                       model_references, seed_default)
+from router.store.routing_trees import RoutingTreeRepo
 
 
 @pytest.fixture
@@ -15,62 +24,89 @@ def conn(tmp_path):
     c.close()
 
 
-def test_seed_idempotent(conn):
+def test_seed_is_idempotent_and_creates_no_routing_tree(conn):
     seed_default(conn)
     seed_default(conn)
-    stations = StationRepo(conn).load()
-    assert [s.name for s in stations] == \
-        ["① 安全闸", "② 关键词直达", "③ 学科 → 难度", "④ 兜底"]
     assert len(ModelRepo(conn).list()) == 5
     assert "医疗急症" in KeywordRepo(conn).groups()
+    # no implicit live routing: a fresh DB has zero trees (all disabled is legal)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM routing_trees").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0] == 0
 
 
-def test_station_save_bumps_version(conn):
-    seed_default(conn)
-    repo = StationRepo(conn)
-    v0 = SettingsRepo(conn).get("pipeline_version", "0")
-    stations = repo.load()
-    stations[0].name = "改名"
-    repo.save(stations)
-    assert SettingsRepo(conn).get("pipeline_version") != v0
-    assert repo.load()[0].name == "改名"
+def _route_tree() -> RoutingTree:
+    return RoutingTree(
+        id="t-route", name="Route tree", enabled=False,
+        root=Branch(id="root", children=(
+            Route("r1", "m1"),
+            Route("r2", "m2"),
+        ), otherwise=Route("route-fallback", "m0")))
 
 
-def test_station_roundtrip_tree(conn):
-    seed_default(conn)
-    stations = StationRepo(conn).load()
-    subject = stations[2]
-    assert subject.name == "③ 学科 → 难度"
-    assert subject.root.signal is None and subject.root.kind == "fork"
-    health = subject.root.children[0]
-    assert health.signal == "domain" and health.value == "health"
-    assert health.conf_min == 0.70      # uniform default floor
-    leaves = {leaf.value: leaf for leaf in health.children}
-    assert leaves["hard"].model == "qwen3-8b-medical"
-    assert leaves["easy"].model == "qwen3-0.6b-medical"
-    fallback = stations[-1]
-    assert fallback.root.signal is None and fallback.root.action == "route"
-    assert fallback.root.model == "qwen3-8b"
+def _nl_tree() -> RoutingTree:
+    return RoutingTree(
+        id="t-nl", name="NL tree", enabled=False,
+        root=NLChoice(
+            id="nl", instructions="choose",
+            options=(
+                NLOption("a", "", Route("nl/options/a", "m1"), "m1"),
+                NLOption("b", "deep path", Route("b-route", "m2")),
+            ),
+            otherwise=Route("nl-fallback", "m0")))
 
 
-def test_seeded_floors_are_uniform_and_healthy(conn):
-    from router.pipeline.health import check_pipeline
-    seed_default(conn)
-    stations = StationRepo(conn).load()
+def test_model_references_reports_route_nodes(conn):
+    repo = RoutingTreeRepo(conn)
+    saved = repo.create("t-route", "Route tree", _route_tree().root)
 
-    def walk(node):
-        if node.signal is not None and node.conf_min is not None:
-            assert node.conf_min == 0.70, node.id
-        for child in node.children:
-            walk(child)
-
-    for station in stations:
-        walk(station.root)
-    assert check_pipeline(stations, {m["id"] for m in ModelRepo(conn).list()}) == []
+    refs = model_references(repo.list(), "m1")
+    assert len(refs) == 1
+    assert set(refs[0]) == {"tree_id", "tree_revision", "node_id", "via"}
+    assert refs[0]["tree_id"] == "t-route"
+    assert refs[0]["tree_revision"] == saved.tree_revision
+    assert refs[0]["node_id"] == "r1"
+    assert refs[0]["via"] == "route"
+    assert model_references(repo.list(), "no-such-model") == []
 
 
-def test_default_pipeline_shape():
-    stations = default_pipeline()
-    assert len(stations) == 4
-    assert isinstance(stations[0], Station)
-    assert stations[0].root.kind == "fork"
+def test_model_references_reports_direct_nl_model_candidates(conn):
+    repo = RoutingTreeRepo(conn)
+    saved = repo.create("t-nl", "NL tree", _nl_tree().root)
+    trees = repo.list()
+
+    refs = model_references(trees, "m1")
+    option_refs = [ref for ref in refs if ref["via"] == "nl_option"]
+    assert len(option_refs) == 1
+    option = option_refs[0]
+    assert option["tree_id"] == "t-nl"
+    assert option["tree_revision"] == saved.tree_revision
+    assert option["node_id"] == "nl/options/a"       # auto-built route target
+    assert option["nl_node_id"] == "nl"
+    assert option["option_key"] == "a"
+    # the auto-built route is also a route reference (delete-guard parity)
+    auto = [ref for ref in refs
+            if ref["via"] == "route" and ref["node_id"] == "nl/options/a"]
+    assert len(auto) == 1
+
+    # a child candidate's target route is a plain route reference
+    m2 = model_references(trees, "m2")
+    assert [ref["node_id"] for ref in m2 if ref["via"] == "route"] == [
+        "b-route"]
+
+
+def test_model_references_does_not_treat_signal_strings_as_references(conn):
+    """Only real model references count — a condition value naming the model
+    (the retired ``capability_route`` matching) is not a reference."""
+    tree = RoutingTree(
+        id="t-signal", name="signal", enabled=False,
+        root=Branch(id="root", children=(
+            Route("signal-only", "other-model",
+                  when=When("capability_route", "m1")),
+        ), otherwise=Route("signal-fallback", "m0")))
+    RoutingTreeRepo(conn).create("t-signal", "signal", tree.root)
+
+    refs = model_references(RoutingTreeRepo(conn).list(), "m1")
+    assert refs == []
+    assert all("capability" not in ref["via"] for ref in
+               model_references(RoutingTreeRepo(conn).list(), "other-model"))

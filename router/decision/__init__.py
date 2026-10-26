@@ -1,34 +1,43 @@
-"""Decision-model routing helpers (natural-language capability routing)."""
+"""Decision-model routing helpers (unified routing tree).
 
-from router.decision.capability import (CapabilityConfigError, build_choice_record,
-                                        decide, fingerprint,
-                                        load_capability_config, rank,
-                                        score_with_tagger,
-                                        validate_capability_config)
-from router.decision.pack import (CAPABILITY_SIGNAL, CapabilityPackError,
-                                  POLICY_SETTINGS, build_pack, capability_of_model,
-                                  empty_pack, is_configured, normalize_capability,
-                                  normalize_instructions, pack_document,
-                                  pack_revision)
+The decision layer exposes exactly three pure boundaries, consumed by the tree
+compiler/evaluator and the admin API:
+
+* :mod:`router.decision.catalog` — the model catalog side of routing: validate
+  and read ``profile.capability`` (the natural-language text of a direct model
+  candidate).  Survives the unified-tree migration because it is a model-catalog
+  field, not a routing policy.
+* :mod:`router.decision.choice` — the pure JEV ``choice`` record builder and
+  probability decoder used by the decision adapter.
+* :mod:`router.decision.runner` — the :class:`DecisionRunner` protocol plus the
+  request/result DTOs every adapter implements.
+
+The retired flat capability policy (global instructions/thresholds/fallback and
+the decision-only candidate signal) and its pack module were removed with the
+unified routing tree (2026-10-26); per-node ``nl_choice`` configuration replaced
+them.  The concrete JEV adapter lives in ``router.decision.jev_runner`` and is
+wired by ``router.api.app``.
+
+Pure package: no torch, no sqlite, no FastAPI.
+"""
+
+from router.decision.catalog import (MAX_CAPABILITY_CHARS, CapabilityPackError,
+                                     capability_of_model, normalize_capability)
+from router.decision.choice import (ChoiceError, build_choice_record,
+                                    decode_choice)
+from router.decision.runner import (ChoiceOption, ChoiceRequest, ChoiceResult,
+                                    DecisionRunner)
 
 __all__ = [
-    "CAPABILITY_SIGNAL",
-    "CapabilityConfigError",
+    "MAX_CAPABILITY_CHARS",
     "CapabilityPackError",
-    "POLICY_SETTINGS",
+    "ChoiceError",
+    "ChoiceOption",
+    "ChoiceRequest",
+    "ChoiceResult",
+    "DecisionRunner",
     "build_choice_record",
-    "build_pack",
     "capability_of_model",
-    "decide",
-    "empty_pack",
-    "fingerprint",
-    "is_configured",
-    "load_capability_config",
+    "decode_choice",
     "normalize_capability",
-    "normalize_instructions",
-    "pack_document",
-    "pack_revision",
-    "rank",
-    "score_with_tagger",
-    "validate_capability_config",
 ]

@@ -107,32 +107,22 @@ def test_choice_module_does_not_import_the_jev_tagger():
                 if "signals" in name or "jev" in name.lower()]
 
 
-# ── boundary ownership: catalog must not depend on the retiring module ─────
-def test_catalog_is_importable_without_the_retiring_capability_module():
-    """Task 11 deletes ``router/decision/capability.py``; catalog must stand alone.
+# ── boundary ownership: catalog stands alone after Task 11 ────────────────
+def test_catalog_is_importable_without_the_retired_policy_modules():
+    """The model-catalog boundary must not depend on the retired policy modules.
 
-    The subprocess pre-registers a stub ``router.decision`` package so importing
-    the submodule skips ``router/decision/__init__.py`` (which still imports the
-    capability-policy helpers); the only thing under test is whether
-    ``catalog.py`` itself pulls in the retiring module.
+    Task 11 deletes the flat capability-policy module and its pack; the catalog
+    survives (``profile.capability`` is a model-catalog field), so importing it
+    in a fresh interpreter must work and must not pull the retired modules in.
     """
     repo_root = Path(__file__).resolve().parent.parent
     script = textwrap.dedent("""
-        import pathlib
         import sys
-        import types
-
-        import router
-
-        decision_dir = pathlib.Path(router.__file__).parent / "decision"
-        package = types.ModuleType("router.decision")
-        package.__path__ = [str(decision_dir)]
-        sys.modules["router.decision"] = package
 
         import router.decision.catalog as catalog
 
-        assert "router.decision.capability" not in sys.modules, (
-            "catalog must not import the retiring capability module")
+        assert "router.decision.capability" not in sys.modules
+        assert "router.decision.pack" not in sys.modules
         assert catalog.MAX_CAPABILITY_CHARS == 2000
         assert catalog.normalize_capability("  x  ") == "x"
         print("catalog-isolated-ok")
@@ -142,22 +132,6 @@ def test_catalog_is_importable_without_the_retiring_capability_module():
         capture_output=True, text=True, check=False)
     assert completed.returncode == 0, completed.stderr
     assert "catalog-isolated-ok" in completed.stdout
-
-
-def test_max_capability_chars_is_shared_with_the_retiring_module():
-    from router.decision import capability, catalog
-
-    assert catalog.MAX_CAPABILITY_CHARS == 2000
-    assert capability.MAX_CAPABILITY_CHARS == catalog.MAX_CAPABILITY_CHARS
-
-
-def test_pack_forwards_the_catalog_boundary_names():
-    """Task 11 keeps these import paths working until pack.py itself is deleted."""
-    from router.decision import catalog, pack
-
-    assert pack.CapabilityPackError is catalog.CapabilityPackError
-    assert pack.normalize_capability is catalog.normalize_capability
-    assert pack.capability_of_model is catalog.capability_of_model
 
 
 # ── deliberate fail-open tightening at the adapter boundary ────────────────

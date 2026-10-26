@@ -38,12 +38,10 @@ from router.signals.tagger import TagRequest, TagResult
 
 logger = logging.getLogger(__name__)
 
-#: Model signals judged by the prompt. ``capability_route`` is excluded: it is
-#: produced by the JEV decision model from the model catalog (router/decision),
-#: not by a judgeable question in this prompt config.
+#: Model signals judged by the prompt (every registered model signal; the
+#: retired decision-only candidate signal is gone with the unified tree).
 JUDGED_SIGNALS: tuple[str, ...] = tuple(
-    key for key, spec in SIGNALS.items()
-    if spec.kind == "model" and key != "capability_route")
+    key for key, spec in SIGNALS.items() if spec.kind == "model")
 
 #: Shipped default prompt config (edit the JSON, not this module).
 DEFAULT_PROMPTS_PATH = (Path(__file__).resolve().parent.parent.parent

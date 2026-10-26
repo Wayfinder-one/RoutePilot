@@ -87,15 +87,17 @@ def test_requests_stats_endpoint(tmp_path):
 
 
 def test_signals_endpoint_includes_keyword_groups(tmp_path):
+    """Every registry signal is exposed with its metadata; rule signals carry
+    the dynamic keyword/time-period values.  The retired capability-routing
+    endpoints and their model-dropdown value injection are gone (Task 11): the
+    direct-model candidates now live in the routing tree editor, not in a
+    routing signal's value list."""
     from router.signals.registry import SIGNALS
     body = client(tmp_path).get("/admin/signals").json()
     assert len(body["signals"]) == len(SIGNALS)
     assert "医疗急症" in body["keyword_groups"]
-    # capability_route has dynamic model-id values, injected from the snapshot
-    # pack; unconfigured ⇒ free-form + no values.
-    capability = next(s for s in body["signals"]
-                      if s["key"] == "capability_route")
-    assert capability["free"] is True and capability["values"] == []
+    for row in body["signals"]:
+        assert {"key", "kind", "group", "free"} <= set(row)
 
 
 def test_overview(tmp_path):

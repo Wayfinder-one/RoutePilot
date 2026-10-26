@@ -75,9 +75,7 @@ def tag(tagger, req):
 def test_full_pack_and_canonical_values(tmp_path):
     tagger, _ = build(tmp_path)
     s = tag(tagger, TagRequest(text="hello"))
-    # capability_route is produced by the JEV decision model only (not by the
-    # multi-head checkpoint tagger), so the checkpoint pack excludes it.
-    assert set(s) == set(SIGNALS) - {"capability_route"}
+    assert set(s) == set(SIGNALS)
     assert s["domain"]["value"] == "biology"
     assert s["complexity"]["value"] == "easy"
     assert s["jailbreak"]["value"] == "benign"

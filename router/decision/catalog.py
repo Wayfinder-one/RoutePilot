@@ -13,23 +13,21 @@ that text and the tolerant read the routing hot path uses:
 
 Pure module: no torch, no sqlite, no FastAPI.
 
-(2026-10-26 unified routing tree, Task 1: extracted from
-``router.decision.pack``; that module still forwards the two public names for
-its existing callers until the cleanup task retires it.)
+(2026-10-26 unified routing tree: extracted from the retired decision pack and
+kept as the model-catalog boundary after Task 11; ``profile.capability`` is a
+model field, not a routing policy, so this module survives the cleanup.)
 
-This module deliberately imports **nothing** from
-``router.decision.capability``: that capability-policy module is retired by the
-cleanup task, while the model-catalog boundary survives (``profile.capability``
-stays a model field), so the length limit moved here with the validator.
+This module deliberately imports **nothing** from the retired capability-policy
+modules: the catalog must be importable on its own (it outlives them), so the
+description length limit moved here with the validator.
 """
 
 from __future__ import annotations
 
 import json
 
-#: Max chars of one model's ``profile.capability`` description.  Re-exported by
-#: ``router.decision.capability`` for its legacy config validator until that
-#: module is retired; the catalog owns the value.
+#: Max chars of one model's ``profile.capability`` description (product limit;
+#: owned by the catalog because that is the surviving boundary).
 MAX_CAPABILITY_CHARS = 2000
 
 #: Model profile key holding the natural-language capability description.

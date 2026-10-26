@@ -237,14 +237,38 @@ def test_put_model_rejects_unknown_provider(client, app):
         conn.close()
 
 
-def test_delete_model_referenced_409_then_ok(client):
-    r = client.delete("/admin/models/qwen3-8b")     # seeded fallback references it
+def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
+    """Reference check now walks the SAVED routing trees (Task 11): both a
+    route target and a direct natural-language model option block the delete,
+    and every finding names its tree/node/edge (``via``)."""
+    route_root = {"id": "root", "type": "route", "model": "qwen3-8b"}
+    created = client.post("/admin/trees", json={
+        "id": "ref-tree", "name": "Ref", "root": route_root})
+    assert created.status_code == 201, created.text
+    nl_root = {
+        "id": "nl-root", "type": "nl_choice", "instructions": "choose",
+        "options": [
+            {"key": "fast", "model": "qwen3-8b"},
+            {"key": "deep", "model": "qwen3-32b"},
+        ],
+        "otherwise": {"id": "fallback", "type": "route", "model": "qwen3-32b"},
+    }
+    created = client.post("/admin/trees", json={
+        "id": "nl-ref", "name": "NL Ref", "root": nl_root})
+    assert created.status_code == 201, created.text
+
+    r = client.delete("/admin/models/qwen3-8b")
     assert r.status_code == 409
     detail = r.json()["detail"]
-    assert detail["references"]
-    assert detail["references"][0]["station"] and detail["references"][0]["node"]
+    assert "路由树引用" in detail["message"]
+    refs = detail["references"]
+    assert {ref["tree_id"] for ref in refs} == {"ref-tree", "nl-ref"}
+    for ref in refs:
+        assert ref["tree_id"] and ref["node_id"] and ref["via"]
+        assert "tree_revision" in ref
     assert "qwen3-8b" in {m["id"] for m in
                           client.get("/admin/models").json()["models"]}
+
     assert client.delete("/admin/models/nope").status_code == 404
     # unreferenced model deletes fine
     assert client.post("/admin/models", json={

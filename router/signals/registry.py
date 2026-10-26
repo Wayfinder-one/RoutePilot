@@ -13,8 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-GROUPS = ("safety", "domain", "difficulty", "context", "session", "decision",
-          "rule")
+GROUPS = ("safety", "domain", "difficulty", "context", "session", "rule")
 
 
 @dataclass(frozen=True)
@@ -96,16 +95,6 @@ _SPECS = (
                        ("need_clarification", "需澄清", "Need Clarification"),
                        ("wrong_answer", "答错了", "Wrong Answer"),
                        ("want_different", "想换个", "Want Different"))),
-    #: Natural-language capability routing (2026-10-26): the tagger asks the
-    #: JEV decision model which capability description fits the request and
-    #: reports the chosen model id as the value. Values are the **model catalog
-    #: ids that carry a profile.capability description** — dynamic, so the
-    #: palette/values are injected by GET /admin/signals from the snapshot pack
-    #: (``router/decision/pack.py``). Confidence = entropy confidence of the
-    #: candidate distribution; the pack's min_prob/min_margin gates select the
-    #: fallback model before the signal is emitted (fail-open).
-    SignalSpec("capability_route", "模型选择", "Model Choice", "decision",
-               "model"),
     SignalSpec("keyword", "关键词", "Keyword", "rule", "rule", multi=True),  # values = lexicon groups, dynamic
     SignalSpec("tenant", "身份", "Tenant", "rule", "rule"),                  # header value, free-form
     SignalSpec("time_window", "时段", "Time Window", "rule", "rule",

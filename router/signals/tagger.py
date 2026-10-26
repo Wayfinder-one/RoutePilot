@@ -24,14 +24,6 @@ class TagRequest:
     #: complete pack — the default for /admin/try, the eval endpoints and every
     #: tagger that does not implement trimming.
     scope: "SignalScope | None" = None
-    #: Capability-routing pack (``router/decision/pack.py``) for this request:
-    #: ``{candidates: {model_id: description}, instructions, min_prob,
-    #: min_margin, fallback_model, fingerprint}``. ``None`` = no capability
-    #: routing configured; the tagger then emits no ``capability_route`` signal
-    #: (a tree that references it misses, and startup health rejects that tree).
-    #: Passed per request from the immutable snapshot so a mid-flight config
-    #: write cannot desync the decision from its fingerprint.
-    capability: dict | None = None
     #: Fixed signal-question config for this request, captured in the immutable
     #: routing snapshot (``RoutingSnapshot.questions``, thawed to a plain dict).
     #: ``None`` = use the tagger's current config — the historical behaviour for

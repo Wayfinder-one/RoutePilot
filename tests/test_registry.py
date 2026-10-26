@@ -2,11 +2,13 @@ from router.signals.registry import GROUPS, SIGNALS
 
 
 def test_registry_shape():
-    assert len(SIGNALS) == 16
-    assert sum(1 for s in SIGNALS.values() if s.kind == "model") == 8
+    # The retired decision-only candidate signal is gone with the unified tree:
+    # 15 signals = 7 model + 8 rule, and no empty "decision" palette group.
+    assert len(SIGNALS) == 15
+    assert sum(1 for s in SIGNALS.values() if s.kind == "model") == 7
     assert sum(1 for s in SIGNALS.values() if s.kind == "rule") == 8
-    assert set(GROUPS) == {"safety", "domain", "difficulty",
-                           "context", "session", "decision", "rule"}
+    assert set(GROUPS) == {"safety", "domain", "difficulty", "context",
+                           "session", "rule"}
     for spec in SIGNALS.values():
         assert spec.kind in ("model", "rule")
         assert spec.group in GROUPS

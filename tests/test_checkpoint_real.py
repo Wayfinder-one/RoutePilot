@@ -55,7 +55,7 @@ def test_real_checkpoint_tags_all_signals_with_canonical_values():
     result = asyncio.run(tagger.tag(TagRequest(text="用 Python 写一个快速排序算法")))
 
     signals = result.signals
-    assert set(signals) == set(SIGNALS)                    # 15 signals
+    assert set(signals) == set(SIGNALS)                    # 15 ordinary signals
     assert signals["domain"]["is_rule"] is False
     domain_values = {v[0] for v in SIGNALS["domain"].values}
     assert signals["domain"]["value"] in domain_values
