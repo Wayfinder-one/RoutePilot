@@ -1,1396 +1,1164 @@
-/* Routing-tree console — explicit-tree editor (2026-10-19 rewrite).
+/* Unified routing-tree console — composition root (2026-10-26 rewrite).
 
-   Each station is an independent ordered tree:
-     Station {id, name, root}
-     TreeNode {id, signal?, value, conf_min, kind: leaf|fork,
-               action, model, min_score, weights[], children[]}
+   This file wires the modules into the page and owns *only* page concerns:
+   boot data, tree list, editor popovers, import/export, try drawer, keyboard
+   shortcuts and the DND controller lifecycle.
 
-   A LEAF is terminal: direct hit (命中路由) or weighted scoring (weight chips +
-   达成率门槛). A FORK holds ordered children; the first child that produces a
-   decision wins — when several matching children end in weighted leaves, the
-   highest score wins (direct-hit leaves keep their order). Children are
-   independent branches.
+   Node semantics live in exactly one place each:
+     routing-tree-model.js   pure tree data / full out-edge model / mutations
+     routing-tree-store.js   per-tree draft+saved+dirty+revision state
+     routing-tree-view.js    read-only DOM renderer
+     routing-tree-editor.js  per-type forms + pure apply helpers
+     routing-tree-dnd.js     destroyable pointer drag controller
 
-   Editing model:
-   - a station is created by picking a root condition (or an
-     unconditional entry); the root's condition value is not editable in place
-   - [+] on any node opens the same signal→value picker and adds a CHILD node
-   - [−] deletes a node and its subtree (undo toast); the root's [−] deletes
-     the station (the last station is the locked fallback)
-   - dragging a signal onto a LEAF adds a weighted condition; dragging a signal
-     the leaf already carries forks the leaf on that signal (children for the
-     weighted values + one more value)
-   - changing a condition's value = delete the node and rebuild it
-*/
-const $ = (s, r = document) => (r || document).querySelector(s);
-const $$ = (s, r = document) => Array.from((r || document).querySelectorAll(s));
+   No second node interpreter here: this file never walks `children`/`options`
+   itself, it asks the model/view/editor.
 
-/* ── state ───────────────────────────────────────────────────────────── */
+   Backend contract (Task 9, frozen): GET/POST /admin/trees,
+   GET/PUT /admin/trees/{id}, POST /admin/trees/{id}/copy|enable|disable,
+   POST /admin/try {tree_id,text,headers,n_messages}. Saves never send
+   `enabled`; activation always re-reads the server list. */
+"use strict";
+
+const $ = (selector, scope = document) => (scope || document).querySelector(selector);
+const $$ = (selector, scope = document) => Array.from((scope || document).querySelectorAll(selector));
+const nid = prefix => (prefix || "n") + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+const NODE_TYPES = ["branch", "nl_choice", "route", "block"];
+const DEFAULT_CONF_MIN = 0.7;      // model-signal when floor (engine default, mirrors the tree editor default)
+const DEFAULT_WEIGHT = 0.5;
+const REV_CHARS = 8;               // short revision display
+
+/* ── UI-only state (per-tree state lives in SRTreeStore) ─────────────── */
+let SIGNALS = [];
 let GROUPS = [];
 let KEYWORD_GROUPS = [];
 let TIME_PERIODS = [];
-let MODELS = [];
-let MODEL_INFO = {};           // id -> normalized reasoning object (§3.2)
-let stations = [];             // API shape: [{id,name,root}]
-let version = '0';
-let tagger = {};
-let lastTry = null;
-let dragSig = null;
-let dragNodeId = null;
-let nodeDrop = null;
-let popTarget = null;
-let uid = 0;
-let savedJson = null;
-const nid = p => (p || 'x') + Date.now().toString(36) + (++uid).toString(36);
+let dnd = null;
+let pendingSignal = null;          // palette click -> explicit drop zone
+let popContext = null;             // {kind, nodeId, anchor} of the open popover
+let tryBusy = false;
+let lastDropAt = 0;
 
-/* ── editor defaults (mirror router/pipeline/model.py) ───────────────── */
-const DEFAULT_CONF_MIN = 0.70;      // condition confidence floor
-const DEFAULT_WEIGHT = 0.50;        // weight of a dragged-in condition
-const DEFAULT_MIN_SCORE = 0.50;     // attainment floor of a weighted leaf
+const shortRev = rev => (rev ? String(rev).slice(0, REV_CHARS) : "—");
+const modelsById = () => SRTreeStore.state.modelsById;
+const currentTreeId = () => SRTreeStore.selectedTreeId();
+const currentTree = () => SRTreeStore.selectedTree();
+const currentDraft = () => SRTreeStore.draft(currentTreeId());
 
-/* ── i18n / signal helpers (shared.js) ───────────────────────────────── */
-const groupName = g => t('group.' + g);
-const condText = n => n.signal
-  ? `${sigName(n.signal)} = ${valLabel(n.signal, n.value) || n.value}`
-  : t('p6.entry');
-
-/* ── model reasoning capability (docs §3.2) ──────────────────────────── */
-const modelReasoning = id => MODEL_INFO[id] || FALLBACK_REASON;
-const modelEfforts = id => {
-  const r = modelReasoning(id);
-  if (!r || !r.declared || r.supported === false) return [];
-  return Array.isArray(r.efforts) ? r.efforts : [];
-};
-const reasonName = lvl => t('reason.' + lvl);
-const reasonSuffix = n => (n && n.reasoning ? ' · ' + reasonName(n.reasoning) : '');
-
-/* ── tree helpers ────────────────────────────────────────────────────── */
-const findStation = id => stations.find(s => s.id === id);
-function walkNodes(node, cb, parent = null) {
-  cb(node, parent);
-  (node.children || []).forEach(child => walkNodes(child, cb, node));
+/* ── i18n / issue helpers ────────────────────────────────────────────── */
+const tr = (key, vars) => (vars ? tf(key, vars) : t(key));
+const groupName = group => t('group.' + group);
+function issueText(item) {
+  if (item == null) return "";
+  if (typeof item === "string") return item;
+  const zh = item.zh || item.code || "";
+  const en = item.en || item.zh || item.code || "";
+  return LANG === "zh" ? zh : en;
 }
-function findNodeRef(nodeId) {
-  for (const station of stations) {
-    let found = null;
-    walkNodes(station.root, (node, parent) => {
-      if (node.id === nodeId) found = { station, node, parent };
-    });
-    if (found) return found;
+function errText(err) {
+  const detail = err && err.detail;
+  if (Array.isArray(detail)) return detail.map(issueText).filter(Boolean).join("; ");
+  if (detail) return issueText(detail) || String(detail);
+  return (err && err.message != null) ? String(err.message) : String(err);
+}
+function issueList(err) {
+  return err && Array.isArray(err.detail) ? err.detail : null;
+}
+function localIssue(code, message) {
+  return {code: code, zh: message, en: message, level: "hard", node_id: ""};
+}
+
+/* ── chrome: issues / warnings / dirty / revisions ───────────────────── */
+function renderIssues(list) {
+  const box = $("#issues");
+  if (!box) return;
+  const items = Array.isArray(list) ? list : [];
+  box.innerHTML = items.map(item => {
+    const nodeId = item && item.node_id ? item.node_id : "";
+    const locate = nodeId
+      ? `<button type="button" class="iv-locate" data-issue-node="${esc(nodeId)}">${esc(nodeId)}</button>`
+      : "";
+    const level = item && item.level === "warn" ? "warn" : "hard";
+    return `<div class="iv ${level}">• ${esc(issueText(item))}${locate}</div>`;
+  }).join("");
+}
+function renderWarnings(list) {
+  const box = $("#warnings");
+  if (!box) return;
+  const items = Array.isArray(list) ? list : [];
+  box.innerHTML = items.map(item => `<div class="iv warn">• ${esc(issueText(item))}</div>`).join("");
+  box.classList.toggle("show", items.length > 0);
+}
+function renderChrome() {
+  const tree = currentTree();
+  const dirty = tree ? SRTreeStore.isDirty(tree.id) : false;
+  const save = $("#saveTree");
+  if (save) {
+    save.classList.toggle("has-dirty", dirty);
+    save.title = dirty ? tr("pipeline.dirty") : tr("pipeline.clean");
   }
-  return null;
-}
-function usedSignals() {
-  const used = new Set();
-  stations.forEach(st => st.root && walkNodes(st.root, n => {
-    if (n.signal) used.add(n.signal);
-    (n.weights || []).forEach(w => used.add(w.signal));
-  }));
-  return used;
-}
-const isFallback = st => stations.length && st.id === stations[stations.length - 1].id;
-
-/* ── header / dirty ──────────────────────────────────────────────────── */
-function isDirty() { return savedJson == null || JSON.stringify(stations) !== savedJson; }
-function renderDirty() {
-  const btn = $('#savePipeline');
-  if (!btn) return;
-  btn.classList.toggle('has-dirty', isDirty());
-  btn.title = isDirty() ? t('pipe.dirty') : t('pipe.clean');
-}
-function renderHeader() {
-  $('#exportPipeline').title = t('p4.exportTitle');
-  $('#importPipeline').title = t('p4.importTitle');
-  renderDirty();
-}
-function markDirty() { renderDirty(); }
-
-/* ── palette ─────────────────────────────────────────────────────────── */
-function renderPalette() {
-  $('#palBody').innerHTML = GROUPS.map(g => {
-    const items = Object.values(SIGNAL_REGISTRY).filter(s => s.group === g);
-    if (!items.length) return '';
-    return `<section class="grp">
-      <h3>${esc(groupName(g))}<span class="rl"></span></h3>
-      <div class="chips">${items.map(s =>
-        `<button class="sig" data-sig="${esc(s.key)}" draggable="true"
-                 title="${esc(t('p4.sigTitle'))}">
-           <svg class="grip" width="7" height="11" viewBox="0 0 7 11" fill="currentColor" aria-hidden="true">
-             <circle cx="1.5" cy="1.5" r="1.2"/><circle cx="5.5" cy="1.5" r="1.2"/>
-             <circle cx="1.5" cy="5.5" r="1.2"/><circle cx="5.5" cy="5.5" r="1.2"/>
-             <circle cx="1.5" cy="9.5" r="1.2"/><circle cx="5.5" cy="9.5" r="1.2"/>
-           </svg>${esc(sigName(s.key))}</button>`).join('')}</div>
-    </section>`;
-  }).join('');
-  $('#palCount').textContent = Object.keys(SIGNAL_REGISTRY).length + (LANG === 'zh' ? ' 个' : '');
-}
-function syncPalFade() {
-  const body = $('#palBody');
-  body.classList.toggle('more',
-    body.scrollHeight - body.scrollTop - body.clientHeight > 2);
-}
-
-/* ── tree rendering ──────────────────────────────────────────────────── */
-function conditionChip(n) {
-  const conf = n.signal
-    ? (isRuleSig(n.signal)
-        ? `<button class="tn-conf det" data-cond="${esc(n.id)}">${esc(t('p4.deterministic'))}</button>`
-        : `<button class="tn-conf" data-cond="${esc(n.id)}">${esc(t('p4.confFloor'))}${(n.conf_min != null ? n.conf_min : DEFAULT_CONF_MIN).toFixed(2)}</button>`)
-    : '';
-  return `<button class="tn-cond${n.signal ? '' : ' entry'}" data-cond="${esc(n.id)}">${esc(condText(n))}</button>${conf}`;
-}
-
-function outcomeChip(n) {
-  if (n.action === 'block') {
-    return `<button class="tn-out block" data-out="${esc(n.id)}">${esc(t('pipe.block'))}</button>`;
+  const pill = $("#snapshotPill");
+  if (pill) {
+    const snapshot = SRTreeStore.snapshotRevision();
+    const revision = tree ? tree.tree_revision : "";
+    pill.textContent = tree
+      ? tr("pipeline.snapshot", {snapshot: shortRev(snapshot), tree: shortRev(revision)})
+      : tr("pipeline.noSnapshot");
+    pill.title = tr("pipeline.snapshotTitle") + " " + (snapshot || "—");
   }
-  const rl = reasonSuffix(n);
-  const text = n.model
-    ? esc(t('pipe.route')) + '<code>' + esc(n.model) + '</code>' +
-      (rl ? `<span class="tn-reason${n.reasoning ? '' : ' auto'}">${esc(rl)}</span>` : '')
-    : esc(t('p4.noModel'));
-  return `<button class="tn-out ${n.model ? 'route' : 'todo'}" data-out="${esc(n.id)}">${text}</button>`;
 }
 
-function weightsHTML(n) {
-  if (!n.weights || !n.weights.length) {
-    return `<span class="tn-hit">${esc(t('p4.hitRoute'))}</span>`;
+/* ── tree list ───────────────────────────────────────────────────────── */
+function renderTreeList() {
+  const list = SRTreeStore.trees();
+  const count = $("#treeCount");
+  if (count) count.textContent = tr("pipeline.treeCount", {n: list.length});
+  const box = $("#treeList");
+  if (!box) return;
+  if (!list.length) {
+    box.innerHTML = `<div class="rt-tree-empty">${esc(tr("pipeline.noTrees"))}</div>`;
+    return;
   }
-  const chips = n.weights.map((w, i) =>
-    `<button class="tn-weight" data-weight="${esc(n.id)}:${i}"
-             title="${esc(t('p6.weightTitle'))}">${esc(sigName(w.signal))}
-       <span class="sp">·</span>${esc(valLabel(w.signal, w.value) || w.value)}
-       <span class="w">×${(+w.weight.toFixed(2))}</span></button>`).join('');
-  const floor = n.min_score != null
-    ? `<span class="tn-min">${esc(t('p4.minScore'))} ${n.min_score.toFixed(2)}</span>` : '';
-  return `<span class="tn-weights">${chips}${floor}</span>`;
-}
-
-function nodeHTML(n, depth, station) {
-  const isLeaf = n.kind === 'leaf';
-  const rootLocked = depth === 0 && isFallback(station);   // fallback station: locked
-  const hasWeights = isLeaf && (n.weights || []).length > 0;
-  const tone = n.action === 'block' ? 'var(--t4-red)'
-    : (rootLocked ? 'var(--t4-slate)' : 'var(--t4-accent)');
-  const children = isLeaf ? '' : `<div class="tnode-children">${
-    (n.children || []).map(c => nodeHTML(c, depth + 1, station)).join('') ||
-    `<div class="tn-empty">${esc(t('p6.noChildren'))}</div>`}</div>`;
-  const right = `<span class="tn-right">
-      ${isLeaf ? outcomeChip(n) : ''}
-      <span class="tn-actions">
-        ${hasWeights ? '' : `<button class="bact add" data-nodeadd="${esc(n.id)}"
-          title="${esc(t('p6.addChild'))}" aria-label="${esc(tf('p6.addChildNamed', { name: condText(n) }))}">+</button>`}
-        ${rootLocked ? '' : `<button class="bact del" data-nodedel="${esc(n.id)}"
-          title="${esc(depth === 0 ? t('p6.delStation') : t('p6.delNode'))}"
-          aria-label="${esc(tf(depth === 0 ? 'p6.delStationNamed' : 'p6.delNodeNamed', { name: condText(n) }))}">−</button>`}
+  const selected = currentTreeId();
+  box.innerHTML = list.map(tree => {
+    const active = tree.id === selected;
+    const dirty = SRTreeStore.isDirty(tree.id);
+    const state = tree.enabled ? tr("pipeline.enabled") : tr("pipeline.disabled");
+    const toggle = tree.enabled ? tr("pipeline.disableTree") : tr("pipeline.enableTree");
+    return `<div class="rt-tree-row${active ? " is-selected" : ""}${tree.enabled ? " is-enabled" : ""}"
+        role="listitem" data-tree-id="${esc(tree.id)}">
+      <button type="button" class="rt-tree-pick" aria-pressed="${active ? "true" : "false"}">
+        <span class="rt-tree-name">${esc(tree.name || tree.id)}</span>
+        <span class="rt-tree-meta">
+          <span class="rt-badge${tree.enabled ? " on" : ""}">${esc(state)}</span>
+          ${dirty ? `<span class="rt-dot" title="${esc(tr("pipeline.dirty"))}"></span>` : ""}
+          <code>${esc(shortRev(tree.tree_revision))}</code>
+        </span>
+      </button>
+      <span class="rt-tree-actions">
+        <button type="button" class="rt-mini" data-tree-action="${tree.enabled ? "disable" : "enable"}"
+                data-tree-id="${esc(tree.id)}" title="${esc(toggle)}" aria-label="${esc(toggle)}">
+          ${tree.enabled ? "⏻" : "▶"}
+        </button>
+        <button type="button" class="rt-mini" data-tree-action="copy" data-tree-id="${esc(tree.id)}"
+                title="${esc(tr("pipeline.copyTree"))}" aria-label="${esc(tr("pipeline.copyTree"))}">⧉</button>
       </span>
-    </span>`;
-  return `<div class="tnode ${isLeaf ? 'leaf' : 'fork'}" data-node="${esc(n.id)}"${isLeaf ? ` style="--leaf-tone:${tone}"` : ''}>
-    <div class="tnode-row">
-      ${conditionChip(n)}
-      ${isLeaf ? weightsHTML(n) : `<span class="tn-count">${(n.children || []).length} ${esc(t('p6.children'))}</span>`}
-      ${right}
-    </div>
-    ${children}
-  </div>`;
+    </div>`;
+  }).join("");
 }
 
-function stationHTML(st, i, last) {
-  return `<div class="station${last ? ' last' : ''}" role="listitem" data-station="${esc(st.id)}" style="--i:${i}">
-      <button class="seq" type="button"${last ? '' : ' draggable="true" title="' + esc(t('p4.dragNode')) + '"'}
-              aria-label="${esc(tf('p4.stepN', { n: i + 1, name: st.name }))}">${String(i + 1).padStart(2, '0')}</button>
-      <div class="st-body">
-        <div class="st-head">
-          <h2>${esc(st.name)}</h2>
-          ${last ? '' : `<button class="st-del" data-delstation="${esc(st.id)}" title="${esc(t('p6.delStation'))}"
-                aria-label="${esc(tf('p6.delStationNamed', { name: st.name }))}">
-              <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true"><path d="M2 2l7 7M9 2l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
-            </button>`}
-        </div>
-        <div class="tree-box" role="group" aria-label="${esc(tf('p4.stackOf', { name: st.name }))}">
-          ${st.root ? nodeHTML(st.root, 0, st) : `<div class="tn-empty">${esc(t('p6.emptyStation'))}</div>`}
-        </div>
-      </div>
-    </div>`;
-}
-
-const newstationRow = () =>
-  `<div class="newnode-row"><button class="newnode" type="button" data-newstation>＋ ${esc(t('p6.newStation'))}</button></div>`;
-const passRow = () =>
-  `<div class="pass" role="presentation">
-      <span class="chev" aria-hidden="true">
-        <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M5.5 1.5v8M2 6l3.5 3.5L9 6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </span>
-      <span class="pt">${esc(t('p4.passOn'))}</span>
-    </div>`;
-
-/* whole-tree innerHTML: once at boot and on language change */
 function renderTree() {
+  const canvas = $("#treeRoot");
+  if (!canvas) return;
+  const tree = currentTree();
+  const root = currentDraft();
+  if (!tree || !root) {
+    canvas.innerHTML = `<div class="rt-empty-canvas">${esc(tr("pipeline.noSelected"))}</div>`;
+    return;
+  }
+  SRTreeView.render(canvas, {root: root, modelsById: modelsById()});
+}
+
+function renderAll() {
+  renderTreeList();
+  renderTree();
+  renderChrome();
+}
+
+/* ── palette (signal library: drag source + click-to-pick) ───────────── */
+function renderPalette() {
+  const body = $("#palBody");
+  if (!body) return;
   const parts = [];
-  stations.forEach((st, i) => {
-    const last = i === stations.length - 1;
-    parts.push(stationHTML(st, i, last));
-    if (!last) parts.push(passRow());
+  GROUPS.forEach(group => {
+    const items = SIGNALS.filter(spec => spec.group === group);
+    if (!items.length) return;
+    parts.push(`<section class="grp"><h3>${esc(groupName(group))}<span class="rl"></span></h3>
+      <div class="chips">${items.map(spec =>
+        `<button type="button" class="sig${pendingSignal === spec.key ? " is-picked" : ""}"
+                 data-sig="${esc(spec.key)}" draggable="false"
+                 title="${esc(tr("pipeline.palSigTitle"))}">${esc(sigName(spec.key))}</button>`).join("")}
+      </div></section>`);
   });
-  parts.push(newstationRow());
-  $('#flow').innerHTML = parts.join('');
-}
-
-function renderStation(stationId) {
-  const st = findStation(stationId);
-  const el = $('#flow').querySelector(`[data-station="${CSS.escape(stationId)}"]`);
-  if (!st || !el) return;
-  const tmp = document.createElement('div');
-  tmp.innerHTML = stationHTML(st, stations.indexOf(st), isFallback(st));
-  el.replaceWith(tmp.firstElementChild);
-}
-
-function syncFlowChrome() {
-  const flow = $('#flow');
-  const stationEls = $$('.station', flow);
-  stationEls.forEach((el, i) => {
-    const last = i === stationEls.length - 1;
-    el.classList.toggle('last', last);
-    const seq = el.querySelector('.seq');
-    if (seq) {
-      seq.textContent = String(i + 1).padStart(2, '0');
-      const st = findStation(el.dataset.station);
-      seq.setAttribute('aria-label', tf('p4.stepN', { n: i + 1, name: st ? st.name : '' }));
-      if (last) { seq.removeAttribute('draggable'); seq.removeAttribute('title'); }
-      else { seq.setAttribute('draggable', 'true'); seq.title = t('p4.dragNode'); }
-    }
-  });
-  $$('.pass', flow).forEach(p => p.remove());
-  stationEls.slice(0, -1).forEach(el => el.insertAdjacentHTML('afterend', passRow()));
-  const nn = flow.querySelector('.newnode-row');
-  if (nn && stationEls.length) stationEls[stationEls.length - 1].after(nn);
-}
-
-function insertStationEl(st, idx) {
-  const flow = $('#flow');
-  const list = $$('.station', flow);
-  const html = stationHTML(st, idx, false);
-  if (idx >= 0 && idx < list.length) list[idx].insertAdjacentHTML('beforebegin', html);
-  else {
-    const nn = flow.querySelector('.newnode-row');
-    if (nn) nn.insertAdjacentHTML('beforebegin', html);
-    else flow.insertAdjacentHTML('beforeend', html);
-  }
-  syncFlowChrome();
-}
-function removeStationEl(id) {
-  const el = $('#flow').querySelector(`[data-station="${CSS.escape(id)}"]`);
-  if (el) el.remove();
-  syncFlowChrome();
-}
-function reorderFlowDOM() {
-  const flow = $('#flow');
-  const nn = flow.querySelector('.newnode-row');
-  stations.forEach(st => {
-    const el = flow.querySelector(`[data-station="${CSS.escape(st.id)}"]`);
-    if (el) flow.insertBefore(el, nn);
-  });
-  syncFlowChrome();
-}
-function flashNode(id) {
-  const el = $('#flow').querySelector(`[data-node="${CSS.escape(id)}"]`);
-  if (!el) return;
-  el.classList.add('is-new');
-  setTimeout(() => el.classList.remove('is-new'), 1000);
-}
-
-/* ── toast ───────────────────────────────────────────────────────────── */
-let toastTimer = null;
-function toastUndo(msg, undo) {
-  const el = $('#t4toast');
-  el.innerHTML = `<span>${esc(msg)}</span>${undo ? '<button type="button">' + esc(t('p4.undo')) + '</button>' : ''}`;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), undo ? 6000 : 3600);
-  if (undo) {
-    el.querySelector('button').addEventListener('click', () => {
-      undo();
-      el.classList.remove('show');
-    }, { once: true });
+  body.innerHTML = parts.join("");
+  const counter = $("#palCount");
+  if (counter) counter.textContent = tr("pipeline.signalCount", {n: SIGNALS.length});
+  const hint = $("#palHint");
+  if (hint) {
+    hint.textContent = pendingSignal
+      ? tr("pipeline.palHintPicked", {name: sigName(pendingSignal)})
+      : tr("pipeline.palHint");
   }
 }
 
-/* ── node mutations ──────────────────────────────────────────────────── */
-function newNode(station, signal, value) {
-  return {
-    id: nid('n'), signal, value: value == null ? '' : String(value),
-    conf_min: signal && !isRuleSig(signal) ? DEFAULT_CONF_MIN : null,
-    kind: 'leaf', action: 'route',
-    model: MODELS[0] || '',
-    reasoning: null,
-    min_score: null, weights: [], children: [],
-  };
-}
-
-function addChild(nodeId, signal, value) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node } = ref;
-  const snapshot = JSON.parse(JSON.stringify(node));
-  const becameFork = node.kind === 'leaf';
-  if (becameFork) {
-    node.kind = 'fork';
-    node.action = 'route';
-    node.model = null;
-    node.reasoning = null;
-    node.min_score = null;
-    node.weights = [];
-    node.children = [newNode(station, signal, value)];
-  } else {
-    node.children.push(newNode(station, signal, value));
-  }
-  markDirty();
-  renderStation(station.id);
-  flashNode(node.children[node.children.length - 1].id);
-  toastUndo(becameFork
-    ? tf('p6.leafBecameFork', { name: condText(node) })
-    : tf('p6.toastChildAdded', { name: sigName(signal) }), () => {
-    const back = findNodeRef(nodeId);
-    if (!back) return;
-    Object.assign(back.node, snapshot);
-    markDirty();
-    renderStation(back.station.id);
-  });
-}
-
-function deleteNode(nodeId) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node, parent } = ref;
-  if (!parent) { deleteStation(station.id); return; }
-  const index = parent.children.findIndex(c => c.id === nodeId);
-  if (index < 0) return;
-  const snapshot = parent.children.splice(index, 1)[0];
-  markDirty();
-  renderStation(station.id);
-  toastUndo(tf('p6.toastNodeDeleted', { name: condText(snapshot) }), () => {
-    const back = findNodeRef(parent.id);
-    if (!back) return;
-    back.node.children.splice(index, 0, snapshot);
-    markDirty();
-    renderStation(back.station.id);
-  });
-}
-
-function deleteStation(stationId) {
-  const idx = stations.findIndex(s => s.id === stationId);
-  if (idx < 0) return;
-  if (idx === stations.length - 1) {
-    toastUndo(t('p6.toastNoDeleteFallback'));
-    return;
-  }
-  const [st] = stations.splice(idx, 1);
-  markDirty();
-  removeStationEl(stationId);
-  toastUndo(tf('p6.toastStationDeleted', { name: st.name }), () => {
-    stations.splice(idx, 0, st);
-    markDirty();
-    insertStationEl(st, idx);
-  });
-}
-
-function addStation(signal, value) {
-  const body = { id: nid('st'),
-                 name: `${t('p6.stationName')} ${stations.length}`, root: null };
-  if (signal === null) {
-    body.root = { id: nid('n'), signal: null, value: '', conf_min: null,
-                  kind: 'fork', action: 'route', model: null, reasoning: null,
-                  min_score: null, weights: [], children: [] };
-  } else {
-    body.root = newNode(body, signal, value);
-  }
-  stations.splice(Math.max(0, stations.length - 1), 0, body);
-  markDirty();
-  insertStationEl(body, stations.length - 2);
-  toastUndo(tf('p6.toastStationAdded', { name: body.name }), () => {
-    const i = stations.findIndex(s => s.id === body.id);
-    if (i >= 0) { stations.splice(i, 1); markDirty(); removeStationEl(body.id); }
-  });
-}
-
-/* ── weights ─────────────────────────────────────────────────────────── */
-function addWeight(nodeId, signal, value) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node } = ref;
-  if (node.kind !== 'leaf') { toastUndo(t('p6.forkNoWeights')); return; }
-  if (node.signal === signal) { toastUndo(t('p6.sameAsCondition')); return; }
-  if ((node.weights || []).some(w => w.signal === signal && w.value === value)) {
-    toastUndo(t('p6.duplicateWeight'));
-    return;
-  }
-  const added = { signal, value, weight: DEFAULT_WEIGHT };
-  node.weights.push(added);
-  if (node.min_score == null) node.min_score = DEFAULT_MIN_SCORE;
-  markDirty();
-  renderStation(station.id);
-  toastUndo(tf('p6.toastWeightAdded', { name: sigName(signal) }), () => {
-    const back = findNodeRef(nodeId);
-    if (!back) return;
-    back.node.weights = back.node.weights.filter(w => w !== added);
-    markDirty();
-    renderStation(back.station.id);
-  });
-}
-
-/* a repeated signal forks the leaf on it: weighted values become child
-   conditions, plus one more unused value as a sibling seed. */
-function forkOnSignal(nodeId, signal) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node } = ref;
-  if (node.signal === signal) { toastUndo(t('p6.sameAsCondition')); return; }
-  const spec = sigSpec(signal);
-  const used = [...new Set((node.weights || [])
-    .filter(w => w.signal === signal).map(w => w.value))];
-  if (!used.length) { openValuePicker(signal, (key, v) => addWeight(nodeId, key, v)); return; }
-  const rest = (spec.values || []).map(([v]) => v).filter(v => !used.includes(v));
-  const otherWeights = (node.weights || []).filter(w => w.signal !== signal);
-  const makeChild = value => ({
-    id: nid('n'), signal, value: value == null ? '' : String(value),
-    conf_min: isRuleSig(signal) ? null : DEFAULT_CONF_MIN, kind: 'leaf',
-    action: node.action, model: node.model, reasoning: node.reasoning || null,
-    min_score: node.min_score,
-    weights: otherWeights.map(w => ({ ...w })), children: [],
-  });
-  const children = used.map(makeChild);
-  if (rest.length) children.push(makeChild(rest[0]));
-  const snapshot = JSON.parse(JSON.stringify(node));
-  node.kind = 'fork';
-  node.weights = [];
-  node.children = children;
-  node.action = 'route';
-  node.model = null;
-  node.reasoning = null;
-  node.min_score = null;
-  markDirty();
-  renderStation(station.id);
-  children.forEach(c => flashNode(c.id));
-  toastUndo(tf('p6.toastForked', { name: sigName(signal), n: children.length }), () => {
-    const back = findNodeRef(nodeId);
-    if (!back) return;
-    Object.assign(back.node, snapshot);
-    markDirty();
-    renderStation(back.station.id);
-  });
-}
-
-/* ── popovers ────────────────────────────────────────────────────────── */
-function rangeBlock(id, label, value, step, hint) {
-  return `<div class="pop-range">
-      <div class="pr-head">
-        <label for="${id}Num">${esc(label)}</label>
-        <input class="pr-num" id="${id}Num" type="number" inputmode="decimal"
-               min="0" max="1" step="${step}" value="${Number(value).toFixed(2)}">
-      </div>
-      <input class="pr-track" id="${id}Range" type="range" min="0" max="1" step="${step}"
-             value="${Number(value)}" aria-label="${esc(label)}" style="--p:${Number(value) * 100}%">
-      <div class="pr-scale" aria-hidden="true"><span>0</span><span>1</span></div>
-      ${hint ? `<p class="pr-hint">${esc(hint)}</p>` : ''}
-    </div>`;
-}
-
-function wireRange(id, { onInput, onCommit }) {
-  const num = $('#' + id + 'Num'), rng = $('#' + id + 'Range');
-  if (!num || !rng) return;
-  const paint = v => rng.style.setProperty('--p', (v * 100) + '%');
-  const clamp = v => Math.min(1, Math.max(0, v));
-  let last = parseFloat(rng.value);
-  paint(last);
-  const set = (v, src) => {
-    v = clamp(v);
-    last = v;
-    rng.value = v;
-    paint(v);
-    if (src !== 'num') num.value = v.toFixed(2);
-    if (src === 'commit') onCommit(v); else onInput(v);
-  };
-  rng.addEventListener('input', e => set(parseFloat(e.target.value), 'range'));
-  rng.addEventListener('change', e => set(parseFloat(e.target.value), 'commit'));
-  num.addEventListener('input', e => {
-    const v = parseFloat(e.target.value);
-    if (!Number.isNaN(v)) set(v, 'num');
-  });
-  num.addEventListener('blur', () => {
-    const v = parseFloat(num.value);
-    set(Number.isNaN(v) ? last : v, 'commit');
-  });
-  num.addEventListener('keydown', e => {
-    if (e.key === 'Enter') { e.preventDefault(); num.blur(); }
-  });
-}
-
+/* ── generic popover ─────────────────────────────────────────────────── */
 function popHead(title, sub) {
   return `<div class="pop-head">
-      <b>${esc(title)}</b>${sub ? `<span class="sub">${esc(sub)}</span>` : ''}
-      <button class="pop-x" data-popclose aria-label="${esc(t('common.close'))}">
+      <b>${esc(title)}</b>${sub ? `<span class="sub">${esc(sub)}</span>` : ""}
+      <button type="button" class="pop-x" data-popclose aria-label="${esc(t("common.close"))}">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
       </button>
     </div>`;
 }
-
-function placePop(anchor, preferTop) {
-  const pop = $('#pop');
-  if (!anchor) return;
-  const r = anchor.getBoundingClientRect();
-  const w = pop.offsetWidth, h = pop.offsetHeight;
-  const left = Math.min(Math.max(12, r.left), window.innerWidth - w - 12);
-  let top = r.bottom + 8;
-  if (preferTop) top = Math.max(12, r.top - h - 8);
-  if (top + h > window.innerHeight - 12) top = Math.max(12, r.top - h - 8);
-  if (top < 12) top = Math.min(r.bottom + 8, window.innerHeight - h - 12);
-  pop.style.left = left + 'px';
-  pop.style.top = top + 'px';
-}
-function closePop() { const pop = $('#pop'); pop.hidden = true; pop.innerHTML = ''; popTarget = null; }
-const anchorOf = sel => $('#flow').querySelector(sel);
-
-/* condition editor: value read-only, confidence adjustable */
-function openConditionEditor(nodeId) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node } = ref;
-  popTarget = { kind: 'cond', nodeId };
-  const pop = $('#pop');
-  pop.hidden = false;
-  pop.innerHTML = `${popHead(node.signal ? sigName(node.signal) : t('p6.entry'), station.name)}
-    <p class="pop-label">${esc(t('p4.value'))}</p>
-    <p class="pop-note" style="margin:0 0 10px">${esc(condText(node))} · ${esc(t('p6.valueReadonly'))}</p>
-    ${node.signal && isRuleSig(node.signal)
-      ? `<p class="pop-note">${esc(t('p4.ruleNote'))}</p>`
-      : node.signal
-        ? rangeBlock('nc', t('p4.confMin'), node.conf_min != null ? node.conf_min : DEFAULT_CONF_MIN, 0.01, t('p4.confHint'))
-        : `<p class="pop-note">${esc(t('p6.entryNote'))}</p>`}
-    <div class="pop-foot">
-      <span class="pop-note">${esc(t('p6.changeByRebuild'))}</span>
-      <button class="pop-ok" data-popclose>${esc(t('common.close'))}</button>
+function popFoot(applyLabel) {
+  return `<div class="pop-foot">
+      <span class="pop-err" id="popErr"></span>
+      <button type="button" class="pop-ok" data-pop="apply">${esc(applyLabel || t("common.save"))}</button>
     </div>`;
-  placePop(anchorOf(`[data-cond="${CSS.escape(nodeId)}"]`));
-  if (node.signal && !isRuleSig(node.signal)) wireRange('nc', {
-    onInput(v) {
-      node.conf_min = v;
-      // Only the confidence chip carries the floor text. The condition button
-      // shares the data-cond attribute, so writing to it would erase the
-      // condition label ("学科 = 医疗" -> "门槛 0.70").
-      const chip = $('#flow').querySelector(`.tn-conf[data-cond="${CSS.escape(nodeId)}"]`);
-      if (chip) chip.textContent = t('p4.confFloor') + v.toFixed(2);
-    },
-    onCommit() { markDirty(); renderStation(station.id); placePop(anchorOf(`[data-cond="${CSS.escape(nodeId)}"]`)); }
-  });
 }
-
-/* leaf reasoning picker: only the efforts declared by the target model */
-function reasoningEditorHTML(node) {
-  const r = modelReasoning(node.model);
-  const efforts = modelEfforts(node.model);
-  const known = !!MODEL_INFO[node.model];
-  const current = node.reasoning || '';
-  const stale = !!current && !efforts.some(e => e.id === current);
-  const auto = `<option value="">${esc(t('reason.auto'))}</option>`;
-  const opts = auto + efforts.map(e => {
-    const def = e.id === r.default;
-    return `<option value="${esc(e.id)}"${e.id === current ? ' selected' : ''}>` +
-      `${esc(reasonName(e.id))}${def ? ' · ' + esc(t('models.reason.defaultMark')) : ''}</option>`;
-  }).join('') + (stale ? `<option value="${esc(current)}" selected>${esc(reasonName(current))} ⚠</option>` : '');
-  const disabled = !efforts.length && !stale;
-  let note;
-  if (stale) note = t('pipe.reasoning.stale');
-  else if (!efforts.length) note = known ? t('pipe.reasoning.disabled') : t('pipe.reasoning.unknown');
-  else note = t('pipe.reasoning.tip') +
-    (r.default ? ' · ' + tf('pipe.reasoning.default', { level: reasonName(r.default) }) : '');
-  return `<select class="pop-select${disabled ? ' is-off' : ''}" id="lfReasoning"${disabled ? ' disabled' : ''}>${opts}</select>
-    <p class="pop-note${stale ? ' bad' : ''}" id="lfReasonNote">${esc(note)}</p>
-    ${r.error ? `<p class="pop-note bad">${esc(tf('models.reason.error', { err: r.error }))}</p>` : ''}`;
+function placePop(anchor) {
+  const pop = $("#pop");
+  if (!anchor || !pop || pop.hidden) return;
+  const rect = anchor.getBoundingClientRect();
+  const width = pop.offsetWidth;
+  const height = pop.offsetHeight;
+  const left = Math.min(Math.max(12, rect.left), window.innerWidth - width - 12);
+  let top = rect.bottom + 8;
+  if (top + height > window.innerHeight - 12) top = Math.max(12, rect.top - height - 8);
+  if (top < 12) top = Math.min(rect.bottom + 8, window.innerHeight - height - 12);
+  pop.style.left = left + "px";
+  pop.style.top = top + "px";
 }
-
-/* leaf editor: action / model / min_score / weights */
-function openLeafEditor(nodeId) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node } = ref;
-  if (node.kind !== 'leaf') { openConditionEditor(nodeId); return; }
-  popTarget = { kind: 'leaf', nodeId };
-  const pop = $('#pop');
+function openPop(html, anchor, context) {
+  const pop = $("#pop");
   pop.hidden = false;
-  const weightRows = (node.weights || []).map((w, i) => `
-    <div class="wrow">
-      <span class="wname">${esc(sigName(w.signal))} · ${esc(valLabel(w.signal, w.value) || w.value)}</span>
-      <input class="pr-num" type="number" min="0" max="1" step="0.05"
-             data-weightnum="${i}" value="${(+w.weight).toFixed(2)}">
-      <button class="wdel" data-weightdel="${i}" aria-label="${esc(t('p4.delCond'))}">✕</button>
-    </div>`).join('');
-  pop.innerHTML = `${popHead(t('p6.leafTitle'), station.name)}
-    <p class="pop-label">${esc(t('p4.afterHit'))}</p>
-    <div class="pop-vals" id="lfAction">
-      <button data-act="route" class="${node.action !== 'block' ? 'on' : ''}">${esc(t('p4.routeModel'))}</button>
-      <button data-act="block" class="${node.action === 'block' ? 'on' : ''}">${esc(t('p4.blockNow'))}</button>
-    </div>
-    ${node.action !== 'block' ? `
-      <p class="pop-label">${esc(t('p4.model'))}</p>
-      <input class="pop-text" id="lfModel" list="lfModels" value="${esc(node.model || '')}" placeholder="qwen3-8b">
-      <datalist id="lfModels">${MODELS.map(m => `<option value="${esc(m)}">`).join('')}</datalist>
-      <p class="pop-label">${esc(t('pipe.reasoning'))}</p>
-      ${reasoningEditorHTML(node)}` : ''}
-    ${(node.weights && node.weights.length) ? `
-      <p class="pop-label">${esc(t('p6.weights'))}</p>
-      <div class="wlist" id="lfWeights">${weightRows}</div>
-      ${rangeBlock('lfMin', t('p4.minScore'), node.min_score != null ? node.min_score : DEFAULT_MIN_SCORE, 0.05, t('p4.minScoreHint'))}
-    ` : `<p class="pop-note">${esc(t('p6.noWeightsNote'))}</p>`}
-    <div class="pop-foot">
-      <button class="pop-del" data-popdelnode="${esc(nodeId)}">${esc(t('p6.delNode'))}</button>
-      <button class="pop-ok" data-popclose>${esc(t('common.close'))}</button>
-    </div>`;
-  placePop(anchorOf(`[data-out="${CSS.escape(nodeId)}"]`));
-  pop.querySelector('#lfAction').addEventListener('click', e => {
-    const b = e.target.closest('[data-act]');
-    if (!b) return;
-    node.action = b.dataset.act;
-    if (node.action === 'block') node.reasoning = null;
-    else if (!node.model) node.model = MODELS[0] || '';
-    markDirty();
-    renderStation(station.id);
-    openLeafEditor(nodeId);
-  });
-  const modelInput = $('#lfModel');
-  if (modelInput) modelInput.addEventListener('change', e => {
-    node.model = e.target.value.trim() || null;
-    /* the model's declared default effort is preselected *explicitly* (visible
-       in the UI); undeclared/unsupported models fall back to passthrough */
-    const r = modelReasoning(node.model);
-    const efforts = modelEfforts(node.model);
-    const def = r && r.declared && r.supported !== false && r.default &&
-      efforts.some(x => x.id === r.default) ? r.default : null;
-    node.reasoning = def;
-    markDirty();
-    renderStation(station.id);
-    openLeafEditor(nodeId);
-  });
-  const reasonSelect = $('#lfReasoning');
-  if (reasonSelect) reasonSelect.addEventListener('change', e => {
-    node.reasoning = e.target.value || null;
-    markDirty();
-    renderStation(station.id);
-    const note = $('#lfReasonNote');
-    if (note) note.classList.toggle('bad', false);
-  });
-  if (node.weights && node.weights.length) {
-    wireRange('lfMin', {
-      onInput(v) { node.min_score = v; },
-      onCommit() { markDirty(); renderStation(station.id); }
-    });
-    pop.querySelectorAll('[data-weightnum]').forEach(input => {
-      input.addEventListener('change', () => {
-        const i = Number(input.dataset.weightnum);
-        const v = Math.min(1, Math.max(0, parseFloat(input.value)));
-        if (Number.isNaN(v)) return;
-        node.weights[i].weight = v;
-        markDirty();
-        renderStation(station.id);
-        openLeafEditor(nodeId);
-      });
-    });
-    pop.querySelectorAll('[data-weightdel]').forEach(btn => {
-      btn.addEventListener('click', () => {
-        node.weights.splice(Number(btn.dataset.weightdel), 1);
-        markDirty();
-        renderStation(station.id);
-        openLeafEditor(nodeId);
-      });
-    });
-  }
-  pop.querySelector('[data-popdelnode]').addEventListener('click', () => {
-    closePop();
-    deleteNode(nodeId);
-  });
+  pop.innerHTML = html;
+  popContext = context || {anchor: anchor};
+  popContext.anchor = anchor;
+  placePop(anchor);
+  const first = pop.querySelector("input, select, textarea, .pop-ok");
+  if (first) first.focus();
+  return pop;
+}
+function closePop() {
+  const pop = $("#pop");
+  pop.hidden = true;
+  pop.innerHTML = "";
+  popContext = null;
+}
+function showPopIssues(list) {
+  const box = $("#popErr");
+  if (!box) return;
+  const issues = Array.isArray(list) ? list : [];
+  box.innerHTML = issues.map(item =>
+    `<div class="iv ${item.level === "warn" ? "warn" : "hard"}">• ${esc(issueText(item))}</div>`).join("");
+  box.classList.toggle("show", issues.length > 0);
+  if (popContext && popContext.anchor) placePop(popContext.anchor);
+  else placePop(popContext && popContext.nodeId ? $("#pop") : null);
 }
 
-/* weight editor (click a weight chip) */
-function openWeightEditor(nodeId, index) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  const { station, node } = ref;
-  const w = node.weights[index];
-  if (!w) return;
-  popTarget = { kind: 'weight', nodeId };
-  const pop = $('#pop');
-  pop.hidden = false;
-  pop.innerHTML = `${popHead(sigName(w.signal), station.name)}
-    <p class="pop-label">${esc(t('p4.value'))}</p>
-    <p class="pop-note" style="margin:0 0 10px">${esc(valLabel(w.signal, w.value) || w.value)}</p>
-    ${rangeBlock('wt', t('p4.weight'), w.weight, 0.05, t('p4.weightHint'))}
-    <div class="pop-foot">
-      <button class="pop-del" data-weightdel="${esc(nodeId)}:${index}">${esc(t('p4.delCond'))}</button>
-      <button class="pop-ok" data-popclose>${esc(t('common.close'))}</button>
-    </div>`;
-  placePop(anchorOf(`[data-weight="${CSS.escape(nodeId + ':' + index)}"]`));
-  wireRange('wt', {
-    onInput(v) { w.weight = v; },
-    onCommit() {
-      markDirty();
-      renderStation(station.id);
-      placePop(anchorOf(`[data-weight="${CSS.escape(nodeId + ':' + index)}"]`));
+/* ── draft updates ───────────────────────────────────────────────────── */
+function commitDraft(nextDraft, options) {
+  const opts = options || {};
+  const treeId = currentTreeId();
+  if (!treeId || !nextDraft) return false;
+  SRTreeStore.setDraft(treeId, nextDraft);
+  renderAll();
+  if (opts.toast) toastUndo(opts.toast);
+  return true;
+}
+function patchNode(nodeId, updater, options) {
+  const draft = currentDraft();
+  if (!draft) return false;
+  const ref = SRTreeModel.findNodeRef(draft, nodeId);
+  if (!ref) return false;
+  return commitDraft(SRTreeModel.updateNode(draft, nodeId, updater), options);
+}
+
+/* ── form bindings ───────────────────────────────────────────────────── */
+function refreshFormModelBits(formEl) {
+  const modelSelect = formEl.querySelector('[data-field="node.model"]');
+  if (!modelSelect) return;
+  modelSelect.addEventListener("change", () => {
+    const reasoning = formEl.querySelector('[data-field="node.reasoning"]');
+    if (reasoning) {
+      reasoning.innerHTML = SRTreeEditor.reasoningOptionsHTML(
+        modelSelect.value, modelsById(), reasoning.value);
+    }
+    const preview = formEl.querySelector(".rt-cap-preview");
+    if (preview) {
+      const capability = SRTreeView.capabilityOf(modelsById(), modelSelect.value);
+      preview.textContent = capability.missing === "model" ? tr("tree.modelMissing")
+        : capability.missing === "capability" ? tr("tree.capabilityMissing") : capability.text;
+      if (capability.missing) preview.setAttribute("data-missing", capability.missing);
+      else preview.removeAttribute("data-missing");
     }
   });
-  pop.querySelector('[data-weightdel]').addEventListener('click', () => {
-    node.weights.splice(index, 1);
-    closePop();
-    markDirty();
-    renderStation(station.id);
+}
+function bindWhenForm(scope) {
+  const form = scope.querySelector("[data-when-form]");
+  if (!form) return;
+  const signalSelect = form.querySelector('[data-field="when.signal"]');
+  if (!signalSelect || signalSelect.dataset.bound === "1") return;
+  signalSelect.dataset.bound = "1";
+  signalSelect.addEventListener("change", () => {
+    const previous = SRTreeEditor.readWhenForm(form);
+    const signalKey = signalSelect.value;
+    const spec = SRTreeEditor.signalSpecOf(SIGNALS, signalKey);
+    const when = signalKey ? {
+      signal: signalKey,
+      value: "",
+      op: SRTreeEditor.opForSignal(SIGNALS, signalKey),
+      conf_min: spec && spec.kind !== "rule" ? DEFAULT_CONF_MIN : previous.conf_min,
+    } : null;
+    form.outerHTML = SRTreeEditor.whenFormHTML({when: when, signals: SIGNALS});
+    bindWhenForm(scope);
+    const fresh = scope.querySelector('[data-when-form] [data-field="when.value"]');
+    if (fresh && typeof fresh.focus === "function") fresh.focus();
+    if (popContext && popContext.anchor) placePop(popContext.anchor);
   });
 }
-
-/* ── shared picker: signal -> value ──────────────────────────────────── */
-function openPicker({ title, sub, anchor, allowFree, note, onPick, disabledValues,
-                      preselect }) {
-  const pop = $('#pop');
-  const anchorEl = () => (typeof anchor === 'function' ? anchor() : anchor);
-  popTarget = { kind: 'picker', anchor: anchorEl };
-
-  function place() { placePop(anchorEl(), true); }
-
-  function renderSignals() {
-    pop.hidden = false;
-    pop.innerHTML = `${popHead(title, sub)}
-      <p class="pop-label">${esc(t('p6.pickSignal'))}</p>
-      <div class="pop-vals" id="pkSigs">
-        ${Object.values(SIGNAL_REGISTRY).filter(x => allowFree || !isFreeSig(x.key)).map(x =>
-          `<button data-pk="${esc(x.key)}">${esc(sigName(x.key))}</button>`).join('')}
-      </div>
-      <div class="pop-foot"><span class="pop-note">${esc(note || '')}</span></div>`;
-    place();
-    $('#pkSigs').addEventListener('click', e => {
-      const b = e.target.closest('[data-pk]');
-      if (b) renderValues(b.dataset.pk);
-    });
-  }
-
-  function renderValues(key) {
-    pop.hidden = false;
-    const spec = sigSpec(key);
-    const back = `<button class="pop-del" id="pkBack" style="color:var(--t4-ink-3)">← ${esc(t('p4.back'))}</button>`;
-    if (isFreeSig(key)) {
-      const options = key === 'keyword' ? KEYWORD_GROUPS
-        : key === 'time_window' ? TIME_PERIODS : [];
-      const list = options.length
-        ? `<datalist id="pkOpts">${options.map(g => `<option value="${esc(g)}">`).join('')}</datalist>` : '';
-      pop.innerHTML = `${popHead(tf('p4.pickRootValue', { sig: sigName(key) }), sub)}
-        <p class="pop-label">${esc(t('p4.value'))}</p>
-        <input class="pop-text" id="pkText" value="" list="${options.length ? 'pkOpts' : ''}"
-               placeholder="${esc(t('p4.freePlaceholder'))}">${list}
-        <div class="pop-foot">${back}
-          <button class="pop-ok" id="pkOk">${esc(t('common.add'))}</button></div>`;
-      place();
-      const input = $('#pkText');
-      input.focus();
-      const submit = () => {
-        const v = input.value.trim();
-        if (!v) { input.focus(); return; }
-        closePop();
-        onPick(key, v);
+function bindWeightRowSignals(scope) {
+  $$("[data-weight-row]", scope).forEach(row => {
+    const signalSelect = row.querySelector('[data-weight-field="signal"]');
+    if (!signalSelect || signalSelect.dataset.bound === "1") return;
+    signalSelect.dataset.bound = "1";
+    signalSelect.addEventListener("change", () => {
+      const weightInput = row.querySelector('[data-weight-field="weight"]');
+      const weight = {
+        signal: signalSelect.value, value: "",
+        weight: weightInput && weightInput.value !== "" ? Number(weightInput.value) : DEFAULT_WEIGHT,
       };
-      input.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-      $('#pkOk').addEventListener('click', submit);
-    } else {
-      const hidden = disabledValues ? disabledValues(key) : new Set();
-      const allowed = (spec.values || []).filter(([v]) => !hidden.has(v));
-      const body = allowed.length
-        ? `<div class="pop-vals" id="pkVals">
-             ${allowed.map(([v, zh, en]) =>
-               `<button data-pv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
-           </div>`
-        : `<p class="pop-note" style="margin:2px 0 10px">${esc(tf('p4.noFreeValue', { sig: sigName(key) }))}</p>`;
-      pop.innerHTML = `${popHead(tf('p4.pickRootValue', { sig: sigName(key) }), sub)}
-        ${body}
-        <div class="pop-foot">${back}<span class="pop-note">${esc(note || '')}</span></div>`;
-      place();
-      if (allowed.length) $('#pkVals').addEventListener('click', e => {
-        const b = e.target.closest('[data-pv]');
-        if (!b) return;
-        closePop();
-        onPick(key, b.dataset.pv);
-      });
+      row.outerHTML = SRTreeEditor.weightRowHTML({weight: weight, signals: SIGNALS});
+      bindWeightRowSignals(scope);
+      const fresh = scope.querySelector("[data-weight-row] [data-weight-field='value'], " +
+        "[data-weight-row] [data-weight-field='signal']");
+      if (fresh) fresh.focus();
+      if (popContext && popContext.anchor) placePop(popContext.anchor);
+    });
+  });
+}
+function bindNodeForm(formEl, nodeId, context) {
+  refreshFormModelBits(formEl);
+  bindWhenForm(formEl);
+  bindWeightRowSignals(formEl);
+  formEl.addEventListener("click", event => {
+    const actionEl = event.target.closest("[data-rt-form-action]");
+    if (!actionEl) return;
+    const action = actionEl.dataset.rtFormAction;
+    if (action === "add-weight") {
+      event.preventDefault();
+      const holder = formEl.querySelector("[data-weights-form]");
+      if (!holder) return;
+      const first = SIGNALS.length ? SIGNALS[0].key : "";
+      holder.insertAdjacentHTML("beforeend",
+        SRTreeEditor.weightRowHTML({weight: {signal: first, value: "", weight: DEFAULT_WEIGHT}, signals: SIGNALS}));
+      bindWeightRowSignals(holder);
+      if (popContext && popContext.anchor) placePop(popContext.anchor);
+    } else if (action === "remove-weight") {
+      event.preventDefault();
+      const row = actionEl.closest("[data-weight-row]");
+      if (row) row.remove();
+      if (popContext && popContext.anchor) placePop(popContext.anchor);
+    } else if (action === "remove-option") {
+      event.preventDefault();
+      closePop();
+      removeOption(nodeId, actionEl.dataset.optionKey);
+    } else if (action === "add-option") {
+      event.preventDefault();
+      const kind = actionEl.dataset.optionKind;
+      closePop();
+      if (kind === "child") openNewChildOption(nodeId);
+      else openNewModelOption(nodeId);
     }
-    $('#pkBack').addEventListener('click', renderSignals);
-  }
-
-  if (preselect) renderValues(preselect);
-  else renderSignals();
-}
-
-function openChildPicker(nodeId) {
-  const ref = findNodeRef(nodeId);
-  if (!ref) return;
-  openPicker({
-    title: t('p6.addChild'),
-    sub: condText(ref.node),
-    anchor: () => anchorOf(`[data-nodeadd="${CSS.escape(nodeId)}"]`),
-    allowFree: true,
-    note: t('p6.childNote'),
-    onPick: (signal, value) => addChild(nodeId, signal, value),
   });
 }
 
-function openValuePicker(signal, onPick, anchor) {
-  openPicker({
-    title: t('p6.addWeight'),
-    sub: sigName(signal),
-    anchor: anchor || (() => $('#palBody .sig[data-sig="' + CSS.escape(signal) + '"]')),
-    allowFree: true,
-    preselect: signal,
-    note: t('p6.weightNote'),
-    onPick,
-  });
+/* ── node editors ────────────────────────────────────────────────────── */
+function refContext(ref) {
+  return {
+    isRoot: !ref || !ref.parent,
+    isOtherwise: !!ref && ref.edgeKind === "otherwise",
+  };
 }
-
-/* drop handler shared by pointer drag and click-to-pick */
-function handleSignalDrop(nodeId, signal) {
-  const ref = findNodeRef(nodeId);
+function nodeAnchorFn(nodeId) {
+  return () => $("#treeRoot").querySelector(
+    `[data-node-id="${CSS.escape(nodeId)}"][data-node-type]`);
+}
+function openNodeEditor(nodeId) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
   if (!ref) return;
   const node = ref.node;
-  if (node.kind !== 'leaf') { toastUndo(t('p6.forkNoWeights')); return; }
-  if (node.signal === signal) { toastUndo(t('p6.sameAsCondition')); return; }
-  if ((node.weights || []).some(w => w.signal === signal)) {
-    forkOnSignal(nodeId, signal);
-    return;
-  }
-  openValuePicker(signal, (key, value) => addWeight(nodeId, key, value),
-                  () => $(`[data-node="${CSS.escape(nodeId)}"]`));
+  const context = refContext(ref);
+  const anchor = nodeAnchorFn(nodeId);
+  const html = popHead(tr("pipeline.editNodeTitle", {type: SRTreeView.nodeTypeLabel(node.type)}),
+    node.id) + SRTreeEditor.nodeFormHTML({
+    node: node, signals: SIGNALS, modelsById: modelsById(), context: context,
+  }) + popFoot(t("common.save"));
+  const pop = openPop(html, anchor(), {kind: "node", nodeId: nodeId, anchor: anchor});
+  const formEl = pop.querySelector("[data-node-form]");
+  bindNodeForm(formEl, nodeId, context);
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+    const values = SRTreeEditor.readNodeForm(formEl);
+    const result = SRTreeEditor.applyNodeForm(node, values, {
+      signals: SIGNALS, modelsById: modelsById(), context: context,
+    });
+    if (result.issues.some(item => item.level !== "warn")) {
+      showPopIssues(result.issues);
+      return;
+    }
+    closePop();
+    patchNode(nodeId, () => result.node);
+  });
+}
+function openWhenEditor(nodeId) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
+  if (!ref) return;
+  const context = refContext(ref);
+  if (context.isRoot || context.isOtherwise) { toastUndo(tr("pipeline.whenNotAllowed")); return; }
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-drop="when"][data-node-id="${CSS.escape(nodeId)}"]`) || nodeAnchorFn(nodeId)();
+  const html = popHead(tr("pipeline.editWhenTitle"), ref.node.id) +
+    SRTreeEditor.whenFormHTML({when: ref.node.when, signals: SIGNALS}) + popFoot(t("common.save"));
+  const pop = openPop(html, anchor(), {kind: "when", nodeId: nodeId, anchor: anchor});
+  bindWhenForm(pop);
+  const formEl = pop.querySelector("[data-when-form]");
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+    // the signal select rebuilds the form, so always read the live node
+    const values = SRTreeEditor.readWhenForm(pop.querySelector("[data-when-form]"));
+    const result = SRTreeEditor.applyWhenForm(ref.node, values, {signals: SIGNALS, context: context});
+    if (result.issues.some(item => item.level !== "warn")) { showPopIssues(result.issues); return; }
+    closePop();
+    patchNode(nodeId, () => result.node, {toast: tr("pipeline.conditionSet")});
+  });
+  const clear = pop.querySelector('[data-when-action="clear"]');
+  if (clear) clear.addEventListener("click", () => {
+    closePop();
+    patchNode(nodeId, node => Object.assign({}, node, {when: null}));
+  });
+}
+function openOptionEditor(parentId, optionKey) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, parentId) : null;
+  if (!ref || ref.node.type !== "nl_choice") return;
+  const parent = ref.node;
+  const index = parent.options.findIndex(option => option.key === optionKey);
+  if (index < 0) return;
+  const option = parent.options[index];
+  const kind = option.child != null ? "child" : "model";
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-action="edit-option"][data-option-key="${CSS.escape(optionKey)}"]`) ||
+    nodeAnchorFn(parentId)();
+  const html = popHead(tr("pipeline.editOptionTitle"), `${parent.id} · ${optionKey}`) +
+    SRTreeEditor.optionFormHTML({option: option, kind: kind, modelsById: modelsById(), index: index}) +
+    popFoot(t("common.save"));
+  const pop = openPop(html, anchor(), {kind: "option", nodeId: parentId, optionKey: optionKey, anchor: anchor});
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+    const formEl = pop.querySelector("[data-option-form]");
+    const values = SRTreeEditor.readOptionForm(formEl);
+    const taken = parent.options.filter(item => item.key !== optionKey).map(item => item.key);
+    const result = SRTreeEditor.applyOptionForm(option, values, {
+      kind: kind, modelsById: modelsById(), takenKeys: taken,
+    });
+    if (result.issues.some(item => item.level !== "warn")) { showPopIssues(result.issues); return; }
+    const replaced = SRTreeEditor.replaceOption(parent, optionKey, result.option);
+    if (replaced.issues.length) { showPopIssues(replaced.issues); return; }
+    closePop();
+    patchNode(parentId, () => replaced.node);
+  });
+  const remove = pop.querySelector('[data-rt-form-action="remove-option"]');
+  if (remove) remove.addEventListener("click", () => { closePop(); removeOption(parentId, optionKey); });
+}
+function openWeightEditor(nodeId, index) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
+  if (!ref || !Array.isArray(ref.node.weights) || !ref.node.weights[index]) return;
+  const weight = ref.node.weights[index];
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-action="edit-weight"][data-weight-index="${index}"]`) || nodeAnchorFn(nodeId)();
+  const html = popHead(tr("pipeline.editWeightTitle"), ref.node.id) +
+    SRTreeEditor.weightRowHTML({weight: weight, signals: SIGNALS, index: index}) +
+    popFoot(t("common.save"));
+  const pop = openPop(html, anchor(), {kind: "weight", nodeId: nodeId, anchor: anchor});
+  bindWeightRowSignals(pop);
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+    const values = SRTreeEditor.readWeightRow(pop.querySelector("[data-weight-row]"));
+    const issues = [];
+    if (!SRTreeEditor.signalSpecOf(SIGNALS, values.signal)) issues.push(localIssue("unknown_signal", tr("pipeline.badSignal")));
+    if (!values.value) issues.push(localIssue("missing_value", tr("pipeline.badValue")));
+    if (!Number.isFinite(values.weight) || values.weight < 0 || values.weight > 1) {
+      issues.push(localIssue("invalid_threshold", tr("pipeline.badWeight")));
+    }
+    if (issues.length) { showPopIssues(issues); return; }
+    closePop();
+    patchNode(nodeId, node => Object.assign({}, node, {
+      weights: node.weights.map((item, itemIndex) => itemIndex === index
+        ? {signal: values.signal, value: values.value, weight: values.weight} : item),
+    }));
+  });
 }
 
-/* station creation: pick the root condition (or an unconditional entry) */
-function openStationPicker() {
-  popTarget = { kind: 'picker' };
-  const pop = $('#pop');
-  function renderRoots() {
-    pop.hidden = false;
-    pop.innerHTML = `${popHead(t('p6.newStation'), t('p6.stationNote'))}
-      <p class="pop-label">${esc(t('p6.rootCondition'))}</p>
-      <div class="pop-vals" id="stRoots">
-        <button data-uncond="1">${esc(t('p6.unconditional'))}</button>
-        ${Object.values(SIGNAL_REGISTRY).map(x =>
-          `<button data-pk="${esc(x.key)}">${esc(sigName(x.key))}</button>`).join('')}
-      </div>
-      <div class="pop-foot"><span class="pop-note">${esc(t('p6.stationNote'))}</span></div>`;
-    placePop(anchorOf('[data-newstation]'), true);
-    $('#stRoots').addEventListener('click', e => {
-      if (e.target.closest('[data-uncond]')) { closePop(); addStation(null, ''); return; }
-      const b = e.target.closest('[data-pk]');
-      if (!b) return;
-      const key = b.dataset.pk;
-      const spec = sigSpec(key);
-      if (isFreeSig(key)) {
-        pop.innerHTML = `${popHead(tf('p4.pickRootValue', { sig: sigName(key) }), '')}
-          <p class="pop-label">${esc(t('p4.value'))}</p>
-          <input class="pop-text" id="stText" value="">
-          <div class="pop-foot"><button class="pop-ok" id="stOk">${esc(t('common.add'))}</button></div>`;
-        placePop(anchorOf('[data-newstation]'), true);
-        const submit = () => {
-          const v = $('#stText').value.trim();
-          if (!v) { $('#stText').focus(); return; }
-          closePop();
-          addStation(key, v);
-        };
-        $('#stText').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
-        $('#stOk').addEventListener('click', submit);
-        return;
-      }
-      pop.innerHTML = `${popHead(tf('p4.pickRootValue', { sig: sigName(key) }), '')}
-        <div class="pop-vals" id="stVals">
-          ${(spec.values || []).map(([v, zh, en]) =>
-            `<button data-pv="${esc(v)}">${esc(LANG === 'zh' ? zh : (en || zh))}</button>`).join('')}
-        </div>`;
-      placePop(anchorOf('[data-newstation]'), true);
-      $('#stVals').addEventListener('click', e => {
-        const v = e.target.closest('[data-pv]');
-        if (!v) return;
+/* ── structure changes ───────────────────────────────────────────────── */
+function uniqueNodeId(prefix) {
+  return SRTreeEditor.uniqueNodeId(currentDraft(), prefix || "n");
+}
+function defaultRouteModel() {
+  const ids = Array.from(modelsById().keys());
+  return ids.length ? ids[0] : "";
+}
+function newNodeOfType(type, options) {
+  const opts = options || {};
+  if (type === "route") {
+    const model = opts.model || defaultRouteModel();
+    if (!model) return null;
+    return SRTreeEditor.emptyNode("route", uniqueNodeId("n"), {model: model});
+  }
+  return SRTreeEditor.emptyNode(type, uniqueNodeId("n"));
+}
+function nodeTypeButtonsHTML() {
+  return `<div class="rt-type-picker">${NODE_TYPES.map(type =>
+    `<button type="button" class="rt-type-choice" data-new-node-type="${type}">${esc(SRTreeView.nodeTypeLabel(type))}</button>`).join("")}</div>`;
+}
+function openNewNodePicker(parentId, target) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, parentId) : null;
+  if (!ref) return;
+  const actionName = target === "otherwise" ? "add-otherwise" : "add-child";
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-action="${actionName}"][data-node-id="${CSS.escape(parentId)}"]`) || nodeAnchorFn(parentId)();
+  const html = popHead(tr("pipeline.newNodeTitle"), SRTreeView.nodeTypeLabel(ref.node.type)) +
+    nodeTypeButtonsHTML();
+  const pop = openPop(html, anchor(), {kind: "new-node", nodeId: parentId, target: target, anchor: anchor});
+  pop.querySelectorAll("[data-new-node-type]").forEach(button => {
+    button.addEventListener("click", () => {
+      const newNode = newNodeOfType(button.dataset.newNodeType);
+      if (!newNode) { showPopIssues([localIssue("no_models", tr("pipeline.noModels"))]); return; }
+      const result = target === "otherwise"
+        ? SRTreeEditor.setOtherwise(ref.node, newNode)
+        : SRTreeEditor.addChild(ref.node, newNode);
+      if (result.issues.length) { showPopIssues(result.issues); return; }
+      closePop();
+      patchNode(parentId, () => result.node, {toast: tr("pipeline.nodeAdded")});
+    });
+  });
+}
+function openNewModelOption(parentId) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, parentId) : null;
+  if (!ref || ref.node.type !== "nl_choice") return;
+  const parent = ref.node;
+  const modelIds = Array.from(modelsById().keys());
+  if (!modelIds.length) { toastUndo(tr("pipeline.noModels")); return; }
+  const suggestedKey = SRTreeEditor.nextOptionKey(parent);
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-action="add-option"][data-option-kind="model"][data-node-id="${CSS.escape(parentId)}"]`);
+  const html = popHead(tr("pipeline.addModelOption"), parent.id) +
+    `<label class="rt-field"><span>${esc(tr("pipeline.optionKey"))}</span>
+       <input type="text" id="newOptionKey" value="${esc(suggestedKey)}"></label>
+     <label class="rt-field"><span>${esc(tr("tree.model"))}</span>
+       <select id="newOptionModel">${modelIds.map(id =>
+         `<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select></label>` +
+    popFoot(t("common.add"));
+  const pop = openPop(html, anchor(), {kind: "new-option", nodeId: parentId, anchor: anchor});
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+    const key = ($("#newOptionKey").value || "").trim();
+    const option = SRTreeEditor.emptyOption("model", key, {model: $("#newOptionModel").value});
+    const result = SRTreeEditor.addOption(parent, option);
+    if (result.issues.length) { showPopIssues(result.issues); return; }
+    closePop();
+    patchNode(parentId, () => result.node, {toast: tr("pipeline.optionAdded")});
+  });
+}
+function openNewChildOption(parentId) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, parentId) : null;
+  if (!ref || ref.node.type !== "nl_choice") return;
+  const parent = ref.node;
+  const modelIds = Array.from(modelsById().keys());
+  const suggestedKey = SRTreeEditor.nextOptionKey(parent);
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-action="add-option"][data-option-kind="child"][data-node-id="${CSS.escape(parentId)}"]`);
+  const html = popHead(tr("pipeline.addChildOption"), parent.id) +
+    `<label class="rt-field"><span>${esc(tr("pipeline.optionKey"))}</span>
+       <input type="text" id="newOptionKey" value="${esc(suggestedKey)}"></label>
+     <label class="rt-field"><span>${esc(tr("pipeline.optionDescription"))}</span>
+       <textarea id="newOptionDesc" rows="2" placeholder="${esc(tr("pipeline.descriptionPlaceholder"))}"></textarea></label>
+     <label class="rt-field"><span>${esc(tr("pipeline.childNodeType"))}</span>
+       <select id="newChildType">${NODE_TYPES.map(type =>
+         `<option value="${type}"${type === "route" ? " selected" : ""}>${esc(SRTreeView.nodeTypeLabel(type))}</option>`).join("")}</select></label>
+     <label class="rt-field" id="newChildModelRow"><span>${esc(tr("tree.model"))}</span>
+       <select id="newChildModel">${modelIds.map(id =>
+         `<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select></label>` +
+    popFoot(t("common.add"));
+  const pop = openPop(html, anchor(), {kind: "new-child-option", nodeId: parentId, anchor: anchor});
+  const typeSelect = $("#newChildType");
+  const syncModelRow = () => {
+    const row = $("#newChildModelRow");
+    if (row) row.style.display = typeSelect.value === "route" ? "" : "none";
+  };
+  typeSelect.addEventListener("change", syncModelRow);
+  syncModelRow();
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+    const key = ($("#newOptionKey").value || "").trim();
+    const description = ($("#newOptionDesc").value || "").trim();
+    const child = newNodeOfType(typeSelect.value, {
+      model: $("#newChildModel") ? $("#newChildModel").value : "",
+    });
+    if (!child) { showPopIssues([localIssue("no_models", tr("pipeline.noModels"))]); return; }
+    const option = SRTreeEditor.emptyOption("child", key, {child: child, description: description});
+    const result = SRTreeEditor.addOption(parent, option);
+    if (result.issues.length) { showPopIssues(result.issues); return; }
+    closePop();
+    patchNode(parentId, () => result.node, {toast: tr("pipeline.optionAdded")});
+  });
+}
+function removeWithUndo(nextDraft, message) {
+  const before = SRTreeModel.clone(currentDraft());
+  if (!commitDraft(nextDraft)) return;
+  toastUndo(message, () => commitDraft(before));
+}
+function removeNodeById(nodeId) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
+  if (!ref) return;
+  if (!ref.parent) { toastUndo(tr("pipeline.cannotRemoveRoot")); return; }
+  let next;
+  try { next = SRTreeModel.removeNode(draft, nodeId); }
+  catch (err) { toastUndo(String((err && err.message) || err)); return; }
+  removeWithUndo(next, tr("pipeline.nodeRemoved"));
+}
+function removeOption(parentId, optionKey) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, parentId) : null;
+  if (!ref || ref.node.type !== "nl_choice") return;
+  const result = SRTreeEditor.removeOption(ref.node, optionKey);
+  if (result.issues.length) { renderIssues(result.issues); return; }
+  removeWithUndo(SRTreeModel.updateNode(draft, parentId, () => result.node), tr("pipeline.optionRemoved"));
+}
+function removeOtherwise(parentId) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, parentId) : null;
+  if (!ref) return;
+  const result = SRTreeEditor.clearOtherwise(ref.node);
+  if (result.issues.length) { renderIssues(result.issues); return; }
+  removeWithUndo(SRTreeModel.updateNode(draft, parentId, () => result.node),
+    tr("pipeline.otherwiseRemoved"));
+}
+function moveNodeBy(nodeId, delta) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
+  if (!ref || ref.edgeKind === "root" || ref.edgeKind === "otherwise") return;
+  const next = SRDnd.applyMove(draft, {nodeId: nodeId, targetIndex: ref.index + delta});
+  if (JSON.stringify(next) === JSON.stringify(draft)) return;
+  commitDraft(next);
+}
+
+/* ── signal drops: only explicit when / weights zones ────────────────── */
+function applySignalToWhen(nodeId, signalKey, value) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
+  if (!ref) return;
+  const values = {signal: signalKey, value: value};
+  const spec = SRTreeEditor.signalSpecOf(SIGNALS, signalKey);
+  if (spec && spec.kind !== "rule") values.conf_min = DEFAULT_CONF_MIN;
+  const result = SRTreeEditor.applyWhenForm(ref.node, values,
+    {signals: SIGNALS, context: refContext(ref)});
+  if (result.issues.some(item => item.level !== "warn")) { renderIssues(result.issues); return; }
+  patchNode(nodeId, () => result.node, {toast: tr("pipeline.conditionSet")});
+}
+function applySignalToWeights(nodeId, signalKey, value) {
+  const draft = currentDraft();
+  const ref = draft ? SRTreeModel.findNodeRef(draft, nodeId) : null;
+  if (!ref) return;
+  const result = SRTreeEditor.addWeight(ref.node, {signal: signalKey, value: value, signals: SIGNALS});
+  if (result.issues.length) { renderIssues(result.issues); return; }
+  patchNode(nodeId, () => result.node, {toast: tr("pipeline.weightAdded")});
+}
+function dropSignalOn(signalKey, target) {
+  if (!target || !target.nodeId) return;
+  lastDropAt = Date.now();
+  const zone = target.zone;
+  const anchor = () => $("#treeRoot").querySelector(
+    `[data-rt-drop="${zone}"][data-node-id="${CSS.escape(target.nodeId)}"]`);
+  openValuePicker(signalKey, anchor, value => {
+    if (zone === "when") applySignalToWhen(target.nodeId, signalKey, value);
+    else applySignalToWeights(target.nodeId, signalKey, value);
+  });
+}
+
+/* ── signal -> value picker (generic UI; no node semantics) ──────────── */
+function listChoices(signalKey) {
+  if (signalKey === "keyword") return KEYWORD_GROUPS.slice();
+  if (signalKey === "time_window") return TIME_PERIODS.slice();
+  return [];
+}
+function openValuePicker(signalKey, anchorFn, onPick) {
+  const spec = SRTreeEditor.signalSpecOf(SIGNALS, signalKey);
+  const anchor = typeof anchorFn === "function" ? anchorFn : () => anchorFn;
+  const free = !spec || !Array.isArray(spec.values) || !spec.values.length;
+  const values = free ? [] : spec.values.map(entry => Array.isArray(entry) ? entry : [entry.key, entry.zh, entry.en]);
+  const head = popHead(tr("pipeline.pickValueTitle", {signal: sigName(signalKey)}), "");
+  const body = free
+    ? `<label class="rt-field"><span>${esc(tr("pipeline.value"))}</span>
+         <input type="text" id="pickValueInput" list="pickValueList"
+                placeholder="${esc(tr("pipeline.freePlaceholder"))}"></label>
+       <datalist id="pickValueList">${listChoices(signalKey).map(item =>
+         `<option value="${esc(item)}">`).join("")}</datalist>`
+    : `<div class="pop-vals" id="pickValueList">${values.map(entry =>
+        `<button type="button" data-pick-value="${esc(entry[0])}">${esc(
+          LANG === "zh" ? (entry[1] || entry[0]) : (entry[2] || entry[1] || entry[0]))}</button>`).join("")}</div>`;
+  const pop = openPop(head + body + popFoot(t("common.add")), anchor(), {kind: "value-picker", anchor: anchor});
+  if (free) {
+    pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
+      const value = ($("#pickValueInput").value || "").trim();
+      if (!value) { $("#pickValueInput").focus(); return; }
+      closePop();
+      onPick(value);
+    });
+    $("#pickValueInput").addEventListener("keydown", event => {
+      if (event.key === "Enter") { event.preventDefault(); pop.querySelector('[data-pop="apply"]').click(); }
+    });
+  } else {
+    const apply = pop.querySelector('[data-pop="apply"]');
+    if (apply) apply.style.display = "none";
+    pop.querySelectorAll("[data-pick-value]").forEach(button => {
+      button.addEventListener("click", () => {
+        const value = button.dataset.pickValue;
         closePop();
-        addStation(key, v.dataset.pv);
+        onPick(value);
       });
     });
   }
-  renderRoots();
 }
-
-/* ── pointer interactions (no native HTML5 DnD) ─────────────────────── */
-let pdrag = null;        // {kind:'signal'|'station', ...}
-
-function clearHot() { $$('.tnode.hot').forEach(el => el.classList.remove('hot')); }
-function clearDropIndicators() {
-  $$('.station.drop-before, .station.drop-after')
-    .forEach(el => el.classList.remove('drop-before', 'drop-after'));
-}
-function elementAt(x, y) {
-  const el = document.elementFromPoint(x, y);
-  return el && el.closest ? el : null;
-}
-
-function onPointerMove(ev) {
-  if (!pdrag) return;
-  const dx = ev.clientX - pdrag.startX, dy = ev.clientY - pdrag.startY;
-  if (!pdrag.active) {
-    if (Math.hypot(dx, dy) < 6) return;
-    pdrag.active = true;
-    document.body.classList.add('dragging');
-    if (pdrag.kind === 'signal') {
-      const ghost = document.createElement('div');
-      ghost.className = 'drag-ghost';
-      ghost.textContent = sigName(pdrag.sig);
-      ghost.style.cssText = 'position:fixed;pointer-events:none;z-index:80;';
-      // append inside .t4 so the drag-ghost styles and CSS variables apply
-      ($('.t4') || document.body).appendChild(ghost);
-      pdrag.ghost = ghost;
-      dragSig = pdrag.sig;
-    } else {
-      const el = $(`[data-station="${CSS.escape(pdrag.stationId)}"]`);
-      if (el) el.classList.add('moving');
-    }
-  }
-  if (pdrag.kind === 'signal') {
-    if (pdrag.ghost) {
-      pdrag.ghost.style.left = (ev.clientX + 14) + 'px';
-      pdrag.ghost.style.top = (ev.clientY + 10) + 'px';
-    }
-    clearHot();
-    const tn = elementAt(ev.clientX, ev.clientY)?.closest('.tnode');
-    if (tn) {
-      const ref = findNodeRef(tn.dataset.node);
-      if (ref && ref.node.kind === 'leaf') tn.classList.add('hot');
-    }
-    return;
-  }
-  clearDropIndicators();
-  const stEl = elementAt(ev.clientX, ev.clientY)?.closest('.station');
-  if (!stEl) return;
-  const r = stEl.getBoundingClientRect();
-  const before = ev.clientY < r.top + r.height / 2;
-  stEl.classList.add(before ? 'drop-before' : 'drop-after');
-  pdrag.target = { id: stEl.dataset.station, before };
-}
-
-function onPointerUp(ev) {
-  if (!pdrag) return;
-  const drag = pdrag;
-  pdrag = null;
-  document.body.classList.remove('dragging');
-  if (drag.ghost) drag.ghost.remove();
-  dragSig = null;
-  clearHot();
-  clearDropIndicators();
-  if (drag.kind === 'station') {
-    $$('.station.moving').forEach(el => el.classList.remove('moving'));
-    if (drag.active && drag.target) {
-      const idx = stations.findIndex(s => s.id === drag.target.id);
-      if (idx >= 0) moveStation(drag.stationId,
-                                drag.target.before ? idx : idx + 1);
-    }
-    return;
-  }
-  if (!drag.active) return;
-  const tn = elementAt(ev.clientX, ev.clientY)?.closest('.tnode');
-  if (tn) handleSignalDrop(tn.dataset.node, drag.sig);
-}
-
-function bindPalette() {
-  const palBody = $('#palBody');
-  palBody.addEventListener('mousedown', e => {
-    const sig = e.target.closest('.sig');
-    if (!sig || e.button !== 0) return;
-    e.preventDefault();                       // avoid text selection while dragging
-    pdrag = { kind: 'signal', sig: sig.dataset.sig,
-              startX: e.clientX, startY: e.clientY, active: false, ghost: null };
+function openSignalPicker(anchorEl, onPick) {
+  const anchor = () => anchorEl || $("#palBody .sig");
+  const html = popHead(tr("pipeline.pickSignalTitle"), "") +
+    `<div class="pop-vals" id="pickSignalList">${SIGNALS.map(spec =>
+      `<button type="button" data-pick-signal="${esc(spec.key)}">${esc(sigName(spec.key))}</button>`).join("")}</div>`;
+  const pop = openPop(html, anchor(), {kind: "signal-picker", anchor: anchor});
+  pop.querySelectorAll("[data-pick-signal]").forEach(button => {
+    button.addEventListener("click", () => {
+      const signalKey = button.dataset.pickSignal;
+      closePop();
+      openValuePicker(signalKey, anchor, value => onPick(signalKey, value));
+    });
   });
-  palBody.addEventListener('scroll', syncPalFade, { passive: true });
-  $('#palToggle').addEventListener('click', () =>
-    setPalOpen($('#palette').classList.contains('closed')));
-}
-function setPalOpen(open) {
-  $('#palette').classList.toggle('closed', !open);
-  $('#palToggle').setAttribute('aria-expanded', String(open));
 }
 
-function bindFlow() {
-  const flow = $('#flow');
+/* ── delegated canvas actions ────────────────────────────────────────── */
+function onCanvasClick(event) {
+  const zoneEl = event.target.closest("[data-rt-drop]");
+  if (zoneEl && pendingSignal) {
+    event.preventDefault();
+    const signalKey = pendingSignal;
+    pendingSignal = null;
+    renderPalette();
+    dropSignalOn(signalKey, {nodeId: zoneEl.dataset.nodeId, zone: zoneEl.dataset.rtDrop});
+    return;
+  }
+  const actionEl = event.target.closest("[data-rt-action]");
+  if (!actionEl) return;
+  const action = actionEl.dataset.rtAction;
+  const nodeId = actionEl.dataset.nodeId;
+  if (action === "edit-node") openNodeEditor(nodeId);
+  else if (action === "edit-when") openWhenEditor(nodeId);
+  else if (action === "edit-option") openOptionEditor(nodeId, actionEl.dataset.optionKey);
+  else if (action === "remove-option") removeOption(nodeId, actionEl.dataset.optionKey);
+  else if (action === "edit-weight") openWeightEditor(nodeId, Number(actionEl.dataset.weightIndex));
+  else if (action === "add-weight") openSignalPicker(actionEl, (signalKey, value) =>
+    applySignalToWeights(nodeId, signalKey, value));
+  else if (action === "add-child") openNewNodePicker(nodeId, "children");
+  else if (action === "add-otherwise") openNewNodePicker(nodeId, "otherwise");
+  else if (action === "remove-otherwise") removeOtherwise(nodeId);
+  else if (action === "remove-node") removeNodeById(nodeId);
+  else if (action === "move-node") moveNodeBy(nodeId, Number(actionEl.dataset.direction));
+  else if (action === "add-option") {
+    if (actionEl.dataset.optionKind === "child") openNewChildOption(nodeId);
+    else openNewModelOption(nodeId);
+  }
+}
+function onCanvasKeydown(event) {
+  if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+  const holder = event.target.closest(
+    '[data-rt-action="move-node"], [data-rt-drag="node"], [data-node-id][data-node-type]');
+  if (!holder) return;
+  const nodeId = holder.getAttribute("data-node-id");
+  if (!nodeId) return;
+  event.preventDefault();
+  moveNodeBy(nodeId, event.key === "ArrowUp" ? -1 : 1);
+}
 
-  flow.addEventListener('click', e => {
-    const add = e.target.closest('[data-nodeadd]');
-    if (add) { openChildPicker(add.dataset.nodeadd); return; }
-    const del = e.target.closest('[data-nodedel]');
-    if (del) { deleteNode(del.dataset.nodedel); return; }
-    const cond = e.target.closest('[data-cond]');
-    if (cond) { openConditionEditor(cond.dataset.cond); return; }
-    const out = e.target.closest('[data-out]');
-    if (out) { openLeafEditor(out.dataset.out); return; }
-    const weight = e.target.closest('[data-weight]');
-    if (weight) {
-      const [nid_, idx] = weight.dataset.weight.split(':');
-      openWeightEditor(nid_, Number(idx));
+/* ── tree list actions ───────────────────────────────────────────────── */
+function selectTree(treeId) {
+  try { SRTreeStore.select(treeId); }
+  catch (err) { toastUndo(errText(err)); return; }
+  closePop();
+  renderAll();
+}
+function treeIdFromName(name) {
+  const base = String(name || "").toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-").replace(/^[-._]+|[-._]+$/g, "").slice(0, 48);
+  const prefix = /^[a-z0-9]/.test(base) ? base : "tree";
+  const taken = new Set(SRTreeStore.trees().map(tree => tree.id));
+  let candidate = `${prefix}-${Date.now().toString(36)}`;
+  if (taken.has(candidate.slice(0, 64))) {
+    candidate = `${candidate}-${Math.random().toString(36).slice(2, 7)}`;
+  }
+  return candidate.slice(0, 64);
+}
+function openCreateTree() {
+  const modelIds = Array.from(modelsById().keys());
+  const anchor = () => $("#newTree");
+  const html = popHead(tr("pipeline.treeCreateTitle"), "") +
+    `<label class="rt-field"><span>${esc(tr("pipeline.treeName"))}</span>
+       <input type="text" id="newTreeName" placeholder="${esc(tr("pipeline.treeNamePlaceholder"))}"></label>
+     <label class="rt-field"><span>${esc(tr("pipeline.rootType"))}</span>
+       <select id="newTreeRootType">${NODE_TYPES.map(type =>
+         `<option value="${type}"${type === "branch" ? " selected" : ""}>${esc(SRTreeView.nodeTypeLabel(type))}</option>`).join("")}</select></label>
+     <label class="rt-field" id="newTreeModelRow"><span>${esc(tr("tree.model"))}</span>
+       <select id="newTreeModel">${modelIds.map(id =>
+         `<option value="${esc(id)}">${esc(id)}</option>`).join("")}</select></label>
+     <p class="rt-form-note">${esc(tr("pipeline.newTreeNote"))}</p>` + popFoot(t("pipeline.treeCreate"));
+  const pop = openPop(html, anchor(), {kind: "create-tree", anchor: anchor});
+  const typeSelect = $("#newTreeRootType");
+  const syncModelRow = () => {
+    const row = $("#newTreeModelRow");
+    if (row) row.style.display = typeSelect.value === "route" ? "" : "none";
+  };
+  typeSelect.addEventListener("change", syncModelRow);
+  syncModelRow();
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", async () => {
+    const name = ($("#newTreeName").value || "").trim();
+    if (!name) { showPopIssues([localIssue("name_required", tr("pipeline.treeNameRequired"))]); return; }
+    if (typeSelect.value === "route" && !modelIds.length) {
+      showPopIssues([localIssue("no_models", tr("pipeline.noModels"))]);
       return;
     }
-    const delStation = e.target.closest('[data-delstation]');
-    if (delStation) { deleteStation(delStation.dataset.delstation); return; }
-    const newStation = e.target.closest('[data-newstation]');
-    if (newStation) { openStationPicker(); return; }
-  });
-
-  /* station reorder by dragging the number badge (fallback locked last) */
-  flow.addEventListener('mousedown', e => {
-    const seq = e.target.closest('.seq');
-    if (!seq || e.button !== 0) return;
-    const id = seq.closest('.station').dataset.station;
-    if (id === stations[stations.length - 1].id) return;
-    e.preventDefault();
-    pdrag = { kind: 'station', stationId: id,
-              startX: e.clientX, startY: e.clientY, active: false };
-  });
-
-  flow.addEventListener('keydown', e => {
-    const seq = e.target.closest('.seq');
-    if (seq && e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
-      const id = seq.closest('.station').dataset.station;
-      const idx = stations.findIndex(s => s.id === id);
-      if (idx < 0 || idx === stations.length - 1) return;
-      e.preventDefault();
-      moveStation(id, e.key === 'ArrowUp' ? idx - 1 : idx + 2);
-      const again = flow.querySelector(`[data-station="${CSS.escape(id)}"] .seq`);
-      if (again) again.focus();
+    try {
+      const root = SRTreeEditor.emptyNode(typeSelect.value, `root-${Date.now().toString(36)}`, {
+        model: $("#newTreeModel") ? $("#newTreeModel").value : undefined,
+      });
+      await SRTreeStore.create(name, root);
+      closePop();
+      renderAll();
+      toastUndo(tr("pipeline.treeCreated"));
+    } catch (err) {
+      showPopIssues(issueList(err) || [localIssue("create", errText(err))]);
     }
   });
 }
-
-document.addEventListener('mousemove', onPointerMove);
-document.addEventListener('mouseup', onPointerUp);
-
-function moveStation(stationId, beforeIdx) {
-  const from = stations.findIndex(s => s.id === stationId);
-  if (from < 0 || from === stations.length - 1) return;
-  const snapshot = stations.map(s => s.id);
-  const st = stations[from];
-  let to = beforeIdx > from ? beforeIdx - 1 : beforeIdx;
-  to = Math.max(0, Math.min(to, stations.length - 2));
-  if (to === from) return;
-  stations.splice(from, 1);
-  stations.splice(to, 0, st);
-  markDirty();
-  reorderFlowDOM();
-  toastUndo(tf('p4.toastMoved', { name: st.name, n: to + 1 }), () => {
-    const byId = new Map(stations.map(s => [s.id, s]));
-    stations.length = 0;
-    snapshot.forEach(id => stations.push(byId.get(id)));
-    markDirty();
-    reorderFlowDOM();
+function openCopyTree(treeId) {
+  const tree = SRTreeStore.tree(treeId);
+  if (!tree) return;
+  const suggested = tr("pipeline.copySuffix", {name: tree.name || tree.id});
+  const anchor = () => $("#treeList").querySelector(`[data-tree-id="${CSS.escape(treeId)}"]`);
+  const html = popHead(tr("pipeline.treeCopyTitle"), tree.name || tree.id) +
+    `<label class="rt-field"><span>${esc(tr("pipeline.treeName"))}</span>
+       <input type="text" id="copyTreeName" value="${esc(suggested)}"></label>
+     <p class="rt-form-note">${esc(tr("pipeline.copyNote"))}</p>` + popFoot(t("pipeline.treeCopy"));
+  const pop = openPop(html, anchor(), {kind: "copy-tree", treeId: treeId, anchor: anchor});
+  pop.querySelector('[data-pop="apply"]').addEventListener("click", async () => {
+    const name = ($("#copyTreeName").value || "").trim();
+    if (!name) { showPopIssues([localIssue("name_required", tr("pipeline.treeNameRequired"))]); return; }
+    try {
+      await SRTreeStore.copy(treeId, {id: treeIdFromName(name), name: name});
+      closePop();
+      renderAll();
+      toastUndo(tr("pipeline.treeCopied"));
+    } catch (err) {
+      showPopIssues(issueList(err) || [localIssue("copy", errText(err))]);
+    }
   });
 }
+async function treeAction(action, treeId) {
+  if (action === "copy") { openCopyTree(treeId); return; }
+  try {
+    if (action === "enable") { await SRTreeStore.enable(treeId); toastUndo(tr("pipeline.treeEnabled")); }
+    else if (action === "disable") { await SRTreeStore.disable(treeId); toastUndo(tr("pipeline.treeDisabled")); }
+  } catch (err) {
+    const issues = issueList(err);
+    if (issues) renderIssues(issues);
+    toastUndo(errText(err));
+    return;
+  }
+  renderAll();
+}
 
-/* popover external-click close */
-function bindPop() {
-  const pop = $('#pop');
-  pop.addEventListener('click', e => {
-    if (e.target.closest('[data-popclose]')) closePop();
-  });
-  document.addEventListener('mousedown', e => {
-    if (pop.hidden) return;
-    if (pop.contains(e.target)) return;
-    if (e.target.closest('[data-cond],[data-out],[data-weight],[data-nodeadd],[data-newstation]')) return;
-    closePop();
-  });
+/* ── save / export / import ──────────────────────────────────────────── */
+async function saveTree() {
+  const treeId = currentTreeId();
+  if (!treeId) { toastUndo(tr("pipeline.noSelected")); return; }
+  try {
+    const out = await SRTreeStore.save(treeId);
+    renderIssues([]);
+    renderWarnings(out.warnings || []);
+    renderAll();
+    toastUndo(t("common.saved"));
+  } catch (err) {
+    const issues = issueList(err);
+    renderIssues(issues || [localIssue("save", errText(err))]);
+    toastUndo(tr("pipeline.saveFail"));
+  }
+}
+function exportTree() {
+  const tree = currentTree();
+  const root = currentDraft();
+  if (!tree || !root) { toastUndo(tr("pipeline.noSelected")); return; }
+  const payload = {
+    format: "sr-routing-tree",
+    version: 1,
+    name: tree.name || tree.id,
+    root: SRTreeModel.clone(root),
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2) + "\n"], {type: "application/json"});
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `${tree.id}.json`;
+  document.body.appendChild(link);
+  link.click();
+  setTimeout(() => { URL.revokeObjectURL(link.href); link.remove(); }, 0);
+  toastUndo(tr("pipeline.exportOk", {name: link.download}));
+}
+async function importTree(file) {
+  try {
+    const parsed = JSON.parse(await file.text());
+    const payload = parsed && typeof parsed === "object" ? parsed : {};
+    if (payload.format && payload.format !== "sr-routing-tree") {
+      throw new Error(tr("pipeline.importBadFormat"));
+    }
+    const rawRoot = payload.root != null ? payload.root
+      : (payload.id && payload.type ? payload : null);
+    if (!rawRoot) throw new Error(tr("pipeline.importEmpty"));
+    const root = SRTreeModel.normalizeNode(rawRoot, {root: true, otherwise: false});
+    commitDraft(root, {toast: tr("pipeline.importOk")});
+    renderWarnings([]);
+  } catch (err) {
+    toastUndo(tr("pipeline.importBad", {err: errText(err)}));
+  } finally {
+    const input = $("#importFile");
+    if (input) input.value = "";
+  }
 }
 
 /* ── try drawer ──────────────────────────────────────────────────────── */
-let tryBusy = false;
 function openSim() {
-  document.body.classList.add('sim-open');
-  $('#sim').setAttribute('aria-hidden', 'false');
+  document.body.classList.add("sim-open");
+  $("#sim").setAttribute("aria-hidden", "false");
   renderSimText();
-  $('#simText').focus();
+  renderTry();
+  $("#simText").focus();
 }
 function closeSim() {
-  document.body.classList.remove('sim-open');
-  $('#sim').setAttribute('aria-hidden', 'true');
+  document.body.classList.remove("sim-open");
+  $("#sim").setAttribute("aria-hidden", "true");
 }
 function renderSimText() {
-  $('#simText').placeholder = t('p4.simPlaceholder');
-  $('#simRun').textContent = t('p4.simRun');
-  $('#simEx').innerHTML = [
-    t('p4.exMedical'), t('p4.exCode'), t('p4.exJail'), t('p4.exFact'),
-  ].map(x => `<button type="button">${esc(x)}</button>`).join('');
-  if (!lastTry) {
-    $('#simOut').innerHTML = dirtyWarning() +
-      `<b>${esc(t('p4.simEmptyTitle'))}</b>${esc(t('p4.simEmptyBody'))}`;
-  }
-}
-function stepText(s) {
-  const conf = (s.conf === 1.0 && s.conf_min == null)
-    ? t('p4.deterministic')
-    : pct(s.conf) + (s.conf_min != null ? ' ' + t('p4.confFloor') + Number(s.conf_min).toFixed(2) : '');
-  const why = s.pass ? ''
-    : (s.m === 0 ? ' · ' + t('p6.notMatched') : ' · ' + t('p4.cut'));
-  return `${sigName(s.signal)} = ${esc(valLabel(s.signal, s.value) || s.value)} · ${esc(conf)}${why}`;
-}
-function dirtyWarning() {
-  return isDirty()
-    ? `<div class="sim-warn">⚠ ${esc(t('p6.dirtyTry'))}</div>` : '';
+  $("#simText").placeholder = tr("pipeline.tryPlaceholder");
+  $("#simRun").textContent = tr("pipeline.tryRun");
 }
 function renderTry() {
-  const out = $('#simOut');
-  if (!lastTry) { renderSimText(); return; }
-  const d = lastTry.decision || {};
-  const cls = d.kind === 'block' ? 'block' : (d.kind === 'route' ? 'route' : 'none');
-  const badge = d.kind === 'route' ? t('pipe.try.finalhit')
-    : d.kind === 'block' ? t('pipe.try.finalblock') : t('pipe.try.finalnone');
-  const label = d.kind === 'block' ? '✕ ' + t('pipe.try.finalblock')
-    : d.kind === 'route'
-      ? '→ ' + (d.model || '—') + (d.reasoning ? ' · ' + reasonName(d.reasoning) : '')
-      : t('pipe.try.finalnone');
-  const station = d.station_id ? findStation(d.station_id) : null;
-  let html = dirtyWarning() + `<div class="final ${cls}">
-      <div><div class="m">${esc(label)}</div>
-      <div class="via">${esc(station ? station.name : '')}${d.score != null ? ' · score ' + Number(d.score).toFixed(2) : ''}</div></div>
-      <span class="badge">${esc(badge)}</span></div>`;
-  html += `<div class="col-h">${esc(t('pipe.try.trace'))}</div>`;
-  (lastTry.trace || []).forEach((r, i) => {
-    const hit = r.result === 'hit';
-    let body = '';
-    if ((r.path || []).length) {
-      body += `<div class="pathrow">${r.path.map(s =>
-        `<div class="pstep${s.pass ? '' : ' cut'}">${esc(stepText(s))}</div>`).join('')}</div>`;
-    }
-    if ((r.board || []).length) {
-      body += `<div class="board" style="margin-top:5px">${r.board.map(b =>
-        `<div class="brow${b.winner ? ' win' : ''}">${b.winner ? '★ ' : ''}
-           <span class="mono">score ${Number(b.score).toFixed(2)} ≥ ${Number(b.min_score).toFixed(2)}</span>
-           <span class="mono">${b.passed ? t('p6.passed') : t('p6.failed')}</span></div>`).join('')}</div>`;
-    }
-    if (!body) {
-      body = hit
-        ? `<div class="pstep">${esc(t('p6.traceUncondHit'))}</div>`
-        : `<div class="pstep cut">${esc(t('p6.traceNoMatch'))}</div>`;
-    }
-    html += `<div class="pstep" style="align-items:flex-start;flex-direction:column">
-        <div style="display:flex;gap:7px;align-items:center;width:100%">
-          <span class="mono">${i + 1}</span><b>${esc(r.name || r.station_id)}</b>
-          <span class="mono" style="color:${hit ? 'var(--t4-green)' : 'var(--t4-ink-3)'}">${hit ? t('pipe.hit') : t('pipe.miss')}</span>
-        </div>
-        <div style="width:100%;margin-top:4px">${body}</div>
-      </div>`;
-  });
-  const pack = lastTry.signals || {};
-  const chips = Object.entries(pack).filter(([, s]) => !s.is_rule).slice(0, 12).map(([k, s]) => {
-    let v = s.value;
-    if (Array.isArray(v)) v = v.length ? v.join(',') : '—';
-    else if (v == null) v = '—';
-    const conf = s.confidence != null ? ' ' + pct(s.confidence) : '';
-    return `<span>${esc(sigName(k))} ${esc(String(v))}${esc(conf)}</span>`;
-  }).join('');
-  html += `<div class="col-h" style="margin-top:4px">${esc(t('p4.signals'))}</div>
-    <div class="sigchips">${chips}</div>`;
-  out.innerHTML = html;
+  const out = $("#simOut");
+  if (!out) return;
+  const treeId = currentTreeId();
+  const tree = currentTree();
+  const result = treeId ? SRTreeStore.lastTry(treeId) : null;
+  const dirtyWarn = tree && SRTreeStore.isDirty(tree.id)
+    ? `<div class="sim-warn">⚠ ${esc(tr("pipeline.tryDirtyWarn"))}</div>` : "";
+  if (!tree || !treeId) {
+    out.innerHTML = `<b>${esc(tr("pipeline.tryEmptyTitle"))}</b>${esc(tr("pipeline.tryEmpty"))}`;
+    return;
+  }
+  if (!result) {
+    out.innerHTML = dirtyWarn + `<b>${esc(tr("pipeline.tryEmptyTitle"))}</b>` +
+      esc(tr("pipeline.tryEmpty"));
+    return;
+  }
+  const stale = result.tree_id !== treeId ||
+    (result.tree_revision && tree.tree_revision &&
+     result.tree_revision !== tree.tree_revision);
+  const staleWarn = stale ? `<div class="sim-warn">⚠ ${esc(tr("pipeline.tryStale"))}</div>` : "";
+  out.innerHTML = dirtyWarn + staleWarn + '<div class="sim-trace" id="simTrace"></div>';
+  /* one shared renderer for the try drawer AND the calculation log */
+  SRTraceView.renderRoutingTrace($("#simTrace"), result, {tree: tree});
 }
+
 async function runTry() {
-  const text = $('#simText').value.trim();
-  if (!text) { $('#simText').focus(); return; }
+  const text = ($("#simText").value || "").trim();
+  if (!text) { $("#simText").focus(); return; }
+  const treeId = currentTreeId();
+  if (!treeId) { toastUndo(tr("pipeline.noSelected")); return; }
   if (tryBusy) return;
   tryBusy = true;
-  $('#simRun').disabled = true;
+  $("#simRun").disabled = true;
   try {
-    lastTry = await api.post('/admin/try', { text });
+    await SRTreeStore.tryTree(treeId, {text: text});
     renderTry();
-  } catch (e) {
-    $('#simOut').innerHTML = `<b>${esc(t('p4.tryFail'))}</b>${esc(Array.isArray(e.detail) ? JSON.stringify(e.detail) : (e.detail || e.message))}`;
+  } catch (err) {
+    const issues = issueList(err);
+    $("#simOut").innerHTML = `<b>${esc(tr("pipeline.tryFail"))}</b>${esc(
+      issues ? issues.map(issueText).join("; ") : errText(err))}`;
   }
   tryBusy = false;
-  $('#simRun').disabled = false;
+  $("#simRun").disabled = false;
 }
 
-/* ── export / import ─────────────────────────────────────────────────── */
-function exportPipeline() {
-  const body = { version, exported_at: new Date().toISOString(), stations };
-  const blob = new Blob([JSON.stringify(body, null, 2) + '\n'],
-                        { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `pipeline-v${version}.json`;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
-  toastUndo(tf('p4.exportOk', { name: a.download }));
-}
-
-function normalizeImported(raw) {
-  const list = Array.isArray(raw) ? raw
-    : (raw && Array.isArray(raw.stations) ? raw.stations : null);
-  if (!list) throw new Error(t('p4.importNoNodes'));
-  function normNode(n, where) {
-    if (!n || typeof n !== 'object') throw new Error(where);
-    const kind = n.kind === 'fork' ? 'fork' : 'leaf';
-    const node = {
-      id: String(n.id || nid('n')), signal: n.signal || null,
-      value: n.value == null ? '' : String(n.value),
-      conf_min: n.conf_min != null ? Number(n.conf_min) : null,
-      kind, action: n.action === 'block' ? 'block' : 'route',
-      model: n.model || null,
-      reasoning: n.reasoning == null || n.reasoning === '' ? null : String(n.reasoning),
-      min_score: n.min_score != null ? Number(n.min_score) : null,
-      weights: (n.weights || []).map(w => ({
-        signal: String(w.signal), value: String(w.value ?? ''),
-        weight: w.weight != null ? Number(w.weight) : DEFAULT_WEIGHT,
-      })),
-      children: [],
-    };
-    if (kind === 'fork') {
-      if (!Array.isArray(n.children) || !n.children.length)
-        throw new Error(where + ': fork children');
-      node.children = n.children.map((c, i) =>
-        normNode(c, where + '/' + (i + 1)));
-    }
-    return node;
+/* ── toast ───────────────────────────────────────────────────────────── */
+let toastTimer = null;
+function toastUndo(message, undo) {
+  const el = $("#t4toast");
+  if (!el) return;
+  el.innerHTML = `<span>${esc(message)}</span>` +
+    (undo ? `<button type="button">${esc(tr("pipeline.undo"))}</button>` : "");
+  el.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), undo ? 6000 : 3200);
+  if (undo) {
+    el.querySelector("button").addEventListener("click", () => {
+      undo();
+      el.classList.remove("show");
+    }, {once: true});
   }
-  return list.map((st, i) => {
-    const where = t('p4.importRow') + ' #' + (i + 1);
-    if (!st || typeof st !== 'object') throw new Error(where);
-    return {
-      id: String(st.id || nid('st')),
-      name: String(st.name || ''),
-      root: st.root ? normNode(st.root, where + '/root') : null,
-    };
+}
+
+/* ── server clock (time_window judges by server time) ────────────────── */
+function startServerClock() {
+  startServerClockTick(() => {
+    const el = $("#serverClockPill");
+    if (!el) return;
+    el.innerHTML = `${esc(tr("pipeline.serverClock"))} <b>${esc(fmtServerTime(serverNow()))}</b>`;
   });
 }
 
-async function importPipeline(file) {
-  try {
-    const raw = JSON.parse(await file.text());
-    const imported = normalizeImported(raw);
-    if (!imported.length) throw new Error(t('p4.importEmpty'));
-    stations = imported;
-    markDirty();
-    renderAll();
-    toastUndo(tf('p4.importOk', { n: imported.length }));
-  } catch (e) {
-    toastUndo(tf('p4.importBad', { err: e.message }));
-  } finally {
-    $('#importFile').value = '';
-  }
+/* ── DND lifecycle (destroy before create: never double-bind) ────────── */
+function rebuildDnd() {
+  if (dnd) { dnd.destroy(); dnd = null; }
+  const root = $("#treeRoot");
+  if (!root) return;
+  dnd = SRDnd.createDndController({
+    root: root,
+    onMove: info => {
+      const draft = currentDraft();
+      if (!draft) return;
+      const next = SRDnd.applyMove(draft, info);
+      if (JSON.stringify(next) !== JSON.stringify(draft)) commitDraft(next);
+    },
+    onDropSignal: (signalKey, target) => dropSignalOn(signalKey, target),
+  });
 }
 
-/* ── save ────────────────────────────────────────────────────────────── */
-function showIssues(list, boxId) {
-  const box = $(boxId);
-  if (!list || !list.length) { box.innerHTML = ''; return; }
-  box.innerHTML = list.map(i => {
-    const msg = LANG === 'zh' ? (i.zh || i.code || JSON.stringify(i)) : (i.en || i.code || JSON.stringify(i));
-    return `<div class="iv">• ${esc(msg)}</div>`;
-  }).join('');
+/* ── wiring ──────────────────────────────────────────────────────────── */
+function bindChrome() {
+  $("#saveTree").addEventListener("click", saveTree);
+  $("#openSim").addEventListener("click", openSim);
+  $("#simClose").addEventListener("click", closeSim);
+  $("#simMask").addEventListener("click", closeSim);
+  $("#simRun").addEventListener("click", runTry);
+  $("#simText").addEventListener("keydown", event => {
+    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      runTry();
+    }
+  });
+  $("#exportTree").addEventListener("click", exportTree);
+  $("#importTree").addEventListener("click", () => $("#importFile").click());
+  $("#importFile").addEventListener("change", event => {
+    const file = event.target.files && event.target.files[0];
+    if (file) importTree(file);
+  });
+  $("#newTree").addEventListener("click", openCreateTree);
+  $("#palToggle").addEventListener("click", () => {
+    const palette = $("#palette");
+    const open = palette.classList.contains("closed");
+    palette.classList.toggle("closed", !open);
+    $("#palToggle").setAttribute("aria-expanded", String(open));
+  });
+  $("#palBody").addEventListener("click", event => {
+    const chip = event.target.closest("[data-sig]");
+    if (!chip) return;
+    if (Date.now() - lastDropAt < 400) return;   // a completed drag already applied it
+    pendingSignal = pendingSignal === chip.dataset.sig ? null : chip.dataset.sig;
+    renderPalette();
+  });
+  $("#treeList").addEventListener("click", event => {
+    const actionEl = event.target.closest("[data-tree-action]");
+    if (actionEl) {
+      event.preventDefault();
+      treeAction(actionEl.dataset.treeAction, actionEl.dataset.treeId);
+      return;
+    }
+    const row = event.target.closest("[data-tree-id]");
+    if (row) selectTree(row.getAttribute("data-tree-id"));
+  });
+  $("#treeRoot").addEventListener("click", onCanvasClick);
+  $("#treeRoot").addEventListener("keydown", onCanvasKeydown);
+  $("#issues").addEventListener("click", event => {
+    const locate = event.target.closest("[data-issue-node]");
+    if (locate) highlightNode(locate.getAttribute("data-issue-node"));
+  });
+  $("#pop").addEventListener("click", event => {
+    if (event.target.closest("[data-popclose]")) closePop();
+  });
+  document.addEventListener("mousedown", event => {
+    const pop = $("#pop");
+    if (pop.hidden) return;
+    if (pop.contains(event.target)) return;
+    if (event.target.closest(
+      "[data-rt-action],[data-rt-form-action],[data-rt-drop],[data-popclose],#newTree,#treeList")) return;
+    closePop();
+  });
+  document.addEventListener("keydown", event => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      saveTree();
+    } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+      event.preventDefault();
+      openSim();
+      runTry();
+    } else if (event.key === "Escape") {
+      if (!$("#pop").hidden) { closePop(); return; }
+      if (document.body.classList.contains("sim-open")) closeSim();
+    }
+  });
+  window.addEventListener("resize", () => {
+    if (!$("#pop").hidden && popContext && popContext.anchor) placePop(popContext.anchor());
+  });
 }
-
-async function save() {
-  try {
-    const out = await api.put('/admin/pipeline', { stations });
-    showIssues([], '#issues');
-    showIssues(out.warnings || [], '#warnings');
-    version = String(out.version != null ? out.version : version);
-    savedJson = JSON.stringify(stations);
-    renderHeader();
-    toastUndo(t('common.saved'));
-  } catch (e) {
-    if (Array.isArray(e.detail)) showIssues(e.detail, '#issues');
-    else toastUndo((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + (e.detail || e.message));
-  }
+function highlightNode(nodeId) {
+  const card = $("#treeRoot").querySelector(`[data-node-id="${CSS.escape(nodeId)}"][data-node-type]`);
+  if (!card) return;
+  card.classList.add("is-error");
+  card.scrollIntoView({block: "center", behavior: "smooth"});
+  setTimeout(() => card.classList.remove("is-error"), 2400);
 }
 
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function boot() {
   try {
-    const [sigBody, pipeBody, modelBody, tagBody] = await Promise.all([
-      api.get('/admin/signals'), api.get('/admin/pipeline'),
-      api.get('/admin/models'),
-      api.get('/admin/tagger').catch(() => ({ tagger: { name: '?' } })),
+    const [signalBody] = await Promise.all([
+      api.get("/admin/signals"),
+      SRTreeStore.load(),
     ]);
-    GROUPS = sigBody.groups && sigBody.groups.length
-      ? sigBody.groups
-      : ['safety', 'domain', 'difficulty', 'context', 'session', 'rule'];
-    setSignalRegistry(sigBody.signals);
-    KEYWORD_GROUPS = sigBody.keyword_groups || [];
-    TIME_PERIODS = sigBody.time_periods || [];
-    setServerOffset(sigBody.now);
+    GROUPS = Array.isArray(signalBody.groups) && signalBody.groups.length
+      ? signalBody.groups
+      : ["safety", "domain", "difficulty", "context", "session", "rule"];
+    SIGNALS = Array.isArray(signalBody.signals) ? signalBody.signals : [];
+    KEYWORD_GROUPS = Array.isArray(signalBody.keyword_groups) ? signalBody.keyword_groups : [];
+    TIME_PERIODS = Array.isArray(signalBody.time_periods) ? signalBody.time_periods : [];
+    setSignalRegistry(SIGNALS);
+    setServerOffset(signalBody.now);
     startServerClock();
-    const modelRows = modelBody.models || [];
-    MODELS = modelRows.map(m => m.id);
-    MODEL_INFO = {};
-    modelRows.forEach(m => {
-      MODEL_INFO[m.id] = (m.reasoning && typeof m.reasoning === 'object')
-        ? m.reasoning : { ...FALLBACK_REASON };
-    });
-    stations = pipeBody.stations || [];
-    version = String(pipeBody.version || '0');
-    tagger = tagBody.tagger || {};
-    savedJson = JSON.stringify(stations);
+    renderPalette();
     renderAll();
-  } catch (e) {
-    showIssues([{ zh: '加载失败: ' + (e.detail || e.message),
-                  en: 'load failed: ' + (e.detail || e.message) }], '#issues');
+  } catch (err) {
+    const issues = issueList(err);
+    renderIssues(issues || [localIssue("load", tr("pipeline.loadFail", {err: errText(err)}))]);
+    toastUndo(tr("pipeline.loadFail", {err: errText(err)}));
   }
-}
-
-function renderAll() {
-  renderHeader();
-  renderPalette();
-  renderTree();
-  syncFlowChrome();
-  syncPalFade();
-}
-
-/* ── wiring ──────────────────────────────────────────────────────────── */
-$('#savePipeline').addEventListener('click', save);
-$('#openSim').addEventListener('click', openSim);
-$('#simClose').addEventListener('click', closeSim);
-$('#simMask').addEventListener('click', closeSim);
-$('#simRun').addEventListener('click', runTry);
-$('#simText').addEventListener('keydown', e => {
-  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); runTry(); }
-});
-$('#simEx').addEventListener('click', e => {
-  const b = e.target.closest('button');
-  if (b) { $('#simText').value = b.textContent; $('#simText').focus(); }
-});
-$('#exportPipeline').addEventListener('click', exportPipeline);
-$('#importPipeline').addEventListener('click', () => $('#importFile').click());
-$('#importFile').addEventListener('change', e => {
-  const file = e.target.files && e.target.files[0];
-  if (file) importPipeline(file);
-});
-document.addEventListener('keydown', e => {
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') { e.preventDefault(); save(); }
-  else if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); openSim(); runTry(); }
-  else if (e.key === 'Escape') {
-    if (!$('#pop').hidden) { closePop(); return; }
-    if (document.body.classList.contains('sim-open')) { closeSim(); return; }
-  }
-});
-window.addEventListener('resize', () => {
-  if (!$('#pop').hidden && popTarget && popTarget.kind === 'picker' && popTarget.anchor) {
-    placePop(popTarget.anchor(), true);
-  }
-});
-/* ── server clock (time_window judges by server time) ────────────────── */
-function startServerClock() {
-  startServerClockTick(() => {
-    const el = $('#serverClockPill');
-    if (!el) return;
-    el.innerHTML = `${esc(t('p4.serverClock'))} <b>${esc(fmtServerTime(serverNow()))}</b>`;
-  });
 }
 
 window.onLangChange = () => {
+  renderPalette();
   renderAll();
   renderSimText();
-  if (lastTry) renderTry();
+  renderTry();
+  rebuildDnd();
 };
-bindFlow();
-bindPalette();
-bindPop();
-renderHeader();
+
+bindChrome();
+renderChrome();
+renderPalette();
+renderTree();
 boot();

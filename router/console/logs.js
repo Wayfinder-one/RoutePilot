@@ -1,24 +1,34 @@
 /* Calculation log page: the newest requests kept in memory (detail is never
-   persisted), the stations the pipeline walked, why each station hit or
-   missed, the decision path against its confidence floors, the weighted score
-   boards and the signal pack. Data: GET /admin/requests/recent (memory ring). */
+   persisted). The expanded row renders the routing trace through the SAME
+   shared renderer as the pipeline try drawer (`SRTraceView`), so one backend
+   event always produces the same text on both pages.
+
+   Data: GET /admin/requests/recent (memory ring) + GET /admin/trees (id ->
+   name map, read once per page load and cached) + GET /admin/signals (label
+   registry) + GET /admin/tagger (engine pill). The retired station/pipeline
+   explanation and `GET /admin/pipeline` are gone. */
 const $ = s => document.querySelector(s);
 
-const MODEL_ORDER = ['jailbreak', 'pii', 'domain', 'fact_check', 'modality',
-  'complexity', 'user_feedback'];
-
 let requests = [];
-let questions = null;
 let meta = {};
-let stations = [];
 let filter = 'all';
 const openIds = new Set();
 
-const stationName = id => (stations.find(s => s.id === id) || {}).name || '';
-const lastStep = st => {
-  const path = Array.isArray(st.path) ? st.path : [];
-  return path.length ? path[path.length - 1] : null;
-};
+/* tree id -> tree row, read once per page load (never per row; no refresh). */
+let treesById = {};
+let treesPromise = null;
+function ensureTrees() {
+  if (!treesPromise) {
+    treesPromise = api.get('/admin/trees')
+      .then(body => {
+        treesById = {};
+        (body.trees || []).forEach(tree => { if (tree && tree.id) treesById[tree.id] = tree; });
+        return treesById;
+      })
+      .catch(() => ({}));        // tree list unavailable: names stay empty
+  }
+  return treesPromise;
+}
 
 /* ---------- header row ---------- */
 const reasonLabel = lvl => t('reason.' + lvl);
@@ -30,8 +40,8 @@ function reasoningWarn(r) {
   if (!r.reasoning_warning) return '';
   return `<span class="dec warn" title="${esc(t('logs.reasoningWarn'))}">⚠ ${esc(t('logs.reasoning'))}</span>`;
 }
-/* Model-input window (JEV head-truncation): show it, because the model judged
-   only the first N tokens of the request text while the log keeps the full text. */
+/* Model-input window (JEV head-truncation): the model judged only the first N
+   tokens while the log keeps the full text. */
 function inputTruncBadge(r) {
   if (!r.input_truncated) return '';
   const vis = r.input_visible_tokens != null ? r.input_visible_tokens : '?';
@@ -41,185 +51,58 @@ function inputTruncBadge(r) {
 }
 function decisionHtml(r) {
   if (r.decision === 'block') return `<span class="dec block">✕ ${t('logs.blocked')}</span>`;
-  if (r.decision === 'route')
-    return `<span class="dec route">→ ${esc(r.model || '?')}</span>${reasonBadge(r)}${reasoningWarn(r)}`;
+  if (r.decision === 'route') {
+    return `<span class="dec route">→ ${esc(r.model || '?')}</span>` +
+      reasonBadge(r) + reasoningWarn(r);
+  }
   return `<span class="dec none">${t('logs.none')}</span>`;
 }
+
+/* ---------- signal evidence (pack shape: {value, confidence, is_rule}) ---- */
+function confBar(conf) {
+  const width = Math.round(100 * Math.max(0, Math.min(1, Number(conf) || 0)));
+  return `<span class="flow-conf"><i style="width:${width}%"></i></span>`;
+}
+function signalValue(key, payload) {
+  let value = payload && typeof payload === 'object' ? payload.value : payload;
+  if (Array.isArray(value)) value = value.length ? value.join(', ') : '—';
+  else if (value == null) value = '—';
+  else value = valLabel(key, value) || value;
+  return String(value);
+}
 function traceChips(r) {
-  const trace = Array.isArray(r.trace) ? r.trace : [];
-  const pack = r.signals || {};
-  const used = new Set();
-  trace.forEach(st => {
-    (st.path || []).forEach(s => s.signal && used.add(s.signal));
-    (st.board || []).forEach(b => (b.lines || []).forEach(l => l.signal && used.add(l.signal)));
-  });
-  let keys;
-  if (used.size) keys = MODEL_ORDER.filter(k => pack[k] && used.has(k));
-  else keys = MODEL_ORDER.filter(k => pack[k]).slice(0, 4);
-  const chips = keys.map(k => {
-    const s = pack[k];
-    let val = s.value;
-    if (Array.isArray(val)) val = val.length ? val.join(', ') : '—';
-    else if (val == null) val = '—';
-    else val = valLabel(k, val);
-    const conf = s.confidence != null ? `<span class="c">${pct(s.confidence)}</span>` : '';
-    return `<span class="sc"><b>${esc(sigName(k))}</b> ${esc(val)}${conf}</span>`;
+  const pack = r.signals && typeof r.signals === 'object' ? r.signals : {};
+  const entries = Object.entries(pack);
+  const model = entries.filter(([, s]) => s && !s.is_rule).slice(0, 6);
+  const chips = model.map(([key, s]) => {
+    const conf = s.confidence != null
+      ? `<span class="c">${pct(s.confidence)}</span>` : '';
+    const pii = key === 'pii' ? ' pii' : '';
+    return `<span class="sc${pii}"><b>${esc(sigName(key))}</b> ` +
+      `${esc(signalValue(key, s))}${conf}</span>`;
   }).join('');
-  const rules = Object.entries(pack).filter(([, s]) => s.is_rule).slice(0, 6).map(([k, s]) =>
-    `<span class="sc-rule">${esc(sigName(k))} ${esc(Array.isArray(s.value) ? s.value.join(',') : s.value)}</span>`
-  ).join('');
+  const rules = entries.filter(([, s]) => s && s.is_rule).slice(0, 6).map(([key, s]) =>
+    `<span class="sc-rule">${esc(sigName(key))} ${esc(signalValue(key, s))}</span>`).join('');
   return `<div class="log-signals">${chips}${rules}</div>`;
 }
-
-/* ---------- computation flow ---------- */
-function confBar(conf, floor, pass) {
-  const w = Math.round(100 * Math.max(0, Math.min(1, Number(conf) || 0)));
-  const tick = floor != null
-    ? `<u class="tick" style="left:${Math.round(100 * Math.min(1, Number(floor)))}%"></u>` : '';
-  return `<span class="flow-conf${pass === false ? ' cut' : ''}"><i style="width:${w}%"></i>${tick}</span>`;
-}
-function condText(s) {
-  const name = sigName(s.signal);
-  const val = valLabel(s.signal, s.value) || s.value || '';
-  return `${name} = ${val}`;
-}
-function bannerHtml(r) {
-  const kind = r.decision === 'block' ? 'block' : (r.decision === 'route' ? 'route' : 'none');
-  const label = r.decision === 'block' ? '✕ ' + t('logs.blocked')
-    : r.decision === 'route'
-      ? '→ ' + (r.model || '—') + (r.reasoning ? ' · ' + reasonLabel(r.reasoning) : '')
-      : t('logs.none');
-  const via = stationName(r.station_id);
-  const score = r.score != null ? ' · ' + t('logs.score') + ' ' + fmt(r.score) : '';
-  const warn = r.reasoning_warning
-    ? ` <span class="flow-tag cut" title="${esc(t('logs.reasoningWarn'))}">⚠ ${esc(t('logs.reasoning'))}</span>` : '';
-  return `<div class="flow-banner ${kind}">
-    <span class="flow-m">${esc(label)}</span>
-    <span class="flow-via">${via ? esc(t('logs.via') + ' ' + via) + score : ''}${warn}</span>
-    <span class="flow-id mono">${esc(r.id || '')}</span></div>`;
-}
-function stationTrack(r) {
-  const trace = Array.isArray(r.trace) ? r.trace : [];
-  if (!trace.length) return '';
-  const rows = trace.map((st, i) => {
-    const hit = st.result === 'hit';
-    const step = hit ? null : lastStep(st);
-    let detail = '';
-    let scorecard = '';
-    if (hit) {
-      detail = `<span class="flow-tag win">★ ${esc(t('logs.hit'))}</span>`;
-    } else if ((st.board || []).length) {
-      // weighted leaf matched every condition but score < min_score: the last
-      // path step says pass=true, so name the real reason and show the board
-      detail = `<span class="flow-tag cut">${esc(t('logs.belowMinScore'))}</span>`;
-      scorecard = `<div class="flow-sec"><div class="flow-h">${esc(t('logs.scorecard'))}</div>${boardBlocksHtml(st.board)}</div>`;
-    } else if (step) {
-      const cut = step.m === 1 && !step.pass;
-      detail = `<span class="flow-tag${cut ? ' cut' : ''}">${esc(cut ? t('logs.belowFloor') : t('logs.notMatched'))}</span>
-        <span class="flow-cond">${esc(condText(step))}</span>
-        <span class="mono">${step.conf != null ? pct(step.conf) : '—'}${step.conf_min != null ? ' ≥ ' + pct(step.conf_min) : ''}</span>`;
-    } else {
-      detail = `<span class="flow-tag">${esc(t('logs.noChild'))}</span>`;
-    }
-    return `<div class="flow-ststep ${hit ? 'hit' : 'miss'}">
-      <span class="flow-idx mono">${i + 1}</span>
-      <b class="flow-nm">${esc(st.name || st.station_id || '')}</b>${detail}${scorecard}</div>`;
-  }).join('');
-  return `<div class="flow-track">${rows}</div>`;
-}
-function pathHtml(r) {
-  const hit = (Array.isArray(r.trace) ? r.trace : []).find(st => st.result === 'hit');
-  const path = hit && Array.isArray(hit.path) ? hit.path : [];
-  if (!path.length) return '';
-  const steps = path.map(s => `<div class="flow-pathstep">
-      <span class="flow-cond">${esc(condText(s))}</span>
-      ${s.conf_min == null ? `<span class="mut">${esc(t('logs.deterministic'))}</span>`
-        : `${confBar(s.conf, s.conf_min, s.pass)}<span class="mono">${s.conf != null ? pct(s.conf) : '—'} ≥ ${pct(s.conf_min)}</span>`}
-    </div>`).join('');
-  return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.path'))}</div>
-    <div class="flow-paths">${steps}</div></div>`;
-}
-function boardBlocksHtml(board) {
-  return (board || []).map(b => {
-    const pctW = Math.round(100 * Math.max(0, Math.min(1, Number(b.score) || 0)));
-    const tick = b.min_score != null
-      ? `<u class="tick" style="left:${Math.round(100 * Math.min(1, Number(b.min_score)))}%"></u>` : '';
-    const lines = (b.lines || []).map(l => `<tr>
-        <td>${esc(condText(l))}</td>
-        <td class="mono">${Number(l.weight).toFixed(1)}</td>
-        <td class="mono">${pct(l.c)}</td>
-        <td class="mono">${l.m}</td>
-        <td class="mono">${Number(l.contrib).toFixed(2)}</td></tr>`).join('');
-    return `<div class="flow-board${b.winner ? ' win' : ''}">
-      <div class="flow-boardhead">${b.winner ? '★ ' : ''}${esc(t('logs.total'))}
-        <span class="mono">${fmt(b.score)} / ${fmt(b.sum_w)}</span>
-        <span class="flow-conf${b.passed ? '' : ' cut'}"><i style="width:${pctW}%"></i>${tick}</span>
-        <span class="mono">≥ ${fmt(b.min_score)}</span>
-        <span class="flow-tag${b.passed ? ' win' : ' cut'}">${b.passed ? t('logs.passed') : t('logs.failed')}</span>
-      </div>
-      <table class="flow-lines"><tr><th>${t('logs.sig')}</th><th>w</th><th>c</th><th>m</th><th>w·c·m</th></tr>${lines}</table>
-    </div>`;
-  }).join('');
-}
-function boardHtml(r) {
-  const hit = (Array.isArray(r.trace) ? r.trace : []).find(st => st.result === 'hit');
-  const board = hit && Array.isArray(hit.board) ? hit.board : [];
-  if (!board.length) return '';
-  return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.scorecard'))}</div>${boardBlocksHtml(board)}</div>`;
-}
-function methodRowsHtml(r) {
-  const pack = r.signals || {};
-  const temp = meta.temperature != null ? Number(meta.temperature).toFixed(2) : '—';
-  const rows = [];
-  for (const k of MODEL_ORDER) {
-    const s = pack[k];
-    if (!s) continue;
-    const cfg = questions && questions.signals && questions.signals[k];
-    if (k === 'pii') {
-      const q = cfg && cfg.instructions ? cfg.instructions : '—';
-      rows.push(methodRow(sigName(k), String(q).replace('{zh}', '…'), tf('logs.jev.pii')));
-      continue;
-    }
-    const q = cfg ? (Array.isArray(cfg.instructions) ? cfg.instructions[0] : cfg.instructions) : '—';
-    rows.push(methodRow(sigName(k), q || '—', tf('logs.jev', { tmp: temp })));
-  }
-  return rows.join('');
-}
-function methodRow(name, question, formula) {
-  return `<div class="method"><span class="mn">${esc(name)}</span>
-    <span class="mq">${esc(question)}</span>
-    <span class="mf">${esc(formula)}</span></div>`;
-}
 function signalPanelHtml(r) {
-  const pack = r.signals || {};
-  const model = Object.entries(pack).filter(([, s]) => !s.is_rule);
-  const sigs = model.map(([k, s]) => {
-    let v = s.value;
-    if (Array.isArray(v)) v = v.length ? v.join(', ') : '—';
-    else if (v == null) v = '—';
-    else v = valLabel(k, v);
+  const pack = r.signals && typeof r.signals === 'object' ? r.signals : {};
+  const entries = Object.entries(pack);
+  const sigs = entries.filter(([, s]) => s && !s.is_rule).map(([key, s]) => {
     const bar = s.confidence != null
-      ? `${confBar(s.confidence, null, true)}<span class="mono">${pct(s.confidence)}</span>` : '';
-    return `<span class="flow-sig"><b>${esc(sigName(k))}</b><span>${esc(v)}</span>${bar}</span>`;
+      ? `${confBar(s.confidence)}<span class="mono">${pct(s.confidence)}</span>` : '';
+    return `<span class="flow-sig"><b>${esc(sigName(key))}</b>` +
+      `<span>${esc(signalValue(key, s))}</span>${bar}</span>`;
   }).join('');
-  const rules = Object.entries(pack).filter(([, s]) => s.is_rule).map(([k, s]) =>
-    `<span class="sc-rule">${esc(sigName(k))} ${esc(Array.isArray(s.value) ? s.value.join(',') : s.value)}</span>`
-  ).join('');
-  return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.signals'))}</div>
-    <div class="flow-sigs">${sigs || `<span class="mut">${esc(t('logs.nosignals'))}</span>`}</div>
-    <div class="log-signals" style="padding:5px 0 0 0">${rules}</div>
-    <details class="flow-how"><summary>${esc(t('logs.method'))}</summary>${methodRowsHtml(r)}</details>
-  </div>`;
+  if (!sigs && !entries.some(([, s]) => s && s.is_rule)) return '';
+  return `<div class="flow-sec"><div class="flow-h">${esc(t('logs.signals'))}</div>` +
+    `<div class="flow-sigs">${sigs || `<span class="mut">${esc(t('logs.nosignals'))}</span>`}</div></div>`;
 }
+
+/* ---------- rows ---------- */
 function rowHtml(r) {
   const open = openIds.has(r.id);
   const text = String(r.text || '').replace(/\s+/g, ' ');
-  const trace = Array.isArray(r.trace) ? r.trace : null;
-  // The ring is memory-only and every enqueued record carries a trace; the
-  // fallback only keeps a malformed record from rendering an empty panel.
-  const detail = trace && trace.length
-    ? bannerHtml(r) + stationTrack(r) + pathHtml(r) + boardHtml(r) + signalPanelHtml(r)
-    : bannerHtml(r) + methodRowsHtml(r);
   return `<article class="log-row ${open ? 'open' : ''}" data-id="${esc(r.id)}">
     <div class="log-head">
       <span class="log-time">${esc(fmtTime(r.ts))}</span>
@@ -229,34 +112,42 @@ function rowHtml(r) {
       <span class="log-lat">${r.latency_ms != null ? Math.round(r.latency_ms) + 'ms' : '—'}</span>
     </div>
     ${traceChips(r)}
-    <div class="log-detail">${detail}</div>
+    <div class="log-detail"><div class="log-trace" data-trace-for="${esc(r.id)}"></div>${signalPanelHtml(r)}</div>
   </article>`;
+}
+
+/* the shared renderer is mounted into each OPEN row (one DOM write per row) */
+function renderOpenTraces() {
+  const byId = new Map(requests.map(r => [r.id, r]));
+  document.querySelectorAll('.log-row.open [data-trace-for]').forEach(host => {
+    const record = byId.get(host.getAttribute('data-trace-for'));
+    if (!record) return;
+    const tree = record.tree_id ? treesById[record.tree_id] || null : null;
+    SRTraceView.renderRoutingTrace(host, record, {tree: tree});
+  });
 }
 
 function render() {
   const shown = requests.filter(r => filter === 'all' || r.decision === filter);
   $('#countPill').textContent = (LANG === 'zh' ? '共 ' : 'total ') + shown.length;
   $('#taggerPill').innerHTML = `<span class="dot" style="color:var(--indigo)"></span>` +
-    (LANG === 'zh' ? '引擎 <b>' + esc(meta.name || '?') + '</b>' : 'engine <b>' + esc(meta.name || '?') + '</b>');
-  $('#list').innerHTML = shown.map(rowHtml).join('') || `<div class="empty">${t('logs.empty')}</div>`;
+    (LANG === 'zh' ? '引擎 ' : 'engine ') + '<b>' + esc(meta.name || '?') + '</b>';
+  $('#list').innerHTML = shown.map(rowHtml).join('') ||
+    `<div class="empty">${t('logs.empty')}</div>`;
   $('#list').classList.toggle('has-open', openIds.size > 0);
+  renderOpenTraces();
 }
 
 async function load() {
-  const [reqBody, qBody, pipeBody, sigBody] = await Promise.all([
+  const [reqBody, tagBody, sigBody] = await Promise.all([
     api.get('/admin/requests/recent'),
-    api.get('/admin/signal-questions').catch(() => ({ config: null, meta: {} })),
-    api.get('/admin/pipeline'),
+    api.get('/admin/tagger').catch(() => ({ tagger: {} })),
     api.get('/admin/signals'),
   ]);
   requests = reqBody.requests || [];
-  questions = qBody.config || null;
-  meta = (qBody.meta && Object.keys(qBody.meta).length) ? qBody.meta : (meta || {});
-  if (!meta.name) {
-    try { meta = (await api.get('/admin/tagger')).tagger || meta; } catch (e) { /* ignore */ }
-  }
-  stations = pipeBody.stations || [];
+  meta = (tagBody && tagBody.tagger) || meta || {};
   setSignalRegistry(sigBody.signals);
+  await ensureTrees();               // cached after the first page load
   render();
 }
 
@@ -265,7 +156,7 @@ $('#filter').addEventListener('change', e => { filter = e.target.value; render()
 $('#list').addEventListener('click', e => {
   const row = e.target.closest('[data-id]');
   if (!row) return;
-  if (e.target.closest('details')) return;   // "怎么算的" owns its disclosure
+  if (e.target.closest('details')) return;   // trace evidence owns its disclosure
   const id = row.dataset.id;
   if (openIds.has(id)) openIds.delete(id); else openIds.add(id);
   render();

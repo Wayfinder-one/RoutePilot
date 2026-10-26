@@ -5,9 +5,10 @@
    token (browser-local) and the read-only current signal engine card.
 
    The natural-language capability description is part of the model profile
-   (profile.capability) and is shown in the registry; its GLOBAL policy
-   (instructions / gates / fallback) lives on the separate 决策路由 page
-   (capability.html, 2026-10-26).
+   (profile.capability) and is shown in the registry. It is the text source for
+   direct `model` candidates of the unified routing tree (pipeline.html); the
+   retired capability-policy page and its global instructions/fallback are gone
+   (2026-10-26, unified-tree refactor).
 
    Modal #modelModal has two add paths:
      - preset: pick a catalog provider, optional API key, tick preset models,

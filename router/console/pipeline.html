@@ -14,66 +14,79 @@
   <div class="pagehead">
     <div>
       <div class="crumb" data-i18n="nav.pipeline"></div>
-      <h1><span data-i18n="nav.pipeline"></span><span class="sub" data-i18n="p4.sub"></span></h1>
+      <h1><span data-i18n="nav.pipeline"></span><span class="sub" data-i18n="pipeline.sub"></span></h1>
     </div>
     <div class="headmeta">
-    <span class="pill" id="serverClockPill" title=""></span>
-    <button class="btn" id="openSim" title="">
-      <svg width="12" height="12" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M4 1.8 11 6.5 4 11.2V1.8Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
-      <span data-i18n="p4.try"></span>
-    </button>
-    <button class="btn" id="exportPipeline" title="">
-      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 1.5v6M3.5 5 6 7.5 8.5 5M2 9.5v1h8v-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span data-i18n="p4.export"></span>
-    </button>
-    <button class="btn" id="importPipeline" title="">
-      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 7.5v-6M3.5 4 6 1.5 8.5 4M2 9.5v1h8v-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span data-i18n="p4.import"></span>
-    </button>
-    <input type="file" id="importFile" accept="application/json,.json" hidden>
-    <button class="btn pri sm" id="savePipeline" data-i18n="pipe.savelabel"></button>
+      <span class="pill" id="serverClockPill" title=""></span>
+      <span class="pill" id="snapshotPill" title=""></span>
+      <button class="btn" id="openSim" title="">
+        <svg width="12" height="12" viewBox="0 0 13 13" fill="none" aria-hidden="true"><path d="M4 1.8 11 6.5 4 11.2V1.8Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        <span data-i18n="pipeline.try"></span>
+      </button>
+      <button class="btn" id="exportTree" title="">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 1.5v6M3.5 5 6 7.5 8.5 5M2 9.5v1h8v-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span data-i18n="pipeline.export"></span>
+      </button>
+      <button class="btn" id="importTree" title="">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true"><path d="M6 7.5v-6M3.5 4 6 1.5 8.5 4M2 9.5v1h8v-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span data-i18n="pipeline.import"></span>
+      </button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden>
+      <button class="btn pri sm" id="saveTree" data-i18n="pipeline.save"></button>
     </div>
   </div>
   <div class="issues" id="issues"></div>
   <div class="issues warnstrip" id="warnings"></div>
 
-  <a class="skip" href="#flow" data-i18n="p4.skip"></a>
-  <div class="workspace">
-    <aside class="palette" id="palette" aria-label="信号库">
-      <div class="pal-head">
-        <h2 data-i18n="p4.palette"></h2>
-        <span id="palCount"></span>
-        <button class="pal-x" id="palToggle" aria-expanded="true" aria-controls="palBody" data-i18n-aria="p4.palToggle" aria-label="展开或收起信号库">
-          <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M2 4l3.5 3.5L9 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-      </div>
-      <div class="pal-body" id="palBody"></div>
+  <a class="skip" href="#treeRoot" data-i18n="pipeline.skip"></a>
+  <div class="workspace rt-workspace">
+    <aside class="sidepane">
+      <section class="palette rt-trees-panel" aria-label="路由树列表">
+        <div class="pal-head">
+          <h2 data-i18n="pipeline.trees"></h2>
+          <span id="treeCount"></span>
+        </div>
+        <div class="pal-body rt-tree-list" id="treeList" role="list"></div>
+        <div class="rt-tree-foot">
+          <button class="btn ghost sm" id="newTree" data-i18n="pipeline.treeNew"></button>
+        </div>
+      </section>
+      <section class="palette" id="palette" aria-label="信号库">
+        <div class="pal-head">
+          <h2 data-i18n="pipeline.signals"></h2>
+          <span id="palCount"></span>
+          <button class="pal-x" id="palToggle" aria-expanded="true" aria-controls="palBody" data-i18n-aria="pipeline.palToggle" aria-label="展开或收起信号库">
+            <svg width="11" height="11" viewBox="0 0 11 11" fill="none"><path d="M2 4l3.5 3.5L9 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+        <div class="pal-body" id="palBody"></div>
+        <div class="rt-pal-hint" id="palHint"></div>
+      </section>
     </aside>
 
-    <div class="flow" id="flow" role="list" aria-label="分流树，从上到下执行"></div>
+    <div class="flow rt-canvas" id="treeRoot" role="group" aria-label="统一路由树编辑器"></div>
   </div>
 </main>
 
 <div class="kbdhint">
-  <span><kbd>⌘S</kbd> <span data-i18n="pipe.kbd.save"></span></span>
-  <span><kbd>⌘⏎</kbd> <span data-i18n="pipe.kbd.try"></span></span>
-  <span><kbd>Esc</kbd> <span data-i18n="p4.kbd.esc"></span></span>
+  <span><kbd>⌘S</kbd> <span data-i18n="pipeline.kbd.save"></span></span>
+  <span><kbd>⌘⏎</kbd> <span data-i18n="pipeline.kbd.try"></span></span>
+  <span><kbd>Alt</kbd>+<kbd>↑↓</kbd> <span data-i18n="pipeline.kbd.move"></span></span>
+  <span><kbd>Esc</kbd> <span data-i18n="pipeline.kbd.esc"></span></span>
 </div>
 
-<!-- 试算：按需侧滑 -->
 <div class="t4-sim-mask" id="simMask"></div>
 <aside class="t4-sim" id="sim" aria-hidden="true" aria-label="试算">
   <div class="sim-head">
-    <h2 data-i18n="p4.try"></h2>
+    <h2 data-i18n="pipeline.try"></h2>
     <button class="x" id="simClose" aria-label="关闭">
       <svg width="13" height="13" viewBox="0 0 13 13" fill="none"><path d="M3 3l7 7M10 3l-7 7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
     </button>
   </div>
   <div class="sim-body">
-    <label for="simText" data-i18n="p4.simText"></label>
+    <label for="simText" data-i18n="pipeline.tryText"></label>
     <textarea id="simText" placeholder=""></textarea>
-    <div class="ex" id="simEx"></div>
-    <button class="sim-run" id="simRun"></button>
+    <button class="sim-run" id="simRun" data-i18n="pipeline.tryRun"></button>
     <div class="sim-empty" id="simOut"></div>
   </div>
 </aside>
@@ -85,6 +98,12 @@
 <script src="nav.js"></script>
 <script src="api.js"></script>
 <script src="shared.js"></script>
+<script src="routing-tree-model.js"></script>
+<script src="routing-tree-store.js"></script>
+<script src="routing-tree-view.js"></script>
+<script src="routing-tree-editor.js"></script>
+<script src="routing-tree-dnd.js"></script>
+<script src="routing-trace-view.js"></script>
 <script src="pipeline.js"></script>
 </body>
 </html>
