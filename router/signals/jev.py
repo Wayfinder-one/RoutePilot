@@ -111,6 +111,7 @@ import math
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from router.decision.pack import CAPABILITY_SIGNAL
 from router.signals._math import (PII_HIT_THRESHOLD, PII_MIN_CONFIDENCE,
                                  binary_entropy_confidence, entropy_confidence,
                                  pii_hits)
@@ -1279,7 +1280,25 @@ class JevTagger:
         if req.n_messages <= 1:
             records = [item for item in records
                        if item["signal"] != "user_feedback"]
+        # Natural-language capability routing (2026-10-26): one extra choice
+        # record scored in the SAME forward batch as the signals, so enabling
+        # it costs no extra pass when the tree reads it. Trimming keeps it off
+        # trees that do not reference the signal.
+        capability_record = None
+        if (isinstance(req.capability, dict)
+                and self._capability_in_scope(scope)):
+            capability_record = self._build_capability_record(
+                req.capability, req.text if text is None else text)
+        if capability_record is not None:
+            records.append({"signal": CAPABILITY_SIGNAL, "sub": None,
+                            "record": capability_record})
         probs = self._score([item["record"] for item in records])
+        if capability_record is not None:
+            capability_probs = probs.pop()
+            signals = self._decode_signal_pack(records[:-1], probs, req)
+            signals[CAPABILITY_SIGNAL] = self._decode_capability(
+                req.capability, capability_record, capability_probs)
+            return signals
         return self._decode_signal_pack(records, probs, req)
 
     # ── long-text PII chunking (opt-in) ─────────────────────────────────────
@@ -1400,9 +1419,127 @@ class JevTagger:
             signals, chunk_stats = self._model_signals_chunked(
                 req, text=text, questions=questions)
             window.update(chunk_stats)
+            # The chunked path batches only the segment prompts; score the
+            # capability question separately (chunking is opt-in and rare).
+            signal = self._capability_signal(req, text)
+            if signal is not None:
+                signals[CAPABILITY_SIGNAL] = signal
         else:
             signals = self._model_signals(req, text=text, questions=questions)
         return signals, None, window
+
+    #: ------------------------------------------------------------------ #
+    #: Natural-language capability routing (2026-10-26)
+    #: ------------------------------------------------------------------ #
+    @staticmethod
+    def _capability_in_scope(scope) -> bool:
+        """True when the pipeline tree (or a full-pack caller) reads it."""
+        return (scope is None or scope.full
+                or CAPABILITY_SIGNAL in scope.signals)
+
+    def _build_capability_record(self, pack: dict, text: str) -> dict | None:
+        """One JEV choice record over the pack's model capability descriptions."""
+        candidates = pack.get("candidates") if isinstance(pack, dict) else None
+        if not isinstance(candidates, dict) or len(candidates) < 2:
+            return None
+        return {"state": text, "kind": "choice",
+                "question": pack.get("instructions") or "",
+                "options": [f"{model}: {capability}"
+                            for model, capability in candidates.items()],
+                "answer_keys": list(candidates)}
+
+    def _decode_capability(self, pack: dict, record: dict,
+                           probs: list[float]) -> dict:
+        """Candidate probabilities -> the ``capability_route`` signal.
+
+        ``value`` is the model id the tree should route to. The pack's
+        ``min_prob``/``min_margin`` gates implement the article's fail-open
+        contract: a low-confidence / ambiguous decision routes the configured
+        fallback model instead of the argmax (``fallback_used`` + ``reason``
+        are record-only and never read by matching). ``confidence`` keeps the
+        same entropy scale as every other model choice signal.
+        """
+        keys = record["answer_keys"]
+        ranked = sorted(zip(keys, probs), key=lambda item: item[1], reverse=True)
+        top_model, p_top = ranked[0]
+        runner_up = ranked[1][1] if len(ranked) > 1 else 0.0
+        margin = p_top - runner_up
+        fallback = pack.get("fallback_model")
+        min_prob = float(pack.get("min_prob", 0.45))
+        min_margin = float(pack.get("min_margin", 0.10))
+        gated, reason = False, "decision_model"
+        if fallback:
+            if p_top < min_prob:
+                gated, reason = True, "low_confidence"
+            elif margin < min_margin:
+                gated, reason = True, "ambiguous"
+        return {
+            "value": fallback if gated else top_model,
+            "confidence": entropy_confidence(probs),
+            "is_rule": False,
+            # record-only evidence (matching/engine read value+confidence only)
+            "prob_by_value": dict(zip(keys, probs)),
+            "p_top": p_top, "margin": margin, "runner_up": ranked[1][0]
+            if len(ranked) > 1 else None,
+            "top_model": top_model, "fallback_used": gated, "reason": reason,
+            "fingerprint": pack.get("fingerprint") or "",
+        }
+
+    def _capability_signal(self, req: TagRequest, text: str) -> dict | None:
+        """Score just the capability question (chunked-path fallback)."""
+        pack = req.capability
+        if not isinstance(pack, dict) or not self._capability_in_scope(req.scope):
+            return None
+        record = self._build_capability_record(pack, text)
+        if record is None:
+            return None
+        return self._decode_capability(pack, record, self._score([record])[0])
+
+    #: ------------------------------------------------------------------ #
+    #: Natural-language capability routing (2026-10-26)
+    #: ------------------------------------------------------------------ #
+    def score_choice(self, state: str, instructions: str,
+                     candidates: dict) -> dict:
+        """Score an ad-hoc ``choice`` question with the JEV decision model.
+
+        Used by natural-language capability routing
+        (``router.decision.capability``): the operator's per-model capability
+        descriptions are compiled into one JEV choice record, scored by the
+        same model/head/temperature as the routing signals, and returned as a
+        probability per candidate. The request text goes through the same
+        tokenizer-exact input window as a signal request (``self.window``), so
+        a decision never sees more context than the signal pack would.
+
+        This is the same "one model answers a typed question" contract as
+        :meth:`tag`; it does not touch the signal question config, the rule
+        signals, the PII merge or any tagger state — callers can run it on the
+        hot path next to ``tag()``.
+
+        Returns ``{"probabilities": {model: p}, "ranking": [{model, p}...],
+        "input": <window info>, "temperature": T}``. Raises ``JevTaggerError``
+        for a malformed candidate map (a caller that wants fail-open must
+        catch it; see :func:`router.decision.capability.score_with_tagger`).
+        """
+        if not isinstance(instructions, str) or not instructions.strip():
+            raise JevTaggerError("choice instructions must be a nonempty string")
+        if not isinstance(candidates, dict) or not 2 <= len(candidates) <= 255:
+            raise JevTaggerError("choice needs 2..255 candidates")
+        keys = list(candidates)
+        for key, value in candidates.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                raise JevTaggerError(
+                    "choice candidates must map model ids to description strings")
+        windowed, window = self._context_window(state)
+        record = {"state": windowed, "kind": "choice",
+                  "question": instructions,
+                  "options": [f"{key}: {candidates[key]}" for key in keys],
+                  "answer_keys": keys}
+        probs = self._score([record])[0]
+        ranking = sorted(
+            ({"model": key, "p": float(prob)} for key, prob in zip(keys, probs)),
+            key=lambda row: row["p"], reverse=True)
+        return {"probabilities": dict(zip(keys, probs)), "ranking": ranking,
+                "input": window, "temperature": self.temperature}
 
     async def tag(self, req: TagRequest) -> TagResult:
         # Frozen snapshot (2026-10-24 P1-A): capture the question-config object
@@ -1412,6 +1549,12 @@ class JevTagger:
         # config, so both use the captured object -- never a post-hoc re-read.
         questions = self.questions
         tagger_info = self._info_for(questions)
+        # Capability-routing provenance is per request (the pack is passed in
+        # from the immutable snapshot), unlike the model/question fingerprints.
+        if isinstance(req.capability, dict) and req.capability.get("fingerprint"):
+            tagger_info = {**tagger_info,
+                           "capability_fingerprint":
+                               req.capability["fingerprint"]}
         signals, vec, window = await asyncio.to_thread(
             self._tag_row, req, questions)
         # Rule signals keep the FULL request text even though the model only

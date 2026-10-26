@@ -128,5 +128,5 @@ function toast(msg, ms) {
 /* Group key -> CSS color variable (matches signals.css tokens). */
 const GROUP_COLOR = { safety: 'var(--g-safety)', domain: 'var(--g-domain)',
   difficulty: 'var(--g-cx)', context: 'var(--g-ctx)', session: 'var(--g-sess)',
-  rule: 'var(--g-rule)' };
+  decision: 'var(--g-dec)', rule: 'var(--g-rule)' };
 function sigColor(group) { return GROUP_COLOR[group] || 'var(--g-rule)'; }

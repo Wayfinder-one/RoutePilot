@@ -233,9 +233,15 @@ def test_put_pipeline_rejected_by_health(tmp_path):
 
 
 def test_signals_endpoint_includes_keyword_groups(tmp_path):
+    from router.signals.registry import SIGNALS
     body = client(tmp_path).get("/admin/signals").json()
-    assert len(body["signals"]) == 15
+    assert len(body["signals"]) == len(SIGNALS)
     assert "医疗急症" in body["keyword_groups"]
+    # capability_route has dynamic model-id values, injected from the snapshot
+    # pack; unconfigured ⇒ free-form + no values.
+    capability = next(s for s in body["signals"]
+                      if s["key"] == "capability_route")
+    assert capability["free"] is True and capability["values"] == []
 
 
 def test_overview(tmp_path):

@@ -10,7 +10,7 @@
   --red:#b91c1c; --red-soft:#fef2f2; --red-line:#fecaca;
   --violet:#6d28d9; --blue:#1d4ed8; --teal:#0f766e; --pink:#be185d; --slate:#475569;
   --g-safety:#e11d48; --g-domain:#2563eb; --g-cx:#7c3aed; --g-ctx:#0d9488;
-  --g-sess:#be185d; --g-rule:#475569;
+  --g-sess:#be185d; --g-dec:#0891b2; --g-rule:#475569;
   --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
   --sans:-apple-system,BlinkMacSystemFont,"PingFang SC","Segoe UI",Roboto,sans-serif;
   --shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.06);
@@ -377,17 +377,34 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .btn.danger.armed{background:var(--red);border-color:var(--red);color:#fff}
 .empty-cell{padding:18px 6px;text-align:center;color:var(--text-3);font-size:12px}
 
-#modelTable{table-layout:auto}
+#modelTable{table-layout:fixed}
 #modelTable th{font-size:10.5px;text-align:left;color:var(--text-3);font-weight:600;padding:5px;border-bottom:1px solid var(--line)}
 #modelTable td{padding:6px 5px;border-bottom:1px solid var(--line);vertical-align:middle}
 #modelTable td:first-child{width:170px}
-#modelTable td:nth-child(2){width:24%}
-#modelTable td:nth-child(3){width:15%}
-#modelTable td:nth-child(4){width:36%}
+#modelTable td:nth-child(2){width:16%}
+#modelTable td:nth-child(3){width:10%}
+#modelTable td:nth-child(4){width:24%}
+#modelTable td:nth-child(6){width:150px}
+#modelTable .cap-cell{overflow:hidden}
+#modelTable .cap-text{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+  font-size:12px;color:var(--text-2);line-height:1.5;overflow-wrap:anywhere}
 #modelTable .th-actions{text-align:right}
 #modelTable .row-actions{white-space:nowrap;text-align:right}
 #modelTable .row-actions .btn{margin-left:4px;font-weight:550}
 #modelTable tr:hover td{background:var(--panel-2)}
+
+/* capability routing page (2026-10-26) */
+.cap-policy-grid{display:grid;grid-template-columns:1.6fr 1fr 1fr;gap:10px 12px;margin-top:10px}
+.cap-policy-grid > .field{min-width:0}
+.cap-table{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
+.cap-table th{font-size:10.5px;text-align:left;color:var(--text-3);font-weight:600;
+  padding:5px;border-bottom:1px solid var(--line)}
+.cap-table td{padding:6px 5px;border-bottom:1px solid var(--line);vertical-align:top}
+.cap-table td:first-child{width:170px}
+.cap-table td:nth-child(2){width:22%}
+.cap-table .cap-desc{color:var(--text-2);line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}
+.cap-steps{margin:2px 0 2px 18px;padding:0;font-size:12px;color:var(--text-2);line-height:1.75}
+.cap-steps li{margin-bottom:2px}
 
 /* reasoning capability badges */
 .rbadges{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;vertical-align:middle}

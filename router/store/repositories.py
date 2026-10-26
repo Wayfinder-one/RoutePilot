@@ -278,13 +278,29 @@ class ModelRepo:
 
 
 def model_references(stations: list[Station], model_id: str) -> list[dict]:
-    """分树里引用 ``model_id`` 的路由叶子：``[{station, node}]``（删除前 409 用）。"""
+    """分树里引用 ``model_id`` 的节点：``[{station, node, via}]``（删除前 409 用）。
+
+    Two reference kinds (2026-10-26): a route leaf targeting the model
+    (``via="target"``) and a ``capability_route`` row/weight naming it as a
+    candidate (``via="capability"``) — deleting a capability candidate would
+    otherwise leave a dead branch that silently falls through.
+    """
     refs: list[dict] = []
 
     def walk(station: Station, node: TreeNode) -> None:
         if (node.kind == "leaf" and node.action == "route"
                 and node.model == model_id):
-            refs.append({"station": station.id, "node": node.id})
+            refs.append({"station": station.id, "node": node.id,
+                         "via": "target"})
+        if (node.signal == "capability_route"
+                and str(node.value) == model_id):
+            refs.append({"station": station.id, "node": node.id,
+                         "via": "capability"})
+        for weight in node.weights:
+            if weight.signal == "capability_route" \
+                    and str(weight.value) == model_id:
+                refs.append({"station": station.id, "node": node.id,
+                             "via": "capability"})
         for child in node.children:
             walk(station, child)
 

@@ -1,11 +1,15 @@
 # Smart Router v2
 
 LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之前，router 先算出一包路由信号
-（15 个：7 个模型信号 + 8 个规则信号），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
+（16 个：8 个模型信号 + 8 个规则信号），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
+
+其中第 8 个模型信号 `capability_route`（**自然语言能力路由**，2026-10-26）不是固定问题：
+它让模型按「每个候选模型的一段自然语言能力说明」选择本次请求最适合的后端模型
+（详见下文「自然语言能力路由」）。
 
 默认推荐 **JEV 版主模型** 作为信号引擎：**Qwen3.5-0.8B 底座 + JEV 标量决策头**（LoRA 合并
 导出），在 router 进程内按 JEV 标准（context + typed questions + candidates → 候选概率）输出
-全部 7 个模型信号；问题/候选/真值定义 JSON 可配。RoutePilot checkpoint（多头）作为可回退引擎
+全部 7 个固定模型信号；问题/候选/真值定义 JSON 可配。RoutePilot checkpoint（多头）作为可回退引擎
 保留。PII 信号另有确定性正则补充（`router/signals/pii_rules.py`）。
 
 ## 架构
@@ -25,7 +29,8 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
               └─ RequestLog（决策摘要 → SQLite requests slim 行 + request_ledger
                              动作—结果账本（outcome_state/revisions）；信号/trace 只在内存 ring）
 控制台（/console）：概览 / 分流树（信号库 + 树形编辑 + 试算侧滑）/ 计算日志 /
-                    信号配置 / 模型与设置（内置模型目录 + 提供方 + 推理声明）/
+                    信号配置 / 能力路由（自然语言说明 → 模型选择，策略 + 候选 + 缺失）/
+                    模型与设置（模型目录 + 提供方 + 推理声明 + 能力说明列）/
                     用户管理（登录账号：角色 admin/viewer，见「账号与鉴权」）
 ```
 
@@ -183,6 +188,35 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
   档位不再可用，则降级透传并回 `x-sr-reasoning-warning: unsupported`，不打断用户请求。
   成功注入时响应头带 `x-sr-reasoning: <level>`，计算日志也会记录。
 
+## 自然语言能力路由（2026-10-26，方案 A）
+
+让「决策模型按自然语言能力说明选后端模型」成为分流树里的一个普通信号
+`capability_route`（decision 组，模型信号）：
+
+- **能力说明存在模型目录**：`models.profile.capability`（每个模型一段自然语言描述，
+  ≤2000 字符；空 = 不参与）。控制台「模型与设置 → 编辑模型 → 能力说明」维护，
+  模型注册表**直接展示**这段说明（「能力说明」列，在操作列之前；未配置显示「未配置」）。
+- **全局策略**：`settings.capability_instructions` / `capability_min_prob` /
+  `capability_min_margin` / `capability_fallback_model`，控制台独立的「能力路由」页编辑
+  （位于「模型与设置」之前），或 `PUT /admin/capability`。请求里会把候选说明渲染成一个 JEV
+  choice 问题，与 7 个信号**同一批前向**打分（树不引用该信号时不算）。
+- **信号输出**：`value` = 选中的模型位 ID（可直接路由），`confidence` = 候选分布的熵置信度，
+  `prob_by_value` / `p_top` / `margin` / `top_model` / `fallback_used` / `reason` /
+  `fingerprint` 为 record-only 证据（计算日志可见）。`min_prob` / `min_margin` 不满足时
+  直接落到 `fallback_model`（fail-open），不会让请求失败。
+- **分流树写法**：在兜底站点前加一个站点，每个候选一个叶子：
+  `capability_route == qwen3-32b, conf ≥ 0.2 → route qwen3-32b`（置信度是熵标度，
+  不要沿用旧节点的 0.7）。`GET /admin/signals` 会把当前能力候选注入为该信号的取值下拉。
+- **健康检查**：树引用了 `capability_route` 但取值不是能力候选 / 没有任何模型配置说明 /
+  tagger 不是 JEV 引擎 → 启动或保存时拒绝（422 / 拒绝启动），不会静默落到兜底。
+- **配置版本**：能力包随 `RoutingSnapshot` 发布，内容写入 `config_revisions(kind="capability")`，
+  账本新增 `capability_revision`（migration v18），可回放；模型写入会预检并阻止删掉被树引用的候选
+  （409 带 `via="capability"`）。
+- **离线回归**：`configs/capability_golden.jsonl`（30 条）+ `scripts/capability_ab_eval.py`
+  （复制 DB 跑「现有树 vs 能力信号」A/B，不碰生产库）。首轮实测：能力信号 26/30、默认树 10/30
+  （默认树把 30 条全落 `qwen3-8b` 兜底）；只改能力说明文本两轮后 29/30。
+  设计、证据与上线/回滚步骤见 `docs/能力路由-自然语言能力分配-2026-10-26.md`。
+
 ## 部署
 
 任意一台有模型目录的机器上，用 systemd 或进程管理器拉起：
@@ -233,5 +267,5 @@ python -m router
 - i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
   `scripts/i18n_prune_i18n.py` 负责批量删除）。
 - 控制台冒烟：`BASE=http://<host>:<port> ADMIN_TOKEN=<token> node scripts/console_check.js`
-  （覆盖六个页面（含登录页/用户管理页）、模型目录/添加模型弹窗/推理声明编辑器、
-  分流树叶推理下拉与日志徽章；不带 `ADMIN_TOKEN` 时会先走一次真实登录流程）。
+  （覆盖七个页面（含登录页/用户管理页/能力路由页）、模型目录/添加模型弹窗/推理声明编辑器、
+  能力说明列与能力策略保存、分流树叶推理下拉与日志徽章；不带 `ADMIN_TOKEN` 时会先走一次真实登录流程）。

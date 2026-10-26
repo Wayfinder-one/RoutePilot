@@ -25,13 +25,17 @@ from fastapi.staticfiles import StaticFiles
 
 from router.config import Settings
 from router.api.upstream import model_reasoning_from_db
+from router.decision.pack import CAPABILITY_SIGNAL, build_pack
 from router.pipeline.health import check_pipeline
-from router.pipeline.snapshot import install_snapshot, load_snapshot
+from router.pipeline.scope import compute_signal_scope
+from router.pipeline.snapshot import (ensure_capability_revision,
+                                      install_snapshot, load_snapshot)
 from router.signals.heuristic import HeuristicTagger
 from router.store.db import connect, migrate
 from router.store.repositories import (
-    KeywordRepo, ModelRepo, SessionRepo, StationRepo, TimePeriodRepo, UserRepo,
-    ensure_pipeline_revision, ensure_questions_revision, seed_default)
+    KeywordRepo, ModelRepo, SessionRepo, SettingsRepo, StationRepo,
+    TimePeriodRepo, UserRepo, ensure_pipeline_revision,
+    ensure_questions_revision, seed_default)
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 
@@ -199,17 +203,26 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     # and pipelines written straight into the database (migrations, older
     # versions, a manual edit) must be judged by the same rule here.
     model_reasoning = model_reasoning_from_db(conn)
+    # Capability routing (2026-10-26): the candidate set comes from the model
+    # catalog (profile.capability) + the global policy settings. Build it here
+    # so the startup health check rejects a tree referencing models that cannot
+    # ever be selected.
+    capability_pack = build_pack(ModelRepo(conn).list(),
+                                 SettingsRepo(conn).all())
+    capability_candidates = set(capability_pack["candidates"])
     # v15: the tree that is about to serve traffic must be resolvable from
     # config_revisions (first boot after the migration: stations predate the
     # table). Identical content maps to the same sha, so this is idempotent.
     ensure_pipeline_revision(conn, pipeline)
+    ensure_capability_revision(conn, capability_pack)
     conn.close()
 
     # A tree that the engine cannot execute must not reach the hot path: the
     # console would happily save it, but every request would then 502 or pick
     # a wrong branch. Refuse to start instead (the operator fixes the DB and
     # restarts). Warnings are logged, they do not block the boot.
-    issues = check_pipeline(pipeline, known_models, model_reasoning)
+    issues = check_pipeline(pipeline, known_models, model_reasoning,
+                            capability_candidates=capability_candidates)
     hard = [i for i in issues if i.level == "hard"]
     if hard:
         for issue in hard:
@@ -228,6 +241,16 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
 
     tagger = _make_tagger(settings, kw_groups)
     tagger.time_periods = time_periods
+    # The capability signal is produced by the JEV decision model only; a
+    # heuristic/checkpoint/prompt tagger cannot answer it, so a tree that reads
+    # it would silently fall through to its fallback station forever. Refuse to
+    # start instead of routing every such request to the fallback.
+    if CAPABILITY_SIGNAL in compute_signal_scope(pipeline).signals \
+            and getattr(tagger, "name", "") != "jev":
+        raise RuntimeError(
+            f"refusing to start: the stored pipeline reads "
+            f"{CAPABILITY_SIGNAL!r} but ROUTER_TAGGER={settings.tagger!r} "
+            "cannot produce it (use ROUTER_TAGGER=jev)")
     # Build the immutable snapshot ONCE at startup (P1-B): the pipeline, the
     # backend map, the revisions and the trimming switch a request may read.
     conn = connect(settings.db_path)
@@ -238,6 +261,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         if isinstance(questions_cfg, dict):
             ensure_questions_revision(conn, questions_cfg)
         snapshot = load_snapshot(conn, jev_trim=settings.jev_trim)
+        ensure_capability_revision(conn, snapshot.capability)
     finally:
         conn.close()
 

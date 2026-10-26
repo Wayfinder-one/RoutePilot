@@ -28,7 +28,14 @@ from router.evals import summarize
 from router.pipeline.engine import evaluate
 from router.pipeline.health import check_pipeline
 from router.pipeline.model import station_from_dict, station_to_dict
-from router.pipeline.snapshot import install_snapshot, load_snapshot
+from router.decision.pack import (CAPABILITY_SIGNAL, POLICY_SETTINGS,
+                                  SETTING_FALLBACK, SETTING_INSTRUCTIONS,
+                                  SETTING_MIN_MARGIN, SETTING_MIN_PROB,
+                                  CapabilityPackError, build_pack,
+                                  capability_of_model, normalize_capability,
+                                  normalize_instructions, pack_revision)
+from router.pipeline.snapshot import (ensure_capability_revision,
+                                      install_snapshot, load_snapshot)
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
                               normalize_reasoning, validate_model_profile)
@@ -47,7 +54,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 RESERVED_SETTINGS = {"pipeline_version", "pipeline_revision",
-                    "questions_revision"}
+                    "questions_revision", *POLICY_SETTINGS}
 
 #: 模型位 / 提供方名：写进分流树、URL 路径与 OpenAI body，保守字符集。
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -64,9 +71,12 @@ def _refresh_snapshot(request: Request, conn: sqlite3.Connection) -> None:
     This is the ONLY way a pipeline/model/provider write may update the hot
     path (JEV P1-B): one assignment to ``app.state.snapshot``; the legacy
     pipeline/backends aliases are refreshed inside ``install_snapshot``.
+    The capability pack is content-addressed too: its revision is appended to
+    ``config_revisions`` so capability-routed ledger rows can be replayed.
     """
-    install_snapshot(request.app,
-                     load_snapshot(conn, jev_trim=request.app.state.settings.jev_trim))
+    snapshot = load_snapshot(conn, jev_trim=request.app.state.settings.jev_trim)
+    ensure_capability_revision(conn, snapshot.capability)
+    install_snapshot(request.app, snapshot)
 
 
 # --------------------------------------------------------------------------- #
@@ -99,7 +109,11 @@ def put_pipeline(body: PipelineIn, request: Request,
     # declares it; the map comes from the same source as the startup check
     # (``model_reasoning_from_db``), so a boot and a save always agree.
     model_reasoning = model_reasoning_from_db(conn)
-    issues = check_pipeline(stations, known, model_reasoning)
+    capability_candidates = {
+        model_id for model_id, capability in build_pack(
+            models, SettingsRepo(conn).all())["candidates"].items()}
+    issues = check_pipeline(stations, known, model_reasoning,
+                            capability_candidates=capability_candidates)
     # hard issues reject with 422 (pointing at station/node); warn-level issues
     # ride along in the response so the console can show them without blocking.
     hard = [i for i in issues if i.level == "hard"]
@@ -237,6 +251,9 @@ def _public_model(row: dict, provider_format: str) -> dict:
     normalized = normalize_reasoning(parse_profile_text(row.get("profile")),
                                      provider_format)
     return {**row,
+            # Convenience for the console model list / capability panel: the
+            # validated description already lives in profile.capability.
+            "capability": capability_of_model(row),
             "reasoning": normalized or _undeclared_reasoning(provider_format)}
 
 
@@ -258,6 +275,18 @@ def _validated_profile(raw: dict | str | None,
         validated = validate_model_profile(parsed, provider_format)
     except ReasoningError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
+    # Natural-language capability description (2026-10-26). Stored inside the
+    # model profile so it is edited with the model and travels with the same
+    # revision; '' / null removes it (the model stops being a route candidate).
+    if "capability" in parsed:
+        try:
+            capability = normalize_capability(parsed.get("capability"))
+        except CapabilityPackError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+        if capability:
+            validated["capability"] = capability
+        else:
+            validated.pop("capability", None)
     return json.dumps(validated, ensure_ascii=False)
 
 
@@ -319,6 +348,35 @@ class ModelCreateIn(ModelIn):
     id: str
 
 
+def _model_rows_with_profile(models: list[dict], model_id: str,
+                             profile: str | None) -> list[dict]:
+    """Hypothetical catalog rows with one model's profile replaced (health pre-check)."""
+    if profile is None:
+        return models
+    return [{**row, "profile": profile} if row.get("id") == model_id else row
+            for row in models]
+
+
+def _capability_write_issues(conn: sqlite3.Connection,
+                             models: list[dict]) -> list[dict]:
+    """Hard pipeline issues a capability-catalog write would introduce.
+
+    Removing/renaming a model's ``profile.capability`` can break a saved tree
+    whose ``capability_route`` rows name it. Model writes are not full pipeline
+    saves, so run the same health rule here and reject the write (422) instead
+    of letting the branch silently degrade to the fallback station.
+    """
+    stations = StationRepo(conn).load()
+    candidates = {row["id"] for row in models
+                  if capability_of_model(row)}
+    issues = check_pipeline(stations, {row["id"] for row in models},
+                            model_reasoning_from_db(conn),
+                            capability_candidates=candidates)
+    blocked = {"capability_unconfigured", "unknown_capability_model"}
+    return [i.__dict__ for i in issues if i.level == "hard"
+            and i.code in blocked]
+
+
 @router.post("/models", status_code=201)
 def post_model(body: ModelCreateIn, request: Request,
                conn: sqlite3.Connection = Depends(get_conn)):
@@ -333,6 +391,11 @@ def post_model(body: ModelCreateIn, request: Request,
     provider_row = _require_provider(conn, provider)
     profile = _validated_profile(body.profile,
                                  provider_row.get("reasoning_format") or "openai")
+    models_after = _model_rows_with_profile(ModelRepo(conn).list(),
+                                            model_id, profile)
+    blocked = _capability_write_issues(conn, models_after)
+    if blocked:
+        raise HTTPException(422, detail=blocked)
     if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
         raise HTTPException(409, detail=f"model {model_id} 已存在")
     _refresh_snapshot(request, conn)
@@ -364,6 +427,11 @@ def put_model(model_id: str, body: ModelIn, request: Request,
         effective = provider if provider is not None else existing["provider"]
         profile = _validated_profile(body.profile,
                                      formats.get(effective, "openai"))
+        blocked = _capability_write_issues(
+            conn, _model_rows_with_profile(ModelRepo(conn).list(),
+                                           model_id, profile))
+        if blocked:
+            raise HTTPException(422, detail=blocked)
     ModelRepo(conn).update(model_id, upstream=upstream, provider=provider,
                            profile=profile)
     _refresh_snapshot(request, conn)
@@ -544,12 +612,27 @@ async def fetch_models(body: FetchModelsIn, request: Request,
 # Signal registry
 # --------------------------------------------------------------------------- #
 @router.get("/signals")
-def get_signals(conn: sqlite3.Connection = Depends(get_conn)):
+def get_signals(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     # kind ('model'|'rule') + free (values not enumerable) drive the console's
     # fork-key candidates and the deterministic-vs-floor rendering (SPEC-TREE-4 §6).
     # groups follow the registry's canonical order (a raw set() is arbitrary).
-    return {"signals": [{**s.__dict__, "free": not s.values}
-                        for s in SIGNALS.values()],
+    #
+    # capability_route has *dynamic* values (the model ids that declare a
+    # profile.capability description). They are injected here from the current
+    # snapshot pack so the tree editor gets a real model dropdown; when no
+    # model declares a description the signal stays free-form (and saving a
+    # tree that references it is rejected by the health check).
+    capability_candidates = list(
+        (request.app.state.snapshot.capability.get("candidates") or {}))
+    payload = []
+    for spec in SIGNALS.values():
+        row = {**spec.__dict__, "free": not spec.values}
+        if spec.key == CAPABILITY_SIGNAL:
+            row["values"] = [(model_id, model_id, model_id)
+                             for model_id in capability_candidates]
+            row["free"] = not capability_candidates
+        payload.append(row)
+    return {"signals": payload,
             "groups": [g for g in GROUPS if any(s.group == g
                                                 for s in SIGNALS.values())],
             "keyword_groups": list(KeywordRepo(conn).groups()),
@@ -687,12 +770,25 @@ class TryIn(BaseModel):
 async def try_pipeline(body: TryIn, request: Request):
     from router.pipeline.engine import decision_to_dict
     snapshot = request.app.state.snapshot
-    result = await request.app.state.tagger.tag(TagRequest(text=body.text))
+    result = await request.app.state.tagger.tag(
+        TagRequest(text=body.text, capability=snapshot.capability))
     decision, trace = evaluate(snapshot.stations, result.signals)
+    capability_signal = result.signals.get("capability_route") or {}
     return {"signals": result.signals, "vec_dim": len(result.vec or []),
             # Model-input window (JEV only): tokens read vs. original, so the
             # calibration UI can show when a long paste was head-truncated.
             "input": result.input or {},
+            "capability": {
+                "configured": bool(snapshot.capability.get("candidates")),
+                "fingerprint": snapshot.capability.get("fingerprint") or "",
+                "fallback_model": snapshot.capability.get("fallback_model"),
+                "selected": capability_signal.get("value"),
+                "top_model": capability_signal.get("top_model"),
+                "p_top": capability_signal.get("p_top"),
+                "margin": capability_signal.get("margin"),
+                "fallback_used": capability_signal.get("fallback_used"),
+                "reason": capability_signal.get("reason"),
+            },
             "decision": decision_to_dict(decision), "trace": trace}
 
 
@@ -720,6 +816,93 @@ def put_settings(body: dict, request: Request,
             SettingsRepo(conn).set(key, str(value))
         ChangeRepo(conn).record(_now(), "settings", {"keys": sorted(body)})
     return {"ok": True, "settings": SettingsRepo(conn).all()}
+
+
+# --------------------------------------------------------------------------- #
+# Natural-language capability routing (2026-10-26)
+# --------------------------------------------------------------------------- #
+class CapabilityPolicyIn(BaseModel):
+    """Global policy of the capability-routing signal (descriptions live on models)."""
+    instructions: str | None = None
+    min_prob: float | None = None
+    min_margin: float | None = None
+    fallback_model: str | None = None
+
+
+def _capability_payload(request: Request, conn: sqlite3.Connection) -> dict:
+    snapshot = request.app.state.snapshot
+    pack = snapshot.capability
+    models = ModelRepo(conn).list()
+    upstream = {m["id"]: m.get("upstream") or m["id"] for m in models}
+    declared = {m["id"]: capability_of_model(m) for m in models}
+    candidates = [
+        {"id": model_id, "capability": capability,
+         "upstream": upstream.get(model_id), "name": upstream.get(model_id)}
+        for model_id, capability in sorted((pack.get("candidates") or {}).items())
+    ]
+    return {
+        "configured": bool(candidates),
+        "enabled_engine": getattr(request.app.state.tagger, "name", ""),
+        "fingerprint": pack.get("fingerprint") or "",
+        "revision": snapshot.capability_revision,
+        "instructions": pack.get("instructions"),
+        "min_prob": pack.get("min_prob"),
+        "min_margin": pack.get("min_margin"),
+        "fallback_model": pack.get("fallback_model"),
+        "candidates": candidates,
+        "missing": [{"id": model_id, "upstream": upstream.get(model_id)}
+                    for model_id, capability in sorted(declared.items())
+                    if not capability],
+        "models": [{"id": model_id, "upstream": upstream.get(model_id)}
+                   for model_id in sorted(upstream)],
+    }
+
+
+@router.get("/capability")
+def get_capability(request: Request,
+                   conn: sqlite3.Connection = Depends(get_conn)):
+    """Editing surface for the capability signal: policy + candidate summary.
+
+    The per-model description itself is a model-catalog field
+    (``profile.capability``), edited through POST/PUT /admin/models; this view
+    shows which models are candidates and which still miss a description.
+    """
+    return _capability_payload(request, conn)
+
+
+@router.put("/capability")
+def put_capability(body: CapabilityPolicyIn, request: Request,
+                   conn: sqlite3.Connection = Depends(get_conn)):
+    """Update the global capability policy (instructions / gates / fallback)."""
+    policy: dict[str, str] = {}
+    if body.instructions is not None:
+        try:
+            policy[SETTING_INSTRUCTIONS] = normalize_instructions(body.instructions)
+        except CapabilityPackError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+    for name, value, key in (("min_prob", body.min_prob, SETTING_MIN_PROB),
+                             ("min_margin", body.min_margin, SETTING_MIN_MARGIN)):
+        if value is None:
+            continue
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not 0.0 <= float(value) <= 1.0):
+            raise HTTPException(422, detail=f"{name} 必须是 [0,1] 的数字")
+        policy[key] = str(float(value))
+    if body.fallback_model is not None:
+        fallback = body.fallback_model.strip()
+        if fallback and ModelRepo(conn).get(fallback) is None:
+            raise HTTPException(422, detail=f"unknown fallback model {fallback!r}")
+        policy[SETTING_FALLBACK] = fallback
+    if not policy:
+        raise HTTPException(422, detail="no policy field supplied")
+    with conn:
+        for key, value in policy.items():
+            SettingsRepo(conn).set(key, value)
+        ChangeRepo(conn).record(_now(), "capability",
+                                {"action": "policy", "keys": sorted(policy)})
+    _refresh_snapshot(request, conn)
+    payload = _capability_payload(request, conn)
+    return {"ok": True, **payload}
 
 
 @router.get("/changes")
@@ -760,7 +943,9 @@ async def _eval_pairs(body: EvalIn, request: Request):
         for case in body.labels:
             text = str(case.get("text", ""))
             expect = case.get("expect_model")
-            result = await request.app.state.tagger.tag(TagRequest(text=text))
+            result = await request.app.state.tagger.tag(
+                TagRequest(text=text,
+                           capability=request.app.state.snapshot.capability))
             decision, _ = evaluate(stations, result.signals)
             got = decision.model if decision.kind == "route" else None
             pairs.append((expect, got))

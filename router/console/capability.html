@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Router · 能力路由</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="shared.css">
+</head>
+<body data-page="capability">
+<div class="pagehead">
+  <div>
+    <div class="crumb" data-i18n="nav.capability"></div>
+    <h1><span data-i18n="nav.capability"></span><span class="sub" data-i18n="cap.sub"></span></h1>
+  </div>
+  <div class="headmeta">
+    <span class="pill" id="capEngine"></span>
+    <span class="pill" id="capabilityBadge"></span>
+  </div>
+</div>
+<main class="page">
+  <div id="capNotice"></div>
+
+  <div class="card" id="capPolicyCard">
+    <div class="col-h">
+      <span data-i18n="cap.policy"></span>
+      <span class="mut mono push-right" id="capMeta"></span>
+    </div>
+    <div class="footnote" data-i18n="cap.policyHint" style="margin-bottom:12px"></div>
+    <div id="capPolicy"></div>
+  </div>
+
+  <div class="card" id="capCandidatesCard">
+    <div class="col-h">
+      <span data-i18n="cap.candidates"></span>
+      <span class="mut" id="capCandidateCount"></span>
+      <a class="btn sm push-right" href="models.html" data-i18n="cap.editModels"></a>
+    </div>
+    <div id="capCandidates"></div>
+  </div>
+
+  <div class="card" id="capHowtoCard">
+    <div class="col-h" data-i18n="cap.howto.title"></div>
+    <ol class="cap-steps">
+      <li data-i18n="cap.howto.1"></li>
+      <li data-i18n="cap.howto.2"></li>
+      <li data-i18n="cap.howto.3"></li>
+    </ol>
+    <div class="footnote" data-i18n="cap.howto.hint"></div>
+  </div>
+</main>
+<script src="i18n.js"></script>
+<script src="nav.js"></script>
+<script src="api.js"></script>
+<script src="shared.js"></script>
+<script src="capability.js"></script>
+</body>
+</html>

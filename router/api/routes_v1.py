@@ -186,6 +186,7 @@ def _version_fields(snapshot, result) -> dict:
         "pipeline_version": snapshot.pipeline_version,
         "pipeline_revision": snapshot.pipeline_revision,
         "backends_revision": snapshot.backends_revision,
+        "capability_revision": snapshot.capability_revision,
         **_tagger_fingerprint(result),
     }
 
@@ -369,7 +370,7 @@ async def chat_completions(request: Request):
              if snapshot.jev_trim else None)
     result = await tagger.tag(TagRequest(
         text=text, headers=dict(request.headers), n_messages=len(messages),
-        scope=scope))
+        scope=scope, capability=snapshot.capability))
     # Every request is judged on its own: tag -> pipeline decision. There is
     # no session state (2026-10-21: session stickiness removed — vanilla
     # clients carry no reliable conversation identity; see

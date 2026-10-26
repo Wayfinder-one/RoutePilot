@@ -2,11 +2,11 @@ from router.signals.registry import GROUPS, SIGNALS
 
 
 def test_registry_shape():
-    assert len(SIGNALS) == 15
-    assert sum(1 for s in SIGNALS.values() if s.kind == "model") == 7
+    assert len(SIGNALS) == 16
+    assert sum(1 for s in SIGNALS.values() if s.kind == "model") == 8
     assert sum(1 for s in SIGNALS.values() if s.kind == "rule") == 8
     assert set(GROUPS) == {"safety", "domain", "difficulty",
-                           "context", "session", "rule"}
+                           "context", "session", "decision", "rule"}
     for spec in SIGNALS.values():
         assert spec.kind in ("model", "rule")
         assert spec.group in GROUPS

@@ -25,10 +25,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Mapping
 
+from router.decision.pack import (canonical_pack_json, empty_pack, freeze_pack,
+                                  pack_revision)
 from router.pipeline.model import Station, station_to_dict
 
 if TYPE_CHECKING:                                # pragma: no cover - typing only
@@ -42,6 +44,8 @@ if TYPE_CHECKING:                                # pragma: no cover - typing onl
 #: revision kinds recorded in config_revisions (v15)
 REVISION_PIPELINE = "pipeline"
 REVISION_QUESTIONS = "questions"
+#: capability pack: model catalog descriptions + decision policy (2026-10-26)
+REVISION_CAPABILITY = "capability"
 
 
 def canonical_json(value) -> str:
@@ -95,26 +99,46 @@ class RoutingSnapshot:
     backends: Mapping[str, "Backend"]          # MappingProxyType: read-only
     backends_revision: str
     jev_trim: bool
+    #: Capability-routing pack (model id -> natural-language description,
+    #: decision instruction, gates, fallback). Empty when not configured.
+    capability: dict = field(default_factory=dict)
+    #: Content hash of the pack ('' when no candidate is configured); the
+    #: ledger value a capability decision can be replayed against.
+    capability_revision: str = ""
+
+
+def capability_content(pack: dict) -> str:
+    """Canonical text stored in ``config_revisions[CARABILITY]`` for replay."""
+    return canonical_pack_json(freeze_pack(pack))
 
 
 def build_snapshot(*, stations, backends, pipeline_version: int,
-                   jev_trim: bool) -> RoutingSnapshot:
+                   jev_trim: bool, capability: dict | None = None) -> RoutingSnapshot:
     """Pure constructor: canonical revisions are derived from the content."""
     station_tuple = tuple(stations)
     backend_map = MappingProxyType(dict(backends))
+    pack = freeze_pack(capability or empty_pack())
     return RoutingSnapshot(
         stations=station_tuple,
         pipeline_revision=pipeline_revision_of(station_tuple),
         pipeline_version=int(pipeline_version or 0),
         backends=backend_map,
         backends_revision=backends_revision_of(backend_map),
-        jev_trim=bool(jev_trim))
+        jev_trim=bool(jev_trim),
+        capability=pack,
+        capability_revision=pack_revision(pack))
 
 
 def load_snapshot(conn: "sqlite3.Connection", *, jev_trim: bool) -> RoutingSnapshot:
-    """Read the current pipeline/backends/version from the database."""
+    """Read the current pipeline/backends/version + capability pack from the DB.
+
+    The capability pack is built from the model catalog (``profile.capability``)
+    and the global policy settings; both are edited through /admin, which
+    refreshes the snapshot, so the hot path never reads the DB.
+    """
     from router.api.upstream import load_backends
-    from router.store.repositories import SettingsRepo, StationRepo
+    from router.decision.pack import build_pack
+    from router.store.repositories import ModelRepo, SettingsRepo, StationRepo
 
     stations = tuple(StationRepo(conn).load())
     version = SettingsRepo(conn).get("pipeline_version", "0") or "0"
@@ -122,8 +146,25 @@ def load_snapshot(conn: "sqlite3.Connection", *, jev_trim: bool) -> RoutingSnaps
         version_int = int(version)
     except (TypeError, ValueError):
         version_int = 0
+    capability = build_pack(ModelRepo(conn).list(), SettingsRepo(conn).all())
     return build_snapshot(stations=stations, backends=load_backends(conn),
-                          pipeline_version=version_int, jev_trim=jev_trim)
+                          pipeline_version=version_int, jev_trim=jev_trim,
+                          capability=capability)
+
+
+def ensure_capability_revision(conn: "sqlite3.Connection", pack: dict) -> str:
+    """Append the capability pack content to ``config_revisions`` (idempotent).
+
+    Returns the content sha. Called on config writes/boot (not per request):
+    a ledger row's ``capability_revision`` must be resolvable from the store.
+    """
+    from router.store.repositories import record_revision
+
+    content = capability_content(pack)
+    revision = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    with conn:
+        record_revision(conn, REVISION_CAPABILITY, content)
+    return revision
 
 
 def install_snapshot(app: "FastAPI", snapshot: RoutingSnapshot) -> None:

@@ -1,8 +1,13 @@
 /* Models & settings page (2026-10-21 rewrite).
 
-   Sections: model registry (id / upstream / provider / reasoning / actions),
-   provider catalog cards, runtime settings, admin token (browser-local) and the
-   read-only current signal engine card.
+   Sections: model registry (id / upstream / provider / reasoning / capability
+   description / actions), provider catalog cards, runtime settings, admin
+   token (browser-local) and the read-only current signal engine card.
+
+   The natural-language capability description is part of the model profile
+   (profile.capability) and is shown in the registry; its GLOBAL policy
+   (instructions / gates / fallback) lives on the separate 能力路由 page
+   (capability.html, 2026-10-26).
 
    Modal #modelModal has two add paths:
      - preset: pick a catalog provider, optional API key, tick preset models,
@@ -106,6 +111,14 @@ function profileOf(model) {
   // The server stores models.profile as a JSON *text* column, so it arrives
   // as a string. TODO(remove after the server returns an object).
   try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+}
+/* Natural-language capability description. GET /admin/models also returns the
+   validated text as a top-level ``capability`` field; fall back to the raw
+   profile for older backends so the list never renders empty by accident. */
+function capabilityOf(model) {
+  if (model && typeof model.capability === 'string') return model.capability;
+  const cap = profileOf(model).capability;
+  return typeof cap === 'string' ? cap : '';
 }
 function modelIds() { return new Set(STATE.models.map(m => m.id)); }
 function providerNames() { return new Set(STATE.providers.map(p => p.name)); }
@@ -218,20 +231,28 @@ function renderModels() {
   if (!table) return;
   const head = `<tr><th>${t('models.col.model')}</th><th>${t('models.col.upstream')}</th>
       <th>${t('models.col.provider')}</th><th>${t('models.col.reasoning')}</th>
+      <th>${t('models.col.capability')}</th>
       <th class="th-actions">${t('models.col.actions')}</th></tr>`;
   if (!rows.length) {
-    table.innerHTML = head + `<tr><td colspan="5"><div class="empty-cell">${esc(t('models.empty'))}</div></td></tr>`;
+    table.innerHTML = head + `<tr><td colspan="6"><div class="empty-cell">${esc(t('models.empty'))}</div></td></tr>`;
     return;
   }
-  table.innerHTML = head + rows.map(m => `<tr data-mrow="${esc(m.id)}">
+  table.innerHTML = head + rows.map(m => {
+    const capability = capabilityOf(m);
+    const capCell = capability
+      ? `<td class="cap-cell"><span class="cap-text" title="${esc(capability)}">${esc(capability)}</span></td>`
+      : `<td class="cap-cell"><span class="mut" title="${esc(t('models.capability.unsetHint'))}">${esc(t('models.capability.unset'))}</span></td>`;
+    return `<tr data-mrow="${esc(m.id)}">
       <td class="mono" style="font-size:11.5px">${esc(m.id)}</td>
       <td class="mono mut" style="font-size:11px">${esc(m.upstream || '—')}</td>
       <td>${esc(m.provider || '—')}</td>
       <td>${reasonChips(m.reasoning)}</td>
+      ${capCell}
       <td class="row-actions">
         <button class="btn sm" data-editmodel="${esc(m.id)}">${esc(t('models.edit'))}</button>
         <button class="btn sm danger" data-delmodel="${esc(m.id)}">${esc(t('models.delete'))}</button>
-      </td></tr>`).join('');
+      </td></tr>`;
+  }).join('');
 }
 
 async function deleteModel(id) {
@@ -483,6 +504,7 @@ function customBody() {
   const p = model ? profileOf(model) : {};
   const tier = d.tier != null ? d.tier : (p.tier || '');
   const domains = d.domains != null ? d.domains : (Array.isArray(p.domains) ? p.domains.join(', ') : '');
+  const capability = d.capability != null ? d.capability : (p.capability || '');
   const fetched = modal.fetched || [];
   const upstreamOpts = [...new Set([...fetched, ...catalogModelIds()])];
   const provOpts = providers.map(x =>
@@ -522,6 +544,9 @@ function customBody() {
         <input id="dprovKey" type="password" autocomplete="off" value="${esc((d.provDraft && d.provDraft.api_key) || '')}"
                placeholder="${esc(t('models.prov.keyEmptyHint'))}"></label>
     </div>
+    <label class="field"><span>${esc(t('models.custom.capability'))}</span>
+      <textarea id="cmCapability" rows="3" placeholder="${esc(t('models.custom.capabilityHint'))}">${esc(capability)}</textarea>
+      <small>${esc(t('models.custom.capabilityHint'))}</small></label>
     <div id="reasonEditor">${reasonEditorBody()}</div>
     <details class="adv"${d.advOpen ? ' open' : ''}>
       <summary>${esc(t('models.custom.advanced'))}</summary>
@@ -687,6 +712,7 @@ function captureCustom() {
   if ($('#cmProvider')) d.provider = g('#cmProvider');
   if ($('#cmTier')) d.tier = g('#cmTier');
   if ($('#cmDomains')) d.domains = g('#cmDomains');
+  if ($('#cmCapability')) d.capability = g('#cmCapability');
   d.provOpen = $('#cmProvInline') ? !$('#cmProvInline').hidden : false;
   if (d.provOpen) {
     d.provDraft = {
@@ -739,6 +765,8 @@ async function saveCustom() {
     delete profile.reasoning;
     profile.domains = domains;
     if (tier) profile.tier = tier; else delete profile.tier;
+    const capability = ($('#cmCapability') ? $('#cmCapability').value.trim() : '');
+    if (capability) profile.capability = capability; else delete profile.capability;
     const reason = reasonFromEditor();
     if (reason.kind === 'false') profile.reasoning = false;
     else if (reason.kind === 'object') profile.reasoning = reason.value;
@@ -774,6 +802,7 @@ function openModelModal(kind, modelId) {
     modal.custom = {
       id: model.id, upstream: model.upstream || '', provider: model.provider || '',
       tier: p.tier || '', domains: Array.isArray(p.domains) ? p.domains.join(', ') : '',
+      capability: p.capability || '',
       provOpen: false, advOpen: false,
     };
   } else {

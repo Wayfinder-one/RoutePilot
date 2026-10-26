@@ -61,7 +61,10 @@ LEDGER_COLUMNS = (
     "usage_observed",
     # v16 (JEV P2-A/D): chunked long-input attribution
     "jev_chunk", "input_chunk_mode", "input_chunk_segments",
-    "input_chunk_prompt_tokens")
+    "input_chunk_prompt_tokens",
+    # v18 (2026-10-26): capability-routing pack revision (''
+    # when no capability routing is configured)
+    "capability_revision")
 
 _SLIM_INSERT = (
     "INSERT OR REPLACE INTO requests (id, ts, text, decision, model, "

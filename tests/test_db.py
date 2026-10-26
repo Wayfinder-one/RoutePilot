@@ -50,7 +50,9 @@ def test_migrations_14_15_16_create_the_action_result_ledger(tmp_path):
         "quality_evaluator", "usage_observed",
         # v16 (JEV P2-A/D): chunked long-input attribution
         "jev_chunk", "input_chunk_mode", "input_chunk_segments",
-        "input_chunk_prompt_tokens"]
+        "input_chunk_prompt_tokens",
+        # v18 (2026-10-26): capability-routing pack revision
+        "capability_revision"]
     assert not {"text", "signals", "trace"} & set(ledger_columns)
 
     # v14 must NOT alter the slim contract of the existing requests table.

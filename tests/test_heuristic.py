@@ -11,7 +11,8 @@ def tag(text, **kw):
 def test_full_pack_keys():
     from router.signals.registry import SIGNALS
     s = tag("你好")
-    assert set(s) == set(SIGNALS)
+    # capability_route is produced by the JEV decision model only.
+    assert set(s) == set(SIGNALS) - {"capability_route"}
 
 
 def test_domain_and_complexity():

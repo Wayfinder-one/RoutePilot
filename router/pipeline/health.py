@@ -238,8 +238,52 @@ def _is_unconditional_leaf(station: Station) -> bool:
             and root.kind == "leaf" and not root.weights)
 
 
+def _check_capability_rows(stations: list[Station],
+                           capability_candidates: set[str]) -> list[Issue]:
+    """``capability_route`` rows must name a model that has a capability text.
+
+    The tagger only ever emits a candidate model id as the signal value, so a
+    row naming anything else can never match — a hard error, not a warning:
+    the operator would otherwise wonder why the branch never runs. An empty
+    candidate set means no model declares ``profile.capability``, so every such
+    row is dead; reject it too (the fix is adding descriptions in the catalog).
+    """
+    issues: list[Issue] = []
+
+    def check(signal: str, value: str, station: Station, node_id: str) -> None:
+        if signal != "capability_route":
+            return
+        if not capability_candidates:
+            issues.append(Issue(
+                "capability_unconfigured",
+                "分流树引用了「模型选择」信号，但没有模型配置能力说明",
+                "The pipeline reads the capability-routing signal, but no "
+                "model declares profile.capability", station.id, node_id))
+        elif str(value) not in capability_candidates:
+            issues.append(Issue(
+                "unknown_capability_model",
+                f"「模型选择」的取值 {value} 不是配置了能力说明的模型",
+                f"Capability-routing value {value!r} is not a model with a "
+                f"capability description", station.id, node_id))
+
+    def walk(station: Station, node: TreeNode) -> None:
+        if node.signal is not None:
+            check(node.signal, node.value, station, node.id)
+        for weight in node.weights:
+            check(weight.signal, weight.value, station, node.id)
+        for child in node.children:
+            walk(station, child)
+
+    for station in stations:
+        if station.root is not None:
+            walk(station, station.root)
+    return issues
+
+
 def check_pipeline(stations: list[Station], known_models: set[str],
-                   model_reasoning: dict[str, dict | None] | None = None
+                   model_reasoning: dict[str, dict | None] | None = None,
+                   *,
+                   capability_candidates: set[str] | None = None
                    ) -> list[Issue]:
     """Health-check a pipeline.
 
@@ -248,6 +292,10 @@ def check_pipeline(stations: list[Station], known_models: set[str],
     previous behaviour is preserved. When given, it maps model_id to the
     normalized reasoning object (``router.reasoning.normalize_reasoning``
     output, or None when undeclared).
+
+    ``capability_candidates`` is optional too: when given (the app/admin
+    callers pass the ids that declare ``profile.capability``), every
+    ``capability_route`` row must name one of them.
     """
     issues: list[Issue] = []
     if not stations:
@@ -273,6 +321,9 @@ def check_pipeline(stations: list[Station], known_models: set[str],
                                   is_root=True, siblings_seen=set(),
                                   model_reasoning=model_reasoning))
         issues.extend(_check_node_ids(station.root, station))
+    if capability_candidates is not None:
+        issues.extend(_check_capability_rows(list(stations),
+                                            set(capability_candidates)))
     # An always-hit station anywhere but last shadows every following station.
     for i, station in enumerate(stations[:-1]):
         if _is_unconditional_leaf(station):

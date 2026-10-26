@@ -227,6 +227,14 @@ MIGRATIONS = [
     CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
     CREATE INDEX idx_user_sessions_exp ON user_sessions(expires_at);
     """,
+    # v18 (2026-10-26, natural-language capability routing): the capability
+    # pack (model catalog descriptions + decision policy) becomes a fourth
+    # content-addressed config revision, so a ledger row that was routed by the
+    # capability signal can be replayed against the exact descriptions. NULL
+    # for requests where no capability routing was configured.
+    """
+    ALTER TABLE request_ledger ADD COLUMN capability_revision TEXT;
+    """,
 ]
 
 
