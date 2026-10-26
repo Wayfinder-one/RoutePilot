@@ -3,9 +3,9 @@
 LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之前，router 先算出一包路由信号
 （16 个：8 个模型信号 + 8 个规则信号），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
 
-其中第 8 个模型信号 `capability_route`（**自然语言能力路由**，2026-10-26）不是固定问题：
+其中第 8 个模型信号 `capability_route`（**自然语言决策路由**，2026-10-26）不是固定问题：
 它让模型按「每个候选模型的一段自然语言能力说明」选择本次请求最适合的后端模型
-（详见下文「自然语言能力路由」）。
+（详见下文「自然语言决策路由」）。
 
 默认推荐 **JEV 版主模型** 作为信号引擎：**Qwen3.5-0.8B 底座 + JEV 标量决策头**（LoRA 合并
 导出），在 router 进程内按 JEV 标准（context + typed questions + candidates → 候选概率）输出
@@ -29,7 +29,7 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
               └─ RequestLog（决策摘要 → SQLite requests slim 行 + request_ledger
                              动作—结果账本（outcome_state/revisions）；信号/trace 只在内存 ring）
 控制台（/console）：概览 / 分流树（信号库 + 树形编辑 + 试算侧滑）/ 计算日志 /
-                    信号配置 / 能力路由（自然语言说明 → 模型选择，策略 + 候选 + 缺失）/
+                    信号配置 / 决策路由（自然语言说明 → 模型选择，策略 + 候选 + 缺失）/
                     模型与设置（模型目录 + 提供方 + 推理声明 + 能力说明列）/
                     用户管理（登录账号：角色 admin/viewer，见「账号与鉴权」）
 ```
@@ -187,18 +187,20 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
   档位不再可用，则降级透传并回 `x-sr-reasoning-warning: unsupported`，不打断用户请求。
   成功注入时响应头带 `x-sr-reasoning: <level>`，计算日志也会记录。
 
-## 自然语言能力路由（2026-10-26，方案 A）
+## 自然语言决策路由（2026-10-26，方案 A）
 
 让「决策模型按自然语言能力说明选后端模型」成为分流树里的一个普通信号
-`capability_route`（decision 组，模型信号）：
+`capability_route`（decision 组，模型信号）。**2026-10-26 起控制台页面名为「决策路由」**，
+内部标识不变（信号 `capability_route`、字段 `profile.capability`、接口 `GET/PUT /admin/capability`、
+控制台 URL `capability.html`）：
 
 - **能力说明存在模型目录**：`models.profile.capability`（每个模型一段自然语言描述，
   ≤2000 字符；空 = 不参与）。控制台「模型与设置 → 编辑模型 → 能力说明」维护，
   模型注册表**直接展示**这段说明（「能力说明」列，在操作列之前；未配置显示「未配置」）；
-  「能力路由」页的候选表与「缺少能力说明」列表也支持**行内「编辑」**（弹窗只改
+  「决策路由」页的候选表与「缺少能力说明」列表也支持**行内「编辑」**（弹窗只改
   `profile.capability`，推理声明等其余 profile 字段原样保留）。
 - **全局策略**：`settings.capability_instructions` / `capability_min_prob` /
-  `capability_min_margin` / `capability_fallback_model`，控制台独立的「能力路由」页编辑
+  `capability_min_margin` / `capability_fallback_model`，控制台独立的「决策路由」页编辑
   （位于「模型与设置」之前），或 `PUT /admin/capability`。请求里会把候选说明渲染成一个 JEV
   choice 问题，与 7 个信号**同一批前向**打分（树不引用该信号时不算）。
 - **信号输出**：`value` = 选中的模型位 ID（可直接路由），`confidence` = 候选分布的熵置信度，
@@ -269,5 +271,5 @@ python -m router
 - i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
   `scripts/i18n_prune_i18n.py` 负责批量删除）。
 - 控制台冒烟：`BASE=http://<host>:<port> LOGIN_EMAIL=<admin> LOGIN_PASSWORD=<pass> node scripts/console_check.js`
-  （覆盖七个页面（含登录页/用户管理页/能力路由页）、模型目录/添加模型弹窗/推理声明编辑器、
+  （覆盖七个页面（含登录页/用户管理页/决策路由页）、模型目录/添加模型弹窗/推理声明编辑器、
   能力说明列与能力策略保存、分流树叶推理下拉与日志徽章；脚本先用账号登录换会话 token 再做检查）。

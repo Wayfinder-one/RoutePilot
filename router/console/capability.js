@@ -1,4 +1,4 @@
-/* 能力路由 page (split out of 模型与设置 on 2026-10-26).
+/* 决策路由 page (named 能力路由 until 2026-10-26; split out of 模型与设置 the same day).
 
    Natural-language capability routing has two halves:
      - per-model capability description, stored as models.profile.capability,
