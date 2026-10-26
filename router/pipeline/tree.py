@@ -119,17 +119,39 @@ class RoutingTree:
     updated_at: str = ""
 
 
-# Fields that belong to another node type.  They cannot be represented by the
-# frozen dataclass, so they must be rejected here instead of silently dropped.
-_FOREIGN_FIELDS: dict[str, tuple[str, ...]] = {
-    "route": ("children", "otherwise", "instructions", "options",
-              "min_prob", "min_margin"),
-    "block": ("model", "reasoning", "children", "otherwise", "instructions",
-              "options", "min_prob", "min_margin"),
-    "branch": ("model", "reasoning", "instructions", "options", "min_prob",
-               "min_margin", "min_score", "weights"),
-    "nl_choice": ("model", "reasoning", "children", "min_score", "weights"),
+# Allowed JSON keys per node type.  This parser is a trust boundary: any key
+# outside the whitelist (a typo such as ``min_scor``, or a field of another node
+# type — even with a ``null`` value) must be rejected, never silently dropped.
+_ALLOWED_KEYS: dict[str, frozenset[str]] = {
+    "route": frozenset({"id", "type", "when", "model", "reasoning",
+                        "weights", "min_score"}),
+    "block": frozenset({"id", "type", "when", "weights", "min_score"}),
+    "branch": frozenset({"id", "type", "when", "children", "otherwise"}),
+    "nl_choice": frozenset({"id", "type", "when", "instructions",
+                            "min_prob", "min_margin", "options",
+                            "otherwise"}),
 }
+
+#: Allowed keys of a saved-tree envelope.
+_TREE_KEYS = frozenset({"id", "name", "enabled", "root", "tree_revision",
+                        "updated_at"})
+
+#: Allowed JSON keys per NL option kind (``model`` and ``child`` are exclusive).
+_OPTION_MODEL_KEYS = frozenset({"key", "model", "reasoning"})
+_OPTION_CHILD_KEYS = frozenset({"key", "description", "child"})
+
+#: Nested ``when`` / ``weight`` objects are part of the same trust boundary.
+_WHEN_KEYS = frozenset({"signal", "op", "value", "conf_min"})
+_WEIGHT_KEYS = frozenset({"signal", "value", "weight"})
+
+
+def _reject_unknown_fields(kind: str, raw: dict,
+                           allowed: frozenset[str]) -> None:
+    """Reject any key outside ``allowed`` (presence-based, null is not exempt)."""
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(
+            f"{kind} cannot carry {', '.join(repr(key) for key in unknown)}")
 
 
 def _unit(raw, name: str) -> float:
@@ -156,15 +178,21 @@ def _node_id(raw: dict) -> str:
 def _when_from_dict(raw) -> When:
     if not isinstance(raw, dict):
         raise ValueError(f"when must be an object: {raw!r}")
+    _reject_unknown_fields("when", raw, _WHEN_KEYS)
     signal = raw.get("signal")
     if not isinstance(signal, str) or not signal:
         raise ValueError(f"when needs a nonempty string signal: {raw!r}")
-    value = raw.get("value", "")
+    if "value" not in raw:
+        raise ValueError(f"when needs a string value: {raw!r}")
+    value = raw["value"]
     if not isinstance(value, str):
         raise ValueError(f"when value must be a string: {raw!r}")
-    op = raw.get("op") or "eq"
-    if op not in WHEN_OPS:
-        raise ValueError(f"when op must be one of {WHEN_OPS}: {raw!r}")
+    if "op" in raw:
+        op = raw["op"]
+        if not isinstance(op, str) or op not in WHEN_OPS:
+            raise ValueError(f"when op must be one of {WHEN_OPS}: {raw!r}")
+    else:
+        op = "eq"
     return When(signal=signal, value=value, op=op,
                 conf_min=_optional_unit(raw.get("conf_min"), "conf_min"))
 
@@ -172,10 +200,13 @@ def _when_from_dict(raw) -> When:
 def _weight_from_dict(raw) -> Weight:
     if not isinstance(raw, dict):
         raise ValueError(f"weight must be an object: {raw!r}")
+    _reject_unknown_fields("weight", raw, _WEIGHT_KEYS)
     signal = raw.get("signal")
     if not isinstance(signal, str) or not signal:
         raise ValueError(f"weight needs a nonempty string signal: {raw!r}")
-    value = raw.get("value", "")
+    if "value" not in raw:
+        raise ValueError(f"weight needs a string value: {raw!r}")
+    value = raw["value"]
     if not isinstance(value, str):
         raise ValueError(f"weight value must be a string: {raw!r}")
     raw_weight = raw.get("weight")
@@ -208,33 +239,40 @@ def _options_list(raw, parent_id: str) -> tuple[NLOption, ...]:
     return tuple(_option_from_dict(option, parent_id) for option in raw)
 
 
-def _reject_foreign_fields(node_type: str, node_id: str, raw: dict) -> None:
-    for key in _FOREIGN_FIELDS[node_type]:
-        if key in raw and raw[key] is not None:
-            raise ValueError(
-                f"{node_type} node {node_id} cannot carry {key!r}")
-
-
 def _option_from_dict(raw: dict, parent_id: str) -> NLOption:
-    if not isinstance(raw, dict) or not isinstance(raw.get("key"), str) or not raw["key"]:
+    if not isinstance(raw, dict):
+        raise ValueError(f"nl option must be an object: {raw!r}")
+    key = raw.get("key")
+    if not isinstance(key, str) or not key:
         raise ValueError("nl option needs a nonempty string key")
     has_model = "model" in raw
     has_child = "child" in raw
     if has_model == has_child:
         raise ValueError("nl option needs exactly one of model or child")
     if has_model:
-        if not isinstance(raw["model"], str) or not raw["model"]:
+        _reject_unknown_fields(f"nl model option {key!r}", raw,
+                               _OPTION_MODEL_KEYS)
+        model = raw["model"]
+        if not isinstance(model, str) or not model:
             raise ValueError("nl model option needs a nonempty model")
-        target = Route(
-            id=f"{parent_id}/options/{raw['key']}",
-            model=raw["model"], reasoning=raw.get("reasoning"))
-        return NLOption(key=raw["key"], text="", target=target,
-                        capability_model=raw["model"])
-    if not isinstance(raw.get("description"), str) or not raw["description"].strip():
+        reasoning = raw.get("reasoning")
+        if reasoning is not None and not isinstance(reasoning, str):
+            raise ValueError(
+                f"nl model option {key!r} reasoning must be a string or null")
+        target = Route(id=f"{parent_id}/options/{key}", model=model,
+                       reasoning=reasoning)
+        return NLOption(key=key, text="", target=target,
+                        capability_model=model)
+    _reject_unknown_fields(f"nl child option {key!r}", raw, _OPTION_CHILD_KEYS)
+    description = raw.get("description")
+    if not isinstance(description, str) or not description.strip():
         raise ValueError("nl child option needs a nonempty description")
-    return NLOption(
-        key=raw["key"], text=raw["description"].strip(),
-        target=node_from_dict(raw["child"]), capability_model=None)
+    child = raw["child"]
+    if not isinstance(child, dict):
+        raise ValueError(
+            f"nl child option {key!r} needs a child node object")
+    return NLOption(key=key, text=description.strip(),
+                    target=node_from_dict(child), capability_model=None)
 
 
 def node_from_dict(raw) -> Node:
@@ -245,7 +283,8 @@ def node_from_dict(raw) -> Node:
     node_type = raw.get("type")
     if node_type not in NODE_TYPES:
         raise ValueError(f"node type must be one of {NODE_TYPES}: {raw!r}")
-    _reject_foreign_fields(node_type, node_id, raw)
+    _reject_unknown_fields(f"{node_type} node {node_id!r}", raw,
+                           _ALLOWED_KEYS[node_type])
     when = None if raw.get("when") is None else _when_from_dict(raw["when"])
 
     if node_type == "route":
@@ -271,10 +310,11 @@ def node_from_dict(raw) -> Node:
         return Branch(id=node_id, children=_children_from_dict(raw.get("children")),
                       otherwise=otherwise, when=when)
 
-    instructions = raw.get("instructions")
-    if instructions is None:
-        instructions = ""
-    elif not isinstance(instructions, str):
+    if "instructions" not in raw:
+        raise ValueError(
+            f"nl_choice node {node_id} needs an instructions string")
+    instructions = raw["instructions"]
+    if not isinstance(instructions, str):
         raise ValueError(
             f"nl_choice node {node_id} instructions must be a string")
     min_prob = raw.get("min_prob")
@@ -313,6 +353,11 @@ def _option_to_dict(option: NLOption) -> dict:
         if not isinstance(option.target, Route):
             raise ValueError(
                 f"direct model option {option.key!r} must target a route")
+        if option.target.model != option.capability_model:
+            raise ValueError(
+                f"direct model option {option.key!r} declares "
+                f"{option.capability_model!r} but targets "
+                f"{option.target.model!r}")
         return {"key": option.key, "model": option.target.model,
                 "reasoning": option.target.reasoning}
     return {"key": option.key, "description": option.text,
@@ -356,10 +401,12 @@ def node_to_dict(node: Node) -> dict:
 def walk_nodes(root: Node) -> Iterator[Node]:
     """Yield ``root`` and every reachable node, in configuration order.
 
-    Every out-edge is followed exactly once: ``Branch.children`` in order,
-    ``Branch.otherwise``, every ``NLChoice.options[].target`` in order (which
-    includes the auto-built route of a direct ``model`` option) and
-    ``NLChoice.otherwise``.  ``otherwise`` is emitted after all ordinary edges.
+    The walk keeps no visited set: it relies on the embedded-tree invariant
+    that nodes are never shared (no cross references, no cycles), so every
+    out-edge is visited exactly once by construction: ``Branch.children`` in
+    order, ``Branch.otherwise``, every ``NLChoice.options[].target`` in order
+    (which includes the auto-built route of a direct ``model`` option) and
+    ``NLChoice.otherwise``.  ``otherwise`` is emitted after the ordinary edges.
     """
     if not isinstance(root, (Route, Block, Branch, NLChoice)):
         raise TypeError(f"not a routing tree node: {root!r}")
@@ -389,6 +436,7 @@ def tree_from_dict(raw) -> RoutingTree:
     """Parse a saved tree envelope (``{id,name,enabled,root,...}``)."""
     if not isinstance(raw, dict):
         raise ValueError(f"tree must be an object: {raw!r}")
+    _reject_unknown_fields("tree", raw, _TREE_KEYS)
     tree_id = raw.get("id")
     if not isinstance(tree_id, str) or not tree_id:
         raise ValueError(f"tree needs a nonempty string id: {raw!r}")

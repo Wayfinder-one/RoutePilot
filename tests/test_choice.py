@@ -8,6 +8,9 @@ change the observable contract (2026-10-26 unified routing tree, Task 1).
 """
 
 import ast
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -102,3 +105,76 @@ def test_choice_module_does_not_import_the_jev_tagger():
             imported.append(node.module or "")
     assert not [name for name in imported
                 if "signals" in name or "jev" in name.lower()]
+
+
+# ── boundary ownership: catalog must not depend on the retiring module ─────
+def test_catalog_is_importable_without_the_retiring_capability_module():
+    """Task 11 deletes ``router/decision/capability.py``; catalog must stand alone.
+
+    The subprocess pre-registers a stub ``router.decision`` package so importing
+    the submodule skips ``router/decision/__init__.py`` (which still imports the
+    capability-policy helpers); the only thing under test is whether
+    ``catalog.py`` itself pulls in the retiring module.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    script = textwrap.dedent("""
+        import pathlib
+        import sys
+        import types
+
+        import router
+
+        decision_dir = pathlib.Path(router.__file__).parent / "decision"
+        package = types.ModuleType("router.decision")
+        package.__path__ = [str(decision_dir)]
+        sys.modules["router.decision"] = package
+
+        import router.decision.catalog as catalog
+
+        assert "router.decision.capability" not in sys.modules, (
+            "catalog must not import the retiring capability module")
+        assert catalog.MAX_CAPABILITY_CHARS == 2000
+        assert catalog.normalize_capability("  x  ") == "x"
+        print("catalog-isolated-ok")
+    """)
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=repo_root,
+        capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert "catalog-isolated-ok" in completed.stdout
+
+
+def test_max_capability_chars_is_shared_with_the_retiring_module():
+    from router.decision import capability, catalog
+
+    assert catalog.MAX_CAPABILITY_CHARS == 2000
+    assert capability.MAX_CAPABILITY_CHARS == catalog.MAX_CAPABILITY_CHARS
+
+
+def test_pack_forwards_the_catalog_boundary_names():
+    """Task 11 keeps these import paths working until pack.py itself is deleted."""
+    from router.decision import catalog, pack
+
+    assert pack.CapabilityPackError is catalog.CapabilityPackError
+    assert pack.normalize_capability is catalog.normalize_capability
+    assert pack.capability_of_model is catalog.capability_of_model
+
+
+# ── deliberate fail-open tightening at the adapter boundary ────────────────
+def test_score_choice_rejects_probability_count_mismatch_as_jev_error():
+    """3 candidates + a 2-probability answer is a ChoiceError -> JevTaggerError.
+
+    The retired ad-hoc path silently truncated/zipped the distribution; the
+    decision-runner contract must refuse it (a caller that wants fail-open
+    catches ``JevTaggerError``, see the unified-tree NL node).
+    """
+    class MismatchedChoiceTagger(FakeChoiceTagger):
+        def _score(self, records):
+            self.records = records
+            return [[0.2, 0.8]]        # wrong length for three candidates
+
+    tagger = MismatchedChoiceTagger()
+    with pytest.raises(JevTaggerError) as excinfo:
+        JevTagger.score_choice(tagger, "request", "choose",
+                               {"a": "A", "b": "B", "c": "C"})
+    assert "probability count" in str(excinfo.value)

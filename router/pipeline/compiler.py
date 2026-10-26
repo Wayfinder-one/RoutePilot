@@ -117,10 +117,39 @@ def effective_node_from_dict(raw: dict) -> Node:
     """Parse the effective serde back, keeping compiled direct-candidate text.
 
     Companion of :func:`effective_node_to_dict` used by ``snapshot_from_content``
-    for decision replay: the stored tree parser ignores the extra
-    ``text`` field, so the texts are re-attached structurally afterwards.
+    for decision replay.  The stored-tree parser is strict (unknown keys are
+    rejected), so the effective-only ``text`` field is first stripped in a
+    recursive copy — ``raw`` itself is never mutated — then the texts are
+    re-attached structurally.
     """
-    return _restore_compiled_text(raw, node_from_dict(raw))
+    return _restore_compiled_text(raw, node_from_dict(_without_compiled_text(raw)))
+
+
+def _without_compiled_text(raw):
+    """Deep copy of an effective node dict with direct-candidate ``text`` removed."""
+    if not isinstance(raw, dict):
+        return raw
+    node = dict(raw)
+    children = node.get("children")
+    if isinstance(children, list):
+        node["children"] = [_without_compiled_text(child) for child in children]
+    otherwise = node.get("otherwise")
+    if isinstance(otherwise, dict):
+        node["otherwise"] = _without_compiled_text(otherwise)
+    options = node.get("options")
+    if isinstance(options, list):
+        stripped = []
+        for option in options:
+            if isinstance(option, dict) and "model" in option:
+                option = {key: value for key, value in option.items()
+                          if key != EFFECTIVE_TEXT_FIELD}
+            elif isinstance(option, dict) \
+                    and isinstance(option.get("child"), dict):
+                option = dict(option)
+                option["child"] = _without_compiled_text(option["child"])
+            stripped.append(option)
+        node["options"] = stripped
+    return node
 
 
 def _restore_compiled_text(encoded: dict, node: Node) -> Node:

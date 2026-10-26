@@ -52,6 +52,12 @@ import hashlib
 import json
 from pathlib import Path
 
+# ``MAX_CAPABILITY_CHARS`` is owned by the model-catalog boundary
+# (``router.decision.catalog``); this policy module is retired by the cleanup
+# task while the catalog outlives it, so the import direction points at the
+# survivor.
+from router.decision.catalog import MAX_CAPABILITY_CHARS
+
 #: Default decision question (mirrors the article's "决策指令" + capability table).
 DEFAULT_INSTRUCTIONS = (
     "根据候选模型的能力说明和本次请求的任务内容，选择最适合处理该请求的模型。"
@@ -60,7 +66,6 @@ DEFAULT_INSTRUCTIONS = (
 DEFAULT_MIN_PROB = 0.45
 DEFAULT_MIN_MARGIN = 0.10
 MAX_CANDIDATES = 255
-MAX_CAPABILITY_CHARS = 2000
 MAX_INSTRUCTIONS_CHARS = 4000
 
 

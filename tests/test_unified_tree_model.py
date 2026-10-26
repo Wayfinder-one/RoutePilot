@@ -165,19 +165,101 @@ def test_tree_serde_fills_contract_defaults_for_absent_fields():
     }
 
 
-def test_absent_optional_node_fields_fall_back_to_contract_defaults():
-    nl = node_from_dict({"id": "n", "type": "nl_choice"})
+def test_explicit_empty_strings_are_accepted_for_draft_fields():
+    """Empty strings are a legal draft value (Task 3 saves incomplete drafts)."""
+    nl = node_from_dict({"id": "n", "type": "nl_choice", "instructions": ""})
     assert nl == NLChoice(id="n", instructions="", options=())
-    assert (nl.min_prob, nl.min_margin, nl.otherwise, nl.when) == (
-        0.45, 0.10, None, None)
+    when = node_from_dict({"id": "r", "type": "route", "model": "m",
+                           "when": {"signal": "domain", "value": ""}})
+    assert when.when == When(signal="domain", value="")
+    weighted = node_from_dict({
+        "id": "r2", "type": "route", "model": "m",
+        "weights": [{"signal": "domain", "value": ""}]})
+    assert weighted.weights == (Weight(signal="domain", value=""),)
+
+
+def test_missing_required_node_fields_are_rejected_not_defaulted():
+    """Trust boundary: a missing required key is malformed, never ''."""
+    with pytest.raises(ValueError):
+        node_from_dict({"id": "n", "type": "nl_choice"})
+    with pytest.raises(ValueError):
+        node_from_dict({"id": "r", "type": "route", "model": "m",
+                        "when": {"signal": "domain"}})
+    with pytest.raises(ValueError):
+        node_from_dict({"id": "r2", "type": "route", "model": "m",
+                        "weights": [{"signal": "domain"}]})
+
+
+def test_null_optional_fields_are_accepted_but_instructions_is_not_nullable():
     nulled = node_from_dict({
-        "id": "n2", "type": "nl_choice", "instructions": None,
+        "id": "n2", "type": "nl_choice", "instructions": "",
         "options": None, "min_prob": None, "min_margin": None, "when": None,
         "otherwise": None})
     assert nulled == NLChoice(id="n2", instructions="", options=())
+    with pytest.raises(ValueError):
+        node_from_dict({"id": "n3", "type": "nl_choice",
+                        "instructions": None})
     assert node_from_dict({"id": "r", "type": "route", "model": "m"}) == Route(
         id="r", model="m")
     assert node_from_dict({"id": "b", "type": "branch"}) == Branch(id="b")
+    nulled_route = node_from_dict({
+        "id": "r2", "type": "route", "model": "m", "reasoning": None,
+        "min_score": None, "when": None, "weights": None})
+    assert nulled_route == Route(id="r2", model="m")
+
+
+def test_when_op_defaults_to_eq_and_accepts_only_eq_or_contains():
+    raw = {"id": "r", "type": "route", "model": "m"}
+    default = node_from_dict({**raw, "when": {"signal": "domain",
+                                              "value": "math"}})
+    assert default.when.op == "eq"
+    explicit_eq = node_from_dict({**raw, "when": {
+        "signal": "domain", "value": "math", "op": "eq"}})
+    assert explicit_eq.when.op == "eq"
+    contains = node_from_dict({**raw, "when": {
+        "signal": "pii", "value": "email_address", "op": "contains"}})
+    assert contains.when.op == "contains"
+
+
+def test_model_option_serde_requires_the_declared_and_target_model_to_match():
+    option = NLOption(key="fast", text="",
+                      target=Route(id="nl/options/fast", model="m2"),
+                      capability_model="m1")
+    with pytest.raises(ValueError):
+        node_to_dict(NLChoice(id="nl", instructions="pick",
+                              options=(option,)))
+    consistent = NLOption(key="fast", text="",
+                          target=Route(id="nl/options/fast", model="m1"),
+                          capability_model="m1")
+    encoded = node_to_dict(NLChoice(id="nl", instructions="pick",
+                                    options=(consistent,)))
+    assert encoded["options"] == [
+        {"key": "fast", "model": "m1", "reasoning": None}]
+
+
+def test_fixture_when_ops_match_the_signal_arity():
+    from router.signals.registry import SIGNALS
+    from tests.routing_tree_fixtures import mixed_tree
+
+    for node in walk_nodes(mixed_tree().root):
+        when = node.when
+        if when is None:
+            continue
+        spec = SIGNALS[when.signal]
+        expected = "contains" if spec.multi else "eq"
+        assert when.op == expected, (when.signal, when.op, expected)
+
+
+def test_every_fixture_node_and_envelope_round_trips_through_strict_parser():
+    from tests.routing_tree_fixtures import mixed_tree
+
+    tree = mixed_tree()
+    encoded = tree_to_dict(tree)
+    assert tree_to_dict(tree_from_dict(encoded)) == encoded
+    for node in walk_nodes(tree.root):
+        assert node_from_dict(node_to_dict(node)) == node, node.id
+    assert node_to_dict(node_from_dict(node_to_dict(tree.root))) == \
+        node_to_dict(tree.root)
 
 
 @pytest.mark.parametrize("raw", [
@@ -234,6 +316,46 @@ def test_absent_optional_node_fields_fall_back_to_contract_defaults():
         "signal": "pii", "value": "x", "conf_min": 1.2}},
     {"id": "r", "type": "route", "model": "m", "when": {
         "signal": "pii", "value": 5}},
+    # unknown keys are rejected per node type (typos must not be dropped)
+    {"id": "r", "type": "route", "model": "m", "min_scor": 0.5},
+    {"id": "r", "type": "route", "model": "m", "max_score": 1.0},
+    {"id": "r", "type": "route", "model": "m", "children": None},
+    {"id": "b", "type": "block", "model": None},
+    {"id": "b", "type": "branch", "instructions": None},
+    {"id": "n", "type": "nl_choice", "instructions": "", "weights": []},
+    {"id": "n", "type": "nl_choice", "instructions": "", "min_score": None},
+    # when.op is strict: no truthy fallback, explicit values only
+    {"id": "r", "type": "route", "model": "m", "when": {
+        "signal": "pii", "value": "x", "op": 0}},
+    {"id": "r", "type": "route", "model": "m", "when": {
+        "signal": "pii", "value": "x", "op": None}},
+    {"id": "r", "type": "route", "model": "m", "when": {
+        "signal": "pii", "value": "x", "op": True}},
+    {"id": "r", "type": "route", "model": "m", "when": {
+        "signal": "pii", "value": "x", "op": ""}},
+    # a direct model option is exactly {key, model, reasoning}
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "model": "m", "description": "d"}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "model": "m", "when": None}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "model": "m", "weights": []}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "model": "m", "min_score": 0.5}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "model": "m", "capability_model": "m"}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "model": "m", "reasoning": 5}]},
+    # a child option is exactly {key, description, child}
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "description": "d", "reasoning": None,
+         "child": {"id": "c", "type": "route", "model": "m"}}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "description": "d", "weights": [],
+         "child": {"id": "c", "type": "route", "model": "m"}}]},
+    {"id": "n", "type": "nl_choice", "instructions": "", "options": [
+        {"key": "k", "description": "d", "model": None,
+         "child": {"id": "c", "type": "route", "model": "m"}}]},
 ])
 def test_node_from_dict_rejects_malformed_nodes(raw):
     with pytest.raises(ValueError):
@@ -249,6 +371,11 @@ def test_node_from_dict_rejects_malformed_nodes(raw):
     {"id": "t", "name": 5, "root": {"id": "r", "type": "route", "model": "m"}},
     {"id": "t", "root": "nope"},
     {"id": "", "root": {"id": "r", "type": "route", "model": "m"}},
+    # unknown envelope keys are rejected (a typo must never be dropped)
+    {"id": "t", "root": {"id": "r", "type": "route", "model": "m"},
+     "stations": []},
+    {"id": "t", "root": {"id": "r", "type": "route", "model": "m"},
+     "tree_revison": "x"},
     "not an object",
 ])
 def test_tree_from_dict_rejects_malformed_trees(raw):

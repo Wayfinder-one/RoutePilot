@@ -16,13 +16,21 @@ Pure module: no torch, no sqlite, no FastAPI.
 (2026-10-26 unified routing tree, Task 1: extracted from
 ``router.decision.pack``; that module still forwards the two public names for
 its existing callers until the cleanup task retires it.)
+
+This module deliberately imports **nothing** from
+``router.decision.capability``: that capability-policy module is retired by the
+cleanup task, while the model-catalog boundary survives (``profile.capability``
+stays a model field), so the length limit moved here with the validator.
 """
 
 from __future__ import annotations
 
 import json
 
-from router.decision.capability import MAX_CAPABILITY_CHARS
+#: Max chars of one model's ``profile.capability`` description.  Re-exported by
+#: ``router.decision.capability`` for its legacy config validator until that
+#: module is retired; the catalog owns the value.
+MAX_CAPABILITY_CHARS = 2000
 
 #: Model profile key holding the natural-language capability description.
 PROFILE_KEY = "capability"
