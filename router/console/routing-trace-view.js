@@ -55,6 +55,7 @@ const SRTraceView = (function () {
     "trace.event.selected_child_miss": "选中子树未命中",
     "trace.event.otherwise_hit": "兜底出边命中",
     "trace.event.otherwise_miss": "兜底出边未命中",
+    "trace.event.entered": "进入容器节点",
     "trace.event.invalid": "无效事件",
     "trace.reason.condition_false": "条件不匹配",
     "trace.reason.below_confidence": "置信度低于门槛",
@@ -87,6 +88,7 @@ const SRTraceView = (function () {
     "trace.nl.error": "调用错误",
     "trace.selected": "选中",
     "trace.selectedNode": "选中子树",
+    "trace.superseded": "已被直接命中取代",
     "trace.otherwiseHit": "兜底出边返回了结果",
     "trace.otherwiseMiss": "兜底出边也未命中",
   };
@@ -140,6 +142,16 @@ const SRTraceView = (function () {
     return EFFORT_FALLBACK[String(effort)] || String(effort);
   }
   function reasonEffort(effort) { return effortLabel(effort); }
+  const KIND_FALLBACK = {
+    branch: "普通分支", nl_choice: "自然语言选择", route: "路由", block: "拦截",
+  };
+  function entryKindLabel(kind) {
+    if (kind == null || kind === "") return "";
+    const key = "tree." + String(kind);
+    const label = tr(key);
+    if (label !== key) return label;
+    return KIND_FALLBACK[String(kind)] || String(kind);
+  }
 
   /* ── human text for event names / reason codes (raw fallback) ──────── */
   function eventLabel(name) {
@@ -408,6 +420,12 @@ const SRTraceView = (function () {
     return `<div class="rtt-event-body">${parts.join("")}</div>`;
   }
 
+  function enteredBody(event) {
+    const kind = entryKindLabel(event.kind);
+    return `<div class="rtt-event-body">` +
+      `<span class="mut">${esc(kind || "—")}</span></div>`;
+  }
+
   function otherwiseBody(event) {
     const parts = [`<span class="mut">${escHTML(
       event.event === "otherwise_hit" ? tr("trace.otherwiseHit") : tr("trace.otherwiseMiss"))}</span>`];
@@ -429,6 +447,7 @@ const SRTraceView = (function () {
       case "selected_child_miss": return selectedChildBody(event);
       case "otherwise_hit":
       case "otherwise_miss": return otherwiseBody(event);
+      case "entered": return enteredBody(event);
       default: return rawBody(event);
     }
   }
@@ -439,13 +458,19 @@ const SRTraceView = (function () {
     const nodeId = valid && event.node_id != null ? String(event.node_id) : "";
     const reason = valid && event.reason != null ? String(event.reason) : "";
     const label = valid ? eventLabel(name) : tr("trace.invalidEvent");
+    const superseded = valid && event.superseded === true;
     const head = `<span class="rtt-idx mono">${index + 1}</span>` +
       (nodeId ? `<code class="rtt-node">${escHTML(nodeId)}</code>` : "") +
       `<span class="rtt-event-label" data-role="event-label">${escHTML(label)}</span>` +
       (reason
         ? `<span class="rtt-reason" data-role="reason-label">${escHTML(reasonLabel(reason))}</span>`
+        : "") +
+      (superseded
+        ? `<span class="rtt-superseded" data-role="superseded">` +
+          `${escHTML(tr("trace.superseded"))}</span>`
         : "");
-    return `<li class="rtt-event" data-event="${escHTML(name)}"` +
+    return `<li class="rtt-event${superseded ? " is-superseded" : ""}"` +
+      ` data-event="${escHTML(name)}"` +
       (nodeId ? ` data-node-id="${escHTML(nodeId)}"` : "") +
       (reason ? ` data-reason="${escHTML(reason)}"` : "") + ">" +
       `<div class="rtt-event-head">${head}</div>` +

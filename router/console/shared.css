@@ -278,6 +278,8 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .rtt-event{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:5px 9px}
 .rtt-event[data-event="hit"]{border-color:var(--green-line);background:var(--green-soft)}
 .rtt-event[data-event="otherwise_hit"]{border-color:var(--green-line)}
+.rtt-event[data-event="entered"]{border-style:dashed}
+.rtt-event.is-superseded{opacity:.62}
 .rtt-event-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .rtt-idx{width:16px;height:16px;border-radius:99px;background:var(--panel-2);
   border:1px solid var(--line);display:inline-flex;align-items:center;justify-content:center;
@@ -285,6 +287,8 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .rtt-event-label{font-size:11.5px;font-weight:650;color:var(--text)}
 .rtt-reason{font-size:10px;border-radius:99px;padding:0 7px;flex:none;
   color:var(--red);border:1px solid var(--red-line);background:var(--red-soft)}
+.rtt-superseded{font-size:10px;border-radius:99px;padding:0 7px;flex:none;
+  color:var(--text-3);border:1px dashed var(--line-2);background:var(--panel-2)}
 .rtt-event[data-event="hit"] .rtt-reason,
 .rtt-event[data-event="otherwise_hit"] .rtt-reason{color:var(--text-3);
   border-color:var(--line);background:var(--panel-2)}

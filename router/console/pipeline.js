@@ -164,6 +164,10 @@ function renderAll() {
   renderTreeList();
   renderTree();
   renderChrome();
+  /* one DND lifecycle path for boot, every re-render and language switches:
+     rebuildDnd() destroys the previous controller first, so pointer listeners
+     are bound exactly once and the first page load is draggable (review C-2). */
+  rebuildDnd();
 }
 
 /* ── palette (signal library: drag source + click-to-pick) ───────────── */
@@ -249,14 +253,20 @@ function showPopIssues(list) {
 }
 
 /* ── draft updates ───────────────────────────────────────────────────── */
-function commitDraft(nextDraft, options) {
+/* Every draft write is pinned to an explicit tree id. The selected tree may
+   change while a toast is on screen, so no delayed action (undo included) may
+   resolve its target from currentTreeId() at click time (review C-1). */
+function commitTreeDraft(treeId, nextDraft, options) {
   const opts = options || {};
-  const treeId = currentTreeId();
   if (!treeId || !nextDraft) return false;
+  if (!SRTreeStore.tree(treeId)) return false;     // tree vanished: no-op
   SRTreeStore.setDraft(treeId, nextDraft);
   renderAll();
   if (opts.toast) toastUndo(opts.toast);
   return true;
+}
+function commitDraft(nextDraft, options) {
+  return commitTreeDraft(currentTreeId(), nextDraft, options);
 }
 function patchNode(nodeId, updater, options) {
   const draft = currentDraft();
@@ -554,9 +564,17 @@ function openNewModelOption(parentId) {
     popFoot(t("common.add"));
   const pop = openPop(html, anchor(), {kind: "new-option", nodeId: parentId, anchor: anchor});
   pop.querySelector('[data-pop="apply"]').addEventListener("click", () => {
-    const key = ($("#newOptionKey").value || "").trim();
-    const option = SRTreeEditor.emptyOption("model", key, {model: $("#newOptionModel").value});
-    const result = SRTreeEditor.addOption(parent, option);
+    const values = {
+      key: ($("#newOptionKey").value || "").trim(),
+      model: $("#newOptionModel").value,
+      reasoning: null,
+    };
+    const validated = SRTreeEditor.applyOptionForm({key: ""}, values, {
+      kind: "model", modelsById: modelsById(),
+      takenKeys: parent.options.map(option => option.key),
+    });
+    if (validated.issues.length) { showPopIssues(validated.issues); return; }
+    const result = SRTreeEditor.addOption(parent, validated.option);
     if (result.issues.length) { showPopIssues(result.issues); return; }
     closePop();
     patchNode(parentId, () => result.node, {toast: tr("pipeline.optionAdded")});
@@ -598,17 +616,33 @@ function openNewChildOption(parentId) {
       model: $("#newChildModel") ? $("#newChildModel").value : "",
     });
     if (!child) { showPopIssues([localIssue("no_models", tr("pipeline.noModels"))]); return; }
-    const option = SRTreeEditor.emptyOption("child", key, {child: child, description: description});
-    const result = SRTreeEditor.addOption(parent, option);
+    const validated = SRTreeEditor.applyOptionForm(
+      {key: "", description: "", child: child}, {key: key, description: description}, {
+        kind: "child", modelsById: modelsById(),
+        takenKeys: parent.options.map(option => option.key),
+      });
+    if (validated.issues.length) { showPopIssues(validated.issues); return; }
+    const result = SRTreeEditor.addOption(parent, validated.option);
     if (result.issues.length) { showPopIssues(result.issues); return; }
     closePop();
     patchNode(parentId, () => result.node, {toast: tr("pipeline.optionAdded")});
   });
 }
 function removeWithUndo(nextDraft, message) {
+  const treeId = currentTreeId();
+  const tree = SRTreeStore.tree(treeId);
+  const treeName = tree ? (tree.name || tree.id) : treeId;
   const before = SRTreeModel.clone(currentDraft());
-  if (!commitDraft(nextDraft)) return;
-  toastUndo(message, () => commitDraft(before));
+  if (!commitTreeDraft(treeId, nextDraft)) return;
+  toastUndo(message, () => {
+    if (!commitTreeDraft(treeId, before)) {
+      toastUndo(tr("pipeline.undoGone"));
+      return;
+    }
+    /* undo belongs to the tree it was issued on; say so when the user has
+       switched away instead of silently editing another tree's draft */
+    if (currentTreeId() !== treeId) toastUndo(tr("pipeline.undoOtherTree", {name: treeName}));
+  });
 }
 function removeNodeById(nodeId) {
   const draft = currentDraft();
@@ -970,7 +1004,14 @@ function renderTry() {
     (result.tree_revision && tree.tree_revision &&
      result.tree_revision !== tree.tree_revision);
   const staleWarn = stale ? `<div class="sim-warn">⚠ ${esc(tr("pipeline.tryStale"))}</div>` : "";
-  out.innerHTML = dirtyWarn + staleWarn + '<div class="sim-trace" id="simTrace"></div>';
+  /* non-blocking validation warnings from /admin/try are shown, not dropped */
+  const tryWarnings = Array.isArray(result.warnings) ? result.warnings : [];
+  const warningsHtml = tryWarnings.length
+    ? `<div class="sim-warn sim-warnings">⚠ ` +
+      tryWarnings.map(item => esc(issueText(item))).join("；") + `</div>`
+    : "";
+  out.innerHTML = dirtyWarn + staleWarn + warningsHtml +
+    '<div class="sim-trace" id="simTrace"></div>';
   /* one shared renderer for the try drawer AND the calculation log */
   SRTraceView.renderRoutingTrace($("#simTrace"), result, {tree: tree});
 }
@@ -1151,10 +1192,9 @@ async function boot() {
 
 window.onLangChange = () => {
   renderPalette();
-  renderAll();
+  renderAll();          // includes the single rebuildDnd() lifecycle
   renderSimText();
   renderTry();
-  rebuildDnd();
 };
 
 bindChrome();

@@ -404,6 +404,10 @@ const I18N = {
     'trace.tree': '路由树',
     'trace.treeRevision': '树 revision',
     'trace.weights': '加权条件（达成率）',
+    'trace.event.entered': '进入容器节点',
+    'trace.superseded': '已被直接命中取代',
+    'pipeline.undoOtherTree': '已撤销到「{name}」',
+    'pipeline.undoGone': '这棵树已不存在，撤销已忽略',
   },
   en: {
     'app.title': 'Smart Router',
@@ -809,6 +813,10 @@ const I18N = {
     'trace.tree': 'tree',
     'trace.treeRevision': 'tree revision',
     'trace.weights': 'Weighted conditions (attainment)',
+    'trace.event.entered': 'Enter container',
+    'trace.superseded': 'Superseded by a direct hit',
+    'pipeline.undoOtherTree': 'Undone in “{name}”',
+    'pipeline.undoGone': 'That tree no longer exists; undo ignored',
   },
 };
 let LANG = localStorage.getItem('router_lang') || 'zh';

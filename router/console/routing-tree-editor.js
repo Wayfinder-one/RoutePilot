@@ -596,9 +596,21 @@ const SRTreeEditor = (function () {
       const number = Number(raw);
       out[name] = Number.isFinite(number) ? number : raw;
     });
-    const weightRows = scope ? scope.querySelectorAll("[data-weight-row]") : [];
-    if (weightRows.length) {
-      out.weights = Array.prototype.map.call(weightRows, row => readWeightRow(row));
+    /* A terminal form always renders [data-weights-form] (even with zero rows):
+       an empty row set means "weights cleared", not "leave the old array". */
+    const weightsForm = scope && scope.querySelector("[data-weights-form]");
+    if (weightsForm) {
+      out.weights = Array.prototype.map.call(
+        weightsForm.querySelectorAll("[data-weight-row]"), row => readWeightRow(row));
+    }
+    /* Inline candidate rows are editable in the nl_choice form: they must be
+       read back, otherwise edited key/model/description would be silently
+       dropped on save (task-14 review C-3). */
+    const optionForms = scope ? scope.querySelectorAll("[data-option-form]") : [];
+    if (optionForms.length) {
+      out.options = Array.prototype.map.call(optionForms, form => Object.assign(
+        {kind: form.getAttribute("data-option-kind") || "model"},
+        readOptionForm(form)));
     }
     const whenScope = scope && scope.querySelector("[data-when-form]");
     if (whenScope) out.when = readWhenForm(whenScope);
@@ -703,6 +715,40 @@ const SRTreeEditor = (function () {
         }
         next = Object.assign({}, next, {[name]: value});
       });
+      if (Array.isArray(input.options)) {
+        const current = Array.isArray(next.options) ? next.options : [];
+        if (input.options.length !== current.length) {
+          issues.push(issue("option_count_changed", next.id,
+            "候选数量在表单里发生了变化，请重新打开节点编辑器",
+            "The candidate count changed while the form was open; reopen the node editor"));
+        } else {
+          const updated = [];
+          const seen = new Set();
+          input.options.forEach((values, index) => {
+            const base = current[index];
+            const kind = values.kind || (base && base.child != null ? "child" : "model");
+            const taken = current
+              .map((option, itemIndex) => itemIndex === index ? null : option.key)
+              .filter(key => key != null);
+            const result = applyOptionForm(base, values, {
+              kind: kind, modelsById: opts.modelsById, takenKeys: taken,
+            });
+            issues = issues.concat(result.issues);
+            updated.push(result.option);
+            if (result.option && updated.length === index + 1 && result.option.key) {
+              if (seen.has(result.option.key)) {
+                issues.push(issue("duplicate_option_key", next.id,
+                  "候选 key 重复：" + result.option.key,
+                  "Duplicate candidate key: " + result.option.key));
+              }
+              seen.add(result.option.key);
+            }
+          });
+          if (!issues.some(item => item.level !== "warn")) {
+            next = Object.assign({}, next, {options: updated});
+          }
+        }
+      }
     }
     return {node: next, issues: issues};
   }
