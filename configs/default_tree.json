@@ -1,0 +1,115 @@
+{
+  "id": "default",
+  "name": "默认统一树",
+  "enabled": false,
+  "root": {
+    "id": "root",
+    "type": "branch",
+    "children": [
+      {
+        "id": "safety-jailbreak",
+        "type": "block",
+        "when": {
+          "signal": "jailbreak",
+          "value": "jailbreak",
+          "op": "eq",
+          "conf_min": 0.7
+        },
+        "weights": []
+      },
+      {
+        "id": "safety-pii-cn-id",
+        "type": "block",
+        "when": {
+          "signal": "pii",
+          "value": "cn_id_card",
+          "op": "contains",
+          "conf_min": 0.7
+        },
+        "weights": []
+      },
+      {
+        "id": "keyword-emergency",
+        "type": "route",
+        "when": {
+          "signal": "keyword",
+          "value": "医疗急症",
+          "op": "contains"
+        },
+        "model": "qwen3-8b-medical",
+        "reasoning": null,
+        "weights": []
+      },
+      {
+        "id": "health",
+        "type": "branch",
+        "when": {
+          "signal": "domain",
+          "value": "health",
+          "op": "eq",
+          "conf_min": 0.7
+        },
+        "children": [
+          {
+            "id": "health-hard",
+            "type": "route",
+            "when": {
+              "signal": "complexity",
+              "value": "hard",
+              "op": "eq",
+              "conf_min": 0.7
+            },
+            "model": "qwen3-8b-medical",
+            "reasoning": null,
+            "weights": []
+          },
+          {
+            "id": "health-easy",
+            "type": "route",
+            "when": {
+              "signal": "complexity",
+              "value": "easy",
+              "op": "eq",
+              "conf_min": 0.7
+            },
+            "model": "qwen3-0.6b-medical",
+            "reasoning": null,
+            "weights": []
+          }
+        ]
+      },
+      {
+        "id": "computer-science",
+        "type": "branch",
+        "when": {
+          "signal": "domain",
+          "value": "computer_science",
+          "op": "eq",
+          "conf_min": 0.7
+        },
+        "children": [
+          {
+            "id": "cs-hard",
+            "type": "route",
+            "when": {
+              "signal": "complexity",
+              "value": "hard",
+              "op": "eq",
+              "conf_min": 0.7
+            },
+            "model": "deepseek-v3",
+            "reasoning": null,
+            "weights": []
+          }
+        ]
+      }
+    ],
+    "otherwise": {
+      "id": "fallback",
+      "type": "route",
+      "model": "qwen3-8b",
+      "reasoning": null,
+      "weights": []
+    }
+  }
+}

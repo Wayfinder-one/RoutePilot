@@ -504,7 +504,8 @@ def test_real_default_pipeline_replays_gsm8k_like_to_fallback() -> None:
     assert replay["summary"]["n"] == 5
     assert replay["summary"]["model_counts"] == {"qwen3-8b": 5}
     assert replay["summary"]["kind_counts"] == {"route": 5}
-    assert all(decision["station"] == "④ 兜底"
+    assert replay["summary"]["node_counts"] == {"fallback": 5}
+    assert all(decision["node_id"] == "fallback"
                for decision in replay["decisions"])
     comparison = strategies.compare_candidate_sets(
         replay["summary"], cheap_model="Qwen3-0.6B", strong_model="qwen3.8-27b")
@@ -513,30 +514,29 @@ def test_real_default_pipeline_replays_gsm8k_like_to_fallback() -> None:
 
 
 def test_real_default_pipeline_custom_tree_blocks_jailbreak() -> None:
-    from router.pipeline.model import station_from_dict
+    from router.pipeline.tree import Block, Branch, Route, RoutingTree, When
 
-    stations = [station_from_dict({
-        "id": "safety", "name": "安全闸",
-        "root": {"id": "r", "signal": None, "value": "", "conf_min": None,
-                 "kind": "fork", "action": "route", "model": None,
-                 "min_score": None, "weights": [], "children": [
-                     {"id": "block", "signal": "jailbreak", "value": "jailbreak",
-                      "conf_min": 0.7, "kind": "leaf", "action": "block",
-                      "model": None, "min_score": None, "weights": [],
-                      "children": []}]}})]
+    tree = RoutingTree(
+        id="custom", name="安全闸", enabled=True,
+        root=Branch(id="r", children=(
+            Block("block", when=When("jailbreak", "jailbreak",
+                                     conf_min=0.7)),),
+            otherwise=Route("fallback", "qwen3-8b")))
     item = make_item(0, c_correct=True, s_correct=True)
     item["jev"]["jailbreak"] = {"value": "jailbreak", "confidence": 0.95,
                                 "is_rule": False, "p_yes": 0.95}
-    replay = strategies.replay_real_default_pipeline([item], stations)
+    replay = strategies.replay_real_default_pipeline([item], tree)
     assert replay["summary"]["kind_counts"] == {"block": 1}
     assert replay["decisions"][0]["model"] is None
+    assert replay["decisions"][0]["node_id"] == "block"
 
 
-def test_pipeline_fingerprint_stable_despite_random_station_ids() -> None:
-    first = strategies.load_default_pipeline()
-    second = strategies.load_default_pipeline()
-    assert strategies.pipeline_fingerprint(first)["sha256"] == \
-        strategies.pipeline_fingerprint(second)["sha256"]
+def test_tree_fingerprint_is_stable_across_default_loads() -> None:
+    first = strategies.load_default_tree()
+    second = strategies.load_default_tree()
+    assert strategies.tree_fingerprint(first)["sha256"] == \
+        strategies.tree_fingerprint(second)["sha256"]
+    assert strategies.tree_fingerprint(first)["tree_id"] == "default"
 
 
 def test_map_pipeline_to_arms_hook() -> None:

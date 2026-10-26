@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 
 from router.eval_metrics import Confusion, bootstrap_ci, percentile  # noqa: E402
+from router.pipeline.tree import (Block, Branch, Route, RoutingTree,  # noqa: E402
+                                  When, tree_to_dict, walk_nodes)
 from router.signals._math import binary_entropy_confidence  # noqa: E402
 
 
@@ -379,64 +381,74 @@ def test_condition_labels_keep_legacy_name_for_b0_only():
 # --------------------------------------------------------------------------- #
 # matrix: pipeline floor override + final actions
 # --------------------------------------------------------------------------- #
-def _demo_stations():
-    from router.pipeline.model import station_from_dict
-    return [station_from_dict({
-        "id": "safety", "name": "safety", "root": {
-            "id": "fork", "kind": "fork", "action": "route",
-            "children": [
-                {"id": "jb", "signal": "jailbreak", "value": "jailbreak",
-                 "conf_min": 0.6, "kind": "leaf", "action": "block"},
-                {"id": "cmp", "signal": "complexity", "value": "hard",
-                 "conf_min": 0.7, "kind": "leaf", "action": "route",
-                 "model": "strong"},
-            ]}}),
-        station_from_dict({"id": "fallback", "name": "fallback", "root": {
-            "id": "fb", "kind": "leaf", "action": "route", "model": "cheap"}})]
+def _demo_tree():
+    """A tiny signal tree: jailbreak -> block, complexity hard -> strong, fallback."""
+    return RoutingTree(
+        id="demo", name="demo", enabled=True,
+        root=Branch(id="root", children=(
+            Block("jb", when=When("jailbreak", "jailbreak", conf_min=0.6)),
+            Route("cmp", "strong",
+                  when=When("complexity", "hard", conf_min=0.7)),
+        ), otherwise=Route("fb", "cheap")))
 
 
-def _collect_conditions(station):
+def _collect_conditions(root):
     out = []
-
-    def walk(node):
-        if node.signal is not None:
-            out.append((node.signal, node.conf_min))
-        for child in node.children:
-            walk(child)
-
-    walk(station.root)
+    for node in walk_nodes(root):
+        if node.when is not None:
+            out.append((node.when.signal, node.when.conf_min))
     return out
 
 
+def _write_demo_tree(path):
+    path.write_text(json.dumps(tree_to_dict(_demo_tree())), encoding="utf-8")
+    return path
+
+
+def test_default_tree_config_is_canonical_and_signal_only():
+    """The committed default tree must load through the strict parser and stay
+    a pure signal tree (no natural-language nodes) for the offline scripts."""
+    tree, source = matrix.load_tree(None)
+    assert source.endswith("configs/default_tree.json")
+    assert tree.id == "default"
+    assert tree.enabled is False
+    required, scope = matrix.tree_signal_requirements(tree.root)
+    assert required == frozenset({"jailbreak", "pii", "keyword", "domain",
+                                  "complexity"})
+    assert scope.signals == frozenset({"jailbreak", "pii", "domain",
+                                       "complexity"})
+    assert not scope.full
+    # the on-disk root is the canonical serde view (no hand-edit drift)
+    from router.pipeline.tree import node_to_dict
+    on_disk = json.loads(Path(source).read_text(encoding="utf-8"))
+    assert on_disk["root"] == node_to_dict(tree.root)
+
+
 def test_override_floors_reparameterises_every_model_condition():
-    stations = _demo_stations()
-    low = matrix.override_floors(stations, 0.2)
-    high = matrix.override_floors(stations, 0.8)
-    assert _collect_conditions(low[0]) == [("jailbreak", 0.2),
-                                          ("complexity", 0.2)]
-    assert _collect_conditions(high[0]) == [("jailbreak", 0.8),
-                                           ("complexity", 0.8)]
+    root = _demo_tree().root
+    low = matrix.override_floors(root, 0.2)
+    high = matrix.override_floors(root, 0.8)
+    assert _collect_conditions(low) == [("jailbreak", 0.2),
+                                        ("complexity", 0.2)]
+    assert _collect_conditions(high) == [("jailbreak", 0.8),
+                                         ("complexity", 0.8)]
     # Rule signals keep their deterministic semantics (null floor).
-    from router.pipeline.model import station_from_dict
-    keyword = [station_from_dict({
-        "id": "kw", "name": "kw", "root": {
-            "id": "k", "signal": "keyword", "value": "医疗急症",
-            "conf_min": None, "kind": "leaf", "action": "route",
-            "model": "medical"}})]
-    assert _collect_conditions(matrix.override_floors(keyword, 0.9)[0]) == \
-        [("keyword", None)]
+    keyword_root = Route("k", "medical",
+                         when=When("keyword", "医疗急症", op="contains"))
+    assert _collect_conditions(
+        matrix.override_floors(keyword_root, 0.9)) == [("keyword", None)]
 
 
 def test_floor_changes_final_action_and_is_recorded_per_floor():
-    stations = _demo_stations()
+    tree = _demo_tree()
     floors = [0.3, 0.9]
-    stations_by_floor = {floor: matrix.override_floors(stations, floor)
-                         for floor in floors}
+    trees_by_floor = {floor: matrix.override_floors(tree.root, floor)
+                      for floor in floors}
     signals = {"jailbreak": {"value": "jailbreak", "confidence": 0.8,
                              "is_rule": False},
                "complexity": {"value": "easy", "confidence": 0.1,
                               "is_rule": False}}
-    actions = matrix.instance_actions(signals, stations_by_floor, floors)
+    actions = matrix.instance_actions(signals, trees_by_floor, floors)
     assert actions["0.3"]["kind"] == "block"
     # At floor 0.9 the jailbreak condition is below its floor -> fallback route.
     assert actions["0.9"]["kind"] == "route"
@@ -444,10 +456,10 @@ def test_floor_changes_final_action_and_is_recorded_per_floor():
 
 
 def test_matrix_row_is_report_compatible():
-    stations = _demo_stations()
+    tree = _demo_tree()
     floors = [0.3, 0.9]
-    stations_by_floor = {floor: matrix.override_floors(stations, floor)
-                         for floor in floors}
+    trees_by_floor = {floor: matrix.override_floors(tree.root, floor)
+                      for floor in floors}
     instance = {
         "sha256": "abc", "rows": [{"id": "r1", "signal": "jailbreak",
                                    "kind": "noul", "gold": 1, "lang": "en",
@@ -459,7 +471,7 @@ def test_matrix_row_is_report_compatible():
         "rule_hits": [], "score_ms": 12.0, "prep_ms": 2.0, "forward_ms": 10.0,
         "actions": matrix.instance_actions(instance_signals := {
             "jailbreak": {"value": "jailbreak", "confidence": 0.8,
-                          "is_rule": False}}, stations_by_floor, floors),
+                          "is_rule": False}}, trees_by_floor, floors),
     }
     row = matrix._matrix_row(instance["rows"][0], instance,
                              condition="padded4k", position="tail",
@@ -599,17 +611,17 @@ def test_production_check_summary_counts_flips_and_deltas():
 
 
 def test_matrix_section_renders_from_report_payload():
-    stations = _demo_stations()
+    tree = _demo_tree()
     floors = [0.3, 0.9]
-    stations_by_floor = {floor: matrix.override_floors(stations, floor)
-                         for floor in floors}
+    trees_by_floor = {floor: matrix.override_floors(tree.root, floor)
+                      for floor in floors}
     signals = {"jailbreak": {"value": "jailbreak", "confidence": 0.8,
                              "is_rule": False}}
     instance = {
         "sha256": "s1", "rows": [{"id": "r1", "signal": "jailbreak",
                                   "kind": "noul", "gold": 1}],
         "signals": signals, "tag_window": {}, "rule_hits": [], "score_ms": 1.0,
-        "actions": matrix.instance_actions(signals, stations_by_floor, floors),
+        "actions": matrix.instance_actions(signals, trees_by_floor, floors),
     }
     row = matrix._matrix_row(instance["rows"][0], instance,
                              condition="padded4k", position="tail",
@@ -864,11 +876,7 @@ def test_matrix_main_end_to_end_with_fake_backbone(tmp_path, monkeypatch):
     eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
     filler_path = tmp_path / "clean_b0.txt"
     filler_path.write_text(" ".join(["filler"] * 40), encoding="utf-8")
-    pipeline_path = tmp_path / "pipeline.json"
-    from router.pipeline.model import station_to_dict
-    pipeline_path.write_text(json.dumps(
-        [station_to_dict(station) for station in _demo_stations()]),
-        encoding="utf-8")
+    tree_path = _write_demo_tree(tmp_path / "tree.json")
     tagger = _fake_jev_tagger(monkeypatch)
     monkeypatch.setattr(matrix, "_load_tagger", lambda args: tagger)
     monkeypatch.setattr(
@@ -879,7 +887,7 @@ def test_matrix_main_end_to_end_with_fake_backbone(tmp_path, monkeypatch):
     code = matrix.main([
         "--eval", str(eval_path), "--out", str(out),
         "--filler", str(filler_path),
-        "--pipeline-json", str(pipeline_path),
+        "--tree-json", str(tree_path),
         "--windows", "1024:0,0:1024",
         "--positions", "tail",
         "--floors", "0.15,0.30",
@@ -953,17 +961,14 @@ def test_matrix_main_production_scoring_mode(tmp_path, monkeypatch):
     eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
     filler_path = tmp_path / "clean_b0.txt"
     filler_path.write_text(" ".join(["filler"] * 20), encoding="utf-8")
-    from router.pipeline.model import station_to_dict
-    pipeline_path = tmp_path / "pipeline.json"
-    pipeline_path.write_text(json.dumps(
-        [station_to_dict(station) for station in _demo_stations()]))
+    tree_path = _write_demo_tree(tmp_path / "tree.json")
     tagger = _fake_jev_tagger(monkeypatch)
     monkeypatch.setattr(matrix, "_load_tagger", lambda args: tagger)
     out = tmp_path / "matrix_prod.jsonl"
     code = matrix.main([
         "--eval", str(eval_path), "--out", str(out),
         "--filler", str(filler_path),
-        "--pipeline-json", str(pipeline_path),
+        "--tree-json", str(tree_path),
         "--windows", "1024:0", "--skip-natural",
         "--positions", "head", "--floors", "0.3",
         "--signals", "jailbreak,pii",
@@ -1167,10 +1172,7 @@ def test_matrix_main_compare_mode_pairs_rows_end_to_end(tmp_path, monkeypatch):
     eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
     filler_path = tmp_path / "clean_b0.txt"
     filler_path.write_text(" ".join(["filler"] * 20), encoding="utf-8")
-    from router.pipeline.model import station_to_dict
-    pipeline_path = tmp_path / "pipeline.json"
-    pipeline_path.write_text(json.dumps(
-        [station_to_dict(station) for station in _demo_stations()]))
+    tree_path = _write_demo_tree(tmp_path / "tree.json")
     tagger = _fake_jev_tagger(monkeypatch)
     monkeypatch.setattr(matrix, "_load_tagger", lambda args: tagger)
     # Fixed pass: p_yes = 0.5 everywhere -> no block.  Production pass: the fake
@@ -1183,7 +1185,7 @@ def test_matrix_main_compare_mode_pairs_rows_end_to_end(tmp_path, monkeypatch):
     code = matrix.main([
         "--eval", str(eval_path), "--out", str(out),
         "--filler", str(filler_path),
-        "--pipeline-json", str(pipeline_path),
+        "--tree-json", str(tree_path),
         "--windows", "1024:0",
         "--positions", "tail",
         "--conditions", "natural,padded4k",
@@ -1234,10 +1236,7 @@ def test_matrix_main_conditions_filter_end_to_end(tmp_path, monkeypatch):
     eval_path = _write_jsonl(tmp_path / "eval.jsonl", _official_eval_rows())
     filler_path = tmp_path / "clean_b0.txt"
     filler_path.write_text(" ".join(["filler"] * 20), encoding="utf-8")
-    from router.pipeline.model import station_to_dict
-    pipeline_path = tmp_path / "pipeline.json"
-    pipeline_path.write_text(json.dumps(
-        [station_to_dict(station) for station in _demo_stations()]))
+    tree_path = _write_demo_tree(tmp_path / "tree.json")
     tagger = _fake_jev_tagger(monkeypatch)
     monkeypatch.setattr(matrix, "_load_tagger", lambda args: tagger)
     monkeypatch.setattr(
@@ -1248,7 +1247,7 @@ def test_matrix_main_conditions_filter_end_to_end(tmp_path, monkeypatch):
     code = matrix.main([
         "--eval", str(eval_path), "--out", str(out),
         "--filler", str(filler_path),
-        "--pipeline-json", str(pipeline_path),
+        "--tree-json", str(tree_path),
         "--windows", "1024:0",
         "--conditions", "padded4k",
         "--floors", "0.15",
