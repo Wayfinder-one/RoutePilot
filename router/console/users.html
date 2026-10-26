@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Router · 用户管理</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="shared.css">
+</head>
+<body data-page="users">
+<div class="pagehead">
+  <div>
+    <div class="crumb" data-i18n="nav.users"></div>
+    <h1><span data-i18n="nav.users"></span><span class="sub" data-i18n="users.sub"></span></h1>
+  </div>
+  <div class="headmeta">
+    <span class="pill" id="mePill" hidden></span>
+  </div>
+</div>
+<main class="page">
+  <div class="card" id="usersCard">
+    <div class="col-h">
+      <span data-i18n="users.title"></span>
+      <span class="mut" id="userCount"></span>
+      <button class="btn pri sm push-right" id="addUser" data-i18n="users.new"></button>
+    </div>
+    <table class="list users-list" id="usersTable"></table>
+    <div class="footnote" data-i18n="users.footnote"></div>
+  </div>
+
+  <div class="card" id="denyCard" hidden>
+    <div class="col-h" data-i18n="users.deniedTitle"></div>
+    <div class="notice bad" data-i18n="users.deniedBody"></div>
+  </div>
+</main>
+
+<!-- 新建 / 编辑用户 -->
+<div class="modal" id="userModal" hidden role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+  <div class="modal-card" style="width:min(520px,100%)">
+    <div class="modal-h">
+      <b id="userModalTitle"></b>
+      <button class="modal-x" data-close="userModal" data-i18n-aria="common.close" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-grid">
+        <label class="field" style="grid-column:1/-1">
+          <span data-i18n="users.col.email"></span>
+          <input id="ufEmail" type="email" autocomplete="off" spellcheck="false" placeholder="name@example.com">
+        </label>
+        <label class="field" id="ufPasswordRow" style="grid-column:1/-1">
+          <span data-i18n="users.password"></span>
+          <input id="ufPassword" type="password" autocomplete="new-password">
+          <small data-i18n="users.passwordHint"></small>
+        </label>
+        <label class="field">
+          <span data-i18n="users.col.role"></span>
+          <select id="ufRole">
+            <option value="viewer" data-i18n="users.roleViewer"></option>
+            <option value="admin" data-i18n="users.roleAdmin"></option>
+          </select>
+        </label>
+        <label class="field" id="ufStatusRow" hidden>
+          <span data-i18n="users.col.status"></span>
+          <select id="ufStatus">
+            <option value="active" data-i18n="users.active"></option>
+            <option value="disabled" data-i18n="users.disabled"></option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-msg" id="userModalMsg"></span>
+      <button class="btn" data-close="userModal" data-i18n="common.cancel"></button>
+      <button class="btn pri" id="userModalSave" data-i18n="common.save"></button>
+    </div>
+  </div>
+</div>
+
+<!-- 重置密码 -->
+<div class="modal" id="pwdModal" hidden role="dialog" aria-modal="true" aria-labelledby="pwdModalTitle">
+  <div class="modal-card" style="width:min(460px,100%)">
+    <div class="modal-h">
+      <b id="pwdModalTitle"></b>
+      <button class="modal-x" data-close="pwdModal" data-i18n-aria="common.close" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="notice warn" data-i18n="users.pwdRevokeHint"></div>
+      <label class="field">
+        <span data-i18n="users.newPassword"></span>
+        <input id="pwdNew" type="password" autocomplete="new-password">
+        <small data-i18n="users.passwordHint"></small>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <span class="modal-msg" id="pwdModalMsg"></span>
+      <button class="btn" data-close="pwdModal" data-i18n="common.cancel"></button>
+      <button class="btn pri" id="pwdModalSave" data-i18n="common.save"></button>
+    </div>
+  </div>
+</div>
+
+<script src="i18n.js"></script>
+<script src="nav.js"></script>
+<script src="api.js"></script>
+<script src="shared.js"></script>
+<script src="users.js"></script>
+</body>
+</html>

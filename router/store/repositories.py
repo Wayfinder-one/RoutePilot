@@ -17,8 +17,10 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 
+from router import auth
 from router.pipeline.model import Station, TreeNode, Weight, station_from_dict, \
     station_to_dict
 from router.pipeline.snapshot import (REVISION_PIPELINE, REVISION_QUESTIONS,
@@ -471,3 +473,248 @@ class EvalRepo:
             "SELECT id, ts, mode, total, matched, rate, report FROM evals "
             "ORDER BY id DESC LIMIT ?", (limit,))
         return [{**dict(r), "report": json.loads(r["report"])} for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# 用户体系（migration v17，2026-10-26）
+# --------------------------------------------------------------------------- #
+class EmailExists(Exception):
+    """邮箱已被占用（唯一性大小写不敏感）；API 层映射成 409。"""
+
+
+def _is_expired(value: str, now: datetime) -> bool:
+    """ISO 时间串是否已到期；解析不了的值按「已过期」处理（安全优先）。"""
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return True
+    if when.tzinfo is None:              # 手工写入的无时区值按本地时区理解
+        when = when.astimezone()
+    return when <= now
+
+
+@contextmanager
+def write_transaction(conn: sqlite3.Connection):
+    """BEGIN IMMEDIATE 写事务：先拿写锁，再做「读-判断-写」。
+
+    普通 ``with conn:`` 是 DEFERRED：两个并发请求可能都先读到「还有 2 个
+    active admin」然后各自降级，最后 0 个 admin。用户体系的保护规则
+    （spec §7「并发最后 admin 保护」）要求不依赖前端与请求顺序，所以守卫写
+    用这个 helper 串行化。UserRepo/SessionRepo 的写方法通过 ``_tx`` 加入外层
+    事务而不是各自提交。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+@contextmanager
+def _tx(conn: sqlite3.Connection):
+    """新仓储的写事务：外层已有事务就加入（由外层提交），否则自己开一个。
+
+    旧仓储的 ``with self.conn:`` 在嵌套时会提前提交外层事务，因此用户/会话
+    仓储改用这个 helper，让 ``write_transaction`` 里的组合写保持原子。
+    """
+    if conn.in_transaction:
+        yield
+        return
+    with conn:
+        yield
+
+
+class UserRepo:
+    """控制台账号（users 表）。
+
+    ``create``/``get``/``get_by_email`` 返回的行**含 password_hash**（登录校验
+    需要）；对外输出必须先过 ``public()``——spec 明确要求任何响应/日志都不带
+    哈希。审计同理，只记 metadata。
+    """
+
+    #: 对外的用户字段（顺序即 API 输出顺序）
+    PUBLIC_FIELDS = ("id", "email", "role", "status", "created_at",
+                     "last_login_at")
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def list(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM users ORDER BY created_at, id")]
+
+    def get(self, user_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM users WHERE id = ?",
+                                (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_by_email(self, email: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM users WHERE email = ?",
+                                (auth.normalize_email(email),)).fetchone()
+        return dict(row) if row else None
+
+    def public(self, user: dict) -> dict:
+        """Strip password_hash/updated_at: the only shape the API may return."""
+        return {key: user.get(key) for key in self.PUBLIC_FIELDS}
+
+    def count_active_admins(self) -> int:
+        return int(self.conn.execute(
+            "SELECT COUNT(*) FROM users WHERE role = 'admin' "
+            "AND status = 'active'").fetchone()[0])
+
+    def create(self, email: str, password: str, role: str = "viewer") -> dict:
+        """Insert one account; returns the full row (callers use public())."""
+        email = auth.normalize_email(email)
+        if self.get_by_email(email) is not None:
+            raise EmailExists(email)          # 先查一次：重复请求不必付哈希成本
+        user_id = uuid.uuid4().hex
+        now = _now_iso()
+        # 哈希慢（~0.3s）且不可回滚，放在事务外：别让它把写锁一起捧着。
+        password_hash = auth.hash_password(password)
+        try:
+            with _tx(self.conn):
+                self.conn.execute(
+                    "INSERT INTO users (id, email, password_hash, role, status, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, email, password_hash, role, "active", now, now))
+        except sqlite3.IntegrityError:
+            raise EmailExists(email) from None
+        return self.get(user_id)              # type: ignore[return-value]
+
+    def update(self, user_id: str, *, email: str | None = None,
+               role: str | None = None, status: str | None = None
+               ) -> dict | None:
+        """Patch only the provided fields; None when the user is unknown."""
+        fields, values = [], []
+        if email is not None:
+            fields.append("email = ?")
+            values.append(auth.normalize_email(email))
+        if role is not None:
+            fields.append("role = ?")
+            values.append(role)
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        if not fields:
+            return self.get(user_id)
+        fields.append("updated_at = ?")
+        values.extend([_now_iso(), user_id])
+        try:
+            with _tx(self.conn):
+                cur = self.conn.execute(
+                    f"UPDATE users SET {', '.join(fields)} WHERE id = ?", values)
+        except sqlite3.IntegrityError:
+            raise EmailExists(auth.normalize_email(email or "")) from None
+        return self.get(user_id) if cur.rowcount else None
+
+    def set_password(self, user_id: str, password: str) -> bool:
+        """Replace the password hash; False when the user is unknown.
+
+        Plan Task 1 的接口清单没列这个方法，但 Task 2 的改密/重置密码需要它；
+        单独一个方法比给 update() 加 password 参数更不容易误把哈希当普通字段。
+        """
+        password_hash = auth.hash_password(password)
+        with _tx(self.conn):
+            cur = self.conn.execute(
+                "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                (password_hash, _now_iso(), user_id))
+        return cur.rowcount > 0
+
+    def delete(self, user_id: str) -> bool:
+        with _tx(self.conn):
+            cur = self.conn.execute("DELETE FROM users WHERE id = ?",
+                                    (user_id,))
+        return cur.rowcount > 0
+
+    def record_login(self, user_id: str) -> None:
+        with _tx(self.conn):
+            self.conn.execute(
+                "UPDATE users SET last_login_at = ? WHERE id = ?",
+                (_now_iso(), user_id))
+
+    def seed_admin(self, email: str, password: str) -> bool:
+        """Seed the default admin only into an empty users table (idempotent).
+
+        非空即返回，绝不覆盖已改过的密码；空表才做一次 scrypt（0.3s 的量级，
+        所以 user_auth 关闭的部署不该走到这里）。
+        """
+        if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+            return False
+        self.create(email, password, role="admin")
+        return True
+
+
+class SessionRepo:
+    """登录会话（user_sessions 表，只存 sha256(token)）。
+
+    TTL 默认 168h（spec §6）；过期行在校验/清理时惰性删除。会话绑定用户，
+    校验时查 status：停用账号已签发的 token 立即失效。
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def create(self, user_id: str, ttl_hours: int) -> tuple[str, str]:
+        """Issue one session; returns ``(token, expires_at)`` (token 明文只出现一次)."""
+        token = auth.new_session_token()
+        now = datetime.now().astimezone()
+        expires_at = (now + timedelta(hours=ttl_hours)).isoformat(
+            timespec="seconds")
+        with _tx(self.conn):
+            self.conn.execute(
+                "INSERT INTO user_sessions (token_hash, user_id, created_at, "
+                "expires_at) VALUES (?, ?, ?, ?)",
+                (auth.session_token_hash(token), user_id,
+                 now.isoformat(timespec="seconds"), expires_at))
+        return token, expires_at
+
+    def user_for_token(self, token: str) -> dict | None:
+        """Resolve a session token to its active user (None = invalid).
+
+        返回的用户 dict 是 ``UserRepo.public()`` 的字段再加 ``expires_at``；
+        中间件只需要身份信息，所以不带 password_hash。
+        """
+        if not token:
+            return None
+        row = self.conn.execute(
+            "SELECT s.expires_at AS session_expires_at, u.* "
+            "FROM user_sessions s JOIN users u ON u.id = s.user_id "
+            "WHERE s.token_hash = ?",
+            (auth.session_token_hash(token),)).fetchone()
+        if row is None:
+            return None
+        expires_at = row["session_expires_at"]
+        if _is_expired(expires_at, datetime.now().astimezone()):
+            self.delete(token)                # 惰性清理过期行
+            return None
+        user = {key: row[key] for key in row.keys()
+                if key != "session_expires_at"}
+        if user["status"] != "active":
+            # 停用账号立即失效；会话行留着——重新启用后无需再登录
+            # （spec §7 只要求「校验时查 status」，没有要求删除）。
+            return None
+        return {**UserRepo(self.conn).public(user), "expires_at": expires_at}
+
+    def delete(self, token: str) -> None:
+        with _tx(self.conn):
+            self.conn.execute("DELETE FROM user_sessions WHERE token_hash = ?",
+                              (auth.session_token_hash(token),))
+
+    def delete_for_user(self, user_id: str) -> None:
+        with _tx(self.conn):
+            self.conn.execute("DELETE FROM user_sessions WHERE user_id = ?",
+                              (user_id,))
+
+    def purge_expired(self) -> None:
+        now = datetime.now().astimezone()
+        expired = [r["token_hash"] for r in self.conn.execute(
+            "SELECT token_hash, expires_at FROM user_sessions")
+            if _is_expired(r["expires_at"], now)]
+        if not expired:
+            return
+        with _tx(self.conn):
+            self.conn.executemany(
+                "DELETE FROM user_sessions WHERE token_hash = ?",
+                [(token_hash,) for token_hash in expired])

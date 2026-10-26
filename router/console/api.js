@@ -1,42 +1,97 @@
 /* Same-origin admin API client. Throws on non-2xx with the parsed detail.
 
-   When the server runs with ROUTER_ADMIN_TOKEN, every /admin call needs
-   "Authorization: Bearer <token>". The token is kept in this browser's
-   localStorage ("sr_admin_token"); a ?token=... query parameter is accepted
-   once, stored and stripped from the URL. On a 401 the console asks for the
-   token and retries the request once. */
+   Auth: the console signs in with email + password (POST /admin/login) and
+   keeps the opaque session token in this browser's localStorage
+   ("sr_admin_token"). A ?token=... query parameter is still accepted once
+   (static ROUTER_ADMIN_TOKEN for scripts / shared demo links), stored and
+   stripped from the URL. On a 401 the session is gone: clear the token and
+   bounce to login.html?next=<this page>; the login page itself never bounces
+   (login.js shows the error instead). */
 const api = {
   TOKEN_KEY: 'sr_admin_token',
+  _bouncing: false,
   token() { return localStorage.getItem(this.TOKEN_KEY) || ''; },
   setToken(t) {
-    if (t && t.trim()) localStorage.setItem(this.TOKEN_KEY, t.trim());
+    if (t && String(t).trim()) localStorage.setItem(this.TOKEN_KEY, String(t).trim());
     else localStorage.removeItem(this.TOKEN_KEY);
   },
-  async req(method, path, body, _retried) {
+  /* 登录页上的 401 是「密码错」，不是会话过期：不跳转，交给 login.js 展示。 */
+  onLoginPage() {
+    return /(?:^|\/)login\.html$/.test(window.location.pathname);
+  },
+  /* 站内绝对路径（含查询/锚点），登录成功后回到这一页。 */
+  currentPath() {
+    return window.location.pathname + window.location.search + window.location.hash;
+  },
+  toLogin() {
+    if (this._bouncing || this.onLoginPage()) return;
+    this._bouncing = true;
+    const next = encodeURIComponent(this.currentPath());
+    window.location.href = 'login.html?next=' + next + '&expired=1';
+  },
+  async req(method, path, body, opts) {
     const headers = {};
-    if (body) headers['Content-Type'] = 'application/json';
+    if (body !== undefined && body !== null) headers['Content-Type'] = 'application/json';
     const tok = this.token();
     if (tok) headers['Authorization'] = 'Bearer ' + tok;
     const r = await fetch(path, {
       method,
       headers: Object.keys(headers).length ? headers : undefined,
-      body: body ? JSON.stringify(body) : undefined,
+      body: body === undefined || body === null ? undefined : JSON.stringify(body),
     });
-    if (r.status === 401 && !_retried) {
-      const entered = window.prompt('需要 /admin 鉴权令牌（Admin token）：', '');
-      if (entered && entered.trim()) {
-        this.setToken(entered);
-        return this.req(method, path, body, true);
-      }
+    if (r.status === 401) {
+      this.setToken('');
+      if (!(opts && opts.noBounce)) this.toLogin();
     }
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) { const e = new Error(r.status); e.detail = data.detail; throw e; }
+    if (!r.ok) {
+      const e = new Error(r.status);
+      e.status = r.status;
+      e.detail = data.detail;
+      throw e;
+    }
     return data;
   },
   get(p) { return this.req('GET', p); },
   put(p, b) { return this.req('PUT', p, b); },
   post(p, b) { return this.req('POST', p, b); },
+  del(p) { return this.req('DELETE', p); },
+  /* 邮箱 + 密码换会话 token（成功后落到 localStorage，调用方只管跳页）。 */
+  async login(email, password) {
+    const data = await this.req('POST', '/admin/login', { email, password });
+    if (data && data.token) this.setToken(data.token);
+    return data;
+  },
+  /* 退出：无论服务端是否成功都清掉本地 token；登出接口的 401 不该再弹回登录页。 */
+  async logout() {
+    try {
+      await this.req('POST', '/admin/logout', undefined, { noBounce: true });
+    } finally {
+      this.setToken('');
+    }
+  },
+  /* 当前身份；静态管理 token 时返回 {id:null, email:null, role:"admin", service:true}。 */
+  me() { return this.req('GET', '/admin/me'); },
 };
+
+/* FastAPI error detail: a string, or a 422 validation array ([{loc,msg,...}]).
+   Always String() before showing it in the DOM. */
+function apiErrText(e) {
+  const pick = x => {
+    if (x == null) return '';
+    if (typeof x === 'string') return x;
+    if (Array.isArray(x)) return x.map(pick).filter(Boolean).join('; ');
+    if (typeof x === 'object') {
+      const msg = x.msg || x.detail || x.zh || x.en || '';
+      return msg ? String(msg) : JSON.stringify(x);
+    }
+    return String(x);
+  };
+  const out = pick(e && e.detail);
+  if (out) return out;
+  const m = e && e.message != null ? String(e.message) : '';
+  return m === '[object Object]' ? JSON.stringify(e) : m;
+}
 
 /* Accept ?token=... once (handy for shared demo links), then strip it. */
 (function () {

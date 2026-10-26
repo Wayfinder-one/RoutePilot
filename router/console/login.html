@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Router · 登录</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="shared.css">
+</head>
+<body data-page="login">
+<div class="login-top">
+  <a class="brand" href="index.html"><span class="mark">SR</span><span data-i18n="app.title"></span></a>
+  <span class="spacer"></span>
+  <span class="langtog">
+    <button data-lang="zh" onclick="setLang('zh')">中文</button>
+    <button data-lang="en" onclick="setLang('en')">EN</button>
+  </span>
+</div>
+<main class="login-wrap">
+  <div class="card login-card">
+    <div class="login-head">
+      <span class="mark">SR</span>
+      <div>
+        <h1 data-i18n="login.title"></h1>
+        <div class="sub" data-i18n="login.sub"></div>
+      </div>
+    </div>
+    <div class="login-error" id="loginError" hidden></div>
+    <form class="login-form" id="loginForm" hidden>
+      <label class="field">
+        <span data-i18n="login.email"></span>
+        <input id="loginEmail" type="email" autocomplete="username" spellcheck="false"
+               placeholder="admin@test.com">
+      </label>
+      <label class="field">
+        <span data-i18n="login.password"></span>
+        <input id="loginPassword" type="password" autocomplete="current-password">
+      </label>
+      <button class="btn pri login-btn" id="loginSubmit" type="submit" data-i18n="login.submit"></button>
+    </form>
+    <div class="login-hint">
+      <b data-i18n="login.defaultTitle"></b>
+      <div><span class="cred">admin@test.com / 1qaz@WSX</span></div>
+      <div data-i18n="login.defaultHint"></div>
+    </div>
+  </div>
+</main>
+<script src="i18n.js"></script>
+<script src="api.js"></script>
+<script src="login.js"></script>
+</body>
+</html>

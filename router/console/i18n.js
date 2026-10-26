@@ -4,7 +4,8 @@ const I18N = {
     'app.title': 'Smart Router',
     'nav.overview': '概览', 'nav.pipeline': '分流树', 'nav.logs': '计算日志',
     'nav.signals': '信号配置', 'nav.models': '模型与设置',
-    'common.add': '添加', 'common.delete': '删除',
+    'nav.users': '用户管理', 'nav.logout': '退出', 'nav.service': '服务令牌',
+    'common.add': '添加', 'common.delete': '删除', 'common.save': '保存',
     'common.loading': '加载中…', 'common.saved': '已保存',
     'common.cancel': '取消', 'common.close': '关闭', 'common.none': '无',
     'group.safety': '安全', 'group.domain': '领域', 'group.difficulty': '难度',
@@ -253,12 +254,58 @@ const I18N = {
     'pipe.reasoning.stale': '当前档位不在该模型声明里：保存会被拦截，选「透传」可清除',
     /* ── calc log reasoning ── */
     'logs.reasoning': '推理', 'logs.reasoningWarn': '推理未生效（降级透传）',
+    /* ── login (2026-10-26 user management) ── */
+    'login.title': '登录控制台',
+    'login.sub': '邮箱 + 密码登录；未登录时 /admin 数据不可读',
+    'login.email': '邮箱', 'login.password': '密码',
+    'login.submit': '登录', 'login.signingIn': '登录中…',
+    'login.invalid': '邮箱或密码不正确',
+    'login.empty': '请填写邮箱和密码',
+    'login.emailInvalid': '邮箱格式不正确',
+    'login.failed': '登录失败：{err}',
+    'login.sessionExpired': '登录已过期或未登录，请重新登录',
+    'login.defaultTitle': '默认管理员',
+    'login.defaultHint': '首次部署的默认账号，请登录后尽快修改密码',
+    /* ── users page ── */
+    'users.sub': '控制台账号：admin 可读写，viewer 只读',
+    'users.title': '全部用户',
+    'users.new': '+ 新建用户',
+    'users.edit': '编辑', 'users.reset': '重置密码', 'users.delete': '删除',
+    'users.confirmDelete': '确认删除？',
+    'users.col.email': '邮箱', 'users.col.role': '角色', 'users.col.status': '状态',
+    'users.col.created': '创建时间', 'users.col.lastLogin': '最后登录',
+    'users.col.actions': '操作',
+    'users.roleAdmin': '管理员', 'users.roleViewer': '只读',
+    'users.active': '启用', 'users.disabled': '已停用',
+    'users.you': '当前账号', 'users.never': '从未登录', 'users.empty': '还没有用户',
+    'users.mePill': '当前登录：{email}（{role}）',
+    'users.footnote': '默认管理员 admin@test.com / 1qaz@WSX，请登录后尽快改密；删除自己或最后一个启用中的管理员会被拒绝。',
+    'users.newTitle': '新建用户', 'users.editTitle': '编辑用户',
+    'users.password': '初始密码', 'users.newPassword': '新密码',
+    'users.passwordHint': '至少 8 位；改密会吊销该用户全部登录会话',
+    'users.pwdShort': '密码至少 8 位',
+    'users.required': '请填写邮箱和密码',
+    'users.pwdTitle': '重置密码 · {email}',
+    'users.pwdRevokeHint': '保存后该用户已登录的会话立即失效。',
+    'users.emailTaken': '该邮箱已被使用',
+    'users.emailInvalid': '邮箱格式不正确',
+    'users.selfDeleteHint': '不能删除当前登录的账号',
+    'users.lastAdmin': '不能删除或降级最后一个启用中的管理员',
+    'users.lastAdminHint': '这是最后一个启用中的管理员：角色与状态已锁定',
+    'users.createdOk': '用户已创建', 'users.updatedOk': '用户已更新',
+    'users.deletedOk': '用户已删除', 'users.pwdOk': '密码已重置，旧会话已失效',
+    'users.loadFail': '加载用户列表失败：{err}',
+    'users.notFound': '用户不存在（可能已被其他管理员删除）',
+    'users.oldBackend': '后端版本过旧，暂无用户管理接口',
+    'users.deniedTitle': '需要管理员权限',
+    'users.deniedBody': '当前账号是只读（viewer），不能访问用户管理。请用管理员账号登录。',
   },
   en: {
     'app.title': 'Smart Router',
     'nav.overview': 'Overview', 'nav.pipeline': 'Routing Tree', 'nav.logs': 'Calc Log',
     'nav.signals': 'Signal Config', 'nav.models': 'Models & Settings',
-    'common.add': 'Add', 'common.delete': 'Delete',
+    'nav.users': 'Users', 'nav.logout': 'Sign out', 'nav.service': 'service token',
+    'common.add': 'Add', 'common.delete': 'Delete', 'common.save': 'Save',
     'common.loading': 'Loading…', 'common.saved': 'Saved',
     'common.cancel': 'Cancel', 'common.close': 'Close', 'common.none': 'none',
     'group.safety': 'Safety', 'group.domain': 'Domain', 'group.difficulty': 'Difficulty',
@@ -507,6 +554,51 @@ const I18N = {
     'pipe.reasoning.stale': 'This effort is not declared by the model: saving will be rejected. Pick "Passthrough" to clear it.',
     /* ── calc log reasoning ── */
     'logs.reasoning': 'reasoning', 'logs.reasoningWarn': 'reasoning not applied (fell back to passthrough)',
+    /* ── login (2026-10-26 user management) ── */
+    'login.title': 'Sign in to the console',
+    'login.sub': 'Email + password; /admin data is unreadable without a session',
+    'login.email': 'Email', 'login.password': 'Password',
+    'login.submit': 'Sign in', 'login.signingIn': 'Signing in…',
+    'login.invalid': 'Wrong email or password',
+    'login.empty': 'Email and password are required',
+    'login.emailInvalid': 'Invalid email address',
+    'login.failed': 'Sign-in failed: {err}',
+    'login.sessionExpired': 'Your session expired or is missing; please sign in again',
+    'login.defaultTitle': 'Default admin',
+    'login.defaultHint': 'Seeded on first deploy — change this password right after signing in',
+    /* ── users page ── */
+    'users.sub': 'Console accounts: admin can write, viewer is read-only',
+    'users.title': 'All users',
+    'users.new': '+ New user',
+    'users.edit': 'Edit', 'users.reset': 'Reset password', 'users.delete': 'Delete',
+    'users.confirmDelete': 'Confirm delete?',
+    'users.col.email': 'Email', 'users.col.role': 'Role', 'users.col.status': 'Status',
+    'users.col.created': 'Created', 'users.col.lastLogin': 'Last login',
+    'users.col.actions': 'Actions',
+    'users.roleAdmin': 'admin', 'users.roleViewer': 'viewer',
+    'users.active': 'active', 'users.disabled': 'disabled',
+    'users.you': 'you', 'users.never': 'never', 'users.empty': 'No users yet',
+    'users.mePill': 'signed in as {email} ({role})',
+    'users.footnote': 'Default admin admin@test.com / 1qaz@WSX — change it soon. Deleting yourself or the last active admin is rejected by the server.',
+    'users.newTitle': 'New user', 'users.editTitle': 'Edit user',
+    'users.password': 'Initial password', 'users.newPassword': 'New password',
+    'users.passwordHint': 'At least 8 characters; changing it revokes all of this user\'s sessions',
+    'users.pwdShort': 'Password must be at least 8 characters',
+    'users.required': 'Email and password are required',
+    'users.pwdTitle': 'Reset password · {email}',
+    'users.pwdRevokeHint': 'Existing sessions of this user stop working as soon as you save.',
+    'users.emailTaken': 'That email is already in use',
+    'users.emailInvalid': 'Invalid email address',
+    'users.selfDeleteHint': 'You cannot delete the account you are signed in with',
+    'users.lastAdmin': 'The last active admin cannot be deleted, demoted or disabled',
+    'users.lastAdminHint': 'This is the last active admin: role and status are locked',
+    'users.createdOk': 'User created', 'users.updatedOk': 'User updated',
+    'users.deletedOk': 'User deleted', 'users.pwdOk': 'Password reset; old sessions revoked',
+    'users.loadFail': 'Could not load users: {err}',
+    'users.notFound': 'User not found (perhaps deleted by another admin)',
+    'users.oldBackend': 'This backend predates user management',
+    'users.deniedTitle': 'Admin permission required',
+    'users.deniedBody': 'This account is viewer (read-only) and cannot manage users. Sign in with an admin account.',
   },
 };
 let LANG = localStorage.getItem('router_lang') || 'zh';
@@ -517,6 +609,11 @@ function tf(key, vars) {
   Object.entries(vars || {}).forEach(([k, v]) => { s = s.split('{' + k + '}').join(String(v)); });
   return s;
 }
+/* Additive hook for code-owned DOM (nav user chip, users table): pages
+   register here instead of replacing window.onLangChange, so several
+   components can repaint without fighting over the single global slot. */
+const LANG_HOOKS = [];
+function onLangChange(fn) { if (typeof fn === 'function') LANG_HOOKS.push(fn); }
 function setLang(l) {
   LANG = l; localStorage.setItem('router_lang', l);
   document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
@@ -528,5 +625,6 @@ function setLang(l) {
   });
   document.querySelectorAll('.langtog button').forEach(b =>
     b.classList.toggle('on', b.dataset.lang === l));
+  LANG_HOOKS.forEach(fn => { try { fn(l); } catch (e) { /* one bad hook must not break the toggle */ } });
   if (typeof window.onLangChange === 'function') window.onLangChange();
 }

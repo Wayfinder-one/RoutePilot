@@ -200,6 +200,33 @@ MIGRATIONS = [
     ALTER TABLE request_ledger ADD COLUMN input_chunk_segments INTEGER;
     ALTER TABLE request_ledger ADD COLUMN input_chunk_prompt_tokens INTEGER;
     """,
+    # v17 (2026-10-26 用户管理): console accounts + login sessions. Replaces the
+    # single static /admin token with email+password accounts while keeping the
+    # static token as a service super-admin
+    # (docs/superpowers/specs/2026-10-26-user-management-design.md §2).
+    # `email` is COLLATE NOCASE so the UNIQUE index itself is case-insensitive
+    # (auth.normalize_email lowercases before writes/reads as well).
+    # `password_hash` is the scrypt storage string, never returned by the API.
+    # user_sessions stores ONLY sha256(token) hex — the plaintext bearer token
+    # is shown to the browser once at login and never persisted.
+    """
+    CREATE TABLE users (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'viewer',
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_login_at TEXT);
+    CREATE TABLE user_sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL);
+    CREATE INDEX idx_user_sessions_user ON user_sessions(user_id);
+    CREATE INDEX idx_user_sessions_exp ON user_sessions(expires_at);
+    """,
 ]
 
 

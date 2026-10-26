@@ -56,6 +56,21 @@ class Settings:
     # current pipeline tree can read (docs/pipeline-aware-trimming.md). The
     # default is on; ROUTER_JEV_TRIM=0 restores the full pack.
     jev_trim: bool = True
+    # Console accounts (2026-10-26 user management, design doc §6). NOTE the
+    # deliberate asymmetry between the two defaults:
+    #   * dataclass default False — tests and code that build Settings(...)
+    #     without this field keep the pre-2026-10-26 behavior (static token
+    #     only), so existing deployments/tests do not suddenly need a login;
+    #   * from_env() default True — a service started from the environment
+    #     (production, systemd unit, deploy script) DOES require login by
+    #     default, because the empty admin_token case used to leave /admin
+    #     open to the network. ROUTER_USER_AUTH=0 explicitly restores the old
+    #     open behavior for local dev/scripts.
+    # The default admin account is seeded once into an empty users table only.
+    user_auth: bool = False
+    admin_email: str = "admin@test.com"
+    admin_password: str = "1qaz@WSX"
+    session_ttl_hours: int = 168
 
     @staticmethod
     def from_env() -> "Settings":
@@ -81,4 +96,9 @@ class Settings:
             jev_chunk_calibration=os.environ.get(
                 "ROUTER_JEV_CHUNK_CALIBRATION", ""),
             jev_trim=_flag("ROUTER_JEV_TRIM", True),
+            user_auth=_flag("ROUTER_USER_AUTH", True),
+            admin_email=os.environ.get("ROUTER_ADMIN_EMAIL", "admin@test.com"),
+            admin_password=os.environ.get("ROUTER_ADMIN_PASSWORD", "1qaz@WSX"),
+            session_ttl_hours=int(os.environ.get("ROUTER_SESSION_TTL_HOURS",
+                                                 "168")),
         )

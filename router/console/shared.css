@@ -508,3 +508,52 @@ body.modal-open{overflow:hidden}
 /* calc log: reasoning badge on the decision row (2026-10-21) */
 .dec.reason{background:var(--panel-2);color:var(--text-2);border:1px solid var(--line);font-weight:600}
 .dec.warn{background:var(--amber-soft);color:var(--amber);border:1px solid var(--amber-line);font-weight:600}
+
+/* ══ user management / auth (2026-10-26) ══════════════════════════════ */
+/* [hidden] must win over the component display rules below (label.field etc.) */
+label.field[hidden],.login-form[hidden],#mePill[hidden],.userbox[hidden]{display:none}
+/* signed-in chip in the top bar (nav.js): email + role + sign out */
+.userbox{display:flex;align-items:center;gap:6px}
+.user-email{max-width:220px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#logoutBtn{white-space:nowrap}
+
+/* login page: centered card, no main nav */
+body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
+.login-top{height:52px;display:flex;align-items:center;gap:16px;padding:0 18px;
+  border-bottom:1px solid var(--line);background:var(--panel)}
+.login-top .spacer{flex:1}
+.login-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:32px 18px 72px}
+.login-card{width:min(400px,100%);padding:22px 22px 18px;border-radius:14px}
+.login-head{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+.login-head .mark{width:34px;height:34px;border-radius:9px;font-size:13px}
+.login-head h1{font-size:18px;margin:0}
+.login-head .sub{display:block;font-size:11.5px;color:var(--text-3);font-weight:500;margin-top:3px}
+.login-form{display:flex;flex-direction:column;gap:12px}
+.login-form label.field input{width:100%}
+.login-btn{justify-content:center;width:100%;padding:9px 13px;margin-top:2px}
+.login-error{border:1px solid var(--red-line);background:var(--red-soft);color:var(--red);
+  border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;margin-bottom:12px}
+.login-error.warn{border-color:var(--amber-line);background:var(--amber-soft);color:var(--amber)}
+.login-error[hidden]{display:none}
+.login-hint{margin-top:18px;padding-top:13px;border-top:1px dashed var(--line);
+  font-size:11.5px;color:var(--text-3);line-height:1.6}
+.login-hint b{display:block;font-size:11px;color:var(--text-2);letter-spacing:.03em;margin-bottom:5px}
+.login-hint .cred{font-family:var(--mono);font-size:11.5px;color:var(--text-2);
+  background:var(--panel-2);border:1px solid var(--line);border-radius:6px;
+  padding:3px 7px;display:inline-block;margin-bottom:5px}
+
+/* users page table */
+.users-list{table-layout:auto}
+.users-list td:first-child,.users-list td:nth-child(2),.users-list td:nth-child(3){width:auto}
+.users-list th{white-space:nowrap}
+.users-list td{white-space:nowrap}
+.users-list td:first-child{white-space:normal;word-break:break-all;min-width:190px}
+.users-list .u-email{font-size:11.5px}
+.users-list .self .pill{margin-left:6px;font-size:10px;padding:0 6px}
+.users-list th.u-act{text-align:right}
+.users-list td.u-act{text-align:right;white-space:nowrap}
+.users-list td.u-act .btn{margin-left:4px}
+@media (max-width:640px){
+  .login-card{padding:18px 15px 14px}
+  .user-email{max-width:130px}
+}
