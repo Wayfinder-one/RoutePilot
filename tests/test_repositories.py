@@ -96,13 +96,13 @@ def test_model_references_reports_direct_nl_model_candidates(conn):
 
 
 def test_model_references_does_not_treat_signal_strings_as_references(conn):
-    """Only real model references count — a condition value naming the model
-    (the retired ``capability_route`` matching) is not a reference."""
+    """Only real model references count — a ``when`` value that happens to name
+    a model id is not a reference."""
     tree = RoutingTree(
         id="t-signal", name="signal", enabled=False,
         root=Branch(id="root", children=(
             Route("signal-only", "other-model",
-                  when=When("capability_route", "m1")),
+                  when=When("some_unregistered_signal", "m1")),
         ), otherwise=Route("signal-fallback", "m0")))
     RoutingTreeRepo(conn).create("t-signal", "signal", tree.root)
 

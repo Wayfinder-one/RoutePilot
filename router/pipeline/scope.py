@@ -16,9 +16,9 @@ Design rules (correctness first):
 * **Rule signals are local** (``signals/rules.py``, no model forward): they are
   listed by :func:`required_signal_keys` for signal preparation/validation but
   never added to the model-question scope.
-* **Decision-group signals are not regular model questions**: ``capability_route``
-  was the old decision bridge and is retired with the unified tree, so
-  :func:`compute_tree_scope` never asks JEV for it.
+* **Natural-language decisions are not model questions**: ``nl_choice`` nodes
+  call the DecisionRunner on the path that reaches them, so
+  :func:`compute_tree_scope` never turns them into batch-scored JEV questions.
 * **A model multi-signal is trimmed per subtype** (currently only ``pii``): only
   referenced PII subtypes are scored, because the tree can only match those.
 * **Choice signals keep every configured candidate** even when the tree only

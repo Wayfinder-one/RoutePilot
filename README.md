@@ -1,11 +1,9 @@
 # Smart Router v2
 
-LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之前，router 先算出一包路由信号
-（16 个：8 个模型信号 + 8 个规则信号），再按可编辑的分流树（pipeline）决定走哪个模型、或直接拦截。
-
-其中第 8 个模型信号 `capability_route`（**自然语言决策路由**，2026-10-26）不是固定问题：
-它让模型按「每个候选模型的一段自然语言能力说明」选择本次请求最适合的后端模型
-（详见下文「自然语言决策路由」）。
+LLM 请求的**信号计算 + 统一路由树 + 控制台**。请求进入后端之前，router 按树里的静态引用批量算出
+一包路由信号（15 个：7 个模型信号 + 8 个规则信号），再由一棵可编辑的**统一路由树**决定走哪个模型、
+或直接拦截；树里的自然语言节点（`nl_choice`）还会让 JEV 决策模型按「模型能力说明 / 分支说明」
+在有序候选里做多级选择（详见下文「统一路由树」）。
 
 默认推荐 **JEV 版主模型** 作为信号引擎：**Qwen3.5-0.8B 底座 + JEV 标量决策头**（LoRA 合并
 导出），在 router 进程内按 JEV 标准（context + typed questions + candidates → 候选概率）输出
@@ -18,19 +16,20 @@ LLM 请求的**信号计算 + 分流决策 + 控制台**。请求进入后端之
 用户请求 ──▶ FastAPI (/v1/chat/completions)
               │
               ├─ Tagger（二选一）
-              │   ├─ checkpoint: RoutePilot-0.8B 一次前向 → 7 信号
+              │   ├─ checkpoint: RoutePilot-0.8B 一次前向 → 7 个模型信号
               │   └─ jev:       Qwen3.5-0.8B JEV 头按问题作答 → 候选概率（推荐）
               │   + 8 个确定性规则信号（signals/rules.py）
+              │   （普通信号按树引用批量算一次：纯自然语言树跳过打标、纯规则树不触发模型前向）
               │
-              ├─ Pipeline（分流树：每个站点一棵独立显式树，节点可增删、叶子可加权；
-              │            存 SQLite JSON，可热更新）
-              ├─ Upstream（OpenAI 兼容推理后端 + 熔断；按路由叶选择的推理档位
+              ├─ RoutingRuntime（异步统一树求值：branch 顺序/加权；route/block 终止；
+              │                  nl_choice 按实际路径调用 JEV 决策模型；不可变快照 + Hit/Miss/trace）
+              ├─ Upstream（OpenAI 兼容推理后端 + 熔断；按 route 节点声明的推理档位
               │            注入各家协议字段：reasoning_effort / thinking / enable_thinking…）
               └─ RequestLog（决策摘要 → SQLite requests slim 行 + request_ledger
-                             动作—结果账本（outcome_state/revisions）；信号/trace 只在内存 ring）
-控制台（/console）：概览 / 分流树（信号库 + 树形编辑 + 试算侧滑）/ 计算日志 /
-                    信号配置 / 决策路由（自然语言说明 → 模型选择，策略 + 候选 + 缺失）/
-                    模型与设置（模型目录 + 提供方 + 推理声明 + 能力说明列）/
+                             动作—结果账本（outcome_state / tree_id / tree_revision /
+                             snapshot_revision）；信号/trace 只在内存 ring）
+控制台（/console）：概览 / 统一路由树（多棵树：列表 + 四类型节点编辑 + 试算侧滑）/
+                    计算日志 / 信号配置 / 模型与设置（模型目录 + 提供方 + 推理声明 + 能力说明列）/
                     用户管理（登录账号：角色 admin/viewer，见「账号与鉴权」）
 ```
 
@@ -51,14 +50,20 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 .venv/bin/python -m router
 ```
 
-### 启动即体检
+### 保存与启用两级校验
 
-服务启动时会用库里的分流树跑一次健康检查（`router/pipeline/health.py`）：
+`router/pipeline/validation.py` 把校验拆成两级：
 
-- **硬错误**（未知信号/未知模型、节点或站点 id 重复、缺兜底…）→ **拒绝启动**并打印问题，
-  避免「树跑不起来」变成线上 502；
-- **警告**（配了但不会生效的字段：无权重叶的 `min_score`、fork 的 `model/action/min_score`、
-  无条件节点的 `conf_min`、拦截叶的 `model`）→ 记录日志，控制台保存时也会回显。
+- **保存（结构）**：节点/候选 id 唯一、节点类型与字段组合合法、根节点不能带 `when`、
+  `otherwise` 不能带 `when`、内嵌树有界无循环；不合法返回 422。**关闭的草稿树允许不完整**
+  （缺能力说明、缺最终兜底也能保存）。
+- **启用（运行就绪）**：结构校验 + 信号/取值/操作符与置信门槛、`route` 模型存在、直接模型候选
+  有非空能力说明、推理档位合法、树含 `nl_choice` 时 DecisionRunner 可用、NL 候选 2–255、
+  **必须存在明确的最终兜底**（根是无权重 `route/block`，或从根沿 `otherwise` 链到无权重
+  `route/block`）；不满足返回 422 并定位节点。
+- **启动**：只对**当前启用树**跑完整启用检查（硬错误拒绝启动）；关闭树可以是残缺草稿；
+  没有任何启用树时正常启动，`/v1` 返回 503 `no_active_tree`。新建树默认关闭，
+  新库不隐式创建或启用默认树。
 
 ### 关键环境变量
 
@@ -83,16 +88,19 @@ ROUTER_SIGNAL_QUESTIONS=configs/signal_questions.json \
 
 ```
 router/
-  api/            FastAPI 应用、/v1、/admin、认证、上游与熔断
-  pipeline/       分流树引擎（显式树、加权叶子、trace）
+  api/            FastAPI 应用、/v1、/admin、认证、上游与熔断、/admin/trees 管理 API
+  pipeline/       统一路由树（tree 模型、validation、compiler、不可变 snapshot、
+                  evaluator、runtime、scope/matching/scoring 纯函数）
+  decision/       自然语言决策边界（choice 纯函数、DecisionRunner 协议与 JEV 适配、
+                  模型能力目录）
   signals/        信号注册表、规则、checkpoint / jev / prompt tagger
   reasoning.py    推理能力声明校验 + 9 种协议方言的上行派发
   presets.py      内置提供方 / 预置模型目录（纯数据）
-  store/          SQLite schema、repositories、迁移
+  store/          SQLite schema、repositories（含 routing_trees）、迁移
   console/        静态控制台（HTML/CSS/JS，中英双语）
-configs/          signal_questions.json（JEV 问题配置）等
-scripts/          运维与联调脚本（部署、上游配置、控制台冒烟）
-tests/            pytest（信号纯函数、pipeline、admin API、tagger 单测）
+configs/          signal_questions.json（JEV 问题配置）、default_tree.json（出厂统一树）等
+scripts/          运维与联调脚本（部署、上游配置、统一树金标、控制台冒烟）
+tests/            pytest（信号纯函数、统一树、admin API、tagger 单测）
 ```
 
 ## 两个信号引擎
@@ -115,11 +123,12 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 | fact_check | 0.948 | 0.8188 |
 | user_feedback | 0.802 | 0.1749 |
 
-> **标度说明（2026-10-21 审核 P2 4.4）**：上表准确率是 **argmax 正确率**，与分流树
-> 置信门槛（默认 `conf_min = 0.70`）不在同一标度。置信度 `1 - H(p)/log K` 在 K 大时
-> 很陡：domain（K=14）要过 0.70 需 p_top ≥ 0.854（折合 T=3.45 下原始 logit gap ≈ 14.9），
+> **标度说明（2026-10-21 审核 P2 4.4）**：上表准确率是 **argmax 正确率**，与统一树
+> `when` 的置信门槛（`conf_min`，模型信号默认 0.70）不在同一标度。置信度 `1 - H(p)/log K`
+> 在 K 大时很陡：domain（K=14）要过 0.70 需 p_top ≥ 0.854（折合 T=3.45 下原始 logit gap ≈ 14.9），
 > 二类信号需 p ≥ 0.947。README 不提供「过门槛后的条件命中率」，选型评估时请勿把
-> argmax 准确率当作门槛通过率使用。
+> argmax 准确率当作门槛通过率使用。`nl_choice` 不叠加 `conf_min`，只用 `min_prob` /
+> `min_margin` 两个概率门槛。
 
 ## JEV 模型使用注意
 
@@ -139,22 +148,31 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 
 ## 热路径裁剪
 
-`/v1` 会按当前 pipeline 树只计算会被读取的信号问题（`ROUTER_JEV_TRIM=0` 一键关闭）；
-`/admin/try` 与 eval 入口始终全量打标，便于试算与回归。
+`/v1` 按当前启用树的**静态信号引用**（所有 `when` 与权重）只计算会被读取的模型信号问题
+（`ROUTER_JEV_TRIM=0` 一键关闭）。纯自然语言树没有普通信号引用时跳过打标；纯规则树不触发模型
+前向；`/admin/try` 用被试树自己的快照做同样的裁剪（与线上同一 compiler + runtime）。
 
-## 决策快照、账本终态与 config revision（2026-10-24 P1）
+## 决策快照、账本终态与 config revision
 
-- 每个请求只读一份不可变 `RoutingSnapshot`（pipeline/backends/版本/revision）；打标期间的热更新
-  不会让路由与账本错配。pipeline/questions 以 canonical content + sha256 写入 `config_revisions`
-  （append-only，旧 revision 可回放）；账本记录 `pipeline_revision / questions_revision /
-  backends_revision` 与 `TagResult` 的实际评分配置指纹。
+- 每个请求只读一份不可变 `RoutingSnapshot`（编译后的统一树 / 信号 scope / questions / backends /
+  DecisionRunner 配置 / `tree_revision` / `snapshot_revision`）；打标与决策期间的配置热更新不会让
+  路由与账本错配（进行中的请求用旧快照跑完）。
+- 树内容与有效快照分别以 canonical content + sha256 写入 `config_revisions`
+  （`kind="tree"` / `kind="snapshot"`，append-only，旧 revision 可回放）。账本记录
+  `tree_id / terminal_node_id / tree_revision / snapshot_revision` 与 `TagResult` 的实际评分配置指纹；
+  回放用当时快照内容恢复**编译树与候选文本**，不重新读今天的模型目录。
 - 流式请求终态 `outcome_state ∈ completed / upstream_error / client_disconnected / cancelled /
   incomplete`，结果更新恰好一次；`GET /admin/requests/stats` 暴露 ring/队列与
   dropped_rows / dropped_updates / partial_rows / ledger_write_failures。
-- `app.state.pipeline / backends` 仅作为管理端兼容别名；hot path 只读 snapshot。
+- 不再有 `app.state.pipeline / backends` 兼容别名：hot path 只读 `app.state.snapshot`。
 
 ## `/v1` 入口约定
 
+- 没有启用树 → **503** `{"error":{"message":"no_active_tree"}}`（在打标之前返回）。
+- 信号准备失败（必需信号缺失 / 结构损坏 / tagger 异常）→ **503**
+  `{"error":{"message":"signal_preparation_failed"}}`，绝不静默落到默认模型。
+- 启用的健康树仍未命中（不应发生）→ **503** `{"error":{"message":"routing_invariant_violation"}}`，
+  并记录完整 trace 到计算日志。
 - 请求体必须是 JSON 对象、`messages` 必须是数组：畸形请求回 **400**（不是 500）；
   请求体超过 **10 MB** 回 **413**。
 - 上游返回 **4xx** 时按原状态码与错误体透传给客户端（流式与非流式一致），
@@ -164,7 +182,7 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 
 ## 模型目录与推理配置
 
-「模型与设置」页是后端模型（分流树的叶子目标）的唯一配置面，参考
+「模型与设置」页是后端模型（统一树 `route` 节点的目标）的唯一配置面，参考
 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) 的声明式提供方目录与
 「每模型推理档位」设计（详细设计与实现记录见本地工作记录
 `docs/模型目录与推理配置-2026-10-21.md`，按仓库约定 `docs/` 不入库）。
@@ -182,43 +200,100 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
   `openai`(reasoning_effort) / `deepseek`(thinking.type) / `qwen`(enable_thinking) /
   `qwen-chat-template` / `openrouter`(reasoning.effort) / `zai` / `together` /
   `string-thinking` / `ant-ling`，提供方级 `reasoning_format` 做默认、模型级 `format` 覆盖。
-- **分流树叶子选择推理**：`reasoning` 为 `null`（默认）= 完全透传客户端请求体；`off` = 强制
-  关闭；档位 id = 强制该档。保存分流树时按目标模型的能力硬校验（422）；运行期若配置竞态导致
-  档位不再可用，则降级透传并回 `x-sr-reasoning-warning: unsupported`，不打断用户请求。
+- **route 节点选择推理**：`reasoning` 为 `null`（默认）= 完全透传客户端请求体；`off` = 强制
+  关闭；档位 id = 强制该档。保存树时按目标模型的能力硬校验（422，启用时也会复检）；运行期若配置
+  竞态导致档位不再可用，则降级透传并回 `x-sr-reasoning-warning: unsupported`，不打断用户请求。
   成功注入时响应头带 `x-sr-reasoning: <level>`，计算日志也会记录。
 
-## 自然语言决策路由（2026-10-26，方案 A）
+## 统一路由树
 
-让「决策模型按自然语言能力说明选后端模型」成为分流树里的一个普通信号
-`capability_route`（decision 组，模型信号）。**2026-10-26 起控制台页面名为「决策路由」**，
-内部标识不变（信号 `capability_route`、字段 `profile.capability`、接口 `GET/PUT /admin/capability`、
-控制台 URL `capability.html`）：
+一棵树就是一份路由配置：**信号条件**（`when`）、**自然语言多级选择**（`nl_choice`）、
+**路由**（`route`）、**拦截**（`block`）和**显式兜底**（`otherwise`）都在同一棵树里表达，
+不再有「信号树 / 自然语言树」两种模式。设计文档：
+`docs/superpowers/specs/2026-10-26-unified-routing-tree-design.md`（按仓库约定 `docs/` 不入库）。
 
-- **能力说明存在模型目录**：`models.profile.capability`（每个模型一段自然语言描述，
-  ≤2000 字符；空 = 不参与）。控制台「模型与设置 → 编辑模型 → 能力说明」维护，
-  模型注册表**直接展示**这段说明（「能力说明」列，在操作列之前；未配置显示「未配置」）；
-  「决策路由」页的候选表与「缺少能力说明」列表也支持**行内「编辑」**（弹窗只改
-  `profile.capability`，推理声明等其余 profile 字段原样保留）。
-- **全局策略**：`settings.capability_instructions` / `capability_min_prob` /
-  `capability_min_margin` / `capability_fallback_model`，控制台独立的「决策路由」页编辑
-  （位于「模型与设置」之前），或 `PUT /admin/capability`。请求里会把候选说明渲染成一个 JEV
-  choice 问题，与 7 个信号**同一批前向**打分（树不引用该信号时不算）。
-- **信号输出**：`value` = 选中的模型位 ID（可直接路由），`confidence` = 候选分布的熵置信度，
-  `prob_by_value` / `p_top` / `margin` / `top_model` / `fallback_used` / `reason` /
-  `fingerprint` 为 record-only 证据（计算日志可见）。`min_prob` / `min_margin` 不满足时
-  直接落到 `fallback_model`（fail-open），不会让请求失败。
-- **分流树写法**：在兜底站点前加一个站点，每个候选一个叶子：
-  `capability_route == qwen3-32b, conf ≥ 0.2 → route qwen3-32b`（置信度是熵标度，
-  不要沿用旧节点的 0.7）。`GET /admin/signals` 会把当前能力候选注入为该信号的取值下拉。
-- **健康检查**：树引用了 `capability_route` 但取值不是能力候选 / 没有任何模型配置说明 /
-  tagger 不是 JEV 引擎 → 启动或保存时拒绝（422 / 拒绝启动），不会静默落到兜底。
-- **配置版本**：能力包随 `RoutingSnapshot` 发布，内容写入 `config_revisions(kind="capability")`，
-  账本新增 `capability_revision`（migration v18），可回放；模型写入会预检并阻止删掉被树引用的候选
-  （409 带 `via="capability"`）。
-- **离线回归**：`configs/capability_golden.jsonl`（30 条）+ `scripts/capability_ab_eval.py`
-  （复制 DB 跑「现有树 vs 能力信号」A/B，不碰生产库）。首轮实测：能力信号 26/30、默认树 10/30
-  （默认树把 30 条全落 `qwen3-8b` 兜底）；只改能力说明文本两轮后 29/30。
-  设计、证据与上线/回滚步骤见 `docs/能力路由-自然语言能力分配-2026-10-26.md`。
+### 节点类型
+
+| 类型 | 作用 | 关键字段 |
+|---|---|---|
+| `branch` | 普通分支：按顺序求值子节点（子节点用 `when` 决定是否进入），直接命中优先、加权命中按分数竞争 | `children[]`、可选 `otherwise` |
+| `nl_choice` | 自然语言多分支选择：按请求文本 + 本节点问题 + 有序候选选一个候选目标 | `instructions`、`options[2..255]`、`min_prob`(0.45)、`min_margin`(0.10)、可选 `otherwise` |
+| `route` | 终止并路由到模型（可带推理档位、可选加权条件） | `model`、`reasoning`、可选 `weights[]`/`min_score` |
+| `block` | 终止并拦截 | 可选 `weights[]`/`min_score` |
+
+- 树只有一个 `root`；除根节点外都可以带 `when`（信号条件）；`branch`/`nl_choice` 可带一个
+  `otherwise`（自身不能带 `when`）。终止节点不能带 `children`/`otherwise`。
+- `branch` 的求值规则：`Miss` 继续下一个子节点；直接 `Hit` 立即返回（丢弃此前的加权候选）；
+  加权 `Hit` 暂存、最后取最高分（同分保留较早）；全部无命中才走本节点 `otherwise`。
+- `nl_choice` 的门槛只看最高概率 `p_top ≥ min_prob` 与前两名差 `p_top-p_second ≥ min_margin`；
+  未过门槛/调用失败/结果非法 = `Miss` → 本节点 `otherwise`（没有则向父节点传播）。
+  **选中子树再 Miss 不会尝试第二候选、也不会重调当前节点**——所有备用路径都必须用显式
+  `otherwise` 或其他分支表达（避免额外模型调用与语义冲突）。
+- 自然语言节点只在**执行路径实际到达时**调用；未到达的节点 0 次模型调用。
+
+### 自然语言候选：model 与 child
+
+```json
+{
+  "id": "root", "type": "nl_choice",
+  "instructions": "根据请求内容选择处理方式。",
+  "options": [
+    {"key": "fast", "model": "qwen3-8b"},
+    {"key": "complex", "description": "需要多步推理、复杂代码或架构分析的任务",
+     "child": {"id": "complex", "type": "nl_choice", "instructions": "进一步选择模型。",
+               "options": [{"key": "code", "model": "qwen3-32b"},
+                           {"key": "reason", "model": "deepseek-v3"}]}}
+  ],
+  "otherwise": {"id": "safe", "type": "route", "model": "qwen3-8b"}
+}
+```
+
+- **model 候选**：编译时从模型目录的 `profile.capability` 展开候选文本（`"<model>: <能力说明>"`），
+  树配置里不复制能力说明；模型必须存在且能力说明非空（启用时校验）。
+- **child 候选**：用 `description` 说明什么情景进入该分支，`child` 可以是任意合法的非根子树
+  （包括另一个 `nl_choice`），支持多级自然语言决策。
+- 候选顺序是行为的一部分，会进入版本哈希，编译/序列化/日志都不得重排。
+
+### 管理、启停与试算
+
+- `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}`、`POST /admin/trees/{id}/copy`、
+  `POST /admin/trees/{id}/enable|disable`；通用 `PUT` 不接受 `enabled`（422），启停走独立端点。
+- 同一时刻**最多一棵树启用**（数据库部分唯一索引强制）；启用一棵会自动关闭其他树；
+  **允许全部关闭**（此时 `/v1` 返回 503 `no_active_tree`）。进行中的请求继续用旧快照跑完。
+- **试算** `POST /admin/try {tree_id,text,headers?,n_messages?}`：可以试算任意已保存的树
+  （不要求启用，也不改变线上快照），返回命中/未命中、信号、逐节点 trace、两级耗时、
+  `nl_calls` 与 `tree_id/tree_revision/snapshot_revision`。试算与线上共用同一个编译器与
+  `RoutingRuntime`，不维护第二套路由逻辑。
+- 控制台「统一路由树」页：左侧信号库 + 树列表（新建/复制/启停/试算），右侧单根画布；
+  四类型节点、三类出边（普通子节点 / 模型或分支候选 / `otherwise`）、拖拽与 Alt+↑↓ 排序；
+  启用前会提示缺失能力说明、无效门槛、缺失最终兜底等定位错误。
+
+### 配置版本与回放
+
+启用树或修改当前启用树时构建新的不可变快照，`tree_revision` 是树内容的 canonical hash
+（不含名称/启用状态/更新时间），`snapshot_revision` 覆盖编译树（含展开后的候选文本）、
+信号问题版本、DecisionRunner 配置/模型版本与后端路由相关版本（不含密钥）。修改关闭树不影响
+线上快照；修改当前树未引用的模型能力说明不改变有效快照。
+
+### 离线回归
+
+`configs/capability_golden.jsonl`（30 条金标）+ `scripts/unified_tree_eval.py`：通过
+`POST /admin/eval {mode:"labels"}` 用当前启用树逐条跑真实 JEV 决策，输出每条请求的
+`tree_revision / snapshot_revision / 选中模型 / mismatch` 报告（不实现第二套打分逻辑）：
+
+```bash
+ROUTER_ADMIN_EMAIL=... ROUTER_ADMIN_PASSWORD=... \
+.venv/bin/python scripts/unified_tree_eval.py \
+  --base-url http://127.0.0.1:8000 \
+  --golden configs/capability_golden.jsonl \
+  --out /tmp/unified-tree-eval.json
+```
+
+### 迁移说明（不兼容演进）
+
+旧的 `capability_route` 特殊信号、全局 `capability_*` 策略、Station 执行层级与
+`/admin/pipeline` 接口已移除；旧路由配置表不再作为运行输入（历史请求行保留）。
+`GET/PUT /admin/pipeline`、`/admin/capability` 不再存在：树配置统一走 `/admin/trees`。
 
 ## 部署
 
@@ -238,6 +313,12 @@ python -m router
 `http://<host>:<port>/console/login.html`；`/admin*` 需要登录会话。
 **静态 `ROUTER_ADMIN_TOKEN` 已于 2026-10-26 移除**——脚本改为用
 `POST /admin/login` 换会话 token（`scripts/configure_upstream.py` 等已内置）。
+
+新库**没有任何启用树**（`/v1` 会返回 503 `no_active_tree`）：首次上线用控制台
+「统一路由树」页新建并启用，或跑
+`SR_BASE=http://127.0.0.1:8400 scripts/apply_default_pipeline.py --enable`
+（不带 `--enable` 只创建一棵关闭的默认树，绝不隐式恢复线上路由）。出厂统一树数据见
+`configs/default_tree.json`。
 
 `scripts/` 内附部署与上游配置脚本模板，可按目标环境改写。
 
@@ -263,7 +344,8 @@ python -m router
 
 ## 测试与验证
 
-- 单元/集成：`pytest`（873 passed, 7 skipped；skip 均为缺 GPU/模型/可选依赖的用例）。
+- 单元/集成：`pytest`（1100 passed, 7 skipped；skip 均为缺 GPU/模型/可选依赖的用例）。
+- 统一树验收脚本：`scripts/unified_tree_eval.py`（真实 JEV 30 条金标，见「离线回归」）。
 - 离线 JEV 评估：`scripts/jev_dump_scores.py`（官方 test 集 raw 分布 dump，需模型）、
   `scripts/jev_calibrate.py`（coverage-risk / AURC / ECE / 各门槛 block recall 报告，纯 CPU）、
   `scripts/eval_jev_window_ab.py`（输入窗口 head/tail/head+tail A/B，需 GPU）、
@@ -271,5 +353,6 @@ python -m router
 - i18n 死键 lint：`python scripts/i18n_dead_keys.py`（有死键时退出码非 0，可挂 CI；
   `scripts/i18n_prune_i18n.py` 负责批量删除）。
 - 控制台冒烟：`BASE=http://<host>:<port> LOGIN_EMAIL=<admin> LOGIN_PASSWORD=<pass> node scripts/console_check.js`
-  （覆盖七个页面（含登录页/用户管理页/决策路由页）、模型目录/添加模型弹窗/推理声明编辑器、
-  能力说明列与能力策略保存、分流树叶推理下拉与日志徽章；脚本先用账号登录换会话 token 再做检查）。
+  （七个页面含登录页/用户管理页；统一路由树多树列表、四类型节点编辑、候选/`otherwise` 出边、
+  保存不带 enabled、导入导出 round-trip、试算与日志共享 trace、启停与全关闭 503；脚本先用
+  账号登录换会话 token 再做检查）。
