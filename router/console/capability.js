@@ -189,7 +189,13 @@ async function saveCapEdit() {
     await api.put('/admin/models/' + encodeURIComponent(d.id), { profile });
     closeCapEdit();
     toast(t('cap.edit.saved'));
-    await reloadCapability();
+    // The write already succeeded; a failed refresh must surface as a toast,
+    // not as an error inside the (already closed) modal.
+    try {
+      await reloadCapability();
+    } catch (e2) {
+      toast(apiErrText(e2), 4000);
+    }
   } catch (e) {
     if (msg) { msg.className = 'modal-msg bad'; msg.textContent = apiErrText(e); }
     if (save) save.disabled = false;
