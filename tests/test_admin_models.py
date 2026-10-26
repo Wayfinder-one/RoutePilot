@@ -8,6 +8,7 @@ tests/test_routing_trees_admin.py).
 
 import json
 import sqlite3
+from contextlib import contextmanager
 
 import httpx
 import pytest
@@ -560,3 +561,65 @@ def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
 
     restarted = make_app(tmp_path)           # create_app on the same DB file
     assert restarted.state.snapshot.tree_id == "reasoning-tree"
+
+
+# --------------------------------------------------------------------------- #
+# delete-model: the reference check and the delete share the publish lock
+# --------------------------------------------------------------------------- #
+def _instrument_delete_lock(app, client, monkeypatch):
+    """Record whether ``model_references`` is called while the lock is held."""
+    from router.api import routes_admin
+
+    publisher = app.state.publisher
+    real_locked = publisher.locked
+    trace: list[str] = []
+    state = {"inside": False}
+
+    @contextmanager
+    def recording_locked():
+        state["inside"] = True
+        trace.append("lock-enter")
+        try:
+            with real_locked():
+                yield publisher
+        finally:
+            state["inside"] = False
+            trace.append("lock-exit")
+
+    monkeypatch.setattr(publisher, "locked", recording_locked)
+
+    real_references = routes_admin.model_references
+
+    def recording_references(trees, model_id):
+        trace.append("check")
+        assert state["inside"], "reference check must run inside the publish lock"
+        return real_references(trees, model_id)
+
+    monkeypatch.setattr(routes_admin, "model_references", recording_references)
+    return trace
+
+
+def test_delete_model_checks_references_inside_the_publish_lock(
+        app, client, monkeypatch):
+    created = client.post("/admin/trees", json={
+        "id": "ref-tree", "name": "Ref",
+        "root": {"id": "root", "type": "route", "model": "qwen3-8b"}})
+    assert created.status_code == 201, created.text
+    trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
+
+    response = client.delete("/admin/models/qwen3-8b")
+
+    assert response.status_code == 409
+    assert trace == ["lock-enter", "check", "lock-exit"]
+
+
+def test_delete_free_model_also_checks_inside_the_publish_lock(
+        app, client, monkeypatch):
+    trace = _instrument_delete_lock(app, client, monkeypatch)
+
+    response = client.delete("/admin/models/qwen3-32b")
+
+    assert response.status_code == 200, response.text
+    assert trace[0] == "lock-enter"
+    assert "check" in trace
+    assert trace[-1] == "lock-exit"

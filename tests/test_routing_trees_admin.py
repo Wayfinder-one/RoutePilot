@@ -39,15 +39,22 @@ and 9 (routes) land; the failure mode is the point of this file.
 
 from __future__ import annotations
 
+import json
 import re
+import threading
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
+from router.api import routes_trees
 from router.api.app import create_app
 from router.config import Settings
-from router.pipeline.tree import NLChoice, NLOption, Route, node_to_dict
+from router.pipeline.tree import (Block, Branch, NLChoice, NLOption, Route,
+                                  When, node_to_dict)
+from router.signals.jev import load_question_config
 from router.store.db import connect
+from router.store.routing_trees import RoutingTreeRepo
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -360,7 +367,7 @@ def test_incomplete_draft_can_be_saved_but_not_enabled(tmp_path):
 # --------------------------------------------------------------------------- #
 TRY_KEYS = {"outcome", "signals", "trace", "input", "signal_ms", "decision_ms",
             "nl_calls", "tree_id", "tree_revision", "snapshot_revision",
-            "questions_sha256", "tagger_info"}
+            "questions_sha256", "tagger_info", "warnings"}
 
 
 def test_try_closed_signal_tree_keeps_online_snapshot(tmp_path):
@@ -386,6 +393,7 @@ def test_try_closed_signal_tree_keeps_online_snapshot(tmp_path):
     assert body["tree_revision"] == target["tree_revision"]
     assert body["snapshot_revision"] != revision      # the closed tree's snapshot
     assert body["nl_calls"] == 0
+    assert body["warnings"] == []          # healthy tree: nothing to warn about
 
     # the online snapshot object/revision/active tree are all untouched
     assert app.state.snapshot is online
@@ -422,6 +430,7 @@ def test_try_closed_nl_tree_uses_the_decision_runner(tmp_path):
     assert body["tree_id"] == "tree-nl"
     assert body["tree_revision"] == target["tree_revision"]
     assert body["snapshot_revision"] not in ("", revision)
+    assert body["warnings"] == []
     assert app.state.snapshot is online
     assert app.state.snapshot.snapshot_revision == revision
     assert app.state.snapshot.tree_id == "tree-a"
@@ -434,3 +443,369 @@ def test_delete_is_not_exposed(tmp_path):
     client = make_client(tmp_path)
     create_tree(client, "A", route_root(), tree_id="tree-a")
     assert client.delete("/admin/trees/tree-a").status_code == 405
+
+
+# --------------------------------------------------------------------------- #
+# fix-wave 2: payload strictness (B-M-2)
+# --------------------------------------------------------------------------- #
+def test_create_payload_with_enabled_is_422(tmp_path):
+    """Activation is enable/disable-only: a create payload carrying `enabled`
+    (any value) is rejected instead of being silently ignored."""
+    client = make_client(tmp_path)
+    for value in (True, False, None):
+        response = client.post("/admin/trees", json={
+            "id": "tree-x", "name": "X", "root": route_root(),
+            "enabled": value})
+        assert response.status_code == 422, (value, response.text)
+        assert response.json()["detail"][0]["code"] == "enabled_not_editable"
+    assert tree_list(client)["trees"] == []
+
+
+def test_update_payload_id_must_match_the_path(tmp_path):
+    client = make_client(tmp_path)
+    create_tree(client, "A", route_root(), tree_id="tree-a")
+    response = client.put("/admin/trees/tree-a", json={
+        "id": "tree-b", "name": "A", "root": route_root()})
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["code"] == "tree_id_mismatch"
+    # the same id is accepted, and the id stays optional
+    assert client.put("/admin/trees/tree-a", json={
+        "id": "tree-a", "name": "A2", "root": route_root()}).status_code == 200
+    assert client.put("/admin/trees/tree-a", json={
+        "name": "A3", "root": route_root()}).status_code == 200
+    assert fetch_tree(client, "tree-a")["name"] == "A3"
+
+
+# --------------------------------------------------------------------------- #
+# fix-wave 2: /admin/try is best-effort for saved drafts (B-M-1)
+# --------------------------------------------------------------------------- #
+def incomplete_draft_root():
+    """Structure-valid but NO guaranteed fallback (a legal saved draft)."""
+    return node_to_dict(Branch(id="root", children=(
+        Route(id="law-only", model="qwen3-8b",
+              when=When(signal="domain", value="law", conf_min=0.4)),)))
+
+
+def test_try_incomplete_draft_runs_and_reports_enable_warnings(tmp_path):
+    """spec §9: any SAVED tree is tryable.  A draft missing its fallback is a
+    legal save (§7.2), so try must not reject it; the enable findings are
+    returned as non-blocking warnings."""
+    app = make_app(tmp_path)
+    client = TestClient(app)
+    create_tree(client, "Draft", incomplete_draft_root(), tree_id="draft")
+    assert app.state.snapshot.tree_id is None        # nothing enabled
+
+    response = client.post("/admin/try", json={
+        "tree_id": "draft", "text": "今天天气怎么样"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["outcome"]["type"] == "miss"
+    assert body["trace"], "the evaluated path must be reported"
+    assert any(event.get("event") == "condition"
+               for event in body["trace"])
+    codes = {issue["code"] for issue in body["warnings"]}
+    assert "missing_fallback" in codes
+    assert body["tree_id"] == "draft"
+    # trying never enables or publishes
+    assert app.state.snapshot.tree_id is None
+    assert fetch_tree(client, "draft")["enabled"] is False
+
+
+def test_try_nl_draft_without_a_runner_is_a_local_nl_error(tmp_path):
+    """A draft may contain nl_choice while the deployment has no decision
+    model: try uses an always-failing runner so the NL node becomes a local
+    nl_error (otherwise/Miss) instead of a 500."""
+    client = make_client(tmp_path)                   # heuristic => runner None
+    create_tree(client, "NL draft", nl_root(), tree_id="nl-draft")
+
+    response = client.post("/admin/try", json={
+        "tree_id": "nl-draft", "text": "write some code"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    codes = {issue["code"] for issue in body["warnings"]}
+    assert "decision_runner_unavailable" in codes
+    nl_events = [event for event in body["trace"]
+                 if event.get("event") == "nl_choice"]
+    assert nl_events and nl_events[0]["reason"] == "nl_error"
+    # the NL node fell through to its explicit otherwise route
+    assert body["outcome"]["type"] == "hit"
+    assert body["outcome"]["model"] == "qwen3-8b"
+    assert body["nl_calls"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# fix-wave 2: TOCTOU — the validation level/publish decision come from a
+# lock-internal re-read (B-I-1)
+# --------------------------------------------------------------------------- #
+def _active_tree(conn):
+    trees = [tree for tree in RoutingTreeRepo(conn).list() if tree.enabled]
+    assert len(trees) <= 1
+    return trees[0] if trees else None
+
+
+def test_concurrent_enable_cannot_defeat_an_in_flight_put_health_check(
+        tmp_path, monkeypatch):
+    """Deterministic interleaving: a PUT starts while tree-b is CLOSED (so it
+    would only need the structure check), a concurrent enable makes tree-b
+    ACTIVE before the PUT reaches the lock.  The PUT must then run the FULL
+    health check (422 for the unhealthy body), not persist an unhealthchecked
+    enabled tree with a stale snapshot."""
+    app = make_app(tmp_path)
+    client = TestClient(app)
+    create_tree(client, "A", route_root(), tree_id="tree-a")
+    enable(client, "tree-a")
+    create_tree(client, "B", route_root(), tree_id="tree-b")
+    unhealthy = incomplete_draft_root()
+
+    real_clean_name = routes_trees._clean_name
+    paused = threading.Event()
+    release = threading.Event()
+
+    def gated_clean_name(raw):
+        value = real_clean_name(raw)
+        if raw == "B renamed" and not paused.is_set():
+            paused.set()
+            assert release.wait(10)
+        return value
+
+    monkeypatch.setattr(routes_trees, "_clean_name", gated_clean_name)
+    response_box = {}
+
+    def put_worker():
+        own = TestClient(app)
+        response_box["put"] = own.put(
+            "/admin/trees/tree-b",
+            json={"name": "B renamed", "root": unhealthy})
+
+    thread = threading.Thread(target=put_worker)
+    thread.start()
+    assert paused.wait(10), "the PUT never reached the race window"
+
+    # The concurrent enable lands while the PUT is between its pure parse and
+    # the lock: the lock-internal re-read now sees enabled=True.
+    assert client.post("/admin/trees/tree-b/enable").status_code == 200
+    release.set()
+    thread.join(10)
+    assert not thread.is_alive()
+
+    rejected = response_box["put"]
+    assert rejected.status_code == 422, rejected.text
+    assert "missing_fallback" in rejected.text
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        active = _active_tree(conn)
+        assert active is not None and active.id == "tree-b"
+        # the stored tree still has the healthy content the enable validated
+        assert active.tree_revision == app.state.snapshot.tree_revision
+        issues = routes_trees.enable_issues(
+            conn, active, runner_available=False)
+        assert [issue for issue in issues if issue.level == "hard"] == []
+    finally:
+        conn.close()
+    # published snapshot == the database's active tree
+    assert app.state.snapshot.tree_id == active.id
+
+
+def test_concurrent_put_and_enable_end_consistent(tmp_path):
+    """Hammer PUT(alternating healthy/unhealthy draft) and enable on one tree;
+    every published snapshot must describe the DB's active tree and that tree
+    must have passed the full health check."""
+    app = make_app(tmp_path)
+    client = TestClient(app)
+    create_tree(client, "A", route_root(), tree_id="tree-a")
+    enable(client, "tree-a")
+    create_tree(client, "B", route_root(), tree_id="tree-b")
+    unhealthy = incomplete_draft_root()
+    healthy = route_root()
+    errors = []
+
+    def put_worker():
+        own = TestClient(app)
+        for index in range(12):
+            body = unhealthy if index % 2 == 0 else healthy
+            response = own.put("/admin/trees/tree-b",
+                               json={"name": "B", "root": body})
+            if response.status_code not in (200, 422):
+                errors.append(("put", response.status_code, response.text))
+
+    def enable_worker():
+        own = TestClient(app)
+        for _ in range(12):
+            response = own.post("/admin/trees/tree-b/enable")
+            # 422 is legitimate: a concurrent PUT may have stored an
+            # unhealthy draft while tree-b was still closed.
+            if response.status_code not in (200, 422):
+                errors.append(("enable", response.status_code, response.text))
+
+    threads = [threading.Thread(target=put_worker),
+               threading.Thread(target=enable_worker)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(20)
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        active = _active_tree(conn)
+        # e.g. the last successful enable may have been followed by no state
+        # change at all; tree-b may also still be closed with tree-a active.
+        assert active is not None and active.id in ("tree-a", "tree-b")
+        # the DB's enabled tree ALWAYS passed the full health check ...
+        issues = routes_trees.enable_issues(
+            conn, active, runner_available=False)
+        assert [issue for issue in issues if issue.level == "hard"] == []
+        # ... and the published snapshot describes exactly that tree.
+        assert app.state.snapshot.tree_id == active.id
+        assert app.state.snapshot.tree_revision == active.tree_revision
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# fix-wave 2: provider signal-value coverage wiring (B-I-2)
+# --------------------------------------------------------------------------- #
+def test_enable_context_carries_provider_signal_values(tmp_path):
+    """The tagger's questions config becomes the validation context's
+    ``signal_values`` (provider coverage); no questions -> unconstrained."""
+    from router.pipeline.validation import provider_signal_values
+
+    app = make_app(tmp_path)
+    conn = connect(app.state.settings.db_path)
+    try:
+        cfg = {"signals": {"domain": {"instructions": ["选择领域"]}}}
+        context = routes_trees.build_enable_context(
+            conn, runner_available=False, questions=cfg)
+        assert context.signal_values == provider_signal_values(cfg)
+        plain = routes_trees.build_enable_context(
+            conn, runner_available=False)
+        assert plain.signal_values is None
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# signal-question writes judge the ACTIVE tree against the PROSPECTIVE config
+# --------------------------------------------------------------------------- #
+def pii_signal_root():
+    return node_to_dict(Branch(
+        id="pii-root",
+        children=(Block(id="pii-block",
+                        when=When("pii", "cn_id_card", op="contains")),),
+        otherwise=Route(id="pii-fallback", model="qwen3-8b")))
+
+
+def questions_app(tmp_path):
+    settings = Settings(db_path=str(tmp_path / "t.db"),
+                        signal_questions=str(tmp_path / "q.json"))
+    return create_app(settings, transport=httpx.MockTransport(ok_upstream))
+
+
+def edited_questions(*, drop_pii_type=None):
+    cfg = json.loads(json.dumps(load_question_config()))
+    if drop_pii_type is not None:
+        del cfg["signals"]["pii"]["types"][drop_pii_type]
+    return cfg
+
+
+def _active_pii_tree(tmp_path):
+    app = questions_app(tmp_path)
+    client = TestClient(app)
+    create_tree(client, "PII tree", pii_signal_root(), tree_id="pii-tree")
+    enable(client, "pii-tree")
+    return app, client
+
+
+def test_signal_questions_rejects_dropping_a_value_the_active_tree_needs(
+        tmp_path):
+    """A prospective config must not silently break the running tree."""
+    app, client = _active_pii_tree(tmp_path)
+    before = online_revision(app)
+
+    response = client.put("/admin/signal-questions",
+                          json={"config": edited_questions(
+                              drop_pii_type="cn_id_card")})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert "signal_value_unavailable" in {issue["code"] for issue in detail}
+    issue = next(i for i in detail if i["code"] == "signal_value_unavailable")
+    assert set(issue) == {"code", "zh", "en", "node_id", "level"}
+    assert issue["level"] == "hard" and issue["node_id"] == "pii-block"
+    # rejected BEFORE applying/persisting/publishing: nothing moved
+    assert online_revision(app) == before
+    assert not (tmp_path / "q.json").exists()
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM config_revisions WHERE kind = 'questions'"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM changes WHERE kind = 'signal_questions'"
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_signal_questions_accepts_dropping_an_unreferenced_value(tmp_path):
+    app, client = _active_pii_tree(tmp_path)
+    before = online_revision(app)
+
+    response = client.put("/admin/signal-questions",
+                          json={"config": edited_questions(
+                              drop_pii_type="email_address")})
+
+    assert response.status_code == 200, response.text
+    assert (tmp_path / "q.json").exists()
+    # the write republished the snapshot with the new question revision
+    assert online_revision(app) != before
+
+
+def test_signal_questions_without_an_active_tree_is_accepted(tmp_path):
+    app = questions_app(tmp_path)
+    client = TestClient(app)
+
+    response = client.put("/admin/signal-questions",
+                          json={"config": edited_questions(
+                              drop_pii_type="cn_id_card")})
+
+    assert response.status_code == 200, response.text
+    assert (tmp_path / "q.json").exists()
+
+
+def test_saved_question_config_boots_with_the_active_tree(tmp_path,
+                                                          monkeypatch):
+    """No "write accepted / restart rejected": boot judges the same config."""
+    app, client = _active_pii_tree(tmp_path)
+    response = client.put("/admin/signal-questions",
+                          json={"config": edited_questions(
+                              drop_pii_type="email_address")})
+    assert response.status_code == 200, response.text
+    saved = json.loads((tmp_path / "q.json").read_text(encoding="utf-8"))
+
+    import router.api.app as app_module
+
+    class LoadedQuestionsTagger:
+        name = "fake-jev"
+
+        def __init__(self):
+            self.questions = saved
+
+        def info(self):
+            return {"engine": "fake-jev"}
+
+        async def tag(self, request):        # pragma: no cover - boot only
+            raise AssertionError("not called at boot")
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(app_module, "_make_tagger",
+                        lambda settings, kw: LoadedQuestionsTagger())
+    restarted = create_app(
+        Settings(db_path=str(tmp_path / "t.db"),
+                 signal_questions=str(tmp_path / "q.json")),
+        transport=httpx.MockTransport(ok_upstream))
+    assert restarted.state.snapshot.tree_id == "pii-tree"

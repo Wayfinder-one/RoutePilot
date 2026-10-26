@@ -8,9 +8,11 @@ declare, whether the DecisionRunner is available) is deliberately absent there,
 so an incomplete **disabled** draft tree can still be stored (design §7.2).
 
 Enabling a tree runs the same structural checks first and then the full
-runtime-readiness check: signal references and values, route models, direct-model
-capabilities, reasoning levels, DecisionRunner availability, the 2..255
-candidate range for every ``nl_choice`` and a conservative guaranteed fallback.
+runtime-readiness check: signal references and values, **whether the current
+question config can still produce every referenced signal value**, route models,
+direct-model capabilities, reasoning levels, DecisionRunner availability, the
+2..255 candidate range for every ``nl_choice`` and a conservative guaranteed
+fallback.
 
 The API layer maps ``level == 'hard'`` issues to a 422 response and must not
 duplicate any of these rules.
@@ -75,6 +77,57 @@ class EnableContext:
     #: model_id -> normalized reasoning object (``normalize_reasoning`` output).
     model_reasoning: Mapping[str, dict | None] = field(default_factory=dict)
     decision_runner_available: bool = False
+    #: Model-signal value domains the current question config can produce
+    #: (``provider_signal_values`` output).  ``None`` = unknown/unreadable
+    #: config -> the dynamic-value checks are skipped (backwards compatible).
+    signal_values: Mapping[str, frozenset[str]] | None = None
+
+
+def provider_signal_values(
+        questions: Mapping | None) -> dict[str, frozenset[str]] | None:
+    """The model-signal value domain the current question config can produce.
+
+    ``None`` = unknown/unreadable config: callers must skip dynamic-value
+    validation (a tree cannot be judged against a config we cannot parse).
+    A signal key absent from the result means "this config no longer produces
+    that question at all".  Rule signals are ignored (they are computed locally
+    from request attributes, not by the JEV question pack).
+
+    Shapes (config/signal_questions.json):
+    * ``pii`` -> ``entry["types"]`` keys (the scored PII subtypes);
+    * ``entry["kind"] == "choice"`` -> ``entry["candidates"]`` keys;
+    * ``entry["kind"] == "noul"`` -> the registry's fixed two-way values
+      (jailbreak/fact_check/complexity — same value space as the JEV noul
+      records; deliberately no ``jev`` import here);
+    * any other model-signal entry -> present but free-form (empty domain).
+    """
+    if not isinstance(questions, Mapping):
+        return None
+    signals = questions.get("signals")
+    if not isinstance(signals, Mapping):
+        return None
+    values: dict[str, frozenset[str]] = {}
+    for key, entry in signals.items():
+        spec = SIGNALS.get(key) if isinstance(key, str) else None
+        if spec is None or spec.kind != "model":
+            continue
+        if not isinstance(entry, Mapping):
+            continue
+        if key == "pii":
+            types = entry.get("types")
+            if isinstance(types, Mapping) and types:
+                values[key] = frozenset(str(name) for name in types)
+            continue
+        kind = entry.get("kind")
+        if kind == "choice":
+            candidates = entry.get("candidates")
+            if isinstance(candidates, Mapping) and candidates:
+                values[key] = frozenset(str(name) for name in candidates)
+        elif kind == "noul":
+            values[key] = frozenset(name for name, _zh, _en in spec.values)
+        else:
+            values[key] = frozenset()       # free-form: existence check only
+    return values
 
 
 def _issue(code: str, node_id: str, zh: str, en: str, *, level: str = HARD) -> Issue:
@@ -87,6 +140,38 @@ def _is_unit(value) -> bool:
         return False
     number = float(value)
     return math.isfinite(number) and 0.0 <= number <= 1.0
+
+
+def _check_provider_signal(signal, value, node_id: str,
+                           context: EnableContext,
+                           issues: list[Issue]) -> None:
+    """[B-I-2] the current question config must still produce this reference.
+
+    A trimmed pack only asks for referenced subtypes/candidates, so a tree that
+    references a value the question config no longer produces would silently
+    never match (and a removed choice candidate also changes the confidence
+    semantics of the remaining ones).  Reject it before the tree can run.
+    """
+    domain = context.signal_values
+    if domain is None:
+        return                              # config unknown -> skip (compatible)
+    spec = SIGNALS.get(signal) if isinstance(signal, str) else None
+    if spec is None or spec.kind != "model":
+        return                              # unknown/rule: other checks own it
+    if signal not in domain:
+        issues.append(_issue(
+            "signal_unavailable", node_id,
+            f"当前问题配置不再包含信号 {signal!r}，该条件永远无法命中",
+            f"Signal {signal!r} is not produced by the current question config"))
+        return
+    available = domain[signal]
+    if available and isinstance(value, str) and value and value not in available:
+        issues.append(_issue(
+            "signal_value_unavailable", node_id,
+            f"信号 {signal} 的取值 {value!r} 当前无法产出（可用："
+            f"{', '.join(sorted(available))}）",
+            f"Value {value!r} of signal {signal} is not produced by the current "
+            f"question config (available: {', '.join(sorted(available))})"))
 
 
 # --------------------------------------------------------------------------
@@ -272,13 +357,14 @@ def _check_condition(signal, value, op, conf_min, node_id: str,
 
 
 def _check_weight(signal, value, weight, node_id: str,
-                  issues: list[Issue]) -> None:
+                  context: EnableContext, issues: list[Issue]) -> None:
     spec = SIGNALS.get(signal) if isinstance(signal, str) else None
     if spec is None:
         issues.append(_issue("unknown_signal", node_id,
                              f"未知信号 {signal}",
                              f"Unknown signal {signal}"))
         return
+    _check_provider_signal(signal, value, node_id, context, issues)
     if not isinstance(value, str) or not value:
         issues.append(_issue("missing_value", node_id,
                              f"加权条件 {signal} 缺少取值",
@@ -295,10 +381,11 @@ def _check_weight(signal, value, weight, node_id: str,
             "A weight must be a number in [0,1]"))
 
 
-def _check_terminal(node: Route | Block, issues: list[Issue]) -> None:
+def _check_terminal(node: Route | Block, context: EnableContext,
+                    issues: list[Issue]) -> None:
     for weight in node.weights:
         _check_weight(weight.signal, weight.value, weight.weight, node.id,
-                      issues)
+                      context, issues)
     if node.min_score is not None and not _is_unit(node.min_score):
         issues.append(_issue(
             "invalid_threshold", node.id,
@@ -339,7 +426,7 @@ def _check_reasoning(model: str, reasoning, node_id: str,
 
 def _check_route(node: Route, context: EnableContext,
                  issues: list[Issue]) -> None:
-    _check_terminal(node, issues)
+    _check_terminal(node, context, issues)
     if not isinstance(node.model, str) or not node.model:
         return                                  # reported by the structure pass
     if node.model not in context.known_models:
@@ -446,11 +533,13 @@ def validate_tree_for_enable(tree: RoutingTree,
         if node.when is not None:
             _check_condition(node.when.signal, node.when.value, node.when.op,
                              node.when.conf_min, node.id, issues)
+            _check_provider_signal(node.when.signal, node.when.value, node.id,
+                                   context, issues)
         if isinstance(node, Route):
             if id(node) not in compiled_option_targets:
                 _check_route(node, context, issues)
         elif isinstance(node, Block):
-            _check_terminal(node, issues)
+            _check_terminal(node, context, issues)
         elif isinstance(node, NLChoice):
             has_nl = True
             _check_nl_choice(node, context, issues)

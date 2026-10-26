@@ -9,6 +9,9 @@ the "structure never judges runtime context" boundary.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from router.pipeline.tree import (
     Block,
     Branch,
@@ -25,6 +28,7 @@ from router.pipeline.validation import (
     EnableContext,
     Issue,
     has_guaranteed_fallback,
+    provider_signal_values,
     validate_tree_for_enable,
     validate_tree_structure,
 )
@@ -432,3 +436,114 @@ def test_shared_mixed_tree_fixture_enables_cleanly():
     # The Task 2 fixtures are the shared input for engine/runtime/API tests, so
     # the complete mixed tree must pass the full enable health check as built.
     assert validate_tree_for_enable(mixed_tree(), context()) == []
+
+
+# --------------------------------------------------------------------------
+# [B-I-2] dynamic signal availability: can the current question config still
+# produce every value the tree references?
+# --------------------------------------------------------------------------
+def _question_config(**overrides) -> dict:
+    signals = {
+        "jailbreak": {"kind": "noul"},
+        "complexity": {"kind": "noul"},
+        "pii": {"kind": "noul",
+                "types": {"email_address": "邮箱", "cn_id_card": "身份证"}},
+        "domain": {"kind": "choice",
+                   "candidates": {"health": "医疗", "math": "数学"}},
+    }
+    signals.update(overrides)
+    return {"signals": signals}
+
+
+def test_provider_signal_values_reads_each_question_shape():
+    values = provider_signal_values(_question_config())
+    assert values == {
+        "jailbreak": frozenset({"jailbreak", "benign"}),
+        "complexity": frozenset({"easy", "hard"}),
+        "pii": frozenset({"email_address", "cn_id_card"}),
+        "domain": frozenset({"health", "math"}),
+    }
+    # rule signals and unknown/retired signal keys have no model value domain
+    config = _question_config(keyword={"kind": "noul"},
+                              capability_route={"kind": "choice",
+                                                "candidates": {"m1": "x"}})
+    values = provider_signal_values(config)
+    assert "keyword" not in values and "capability_route" not in values
+
+
+def test_provider_signal_values_returns_none_for_unknown_configs():
+    for broken in (None, {}, {"signals": None}, {"signals": []},
+                   {"signals": "nope"}, "not-a-mapping", []):
+        assert provider_signal_values(broken) is None
+
+
+def test_unavailable_signal_is_a_hard_enable_issue():
+    root = branch(children=(
+        route("a", when=When("pii", "email_address", op="contains")),),
+        otherwise=route("f"))
+    issues = enable(root, signal_values={"complexity": frozenset({"hard"})})
+    hits = [issue for issue in issues if issue.code == "signal_unavailable"]
+    assert hits and hits[0].level == "hard" and hits[0].node_id == "a"
+    assert "pii" in hits[0].zh and "pii" in hits[0].en
+
+
+def test_unavailable_signal_value_is_a_hard_enable_issue():
+    root = branch(children=(
+        route("a", when=When("pii", "email_address", op="contains")),),
+        otherwise=route("f"))
+    issues = enable(root, signal_values={"pii": frozenset({"cn_id_card"})})
+    hits = [issue for issue in issues
+            if issue.code == "signal_value_unavailable"]
+    assert hits and hits[0].level == "hard" and hits[0].node_id == "a"
+    assert "email_address" in hits[0].zh
+    assert "email_address" in hits[0].en
+
+
+def test_unavailable_choice_and_weight_values_are_hard_issues():
+    choice_root = branch(children=(
+        route("c", when=When("domain", "math")),), otherwise=route("f"))
+    assert "signal_value_unavailable" in codes(enable(
+        choice_root, signal_values={"domain": frozenset({"health"})}))
+
+    weighted = branch(children=(
+        Route("w", "qwen3-8b",
+              weights=(Weight("complexity", "hard", 0.5),), min_score=0.5),),
+        otherwise=route("f"))
+    assert "signal_value_unavailable" in codes(enable(
+        weighted, signal_values={"complexity": frozenset({"easy"})}))
+
+
+def test_signal_values_none_skips_the_dynamic_checks():
+    root = branch(children=(
+        route("a", when=When("pii", "email_address", op="contains")),),
+        otherwise=route("f"))
+    assert codes(enable(root)) == set()            # default: context unknown
+    assert not codes(enable(root, signal_values=None))
+
+
+def test_rule_signals_skip_dynamic_value_checks():
+    root = branch(children=(
+        route("office", when=When("time_window", "work_hours",
+                                  op="contains")),),
+        otherwise=route("f"))
+    assert codes(enable(root, signal_values={
+        "pii": frozenset({"email_address"})})) == set()
+
+
+def test_real_question_config_detects_a_removed_pii_subtype():
+    config_path = (Path(__file__).resolve().parents[1]
+                   / "configs" / "signal_questions.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    values = provider_signal_values(config)
+    assert "pii" in values and "email_address" in values["pii"]
+    assert validate_tree_for_enable(mixed_tree(),
+                                    context(signal_values=values)) == []
+
+    config["signals"]["pii"]["types"].pop("email_address")
+    removed = provider_signal_values(config)
+    issues = validate_tree_for_enable(mixed_tree(),
+                                      context(signal_values=removed))
+    hits = [issue for issue in issues
+            if issue.code == "signal_value_unavailable"]
+    assert len(hits) == 1 and hits[0].node_id == "pii-nl"
+    assert hits[0].level == "hard"

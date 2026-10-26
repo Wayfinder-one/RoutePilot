@@ -92,7 +92,9 @@ def _make_decision_runner(settings: Settings, tagger):
     """
     if settings.tagger == "jev":
         from router.decision.jev_runner import JevDecisionRunner
-        return JevDecisionRunner(tagger)
+        # design §6.4: a per-node timeout turns a slow/hung decision model into
+        # a local nl_error (otherwise/Miss) instead of stalling the request.
+        return JevDecisionRunner(tagger, timeout=settings.decision_timeout)
     return None
 
 
@@ -263,8 +265,12 @@ def create_app(settings: Settings, *,
             ensure_questions_revision(conn, questions_cfg)
         active = active_tree(conn)
         if active is not None:
+            # The provider-value coverage check runs against the SAME question
+            # config the tagger booted with (B-I-2): boot and admin enable must
+            # judge a tree identically.
             issues = hard_issues(enable_issues(
-                conn, active, runner_available=runner is not None))
+                conn, active, runner_available=runner is not None,
+                questions=questions_cfg))
             if issues:
                 for issue in issues:
                     logger.error("active tree health: %s (%s) node=%s",

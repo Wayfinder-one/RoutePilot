@@ -13,6 +13,27 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _decision_timeout_from_env() -> float | None:
+    """ROUTER_DECISION_TIMEOUT -> per-NL-node timeout seconds (None = no limit).
+
+    Default 60.0 (design §6.4: a timed-out nl_choice becomes a local
+    ``nl_error`` and follows its ``otherwise``); ``0`` or an empty value
+    disables the timeout (the pre-existing behavior).
+    """
+    raw = os.environ.get("ROUTER_DECISION_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_DECISION_TIMEOUT
+    raw = raw.strip()
+    if not raw:
+        return None
+    value = float(raw)
+    return None if value <= 0 else value
+
+
+#: Default DecisionRunner per-NL-node timeout (design §6.4).
+_DEFAULT_DECISION_TIMEOUT = 60.0
+
+
 @dataclass(frozen=True)
 class Settings:
     db_path: str = "router.db"
@@ -65,6 +86,10 @@ class Settings:
     # in with ROUTER_ADMIN_EMAIL/ROUTER_ADMIN_PASSWORD and reuse the session
     # token (see scripts/configure_upstream.py).
     # The default admin account is seeded once into an empty users table only.
+    #: Per-``nl_choice`` DecisionRunner timeout in seconds (ROUTER_DECISION_TIMEOUT,
+    #: default 60.0). ``None`` = no timeout: a slow/hung decision model blocks
+    #: the request instead of turning into a local ``nl_error`` (design §6.4).
+    decision_timeout: float | None = 60.0
     user_auth: bool = False
     admin_email: str = "admin@test.com"
     admin_password: str = "1qaz@WSX"
@@ -93,6 +118,7 @@ class Settings:
             jev_chunk_calibration=os.environ.get(
                 "ROUTER_JEV_CHUNK_CALIBRATION", ""),
             jev_trim=_flag("ROUTER_JEV_TRIM", True),
+            decision_timeout=_decision_timeout_from_env(),
             user_auth=_flag("ROUTER_USER_AUTH", True),
             admin_email=os.environ.get("ROUTER_ADMIN_EMAIL", "admin@test.com"),
             admin_password=os.environ.get("ROUTER_ADMIN_PASSWORD", "1qaz@WSX"),

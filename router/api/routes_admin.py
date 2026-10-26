@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 
 import httpx
@@ -23,7 +24,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn
-from router.api.routes_trees import capability_write_issues
+from router.api.routes_trees import (active_tree, capability_write_issues,
+                                     enable_issues, hard_issues)
 from router.api.upstream import parse_profile_text
 from router.evals import summarize
 from router.pipeline.errors import NoActiveTreeError, SignalPreparationError
@@ -371,15 +373,25 @@ def put_model(model_id: str, body: ModelIn, request: Request,
 @router.delete("/models/{model_id}")
 def delete_model(model_id: str, request: Request,
                  conn: sqlite3.Connection = Depends(get_conn)):
-    if ModelRepo(conn).get(model_id) is None:
-        raise HTTPException(404, detail=f"unknown model {model_id}")
-    refs = model_references(RoutingTreeRepo(conn).list(), model_id)
-    if refs:
-        raise HTTPException(409, detail={
-            "message": f"model {model_id} 被路由树引用，先解除引用再删除",
-            "references": refs})
+    """Delete a model; the reference check and the delete share ONE lock (B-M-3).
+
+    Checking first and deleting later left a window where a concurrent tree
+    write could start referencing the model between the two steps (the saved
+    tree would then route to a model that no longer exists, and a restart's
+    health check would refuse to boot).  The whole check/delete/publish runs
+    under the publisher lock, so tree writes and this delete serialize: either
+    the reference lands first (409 here) or the model is gone first and the
+    tree write re-checks against the post-delete catalog.
+    """
     publisher = request.app.state.publisher
     with publisher.locked():
+        if ModelRepo(conn).get(model_id) is None:
+            raise HTTPException(404, detail=f"unknown model {model_id}")
+        refs = model_references(RoutingTreeRepo(conn).list(), model_id)
+        if refs:
+            raise HTTPException(409, detail={
+                "message": f"model {model_id} 被路由树引用，先解除引用再删除",
+                "references": refs})
         ModelRepo(conn).delete(model_id)
         ChangeRepo(conn).record(_now(), "model",
                                 {"action": "delete", "id": model_id})
@@ -702,6 +714,22 @@ def put_signal_questions(body: SignalQuestionsIn, request: Request,
     publisher = request.app.state.publisher
     applied = getattr(tagger, "set_questions", None) is not None
     with publisher.locked():
+        # The prospective config must not silently break the tree that is
+        # currently serving traffic: judge it with the SAME enable-time
+        # validation a tree save/enable runs (design §7.2 + audit B-I-2),
+        # BEFORE applying, persisting or publishing anything.  A hard issue
+        # (e.g. the active tree reads a PII subtype the new config dropped)
+        # leaves memory, disk and the published snapshot untouched.
+        active = active_tree(conn)
+        if active is not None:
+            issues = hard_issues(enable_issues(
+                conn, active,
+                runner_available=getattr(request.app.state, "runner",
+                                         None) is not None,
+                questions=cfg))
+            if issues:
+                raise HTTPException(
+                    422, detail=[dict(issue.__dict__) for issue in issues])
         previous = apply_questions(tagger, cfg)
         try:
             _path, revision = persist_questions(request, conn, cfg)
@@ -787,11 +815,90 @@ def _current_tagger_info(request: Request) -> dict:
     return dict(info()) if callable(info) else {}
 
 
-def _current_decision_revision(request: Request) -> str:
-    """The DecisionRunner evidence hash — same rule as build_snapshot."""
+def _current_decision_info(request: Request) -> dict:
+    """The DecisionRunner's version evidence (``{}`` when no runner)."""
     runner = getattr(request.app.state, "runner", None)
-    info = dict(runner.info()) if runner is not None else {}
-    return "" if not info else sha256_text(canonical_json(info))
+    return dict(runner.info()) if runner is not None else {}
+
+
+#: Evidence keys that describe the hot-editable question config, not the model.
+_QUESTION_EVIDENCE_KEYS = frozenset({"questions_sha256", "questions_revision"})
+
+
+def stable_evidence(info: Mapping | None) -> dict:
+    """Model-identity evidence only — the replay fingerprint (audit B-I-3).
+
+    Tagger/decision evidence mixes three kinds of data, and only the first is
+    a model-identity fact:
+
+    * **model identity** (engine, model name, window, head/tokenizer/weights
+      hashes, decoding temperature, chunk config) — keep it: re-running a
+      record against a different model would be dishonest;
+    * **hot-editable question config** (``questions_sha256`` /
+      ``questions_revision``) — drop it: replay restores the recorded
+      questions from the snapshot, so a later edit must never block an old
+      record;
+    * **deployment location** (any ``*dir*``/``*path*`` key or absolute-path
+      value) — drop it: the same artifact moved to another path is still the
+      same model.
+
+    Returns the stable subset; ``{}`` for missing/malformed evidence.
+    """
+    if not isinstance(info, Mapping):
+        return {}
+    stable: dict = {}
+    for key, value in info.items():
+        if not isinstance(key, str):
+            continue
+        lowered = key.lower()
+        if key in _QUESTION_EVIDENCE_KEYS:
+            continue
+        if "dir" in lowered or "path" in lowered:
+            continue
+        if isinstance(value, str) and value.startswith("/"):
+            continue
+        stable[key] = value
+    return stable
+
+
+def _evidence_revision(info: Mapping | None) -> str:
+    """Canonical hash of one evidence map (same rule as ``build_snapshot``)."""
+    data = dict(info or {})
+    return "" if not data else sha256_text(canonical_json(data))
+
+
+def _decision_evidence_blocker(recorded_tagger, snapshot,
+                               decision_info: dict) -> str | None:
+    """Replay blocker for the DecisionRunner identity, or None when trusted.
+
+    Compares MODEL identity, never the raw historical hash alone: the stored
+    ``decision_revision`` used to include the hot-editable questions
+    fingerprint (and deployment paths), so a plain hash comparison marked every
+    record older than the last ``PUT /admin/signal-questions`` unreplayable.
+    """
+    historical = snapshot.decision_revision
+    if not historical:
+        # No decision evidence was recorded (no runner at snapshot build time).
+        return None if not decision_info else "decision_runner_mismatch"
+    if historical == _evidence_revision(decision_info):
+        return None
+    # JEV contract: ``JevDecisionRunner.info() == tagger.info()`` — the frozen
+    # per-request tagger evidence is that request's decision identity, and its
+    # stable projection ignores questions/deploy-path churn.
+    recorded_stable = stable_evidence(recorded_tagger)
+    if recorded_stable and recorded_stable == stable_evidence(decision_info):
+        return None
+    # LEGACY revisions hashed the FULL info including the questions
+    # fingerprint: rebuild that historical hash with the questions revision
+    # stored in the snapshot content (design §8.2) and accept an exact match.
+    normalized = dict(decision_info)
+    questions_revision = snapshot.questions_revision
+    for key in _QUESTION_EVIDENCE_KEYS:
+        if key in normalized:
+            normalized[key] = questions_revision
+    if historical == _evidence_revision(normalized):
+        return None
+    return "decision_runner_mismatch"
 
 
 def _replay_snapshot(conn: sqlite3.Connection, revision):
@@ -814,14 +921,20 @@ def _replay_snapshot(conn: sqlite3.Connection, revision):
 
 
 def _replay_blocker(record: dict, conn: sqlite3.Connection, *,
-                    tagger_info: dict, decision_revision: str) -> str | None:
+                    tagger_info: dict, decision_info: dict) -> str | None:
     """Concrete reason a ring record cannot be replayed (None = replayable).
 
     Checked in order: the original request inputs -> the historical snapshot
-    pointer/content -> the model fingerprints.  Nothing is defaulted: a record
+    pointer/content -> the model evidence.  Nothing is defaulted: a record
     missing the text, the headers/n_messages actually used, or the revision
     content is listed in ``non_replayable`` instead of being replayed with
     fabricated inputs or today's configuration.
+
+    Tagger evidence is only required when the historical tree actually needed
+    the tagger (``snapshot.required_signals``): a pure-NL request never tags,
+    so its record legitimately carries ``tagger_info={}`` and must replay.
+    The comparison itself uses :func:`stable_evidence` (model identity, not
+    the hot-editable questions/paths) — see audit B-I-3.
     """
     text = record.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -835,22 +948,26 @@ def _replay_blocker(record: dict, conn: sqlite3.Connection, *,
     if snapshot is None:
         return reason
     recorded_tagger = record.get("tagger_info")
-    if not isinstance(recorded_tagger, dict):
-        return "missing_tagger_evidence"      # pre-Task-10 ring record
-    if recorded_tagger != tagger_info:
-        return "tagger_model_mismatch"
-    if snapshot.decision_revision != decision_revision:
-        return "decision_runner_mismatch"
-    return None
+    if snapshot.required_signals:
+        if not isinstance(recorded_tagger, dict):
+            return "missing_tagger_evidence"  # pre-Task-10 ring record
+        if stable_evidence(recorded_tagger) != stable_evidence(tagger_info):
+            return "tagger_model_mismatch"
+    return _decision_evidence_blocker(recorded_tagger, snapshot, decision_info)
 
 
 def _replay_case(record: dict) -> dict:
-    """Record-only fields of one replay case (no text: replay never persists it)."""
+    """Record-only fields of one replay case (no text: replay never persists it).
+
+    ``questions_revision`` is purely informational: the historical questions
+    come from the snapshot content, so a question edit is never a blocker.
+    """
     return {"id": record.get("id"), "ts": record.get("ts"),
             "expect": record.get("model"), "got": None,
             "tree_id": record.get("tree_id"),
             "tree_revision": record.get("tree_revision"),
-            "snapshot_revision": record.get("snapshot_revision")}
+            "snapshot_revision": record.get("snapshot_revision"),
+            "questions_revision": record.get("questions_revision")}
 
 
 async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
@@ -901,7 +1018,7 @@ async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
         since = (datetime.now().astimezone()
                  - timedelta(days=body.days)).date().isoformat()
         tagger_info = _current_tagger_info(request)
-        decision_revision = _current_decision_revision(request)
+        decision_info = _current_decision_info(request)
         pairs = []
         mismatches = []
         cases = []
@@ -909,11 +1026,15 @@ async def _eval_pairs(body: EvalIn, request: Request, conn: sqlite3.Connection):
         for record in request.app.state.requestlog.replayable(since):
             entry = _replay_case(record)
             reason = _replay_blocker(record, conn, tagger_info=tagger_info,
-                                     decision_revision=decision_revision)
+                                     decision_info=decision_info)
             snapshot = None
             if reason is None:
                 snapshot, reason = _replay_snapshot(
                     conn, record["snapshot_revision"])
+                if reason is None:
+                    # informational only: the recorded questions revision (the
+                    # snapshot's copy is authoritative for the replay itself)
+                    entry["questions_revision"] = snapshot.questions_revision
             if reason is not None:
                 entry.update({"got": None, "replayable": False,
                               "reason": reason})

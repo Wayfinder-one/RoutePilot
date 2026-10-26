@@ -112,6 +112,8 @@ def test_weighted_hits_compete_by_score_when_no_direct_hit():
     assert isinstance(result, Hit) and result.model == "m-high"
     assert result.score == pytest.approx(0.9)
     assert runner.calls == []
+    # no direct hit discarded a candidate -> nothing is marked superseded
+    assert not any(event.get("superseded") for event in result.trace)
 
 
 def test_direct_hit_wins_over_earlier_weighted_hit_and_stops_later_nl():
@@ -387,11 +389,13 @@ def test_passing_branch_child_condition_is_traced_before_its_hit():
     ), otherwise=Route(id="fallback", model="m0"))
     result, _ = evaluate(root, [], {"domain": signal("math", 0.9)})
     assert isinstance(result, Hit) and result.model == "m1"
-    assert [event["event"] for event in result.trace] == ["condition", "hit"]
-    assert result.trace[0]["node_id"] == "child"
-    assert result.trace[0]["pass"] is True
+    assert [event["event"] for event in result.trace] == [
+        "entered", "condition", "hit"]
+    assert result.trace[0] == {"node_id": "root", "event": "entered"}
     assert result.trace[1]["node_id"] == "child"
-    assert result.trace[1]["event"] == "hit"
+    assert result.trace[1]["pass"] is True
+    assert result.trace[2]["node_id"] == "child"
+    assert result.trace[2]["event"] == "hit"
 
 
 def test_passing_when_on_a_container_node_is_traced_once():
@@ -400,9 +404,11 @@ def test_passing_when_on_a_container_node_is_traced_once():
                             Route(id="later", model="m2")))
     result, _ = evaluate(root, [], {"domain": signal("math", 0.9)})
     assert isinstance(result, Hit) and result.model == "m1"
-    assert [event["event"] for event in result.trace] == ["condition", "hit"]
-    assert result.trace[0]["node_id"] == "root"
-    assert result.trace[0]["pass"] is True
+    assert [event["event"] for event in result.trace] == [
+        "entered", "condition", "hit"]
+    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[1]["node_id"] == "root"
+    assert result.trace[1]["pass"] is True
 
 
 def test_passing_when_on_an_nl_node_precedes_the_nl_call_event():
@@ -414,9 +420,10 @@ def test_passing_when_on_an_nl_node_precedes_the_nl_call_event():
         {"domain": signal("math", 0.9)})
     assert isinstance(result, Hit) and result.model == "m1"
     assert [event["event"] for event in result.trace] == [
-        "condition", "nl_choice", "hit"]
-    assert result.trace[0]["node_id"] == "root"
-    assert result.trace[0]["pass"] is True
+        "entered", "condition", "nl_choice", "hit"]
+    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+    assert result.trace[1]["node_id"] == "root"
+    assert result.trace[1]["pass"] is True
 
 
 def test_failing_when_trace_stays_a_single_condition_event():
@@ -427,6 +434,55 @@ def test_failing_when_trace_stays_a_single_condition_event():
     assert [event["event"] for event in result.trace] == ["condition"]
     assert result.trace[0]["pass"] is False
     assert result.trace[0]["reason"] == "below_confidence"
+
+
+# ── trace: container `entered` events + superseded weighted hits (M-6) ────
+def test_container_entered_event_is_traced_before_its_children():
+    root = Branch(id="root", children=(Route(id="child", model="m1"),))
+    result, _ = evaluate(root, [])
+    assert isinstance(result, Hit) and result.model == "m1"
+    assert [event["event"] for event in result.trace] == ["entered", "hit"]
+    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+
+
+def test_nested_container_entered_events_keep_the_parent_first():
+    inner = Branch(id="inner", children=(Route(id="leaf", model="m1"),))
+    root = Branch(id="root", children=(inner,))
+    result, _ = evaluate(root, [])
+    assert [event["event"] for event in result.trace] == [
+        "entered", "entered", "hit"]
+    assert [event["node_id"] for event in result.trace[:2]] == [
+        "root", "inner"]
+
+
+def test_nl_container_entered_event_precedes_its_call():
+    root = nl("root", TWO_OPTIONS)
+    result, _ = evaluate(root, [ChoiceResult(probabilities={"a": 1.0,
+                                                           "b": 0.0})])
+    assert [event["event"] for event in result.trace] == [
+        "entered", "nl_choice", "hit"]
+    assert result.trace[0] == {"node_id": "root", "event": "entered"}
+
+
+def test_direct_hit_marks_discarded_weighted_hits_superseded():
+    signals = {"complexity": signal("hard", 0.9)}
+    root = Branch(id="root", children=(
+        Route(id="weighted", model="m-weighted", min_score=0.5,
+              weights=(Weight("complexity", "hard", 0.5),)),
+        Route(id="direct", model="m-direct"),
+    ), otherwise=Route(id="fallback", model="m0"))
+    result, _ = evaluate(root, [], signals)
+    assert isinstance(result, Hit) and result.model == "m-direct"
+    assert result.score is None
+    hits = [event for event in result.trace if event.get("event") == "hit"]
+    weighted_hit = next(event for event in hits
+                        if event["node_id"] == "weighted")
+    direct_hit = next(event for event in hits if event["node_id"] == "direct")
+    assert weighted_hit["superseded"] is True
+    assert "superseded" not in direct_hit
+    # only the terminal hit events are marked, not their condition evidence
+    assert all("superseded" not in event for event in result.trace
+               if event.get("event") != "hit")
 
 
 # ── strict signal reader ────────────────────────────────────────────────────

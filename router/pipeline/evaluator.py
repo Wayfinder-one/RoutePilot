@@ -37,13 +37,16 @@ doc §10's (``condition_false`` / ``below_confidence`` / ``nl_low_probability``
 / ``nl_ambiguous`` / ``nl_error`` / ``selected_child_miss`` / ``otherwise_hit``
 plus ``below_min_score`` / ``no_hit`` for the signal side):
 
+* ``entered`` — a ``branch``/``nl_choice`` node was entered (recorded before its
+  own ``condition``/child events; emitted even without a ``when``).
 * ``condition`` — a ``when`` check: signal/op/value, ``m``, ``conf``,
   ``conf_min``, ``pass`` and (on failure only) the ``reason``.  A **passing**
   gate is recorded too, prepended to the node's own events, so the trace shows
   which conditions admitted the path (design §10 "entered / skipped"); a
   failing gate is the node's whole result (a one-event ``Miss``).
 * ``hit`` / ``miss`` — a terminal node: kind/model/reasoning/score; a weighted
-  terminal also carries ``min_score`` and the ``leaf_score`` ``lines``.
+  terminal also carries ``min_score`` and the ``leaf_score`` ``lines``.  A kept
+  weighted ``hit`` that a later direct ``hit`` discarded is marked ``superseded``.
 * ``nl_choice`` — one per real runner call (``nl_call=True``): ordered
   ``candidates`` keys, ``probabilities`` (candidate order), ``ranking``,
   ``selected_key``, thresholds, ``p_top``/``margin``, ``reason`` (or null),
@@ -104,6 +107,22 @@ class EvalContext:
     request_text: str
 
 
+def _mark_superseded(traces: list[dict],
+                     spans: list[tuple[int, int]]) -> None:
+    """[M-6] Mark kept-but-discarded weighted ``hit`` events (copy only).
+
+    ``traces`` is the branch's growing event list; ``spans`` are the event
+    ranges of the weighted candidates kept so far.  Child result objects are
+    immutable and never mutated: only the merged trace dicts gain a
+    ``superseded`` copy.
+    """
+    for start, end in spans:
+        for index in range(start, min(end, len(traces))):
+            event = traces[index]
+            if event.get("event") == "hit":
+                traces[index] = {**event, "superseded": True}
+
+
 def _elapsed_ms(started: float) -> float:
     return round((time.perf_counter() - started) * 1000.0, 3)
 
@@ -138,6 +157,15 @@ class TreeEvaluator:
         if not entered:
             # A failed gate is the whole evaluation of this node: one event.
             return Miss(step["reason"], (step,))
+        prefix: list[dict] = []
+        if isinstance(node, (Branch, NLChoice)):
+            # design §10: entering a container is visible even when it has no
+            # ``when``; order = entered, [condition], child events, terminal.
+            prefix.append({"node_id": node.id, "event": "entered"})
+        if step is not None:
+            # a passing ``when`` records the gate that admitted this path
+            # (before the node's own events, after its `entered` event).
+            prefix.append(step)
         if isinstance(node, (Route, Block)):
             result = self._eval_terminal(node, context)
         elif isinstance(node, Branch):
@@ -146,12 +174,8 @@ class TreeEvaluator:
             result = await self._eval_nl_choice(node, context)
         else:
             raise TypeError(f"not a routing tree node: {node!r}")
-        if step is not None:
-            # design §10 records the nodes that were entered: a passing ``when``
-            # emits its condition event BEFORE the node's own events, so a trace
-            # shows which gates admitted the path (the terminal hit alone does
-            # not carry the parent's condition evidence).
-            result = replace(result, trace=(step,) + result.trace)
+        if prefix:
+            result = replace(result, trace=tuple(prefix) + result.trace)
         return result
 
     # ── when: entering a node ─────────────────────────────────────────────
@@ -216,15 +240,22 @@ class TreeEvaluator:
     async def _eval_branch(self, node: Branch,
                            context: EvalContext) -> EvalResult:
         weighted: list[Hit] = []
+        #: Trace spans of the kept weighted candidates: (start, end) indexes
+        #: into ``traces``; a later direct hit marks their ``hit`` event
+        #: ``superseded`` because those candidates never take effect.
+        weighted_spans: list[tuple[int, int]] = []
         traces: list[dict] = []
         for child in node.children:
+            start = len(traces)
             result = await self._eval_node(child, context)
             traces.extend(result.trace)
             if isinstance(result, Miss):
                 continue
             if result.score is None:
+                _mark_superseded(traces, weighted_spans)
                 return replace(result, trace=tuple(traces))
             weighted.append(result)
+            weighted_spans.append((start, len(traces)))
         if weighted:
             best = max(weighted, key=lambda hit: hit.score)
             return replace(best, trace=tuple(traces))

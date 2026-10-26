@@ -58,3 +58,16 @@ def test_jev_window_default_and_env(monkeypatch):
     assert Settings.from_env().jev_window == ""
     monkeypatch.setenv("ROUTER_JEV_WINDOW", "256:768")
     assert Settings.from_env().jev_window == "256:768"
+
+
+def test_decision_timeout_default_and_env(monkeypatch):
+    """ROUTER_DECISION_TIMEOUT: default 60s per NL node (design §6.4); 0 or an
+    empty value disables the timeout (None = no limit)."""
+    monkeypatch.delenv("ROUTER_DECISION_TIMEOUT", raising=False)
+    assert Settings().decision_timeout == 60.0
+    assert Settings.from_env().decision_timeout == 60.0
+    monkeypatch.setenv("ROUTER_DECISION_TIMEOUT", "12.5")
+    assert Settings.from_env().decision_timeout == 12.5
+    for disabled in ("0", "0.0", ""):
+        monkeypatch.setenv("ROUTER_DECISION_TIMEOUT", disabled)
+        assert Settings.from_env().decision_timeout is None, disabled

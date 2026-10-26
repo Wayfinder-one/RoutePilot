@@ -145,3 +145,22 @@ def test_startup_accepts_a_declared_reasoning_level(tmp_path):
     app = create_app(Settings(db_path=path))     # must not raise
     assert app.state.snapshot.tree_id == "reasoning-ok"
     assert app.state.snapshot.tree.root.reasoning == "high"
+
+
+def test_decision_runner_uses_the_configured_timeout(tmp_path):
+    """App whitebox: the production DecisionRunner adapter receives the
+    configured per-NL-node timeout (design §6.4) — default 60s, overridable,
+    and None disables the timeout."""
+    from router.api.app import _make_decision_runner
+
+    tagger = object()                     # only held; no model is loaded
+    default = _make_decision_runner(Settings(tagger="jev"), tagger)
+    assert default._timeout == 60.0
+    tuned = _make_decision_runner(
+        Settings(tagger="jev", decision_timeout=12.5), tagger)
+    assert tuned._timeout == 12.5
+    disabled = _make_decision_runner(
+        Settings(tagger="jev", decision_timeout=None), tagger)
+    assert disabled._timeout is None
+    # non-JEV modes have no decision model at all
+    assert _make_decision_runner(Settings(tagger="heuristic"), tagger) is None

@@ -31,9 +31,10 @@ Design rules (correctness first):
   a read signal never is.  Save/enable validation rejects such trees before they
   can run, so this is only a stale-DB safety net.
 
-The scope is recomputed from the in-memory tree snapshot on every request (one
-pass over the nodes, microseconds), so a hot tree edit takes effect on the next
-request without any cache invalidation.
+The scope and the required-signal set are computed **once per snapshot build**
+(``router.pipeline.compiler.tree_signal_requirements``) and carried by the
+immutable ``RoutingSnapshot``; the request path never rescans the tree, so a hot
+tree edit takes effect on the next published snapshot.
 """
 
 from __future__ import annotations
