@@ -194,7 +194,9 @@ tests/            pytest（信号纯函数、pipeline、admin API、tagger 单�
 
 - **能力说明存在模型目录**：`models.profile.capability`（每个模型一段自然语言描述，
   ≤2000 字符；空 = 不参与）。控制台「模型与设置 → 编辑模型 → 能力说明」维护，
-  模型注册表**直接展示**这段说明（「能力说明」列，在操作列之前；未配置显示「未配置」）。
+  模型注册表**直接展示**这段说明（「能力说明」列，在操作列之前；未配置显示「未配置」）；
+  「能力路由」页的候选表与「缺少能力说明」列表也支持**行内「编辑」**（弹窗只改
+  `profile.capability`，推理声明等其余 profile 字段原样保留）。
 - **全局策略**：`settings.capability_instructions` / `capability_min_prob` /
   `capability_min_margin` / `capability_fallback_model`，控制台独立的「能力路由」页编辑
   （位于「模型与设置」之前），或 `PUT /admin/capability`。请求里会把候选说明渲染成一个 JEV

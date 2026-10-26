@@ -2,7 +2,8 @@
 
    Natural-language capability routing has two halves:
      - per-model capability description, stored as models.profile.capability,
-       edited in the model modal on models.html and shown in its registry list;
+       edited INLINE from the candidate / missing lists on this page (2026-10-26)
+       or in the model modal on models.html, and shown in the registry list there;
      - global policy (instructions / min_prob / min_margin / fallback_model),
        stored as settings.capability_* and edited HERE.
    This page owns the policy plus the candidate / missing-description summary
@@ -10,7 +11,22 @@
    answers 404: show a notice instead of an empty, unsaveable form. */
 const $ = s => document.querySelector(s);
 
-const STATE = { cap: null, unavailable: '' };
+const STATE = { cap: null, unavailable: '', models: [] };
+
+/* models.html stores the profile as JSON text; edits must merge into the whole
+   object so saving the description never drops reasoning/domains/tier. */
+function profileOf(model) {
+  const raw = model && model.profile;
+  if (!raw) return {};
+  if (typeof raw === 'object') return { ...raw };
+  try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+}
+function capabilityOf(model) {
+  if (model && typeof model.capability === 'string') return model.capability;
+  const cap = profileOf(model).capability;
+  return typeof cap === 'string' ? cap : '';
+}
+function modelById(id) { return (STATE.models || []).find(m => m.id === id) || null; }
 
 /* ── render ──────────────────────────────────────────────────────────── */
 function renderCapability(cap) {
@@ -73,17 +89,24 @@ function renderPolicy(cap) {
     </div>`;
 }
 
+/* One inline edit link (candidate rows + missing-description rows). */
+function editLink(id, label) {
+  return `<button class="linkbtn" data-editcap="${esc(id)}">${esc(label)}</button>`;
+}
+
 function renderCandidates(cap) {
   const wrap = $('#capCandidates');
   if (!wrap) return;
   const candidates = cap.candidates || [];
   const missing = (cap.missing || []).map(m => m.id);
+  const canEdit = (STATE.models || []).length > 0;
   const count = $('#capCandidateCount');
   if (count) count.textContent = candidates.length ? `· ${candidates.length}` : '';
   const rows = candidates.map(c => `<tr>
       <td class="mono" style="font-size:11.5px">${esc(c.id)}</td>
       <td class="mono mut" style="font-size:11px">${esc(c.upstream || '—')}</td>
       <td class="cap-desc">${esc(c.capability)}</td>
+      <td class="cap-act">${canEdit ? editLink(c.id, t('models.edit')) : ''}</td>
     </tr>`).join('');
   const table = candidates.length ? `
     <table class="cap-table">
@@ -91,14 +114,95 @@ function renderCandidates(cap) {
         <th>${esc(t('models.col.model'))}</th>
         <th>${esc(t('models.col.upstream'))}</th>
         <th>${esc(t('models.col.capability'))}</th>
+        <th class="cap-act">${esc(t('models.col.actions'))}</th>
       </tr></thead>
       <tbody>${rows}</tbody>
     </table>` : `<div class="empty">${esc(t('cap.none'))}</div>`;
+  const missingList = canEdit
+    ? missing.map(id => editLink(id, id + ' · ' + t('models.edit'))).join('')
+    : `<span class="mono">${missing.map(esc).join(', ')}</span>`;
   const missingHtml = missing.length
-    ? `<div class="footnote">${esc(t('cap.missing'))}:
-         <span class="mono">${missing.map(esc).join(', ')}</span></div>` : '';
+    ? `<div class="cap-missing"><span class="mut">${esc(t('cap.missing'))}:</span>${missingList}</div>`
+    : '';
+  const noModels = canEdit ? '' : `<div class="footnote">${esc(t('cap.edit.noModels'))}</div>`;
   wrap.innerHTML = table +
-    `<div class="footnote">${esc(t('cap.editHint'))}</div>` + missingHtml;
+    `<div class="footnote">${esc(t('cap.editHint'))}</div>` + missingHtml + noModels;
+}
+
+/* ── inline capability editing (2026-10-26) ──────────────────────────── */
+let capEdit = null;          // {id, upstream, profile, capability}
+
+function renderCapEdit() {
+  const d = capEdit;
+  if (!d) return;
+  const title = $('#capEditTitle');
+  if (title) title.textContent = t('cap.edit.title');
+  const body = $('#capEditBody');
+  if (body) body.innerHTML = `
+    <div class="keyline">
+      <span class="mut">${esc(t('models.col.model'))}</span>
+      <span class="mono">${esc(d.id)}</span>
+      <span class="mut" style="margin-left:14px">${esc(t('models.col.upstream'))}</span>
+      <span class="mono">${esc(d.upstream || '—')}</span>
+    </div>
+    <label class="field"><span>${esc(t('models.col.capability'))}</span>
+      <textarea id="capEditText" rows="6" maxlength="2000">${esc(d.capability)}</textarea>
+      <small>${esc(t('cap.edit.hint'))}</small></label>`;
+  const msg = $('#capEditMsg');
+  if (msg) { msg.className = 'modal-msg'; msg.textContent = ''; }
+  const save = $('#capEditSave');
+  if (save) save.disabled = false;
+}
+
+function openCapEdit(id) {
+  const model = modelById(id);
+  if (!model) { toast(t('cap.edit.noModels'), 3200); return; }
+  capEdit = { id, upstream: model.upstream || '', profile: profileOf(model),
+              capability: capabilityOf(model) };
+  renderCapEdit();
+  const modal = $('#capEditModal');
+  if (modal) modal.hidden = false;
+  document.body.classList.add('modal-open');
+}
+
+function closeCapEdit() {
+  capEdit = null;
+  const modal = $('#capEditModal');
+  if (modal) modal.hidden = true;
+  document.body.classList.remove('modal-open');
+}
+
+async function saveCapEdit() {
+  const d = capEdit;
+  if (!d) return;
+  const el = $('#capEditText');
+  const text = (el ? el.value : '').trim();
+  // Merge into the WHOLE profile: PUT /admin/models replaces the object, so
+  // sending only {capability} would wipe reasoning / domains / tier.
+  const profile = { ...d.profile };
+  if (text) profile.capability = text; else delete profile.capability;
+  const save = $('#capEditSave');
+  const msg = $('#capEditMsg');
+  if (save) save.disabled = true;
+  if (msg) { msg.className = 'modal-msg'; msg.textContent = t('common.loading'); }
+  try {
+    await api.put('/admin/models/' + encodeURIComponent(d.id), { profile });
+    closeCapEdit();
+    toast(t('cap.edit.saved'));
+    await reloadCapability();
+  } catch (e) {
+    if (msg) { msg.className = 'modal-msg bad'; msg.textContent = apiErrText(e); }
+    if (save) save.disabled = false;
+  }
+}
+
+async function reloadCapability() {
+  const [cap, models] = await Promise.all([
+    api.get('/admin/capability'),
+    api.get('/admin/models').catch(() => ({ models: [] })),
+  ]);
+  STATE.models = Array.isArray(models.models) ? models.models : [];
+  renderCapability(cap);
 }
 
 /* ── save ────────────────────────────────────────────────────────────── */
@@ -166,13 +270,25 @@ function renderUnavailable(key) {
 
 window.onLangChange = () => {
   if (STATE.unavailable) { renderUnavailable(STATE.unavailable); return; }
+  if (capEdit) {                        // keep the draft across a language switch
+    const el = $('#capEditText');
+    if (el) capEdit.capability = el.value;
+    renderCapEdit();
+  }
   renderCapability(captureDraft());
 };
 
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function bootCapability() {
   try {
-    renderCapability(await api.get('/admin/capability'));
+    const [cap, models] = await Promise.all([
+      api.get('/admin/capability'),
+      // model profiles feed the inline editor; a failed fetch degrades to
+      // read-only candidates instead of hiding the policy form
+      api.get('/admin/models').catch(() => ({ models: [] })),
+    ]);
+    STATE.models = Array.isArray(models.models) ? models.models : [];
+    renderCapability(cap);
   } catch (e) {
     if (e && e.status === 404) { renderUnavailable('cap.unsupported'); return; }
     renderUnavailable('cap.unreachable');
@@ -182,6 +298,20 @@ async function bootCapability() {
 
 $('#capPolicy').addEventListener('click', e => {
   if (e.target.closest('#capSave')) saveCapability();
+});
+$('#capCandidates').addEventListener('click', e => {
+  const btn = e.target.closest('[data-editcap]');
+  if (btn) openCapEdit(btn.dataset.editcap);
+});
+$('#capEditSave').addEventListener('click', saveCapEdit);
+document.querySelectorAll('[data-close-capedit]').forEach(btn =>
+  btn.addEventListener('click', closeCapEdit));
+$('#capEditModal').addEventListener('click', e => {
+  if (e.target.id === 'capEditModal') closeCapEdit();
+});
+document.addEventListener('keydown', e => {
+  const modal = $('#capEditModal');
+  if (e.key === 'Escape' && modal && !modal.hidden) closeCapEdit();
 });
 
 bootCapability();
