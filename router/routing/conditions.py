@@ -24,7 +24,7 @@ class TimePeriod:
     end: str
 
     def __post_init__(self):
-        if not self.name.strip():
+        if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("period name must be nonempty")
         if not self.days or any(isinstance(day, bool) or not isinstance(day, int) or not 0 <= day <= 6 for day in self.days):
             raise ValueError("period days must contain weekdays in [0,6]")

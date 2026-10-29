@@ -42,8 +42,8 @@ class Affinity:
         self.gets = []
         self.puts = []
 
-    def get(self, session_id, *, tree_revision, policy_path, allowed_models):
-        self.gets.append({"session_id": session_id, "tree_revision": tree_revision, "policy_path": policy_path, "allowed_models": list(allowed_models)})
+    def get(self, session_id, *, tree_revision, policy_path, allowed_models, touch=True):
+        self.gets.append({"session_id": session_id, "tree_revision": tree_revision, "policy_path": policy_path, "allowed_models": list(allowed_models), "touch": touch})
         return self.sticky
 
     def put(self, session_id, model, *, tree_revision, policy_path, ttl_seconds):
@@ -182,6 +182,20 @@ def test_dry_run_does_not_write_affinity_or_acquire_inflight():
     assert affinity.puts == []
     assert balancer.calls[0]["dry_run"] is True
     decision.release()
+
+
+def test_dry_run_sticky_lookup_does_not_extend_its_lifetime():
+    from router.routing.affinity import SessionAffinity
+
+    clock = [0.0]
+    affinity = SessionAffinity(clock=lambda: clock[0])
+    snap = snapshot()
+    affinity.put("s", "strong-b", tree_revision=snap.tree_revision, policy_path="choose", ttl_seconds=10)
+    clock[0] = 5
+    decision = route(RoutingEngine(Jev(answer()), affinity, Balancer()), snap, session="s", dry_run=True)
+    assert decision.model == "strong-b"
+    clock[0] = 11
+    assert affinity.get("s", tree_revision=snap.tree_revision, policy_path="choose", allowed_models=["strong-b"]) is None
 
 
 def test_no_active_tree_fails_before_jev():

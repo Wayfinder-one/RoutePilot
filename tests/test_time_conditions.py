@@ -23,3 +23,10 @@ def test_when_periods_are_or_and_empty_condition_matches():
     assert when_matches(When(periods=("白天", "夜间")), ["夜间"]) is True
     assert when_matches(When(periods=("白天",)), ["周末"]) is False
     assert when_matches(None, []) is True
+
+
+def test_invalid_period_name_raises_value_error():
+    import pytest
+
+    with pytest.raises(ValueError):
+        TimePeriod.from_dict({"name": 3, "days": [0], "start": "09:00", "end": "18:00"})

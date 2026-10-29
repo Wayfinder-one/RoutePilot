@@ -39,3 +39,16 @@ def test_missing_session_never_reads_or_writes():
     assert affinity.get("", tree_revision="t", policy_path="p", allowed_models=["a"]) is None
     affinity.put("", "a", tree_revision="t", policy_path="p", ttl_seconds=100)
     assert len(affinity) == 0
+
+
+def test_untouched_read_does_not_refresh_ttl_or_remove_mismatch():
+    clock = [0.0]
+    affinity = SessionAffinity(clock=lambda: clock[0])
+    affinity.put("s", "a", tree_revision="t", policy_path="p", ttl_seconds=10)
+    clock[0] = 5
+    assert affinity.get("s", tree_revision="t", policy_path="p", allowed_models=["a"], touch=False) == "a"
+    clock[0] = 11
+    assert affinity.get("s", tree_revision="t", policy_path="p", allowed_models=["a"]) is None
+    affinity.put("s", "a", tree_revision="t", policy_path="p", ttl_seconds=10)
+    assert affinity.get("s", tree_revision="other", policy_path="p", allowed_models=["a"], touch=False) is None
+    assert affinity.get("s", tree_revision="t", policy_path="p", allowed_models=["a"]) == "a"

@@ -60,6 +60,7 @@ class RoutingEngine:
                 tree_revision=snapshot.tree_revision,
                 policy_path=path_text,
                 allowed_models=allowed_models,
+                touch=not dry_run,
             )
             if candidate in allowed_models:
                 preferred = candidate

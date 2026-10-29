@@ -30,7 +30,7 @@ class SessionAffinity:
         with self._lock:
             return len(self._entries)
 
-    def get(self, session_id: str, *, tree_revision: str, policy_path: str, allowed_models: list[str]) -> str | None:
+    def get(self, session_id: str, *, tree_revision: str, policy_path: str, allowed_models: list[str], touch: bool = True) -> str | None:
         if not session_id:
             return None
         key = session_digest(session_id)
@@ -40,13 +40,16 @@ class SessionAffinity:
             if entry is None:
                 return None
             if entry.expires_at <= now:
-                self._entries.pop(key, None)
+                if touch:
+                    self._entries.pop(key, None)
                 return None
             if entry.tree_revision != tree_revision or entry.policy_path != policy_path or entry.model not in allowed_models:
-                self._entries.pop(key, None)
+                if touch:
+                    self._entries.pop(key, None)
                 return None
-            entry.expires_at = now + entry.ttl_seconds
-            self._entries.move_to_end(key)
+            if touch:
+                entry.expires_at = now + entry.ttl_seconds
+                self._entries.move_to_end(key)
             return entry.model
 
     def put(self, session_id: str, model: str, *, tree_revision: str, policy_path: str, ttl_seconds: int) -> None:
