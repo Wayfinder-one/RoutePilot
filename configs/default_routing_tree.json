@@ -2,7 +2,10 @@
   "id": "default-jev",
   "name": "默认 JEV 分流树",
   "timezone": "Asia/Shanghai",
-  "sticky": {"enabled": true, "ttl_seconds": 1800},
+  "sticky": {
+    "enabled": true,
+    "ttl_seconds": 1800
+  },
   "root": {
     "id": "root",
     "type": "jev",
@@ -17,8 +20,13 @@
           "id": "fast-target",
           "type": "target",
           "strategy": "least_inflight",
-          "capability": "速度最快、成本最低，适合闲聊、简单问答、格式转换、短翻译和信息提取。",
-          "models": [{"model": "qwen3-8b", "reasoning": null}]
+          "capability": "速度最快、成本最低。适合简单短小的请求：闲聊、简单事实问答、格式转换、短翻译、信息提取、简单提醒。复杂任务容易出错。",
+          "models": [
+            {
+              "model": "qwen3-8b",
+              "reasoning": null
+            }
+          ]
         }
       },
       {
@@ -28,8 +36,13 @@
           "id": "strong-target",
           "type": "target",
           "strategy": "least_inflight",
-          "capability": "能力更强，适合复杂代码、长文档、多约束方案、统计建模和深度推理。",
-          "models": [{"model": "qwen3-32b", "reasoning": null}]
+          "capability": "能力最强但较慢、成本高。适合复杂请求：长文档分析、多约束方案设计、复杂代码与故障排查、统计建模、风险判断与深度决策。简单问答和普通写作不适合。",
+          "models": [
+            {
+              "model": "qwen3-32b",
+              "reasoning": null
+            }
+          ]
         }
       }
     ],
@@ -37,7 +50,12 @@
       "id": "safe-target",
       "type": "target",
       "strategy": "least_inflight",
-      "models": [{"model": "qwen3-8b", "reasoning": null}]
+      "models": [
+        {
+          "model": "qwen3-8b",
+          "reasoning": null
+        }
+      ]
     }
   }
 }
