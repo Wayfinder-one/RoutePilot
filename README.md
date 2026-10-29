@@ -1,6 +1,6 @@
 # Smart Router v3
 
-Smart Router 是一个 OpenAI 兼容的模型路由代理：**NeoHorse-JEV 负责按模型能力选择目标，会话粘性和最小在途请求负责选择实际上游**。控制台提供模型管理、JEV 服务配置、分流树、时间段和计算日志。
+Smart Router 是一个 OpenAI 兼容的模型路由代理：**NeoHorse-JEV 负责按模型能力选择目标，会话粘性和最小在途请求负责选择实际上游**。控制台提供模型管理、JEV 服务配置、分流配置和计算日志。
 
 本版是开发中的不兼容重构：旧信号体系、旧路由树和旧数据库 schema 均已移除，没有兼容适配层，也不会在 router 进程内加载 torch/transformers。
 
@@ -155,6 +155,10 @@ ROUTER_JEV_API_KEY= \
 
 树支持草稿、复制、启停、导入导出和 dry-run 试算。启用时要求模型、时间段、能力说明、推理档位和最终 fallback 全部有效；新库不隐式创建或启用树。没有启用树时 `/v1` 返回 503 `no_active_tree`。
 
+控制台的「分流树」页（标题「分流配置」）只做 JEV 需要的两件事：**提示词**（`root.instructions`）和**每个候选模型的能力描述**（`root.options[].target.capability`，留空则继承模型目录的 `profile.capability`），外加必需的兜底模型和少量高级项（sticky、`min_prob`/`min_margin`、多树切换、导入导出）。页面不再编辑时间分支：`branch` / `when` / 时间段仍保留在数据模型与引擎中，可通过 API 或导入 JSON 维护；选中含时间分支的树时页面只显示提示和「新建简化配置」入口。右侧 dock 提供请求预览与 dry-run 试算（试算前会自动保存）。
+
+`GET /admin/jev` 的 `defaults` 提供默认提示词和 state 模板；预览里的 `state` 模板来自该配置，`{request}` 由服务端拼入请求原文。
+
 出厂示例见 `configs/default_routing_tree.json`，可通过以下脚本应用：
 
 ```bash
@@ -163,7 +167,7 @@ SR_BASE=http://127.0.0.1:8400 .venv/bin/python scripts/apply_default_routing_tre
 
 ## 时间段
 
-「分流树」页保留命名时间段：`name/days/start/end`。
+时间段（`name/days/start/end`）仍是树的原生确定性条件，保存在 `/admin/time-periods`，由 `branch` 节点的 `when.periods` 引用：
 
 - 周一为 0，周日为 6；
 - `start > end` 表示跨午夜；
@@ -172,6 +176,8 @@ SR_BASE=http://127.0.0.1:8400 .venv/bin/python scripts/apply_default_routing_tre
 - 树级 IANA timezone 默认 `Asia/Shanghai`。
 
 时间是树的原生确定性条件，不是模型信号。时间段在粘性和 JEV 之前求值，因此旧会话不能借粘性绕过当前时段策略。
+
+当前控制台「分流配置」页只编辑单 JEV 树，不展示时间段和 `branch`；需要分时策略时通过 API 或导入 JSON 维护树，再用页面预览/试算其行为。
 
 ## 会话粘性
 

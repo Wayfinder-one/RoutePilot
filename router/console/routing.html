@@ -2,34 +2,209 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Router · 分流树</title>
+<title>Smart Router · 分流配置</title>
 <link rel="icon" href="data:"><link rel="stylesheet" href="shared.css"><link rel="stylesheet" href="routing.css">
 </head>
 <body data-page="routing">
-<div class="pagehead">
-  <div><div class="crumb" data-i18n="nav.routing"></div><h1><span data-i18n="nav.routing"></span><span class="sub" data-i18n="routing.sub"></span></h1></div>
-  <div class="headmeta"><span class="pill" id="serverClockPill"></span><span class="pill" id="snapshotPill"></span>
-    <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
-    <button class="btn sm" id="importTree" data-i18n="routing.import"></button><input type="file" id="importFile" accept="application/json,.json" hidden>
-    <button class="btn pri sm" id="saveTree" data-i18n="common.save"></button></div>
-</div>
-<main class="routing-layout">
-  <aside>
-    <section class="card"><div class="col-h"><span data-i18n="routing.trees"></span><button class="btn ghost sm push-right" id="newTree" data-i18n="routing.new"></button></div><div id="treeList" class="tree-list"></div></section>
-    <section class="card"><div class="col-h"><span data-i18n="routing.periods"></span><button class="btn ghost sm push-right" id="addPeriod" data-i18n="common.add"></button></div><div id="periods"></div><button class="btn sm" id="savePeriods" data-i18n="routing.savePeriods"></button></section>
-  </aside>
-  <section class="card editor-card">
-    <div class="field-row"><label class="field"><span data-i18n="routing.treeName"></span><input id="treeName"></label><label class="field"><span data-i18n="routing.timezone"></span><input id="timezone"></label></div>
-    <div class="sticky-row"><label><input type="checkbox" id="stickyEnabled"> <span data-i18n="routing.sticky"></span></label><label><span data-i18n="routing.ttl"></span><input type="number" id="stickyTtl" min="1" max="31536000"></label><span id="dirty" class="mut"></span></div>
-    <div class="editor-actions"><button class="btn sm" id="copyTree" data-i18n="routing.copy"></button><button class="btn sm" id="enableTree"></button><span class="mut" data-i18n="routing.editorHint"></span></div>
-    <div id="issues"></div><div id="nodeEditor"></div>
-  </section>
-  <aside class="card try-card"><div class="col-h" data-i18n="routing.try"></div>
-    <label class="field"><span data-i18n="routing.tryText"></span><textarea id="tryText" rows="6"></textarea></label>
-    <label class="field"><span data-i18n="routing.trySession"></span><input id="trySession" placeholder="try-session"></label>
-    <label class="field"><span data-i18n="routing.tryNow"></span><input id="tryNow" placeholder="2026-10-29T23:00:00+08:00"></label>
-    <button class="btn pri" id="tryRun" data-i18n="routing.tryRun"></button><div id="tryOut" class="try-out"></div>
-  </aside>
+
+<!-- Icons: one sprite, reused through <use> (no external requests). -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M6 4.3v7.4L12.2 8z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-save" viewBox="0 0 16 16"><path d="M3.6 2.7h6.5L13 5.6V13.3H3.6z"/><path d="M5.7 2.7v3.4h4.7V2.7"/><path d="M5.5 13.3V9.6h5.1v3.7"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.4 8.6l3 3 6.3-6.5"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.7" y="5.7" width="6.9" height="6.9" rx="1.4"/><path d="M10.3 3.7V3a.9.9 0 0 0-.9-.9H3.1a.9.9 0 0 0-.9.9v6.3c0 .5.4.9.9.9h.7"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 16 16"><path d="M6.2 3.9L10.3 8l-4.1 4.1"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 2.4l4.8 1.9v3.8c0 2.8-2 4.4-4.8 5.4-2.8-1-4.8-2.6-4.8-5.4V4.3z"/><path d="M5.9 8.1l1.5 1.5 2.9-2.9"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7.1" cy="7.1" r="3.8"/><path d="M10.1 10.1L13 13"/></symbol>
+  <symbol id="i-reset" viewBox="0 0 16 16"><path d="M3.4 7.3a4.6 4.6 0 1 1 1.3 4.5"/><path d="M3.1 3.8v3.5h3.5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 16 16"><path d="M8 2.7l5.5 10H2.5z"/><path d="M8 6.3v3"/><circle cx="8" cy="11.2" r=".75" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-grip" viewBox="0 0 10 16"><circle cx="3.3" cy="3.6" r="1" fill="currentColor" stroke="none"/><circle cx="6.7" cy="3.6" r="1" fill="currentColor" stroke="none"/><circle cx="3.3" cy="8" r="1" fill="currentColor" stroke="none"/><circle cx="6.7" cy="8" r="1" fill="currentColor" stroke="none"/><circle cx="3.3" cy="12.4" r="1" fill="currentColor" stroke="none"/><circle cx="6.7" cy="12.4" r="1" fill="currentColor" stroke="none"/></symbol>
+</svg>
+
+<main class="rt2-shell">
+  <!-- ── page head ── -->
+  <div class="rt2-head">
+    <div class="rt2-headl">
+      <div class="rt2-crumb"><span data-i18n="nav.routing"></span><i>/</i><span data-i18n="routing.title"></span></div>
+      <h1 data-i18n="routing.title"></h1>
+      <div class="rt2-sub" data-i18n="routing.sub"></div>
+    </div>
+    <div class="rt2-headr">
+      <div class="rt2-status">
+        <span class="rt2-pill rt2-jev" id="jevPill"><span class="rt2-ldot"></span><span data-i18n="routing.jevService"></span><code id="jevModel">—</code></span>
+        <span class="rt2-pill rt2-off" id="statePill"></span>
+        <span class="rt2-pill rt2-rev" id="revPill"><span data-i18n="routing.snapshot"></span><code id="revCode">—</code></span>
+        <span class="rt2-pill rt2-saved" id="savePill"></span>
+      </div>
+      <div class="rt2-acts">
+        <button class="btn sm" id="headerTry"><svg class="rt2-ic" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="routing.try"></span></button>
+        <button class="btn sm pri" id="saveTree"><svg class="rt2-ic" aria-hidden="true"><use href="#i-save"/></svg><span data-i18n="routing.save"></span></button>
+        <button class="btn sm rt2-enable" id="enableTree"><span class="rt2-swt"></span><span id="enableLabel"></span></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── validation issues (server 422 / local checks) ── -->
+  <div id="issues" class="rt2-issues" role="alert" hidden></div>
+
+  <div class="rt2-grid">
+    <!-- ══ left column ══ -->
+    <div class="rt2-col">
+      <div class="rt2-banner" id="branchBanner" hidden>
+        <svg class="rt2-ic" aria-hidden="true"><use href="#i-alert"/></svg>
+        <b data-i18n="routing.branchTree"></b>
+        <button class="btn sm" id="branchNew" data-i18n="routing.branchTreeNew"></button>
+      </div>
+
+      <!-- ① prompt -->
+      <section class="rt2-card" id="promptCard">
+        <div class="rt2-card-h">
+          <h2 data-i18n="routing.instructions"></h2>
+          <span class="rt2-api">questions.route.instructions</span>
+          <span class="rt2-hint" data-i18n="routing.onlyWritesHow"></span>
+        </div>
+        <div class="rt2-prompt-body">
+          <p class="rt2-note" data-i18n="routing.instructionsHint"></p>
+          <textarea class="rt2-ta" id="instructions" spellcheck="false"></textarea>
+          <div class="rt2-prompt-foot">
+            <span class="rt2-count" id="charCount"></span>
+            <button class="btn ghost sm rt2-reset" id="restoreDefault">
+              <svg class="rt2-ic" aria-hidden="true"><use href="#i-reset"/></svg><span data-i18n="routing.restoreDefault"></span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ② candidate models -->
+      <section class="rt2-card" id="candidateCard">
+        <div class="rt2-card-h">
+          <h2><span data-i18n="routing.candidates"></span><span class="rt2-nbadge" id="candidateCount">0</span></h2>
+          <span class="rt2-hint" data-i18n="routing.orderHint"></span>
+          <button class="btn sm" id="addModelBtn" data-i18n="routing.addModel"></button>
+        </div>
+        <div class="rt2-models-body" id="candidateList"></div>
+      </section>
+
+      <!-- ③ fallback -->
+      <section class="rt2-fb" id="fallbackCard">
+        <span class="rt2-fb-ico"><svg class="rt2-ic" aria-hidden="true"><use href="#i-shield"/></svg></span>
+        <div class="rt2-fb-main">
+          <div class="rt2-fb-t"><span data-i18n="routing.fallback"></span><span class="rt2-tag" data-i18n="routing.noScore"></span></div>
+          <p class="rt2-fb-note" data-i18n="routing.fallbackHint"></p>
+        </div>
+        <select class="rt2-select" id="fallbackSelect"></select>
+      </section>
+
+      <!-- ④ advanced (collapsed by default) -->
+      <section class="rt2-adv" id="advanced">
+        <button class="rt2-adv-head" id="advancedToggle" aria-expanded="false" aria-controls="advancedBody">
+          <span class="rt2-adv-chev"><svg class="rt2-ic" aria-hidden="true"><use href="#i-chev"/></svg></span>
+          <b data-i18n="routing.advanced"></b>
+          <span class="rt2-adv-sum" data-i18n="routing.advancedHint"></span>
+        </button>
+        <div class="rt2-adv-body" id="advancedBody" hidden>
+          <div class="rt2-adv-row">
+            <label class="rt2-adv-field rt2-grow"><span data-i18n="routing.tree"></span><select id="treeSelect"></select></label>
+            <button class="btn sm" id="newTree" data-i18n="routing.newTree"></button>
+            <button class="btn sm" id="copyTree" data-i18n="routing.copyTree"></button>
+          </div>
+          <div class="rt2-adv-row">
+            <label class="rt2-adv-field rt2-grow"><span data-i18n="routing.treeName"></span><input id="treeName" autocomplete="off"></label>
+            <label class="rt2-adv-field rt2-grow"><span data-i18n="routing.timezone"></span><input id="timezone" autocomplete="off"></label>
+          </div>
+          <div class="rt2-adv-row">
+            <label class="rt2-check"><input type="checkbox" id="stickyEnabled"><span data-i18n="routing.sticky"></span></label>
+            <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.ttl"></span><input type="number" id="stickyTtl" min="1" max="31536000" step="60"></label>
+          </div>
+          <div class="rt2-adv-row">
+            <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minProb"></span><input type="number" id="minProb" min="0" max="1" step="0.01"></label>
+            <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minMargin"></span><input type="number" id="minMargin" min="0" max="1" step="0.01"></label>
+            <span class="rt2-adv-note" data-i18n="routing.thresholdHint"></span>
+          </div>
+          <div class="rt2-adv-acts">
+            <button class="btn sm" id="importTree" data-i18n="routing.import"></button>
+            <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
+            <input type="file" id="importFile" accept="application/json,.json" hidden>
+          </div>
+        </div>
+      </section>
+
+      <p class="rt2-pagefoot"><code>POST /v1/systemone</code> · <code>state</code> · <code>instructions</code> · <code>criteria</code></p>
+    </div>
+
+    <!-- ══ right dock ══ -->
+    <aside class="rt2-dock" id="dock">
+      <div class="rt2-tabs" role="tablist">
+        <button class="rt2-tab on" id="tabsPreview" role="tab" data-tab="preview" aria-selected="true" aria-controls="panePreview"><span data-i18n="routing.preview"></span></button>
+        <button class="rt2-tab" id="tabsTry" role="tab" data-tab="try" aria-selected="false" aria-controls="paneTry"><span data-i18n="routing.try"></span><span class="rt2-tabdot" id="tryDot" hidden></span></button>
+        <span class="rt2-dock-ro">dry_run</span>
+      </div>
+
+      <!-- request preview -->
+      <div class="rt2-pane" id="panePreview" data-pane="preview" role="tabpanel">
+        <div class="rt2-req">
+          <span class="rt2-verb">POST</span>
+          <code class="rt2-path">/v1/systemone</code>
+          <span class="rt2-mtag" id="previewModel">—</span>
+          <button class="rt2-copy" id="copyJson"><svg class="rt2-ic" aria-hidden="true"><use href="#i-copy"/></svg><span data-i18n="routing.copyJson"></span></button>
+        </div>
+
+        <section class="rt2-sec" style="border-top:0;padding-top:0">
+          <div class="rt2-slab">
+            <span class="rt2-slab-n">01</span><b data-i18n="routing.previewState"></b>
+            <span class="rt2-slab-note" data-i18n="routing.previewStateHint"></span>
+          </div>
+          <pre class="rt2-code" id="stateCode"></pre>
+        </section>
+
+        <section class="rt2-sec">
+          <div class="rt2-slab">
+            <span class="rt2-slab-n">02</span><b data-i18n="routing.previewInstructions"></b>
+            <span class="rt2-slab-note rt2-live" data-i18n="routing.previewInstructionsHint"></span>
+          </div>
+          <div class="rt2-instr" id="instrOut"></div>
+        </section>
+
+        <section class="rt2-sec">
+          <div class="rt2-slab">
+            <span class="rt2-slab-n">03</span><b data-i18n="routing.previewCriteria"></b>
+            <span class="rt2-slab-note" id="critNote"></span>
+          </div>
+          <div class="rt2-crits" id="crits"></div>
+        </section>
+
+        <div class="rt2-fixed">
+          <span data-i18n="routing.previewFixed"></span>
+          <code id="fixedModel">model=—</code>
+          <code>route.type=choice</code>
+        </div>
+
+        <p class="rt2-foot" data-i18n="routing.previewHint"></p>
+      </div>
+
+      <!-- try -->
+      <div class="rt2-pane" id="paneTry" data-pane="try" role="tabpanel" hidden>
+        <div class="rt2-trylbl"><b data-i18n="routing.try"></b><span>dry_run</span></div>
+        <div class="rt2-input">
+          <textarea id="tryText" spellcheck="false"></textarea>
+          <div class="rt2-inputfoot"><span id="tryCount"></span><span data-i18n="routing.tryNoLog"></span></div>
+        </div>
+        <div class="rt2-chips" id="tryChips">
+          <span class="rt2-chiplbl" data-i18n="routing.trySampleLabel"></span>
+          <button class="rt2-chip" data-sample="1"></button>
+          <button class="rt2-chip" data-sample="2"></button>
+          <button class="rt2-chip" data-sample="3"></button>
+        </div>
+        <button class="btn pri rt2-run" id="tryRun"><svg class="rt2-ic" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="routing.tryRun"></span></button>
+        <div id="tryOut"></div>
+      </div>
+    </aside>
+  </div>
 </main>
-<script src="i18n.js"></script><script src="nav.js"></script><script src="api.js"></script><script src="shared.js"></script><script src="trace.js"></script><script src="routing.js"></script>
+
+<!-- add-model popover (fixed, so card overflow cannot clip it) -->
+<div class="rt2-pop" id="addModelPop" hidden></div>
+
+<script src="i18n.js"></script><script src="nav.js"></script><script src="api.js"></script><script src="shared.js"></script><script src="routing.js"></script>
 </body></html>
