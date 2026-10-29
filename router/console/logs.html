@@ -22,8 +22,9 @@
   <div class="logs-toolbar">
     <select id="filter">
       <option value="all">全部 / all</option>
-      <option value="route">路由 / routed</option>
-      <option value="block">拦截 / blocked</option>
+      <option value="jev">JEV 决策 / JEV</option>
+      <option value="sticky">会话粘性 / sticky</option>
+      <option value="fallback">兜底 / fallback</option>
     </select>
     <span class="pill" id="countPill"></span>
     <span class="spacer" style="flex:1"></span>
@@ -35,7 +36,7 @@
 <script src="nav.js"></script>
 <script src="api.js"></script>
 <script src="shared.js"></script>
-<script src="routing-trace-view.js"></script>
+<script src="trace.js"></script>
 <script src="logs.js"></script>
 </body>
 </html>

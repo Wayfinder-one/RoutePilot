@@ -1,14 +1,6 @@
-/* Models & settings page (2026-10-21 rewrite).
-
-   Sections: model registry (id / upstream / provider / reasoning / capability
-   description / actions), provider catalog cards, runtime settings and the
-   read-only current signal engine card.
-
-   The natural-language capability description is part of the model profile
-   (profile.capability) and is shown in the registry. It is the text source for
-   direct `model` candidates of the unified routing tree (pipeline.html); the
-   retired capability-policy page and its global instructions/fallback are gone
-   (2026-10-26, unified-tree refactor).
+/* Models & settings page: model registry, providers, runtime settings and
+   the remote JEV service summary. Model profile.capability is the text source
+   for single-model JEV targets in routing.html.
 
    Modal #modelModal has two add paths:
      - preset: pick a catalog provider, optional API key, tick preset models,
@@ -49,7 +41,7 @@ function uniqueSlot(base, taken) {
 
 /* ── state ───────────────────────────────────────────────────────────── */
 const STATE = {
-  models: [], providers: [], settings: {}, tagger: {},
+  models: [], providers: [], settings: {}, jev: {},
   catalog: null,            // GET /admin/model-catalog, null when unavailable
   formats: [],              // [{id, zh, en}]
 };
@@ -202,25 +194,15 @@ function armDelete(btn) {
   return false;
 }
 
-/* ── current signal engine (read-only) ───────────────────────────────── */
-function renderEngine(tag) {
-  tag = tag || {};
+function renderEngine(config) {
+  config = config || {};
   const pill = $('#enginePill');
-  if (pill) {
-    pill.innerHTML = `<span class="dot" style="color:var(--indigo)"></span>` +
-      (LANG === 'zh' ? '引擎 <b>' + esc(tag.name || '?') + '</b>'
-        : 'engine <b>' + esc(tag.name || '?') + '</b>');
-  }
+  if (pill) pill.innerHTML = `<span class="dot" style="color:var(--indigo)"></span>JEV <b>${esc(config.model || '—')}</b>`;
   const card = $('#engineCard');
   if (!card) return;
-  const temp = tag.temperature != null ? Number(tag.temperature).toFixed(2) : '—';
-  card.innerHTML = `<div class="col-h">${t('models.engine')}
-      <span class="pill indigo">${esc(tag.name || '?')}</span></div>
-    <div class="bar-row"><span class="bl">${t('sig.temperature')}</span><b class="mono">${temp}</b></div>
-    <div class="bar-row"><span class="bl">${t('sig.maxlen')}</span><b class="mono">${tag.max_length ?? '—'}</b></div>
-    <div class="bar-row"><span class="bl">${t('sig.model')}</span>
-      <span class="mono" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:330px" title="${esc(tag.model_dir || '')}">${esc(tag.model_dir || '—')}</span></div>
-    <div class="footnote">${t('models.engine.hint')} <a href="signals.html">${t('nav.signals')} →</a></div>`;
+  card.innerHTML = `<div class="col-h">JEV<span class="pill indigo">${esc(config.model || '—')}</span></div>
+    <div class="bar-row"><span class="bl">${esc(config.base_url || '—')}</span></div>
+    <div class="footnote"><a href="jev.html">${t('nav.jev')} →</a></div>`;
 }
 
 /* ── model registry ──────────────────────────────────────────────────── */
@@ -992,13 +974,13 @@ async function fetchAvailableModels() {
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function boot() {
   let m = { models: [] }, prov = { providers: [] }, set = { settings: {} };
-  let tagBody = { tagger: {} }, catalog = null;
+  let jevBody = { config: null }, catalog = null;
   try {
-    [m, prov, set, tagBody, catalog] = await Promise.all([
+    [m, prov, set, jevBody, catalog] = await Promise.all([
       api.get('/admin/models'),
       api.get('/admin/providers'),
       api.get('/admin/settings'),
-      api.get('/admin/tagger').catch(() => ({ tagger: {} })),
+      api.get('/admin/jev').catch(() => ({ config: null })),
       api.get('/admin/model-catalog').catch(() => null),
     ]);
   } catch (e) {
@@ -1007,10 +989,10 @@ async function boot() {
   STATE.models = m.models || [];
   STATE.providers = prov.providers || [];
   STATE.settings = set.settings || {};
-  STATE.tagger = tagBody.tagger || {};
+  STATE.jev = jevBody.config || {};
   STATE.catalog = catalog && Array.isArray(catalog.providers) ? catalog : null;
   STATE.formats = catalog && Array.isArray(catalog.formats) ? catalog.formats : [];
-  renderEngine(STATE.tagger);
+  renderEngine(STATE.jev);
   renderModels();
   renderProviders();
   renderSettings(STATE.settings);
@@ -1192,7 +1174,7 @@ window.onLangChange = () => {
   // keep the draft, not the DOM).
   if (modal && modal.tab === 'custom') captureCustom();
   if (provModal) captureProvModal();
-  renderEngine(STATE.tagger);
+  renderEngine(STATE.jev);
   renderModels();
   renderProviders();
   renderSettings(STATE.settings);

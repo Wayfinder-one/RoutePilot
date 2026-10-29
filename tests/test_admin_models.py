@@ -18,7 +18,7 @@ from router.api.app import create_app
 from router.api.upstream import load_backends
 from router.config import Settings
 from router.reasoning import FORMAT_IDS, LEVELS
-from router.store.db import MIGRATIONS, connect, migrate
+from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 
 OPENAI_REASONING = {"reasoning": {
@@ -242,17 +242,24 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
     """Reference check now walks the SAVED routing trees (Task 11): both a
     route target and a direct natural-language model option block the delete,
     and every finding names its tree/node/edge (``via``)."""
-    route_root = {"id": "root", "type": "route", "model": "qwen3-8b"}
+    route_root = {"id": "root", "type": "target", "strategy": "least_inflight",
+                  "models": [{"model": "qwen3-8b", "reasoning": None}]}
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref", "root": route_root})
     assert created.status_code == 201, created.text
     nl_root = {
-        "id": "nl-root", "type": "nl_choice", "instructions": "choose",
+        "id": "nl-root", "type": "jev", "instructions": "choose",
         "options": [
-            {"key": "fast", "model": "qwen3-8b"},
-            {"key": "deep", "model": "qwen3-32b"},
+            {"key": "fast", "label": "轻量", "target": {
+                "id": "fast-target", "type": "target", "strategy": "least_inflight",
+                "models": [{"model": "qwen3-8b", "reasoning": None}]}},
+            {"key": "deep", "label": "增强", "target": {
+                "id": "deep-target", "type": "target", "strategy": "least_inflight",
+                "capability": "复杂任务",
+                "models": [{"model": "qwen3-32b", "reasoning": None}]}},
         ],
-        "otherwise": {"id": "fallback", "type": "route", "model": "qwen3-32b"},
+        "fallback": {"id": "fallback", "type": "target", "strategy": "least_inflight",
+                     "models": [{"model": "qwen3-32b", "reasoning": None}]},
     }
     created = client.post("/admin/trees", json={
         "id": "nl-ref", "name": "NL Ref", "root": nl_root})
@@ -472,8 +479,8 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 # fix-wave 1 / I-1: model writes are judged against the PROSPECTIVE catalog
 # --------------------------------------------------------------------------- #
 def _reasoning_tree_root(level="high"):
-    return {"id": "root", "type": "route", "model": "qwen3-8b",
-            "reasoning": level}
+    return {"id": "root", "type": "target", "strategy": "least_inflight",
+            "models": [{"model": "qwen3-8b", "reasoning": level}]}
 
 
 def _declare_high(client):
@@ -568,7 +575,7 @@ def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
 # --------------------------------------------------------------------------- #
 def _instrument_delete_lock(app, client, monkeypatch):
     """Record whether ``model_references`` is called while the lock is held."""
-    from router.api import routes_admin
+    from router.api import routes_models
 
     publisher = app.state.publisher
     real_locked = publisher.locked
@@ -588,14 +595,14 @@ def _instrument_delete_lock(app, client, monkeypatch):
 
     monkeypatch.setattr(publisher, "locked", recording_locked)
 
-    real_references = routes_admin.model_references
+    real_references = routes_models.model_references
 
     def recording_references(trees, model_id):
         trace.append("check")
         assert state["inside"], "reference check must run inside the publish lock"
         return real_references(trees, model_id)
 
-    monkeypatch.setattr(routes_admin, "model_references", recording_references)
+    monkeypatch.setattr(routes_models, "model_references", recording_references)
     return trace
 
 
@@ -603,7 +610,8 @@ def test_delete_model_checks_references_inside_the_publish_lock(
         app, client, monkeypatch):
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref",
-        "root": {"id": "root", "type": "route", "model": "qwen3-8b"}})
+        "root": {"id": "root", "type": "target", "strategy": "least_inflight",
+                 "models": [{"model": "qwen3-8b", "reasoning": None}]}})
     assert created.status_code == 201, created.text
     trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
 

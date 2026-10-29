@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Router · 分流树</title>
+<link rel="icon" href="data:"><link rel="stylesheet" href="shared.css"><link rel="stylesheet" href="routing.css">
+</head>
+<body data-page="routing">
+<div class="pagehead">
+  <div><div class="crumb" data-i18n="nav.routing"></div><h1><span data-i18n="nav.routing"></span><span class="sub" data-i18n="routing.sub"></span></h1></div>
+  <div class="headmeta"><span class="pill" id="serverClockPill"></span><span class="pill" id="snapshotPill"></span>
+    <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
+    <button class="btn sm" id="importTree" data-i18n="routing.import"></button><input type="file" id="importFile" accept="application/json,.json" hidden>
+    <button class="btn pri sm" id="saveTree" data-i18n="common.save"></button></div>
+</div>
+<main class="routing-layout">
+  <aside>
+    <section class="card"><div class="col-h"><span data-i18n="routing.trees"></span><button class="btn ghost sm push-right" id="newTree" data-i18n="routing.new"></button></div><div id="treeList" class="tree-list"></div></section>
+    <section class="card"><div class="col-h"><span data-i18n="routing.periods"></span><button class="btn ghost sm push-right" id="addPeriod" data-i18n="common.add"></button></div><div id="periods"></div><button class="btn sm" id="savePeriods" data-i18n="routing.savePeriods"></button></section>
+  </aside>
+  <section class="card editor-card">
+    <div class="field-row"><label class="field"><span data-i18n="routing.treeName"></span><input id="treeName"></label><label class="field"><span data-i18n="routing.timezone"></span><input id="timezone"></label></div>
+    <div class="sticky-row"><label><input type="checkbox" id="stickyEnabled"> <span data-i18n="routing.sticky"></span></label><label><span data-i18n="routing.ttl"></span><input type="number" id="stickyTtl" min="1" max="31536000"></label><span id="dirty" class="mut"></span></div>
+    <div class="editor-actions"><button class="btn sm" id="copyTree" data-i18n="routing.copy"></button><button class="btn sm" id="enableTree"></button><span class="mut" data-i18n="routing.editorHint"></span></div>
+    <div id="issues"></div><div id="nodeEditor"></div>
+  </section>
+  <aside class="card try-card"><div class="col-h" data-i18n="routing.try"></div>
+    <label class="field"><span data-i18n="routing.tryText"></span><textarea id="tryText" rows="6"></textarea></label>
+    <label class="field"><span data-i18n="routing.trySession"></span><input id="trySession" placeholder="try-session"></label>
+    <label class="field"><span data-i18n="routing.tryNow"></span><input id="tryNow" placeholder="2026-10-29T23:00:00+08:00"></label>
+    <button class="btn pri" id="tryRun" data-i18n="routing.tryRun"></button><div id="tryOut" class="try-out"></div>
+  </aside>
+</main>
+<script src="i18n.js"></script><script src="nav.js"></script><script src="api.js"></script><script src="shared.js"></script><script src="trace.js"></script><script src="routing.js"></script>
+</body></html>

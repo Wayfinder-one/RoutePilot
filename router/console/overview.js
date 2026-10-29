@@ -1,60 +1,23 @@
-/* Overview page: traffic, route distribution, model-signal confidence,
-   recent evaluations, and the signal engine card (JEV model metadata). */
-const $ = s => document.querySelector(s);
+const $ = selector => document.querySelector(selector);
 
 async function boot() {
-  const [o, tagBody] = await Promise.all([
-    api.get('/admin/overview'),
-    api.get('/admin/tagger').catch(() => ({ tagger: {} })),
+  const [overview, jevBody, treeBody] = await Promise.all([
+    api.get('/admin/overview'), api.get('/admin/jev'), api.get('/admin/trees'),
   ]);
-  const tag = tagBody.tagger || {};
-  const rate = o.total ? Math.round(100 * o.blocked / o.total) : 0;
-  const dailyAvg = o.daily.length
-    ? Math.round(o.daily.reduce((a, d) => a + d.count, 0) / o.daily.length) : 0;
-
-  const cards = [
-    ['ov.total', o.total], ['ov.blocked', o.blocked],
-    ['ov.blockrate', rate + '%'], ['ov.dailyavg', dailyAvg]];
-  $('#cards').innerHTML = cards.map(([k, v]) =>
-    `<div class="card statcard"><div class="num">${v}</div>
-     <div class="lbl">${t(k)}</div></div>`).join('');
-
-  const maxRoute = Math.max(1, ...o.routes.map(r => r.count));
-  $('#routes').innerHTML = o.routes.map(r =>
-    `<div class="bar-row"><span class="bl">${esc(r.model)}</span>
-     <div class="scorebar"><i style="width:${Math.round(100 * r.count / maxRoute)}%"></i></div>
-     <span class="confv">${r.count}</span></div>`).join('') ||
-    `<div class="empty">${t('ov.empty')}</div>`;
-
-  const temp = tag.temperature != null ? Number(tag.temperature).toFixed(2) : '—';
-  $('#engineCard').innerHTML = `<div class="col-h">${t('ov.engine')} <span class="pill indigo" style="font-weight:600">${esc(tag.name || '?')}</span></div>
-    <div style="font-size:12px;color:var(--text-3);margin-bottom:10px">${t('ov.engine.desc')}</div>
-    <div class="bar-row"><span class="bl">${t('ov.temperature')}</span><b class="mono">${temp}</b></div>
-    <div class="bar-row"><span class="bl">${t('ov.maxlen')}</span><b class="mono">${tag.max_length ?? t('ov.nodata')}</b></div>
-    <div class="bar-row"><span class="bl">${t('ov.modelpath')}</span><span class="mono" style="font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px" title="${esc(tag.model_dir || '')}">${esc((tag.model_dir || '—').split('/').slice(-2).join('/'))}</span></div>
-    <div class="hr" style="margin:10px 0"></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <a class="btn sm" href="signals.html">${t('ov.go.signals')}</a>
-      <a class="btn sm" href="logs.html">${t('ov.go.logs')}</a>
-    </div>`;
-
-  const conf = o.confidence || [];
-  const maxConf = Math.max(1, ...conf.map(c => c.count));
-  $('#conf').innerHTML = conf.map(c =>
-    `<div class="bar-row"><span class="bl">${c.lo.toFixed(1)}–${c.hi.toFixed(1)}</span>
-     <div class="scorebar"><i style="width:${Math.round(100 * c.count / maxConf)}%"></i></div>
-     <span class="confv">${c.count}</span></div>`).join('') ||
-    `<div class="empty">${t('ov.empty')}</div>`;
-  $('#confSince').textContent = o.confidence_since
-    ? ' · ' + tf('ov.since', { ts: fmtTime(o.confidence_since) }) : '';
-
-  $('#evals').innerHTML = (o.evals || []).map(e =>
-    `<div class="bar-row"><span class="bl">${esc(tf('ov.evalrow', {
-      mode: e.mode, matched: e.matched, total: e.total,
-      rate: Math.round(100 * e.rate) + '%'}))}</span>
-     <span class="confv">${esc(e.ts)}</span></div>`).join('') ||
-    `<div class="empty">${t('ov.noeval')}</div>`;
+  const dailyAvg = overview.daily.length ? Math.round(overview.daily.reduce((sum, day) => sum + day.count, 0) / overview.daily.length) : 0;
+  const cards = [['ov.total', overview.total], ['ov.sticky', overview.sticky], ['ov.dailyavg', dailyAvg], ['ov.treeCount', treeBody.trees.length]];
+  $('#cards').innerHTML = cards.map(([key, value]) => `<div class="card statcard"><div class="num">${value}</div><div class="lbl">${t(key)}</div></div>`).join('');
+  const maxRoute = Math.max(1, ...overview.routes.map(row => row.count));
+  $('#routes').innerHTML = overview.routes.map(row => `<div class="bar-row"><span class="bl">${esc(row.model)}</span><div class="scorebar"><i style="width:${Math.round(100 * row.count / maxRoute)}%"></i></div><span class="confv">${row.count}</span></div>`).join('') || `<div class="empty">${t('ov.empty')}</div>`;
+  const config = jevBody.config || {};
+  $('#engineCard').innerHTML = `<div class="col-h">JEV<span class="pill indigo">${esc(config.model || '—')}</span></div><div class="bar-row"><span class="bl">${esc(config.base_url || '—')}</span></div><div class="hr"></div><a class="btn sm" href="jev.html">${t('ov.go.jev')}</a> <a class="btn sm" href="logs.html">${t('ov.go.logs')}</a>`;
+  const active = treeBody.trees.find(tree => tree.enabled);
+  $('#routingCard').innerHTML = `<div class="col-h">${t('ov.activeTree')}</div><div class="num">${esc(active ? active.name || active.id : '—')}</div><div class="footnote mono">${esc((treeBody.snapshot_revision || '').slice(0, 16))}</div><a class="btn sm" href="routing.html">${t('ov.go.routing')}</a>`;
+  const confidence = overview.confidence || [];
+  const maxConf = Math.max(1, ...confidence.map(row => row.count));
+  $('#conf').innerHTML = confidence.map(row => `<div class="bar-row"><span class="bl">${row.lo.toFixed(1)}–${row.hi.toFixed(1)}</span><div class="scorebar"><i style="width:${Math.round(100 * row.count / maxConf)}%"></i></div><span class="confv">${row.count}</span></div>`).join('');
+  $('#confSince').textContent = overview.confidence_since ? ' · ' + fmtTime(overview.confidence_since) : '';
 }
 
-window.onLangChange = () => boot();
-boot();
+window.onLangChange = () => boot().catch(() => {});
+boot().catch(error => { $('#cards').innerHTML = `<div class="empty">${esc(apiErrText(error))}</div>`; });

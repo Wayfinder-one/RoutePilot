@@ -126,8 +126,3 @@ function toast(msg, ms) {
   d.className = 'toast'; d.textContent = msg;
   document.body.appendChild(d); setTimeout(() => d.remove(), ms || 2200);
 }
-/* Group key -> CSS color variable (matches signals.css tokens). */
-const GROUP_COLOR = { safety: 'var(--g-safety)', domain: 'var(--g-domain)',
-  difficulty: 'var(--g-cx)', context: 'var(--g-ctx)', session: 'var(--g-sess)',
-  decision: 'var(--g-dec)', rule: 'var(--g-rule)' };
-function sigColor(group) { return GROUP_COLOR[group] || 'var(--g-rule)'; }

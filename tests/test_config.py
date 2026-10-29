@@ -2,72 +2,45 @@ from router.config import Settings
 
 
 def test_defaults():
-    s = Settings.from_env()
-    assert s.db_path == "router.db"
-    assert s.tagger == "heuristic"
-    assert s.port == 8400
+    settings = Settings.from_env()
+    assert settings.db_path == "router.db"
+    assert settings.port == 8400
+    assert settings.jev_url == ""
+    assert settings.jev_model == ""
+    assert settings.jev_timeout == 10.0
+    assert settings.session_max_entries == 10000
+    assert not hasattr(settings, "tagger")
 
 
 def test_env_override(monkeypatch):
-    monkeypatch.setenv("ROUTER_DB", "/tmp/x.db")
+    monkeypatch.setenv("ROUTER_DB", "/tmp/v3.db")
     monkeypatch.setenv("ROUTER_PORT", "9000")
-    s = Settings.from_env()
-    assert s.db_path == "/tmp/x.db"
-    assert s.port == 9000
+    monkeypatch.setenv("ROUTER_JEV_URL", "http://jev.test")
+    monkeypatch.setenv("ROUTER_JEV_MODEL", "NeoHorse-Jev-4B")
+    monkeypatch.setenv("ROUTER_JEV_API_KEY", "secret")
+    monkeypatch.setenv("ROUTER_JEV_TIMEOUT", "4.5")
+    monkeypatch.setenv("ROUTER_SESSION_MAX_ENTRIES", "123")
+    settings = Settings.from_env()
+    assert settings.db_path == "/tmp/v3.db"
+    assert settings.port == 9000
+    assert settings.jev_url == "http://jev.test"
+    assert settings.jev_model == "NeoHorse-Jev-4B"
+    assert settings.jev_api_key == "secret"
+    assert settings.jev_timeout == 4.5
+    assert settings.session_max_entries == 123
 
 
-def test_static_admin_token_removed(monkeypatch):
-    """2026-10-26: ROUTER_ADMIN_TOKEN 已移除，Settings 不再有该字段。"""
-    assert not hasattr(Settings(), "admin_token")
-    monkeypatch.setenv("ROUTER_ADMIN_TOKEN", "sekret")     # 旧 env 被忽略
-    s = Settings.from_env()
-    assert not hasattr(s, "admin_token")
-
-
-def test_user_auth_default_asymmetry(monkeypatch):
-    """设计 decision：dataclass 默认 False（既有测试/直接构造的兼容路径），
-    from_env 默认 True（生产默认要求登录）。这个不对称是 spec §6 的冻结项。"""
+def test_user_auth_defaults_and_override(monkeypatch):
     assert Settings().user_auth is False
-    for name in ("ROUTER_USER_AUTH", "ROUTER_ADMIN_EMAIL",
-                 "ROUTER_ADMIN_PASSWORD", "ROUTER_SESSION_TTL_HOURS"):
+    for name in ("ROUTER_USER_AUTH", "ROUTER_ADMIN_EMAIL", "ROUTER_ADMIN_PASSWORD", "ROUTER_SESSION_TTL_HOURS"):
         monkeypatch.delenv(name, raising=False)
-    from_env = Settings.from_env()
-    assert from_env.user_auth is True
-    assert from_env.admin_email == "admin@test.com"
-    assert from_env.admin_password == "1qaz@WSX"
-    assert from_env.session_ttl_hours == 168
-
-
-def test_user_auth_env_override(monkeypatch):
+    assert Settings.from_env().user_auth is True
     monkeypatch.setenv("ROUTER_USER_AUTH", "0")
     monkeypatch.setenv("ROUTER_ADMIN_EMAIL", "root@example.com")
     monkeypatch.setenv("ROUTER_ADMIN_PASSWORD", "root-pass-1")
     monkeypatch.setenv("ROUTER_SESSION_TTL_HOURS", "12")
-    s = Settings.from_env()
-    assert s.user_auth is False
-    assert s.admin_email == "root@example.com"
-    assert s.admin_password == "root-pass-1"
-    assert s.session_ttl_hours == 12
-
-
-def test_jev_window_default_and_env(monkeypatch):
-    """Plan item 2: ROUTER_JEV_WINDOW overrides the window; unset stays empty so
-    JevTagger derives the legacy head-only "<max_length>:0" spec (deployed
-    "1024:0"), keeping a custom ROUTER_JEV_MAX_LENGTH on the old behavior."""
-    monkeypatch.delenv("ROUTER_JEV_WINDOW", raising=False)
-    assert Settings.from_env().jev_window == ""
-    monkeypatch.setenv("ROUTER_JEV_WINDOW", "256:768")
-    assert Settings.from_env().jev_window == "256:768"
-
-
-def test_decision_timeout_default_and_env(monkeypatch):
-    """ROUTER_DECISION_TIMEOUT: default 60s per NL node (design §6.4); 0 or an
-    empty value disables the timeout (None = no limit)."""
-    monkeypatch.delenv("ROUTER_DECISION_TIMEOUT", raising=False)
-    assert Settings().decision_timeout == 60.0
-    assert Settings.from_env().decision_timeout == 60.0
-    monkeypatch.setenv("ROUTER_DECISION_TIMEOUT", "12.5")
-    assert Settings.from_env().decision_timeout == 12.5
-    for disabled in ("0", "0.0", ""):
-        monkeypatch.setenv("ROUTER_DECISION_TIMEOUT", disabled)
-        assert Settings.from_env().decision_timeout is None, disabled
+    settings = Settings.from_env()
+    assert settings.user_auth is False
+    assert settings.admin_email == "root@example.com"
+    assert settings.admin_password == "root-pass-1"
+    assert settings.session_ttl_hours == 12

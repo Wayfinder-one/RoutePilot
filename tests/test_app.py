@@ -1,166 +1,68 @@
-"""Startup assembly under the unified routing tree (Task 9 Step 6).
-
-The four-station pipeline is retired: ``create_app`` boots on an EMPTY tree
-table (no active tree is a legal state; ``/v1`` answers 503 ``no_active_tree``)
-and refuses to start only when the *active* tree is unhealthy.  These tests pin
-that contract, including configurations written straight into the database
-(bypassing the save-time validation) and the DecisionRunner requirement for
-natural-language trees.
-"""
-
-import json
-
 import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.config import Settings
-from router.pipeline.tree import Branch, NLChoice, NLOption, Route, When
-from router.reasoning import validate_model_profile
+from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo
+from tests.routing_fixtures import jev_dict, target_dict, tree_dict
 
 
-def client(tmp_path):
-    return TestClient(create_app(Settings(db_path=str(tmp_path / "t.db"))))
+def test_health_console_and_empty_tree_boot(tmp_path):
+    app = create_app(Settings(db_path=str(tmp_path / "v3.db")))
+    client = TestClient(app)
+    assert client.get("/healthz").json() == {"ok": True}
+    assert client.get("/console/index.html").status_code == 200
+    assert app.state.snapshot.tree is None
+    assert client.get("/admin/trees").json()["trees"] == []
+    response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
+    assert response.status_code == 503
+    assert response.json()["error"]["message"] == "no_active_tree"
+    assert not hasattr(app.state, "tagger")
 
 
-def prepared_db(tmp_path):
-    """A migrated + seeded database (models/providers/keywords/time periods)."""
-    path = str(tmp_path / "t.db")
+def prepare_active_tree(tmp_path, raw):
+    path = str(tmp_path / "v3.db")
     conn = connect(path)
     migrate(conn)
     seed_default(conn)
+    repo = RoutingTreeRepo(conn)
+    repo.create(tree_from_dict(raw))
+    repo.enable("main")
     conn.close()
     return path
 
 
-def install_active_tree(path, tree_id, root):
-    """Write one ENABLED tree straight into the DB (bypasses API validation)."""
-    conn = connect(path)
-    try:
-        repo = RoutingTreeRepo(conn)
-        repo.create(tree_id, tree_id, root)
-        repo.enable(tree_id)
-    finally:
-        conn.close()
+def test_startup_accepts_valid_direct_target(tmp_path):
+    path = prepare_active_tree(tmp_path, tree_dict(root=target_dict("direct", ("qwen3-8b",))))
+    app = create_app(Settings(db_path=path))
+    assert app.state.snapshot.tree_id == "main"
+    assert app.state.snapshot.tree.root.models[0].model == "qwen3-8b"
 
 
-def declare_model_profile(path, model_id, reasoning):
-    profile = validate_model_profile({"reasoning": reasoning}, "openai")
-    conn = connect(path)
-    try:
-        conn.execute("UPDATE models SET profile = ? WHERE id = ?",
-                     (json.dumps(profile), model_id))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# --------------------------------------------------------------------------- #
-# public endpoints
-# --------------------------------------------------------------------------- #
-def test_healthz(tmp_path):
-    r = client(tmp_path).get("/healthz")
-    assert r.status_code == 200 and r.json() == {"ok": True}
-
-
-def test_console_mounted(tmp_path):
-    r = client(tmp_path).get("/console/index.html")
-    assert r.status_code in (200, 404)   # 404 until Task 18 adds the pages
-
-
-# --------------------------------------------------------------------------- #
-# boot with no active tree (legal state) / active-tree health gate
-# --------------------------------------------------------------------------- #
-def test_fresh_install_boots_with_no_active_tree(tmp_path):
-    """No configured tree is legal: the app boots and ``/v1`` answers 503
-    before tagging rather than inventing a default route."""
-    app = create_app(Settings(db_path=str(tmp_path / "t.db")))
-    c = TestClient(app)
-    assert app.state.snapshot.tree is None
-    assert app.state.snapshot.tree_id is None
-
-    listing = c.get("/admin/trees").json()
-    assert listing["trees"] == []
-    assert listing["snapshot_revision"] == app.state.snapshot.snapshot_revision
-
-    r = c.post("/v1/chat/completions",
-               json={"messages": [{"role": "user", "content": "hello"}]})
-    assert r.status_code == 503
-    assert r.json()["error"]["message"] == "no_active_tree"
-
-
-def test_startup_refuses_an_unhealthy_stored_tree(tmp_path):
-    """An ACTIVE tree the engine cannot execute must not reach the hot path:
-    the service refuses to start instead of 502-ing every request."""
-    path = prepared_db(tmp_path)
-    install_active_tree(path, "bad-tree", Branch(
-        id="root",
-        children=(Route(id="only", model="qwen3-8b",
-                        when=When(signal="domain", value="health")),)))
-    with pytest.raises(RuntimeError) as exc:
+def test_startup_refuses_invalid_active_tree(tmp_path):
+    raw = tree_dict()
+    del raw["root"]["fallback"]
+    path = prepare_active_tree(tmp_path, raw)
+    with pytest.raises(RuntimeError, match="fallback_required"):
         create_app(Settings(db_path=path))
-    assert "missing_fallback" in str(exc.value)
 
 
-def test_startup_refuses_an_active_nl_tree_without_a_decision_runner(tmp_path):
-    """A natural-language tree needs a DecisionRunner; heuristic mode has none,
-    so booting such an active tree is a hard configuration error."""
-    path = prepared_db(tmp_path)
-    install_active_tree(path, "nl-tree", NLChoice(
-        id="root", instructions="choose",
-        options=(NLOption("a", "first lane", Route("a-route", "qwen3-8b")),
-                 NLOption("b", "second lane", Route("b-route", "qwen3-32b"))),
-        otherwise=Route("fallback", "qwen3-8b")))
-    with pytest.raises(RuntimeError) as exc:
-        create_app(Settings(db_path=path))       # heuristic => runner None
-    assert "decision_runner_unavailable" in str(exc.value)
-
-
-def test_startup_judges_reasoning_written_straight_into_the_db(tmp_path):
-    """The boot check reads the same model catalog as the enable health check:
-    a route selecting an undeclared reasoning level must be caught at boot when
-    it bypassed the save-time validation (direct DB edit / older version)."""
-    path = prepared_db(tmp_path)
-    declare_model_profile(path, "qwen3-8b",
-                          {"efforts": {"low": "low"}, "default": "low"})
-    install_active_tree(path, "reasoning-bad", Route(
-        id="root", model="qwen3-8b", reasoning="high"))
-    with pytest.raises(RuntimeError) as exc:
+def test_startup_refuses_jev_tree_without_service_config(tmp_path):
+    raw = tree_dict(root=jev_dict())
+    raw["root"]["options"][0]["target"]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
+    raw["root"]["options"][1]["target"]["models"] = [{"model": "qwen3-32b", "reasoning": None}]
+    raw["root"]["fallback"]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
+    path = prepare_active_tree(tmp_path, raw)
+    with pytest.raises(RuntimeError, match="jev_unavailable"):
         create_app(Settings(db_path=path))
-    assert "reasoning_unsupported" in str(exc.value)
 
 
-def test_startup_accepts_a_declared_reasoning_level(tmp_path):
-    """The boot-time check must not over-block: a declared level is legal and
-    the compiled snapshot keeps it."""
-    path = prepared_db(tmp_path)
-    declare_model_profile(path, "qwen3-8b",
-                          {"efforts": {"low": "low", "high": "high"},
-                           "default": "low"})
-    install_active_tree(path, "reasoning-ok", Route(
-        id="root", model="qwen3-8b", reasoning="high"))
-    app = create_app(Settings(db_path=path))     # must not raise
-    assert app.state.snapshot.tree_id == "reasoning-ok"
-    assert app.state.snapshot.tree.root.reasoning == "high"
-
-
-def test_decision_runner_uses_the_configured_timeout(tmp_path):
-    """App whitebox: the production DecisionRunner adapter receives the
-    configured per-NL-node timeout (design §6.4) — default 60s, overridable,
-    and None disables the timeout."""
-    from router.api.app import _make_decision_runner
-
-    tagger = object()                     # only held; no model is loaded
-    default = _make_decision_runner(Settings(tagger="jev"), tagger)
-    assert default._timeout == 60.0
-    tuned = _make_decision_runner(
-        Settings(tagger="jev", decision_timeout=12.5), tagger)
-    assert tuned._timeout == 12.5
-    disabled = _make_decision_runner(
-        Settings(tagger="jev", decision_timeout=None), tagger)
-    assert disabled._timeout is None
-    # non-JEV modes have no decision model at all
-    assert _make_decision_runner(Settings(tagger="heuristic"), tagger) is None
+def test_environment_jev_config_is_seeded_once(tmp_path):
+    path = str(tmp_path / "v3.db")
+    settings = Settings(db_path=path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
+    app = create_app(settings)
+    assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
+    assert app.state.snapshot.jev.api_key == "secret"

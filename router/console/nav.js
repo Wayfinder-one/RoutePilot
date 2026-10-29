@@ -7,7 +7,7 @@
    deferred to DOMContentLoaded because nav.js loads *before* api.js. */
 (function () {
   const page = document.body.dataset.page;
-  const pages = ['overview', 'pipeline', 'logs', 'signals', 'models'];
+  const pages = ['overview', 'routing', 'logs', 'jev', 'models'];
   const bar = document.createElement('header');
   bar.className = 'top';
   bar.innerHTML =

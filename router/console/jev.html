@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Smart Router · JEV 模型</title><link rel="icon" href="data:"><link rel="stylesheet" href="shared.css"></head>
+<body data-page="jev"><div class="pagehead"><div><div class="crumb" data-i18n="nav.jev"></div><h1><span data-i18n="nav.jev"></span><span class="sub" data-i18n="jev.sub"></span></h1></div><div class="headmeta"><span class="pill indigo" id="jevStatus"></span></div></div>
+<main class="page"><div class="grid2"><section class="card"><div class="col-h" data-i18n="jev.config"></div>
+<div class="field-row"><label class="field"><span data-i18n="jev.url"></span><input id="baseUrl" placeholder="http://127.0.0.1:30000"></label><label class="field"><span data-i18n="jev.model"></span><input id="model" placeholder="NeoHorse-Jev-4B"></label></div>
+<div class="field-row"><label class="field"><span data-i18n="jev.key"></span><input id="apiKey" type="password" autocomplete="off"></label><label class="field"><span data-i18n="jev.timeout"></span><input id="timeout" type="number" min="0.1" max="120" step="0.1"></label></div>
+<label><input type="checkbox" id="clearKey"> <span data-i18n="jev.clearKey"></span></label>
+<label class="field" style="margin-top:10px"><span data-i18n="jev.instructions"></span><textarea id="instructions" rows="4"></textarea></label>
+<label class="field" style="margin-top:10px"><span data-i18n="jev.template"></span><textarea id="stateTemplate" rows="5"></textarea></label>
+<div style="margin-top:12px"><button class="btn pri" id="saveJev" data-i18n="common.save"></button></div><div id="saveMsg" class="footnote"></div>
+</section><section class="card"><div class="col-h" data-i18n="jev.test"></div><p class="mut" data-i18n="jev.testHint"></p><textarea id="testText" rows="5" style="width:100%"></textarea><button class="btn pri" id="testJev" style="margin-top:10px" data-i18n="jev.testRun"></button><div id="testOut" class="try-out"></div></section></div></main>
+<script src="i18n.js"></script><script src="nav.js"></script><script src="api.js"></script><script src="shared.js"></script><script src="jev.js"></script></body></html>
