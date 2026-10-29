@@ -1,26 +1,3 @@
-"""OpenAI-compatible entry into the unified routing tree (Task 9 Step 6).
-
-A request reads the immutable ``app.state.snapshot`` ONCE at entry and runs it
-through the SHARED ``app.state.runtime`` (the same flow ``/admin/try`` and eval
-replay use). A concurrent tree/model write publishes a new snapshot with one
-assignment; an in-flight request keeps the old one, so the ledger's tree and
-snapshot revisions always describe the configuration that produced the
-decision. Failure semantics: no active tree / signal preparation failure are
-503 before any upstream work; a healthy-shape snapshot that still misses is an
-invariant violation (503), never a silent default model.
-
-JEV P1-C: each request finishes in exactly one terminal state, recorded in
-``request_ledger.outcome_state`` by an exactly-once recorder:
-``completed / upstream_error / client_disconnected / cancelled / incomplete``.
-The streaming relay reports ``completed`` only when the upstream iterator is
-exhausted normally; GeneratorExit (client went away) and CancelledError are
-classified separately and re-raised, never swallowed.
-
-The ledger record is enqueued before the upstream call (the half row) and
-mutated in place once the response is known; the flush overwrites the row by
-id. No request text, signals or PII reach the ledger.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -34,208 +11,50 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from router.api.upstream import resolve_backend
-from router.pipeline.errors import NoActiveTreeError, SignalPreparationError
-from router.pipeline.evaluator import Hit
-from router.pipeline.runtime import RoutingRuntime, RuntimeRequest
 from router.reasoning import ReasoningError, apply_reasoning
+from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest
 
 router = APIRouter()
-
 logger = logging.getLogger(__name__)
 
-BLOCK_MESSAGE = {"zh": "请求被安全策略拦截", "en": "Blocked by safety policy"}
-
-
-#: Upper bound for a request body (10 MiB). The router reads the body into
-#: memory; a bigger one is rejected instead of being buffered.
 MAX_BODY_BYTES = 10 * 1024 * 1024
-
-#: Give up sniffing one SSE line once the unparsed remainder is this large: the
-#: usage chunk is a short JSON line; a pathological stream must not grow the
-#: buffer without bound while we merely look for optional usage data.
 MAX_SSE_LINE_BYTES = 1024 * 1024
-
-# ── terminal states (JEV P1-C §3) ───────────────────────────────────────────
 OUTCOME_COMPLETED = "completed"
 OUTCOME_UPSTREAM_ERROR = "upstream_error"
 OUTCOME_CLIENT_DISCONNECTED = "client_disconnected"
 OUTCOME_CANCELLED = "cancelled"
 OUTCOME_INCOMPLETE = "incomplete"
-OUTCOME_STATES = (OUTCOME_COMPLETED, OUTCOME_UPSTREAM_ERROR,
-                  OUTCOME_CLIENT_DISCONNECTED, OUTCOME_CANCELLED,
-                  OUTCOME_INCOMPLETE)
-
-#: Optional experiment/arm attribution supplied by the caller (window A/B,
-#: cheap-vs-strong rollouts, ...). Kept small and opaque: the ledger only
-#: groups by it.
-EXPERIMENT_ARM_HEADER = "x-sr-experiment-arm"
-MAX_EXPERIMENT_ARM = 64
+OUTCOME_STATES = (OUTCOME_COMPLETED, OUTCOME_UPSTREAM_ERROR, OUTCOME_CLIENT_DISCONNECTED, OUTCOME_CANCELLED, OUTCOME_INCOMPLETE)
 
 
 def _last_user_text(messages: list) -> str:
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content")
+    for message in reversed(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
             if isinstance(content, str):
                 return content
-            if isinstance(content, list):      # OpenAI content parts
-                return " ".join(p.get("text", "") for p in content
-                                if isinstance(p, dict))
+            if isinstance(content, list):
+                return " ".join(part.get("text", "") for part in content if isinstance(part, dict))
     return ""
 
 
-def _as_int(value) -> int | None:
-    """int-or-NULL coercion for optional contract integers (bool is not int)."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _chunk_summary(info: dict) -> str | None:
-    """Human-readable chunk-config digest for the ledger (P2-D).
-
-    Built from the tagger's frozen ``tagger_info`` keys (P2-A contract):
-    ``"8x512/noisy_or"`` = 8 planned segments of 512 tokens aggregated with
-    noisy-or; plain ``"off"`` when the tagger reports chunking disabled; NULL
-    when it reports nothing (non-JEV taggers).
-    """
-    agg = info.get("chunk_agg")
-    segments = info.get("chunk_segments")
-    size = info.get("chunk_size")
-    if str(agg) == "off" or str(segments) == "off":
-        return "off"
-    seg_int = _as_int(segments)
-    size_int = _as_int(size)
-    if seg_int is None and size_int is None and agg is None:
-        return None
-    if seg_int is not None and size_int is not None:
-        shape = f"{seg_int}x{size_int}"
-    elif seg_int is not None:
-        shape = f"{seg_int}seg"
-    elif size_int is not None:
-        shape = f"{size_int}tok"
-    else:
-        shape = ""
-    parts = [part for part in (shape, None if agg is None else str(agg))
-             if part]
-    return "/".join(parts) or None
-
-
-def _chunk_fields(result, info: dict) -> dict:
-    """Chunked-input attribution columns (migration v16).
-
-    Tolerant reads of the optional P2-A contract (``TagResult.input`` plus the
-    frozen ``tagger_info``): old taggers or chunking-off requests leave NULLs —
-    a ledger row must never fail because a tagger does not implement chunking.
-
-    ``input_chunk_segments`` records the segments that were ACTUALLY scored
-    (``chunk_scored_segments``), because the column feeds online cost
-    attribution — how much work this request really caused. The planned
-    segment count is recoverable from the mode/config side, so it is only a
-    fallback when the tagger reports no actual count (older/mid-rollout packs).
-    """
-    window = getattr(result, "input", None)
-    window = window if isinstance(window, dict) else {}
-    mode = window.get("chunk_strategy")
-    planned = _as_int(window.get("chunk_segments"))
-    scored = _as_int(window.get("chunk_scored_segments"))
-    return {
-        "jev_chunk": _chunk_summary(info),
-        "input_chunk_mode": mode if isinstance(mode, str) else None,
-        "input_chunk_segments": scored if scored is not None else planned,
-        "input_chunk_prompt_tokens": _as_int(
-            window.get("chunk_prompt_tokens")),
-    }
-
-
-def _tagger_fingerprint(result) -> dict:
-    """Ledger version/attribution columns from the per-tag fingerprint (P1-A).
-
-    ``TagResult.questions_sha256`` is captured by the tagger at tag() start and
-    ``TagResult.tagger_info`` is its frozen ``info()`` snapshot — both describe
-    the model/question pack that actually scored THIS request, so no tagger
-    state is re-read after the response (which would race a hot edit). Taggers
-    that do not provide them (heuristic/checkpoint/prompt) leave the columns
-    NULL. The v16 chunk columns (P2-A/D) ride on the same two objects.
-
-    """
-    info = getattr(result, "tagger_info", None)
-    if not isinstance(info, dict):
-        info = {}
-    question_sha = getattr(result, "questions_sha256", None)
-    if question_sha is None:                   # tolerate info-only taggers
-        question_sha = info.get("questions_sha256")
-    return {
-        # v15 provenance column + v14 compatibility column (same canonical sha)
-        "questions_revision": question_sha,
-        "questions_sha256": question_sha,
-        "jev_engine": info.get("engine"),
-        "jev_model": info.get("model_name") or info.get("model_dir"),
-        "jev_window": info.get("window"),
-        "jev_temperature": info.get("temperature"),
-        # v16 chunked-input attribution (NULL for non-chunking taggers)
-        **_chunk_fields(result, info),
-    }
-
-
-def _version_fields(snapshot, result) -> dict:
-    """Reproduction columns: the request's tree/snapshot revisions + tagger.
-
-    Nothing is read from app.state/tagger here beyond the already-materialized
-    RoutingResult (P1-B: no post-tagging re-read, no request-time DB access).
-    The retired station/pipeline/capability columns stay NULL for new rows
-    (migration v19 keeps them for historical rows only).
-    """
-    return {
-        "tree_id": snapshot.tree_id,
-        "tree_revision": snapshot.tree_revision,
-        "snapshot_revision": snapshot.snapshot_revision,
-        "backends_revision": snapshot.backends_revision,
-        **_tagger_fingerprint(result),
-    }
-
-
 def _error(message: str, status_code: int) -> JSONResponse:
-    """The compact error body shared by the routing failure semantics."""
-    return JSONResponse(status_code=status_code,
-                        content={"error": {"message": message}})
+    return JSONResponse(status_code=status_code, content={"error": {"message": message}})
 
 
 def prepare_upstream_request(body: dict, backend, reasoning_level):
-    """Pure upstream-body builder: model replacement + reasoning injection.
-
-    ``reasoning_level is None`` -> FULL passthrough: only ``model`` is replaced,
-    client reasoning fields are neither injected nor stripped. A configured
-    level the CURRENT snapshot's backend cannot honour (concurrent capability
-    edit) degrades to passthrough + an "unsupported" warning header instead of
-    failing the user's request (external contract unchanged).
-
-    Returns ``(upstream_body, reasoning_warning)`` with warning None or
-    ``"unsupported"``. Kept pure so the representation is pinned by tests.
-    """
-    base_body = {**body, "model": backend.upstream_name}
+    upstream_body = {**body, "model": backend.upstream_name}
     if reasoning_level is None:
-        return base_body, None
+        return upstream_body, None
     try:
-        return (apply_reasoning(base_body, backend.reasoning, reasoning_level),
-                None)
+        return apply_reasoning(upstream_body, backend.reasoning, reasoning_level), None
     except ReasoningError as exc:
-        logger.warning("reasoning fallback model=%s level=%s: %s",
-                       backend.upstream_name, reasoning_level, exc)
-        return base_body, "unsupported"
-
-
-def _experiment_arm(request: Request) -> str | None:
-    arm = request.headers.get(EXPERIMENT_ARM_HEADER)
-    if not arm:
-        return None
-    arm = arm.strip()[:MAX_EXPERIMENT_ARM]
-    return arm or None
+        logger.warning("reasoning fallback model=%s level=%s: %s", backend.upstream_name, reasoning_level, exc)
+        return upstream_body, "unsupported"
 
 
 def _usage_fields(usage) -> dict:
-    """Token columns from an OpenAI ``usage`` object (all NULL when absent)."""
-    fields: dict = {"prompt_tokens": None, "completion_tokens": None,
-                    "total_tokens": None}
+    fields = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
     if isinstance(usage, dict):
         for key in fields:
             value = usage.get(key)
@@ -245,50 +64,30 @@ def _usage_fields(usage) -> dict:
 
 
 async def _is_disconnected(request) -> bool:
-    """Client-disconnect probe used by the streaming relay (P1-C)."""
     if request is None:
         return False
     try:
         return bool(await request.is_disconnected())
-    except BaseException:                      # noqa: BLE001 - never break the relay
+    except BaseException:
         return False
 
 
 class _OutcomeRecorder:
-    """Exactly-once terminal update for one request_ledger record (P1-C §3).
-
-    Every exit path calls :meth:`finish`; the first call wins and the guard
-    makes a duplicate (double-finally, aborted stream, handler + relay racing)
-    a no-op instead of a second queued update. The ring dict and the flush
-    event are the same object, so the console and the ledger agree.
-    """
-
-    __slots__ = ("requestlog", "record", "started", "_done")
-
     def __init__(self, requestlog, record: dict, started: float):
         self.requestlog = requestlog
         self.record = record
         self.started = started
         self._done = False
 
-    @property
-    def done(self) -> bool:
-        return self._done
-
-    def finish(self, *, outcome_state: str,
-               error_class: str | None = None,
-               upstream_model: str | None = None,
-               upstream_status: int | None = None,
-               upstream_ms: float | None = None,
-               ttft_ms: float | None = None,
+    def finish(self, *, outcome_state: str, error_class: str | None = None,
+               upstream_model: str | None = None, upstream_status: int | None = None,
+               upstream_ms: float | None = None, ttft_ms: float | None = None,
                usage: dict | None = None) -> bool:
         if outcome_state not in OUTCOME_STATES:
             raise ValueError(f"unknown outcome_state {outcome_state!r}")
         if self._done:
             return False
         self._done = True
-        tokens = _usage_fields(usage)
-        observed = any(value is not None for value in tokens.values())
         self.record.update({
             "upstream_model": upstream_model,
             "upstream_status": upstream_status,
@@ -297,25 +96,13 @@ class _OutcomeRecorder:
             "total_ms": (time.monotonic() - self.started) * 1000.0,
             "error_class": error_class,
             "outcome_state": outcome_state,
-            "usage_observed": 1 if observed else 0,
-            **tokens,
+            **_usage_fields(usage),
         })
         self.requestlog.enqueue_result(self.record)
         return True
 
 
 class _SseUsage:
-    """Passive SSE scanner that remembers the last ``usage`` object it sees.
-
-    The router never injects ``stream_options.include_usage`` (§3.1: the
-    upstream request semantics are unchanged): when the *client* asks for usage
-    the upstream's final ``data: {...}`` chunk carries it and the ledger records
-    the tokens; otherwise the token columns stay NULL. Bytes are relayed
-    verbatim — this class only reads them.
-    """
-
-    __slots__ = ("_buf", "usage")
-
     def __init__(self):
         self._buf = b""
         self.usage: dict | None = None
@@ -323,16 +110,15 @@ class _SseUsage:
     def feed(self, chunk: bytes) -> None:
         self._buf += chunk
         while True:
-            nl = self._buf.find(b"\n")
-            if nl < 0:
+            newline = self._buf.find(b"\n")
+            if newline < 0:
                 break
-            line, self._buf = self._buf[:nl], self._buf[nl + 1:]
+            line, self._buf = self._buf[:newline], self._buf[newline + 1:]
             self._scan(line)
         if len(self._buf) > MAX_SSE_LINE_BYTES:
-            self._buf = b""                    # never need a >1MiB "line"
+            self._buf = b""
 
     def finish(self) -> None:
-        """Scan a trailing line that arrived without its newline (defensive)."""
         if self._buf:
             line, self._buf = self._buf, b""
             self._scan(line)
@@ -345,339 +131,235 @@ class _SseUsage:
         if not payload or payload == b"[DONE]":
             return
         try:
-            obj = json.loads(payload)
+            value = json.loads(payload)
         except (ValueError, TypeError):
             return
-        if isinstance(obj, dict) and isinstance(obj.get("usage"), dict):
-            self.usage = obj["usage"]
+        if isinstance(value, dict) and isinstance(value.get("usage"), dict):
+            self.usage = value["usage"]
+
+
+def _decision_record(request: Request, decision, snapshot, body, text: str,
+                     reasoning_warning, routing_ms: float, started: float) -> dict:
+    answer = decision.jev_answer
+    jev_event = next((event for event in decision.trace if event.get("event") == "jev_choice"), None)
+    return {
+        "id": uuid.uuid4().hex,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "text": text,
+        "decision": "route",
+        "model": decision.model,
+        "target_id": decision.target_id,
+        "tree_id": snapshot.tree_id,
+        "tree_revision": snapshot.tree_revision,
+        "snapshot_revision": snapshot.snapshot_revision,
+        "policy_path": decision.policy_path,
+        "selection_reason": decision.selection_reason,
+        "fallback_reason": decision.fallback_reason,
+        "sticky_hit": 1 if decision.sticky_hit else 0,
+        "session_hash": decision.session_hash,
+        "jev_model": snapshot.jev.model if jev_event is not None and snapshot.jev else None,
+        "jev_choice": answer.selected_key if answer else None,
+        "jev_top": answer.p_top if answer else None,
+        "jev_margin": answer.margin if answer else None,
+        "jev_ms": answer.duration_ms if answer else (jev_event or {}).get("duration_ms"),
+        "jev_probabilities": answer.probabilities if answer else None,
+        "reasoning": decision.reasoning,
+        "reasoning_warning": reasoning_warning,
+        "routing_ms": routing_ms,
+        "latency_ms": (time.monotonic() - started) * 1000.0,
+        "trace": list(decision.trace),
+        "upstream_model": None,
+        "upstream_status": None,
+        "upstream_ms": None,
+        "ttft_ms": None,
+        "total_ms": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "error_class": None,
+        "outcome_state": OUTCOME_INCOMPLETE,
+    }
 
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request):
     started = time.monotonic()
-    # Entry defense: a malformed body is the client's mistake (400), not a
-    # server error (500).
     length = request.headers.get("content-length")
     if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
-        return JSONResponse(status_code=413,
-                            content={"error": {"message": "request_too_large"}})
-    # A chunked transfer declares no content-length, so the gate above passes
-    # for it by design (the value "None" is unknown until read): count the
-    # bytes while streaming them off the wire and stop at the cap. A body is
-    # never buffered past MAX_BODY_BYTES regardless of what the headers claim.
-    buf = bytearray()
+        return _error("request_too_large", 413)
+    buffer = bytearray()
     async for chunk in request.stream():
-        buf.extend(chunk)
-        if len(buf) > MAX_BODY_BYTES:
-            return JSONResponse(status_code=413,
-                                content={"error": {"message":
-                                                   "request_too_large"}})
+        buffer.extend(chunk)
+        if len(buffer) > MAX_BODY_BYTES:
+            return _error("request_too_large", 413)
     try:
-        body = json.loads(bytes(buf))        # same contract as request.json()
-    except Exception:                     # noqa: BLE001 - any decode error
-        return JSONResponse(status_code=400,
-                            content={"error": {"message": "invalid_json"}})
+        body = json.loads(bytes(buffer))
+    except Exception:
+        return _error("invalid_json", 400)
     if not isinstance(body, dict):
-        return JSONResponse(status_code=400,
-                            content={"error": {"message": "body_must_be_object"}})
-    messages = body.get("messages")
-    if messages is None:
-        messages = []
+        return _error("body_must_be_object", 400)
+    messages = body.get("messages", [])
     if not isinstance(messages, list):
-        return JSONResponse(status_code=400,
-                            content={"error": {"message": "messages_must_be_list"}})
-    text = _last_user_text(messages)
+        return _error("messages_must_be_list", 400)
+    session_id = request.headers.get("x-sr-session-id", "").strip()
+    if len(session_id) > 256:
+        return _error("invalid_session_id", 400)
 
-    # ONE snapshot for the whole request: signal trimming, tree evaluation,
-    # backend resolution and ledger provenance all come from this object. A
-    # concurrent admin write replaces app.state.snapshot atomically; this
-    # request keeps the configuration it started with.
     snapshot = request.app.state.snapshot
-    runtime: RoutingRuntime = request.app.state.runtime
-    requestlog = request.app.state.requestlog
-    # Ledger `routing_ms`: from the fully read body to the finished decision.
     routing_started = time.monotonic()
     try:
-        result = await runtime.route(
+        decision = await request.app.state.engine.route(
             snapshot,
-            RuntimeRequest(text=text, headers=dict(request.headers),
-                           n_messages=len(messages)))
+            RoutingRequest(text=_last_user_text(messages), session_id=session_id),
+        )
     except NoActiveTreeError:
-        # All trees closed is a legal configuration state (design §7.1): fail
-        # BEFORE tagging, the decision model or any upstream call.
         return _error("no_active_tree", 503)
-    except SignalPreparationError:
-        # Infrastructure failure is NOT a normal branch Miss and must never
-        # degrade to a default model (design §6.4).
-        return _error("signal_preparation_failed", 503)
+    except NoAvailableBackend:
+        return _error("no_available_backend", 503)
+    except RoutingMiss:
+        return _error("routing_invariant_violation", 503)
+    except Exception:
+        logger.exception("routing failed")
+        return _error("routing_failed", 503)
     routing_ms = (time.monotonic() - routing_started) * 1000.0
-
-    hit = result.outcome if isinstance(result.outcome, Hit) else None
-    reasoning_level = hit.reasoning if hit is not None else None
-    backend = None
-    upstream_body = None
-    reasoning_warning = None
-    if hit is not None and hit.kind == "route" and hit.model:
-        try:
-            backend = resolve_backend(snapshot.backends, hit.model)
-        except KeyError:
-            backend = None
-        if backend is not None:
-            upstream_body, reasoning_warning = prepare_upstream_request(
-                body, backend, reasoning_level)
-
-    # Input window actually scored by the model signals (JEV head-truncates the
-    # request text; heuristic/checkpoint read the full text and report {}).
-    window = result.input or {}
-    # The record is enqueued BEFORE the upstream call (the requests half row is
-    # written as soon as the decision is known) and mutated in place once the
-    # outcome is known — see _OutcomeRecorder. Detail (text/signals/trace)
-    # stays memory-only: the ledger flush selects only metadata columns.
-    record = {
-        "id": uuid.uuid4().hex,
-        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "text": text,
-        # Replay inputs (Task 10 Step 4). Only the request header the rule
-        # signals actually read is kept — the ring is served verbatim by
-        # /admin/requests/recent, so Authorization and every other header must
-        # never enter it. Missing tenant = {} -> rule_signals falls back to
-        # "anonymous", exactly like the online path.
-        "headers": {k: v for k, v in request.headers.items()
-                    if k.lower() == "x-sr-tenant"},
-        "n_messages": len(messages),
-        "decision": hit.kind if hit is not None else "none",
-        "model": hit.model if hit is not None else None,
-        "terminal_node_id": hit.node_id if hit is not None else None,
-        "score": hit.score if hit is not None else None,
-        "reasoning": reasoning_level,
-        "reasoning_warning": reasoning_warning,
-        # Truncation must be visible downstream (PII report P0): the model only
-        # reads the first N tokens of the request text.
-        "input_tokens": window.get("input_tokens"),
-        "input_visible_tokens": window.get("input_visible_tokens"),
-        "input_truncated": bool(window.get("input_truncated", False)),
-        "latency_ms": (time.monotonic() - started) * 1000,
-        "trace": list(result.trace), "signals": result.signals,
-        # Routing timing evidence (ring only; the v19 ledger has no such cols).
-        "routing_ms": routing_ms,
-        "signal_ms": result.signal_ms,
-        "decision_ms": result.decision_ms,
-        "nl_calls": result.nl_calls,
-        # Ledger metadata known already at decision time (design §3.1/P1-B).
-        **_version_fields(snapshot, result),
-        # Frozen tagger version evidence (ring only): the replay fingerprint a
-        # historical row is compared against before it may be re-run.
-        "tagger_info": dict(result.tagger_info or {}),
-        "experiment_arm": _experiment_arm(request),
-        # Outcome placeholders (filled exactly once by the recorder).
-        "upstream_model": None, "upstream_status": None,
-        "prompt_tokens": None, "completion_tokens": None, "total_tokens": None,
-        "upstream_ms": None, "ttft_ms": None, "total_ms": None,
-        "error_class": None,
-        "outcome_state": OUTCOME_INCOMPLETE,
-        "quality_score": None, "quality_evaluator": None,
-        "usage_observed": 0,
-    }
+    backend = snapshot.backends.get(decision.model)
+    if backend is None:
+        decision.release()
+        return _error("no_available_backend", 503)
+    upstream_body, reasoning_warning = prepare_upstream_request(body, backend, decision.reasoning)
+    requestlog = request.app.state.requestlog
+    record = _decision_record(request, decision, snapshot, body, _last_user_text(messages), reasoning_warning, routing_ms, started)
     requestlog.enqueue(record)
     outcome = _OutcomeRecorder(requestlog, record, started)
-
-    if hit is None:
-        # A healthy active tree has a guaranteed fallback (enable-time check),
-        # so a Miss on the hot path is an invariant violation: answer 503 and
-        # keep the COMPLETE trace in the ring instead of silently routing a
-        # default model.
-        outcome.finish(outcome_state=OUTCOME_COMPLETED,
-                       error_class="routing_invariant_violation")
-        return _error("routing_invariant_violation", 503)
-    if hit.kind == "block":
-        # A decision that never calls an upstream is a COMPLETED request (the
-        # action outcome — block — is what the caller received).
-        outcome.finish(outcome_state=OUTCOME_COMPLETED)
-        return JSONResponse(status_code=403, content={
-            "error": {"message": BLOCK_MESSAGE, "code": "blocked_by_policy"}})
-    if not hit.model:
-        outcome.finish(outcome_state=OUTCOME_COMPLETED, error_class="no_route")
-        return _error("no_route", 502)
-    if backend is None:
-        outcome.finish(outcome_state=OUTCOME_COMPLETED,
-                       error_class="unknown_model")
-        return _error("unknown_model", 502)
-
-    model = hit.model
     breaker = request.app.state.breaker
-    if breaker.is_open(model):
-        outcome.finish(outcome_state=OUTCOME_COMPLETED,
-                       error_class="circuit_open",
-                       upstream_model=backend.upstream_name)
-        return JSONResponse(status_code=503, content={
-            "error": {"message": "model_circuit_open", "model": model}})
-
     client: httpx.AsyncClient = request.app.state.http
-    headers = {"x-sr-model": model}
+    headers = {"x-sr-model": decision.model, "x-sr-selection": decision.selection_reason}
     if reasoning_warning:
         headers["x-sr-reasoning-warning"] = reasoning_warning
-    elif reasoning_level is not None:
-        headers["x-sr-reasoning"] = reasoning_level
+    elif decision.reasoning is not None:
+        headers["x-sr-reasoning"] = decision.reasoning
     upstream_started = time.monotonic()
+    release_in_handler = True
     try:
         if body.get("stream"):
-            return await _stream(client, backend, upstream_body, headers,
-                                 breaker, model, outcome=outcome,
-                                 request=request, started=started)
-        resp = await client.post(backend.url, json=upstream_body,
-                                 headers=backend.headers)
-    except httpx.HTTPError:
-        breaker.failure(model)
-        outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
-                       error_class="upstream_error",
+            response = await _stream(client, backend, upstream_body, headers, breaker,
+                                     decision.model, outcome=outcome, request=request,
+                                     on_release=decision.release)
+            if isinstance(response, StreamingResponse):
+                release_in_handler = False
+            return response
+        response = await client.post(backend.url, json=upstream_body, headers=backend.headers)
+        upstream_ms = (time.monotonic() - upstream_started) * 1000.0
+        if response.status_code >= 500:
+            breaker.failure(decision.model)
+            outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR, error_class="upstream_error",
+                           upstream_model=backend.upstream_name, upstream_status=response.status_code,
+                           upstream_ms=upstream_ms)
+            return JSONResponse(status_code=502, content={"error": {"message": "upstream_error"}}, headers=headers)
+        if response.status_code < 400:
+            breaker.success(decision.model)
+        try:
+            content = response.json()
+        except json.JSONDecodeError:
+            content = {"raw": response.text}
+        outcome.finish(outcome_state=OUTCOME_COMPLETED,
+                       error_class=None if response.status_code < 400 else "client_4xx",
+                       upstream_model=backend.upstream_name, upstream_status=response.status_code,
+                       upstream_ms=upstream_ms,
+                       usage=content.get("usage") if isinstance(content, dict) else None)
+        return JSONResponse(status_code=response.status_code, content=content, headers=headers)
+    except asyncio.CancelledError:
+        outcome.finish(outcome_state=OUTCOME_CANCELLED, error_class="cancelled",
                        upstream_model=backend.upstream_name,
                        upstream_ms=(time.monotonic() - upstream_started) * 1000.0)
-        return JSONResponse(status_code=502,
-                            content={"error": {"message": "upstream_error"}},
-                            headers=headers)
-    upstream_ms = (time.monotonic() - upstream_started) * 1000.0
-    if resp.status_code >= 500:
-        breaker.failure(model)
-        # The ledger keeps the REAL upstream status; the client keeps seeing the
-        # mapped 502 (external contract unchanged).
-        outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
-                       error_class="upstream_error",
+        raise
+    except httpx.HTTPError:
+        breaker.failure(decision.model)
+        outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR, error_class="upstream_error",
                        upstream_model=backend.upstream_name,
-                       upstream_status=resp.status_code,
-                       upstream_ms=upstream_ms)
-        return JSONResponse(status_code=502,
-                            content={"error": {"message": "upstream_error"}},
-                            headers=headers)
-    if resp.status_code < 400:
-        # Same contract as the streaming path (_stream): a 4xx is
-        # request-specific — neither a model failure nor proof of health — so
-        # it must not clear the failure counter (an already open circuit must
-        # not be closed by an error response; a half-open probe needs a real
-        # 2xx to recover).
-        breaker.success(model)
-    try:
-        content = resp.json()
-    except json.JSONDecodeError:
-        content = {"raw": resp.text}
-    outcome.finish(
-        outcome_state=OUTCOME_COMPLETED,
-        error_class=None if resp.status_code < 400 else "client_4xx",
-        upstream_model=backend.upstream_name,
-        upstream_status=resp.status_code,
-        upstream_ms=upstream_ms,
-        usage=content.get("usage") if isinstance(content, dict) else None)
-    return JSONResponse(status_code=resp.status_code, content=content,
-                        headers=headers)
+                       upstream_ms=(time.monotonic() - upstream_started) * 1000.0)
+        return JSONResponse(status_code=502, content={"error": {"message": "upstream_error"}}, headers=headers)
+    finally:
+        if release_in_handler:
+            decision.release()
 
 
 def _relay(resp, *, outcome, request, backend, upstream_started: float,
-           upstream_ms: float):
-    """The real SSE relay: classify the terminal state, then finalize once.
-
-    Returned as an async generator so the streaming tests can drive every
-    terminal path (normal EOF, upstream exception, client disconnect before the
-    first chunk, mid-stream disconnect via ``aclose()``, cancellation) without
-    a network stack. ``GeneratorExit``/``CancelledError`` are re-raised: the
-    disconnect/cancel must propagate, only the ledger classification differs.
-    """
+           upstream_ms: float, on_release):
     async def generator():
         usage_sniffer = _SseUsage()
         first_chunk_at: float | None = None
         state = OUTCOME_INCOMPLETE
         try:
-            # A client that already went away before the first chunk: nothing
-            # will be sent, so the request is a disconnect, not a completion.
             if await _is_disconnected(request):
                 state = OUTCOME_CLIENT_DISCONNECTED
                 return
             async for chunk in resp.aiter_raw():
-                if first_chunk_at is None:       # TTFT: first byte of the body
+                if first_chunk_at is None:
                     first_chunk_at = time.monotonic()
                 usage_sniffer.feed(chunk)
                 yield chunk
-            # Only a normally exhausted upstream iterator is "completed".
             state = OUTCOME_COMPLETED
         except GeneratorExit:
-            # The consumer closed us (client disconnected / response aborted).
             state = OUTCOME_CLIENT_DISCONNECTED
             raise
         except asyncio.CancelledError:
-            # Task cancellation; a concurrent detected disconnect is still a
-            # disconnect. Re-raise so the cancellation is never swallowed.
-            state = (OUTCOME_CLIENT_DISCONNECTED
-                     if await _is_disconnected(request) else OUTCOME_CANCELLED)
+            state = OUTCOME_CLIENT_DISCONNECTED if await _is_disconnected(request) else OUTCOME_CANCELLED
             raise
-        except Exception:                        # noqa: BLE001 - upstream/transport
+        except Exception:
             state = OUTCOME_UPSTREAM_ERROR
             raise
         finally:
             try:
                 await resp.aclose()
-            except Exception:                    # noqa: BLE001 - close is best effort
+            except Exception:
                 logger.warning("upstream stream close failed", exc_info=True)
-            ttft_ms = (None if first_chunk_at is None
-                       else (first_chunk_at - upstream_started) * 1000.0)
-            usage_sniffer.finish()               # trailing line without '\n'
+            ttft_ms = None if first_chunk_at is None else (first_chunk_at - upstream_started) * 1000.0
+            usage_sniffer.finish()
             outcome.finish(
                 outcome_state=state,
-                error_class=("upstream_error"
-                             if state == OUTCOME_UPSTREAM_ERROR else None),
+                error_class="upstream_error" if state == OUTCOME_UPSTREAM_ERROR else None,
                 upstream_model=backend.upstream_name,
                 upstream_status=resp.status_code,
                 upstream_ms=upstream_ms,
                 ttft_ms=ttft_ms,
-                usage=usage_sniffer.usage)
-
+                usage=usage_sniffer.usage,
+            )
+            on_release()
     return generator()
 
 
 async def _stream(client, backend, body, headers, breaker, model, *,
-                  outcome, request, started):
-    # Streaming has its own timeout policy: the global 60s read timeout would
-    # cut a slow-but-alive stream (a thinking model can pause for a minute
-    # before its first token). Connect/write stay bounded; the read timeout is
-    # unlimited.
+                  outcome, request, on_release):
     upstream_started = time.monotonic()
-    req = client.build_request("POST", backend.url, json=body,
-                               headers=backend.headers,
-                               timeout=httpx.Timeout(60.0, read=None))
-    resp = await client.send(req, stream=True)
-    # "upstream_ms" for a stream = request start -> response headers received
-    # (the rest of the body keeps flowing; total_ms covers the whole stream).
+    upstream_request = client.build_request(
+        "POST", backend.url, json=body, headers=backend.headers,
+        timeout=httpx.Timeout(60.0, read=None),
+    )
+    response = await client.send(upstream_request, stream=True)
     upstream_ms = (time.monotonic() - upstream_started) * 1000.0
-    if resp.status_code >= 400:
-        # An upstream rejection is not a stream: read the error body and answer
-        # with its status code, exactly like the non-streaming path. Reporting
-        # it as a 200 SSE would hand the client an empty event stream instead
-        # of the real error (e.g. 400 "model not found").
-        raw = await resp.aread()
-        await resp.aclose()
-        if resp.status_code >= 500:
+    if response.status_code >= 400:
+        raw = await response.aread()
+        await response.aclose()
+        if response.status_code >= 500:
             breaker.failure(model)
-            outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR,
-                           error_class="upstream_error",
-                           upstream_model=backend.upstream_name,
-                           upstream_status=resp.status_code,
+            outcome.finish(outcome_state=OUTCOME_UPSTREAM_ERROR, error_class="upstream_error",
+                           upstream_model=backend.upstream_name, upstream_status=response.status_code,
                            upstream_ms=upstream_ms)
-            return JSONResponse(status_code=502,
-                                content={"error": {"message": "upstream_error"}},
-                                headers=headers)
-        # 4xx: the upstream rejected the request. It is neither a model
-        # failure (no breaker.failure) nor proof of health (no breaker.success:
-        # the counter must survive so an open circuit stays open).
+            return JSONResponse(status_code=502, content={"error": {"message": "upstream_error"}}, headers=headers)
         try:
             content = json.loads(raw)
         except (ValueError, TypeError):
             content = {"raw": raw.decode("utf-8", "replace")}
-        outcome.finish(outcome_state=OUTCOME_COMPLETED,
-                       error_class="client_4xx",
-                       upstream_model=backend.upstream_name,
-                       upstream_status=resp.status_code,
+        outcome.finish(outcome_state=OUTCOME_COMPLETED, error_class="client_4xx",
+                       upstream_model=backend.upstream_name, upstream_status=response.status_code,
                        upstream_ms=upstream_ms)
-        return JSONResponse(status_code=resp.status_code, content=content,
-                            headers=headers)
+        return JSONResponse(status_code=response.status_code, content=content, headers=headers)
     breaker.success(model)
     return StreamingResponse(
-        _relay(resp, outcome=outcome, request=request, backend=backend,
-               upstream_started=upstream_started, upstream_ms=upstream_ms),
-        media_type="text/event-stream", headers=headers)
+        _relay(response, outcome=outcome, request=request, backend=backend,
+               upstream_started=upstream_started, upstream_ms=upstream_ms,
+               on_release=on_release),
+        media_type="text/event-stream",
+        headers=headers,
+    )
