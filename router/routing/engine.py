@@ -44,8 +44,14 @@ class RoutingEngine:
         active_periods = matching_periods(local_now, list(snapshot.time_periods))
         trace: list[dict] = [{"event": "time", "active_periods": active_periods, "timezone": tree.timezone}]
         policy, policy_path = self._policy(tree.root, active_periods, trace)
+
+        def available(targets):
+            models = self._models(targets, snapshot)
+            health_filter = getattr(self.balancer, "available", None)
+            return health_filter(models) if health_filter is not None else models
+
         targets = self._targets(policy)
-        allowed_models = self._models(targets, snapshot)
+        allowed_models = available(targets)
         path_text = "/".join(policy_path)
         preferred = None
         if tree.sticky.enabled and request.session_id:
@@ -75,7 +81,7 @@ class RoutingEngine:
             )
         else:
             raise RoutingMiss("no target matched")
-        models = self._models((target,), snapshot)
+        models = available((target,))
         if not models:
             raise NoAvailableBackend("target has no configured backend")
         lease = self.balancer.acquire(models, preferred=preferred, dry_run=dry_run)

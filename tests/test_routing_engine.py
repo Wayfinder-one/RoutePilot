@@ -139,6 +139,22 @@ def test_valid_sticky_model_skips_jev_and_selects_its_target():
     assert affinity.gets[0]["policy_path"] == "choose"
 
 
+def test_circuit_open_sticky_model_is_recomputed_instead_of_reused():
+    from router.routing.scheduler import LoadBalancer
+
+    class Breaker:
+        def is_open(self, model):
+            return model == "strong-b"
+
+    jev = Jev(answer())
+    affinity = Affinity("strong-b")
+    decision = route(RoutingEngine(jev, affinity, LoadBalancer(Breaker())), snapshot())
+    assert decision.model == "strong-a"
+    assert decision.sticky_hit is False
+    assert decision.selection_reason == "jev"
+    assert len(jev.calls) == 1
+
+
 def test_time_branch_runs_before_sticky_and_jev():
     root = {
         "id": "root", "type": "branch",
