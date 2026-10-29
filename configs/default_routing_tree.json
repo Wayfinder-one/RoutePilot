@@ -1,0 +1,43 @@
+{
+  "id": "default-jev",
+  "name": "默认 JEV 分流树",
+  "timezone": "Asia/Shanghai",
+  "sticky": {"enabled": true, "ttl_seconds": 1800},
+  "root": {
+    "id": "root",
+    "type": "jev",
+    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+    "min_prob": 0.0,
+    "min_margin": 0.0,
+    "options": [
+      {
+        "key": "fast",
+        "label": "轻量模型",
+        "target": {
+          "id": "fast-target",
+          "type": "target",
+          "strategy": "least_inflight",
+          "capability": "速度最快、成本最低，适合闲聊、简单问答、格式转换、短翻译和信息提取。",
+          "models": [{"model": "qwen3-8b", "reasoning": null}]
+        }
+      },
+      {
+        "key": "strong",
+        "label": "增强模型",
+        "target": {
+          "id": "strong-target",
+          "type": "target",
+          "strategy": "least_inflight",
+          "capability": "能力更强，适合复杂代码、长文档、多约束方案、统计建模和深度推理。",
+          "models": [{"model": "qwen3-32b", "reasoning": null}]
+        }
+      }
+    ],
+    "fallback": {
+      "id": "safe-target",
+      "type": "target",
+      "strategy": "least_inflight",
+      "models": [{"model": "qwen3-8b", "reasoning": null}]
+    }
+  }
+}

@@ -1,8 +1,0 @@
-# Checkpoint mode (M2) extra dependencies. The heuristic mode and every
-# non-checkpoint test run without these — torch/transformers are imported
-# lazily by router/signals/checkpoint.py only when that tagger is constructed.
-torch>=2.1
-transformers>=4.40
-safetensors>=0.4
-huggingface-hub>=0.23
-numpy>=1.24
