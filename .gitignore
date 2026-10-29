@@ -2,6 +2,7 @@
 docs/
 .workbuddy/
 .superpowers/
+.kimi-code/
 
 # ---- Python ----
 __pycache__/
