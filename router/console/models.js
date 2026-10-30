@@ -219,12 +219,13 @@ function windowValues() {
 
 function windowProblem(values, limits) {
   const { context, input } = values;
-  const min = (limits && limits.min_input_tokens) || 256;
+  const minContext = (limits && limits.min_context_tokens) || 512;
+  const minInput = (limits && limits.min_input_tokens) || 256;
   const max = (limits && limits.max_tokens) || 131072;
-  if (!Number.isInteger(context) || context < min || context > max)
-    return t('models.window.badContext', { min, max });
-  if (!Number.isInteger(input) || input < min || input > max)
-    return t('models.window.badInput', { min, max });
+  if (!Number.isInteger(context) || context < minContext || context > max)
+    return tf('models.window.badContext', { min: minContext, max });
+  if (!Number.isInteger(input) || input < minInput || input > max)
+    return tf('models.window.badInput', { min: minInput, max });
   if (input > context) return t('models.window.badRelation');
   return '';
 }

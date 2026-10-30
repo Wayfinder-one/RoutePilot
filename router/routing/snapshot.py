@@ -14,6 +14,7 @@ from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_INPUT_TOKENS,
     MAX_TOKENS,
+    MIN_CONTEXT_TOKENS,
     MIN_INPUT_TOKENS,
 )
 from router.routing.conditions import TimePeriod
@@ -132,7 +133,7 @@ def _int_setting(repo: SettingsRepo, key: str, default: int, minimum: int, maxim
 def read_jev_window(conn) -> tuple[int, int]:
     """返回 (input_tokens, context_tokens)；缺省/非法值回落到默认值。"""
     repo = SettingsRepo(conn)
-    context_tokens = _int_setting(repo, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS, MIN_INPUT_TOKENS, MAX_TOKENS)
+    context_tokens = _int_setting(repo, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, MAX_TOKENS)
     input_tokens = _int_setting(repo, "jev_input_tokens", DEFAULT_INPUT_TOKENS, MIN_INPUT_TOKENS, context_tokens)
     if input_tokens > context_tokens:
         input_tokens = context_tokens

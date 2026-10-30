@@ -105,6 +105,7 @@ const I18N = {
     'logs.ev.time': '时间窗口', 'logs.ev.jev': 'JEV 决策', 'logs.ev.sticky': '粘性命中',
     'logs.ev.fallback': '兜底', 'logs.ev.scheduled': '调度完成',
     'logs.ev.branch': '命中分支', 'logs.ev.branchSkip': '跳过分支', 'logs.ev.branchOther': '兜底分支',
+    'logs.ev.window': '输入截断',
     /* ── models & settings ── */
     'models.sub': '模型目录、提供方、推理声明与系统设置',
     'models.providers': '提供方',
@@ -359,6 +360,7 @@ const I18N = {
     'logs.ev.time': 'Time window', 'logs.ev.jev': 'JEV decision', 'logs.ev.sticky': 'Sticky hit',
     'logs.ev.fallback': 'Fallback', 'logs.ev.scheduled': 'Scheduled',
     'logs.ev.branch': 'Branch hit', 'logs.ev.branchSkip': 'Branch skipped', 'logs.ev.branchOther': 'Branch otherwise',
+    'logs.ev.window': 'Input window',
     /* ── models ── */
     'models.sub': 'Model catalog, providers, reasoning declarations and settings',
     'models.providers': 'Providers',

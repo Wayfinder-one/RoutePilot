@@ -7,7 +7,7 @@ const SRTrace = (() => {
     time: 'logs.ev.time', jev_choice: 'logs.ev.jev', sticky_hit: 'logs.ev.sticky',
     fallback: 'logs.ev.fallback', scheduled: 'logs.ev.scheduled',
     branch_selected: 'logs.ev.branch', branch_skipped: 'logs.ev.branchSkip',
-    branch_otherwise: 'logs.ev.branchOther',
+    branch_otherwise: 'logs.ev.branchOther', jev_input_window: 'logs.ev.window',
   };
   /* Tones drive the timeline dot: green = decided, amber = degraded,
      red = error. Anything unknown keeps the neutral dot. */
@@ -20,11 +20,14 @@ const SRTrace = (() => {
     ['selected_key', 'selected'], ['p_top', 'p_top'], ['margin', 'margin'],
     ['model', 'model'], ['target_id', 'target'], ['child_id', 'child'], ['node_id', 'node'],
     ['policy_path', 'path'], ['reason', 'reason'], ['error', 'error'],
+    ['input_tokens_limit', 'limit'], ['tokens_before', 'before'], ['tokens_after', 'after'],
+    ['truncated', 'truncated'],
   ];
 
   function tone(event) {
     if (event.error || event.reason === 'jev_error') return 'bad';
     if (event.event === 'fallback') return 'warn';
+    if (event.event === 'jev_input_window' && event.truncated) return 'warn';
     return TONES[event.event] || '';
   }
 

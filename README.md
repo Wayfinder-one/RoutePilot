@@ -141,7 +141,7 @@ ROUTER_JEV_API_KEY= \
 「模型与设置」页新增 **上下文长度（JEV 决策服务）** 卡片，配置两项：
 
 - **服务上下文预算** `jev_context_tokens`：应与 llama.cpp 的 `-c / --parallel`（`n_ctx_slot`）一致，
-  用于校验与提示（默认 4096，范围 256–131072）；
+  用于校验与提示（默认 4096，范围 512–131072）；
 - **输入截断上限** `jev_input_tokens`：实际发送给 JEV 的 state token 上限（默认 1024，必须 ≤ 服务预算）。
 
 行为：

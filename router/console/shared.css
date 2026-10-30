@@ -406,6 +406,7 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .list td{padding:5px;border-bottom:1px solid var(--line);vertical-align:middle}
 .list td input{width:100%;padding:3px 5px;font-size:12px}
 .prov-group,.kw-group,.set-row{display:flex;gap:6px;align-items:center;margin-bottom:6px}
+.addrow{display:flex;align-items:center;gap:8px}
 .prov-group input,.kw-group input,.set-row input{flex:1;font-size:12px;padding:4px 6px}
 .prov-group .grow,.kw-group .grow,.set-row .grow{flex:1}
 /* ── misc ───────────────────────────────────── */

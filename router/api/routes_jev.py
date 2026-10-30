@@ -17,6 +17,7 @@ from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_INPUT_TOKENS,
     MAX_TOKENS,
+    MIN_CONTEXT_TOKENS,
     MIN_INPUT_TOKENS,
 )
 from router.routing.snapshot import read_jev_window
@@ -112,6 +113,7 @@ def get_jev_window(conn: sqlite3.Connection = Depends(get_conn)):
         "context_tokens": context_tokens,
         "input_tokens": input_tokens,
         "defaults": {"context_tokens": DEFAULT_CONTEXT_TOKENS, "input_tokens": DEFAULT_INPUT_TOKENS},
+        "min_context_tokens": MIN_CONTEXT_TOKENS,
         "min_input_tokens": MIN_INPUT_TOKENS,
         "max_tokens": MAX_TOKENS,
     }
@@ -121,7 +123,7 @@ def get_jev_window(conn: sqlite3.Connection = Depends(get_conn)):
 def put_jev_window(body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
     """保存输入窗口配置。
 
-    - context_tokens：JEV 服务每请求上下文预算（= llama.cpp -c/--parallel），256..131072；
+    - context_tokens：JEV 服务每请求上下文预算（= llama.cpp -c/--parallel），512..131072；
     - input_tokens：实际发送给 JEV 的输入上限，256..context_tokens；超出按首尾保留截断。
     """
     allowed = {"context_tokens", "input_tokens"}
@@ -138,8 +140,8 @@ def put_jev_window(body: dict, request: Request, conn: sqlite3.Connection = Depe
     input_tokens = (
         _coerce_tokens(body["input_tokens"], "input_tokens") if "input_tokens" in body else current_input
     )
-    if not MIN_INPUT_TOKENS <= context_tokens <= MAX_TOKENS:
-        raise HTTPException(422, detail=f"context_tokens 必须在 {MIN_INPUT_TOKENS}..{MAX_TOKENS} 之间")
+    if not MIN_CONTEXT_TOKENS <= context_tokens <= MAX_TOKENS:
+        raise HTTPException(422, detail=f"context_tokens 必须在 {MIN_CONTEXT_TOKENS}..{MAX_TOKENS} 之间")
     if not MIN_INPUT_TOKENS <= input_tokens <= MAX_TOKENS:
         raise HTTPException(422, detail=f"input_tokens 必须在 {MIN_INPUT_TOKENS}..{MAX_TOKENS} 之间")
     if input_tokens > context_tokens:
@@ -152,7 +154,7 @@ def put_jev_window(body: dict, request: Request, conn: sqlite3.Connection = Depe
             repo.set("jev_context_tokens", str(context_tokens))
             repo.set("jev_input_tokens", str(input_tokens))
             ChangeRepo(conn).record(_now_iso(), "jev_window", {
-                "action": "save",
+                "action": "window",
                 "context_tokens": context_tokens,
                 "input_tokens": input_tokens,
             })

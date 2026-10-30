@@ -13,6 +13,7 @@ from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevS
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_INPUT_TOKENS,
+    MIN_CONTEXT_TOKENS,
     MIN_INPUT_TOKENS,
     apply_window,
     estimate_tokens,
@@ -90,6 +91,10 @@ def test_read_jev_window_defaults_and_overrides(tmp_path):
         repo.set("jev_context_tokens", "not-a-number")  # 非法 -> 回默认；input 收口到默认 context
         conn.commit()
         assert read_jev_window(conn) == (DEFAULT_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS)
+        repo.set("jev_context_tokens", "256")           # 低于上下限 -> 收口到 512
+        repo.set("jev_input_tokens", "256")
+        conn.commit()
+        assert read_jev_window(conn) == (MIN_INPUT_TOKENS, MIN_CONTEXT_TOKENS)
     finally:
         conn.close()
 
@@ -140,6 +145,7 @@ def test_get_window_returns_defaults(tmp_path):
     assert body["context_tokens"] == DEFAULT_CONTEXT_TOKENS
     assert body["input_tokens"] == DEFAULT_INPUT_TOKENS
     assert body["defaults"] == {"context_tokens": DEFAULT_CONTEXT_TOKENS, "input_tokens": DEFAULT_INPUT_TOKENS}
+    assert body["min_context_tokens"] == MIN_CONTEXT_TOKENS
     assert body["min_input_tokens"] == MIN_INPUT_TOKENS
 
 
@@ -159,6 +165,7 @@ def test_put_window_persists_and_refreshes_snapshot(tmp_path):
     "payload",
     [
         {"context_tokens": 1024, "input_tokens": 4096},   # 关系不合法
+        {"context_tokens": 256},                           # 低于上下文下限（512）
         {"context_tokens": 100},                           # 低于下限
         {"context_tokens": 999999},                        # 超上限
         {"input_tokens": "abc"},                           # 非整数

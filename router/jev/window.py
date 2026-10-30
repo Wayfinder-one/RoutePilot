@@ -18,6 +18,7 @@ from dataclasses import dataclass
 DEFAULT_CONTEXT_TOKENS = 4096
 DEFAULT_INPUT_TOKENS = 1024
 MIN_INPUT_TOKENS = 256
+MIN_CONTEXT_TOKENS = 512
 MAX_TOKENS = 131072
 
 # 截断时首尾各保留多少（比例）；开头通常是背景，结尾通常是诉求
