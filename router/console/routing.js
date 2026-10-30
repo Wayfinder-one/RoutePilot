@@ -218,18 +218,7 @@
   /* ── page head ────────────────────────────────────────────────── */
   function renderHeader() {
     renderGroupButton();
-    const model = jevModelName();
-    $('#jevModel').textContent = model || t('routing.jevUnconfigured');
-    $('#jevPill').classList.toggle('rt2-warn', !model);
-    $('#jevPill').title = (S.jev && S.jev.config && S.jev.config.base_url) || '';
-
-    $('#revCode').textContent = (S.rev || '').slice(0, 8) || '—';
-    $('#revPill').title = S.rev || '';
-
     const enabled = !!(S.tree && S.tree.enabled);
-    const statePill = $('#statePill');
-    statePill.className = 'rt2-pill ' + (enabled ? 'rt2-on' : 'rt2-off');
-    statePill.innerHTML = `<span class="rt2-ldot"></span>${esc(enabled ? t('routing.enabled') : t('routing.disabled'))}`;
 
     const dirty = dirtyItems();
     const savePill = $('#savePill');
@@ -244,7 +233,7 @@
     }
 
     const enableBtn = $('#enableTree');
-    $('#enableLabel').textContent = enabled ? t('routing.disable') : t('routing.enable');
+    $('#enableLabel').textContent = enabled ? t('routing.enabled') : t('routing.stateOff');
     enableBtn.classList.toggle('on', enabled);
     enableBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
     enableBtn.disabled = !S.tree || S.isNew || isBranch();
@@ -699,7 +688,7 @@
     }
 
     html += `<div class="rt2-outfoot">
-      <span>rev ${esc(String(result.snapshot_revision || S.rev || '').slice(0, 8) || '—')} · dry_run</span>
+      <span>rev ${esc(String(result.snapshot_revision || S.rev || '').slice(0, 8) || '—')}</span>
       <button class="rt2-rawbtn" type="button" data-act="raw">${esc(t(S.rawOpen ? 'routing.rawHide' : 'routing.rawResponse'))}</button>
     </div>`;
     if (S.rawOpen) {

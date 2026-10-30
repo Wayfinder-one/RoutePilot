@@ -38,13 +38,9 @@
           <div class="rt2-gmenu" id="groupMenu" role="dialog" data-i18n-aria="routing.groups" hidden></div>
         </span>
       </h1>
-      <div class="rt2-sub" data-i18n="routing.sub"></div>
     </div>
     <div class="rt2-headr">
       <div class="rt2-status">
-        <span class="rt2-pill rt2-jev" id="jevPill"><span class="rt2-ldot"></span><span data-i18n="routing.jevService"></span><code id="jevModel">—</code></span>
-        <span class="rt2-pill rt2-off" id="statePill"></span>
-        <span class="rt2-pill rt2-rev" id="revPill"><span data-i18n="routing.snapshot"></span><code id="revCode">—</code></span>
         <span class="rt2-pill rt2-saved" id="savePill"></span>
       </div>
       <div class="rt2-acts">
@@ -130,7 +126,6 @@
         <select class="rt2-select" id="fallbackSelect"></select>
       </section>
 
-      <p class="rt2-pagefoot"><code>POST /v1/systemone</code> · <code>state</code> · <code>instructions</code> · <code>criteria</code></p>
     </div>
 
     <!-- ══ right dock ══ -->
@@ -138,7 +133,6 @@
       <div class="rt2-tabs" role="tablist">
         <button class="rt2-tab on" id="tabsPreview" role="tab" data-tab="preview" aria-selected="true" aria-controls="panePreview"><span data-i18n="routing.preview"></span></button>
         <button class="rt2-tab" id="tabsTry" role="tab" data-tab="try" aria-selected="false" aria-controls="paneTry"><span data-i18n="routing.try"></span><span class="rt2-tabdot" id="tryDot" hidden></span></button>
-        <span class="rt2-dock-ro">dry_run</span>
       </div>
 
       <!-- request preview -->
@@ -184,7 +178,7 @@
 
       <!-- try -->
       <div class="rt2-pane" id="paneTry" data-pane="try" role="tabpanel" hidden>
-        <div class="rt2-trylbl"><span class="rt2-trytitle"><b data-i18n="routing.try"></b><button type="button" class="rt2-help" data-help="routing.tryNoLog" data-i18n-aria="routing.help">?</button></span><span>dry_run</span></div>
+        <div class="rt2-trylbl"><span class="rt2-trytitle"><b data-i18n="routing.try"></b><button type="button" class="rt2-help" data-help="routing.tryNoLog" data-i18n-aria="routing.help">?</button></span></div>
         <div class="rt2-input">
           <textarea id="tryText" spellcheck="false"></textarea>
           <div class="rt2-inputfoot"><span id="tryCount"></span></div>
