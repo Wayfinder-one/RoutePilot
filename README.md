@@ -98,14 +98,14 @@ ROUTER_JEV_API_KEY= \
 
 「模型与设置」保留预置目录、自定义模型、提供方密钥、获取可用模型、能力说明和推理档位：
 
-- 模型位 ID 是分流树中的稳定引用；upstream 是实际发给 OpenAI 后端的模型名；
+- 模型位 ID 是决策组中的稳定引用；upstream 是实际发给 OpenAI 后端的模型名；
 - 单模型 target 默认读取 `profile.capability` 作为 JEV 候选说明；
 - 多模型 target 必须直接在 target 上填写整组能力说明；
 - target 中每个模型位可单独设置 reasoning；`null` 表示完全透传客户端字段；
 - 保存模型或提供方时会重新校验启用树，避免删除正在使用的能力说明或推理档位；
 - 被任一保存树引用的模型不能删除。
 
-## 新分流树
+## 新建决策组
 
 只支持三种节点：
 
@@ -122,7 +122,7 @@ ROUTER_JEV_API_KEY= \
 ```json
 {
   "id": "main",
-  "name": "主分流树",
+  "name": "默认决策组",
   "timezone": "Asia/Shanghai",
   "sticky": {"enabled": true, "ttl_seconds": 1800},
   "root": {
@@ -155,7 +155,7 @@ ROUTER_JEV_API_KEY= \
 
 树支持草稿、复制、启停、导入导出和 dry-run 试算。启用时要求模型、时间段、能力说明、推理档位和最终 fallback 全部有效；新库不隐式创建或启用树。没有启用树时 `/v1` 返回 503 `no_active_tree`。
 
-控制台的「分流树」页（标题「分流配置」）只做 JEV 需要的两件事：**提示词**（`root.instructions`）和**每个候选模型的能力描述**（`root.options[].target.capability`，留空则继承模型目录的 `profile.capability`），外加必需的兜底模型和少量高级项（sticky、`min_prob`/`min_margin`、多树切换、导入导出）。页面不再编辑时间分支：`branch` / `when` / 时间段仍保留在数据模型与引擎中，可通过 API 或导入 JSON 维护；选中含时间分支的树时页面只显示提示和「新建简化配置」入口。右侧 dock 提供请求预览与 dry-run 试算（试算前会自动保存）。
+控制台的「决策组」页只做 JEV 需要的两件事：**提示词**（`root.instructions`）和**每个候选模型的能力描述**（`root.options[].target.capability`，留空则继承模型目录的 `profile.capability`），外加必需的兜底模型和少量高级项（页首「试算」旁的「高级配置」浮层：sticky、`min_prob`/`min_margin`、导入导出）。多组配置通过页首标题下拉切换、新建、复制、重命名。页面不再编辑时间分支：`branch` / `when` / 时间段仍保留在数据模型与引擎中，可通过 API 或导入 JSON 维护；当前组含时间分支时页面只显示提示和「新建决策组」入口。右侧 dock 提供请求预览与 dry-run 试算（试算前会自动保存）。
 
 `GET /admin/jev` 的 `defaults` 提供默认提示词和 state 模板；预览里的 `state` 模板来自该配置，`{request}` 由服务端拼入请求原文。
 
@@ -167,7 +167,7 @@ SR_BASE=http://127.0.0.1:8400 .venv/bin/python scripts/apply_default_routing_tre
 
 ## 时间段
 
-时间段（`name/days/start/end`）仍是树的原生确定性条件，保存在 `/admin/time-periods`，由 `branch` 节点的 `when.periods` 引用：
+时间段（`name/days/start/end`）仍是决策组的原生确定性条件，保存在 `/admin/time-periods`，由 `branch` 节点的 `when.periods` 引用：
 
 - 周一为 0，周日为 6；
 - `start > end` 表示跨午夜；
@@ -175,9 +175,9 @@ SR_BASE=http://127.0.0.1:8400 .venv/bin/python scripts/apply_default_routing_tre
 - 结束时刻不包含；
 - 树级 IANA timezone 默认 `Asia/Shanghai`。
 
-时间是树的原生确定性条件，不是模型信号。时间段在粘性和 JEV 之前求值，因此旧会话不能借粘性绕过当前时段策略。
+时间是决策组的原生确定性条件，不是模型信号。时间段在粘性和 JEV 之前求值，因此旧会话不能借粘性绕过当前时段策略。
 
-当前控制台「分流配置」页只编辑单 JEV 树，不展示时间段和 `branch`；需要分时策略时通过 API 或导入 JSON 维护树，再用页面预览/试算其行为。
+当前控制台「决策组」页只编辑单 JEV 配置，不展示时间段和 `branch`；需要分时策略时通过 API 或导入 JSON 维护树，再用页面预览/试算其行为。
 
 ## 会话粘性
 

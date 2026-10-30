@@ -1,12 +1,12 @@
-/* Smart Router console — routing config (direction D1, 2026-10-29).
+/* Smart Router console — decision group config (2026-10-30).
 
-   One page = one JEV routing tree. Only two things are edited:
+   One page = one decision group. Only two things are edited:
      1. root.instructions        — "how to choose"
      2. option.target.capability — "what each model is good at"
    A candidate with an empty target.capability inherits the model catalog
    capability (single-model target only), exactly like the engine does.
-   There are no time periods, branches, weights or nested trees here; a
-   tree whose root is not a JEV node is shown read-only with a banner.
+   There are no time periods, branches, weights or nested groups here; a
+   group whose root is not a JEV node is shown read-only with a banner.
 
    API used (unchanged): GET /admin/trees, GET /admin/models, GET /admin/jev,
    POST/PUT /admin/trees, POST /admin/trees/{id}/enable|disable|copy,
@@ -151,7 +151,6 @@
     const sticky = (tree && tree.sticky) || {};
     return {
       name: (tree && tree.name) || '',
-      timezone: (tree && tree.timezone) || 'Asia/Shanghai',
       sticky: { enabled: !!sticky.enabled, ttl: Number(sticky.ttl_seconds) || 1800 },
       instructions: jev.instructions || '',
       min_prob: Number(jev.min_prob) || 0,
@@ -169,21 +168,22 @@
 
   function dirtyItems() {
     if (!S.tree) return [];
-    if (S.isNew) return [t('routing.tree')];
+    if (S.isNew) return [t('routing.groups')];
     if (isBranch()) return [];
     const base = projection(S.base || {});
     const now = projection(S.tree);
+    const baseSticky = base.sticky || { enabled: false, ttl: 1800 };
+    const baseOptions = base.options || [];
     const out = [];
     if (base.instructions !== now.instructions) out.push(t('routing.instructions'));
-    if (base.name !== now.name) out.push(t('routing.treeName'));
-    if (base.timezone !== now.timezone) out.push(t('routing.timezone'));
-    if (base.sticky.enabled !== now.sticky.enabled || base.sticky.ttl !== now.sticky.ttl) out.push(t('routing.sticky'));
+    if (base.name !== now.name) out.push(t('routing.groupName'));
+    if (baseSticky.enabled !== now.sticky.enabled || baseSticky.ttl !== now.sticky.ttl) out.push(t('routing.sticky'));
     if (base.min_prob !== now.min_prob) out.push(t('routing.minProb'));
     if (base.min_margin !== now.min_margin) out.push(t('routing.minMargin'));
     if (base.fallback !== now.fallback) out.push(t('routing.fallback'));
 
-    const baseMap = new Map(base.options.map(option => [option.key, option]));
-    const baseKeys = base.options.map(option => option.key);
+    const baseMap = new Map(baseOptions.map(option => [option.key, option]));
+    const baseKeys = baseOptions.map(option => option.key);
     const nowKeys = now.options.map(option => option.key);
     const structural = baseKeys.length !== nowKeys.length ||
       baseKeys.some((key, index) => key !== nowKeys[index]) ||
@@ -217,6 +217,7 @@
 
   /* ── page head ────────────────────────────────────────────────── */
   function renderHeader() {
+    renderGroupButton();
     const model = jevModelName();
     $('#jevModel').textContent = model || t('routing.jevUnconfigured');
     $('#jevPill').classList.toggle('rt2-warn', !model);
@@ -249,7 +250,7 @@
     enableBtn.disabled = !S.tree || S.isNew || isBranch();
     $('#saveTree').disabled = !S.tree || isBranch();
     $('#headerTry').disabled = !S.tree || isBranch();
-    $('#copyTree').disabled = !S.tree || S.isNew;
+    $('#advancedBtn').disabled = !S.tree;
     $('#restoreDefault').disabled = isBranch();
   }
 
@@ -454,37 +455,133 @@
     select.value = current || '';
   }
 
-  /* ── advanced ─────────────────────────────────────────────────── */
-  function renderAdvanced() {
-    const current = S.isNew ? '' : (S.tree && S.tree.id) || '';
-    const select = $('#treeSelect');
-    let items = S.trees.map(tree =>
-      `<option value="${esc(tree.id)}">${esc(tree.name || tree.id)}${tree.enabled ? ' ●' : ''}</option>`);
-    if (S.isNew) items.unshift(`<option value="">${esc(t('routing.newTree'))}</option>`);
-    select.innerHTML = items.join('') || '<option value="">—</option>';
-    select.value = current;
-    if (select.value !== current) select.value = items.length ? select.options[0].value : '';
+  /* ── advanced config popover ──────────────────────────────────── */
+  const ADV = { open: false, pending: null };
 
-    const name = S.tree ? S.tree.name || '' : '';
-    if ($('#treeName').value !== name) $('#treeName').value = name;
-    const timezone = (S.tree && S.tree.timezone) || 'Asia/Shanghai';
-    if ($('#timezone').value !== timezone) $('#timezone').value = timezone;
-
+  function renderAdvancedPop() {
     const sticky = (S.tree && S.tree.sticky) || {};
     $('#stickyEnabled').checked = !!sticky.enabled;
     setNumber($('#stickyTtl'), ttlOf(sticky.ttl_seconds));
-
     const root = rootJev();
     setNumber($('#minProb'), root ? Number(root.min_prob) || 0 : 0);
     setNumber($('#minMargin'), root ? Number(root.min_margin) || 0 : 0);
-
-    $('#treeName').disabled = !S.tree;
-    $('#timezone').disabled = !S.tree;
-    $('#stickyEnabled').disabled = !S.tree || isBranch();
-    $('#stickyTtl').disabled = !S.tree || isBranch();
-    $('#minProb').disabled = !S.tree || isBranch();
-    $('#minMargin').disabled = !S.tree || isBranch();
+    const off = !S.tree || isBranch();
+    $('#stickyEnabled').disabled = off;
+    $('#stickyTtl').disabled = off;
+    $('#minProb').disabled = off;
+    $('#minMargin').disabled = off;
     $('#exportTree').disabled = !S.tree;
+    if (ADV.pending) {
+      $('#importConfirmText').textContent = tf('routing.importConfirm', {
+        name: (S.tree && (S.tree.name || S.tree.id)) || t('routing.title'),
+      });
+    }
+    $('#importConfirm').hidden = !ADV.pending;
+  }
+
+  function setAdvancedOpen(open) {
+    ADV.open = !!open;
+    $('#advancedPop').hidden = !ADV.open;
+    $('#advancedBtn').setAttribute('aria-expanded', ADV.open ? 'true' : 'false');
+    if (ADV.open) renderAdvancedPop();
+    else ADV.pending = null;
+  }
+
+  function toggleAdvanced() {
+    setAdvancedOpen(!ADV.open);
+  }
+
+  /* Import replaces the current group: keep its id so save() does a PUT. */
+  function applyImportedTree(tree) {
+    const keepId = S.tree && !S.isNew ? S.tree.id : '';
+    const keepEnabled = !!(keepId && S.tree.enabled);
+    const next = clone(tree);
+    delete next.id;
+    delete next.enabled;
+    delete next.tree_revision;
+    delete next.updated_at;
+    S.tree = next;
+    if (keepId) {
+      S.tree.id = keepId;
+      S.tree.enabled = keepEnabled;
+    }
+    S.base = null;
+    S.isNew = !keepId;
+    S.editing = null;
+    S.draftLabel = '';
+    S.draftCap = '';
+    S.tryState = 'idle';
+    S.tryResult = null;
+    S.rawOpen = false;
+    setIssues([]);
+    setAdvancedOpen(false);
+    renderAll();
+    toast(t('routing.importOk'));
+  }
+
+  /* ── help tooltips (? bubbles) ───────────────────────────────── */
+  const TIP = { el: null, timer: 0, anchor: null };
+  const tipEl = () => (TIP.el || (TIP.el = $('#rt2Tip')));
+
+  function tipVars(anchor) {
+    try { return JSON.parse(anchor.dataset.helpVars || '{}'); } catch (error) { return {}; }
+  }
+
+  function placeTip(anchor) {
+    const tip = tipEl();
+    const box = anchor.getBoundingClientRect();
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = Math.max(8, Math.min(box.left + box.width / 2 - width / 2, window.innerWidth - width - 8));
+    const above = box.top - height - 8;
+    const below = above < 8;
+    tip.style.left = left + 'px';
+    tip.style.top = (below ? box.bottom + 8 : above) + 'px';
+    tip.classList.toggle('below', below);
+    const arrow = Math.max(12, Math.min(box.left + box.width / 2 - left, width - 12));
+    tip.style.setProperty('--tip-arrow', arrow + 'px');
+  }
+
+  function showTip(anchor) {
+    const key = anchor && anchor.dataset.help;
+    if (!key) return;
+    const tip = tipEl();
+    tip.textContent = tf(key, tipVars(anchor));
+    tip.hidden = false;
+    TIP.anchor = anchor;
+    anchor.setAttribute('aria-describedby', 'rt2Tip');
+    placeTip(anchor);
+  }
+
+  function hideTip() {
+    clearTimeout(TIP.timer);
+    const tip = tipEl();
+    if (!tip || tip.hidden) return;
+    tip.hidden = true;
+    if (TIP.anchor) TIP.anchor.removeAttribute('aria-describedby');
+    TIP.anchor = null;
+  }
+
+  function bindHelpTips() {
+    document.addEventListener('mouseover', event => {
+      const anchor = event.target.closest && event.target.closest('.rt2-help');
+      if (!anchor) return;
+      clearTimeout(TIP.timer);
+      TIP.timer = setTimeout(() => showTip(anchor), 120);
+    });
+    document.addEventListener('mouseout', event => {
+      if (!event.target.closest || !event.target.closest('.rt2-help')) return;
+      hideTip();
+    });
+    document.addEventListener('focusin', event => {
+      const anchor = event.target.closest && event.target.closest('.rt2-help');
+      if (anchor) showTip(anchor);
+    });
+    document.addEventListener('focusout', event => {
+      if (event.target.closest && event.target.closest('.rt2-help')) hideTip();
+    });
+    window.addEventListener('scroll', hideTip, true);
+    window.addEventListener('resize', hideTip);
   }
 
   /* ── request preview ──────────────────────────────────────────── */
@@ -508,7 +605,8 @@
         </div>`;
       }).join('');
     }
-    $('#critNote').textContent = tf('routing.previewCriteriaHint', { n: list.length });
+    const critHelp = $('#critHelp');
+    if (critHelp) critHelp.dataset.helpVars = JSON.stringify({ n: list.length });
   }
 
   function renderPreview() {
@@ -645,7 +743,8 @@
     renderPrompt();
     renderCandidates();
     renderFallback();
-    renderAdvanced();
+    if (ADV.open) renderAdvancedPop();
+    if (GROUP.open) renderGroupMenu();
     renderPreview();
     renderTryInputs();
     renderTry();
@@ -702,7 +801,7 @@
     const fallbackId = picks.length ? picks[0].id : (S.models[0] && S.models[0].id) || '';
     return {
       id: '',
-      name: t('routing.title'),
+      name: nextGroupName(),
       enabled: false,
       timezone: 'Asia/Shanghai',
       sticky: { enabled: true, ttl_seconds: 1800 },
@@ -725,6 +824,7 @@
   }
 
   function startNewTree() {
+    GROUP.renaming = false;
     setIssues([]);
     S.tree = defaultTree();
     S.base = null;
@@ -738,19 +838,120 @@
     renderAll();
   }
 
-  /* Banner action for a non-JEV tree: immediately create a simplified JEV
-     tree (default prompt + up to 4 catalog models with a capability) and
-     switch to it. The catalog capability is inherited, so target.capability
-     stays empty and the new tree is enable-ready. */
-  async function createSimplifiedTree() {
-    const draft = defaultTree();
+  /* ── decision groups: title menu ──────────────────────────────── */
+  const GROUP = { open: false, pending: null, renaming: false };
+  const groupMenu = () => $('#groupMenu');
+
+  function nextGroupName() {
+    const base = t('routing.title');
+    const names = new Set(S.trees.map(tree => tree.name || tree.id));
+    if (!names.has(base)) return base;
+    let index = 2;
+    while (names.has(base + ' ' + index)) index += 1;
+    return base + ' ' + index;
+  }
+
+  function renderGroupButton() {
+    const name = S.tree ? (S.tree.name || S.tree.id || t('routing.title')) : t('routing.title');
+    $('#groupName').textContent = name;
+    $('#groupName').title = name;
+    $('#groupBtn').hidden = GROUP.renaming;
+    const input = $('#groupNameInput');
+    input.hidden = !GROUP.renaming;
+    input.setAttribute('aria-label', t('routing.groupName'));
+    if (GROUP.renaming && document.activeElement !== input) input.value = S.tree ? (S.tree.name || '') : '';
+  }
+
+  function renderGroupMenu() {
+    const menu = groupMenu();
+    if (menu.hidden) return;
+    const rows = S.trees.map(tree => {
+      const current = !S.isNew && S.tree && tree.id === S.tree.id;
+      return `<button type="button" class="rt2-gitem${current ? ' on' : ''}" data-group="${esc(tree.id)}">
+          <span class="rt2-gdot${tree.enabled ? ' on' : ''}"></span>
+          <span class="rt2-glabel">${esc(tree.name || tree.id)}</span>
+          <span class="rt2-gtag">${esc(tree.enabled ? t('routing.enabled') : t('routing.disabled'))}</span>
+          ${current ? ic('check') : ''}
+        </button>`;
+    }).join('');
+    const draft = S.isNew ? `<div class="rt2-gitem rt2-gdraft on">
+        <span class="rt2-gdot"></span>
+        <span class="rt2-glabel">${esc((S.tree && S.tree.name) || t('routing.title'))}</span>
+        <span class="rt2-gtag">${esc(t('routing.unsavedTag'))}</span>${ic('check')}
+      </div>` : '';
+    const confirm = GROUP.pending ? `<div class="rt2-gconfirm" data-gconfirm>
+        <span>${esc(t('routing.switchDirty'))}</span>
+        <div>
+          <button type="button" class="btn sm" data-gcancel>${esc(t('routing.cancel'))}</button>
+          <button type="button" class="btn sm danger" data-gdiscard>${esc(t('routing.discardSwitch'))}</button>
+        </div>
+      </div>` : '';
+    const actions = GROUP.pending ? '' : `
+      <div class="rt2-gacts">
+        <button type="button" class="rt2-gact" data-gact="rename">${esc(t('routing.rename'))}</button>
+        <button type="button" class="rt2-gact" data-gact="copy"${S.tree && !S.isNew ? '' : ' disabled'}>${esc(t('routing.copyGroup'))}</button>
+      </div>
+      <button type="button" class="rt2-gnew" data-gact="new">${esc(t('routing.newGroup'))}</button>`;
+    menu.innerHTML = `<div class="rt2-ghead"><b>${esc(t('routing.groups'))}</b><span>${S.trees.length}</span></div>
+      <div class="rt2-glist">${draft}${rows || `<div class="rt2-gempty">${esc(t('routing.emptyGroups'))}</div>`}</div>
+      ${confirm}${actions}`;
+  }
+
+  function openGroupMenu() {
+    GROUP.open = true;
+    GROUP.pending = null;
+    groupMenu().hidden = false;
+    $('#groupBtn').setAttribute('aria-expanded', 'true');
+    renderGroupMenu();
+  }
+
+  function closeGroupMenu() {
+    GROUP.open = false;
+    GROUP.pending = null;
+    groupMenu().hidden = true;
+    $('#groupBtn').setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleGroupMenu() {
+    if (GROUP.open) closeGroupMenu();
+    else openGroupMenu();
+  }
+
+  /* Switching discards unsaved edits: ask inside the menu first. */
+  function guardDirty(run) {
+    if (S.isNew || dirtyItems().length) {
+      GROUP.pending = run;
+      renderGroupMenu();
+      return;
+    }
+    closeGroupMenu();
+    run();
+  }
+
+  function runPending() {
+    const run = GROUP.pending;
+    GROUP.pending = null;
+    if (run) run();
+  }
+
+  function requestSwitch(id) {
+    if (!S.isNew && S.tree && S.tree.id === id) { closeGroupMenu(); return; }
+    guardDirty(() => { closeGroupMenu(); selectTree(id); });
+  }
+
+  function requestNew() {
+    guardDirty(() => { closeGroupMenu(); startNewTree(); });
+  }
+
+  function requestCopy() {
+    if (!S.tree || S.isNew) return;
+    guardDirty(async () => { closeGroupMenu(); await copyCurrentGroup(); });
+  }
+
+  async function copyCurrentGroup() {
     try {
-      const response = await api.post('/admin/trees', {
-        name: draft.name,
-        timezone: draft.timezone,
-        sticky: draft.sticky,
-        root: draft.root,
-      });
+      const name = ((S.tree.name || S.tree.id) + ' · ' + t('routing.copySuffix')).trim();
+      const response = await api.post('/admin/trees/' + encodeURIComponent(S.tree.id) + '/copy', { name });
       const listed = await api.get('/admin/trees');
       S.trees = listed.trees || S.trees;
       S.rev = listed.snapshot_revision || S.rev;
@@ -760,6 +961,32 @@
     } catch (error) {
       reportError(error, 'routing.saveFail');
     }
+  }
+
+  function startRename() {
+    if (!S.tree) return;
+    closeGroupMenu();
+    GROUP.renaming = true;
+    renderGroupButton();
+    const input = $('#groupNameInput');
+    input.value = S.tree.name || '';
+    input.focus();
+    input.select();
+  }
+
+  function commitRename() {
+    if (!GROUP.renaming) return;
+    const input = $('#groupNameInput');
+    const next = String(input.value || '').trim();
+    GROUP.renaming = false;
+    if (next && S.tree && next !== S.tree.name) S.tree.name = next;
+    renderAll();
+  }
+
+  function cancelRename() {
+    if (!GROUP.renaming) return;
+    GROUP.renaming = false;
+    renderAll();
   }
 
   function pickInitialTree() {
@@ -1215,22 +1442,11 @@
       if (!data || data.kind !== 'sr-jev-routing-tree' || data.version !== 1 || !data.tree) {
         throw new Error(t('routing.importBad'));
       }
-      const tree = clone(data.tree);
-      if (!tree.root || tree.root.type !== 'jev') throw new Error(t('routing.importBad'));
-      delete tree.id;
-      delete tree.enabled;
-      delete tree.tree_revision;
-      delete tree.updated_at;
+      if (!data.tree.root || data.tree.root.type !== 'jev') throw new Error(t('routing.importBad'));
       setIssues([]);
-      S.tree = tree;
-      S.base = null;
-      S.isNew = true;
-      S.editing = null;
-      S.draftLabel = '';
-      S.draftCap = '';
-      S.tryState = 'idle';
-      S.tryResult = null;
-      renderAll();
+      ADV.pending = clone(data.tree);
+      setAdvancedOpen(true);
+      renderAdvancedPop();
     } catch (error) {
       setIssues([{ code: 'import', zh: error.message, en: error.message }]);
     }
@@ -1238,6 +1454,8 @@
 
   /* ── events ───────────────────────────────────────────────────── */
   function bind() {
+    bindHelpTips();
+
     /* prompt */
     $('#instructions').addEventListener('input', event => {
       const root = rootJev();
@@ -1443,45 +1661,55 @@
       renderHeader();
     });
 
-    /* advanced */
-    $('#advancedToggle').addEventListener('click', () => {
-      const panel = $('#advanced');
-      const open = !panel.classList.contains('open');
-      panel.classList.toggle('open', open);
-      $('#advancedBody').hidden = !open;
-      $('#advancedToggle').setAttribute('aria-expanded', open ? 'true' : 'false');
-    });
-    $('#treeSelect').addEventListener('change', event => {
-      const value = event.target.value;
-      if (!value) { startNewTree(); return; }
-      if (S.tree && S.tree.id === value && !S.isNew) return;
-      selectTree(value);
-    });
-    $('#newTree').addEventListener('click', startNewTree);
-    $('#branchNew').addEventListener('click', createSimplifiedTree);
-    $('#copyTree').addEventListener('click', async () => {
-      if (!S.tree || S.isNew) return;
-      try {
-        const name = ((S.tree.name || S.tree.id) + ' · ' + t('routing.copyTree')).trim();
-        const response = await api.post('/admin/trees/' + encodeURIComponent(S.tree.id) + '/copy', { name });
-        const listed = await api.get('/admin/trees');
-        S.trees = listed.trees || S.trees;
-        S.rev = listed.snapshot_revision || S.rev;
-        selectTree(response.tree.id);
-      } catch (error) {
-        reportError(error, 'routing.saveFail');
+    /* decision groups */
+    $('#groupBtn').addEventListener('click', toggleGroupMenu);
+    groupMenu().addEventListener('click', event => {
+      const row = event.target.closest('[data-group]');
+      if (row) { requestSwitch(row.dataset.group); return; }
+      const action = event.target.closest('[data-gact]');
+      if (action) {
+        const kind = action.dataset.gact;
+        if (kind === 'new') requestNew();
+        else if (kind === 'copy') requestCopy();
+        else if (kind === 'rename') startRename();
+        return;
+      }
+      if (event.target.closest('[data-gdiscard]')) { runPending(); return; }
+      if (event.target.closest('[data-gcancel]')) {
+        GROUP.pending = null;
+        renderGroupMenu();
       }
     });
-    $('#treeName').addEventListener('input', event => {
-      if (!S.tree) return;
-      S.tree.name = event.target.value;
-      renderAdvanced();
-      renderHeader();
+    $('#groupNameInput').addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); commitRename(); }
+      else if (event.key === 'Escape') { event.preventDefault(); cancelRename(); }
     });
-    $('#timezone').addEventListener('input', event => {
-      if (!S.tree) return;
-      S.tree.timezone = event.target.value;
-      renderHeader();
+    $('#groupNameInput').addEventListener('blur', () => { if (GROUP.renaming) commitRename(); });
+    $('#branchNew').addEventListener('click', requestNew);
+    document.addEventListener('click', event => {
+      if (!GROUP.open) return;
+      /* A click inside the menu re-renders it, so the target can already be
+         detached by the time the event bubbles here. */
+      if (!event.target.isConnected) return;
+      if (event.target.closest('#groupBtn') || event.target.closest('#groupMenu')) return;
+      closeGroupMenu();
+    });
+
+    /* advanced config popover */
+    $('#advancedBtn').addEventListener('click', toggleAdvanced);
+    $('#importOk').addEventListener('click', () => {
+      const tree = ADV.pending;
+      ADV.pending = null;
+      if (tree) applyImportedTree(tree);
+    });
+    $('#importCancel').addEventListener('click', () => {
+      ADV.pending = null;
+      renderAdvancedPop();
+    });
+    document.addEventListener('click', event => {
+      if (!ADV.open) return;
+      if (event.target.closest('#advancedBtn') || event.target.closest('#advancedPop')) return;
+      setAdvancedOpen(false);
     });
     $('#stickyEnabled').addEventListener('change', event => {
       if (!S.tree) return;
@@ -1583,7 +1811,10 @@
         return;
       }
       if (event.key === 'Escape') {
-        if (!$('#addModelPop').hidden) closeAddPop();
+        if (!tipEl().hidden) { hideTip(); return; }
+        if (ADV.open) setAdvancedOpen(false);
+        else if (GROUP.open) closeGroupMenu();
+        else if (!$('#addModelPop').hidden) closeAddPop();
         else if (S.editing) cancelEditor();
       }
     });

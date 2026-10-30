@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Smart Router · 分流配置</title>
+<title>Smart Router · 决策组</title>
 <link rel="icon" href="data:"><link rel="stylesheet" href="shared.css"><link rel="stylesheet" href="routing.css">
 </head>
 <body data-page="routing">
@@ -15,6 +15,7 @@
   <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.7" y="5.7" width="6.9" height="6.9" rx="1.4"/><path d="M10.3 3.7V3a.9.9 0 0 0-.9-.9H3.1a.9.9 0 0 0-.9.9v6.3c0 .5.4.9.9.9h.7"/></symbol>
   <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></symbol>
   <symbol id="i-chev" viewBox="0 0 16 16"><path d="M6.2 3.9L10.3 8l-4.1 4.1"/></symbol>
+  <symbol id="i-sliders" viewBox="0 0 16 16"><path d="M2.6 5h5.9M12.2 5h1.2M2.6 11h1.2M7.6 11h5.8"/><circle cx="10.2" cy="5" r="1.35"/><circle cx="6" cy="11" r="1.35"/></symbol>
   <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 2.4l4.8 1.9v3.8c0 2.8-2 4.4-4.8 5.4-2.8-1-4.8-2.6-4.8-5.4V4.3z"/><path d="M5.9 8.1l1.5 1.5 2.9-2.9"/></symbol>
   <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7.1" cy="7.1" r="3.8"/><path d="M10.1 10.1L13 13"/></symbol>
   <symbol id="i-reset" viewBox="0 0 16 16"><path d="M3.4 7.3a4.6 4.6 0 1 1 1.3 4.5"/><path d="M3.1 3.8v3.5h3.5"/></symbol>
@@ -26,8 +27,17 @@
   <!-- ── page head ── -->
   <div class="rt2-head">
     <div class="rt2-headl">
-      <div class="rt2-crumb"><span data-i18n="nav.routing"></span><i>/</i><span data-i18n="routing.title"></span></div>
-      <h1 data-i18n="routing.title"></h1>
+      <div class="rt2-crumb"><span data-i18n="nav.routing"></span></div>
+      <h1 class="rt2-h1">
+        <span class="rt2-gwrap">
+          <button type="button" class="rt2-gbtn" id="groupBtn" aria-haspopup="true" aria-expanded="false" aria-controls="groupMenu">
+            <span class="rt2-gname" id="groupName">—</span>
+            <svg class="rt2-ic rt2-gchev" aria-hidden="true"><use href="#i-chev"/></svg>
+          </button>
+          <input class="rt2-ginput" id="groupNameInput" autocomplete="off" hidden>
+          <div class="rt2-gmenu" id="groupMenu" role="dialog" data-i18n-aria="routing.groups" hidden></div>
+        </span>
+      </h1>
       <div class="rt2-sub" data-i18n="routing.sub"></div>
     </div>
     <div class="rt2-headr">
@@ -39,6 +49,34 @@
       </div>
       <div class="rt2-acts">
         <button class="btn sm" id="headerTry"><svg class="rt2-ic" aria-hidden="true"><use href="#i-play"/></svg><span data-i18n="routing.try"></span></button>
+        <span class="rt2-awrap">
+          <button class="btn sm" id="advancedBtn" aria-expanded="false" aria-controls="advancedPop" data-i18n-aria="routing.advanced">
+            <svg class="rt2-ic" aria-hidden="true"><use href="#i-sliders"/></svg><span data-i18n="routing.advanced"></span>
+          </button>
+          <div class="rt2-advpop" id="advancedPop" role="dialog" data-i18n-aria="routing.advanced" hidden>
+            <div class="rt2-ap-row">
+              <label class="rt2-check"><input type="checkbox" id="stickyEnabled"><span data-i18n="routing.sticky"></span></label>
+              <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.ttl"></span><input type="number" id="stickyTtl" min="1" max="31536000" step="60"></label>
+            </div>
+            <div class="rt2-ap-row">
+              <span class="rt2-ap-label"><span data-i18n="routing.thresholds"></span><button type="button" class="rt2-help" data-help="routing.thresholdHint" data-i18n-aria="routing.help">?</button></span>
+              <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minProb"></span><input type="number" id="minProb" min="0" max="1" step="0.01"></label>
+              <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minMargin"></span><input type="number" id="minMargin" min="0" max="1" step="0.01"></label>
+            </div>
+            <div class="rt2-ap-acts">
+              <button class="btn sm" id="importTree" data-i18n="routing.import"></button>
+              <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
+              <input type="file" id="importFile" accept="application/json,.json" hidden>
+            </div>
+            <div class="rt2-ap-confirm" id="importConfirm" hidden>
+              <p id="importConfirmText"></p>
+              <div class="rt2-ap-confirmacts">
+                <button class="btn sm" id="importCancel" data-i18n="routing.cancel"></button>
+                <button class="btn sm danger" id="importOk" data-i18n="routing.importConfirmOk"></button>
+              </div>
+            </div>
+          </div>
+        </span>
         <button class="btn sm pri" id="saveTree"><svg class="rt2-ic" aria-hidden="true"><use href="#i-save"/></svg><span data-i18n="routing.save"></span></button>
         <button class="btn sm rt2-enable" id="enableTree"><span class="rt2-swt"></span><span id="enableLabel"></span></button>
       </div>
@@ -60,12 +98,10 @@
       <!-- ① prompt -->
       <section class="rt2-card" id="promptCard">
         <div class="rt2-card-h">
-          <h2 data-i18n="routing.instructions"></h2>
+          <h2><span data-i18n="routing.instructions"></span><button type="button" class="rt2-help" data-help="routing.instructionsHint" data-i18n-aria="routing.help">?</button></h2>
           <span class="rt2-api">questions.route.instructions</span>
-          <span class="rt2-hint" data-i18n="routing.onlyWritesHow"></span>
         </div>
         <div class="rt2-prompt-body">
-          <p class="rt2-note" data-i18n="routing.instructionsHint"></p>
           <textarea class="rt2-ta" id="instructions" spellcheck="false"></textarea>
           <div class="rt2-prompt-foot">
             <span class="rt2-count" id="charCount"></span>
@@ -79,8 +115,7 @@
       <!-- ② candidate models -->
       <section class="rt2-card" id="candidateCard">
         <div class="rt2-card-h">
-          <h2><span data-i18n="routing.candidates"></span><span class="rt2-nbadge" id="candidateCount">0</span></h2>
-          <span class="rt2-hint" data-i18n="routing.orderHint"></span>
+          <h2><span data-i18n="routing.candidates"></span><span class="rt2-nbadge" id="candidateCount">0</span><button type="button" class="rt2-help" data-help="routing.orderHint" data-i18n-aria="routing.help">?</button></h2>
           <button class="btn sm" id="addModelBtn" data-i18n="routing.addModel"></button>
         </div>
         <div class="rt2-models-body" id="candidateList"></div>
@@ -90,44 +125,9 @@
       <section class="rt2-fb" id="fallbackCard">
         <span class="rt2-fb-ico"><svg class="rt2-ic" aria-hidden="true"><use href="#i-shield"/></svg></span>
         <div class="rt2-fb-main">
-          <div class="rt2-fb-t"><span data-i18n="routing.fallback"></span><span class="rt2-tag" data-i18n="routing.noScore"></span></div>
-          <p class="rt2-fb-note" data-i18n="routing.fallbackHint"></p>
+          <div class="rt2-fb-t"><span data-i18n="routing.fallback"></span><span class="rt2-tag" data-i18n="routing.noScore"></span><button type="button" class="rt2-help" data-help="routing.fallbackHint" data-i18n-aria="routing.help">?</button></div>
         </div>
         <select class="rt2-select" id="fallbackSelect"></select>
-      </section>
-
-      <!-- ④ advanced (collapsed by default) -->
-      <section class="rt2-adv" id="advanced">
-        <button class="rt2-adv-head" id="advancedToggle" aria-expanded="false" aria-controls="advancedBody">
-          <span class="rt2-adv-chev"><svg class="rt2-ic" aria-hidden="true"><use href="#i-chev"/></svg></span>
-          <b data-i18n="routing.advanced"></b>
-          <span class="rt2-adv-sum" data-i18n="routing.advancedHint"></span>
-        </button>
-        <div class="rt2-adv-body" id="advancedBody" hidden>
-          <div class="rt2-adv-row">
-            <label class="rt2-adv-field rt2-grow"><span data-i18n="routing.tree"></span><select id="treeSelect"></select></label>
-            <button class="btn sm" id="newTree" data-i18n="routing.newTree"></button>
-            <button class="btn sm" id="copyTree" data-i18n="routing.copyTree"></button>
-          </div>
-          <div class="rt2-adv-row">
-            <label class="rt2-adv-field rt2-grow"><span data-i18n="routing.treeName"></span><input id="treeName" autocomplete="off"></label>
-            <label class="rt2-adv-field rt2-grow"><span data-i18n="routing.timezone"></span><input id="timezone" autocomplete="off"></label>
-          </div>
-          <div class="rt2-adv-row">
-            <label class="rt2-check"><input type="checkbox" id="stickyEnabled"><span data-i18n="routing.sticky"></span></label>
-            <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.ttl"></span><input type="number" id="stickyTtl" min="1" max="31536000" step="60"></label>
-          </div>
-          <div class="rt2-adv-row">
-            <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minProb"></span><input type="number" id="minProb" min="0" max="1" step="0.01"></label>
-            <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minMargin"></span><input type="number" id="minMargin" min="0" max="1" step="0.01"></label>
-            <span class="rt2-adv-note" data-i18n="routing.thresholdHint"></span>
-          </div>
-          <div class="rt2-adv-acts">
-            <button class="btn sm" id="importTree" data-i18n="routing.import"></button>
-            <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
-            <input type="file" id="importFile" accept="application/json,.json" hidden>
-          </div>
-        </div>
       </section>
 
       <p class="rt2-pagefoot"><code>POST /v1/systemone</code> · <code>state</code> · <code>instructions</code> · <code>criteria</code></p>
@@ -153,7 +153,7 @@
         <section class="rt2-sec" style="border-top:0;padding-top:0">
           <div class="rt2-slab">
             <span class="rt2-slab-n">01</span><b data-i18n="routing.previewState"></b>
-            <span class="rt2-slab-note" data-i18n="routing.previewStateHint"></span>
+            <button type="button" class="rt2-help" data-help="routing.previewStateHint" data-i18n-aria="routing.help">?</button>
           </div>
           <pre class="rt2-code" id="stateCode"></pre>
         </section>
@@ -161,7 +161,7 @@
         <section class="rt2-sec">
           <div class="rt2-slab">
             <span class="rt2-slab-n">02</span><b data-i18n="routing.previewInstructions"></b>
-            <span class="rt2-slab-note rt2-live" data-i18n="routing.previewInstructionsHint"></span>
+            <button type="button" class="rt2-help" data-help="routing.previewInstructionsHint" data-i18n-aria="routing.help">?</button>
           </div>
           <div class="rt2-instr" id="instrOut"></div>
         </section>
@@ -169,7 +169,7 @@
         <section class="rt2-sec">
           <div class="rt2-slab">
             <span class="rt2-slab-n">03</span><b data-i18n="routing.previewCriteria"></b>
-            <span class="rt2-slab-note" id="critNote"></span>
+            <button type="button" class="rt2-help" id="critHelp" data-help="routing.previewCriteriaHint" data-i18n-aria="routing.help">?</button>
           </div>
           <div class="rt2-crits" id="crits"></div>
         </section>
@@ -180,15 +180,14 @@
           <code>route.type=choice</code>
         </div>
 
-        <p class="rt2-foot" data-i18n="routing.previewHint"></p>
       </div>
 
       <!-- try -->
       <div class="rt2-pane" id="paneTry" data-pane="try" role="tabpanel" hidden>
-        <div class="rt2-trylbl"><b data-i18n="routing.try"></b><span>dry_run</span></div>
+        <div class="rt2-trylbl"><span class="rt2-trytitle"><b data-i18n="routing.try"></b><button type="button" class="rt2-help" data-help="routing.tryNoLog" data-i18n-aria="routing.help">?</button></span><span>dry_run</span></div>
         <div class="rt2-input">
           <textarea id="tryText" spellcheck="false"></textarea>
-          <div class="rt2-inputfoot"><span id="tryCount"></span><span data-i18n="routing.tryNoLog"></span></div>
+          <div class="rt2-inputfoot"><span id="tryCount"></span></div>
         </div>
         <div class="rt2-chips" id="tryChips">
           <span class="rt2-chiplbl" data-i18n="routing.trySampleLabel"></span>
@@ -202,6 +201,8 @@
     </aside>
   </div>
 </main>
+
+<div class="rt2-tip" id="rt2Tip" role="tooltip" hidden></div>
 
 <!-- add-model popover (fixed, so card overflow cannot clip it) -->
 <div class="rt2-pop" id="addModelPop" hidden></div>
