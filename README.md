@@ -155,7 +155,7 @@ ROUTER_JEV_API_KEY= \
 
 树支持草稿、复制、启停、导入导出和 dry-run 试算。启用时要求模型、时间段、能力说明、推理档位和最终 fallback 全部有效；新库不隐式创建或启用树。没有启用树时 `/v1` 返回 503 `no_active_tree`。
 
-控制台的「决策组」页只做 JEV 需要的两件事：**提示词**（`root.instructions`）和**每个候选模型的能力描述**（`root.options[].target.capability`，留空则继承模型目录的 `profile.capability`），外加必需的兜底模型和少量高级项（页首「试算」旁的「高级配置」浮层：sticky、`min_prob`/`min_margin`、导入导出）。多组配置通过页首标题下拉切换、新建、复制、重命名。页面不再编辑时间分支：`branch` / `when` / 时间段仍保留在数据模型与引擎中，可通过 API 或导入 JSON 维护；当前组含时间分支时页面只显示提示和「新建决策组」入口。右侧 dock 提供请求预览与 dry-run 试算（试算前会自动保存）。
+控制台的「决策组」页只做 JEV 需要的两件事：**提示词**（`root.instructions`）和**每个候选模型的能力描述**（`root.options[].target.capability`，留空则继承模型目录的 `profile.capability`），外加必需的兜底模型和少量高级项（页首「高级配置」浮层：sticky、`min_prob`/`min_margin`；导入、导出在「保存」旁）。多组配置通过页首标题下拉切换、新建、复制、重命名。页面不再编辑时间分支：`branch` / `when` / 时间段仍保留在数据模型与引擎中，可通过 API 或导入 JSON 维护；当前组含时间分支时页面只显示提示和「新建决策组」入口。右侧 dock 提供请求预览与 dry-run 试算（试算前会自动保存）。
 
 `GET /admin/jev` 的 `defaults` 提供默认提示词和 state 模板；预览里的 `state` 模板来自该配置，`{request}` 由服务端拼入请求原文。
 

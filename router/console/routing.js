@@ -241,6 +241,7 @@
     $('#saveTree').disabled = !S.tree || isBranch();
     $('#headerTry').disabled = !S.tree || isBranch();
     $('#advancedBtn').disabled = !S.tree;
+    $('#exportTree').disabled = !S.tree;
     $('#restoreDefault').disabled = isBranch();
   }
 
@@ -460,13 +461,18 @@
     $('#stickyTtl').disabled = off;
     $('#minProb').disabled = off;
     $('#minMargin').disabled = off;
-    $('#exportTree').disabled = !S.tree;
-    if (ADV.pending) {
-      $('#importConfirmText').textContent = tf('routing.importConfirm', {
-        name: (S.tree && (S.tree.name || S.tree.id)) || t('routing.title'),
-      });
+  }
+
+  function renderImportPop() {
+    const box = $('#importConfirm');
+    if (!ADV.pending) {
+      box.hidden = true;
+      return;
     }
-    $('#importConfirm').hidden = !ADV.pending;
+    $('#importConfirmText').textContent = tf('routing.importConfirm', {
+      name: (S.tree && (S.tree.name || S.tree.id)) || t('routing.title'),
+    });
+    box.hidden = false;
   }
 
   function setAdvancedOpen(open) {
@@ -474,7 +480,6 @@
     $('#advancedPop').hidden = !ADV.open;
     $('#advancedBtn').setAttribute('aria-expanded', ADV.open ? 'true' : 'false');
     if (ADV.open) renderAdvancedPop();
-    else ADV.pending = null;
   }
 
   function toggleAdvanced() {
@@ -504,7 +509,7 @@
     S.tryResult = null;
     S.rawOpen = false;
     setIssues([]);
-    setAdvancedOpen(false);
+    renderImportPop();
     renderAll();
     toast(t('routing.importOk'));
   }
@@ -1435,8 +1440,7 @@
       if (!data.tree.root || data.tree.root.type !== 'jev') throw new Error(t('routing.importBad'));
       setIssues([]);
       ADV.pending = clone(data.tree);
-      setAdvancedOpen(true);
-      renderAdvancedPop();
+      renderImportPop();
     } catch (error) {
       setIssues([{ code: 'import', zh: error.message, en: error.message }]);
     }
@@ -1690,16 +1694,24 @@
     $('#importOk').addEventListener('click', () => {
       const tree = ADV.pending;
       ADV.pending = null;
+      renderImportPop();
       if (tree) applyImportedTree(tree);
     });
     $('#importCancel').addEventListener('click', () => {
       ADV.pending = null;
-      renderAdvancedPop();
+      renderImportPop();
     });
     document.addEventListener('click', event => {
       if (!ADV.open) return;
       if (event.target.closest('#advancedBtn') || event.target.closest('#advancedPop')) return;
       setAdvancedOpen(false);
+    });
+    document.addEventListener('click', event => {
+      if (!ADV.pending) return;
+      if (!event.target.isConnected) return;
+      if (event.target.closest('#importTree') || event.target.closest('#importConfirm')) return;
+      ADV.pending = null;
+      renderImportPop();
     });
     $('#stickyEnabled').addEventListener('change', event => {
       if (!S.tree) return;
@@ -1802,6 +1814,7 @@
       }
       if (event.key === 'Escape') {
         if (!tipEl().hidden) { hideTip(); return; }
+        if (ADV.pending) { ADV.pending = null; renderImportPop(); return; }
         if (ADV.open) setAdvancedOpen(false);
         else if (GROUP.open) closeGroupMenu();
         else if (!$('#addModelPop').hidden) closeAddPop();

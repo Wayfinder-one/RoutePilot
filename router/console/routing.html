@@ -58,20 +58,20 @@
               <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minProb"></span><input type="number" id="minProb" min="0" max="1" step="0.01"></label>
               <label class="rt2-adv-field rt2-inline"><span data-i18n="routing.minMargin"></span><input type="number" id="minMargin" min="0" max="1" step="0.01"></label>
             </div>
-            <div class="rt2-ap-acts">
-              <button class="btn sm" id="importTree" data-i18n="routing.import"></button>
-              <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
-              <input type="file" id="importFile" accept="application/json,.json" hidden>
-            </div>
-            <div class="rt2-ap-confirm" id="importConfirm" hidden>
-              <p id="importConfirmText"></p>
-              <div class="rt2-ap-confirmacts">
-                <button class="btn sm" id="importCancel" data-i18n="routing.cancel"></button>
-                <button class="btn sm danger" id="importOk" data-i18n="routing.importConfirmOk"></button>
-              </div>
-            </div>
           </div>
         </span>
+        <span class="rt2-awrap">
+          <button class="btn sm" id="importTree" data-i18n="routing.import"></button>
+          <div class="rt2-advpop rt2-importpop" id="importConfirm" role="dialog" data-i18n-aria="routing.import" hidden>
+            <p id="importConfirmText"></p>
+            <div class="rt2-ap-confirmacts">
+              <button class="btn sm" id="importCancel" data-i18n="routing.cancel"></button>
+              <button class="btn sm danger" id="importOk" data-i18n="routing.importConfirmOk"></button>
+            </div>
+          </div>
+          <input type="file" id="importFile" accept="application/json,.json" hidden>
+        </span>
+        <button class="btn sm" id="exportTree" data-i18n="routing.export"></button>
         <button class="btn sm pri" id="saveTree"><svg class="rt2-ic" aria-hidden="true"><use href="#i-save"/></svg><span data-i18n="routing.save"></span></button>
         <button class="btn sm rt2-enable" id="enableTree"><span class="rt2-swt"></span><span id="enableLabel"></span></button>
       </div>
@@ -94,7 +94,6 @@
       <section class="rt2-card" id="promptCard">
         <div class="rt2-card-h">
           <h2><span data-i18n="routing.instructions"></span><button type="button" class="rt2-help" data-help="routing.instructionsHint" data-i18n-aria="routing.help">?</button></h2>
-          <span class="rt2-api">questions.route.instructions</span>
         </div>
         <div class="rt2-prompt-body">
           <textarea class="rt2-ta" id="instructions" spellcheck="false"></textarea>
