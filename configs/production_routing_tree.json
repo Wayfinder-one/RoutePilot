@@ -1,6 +1,6 @@
 {
   "id": "default-jev",
-  "name": "默认 JEV 分流树",
+  "name": "默认决策组",
   "timezone": "Asia/Shanghai",
   "sticky": {
     "enabled": true,
