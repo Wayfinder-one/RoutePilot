@@ -29,6 +29,15 @@
      </span>`;
   document.body.prepend(bar);
   setLang(LANG);
+  /* Narrow view scrolls the nav sideways; keep the current page in view
+     without moving the document itself (scrollIntoView can move both). */
+  requestAnimationFrame(() => {
+    const nav = bar.querySelector('nav');
+    const current = nav && nav.querySelector('a.on');
+    if (!nav || !current || nav.scrollWidth <= nav.clientWidth) return;
+    const box = nav.getBoundingClientRect();
+    nav.scrollLeft += current.getBoundingClientRect().left - box.left - 10;
+  });
 
   /* ── current user (async; everything stays hidden until it is known) ── */
   let me = null;

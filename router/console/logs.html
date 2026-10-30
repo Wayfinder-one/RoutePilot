@@ -18,19 +18,23 @@
     <button class="btn sm" id="refresh" data-i18n="logs.refresh"></button>
   </div>
 </div>
-<main class="page">
-  <div class="logs-toolbar">
-    <select id="filter">
-      <option value="all">全部 / all</option>
-      <option value="jev">JEV 决策 / JEV</option>
-      <option value="sticky">会话粘性 / sticky</option>
-      <option value="fallback">兜底 / fallback</option>
-    </select>
+<main class="page lg-page">
+  <!-- summary: what the last 20 requests did, readable without opening anything -->
+  <section class="lg-stats" id="stats" aria-live="polite"></section>
+
+  <div class="lg-toolbar">
+    <div class="lg-seg" id="filter" role="group" aria-label="filter">
+      <button type="button" data-filter="all" data-i18n="logs.filter.all"></button>
+      <button type="button" data-filter="jev" data-i18n="logs.filter.jev"></button>
+      <button type="button" data-filter="sticky" data-i18n="logs.filter.sticky"></button>
+      <button type="button" data-filter="fallback" data-i18n="logs.filter.fallback"></button>
+    </div>
     <span class="pill" id="countPill"></span>
-    <span class="spacer" style="flex:1"></span>
-    <span class="mut" style="font-size:11.5px" data-i18n="logs.click"></span>
+    <span class="lg-spacer"></span>
+    <span class="lg-hint" data-i18n="logs.expand"></span>
   </div>
-  <div id="list"></div>
+
+  <section class="lg-list" id="list"></section>
 </main>
 <script src="i18n.js"></script>
 <script src="nav.js"></script>
