@@ -223,13 +223,14 @@
     const dirty = dirtyItems();
     const savePill = $('#savePill');
     if (dirty.length) {
+      savePill.hidden = false;
       savePill.className = 'rt2-pill rt2-dirty';
       savePill.title = dirty.join(' · ');
       savePill.innerHTML = `<span class="rt2-ldot"></span>${esc(tf('routing.unsaved', { n: dirty.length }))}`;
     } else {
-      savePill.className = 'rt2-pill rt2-saved';
-      savePill.title = t('routing.saved');
-      savePill.innerHTML = ic('check') + esc(t('routing.saved'));
+      savePill.hidden = true;
+      savePill.className = 'rt2-pill';
+      savePill.innerHTML = '';
     }
 
     const enableBtn = $('#enableTree');

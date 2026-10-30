@@ -7,7 +7,7 @@ const I18N = {
     'ov.go.routing': '编辑决策组 →', 'ov.activeTree': '当前决策组',
     /* ── routing (2026-10-29 minimal JEV config) ── */
     'routing.title': '决策组',
-    'routing.saved': '已保存', 'routing.unsaved': '未保存 {n}',
+    'routing.unsaved': '未保存 {n}',
     'routing.save': '保存', 'routing.saveOk': '已保存',
     'routing.enabled': '已启用', 'routing.disabled': '未启用', 'routing.stateOff': '关闭',
     'routing.jevUnconfigured': 'JEV 未配置',
@@ -252,7 +252,7 @@ const I18N = {
     'ov.go.routing': 'Edit decision group →', 'ov.activeTree': 'Active decision group',
     /* ── routing (2026-10-29 minimal JEV config) ── */
     'routing.title': 'Decision group',
-    'routing.saved': 'Saved', 'routing.unsaved': 'Unsaved {n}',
+    'routing.unsaved': 'Unsaved {n}',
     'routing.save': 'Save', 'routing.saveOk': 'Saved',
     'routing.enabled': 'Enabled', 'routing.disabled': 'Disabled', 'routing.stateOff': 'Off',
     'routing.jevUnconfigured': 'JEV not configured',

@@ -16,11 +16,10 @@
 /* ── shell ───────────────────────────────────── */
 .rt2-shell{max-width:1220px;margin:0 auto;padding:0 20px 30px}
 .rt2-head{display:flex;align-items:flex-end;justify-content:space-between;gap:26px;padding:15px 0 12px}
-.rt2-crumb{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--text-3);letter-spacing:.02em}
-.rt2-crumb i{font-style:normal;color:var(--line-2)}
 .rt2-head h1{font-size:21px;letter-spacing:-.02em;line-height:1.25;margin-top:3px}
 .rt2-headr{display:flex;flex-direction:column;align-items:flex-end;gap:9px;flex:none}
 .rt2-status{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.rt2-status .rt2-pill[hidden]{display:none}
 .rt2-acts{display:flex;align-items:center;gap:7px}
 .rt2-grid{display:grid;grid-template-columns:minmax(0,1fr) 420px;gap:16px;align-items:start}
 .rt2-col{min-width:0}
@@ -31,7 +30,6 @@
   white-space:nowrap;line-height:1}
 .rt2-pill .rt2-ic{width:11px;height:11px}
 .rt2-dirty{background:var(--amber-soft);border-color:var(--amber-line);color:var(--amber);font-weight:650}
-.rt2-saved{color:var(--text-3)}
 .rt2-ldot{width:6px;height:6px;border-radius:99px;background:currentColor;flex:none;display:inline-block}
 
 .rt2-ic{width:13px;height:13px;display:block;fill:none;stroke:currentColor;stroke-width:1.55;
