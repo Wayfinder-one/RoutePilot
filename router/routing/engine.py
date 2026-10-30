@@ -4,6 +4,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from router.jev.client import JevCandidate
+from router.jev.window import apply_window
 from router.routing.conditions import matching_periods, when_matches
 from router.routing.model import Branch, Jev, Node, Target
 from router.routing.snapshot import RoutingSnapshot
@@ -164,9 +165,19 @@ class RoutingEngine:
                 JevCandidate(option.key, option.label, self._capability(snapshot, option.target))
                 for option in node.options
             )
+            window = apply_window(text, snapshot.jev_input_tokens)
+            if window.truncated:
+                trace.append({
+                    "event": "jev_input_window",
+                    "node_id": node.id,
+                    "input_tokens_limit": snapshot.jev_input_tokens,
+                    "tokens_before": window.tokens_before,
+                    "tokens_after": window.tokens_after,
+                    "truncated": True,
+                })
             answer = await self.jev_client.choose(
                 snapshot.jev,
-                text,
+                window.text,
                 candidates,
                 instructions=node.instructions,
             )

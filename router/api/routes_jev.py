@@ -13,7 +13,14 @@ from router.jev.config import (
     JevConfigRepo,
     JevSettings,
 )
-from router.store.repositories import ChangeRepo, _now_iso
+from router.jev.window import (
+    DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_INPUT_TOKENS,
+    MAX_TOKENS,
+    MIN_INPUT_TOKENS,
+)
+from router.routing.snapshot import read_jev_window
+from router.store.repositories import ChangeRepo, SettingsRepo, _now_iso
 
 router = APIRouter()
 
@@ -83,3 +90,71 @@ async def test_jev(body: dict, request: Request, conn: sqlite3.Connection = Depe
         "usage": answer.usage,
         "duration_ms": answer.duration_ms,
     }
+
+
+def _coerce_tokens(value, field: str) -> int:
+    if isinstance(value, bool):
+        raise HTTPException(422, detail=f"{field} 必须是整数")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+        return int(value.strip())
+    raise HTTPException(422, detail=f"{field} 必须是整数")
+
+
+@router.get("/jev/window")
+def get_jev_window(conn: sqlite3.Connection = Depends(get_conn)):
+    """JEV 输入窗口：服务上下文预算与发送给决策服务的输入上限。"""
+    input_tokens, context_tokens = read_jev_window(conn)
+    return {
+        "context_tokens": context_tokens,
+        "input_tokens": input_tokens,
+        "defaults": {"context_tokens": DEFAULT_CONTEXT_TOKENS, "input_tokens": DEFAULT_INPUT_TOKENS},
+        "min_input_tokens": MIN_INPUT_TOKENS,
+        "max_tokens": MAX_TOKENS,
+    }
+
+
+@router.put("/jev/window")
+def put_jev_window(body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    """保存输入窗口配置。
+
+    - context_tokens：JEV 服务每请求上下文预算（= llama.cpp -c/--parallel），256..131072；
+    - input_tokens：实际发送给 JEV 的输入上限，256..context_tokens；超出按首尾保留截断。
+    """
+    allowed = {"context_tokens", "input_tokens"}
+    unknown = set(body) - allowed
+    if unknown:
+        raise HTTPException(422, detail=f"unknown JEV window fields: {sorted(unknown)}")
+    if not body:
+        raise HTTPException(422, detail="至少提供一个字段")
+
+    current_input, current_context = read_jev_window(conn)
+    context_tokens = (
+        _coerce_tokens(body["context_tokens"], "context_tokens") if "context_tokens" in body else current_context
+    )
+    input_tokens = (
+        _coerce_tokens(body["input_tokens"], "input_tokens") if "input_tokens" in body else current_input
+    )
+    if not MIN_INPUT_TOKENS <= context_tokens <= MAX_TOKENS:
+        raise HTTPException(422, detail=f"context_tokens 必须在 {MIN_INPUT_TOKENS}..{MAX_TOKENS} 之间")
+    if not MIN_INPUT_TOKENS <= input_tokens <= MAX_TOKENS:
+        raise HTTPException(422, detail=f"input_tokens 必须在 {MIN_INPUT_TOKENS}..{MAX_TOKENS} 之间")
+    if input_tokens > context_tokens:
+        raise HTTPException(422, detail="input_tokens 不能大于 context_tokens")
+
+    publisher = request.app.state.publisher
+    with publisher.locked():
+        repo = SettingsRepo(conn)
+        with conn:
+            repo.set("jev_context_tokens", str(context_tokens))
+            repo.set("jev_input_tokens", str(input_tokens))
+            ChangeRepo(conn).record(_now_iso(), "jev_window", {
+                "action": "save",
+                "context_tokens": context_tokens,
+                "input_tokens": input_tokens,
+            })
+        publisher.refresh(conn)
+    return get_jev_window(conn)

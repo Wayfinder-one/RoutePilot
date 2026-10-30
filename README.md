@@ -56,18 +56,25 @@ npm install
 npm run check:console   # 需要已启动服务和可用的 Chromium
 ```
 
-## 配置 NeoHorse JEV
+## 配置 JEV 决策服务
 
-先在训练仓库部署原生 vLLM 0.32 服务，确保其提供：
+当前生产后端是 **llama.cpp 官方镜像 + LiquidAI/d1-2B**（BF16 GGUF，原生 `/v1/systemone`，
+部署与容量实测见训练仓库 `docs/llamacpp_d1_2b_deploy.md`）：
 
 ```text
-POST http://<jev-host>:30000/v1/systemone
+POST http://<jev-host>:30104/v1/systemone
 ```
+
+P0 约束（决策模型无法分块 prefill，必须整 prompt 一次送入）：
+
+- 单请求 prompt 上限 = llama.cpp `--ubatch-size`；
+- 每请求上下文 = `-c / --parallel`（即 `n_ctx_slot`）；
+- 总 KV 容量 = `-c`，决定显存；并发 = `--parallel`。
 
 然后通过控制台「JEV 模型」填写：
 
-- 服务地址，例如 `http://127.0.0.1:30000`；不要重复追加 `/v1/systemone`；
-- served model name，例如 `NeoHorse-Jev-4B`；
+- 服务地址，例如 `http://127.0.0.1:30104`；不要重复追加 `/v1/systemone`；
+- served model name，例如 `d1-2B`（llama.cpp 会回显真实 id，填入任意可读名即可）；
 - 可选 API 密钥、超时、默认 instructions 和 state 模板；
 - 「连接测试」会真实调用该服务，但不改变分流状态。
 
@@ -75,8 +82,8 @@ POST http://<jev-host>:30000/v1/systemone
 
 ```bash
 ROUTER_DB=/tmp/smart-router-v3.db \
-ROUTER_JEV_URL=http://127.0.0.1:30000 \
-ROUTER_JEV_MODEL=NeoHorse-Jev-4B \
+ROUTER_JEV_URL=http://127.0.0.1:30104 \
+ROUTER_JEV_MODEL=d1-2B \
 ROUTER_JEV_API_KEY= \
 .venv/bin/python -m router
 ```
@@ -93,6 +100,59 @@ ROUTER_JEV_API_KEY= \
 ```
 
 一个 `choice` question 包含有序 `criteria`。客户端根据完整 `probabilities` 排序，不直接信任 `choice`，也不把原生 `confidence` 当作跨候选数可比较的校准值。
+
+## 上下文长度与容量规划（指导手册）
+
+### 决策后端的硬约束
+
+| 参数 | 含义 | 本项目的取值 |
+|---|---|---|
+| `--ubatch-size` | 单批物理大小；决策模型必须整 prompt 一次算完，**= 单请求 prompt(token) 上限** | 8192 |
+| `-c` / `--parallel` | 每请求可用上下文 = `-c / --parallel`（`n_ctx_slot`） | 32768 / 8 = **4096** |
+| `-c` | 总 KV 容量，决定显存 | 32768 |
+| `--parallel` | 并发槽位 | 8 |
+
+### 实测容量与延迟（A100-40G，d1-2B BF16，llama.cpp 官方镜像）
+
+| 配置 | 每请求上下文 | 并发 | 实例显存 | 363 tok | 4K tok | 8K tok | 16K tok |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 16×2048（旧） | 2048 | 16 | ~4.6GB | 22ms | ✗ 400 | ✗ | ✗ |
+| **8×4096（现行）** | **4096** | **8** | **5.8GB** | **21ms** | **199ms** | ✗ | ✗ |
+| 8×16384 | 16384 | 8 | 7.5GB | 23ms | 197ms | 822ms | **2.7s** |
+| 4×32768 | 32768 | 4 | ~9GB | 23ms | ~200ms | ~0.8s | ~2.7s |
+
+- 阈值：**超过每请求上下文** → 400 `exceed_context_size_error`；超过 ubatch → 500
+  `input (N tokens) is too large to process`；
+- 短请求（<1K token）延迟与并发配置无关（~21-23ms）；**长请求延迟随 token 超线性增长**
+  （4K≈0.2s、8K≈0.8s、16K≈2.7s）；
+- 峰值吞吐约 78-80 req/s（8 并发即饱和；再往上加并发只增尾延迟）；
+- 显存只与 `-c` 总量相关：**降低 `--parallel` 换更长的单请求上下文不额外占 KV 显存**。
+
+### 配置建议
+
+1. **在线路由**（大多数场景）：4K/请求足够——`-c 32768 --parallel 8 --batch-size 8192 --ubatch-size 8192`；
+2. **长文决策**（16K 级）：单独起一个长窗口实例（`-c 131072 --parallel 8 --ubatch-size 16384`）
+   异步/批量调用，不要和在线高并发池混用；
+3. **不要指望靠量化提速**：决策负载是纯 prefill，llama.cpp 在 batch ≥64 时走 cuBLAS+反量化，
+   Q8_0 反而比 BF16 慢约 1.5 倍（详见训练仓库 README 的量化实测）。
+
+### 在控制台配置「上下文长度」
+
+「模型与设置」页新增 **上下文长度（JEV 决策服务）** 卡片，配置两项：
+
+- **服务上下文预算** `jev_context_tokens`：应与 llama.cpp 的 `-c / --parallel`（`n_ctx_slot`）一致，
+  用于校验与提示（默认 4096，范围 256–131072）；
+- **输入截断上限** `jev_input_tokens`：实际发送给 JEV 的 state token 上限（默认 1024，必须 ≤ 服务预算）。
+
+行为：
+
+- 超出输入上限时按 **首尾保留**（前 70% + 后 30%）截断，中间插入 `…（已截断 N 字）…`，
+  router 不会因为长文本返回 4xx/5xx；
+- token 估算：CJK 1 token/字、其他 4 字符/token（保守，故意偏高）；
+- 截断发生时，计算日志（trace）记录 `jev_input_window` 事件（`tokens_before` / `tokens_after` /
+  `truncated`），可在「计算日志」页检索；
+- API：`GET/PUT /admin/jev/window`（PUT 参数 `context_tokens`、`input_tokens`，校验关系与范围）；
+- 设计文档：`docs/上下文长度配置-spec-2026-10-30.md`。
 
 ## 模型与提供方
 
