@@ -1,4 +1,7 @@
-# ---- 文档与工作记录（按约定不入库）----
+# ---- 本地工具与工作记录（按约定不入库）----
+scripts/
+package.json
+package-lock.json
 docs/
 .workbuddy/
 .superpowers/

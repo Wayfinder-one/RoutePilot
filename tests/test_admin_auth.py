@@ -2,7 +2,7 @@
 
 历史：2026-10-17 的 P0-1 给 /admin 加了静态 Bearer token；2026-10-26 用户管理
 把它换成了邮箱+密码登录的会话 token（``POST /admin/login`` → opaque token，
-DB 只存 hash），脚本也改成登录拿会话（``scripts/configure_upstream.py``）。
+DB 只存 hash）。
 本文件只覆盖"门"本身；登录/角色/CRUD 的细节在 ``tests/test_users.py``。
 
 两种模式：

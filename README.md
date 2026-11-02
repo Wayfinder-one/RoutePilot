@@ -53,9 +53,6 @@ ROUTER_DB=/tmp/smart-router-v3.db .venv/bin/python -m router
 
 ```bash
 .venv/bin/python -m pytest tests/ -q
-.venv/bin/python scripts/i18n_dead_keys.py
-npm install
-npm run check:console   # 需要已启动服务和可用的 Chromium
 ```
 
 ## 配置 JEV 决策服务
@@ -220,11 +217,7 @@ ROUTER_JEV_API_KEY= \
 
 `GET /admin/jev` 的 `defaults` 提供默认提示词和 state 模板；预览里的 `state` 模板来自该配置，`{request}` 由服务端拼入请求原文。
 
-出厂示例见 `configs/default_routing_tree.json`，可通过以下脚本应用：
-
-```bash
-SR_BASE=http://127.0.0.1:8400 .venv/bin/python scripts/apply_default_routing_tree.py --enable
-```
+出厂示例见 `configs/default_routing_tree.json`，可在「决策组」页用导入（「保存」旁）载入并启用。
 
 ## 时间段
 
@@ -292,7 +285,7 @@ SQLite 使用单张 `request_logs` 保存决策与结果元数据：tree/snapsho
 
 ## 运维
 
-`scripts/deploy-76.sh` 与 `scripts/smart-router-v3.service` 是 v3 systemd 部署模板。JEV 是独立 HTTP 服务，部署时只需提供 `SR_JEV_URL` 和 `SR_JEV_MODEL`，不再配置 checkpoint、tagger 或本地模型目录。
+部署脚本与 systemd 模板属本地运维工具，不随本仓库发布。JEV 是独立 HTTP 服务，部署时只需提供 `SR_JEV_URL` 和 `SR_JEV_MODEL`，不再配置 checkpoint、tagger 或本地模型目录。
 
 主要环境变量：
 
