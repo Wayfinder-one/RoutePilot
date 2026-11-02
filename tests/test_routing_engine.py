@@ -37,17 +37,18 @@ class Balancer:
 
 
 class Affinity:
-    def __init__(self, sticky=None):
+    def __init__(self, sticky=None, target_id="strong-target"):
         self.sticky = sticky
+        self.target_id = target_id
         self.gets = []
         self.puts = []
 
     def get(self, session_id, *, tree_revision, policy_path, allowed_models, touch=True):
         self.gets.append({"session_id": session_id, "tree_revision": tree_revision, "policy_path": policy_path, "allowed_models": list(allowed_models), "touch": touch})
-        return self.sticky
+        return (self.sticky, self.target_id) if self.sticky is not None else None
 
-    def put(self, session_id, model, *, tree_revision, policy_path, ttl_seconds):
-        self.puts.append({"session_id": session_id, "model": model, "tree_revision": tree_revision, "policy_path": policy_path, "ttl_seconds": ttl_seconds})
+    def put(self, session_id, model, *, target_id, tree_revision, policy_path, ttl_seconds):
+        self.puts.append({"session_id": session_id, "model": model, "target_id": target_id, "tree_revision": tree_revision, "policy_path": policy_path, "ttl_seconds": ttl_seconds})
 
 
 class Jev:
@@ -108,6 +109,7 @@ def test_jev_selects_target_and_records_probability_evidence():
     assert decision.trace[-1]["event"] == "scheduled"
     assert len(jev.calls) == 1
     assert affinity.puts[0]["model"] == "strong-a"
+    assert affinity.puts[0]["target_id"] == "strong-target"
 
 
 def test_low_probability_and_jev_failure_use_fallback_without_second_choice():
@@ -137,6 +139,30 @@ def test_valid_sticky_model_skips_jev_and_selects_its_target():
     assert decision.selection_reason == "sticky"
     assert jev.calls == []
     assert affinity.gets[0]["policy_path"] == "choose"
+
+
+def test_sticky_restores_original_target_for_shared_model():
+    from router.routing.affinity import SessionAffinity
+
+    raw = tree_dict(root=jev_dict(options=[
+        {"key": "fast", "label": "低推理", "target": target_dict("low-reasoning", ("strong-a",), reasoning="low")},
+        {"key": "strong", "label": "高推理", "target": target_dict("high-reasoning", ("strong-a",), reasoning="high")},
+    ]))
+    snap = snapshot(raw)
+    jev = Jev(answer())
+    affinity = SessionAffinity()
+    engine = RoutingEngine(jev, affinity, Balancer())
+
+    first = route(engine, snap)
+    assert first.target.id == "high-reasoning"
+    assert first.reasoning == "high"
+
+    second = route(engine, snap)
+    assert second.target.id == "high-reasoning"
+    assert second.reasoning == "high"
+    assert second.sticky_hit is True
+    assert second.selection_reason == "sticky"
+    assert len(jev.calls) == 1
 
 
 def test_circuit_open_sticky_model_is_recomputed_instead_of_reused():
@@ -190,7 +216,7 @@ def test_dry_run_sticky_lookup_does_not_extend_its_lifetime():
     clock = [0.0]
     affinity = SessionAffinity(clock=lambda: clock[0])
     snap = snapshot()
-    affinity.put("s", "strong-b", tree_revision=snap.tree_revision, policy_path="choose", ttl_seconds=10)
+    affinity.put("s", "strong-b", target_id="strong-target", tree_revision=snap.tree_revision, policy_path="choose", ttl_seconds=10)
     clock[0] = 5
     decision = route(RoutingEngine(Jev(answer()), affinity, Balancer()), snap, session="s", dry_run=True)
     assert decision.model == "strong-b"
