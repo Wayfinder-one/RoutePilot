@@ -1,6 +1,6 @@
 import asyncio
 
-from router.api.requestlog import RECENT_LIMIT, RequestLogger
+from router.api.requestlog import LOG_COLUMNS, RECENT_LIMIT, RequestLogger
 from router.config import Settings
 from router.store.db import connect, migrate
 
@@ -88,3 +88,38 @@ def test_stats_exposes_queue_and_drop_health(tmp_path):
     assert stats["queue_size"] == 1
     assert stats["dropped_rows"] == 0
     assert stats["ring_limit"] == RECENT_LIMIT
+
+
+def test_waves_persists_but_answers_text_and_trace_stay_in_memory(tmp_path):
+    log = make_log(tmp_path)
+    answers = {
+        "capability": {
+            "type": "choice",
+            "choice": "strong",
+            "probabilities": {"fast": 0.2, "strong": 0.8},
+        },
+    }
+    item = record(1, waves=2, answers=answers, fallback_reason="otherwise")
+    log.enqueue(item)
+    asyncio.run(log.flush())
+    stored = rows(log)[0]
+    assert stored["waves"] == 2
+    for forbidden in (
+        "text", "trace", "answers", "jev_probabilities", "fallback_reason",
+        "session_id", "latency_ms", "reasoning_warning",
+    ):
+        assert forbidden not in stored
+    assert log.recent_requests(1)[0]["answers"] == answers
+    assert log.recent_requests(1)[0]["trace"] == item["trace"]
+
+
+def test_log_columns_are_the_sqlite_whitelist(tmp_path):
+    log = make_log(tmp_path)
+    conn = connect(log.settings.db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)")}
+    finally:
+        conn.close()
+    assert set(LOG_COLUMNS) == columns
+    assert "waves" in LOG_COLUMNS
+    assert not {"answers", "text", "trace", "session_id", "jev_probabilities"} & set(LOG_COLUMNS)

@@ -11,7 +11,7 @@ RoutePilot is an OpenAI-compatible model routing proxy. Routing policy is config
 | Status | Design stage (2026-11-02, graph v2). Console prototype complete; runtime to be migrated to this design. |
 | Design spec | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md` (local only, not published) |
 | Console prototype | `docs/od-design/routing-canvas-2026-11-02/index.html` (Direction A · Canvas-first; local only, not published) |
-| Config format | `sr-routing-graph` v3. No legacy compatibility or migration in this phase. |
+| Config format | `sr-routing-graph` v3. Legacy routing trees are not converted; see [Upgrading a legacy database](#upgrading-a-legacy-database). |
 
 ## Decision canvas
 
@@ -117,6 +117,32 @@ ROUTER_DB=/tmp/routepilot.db .venv/bin/python -m router
 ```
 
 Default listener: `127.0.0.1:8400`; console: `http://127.0.0.1:8400/console/`. On first production start, a default admin account is seeded into an empty users table; change the password immediately. Set `ROUTER_USER_AUTH=0` for local development to disable `/admin` authentication.
+
+## Upgrading a legacy database
+
+The graph runtime persists the complete decision graph in `routing_trees.root`. A database whose routing trees still contain the pre-graph payload (for example `root.type = "jev"`) is **not converted automatically**. The new version refuses to start, keeps the schema at v1 and reports:
+
+```
+legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: <tree ids>
+```
+
+1. Stop the old service.
+2. Back up the database:
+
+   ```bash
+   sqlite3 router.db ".backup 'router.db-pre-graph-v3'"
+   ```
+
+3. Start the new version once. It stops before changing the schema and names the legacy tree ids.
+4. Only after confirming that the old routing configurations are no longer needed, delete them:
+
+   ```bash
+   sqlite3 router.db "DELETE FROM routing_trees"
+   ```
+
+5. Start the new version again. The migration adds `request_logs.waves`, records schema version 2 and keeps existing request-log rows with `waves = NULL`.
+
+The reset deletes the old routing configuration only. Models, providers, users, sessions, decision-service settings and request logs are kept. There is no automatic conversion of legacy trees, so rebuild any policy you still need on the canvas and enable it again.
 
 ## Decision service
 

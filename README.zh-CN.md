@@ -11,7 +11,7 @@ RoutePilot 是 OpenAI 兼容的模型路由代理。路由策略由一张通用�
 | 项目状态 | 设计阶段（2026-11-02，graph v2）；控制台原型已完成，服务端按本文设计迁移 |
 | 设计文档 | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md`（仅本地保留，不随仓库发布） |
 | 控制台原型 | `docs/od-design/routing-canvas-2026-11-02/index.html`（方向 A · 画布优先；仅本地保留，不随仓库发布） |
-| 配置格式 | `sr-routing-graph` v3；本期不做旧配置兼容与迁移 |
+| 配置格式 | `sr-routing-graph` v3；旧版路由树不自动转换，见[从旧数据库升级](#从旧数据库升级) |
 
 ## 决策画布
 
@@ -117,6 +117,32 @@ ROUTER_DB=/tmp/routepilot.db .venv/bin/python -m router
 ```
 
 默认监听 `127.0.0.1:8400`，控制台 `http://127.0.0.1:8400/console/`。生产环境首次启动向空 users 表写入默认管理员账号；上线后立即修改密码。本地开发可设 `ROUTER_USER_AUTH=0` 关闭 `/admin` 鉴权。
+
+## 从旧数据库升级
+
+graph 运行时把完整决策图持久化在 `routing_trees.root`。如果库里的路由树仍是旧版载荷（例如 `root.type = "jev"`），新版**不会自动转换**：启动会拒绝并停留在 v1，同时报出：
+
+```
+legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: <tree ids>
+```
+
+1. 停止旧服务。
+2. 备份数据库：
+
+   ```bash
+   sqlite3 router.db ".backup 'router.db-pre-graph-v3'"
+   ```
+
+3. 启动一次新版：新版会在修改 schema 之前退出，并列出旧树 id。
+4. 仅在管理员确认旧路由配置已不再需要后，删除旧树：
+
+   ```bash
+   sqlite3 router.db "DELETE FROM routing_trees"
+   ```
+
+5. 再次启动新版：迁移新增 `request_logs.waves`、写入 schema 版本 2；已有请求日志保留，`waves` 为 NULL。
+
+该重置只删除旧的路由配置；模型、提供方、用户、会话、决策服务配置和请求日志都会保留。旧树不会被自动转换，仍需要的策略请在画布上重建后重新启用。
 
 ## 决策服务
 

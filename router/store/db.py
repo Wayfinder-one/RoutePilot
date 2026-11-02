@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = (
     """
@@ -81,6 +82,7 @@ SCHEMA = (
         jev_top REAL,
         jev_margin REAL,
         jev_ms REAL,
+        waves INTEGER,
         reasoning TEXT,
         routing_ms REAL,
         upstream_model TEXT,
@@ -165,6 +167,62 @@ def connect(path: str) -> sqlite3.Connection:
     return conn
 
 
+def legacy_tree_ids(conn) -> list[str]:
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='routing_trees'").fetchone() is None:
+        return []
+    legacy = []
+    for row in conn.execute("SELECT id, root FROM routing_trees ORDER BY id"):
+        try:
+            root_type = json.loads(row["root"]).get("root", {}).get("type")
+        except (ValueError, AttributeError):
+            root_type = None
+        if root_type != "graph":
+            legacy.append(row["id"])
+    return legacy
+
+
+def _table_names(conn: sqlite3.Connection) -> set[str]:
+    return {
+        row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        if not row[0].startswith("sqlite_")
+    }
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _in_transaction(conn: sqlite3.Connection, action) -> None:
+    previous_isolation = conn.isolation_level
+    conn.isolation_level = None
+    begun = False
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            begun = True
+            action()
+            conn.execute("COMMIT")
+            begun = False
+        except BaseException:
+            if begun:
+                conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.isolation_level = previous_isolation
+
+
+def _create_current_schema(conn: sqlite3.Connection) -> None:
+    for statement in SCHEMA:
+        conn.execute(statement)
+    conn.execute("INSERT INTO schema_migrations VALUES (?)", (SCHEMA_VERSION,))
+
+
+def _upgrade_v1_to_v2(conn: sqlite3.Connection) -> None:
+    if "waves" not in _column_names(conn, "request_logs"):
+        conn.execute("ALTER TABLE request_logs ADD COLUMN waves INTEGER")
+    conn.execute("INSERT INTO schema_migrations VALUES (?)", (SCHEMA_VERSION,))
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
     applied = int(conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
@@ -172,22 +230,20 @@ def migrate(conn: sqlite3.Connection) -> None:
         raise RuntimeError("unsupported database schema; use a new database")
     if applied == SCHEMA_VERSION:
         return
-    existing = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name != 'schema_migrations'"
-    ).fetchone()
-    if existing is not None:
+    tables = _table_names(conn)
+    existing = tables - {"schema_migrations"}
+    if applied == 0:
+        if existing:
+            raise RuntimeError("unsupported database contents; use a new database")
+        _in_transaction(conn, lambda: _create_current_schema(conn))
+        return
+    if applied != 1 or not {"routing_trees", "request_logs"} <= tables:
         raise RuntimeError("unsupported database contents; use a new database")
-    previous_isolation = conn.isolation_level
-    conn.isolation_level = None
-    try:
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            for statement in SCHEMA:
-                conn.execute(statement)
-            conn.execute("INSERT INTO schema_migrations VALUES (?)", (SCHEMA_VERSION,))
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-    finally:
-        conn.isolation_level = previous_isolation
+    legacy = legacy_tree_ids(conn)
+    if legacy:
+        raise RuntimeError(
+            "legacy routing trees require explicit reset; back up the database, then "
+            "DELETE FROM routing_trees if these old routing configs are no longer needed: "
+            + ", ".join(legacy)
+        )
+    _in_transaction(conn, lambda: _upgrade_v1_to_v2(conn))

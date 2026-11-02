@@ -8,9 +8,9 @@ from dataclasses import replace
 from router.routing.model import (
     RoutingTree,
     canonical_json,
-    tree_behavior_dict,
     tree_from_dict,
     tree_revision_of,
+    tree_storage_dict,
 )
 from router.store.repositories import _now_iso, _tx, record_revision, write_transaction
 
@@ -18,7 +18,7 @@ REVISION_TREE = "tree"
 
 
 def _canonical_tree(tree: RoutingTree) -> str:
-    return canonical_json(tree_behavior_dict(tree))
+    return canonical_json(tree_storage_dict(tree))
 
 
 def _row_to_tree(row: sqlite3.Row) -> RoutingTree:

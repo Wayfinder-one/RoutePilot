@@ -22,7 +22,7 @@ LOG_COLUMNS = (
     "session_hash", "jev_model", "jev_choice", "jev_top", "jev_margin",
     "jev_ms", "reasoning", "routing_ms", "upstream_model", "upstream_status",
     "upstream_ms", "ttft_ms", "total_ms", "prompt_tokens", "completion_tokens",
-    "total_tokens", "outcome_state", "error_class",
+    "total_tokens", "outcome_state", "error_class", "waves",
 )
 
 _LOG_INSERT = (
