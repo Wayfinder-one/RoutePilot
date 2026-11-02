@@ -315,7 +315,20 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
   flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-family: var(--mono); font-size: 8.5px; color: var(--text-2);
 }
-.rtc-slot.is-empty .rtc-slot-src { font-family: var(--sans); font-style: italic; color: var(--text-3); }
+.rtc-slot.is-empty {
+  margin: 3px 0;
+  border: 1px dashed var(--line-2);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--panel-2) 60%, transparent);
+  color: var(--text-3);
+}
+.rtc-slot.is-empty .rtc-slot-id { color: var(--text-3); letter-spacing: .03em; }
+.rtc-slot-add {
+  margin-left: auto; flex: none;
+  border: 1px dashed var(--line-2); border-radius: 4px;
+  padding: 0 5px; line-height: 14px;
+  font-size: 8px; color: var(--text-3); background: transparent; white-space: nowrap;
+}
 .rtc-slot.is-empty .rtc-port { opacity: .5; background: var(--panel); border: 1px solid var(--line-2); box-shadow: none; }
 .rtc-cond {
   flex: none; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

@@ -783,6 +783,36 @@ async function clickNode(nodeId) {
   await page.mouse.up();
 }
 
+async function clickEdge(edgeId) {
+  const point = await page.evaluate(id => {
+    const hit = Array.from(document.querySelectorAll('.rtc-edge-hit'))
+      .find(path => path.dataset.edgeId === id);
+    if (!hit) return null;
+    const length = hit.getTotalLength();
+    const matrix = hit.getScreenCTM();
+    for (const ratio of [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9]) {
+      const local = hit.getPointAtLength(length * ratio);
+      const screen = new DOMPoint(local.x, local.y).matrixTransform(matrix);
+      if (document.elementFromPoint(screen.x, screen.y) === hit) return { x: screen.x, y: screen.y };
+    }
+    return null;
+  }, edgeId);
+  if (point) await page.mouse.click(point.x, point.y);
+  else await page.evaluate(id => window.App.kit.select('edge', id), edgeId);
+}
+
+/* 负向断言：给异步副作用一个有限的窗口；窗口内出现坏状态即失败。 */
+async function expectNever(predicate, message, timeout) {
+  let seen = false;
+  try {
+    await page.waitForFunction(predicate, null, { timeout: timeout || 400 });
+    seen = true;
+  } catch (error) {
+    if (error.name !== 'TimeoutError') throw error;
+  }
+  assert.equal(seen, false, message);
+}
+
 async function dragLibraryItem(kind, target) {
   const item = page.locator(`[data-lib-kind="${kind}"]`);
   const box = await item.boundingBox();
@@ -821,10 +851,42 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
   assert.equal(metrics.historyLimit, 100);
   assert.ok(metrics.scrollW <= metrics.clientW + 1, `horizontal overflow: ${metrics.scrollW} > ${metrics.clientW}`);
   assert.ok(metrics.scrollH <= metrics.innerH + 1, `vertical page scroll: ${metrics.scrollH} > ${metrics.innerH}`);
+  const emptySlot = await page.evaluate(() => {
+    const row = document.querySelector('#cvNodes .rtc-slot.is-empty');
+    if (!row) return null;
+    const id = row.querySelector('.rtc-slot-id');
+    const add = row.querySelector('.rtc-slot-add');
+    return {
+      id: id ? id.textContent.trim() : '',
+      add: add ? add.textContent.trim() : '',
+      border: getComputedStyle(row).borderTopStyle,
+      title: row.getAttribute('title') || ''
+    };
+  });
+  assert.ok(emptySlot, 'empty slot placeholder missing');
+  assert.match(emptySlot.id, /^in_\d+$/);
+  assert.equal(emptySlot.add, await page.evaluate(() => window.t('cv.slot.add')));
+  assert.equal(emptySlot.border, 'dashed');
+  assert.ok(emptySlot.title.length > 0, 'empty slot placeholder lacks a next-slot tooltip');
+  const english = await page.evaluate(() => {
+    window.setLang('en');
+    const node = document.querySelector('[data-node-id="and-power"]');
+    const chip = node.querySelector('[data-cond-edge]');
+    const out = {
+      badge: node.querySelector('.rtc-badge').textContent.trim(),
+      chip: chip ? chip.textContent.trim() : ''
+    };
+    window.setLang('zh');
+    return out;
+  });
+  assert.equal(english.badge, 'AND', 'logic operator name leaked graph.js Chinese into the EN card');
+  assert.equal(english.chip, '> 0.65', 'numeric condition chip is not rendered from the port type');
   await screenshot('task10-canvas-1440.png');
 
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.waitForTimeout(160);
+  await page.waitForFunction(() => window.innerWidth === 1280 &&
+    document.getElementById('cvPalette').getBoundingClientRect().width > 0 &&
+    document.getElementById('cvInspector').getBoundingClientRect().width > 0);
   const narrow = await page.evaluate(() => ({
     scrollW: document.documentElement.scrollWidth,
     clientW: document.documentElement.clientWidth,
@@ -838,7 +900,8 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
   assert.ok(narrow.paletteVisible && narrow.inspectorVisible);
   await screenshot('task10-canvas-1280.png');
   await page.locator('[data-act="zoom-reset"]').click();
-  await page.waitForTimeout(140);
+  await page.waitForFunction(() => document.querySelector('#cvZoomLabel').textContent === '100%' &&
+    /scale\(1\)/.test(document.getElementById('cvWorld').style.transform));
   await screenshot('task10-canvas-100.png');
   await page.setViewportSize({ width: 1440, height: 960 });
 });
@@ -879,6 +942,15 @@ test('Task 10 · blank drag, space+drag and middle-button drag all pan the viewp
   viewport = await page.evaluate(() => window.App.kit.getViewport());
   assert.ok(Math.abs((viewport.tx - beforeMiddle.tx) - 35) < 2, `middle pan tx ${viewport.tx - beforeMiddle.tx} != 35`);
   assert.ok(Math.abs((viewport.ty - beforeMiddle.ty) + 20) < 2, `middle pan ty ${viewport.ty - beforeMiddle.ty} != -20`);
+
+  /* 空格仍是按钮的原生激活键：焦点在顶栏按钮上时不能开始平移。 */
+  await page.focus('#cvIssuesBtn');
+  await page.keyboard.press('Space');
+  await page.waitForFunction(() => !document.getElementById('cvIssues').hidden, null, { timeout: 2000 });
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getViewport()), viewport,
+    'Space on a focused toolbar button started space-pan instead of activating the button');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvIssues').isHidden(), true);
 });
 
 test('Task 10 · wheel zoom anchors at the pointer; zoom buttons, 100% reset and fit work', async () => {
@@ -905,16 +977,16 @@ test('Task 10 · wheel zoom anchors at the pointer; zoom buttons, 100% reset and
   await page.locator('[data-act="zoom-reset"]').click();
   await page.waitForFunction(() => document.querySelector('#cvZoomLabel').textContent === '100%');
   await page.locator('[data-act="zoom-fit"]').click();
-  await page.waitForTimeout(120);
-  const inside = await page.evaluate(() => {
+  const inside = await page.waitForFunction(() => {
     const stage = document.getElementById('cvStage').getBoundingClientRect();
-    return Array.from(document.querySelectorAll('#cvStage [data-node-id]')).every(el => {
+    const nodes = Array.from(document.querySelectorAll('#cvStage [data-node-id]'));
+    return nodes.length > 0 && nodes.every(el => {
       const rect = el.getBoundingClientRect();
       return rect.left >= stage.left - 1 && rect.right <= stage.right + 1 &&
         rect.top >= stage.top - 1 && rect.bottom <= stage.bottom + 1;
     });
-  });
-  assert.ok(inside, 'fit left some nodes outside the stage');
+  }, null, { timeout: 3000 });
+  assert.equal(await inside.jsonValue(), true, 'fit left some nodes outside the stage');
 });
 
 test('Task 10 · Esc closes the quick-create overlay before clearing the selection', async () => {
@@ -1039,6 +1111,8 @@ test('Task 10 · a number port dropped on an empty slot creates gt 0.5 and opens
   assert.equal(edge.source, 'capability');
   assert.equal(edge.source_port, 'prob.strong');
   assert.deepEqual(edge.condition, { op: 'gt', value: 0.5 });
+  const chipText = await page.locator(`#cvNodes [data-cond-edge="${edge.id}"]`).textContent();
+  assert.equal(chipText.trim(), '> 0.5');
   const pop = await page.evaluate(() => ({
     hidden: document.getElementById('cvCondPop').hidden,
     edgeId: document.getElementById('cvCondPop').dataset.edgeId
@@ -1063,6 +1137,8 @@ test('Task 10 · a boolean edge defaults to condition null and does not open the
   const edge = after.edges.find(item => item.target === 'and-power' && item.target_port === 'in_3');
   assert.ok(edge, 'boolean edge not created');
   assert.equal(edge.condition, null);
+  const chipText = await page.locator(`#cvNodes [data-cond-edge="${edge.id}"]`).textContent();
+  assert.equal(chipText.trim(), '= true');
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
 });
 
@@ -1133,7 +1209,8 @@ test('Task 10 · output dropped on blank opens quick-create; dropping on an ille
   const beforeCancel = await appSnapshot();
   const nodeBox = await page.locator('[data-node-id="and-power"]').boundingBox();
   await dragPort('capability', 'prob.easy', { x: nodeBox.x + nodeBox.width / 2, y: nodeBox.y + 12 });
-  await page.waitForTimeout(120);
+  await expectNever(() => !document.getElementById('cvQuick').hidden,
+    'quick-create opened for a drop on an illegal node');
   assert.equal(await page.locator('#cvQuick').isHidden(), true);
   const afterCancel = await appSnapshot();
   assert.equal(afterCancel.nodes.length, beforeCancel.nodes.length);
@@ -1180,6 +1257,91 @@ test('Task 10 · delete confirmation lists affected edges; slots are not renumbe
   assert.ok(orEdges.some(edge => edge.target_port === 'in_2' && edge.source === 'cond-peak'), 'existing in_2 edge was renumbered');
 });
 
+test('Task 10 · auto layout is layout-only and a second run adds no history entry', async () => {
+  await openCanvas();
+  const before = await page.evaluate(() => Object.fromEntries(window.App.graph.nodes.map(node => [node.id, { x: node.position.x, y: node.position.y }])));
+  const expected = await page.evaluate(() => window.RTGraph.layoutPositions('dag', window.App.graph));
+  assert.equal(Object.keys(expected).length, Object.keys(before).length);
+
+  await page.locator('#cvAutoLayout').click();
+  await page.waitForFunction(positions => {
+    const nodes = window.App.graph.nodes;
+    return nodes.length === Object.keys(positions).length &&
+      nodes.every(node => node.position.x === positions[node.id].x && node.position.y === positions[node.id].y);
+  }, expected, { timeout: 3000 });
+
+  const laidOut = await page.evaluate(() => ({
+    positions: Object.fromEntries(window.App.graph.nodes.map(node => [node.id, { x: node.position.x, y: node.position.y }])),
+    edges: window.App.graph.edges.map(edge => ({ source: edge.source, target: edge.target })),
+    kind: window.App.kind(),
+    badge: { kind: document.getElementById('cvDirty').dataset.kind, hidden: document.getElementById('cvDirty').hidden },
+    history: { undo: window.App.kit.canUndo(), redo: window.App.kit.canRedo() }
+  }));
+  const moved = Object.keys(laidOut.positions)
+    .filter(id => laidOut.positions[id].x !== before[id].x || laidOut.positions[id].y !== before[id].y);
+  assert.equal(moved.length, Object.keys(before).length, 'auto layout did not move every node');
+  assert.equal(laidOut.kind, 'layout', 'auto layout must not dirty behavior');
+  assert.deepEqual(laidOut.badge, { kind: 'layout', hidden: false });
+  assert.deepEqual(laidOut.history, { undo: true, redo: false });
+  laidOut.edges.forEach(edge => {
+    assert.ok(laidOut.positions[edge.target].x > laidOut.positions[edge.source].x,
+      `${edge.source} -> ${edge.target} is not laid out left-to-right`);
+  });
+
+  /* 第二次自动整理是 no-op：不得再入栈。若入了空历史，下面一次 undo 会退到同样的布局。 */
+  await page.locator('#cvAutoLayout').click();
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(positions => {
+    const nodes = window.App.graph.nodes;
+    return nodes.length === Object.keys(positions).length &&
+      nodes.every(node => node.position.x === positions[node.id].x && node.position.y === positions[node.id].y);
+  }, before, { timeout: 3000 });
+  const undone = await page.evaluate(() => ({
+    kind: window.App.kind(),
+    badgeHidden: document.getElementById('cvDirty').hidden,
+    history: { undo: window.App.kit.canUndo(), redo: window.App.kit.canRedo() }
+  }));
+  assert.equal(undone.kind, 'clean', 'undo after a no-op layout did not restore the saved positions');
+  assert.equal(undone.badgeHidden, true);
+  assert.deepEqual(undone.history, { undo: false, redo: true });
+});
+
+test('Task 10 · edge delete confirm lists the edge, removes it and undo restores it', async () => {
+  await openCanvas();
+  const edgeId = 'e-selected-strong-strong';
+  const before = await appSnapshot();
+  assert.equal(before.edges.some(edge => edge.id === edgeId), true);
+  await clickEdge(edgeId);
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: 'edge', id: edgeId });
+  await page.keyboard.press('Delete');
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  assert.equal(await page.locator('#cvDeleteBody li').count(), 1);
+  const dialogText = await page.locator('#cvDeleteBody').innerText();
+  assert.match(dialogText, /capability/);
+  assert.match(dialogText, /selected\.strong/);
+  assert.match(dialogText, /strong-target/);
+  assert.match(dialogText, /in_1/);
+
+  await page.locator('[data-act="delete-confirm"]').click();
+  await page.waitForFunction(id => !window.App.graph.edges.some(edge => edge.id === id), edgeId);
+  assert.equal(await page.locator(`#cvEdges path.rtc-edge[data-edge-id="${edgeId}"]`).count(), 0);
+  const removed = await appSnapshot();
+  assert.equal(removed.edges.length, before.edges.length - 1);
+  assert.equal(removed.edges.some(edge => edge.id === edgeId), false);
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(id => window.App.graph.edges.some(edge => edge.id === id), edgeId);
+  const restored = await appSnapshot();
+  const edge = restored.edges.find(item => item.id === edgeId);
+  assert.ok(edge, 'undo did not restore the deleted edge');
+  assert.equal(edge.source, 'capability');
+  assert.equal(edge.source_port, 'selected.strong');
+  assert.equal(edge.target, 'strong-target');
+  assert.equal(edge.target_port, 'in_1');
+  assert.equal(edge.condition, null);
+  assert.equal(restored.kind, 'clean');
+});
+
 test('Task 10 · Delete/Backspace do nothing while an input is focused', async () => {
   await openCanvas();
   const before = await appSnapshot();
@@ -1187,7 +1349,8 @@ test('Task 10 · Delete/Backspace do nothing while an input is focused', async (
   await page.locator('#cvTryInput').click();
   await page.keyboard.press('Backspace');
   await page.keyboard.press('Delete');
-  await page.waitForTimeout(150);
+  await expectNever(() => !document.getElementById('cvDeleteModal').hidden,
+    'Delete key opened the confirm modal while an input was focused');
   assert.equal(await page.locator('#cvDeleteModal').isHidden(), true);
   const after = await appSnapshot();
   assert.equal(after.nodes.length, before.nodes.length);

@@ -14,6 +14,7 @@
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     const t = key => (typeof root.t === 'function' ? root.t(key) : key);
+    const tf = (key, vars) => (typeof root.tf === 'function' ? root.tf(key, vars) : t(key));
 
     function icon(name, cls) {
       return '<svg class="rtc-ic' + (cls ? ' ' + cls : '') + '" aria-hidden="true"><use href="#ri-' + name + '"/></svg>';
@@ -56,17 +57,30 @@
     }
 
     function conditionText(graph, edge) {
-      const label = RTGraph.conditionLabel(edge, graph);
-      return label === '未配置条件' ? t('cv.card.noCondition') : label;
+      const type = RTGraph.edgeType(edge, graph);
+      const condition = edge.condition;
+      if (type === 'boolean') {
+        if (condition == null) return '= true';
+        if (condition.op === 'is' && typeof condition.value === 'boolean') {
+          return condition.value ? '= true' : '= false';
+        }
+        return t('cv.cond.invalid');
+      }
+      if (condition == null) return t('cv.cond.unset');
+      const op = RTGraph.OP[condition.op];
+      const value = Number(condition.value);
+      if (!op || !Number.isFinite(value)) return t('cv.cond.invalid');
+      return op + ' ' + value;
     }
 
     function slotRow(graph, node, port) {
       const edge = incomingEdge(graph, node.id, port.id);
       if (!edge) {
-        return '<div class="rtc-slot is-empty" data-slot="' + esc(port.id) + '">' +
+        return '<div class="rtc-slot is-empty" data-slot="' + esc(port.id) + '"' +
+          ' title="' + esc(tf('cv.slot.addTitle', { slot: port.id })) + '">' +
           portHTML(node, port, { side: 'left' }) +
           '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +
-          '<span class="rtc-slot-src">' + esc(t('cv.card.emptySlot')) + '</span>' +
+          '<span class="rtc-slot-add">' + esc(t('cv.slot.add')) + '</span>' +
           '</div>';
       }
       const kind = RTGraph.edgeType(edge, graph);
@@ -195,14 +209,16 @@
     function logicCard(graph, node) {
       const ports = RTGraph.portsOf(node, graph);
       const output = ports.find(port => port.dir === 'out');
-      const logic = RTGraph.LOGIC[node.operator] || { symbol: '?', name: 'logic' };
-      const name = String(logic.name).split(' ');
+      const logic = RTGraph.LOGIC[node.operator] || { symbol: '?' };
+      const key = 'cv.op.' + node.operator;
+      const translated = t(key);
+      const name = translated === key ? (logic.name || node.operator) : translated;
       return nodeWrap(node, 'logic',
         header(node, {
           symbol: logic.symbol,
           textTitle: true,
-          title: name[0] || logic.name,
-          badge: logic.name,
+          title: String(name).split(' ')[0] || name,
+          badge: name,
           tail: '<span class="rtc-gate" data-live="value"></span>' + portHTML(node, output, { side: 'right' })
         }) + slotsHTML(graph, node));
     }

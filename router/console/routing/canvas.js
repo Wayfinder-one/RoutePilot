@@ -30,6 +30,12 @@
     const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
     const noop = () => {};
     const clone = value => (value == null ? value : JSON.parse(JSON.stringify(value)));
+    const t = key => (typeof root.t === 'function' ? root.t(key) : key);
+    /* Space 是按钮/链接等控件的原生激活键：焦点在控件上时不能把它劫持成平移。 */
+    const INTERACTIVE_SELECTOR = 'input, textarea, select, button, a, [role="button"], [contenteditable]';
+    function isInteractiveElement(el) {
+      return !!(el && el.closest && el.closest(INTERACTIVE_SELECTOR));
+    }
 
     function create(opts) {
       const stage = opts.stage;
@@ -606,7 +612,7 @@
           clientX: event.clientX,
           clientY: event.clientY
         });
-        if (!handled) cb.onInvalid('连线已取消：请松手在兼容的输入端口上', finished.draft);
+        if (!handled) cb.onInvalid(t('cv.cancelConnect'), finished.draft);
       }
 
       function onPointerUp(event) {
@@ -656,7 +662,8 @@
       }
 
       function onKeyDown(event) {
-        if (event.code === 'Space' && !typingInField(event)) {
+        const interactive = isInteractiveElement(event.target) || isInteractiveElement(document.activeElement);
+        if (event.code === 'Space' && !interactive) {
           if (!spaceDown) {
             spaceDown = true;
             stage.classList.add('is-space-pan');
@@ -690,10 +697,11 @@
       }
 
       function onKeyUp(event) {
-        if (event.code === 'Space') {
-          spaceDown = false;
-          stage.classList.remove('is-space-pan');
-        }
+        if (event.code !== 'Space') return;
+        /* 焦点在控件上、且当前没有画布平移时，keyup 也要留给控件自己。 */
+        if (!spaceDown && isInteractiveElement(event.target)) return;
+        spaceDown = false;
+        stage.classList.remove('is-space-pan');
       }
 
       function onWindowBlur() {

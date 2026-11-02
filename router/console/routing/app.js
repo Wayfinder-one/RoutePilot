@@ -280,7 +280,7 @@
   function issueCounts() {
     const issues = App.issues || [];
     return {
-      hard: issues.filter(issue => issue.level === 'hard'),
+      hard: issues.filter(issue => issue.level !== 'hint'),
       hints: issues.filter(issue => issue.level === 'hint')
     };
   }
@@ -300,7 +300,7 @@
     if (!panel) return;
     if (panel.hidden) { panel.innerHTML = ''; return; }
     const lang = (typeof LANG === 'string' && LANG === 'en') ? 'en' : 'zh';
-    const rows = counts.hard.length ? counts.hard : counts.hints;
+    const rows = counts.hard.concat(counts.hints);
     panel.innerHTML = rows.map(issue => {
       const title = (lang === 'en' && issue.en) ? issue.en : issue.zh;
       const target = issue.node_id
@@ -562,6 +562,12 @@
     const id = modal.dataset.id;
     hideDelete();
     if (!kind || !id) return;
+    /* 弹窗打开后目标可能已被撤销/重做移除：先在快照上试删，避免推入空历史。 */
+    const probe = App.tree ? RTGraph.clone(App.tree) : null;
+    const check = kind === 'node'
+      ? RTGraph.removeNode(probe && probe.root, id)
+      : RTGraph.removeEdge(probe && probe.root, id);
+    if (!check.ok) return;
     let cleared = [];
     let removed = false;
     change('behavior', tree => {
@@ -593,11 +599,14 @@
       otherwise_target: App.graph.otherwise_target,
       error_fallback: App.graph.error_fallback
     };
+    const targetPort = RTGraph.nextSlot(tmp, '__quick_probe');
+    const hasPort = RTGraph.portsOf(probe, tmp).some(port => port.dir === 'in' && port.id === targetPort);
+    if (!hasPort) return false;
     return RTGraph.canConnect(tmp, {
       source: context.sourceNodeId,
       source_port: context.sourcePort,
       target: '__quick_probe',
-      target_port: 'in_1'
+      target_port: targetPort
     }).ok;
   }
 
@@ -668,6 +677,7 @@
 
   /* ── 节点库创建（点击 / 拖入） ───────────────────────────────── */
   function createFromLibrary(kind, position) {
+    if (!App.booted) return;
     let created = null;
     change('behavior', tree => {
       created = makeNode(kind, position, tree.root);
@@ -755,6 +765,10 @@
   function onLibraryDown(event) {
     const item = event.target.closest('[data-lib-kind]');
     if (!item || event.button !== 0) return;
+    if (!App.booted) {
+      toast(t('cv.toastNotReady'), 'warn');
+      return;
+    }
     event.preventDefault();
     const labelNode = item.querySelector('.rtc-pnm');
     libDrag = {
@@ -788,7 +802,8 @@
       { re: /环/, key: 'cv.errCycle' },
       { re: /已存在/, key: 'cv.errDuplicate' },
       { re: /已连接一条线|已连接/, key: 'cv.errOccupied' },
-      { re: /端口不存在/, key: 'cv.errPort' }
+      { re: /端口不存在/, key: 'cv.errPort' },
+      { re: /连线已取消|Connection cancelled/, key: 'cv.cancelConnect' }
     ];
     let key = 'cv.errGeneric';
     for (let index = 0; index < mapping.length; index += 1) {
@@ -835,11 +850,18 @@
     $('#cvAutoLayout').addEventListener('click', () => {
       if (!App.graph) return;
       const positions = RTGraph.layoutPositions('dag', App.graph);
-      change('layout', tree => {
-        tree.root.nodes.forEach(node => {
-          if (positions[node.id]) node.position = { x: positions[node.id].x, y: positions[node.id].y };
-        });
+      const moved = (App.graph.nodes || []).some(node => {
+        const next = positions[node.id];
+        const current = node.position || {};
+        return !!next && (next.x !== current.x || next.y !== current.y);
       });
+      if (moved) {
+        change('layout', tree => {
+          tree.root.nodes.forEach(node => {
+            if (positions[node.id]) node.position = { x: positions[node.id].x, y: positions[node.id].y };
+          });
+        });
+      }
       App.kit.fit({ padding: 24 });
       toast(t('cv.toastAutoLayout'));
     });
@@ -1072,29 +1094,31 @@
     createKit();
     bindEvents();
     renderPalette();
+    /* 模型目录与决策组解耦：/admin/models 抖动不能回退或清空已加载的草稿。 */
+    const modelsReady = api.get('/admin/models')
+      .then(result => { App.models = result.models || []; })
+      .catch(() => { App.models = []; });
     try {
-      const [treeResult, modelResult] = await Promise.all([
-        api.get('/admin/trees'),
-        api.get('/admin/models')
-      ]);
+      const treeResult = await api.get('/admin/trees');
       App.trees = treeResult.trees || [];
-      App.models = modelResult.models || [];
       renderTreeSelect();
       const enabled = App.trees.find(tree => tree.enabled) || App.trees[0];
       if (enabled) {
         const result = await api.get('/admin/trees/' + encodeURIComponent(enabled.id));
-        loadTree(result.tree || enabled, true);
+        const tree = result && result.tree;
+        if (tree && tree.root) loadTree(tree, true);
+        else loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
       } else {
         loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
       }
     } catch (error) {
       App.trees = [];
-      App.models = [];
       App.treeId = 'local';
       toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
       loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
     }
     App.booted = true;
+    await modelsReady;
   }
 
   boot();
