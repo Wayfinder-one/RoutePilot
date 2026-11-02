@@ -1,46 +1,260 @@
+"""`/v1/chat/completions` 真链路：MockTransport 分流 `/v1/systemone` 与假 OpenAI 上游。
+
+覆盖 M1 验收矩阵（spec §7.2）：selected 直连、数值 AND、两波追问、otherwise、
+error_fallback（缺答案 key / 非法概率 / timeout）、同波合并一次调用、粘性二次请求
+仍然执行被激活的问题再 preferred 调度、移动节点不改变 revision、首选 target 熔断
+返回 503 且不调用次优上游、流式/非流式/取消的 lease 释放、SQLite waves 与内存
+answers 的边界，以及 `x-sr-selection` 取值集合。
+"""
+from __future__ import annotations
+
 import asyncio
+import copy
 import json
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from router.api.requestlog import RequestLogger
+from router.api.requestlog import LOG_COLUMNS, RequestLogger
 from router.api.routes_v1 import router
 from router.api.upstream import Backend, CircuitBreaker
 from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.routing.affinity import SessionAffinity
-from router.routing.conditions import TimePeriod
-from router.routing.engine import RoutingEngine
+from router.routing.graph.engine import GraphExecutionEngine
 from router.routing.model import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import build_snapshot
 from router.store.db import connect, migrate
-from tests.routing_fixtures import target_dict, tree_dict
+from tests.routing_fixtures import tree_dict
 
 
-CAPABILITIES = {"fast": "简单请求", "strong-a": "复杂请求", "strong-b": "复杂请求", "standard": "通用请求"}
-JEV_SETTINGS = JevSettings("http://jev.test", "NeoHorse-Jev-4B", "", 5, DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE)
+JEV_SETTINGS = JevSettings(
+    "http://jev.test", "NeoHorse-Jev-4B", "secret", 5,
+    DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE,
+)
+SELECTION_VALUES = {"target", "sticky", "otherwise", "error_fallback"}
+MODELS = ("fast", "strong", "power", "strong-a", "strong-b", "safe")
+CAPABILITIES = {model: f"{model} 能力" for model in MODELS}
 
 
-def make_app(tmp_path, handler, *, raw_tree=None, active=True):
-    path = str(tmp_path / "v3.db")
+class RecordingBalancer(LoadBalancer):
+    """记录 acquire 的 preferred，其余调度语义复用真实 LoadBalancer。"""
+
+    def __init__(self, breaker=None):
+        super().__init__(breaker)
+        self.calls = []
+
+    def acquire(self, models, *, preferred=None, dry_run=False):
+        self.calls.append({"models": list(models), "preferred": preferred, "dry_run": dry_run})
+        return super().acquire(models, preferred=preferred, dry_run=dry_run)
+
+
+class BlockingTransport(httpx.AsyncBaseTransport):
+    """所有请求都挂起，用于客户端取消路径。"""
+
+    def __init__(self):
+        self.started = asyncio.Event()
+
+    async def handle_async_request(self, request):
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+# ── graph fixtures ──────────────────────────────────────────────────────
+
+
+def _start():
+    return {"id": "start", "type": "start", "position": {"x": 0, "y": 0}}
+
+
+def _target(node_id, priority, models):
+    return {"id": node_id, "type": "target", "priority": priority,
+            "position": {"x": 400, "y": priority * 100},
+            "models": [{"model": model, "reasoning": None} for model in models]}
+
+
+def _edge(edge_id, source, source_port, target, target_port, condition=None):
+    return {"id": edge_id, "source": source, "source_port": source_port,
+            "target": target, "target_port": target_port, "condition": condition}
+
+
+def _graph(nodes, edges, *, otherwise="safe", error="safe"):
+    return {"id": "root", "type": "graph", "nodes": nodes, "edges": edges,
+            "otherwise_target": otherwise, "error_fallback": error}
+
+
+def switch_graph():
+    """start → choice(fast/strong) → 两个 target；safe 兜底。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 200, "y": 0},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            _target("fast-target", 1, ("fast",)),
+            _target("strong-target", 2, ("strong-a", "strong-b")),
+            _target("safe", 3, ("safe",)),
+        ],
+        [
+            _edge("e-start-q", "start", "out", "q", "in_1"),
+            _edge("e-q-fast", "q", "selected.fast", "fast-target", "in_1"),
+            _edge("e-q-strong", "q", "selected.strong", "strong-target", "in_1"),
+        ],
+    )
+
+
+def otherwise_graph():
+    """只有 selected.fast 连到 target；选 strong 时没有任何 target 激活。"""
+    graph = switch_graph()
+    graph["edges"] = [
+        _edge("e-start-q", "start", "out", "q", "in_1"),
+        _edge("e-q-fast", "q", "selected.fast", "fast-target", "in_1"),
+    ]
+    return graph
+
+
+def direct_graph():
+    """start → target，无问题节点（不触碰决策服务）。"""
+    return _graph(
+        [_start(), _target("direct", 1, ("safe",))],
+        [_edge("e-start-direct", "start", "out", "direct", "in_1")],
+        otherwise="direct",
+        error="direct",
+    )
+
+
+def two_question_graph():
+    """同一波两个问题：choice + noul，数值 AND 组合到 power-target。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q-cap", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 180, "y": -100},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            {"id": "q-domain", "type": "question", "question_type": "noul",
+             "instructions": "是否需要电力业务知识？", "position": {"x": 180, "y": 40}},
+            {"id": "and-power", "type": "logic", "operator": "and",
+             "position": {"x": 400, "y": -40}},
+            _target("power-target", 1, ("power",)),
+            _target("strong-target", 2, ("strong-a", "strong-b")),
+            _target("fast-target", 3, ("fast",)),
+            _target("safe", 4, ("safe",)),
+        ],
+        [
+            _edge("e-start-cap", "start", "out", "q-cap", "in_1"),
+            _edge("e-start-domain", "start", "out", "q-domain", "in_1"),
+            _edge("e-cap-and", "q-cap", "prob.strong", "and-power", "in_1",
+                  {"op": "gt", "value": 0.65}),
+            _edge("e-domain-and", "q-domain", "yes", "and-power", "in_2",
+                  {"op": "gt", "value": 0.7}),
+            _edge("e-and-power", "and-power", "out", "power-target", "in_1"),
+            _edge("e-cap-strong", "q-cap", "selected.strong", "strong-target", "in_1"),
+            _edge("e-cap-fast", "q-cap", "selected.fast", "fast-target", "in_1"),
+        ],
+    )
+
+
+def two_wave_graph():
+    """第一波 choice；高置信 strong 再激活第二波 noul 追问。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q-cap", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 180, "y": 0},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            {"id": "q-clarify", "type": "question", "question_type": "noul",
+             "instructions": "是否需要更深入处理？", "position": {"x": 400, "y": 80}},
+            _target("strong-target", 1, ("strong-a", "strong-b")),
+            _target("fast-target", 2, ("fast",)),
+            _target("safe", 3, ("safe",)),
+        ],
+        [
+            _edge("e-start-cap", "start", "out", "q-cap", "in_1"),
+            _edge("e-cap-strong", "q-cap", "selected.strong", "strong-target", "in_1"),
+            _edge("e-cap-fast", "q-cap", "selected.fast", "fast-target", "in_1"),
+            _edge("e-cap-clarify", "q-cap", "prob.strong", "q-clarify", "in_1",
+                  {"op": "gte", "value": 0.5}),
+            _edge("e-clarify-strong", "q-clarify", "yes", "strong-target", "in_2",
+                  {"op": "gt", "value": 0.5}),
+        ],
+    )
+
+
+def priority_graph():
+    """selected.strong 同时激活 p1 power-target 与 p2 strong-target。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 200, "y": 0},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            _target("power-target", 1, ("power",)),
+            _target("strong-target", 2, ("strong-a",)),
+            _target("fast-target", 3, ("fast",)),
+            _target("safe", 4, ("safe",)),
+        ],
+        [
+            _edge("e-start-q", "start", "out", "q", "in_1"),
+            _edge("e-q-power", "q", "selected.strong", "power-target", "in_1"),
+            _edge("e-q-strong", "q", "selected.strong", "strong-target", "in_1"),
+            _edge("e-q-fast", "q", "selected.fast", "fast-target", "in_1"),
+        ],
+    )
+
+
+# ── harness ────────────────────────────────────────────────────────────
+
+
+def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transport=None):
+    path = str(tmp_path / "v1.db")
     conn = connect(path)
     migrate(conn)
     conn.close()
     app = FastAPI()
     app.state.settings = Settings(db_path=path)
-    app.state.http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    app.state.http = httpx.AsyncClient(transport=transport or httpx.MockTransport(handler))
     app.state.breaker = CircuitBreaker()
-    app.state.balancer = LoadBalancer(app.state.breaker)
+    app.state.balancer = RecordingBalancer(app.state.breaker)
     app.state.affinity = SessionAffinity()
-    app.state.engine = RoutingEngine(JevClient(app.state.http), app.state.affinity, app.state.balancer)
+    app.state.jev_client = JevClient(app.state.http)
+    app.state.engine = GraphExecutionEngine(
+        app.state.jev_client, app.state.affinity, app.state.balancer,
+    )
     app.state.requestlog = RequestLogger(app.state.settings)
-    backends = {model: Backend(url=f"http://{model}.test/v1/chat/completions", headers={}, upstream_name=model) for model in CAPABILITIES}
-    tree = tree_from_dict(raw_tree or tree_dict()) if active else None
-    app.state.snapshot = build_snapshot(tree=tree, backends=backends, time_periods=[TimePeriod("夜间", (0, 1, 2, 3, 4, 5, 6), "18:00", "09:00")], jev=JEV_SETTINGS, capabilities=CAPABILITIES)
+    backends = {
+        model: Backend(
+            url=f"http://{model}.test/v1/chat/completions",
+            headers={}, upstream_name=model, provider="local",
+        )
+        for model in MODELS
+    }
+    tree = None
+    if active:
+        tree = tree_from_dict(tree_dict(
+            "main",
+            root=root or switch_graph(),
+            sticky=sticky or {"enabled": False, "ttl_seconds": 1800},
+        ))
+    app.state.snapshot = build_snapshot(
+        tree=tree, backends=backends, time_periods=[],
+        jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+    )
     app.include_router(router, prefix="/v1")
     return app
 
@@ -49,87 +263,310 @@ def payload(text="请求", *, stream=False):
     return {"model": "ignored", "messages": [{"role": "user", "content": text}], "stream": stream}
 
 
-def test_concurrent_sessions_use_least_inflight_then_stick_to_their_models(tmp_path):
-    async def scenario():
-        started = asyncio.Event()
-        release = asyncio.Event()
-        jev_calls = []
-        upstream_calls = []
-        blocked = [True]
-
-        async def handler(request):
-            if request.url.host == "jev.test":
-                jev_calls.append(request)
-                return httpx.Response(200, json={"answers": {"route": {"probabilities": {"轻量模型": 0.1, "增强模型": 0.9}}}, "usage": {"input_tokens": 20}})
-            model = json.loads(request.content)["model"]
-            upstream_calls.append(model)
-            if model == "strong-a" and blocked[0]:
-                blocked[0] = False
-                started.set()
-                await release.wait()
-            return httpx.Response(200, json={"model": model, "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
-
-        app = make_app(tmp_path, handler)
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://router.test") as client:
-            first_task = asyncio.create_task(client.post("/v1/chat/completions", json=payload("first"), headers={"x-sr-session-id": "first-session"}))
-            await asyncio.wait_for(started.wait(), 1)
-            second = await client.post("/v1/chat/completions", json=payload("second"), headers={"x-sr-session-id": "second-session"})
-            third = await client.post("/v1/chat/completions", json=payload("third"), headers={"x-sr-session-id": "second-session"})
-            release.set()
-            first = await first_task
-        assert first.status_code == second.status_code == third.status_code == 200
-        assert upstream_calls == ["strong-a", "strong-b", "strong-b"]
-        assert len(jev_calls) == 2
-        assert app.state.balancer.inflight("strong-a") == 0
-        assert app.state.balancer.inflight("strong-b") == 0
-        await app.state.requestlog.flush()
-        conn = connect(app.state.settings.db_path)
-        stored = [dict(row) for row in conn.execute("SELECT * FROM request_logs")]
-        conn.close()
-        assert len(stored) == 3
-        third_record = app.state.requestlog.recent_requests(1)[0]
-        assert third_record["model"] == "strong-b"
-        assert third_record["sticky_hit"] == 1
-        assert third_record["selection_reason"] == "sticky"
-        assert third_record["outcome_state"] == "completed"
-
-    asyncio.run(scenario())
+def choice(*, fast=0.2, strong=0.8):
+    return {"type": "choice", "probabilities": {"轻量模型": fast, "增强模型": strong}}
 
 
-def test_jev_failure_uses_configured_fallback(tmp_path):
-    async def handler(request):
+def noul(yes):
+    return {"type": "noul", "noul": yes}
+
+
+def upstream_ok(request):
+    model = json.loads(request.content)["model"]
+    return httpx.Response(200, json={
+        "model": model,
+        "choices": [],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+    })
+
+
+class Harness:
+    """按 host 分流：jev.test → 决策服务应答；其余 → 假 OpenAI 上游。"""
+
+    def __init__(self, answers, *, jev_failure=None):
+        self.answers = answers
+        self.jev_failure = jev_failure
+        self.jev_requests = []
+        self.upstream_models = []
+
+    def __call__(self, request):
         if request.url.host == "jev.test":
-            return httpx.Response(503, json={"error": "down"})
-        return httpx.Response(200, json={"model": json.loads(request.content)["model"], "choices": []})
+            self.jev_requests.append(json.loads(request.content))
+            if self.jev_failure is not None:
+                raise self.jev_failure
+            return httpx.Response(200, json={"answers": self.answers, "usage": {"input_tokens": 10}})
+        self.upstream_models.append(json.loads(request.content)["model"])
+        return upstream_ok(request)
 
-    app = make_app(tmp_path, handler)
 
+async def post(app, body=None, *, headers=None):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://router.test",
+    ) as client:
+        return await client.post("/v1/chat/completions", json=body or payload(), headers=headers)
+
+
+def recent(app):
+    return app.state.requestlog.recent_requests(1)[0]
+
+
+async def flush(app):
+    await app.state.requestlog.flush()
+
+
+# ── selected direct / numeric AND / waves ──────────────────────────────
+
+
+def test_selected_target_uses_real_systemone_chain(tmp_path):
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
-            response = await client.post("/v1/chat/completions", json=payload())
+        har = Harness({"q": choice(fast=0.9, strong=0.1)})
+        app = make_app(tmp_path, har, root=switch_graph())
+        response = await post(app)
         assert response.status_code == 200
-        assert response.json()["model"] == "standard"
-        record = app.state.requestlog.recent_requests(1)[0]
-        assert record["selection_reason"] == "fallback"
-        assert record["fallback_reason"] == "jev_error"
-        assert app.state.balancer.inflight("standard") == 0
+        assert response.headers["x-sr-selection"] == "target"
+        assert response.headers["x-sr-model"] == "fast"
+        assert response.headers["x-sr-selection"] in SELECTION_VALUES
+        assert len(har.jev_requests) == 1
+        assert list(har.jev_requests[0]["questions"]) == ["q"]
+        assert har.upstream_models == ["fast"]
+        record = recent(app)
+        assert record["selection_reason"] == "target"
+        assert record["jev_model"] == "NeoHorse-Jev-4B"
+        assert record["jev_choice"] == "fast"
+        assert record["jev_top"] == pytest.approx(0.9)
+        assert record["jev_margin"] == pytest.approx(0.8)
+        assert record["jev_probabilities"] == {
+            "fast": pytest.approx(0.9), "strong": pytest.approx(0.1),
+        }
+        assert record["waves"] == 1
+        assert record["answers"]["q"]["probabilities"]["fast"] == pytest.approx(0.9)
+        assert app.state.balancer.inflight("fast") == 0
 
     asyncio.run(scenario())
+
+
+def test_numeric_and_merges_two_questions_into_one_systemone_call(tmp_path):
+    async def scenario():
+        har = Harness({"q-cap": choice(fast=0.1, strong=0.9), "q-domain": noul(0.95)})
+        app = make_app(tmp_path, har, root=two_question_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "target"
+        assert response.headers["x-sr-model"] == "power"
+        # 同波两个问题只收到一次 systemone 请求，问题按 node_id 排序合并。
+        assert len(har.jev_requests) == 1
+        assert list(har.jev_requests[0]["questions"]) == ["q-cap", "q-domain"]
+        assert har.upstream_models == ["power"]
+        record = recent(app)
+        assert record["waves"] == 1
+        assert set(record["answers"]) == {"q-cap", "q-domain"}
+        question_events = [event for event in record["trace"] if event["event"] == "question"]
+        assert [event["node_id"] for event in question_events] == ["q-cap", "q-domain"]
+        # 兼容列取第一波按 node_id 排序后的首个 ChoiceAnswer。
+        assert record["jev_choice"] == "strong"
+        assert record["jev_top"] == pytest.approx(0.9)
+        assert record["jev_ms"] == pytest.approx(record["answers"]["q-cap"]["duration_ms"])
+        await flush(app)
+        conn = connect(app.state.settings.db_path)
+        row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
+        conn.close()
+        assert row["waves"] == 1
+        assert row["jev_choice"] == "strong"
+        assert set(LOG_COLUMNS) & {"answers", "trace", "text"} == set()
+        assert "answers" in recent(app) and "trace" in recent(app)
+        assert app.state.balancer.inflight("power") == 0
+
+    asyncio.run(scenario())
+
+
+def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_path):
+    async def scenario():
+        har = Harness({"q-cap": choice(fast=0.1, strong=0.9), "q-clarify": noul(0.9)})
+        app = make_app(tmp_path, har, root=two_wave_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "target"
+        assert response.headers["x-sr-model"] == "strong-a"
+        assert [list(request["questions"]) for request in har.jev_requests] == [
+            ["q-cap"], ["q-clarify"],
+        ]
+        assert har.upstream_models == ["strong-a"]
+        record = recent(app)
+        assert record["waves"] == 2
+        assert record["jev_choice"] == "strong"
+        assert record["jev_ms"] == pytest.approx(record["answers"]["q-cap"]["duration_ms"])
+        wave_events = [event for event in record["trace"] if event["event"] == "wave"]
+        assert [event["wave"] for event in wave_events] == [1, 2]
+        assert set(record["answers"]) == {"q-cap", "q-clarify"}
+        await flush(app)
+        conn = connect(app.state.settings.db_path)
+        row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
+        columns = {item[1] for item in conn.execute("PRAGMA table_info(request_logs)")}
+        conn.close()
+        assert row["waves"] == 2
+        assert "answers" not in columns and "trace" not in columns
+        assert app.state.balancer.inflight("strong-a") == 0
+
+    asyncio.run(scenario())
+
+
+def test_otherwise_target_when_no_target_activates(tmp_path):
+    async def scenario():
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(tmp_path, har, root=otherwise_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "otherwise"
+        assert response.headers["x-sr-model"] == "safe"
+        assert har.upstream_models == ["safe"]
+        record = recent(app)
+        assert record["selection_reason"] == "otherwise"
+        assert record["fallback_reason"] == "otherwise"
+        assert record["jev_choice"] == "strong"
+        await flush(app)
+        conn = connect(app.state.settings.db_path)
+        assert conn.execute("SELECT waves FROM request_logs").fetchone()[0] == 1
+        conn.close()
+
+    asyncio.run(scenario())
+
+
+# ── error_fallback 三态 ────────────────────────────────────────────────
+
+
+def test_missing_answer_key_uses_error_fallback(tmp_path):
+    async def scenario():
+        har = Harness({})
+        app = make_app(tmp_path, har, root=switch_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "error_fallback"
+        assert response.headers["x-sr-model"] == "safe"
+        assert har.upstream_models == ["safe"]
+        record = recent(app)
+        assert record["selection_reason"] == "error_fallback"
+        assert record["fallback_reason"] == "error_fallback"
+        assert record["jev_choice"] is None
+        assert record["jev_top"] is None and record["jev_margin"] is None
+        assert record["waves"] == 1
+        failed = [event for event in record["trace"] if event["event"] == "wave"]
+        assert failed[0]["failed"] is True and failed[0]["error"]
+        assert app.state.balancer.inflight("safe") == 0
+
+    asyncio.run(scenario())
+
+
+def test_invalid_probabilities_use_error_fallback(tmp_path):
+    async def scenario():
+        har = Harness({"q": {"type": "choice", "probabilities": {"轻量模型": 0.9, "增强模型": 0.9}}})
+        app = make_app(tmp_path, har, root=switch_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "error_fallback"
+        assert response.headers["x-sr-model"] == "safe"
+        assert har.upstream_models == ["safe"]
+
+    asyncio.run(scenario())
+
+
+def test_timeout_uses_error_fallback(tmp_path):
+    async def scenario():
+        har = Harness({}, jev_failure=httpx.ReadTimeout("timed out"))
+        app = make_app(tmp_path, har, root=switch_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "error_fallback"
+        assert response.headers["x-sr-model"] == "safe"
+        assert har.upstream_models == ["safe"]
+        assert recent(app)["fallback_reason"] == "error_fallback"
+
+    asyncio.run(scenario())
+
+
+# ── sticky / revision / circuit breaker ────────────────────────────────
+
+
+def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
+    async def scenario():
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(
+            tmp_path, har, root=switch_graph(),
+            sticky={"enabled": True, "ttl_seconds": 1800},
+        )
+        headers = {"x-sr-session-id": "session-1"}
+        first = await post(app, headers=headers)
+        assert first.status_code == 200
+        assert first.headers["x-sr-model"] == "strong-a"
+        assert first.headers["x-sr-selection"] == "target"
+        assert app.state.balancer.calls[-1]["preferred"] is None
+        assert app.state.balancer.inflight("strong-a") == 0
+        first_revision = app.state.snapshot.tree_revision
+
+        # 仅移动节点（position 属于纯布局字段）：behavior revision 不变。
+        moved = copy.deepcopy(switch_graph())
+        for node in moved["nodes"]:
+            node["position"] = {
+                "x": node["position"]["x"] + 40,
+                "y": node["position"]["y"] + 40,
+            }
+        moved_snapshot = build_snapshot(
+            tree=tree_from_dict(tree_dict(
+                "main", root=moved,
+                sticky={"enabled": True, "ttl_seconds": 1800},
+            )),
+            backends=app.state.snapshot.backends, time_periods=[],
+            jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+        )
+        assert moved_snapshot.tree_revision == first_revision
+        app.state.snapshot = moved_snapshot
+
+        second = await post(app, headers=headers)
+        assert second.status_code == 200
+        assert second.headers["x-sr-model"] == "strong-a"
+        assert second.headers["x-sr-selection"] == "sticky"
+        # 第二次请求仍先执行被激活的问题，再做 preferred 调度。
+        assert [list(request["questions"]) for request in har.jev_requests] == [["q"], ["q"]]
+        assert app.state.balancer.calls[-1]["preferred"] == "strong-a"
+        assert har.upstream_models == ["strong-a", "strong-a"]
+        record = recent(app)
+        assert record["sticky_hit"] == 1
+        assert record["selection_reason"] == "sticky"
+        assert record["answers"]["q"]["ranking"][0] == "strong"
+
+    asyncio.run(scenario())
+
+
+def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream(tmp_path):
+    async def scenario():
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(tmp_path, har, root=priority_graph())
+        for _ in range(app.state.breaker.threshold):
+            app.state.breaker.failure("power")
+        assert app.state.breaker.is_open("power") is True
+        response = await post(app)
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "no_available_backend"
+        # p1 power-target 熔断后直接 503，不静默改选 p2 strong-target 上游。
+        assert har.upstream_models == []
+        assert app.state.balancer.inflight("power") == 0
+        assert app.state.balancer.inflight("strong-a") == 0
+
+    asyncio.run(scenario())
+
+
+# ── upstream / lease / stream paths ────────────────────────────────────
 
 
 def test_no_active_tree_fails_before_any_http_call(tmp_path):
-    calls = []
-
-    def handler(request):
-        calls.append(request)
-        return httpx.Response(500)
-
-    app = make_app(tmp_path, handler, active=False)
-
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
-            response = await client.post("/v1/chat/completions", json=payload())
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            return httpx.Response(500)
+
+        app = make_app(tmp_path, handler, active=False)
+        response = await post(app)
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_active_tree"
         assert calls == []
@@ -138,63 +575,63 @@ def test_no_active_tree_fails_before_any_http_call(tmp_path):
 
 
 def test_stream_completion_releases_lease_and_records_usage(tmp_path):
-    async def handler(request):
-        if request.url.host == "jev.test":
-            raise AssertionError("direct target must skip JEV")
-        body = b'data: {"choices":[]}\n\ndata: {"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\ndata: [DONE]\n\n'
-
-        class Chunks(httpx.AsyncByteStream):
-            async def __aiter__(self):
-                yield body
-
-        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Chunks())
-
-    app = make_app(tmp_path, handler, raw_tree=tree_dict(root=target_dict("direct", ("standard",))))
-
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
-            response = await client.post("/v1/chat/completions", json=payload(stream=True))
+        jev_calls = []
+
+        def handler(request):
+            if request.url.host == "jev.test":
+                jev_calls.append(request)
+                raise AssertionError("direct target must skip JEV")
+            body = b'data: {"choices":[]}\n\ndata: {"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\ndata: [DONE]\n\n'
+
+            class Chunks(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    yield body
+
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Chunks())
+
+        app = make_app(tmp_path, handler, root=direct_graph())
+        response = await post(app, payload(stream=True))
         assert response.status_code == 200
         assert b"[DONE]" in response.content
-        assert app.state.balancer.inflight("standard") == 0
-        record = app.state.requestlog.recent_requests(1)[0]
+        assert jev_calls == []
+        assert app.state.balancer.inflight("safe") == 0
+        record = recent(app)
         assert record["outcome_state"] == "completed"
         assert record["total_tokens"] == 3
+        assert record["answers"] == {}
 
     asyncio.run(scenario())
 
 
 def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
-    app = make_app(tmp_path, lambda request: httpx.Response(503, json={"error": "down"}), raw_tree=tree_dict(root=target_dict("direct", ("standard",))))
-
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
-            response = await client.post("/v1/chat/completions", json=payload())
+        def handler(request):
+            return httpx.Response(503, json={"error": "down"})
+
+        app = make_app(tmp_path, handler, root=direct_graph())
+        response = await post(app)
         assert response.status_code == 502
-        assert app.state.balancer.inflight("standard") == 0
-        assert app.state.requestlog.recent_requests(1)[0]["outcome_state"] == "upstream_error"
+        assert app.state.balancer.inflight("safe") == 0
+        assert recent(app)["outcome_state"] == "upstream_error"
 
     asyncio.run(scenario())
 
 
 def test_cancellation_during_upstream_records_terminal_state_and_releases(tmp_path):
     async def scenario():
-        started = asyncio.Event()
-
-        async def handler(request):
-            started.set()
-            await asyncio.Event().wait()
-            raise AssertionError("unreachable")
-
-        app = make_app(tmp_path, handler, raw_tree=tree_dict(root=target_dict("direct", ("standard",))))
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
+        transport = BlockingTransport()
+        app = make_app(tmp_path, None, root=direct_graph(), transport=transport)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://router.test",
+        ) as client:
             task = asyncio.create_task(client.post("/v1/chat/completions", json=payload()))
-            await asyncio.wait_for(started.wait(), 1)
+            await asyncio.wait_for(transport.started.wait(), 1)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        assert app.state.balancer.inflight("standard") == 0
-        assert app.state.requestlog.recent_requests(1)[0]["outcome_state"] == "cancelled"
+        assert app.state.balancer.inflight("safe") == 0
+        assert recent(app)["outcome_state"] == "cancelled"
 
     asyncio.run(scenario())
 
@@ -223,7 +660,7 @@ def test_stream_disconnect_releases_lease(tmp_path):
         response = Response()
         outcome = Outcome()
         released = []
-        backend = Backend(url="", headers={}, upstream_name="standard")
+        backend = Backend(url="", headers={}, upstream_name="safe")
         generator = _relay(response, outcome=outcome, request=None, backend=backend,
                            upstream_started=0.0, upstream_ms=1.0,
                            on_release=lambda: released.append(True))
@@ -237,11 +674,15 @@ def test_stream_disconnect_releases_lease(tmp_path):
 
 
 def test_invalid_json_is_a_client_error(tmp_path):
-    app = make_app(tmp_path, lambda request: httpx.Response(500))
-
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
-            response = await client.post("/v1/chat/completions", content="{", headers={"content-type": "application/json"})
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://router.test",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions", content="{",
+                headers={"content-type": "application/json"},
+            )
         assert response.status_code == 400
         assert response.json()["error"]["message"] == "invalid_json"
 

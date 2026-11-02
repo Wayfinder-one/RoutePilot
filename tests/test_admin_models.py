@@ -238,28 +238,56 @@ def test_put_model_rejects_unknown_provider(client, app):
         conn.close()
 
 
+def _direct_graph(models, *, node_id="direct", otherwise="direct"):
+    """start → target 的 graph v3 根；用于模型引用/推理档位回归。"""
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": node_id, "type": "target", "priority": 1,
+             "models": [{"model": model, "reasoning": reasoning}
+                        for model, reasoning in models]},
+        ],
+        "edges": [{
+            "id": f"e-start-{node_id}", "source": "start", "source_port": "out",
+            "target": node_id, "target_port": "in_1", "condition": None,
+        }],
+        "otherwise_target": otherwise, "error_fallback": otherwise,
+    }
+
+
 def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
-    """Reference check now walks the SAVED routing trees (Task 11): both a
-    route target and a direct natural-language model option block the delete,
-    and every finding names its tree/node/edge (``via``)."""
-    route_root = {"id": "root", "type": "target", "strategy": "least_inflight",
-                  "models": [{"model": "qwen3-8b", "reasoning": None}]}
+    """Reference check walks the SAVED routing trees: a direct graph target and
+    a choice option target both block the delete, and every finding names its
+    tree/node (``via``)."""
+    route_root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref", "root": route_root})
     assert created.status_code == 201, created.text
     nl_root = {
-        "id": "nl-root", "type": "jev", "instructions": "choose",
-        "options": [
-            {"key": "fast", "label": "轻量", "target": {
-                "id": "fast-target", "type": "target", "strategy": "least_inflight",
-                "models": [{"model": "qwen3-8b", "reasoning": None}]}},
-            {"key": "deep", "label": "增强", "target": {
-                "id": "deep-target", "type": "target", "strategy": "least_inflight",
-                "capability": "复杂任务",
-                "models": [{"model": "qwen3-32b", "reasoning": None}]}},
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "q", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位",
+             "options": [
+                 {"key": "fast", "label": "轻量", "capability": "简单任务"},
+                 {"key": "deep", "label": "增强", "capability": "复杂任务"},
+             ]},
+            {"id": "fast-target", "type": "target", "priority": 1,
+             "models": [{"model": "qwen3-8b", "reasoning": None}]},
+            {"id": "deep-target", "type": "target", "priority": 2,
+             "models": [{"model": "qwen3-32b", "reasoning": None}]},
         ],
-        "fallback": {"id": "fallback", "type": "target", "strategy": "least_inflight",
-                     "models": [{"model": "qwen3-32b", "reasoning": None}]},
+        "edges": [
+            {"id": "e-start-q", "source": "start", "source_port": "out",
+             "target": "q", "target_port": "in_1", "condition": None},
+            {"id": "e-q-fast", "source": "q", "source_port": "selected.fast",
+             "target": "fast-target", "target_port": "in_1", "condition": None},
+            {"id": "e-q-deep", "source": "q", "source_port": "selected.deep",
+             "target": "deep-target", "target_port": "in_1", "condition": None},
+        ],
+        "otherwise_target": "deep-target", "error_fallback": "deep-target",
     }
     created = client.post("/admin/trees", json={
         "id": "nl-ref", "name": "NL Ref", "root": nl_root})
@@ -479,8 +507,8 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 # fix-wave 1 / I-1: model writes are judged against the PROSPECTIVE catalog
 # --------------------------------------------------------------------------- #
 def _reasoning_tree_root(level="high"):
-    return {"id": "root", "type": "target", "strategy": "least_inflight",
-            "models": [{"model": "qwen3-8b", "reasoning": level}]}
+    return _direct_graph((("qwen3-8b", level),), node_id="reasoning-target",
+                         otherwise="reasoning-target")
 
 
 def _declare_high(client):
@@ -519,7 +547,7 @@ def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
     assert r.status_code == 422, r.text
     issues = r.json()["detail"]
     assert any(issue["code"] == "reasoning_unsupported"
-               and issue["node_id"] == "root" for issue in issues), issues
+               and issue["node_id"] == "reasoning-target" for issue in issues), issues
     after = {m["id"]: m["profile"] for m in
              client.get("/admin/models").json()["models"]}
     assert after["qwen3-8b"] == before["qwen3-8b"]   # rejected write, DB intact
@@ -610,8 +638,7 @@ def test_delete_model_checks_references_inside_the_publish_lock(
         app, client, monkeypatch):
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref",
-        "root": {"id": "root", "type": "target", "strategy": "least_inflight",
-                 "models": [{"model": "qwen3-8b", "reasoning": None}]}})
+        "root": _direct_graph((("qwen3-8b", None),))})
     assert created.status_code == 201, created.text
     trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
 

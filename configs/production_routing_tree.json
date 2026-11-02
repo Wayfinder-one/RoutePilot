@@ -8,109 +8,115 @@
   },
   "root": {
     "id": "root",
-    "type": "jev",
-    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
-    "min_prob": 0.0,
-    "min_margin": 0.0,
-    "options": [
+    "type": "graph",
+    "nodes": [
       {
-        "key": "fast",
-        "label": "轻量模型（qwen3.8-27B）",
-        "target": {
-          "id": "fast-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "速度最快、成本最低。适合简单短小的请求：闲聊、简单事实问答、格式转换、短翻译、信息提取、简单提醒。复杂任务容易出错。",
-          "models": [
-            {
-              "model": "qwen3-8b",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "start",
+        "type": "start",
+        "title": "开始",
+        "position": {"x": 40, "y": 180}
       },
       {
-        "key": "standard",
-        "label": "标准模型（DeepSeek-v4-flash）",
-        "target": {
-          "id": "standard-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "速度与质量均衡。适合中等复杂度请求：写作、总结、简单排错、方案对比、表格整理、一般计划与轻度数据分析。",
-          "models": [
-            {
-              "model": "deepseek-v3",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "capability",
+        "type": "question",
+        "question_type": "choice",
+        "title": "能力档位",
+        "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+        "position": {"x": 260, "y": 180},
+        "options": [
+          {
+            "key": "fast",
+            "label": "轻量模型（qwen3.8-27B）",
+            "capability": "速度最快、成本最低。适合简单短小的请求：闲聊、简单事实问答、格式转换、短翻译、信息提取、简单提醒。复杂任务容易出错。"
+          },
+          {
+            "key": "standard",
+            "label": "标准模型（DeepSeek-v4-flash）",
+            "capability": "速度与质量均衡。适合中等复杂度请求：写作、总结、简单排错、方案对比、表格整理、一般计划与轻度数据分析。"
+          },
+          {
+            "key": "strong",
+            "label": "增强模型（kimi K3.1 pro）",
+            "capability": "能力最强但较慢、成本高。适合复杂请求：长文档分析、多约束方案设计、复杂代码与故障排查、统计建模、风险判断与深度决策。"
+          }
+        ]
       },
       {
-        "key": "strong",
-        "label": "增强模型（kimi K3.1 pro）",
-        "target": {
-          "id": "strong-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "能力最强但较慢、成本高。适合复杂请求：长文档分析、多约束方案设计、复杂代码与故障排查、统计建模、风险判断与深度决策。",
-          "models": [
-            {
-              "model": "qwen3-32b",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "fast-target",
+        "type": "target",
+        "title": "轻量模型",
+        "priority": 1,
+        "position": {"x": 520, "y": 40},
+        "models": [
+          {"model": "qwen3-8b", "reasoning": null}
+        ]
       },
       {
-        "key": "power",
-        "label": "国网电力专用模型（qwen3.8-flash-sft）",
-        "target": {
-          "id": "power-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "专门针对国家电网/电力行业微调。适合需要电力业务知识与规程的问题：调度、营销、安规、设备缺陷、抢修、电价电费、计量采集、继保自动化、供电服务、新能源并网；不适合通用日常请求。",
-          "models": [
-            {
-              "model": "qwen3-32b",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "standard-target",
+        "type": "target",
+        "title": "标准模型",
+        "priority": 2,
+        "position": {"x": 520, "y": 160},
+        "models": [
+          {"model": "deepseek-v3", "reasoning": null}
+        ]
       },
       {
-        "key": "image",
-        "label": "qwen-image-2.1（多模态图像模型）",
-        "target": {
-          "id": "image-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "多模态图像生成/编辑模型。适合：根据文字生成图片（插画、海报、产品图、风景、头像、表情包、壁纸、图标），或基于参考图改图/换风格/换背景/加删元素。不能处理纯文本问答、代码、数据分析、电力业务咨询等请求。",
-          "models": [
-            {
-              "model": "qwen3-32b",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "strong-target",
+        "type": "target",
+        "title": "增强模型",
+        "priority": 3,
+        "position": {"x": 520, "y": 280},
+        "models": [
+          {"model": "qwen3-32b", "reasoning": null}
+        ]
+      },
+      {
+        "id": "safe-target",
+        "type": "target",
+        "title": "安全兜底",
+        "priority": 4,
+        "position": {"x": 520, "y": 400},
+        "models": [
+          {"model": "qwen3-8b", "reasoning": null}
+        ]
       }
     ],
-    "fallback": {
-      "id": "safe-target",
-      "type": "target",
-      "strategy": "least_inflight",
-      "capability": "",
-      "models": [
-        {
-          "model": "qwen3-8b",
-          "reasoning": null
-        }
-      ]
-    }
-  },
-  "_meta": {
-    "source": "live 192.168.95.76:8400",
-    "date": "2026-10-29",
-    "tree_revision": "1a0b49237f7be969a4660531d450fe952feee39b69669ec2d42326727713fc36",
-    "note": "power/image 的 target 为占位（qwen3-32b）：电力专用模型与图像服务上线后用 PUT /admin/trees/default-jev 换 target"
+    "edges": [
+      {
+        "id": "e-start-capability",
+        "source": "start",
+        "source_port": "out",
+        "target": "capability",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-fast",
+        "source": "capability",
+        "source_port": "selected.fast",
+        "target": "fast-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-standard",
+        "source": "capability",
+        "source_port": "selected.standard",
+        "target": "standard-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-strong",
+        "source": "capability",
+        "source_port": "selected.strong",
+        "target": "strong-target",
+        "target_port": "in_1",
+        "condition": null
+      }
+    ],
+    "otherwise_target": "safe-target",
+    "error_fallback": "safe-target"
   }
 }

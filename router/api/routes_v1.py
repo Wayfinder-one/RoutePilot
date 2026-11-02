@@ -11,6 +11,9 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# 与 /admin/try 共用答案序列化契约：完整 answers 只进内存 ring / 试算响应，不进 SQLite。
+from router.api.routes_trees import _answer_payload
+from router.jev.client import ChoiceAnswer
 from router.reasoning import ReasoningError, apply_reasoning
 from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest
 
@@ -138,10 +141,22 @@ class _SseUsage:
             self.usage = value["usage"]
 
 
+def _first_wave_choice(decision):
+    """第一波按 node_id 排序后的首个 ChoiceAnswer（日志兼容列，spec §3.8）。"""
+    first_wave = decision.waves[0] if decision.waves else None
+    if first_wave is None:
+        return None
+    for node_id in sorted(first_wave.questions):
+        answer = decision.answers.get(node_id)
+        if isinstance(answer, ChoiceAnswer):
+            return answer
+    return None
+
+
 def _decision_record(request: Request, decision, snapshot, body, text: str,
                      reasoning_warning, routing_ms: float, started: float) -> dict:
-    answer = decision.jev_answer
-    jev_event = next((event for event in decision.trace if event.get("event") == "jev_choice"), None)
+    first_wave = decision.waves[0] if decision.waves else None
+    answer = _first_wave_choice(decision)
     return {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -157,12 +172,14 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
         "fallback_reason": decision.fallback_reason,
         "sticky_hit": 1 if decision.sticky_hit else 0,
         "session_hash": decision.session_hash,
-        "jev_model": snapshot.jev.model if jev_event is not None and snapshot.jev else None,
+        "jev_model": snapshot.jev.model if first_wave is not None and snapshot.jev else None,
         "jev_choice": answer.selected_key if answer else None,
         "jev_top": answer.p_top if answer else None,
         "jev_margin": answer.margin if answer else None,
-        "jev_ms": answer.duration_ms if answer else (jev_event or {}).get("duration_ms"),
-        "jev_probabilities": answer.probabilities if answer else None,
+        "jev_ms": first_wave.duration_ms if first_wave is not None else None,
+        "jev_probabilities": dict(answer.probabilities) if answer else None,
+        "waves": len(decision.waves),
+        "answers": {node_id: _answer_payload(value) for node_id, value in decision.answers.items()},
         "reasoning": decision.reasoning,
         "reasoning_warning": reasoning_warning,
         "routing_ms": routing_ms,

@@ -540,11 +540,20 @@ def validate_graph_for_enable(value, context: EnableContext) -> list[Issue]:
                     ))
                 else:
                     supported = (context.model_reasoning or {}).get(item.model)
-                    if item.reasoning != supported:
+                    efforts = {
+                        entry.get("id")
+                        for entry in (supported or {}).get("efforts", [])
+                        if isinstance(entry, dict)
+                    } if isinstance(supported, dict) else set()
+                    if item.reasoning is not None and (
+                        not isinstance(supported, dict)
+                        or not supported.get("supported")
+                        or item.reasoning not in efforts
+                    ):
                         issues.append(Issue(
                             "reasoning_unsupported",
-                            f"模型不支持所选推理档位：{item.model} 支持 {supported!r}，目标配置 {item.reasoning!r}（{node.id}）",
-                            f"Model does not support the selected reasoning tier: {item.model} supports {supported!r}, target uses {item.reasoning!r} ({node.id})",
+                            f"模型不支持所选推理档位：{item.model} 支持 {sorted(efforts)!r}，目标配置 {item.reasoning!r}（{node.id}）",
+                            f"Model does not support the selected reasoning tier: {item.model} supports {sorted(efforts)!r}, target uses {item.reasoning!r} ({node.id})",
                             node_id=node.id,
                         ))
         elif isinstance(node, ConditionNode) and node.source == "periods":

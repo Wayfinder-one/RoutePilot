@@ -15,7 +15,7 @@ from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import JevConfigRepo, JevSettings
 from router.routing.affinity import SessionAffinity
-from router.routing.types import NoActiveTreeError
+from router.routing.graph.engine import GraphExecutionEngine
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
@@ -136,12 +136,9 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.balancer = LoadBalancer(app.state.breaker)
     app.state.affinity = SessionAffinity(max_entries=settings.session_max_entries)
     app.state.jev_client = JevClient(app.state.http)
-    # INTERIM(Task 8): GraphExecutionEngine wiring replaces this placeholder
-    class _EngineUnavailable:
-        def route(self, *args, **kwargs):
-            raise NoActiveTreeError("routing engine unavailable during graph migration")
-
-    app.state.engine = _EngineUnavailable()
+    app.state.engine = GraphExecutionEngine(
+        app.state.jev_client, app.state.affinity, app.state.balancer,
+    )
     app.state.requestlog = requestlog
     app.state.publisher = SnapshotPublisher(app)
 

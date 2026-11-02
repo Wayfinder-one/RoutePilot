@@ -8,54 +8,92 @@
   },
   "root": {
     "id": "root",
-    "type": "jev",
-    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
-    "min_prob": 0.0,
-    "min_margin": 0.0,
-    "options": [
+    "type": "graph",
+    "nodes": [
       {
-        "key": "fast",
-        "label": "轻量模型",
-        "target": {
-          "id": "fast-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "速度最快、成本最低。适合简单短小的请求：闲聊、简单事实问答、格式转换、短翻译、信息提取、简单提醒。复杂任务容易出错。",
-          "models": [
-            {
-              "model": "qwen3-8b",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "start",
+        "type": "start",
+        "title": "开始",
+        "position": {"x": 40, "y": 180}
       },
       {
-        "key": "strong",
-        "label": "增强模型",
-        "target": {
-          "id": "strong-target",
-          "type": "target",
-          "strategy": "least_inflight",
-          "capability": "能力最强但较慢、成本高。适合复杂请求：长文档分析、多约束方案设计、复杂代码与故障排查、统计建模、风险判断与深度决策。简单问答和普通写作不适合。",
-          "models": [
-            {
-              "model": "qwen3-32b",
-              "reasoning": null
-            }
-          ]
-        }
+        "id": "capability",
+        "type": "question",
+        "question_type": "choice",
+        "title": "能力档位",
+        "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+        "position": {"x": 260, "y": 180},
+        "options": [
+          {
+            "key": "fast",
+            "label": "轻量模型",
+            "capability": "速度最快、成本最低。适合简单短小的请求：闲聊、简单事实问答、格式转换、短翻译、信息提取、简单提醒。复杂任务容易出错。"
+          },
+          {
+            "key": "strong",
+            "label": "增强模型",
+            "capability": "能力最强但较慢、成本高。适合复杂请求：长文档分析、多约束方案设计、复杂代码与故障排查、统计建模、风险判断与深度决策。简单问答和普通写作不适合。"
+          }
+        ]
+      },
+      {
+        "id": "fast-target",
+        "type": "target",
+        "title": "轻量模型",
+        "priority": 1,
+        "position": {"x": 520, "y": 40},
+        "models": [
+          {"model": "qwen3-8b", "reasoning": null}
+        ]
+      },
+      {
+        "id": "strong-target",
+        "type": "target",
+        "title": "增强模型",
+        "priority": 2,
+        "position": {"x": 520, "y": 180},
+        "models": [
+          {"model": "qwen3-32b", "reasoning": null}
+        ]
+      },
+      {
+        "id": "safe-target",
+        "type": "target",
+        "title": "安全兜底",
+        "priority": 3,
+        "position": {"x": 520, "y": 320},
+        "models": [
+          {"model": "qwen3-8b", "reasoning": null}
+        ]
       }
     ],
-    "fallback": {
-      "id": "safe-target",
-      "type": "target",
-      "strategy": "least_inflight",
-      "models": [
-        {
-          "model": "qwen3-8b",
-          "reasoning": null
-        }
-      ]
-    }
+    "edges": [
+      {
+        "id": "e-start-capability",
+        "source": "start",
+        "source_port": "out",
+        "target": "capability",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-fast",
+        "source": "capability",
+        "source_port": "selected.fast",
+        "target": "fast-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-strong",
+        "source": "capability",
+        "source_port": "selected.strong",
+        "target": "strong-target",
+        "target_port": "in_1",
+        "condition": null
+      }
+    ],
+    "otherwise_target": "safe-target",
+    "error_fallback": "safe-target"
   }
 }

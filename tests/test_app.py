@@ -3,11 +3,30 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.config import Settings
+from router.routing.graph.model import TargetNode
 from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import jev_dict, target_dict, tree_dict
+from tests.routing_fixtures import graph_dict, tree_dict
+
+
+def direct_graph(models=("qwen3-8b",)):
+    """start → target 的直连图（无问题节点，不需要决策服务）。"""
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "direct", "type": "target", "priority": 1,
+             "position": {"x": 200, "y": 0},
+             "models": [{"model": model, "reasoning": None} for model in models]},
+        ],
+        "edges": [{
+            "id": "e-start-direct", "source": "start", "source_port": "out",
+            "target": "direct", "target_port": "in_1", "condition": None,
+        }],
+        "otherwise_target": "direct", "error_fallback": "direct",
+    }
 
 
 def test_health_console_and_empty_tree_boot(tmp_path):
@@ -36,27 +55,28 @@ def prepare_active_tree(tmp_path, raw):
 
 
 def test_startup_accepts_valid_direct_target(tmp_path):
-    path = prepare_active_tree(tmp_path, tree_dict(root=target_dict("direct", ("qwen3-8b",))))
+    path = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
     app = create_app(Settings(db_path=path))
     assert app.state.snapshot.tree_id == "main"
-    assert app.state.snapshot.tree.root.models[0].model == "qwen3-8b"
+    targets = [node for node in app.state.snapshot.tree.root.nodes if isinstance(node, TargetNode)]
+    assert [(node.id, [item.model for item in node.models]) for node in targets] == [
+        ("direct", ["qwen3-8b"]),
+    ]
 
 
 def test_startup_refuses_invalid_active_tree(tmp_path):
-    raw = tree_dict()
-    del raw["root"]["fallback"]
+    raw = tree_dict(root=direct_graph())
+    del raw["root"]["error_fallback"]
     path = prepare_active_tree(tmp_path, raw)
-    with pytest.raises(RuntimeError, match="fallback_required"):
+    with pytest.raises(RuntimeError, match="fallback_missing"):
         create_app(Settings(db_path=path))
 
 
 def test_startup_refuses_jev_tree_without_service_config(tmp_path):
-    raw = tree_dict(root=jev_dict())
-    raw["root"]["options"][0]["target"]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
-    raw["root"]["options"][1]["target"]["models"] = [{"model": "qwen3-32b", "reasoning": None}]
-    raw["root"]["fallback"]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
+    raw = tree_dict(root=graph_dict())
+    raw["root"]["nodes"][2]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
     path = prepare_active_tree(tmp_path, raw)
-    with pytest.raises(RuntimeError, match="jev_unavailable"):
+    with pytest.raises(RuntimeError, match="decision_service_unavailable"):
         create_app(Settings(db_path=path))
 
 

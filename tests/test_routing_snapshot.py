@@ -7,7 +7,24 @@ from router.routing.snapshot import SnapshotPublisher, load_snapshot
 from router.store.db import connect, migrate
 from router.store.repositories import ModelRepo, ProviderRepo, TimePeriodRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import target_dict, tree_dict
+from tests.routing_fixtures import tree_dict
+
+
+def direct_graph(model):
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "target", "type": "target", "priority": 1,
+             "position": {"x": 200, "y": 0},
+             "models": [{"model": model, "reasoning": None}]},
+        ],
+        "edges": [{
+            "id": "e-start-target", "source": "start", "source_port": "out",
+            "target": "target", "target_port": "in_1", "condition": None,
+        }],
+        "otherwise_target": "target", "error_fallback": "target",
+    }
 
 
 def prepare_db(tmp_path):
@@ -19,7 +36,7 @@ def prepare_db(tmp_path):
     TimePeriodRepo(conn).save([{"name": "白天", "days": [0, 1, 2, 3, 4], "start": "09:00", "end": "18:00"}])
     JevConfigRepo(conn).save(JevSettings("http://jev.test", "NeoHorse-Jev-4B", "jev-secret", 5, DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE))
     repo = RoutingTreeRepo(conn)
-    repo.create(tree_from_dict(tree_dict(root=target_dict("target", ("fast",)))))
+    repo.create(tree_from_dict(tree_dict(root=direct_graph("fast"))))
     repo.enable("main")
     return conn
 

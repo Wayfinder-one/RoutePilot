@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.config import Settings
 from router.store.db import connect
-from tests.routing_fixtures import target_dict, tree_dict
+from tests.routing_fixtures import tree_dict
 
 TEXT = "今天天气怎么样"
 
@@ -39,8 +39,26 @@ def harness(tmp_path, *, streaming=False):
     return SimpleNamespace(app=app, client=TestClient(app), requests=transport.requests if streaming else requests)
 
 
+def direct_graph(reasoning=None):
+    """start → target（qwen3-8b）；直连图不激活问题节点。"""
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "direct", "type": "target", "priority": 1,
+             "position": {"x": 200, "y": 0},
+             "models": [{"model": "qwen3-8b", "reasoning": reasoning}]},
+        ],
+        "edges": [{
+            "id": "e-start-direct", "source": "start", "source_port": "out",
+            "target": "direct", "target_port": "in_1", "condition": None,
+        }],
+        "otherwise_target": "direct", "error_fallback": "direct",
+    }
+
+
 def activate(client, level=None):
-    raw = tree_dict("default-tree", root=target_dict("direct", ("qwen3-8b",), reasoning=level))
+    raw = tree_dict("default-tree", root=direct_graph(level))
     body = {"id": raw["id"], "name": raw["name"], "root": raw["root"], "sticky": raw["sticky"], "timezone": raw["timezone"]}
     existing = client.get("/admin/trees/default-tree")
     if existing.status_code == 200:

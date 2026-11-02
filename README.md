@@ -8,7 +8,7 @@ RoutePilot is an OpenAI-compatible model routing proxy. Routing policy is config
 
 | | |
 |---|---|
-| Status | Design stage (2026-11-02, graph v2). Console prototype complete; runtime to be migrated to this design. |
+| Status | Graph v3 runtime (M1 complete, 2026-11-02). The canvas, real `/v1` routing chain, `/admin/try` dry-run and request logging all run on graph v3. |
 | Design spec | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md` (local only, not published) |
 | Console prototype | `docs/od-design/routing-canvas-2026-11-02/index.html` (Direction A · Canvas-first; local only, not published) |
 | Config format | `sr-routing-graph` v3. Legacy routing trees are not converted; see [Upgrading a legacy database](#upgrading-a-legacy-database). |

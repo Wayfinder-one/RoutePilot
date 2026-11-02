@@ -8,7 +8,7 @@ RoutePilot 是 OpenAI 兼容的模型路由代理。路由策略由一张通用�
 
 | | |
 |---|---|
-| 项目状态 | 设计阶段（2026-11-02，graph v2）；控制台原型已完成，服务端按本文设计迁移 |
+| 项目状态 | graph v3 运行时（M1 完成，2026-11-02）；画布、`/v1` 真链路、`/admin/try` 试算与请求日志均已按 graph v3 工作 |
 | 设计文档 | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md`（仅本地保留，不随仓库发布） |
 | 控制台原型 | `docs/od-design/routing-canvas-2026-11-02/index.html`（方向 A · 画布优先；仅本地保留，不随仓库发布） |
 | 配置格式 | `sr-routing-graph` v3；旧版路由树不自动转换，见[从旧数据库升级](#从旧数据库升级) |
