@@ -34,10 +34,11 @@ def snapshot_of(tree):
 
 
 def test_create_defaults_closed_and_stores_complete_graph_document(repo, conn):
-    raw = tree_dict()
+    raw = tree_dict(enabled=True)
     raw["sticky"] = {"enabled": True, "ttl_seconds": 1800}
     source = tree_from_dict(raw)
     tree = repo.create(source)
+    # 行上的 enabled 是权威：即使文档写了 enabled=true，新建也强制关闭。
     assert tree.enabled is False
     assert tree.tree_revision == tree_revision_of(source)
     stored = conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0]
@@ -110,6 +111,23 @@ def test_question_option_order_changes_revision(repo):
     second = repo.update(tree_from_dict(raw))
     assert second.tree_revision != first.tree_revision
     assert [option.key for option in second.root.nodes[1].options] == ["strong", "easy"]
+
+
+def test_copy_preserves_layout_display_and_capability(repo):
+    raw = tree_dict("source")
+    raw["root"]["nodes"][0]["title"] = "请求入口"
+    raw["root"]["nodes"][0]["position"] = {"x": 40, "y": 60}
+    raw["root"]["nodes"][-1]["capability"] = "展示说明"
+    source = repo.create(tree_from_dict(raw))
+
+    copied = repo.copy("source", "copy", "副本")
+
+    assert copied.enabled is False
+    assert copied.name == "副本"
+    assert copied.tree_revision == source.tree_revision
+    assert copied.root.nodes[0].title == "请求入口"
+    assert (copied.root.nodes[0].position.x, copied.root.nodes[0].position.y) == (40.0, 60.0)
+    assert copied.root.nodes[-1].capability == "展示说明"
 
 
 def test_enable_disable_and_copy_preserve_single_active_invariant(repo):

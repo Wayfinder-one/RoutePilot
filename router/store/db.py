@@ -172,12 +172,13 @@ def legacy_tree_ids(conn) -> list[str]:
         return []
     legacy = []
     for row in conn.execute("SELECT id, root FROM routing_trees ORDER BY id"):
+        # 位置索引同时兼容 connect() 的 sqlite3.Row 与裸 sqlite3.Connection 的行元组。
         try:
-            root_type = json.loads(row["root"]).get("root", {}).get("type")
-        except (ValueError, AttributeError):
+            root_type = json.loads(row[1]).get("root", {}).get("type")
+        except (ValueError, AttributeError, IndexError, TypeError):
             root_type = None
         if root_type != "graph":
-            legacy.append(row["id"])
+            legacy.append(row[0])
     return legacy
 
 
