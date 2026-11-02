@@ -40,7 +40,7 @@ setLang(LANG);
   function showErr(text, warn) { notice = text ? { text, warn: !!warn } : null; paintNotice(); }
   function showErrKey(key, warn, vars) { notice = { key, vars, warn: !!warn }; paintNotice(); }
 
-  function paintTitle() { document.title = t('login.title') + ' · Smart Router'; }
+  function paintTitle() { document.title = t('login.title') + ' · RoutePilot'; }
 
   async function boot() {
     /* Signed in (session or ?token= static token) -> go back to the target page. */

@@ -1,5 +1,5 @@
 [project]
-name = "smart-router"
+name = "routepilot"
 version = "3.0.0"
 requires-python = ">=3.11"
 

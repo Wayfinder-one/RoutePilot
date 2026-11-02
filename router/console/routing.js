@@ -1,4 +1,4 @@
-/* Smart Router console — decision group config (2026-10-30).
+/* RoutePilot console — decision group config (2026-10-30).
 
    One page = one decision group. Only two things are edited:
      1. root.instructions        — "how to choose"

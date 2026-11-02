@@ -1,6 +1,8 @@
-# Smart Router v3
+# RoutePilot
 
-Smart Router 是一个 OpenAI 兼容的模型路由代理：**NeoHorse-JEV 负责按模型能力选择目标，会话粘性和最小在途请求负责选择实际上游**。控制台提供模型管理、JEV 服务配置、分流配置和计算日志。
+> **Sandlake** 出品 · 由 Sandlake 团队开发与维护
+
+RoutePilot 是一个 OpenAI 兼容的模型路由代理：**NeoHorse-JEV 负责按模型能力选择目标，会话粘性和最小在途请求负责选择实际上游**。控制台提供模型管理、JEV 服务配置、分流配置和计算日志。
 
 本版是开发中的不兼容重构：旧信号体系、旧路由树和旧数据库 schema 均已移除，没有兼容适配层，也不会在 router 进程内加载 torch/transformers。
 
@@ -28,7 +30,7 @@ POST /v1/chat/completions
 - **LoadBalancer**：判断“target 内哪个后端在途最少”；
 - **CircuitBreaker**：剔除当前熔断的后端。
 
-JEV 客户端与训练仓库 `/Users/yuansu/work/smart-router-train` 的 NeoHorse-JEV-4B 原生 vLLM 0.32 插件对齐。训练仓库既有实验采用 400 条主集和 40 条对抗集；其准确率与延迟结果属于该模型/部署评测，不是本项目的重构验收结果。
+JEV 客户端与训练侧 NeoHorse-JEV-4B 原生 vLLM 0.32 插件对齐。训练侧既有实验采用 400 条主集和 40 条对抗集；其准确率与延迟结果属于该模型/部署评测，不是本项目的重构验收结果。
 
 ## 快速开始
 
@@ -151,8 +153,7 @@ ROUTER_JEV_API_KEY= \
 - token 估算：CJK 1 token/字、其他 4 字符/token（保守，故意偏高）；
 - 截断发生时，计算日志（trace）记录 `jev_input_window` 事件（`tokens_before` / `tokens_after` /
   `truncated`），可在「计算日志」页检索；
-- API：`GET/PUT /admin/jev/window`（PUT 参数 `context_tokens`、`input_tokens`，校验关系与范围）；
-- 设计文档：`docs/上下文长度配置-spec-2026-10-30.md`。
+- API：`GET/PUT /admin/jev/window`（PUT 参数 `context_tokens`、`input_tokens`，校验关系与范围）。
 
 ## 模型与提供方
 
@@ -306,3 +307,7 @@ SQLite 使用单张 `request_logs` 保存决策与结果元数据：tree/snapsho
 | `ROUTER_USER_AUTH` | 生产 `1` | 控制台账号鉴权 |
 | `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 见上文 | 空 users 表首次 seed |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | 控制台登录会话 TTL |
+
+---
+
+**Sandlake** · RoutePilot 由 Sandlake 团队开发与维护。

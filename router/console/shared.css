@@ -1,4 +1,4 @@
-/* Smart Router console — Routing Workbench design (direction B).
+/* RoutePilot console — Routing Workbench design (direction B).
    Light, dense, tool-like. Shared by overview / pipeline / logs / signals /
    models pages. No build step: pure CSS + vanilla JS, served by FastAPI. */
 :root{

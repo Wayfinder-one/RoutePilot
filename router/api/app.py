@@ -129,7 +129,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
             await requestlog.close()
             await app.state.http.aclose()
 
-    app = FastAPI(title="Smart Router v3", lifespan=lifespan)
+    app = FastAPI(title="RoutePilot", lifespan=lifespan)
     app.state.settings = settings
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
     app.state.breaker = CircuitBreaker(db_path=settings.db_path)

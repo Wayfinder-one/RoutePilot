@@ -1,7 +1,7 @@
 /* Bilingual dictionary. zh is default; setLang persists to localStorage. */
 const I18N = {
   zh: {
-    'app.title': 'Smart Router',
+    'app.title': 'RoutePilot',
     'nav.routing': '决策组', 'nav.jev': 'JEV 模型',
     'ov.sticky': '粘性命中', 'ov.treeCount': '决策组数量', 'ov.go.jev': '配置 JEV →',
     'ov.go.routing': '编辑决策组 →', 'ov.activeTree': '当前决策组',
@@ -256,7 +256,7 @@ const I18N = {
     /* ── trace: shared routing-trace renderer (pipeline + logs) ── */
   },
   en: {
-    'app.title': 'Smart Router',
+    'app.title': 'RoutePilot',
     'nav.routing': 'Decision groups', 'nav.jev': 'JEV Model',
     'ov.sticky': 'Sticky hits', 'ov.treeCount': 'Decision groups', 'ov.go.jev': 'Configure JEV →',
     'ov.go.routing': 'Edit decision group →', 'ov.activeTree': 'Active decision group',
