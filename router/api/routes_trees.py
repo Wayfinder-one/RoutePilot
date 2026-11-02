@@ -10,12 +10,19 @@ from router.api.deps import get_conn
 from router.api.upstream import load_backends, model_reasoning_from_db
 from router.jev.config import JevConfigRepo
 from router.routing.conditions import TimePeriod
-from router.routing.model import RoutingTree, node_to_dict, tree_from_dict, tree_to_dict
+from router.routing.model import RoutingTree, graph_to_dict, tree_from_dict, tree_to_dict
 from router.routing.snapshot import _capability, build_snapshot
 from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
-from router.routing.validation import EnableContext, validate_tree_for_enable, validate_tree_structure
 from router.store.repositories import ChangeRepo, ModelRepo, TimePeriodRepo, _now_iso, _uid, write_transaction
 from router.store.routing_trees import RoutingTreeRepo
+
+# INTERIM(Task 7): graph validate_graph_structure/validate_graph_for_enable wiring replaces these stubs
+def validate_tree_structure(tree):
+    return []
+
+
+def validate_tree_for_enable(tree, context):
+    return []
 
 router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -58,15 +65,9 @@ def active_tree(conn: sqlite3.Connection) -> RoutingTree | None:
     return next((tree for tree in RoutingTreeRepo(conn).list() if tree.enabled), None)
 
 
-def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
-    models = ModelRepo(conn).list()
-    return EnableContext(
-        known_models={row["id"] for row in models},
-        capabilities={row["id"]: _capability(row) for row in models},
-        model_reasoning=model_reasoning_from_db(conn),
-        known_periods={period["name"] for period in TimePeriodRepo(conn).load()},
-        jev_available=JevConfigRepo(conn).load() is not None,
-    )
+# INTERIM(Task 7): EnableContext removed by graph model; graph enable-context wiring replaces this stub
+def build_enable_context(conn: sqlite3.Connection):
+    return None
 
 
 def active_tree_issues(conn: sqlite3.Connection):
@@ -127,7 +128,7 @@ def update_tree(tree_id: str, body: dict, request: Request, conn: sqlite3.Connec
         tree = _parse_tree({
             "id": tree_id,
             "name": _clean_name(body.get("name", current.name)),
-            "root": body.get("root", node_to_dict(current.root)),
+            "root": body.get("root", graph_to_dict(current.root)),
             "sticky": body.get("sticky", {"enabled": current.sticky.enabled, "ttl_seconds": current.sticky.ttl_seconds}),
             "timezone": body.get("timezone", current.timezone),
         })

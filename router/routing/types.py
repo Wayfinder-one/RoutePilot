@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from router.jev.client import JevAnswer
-from router.routing.model import Target
 
 
 class NoActiveTreeError(RuntimeError):
@@ -29,7 +28,8 @@ class RoutingRequest:
 @dataclass
 class RoutingDecision:
     model: str
-    target: Target
+    # INTERIM(Task 5): Target removed by graph model; Task 5 rewrites types.py and restores a typed target
+    target: Any
     reasoning: str | None
     policy_path: str
     trace: list[dict]

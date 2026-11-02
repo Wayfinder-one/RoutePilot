@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from router.routing.model import When
-
 
 def _minutes(value: str) -> int:
     try:
@@ -64,7 +62,3 @@ def matching_periods(now: datetime, periods: list[TimePeriod]) -> list[str]:
         if hit:
             matched.append(period.name)
     return matched
-
-
-def when_matches(when: When | None, active_periods: list[str]) -> bool:
-    return when is None or any(period in active_periods for period in when.periods)

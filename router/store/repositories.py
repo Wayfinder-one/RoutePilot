@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from router import auth
 from router.presets import PRESET_BY_ID
 from router.routing.conditions import TimePeriod
-from router.routing.model import RoutingTree, Target, tree_revision_of, walk_nodes
+from router.routing.model import RoutingTree, tree_revision_of
 
 
 def _now_iso() -> str:
@@ -146,11 +146,13 @@ class ModelRepo:
 
 
 def model_references(trees: list[RoutingTree], model_id: str) -> list[dict]:
+    # INTERIM(Task 8): graph-native scan; typed GraphNode TargetNode check replaces this once the engine is deleted
     refs = []
     for tree in trees:
         revision = tree.tree_revision or tree_revision_of(tree)
-        for node in walk_nodes(tree.root):
-            if isinstance(node, Target) and any(item.model == model_id for item in node.models):
+        for node in tree.root.nodes:
+            models = getattr(node, "models", ()) or ()
+            if any(item.model == model_id for item in models):
                 refs.append({"tree_id": tree.id, "tree_revision": revision, "node_id": node.id, "via": "target"})
     return refs
 
