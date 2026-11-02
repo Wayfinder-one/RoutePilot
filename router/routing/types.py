@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
 from router.jev.client import JevAnswer
+from router.routing.graph.model import TargetNode
 
 
 class NoActiveTreeError(RuntimeError):
@@ -25,11 +27,32 @@ class RoutingRequest:
     session_id: str = ""
 
 
+@dataclass(frozen=True)
+class Candidate:
+    """A target node activated by at least one true input slot."""
+
+    target_id: str
+    priority: int
+    via_node: str
+    via_port: str
+    wave: int
+
+
+@dataclass(frozen=True)
+class WaveTrace:
+    """One merged ``/v1/systemone`` decision call (spec §3.8)."""
+
+    wave: int
+    questions: tuple[str, ...]
+    duration_ms: float
+    failed: bool = False
+    error: str | None = None
+
+
 @dataclass
 class RoutingDecision:
     model: str
-    # INTERIM(Task 5): Target removed by graph model; Task 5 rewrites types.py and restores a typed target
-    target: Any
+    target: TargetNode
     reasoning: str | None
     policy_path: str
     trace: list[dict]
@@ -37,8 +60,10 @@ class RoutingDecision:
     selection_reason: str
     session_hash: str | None
     lease: Any
-    jev_answer: JevAnswer | None = None
-    fallback_reason: str | None = None
+    candidates: tuple[Candidate, ...]
+    waves: tuple[WaveTrace, ...]
+    answers: Mapping[str, JevAnswer]
+    fallback_reason: str | None
     _released: bool = field(default=False, init=False, repr=False)
 
     @property
