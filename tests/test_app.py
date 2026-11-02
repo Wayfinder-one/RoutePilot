@@ -1,14 +1,22 @@
+import json
+from pathlib import Path
+
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.config import Settings
 from router.routing.graph.model import TargetNode
+from router.routing.graph.validate import validate_graph_structure
 from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, tree_dict
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+JEV_ENV = {"jev_url": "http://jev.test", "jev_model": "NeoHorse-Jev-4B"}
 
 
 def direct_graph(models=("qwen3-8b",)):
@@ -72,7 +80,7 @@ def test_startup_refuses_invalid_active_tree(tmp_path):
         create_app(Settings(db_path=path))
 
 
-def test_startup_refuses_jev_tree_without_service_config(tmp_path):
+def test_graph_tree_with_questions_without_service_config_is_not_enabled(tmp_path):
     raw = tree_dict(root=graph_dict())
     raw["root"]["nodes"][2]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
     path = prepare_active_tree(tmp_path, raw)
@@ -86,3 +94,68 @@ def test_environment_jev_config_is_seeded_once(tmp_path):
     app = create_app(settings)
     assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
     assert app.state.snapshot.jev.api_key == "secret"
+
+
+def test_shipped_graph_configs_pass_structure_validation():
+    for name in ("default_routing_tree.json", "production_routing_tree.json"):
+        raw = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
+        assert validate_graph_structure(tree_from_dict(raw)) == [], name
+
+
+class TryHandler:
+    """MockTransport 分流：jev.test 回答图问题，其余请求落到假 OpenAI 上游。"""
+
+    def __init__(self):
+        self.jev_paths = []
+
+    def __call__(self, request):
+        if request.url.host == "jev.test":
+            self.jev_paths.append(request.url.path)
+            return httpx.Response(200, json={
+                "answers": {"q": {"type": "choice", "probabilities": {"轻量": 0.85, "增强": 0.15}}},
+                "usage": {"input_tokens": 10},
+            })
+        return httpx.Response(200, json={"choices": [], "usage": {}})
+
+
+def question_graph(model="qwen3-8b"):
+    """start → choice(轻量/增强) → safe target；target 引用已登记的默认模型。"""
+    raw = graph_dict()
+    for node in raw["nodes"]:
+        if node["type"] == "target":
+            node["models"] = [{"model": model, "reasoning": None}]
+    return raw
+
+
+def composed_try_app(tmp_path, handler):
+    """真实组合根：engine/jev_client/breaker 全部由 create_app 构造，测试不注入 engine。"""
+    path = prepare_active_tree(tmp_path, tree_dict(root=question_graph()))
+    return create_app(Settings(db_path=path, **JEV_ENV), transport=httpx.MockTransport(handler))
+
+
+def test_try_through_app_composition_routes_graph(tmp_path):
+    handler = TryHandler()
+    app = composed_try_app(tmp_path, handler)
+    with TestClient(app) as client:
+        response = client.post("/admin/try", json={"tree_id": "main", "text": "你好"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["draft"] is False
+    assert handler.jev_paths == ["/v1/systemone"]
+    assert [(item["target_id"], item["priority"], item["wave"]) for item in body["outcome"]["candidates"]] == [
+        ("safe", 1, 1),
+    ]
+    assert body["outcome"]["waves"][0]["questions"] == ["q"]
+    assert body["answers"]["q"]["ranking"] == ["easy", "strong"]
+
+
+def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
+    handler = TryHandler()
+    app = composed_try_app(tmp_path, handler)
+    for _ in range(app.state.breaker.threshold):
+        app.state.breaker.failure("qwen3-8b")
+    with TestClient(app) as client:
+        response = client.post("/admin/try", json={"tree_id": "main", "text": "你好"})
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == "target 'safe' has no available backend"
+    assert handler.jev_paths == ["/v1/systemone"]

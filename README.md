@@ -144,6 +144,8 @@ legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: 
 
 The reset deletes the old routing configuration only. Models, providers, users, sessions, decision-service settings and request logs are kept. There is no automatic conversion of legacy trees, so rebuild any policy you still need on the canvas and enable it again.
 
+- The production graph config shipped with this release (`configs/production_routing_tree.json`) replaces the old production policy and retires its `power` and `image` options (both were `qwen3-32b` placeholders). Operators who still need those categories must re-add them as question options and targets on the canvas after upgrading.
+
 ## Decision service
 
 The decision service exposes `POST /v1/systemone`. Configure it on the console “JEV Models” page, or seed it via environment variables on first start.

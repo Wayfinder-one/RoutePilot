@@ -144,6 +144,8 @@ legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: 
 
 该重置只删除旧的路由配置；模型、提供方、用户、会话、决策服务配置和请求日志都会保留。旧树不会被自动转换，仍需要的策略请在画布上重建后重新启用。
 
+- 本版本随附的生产 graph 配置（`configs/production_routing_tree.json`）替换旧生产策略时，下线了旧的 `power`、`image` 选项（两者原本都是 `qwen3-32b` 占位）。仍需要这两个类别的运维方，升级后需在画布上重新添加为问题选项与目标节点。
+
 ## 决策服务
 
 决策服务提供 `POST /v1/systemone`。配置方式：控制台「JEV 模型」页，或首次启动时通过环境变量播种。

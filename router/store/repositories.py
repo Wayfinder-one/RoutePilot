@@ -146,7 +146,9 @@ class ModelRepo:
 
 
 def model_references(trees: list[RoutingTree], model_id: str) -> list[dict]:
-    # INTERIM(Task 8): graph-native scan; typed GraphNode TargetNode check replaces this once the engine is deleted
+    # Graph v3 is the only persisted tree shape: target nodes carry their model
+    # list and every other node type has no `models` attribute, so a plain walk
+    # over each tree's nodes is the model-reference scan.
     refs = []
     for tree in trees:
         revision = tree.tree_revision or tree_revision_of(tree)
