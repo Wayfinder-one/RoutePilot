@@ -75,17 +75,24 @@ unknown never activates a question or target; a slot condition on unknown evalua
 - Conditions are stored on the edge. Condition edits change the behavior revision; moving nodes does not.
 - Selecting an edge or slot shows source, target, line type and condition in the inspector.
 
-## Console prototype
+## Console
 
-Direction A “Canvas-first” is the confirmed direction. Implemented interactions:
+The console (`/console/routing.html`, entry `/console/`) is the real canvas-first editor: it
+loads the enabled graph, edits the draft, saves/enables it through `/admin/trees`, and
+dry-runs the draft through `/admin/try` before publishing.
 
 - Drag / click to create nodes; pan and zoom; drag nodes; draw edges with type validation.
 - Quick create: drop an output wire on empty canvas to create a compatible node by source type.
 - Input slot rows on logic gates / questions / targets: source, condition, live replay value.
-- Dry-run 5 samples (grid repair / translation / work order / low-confidence follow-up / timeout) with wave-by-wave replay.
-- Validation error navigation, delete confirmation, undo/redo, auto layout, v3 import/export.
+- Save / enable, unsaved-change and layout-only badges, undo/redo, delete confirmation, auto layout.
+- Dry-run 5 samples (grid repair / translation / work order / low-confidence follow-up / timeout)
+  with wave-by-wave replay, trace drawer and layout-by-waves.
+- Validation error navigation, v3 import/export (legacy formats are rejected with a fixed message).
 
-Prototype entry points (local, open directly via file://):
+### Design prototypes
+
+Direction A “Canvas-first” is the confirmed direction; the files below are the local design
+prototypes (not the shipped console). Open them directly via `file://`:
 
 - Gallery: `docs/od-design/routing-canvas-2026-11-02/index.html`
 - Direction A: `docs/od-design/routing-canvas-2026-11-02/drafts/index-a.html`
@@ -201,7 +208,18 @@ Errors:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Prototype QA (local):
+Console QA (standard command; starts its own temp database, mock services and Chromium, so it
+needs no running server and makes no external requests):
+
+```bash
+npm run check:console
+```
+
+This runs the pure-function Node tests (`scripts/console_graph_test.mjs`) and the Playwright
+acceptance matrix (`scripts/console_qa.mjs`, ends with `ALL PASS (<n>)`). A local Playwright
+Chromium is resolved from the usual cache; set `CHROME=/path/to/chrome` to override it.
+
+Design-prototype QA (local, not part of the shipped console):
 
 ```bash
 cd docs/od-design/routing-canvas-2026-11-02 && node qa.js
@@ -213,7 +231,7 @@ cd docs/od-design/routing-canvas-2026-11-02 && node qa.js
 router/                  server (FastAPI, routing engine, admin API)
 router/console/          console static pages
 configs/                 example decision groups
-scripts/                 local ops scripts (not committed)
+scripts/                 console QA (committed by convention) and local ops scripts
 tests/                   tests
 docs/                    design docs and prototypes (not committed by convention)
 assets/routepilot/       README screenshots

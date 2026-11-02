@@ -24,6 +24,15 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 .rtc-ic use { pointer-events: none; }
 
+/* 键盘焦点：复用 shared.css 的 token，保证按钮/选择器/输入框在 Tab 导航下可见。 */
+.rtc-main button:focus-visible,
+.rtc-main select:focus-visible,
+.rtc-main input:focus-visible,
+.rtc-main [tabindex]:focus-visible {
+  outline: 2px solid var(--indigo-line);
+  outline-offset: 2px;
+}
+
 .rtc-main {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;

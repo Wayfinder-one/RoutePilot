@@ -56,7 +56,12 @@ export function test(name, fn) {
 
 export async function runChecks() {
   const failures = [];
+  /* QA_ONLY 只用于本地定位单条用例；标准命令不设置它，仍跑完整矩阵。 */
+  const filter = process.env.QA_ONLY ? new RegExp(process.env.QA_ONLY) : null;
+  let ran = 0;
   for (const check of checks) {
+    if (filter && !filter.test(check.name)) continue;
+    ran += 1;
     try {
       await check.fn();
       console.log(`PASS ${check.name}`);
@@ -71,7 +76,7 @@ export async function runChecks() {
     failures.push('external requests:\n' + externalRequests.join('\n'));
   }
   if (failures.length) throw new Error(failures.join('\n\n'));
-  console.log(`ALL PASS (${checks.length})`);
+  console.log(`ALL PASS (${ran})`);
 }
 
 /* ── 运行期状态（导出给用例使用） ───────────────────────────────────── */
@@ -985,8 +990,21 @@ test('Task 10 · blank drag, space+drag and middle-button drag all pan the viewp
   assert.equal(await page.locator('#cvIssues').isHidden(), true);
 });
 
-test('Task 10 · wheel zoom anchors at the pointer; zoom buttons, 100% reset and fit work', async () => {
+test('7.4-01-pan-zoom-fit-reset', async () => {
   await openCanvas();
+  /* 平移（空白拖拽）也属于本条验收。 */
+  const panStart = await page.evaluate(() => window.App.kit.getViewport());
+  const blank = await blankPoint();
+  assert.ok(blank, 'no blank canvas point for pan');
+  await page.mouse.move(blank.x, blank.y);
+  await page.mouse.down();
+  await page.mouse.move(blank.x + 30, blank.y + 20, { steps: 5 });
+  await page.mouse.up();
+  const panned = await page.evaluate(() => window.App.kit.getViewport());
+  assert.ok(Math.abs((panned.tx - panStart.tx) - 30) < 2, 'blank pan did not move X');
+  assert.ok(Math.abs((panned.ty - panStart.ty) - 20) < 2, 'blank pan did not move Y');
+  assert.equal(Math.round(panned.k * 1000), Math.round(panStart.k * 1000));
+
   const box = await page.locator('#cvStage').boundingBox();
   const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
   const labelBefore = await page.locator('#cvZoomLabel').textContent();
@@ -1036,7 +1054,7 @@ test('Task 10 · Esc closes the quick-create overlay before clearing the selecti
   assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
 });
 
-test('Task 10 · node drag redraws edges live and pushes one layout history entry (buttons + keyboard)', async () => {
+test('7.4-02-node-drag-live-layout-only', async () => {
   await openCanvas();
   const path = page.locator('#cvEdges path.rtc-edge[data-edge-id="e-start-capability"]');
   const originalD = await path.getAttribute('d');
@@ -1092,7 +1110,7 @@ test('Task 10 · node drag redraws edges live and pushes one layout history entr
   await expectPosition(movedPosition);
 });
 
-test('Task 10 · node library creates every group by click and by drag-in', async () => {
+test('7.4-03-node-library-four-groups', async () => {
   await openCanvas();
   const actions = [
     { kind: 'question-choice', how: 'click', match: node => node.type === 'question' && node.question_type === 'choice' },
@@ -1121,7 +1139,7 @@ test('Task 10 · node library creates every group by click and by drag-in', asyn
   }
 });
 
-test('Task 10 · a number port dropped on an empty slot creates gt 0.5 and opens the condition editor', async () => {
+test('7.4-05-numeric-default-and-boolean-true', async () => {
   await openCanvas();
   const before = await appSnapshot();
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
@@ -1158,6 +1176,17 @@ test('Task 10 · a number port dropped on an empty slot creates gt 0.5 and opens
   await page.locator('#cvRedo').click();
   const redone = await appSnapshot();
   assert.equal(redone.edges.length, before.edges.length + 1, 'redo did not restore the numeric edge');
+
+  /* 布尔线的默认条件：null（= true），且不打开条件浮层。 */
+  await openCanvas();
+  await dragPort('start', 'out', await portPoint('capability', 'in_2', 'in'));
+  const booleanEdge = (await appSnapshot()).edges.find(item =>
+    item.source === 'start' && item.target === 'capability' && item.target_port === 'in_2');
+  assert.ok(booleanEdge, 'boolean edge was not created');
+  assert.equal(booleanEdge.condition, null, 'boolean edge did not default to null (= true)');
+  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${booleanEdge.id}"]`).textContent()).trim(), '= true');
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true,
+    'boolean edge opened the comparison editor');
 });
 
 test('Task 10 · a boolean edge defaults to condition null and does not open the condition editor', async () => {
@@ -1189,7 +1218,7 @@ test('Task 10 · a condition chip opens the condition overlay and Esc closes it'
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
 });
 
-test('Task 10 · occupied/self/cycle/duplicate drops toast specific reasons and are not highlighted compatible', async () => {
+test('7.4-04-port-type-and-reject-reasons', async () => {
   await openCanvas();
   const before = await appSnapshot();
   const cases = [
@@ -1214,6 +1243,24 @@ test('Task 10 · occupied/self/cycle/duplicate drops toast specific reasons and 
     const now = await appSnapshot();
     assert.equal(now.edges.length, before.edges.length, 'invalid drop changed the edge count');
   }
+
+  /* 类型/结构不兼容：条件节点没有输入槽位，拖到它上面不得高亮任何兼容端口。 */
+  const condBox = await page.locator('[data-node-id="cond-text"]').boundingBox();
+  assert.ok(condBox, 'condition node not visible');
+  await dragPort('capability', 'prob.easy',
+    { x: condBox.x + condBox.width / 2, y: condBox.y + 14 },
+    {
+      beforeUp: async () => {
+        assert.equal(await page.evaluate(() =>
+          document.querySelector('[data-node-id="cond-text"]')
+            .querySelectorAll('.is-compatible, .is-incompatible').length), 0,
+        'a node without input slots was highlighted as a drop target');
+      }
+    });
+  assert.equal(await page.locator('#cvQuick').isHidden(), true,
+    'dropping on an incompatible node opened quick-create');
+  assert.equal((await appSnapshot()).edges.length, before.edges.length,
+    'dropping on an incompatible node created an edge');
 });
 
 test('Task 10 · output dropped on blank opens quick-create; dropping on an illegal node only cancels', async () => {
@@ -1249,7 +1296,7 @@ test('Task 10 · output dropped on blank opens quick-create; dropping on an ille
   assert.equal(afterCancel.edges.length, beforeCancel.edges.length);
 });
 
-test('Task 10 · delete confirmation lists affected edges; slots are not renumbered and reuse the smallest hole', async () => {
+test('7.4-10-delete-confirm-and-slot-reuse', async () => {
   await openCanvas();
   await clickNode('and-power');
   let selection = await page.evaluate(() => window.App.kit.getSelection());
@@ -1442,7 +1489,7 @@ async function openIssuesPanel() {
   await page.waitForFunction(() => !document.getElementById('cvIssues').hidden);
 }
 
-test('Task 11 · numeric condition editors expose six operators in both entries, reject bad values, and undo once', async () => {
+test('7.4-06-condition-edit-dual-entry-dirty-undo', async () => {
   await openCanvas();
   const edgeId = 'e-cap-strong-and-power';
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
@@ -1456,6 +1503,7 @@ test('Task 11 · numeric condition editors expose six operators in both entries,
   assert.deepEqual(operators.map(item => item[1]), ['>', '≥', '<', '≤', '=', '≠']);
   assert.equal(await page.locator('#cvCondPop [data-cond-field="op"]').inputValue(), 'gt');
   assert.equal(await page.locator('#cvCondPop [data-cond-field="value"]').inputValue(), '0.65');
+  await screenshot('condition-editing-1440.png');
 
   /* NaN / Infinity / empty / |v| > 1e9 must stay in the editor and write nothing. */
   const historyBefore = (await appSnapshot()).history;
@@ -1607,7 +1655,7 @@ test('Task 11 · boolean conditions toggle = true / = false from both entries wi
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
 });
 
-test('Task 11 · selected edge inspector shows both ends, type, condition and deletes with an affected-edge list', async () => {
+test('7.4-07-selected-edge-inspector', async () => {
   await openCanvas();
   const edgeId = 'e-cap-strong-and-power';
   await clickEdge(edgeId);
@@ -1697,7 +1745,7 @@ test('Task 11 · validate-bar edge and graph issues locate and open the same con
   await page.waitForFunction(() => window.App.graph.otherwise_target === null);
 });
 
-test('Task 11 · NOT shows one slot row, AND/OR show all rows and logic issues locate the node', async () => {
+test('7.4-08-logic-slot-rows', async () => {
   await openCanvas();
   const before = await appSnapshot();
   await page.locator('[data-lib-kind="logic-and"]').click();
@@ -1783,7 +1831,7 @@ test('Task 11 · NOT shows one slot row, AND/OR show all rows and logic issues l
     'NOT with two incoming edges still renders a single slot row');
 });
 
-test('Task 11 · multi-slot question and target rows show source, condition chip and the OR note', async () => {
+test('7.4-09-question-target-rows', async () => {
   await openCanvas();
   await dragPort('cond-text', 'out', await portPoint('capability', 'in_2', 'in'));
   await page.waitForFunction(() => window.App.graph.edges.some(edge =>
@@ -1821,7 +1869,7 @@ test('Task 11 · multi-slot question and target rows show source, condition chip
   assert.match(await targetRows.nth(1).innerText(), /cond-text/);
 });
 
-test('Task 11 · option delete lists selected/prob edges, leaves no dangling ports and one undo restores all', async () => {
+test('option-delete-cascades-edges', async () => {
   await openCanvas();
   await clickNode('capability');
   await waitInspectorBranch('node', 'capability');
@@ -2578,7 +2626,7 @@ test('Task 12 · unsaved switch-group asks one shared confirmation and beforeunl
   await ensureBaselineTree();
 });
 
-test('Task 12 · new tree builds a directly saveable and enableable start→target graph (POST then enable)', async () => {
+test('minimal-new-group-template', async () => {
   await ensureBaselineTree();
   await openCanvas();
   await page.locator('#cvNewTree').click();
@@ -2632,9 +2680,18 @@ test('Task 12 · new tree builds a directly saveable and enableable start→targ
   await ensureBaselineTree();
 });
 
-test('Task 12 · enable auto-saves a dirty draft before calling the enable endpoint', async () => {
+test('7.4-13-save-enable-unsaved-badge', async () => {
   await ensureBaselineTree();
   await openCanvas();
+  /* 未保存提示：布局改动显示「仅布局」徽标；保存后徽标消失。 */
+  await dragNodeBy('start', 26, 16);
+  let badge = await dirtyBadge();
+  assert.equal(badge.hidden, false, 'a dirty draft did not show the unsaved badge');
+  assert.equal(badge.kind, 'layout');
+  assert.equal(badge.text, await page.evaluate(() => window.t('cv.dirtyLayout')));
+  await saveNow();
+  assert.equal((await dirtyBadge()).hidden, true, 'save left the unsaved badge visible');
+  assert.equal(await page.evaluate(() => window.App.kind()), 'clean');
   const requests = [];
   const onRequest = request => {
     const url = new URL(request.url());
@@ -2859,8 +2916,8 @@ test('Task 12 · export downloads the complete v3 envelope including timezone an
   assert.equal((await dirtyBadge()).kind, 'clean', 'export mutated the draft');
 });
 
-test('Task 12 · importing an exported v3 graph round-trips behavior canonical in one history step', async () => {
-  await ensureBaselineTree();
+test('envelope-roundtrip-preserves-revision', async () => {
+  const baseline = await ensureBaselineTree();
   await openCanvas();
   const source = await exportViaUi();
   const sourceCanonical = await page.evaluate(text => {
@@ -2896,15 +2953,29 @@ test('Task 12 · importing an exported v3 graph round-trips behavior canonical i
   assert.equal(imported.kind, 'behavior');
   assert.equal(imported.canUndo, true);
 
+  /* 保存回服务端：行为 canonical 相同 ⇒ 服务端 tree_revision 必须与导出源一致。 */
+  await saveNow();
+  const roundTripped = await serverTree(newId);
+  assert.equal(roundTripped.tree_revision, baseline.tree_revision,
+    'export → import → save changed the behavior revision');
+  assert.equal(roundTripped.root.nodes.length, EXAMPLE_NODES);
+  assert.equal(roundTripped.root.edges.length, EXAMPLE_EDGES);
+
   await page.locator('#cvUndo').click();
   await page.waitForFunction(() => window.App.graph.nodes.length === 2);
   assert.equal(await page.evaluate(() => window.App.graph.edges.length), 1,
     'one undo did not restore the pre-import draft');
 });
 
-test('Task 12 · import rejects legacy/version-2 payloads with the fixed copy and keeps the draft', async () => {
+test('7.4-14-import-export-v3-only', async () => {
   await ensureBaselineTree();
   await openCanvas();
+  /* 导出只产出 sr-routing-graph v3；导入下面只接受同一格式。 */
+  const exported = await exportViaUi();
+  const exportedDoc = JSON.parse(exported.text);
+  assert.equal(exportedDoc.kind, 'sr-routing-graph');
+  assert.equal(exportedDoc.version, 3);
+  assert.equal(exportedDoc.root.type, 'graph');
   await dragNodeBy('start', 36, 24);
 
   /* 未保存时先弹共享确认框；取消后不选文件、草稿保持。 */
@@ -3025,7 +3096,7 @@ test('Task 12 · a valid v3 import without positions lays every node out with fi
   assert.equal(result.kind, 'layout', 'filling missing positions must stay layout-only');
 });
 
-test('Task 12 · auto layout stays layout-only and saving it keeps the server revision', async () => {
+test('7.4-12-auto-layout-layout-only', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
   await dragNodeBy('start', 70, 45);
@@ -3056,7 +3127,7 @@ test('Task 12 · auto layout stays layout-only and saving it keeps the server re
   });
 });
 
-test('Task 12 · a failed save blocks enable and 422 issues locate by node/edge/slot/graph', async () => {
+test('7.4-15-validation-bar-and-locate', async () => {
   await ensureBaselineTree();
   await openCanvas();
   /* 用禁用中的新组（enable 才会先保存）；载入示例，让 422 Issue 有可定位的节点/边。 */
@@ -3125,6 +3196,9 @@ test('Task 12 · a failed save blocks enable and 422 issues locate by node/edge/
       return Math.abs(rect.left + rect.width / 2 - (stage.left + stage.width / 2)) < 60 &&
         Math.abs(rect.top + rect.height / 2 - (stage.top + stage.height / 2)) < 60;
     }), true, 'node issue locate did not center the node');
+    /* 等保存失败 toast 自然消失，截一张干净的「校验错误 + 已定位节点」证据图。 */
+    await page.waitForTimeout(4300);
+    await screenshot('validation-error-locating-1440.png');
 
     /* 边 / 槽位定位：Issue 保留 slot 字段，选中边并打开同一条件浮层 */
     const slotIssue = await page.evaluate(() =>
@@ -3376,8 +3450,17 @@ function assertIncludes(haystack, needle, message) {
     `${message || 'missing text'} (wanted ${JSON.stringify(needle)} in ${JSON.stringify(String(haystack).slice(0, 400))})`);
 }
 
-test('Task 13 · a running try disables both run buttons, blocks canvas edits and keeps panels collapsed', async () => {
+test('7.4-16-try-input-samples-loading-lock', async () => {
   await prepareTryCanvas();
+  /* 试算台 = 文本输入 + 5 个样例 chip；运行中由下面断言 loading 与编辑锁。 */
+  assert.equal(await page.locator('#cvTryInput').count(), 1, 'try input is missing');
+  assert.equal(await page.locator('#cvTryChips [data-try-sample]').count(), 5,
+    'the try bar does not offer exactly five sample chips');
+  const samples = await page.evaluate(() => window.RTTryRun.samples());
+  assert.equal(samples.length, 5);
+  samples.forEach((sample, index) => {
+    assert.equal(sample.text, TRY_SAMPLES[index].text, `sample ${index} text drifted`);
+  });
   const before = await page.evaluate(() => ({
     position: Object.assign({}, window.App.graph.nodes.find(node => node.id === 'start').position),
     undo: window.App.kit.canUndo(),
@@ -3586,7 +3669,7 @@ test('Task 13 · five chips mirror the mock scenarios and answers follow the liv
   assert.deepEqual(snap.final.candidates.map(candidate => candidate.target_id), ['strong-target']);
 });
 
-test('Task 13 · s1 replay shows two true slots, gate values and p1 beating p3', async () => {
+test('7.4-17-replay-slots-gates-targets-priority', async () => {
   await prepareTryCanvas();
   await runTrySample(0);
   const snap = await trySnapshot();
@@ -3645,6 +3728,7 @@ test('Task 13 · s1 replay shows two true slots, gate values and p1 beating p3',
   assertIncludes(snap.hudTitles[0], '0.84');
   assertIncludes(snap.hudTitles[0], '> 0.65');
   assertIncludes(snap.hudTitles[0], '> 0.7');
+  await screenshot('s1-replay-1440.png');
 });
 
 test('Task 13 · the HUD keeps eight wave capsules and the final chip reachable', async () => {
@@ -3841,6 +3925,7 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
   assert.equal(snap.resultKind, 'error_fallback');
   assertIncludes(snap.resultText, 'light-target');
   assertIncludes(snap.resultText, await page.evaluate(() => window.t('cv.tryKind.error')));
+  await screenshot('s5-fallback-amber-1440.png');
 
   /* 清除 s5 后琥珀/非法 class 必须一条不剩（旧用例只清过 s1）。 */
   await page.locator('#cvTryClear').click();
@@ -3908,7 +3993,7 @@ test('Task 13 · a failed /admin/try toasts the api error and fabricates no repl
   }
 });
 
-test('Task 13 · drawer shows wave cards and slot rows; a slot row selects its edge and opens the condition editor', async () => {
+test('trace-drawer-row-locates-slot', async () => {
   await prepareTryCanvas();
   await runTrySample(0);
   assert.equal(await page.evaluate(() => document.getElementById('cvTraceDrawer').hidden), true,
@@ -4016,7 +4101,7 @@ test('Task 13 · Esc closes the drawer and a later render does not reopen it', a
   await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
 });
 
-test('Task 13 · rerun reuses the run now, clear restores the editable canvas and manual runs send no now', async () => {
+test('7.4-19-rerun-and-clear', async () => {
   await prepareTryCanvas();
   await runTrySample(0);
   const first = await page.evaluate(() => ({
@@ -4090,7 +4175,7 @@ test('Task 13 · any edit after a result clears the replay immediately', async (
   assert.equal(after.kind, 'layout');
 });
 
-test('Task 13 · layoutByWaves only writes positions and preserves behavior canonical', async () => {
+test('layout-by-waves-is-layout-only', async () => {
   await prepareTryCanvas();
   await runTrySample(2);
   const before = await page.evaluate(() => ({
@@ -4210,7 +4295,7 @@ test('Task 13 · layoutByWaves only writes positions and preserves behavior cano
     'undo left a stale untriggered column header');
 });
 
-test('Task 13 · replay is trace-only: local condition evaluation is never called', async () => {
+test('7.4-18-replay-data-from-admin-try', async () => {
   await prepareTryCanvas();
   const installed = await page.evaluate(() => {
     window.__rtEvalCalls = 0;
@@ -4308,6 +4393,568 @@ test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async ()
   assert.equal(await page.evaluate(() => !!window.App.replay), true,
     'language switch dropped the replay');
   await screenshot('task13-replay-s3-drawer.png');
+});
+
+/* ── Task 14 · 最终验收矩阵（§7.4 补充项 / 极限图 / 响应式 / 中文） ── */
+
+test('7.4-11-undo-redo-buttons-and-keyboard', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const original = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y };
+  });
+  const moved = await dragNodeBy('start', 46, 26);
+  assert.notDeepEqual(moved, original);
+  assert.equal(await page.evaluate(() => window.App.kit.canUndo()), true);
+  const expectStart = position => page.waitForFunction(expected => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return node && node.position.x === expected.x && node.position.y === expected.y;
+  }, position, { timeout: 4000 });
+
+  await page.locator('#cvUndo').click();
+  await expectStart(original);
+  await page.locator('#cvRedo').click();
+  await expectStart(moved);
+  await page.keyboard.press(`${MOD}+z`);
+  await expectStart(original);
+  await page.keyboard.press(`${MOD}+Shift+z`);
+  await expectStart(moved);
+});
+
+test('quick-create-compatible-node', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const before = await appSnapshot();
+  const point = await blankPoint();
+  assert.ok(point, 'no blank canvas point for quick create');
+  await dragPort('capability', 'prob.easy', point);
+  await page.waitForFunction(() => !document.getElementById('cvQuick').hidden, null, { timeout: 3000 });
+  const menu = await page.evaluate(() => ({
+    kinds: Array.from(document.querySelectorAll('#cvQuick [data-qkind]')).map(el => el.dataset.qkind),
+    head: document.querySelector('#cvQuick .rtc-quick-h').textContent,
+    quick: window.App.quick
+      ? { source: window.App.quick.sourceNodeId, port: window.App.quick.sourcePort }
+      : null
+  }));
+  /* 快速创建只列出「有输入槽位、且当前输出类型可连」的节点；条件/起点不在列。 */
+  assert.deepEqual(menu.kinds, [
+    'question-choice', 'question-noul', 'question-score',
+    'logic-and', 'logic-or', 'logic-not', 'target'
+  ]);
+  assert.deepEqual(menu.quick, { source: 'capability', port: 'prob.easy' });
+  assertIncludes(menu.head, 'capability');
+
+  await page.locator('#cvQuick [data-qkind="target"]').click();
+  const after = await appSnapshot();
+  assert.equal(after.nodes.length, before.nodes.length + 1);
+  assert.equal(after.edges.length, before.edges.length + 1);
+  const created = after.nodes.find(node => !before.nodes.some(previous => previous.id === node.id));
+  assert.equal(created.type, 'target');
+  const edge = after.edges.find(item => item.target === created.id);
+  assert.equal(edge.source, 'capability');
+  assert.equal(edge.source_port, 'prob.easy');
+  assert.equal(edge.target_port, 'in_1');
+  assert.deepEqual(edge.condition, { op: 'gt', value: 0.5 });
+  assert.equal(await page.locator('#cvQuick').isHidden(), true);
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: 'edge', id: edge.id });
+  assert.equal(await page.locator('#cvCondPop').isHidden(), false,
+    'quick-creating from a numeric port did not open the condition editor');
+  await page.keyboard.press('Escape');
+
+  /* 布尔源：同一份兼容清单；新边默认 = true 且不弹比较编辑器。 */
+  await openCanvas();
+  const boolBefore = await appSnapshot();
+  const boolPoint = await blankPoint();
+  await dragPort('start', 'out', boolPoint);
+  await page.waitForFunction(() => !document.getElementById('cvQuick').hidden, null, { timeout: 3000 });
+  assert.deepEqual(await page.evaluate(() =>
+    Array.from(document.querySelectorAll('#cvQuick [data-qkind]')).map(el => el.dataset.qkind)), [
+    'question-choice', 'question-noul', 'question-score',
+    'logic-and', 'logic-or', 'logic-not', 'target'
+  ]);
+  await page.locator('#cvQuick [data-qkind="question-noul"]').click();
+  const boolAfter = await appSnapshot();
+  const boolNode = boolAfter.nodes.find(node => !boolBefore.nodes.some(previous => previous.id === node.id));
+  assert.equal(boolNode.type, 'question');
+  assert.equal(boolNode.question_type, 'noul');
+  const boolEdge = boolAfter.edges.find(item => item.target === boolNode.id);
+  assert.ok(boolEdge, 'boolean quick create did not connect the new node');
+  assert.equal(boolEdge.condition, null);
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+});
+
+test('200-node-400-edge-smoke', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const doc = await page.evaluate(() => {
+    const G = window.RTGraph;
+    const graph = {
+      id: 'root', type: 'graph', nodes: [], edges: [],
+      otherwise_target: 't67', error_fallback: 't67'
+    };
+    graph.nodes.push({ id: 'start', type: 'start' });
+    graph.nodes.push({ id: 'cond', type: 'condition', source: 'text', contains_any: ['故障'] });
+    for (let i = 0; i < 32; i += 1) {
+      graph.nodes.push({
+        id: 'q' + i, type: 'question', question_type: 'choice',
+        instructions: '极限图问题 ' + i + '：请选择最合适的能力档位。',
+        options: [
+          { key: 'easy', label: '轻量', capability: '简单问答' },
+          { key: 'strong', label: '增强', capability: '复杂分析' }
+        ]
+      });
+    }
+    for (let i = 0; i < 98; i += 1) {
+      graph.nodes.push({ id: 'l' + i, type: 'logic', operator: 'or' });
+    }
+    for (let i = 0; i < 68; i += 1) {
+      graph.nodes.push({
+        id: 't' + i, type: 'target',
+        models: [{ model: 'deepseek-v3', reasoning: 'high' }], priority: i + 1
+      });
+    }
+    let seq = 0;
+    const addEdge = (source, sourcePort, target, targetPort) => {
+      seq += 1;
+      graph.edges.push({
+        id: 'e' + seq, source, source_port: sourcePort,
+        target, target_port: targetPort, condition: null
+      });
+    };
+    /* 32：start → 每个问题；196：每个 OR 门由两个问题的 selected 端口各接一条。 */
+    for (let i = 0; i < 32; i += 1) addEdge('start', 'out', 'q' + i, G.nextSlot(graph, 'q' + i));
+    for (let i = 0; i < 98; i += 1) {
+      const logic = 'l' + i;
+      addEdge('q' + ((2 * i) % 32), 'selected.easy', logic, G.nextSlot(graph, logic));
+      addEdge('q' + ((2 * i + 1) % 32), 'selected.strong', logic, G.nextSlot(graph, logic));
+    }
+    /* 68：前 68 个门 → target[i]；104：再按固定公式补齐到 400 边。 */
+    for (let i = 0; i < 68; i += 1) {
+      addEdge('l' + i, 'out', 't' + i, G.nextSlot(graph, 't' + i));
+    }
+    for (let i = 0; i < 104; i += 1) {
+      const target = 't' + ((7 * i + 1) % 68);
+      addEdge('l' + (i % 98), 'out', target, G.nextSlot(graph, target));
+    }
+    return {
+      kind: 'sr-routing-graph', version: 3, name: '极限图 200 节点 / 400 边',
+      timezone: 'Asia/Shanghai', sticky: { enabled: false, ttl_seconds: 1800 }, root: graph
+    };
+  });
+  assert.equal(doc.root.nodes.length, 200, 'generator did not make 200 nodes');
+  assert.equal(doc.root.edges.length, 400, 'generator did not make 400 edges');
+
+  await setImportPayload(doc, 'extreme-200-400.json');
+  await page.waitForFunction(() => window.App.graph.nodes.length === 200 &&
+    window.App.graph.edges.length === 400, null, { timeout: 20000 });
+  await page.waitForFunction(() =>
+    document.querySelectorAll('#cvStage [data-node-id]').length === 200 &&
+    document.querySelectorAll('#cvEdges path.rtc-edge').length === 400, null, { timeout: 20000 });
+
+  const counts = await page.evaluate(() => {
+    const graph = window.App.graph;
+    const byType = {};
+    graph.nodes.forEach(node => { byType[node.type] = (byType[node.type] || 0) + 1; });
+    return {
+      byType,
+      nodes: graph.nodes.length,
+      edges: graph.edges.length,
+      startOut: graph.edges.filter(edge => edge.source === 'start').length,
+      questionIn: graph.edges.filter(edge => edge.target.charAt(0) === 'q').length,
+      logicIn: graph.edges.filter(edge => edge.target.charAt(0) === 'l').length,
+      targetIn: graph.edges.filter(edge => edge.target.charAt(0) === 't').length,
+      domNodes: document.querySelectorAll('#cvStage [data-node-id]').length,
+      domEdges: document.querySelectorAll('#cvEdges path.rtc-edge').length,
+      hard: window.App.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code),
+      limit: window.App.issues.filter(issue => issue.code === 'limit_exceeded').length,
+      priorities: graph.nodes.filter(node => node.type === 'target')
+        .map(node => node.priority).sort((a, b) => a - b),
+      fallbacks: [graph.otherwise_target, graph.error_fallback]
+    };
+  });
+  assert.deepEqual(counts.byType, { start: 1, condition: 1, question: 32, logic: 98, target: 68 });
+  assert.equal(counts.nodes, 200);
+  assert.equal(counts.edges, 400);
+  assert.equal(counts.startOut, 32);
+  assert.equal(counts.questionIn, 32);
+  assert.equal(counts.logicIn, 196);
+  assert.equal(counts.targetIn, 172);
+  assert.equal(counts.domNodes, 200, 'the DOM did not render 200 node cards');
+  assert.equal(counts.domEdges, 400, 'the DOM did not render 400 edge paths');
+  assert.equal(counts.limit, 0, 'the 200/400 graph reported limit_exceeded');
+  assert.deepEqual(counts.hard, [], 'the extreme graph failed structural validation');
+  assert.deepEqual(counts.priorities, Array.from({ length: 68 }, (_, index) => index + 1));
+  assert.deepEqual(counts.fallbacks, ['t67', 't67']);
+
+  /* 平移 / 滚轮缩放 / fit 仍有响应；不设置任何未经验证的帧率指标。 */
+  const center = await page.evaluate(() => {
+    const stage = document.getElementById('cvStage').getBoundingClientRect();
+    const area = window.App.kit.safeArea(20);
+    return { x: stage.left + area.x + area.w / 2, y: stage.top + area.y + area.h / 2 };
+  });
+  const viewport = await page.evaluate(() => window.App.kit.getViewport());
+  await page.mouse.move(center.x, center.y);
+  await page.mouse.down({ button: 'middle' });
+  await page.mouse.move(center.x + 44, center.y + 26, { steps: 6 });
+  await page.mouse.up({ button: 'middle' });
+  const panned = await page.evaluate(() => window.App.kit.getViewport());
+  assert.ok(Math.abs((panned.tx - viewport.tx) - 44) < 2, 'extreme graph ignored a pan');
+  assert.ok(Math.abs((panned.ty - viewport.ty) - 26) < 2, 'extreme graph ignored a pan');
+  const labelBefore = await page.locator('#cvZoomLabel').textContent();
+  await page.mouse.move(center.x, center.y);
+  await page.mouse.wheel(0, -240);
+  await page.waitForFunction(previous => document.querySelector('#cvZoomLabel').textContent !== previous,
+    labelBefore, { timeout: 3000 });
+  const zoomed = await page.evaluate(() => window.App.kit.getViewport());
+  assert.ok(zoomed.k > panned.k, 'wheel zoom did not react on the extreme graph');
+  await page.locator('[data-act="zoom-fit"]').click();
+  await page.waitForFunction(() => {
+    const current = window.App.kit.getViewport();
+    return Number.isFinite(current.tx) && Number.isFinite(current.ty) && current.k > 0;
+  }, null, { timeout: 3000 });
+  const fitted = await page.evaluate(() => ({
+    viewport: window.App.kit.getViewport(),
+    minK: window.RTCanvas.MIN_K
+  }));
+  assert.equal(Math.round(fitted.viewport.k * 1000), Math.round(fitted.minK * 1000),
+    'the 200-node graph should clamp fit at the minimum zoom');
+  await page.locator('[data-act="zoom-reset"]').click();
+  await page.waitForFunction(() => document.querySelector('#cvZoomLabel').textContent === '100%');
+  await screenshot('extreme-200-400.png');
+});
+
+test('condition-only-question-is-valid', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const doc = {
+    kind: 'sr-routing-graph',
+    version: 3,
+    name: '条件可达性图',
+    timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: {
+      id: 'root',
+      type: 'graph',
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'cond-gate', type: 'condition', source: 'text', contains_any: ['故障'] },
+        {
+          id: 'cond-q', type: 'question', question_type: 'choice',
+          instructions: '仅由第 0 阶段条件节点触发的问题。',
+          options: [
+            { key: 'easy', label: '轻量', capability: '简单问答' },
+            { key: 'strong', label: '增强', capability: '复杂分析' }
+          ]
+        },
+        { id: 'target-cond', type: 'target', models: [{ model: 'qwen3-8b' }], priority: 1 }
+      ],
+      edges: [
+        {
+          id: 'e-cond-q', source: 'cond-gate', source_port: 'out',
+          target: 'cond-q', target_port: 'in_1', condition: null
+        },
+        {
+          id: 'e-q-target', source: 'cond-q', source_port: 'selected.easy',
+          target: 'target-cond', target_port: 'in_1', condition: null
+        }
+      ],
+      otherwise_target: 'target-cond',
+      error_fallback: 'target-cond'
+    }
+  };
+  /* 新建未启用的组再导入：保存走 POST /admin/trees，不会覆盖已启用的基线组。 */
+  await page.locator('#cvNewTree').click();
+  await page.waitForFunction(() => window.App.saved === null && window.App.graph.nodes.length === 2);
+  await setImportPayload(doc, 'condition-only.json');
+  await page.waitForFunction(() => window.App.graph.nodes.length === 4 && window.App.graph.edges.length === 2);
+  const imported = await page.evaluate(() => ({
+    hard: window.App.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code),
+    questionSources: window.App.graph.edges
+      .filter(edge => edge.target === 'cond-q').map(edge => edge.source),
+    startOut: window.App.graph.edges.filter(edge => edge.source === 'start').length
+  }));
+  assert.deepEqual(imported.hard, [], 'condition-only reachability was rejected by the client validator');
+  assert.deepEqual(imported.questionSources, ['cond-gate'],
+    'the fixture question must be fed by the condition node only');
+  assert.equal(imported.startOut, 0,
+    'the fixture start node must be isolated, so the question is only reachable from the condition');
+
+  await saveNow();
+  const treeId = await page.evaluate(() => window.App.treeId);
+  const saved = await serverTree(treeId);
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.root.nodes.length, 4);
+  assert.equal(saved.root.edges.length, 2);
+  assert.match(saved.tree_revision, /^[0-9a-f]{64}$/);
+  assert.equal(saved.root.otherwise_target, 'target-cond');
+  await ensureBaselineTree();
+});
+
+test('layout-persists-across-save-and-reload', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  const moved = await dragNodeBy('start', 54, 32);
+  await saveNow();
+  const saved = await page.evaluate(() => ({
+    revision: window.App.tree.tree_revision,
+    positions: Object.fromEntries(window.App.graph.nodes.map(node =>
+      [node.id, { x: node.position.x, y: node.position.y }]))
+  }));
+  assert.equal(saved.revision, baseline.tree_revision, 'a layout-only save changed the revision');
+
+  await page.reload();
+  await page.waitForSelector('#cvStage [data-node-id]', { timeout: 20000 });
+  await page.waitForFunction(() => window.App && window.App.booted && window.App.kit);
+  await page.waitForFunction(() => window.App.changeKind === 'clean');
+  const after = await page.evaluate(() => ({
+    revision: window.App.tree.tree_revision,
+    kind: window.App.kind(),
+    badgeHidden: document.getElementById('cvDirty').hidden,
+    positions: Object.fromEntries(window.App.graph.nodes.map(node =>
+      [node.id, { x: node.position.x, y: node.position.y }]))
+  }));
+  assert.equal(after.revision, saved.revision, 'reload changed the tree revision');
+  assert.equal(after.kind, 'clean');
+  assert.equal(after.badgeHidden, true);
+  Object.keys(saved.positions).forEach(id => {
+    assert.ok(after.positions[id], `${id} disappeared after reload`);
+    assert.ok(Math.abs(after.positions[id].x - saved.positions[id].x) < 0.01, `${id} X moved after reload`);
+    assert.ok(Math.abs(after.positions[id].y - saved.positions[id].y) < 0.01, `${id} Y moved after reload`);
+  });
+  assert.ok(Math.abs(after.positions.start.x - moved.x) < 0.01, 'the dragged layout was not persisted');
+});
+
+test('try-uses-draft-timezone-and-sticky', async () => {
+  await prepareTryCanvas();
+  try {
+    await page.evaluate(() => window.App.kit.clearSelection());
+    await waitInspectorBranch('graph', 'root');
+    await page.locator('#cvInspectorBody [data-field="timezone"]').fill('UTC');
+    await page.locator('#cvInspectorBody [data-field="sticky"]').uncheck();
+    await page.locator('#cvInspectorBody [data-field="stickyTtl"]').fill('600');
+    await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+    await page.waitForFunction(() => window.App.tree.timezone === 'UTC' &&
+      window.App.tree.sticky.enabled === false && window.App.tree.sticky.ttl_seconds === 600);
+
+    const captured = page.waitForRequest(request =>
+      request.method() === 'POST' && new URL(request.url()).pathname === '/admin/try');
+    await page.locator('[data-try-sample="0"]').click();
+    const payload = (await captured).postDataJSON();
+    assert.equal(payload.timezone, 'UTC', 'try did not send the draft timezone');
+    assert.deepEqual(payload.sticky, { enabled: false, ttl_seconds: 600 },
+      'try did not send the draft sticky settings');
+    assert.ok(payload.root && payload.root.nodes.length === EXAMPLE_NODES,
+      'try did not send the draft graph');
+    assert.equal(payload.now, TRY_SAMPLES[0].now);
+    assert.equal(payload.session_id, '');
+
+    await waitTryResult({ text: TRY_SAMPLES[0].text, now: TRY_SAMPLES[0].now });
+    const trace = await page.evaluate(() => ({
+      timezone: window.App.replay.meta.timezone,
+      active: window.App.replay.meta.active_periods.slice()
+    }));
+    assert.equal(trace.timezone, 'UTC', 'the returned trace did not use the draft timezone');
+    assert.deepEqual(trace.active, ['offpeak'], 'UTC 04:00 should resolve to the offpeak period');
+  } finally {
+    await page.evaluate(() => window.RTTryRun.clear()).catch(() => {});
+    await ensureBaselineTree();
+  }
+});
+
+test('7.4-20-responsive-keyboard-and-visual', async () => {
+  await ensureBaselineTree();
+  await page.setViewportSize({ width: 1440, height: 960 });
+  await openCanvas();
+  const metrics = () => page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    clientWidth: document.documentElement.clientWidth,
+    scrollHeight: document.documentElement.scrollHeight,
+    clientHeight: document.documentElement.clientHeight
+  }));
+  let size = await metrics();
+  assert.ok(size.scrollWidth <= size.clientWidth + 1,
+    `1440 horizontal overflow: ${size.scrollWidth} > ${size.clientWidth}`);
+  assert.ok(size.scrollHeight <= size.clientHeight + 1,
+    `1440 vertical overflow: ${size.scrollHeight} > ${size.clientHeight}`);
+  await screenshot('canvas-default-1440.png');
+
+  /* fit 使用安全区：选中节点不能被节点库/检查器/缩放条/试算台/小地图盖住。 */
+  await clickNode('deep-target');
+  const fitInfo = await page.evaluate(() => {
+    window.App.kit.fit({ padding: 24 });
+    const stage = document.getElementById('cvStage').getBoundingClientRect();
+    const area = window.App.kit.safeArea(12);
+    const rect = document.querySelector('[data-node-id="deep-target"]').getBoundingClientRect();
+    const node = {
+      left: rect.left - stage.left,
+      top: rect.top - stage.top,
+      right: rect.right - stage.left,
+      bottom: rect.bottom - stage.top
+    };
+    const overlays = ['cvPalette', 'cvInspector', 'cvZoom', 'cvTryBar', 'cvMinimap']
+      .map(id => {
+        const el = document.getElementById(id);
+        if (!el || el.hidden) return null;
+        const box = el.getBoundingClientRect();
+        return {
+          id, left: box.left, top: box.top,
+          right: box.right, bottom: box.bottom
+        };
+      }).filter(Boolean);
+    return { area, node, selection: window.App.kit.getSelection(), overlays, stage: { left: stage.left, top: stage.top } };
+  });
+  assert.deepEqual(fitInfo.selection, { kind: 'node', id: 'deep-target' });
+  assert.ok(fitInfo.node.left >= fitInfo.area.x - 1 &&
+    fitInfo.node.right <= fitInfo.area.x + fitInfo.area.w + 1,
+  'fit placed the selected node outside the safe area horizontally');
+  assert.ok(fitInfo.node.top >= fitInfo.area.y - 1 &&
+    fitInfo.node.bottom <= fitInfo.area.y + fitInfo.area.h + 1,
+  'fit placed the selected node outside the safe area vertically');
+  const covered = fitInfo.overlays.some(box => {
+    const rect = {
+      left: fitInfo.stage.left + fitInfo.node.left,
+      top: fitInfo.stage.top + fitInfo.node.top,
+      right: fitInfo.stage.left + fitInfo.node.right,
+      bottom: fitInfo.stage.top + fitInfo.node.bottom
+    };
+    return rect.left < box.right && rect.right > box.left &&
+      rect.top < box.bottom && rect.bottom > box.top;
+  });
+  assert.equal(covered, false, 'the selected node is covered by an overlay after fit');
+
+  /* Tab 导航：每个落点都有可见 focus 态。 */
+  await page.evaluate(() => {
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+  });
+  const focusStates = [];
+  for (let index = 0; index < 6; index += 1) {
+    await page.keyboard.press('Tab');
+    focusStates.push(await page.evaluate(() => {
+      const el = document.activeElement;
+      const style = getComputedStyle(el);
+      return {
+        tag: el.tagName,
+        id: el.id,
+        focusVisible: el.matches(':focus-visible'),
+        outline: style.outlineStyle !== 'none' && style.outlineWidth !== '0px',
+        shadow: style.boxShadow !== 'none'
+      };
+    }));
+  }
+  focusStates.forEach((state, index) => {
+    assert.equal(state.focusVisible, true, `Tab stop ${index} (${state.tag}#${state.id}) is not focus-visible`);
+    assert.ok(state.outline || state.shadow,
+      `Tab stop ${index} (${state.tag}#${state.id}) has no visible focus state`);
+  });
+
+  /* 删除确认：焦点入场、Tab 圈定、Esc 关闭并把焦点还给触发按钮。 */
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  const trigger = '#cvInspectorBody [data-act="ins-delete-node"]';
+  await page.locator(trigger).click();
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden);
+  const initial = await page.evaluate(() => ({
+    inside: document.getElementById('cvDeleteBody').contains(document.activeElement),
+    act: document.activeElement.dataset ? document.activeElement.dataset.act : ''
+  }));
+  assert.equal(initial.inside, true, 'the delete dialog did not move focus inside');
+  assert.equal(initial.act, 'delete-cancel');
+  for (let index = 0; index < 5; index += 1) {
+    await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(() =>
+      document.getElementById('cvDeleteBody').contains(document.activeElement)), true,
+    'Tab escaped the delete dialog');
+    await page.keyboard.press('Shift+Tab');
+    assert.equal(await page.evaluate(() =>
+      document.getElementById('cvDeleteBody').contains(document.activeElement)), true,
+    'Shift+Tab escaped the delete dialog');
+  }
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.getElementById('cvDeleteModal').hidden);
+  const restored = await page.evaluate(() => ({
+    act: document.activeElement.dataset ? document.activeElement.dataset.act : '',
+    insideInspector: document.getElementById('cvInspectorBody').contains(document.activeElement),
+    selection: window.App.kit.getSelection()
+  }));
+  assert.equal(restored.act, 'ins-delete-node', 'Esc did not return focus to the delete trigger');
+  assert.equal(restored.insideInspector, true);
+  assert.deepEqual(restored.selection, { kind: 'node', id: 'capability' });
+
+  /* 1280×800：同一页无水平/垂直溢出，两个面板仍可见。 */
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await openCanvas();
+  size = await metrics();
+  assert.ok(size.scrollWidth <= size.clientWidth + 1,
+    `1280 horizontal overflow: ${size.scrollWidth} > ${size.clientWidth}`);
+  assert.ok(size.scrollHeight <= size.clientHeight + 1,
+    `1280 vertical overflow: ${size.scrollHeight} > ${size.clientHeight}`);
+  const narrow = await page.evaluate(() => ({
+    palette: document.getElementById('cvPalette').getBoundingClientRect().width > 0,
+    inspector: document.getElementById('cvInspector').getBoundingClientRect().width > 0,
+    zoom: /^\d+%$/.test(document.getElementById('cvZoomLabel').textContent)
+  }));
+  assert.deepEqual(narrow, { palette: true, inspector: true, zoom: true });
+  await screenshot('canvas-1280.png');
+  await page.setViewportSize({ width: 1440, height: 960 });
+});
+
+test('7.4-21-chinese-product-and-actionable-errors', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const language = await page.evaluate(() => ({
+    lang: document.documentElement.lang,
+    save: document.getElementById('cvSave').textContent.trim(),
+    palette: document.querySelector('#cvPalette .rtc-pal-t span').textContent.trim(),
+    tryRun: document.getElementById('cvTryRun').textContent.trim(),
+    rawKey: /cv\.[a-zA-Z]/.test(document.body.textContent)
+  }));
+  assert.equal(language.lang, 'zh-CN');
+  assert.equal(language.rawKey, false, 'the Chinese page leaked raw i18n keys');
+  assert.match(language.save, /保存/);
+  assert.match(language.palette, /节点/);
+  assert.match(language.tryRun, /试算|运行/);
+
+  /* 具体可操作：被占用槽位的拒绝点名「空槽位 / 下一个 in_N」，且不落边。 */
+  await clearToasts();
+  const before = (await appSnapshot()).edges.length;
+  await dragPort('capability', 'prob.easy', await portPoint('and-power', 'in_1', 'in'));
+  await waitToastIncludes('空槽位');
+  const occupied = await toastText();
+  assert.match(occupied, /占用|已连接/);
+  assert.match(occupied, /in_N/);
+  assert.equal((await appSnapshot()).edges.length, before);
+
+  /* 槽位条件的错误同样具体：文案来自词典、指出阈值非法，且不写回。 */
+  const edgeId = 'e-cap-strong-and-power';
+  const original = (await edgeOf(edgeId)).condition;
+  await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
+  await waitCondPop(edgeId);
+  await page.locator('#cvCondPop [data-cond-field="value"]').fill('NaN');
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  assert.equal((await page.locator('#cvCondPop [data-cond-error]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.badValue')));
+  assert.deepEqual((await edgeOf(edgeId)).condition, original);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+
+  /* 校验错误带节点/边/槽位定位字段，可直接跳到出问题的位置。 */
+  await page.evaluate(() => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(edge => edge.id === 'e-clarify-deep').condition = { op: 'bogus', value: 1 };
+    });
+  });
+  const issue = await page.evaluate(() => {
+    const found = window.App.issues.find(item => item.code === 'numeric_edge_condition_invalid');
+    return found ? {
+      zh: found.zh, edge: found.edge_id, node: found.node_id, port: found.port
+    } : null;
+  });
+  assert.ok(issue, 'invalid slot condition produced no located issue');
+  assert.match(issue.zh, /算子|阈值|条件/);
+  assert.equal(issue.edge, 'e-clarify-deep');
+  assert.equal(issue.node, 'deep-target');
+  assert.equal(issue.port, 'in_1');
 });
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */

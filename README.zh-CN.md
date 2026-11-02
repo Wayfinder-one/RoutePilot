@@ -75,17 +75,21 @@ unknown 不触发任何问题或 target；比较条件遇 unknown 结果为 unkn
 - 条件随边保存；修改条件计入行为 revision，移动节点不计入。
 - 选中边或槽位，右侧检查器同步显示来源、目标、线型与条件。
 
-## 控制台原型
+## 控制台
 
-方向 A「画布优先」已确认。交互包括：
+控制台（`/console/routing.html`，入口 `/console/`）是真正的画布优先编辑器：加载已启用决策图、编辑草稿、
+通过 `/admin/trees` 保存/启用，并在发布前用 `/admin/try` 试算当前草稿。
 
 - 节点库拖入 / 点击创建；画布平移缩放；节点拖动；端口连线与类型校验；
 - 快速创建：输出端口拖到空白处按来源类型创建兼容节点；
 - 判断门 / 问题 / 目标的输入槽位行：来源、条件、试算实际值；
-- 试算 5 个样例（电网抢修 / 翻译 / 工单 / 低置信度追问 / 服务超时），按波次回放；
-- 校验错误定位、删除确认、撤销重做、自动整理、导入导出 v3。
+- 保存 / 启用、未保存与「仅布局」徽标、撤销重做、删除确认、自动整理；
+- 试算 5 个样例（电网抢修 / 翻译 / 工单 / 低置信度追问 / 服务超时），按波次回放、轨迹抽屉与按波次整理；
+- 校验错误定位、导入导出 v3（旧格式按固定文案拒绝）。
 
-原型入口（本地，file:// 直接打开）：
+### 设计原型
+
+方向 A「画布优先」已确认；以下文件是本地设计原型（不是线上控制台），可直接用 `file://` 打开：
 
 - 画廊：`docs/od-design/routing-canvas-2026-11-02/index.html`
 - 方向 A：`docs/od-design/routing-canvas-2026-11-02/drafts/index-a.html`
@@ -201,7 +205,17 @@ ROUTER_JEV_API_KEY= \
 .venv/bin/python -m pytest tests/ -q
 ```
 
-原型 QA（本地）：
+控制台 QA（标准命令；自带临时数据库、mock 服务与 Chromium，不需要预启服务、不访问外网）：
+
+```bash
+npm run check:console
+```
+
+依次运行纯函数 Node 测试（`scripts/console_graph_test.mjs`）与 Playwright 验收矩阵
+（`scripts/console_qa.mjs`，末行输出 `ALL PASS (<n>)`）。Chromium 从本地 Playwright 缓存解析，
+可用 `CHROME=/path/to/chrome` 覆盖。
+
+设计原型 QA（本地，不属于线上控制台）：
 
 ```bash
 cd docs/od-design/routing-canvas-2026-11-02 && node qa.js
@@ -213,7 +227,7 @@ cd docs/od-design/routing-canvas-2026-11-02 && node qa.js
 router/                  服务端（FastAPI、路由执行、管理接口）
 router/console/          控制台静态页
 configs/                 示例决策组
-scripts/                 本地运维脚本（按约定不入库）
+scripts/                 控制台 QA（按约定入库）与本地运维脚本
 tests/                   测试
 docs/                    设计文档、原型（按约定不入库）
 assets/routepilot/       README 截图

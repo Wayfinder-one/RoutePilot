@@ -3,8 +3,8 @@
    草稿状态：App.tree 是完整 envelope（name/timezone/sticky/root），App.graph === App.tree.root。
    所有编辑走 App.change(kind, mutate)：一次完整 envelope 快照入历史栈（上限 100），
    然后重算校验、清空回放、重绘卡片/边、刷新 dirty 徽标。
-   本任务只装配画布骨架、视口、连线、快速创建、删除与历史栈；检查器 / 条件浮层 / 试算台
-   由后续任务填充（inspector.js / condpop.js / tryrun.js 当前是可加载的占位命名空间）。
+   本文件装配画布、视口、连线、快速创建、删除、历史栈、保存/启用/导入导出/校验定位；
+   检查器（inspector.js）、输入槽条件浮层（condpop.js）与试算回放（tryrun.js）各自成模块。
    ------------------------------------------------------------------ */
 (function (root) {
   'use strict';
@@ -607,6 +607,53 @@
   App.toast = toast;
 
   /* ── 删除确认（节点 / 边 / choice 选项共用级联清单） ──────────── */
+  /* 焦点管理：打开时记录触发按钮并把焦点移入对话框，Tab 在框内循环；
+     Esc / 取消关闭后把焦点还给触发按钮（键盘可达性，规格 §6.11）。 */
+  let deleteTrigger = null;
+
+  function deleteFocusables() {
+    const body = $('#cvDeleteBody');
+    if (!body) return [];
+    return Array.prototype.slice.call(
+      body.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')
+    ).filter(el => !el.disabled && el.getClientRects().length > 0);
+  }
+
+  function restoreDeleteFocus() {
+    const trigger = deleteTrigger;
+    deleteTrigger = null;
+    if (trigger && document.contains(trigger) && typeof trigger.focus === 'function') {
+      trigger.focus();
+      return;
+    }
+    const fallback = $('#cvSave');
+    if (fallback) fallback.focus();
+  }
+
+  function onDeleteKeydown(event) {
+    const modal = $('#cvDeleteModal');
+    if (!modal || modal.hidden) return;
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      hideDelete();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const items = deleteFocusables();
+    if (!items.length) { event.preventDefault(); return; }
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    const inside = !!active && $('#cvDeleteBody').contains(active);
+    if (event.shiftKey) {
+      if (!inside || active === first) { event.preventDefault(); last.focus(); }
+    } else if (!inside || active === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   function requestDelete(selection) {
     if (App.tryRunning) { toast(t('cv.tryEditBlocked'), 'warn'); return; }
     if (!selection || !selection.kind) return;
@@ -656,18 +703,25 @@
       '<button type="button" class="btn sm" data-act="delete-cancel">' + esc(t('cv.deleteCancel')) + '</button>' +
       '<button type="button" class="btn sm danger" data-act="delete-confirm">' + esc(t('cv.deleteOk')) + '</button>' +
       '</div>';
+    deleteTrigger = document.activeElement && document.activeElement !== document.body
+      ? document.activeElement
+      : null;
     modal.hidden = false;
     modal.dataset.kind = selection.kind;
     modal.dataset.id = selection.id || '';
     modal.dataset.nodeId = nodeId;
     modal.dataset.key = key;
     body.setAttribute('aria-label', t('cv.deleteTitle'));
+    const cancel = body.querySelector('[data-act="delete-cancel"]');
+    if (cancel) cancel.focus();
   }
   App.requestDelete = requestDelete;
 
-  function hideDelete() {
+  function hideDelete(options) {
     const modal = $('#cvDeleteModal');
     if (modal) modal.hidden = true;
+    if (!options || options.restore !== false) restoreDeleteFocus();
+    else deleteTrigger = null;
   }
 
   function confirmDelete() {
@@ -677,7 +731,7 @@
     const id = modal.dataset.id;
     const nodeId = modal.dataset.nodeId;
     const key = modal.dataset.key;
-    hideDelete();
+    hideDelete({ restore: false });
     if (!kind) return;
     /* 弹窗打开后目标可能已被撤销/重做移除：先在快照上试删，避免推入空历史。 */
     const probe = App.tree ? RTGraph.clone(App.tree) : null;
@@ -708,6 +762,9 @@
     }
     if (cleared.length) toast(t('cv.toastFallbackCleared'), 'warn');
     else toast(t('cv.toastDeleted'));
+    /* 确认删除后触发按钮可能随卡片重绘消失：回到顶栏的稳定焦点位。 */
+    const save = $('#cvSave');
+    if (save && document.contains(save)) save.focus();
   }
 
   /* ── 快速创建（输出端口拖到空白） ─────────────────────────────── */
@@ -1429,6 +1486,7 @@
       if (act.dataset.act === 'delete-cancel') hideDelete();
       else if (act.dataset.act === 'delete-confirm') confirmDelete();
     });
+    $('#cvDeleteModal').addEventListener('keydown', onDeleteKeydown);
     const confirmModal = $('#cvConfirmModal');
     if (confirmModal) {
       confirmModal.addEventListener('click', event => {
@@ -1443,7 +1501,7 @@
     if (importFile) importFile.addEventListener('change', onImportFile);
   }
 
-  /* 试算台、样例 chips、回放与轨迹抽屉全部由 tryrun.js 实现（Task 13）。 */
+  /* 试算台、样例 chips、回放与轨迹抽屉全部由 tryrun.js 实现。 */
   function bindTryBar() {
     if (root.RTTryRun && typeof root.RTTryRun.init === 'function') root.RTTryRun.init();
   }
