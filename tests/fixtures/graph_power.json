@@ -126,7 +126,6 @@
       "id": "deep-target",
       "type": "target",
       "priority": 2,
-      "strategy": "least_inflight",
       "capability": "最深推理：复杂方案与长链分析",
       "position": {
         "x": 1080,
@@ -143,7 +142,6 @@
       "id": "power-target",
       "type": "target",
       "priority": 1,
-      "strategy": "least_inflight",
       "capability": "国网电力专用：设备故障、抢修工单、电力规程",
       "position": {
         "x": 1080,
@@ -160,7 +158,6 @@
       "id": "strong-target",
       "type": "target",
       "priority": 3,
-      "strategy": "least_inflight",
       "capability": "强推理通用模型：复杂分析、方案设计",
       "position": {
         "x": 1080,
@@ -177,7 +174,6 @@
       "id": "standard-target",
       "type": "target",
       "priority": 4,
-      "strategy": "least_inflight",
       "capability": "标准档通用模型：写作、总结与纠错",
       "position": {
         "x": 1080,
@@ -194,7 +190,6 @@
       "id": "light-target",
       "type": "target",
       "priority": 5,
-      "strategy": "least_inflight",
       "capability": "轻量快速模型：简单问答与短输出",
       "position": {
         "x": 1080,

@@ -34,6 +34,14 @@ _CRITERIA_MIN = 2
 _CRITERIA_MAX = 10
 
 
+def _finite_level(level: object) -> bool:
+    """与 model.py 同型的有限性判定：超量级 int 在 float() 处溢出 → 视为非法。"""
+    try:
+        return math.isfinite(float(level))
+    except OverflowError:
+        return False
+
+
 @dataclass(frozen=True)
 class Issue:
     """一条校验问题；node_id/edge_id/port 按错误类型尽量给出，供控制台定位（spec §5.1）。"""
@@ -307,7 +315,7 @@ def validate_graph_structure(value) -> list[Issue]:
                 else:
                     levels = node.criteria
                     broken = len(levels) < _CRITERIA_MIN or len(levels) > _CRITERIA_MAX or any(
-                        isinstance(level, bool) or not isinstance(level, (int, float)) or not math.isfinite(level)
+                        isinstance(level, bool) or not isinstance(level, (int, float)) or not _finite_level(level)
                         for level in levels
                     )
                     if broken:

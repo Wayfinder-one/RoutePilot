@@ -1,7 +1,10 @@
 """Graph v3 校验器测试：结构码表（spec §5.2）+ 启用码表（spec §5.3）+ Task-1 冻结修正。"""
+import json
+from pathlib import Path
+
 import pytest
 
-from router.routing.graph.model import graph_from_dict
+from router.routing.graph.model import graph_from_dict, graph_to_dict
 from router.routing.graph.validate import (
     EnableContext,
     validate_graph_for_enable,
@@ -532,6 +535,12 @@ def test_graph_parse_error_for_raw_dict():
     assert issues[0].zh and issues[0].en
     issues = validate_graph_structure({"id": "root", "type": "graph", "nodes": [{"id": "s", "type": "start"}], "edges": []})
     assert {issue.code for issue in issues} == {"fallback_missing"}  # 两个兜底都未配置
+
+
+def test_power_fixture_roundtrip_exact():
+    """graph_power fixture 已按序列化默认省略规范化：parse→serialize 必须 exact roundtrip。"""
+    raw = json.loads((Path(__file__).with_name("fixtures") / "graph_power.json").read_text(encoding="utf-8"))
+    assert graph_to_dict(graph_from_dict(raw)) == raw
 
 
 # ────────────────────────── enable codes ────────────────────────────

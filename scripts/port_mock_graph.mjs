@@ -9,6 +9,7 @@ const nodes = MOCK.nodes.map(node => {
   delete copy.model;
   delete copy.reasoning;
   delete copy.backends;
+  if (copy.strategy === 'least_inflight') delete copy.strategy;  // 默认值省略，与 model.py 序列化一致
   return copy;
 });
 const root = { ...structuredClone(MOCK.graph), nodes };

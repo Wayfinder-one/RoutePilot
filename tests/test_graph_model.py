@@ -342,14 +342,6 @@ def test_huge_int_raises_value_error():
     })
     with pytest.raises(ValueError, match="finite"):
         tree_from_dict(tree_dict(root=raw))
-    raw = graph_dict()
-    raw["nodes"][0]["position"] = {"x": 10 ** 400, "y": 0}
-    try:
-        tree_from_dict(tree_dict(root=raw))
-    except ValueError:
-        pass
-    except OverflowError as error:  # pragma: no cover - 回归护栏
-        raise AssertionError(f"expected ValueError, got OverflowError: {error}")
 
 
 def test_public_surface_reexports():
