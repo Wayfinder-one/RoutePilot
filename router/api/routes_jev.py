@@ -6,7 +6,7 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from router.api.deps import get_conn
-from router.jev.client import JevCandidate, JevClient, JevError
+from router.jev.client import ChoiceAnswer, DecisionQuestion, JevCandidate, JevClient, JevError
 from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
@@ -80,7 +80,11 @@ async def test_jev(body: dict, request: Request, conn: sqlite3.Connection = Depe
     )
     client = getattr(request.app.state, "jev_client", None) or JevClient(request.app.state.http)
     try:
-        answer = await client.choose(settings, text, candidates)
+        question = DecisionQuestion("choice", settings.instructions, candidates)
+        answers = await client.choose_many(settings, text, {"route": question})
+        answer = answers["route"]
+        if not isinstance(answer, ChoiceAnswer):
+            raise HTTPException(502, detail="JEV route answer is not choice")
     except JevError as exc:
         raise HTTPException(502, detail=str(exc)) from exc
     return {
