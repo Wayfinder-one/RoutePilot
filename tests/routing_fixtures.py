@@ -1,34 +1,26 @@
-def target_dict(node_id="target", models=("fast",), *, capability="", reasoning=None):
+def graph_dict():
     return {
-        "id": node_id,
-        "type": "target",
-        "strategy": "least_inflight",
-        "capability": capability,
-        "models": [{"model": model, "reasoning": reasoning} for model in models],
-    }
-
-
-def jev_dict(node_id="choose", *, options=None, fallback=None):
-    return {
-        "id": node_id,
-        "type": "jev",
-        "instructions": "选择最合适的模型。",
-        "min_prob": 0.0,
-        "min_margin": 0.0,
-        "options": options if options is not None else [
-            {"key": "fast", "label": "轻量模型", "target": target_dict("fast-target", ("fast",))},
-            {"key": "strong", "label": "增强模型", "target": target_dict("strong-target", ("strong-a", "strong-b"), capability="复杂推理、代码和长文档。")},
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "q", "type": "question", "question_type": "choice", "instructions": "选择", "position": {"x": 200, "y": 0}, "options": [
+                {"key": "easy", "label": "轻量", "capability": "简单请求"},
+                {"key": "strong", "label": "增强", "capability": "复杂请求"},
+            ]},
+            {"id": "safe", "type": "target", "priority": 1, "position": {"x": 400, "y": 0}, "models": [{"model": "fast", "reasoning": None}]},
         ],
-        "fallback": fallback if fallback is not None else target_dict("safe", ("standard",)),
+        "edges": [
+            {"id": "e-start-q", "source": "start", "source_port": "out", "target": "q", "target_port": "in_1", "condition": None},
+            {"id": "e-q-safe", "source": "q", "source_port": "selected.easy", "target": "safe", "target_port": "in_1", "condition": None},
+        ],
+        "otherwise_target": "safe", "error_fallback": "safe",
     }
 
 
 def tree_dict(tree_id="main", *, root=None, enabled=False, sticky=None):
     return {
-        "id": tree_id,
-        "name": "主分流树",
-        "enabled": enabled,
+        "id": tree_id, "name": "测试图", "enabled": enabled,
         "timezone": "Asia/Shanghai",
-        "sticky": sticky if sticky is not None else {"enabled": True, "ttl_seconds": 1800},
-        "root": root if root is not None else jev_dict(),
+        "sticky": sticky or {"enabled": False, "ttl_seconds": 1800},
+        "root": root or graph_dict(),
     }
