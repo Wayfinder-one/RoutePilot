@@ -957,7 +957,13 @@
     const modal = $('#cvDeleteModal');
     if (modal && !modal.hidden) { hideDelete(); return true; }
     const drawer = $('#cvTraceDrawer');
-    if (drawer && !drawer.hidden) { drawer.hidden = true; return true; }
+    if (drawer && !drawer.hidden) {
+      /* 关闭必须走 RTTryRun：只隐藏 DOM 会把 drawerOpen / body.has-drawer 留在打开态，
+         下一次 renderAll 又会把抽屉弹回来。 */
+      if (root.RTTryRun && typeof root.RTTryRun.closeDrawer === 'function') root.RTTryRun.closeDrawer();
+      else drawer.hidden = true;
+      return true;
+    }
     const issues = $('#cvIssues');
     if (issues && !issues.hidden) { issues.hidden = true; renderIssues(); return true; }
     return false;

@@ -83,7 +83,7 @@
     <aside class="rtc-palette rtc-overlay" id="cvPalette" data-overlay data-i18n-aria="cv.palette">
       <div class="rtc-pal-h">
         <span class="rtc-pal-t"><span data-i18n="cv.palette"></span><small data-i18n="cv.paletteHint"></small></span>
-        <button type="button" class="rtc-pal-toggle" id="cvPalToggle" data-i18n-aria="cv.paletteToggle" title="折叠 / 展开">
+        <button type="button" class="rtc-pal-toggle" id="cvPalToggle" data-i18n-aria="cv.paletteToggle" data-i18n-title="cv.paletteToggle">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg>
         </button>
       </div>
@@ -102,7 +102,7 @@
         <span class="rtc-insp-tt" data-i18n="cv.inspector"></span>
         <span class="rtc-insp-sub" id="cvInspectorSub">root</span>
         <button type="button" class="rtc-insp-toggle" id="cvInspToggle"
-          data-i18n-aria="cv.inspectorToggle" title="折叠 / 展开检查器" aria-expanded="true">
+          data-i18n-aria="cv.inspectorToggle" data-i18n-title="cv.inspectorToggle" aria-expanded="true">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg>
         </button>
       </div>
@@ -167,8 +167,8 @@
 <!-- 导入 v3 图（隐藏文件选择器） -->
 <input type="file" id="cvImportFile" accept=".json,application/json" hidden>
 
-<!-- 轨迹抽屉（Task 13 填充） -->
-<div class="rtc-drawer" id="cvTraceDrawer" hidden></div>
+<!-- 轨迹抽屉：标题 / 关闭 / 行文案由 RTTryRun 按 i18n 渲染；Esc 与关闭按钮共用 closeDrawer() -->
+<div class="rtc-drawer" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
 
 <!-- toast -->
 <div class="rtc-toasts" id="cvToast" role="status" aria-live="polite"></div>

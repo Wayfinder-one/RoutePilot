@@ -54,11 +54,17 @@
   let runSeq = 0;
   let drawerOpen = false;
   let bound = false;
+  let waveLayout = null;   /* 最近一次按波次整理的列信息（未触发列头用） */
+  let waveHeader = null;
 
   /* ── 格式 ─────────────────────────────────────────────────────── */
   function num(value) {
     if (typeof value !== 'number' || !isFinite(value)) return String(value);
     return String(Math.round(value * 1000) / 1000);
+  }
+
+  function numOrDash(value) {
+    return value === undefined || value === null ? '—' : num(value);
   }
 
   function ms(value) {
@@ -358,11 +364,11 @@
     });
 
     if (final && final.kind === 'error_fallback') {
+      /* §6.8「error_fallback 路径整链琥珀」：只点亮回退目标的入边（+ 目标节点），
+         不能把此前所有 true 槽位边都算成异常路径。 */
       const edgeIds = Object.create(null);
       Object.keys(edgeStates).forEach(id => {
-        const edgeState = edgeStates[id];
-        if (edgeState.node_id === final.target_id) edgeIds[id] = true;
-        if (edgeState.status === 'true') edgeIds[id] = true;
+        if (edgeStates[id].node_id === final.target_id) edgeIds[id] = true;
       });
       if (!fallback) fallback = { target_id: final.target_id, reason: null, edge_ids: [] };
       fallback.edge_ids = Object.keys(edgeIds).sort();
@@ -477,13 +483,18 @@
         const probability = done && nodeState.ports ? nodeState.ports['prob.' + key] : undefined;
         setLive(option, 'prob.' + key, probability === undefined ? '—' : num(probability));
       }
-      setLive(el, 'p_top', done && nodeState.ports ? num(nodeState.ports.p_top) : '—');
-      setLive(el, 'margin', done && nodeState.ports ? num(nodeState.ports.margin) : '—');
+      /* §3.9 question 事件顶层已有 p_top/margin；旧 trace 的 ports 副本只作回退。 */
+      const pTop = nodeState.p_top !== undefined && nodeState.p_top !== null
+        ? nodeState.p_top : (nodeState.ports ? nodeState.ports.p_top : undefined);
+      const margin = nodeState.margin !== undefined && nodeState.margin !== null
+        ? nodeState.margin : (nodeState.ports ? nodeState.ports.margin : undefined);
+      setLive(el, 'p_top', done ? numOrDash(pTop) : '—');
+      setLive(el, 'margin', done ? numOrDash(margin) : '—');
     } else if (node.question_type === 'noul') {
-      setLive(el, 'yes', done && nodeState.ports ? num(nodeState.ports.yes) : '—');
-      setLive(el, 'no', done && nodeState.ports ? num(nodeState.ports.no) : '—');
+      setLive(el, 'yes', done && nodeState.ports ? numOrDash(nodeState.ports.yes) : '—');
+      setLive(el, 'no', done && nodeState.ports ? numOrDash(nodeState.ports.no) : '—');
     } else {
-      setLive(el, 'value', done && nodeState.ports ? num(nodeState.ports.value) : '—');
+      setLive(el, 'value', done && nodeState.ports ? numOrDash(nodeState.ports.value) : '—');
     }
   }
 
@@ -546,7 +557,14 @@
     setLive(el, 'state', 'true');
   }
 
+  function errorPathEdges(replay) {
+    return replay && replay.fallback && replay.final && replay.final.kind === 'error_fallback'
+      ? (replay.fallback.edge_ids || [])
+      : [];
+  }
+
   function paintSlots(replay, graph) {
+    const errorEdges = errorPathEdges(replay);
     (graph.edges || []).forEach(edge => {
       const row = findSlotEl(edge.target, edge.target_port);
       if (!row) return;
@@ -557,6 +575,8 @@
       row.classList.remove.apply(row.classList, SLOT_STATE_CLASSES);
       row.classList.add('is-' + (status === 'true' ? 'true' : status === 'false' ? 'false'
         : status === 'invalid' ? 'invalid' : 'unknown'));
+      /* 回退目标的入边槽位与 SVG 边一起走整链琥珀。 */
+      if (errorEdges.indexOf(edge.id) >= 0) row.classList.add('is-error-path');
       const live = row.querySelector('.rtc-live');
       if (live) {
         live.textContent = edgeState
@@ -572,9 +592,7 @@
     if (svg) svg.classList.add('is-replay');
     const appObj = app();
     const kit = appObj && appObj.kit;
-    const errorEdges = replay.fallback && replay.final && replay.final.kind === 'error_fallback'
-      ? (replay.fallback.edge_ids || [])
-      : [];
+    const errorEdges = errorPathEdges(replay);
     (graph.edges || []).forEach(edge => {
       const path = kit && kit.edgeEl ? kit.edgeEl(edge.id) : null;
       if (!path) return;
@@ -693,7 +711,7 @@
         '<span class="rtc-try-lbl">' + esc(t('cv.tryFinal')) + '</span>' +
         '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' + esc(final.target_id) + '</b>' +
         '<span class="rtc-try-sub">' + (final.model ? esc(final.model) + ' · ' : '') +
-          'priority p' + esc(final.priority) + ' · ' + esc(selectionReason(replay)) + '</span>' +
+          esc(tf('cv.tryPriorityMeta', { priority: final.priority })) + ' · ' + esc(selectionReason(replay)) + '</span>' +
         '<span class="rtc-try-meta">' +
           esc(tf('cv.tryWaves', { n: replay.waves.length })) + ' · ' +
           esc(tf('cv.tryCalls', { n: replay.waves.length })) + ' · ' +
@@ -722,7 +740,8 @@
   function waveConditionTitle(replay, wave) {
     const rows = waveSlotRows(replay, wave);
     if (!rows.length) return t('cv.tryNoHitSlot');
-    return rows.map(row => row.node_id + '.' + row.port + ' ' + slotLine(row)).join('；');
+    return rows.map(row => row.node_id + '.' + row.port + ' ' + slotLine(row))
+      .join(t('cv.trySepClause'));
   }
 
   function renderHud(replay) {
@@ -752,30 +771,36 @@
   function rowText(row) {
     switch (row.kind) {
       case 'condition': {
-        const matched = (row.matched || []).join('、');
+        const matched = (row.matched || []).join(t('cv.trySepList'));
         return matched
           ? tf('cv.tryConditionRow', { matched: matched, value: String(row.value) })
           : t('cv.tryConditionNone') + ' → ' + String(row.value);
       }
       case 'slot':
-        return slotLine(row);
+        /* §6.9 示例是 `in_1 0.84 > 0.65 → true`：节点 id 在中间列，槽位号必须留在行文本里。 */
+        return (row.port ? row.port + ' ' : '') + slotLine(row);
       case 'gate': {
         const inputs = (row.inputs || []).map(input =>
           input.port + ' ' + rawText(input.raw) + ' ' +
-          (input.condition ? conditionText(input.condition) : '= true') + ' → ' + statusText(input.status)).join('；');
+          (input.condition ? conditionText(input.condition) : '= true') + ' → ' + statusText(input.status))
+          .join(t('cv.trySepClause'));
         return tf('cv.tryGateRow', { operator: row.operator, inputs: inputs, value: String(row.value) });
       }
       case 'question': {
+        const pTop = row.p_top !== undefined && row.p_top !== null
+          ? row.p_top : (row.ports ? row.ports.p_top : undefined);
+        const margin = row.margin !== undefined && row.margin !== null
+          ? row.margin : (row.ports ? row.ports.margin : undefined);
         if (row.selected !== undefined) {
           return tf('cv.tryQuestionRow', {
             selected: row.selected,
-            pTop: num(row.p_top), margin: num(row.margin)
+            pTop: numOrDash(pTop), margin: numOrDash(margin)
           });
         }
         if (row.ports && Object.prototype.hasOwnProperty.call(row.ports, 'yes')) {
-          return tf('cv.tryNoulRow', { yes: num(row.ports.yes), no: num(row.ports.no) });
+          return tf('cv.tryNoulRow', { yes: numOrDash(row.ports.yes), no: numOrDash(row.ports.no) });
         }
-        return tf('cv.tryScoreRow', { value: num(row.ports ? row.ports.value : '') });
+        return tf('cv.tryScoreRow', { value: numOrDash(row.ports ? row.ports.value : undefined) });
       }
       case 'activate':
         return tf('cv.tryActivateRow', { port: row.via_port });
@@ -815,15 +840,28 @@
       }
       const edgeId = row.kind === 'slot' ? row.edge_id : '';
       const nodeId = row.node_id || row.target_id || '';
+      /* 槽位行等价于一个按钮：鼠标、Enter、Space 都触发同一个定位动作（§6.11）。 */
+      const keyboard = edgeId ? ' tabindex="0" role="button"' : '';
       html += '<div class="rtc-dw-row rtc-dw-row--' + esc(row.kind) + (edgeId ? ' is-clickable' : '') + '"' +
         (edgeId ? ' data-trace-edge="' + esc(edgeId) + '"' : '') +
-        (nodeId ? ' data-trace-node="' + esc(nodeId) + '"' : '') + '>' +
+        (nodeId ? ' data-trace-node="' + esc(nodeId) + '"' : '') + keyboard + '>' +
         '<span class="rtc-dw-k">' + esc(rowLabel(row.kind)) + '</span>' +
         '<span class="rtc-dw-n" title="' + esc(nodeId) + '">' + esc(nodeId || '—') + '</span>' +
         '<span class="rtc-dw-t">' + esc(rowText(row)) + '</span>' +
         '</div>';
     });
     return html;
+  }
+
+  function closeDrawer() {
+    const wasOpen = drawerOpen || document.body.classList.contains('has-drawer');
+    drawerOpen = false;
+    renderDrawer(state);
+    return wasOpen;
+  }
+
+  function isDrawerOpen() {
+    return drawerOpen;
   }
 
   function renderDrawer(replay) {
@@ -883,6 +921,14 @@
     }
     const topButton = byId('cvTryBtn');
     if (topButton) topButton.disabled = busy;
+    /* 请求在途时输入框与样例 chip 一律禁用：chip 不能在飞行中改写输入。 */
+    const input = byId('cvTryInput');
+    if (input) input.disabled = busy;
+    const chips = byId('cvTryChips');
+    if (chips) {
+      const buttons = chips.querySelectorAll('button');
+      for (let index = 0; index < buttons.length; index += 1) buttons[index].disabled = busy;
+    }
     const appObj = app();
     if (appObj && appObj.kit && typeof appObj.kit.setLocked === 'function') appObj.kit.setLocked(busy);
     if (appObj && typeof appObj.updateToolbar === 'function') appObj.updateToolbar();
@@ -908,12 +954,38 @@
     renderDrawer(null);
   }
 
+  /* 按波次整理后，未触发列没有节点 id 可读；补一个 world 坐标里的列头标签。 */
+  function clearWaveHeader() {
+    if (waveHeader && waveHeader.parentNode) waveHeader.parentNode.removeChild(waveHeader);
+    waveHeader = null;
+    waveLayout = null;
+  }
+
+  function renderWaveHeader() {
+    if (!waveLayout) { clearWaveHeader(); return; }
+    const world = byId('cvWorld');
+    if (!world) return;
+    if (!waveHeader || waveHeader.parentNode !== world) {
+      waveHeader = document.createElement('div');
+      waveHeader.className = 'rtc-wavehead';
+      world.appendChild(waveHeader);
+    }
+    waveHeader.textContent = t('cv.tryUntriggeredColumn');
+    waveHeader.style.left = waveLayout.x + 'px';
+    waveHeader.style.top = waveLayout.y + 'px';
+  }
+
   /* 数据/浮层复位，不重绘卡片（供 App.change 在 renderAll 前调用）。 */
   function reset() {
     runSeq += 1;
     state = null;
     const appObj = app();
-    if (appObj) appObj.replay = null;
+    if (appObj) {
+      appObj.replay = null;
+      /* 运行中 reset（清除/换组）必须同时释放锁，不能把 tryRunning 留给迟到的 finally。 */
+      appObj.tryRunning = false;
+    }
+    clearWaveHeader();
     hideResultPanels();
     removeReplayClasses();
     setBusy(false);
@@ -956,14 +1028,15 @@
     state = null;
     appObj.replay = null;
     appObj.tryRunning = true;
-    hideResultPanels();
-    collapsePanels();
-    removeReplayClasses();
-    if (typeof appObj.render === 'function') appObj.render();
-    setBusy(true);
-    const input = byId('cvTryInput');
-    if (input && input.value !== inputText) input.value = inputText;
     try {
+      /* 收起面板/重绘/锁画布都在 try 内：任一步抛错也必须走 finally 释放运行锁。 */
+      hideResultPanels();
+      collapsePanels();
+      removeReplayClasses();
+      if (typeof appObj.render === 'function') appObj.render();
+      setBusy(true);
+      const input = byId('cvTryInput');
+      if (input && input.value !== inputText) input.value = inputText;
       /* api.js 的 api 是顶层 const（不是 window 属性），这里按全局词法名取。 */
       const client = typeof api !== 'undefined' ? api : root.api;
       const response = await client.post('/admin/try', payloadFor(inputText, now));
@@ -986,9 +1059,13 @@
       if (token !== runSeq) return false;
       state = null;
       appObj.replay = null;
-      hideResultPanels();
-      removeReplayClasses();
-      if (typeof appObj.render === 'function') appObj.render();
+      try {
+        hideResultPanels();
+        removeReplayClasses();
+        if (typeof appObj.render === 'function') appObj.render();
+      } catch (cleanupError) {
+        /* 清理失败不能盖住原始错误；finally 仍会释放运行锁。 */
+      }
       if (appObj.toast) {
         appObj.toast(tf('cv.tryFailed', {
           err: typeof root.apiErrText === 'function' ? root.apiErrText(error) : String(error)
@@ -1074,12 +1151,21 @@
       const current = node.position || {};
       return !!next && (next.x !== current.x || next.y !== current.y);
     });
-    if (typeof appObj.change === 'function') {
-      appObj.change('layout', tree => {
+    /* 与自动整理一致：没移动就不入历史；App.change 拒绝（运行中/只读）时不得报成功。 */
+    if (changedPosition) {
+      if (typeof appObj.change !== 'function') return false;
+      const accepted = appObj.change('layout', tree => {
         tree.root.nodes.forEach(node => {
           if (positions[node.id]) node.position = { x: positions[node.id].x, y: positions[node.id].y };
         });
       });
+      if (accepted === false) return false;
+    }
+    if (untriggered.length) {
+      waveLayout = { x: PAD + (maxWave + 1) * COLUMN_WIDTH, y: PAD - 18 };
+      renderWaveHeader();
+    } else {
+      clearWaveHeader();
     }
     if (appObj.kit && appObj.kit.fit) appObj.kit.fit({ padding: 24 });
     if (appObj.toast) appObj.toast(t(changedPosition ? 'cv.tryWavesLayoutDone' : 'cv.tryWavesLayoutSame'));
@@ -1090,8 +1176,11 @@
   function renderChips() {
     const host = byId('cvTryChips');
     if (!host) return;
+    const appObj = app();
+    const busy = !!(appObj && appObj.tryRunning);
     host.innerHTML = SAMPLES.map((sample, index) =>
-      '<button type="button" class="rtc-trychip" data-try-sample="' + index + '">' +
+      '<button type="button" class="rtc-trychip" data-try-sample="' + index + '"' +
+      (busy ? ' disabled' : '') + '>' +
       esc(t(sample.labelKey)) + '</button>').join('');
     const input = byId('cvTryInput');
     if (input) input.placeholder = t('cv.tryPlaceholder');
@@ -1107,8 +1196,7 @@
       return;
     }
     if (name === 'drawer-close') {
-      drawerOpen = false;
-      renderDrawer(state);
+      closeDrawer();
       return;
     }
     if (name === 'rerun') { rerun(); return; }
@@ -1116,24 +1204,36 @@
     if (name === 'waves') { layoutByWaves(); }
   }
 
+  function locateTraceEdge(edgeId) {
+    const appObj = app();
+    if (!appObj || !appObj.kit || !edgeId) return;
+    appObj.kit.focusEdge(edgeId);
+    if (root.RTCondPop) root.RTCondPop.open(edgeId);
+  }
+
   function onDrawerClick(event) {
     const close = event.target.closest('[data-try-act="drawer-close"]');
     if (close) {
-      drawerOpen = false;
-      renderDrawer(state);
+      closeDrawer();
       return;
     }
     const appObj = app();
     if (!appObj || !appObj.kit) return;
     const row = event.target.closest('[data-trace-edge]');
     if (row) {
-      const edgeId = row.dataset.traceEdge;
-      appObj.kit.focusEdge(edgeId);
-      if (root.RTCondPop) root.RTCondPop.open(edgeId);
+      locateTraceEdge(row.dataset.traceEdge);
       return;
     }
     const nodeRow = event.target.closest('[data-trace-node]');
     if (nodeRow) appObj.kit.focusNode(nodeRow.dataset.traceNode);
+  }
+
+  function onDrawerKeydown(event) {
+    if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') return;
+    const row = event.target.closest('[data-trace-edge]');
+    if (!row) return;
+    event.preventDefault();
+    locateTraceEdge(row.dataset.traceEdge);
   }
 
   function init() {
@@ -1143,7 +1243,7 @@
     const input = byId('cvTryInput');
     if (input) {
       input.addEventListener('keydown', event => {
-        if (event.key !== 'Enter') return;
+        if (event.key !== 'Enter' || event.isComposing) return;
         event.preventDefault();
         run(input.value);
       });
@@ -1153,6 +1253,8 @@
       chips.addEventListener('click', event => {
         const chip = event.target.closest('[data-try-sample]');
         if (!chip) return;
+        const appObj = app();
+        if (appObj && appObj.tryRunning) return;
         const sample = SAMPLES[Number(chip.dataset.trySample)];
         if (!sample) return;
         const textInput = byId('cvTryInput');
@@ -1178,11 +1280,15 @@
     const result = byId('cvTryResult');
     if (result) result.addEventListener('click', onAction);
     const drawer = byId('cvTraceDrawer');
-    if (drawer) drawer.addEventListener('click', onDrawerClick);
+    if (drawer) {
+      drawer.addEventListener('click', onDrawerClick);
+      drawer.addEventListener('keydown', onDrawerKeydown);
+    }
   }
 
   function refresh() {
     renderChips();
+    renderWaveHeader();
     if (state) apply(state);
     else {
       renderResult(null);
@@ -1207,6 +1313,8 @@
     init: init,
     refresh: refresh,
     samples: samples,
-    layoutByWaves: layoutByWaves
+    layoutByWaves: layoutByWaves,
+    closeDrawer: closeDrawer,
+    isDrawerOpen: isDrawerOpen
   };
 })(window);

@@ -139,6 +139,24 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-stage.is-space-pan { cursor: grab; }
 .rtc-stage.is-space-pan:active { cursor: grabbing; }
 .rtc-stage.is-drop-target { box-shadow: 0 0 0 2px var(--indigo-line), var(--shadow); }
+/* 试算运行中：画布锁定提示（进度光标 + 顶部琥珀脉冲 + 内描边），只用 shared token。 */
+.rtc-stage.is-locked { cursor: progress; }
+.rtc-stage.is-locked .rtc-node,
+.rtc-stage.is-locked .rtc-port,
+.rtc-stage.is-locked .rtc-edge-hit { cursor: progress; }
+body.is-try-running .rtc-stage.is-locked {
+  box-shadow: inset 0 0 0 2px var(--amber-soft), var(--shadow);
+}
+body.is-try-running .rtc-stage.is-locked::after {
+  content: ''; position: absolute; top: 6px; left: 50%; z-index: 6;
+  width: 42px; height: 3px; border-radius: 99px; pointer-events: none;
+  background: var(--amber);
+  animation: rtc-lock-pulse 1.1s ease-in-out infinite;
+}
+@keyframes rtc-lock-pulse {
+  0%, 100% { opacity: .35; transform: translateX(-50%) scaleX(.7); }
+  50% { opacity: .9; transform: translateX(-50%) scaleX(1); }
+}
 .rtc-world {
   position: absolute; left: 0; top: 0;
   width: 8000px; height: 5000px;
@@ -876,10 +894,16 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-hud {
   position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
   z-index: 24; display: flex; align-items: center; gap: 5px; flex-wrap: nowrap;
-  max-width: calc(100% - 660px); overflow: hidden;
+  max-width: calc(100% - 660px);
+  /* 8 波胶囊 + 末位 target 会超出可用宽度；保留单行胶囊，但允许横向滚动而非裁掉。 */
+  overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain;
+  scrollbar-width: thin;
   background: var(--panel); border: 1px solid var(--line); border-radius: 99px;
   box-shadow: var(--shadow); padding: 4px 10px; font-size: 9.5px; color: var(--text-2);
 }
+.rtc-hud::-webkit-scrollbar { height: 3px; }
+.rtc-hud::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 99px; }
+.rtc-hud::-webkit-scrollbar-track { background: transparent; }
 .rtc-hud-tt { font-size: 8px; font-weight: 750; letter-spacing: .08em; color: var(--indigo); flex: none; }
 .rtc-hud-wave {
   flex: none; border: 1px solid var(--line); border-radius: 99px; padding: 0 6px;
@@ -889,6 +913,14 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-hud-wave.is-failed { border-color: var(--amber-line); background: var(--amber-soft); color: var(--amber); }
 .rtc-hud-final { flex: none; font-family: var(--mono); font-size: 8.5px; font-weight: 700; color: var(--green); }
 .rtc-hud-final.is-failed { color: var(--amber); }
+
+/* ── 按波次整理的列头（只标注「未触发」列） ───────────────────── */
+.rtc-wavehead {
+  position: absolute; z-index: 2; pointer-events: none;
+  padding: 1px 7px; border: 1px solid var(--line-2); border-radius: 99px;
+  background: var(--panel-2); color: var(--text-3);
+  font-size: 9px; font-weight: 700; letter-spacing: .04em; white-space: nowrap;
+}
 
 /* ── 轨迹抽屉（左侧波次卡 + 右侧逐行轨迹） ────────────────────── */
 .rtc-drawer {

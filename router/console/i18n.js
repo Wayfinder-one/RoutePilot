@@ -304,6 +304,7 @@ const I18N = {
     'cv.tryNoCandidates': '没有 target 激活',
     'cv.tryPriorityWin': '{winner} p{priority} 压过 {rival} p{rivalPriority}',
     'cv.tryUniqueTarget': '唯一命中 {target}（priority p{priority}）',
+    'cv.tryPriorityMeta': '优先级 p{priority}',
     'cv.tryOtherwiseReason': '没有任何 target 激活，使用 otherwise_target',
     'cv.tryErrorPath': '决策调用失败，整波作废并走 error_fallback',
     'cv.try.otherwiseTarget': 'otherwise_target',
@@ -337,6 +338,7 @@ const I18N = {
     'cv.tryRow.condition': '条件', 'cv.tryRow.slot': '槽位', 'cv.tryRow.gate': '门',
     'cv.tryRow.question': '问题', 'cv.tryRow.activate': '激活', 'cv.tryRow.fallback': '兜底',
     'cv.tryRow.final': '结论', 'cv.tryRow.sticky': '粘性', 'cv.tryRow.scheduled': '调度',
+    'cv.trySepList': '、', 'cv.trySepClause': '；',
     'cv.tryConditionRow': '命中「{matched}」→ {value}',
     'cv.tryConditionNone': '未命中任一条件',
     'cv.tryGateRow': '{operator} · {inputs} → {value}',
@@ -352,6 +354,7 @@ const I18N = {
     'cv.tryClear': '清除回放',
     'cv.tryClearDone': '已清除回放',
     'cv.tryWavesLayout': '按波次整理',
+    'cv.tryUntriggeredColumn': '未触发',
     'cv.tryWavesLayoutDone': '已按波次整理画布（仅布局）',
     'cv.tryWavesLayoutSame': '画布已经按波次排好（仅布局）',
     'cv.tryWavesLayoutNone': '还没有可用的试算轨迹',
@@ -733,6 +736,7 @@ const I18N = {
     'cv.tryNoCandidates': 'No target activated',
     'cv.tryPriorityWin': '{winner} p{priority} beats {rival} p{rivalPriority}',
     'cv.tryUniqueTarget': 'Only hit {target} (priority p{priority})',
+    'cv.tryPriorityMeta': 'priority p{priority}',
     'cv.tryOtherwiseReason': 'No target activated; using otherwise_target',
     'cv.tryErrorPath': 'The decision call failed; that wave was voided and error_fallback was used',
     'cv.try.otherwiseTarget': 'otherwise_target',
@@ -766,6 +770,7 @@ const I18N = {
     'cv.tryRow.condition': 'Condition', 'cv.tryRow.slot': 'Slot', 'cv.tryRow.gate': 'Gate',
     'cv.tryRow.question': 'Question', 'cv.tryRow.activate': 'Activate', 'cv.tryRow.fallback': 'Fallback',
     'cv.tryRow.final': 'Verdict', 'cv.tryRow.sticky': 'Sticky', 'cv.tryRow.scheduled': 'Schedule',
+    'cv.trySepList': ', ', 'cv.trySepClause': '; ',
     'cv.tryConditionRow': 'Hit “{matched}” → {value}',
     'cv.tryConditionNone': 'No condition matched',
     'cv.tryGateRow': '{operator} · {inputs} → {value}',
@@ -781,6 +786,7 @@ const I18N = {
     'cv.tryClear': 'Clear replay',
     'cv.tryClearDone': 'Replay cleared',
     'cv.tryWavesLayout': 'Arrange by waves',
+    'cv.tryUntriggeredColumn': 'Not triggered',
     'cv.tryWavesLayoutDone': 'Canvas arranged by waves (layout only)',
     'cv.tryWavesLayoutSame': 'Canvas is already arranged by waves (layout only)',
     'cv.tryWavesLayoutNone': 'No trace available yet',
@@ -880,6 +886,9 @@ function setLang(l) {
   });
   document.querySelectorAll('[data-i18n-aria]').forEach(el => {
     el.setAttribute('aria-label', t(el.dataset.i18nAria));
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(el => {
+    el.title = t(el.dataset.i18nTitle);
   });
   document.querySelectorAll('.langtog button').forEach(b =>
     b.classList.toggle('on', b.dataset.lang === l));
