@@ -459,12 +459,13 @@
       return { ok: false, reason: '选项 key 已存在：' + value };
     }
     option.key = value;
-    const mapping = {};
+    /* 端口名来自用户输入（如 constructor / toString）：用无原型对象避免命中原型链。 */
+    const mapping = Object.create(null);
     mapping['selected.' + oldKey] = 'selected.' + value;
     mapping['prob.' + oldKey] = 'prob.' + value;
     const updated = [];
     edgesOf(graphValue).forEach(edge => {
-      if (edge.source === nodeId && mapping[edge.source_port]) {
+      if (edge.source === nodeId && Object.prototype.hasOwnProperty.call(mapping, edge.source_port)) {
         edge.source_port = mapping[edge.source_port];
         updated.push(edge);
       }

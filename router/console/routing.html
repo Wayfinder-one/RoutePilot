@@ -64,7 +64,7 @@
   </header>
 
   <!-- ── 校验条（点击展开） ─────────────────────────────────────── -->
-  <div class="rtc-issues" id="cvIssues" hidden role="region" aria-label="校验"></div>
+  <div class="rtc-issues" id="cvIssues" hidden role="region" data-i18n-aria="cv.issues"></div>
 
   <!-- ── 画布工作区 ─────────────────────────────────────────────── -->
   <div class="rtc-workspace">
@@ -76,7 +76,7 @@
     </div>
 
     <!-- 左上 · 节点库 -->
-    <aside class="rtc-palette rtc-overlay" id="cvPalette" data-overlay aria-label="节点库">
+    <aside class="rtc-palette rtc-overlay" id="cvPalette" data-overlay data-i18n-aria="cv.palette">
       <div class="rtc-pal-h">
         <span class="rtc-pal-t"><span data-i18n="cv.palette"></span><small data-i18n="cv.paletteHint"></small></span>
         <button type="button" class="rtc-pal-toggle" id="cvPalToggle" data-i18n-aria="cv.paletteToggle" title="折叠 / 展开">
@@ -93,7 +93,7 @@
     </aside>
 
     <!-- 右上 · 检查器（Task 11 填充） -->
-    <aside class="rtc-inspector rtc-overlay" id="cvInspector" data-overlay aria-label="检查器">
+    <aside class="rtc-inspector rtc-overlay" id="cvInspector" data-overlay data-i18n-aria="cv.inspector">
       <div class="rtc-insp-h">
         <span class="rtc-insp-tt" data-i18n="cv.inspector"></span>
         <span class="rtc-insp-sub" id="cvInspectorSub">root</span>
@@ -124,7 +124,7 @@
     </div>
 
     <!-- 底部居中 · 试算台（Task 12/13 接入） -->
-    <section class="rtc-trybar rtc-overlay" id="cvTryBar" data-overlay aria-label="试算台">
+    <section class="rtc-trybar rtc-overlay" id="cvTryBar" data-overlay data-i18n-aria="cv.try">
       <div class="rtc-try-row">
         <span class="rtc-try-ico"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg></span>
         <input type="text" id="cvTryInput" autocomplete="off" spellcheck="false">
@@ -136,16 +136,10 @@
 </main>
 
 <!-- 端口拖到空白 · 快速创建兼容节点 -->
-<div class="rtc-quick" id="cvQuick" hidden role="dialog" aria-label="快速创建"></div>
+<div class="rtc-quick" id="cvQuick" hidden role="dialog" data-i18n-aria="cv.quickTitle"></div>
 
-<!-- 输入槽位条件编辑浮层（Task 11 填充） -->
-<div class="rtc-condpop" id="cvCondPop" hidden role="dialog" aria-label="条件编辑">
-  <div class="rtc-condpop-h">
-    <span data-i18n="cv.condTitle"></span>
-    <button type="button" class="btn ghost sm" id="cvCondClose" data-i18n="cv.condClose"></button>
-  </div>
-  <p class="rtc-condpop-body" data-i18n="cv.condHint"></p>
-</div>
+<!-- 输入槽位条件编辑浮层（condpop.js 渲染表单） -->
+<div class="rtc-condpop" id="cvCondPop" hidden role="dialog" data-i18n-aria="cv.condTitle"></div>
 
 <!-- 删除确认 -->
 <div class="rtc-modal" id="cvDeleteModal" hidden>

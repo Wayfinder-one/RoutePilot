@@ -90,7 +90,8 @@
         '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +
         '<span class="rtc-slot-src" title="' + esc(sourceTitle(edge)) + '">' + esc(sourceLabel(graph, edge)) + '</span>' +
         '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
-        ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '">' +
+        ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
+        ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
         esc(conditionText(graph, edge)) + '</button>' +
         '<span class="rtc-live" data-live="slot.' + esc(port.id) + '"></span>' +
         '</div>';
@@ -108,7 +109,11 @@
     function slotsHTML(graph, node) {
       const slots = visibleSlots(graph, node);
       if (!slots.length) return '';
-      return '<div class="rtc-slots">' + slots.map(port => slotRow(graph, node, port)).join('') + '</div>';
+      /* question / target 的多槽位是 OR 语义（规格 §2.6），卡片上明确标注。 */
+      const note = (node.type === 'question' || node.type === 'target') && slots.length > 1
+        ? '<div class="rtc-slots-note">' + esc(t('cv.slot.orNote')) + '</div>'
+        : '';
+      return '<div class="rtc-slots">' + slots.map(port => slotRow(graph, node, port)).join('') + '</div>' + note;
     }
 
     function header(node, options) {

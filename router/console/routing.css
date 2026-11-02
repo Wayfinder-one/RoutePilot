@@ -543,6 +543,33 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 .rtc-ins-note .rtc-ic { width: 11px; height: 11px; margin-top: 1px; flex: none; }
 
+/* ── 检查器表单（Task 11：节点 / 边 / 图设置三分支） ───────────── */
+.rtc-ins .field { margin-top: 6px; }
+.rtc-ins .field input, .rtc-ins .field select, .rtc-ins .field textarea { width: 100%; box-sizing: border-box; }
+.rtc-ins .field textarea { resize: vertical; }
+.rtc-ins .field-row { margin-top: 6px; }
+.rtc-ins .field-row .field { margin-top: 0; }
+.rtc-ins-type { margin-left: auto; font-size: 8.5px; text-transform: none; letter-spacing: 0; }
+.rtc-ins-acts { display: flex; justify-content: flex-end; gap: 6px; margin: 2px 0 4px; }
+.rtc-ins-error, .rtc-cond-error {
+  margin-top: 7px; padding: 5px 7px; border-radius: 6px;
+  border: 1px solid var(--red-line); background: var(--red-soft); color: var(--red);
+  font-size: 10.5px; line-height: 1.5;
+}
+.rtc-ins-error[hidden], .rtc-cond-error[hidden] { display: none; }
+.rtc-ins-checks { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--text-2); }
+.rtc-ins-checks label { display: flex; align-items: center; gap: 4px; }
+.rtc-check { display: flex; align-items: center; gap: 5px; margin-top: 7px; font-size: 11px; color: var(--text-2); }
+.rtc-opt-edit, .rtc-model-edit {
+  border: 1px solid var(--line); background: var(--panel-2);
+  border-radius: 8px; padding: 6px 7px; margin-bottom: 6px;
+}
+.rtc-opt-edit .btn { margin-top: 4px; }
+.rtc-model-edit { display: flex; align-items: flex-end; gap: 6px; }
+.rtc-model-edit .field { flex: 1; min-width: 0; margin-top: 0; }
+.rtc-model-edit .btn { flex: none; }
+.rtc-slots-note { margin: 1px 0 3px; font-size: 8.5px; line-height: 1.4; color: var(--text-3); }
+
 /* ── 缩放条 / 图例 ────────────────────────────────────────────── */
 .rtc-zoom { position: absolute; left: 20px; bottom: 18px; z-index: 23; display: flex; flex-direction: column; gap: 5px; }
 .rtc-zoom-row {
@@ -659,7 +686,7 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 .rtc-quick-empty { padding: 8px 7px; font-size: 10.5px; color: var(--text-3); line-height: 1.55; }
 
-/* ── 条件浮层（Task 11 填充） ─────────────────────────────────── */
+/* ── 条件浮层（condpop.js；检查器边分支复用同一表单） ─────────── */
 .rtc-condpop {
   position: fixed; z-index: 150; left: 50%; top: 50%; transform: translate(-50%, -50%);
   width: 360px; max-width: calc(100vw - 40px);
@@ -672,7 +699,14 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
   font-size: 12px; font-weight: 750;
 }
 .rtc-condpop-h .btn { margin-left: auto; }
-.rtc-condpop-body { padding: 11px 12px; font-size: 11px; line-height: 1.6; color: var(--text-2); }
+.rtc-condpop-path {
+  flex: 1; min-width: 0; font-family: var(--mono); font-size: 9.5px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-condpop-body { padding: 9px 12px 11px; font-size: 11px; line-height: 1.6; color: var(--text-2); }
+.rtc-condpop-hint { margin: 0 0 8px; font-size: 10px; color: var(--text-3); line-height: 1.5; }
+.rtc-cond-fields .field { flex: 1; min-width: 0; }
+.rtc-cond-fields .field input, .rtc-cond-fields .field select { width: 100%; box-sizing: border-box; }
 
 /* ── 删除确认 ─────────────────────────────────────────────────── */
 .rtc-modal {

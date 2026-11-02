@@ -676,6 +676,46 @@ test('renameOptionKey refuses conflicts and invalid keys without mutating the gr
   assert.equal(RTGraph.renameOptionKey(graph, 'no-such-node', 'a', 'b').ok, false);
 });
 
+test('renameOptionKey handles port names that collide with Object.prototype properties', () => {
+  const { graph, target } = choiceGraph();
+  /* 含原型属性名的非法端口边：旧实现用 {} 查表会把 mapping['toString'] 命中
+     Object.prototype.toString（truthy），把这条无关边的端口改写成函数。 */
+  graph.edges.push({
+    id: 'e-prototype-junk',
+    source: 'capability',
+    source_port: 'toString',
+    target: target.id,
+    target_port: 'in_5',
+    condition: null,
+  });
+  /* constructor / toString 是 Object.prototype 上的名字：端口映射必须用无原型对象。 */
+  const toConstructor = RTGraph.renameOptionKey(graph, 'capability', 'easy', 'constructor');
+  assert.equal(toConstructor.ok, true);
+  assert.equal(toConstructor.key, 'constructor');
+  assert.equal(toConstructor.edges.length, 2, 'the foreign toString edge must not join the rename');
+  assert.ok(graph.edges.some(edge => edge.source_port === 'selected.constructor'));
+  assert.ok(graph.edges.some(edge => edge.source_port === 'prob.constructor'));
+  assert.equal(graph.edges.find(edge => edge.id === 'e-prototype-junk').source_port, 'toString',
+    'prototype-named foreign port was rewritten through Object.prototype');
+  assert.equal(RTGraph.portOf(graph.nodes.find(node => node.id === 'capability'),
+    'selected.constructor', graph).type, 'boolean');
+
+  const toToString = RTGraph.renameOptionKey(graph, 'capability', 'constructor', 'toString');
+  assert.equal(toToString.ok, true);
+  assert.equal(toToString.key, 'toString');
+  assert.equal(toToString.edges.length, 2);
+  assert.ok(graph.edges.some(edge => edge.source_port === 'selected.toString'));
+  assert.ok(graph.edges.some(edge => edge.source_port === 'prob.toString'));
+  assert.ok(graph.edges.every(edge => !/\.constructor$/.test(edge.source_port)));
+  assert.equal(graph.edges.find(edge => edge.id === 'e-prototype-junk').source_port, 'toString');
+
+  const back = RTGraph.renameOptionKey(graph, 'capability', 'toString', 'valueOf');
+  assert.equal(back.ok, true);
+  assert.ok(graph.edges.some(edge => edge.source_port === 'selected.valueOf'));
+  assert.ok(graph.edges.some(edge => edge.source_port === 'prob.valueOf'));
+  assert.equal(graph.edges.find(edge => edge.id === 'e-prototype-junk').source_port, 'toString');
+});
+
 /* ── 8. 行为 canonical / changeKind ─────────────────────────────────── */
 
 test('changeKind separates display fields from behavior fields', () => {

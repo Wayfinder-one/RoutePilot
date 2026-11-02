@@ -73,8 +73,11 @@
 
   function reasoningFor(modelId) {
     const model = (App.models || []).find(item => item.id === modelId);
-    const reasoning = model && model.profile && model.profile.reasoning;
-    return reasoning && reasoning.default ? reasoning.default : null;
+    if (!model) return null;
+    const reasoning = model.reasoning ||
+      (model.profile && typeof model.profile === 'object' ? model.profile.reasoning : null);
+    if (!reasoning || reasoning.declared === false || reasoning.supported === false) return null;
+    return reasoning.default || null;
   }
 
   function nextPriority(graph) {
@@ -169,6 +172,7 @@
   const App = {
     trees: [],
     models: [],
+    periods: [],
     tree: null,
     graph: null,
     treeId: '',
@@ -233,47 +237,11 @@
     body.scrollTop = 0;
   }
 
-  /* ── 渲染：检查器占位（Task 11 接入三分支） ─────────────────── */
+  /* ── 渲染：检查器（三分支由 inspector.js 生成） ──────────────── */
   function renderInspector() {
-    const body = $('#cvInspectorBody');
-    if (!body) return;
-    const graph = App.graph || { nodes: [], edges: [] };
-    const questions = (graph.nodes || []).filter(node => node.type === 'question').length;
-    const fallback = (field) => {
-      const value = graph[field];
-      return value ? value : '—';
-    };
+    if (!root.RTInspector || typeof root.RTInspector.render !== 'function') return;
     const selection = App.kit ? App.kit.getSelection() : App.selection;
-    const sub = $('#cvInspectorSub');
-    if (sub) sub.textContent = selection && selection.id ? selection.id : 'root';
-    let hint = t('cv.inspectorPlaceholder');
-    if (selection && selection.kind === 'node') {
-      const node = RTGraph.findNode(graph, selection.id);
-      if (node) hint = RTGraph.nodeLabel(node) + ' · ' + node.id + ' — ' + t('cv.inspectorNodeHint');
-    } else if (selection && selection.kind === 'edge') {
-      const edge = graph.edges.find(item => item.id === selection.id);
-      if (edge) {
-        hint = edge.source + ' · ' + edge.source_port + ' → ' + edge.target + ' · ' + edge.target_port +
-          ' — ' + t('cv.inspectorEdgeHint');
-      }
-    }
-    body.innerHTML =
-      '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.inspectorStats')) + '</div>' +
-      '<div class="rtc-statgrid">' +
-      '<div class="rtc-statcell"><b>' + (graph.nodes || []).length + '</b><span>' + esc(t('cv.inspectorNodes')) + '</span></div>' +
-      '<div class="rtc-statcell"><b>' + (graph.edges || []).length + '</b><span>' + esc(t('cv.inspectorEdges')) + '</span></div>' +
-      '<div class="rtc-statcell"><b>' + questions + '</b><span>' + esc(t('cv.inspectorQuestions')) + '</span></div>' +
-      '</div></div>' +
-      '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.inspectorGraph')) + '</div>' +
-      '<div class="rtc-ins-row"><span>' + esc(t('cv.inspectorTimezone')) + '</span><b>' + esc(App.tree ? App.tree.timezone : '—') + '</b></div>' +
-      '<div class="rtc-ins-row"><span>' + esc(t('cv.inspectorSticky')) + '</span><b>' +
-      esc(App.tree && App.tree.sticky && App.tree.sticky.enabled
-        ? t('cv.inspectorStickyOn') + ' · ' + App.tree.sticky.ttl_seconds + 's'
-        : t('cv.inspectorStickyOff')) + '</b></div>' +
-      '<div class="rtc-ins-row"><span>otherwise_target</span><b>' + esc(fallback('otherwise_target')) + '</b></div>' +
-      '<div class="rtc-ins-row"><span>error_fallback</span><b>' + esc(fallback('error_fallback')) + '</b></div>' +
-      '</div>' +
-      '<div class="rtc-ins-note">' + icon('help') + '<div>' + esc(hint) + '</div></div>';
+    root.RTInspector.render(selection);
   }
 
   /* ── 渲染：校验条 ─────────────────────────────────────────────── */
@@ -303,9 +271,15 @@
     const rows = counts.hard.concat(counts.hints);
     panel.innerHTML = rows.map(issue => {
       const title = (lang === 'en' && issue.en) ? issue.en : issue.zh;
-      const target = issue.node_id
-        ? ' data-issue-node="' + esc(issue.node_id) + '"'
-        : (issue.edge_id ? ' data-issue-edge="' + esc(issue.edge_id) + '"' : '');
+      /* 图级问题（时区 / 兜底 / 限额 / 解析）在检查器图设置里修；边问题开条件浮层；节点问题选中居中。 */
+      const graphLevel = issue.code === 'invalid_timezone' || issue.code === 'fallback_missing' ||
+        issue.code === 'graph_parse_error' || issue.port === 'otherwise_target' ||
+        issue.port === 'error_fallback' || (!issue.node_id && !issue.edge_id);
+      const target = issue.level === 'hint' ? '' : (graphLevel
+        ? ' data-issue-graph="1"'
+        : (issue.edge_id
+          ? ' data-issue-edge="' + esc(issue.edge_id) + '"'
+          : ' data-issue-node="' + esc(issue.node_id) + '"'));
       return '<div class="rtc-issue ' + (issue.level === 'hint' ? 'is-hint' : 'is-hard') + '">' +
         '<span class="rtc-idot"></span><span class="rtc-issue-text">' + esc(title) + '</span>' +
         (target ? '<button type="button" class="rtc-issue-locate" data-locate="1"' + target + '>' +
@@ -407,11 +381,7 @@
     renderInspector();
     renderMinimap();
     updateToolbar();
-    const pop = $('#cvCondPop');
-    if (pop && !pop.hidden) {
-      const edgeId = pop.dataset.edgeId;
-      if (!(App.graph.edges || []).some(edge => edge.id === edgeId)) root.RTCondPop.close();
-    }
+    if (root.RTCondPop && root.RTCondPop.isOpen && root.RTCondPop.isOpen()) root.RTCondPop.refresh();
   }
 
   function updateToolbar() {
@@ -507,7 +477,7 @@
   }
   App.toast = toast;
 
-  /* ── 删除确认 ─────────────────────────────────────────────────── */
+  /* ── 删除确认（节点 / 边 / choice 选项共用级联清单） ──────────── */
   function requestDelete(selection) {
     if (!selection || !selection.kind) return;
     const modal = $('#cvDeleteModal');
@@ -515,6 +485,8 @@
     const graph = App.graph;
     let title = '';
     let edges = [];
+    let nodeId = '';
+    let key = '';
     if (selection.kind === 'node') {
       const node = RTGraph.findNode(graph, selection.id);
       if (!node) return;
@@ -525,6 +497,15 @@
       if (!edge) return;
       edges = [edge];
       title = t('cv.deleteEdgeTitle');
+    } else if (selection.kind === 'option') {
+      const node = RTGraph.findNode(graph, selection.nodeId);
+      const option = node && (node.options || []).find(item => item.key === selection.key);
+      if (!node || !option) return;
+      const ports = ['selected.' + selection.key, 'prob.' + selection.key];
+      edges = (graph.edges || []).filter(edge => edge.source === selection.nodeId && ports.indexOf(edge.source_port) >= 0);
+      title = tf('cv.deleteOption', { label: option.label, key: selection.key });
+      nodeId = selection.nodeId;
+      key = selection.key;
     } else {
       return;
     }
@@ -547,8 +528,12 @@
       '</div>';
     modal.hidden = false;
     modal.dataset.kind = selection.kind;
-    modal.dataset.id = selection.id;
+    modal.dataset.id = selection.id || '';
+    modal.dataset.nodeId = nodeId;
+    modal.dataset.key = key;
+    body.setAttribute('aria-label', t('cv.deleteTitle'));
   }
+  App.requestDelete = requestDelete;
 
   function hideDelete() {
     const modal = $('#cvDeleteModal');
@@ -560,30 +545,37 @@
     if (!modal || modal.hidden) return;
     const kind = modal.dataset.kind;
     const id = modal.dataset.id;
+    const nodeId = modal.dataset.nodeId;
+    const key = modal.dataset.key;
     hideDelete();
-    if (!kind || !id) return;
+    if (!kind) return;
     /* 弹窗打开后目标可能已被撤销/重做移除：先在快照上试删，避免推入空历史。 */
     const probe = App.tree ? RTGraph.clone(App.tree) : null;
     const check = kind === 'node'
       ? RTGraph.removeNode(probe && probe.root, id)
-      : RTGraph.removeEdge(probe && probe.root, id);
+      : kind === 'edge'
+        ? RTGraph.removeEdge(probe && probe.root, id)
+        : RTGraph.removeOption(probe && probe.root, nodeId, key);
     if (!check.ok) return;
     let cleared = [];
     let removed = false;
     change('behavior', tree => {
-      if (kind === 'node') {
-        const result = RTGraph.removeNode(tree.root, id);
-        if (result.ok) {
-          removed = true;
-          cleared = result.fallbackCleared || [];
-        }
-      } else {
-        const result = RTGraph.removeEdge(tree.root, id);
-        if (result.ok) removed = true;
+      let result;
+      if (kind === 'node') result = RTGraph.removeNode(tree.root, id);
+      else if (kind === 'edge') result = RTGraph.removeEdge(tree.root, id);
+      else result = RTGraph.removeOption(tree.root, nodeId, key);
+      if (result.ok) {
+        removed = true;
+        cleared = result.fallbackCleared || [];
       }
     });
     if (!removed) return;
-    App.kit.clearSelection();
+    if (kind === 'option') {
+      const selection = App.kit.getSelection();
+      if (selection.kind !== 'node' || selection.id !== nodeId) App.kit.select('node', nodeId, true);
+    } else {
+      App.kit.clearSelection();
+    }
     if (cleared.length) toast(t('cv.toastFallbackCleared'), 'warn');
     else toast(t('cv.toastDeleted'));
   }
@@ -879,8 +871,19 @@
     $('#cvIssues').addEventListener('click', event => {
       const locate = event.target.closest('[data-locate]');
       if (!locate) return;
-      if (locate.dataset.issueNode) App.kit.focusNode(locate.dataset.issueNode);
-      else if (locate.dataset.issueEdge) App.kit.focusEdge(locate.dataset.issueEdge);
+      if (locate.dataset.issueGraph) {
+        App.kit.clearSelection();
+        const inspector = $('#cvInspector');
+        if (inspector) {
+          inspector.classList.add('is-focus');
+          setTimeout(() => inspector.classList.remove('is-focus'), 900);
+        }
+      } else if (locate.dataset.issueEdge) {
+        App.kit.focusEdge(locate.dataset.issueEdge);
+        if (root.RTCondPop) root.RTCondPop.open(locate.dataset.issueEdge);
+      } else if (locate.dataset.issueNode) {
+        App.kit.focusNode(locate.dataset.issueNode);
+      }
     });
   }
 
@@ -942,7 +945,6 @@
   }
 
   function bindOverlays() {
-    $('#cvCondClose').addEventListener('click', () => root.RTCondPop.close());
     $('#cvQuick').addEventListener('click', event => {
       const item = event.target.closest('[data-qkind]');
       if (item) createQuick(item.dataset.qkind);
@@ -1098,6 +1100,11 @@
     const modelsReady = api.get('/admin/models')
       .then(result => { App.models = result.models || []; })
       .catch(() => { App.models = []; });
+    const periodsReady = api.get('/admin/time-periods')
+      .then(result => {
+        App.periods = (result.periods || []).map(period => period && period.name).filter(Boolean);
+      })
+      .catch(() => { App.periods = []; });
     try {
       const treeResult = await api.get('/admin/trees');
       App.trees = treeResult.trees || [];
@@ -1117,8 +1124,13 @@
       toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
       loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
     }
+    await Promise.all([modelsReady, periodsReady]);
+    /* 模型/时段目录晚到：重绘一次让检查器的下拉框拿到最新选项。 */
+    if (App.tree) {
+      renderAll();
+      refreshDirty();
+    }
     App.booted = true;
-    await modelsReady;
   }
 
   boot();

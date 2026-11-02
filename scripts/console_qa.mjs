@@ -1356,6 +1356,655 @@ test('Task 10 · Delete/Backspace do nothing while an input is focused', async (
   assert.equal(after.nodes.length, before.nodes.length);
 });
 
+/* ── Task 11 · 检查器 / 条件双入口 / 级联删除 ─────────────────────── */
+
+async function waitCondPop(edgeId) {
+  await page.waitForFunction(id => {
+    const pop = document.getElementById('cvCondPop');
+    return pop && !pop.hidden && pop.dataset.edgeId === id;
+  }, edgeId, { timeout: 4000 });
+}
+
+async function waitInspectorBranch(branch, id) {
+  await page.waitForFunction(([kind, value]) => {
+    const root = document.querySelector('#cvInspectorBody [data-ins-branch]');
+    return root && root.dataset.insBranch === kind && (!value || root.dataset.insId === value);
+  }, [branch, id], { timeout: 4000 });
+}
+
+async function waitEdgeCondition(edgeId, check) {
+  await page.waitForFunction(([id, expected]) => {
+    const edge = window.App.graph.edges.find(item => item.id === id);
+    if (!edge) return false;
+    if (expected === null) return edge.condition === null;
+    return edge.condition && Object.keys(expected).every(key => edge.condition[key] === expected[key]);
+  }, [edgeId, check], { timeout: 4000 });
+}
+
+async function edgeOf(edgeId) {
+  return page.evaluate(id => {
+    const edge = window.App.graph.edges.find(item => item.id === id);
+    return edge ? JSON.parse(JSON.stringify(edge)) : null;
+  }, edgeId);
+}
+
+async function danglingEdgeIds() {
+  return page.evaluate(() => {
+    const graph = window.App.graph;
+    return graph.edges.filter(edge => {
+      const source = window.RTGraph.findNode(graph, edge.source);
+      const target = window.RTGraph.findNode(graph, edge.target);
+      return !source || !target ||
+        !window.RTGraph.portOf(source, edge.source_port, graph) ||
+        !window.RTGraph.portOf(target, edge.target_port, graph);
+    }).map(edge => edge.id);
+  });
+}
+
+async function issueCodes() {
+  return page.evaluate(() => window.App.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code));
+}
+
+async function openIssuesPanel() {
+  await page.locator('#cvIssuesBtn').click();
+  await page.waitForFunction(() => !document.getElementById('cvIssues').hidden);
+}
+
+test('Task 11 · numeric condition editors expose six operators in both entries, reject bad values, and undo once', async () => {
+  await openCanvas();
+  const edgeId = 'e-cap-strong-and-power';
+  await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
+  await waitCondPop(edgeId);
+
+  const operators = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvCondPop [data-cond-field="op"] option'))
+    .map(option => [option.value, option.textContent.trim()]));
+  assert.deepEqual(operators.map(item => item[0]), ['gt', 'gte', 'lt', 'lte', 'eq', 'neq'],
+    'numeric operator dropdown does not expose the six canonical ops in order');
+  assert.deepEqual(operators.map(item => item[1]), ['>', '≥', '<', '≤', '=', '≠']);
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="op"]').inputValue(), 'gt');
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="value"]').inputValue(), '0.65');
+
+  /* NaN / Infinity / empty / |v| > 1e9 must stay in the editor and write nothing. */
+  const historyBefore = (await appSnapshot()).history;
+  for (const raw of ['', '   ', 'NaN', 'Infinity', '1e10', '-1000000001', 'abc']) {
+    await page.locator('#cvCondPop [data-cond-field="op"]').selectOption('gt');
+    await page.locator('#cvCondPop [data-cond-field="value"]').fill(raw);
+    await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+    assert.equal(await page.locator('#cvCondPop').isHidden(), false, `bad threshold ${JSON.stringify(raw)} closed the editor`);
+    const message = (await page.locator('#cvCondPop [data-cond-error]').textContent()).trim();
+    assert.ok(message.length > 0, `bad threshold ${JSON.stringify(raw)} produced no inline error`);
+    const current = (await edgeOf(edgeId)).condition;
+    assert.deepEqual(current, { op: 'gt', value: 0.65 }, `bad threshold ${JSON.stringify(raw)} wrote the condition`);
+    assert.deepEqual((await appSnapshot()).history, historyBefore, 'a rejected condition entered the history stack');
+  }
+
+  /* Valid path through the slot chip entry. */
+  await page.locator('#cvCondPop [data-cond-field="op"]').selectOption('lte');
+  await page.locator('#cvCondPop [data-cond-field="value"]').fill('0.42');
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  await page.waitForFunction(id => {
+    const edge = window.App.graph.edges.find(item => item.id === id);
+    return edge && edge.condition && edge.condition.op === 'lte' && edge.condition.value === 0.42;
+  }, edgeId);
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+  const chipText = (await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim();
+  assert.equal(chipText, '≤ 0.42');
+  let snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'behavior', 'condition confirm did not mark the draft behavior-dirty');
+  assert.deepEqual(snapshot.history, { undo: true, redo: false });
+  await page.locator('#cvUndo').click();
+  await waitEdgeCondition(edgeId, { op: 'gt', value: 0.65 });
+  snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'clean');
+  assert.deepEqual(snapshot.history, { undo: false, redo: true }, 'one confirm must be exactly one history entry');
+
+  /* The inspector edge branch uses the exact same form contract and commit path. */
+  await openCanvas();
+  await clickEdge(edgeId);
+  await waitInspectorBranch('edge', edgeId);
+  assert.equal(await page.locator('#cvInspectorBody [data-ins-branch="edge"]').getAttribute('data-edge-type'), 'number');
+  await page.locator('#cvInspectorBody [data-cond-field="op"]').selectOption('neq');
+  await page.locator('#cvInspectorBody [data-cond-field="value"]').fill('0.7');
+  await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
+  await waitEdgeCondition(edgeId, { op: 'neq', value: 0.7 });
+  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim(), '≠ 0.7');
+  snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'behavior');
+  await page.locator('#cvUndo').click();
+  await waitEdgeCondition(edgeId, { op: 'gt', value: 0.65 });
+  assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
+});
+
+test('Task 11 · boolean conditions toggle = true / = false from both entries without illegal states', async () => {
+  await openCanvas();
+  const edgeId = 'e-selected-easy-light';
+  await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
+  await waitCondPop(edgeId);
+  const options = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvCondPop [data-cond-field="bool"] option')).map(option => option.value));
+  assert.deepEqual(options, ['true', 'false']);
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="bool"]').inputValue(), 'true');
+
+  /* Cancel and Esc save the original copy and write nothing. */
+  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-act="cond-cancel"]').click();
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+  assert.equal((await edgeOf(edgeId)).condition, null);
+  let snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'clean');
+  assert.deepEqual(snapshot.history, { undo: false, redo: false });
+
+  await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
+  await waitCondPop(edgeId);
+  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+  assert.equal((await edgeOf(edgeId)).condition, null);
+  assert.equal((await appSnapshot()).kind, 'clean');
+
+  /* Confirm false → {op:'is', value:false}; then true → canonical null. */
+  await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
+  await waitCondPop(edgeId);
+  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  await waitEdgeCondition(edgeId, { op: 'is', value: false });
+  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim(), '= false');
+  await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
+  await waitCondPop(edgeId);
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="bool"]').inputValue(), 'false');
+  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('true');
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  await waitEdgeCondition(edgeId, null);
+  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim(), '= true');
+  await page.locator('#cvUndo').click();
+  await waitEdgeCondition(edgeId, { op: 'is', value: false });
+
+  /* Inspector entry writes the same shape and one undo restores it. */
+  await openCanvas();
+  await clickEdge(edgeId);
+  await waitInspectorBranch('edge', edgeId);
+  assert.equal(await page.locator('#cvInspectorBody [data-ins-branch="edge"]').getAttribute('data-edge-type'), 'boolean');
+  await page.locator('#cvInspectorBody [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
+  await waitEdgeCondition(edgeId, { op: 'is', value: false });
+  snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'behavior');
+  await page.locator('#cvUndo').click();
+  await waitEdgeCondition(edgeId, null);
+  assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
+});
+
+test('Task 11 · selected edge inspector shows both ends, type, condition and deletes with an affected-edge list', async () => {
+  await openCanvas();
+  const edgeId = 'e-cap-strong-and-power';
+  await clickEdge(edgeId);
+  await waitInspectorBranch('edge', edgeId);
+  const text = await page.locator('#cvInspectorBody').innerText();
+  assert.match(text, /capability/);
+  assert.match(text, /prob\.strong/);
+  assert.match(text, /and-power/);
+  assert.match(text, /in_1/);
+  assert.match(text, /> 0\.65/);
+  assert.ok(await page.evaluate(() => window.t('cv.ins.typeNumber')).then(label => label.length > 0));
+
+  await page.locator('#cvInspectorBody [data-act="ins-delete-edge"]').click();
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  assert.equal(await page.locator('#cvDeleteBody li').count(), 1);
+  const dialog = await page.locator('#cvDeleteBody').innerText();
+  assert.match(dialog, /capability/);
+  assert.match(dialog, /prob\.strong/);
+  assert.match(dialog, /and-power/);
+  assert.match(dialog, /in_1/);
+  await page.locator('[data-act="delete-confirm"]').click();
+  await page.waitForFunction(id => !window.App.graph.edges.some(edge => edge.id === id), edgeId);
+  assert.equal(await page.locator(`#cvEdges path.rtc-edge[data-edge-id="${edgeId}"]`).count(), 0);
+  assert.deepEqual(await danglingEdgeIds(), []);
+  assert.equal((await issueCodes()).includes('edge_port_missing'), false);
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(id => window.App.graph.edges.some(edge => edge.id === id), edgeId);
+  const restored = await edgeOf(edgeId);
+  assert.deepEqual(restored.condition, { op: 'gt', value: 0.65 });
+  assert.equal(restored.target, 'and-power');
+  assert.equal(restored.target_port, 'in_1');
+  assert.equal((await appSnapshot()).kind, 'clean');
+});
+
+test('Task 11 · validate-bar edge and graph issues locate and open the same condition editor / graph settings', async () => {
+  await openCanvas();
+  const edgeId = 'e-clarify-deep';
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(edge => edge.id === id).condition = { op: 'bogus', value: 1 };
+    });
+  }, edgeId);
+  await page.waitForFunction(id => window.App.issues.some(issue =>
+    issue.edge_id === id && issue.code === 'numeric_edge_condition_invalid'), edgeId);
+  assert.equal((await issueCodes()).filter(code => code === 'numeric_edge_condition_invalid').length, 1);
+
+  await openIssuesPanel();
+  await page.locator('#cvIssues [data-issue-edge="e-clarify-deep"]').click();
+  await waitCondPop(edgeId);
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: 'edge', id: edgeId });
+  await page.locator('#cvCondPop [data-cond-field="op"]').selectOption('gt');
+  await page.locator('#cvCondPop [data-cond-field="value"]').fill('0.61');
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  await page.waitForFunction(() => !window.App.issues.some(issue => issue.code === 'numeric_edge_condition_invalid'));
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+
+  /* Graph-level issue opens graph settings and can be fixed there. */
+  await page.evaluate(() => {
+    window.App.change('behavior', tree => { tree.root.otherwise_target = null; });
+  });
+  await page.waitForFunction(() => window.App.issues.some(issue => issue.code === 'fallback_missing'));
+  await page.locator('#cvIssuesBtn').click();
+  if (await page.locator('#cvIssues').isHidden()) await page.locator('#cvIssuesBtn').click();
+  await page.locator('#cvIssues [data-issue-graph="1"]').first().click();
+  await waitInspectorBranch('graph', 'root');
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
+  await page.locator('#cvInspectorBody [data-field="otherwise"]').selectOption('standard-target');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => !window.App.issues.some(issue => issue.code === 'fallback_missing'));
+  assert.equal(await page.evaluate(() => window.App.graph.otherwise_target), 'standard-target');
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.graph.otherwise_target === null);
+});
+
+test('Task 11 · NOT shows one slot row, AND/OR show all rows and logic issues locate the node', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  await page.locator('[data-lib-kind="logic-and"]').click();
+  const andId = await page.evaluate(known => {
+    const node = window.App.graph.nodes.find(item =>
+      item.type === 'logic' && item.operator === 'and' && known.indexOf(item.id) < 0);
+    return node && node.id;
+  }, before.nodes.map(node => node.id));
+  assert.ok(andId, 'AND node was not created');
+  await page.waitForFunction(id => window.App.issues.some(issue =>
+    issue.node_id === id && issue.code === 'logic_slot_count'), andId);
+  assert.equal(await page.locator(`#cvNodes [data-node-id="${andId}"] .rtc-slot`).count(), 2,
+    'a new AND gate must render both input rows');
+  assert.equal(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot').count(), 3,
+    'AND renders its two occupied rows plus the next free slot');
+
+  await openIssuesPanel();
+  await page.locator(`#cvIssues [data-issue-node="${andId}"]`).first().click();
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: 'node', id: andId });
+  const centered = await page.evaluate(id => {
+    const stage = document.getElementById('cvStage').getBoundingClientRect();
+    const rect = document.querySelector(`[data-node-id="${id}"]`).getBoundingClientRect();
+    return Math.abs(rect.left + rect.width / 2 - (stage.left + stage.width / 2)) < 60 &&
+      Math.abs(rect.top + rect.height / 2 - (stage.top + stage.height / 2)) < 60;
+  }, andId);
+  assert.equal(centered, true, 'node issue locate did not center the node');
+
+  await page.locator('[data-lib-kind="logic-not"]').click();
+  const notId = await page.evaluate(known => {
+    const node = window.App.graph.nodes.find(item =>
+      item.type === 'logic' && item.operator === 'not' && known.indexOf(item.id) < 0);
+    return node && node.id;
+  }, before.nodes.map(node => node.id));
+  assert.ok(notId, 'NOT node was not created');
+  assert.equal(await page.locator(`#cvNodes [data-node-id="${notId}"] .rtc-slot`).count(), 1,
+    'NOT must render exactly one input row');
+
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      window.RTGraph.addEdge(tree.root, {
+        source: 'cond-text', source_port: 'out', target: id, target_port: 'in_1', condition: null
+      });
+      window.RTGraph.addEdge(tree.root, {
+        source: 'cond-peak', source_port: 'out', target: id, target_port: 'in_2', condition: null
+      });
+    });
+  }, notId);
+  await page.waitForFunction(id => window.App.issues.some(issue =>
+    issue.node_id === id && issue.code === 'logic_slot_count' && /当前 2 个/.test(issue.zh)), notId);
+  assert.equal(await page.locator(`#cvNodes [data-node-id="${notId}"] .rtc-slot`).count(), 1,
+    'NOT with two incoming edges still renders a single slot row');
+});
+
+test('Task 11 · multi-slot question and target rows show source, condition chip and the OR note', async () => {
+  await openCanvas();
+  await dragPort('cond-text', 'out', await portPoint('capability', 'in_2', 'in'));
+  await page.waitForFunction(() => window.App.graph.edges.some(edge =>
+    edge.target === 'capability' && edge.target_port === 'in_2'));
+
+  assert.equal(await page.locator('#cvNodes [data-node-id="capability"] .rtc-slot').count(), 3);
+  const expectedNote = await page.evaluate(() => window.t('cv.slot.orNote'));
+  assert.ok(expectedNote.length > 0);
+  const note = await page.locator('#cvNodes [data-node-id="capability"] .rtc-slots-note').textContent();
+  assert.equal(note.trim(), expectedNote);
+  const rows = page.locator('#cvNodes [data-node-id="capability"] .rtc-slot');
+  assert.match(await rows.nth(0).innerText(), /start/);
+  assert.match(await rows.nth(0).innerText(), /in_1/);
+  assert.equal((await rows.nth(0).locator('[data-cond-edge]').textContent()).trim(), '= true');
+  assert.match(await rows.nth(1).innerText(), /cond-text/);
+  assert.equal((await rows.nth(1).locator('[data-cond-edge]').textContent()).trim(), '= true');
+
+  await rows.nth(1).locator('[data-cond-edge]').click();
+  await waitCondPop(await rows.nth(1).locator('[data-cond-edge]').getAttribute('data-cond-edge'));
+  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  await page.waitForFunction(() => {
+    const row = document.querySelectorAll('#cvNodes [data-node-id="capability"] .rtc-slot')[1];
+    return row && row.querySelector('[data-cond-edge]').textContent.trim() === '= false';
+  });
+
+  await dragPort('cond-text', 'out', await portPoint('strong-target', 'in_2', 'in'));
+  await page.waitForFunction(() => window.App.graph.edges.some(edge =>
+    edge.target === 'strong-target' && edge.target_port === 'in_2'));
+  assert.equal(await page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slot').count(), 3);
+  const targetNote = await page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slots-note').textContent();
+  assert.equal(targetNote.trim(), expectedNote);
+  const targetRows = page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slot');
+  assert.match(await targetRows.nth(0).innerText(), /selected\.strong|capability/);
+  assert.match(await targetRows.nth(1).innerText(), /cond-text/);
+});
+
+test('Task 11 · option delete lists selected/prob edges, leaves no dangling ports and one undo restores all', async () => {
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  await page.locator('#cvInspectorBody [data-opt-row="strong"] [data-act="opt-delete"]').click();
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  assert.equal(await page.locator('#cvDeleteBody li').count(), 3);
+  const dialog = await page.locator('#cvDeleteBody').innerText();
+  assert.match(dialog, /selected\.strong/);
+  assert.match(dialog, /prob\.strong/);
+  assert.match(dialog, /strong-target/);
+  assert.match(dialog, /and-power/);
+  await page.locator('[data-act="delete-confirm"]').click();
+  await page.waitForFunction(() => !window.App.graph.nodes.find(node => node.id === 'capability')
+    .options.some(option => option.key === 'strong'));
+  assert.equal(await page.locator('#cvNodes [data-node-id="capability"] [data-optkey="strong"]').count(), 0);
+  assert.deepEqual(await danglingEdgeIds(), []);
+  assert.equal((await issueCodes()).includes('edge_port_missing'), false);
+  assert.equal(await page.evaluate(() => window.App.graph.edges.some(edge =>
+    edge.source === 'capability' && (edge.source_port === 'selected.strong' || edge.source_port === 'prob.strong'))), false);
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.graph.nodes.find(node => node.id === 'capability')
+    .options.some(option => option.key === 'strong'));
+  const restored = await appSnapshot();
+  const restoredEdges = restored.edges.filter(edge => edge.source === 'capability' &&
+    (edge.source_port === 'selected.strong' || edge.source_port === 'prob.strong'));
+  assert.equal(restoredEdges.length, 3, 'one undo did not restore all option edges');
+  assert.equal(restoredEdges.find(edge => edge.source_port === 'prob.strong').condition.value, 0.65);
+  assert.equal(restoredEdges.find(edge => edge.source_port === 'selected.strong').condition, null);
+  assert.deepEqual(await danglingEdgeIds(), []);
+  assert.equal(restored.kind, 'clean');
+});
+
+test('Task 11 · option key rename syncs selected/prob source ports and conflicts stay in the editor', async () => {
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  const historyBefore = (await appSnapshot()).history;
+
+  await page.locator('#cvInspectorBody [data-opt-row="easy"] [data-opt-field="key"]').fill('strong');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const error = document.querySelector('#cvInspectorBody [data-ins-error]');
+    return error && !error.hidden && error.textContent.trim().length > 0;
+  });
+  const conflict = (await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim();
+  assert.match(conflict, /已存在|already exists/i);
+  let snapshot = await appSnapshot();
+  assert.deepEqual(snapshot.history, historyBefore, 'conflicting rename pushed history');
+  assert.equal(await page.evaluate(() => !!window.RTGraph.findNode(window.App.graph, 'capability')
+    .options.find(option => option.key === 'easy')), true);
+  assert.equal(snapshot.edges.find(edge => edge.id === 'e-selected-easy-light').source_port, 'selected.easy');
+
+  await page.locator('#cvInspectorBody [data-opt-row="easy"] [data-opt-field="key"]').fill('light');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => window.App.graph.edges.some(edge => edge.source_port === 'selected.light'));
+  snapshot = await appSnapshot();
+  assert.equal(snapshot.edges.find(edge => edge.id === 'e-selected-easy-light').source_port, 'selected.light');
+  assert.equal(snapshot.edges.find(edge => edge.id === 'e-selected-easy-light').condition, null);
+  const ports = await page.evaluate(() => window.RTGraph.portsOf(
+    window.RTGraph.findNode(window.App.graph, 'capability'), window.App.graph).map(port => port.id));
+  assert.ok(ports.includes('selected.light') && ports.includes('prob.light'));
+  assert.equal(ports.includes('selected.easy'), false);
+  assert.equal(await page.locator('#cvNodes [data-node-id="capability"] [data-optkey="light"]').count(), 1);
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.graph.edges.some(edge => edge.source_port === 'selected.easy'));
+  snapshot = await appSnapshot();
+  assert.equal(await page.evaluate(() => window.RTGraph.findNode(window.App.graph, 'capability')
+    .options.some(option => option.key === 'easy')), true);
+  assert.equal(snapshot.edges.some(edge => edge.source_port === 'selected.light'), false);
+});
+
+test('Task 11 · question and condition inspectors edit instructions, options, keywords, periods and criteria', async () => {
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  const original = await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'capability'))));
+  const instructions = '这条请求需要哪个能力档位？请结合复杂度与输出长度判断。';
+  await page.locator('#cvInspectorBody [data-field="instructions"]').fill(instructions);
+  await page.locator('#cvInspectorBody [data-opt-row="easy"] [data-opt-field="label"]').fill('轻量档');
+  await page.locator('#cvInspectorBody [data-act="opt-add"]').click();
+  const newRow = page.locator('#cvInspectorBody [data-opt-row]').last();
+  await newRow.locator('[data-opt-field="key"]').fill('medium');
+  await newRow.locator('[data-opt-field="label"]').fill('中档模型');
+  await newRow.locator('[data-opt-field="capability"]').fill('中等复杂度写作与总结。');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'capability');
+    return node && node.options.length === 4 && node.instructions.indexOf('复杂度') >= 0;
+  });
+  let snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'behavior');
+  assert.equal(await page.evaluate(() => !!window.RTGraph.findNode(window.App.graph, 'capability')
+    .options.find(option => option.key === 'easy')), true);
+  const saved = await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'capability'))));
+  assert.equal(saved.options.find(option => option.key === 'easy').label, '轻量档');
+  assert.deepEqual(saved.options.find(option => option.key === 'medium'),
+    { key: 'medium', label: '中档模型', capability: '中等复杂度写作与总结。' });
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'capability').options.length === 3);
+  snapshot = await appSnapshot();
+  const undone = await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'capability'))));
+  assert.equal(undone.instructions, original.instructions);
+  assert.equal(undone.options.find(option => option.key === 'easy').label, original.options[0].label);
+
+  await clickNode('cond-text');
+  await waitInspectorBranch('node', 'cond-text');
+  await page.locator('#cvInspectorBody [data-field="keywords"]').fill('抢修, 停电, 电梯, 故障');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'cond-text');
+    return node && node.contains_any.indexOf('电梯') >= 0;
+  });
+  assert.deepEqual(await page.evaluate(() => window.RTGraph.findNode(window.App.graph, 'cond-text').contains_any),
+    ['抢修', '停电', '电梯', '故障']);
+  assert.equal(await page.locator('#cvNodes [data-node-id="cond-text"] [data-kw="电梯"]').count(), 1);
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'cond-text').contains_any.indexOf('电梯') < 0);
+
+  await clickNode('cond-peak');
+  await waitInspectorBranch('node', 'cond-peak');
+  await page.locator('#cvInspectorBody [data-field="periods"] input[value="normal"]').check();
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'cond-peak');
+    return node && node.periods.indexOf('normal') >= 0;
+  });
+  assert.deepEqual(await page.evaluate(() => window.RTGraph.findNode(window.App.graph, 'cond-peak').periods),
+    ['peak', 'normal']);
+  assert.equal(await page.locator('#cvNodes [data-node-id="cond-peak"] [data-period="normal"]').count(), 1);
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'cond-peak').periods.length === 1);
+
+  const beforeScore = await appSnapshot();
+  await page.locator('[data-lib-kind="question-score"]').click();
+  const scoreIds = await page.evaluate(known => window.App.graph.nodes
+    .filter(node => node.type === 'question' && node.question_type === 'score' && known.indexOf(node.id) < 0)
+    .map(node => node.id), beforeScore.nodes.map(node => node.id));
+  assert.equal(scoreIds.length, 1);
+  await waitInspectorBranch('node', scoreIds[0]);
+  await page.locator('#cvInspectorBody [data-field="criteria"]').fill('2, 5, 9');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(id => {
+    const node = window.RTGraph.findNode(window.App.graph, id);
+    return node && JSON.stringify(node.criteria) === '[2,5,9]';
+  }, scoreIds[0]);
+});
+
+test('Task 11 · logic and target inspectors edit operator, models, reasoning, priority and strategy with guards', async () => {
+  await openCanvas();
+  await clickNode('and-power');
+  await waitInspectorBranch('node', 'and-power');
+  await page.locator('#cvInspectorBody [data-field="operator"]').selectOption('or');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'and-power').operator === 'or');
+  assert.equal(await page.locator('#cvNodes [data-node-id="and-power"]').getAttribute('data-operator'), 'or');
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'and-power').operator === 'and');
+
+  await clickNode('strong-target');
+  await waitInspectorBranch('node', 'strong-target');
+  const modelIds = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-model-field="model"] option')).map(option => option.value));
+  assert.ok(modelIds.includes('deepseek-v3') && modelIds.includes('qwen3-32b') && modelIds.includes('qwen3-8b'),
+    'model options do not come from /admin/models: ' + modelIds.join(','));
+  const reasoning = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-model-field="reasoning"] option')).map(option => option.value));
+  assert.ok(reasoning.includes('low') && reasoning.includes('medium') && reasoning.includes('high'),
+    'reasoning options do not come from the model profile: ' + reasoning.join(','));
+
+  const historyBefore = (await appSnapshot()).history;
+  await page.locator('#cvInspectorBody [data-field="priority"]').fill('1');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const error = document.querySelector('#cvInspectorBody [data-ins-error]');
+    return error && !error.hidden && error.textContent.trim().length > 0;
+  });
+  assert.match((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(), /priority/i);
+  assert.deepEqual((await appSnapshot()).history, historyBefore, 'duplicate priority pushed history');
+  assert.equal(await page.evaluate(() => window.RTGraph.findNode(window.App.graph, 'strong-target').priority), 3);
+
+  await page.locator('#cvInspectorBody [data-field="priority"]').fill('7');
+  await page.locator('#cvInspectorBody [data-model-field="model"]').first().selectOption('deepseek-v3');
+  await page.locator('#cvInspectorBody [data-model-field="reasoning"]').first().selectOption('high');
+  await page.locator('#cvInspectorBody [data-field="strategy"]').selectOption('least_inflight');
+  await page.locator('#cvInspectorBody [data-field="capability"]').fill('强推理通用模型：复杂分析。');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'strong-target');
+    return node && node.priority === 7 && node.models.length === 1 &&
+      node.models[0].model === 'deepseek-v3' && node.models[0].reasoning === 'high';
+  });
+  const target = await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'strong-target'))));
+  assert.equal(target.strategy, 'least_inflight');
+  assert.equal(target.capability, '强推理通用模型：复杂分析。');
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'strong-target');
+    return node && node.priority === 3 && node.models[0].model === 'qwen3-32b' && node.models[0].reasoning === 'medium';
+  });
+});
+
+test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits and reject an invalid timezone', async () => {
+  await openCanvas();
+  await waitInspectorBranch('graph', 'root');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="name"]').inputValue(), '电力优先决策组');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="timezone"]').inputValue(), 'Asia/Shanghai');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="sticky"]').isChecked(), true);
+  assert.equal(await page.locator('#cvInspectorBody [data-field="stickyTtl"]').inputValue(), '1800');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="otherwise"]').inputValue(), 'standard-target');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="errorFallback"]').inputValue(), 'light-target');
+  const limits = await page.locator('#cvInspectorBody').innerText();
+  assert.match(limits, /200/);
+  assert.match(limits, /400/);
+  assert.match(limits, /32/);
+  assert.match(limits, /8/);
+
+  const historyBefore = (await appSnapshot()).history;
+  await page.locator('#cvInspectorBody [data-field="timezone"]').fill('Mars/Phobos');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => {
+    const error = document.querySelector('#cvInspectorBody [data-ins-error]');
+    return error && !error.hidden && error.textContent.trim().length > 0;
+  });
+  assert.match((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(), /时区|timezone/i);
+  assert.equal(await page.evaluate(() => window.App.tree.timezone), 'Asia/Shanghai');
+  assert.deepEqual((await appSnapshot()).history, historyBefore);
+
+  await page.locator('#cvInspectorBody [data-field="name"]').fill('电力优先决策组 · v2');
+  await page.locator('#cvInspectorBody [data-field="timezone"]').fill('UTC');
+  await page.locator('#cvInspectorBody [data-field="sticky"]').uncheck();
+  await page.locator('#cvInspectorBody [data-field="stickyTtl"]').fill('900');
+  await page.locator('#cvInspectorBody [data-field="otherwise"]').selectOption('power-target');
+  await page.locator('#cvInspectorBody [data-field="errorFallback"]').selectOption('power-target');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => window.App.tree.name === '电力优先决策组 · v2' &&
+    window.App.tree.timezone === 'UTC' && window.App.tree.sticky.enabled === false &&
+    window.App.tree.sticky.ttl_seconds === 900 && window.App.graph.otherwise_target === 'power-target');
+  const snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'behavior');
+  assert.equal(await page.evaluate(() => window.App.graph.error_fallback), 'power-target');
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.tree.name === '电力优先决策组' &&
+    window.App.tree.timezone === 'Asia/Shanghai' && window.App.tree.sticky.enabled === true &&
+    window.App.tree.sticky.ttl_seconds === 1800 && window.App.graph.otherwise_target === 'standard-target');
+  assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
+});
+
+test('Task 11 · Backspace inside editor inputs is safe, all overlays close with Esc and labels are locatable', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  await page.locator('#cvInspectorBody [data-field="instructions"]').click();
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Delete');
+  await expectNever(() => !document.getElementById('cvDeleteModal').hidden,
+    'Delete/Backspace in an inspector input opened the delete confirmation');
+  assert.equal((await appSnapshot()).nodes.length, before.nodes.length);
+
+  const chip = page.locator('#cvNodes [data-cond-edge="e-cap-strong-and-power"]');
+  const chipAria = await chip.getAttribute('aria-label');
+  assert.ok(chipAria && chipAria.includes('in_1'), 'condition chip has no locatable aria-label');
+  await chip.click();
+  await waitCondPop('e-cap-strong-and-power');
+  const popAria = await page.evaluate(() => ({
+    role: document.getElementById('cvCondPop').getAttribute('role'),
+    label: document.getElementById('cvCondPop').getAttribute('aria-label')
+  }));
+  assert.equal(popAria.role, 'dialog');
+  assert.equal(popAria.label, await page.evaluate(() => window.t('cv.condTitle')));
+  assert.equal(await page.locator('#cvInspector').getAttribute('aria-label'),
+    await page.evaluate(() => window.t('cv.inspector')));
+  await page.locator('#cvCondPop [data-cond-field="value"]').click();
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Delete');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+
+  const point = await blankPoint();
+  await dragPort('capability', 'prob.easy', point);
+  await page.waitForFunction(() => !document.getElementById('cvQuick').hidden, null, { timeout: 3000 });
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvQuick').isHidden(), true);
+
+  await clickNode('and-power');
+  await page.keyboard.press('Delete');
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvDeleteModal').isHidden(), true);
+
+  await openIssuesPanel();
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvIssues').isHidden(), true);
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
