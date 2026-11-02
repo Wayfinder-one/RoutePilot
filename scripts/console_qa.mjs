@@ -75,6 +75,15 @@ let repoDbFingerprint = null;
 
 const pageErrors = [];
 const externalRequests = [];
+/* 故意制造的 4xx 会让 Chromium 打印 "Failed to load resource" console error；
+   用例显式声明预期数量后，监听器按数量吞掉这些网络层报错（其余错误照旧失败）。 */
+let expectedHttpStatusErrors = 0;
+function expectHttpStatusError(count) {
+  expectedHttpStatusErrors += count == null ? 1 : count;
+}
+function resetExpectedHttpStatusErrors() {
+  expectedHttpStatusErrors = 0;
+}
 const mockState = { systemoneCalls: [], chatCalls: [], scenarioCalls: {} };
 
 export async function screenshot(name) {
@@ -528,7 +537,13 @@ async function startBrowser() {
     pageErrors.push('pageerror: ' + String(error && error.stack ? error.stack : error));
   });
   page.on('console', message => {
-    if (message.type() === 'error') pageErrors.push('console: ' + message.text());
+    if (message.type() !== 'error') return;
+    const text = 'console: ' + message.text();
+    if (expectedHttpStatusErrors > 0 && /Failed to load resource|加载资源失败|422/.test(text)) {
+      expectedHttpStatusErrors -= 1;
+      return;
+    }
+    pageErrors.push(text);
   });
   page.on('request', request => {
     const url = request.url();
@@ -2296,6 +2311,693 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
     if (held) { try { await held.abort(); } catch { /* already gone */ } }
     await page.unroute(url => url.pathname === '/admin/time-periods' && url.searchParams.has('timeout-probe'));
   }
+});
+
+/* ── Task 12 · 保存 / 启用 / dirty / 导入导出 / 校验定位 ────────────── */
+
+/* 每个 Task 12 用例都从同一份服务端基线开始：power-priority 恢复为示例图并启用。
+   管理面没有 DELETE /admin/trees/{id}，用例新建的组留在临时库里但保持未启用。 */
+async function ensureBaselineTree() {
+  const example = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
+  const restored = await api('PUT', '/admin/trees/' + TREE_ID, {
+    id: TREE_ID,
+    name: '电力优先决策组',
+    timezone: 'Asia/Shanghai',
+    sticky: { enabled: true, ttl_seconds: 1800 },
+    root: example
+  });
+  if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
+  return (await api('GET', '/admin/trees/' + TREE_ID)).tree;
+}
+
+async function serverTree(id) {
+  return (await api('GET', '/admin/trees/' + encodeURIComponent(id))).tree;
+}
+
+async function dirtyBadge() {
+  return page.evaluate(() => {
+    const badge = document.getElementById('cvDirty');
+    return {
+      hidden: badge.hidden,
+      kind: badge.dataset.kind,
+      text: badge.textContent.trim(),
+      appKind: window.App.kind(),
+      cleanHidden: document.getElementById('cvClean').hidden
+    };
+  });
+}
+
+async function dragNodeBy(nodeId, dx, dy) {
+  const before = await page.evaluate(id => {
+    const node = window.App.graph.nodes.find(item => item.id === id);
+    return { x: node.position.x, y: node.position.y };
+  }, nodeId);
+  const box = await page.locator(`[data-node-id="${nodeId}"]`).first().boundingBox();
+  assert.ok(box, `node not visible: ${nodeId}`);
+  const start = { x: box.x + box.width / 2, y: box.y + 11 };
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x + dx, start.y + dy, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForFunction(([id, previous]) => {
+    const node = window.App.graph.nodes.find(item => item.id === id);
+    return node && (node.position.x !== previous.x || node.position.y !== previous.y);
+  }, [nodeId, before], { timeout: 4000 });
+  return page.evaluate(id => {
+    const node = window.App.graph.nodes.find(item => item.id === id);
+    return { x: node.position.x, y: node.position.y };
+  }, nodeId);
+}
+
+async function saveNow() {
+  await page.locator('#cvSave').click();
+  await page.waitForFunction(() => window.App.changeKind === 'clean' && !!window.App.saved,
+    null, { timeout: 8000 });
+}
+
+async function beforeUnloadBlocked() {
+  return page.evaluate(() => {
+    const event = new Event('beforeunload', { cancelable: true });
+    window.dispatchEvent(event);
+    return { prevented: event.defaultPrevented, returnValue: event.returnValue };
+  });
+}
+
+async function exportViaUi() {
+  const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
+  await page.locator('#cvExport').click();
+  const download = await downloadPromise;
+  const file = await download.path();
+  assert.ok(file, 'browser download has no local path');
+  return { name: download.suggestedFilename(), text: fs.readFileSync(file, 'utf8') };
+}
+
+async function setImportPayload(payload, name) {
+  await page.locator('#cvImportFile').setInputFiles({
+    name: name || 'graph.sr-routing-graph-v3.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload))
+  });
+}
+
+async function waitConfirmDialog() {
+  await page.waitForSelector('#cvConfirmModal:not([hidden])', { timeout: 4000 });
+  return page.locator('#cvConfirmBody').innerText();
+}
+
+async function waitToastIncludes(fragment, timeout) {
+  await page.waitForFunction(value => {
+    const host = document.getElementById('cvToast');
+    return !!host && host.textContent.indexOf(value) >= 0;
+  }, fragment, { timeout: timeout || 6000 });
+}
+
+test('Task 12 · moving a node saves layout-only: revision unchanged, coordinates persist, badge 仅布局', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  const moved = await dragNodeBy('start', 66, 38);
+  const badge = await dirtyBadge();
+  assert.equal(badge.hidden, false);
+  assert.equal(badge.kind, 'layout');
+  assert.equal(badge.appKind, 'layout');
+  assert.equal(badge.text, await page.evaluate(() => window.t('cv.dirtyLayout')));
+
+  await saveNow();
+  const saved = await page.evaluate(() => ({
+    kind: window.App.kind(),
+    revision: window.App.tree.tree_revision,
+    savedRevision: window.App.saved.tree_revision,
+    badgeHidden: document.getElementById('cvDirty').hidden
+  }));
+  assert.equal(saved.kind, 'clean');
+  assert.equal(saved.revision, baseline.tree_revision, 'layout-only save changed the local revision');
+  assert.equal(saved.savedRevision, baseline.tree_revision);
+  assert.equal(saved.badgeHidden, true);
+
+  const server = await serverTree(TREE_ID);
+  assert.equal(server.tree_revision, baseline.tree_revision,
+    'a position-only save changed the server tree_revision');
+  const start = server.root.nodes.find(node => node.id === 'start');
+  assert.ok(Math.abs(start.position.x - moved.x) < 0.01, 'saved X coordinate differs from the draft');
+  assert.ok(Math.abs(start.position.y - moved.y) < 0.01, 'saved Y coordinate differs from the draft');
+});
+
+test('Task 12 · save clears dirty while the undo history stays usable', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await page.evaluate(() => window.App.kit.clearSelection());
+  await waitInspectorBranch('graph', 'root');
+  await page.locator('#cvInspectorBody [data-field="name"]').fill('保存后仍可撤销');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => window.App.tree.name === '保存后仍可撤销' && window.App.kind() === 'display');
+  const beforeSave = await dirtyBadge();
+  assert.equal(beforeSave.hidden, false);
+  assert.equal(beforeSave.text, await page.evaluate(() => window.t('cv.dirty')));
+
+  await saveNow();
+  const after = await page.evaluate(() => ({
+    kind: window.App.kind(),
+    canUndo: window.App.kit.canUndo(),
+    canRedo: window.App.kit.canRedo(),
+    revision: window.App.tree.tree_revision,
+    savedRevision: window.App.saved.tree_revision,
+    badgeHidden: document.getElementById('cvDirty').hidden
+  }));
+  assert.equal(after.kind, 'clean');
+  assert.equal(after.canUndo, true, 'save cleared the undo history');
+  assert.equal(after.canRedo, false);
+  assert.equal(after.badgeHidden, true);
+  assert.equal(after.revision, after.savedRevision);
+  assert.equal((await serverTree(TREE_ID)).name, '保存后仍可撤销');
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.tree.name === '电力优先决策组');
+  assert.equal((await dirtyBadge()).kind, 'display', 'undoing a save did not mark the draft dirty again');
+});
+
+test('Task 12 · timezone/sticky are behavior while title/capability/name are display changes', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  await waitInspectorBranch('graph', 'root');
+  await page.locator('#cvInspectorBody [data-field="timezone"]').fill('UTC');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => window.App.tree.timezone === 'UTC');
+  let badge = await dirtyBadge();
+  assert.equal(badge.kind, 'behavior', 'timezone change was not classified as behavior');
+  assert.equal(badge.text, await page.evaluate(() => window.t('cv.dirty')));
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.tree.timezone === 'Asia/Shanghai' && window.App.kind() === 'clean');
+
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  await page.locator('#cvInspectorBody [data-field="title"]').fill('能力分档（展示标题）');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() =>
+    window.App.graph.nodes.find(node => node.id === 'capability').title === '能力分档（展示标题）');
+  assert.equal((await dirtyBadge()).kind, 'display', 'question title was not classified as display');
+
+  await clickNode('strong-target');
+  await waitInspectorBranch('node', 'strong-target');
+  await page.locator('#cvInspectorBody [data-field="capability"]').fill('强推理（展示说明）');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() =>
+    window.App.graph.nodes.find(node => node.id === 'strong-target').capability === '强推理（展示说明）');
+  assert.equal((await dirtyBadge()).kind, 'display', 'target capability was not classified as display');
+
+  await page.evaluate(() => window.App.kit.clearSelection());
+  await waitInspectorBranch('graph', 'root');
+  await page.locator('#cvInspectorBody [data-field="name"]').fill('展示字段决策组');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => window.App.tree.name === '展示字段决策组');
+  badge = await dirtyBadge();
+  assert.equal(badge.kind, 'display', 'tree name was not classified as display');
+  assert.equal(badge.text, await page.evaluate(() => window.t('cv.dirty')));
+
+  await saveNow();
+  const server = await serverTree(TREE_ID);
+  assert.equal(server.tree_revision, baseline.tree_revision,
+    'a display-only save changed the server tree_revision');
+  assert.equal(server.name, '展示字段决策组');
+  assert.equal(server.root.nodes.find(node => node.id === 'capability').title, '能力分档（展示标题）');
+  assert.equal(server.root.nodes.find(node => node.id === 'strong-target').capability, '强推理（展示说明）');
+});
+
+test('Task 12 · unsaved switch-group asks one shared confirmation and beforeunload guards only dirty drafts', async () => {
+  await ensureBaselineTree();
+  const otherId = 'qa-switch-group';
+  const existing = await api('GET', '/admin/trees');
+  if (!existing.trees.some(tree => tree.id === otherId)) {
+    await api('POST', '/admin/trees/' + TREE_ID + '/copy', { id: otherId, name: 'QA 切换组' });
+  }
+  await openCanvas();
+  let event = await beforeUnloadBlocked();
+  assert.equal(event.prevented, false, 'a clean tree blocked beforeunload');
+
+  await dragNodeBy('start', 40, 30);
+  event = await beforeUnloadBlocked();
+  assert.equal(event.prevented, true, 'a dirty draft did not block beforeunload');
+  /* Chrome 把 legacy returnValue='' 暴露成取消标志（false / ''）；两者都表示已请求确认。 */
+  assert.equal(Boolean(event.returnValue), false, 'beforeunload did not set the legacy returnValue');
+
+  const select = page.locator('#cvTreeSelect');
+  await select.selectOption(otherId);
+  const dialog = await waitConfirmDialog();
+  assert.ok(dialog.includes(await page.evaluate(() => window.t('cv.confirmSwitchTitle'))),
+    'switch confirmation is not the shared dirty dialog');
+  await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
+  await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
+  assert.equal(await page.evaluate(() => window.App.treeId), TREE_ID);
+  assert.equal(await select.inputValue(), TREE_ID);
+  assert.equal((await dirtyBadge()).kind, 'layout');
+
+  await select.selectOption(otherId);
+  await waitConfirmDialog();
+  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+  await page.waitForFunction(id => window.App.treeId === id && window.App.changeKind === 'clean',
+    otherId, { timeout: 8000 });
+  assert.equal(await page.evaluate(() => window.App.tree.name), 'QA 切换组');
+  event = await beforeUnloadBlocked();
+  assert.equal(event.prevented, false, 'the clean switched tree still blocked beforeunload');
+  await ensureBaselineTree();
+});
+
+test('Task 12 · new tree builds a directly saveable and enableable start→target graph (POST then enable)', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await page.locator('#cvNewTree').click();
+  await page.waitForFunction(() => window.App.saved === null && window.App.kind() !== 'clean');
+  const draft = await page.evaluate(() => ({
+    id: window.App.tree.id,
+    treeId: window.App.treeId,
+    kind: window.App.kind(),
+    types: window.App.graph.nodes.map(node => node.type).sort(),
+    edges: window.App.graph.edges.map(edge => [edge.source, edge.source_port, edge.target, edge.target_port]),
+    otherwise: window.App.graph.otherwise_target,
+    errorFallback: window.App.graph.error_fallback,
+    target: (window.App.graph.nodes.find(node => node.type === 'target') || {}).id,
+    finite: window.App.graph.nodes.every(node =>
+      window.RTGraph && node.position && Number.isFinite(node.position.x) && Number.isFinite(node.position.y))
+  }));
+  assert.equal(draft.kind, 'behavior');
+  assert.match(draft.id, /^[a-z0-9]{12}$/, 'new tree id is not the 12-char UUID slice');
+  assert.deepEqual(draft.types, ['start', 'target']);
+  assert.equal(draft.edges.length, 1);
+  assert.deepEqual(draft.edges[0], ['start', 'out', draft.target, 'in_1']);
+  assert.equal(draft.otherwise, draft.target, 'otherwise fallback does not point at the target');
+  assert.equal(draft.errorFallback, draft.target, 'error fallback does not point at the target');
+  assert.equal(draft.finite, true, 'new tree nodes have no finite coordinates');
+
+  await saveNow();
+  const saved = await page.evaluate(() => ({
+    id: window.App.treeId,
+    savedId: window.App.saved.id,
+    enabled: window.App.tree.enabled,
+    kind: window.App.kind()
+  }));
+  assert.equal(saved.id, draft.id);
+  assert.equal(saved.savedId, draft.id);
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.kind, 'clean');
+  const server = await serverTree(draft.id);
+  assert.equal(server.enabled, false);
+  assert.equal(server.root.nodes.length, 2);
+  assert.equal(server.root.edges.length, 1);
+
+  await page.locator('#cvEnable').click();
+  await page.waitForFunction(() => window.App.tree.enabled === true, null, { timeout: 8000 });
+  assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.enabled')));
+  const enabled = await serverTree(draft.id);
+  assert.equal(enabled.enabled, true);
+  const list = await api('GET', '/admin/trees');
+  assert.equal(list.trees.find(tree => tree.id === draft.id).enabled, true);
+  assert.equal(list.trees.find(tree => tree.id === TREE_ID).enabled, false);
+  await ensureBaselineTree();
+});
+
+test('Task 12 · enable auto-saves a dirty draft before calling the enable endpoint', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const requests = [];
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'POST' && url.pathname === '/admin/trees') requests.push('create');
+    if (request.method() === 'POST' && /\/admin\/trees\/[^/]+\/enable$/.test(url.pathname)) requests.push('enable');
+  };
+  page.on('request', onRequest);
+  try {
+    await page.locator('#cvNewTree').click();
+    await page.waitForFunction(() => window.App.saved === null);
+    await page.locator('#cvEnable').click();
+    await page.waitForFunction(() => window.App.tree.enabled === true && window.App.changeKind === 'clean',
+      null, { timeout: 10000 });
+    assert.deepEqual(requests, ['create', 'enable'], 'enable did not auto-save the dirty new tree first');
+    assert.equal((await dirtyBadge()).hidden, true);
+    const server = await serverTree(await page.evaluate(() => window.App.treeId));
+    assert.equal(server.enabled, true);
+  } finally {
+    page.off('request', onRequest);
+    await ensureBaselineTree();
+  }
+});
+
+test('Task 12 · loading the example asks for confirmation and replaces the graph as one undo step', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const moved = await dragNodeBy('start', 48, 34);
+
+  await page.locator('#cvLoadExample').click();
+  const dialog = await waitConfirmDialog();
+  assert.ok(dialog.includes(await page.evaluate(() => window.t('cv.confirmExampleTitle'))),
+    'example load did not reuse the shared dirty dialog');
+  await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
+  await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
+  const kept = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y, kind: window.App.kind() };
+  });
+  assert.deepEqual({ x: kept.x, y: kept.y }, { x: moved.x, y: moved.y });
+  assert.equal(kept.kind, 'layout');
+
+  await page.locator('#cvLoadExample').click();
+  await waitConfirmDialog();
+  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+  /* 示例是异步 fetch 的：等待它真正替换草稿（示例 start 坐标），不能只看节点数（本来就是 15）。 */
+  await page.waitForFunction(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return window.App.graph.nodes.length === 15 && window.App.graph.edges.length === 15 &&
+      node && node.position.x === 20 && node.position.y === 150 && window.App.kind() === 'clean';
+  }, null, { timeout: 8000 });
+  const loaded = await page.evaluate(() => ({
+    kind: window.App.kind(),
+    canUndo: window.App.kit.canUndo(),
+    start: (() => {
+      const node = window.App.graph.nodes.find(item => item.id === 'start');
+      return { x: node.position.x, y: node.position.y };
+    })()
+  }));
+  assert.equal(loaded.kind, 'clean');
+  assert.equal(loaded.canUndo, true);
+  assert.notDeepEqual(loaded.start, { x: moved.x, y: moved.y });
+
+  /* 一次撤销必须回到载入前的完整草稿（拖拽后的坐标），而不是半张示例图。 */
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.graph.nodes.length === 15 && window.App.kind() === 'layout');
+  const undone = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y };
+  });
+  assert.deepEqual(undone, { x: moved.x, y: moved.y },
+    'loading the example was not a single replace-entire-graph history operation');
+});
+
+test('Task 12 · export downloads the complete v3 envelope including timezone and sticky', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  const download = await exportViaUi();
+  assert.equal(download.name, TREE_ID + '.sr-routing-graph-v3.json');
+  const parsed = JSON.parse(download.text);
+  assert.equal(parsed.kind, 'sr-routing-graph');
+  assert.equal(parsed.version, 3);
+  assert.equal(parsed.name, baseline.name);
+  assert.equal(parsed.timezone, 'Asia/Shanghai');
+  assert.deepEqual(parsed.sticky, { enabled: true, ttl_seconds: 1800 });
+  assert.equal(parsed.root.nodes.length, 15);
+  assert.equal(parsed.root.edges.length, 15);
+  assert.equal(parsed.root.otherwise_target, 'standard-target');
+  assert.equal(parsed.root.error_fallback, 'light-target');
+  assert.equal((await dirtyBadge()).kind, 'clean', 'export mutated the draft');
+});
+
+test('Task 12 · importing an exported v3 graph round-trips behavior canonical in one history step', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const source = await exportViaUi();
+  const sourceCanonical = await page.evaluate(text => {
+    const parsed = JSON.parse(text);
+    return window.RTGraph.behaviorCanonical({
+      name: parsed.name, timezone: parsed.timezone, sticky: parsed.sticky, root: parsed.root
+    });
+  }, source.text);
+
+  await page.locator('#cvNewTree').click();
+  await page.waitForFunction(() => window.App.saved === null && window.App.graph.nodes.length === 2);
+  const newId = await page.evaluate(() => window.App.treeId);
+  await setImportPayload(source.text);
+  await page.waitForFunction(() =>
+    window.App.graph.nodes.length === 15 && window.App.graph.edges.length === 15, null, { timeout: 8000 });
+  const imported = await page.evaluate(() => ({
+    id: window.App.treeId,
+    treeId: window.App.tree.id,
+    name: window.App.tree.name,
+    timezone: window.App.tree.timezone,
+    sticky: window.App.tree.sticky,
+    kind: window.App.kind(),
+    canonical: window.RTGraph.behaviorCanonical(window.App.tree),
+    canUndo: window.App.kit.canUndo()
+  }));
+  assert.equal(imported.id, newId, 'import replaced the target group id');
+  assert.equal(imported.treeId, newId);
+  assert.equal(imported.name, JSON.parse(source.text).name);
+  assert.equal(imported.timezone, 'Asia/Shanghai');
+  assert.deepEqual(imported.sticky, { enabled: true, ttl_seconds: 1800 });
+  assert.equal(imported.canonical, sourceCanonical, 'import round-trip changed the behavior canonical');
+  assert.equal(imported.kind, 'behavior');
+  assert.equal(imported.canUndo, true);
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.App.graph.nodes.length === 2);
+  assert.equal(await page.evaluate(() => window.App.graph.edges.length), 1,
+    'one undo did not restore the pre-import draft');
+});
+
+test('Task 12 · import rejects legacy/version-2 payloads with the fixed copy and keeps the draft', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await dragNodeBy('start', 36, 24);
+
+  /* 未保存时先弹共享确认框；取消后不选文件、草稿保持。 */
+  await page.locator('#cvImport').click();
+  const dialog = await waitConfirmDialog();
+  assert.ok(dialog.includes(await page.evaluate(() => window.t('cv.confirmImportTitle'))),
+    'import did not reuse the shared dirty dialog');
+  await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
+  await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
+  assert.equal((await dirtyBadge()).kind, 'layout');
+
+  const rejection = await page.evaluate(() => window.RTGraph.REJECT_MESSAGE);
+  const keptBefore = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y };
+  });
+  await setImportPayload({ root: { type: 'jev', nodes: [], edges: [] }, version: 1 }, 'legacy-jev.json');
+  await waitToastIncludes(rejection);
+  const kept = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y, kind: window.App.kind() };
+  });
+  assert.deepEqual({ x: kept.x, y: kept.y }, keptBefore, 'a rejected legacy import replaced the draft');
+  assert.equal(kept.kind, 'layout');
+  assert.equal(await page.evaluate(() => window.App.graph.nodes.length), 15);
+
+  /* 正确 kind、version=2：同一固定拒绝文案。 */
+  await clearToasts();
+  const source = await exportViaUi();
+  const version2 = JSON.parse(source.text);
+  version2.version = 2;
+  await clearToasts();
+  await setImportPayload(version2, 'version-2.json');
+  await waitToastIncludes(rejection);
+  assert.deepEqual(await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y };
+  }), keptBefore, 'a rejected version-2 import replaced the draft');
+});
+
+test('Task 12 · a valid v3 import without positions lays every node out with finite coordinates', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const example = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
+  const stripped = JSON.parse(JSON.stringify(example));
+  stripped.nodes.forEach(node => { delete node.position; });
+  await setImportPayload({
+    kind: 'sr-routing-graph',
+    version: 3,
+    name: '电力优先决策组',
+    timezone: 'Asia/Shanghai',
+    sticky: { enabled: true, ttl_seconds: 1800 },
+    root: stripped
+  }, 'missing-positions.json');
+  await page.waitForFunction(() =>
+    window.App.graph.nodes.length === 15 && window.App.graph.nodes.every(node =>
+      node.position && Number.isFinite(node.position.x) && Number.isFinite(node.position.y)),
+  null, { timeout: 8000 });
+  const result = await page.evaluate(() => ({
+    kind: window.App.kind(),
+    issues: window.App.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code),
+    nodes: window.App.graph.nodes.map(node => ({ id: node.id, x: node.position.x, y: node.position.y })),
+    expected: window.RTGraph.layoutPositions('dag', {
+      nodes: window.App.graph.nodes, edges: window.App.graph.edges
+    })
+  }));
+  assert.deepEqual(result.issues, [], 'position-less valid v3 import failed structure validation');
+  result.nodes.forEach(node => {
+    assert.ok(Number.isFinite(node.x) && Number.isFinite(node.y), `${node.id} has no finite position`);
+    assert.deepEqual({ x: node.x, y: node.y }, result.expected[node.id],
+      `${node.id} was not placed by the shared DAG layout`);
+  });
+  assert.equal(result.kind, 'layout', 'filling missing positions must stay layout-only');
+});
+
+test('Task 12 · auto layout stays layout-only and saving it keeps the server revision', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  await dragNodeBy('start', 70, 45);
+  const expected = await page.evaluate(() => window.RTGraph.layoutPositions('dag', window.App.graph));
+  await page.locator('#cvAutoLayout').click();
+  await page.waitForFunction(positions => window.App.graph.nodes.every(node => {
+    const next = positions[node.id];
+    return next && node.position.x === next.x && node.position.y === next.y;
+  }), expected, { timeout: 4000 });
+  const laidOut = await page.evaluate(() => ({
+    kind: window.App.kind(),
+    badge: document.getElementById('cvDirty').dataset.kind,
+    positions: Object.fromEntries(window.App.graph.nodes.map(node =>
+      [node.id, { x: node.position.x, y: node.position.y }]))
+  }));
+  assert.equal(laidOut.kind, 'layout');
+  assert.equal(laidOut.badge, 'layout');
+
+  await saveNow();
+  const server = await serverTree(TREE_ID);
+  assert.equal(server.tree_revision, baseline.tree_revision,
+    'auto layout leaked into the server behavior revision');
+  server.root.nodes.forEach(node => {
+    const position = laidOut.positions[node.id];
+    assert.ok(position, `${node.id} missing from the client layout`);
+    assert.ok(Math.abs(node.position.x - position.x) < 0.01, `${node.id} saved X differs from the DAG layout`);
+    assert.ok(Math.abs(node.position.y - position.y) < 0.01, `${node.id} saved Y differs from the DAG layout`);
+  });
+});
+
+test('Task 12 · a failed save blocks enable and 422 issues locate by node/edge/slot/graph', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  /* 用禁用中的新组（enable 才会先保存）；载入示例，让 422 Issue 有可定位的节点/边。 */
+  await page.locator('#cvNewTree').click();
+  await page.waitForFunction(() => window.App.saved === null && window.App.graph.nodes.length === 2);
+  const targetId = await page.evaluate(() => window.App.treeId);
+  await page.locator('#cvLoadExample').click();
+  await waitConfirmDialog();
+  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+  await page.waitForFunction(() => window.App.graph.nodes.length === 15 &&
+    window.App.graph.edges.length === 15 &&
+    window.App.graph.nodes.some(node => node.id === 'deep-target'), null, { timeout: 8000 });
+  await saveNow();
+  assert.equal(await page.evaluate(() => window.App.tree.enabled), false,
+    'the fixture tree must start disabled so enable really runs');
+  await dragNodeBy('start', 40, 30);
+  const issuesPayload = [
+    { code: 'invalid_timezone', level: 'hard', zh: '时区无效（QA）', en: 'Invalid timezone (QA)', node_id: '', edge_id: '', port: '' },
+    { code: 'question_incomplete', level: 'hard', zh: '问题节点不完整（QA）', en: 'Incomplete question (QA)', node_id: 'capability', edge_id: '', port: '' },
+    { code: 'numeric_edge_condition_invalid', level: 'hard', zh: '槽位条件非法（QA）', en: 'Invalid slot condition (QA)', node_id: 'deep-target', edge_id: 'e-clarify-deep', port: 'in_1' },
+    { code: 'fallback_missing', level: 'hard', zh: '兜底缺失（QA）', en: 'Missing fallback (QA)', node_id: '', edge_id: '', port: 'otherwise_target' }
+  ];
+  const enableRequests = [];
+  const onRequest = request => {
+    if (request.method() === 'POST' && /\/admin\/trees\/[^/]+\/enable$/.test(new URL(request.url()).pathname)) {
+      enableRequests.push(request.url());
+    }
+  };
+  const putHandler = async route => {
+    const url = new URL(route.request().url());
+    if (route.request().method() === 'PUT' && url.pathname === '/admin/trees/' + targetId) {
+      await route.fulfill({
+        status: 422,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: issuesPayload })
+      });
+      return;
+    }
+    await route.continue();
+  };
+  page.on('request', onRequest);
+  await page.route('**/admin/trees/**', putHandler);
+  try {
+    /* 这个 422 是测试故意制造的：允许 Chromium 的网络层 console error 一条。 */
+    expectHttpStatusError(1);
+    await page.locator('#cvEnable').click();
+    await page.waitForFunction(() => window.App.issues.length === 4 &&
+      !document.getElementById('cvIssues').hidden, null, { timeout: 8000 });
+    await page.waitForTimeout(300);
+    assert.equal(enableRequests.length, 0, 'enable was sent even though the save failed');
+    assert.equal(await page.evaluate(() => window.App.tree.enabled), false);
+    assert.deepEqual(await page.evaluate(() => window.App.issues.map(issue => issue.code)),
+      ['invalid_timezone', 'question_incomplete', 'numeric_edge_condition_invalid', 'fallback_missing']);
+    assert.equal(await page.evaluate(() => window.App.issues.every(issue => issue.level === 'hard')), true);
+
+    /* 节点定位：选中并居中 */
+    await page.locator('#cvIssues [data-issue-node="capability"]').click();
+    assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()),
+      { kind: 'node', id: 'capability' });
+    assert.equal(await page.evaluate(() => {
+      const stage = document.getElementById('cvStage').getBoundingClientRect();
+      const rect = document.querySelector('[data-node-id="capability"]').getBoundingClientRect();
+      return Math.abs(rect.left + rect.width / 2 - (stage.left + stage.width / 2)) < 60 &&
+        Math.abs(rect.top + rect.height / 2 - (stage.top + stage.height / 2)) < 60;
+    }), true, 'node issue locate did not center the node');
+
+    /* 边 / 槽位定位：Issue 保留 slot 字段，选中边并打开同一条件浮层 */
+    const slotIssue = await page.evaluate(() =>
+      window.App.issues.find(issue => issue.code === 'numeric_edge_condition_invalid'));
+    assert.equal(slotIssue.port, 'in_1', 'the slot issue lost its port');
+    await page.locator('#cvIssues [data-issue-edge="e-clarify-deep"]').click();
+    await waitCondPop('e-clarify-deep');
+    assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()),
+      { kind: 'edge', id: 'e-clarify-deep' });
+    await page.keyboard.press('Escape');
+
+    /* 图级定位：打开检查器图设置 */
+    await page.locator('#cvIssues [data-issue-graph="1"]').first().click();
+    assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
+    assert.equal(await page.evaluate(() =>
+      document.getElementById('cvInspector').classList.contains('is-focus')), true);
+    await waitInspectorBranch('graph', 'root');
+  } finally {
+    resetExpectedHttpStatusErrors();
+    page.off('request', onRequest);
+    await page.unroute('**/admin/trees/**', putHandler);
+    await ensureBaselineTree();
+  }
+});
+
+test('Task 12 · example graph saves, enables and survives a page refresh with a consistent revision', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await page.locator('#cvNewTree').click();
+  await page.waitForFunction(() => window.App.saved === null && window.App.graph.nodes.length === 2);
+  const newId = await page.evaluate(() => window.App.treeId);
+  await page.locator('#cvLoadExample').click();
+  await waitConfirmDialog();
+  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+  /* 新建草稿是 2 个节点：必须等示例 root 真正替换后再保存。 */
+  await page.waitForFunction(() => window.App.graph.nodes.length === 15 &&
+    window.App.graph.edges.length === 15 &&
+    window.App.graph.nodes.some(node => node.id === 'deep-target'), null, { timeout: 8000 });
+  await saveNow();
+
+  const savedServer = await serverTree(newId);
+  assert.equal(savedServer.enabled, false);
+  assert.equal(savedServer.root.nodes.length, 15);
+  assert.equal(savedServer.root.edges.length, 15);
+  const revision = savedServer.tree_revision;
+
+  await page.locator('#cvEnable').click();
+  await page.waitForFunction(() => window.App.tree.enabled === true, null, { timeout: 8000 });
+  const enabledServer = await serverTree(newId);
+  assert.equal(enabledServer.enabled, true);
+  assert.equal(enabledServer.tree_revision, revision, 'enabling the example graph changed its revision');
+
+  await openCanvas();
+  const after = await page.evaluate(() => ({
+    treeId: window.App.treeId,
+    revision: window.App.tree.tree_revision,
+    enabled: window.App.tree.enabled,
+    nodes: window.App.graph.nodes.length,
+    edges: window.App.graph.edges.length,
+    kind: window.App.kind(),
+    revisionLabel: document.getElementById('cvRevision').textContent
+  }));
+  assert.equal(after.treeId, newId, 'refresh booted a different tree than the enabled one');
+  assert.equal(after.revision, revision, 'refreshed tree revision differs from the GET revision');
+  assert.equal(after.enabled, true);
+  assert.equal(after.nodes, 15);
+  assert.equal(after.edges, 15);
+  assert.equal(after.kind, 'clean');
+  assert.ok(after.revisionLabel.includes(revision.slice(0, 10)),
+    'toolbar revision label does not show the refreshed revision');
+  assert.equal((await serverTree(newId)).tree_revision, revision);
+  await ensureBaselineTree();
 });
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */

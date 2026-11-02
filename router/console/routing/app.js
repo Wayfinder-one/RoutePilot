@@ -178,6 +178,8 @@
     treeId: '',
     saved: null,
     issues: [],
+    issueRows: [],
+    snapshotRevision: '',
     replay: null,
     changeKind: 'clean',
     selection: { kind: null, id: null },
@@ -202,6 +204,10 @@
   let toastSeq = 0;
   /* 检查器里有未提交输入：焦点仍在表单控件内，或本次渲染后发生过 input/change。 */
   let inspectorDirty = false;
+  /* 共享的「丢弃草稿」确认框；null = 未打开。 */
+  let confirmState = null;
+  /* 保存请求在途：避免双击保存/启用时重复提交。 */
+  let saving = false;
 
   function inspectorEditing() {
     if (inspectorDirty) return true;
@@ -287,26 +293,84 @@
     }
     const panel = $('#cvIssues');
     if (!panel) return;
+    const rows = counts.hard.concat(counts.hints);
+    /* 校验条点击按行号取回原始 Issue（服务端 422 与本地 validate 共用同一份定位规则）。 */
+    App.issueRows = rows;
     if (panel.hidden) { panel.innerHTML = ''; return; }
     const lang = (typeof LANG === 'string' && LANG === 'en') ? 'en' : 'zh';
-    const rows = counts.hard.concat(counts.hints);
-    panel.innerHTML = rows.map(issue => {
-      const title = (lang === 'en' && issue.en) ? issue.en : issue.zh;
-      /* 图级问题（时区 / 兜底 / 限额 / 解析）在检查器图设置里修；边问题开条件浮层；节点问题选中居中。 */
-      const graphLevel = issue.code === 'invalid_timezone' || issue.code === 'fallback_missing' ||
-        issue.code === 'graph_parse_error' || issue.port === 'otherwise_target' ||
-        issue.port === 'error_fallback' || (!issue.node_id && !issue.edge_id);
-      const target = issue.level === 'hint' ? '' : (graphLevel
-        ? ' data-issue-graph="1"'
-        : (issue.edge_id
-          ? ' data-issue-edge="' + esc(issue.edge_id) + '"'
-          : ' data-issue-node="' + esc(issue.node_id) + '"'));
+    panel.innerHTML = rows.map((issue, index) => {
+      const title = (lang === 'en' && issue.en)
+        ? issue.en
+        : (issue.zh || issue.msg || issue.en || issue.code || '');
+      const target = issueTarget(issue);
+      const attrs = target
+        ? (target.kind === 'graph'
+          ? ' data-issue-graph="1"'
+          : target.kind === 'edge'
+            ? ' data-issue-edge="' + esc(target.id) + '"'
+            : ' data-issue-node="' + esc(target.id) + '"') + ' data-issue-idx="' + index + '"'
+        : '';
       return '<div class="rtc-issue ' + (issue.level === 'hint' ? 'is-hint' : 'is-hard') + '">' +
         '<span class="rtc-idot"></span><span class="rtc-issue-text">' + esc(title) + '</span>' +
-        (target ? '<button type="button" class="rtc-issue-locate" data-locate="1"' + target + '>' +
+        (attrs ? '<button type="button" class="rtc-issue-locate" data-locate="1"' + attrs + '>' +
           esc(t('cv.issueLocate')) + '</button>' : '') +
         '</div>';
     }).join('') || '<div class="rtc-issue is-ok">' + esc(t('cv.issueNone')) + '</div>';
+  }
+
+  /* ── 校验定位：edge_id + port → node_id → 图设置（§5.1 / §6.10） ── */
+  /* 这些码的修复入口在检查器「图设置」，即使服务端顺手带了 node_id（如兜底指向）也不选节点。 */
+  const GRAPH_LEVEL_CODES = {
+    invalid_timezone: true,
+    fallback_missing: true,
+    graph_parse_error: true,
+    limit_exceeded: true,
+    decision_service_unavailable: true,
+    start_count: true
+  };
+
+  function issueTarget(issue) {
+    if (!issue || issue.level === 'hint') return null;
+    if (issue.edge_id) return { kind: 'edge', id: String(issue.edge_id), port: String(issue.port || '') };
+    if (!GRAPH_LEVEL_CODES[issue.code] && issue.node_id) return { kind: 'node', id: String(issue.node_id) };
+    return { kind: 'graph' };
+  }
+
+  function focusInspector() {
+    const inspector = $('#cvInspector');
+    if (!inspector) return;
+    inspector.classList.add('is-focus');
+    setTimeout(() => inspector.classList.remove('is-focus'), 900);
+  }
+
+  function locateIssue(issue) {
+    const target = issueTarget(issue);
+    if (!target) return false;
+    if (target.kind === 'edge') {
+      const edge = ((App.graph && App.graph.edges) || []).find(item => item && item.id === target.id);
+      if (!edge) return false;
+      App.kit.focusEdge(target.id);
+      if (root.RTCondPop) root.RTCondPop.open(target.id);
+      return true;
+    }
+    if (target.kind === 'node') {
+      if (!RTGraph.findNode(App.graph, target.id)) return false;
+      App.kit.focusNode(target.id);
+      return true;
+    }
+    App.kit.clearSelection();
+    focusInspector();
+    return true;
+  }
+  App.locateIssue = locateIssue;
+
+  function revealIssues() {
+    const panel = $('#cvIssues');
+    if (!panel) return;
+    panel.hidden = false;
+    renderIssues();
+    const button = $('#cvIssuesBtn');
+    if (button) button.setAttribute('aria-expanded', 'true');
   }
 
   /* ── 渲染：小地图（只读 graph positions/viewport，不写 dirty） ── */
@@ -840,6 +904,7 @@
   }
 
   function closeOverlays() {
+    if (confirmState) { settleConfirm(false); return true; }
     if (App.quick) { closeQuick(); return true; }
     const pop = $('#cvCondPop');
     if (pop && !pop.hidden) { root.RTCondPop.close(); return true; }
@@ -852,6 +917,337 @@
     return false;
   }
 
+  /* ── 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） ───────────── */
+  const CONFIRM_TITLES = {
+    switch: 'cv.confirmSwitchTitle',
+    example: 'cv.confirmExampleTitle',
+    import: 'cv.confirmImportTitle',
+    new: 'cv.confirmNewTitle'
+  };
+
+  function askDiscard(reason) {
+    return new Promise(resolve => {
+      const modal = $('#cvConfirmModal');
+      const body = $('#cvConfirmBody');
+      if (!modal || !body) { resolve(true); return; }
+      if (confirmState) { confirmState.resolve(false); confirmState = null; }
+      const title = t(CONFIRM_TITLES[reason] || 'cv.confirmSwitchTitle');
+      body.innerHTML = '<h3>' + esc(title) + '</h3>' +
+        '<p class="rtc-dialog-lead">' + esc(t('cv.confirmDirtyBody')) + '</p>' +
+        '<div class="rtc-dialog-acts">' +
+        '<button type="button" class="btn sm" data-act="confirm-cancel">' + esc(t('cv.confirmCancel')) + '</button>' +
+        '<button type="button" class="btn sm danger" data-act="confirm-discard">' + esc(t('cv.confirmDiscard')) + '</button>' +
+        '</div>';
+      body.setAttribute('aria-label', title);
+      modal.hidden = false;
+      confirmState = { resolve: resolve };
+      const cancel = body.querySelector('[data-act="confirm-cancel"]');
+      if (cancel) cancel.focus();
+    });
+  }
+
+  function settleConfirm(ok) {
+    const state = confirmState;
+    confirmState = null;
+    const modal = $('#cvConfirmModal');
+    if (modal) modal.hidden = true;
+    if (state) state.resolve(!!ok);
+  }
+
+  /* ── 保存 / 启用 / 切换 / 新建 / 示例 / 导入导出 ─────────────────── */
+  function serverIssues(error) {
+    const detail = error && error.detail;
+    if (!Array.isArray(detail)) return null;
+    const issues = detail
+      .filter(item => item && typeof item === 'object' && !Array.isArray(item))
+      .map(item => Object.assign({ level: 'hard' }, item));
+    return issues.length ? issues : null;
+  }
+
+  function upsertTree(tree) {
+    if (!tree) return;
+    const list = App.trees || [];
+    const index = list.findIndex(item => item && item.id === tree.id);
+    if (index >= 0) list[index] = clone(tree);
+    else list.push(clone(tree));
+    App.trees = list;
+  }
+
+  /* 保存成功的唯一基线：App.saved = 服务端回包的完整 envelope（§2.8）。 */
+  function applySavedResponse(result) {
+    const savedTree = result && result.tree;
+    if (!savedTree) return null;
+    if (savedTree.name != null) App.tree.name = savedTree.name; /* 服务端会 trim 名称 */
+    App.tree.id = savedTree.id || App.treeId;
+    App.tree.enabled = !!savedTree.enabled;
+    App.tree.tree_revision = savedTree.tree_revision || '';
+    App.tree.updated_at = savedTree.updated_at || '';
+    App.treeId = App.tree.id;
+    App.saved = clone(savedTree);
+    App.snapshotRevision = result.snapshot_revision != null
+      ? result.snapshot_revision
+      : App.snapshotRevision;
+    upsertTree(savedTree);
+    bindTreeSelectOptions();
+    return savedTree;
+  }
+
+  /* 保存 payload 只含完整 envelope 字段：不发送 enabled / tree_revision / updated_at。 */
+  async function saveTree() {
+    if (!App.tree || saving) return false;
+    saving = true;
+    const isNew = !App.saved;
+    const payload = {
+      id: App.treeId,
+      name: String(App.tree.name == null ? '' : App.tree.name).trim(),
+      timezone: App.tree.timezone || 'Asia/Shanghai',
+      sticky: RTGraph.clone(App.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
+      root: RTGraph.clone(App.tree.root)
+    };
+    try {
+      const result = isNew
+        ? await api.post('/admin/trees', payload)
+        : await api.put('/admin/trees/' + encodeURIComponent(App.treeId), payload);
+      applySavedResponse(result);
+      App.issues = RTGraph.validate(App.tree.root);
+      /* 在检查器里还有未提交输入时不做整页重绘（复用 boot 的焦点保护）。 */
+      if (inspectorEditing()) renderIssues();
+      else renderAll();
+      refreshDirty();
+      toast(t('cv.toastSaved'));
+      return true;
+    } catch (error) {
+      const issues = serverIssues(error);
+      if (issues) {
+        App.issues = issues;
+        revealIssues();
+        toast(tf('cv.toastSaveIssues', { n: issues.length }), 'error');
+      } else {
+        toast(tf('cv.toastSaveFail', { err: apiErrText(error) }), 'error');
+      }
+      return false;
+    } finally {
+      saving = false;
+    }
+  }
+  App.saveTree = saveTree;
+
+  async function enableTree() {
+    if (!App.tree) return false;
+    if (App.tree.enabled) {
+      toast(t('cv.toastAlreadyEnabled'), 'warn');
+      return true;
+    }
+    /* 启用前先落盘：保存失败（含 422 issue 数组）绝不发 enable。 */
+    if (App.changeKind !== 'clean' || !App.saved) {
+      const saved = await saveTree();
+      if (!saved) return false;
+    }
+    try {
+      const result = await api.post('/admin/trees/' + encodeURIComponent(App.treeId) + '/enable');
+      if (result && Array.isArray(result.trees)) App.trees = result.trees;
+      if (result && result.snapshot_revision != null) App.snapshotRevision = result.snapshot_revision;
+      App.tree.enabled = true;
+      if (App.saved) App.saved.enabled = true;
+      bindTreeSelectOptions();
+      if (inspectorEditing()) {
+        renderIssues();
+        refreshDirty();
+      } else {
+        renderAll();
+        refreshDirty();
+      }
+      toast(t('cv.toastEnabled'));
+      return true;
+    } catch (error) {
+      const issues = serverIssues(error);
+      if (issues) {
+        App.issues = issues;
+        revealIssues();
+        toast(tf('cv.toastEnableIssues', { n: issues.length }), 'error');
+      } else {
+        toast(tf('cv.toastEnableFail', { err: apiErrText(error) }), 'error');
+      }
+      return false;
+    }
+  }
+  App.enableTree = enableTree;
+
+  async function selectTree(id) {
+    if (!id || id === App.treeId) return false;
+    if (App.changeKind !== 'clean') {
+      const discard = await askDiscard('switch');
+      if (!discard) return false;
+    }
+    try {
+      const result = await api.get('/admin/trees/' + encodeURIComponent(id));
+      const tree = result && result.tree;
+      if (!tree || !tree.root) throw new Error('invalid tree payload');
+      loadTree(tree, true);
+      return true;
+    } catch (error) {
+      toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
+      return false;
+    }
+  }
+  App.selectTree = selectTree;
+
+  function newTreeId() {
+    let raw = '';
+    try {
+      raw = root.crypto && typeof root.crypto.randomUUID === 'function'
+        ? root.crypto.randomUUID()
+        : '';
+    } catch (error) { raw = ''; }
+    if (!raw) raw = Date.now().toString(16) + Math.random().toString(16).slice(2);
+    return raw.replace(/[^a-z0-9]/gi, '').slice(0, 12);
+  }
+
+  async function newTree() {
+    if (App.changeKind !== 'clean') {
+      const discard = await askDiscard('new');
+      if (!discard) return false;
+    }
+    const tree = RTGraph.createMinimalTree(defaultModelId());
+    tree.id = newTreeId();
+    tree.name = t('cv.default.name');
+    loadTree(tree, false);
+    toast(t('cv.toastNewTree'));
+    return true;
+  }
+  App.newTree = newTree;
+
+  async function loadExample() {
+    if (App.changeKind !== 'clean') {
+      const discard = await askDiscard('example');
+      if (!discard) return false;
+    }
+    try {
+      const response = await fetch('routing/example.json', { cache: 'no-store' });
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      const example = await response.json();
+      if (!example || example.type !== 'graph' ||
+          !Array.isArray(example.nodes) || !Array.isArray(example.edges)) {
+        throw new Error('invalid example graph');
+      }
+      /* 一次历史操作替换整张图；envelope 的 id/enabled/name/timezone/sticky 保持不变。 */
+      change('behavior', tree => { tree.root = clone(example); });
+      toast(t('cv.toastExampleLoaded'));
+      return true;
+    } catch (error) {
+      toast(tf('cv.toastLoadFail', {
+        err: String(error && error.message != null ? error.message : error)
+      }), 'error');
+      return false;
+    }
+  }
+  App.loadExample = loadExample;
+
+  function exportTree() {
+    if (!App.tree) return false;
+    try {
+      const text = RTGraph.serialize(App.tree);
+      const blob = new Blob([text], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = String(App.treeId || App.tree.id || 'tree') + '.sr-routing-graph-v3.json';
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => {
+        try { URL.revokeObjectURL(url); } catch (error) { /* ignore */ }
+      }, 2000);
+      toast(t('cv.toastExported'));
+      return true;
+    } catch (error) {
+      toast(tf('cv.toastExportFail', {
+        err: String(error && error.message != null ? error.message : error)
+      }), 'error');
+      return false;
+    }
+  }
+  App.exportTree = exportTree;
+
+  /* 导入只接受 v3：先校验 kind/version（固定拒绝文案），再做结构校验；
+     任何失败都保留当前草稿，合法导入作为一次历史操作替换完整 envelope。 */
+  function applyImport(text) {
+    const result = RTGraph.parseImport(text);
+    if (!result || !result.ok) {
+      const reason = (result && result.error) || 'invalid import';
+      toast(tf('cv.toastImportRejected', { err: reason }), 'error');
+      return false;
+    }
+    const issues = Array.isArray(result.issues) ? result.issues : [];
+    const hard = issues.filter(issue => issue.level !== 'hint');
+    if (hard.length) {
+      App.issues = issues;
+      revealIssues();
+      toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
+      return false;
+    }
+    change('behavior', tree => {
+      tree.name = result.tree.name;
+      tree.timezone = result.tree.timezone;
+      tree.sticky = RTGraph.clone(result.tree.sticky);
+      tree.root = RTGraph.clone(result.tree.root);
+    });
+    toast(t('cv.toastImported'));
+    return true;
+  }
+  App.importTree = applyImport;
+
+  async function openImport() {
+    if (App.changeKind !== 'clean') {
+      const discard = await askDiscard('import');
+      if (!discard) return false;
+    }
+    const file = $('#cvImportFile');
+    if (!file) return false;
+    file.value = '';
+    file.click();
+    return true;
+  }
+
+  async function onImportFile(event) {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    if (!file) return;
+    let text = '';
+    try {
+      text = await file.text();
+    } catch (error) {
+      toast(tf('cv.toastImportRejected', {
+        err: String(error && error.message != null ? error.message : error)
+      }), 'error');
+      return;
+    }
+    applyImport(text);
+  }
+
+  /* 自动整理：DAG 分层只写 position；fit 走画布安全区（避开节点库/检查器/小地图/试算台）。 */
+  function autoLayout() {
+    if (!App.graph) return false;
+    const positions = RTGraph.layoutPositions('dag', App.graph);
+    const moved = (App.graph.nodes || []).some(node => {
+      const next = positions[node.id];
+      const current = node.position || {};
+      return !!next && (next.x !== current.x || next.y !== current.y);
+    });
+    if (moved) {
+      change('layout', tree => {
+        tree.root.nodes.forEach(node => {
+          if (positions[node.id]) node.position = { x: positions[node.id].x, y: positions[node.id].y };
+        });
+      });
+    }
+    App.kit.fit({ padding: 24 });
+    toast(t('cv.toastAutoLayout'));
+    return moved;
+  }
+  App.autoLayout = autoLayout;
+
   /* ── 顶栏动作 ─────────────────────────────────────────────────── */
   function bindToolbar() {
     $('#cvUndo').addEventListener('click', () => {
@@ -860,27 +1256,18 @@
     $('#cvRedo').addEventListener('click', () => {
       if (!App.kit.redo()) toast(t('cv.toastNothingRedo'), 'warn');
     });
-    $('#cvAutoLayout').addEventListener('click', () => {
-      if (!App.graph) return;
-      const positions = RTGraph.layoutPositions('dag', App.graph);
-      const moved = (App.graph.nodes || []).some(node => {
-        const next = positions[node.id];
-        const current = node.position || {};
-        return !!next && (next.x !== current.x || next.y !== current.y);
-      });
-      if (moved) {
-        change('layout', tree => {
-          tree.root.nodes.forEach(node => {
-            if (positions[node.id]) node.position = { x: positions[node.id].x, y: positions[node.id].y };
-          });
-        });
-      }
-      App.kit.fit({ padding: 24 });
-      toast(t('cv.toastAutoLayout'));
-    });
-    ['cvImport', 'cvExport', 'cvSave', 'cvEnable', 'cvTryBtn'].forEach(id => {
+    $('#cvAutoLayout').addEventListener('click', autoLayout);
+    const actions = {
+      cvNewTree: newTree,
+      cvLoadExample: loadExample,
+      cvImport: openImport,
+      cvExport: exportTree,
+      cvSave: saveTree,
+      cvEnable: enableTree
+    };
+    Object.keys(actions).forEach(id => {
       const button = document.getElementById(id);
-      if (button) button.addEventListener('click', () => toast(t('cv.task12')));
+      if (button) button.addEventListener('click', () => { actions[id](); });
     });
     $('#cvIssuesBtn').addEventListener('click', () => {
       const panel = $('#cvIssues');
@@ -892,19 +1279,8 @@
     $('#cvIssues').addEventListener('click', event => {
       const locate = event.target.closest('[data-locate]');
       if (!locate) return;
-      if (locate.dataset.issueGraph) {
-        App.kit.clearSelection();
-        const inspector = $('#cvInspector');
-        if (inspector) {
-          inspector.classList.add('is-focus');
-          setTimeout(() => inspector.classList.remove('is-focus'), 900);
-        }
-      } else if (locate.dataset.issueEdge) {
-        App.kit.focusEdge(locate.dataset.issueEdge);
-        if (root.RTCondPop) root.RTCondPop.open(locate.dataset.issueEdge);
-      } else if (locate.dataset.issueNode) {
-        App.kit.focusNode(locate.dataset.issueNode);
-      }
+      const issue = (App.issueRows || [])[Number(locate.dataset.issueIdx)];
+      if (issue) locateIssue(issue);
     });
   }
 
@@ -950,18 +1326,9 @@
     $('#cvTreeSelect').addEventListener('change', async event => {
       const id = event.target.value;
       if (!id || id === App.treeId) return;
-      if (App.changeKind !== 'clean') {
-        event.target.value = App.treeId;
-        toast(t('cv.toastSwitchDirty'), 'warn');
-        return;
-      }
-      try {
-        const result = await api.get('/admin/trees/' + encodeURIComponent(id));
-        loadTree(result.tree, true);
-      } catch (error) {
-        event.target.value = App.treeId;
-        toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
-      }
+      /* 选择框立刻回到当前组；确认/加载成功后再由 loadTree 重建选项。 */
+      event.target.value = App.treeId;
+      await selectTree(id);
     });
   }
 
@@ -980,6 +1347,18 @@
       if (act.dataset.act === 'delete-cancel') hideDelete();
       else if (act.dataset.act === 'delete-confirm') confirmDelete();
     });
+    const confirmModal = $('#cvConfirmModal');
+    if (confirmModal) {
+      confirmModal.addEventListener('click', event => {
+        if (event.target === confirmModal) { settleConfirm(false); return; }
+        const act = event.target.closest('[data-act]');
+        if (!act) return;
+        if (act.dataset.act === 'confirm-cancel') settleConfirm(false);
+        else if (act.dataset.act === 'confirm-discard') settleConfirm(true);
+      });
+    }
+    const importFile = $('#cvImportFile');
+    if (importFile) importFile.addEventListener('change', onImportFile);
   }
 
   const TRY_SAMPLES = [
@@ -1008,7 +1387,9 @@
       const sample = TRY_SAMPLES[Number(chip.dataset.trySample)];
       if (sample) $('#cvTryInput').value = t(sample.text);
     });
-    $('#cvTryRun').addEventListener('click', () => toast(t('cv.task12')));
+    $('#cvTryRun').addEventListener('click', () => toast(t('cv.task13')));
+    const tryButton = $('#cvTryBtn');
+    if (tryButton) tryButton.addEventListener('click', () => toast(t('cv.task13')));
   }
 
   function bindTreeSelectOptions() {
@@ -1088,7 +1469,9 @@
       App.kit.fit();
       renderMinimap();
     });
+
   }
+  App.loadTree = loadTree;
 
   function renderTreeSelect() {
     bindTreeSelectOptions();
@@ -1103,6 +1486,12 @@
     bindTreeSelect();
     bindOverlays();
     bindTryBar();
+    /* 只有存在未保存改动（clean 之外）时才拦截关闭/刷新。 */
+    window.addEventListener('beforeunload', event => {
+      if (!App.tree || App.changeKind === 'clean') return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
     if (typeof root.onLangChange === 'function') {
       root.onLangChange(() => {
         if (!App.booted) return;
@@ -1130,6 +1519,7 @@
     try {
       const treeResult = await api.get('/admin/trees');
       App.trees = treeResult.trees || [];
+      App.snapshotRevision = treeResult.snapshot_revision || '';
       renderTreeSelect();
       const enabled = App.trees.find(tree => tree.enabled) || App.trees[0];
       if (enabled) {

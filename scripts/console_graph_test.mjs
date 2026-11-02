@@ -328,6 +328,34 @@ test('connect rejects self, duplicate, occupied slots and cycles', () => {
   }).ok, false);
 });
 
+test('canConnect tolerates malformed edge entries kept by import instead of throwing', () => {
+  const tree = minimalTree();
+  const graph = tree.root;
+  const target = targetOf(graph);
+  /* parseImport 故意保留非对象 entry 以便 validate 报 graph_parse_error；
+     端口探测/快速创建不能因此抛异常。 */
+  graph.edges.push(null, 42, 'not-an-edge', [1, 2]);
+  const check = RTGraph.canConnect(graph, {
+    source: 'start', source_port: 'out', target: target.id, target_port: 'in_2',
+  });
+  assert.equal(check.ok, true, 'a trailing malformed edge blocked a valid probe');
+  const duplicate = RTGraph.canConnect(graph, {
+    source: 'start', source_port: 'out', target: target.id, target_port: 'in_1',
+  });
+  assert.equal(duplicate.ok, false);
+  assert.match(duplicate.reason, /已存在/);
+  assert.equal(RTGraph.canConnect(graph, {
+    source: 'start', source_port: 'out', target: target.id, target_port: 'in_1',
+  }).ok, false);
+  const imported = RTGraph.parseImport(JSON.stringify({
+    kind: 'sr-routing-graph', version: 3, name: 'x', timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 }, root: graph,
+  }));
+  assert.equal(imported.ok, true);
+  assert.equal(hardIssues(imported.issues).some(issue => issue.code === 'graph_parse_error'), true,
+    'malformed edge entries must still surface as a validation issue');
+});
+
 test('addEdge writes default conditions and stable unique ids', () => {
   const graph = minimalTree().root;
   const target = targetOf(graph);

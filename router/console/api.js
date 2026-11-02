@@ -75,9 +75,9 @@ const api = {
       if (timer) clearTimeout(timer);
     }
   },
-  get(p) { return this.req('GET', p); },
-  put(p, b) { return this.req('PUT', p, b); },
-  post(p, b) { return this.req('POST', p, b); },
+  get(p, o) { return this.req('GET', p, undefined, o); },
+  put(p, b, o) { return this.req('PUT', p, b, o); },
+  post(p, b, o) { return this.req('POST', p, b, o); },
   del(p) { return this.req('DELETE', p); },
   /* 邮箱 + 密码换会话 token（成功后落到 localStorage，调用方只管跳页）。 */
   async login(email, password) {

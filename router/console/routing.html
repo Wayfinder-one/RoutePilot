@@ -30,6 +30,8 @@
   <symbol id="ri-target" viewBox="0 0 16 16"><rect x="2.8" y="2.8" width="10.4" height="4" rx="1"/><rect x="2.8" y="9.2" width="10.4" height="4" rx="1"/><circle cx="5.1" cy="4.8" r=".7" fill="currentColor" stroke="none"/><circle cx="5.1" cy="11.2" r=".7" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-help" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M6.3 6.1a1.8 1.8 0 1 1 2.3 1.7c-.4.2-.6.5-.6.9v.3"/><circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-link" viewBox="0 0 16 16"><path d="M6.2 9.8 9.8 6.2"/><path d="M7 4.4 8.4 3a2.8 2.8 0 0 1 4 4L11 8.4M9 11.6 7.6 13a2.8 2.8 0 0 1-4-4L5 7.6"/></symbol>
+  <symbol id="ri-newtree" viewBox="0 0 16 16"><path d="M3.4 2.8h6.2l3 2.8"/><path d="M3.4 2.8v10.4h4.4"/><path d="M11.6 9.4v3.8M9.7 11.3h3.8"/></symbol>
+  <symbol id="ri-sample" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="6.6" height="6.6" rx="1"/><path d="M6.4 5.8h6.8v7.4H6.4z"/></symbol>
 </svg>
 
 <main class="rtc-main">
@@ -50,6 +52,8 @@
         <button type="button" class="btn sm rtc-iconbtn" id="cvUndo" data-i18n-aria="cv.undo" title="撤销（⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-undo"/></svg></button>
         <button type="button" class="btn sm rtc-iconbtn" id="cvRedo" data-i18n-aria="cv.redo" title="重做（⇧⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-redo"/></svg></button>
         <button type="button" class="btn sm" id="cvAutoLayout"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-layout"/></svg><span data-i18n="cv.autoLayout"></span></button>
+        <button type="button" class="btn sm" id="cvNewTree"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-newtree"/></svg><span data-i18n="cv.newTree"></span></button>
+        <button type="button" class="btn sm" id="cvLoadExample"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-sample"/></svg><span data-i18n="cv.loadExample"></span></button>
         <button type="button" class="btn sm" id="cvImport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-import"/></svg><span data-i18n="cv.import"></span></button>
         <button type="button" class="btn sm" id="cvExport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-export"/></svg><span data-i18n="cv.export"></span></button>
         <button type="button" class="btn sm" id="cvTryBtn"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg><span data-i18n="cv.try"></span></button>
@@ -145,6 +149,14 @@
 <div class="rtc-modal" id="cvDeleteModal" hidden>
   <div class="rtc-dialog" id="cvDeleteBody" role="dialog" aria-modal="true"></div>
 </div>
+
+<!-- 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） -->
+<div class="rtc-modal" id="cvConfirmModal" hidden>
+  <div class="rtc-dialog" id="cvConfirmBody" role="dialog" aria-modal="true"></div>
+</div>
+
+<!-- 导入 v3 图（隐藏文件选择器） -->
+<input type="file" id="cvImportFile" accept=".json,application/json" hidden>
 
 <!-- 轨迹抽屉（Task 13 填充） -->
 <div class="rtc-drawer" id="cvTraceDrawer" hidden></div>

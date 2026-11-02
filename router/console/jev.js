@@ -40,7 +40,8 @@ $('#saveJev').addEventListener('click', async () => {
 $('#testJev').addEventListener('click', async () => {
   $('#testOut').textContent = t('common.loading');
   try {
-    const result = await api.post('/admin/jev/test', { text: $('#testText').value });
+    /* 决策服务单次测试可能跑满可配置的 120s 超时；全局 15s 管理面超时不能中途掐断。 */
+    const result = await api.post('/admin/jev/test', { text: $('#testText').value }, { timeoutMs: 130000 });
     $('#testOut').innerHTML = `<div class="card"><div class="col-h">${esc(result.selected_key)}</div><pre>${esc(JSON.stringify(result, null, 2))}</pre></div>`;
   } catch (error) { $('#testOut').textContent = apiErrText(error); }
 });

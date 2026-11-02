@@ -327,12 +327,14 @@
     }
     if (!targetPort.slot) return { ok: false, reason: '目标不是输入槽位' };
 
-    const duplicated = graphValue.edges.some(edge =>
+    /* 导入会保留非对象条目交给 validate 报错；探测连线时不能因此抛异常。 */
+    const edges = edgesOf(graphValue);
+    const duplicated = edges.some(edge =>
       edge.source === draft.source && edge.source_port === draft.source_port &&
       edge.target === draft.target && edge.target_port === draft.target_port);
     if (duplicated) return { ok: false, reason: '这条连线已存在' };
 
-    const occupied = graphValue.edges.some(edge =>
+    const occupied = edges.some(edge =>
       edge.target === draft.target && edge.target_port === draft.target_port);
     if (occupied) {
       return { ok: false, reason: '该输入槽位已连接一条线，请使用空槽位（数值线可以连到同一个节点的下一个 in_N）' };
