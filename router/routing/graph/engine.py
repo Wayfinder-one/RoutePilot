@@ -63,11 +63,14 @@ def combine_gate(operator, values):
         if len(values) < 2 or any(value == UNKNOWN for value in values):
             return UNKNOWN
         return True
-    if any(value is True for value in values):
-        return True
-    if len(values) < 2 or any(value == UNKNOWN for value in values):
-        return UNKNOWN
-    return False
+    if operator == "or":
+        if any(value is True for value in values):
+            return True
+        if len(values) < 2 or any(value == UNKNOWN for value in values):
+            return UNKNOWN
+        return False
+    # 校验层已拦截非法算子；这里显式失败，绝不把未知算子静默当作 OR。
+    raise ValueError(f"unknown logic operator {operator!r}")
 
 
 def _condition_document(edge: Edge):

@@ -38,6 +38,22 @@ def _raise_issues(issues) -> None:
     raise HTTPException(422, detail=[dict(issue.__dict__) for issue in issues])
 
 
+def _recursion_issue() -> Issue:
+    return Issue(
+        "limit_exceeded",
+        "图结构过深，校验无法在安全深度内完成（节点/边可能超过上限）",
+        "Graph is too deep to validate safely (node/edge limits may be exceeded)",
+    )
+
+
+def _safe_validate(validate, *args):
+    """校验调用兜底：RecursionError 也必须映射为 Issue 数组 422，绝不冒泡成 500。"""
+    try:
+        return validate(*args)
+    except RecursionError:
+        _raise_issues([_recursion_issue()])
+
+
 def _parse_issue(exc: Exception) -> Issue:
     return Issue(
         "graph_parse_error",
@@ -84,7 +100,6 @@ def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
     models = ModelRepo(conn).list()
     return EnableContext(
         known_models={row["id"] for row in models},
-        capabilities={row["id"]: _capability(row) for row in models},
         model_reasoning=model_reasoning_from_db(conn),
         known_periods={period["name"] for period in TimePeriodRepo(conn).load()},
         jev_available=JevConfigRepo(conn).load() is not None,
@@ -93,7 +108,7 @@ def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
 
 def active_tree_issues(conn: sqlite3.Connection):
     tree = active_tree(conn)
-    return [] if tree is None else validate_graph_for_enable(tree, build_enable_context(conn))
+    return [] if tree is None else _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
 
 
 def _published_revision(request: Request) -> str:
@@ -119,7 +134,7 @@ def create_tree(body: dict, request: Request, conn: sqlite3.Connection = Depends
         "root": body.get("root"), "sticky": body.get("sticky"),
         "timezone": body.get("timezone", "Asia/Shanghai"),
     })
-    issues = validate_graph_structure(tree)
+    issues = _safe_validate(validate_graph_structure, tree)
     if issues:
         _raise_issues(issues)
     publisher = request.app.state.publisher
@@ -156,7 +171,10 @@ def update_tree(tree_id: str, body: dict, request: Request, conn: sqlite3.Connec
             "sticky": body.get("sticky", {"enabled": current.sticky.enabled, "ttl_seconds": current.sticky.ttl_seconds}),
             "timezone": body.get("timezone", current.timezone),
         })
-        issues = validate_graph_for_enable(tree, build_enable_context(conn)) if current.enabled else validate_graph_structure(tree)
+        if current.enabled:
+            issues = _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
+        else:
+            issues = _safe_validate(validate_graph_structure, tree)
         if issues:
             _raise_issues(issues)
         with write_transaction(conn):
@@ -191,7 +209,7 @@ def enable_tree(tree_id: str, request: Request, conn: sqlite3.Connection = Depen
     publisher = request.app.state.publisher
     with publisher.locked():
         tree = _tree_or_404(conn, tree_id)
-        issues = validate_graph_for_enable(tree, build_enable_context(conn))
+        issues = _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
         if issues:
             _raise_issues(issues)
         with write_transaction(conn):
@@ -317,11 +335,11 @@ async def try_tree(body: dict, request: Request, conn: sqlite3.Connection = Depe
             now = datetime.fromisoformat(body["now"])
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, detail="now must be an ISO datetime") from exc
-    issues = validate_graph_structure(tree)
+    issues = _safe_validate(validate_graph_structure, tree)
     if issues:
         _raise_issues(issues)
     # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
-    warnings = [dict(issue.__dict__) for issue in validate_graph_for_enable(tree, build_enable_context(conn))]
+    warnings = [dict(issue.__dict__) for issue in _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))]
     snapshot = _try_snapshot(conn, tree)
     try:
         decision = await request.app.state.engine.route(

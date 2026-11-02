@@ -10,6 +10,7 @@ from router.routing.graph.model import (
     Condition,
     Edge,
     ConditionNode,
+    GraphRoot,
     LogicNode,
     Position,
     QuestionNode,
@@ -208,10 +209,24 @@ def test_next_slot_uses_smallest_unoccupied_positive_number():
 def test_slot_keys_reject_invalid_forms():
     assert slot_sort_key("in_1") == 1
     assert slot_sort_key("in_12") == 12
+    assert slot_sort_key("in_400") == 400  # 槽位编号上限 = 边限额
     assert sorted(["in_10", "in_2"], key=slot_sort_key) == ["in_2", "in_10"]
     for bad in ("in_0", "in_01", "in", "in_x", "in_1x", "in_-1", "in_+1", "out", "in_ 1", "IN_1", 3, None):
         with pytest.raises(ValueError, match="in_N"):
             slot_sort_key(bad)
+    for huge in ("in_401", "in_9999"):
+        with pytest.raises(ValueError, match="400"):
+            slot_sort_key(huge)
+
+
+def test_next_slot_refuses_beyond_slot_limit():
+    """400 个槽位都被占用后 next_slot 不得生成 in_401（超出边限额的无效编号）。"""
+    root = GraphRoot("root", (TargetNode("wide", (), 1),), tuple(
+        Edge(f"e{index}", "start", "out", "wide", f"in_{index}")
+        for index in range(1, 401)
+    ))
+    with pytest.raises(ValueError, match="no free input slot"):
+        next_slot(root, "wide")
 
 
 def test_edge_type_reflects_source_port_kind():

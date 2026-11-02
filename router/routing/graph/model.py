@@ -245,6 +245,12 @@ def _node_from_dict(raw) -> GraphNode:
         if not isinstance(options, list):
             raise ValueError("question.options must be a list")
         criteria = raw.get("criteria")
+        # 每类问题只接受自己的配置字段（spec §2.3）：惰性字段若进入 behavior canonical，
+        # 语义无变化的编辑也会 bump revision、让粘性失效（违反 §2.8）。
+        if question_type != "choice" and options:
+            raise ValueError(f"{question_type} question must not declare options")
+        if question_type != "score" and criteria is not None:
+            raise ValueError(f"{question_type} question must not declare criteria")
         return QuestionNode(
             _node_id(raw),
             question_type,
@@ -279,7 +285,11 @@ def _node_from_dict(raw) -> GraphNode:
         if not isinstance(models, list):
             raise ValueError("target.models must be a list")
         priority = raw.get("priority")
-        if isinstance(priority, bool) or not isinstance(priority, int):
+        # 类型在这里保持「数字」层校验（bool/非数字/非有限 → 解析错误）；
+        # 整数性留给 validate，好让 §5.2 的 target_priority_invalid 覆盖 1.5 这类值。
+        if isinstance(priority, bool) or not isinstance(priority, (int, float)):
+            raise ValueError("target.priority must be an integer")
+        if isinstance(priority, float) and not math.isfinite(priority):
             raise ValueError("target.priority must be an integer")
         strategy = raw.get("strategy", "least_inflight")
         if strategy != "least_inflight":
@@ -406,9 +416,11 @@ def _node_behavior_dict(node: GraphNode) -> dict:
         return {"id": node.id, "type": "start"}
     if isinstance(node, QuestionNode):
         result = {"id": node.id, "type": "question", "question_type": node.question_type, "instructions": node.instructions}
-        if node.options:
+        # 只把该类型的语义字段写进 behavior：解析层已禁止跨类型字段，
+        # 这里再按类型投影一次，防止直接构造的节点制造惰性 revision 变化。
+        if node.question_type == "choice" and node.options:
             result["options"] = [{"key": option.key, "label": option.label, "capability": option.capability} for option in node.options]
-        if node.criteria is not None:
+        if node.question_type == "score" and node.criteria is not None:
             result["criteria"] = list(node.criteria)
         return result
     if isinstance(node, LogicNode):
@@ -465,11 +477,11 @@ def graph_revision_of(value) -> str:
     if isinstance(value, GraphRoot):
         payload = graph_behavior_dict(value)
     elif hasattr(value, "root") and hasattr(value, "timezone") and hasattr(value, "sticky"):
-        payload = {
-            "timezone": value.timezone,
-            "sticky": {"enabled": value.sticky.enabled, "ttl_seconds": value.sticky.ttl_seconds},
-            "root": graph_behavior_dict(value.root),
-        }
+        # 单一来源：envelope 的 canonical 结构与 tree_behavior_dict 完全一致。
+        # 局部导入避免 router.routing.model ↔ graph.model 的循环依赖。
+        from router.routing.model import tree_behavior_dict
+
+        payload = tree_behavior_dict(value)
     else:
         raise TypeError("graph_revision_of expects a RoutingTree or a GraphRoot")
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()

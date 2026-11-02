@@ -242,6 +242,47 @@ def test_score_criteria_must_be_finite_levels():
             tree_from_dict(tree_dict(root=_with_score_criteria(bad)))
 
 
+def test_question_fields_are_type_specific():
+    """§2.3/§2.8：只有 choice 接受 options、只有 score 接受 criteria；惰性字段在解析层拒绝，
+    否则语义无变化的编辑会 bump behavior revision 并让粘性失效。"""
+    raw = graph_dict()
+    raw["nodes"][1]["criteria"] = [1, 10]  # choice + criteria
+    with pytest.raises(ValueError, match="criteria"):
+        tree_from_dict(tree_dict(root=raw))
+
+    raw = graph_dict()
+    raw["nodes"].append({
+        "id": "ask", "type": "question", "question_type": "noul", "instructions": "是否复杂",
+        "options": [{"key": "yes", "label": "是", "capability": "能力"}],
+    })
+    with pytest.raises(ValueError, match="options"):
+        tree_from_dict(tree_dict(root=raw))
+
+    raw = graph_dict()
+    raw["nodes"].append({
+        "id": "ask", "type": "question", "question_type": "noul", "instructions": "是否复杂",
+        "criteria": [1, 10],
+    })
+    with pytest.raises(ValueError, match="criteria"):
+        tree_from_dict(tree_dict(root=raw))
+
+    raw = graph_dict()
+    raw["nodes"].append({
+        "id": "grade", "type": "question", "question_type": "score", "instructions": "评分",
+        "criteria": [1, 10], "options": [{"key": "a", "label": "A", "capability": "能力"}],
+    })
+    with pytest.raises(ValueError, match="options"):
+        tree_from_dict(tree_dict(root=raw))
+
+    # 合法的 choice 仍保留 options；合法的 score 仍保留 criteria（revision 依赖它们）。
+    tree = tree_from_dict(tree_dict(root=_with_score_criteria([1, 10])))
+    behavior = {node["id"]: node for node in tree_behavior_dict(tree)["root"]["nodes"]}
+    assert "criteria" not in behavior["q"]  # choice 不带 criteria
+    assert "options" not in behavior["sc"]  # score 不带 options
+    assert behavior["sc"]["criteria"] == [1.0, 10.0]
+    assert [option["key"] for option in behavior["q"]["options"]] == ["easy", "strong"]
+
+
 def test_display_fields_are_excluded_from_revision():
     base = tree_revision_of(tree_from_dict(tree_dict()))
     changed = tree_dict()
@@ -345,10 +386,12 @@ def test_huge_int_raises_value_error():
 
 
 def test_public_surface_reexports():
+    from router.routing.graph import ConditionNode as package_condition_node
     from router.routing.graph import Edge as package_edge
     from router.routing.model import (
         UNKNOWN,
         Condition,
+        ConditionNode,
         ConditionResult,
         Edge,
         edge_type,
@@ -362,6 +405,7 @@ def test_public_surface_reexports():
 
     assert UNKNOWN == "unknown"
     assert package_edge is Edge
+    assert package_condition_node is ConditionNode  # __all__ 里的 ConditionNode 必须真的可导入
     assert canonical_json({"b": 1, "a": [1.0, True, "电网"]}) == '{"a":[1.0,true,"电网"],"b":1}'
     with pytest.raises(ValueError):
         canonical_json(float("nan"))

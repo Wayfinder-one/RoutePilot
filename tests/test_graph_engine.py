@@ -30,7 +30,9 @@ from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import build_snapshot
 from router.routing.types import (
     Candidate,
+    NoActiveTreeError,
     NoAvailableBackend,
+    RoutingMiss,
     RoutingRequest,
     WaveTrace,
 )
@@ -270,6 +272,50 @@ def test_combine_gate_three_valued_truth_tables():
     assert combine_gate("or", [True, UNKNOWN]) is True
     assert combine_gate("or", [False, UNKNOWN]) == UNKNOWN
     assert combine_gate("or", [False]) == UNKNOWN
+    # 防御层：未知算子必须显式失败，绝不静默按 OR 处理（校验层已拦截合法图）。
+    with pytest.raises(ValueError, match="unknown logic operator"):
+        combine_gate("xor", [True, False])
+
+
+# ---------------------------------------------------------------------------
+# 终局异常路径（终审补充）
+# ---------------------------------------------------------------------------
+
+
+def test_route_without_active_tree_raises_no_active_tree():
+    engine = GraphExecutionEngine(FakeJev({"answers": {}}), RecordingAffinity(), RecordingBalancer())
+    snapshot = build_snapshot(
+        tree=None, backends=BACKENDS, time_periods=[], jev=None, capabilities={},
+    )
+    with pytest.raises(NoActiveTreeError):
+        asyncio.run(engine.route(snapshot, RoutingRequest("你好"), now=NOW))
+
+
+def test_wave_guard_rejects_more_than_32_waves():
+    """_MAX_WAVES 防御：33 连问链（校验层本应拦截，引擎仍须自保）在 32 波后 RoutingMiss。"""
+    count = 33
+    nodes = [node("start", "start")]
+    edges = [edge("e0", "start", "out", "q1", "in_1")]
+    answers = {}
+    for index in range(1, count + 1):
+        nodes.append(node(f"q{index}", "question", question_type="noul", instructions="继续？"))
+        answers[f"q{index}"] = {"yes": 0.9}
+        if index > 1:
+            edges.append(edge(
+                f"e{index - 1}", f"q{index - 1}", "yes", f"q{index}", "in_1",
+                {"op": "gt", "value": 0.5},
+            ))
+    nodes.append(node("sink", "target", priority=1, models=[{"model": "qwen3-8b", "reasoning": None}]))
+    with pytest.raises(RoutingMiss, match="32 waves"):
+        run_custom(
+            nodes, edges, otherwise_target="sink", error_fallback="sink",
+            scenario={"answers": answers},
+        )
+
+
+def test_invalid_fallback_target_raises_routing_miss():
+    with pytest.raises(RoutingMiss, match="otherwise"):
+        run_custom([node("start", "start")], [], otherwise_target="ghost", error_fallback="ghost")
 
 
 # ---------------------------------------------------------------------------

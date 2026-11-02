@@ -152,7 +152,9 @@ def test_score_value_is_mapped_through_legend_not_the_raw_index():
 
 def test_choice_tie_is_resolved_by_option_config_order():
     body = multi_body()
-    body["answers"]["capability"] = {"type": "choice", "probabilities": {"轻量": 0.5, "增强": 0.5}}
+    # wire 键序（增强, 轻量）与 option 配置序（light, strong）相反：只有按配置序打破平局
+    # 才会选中 light，按 JSON dict 序实现则会错误地选中 strong。
+    body["answers"]["capability"] = {"type": "choice", "probabilities": {"增强": 0.5, "轻量": 0.5}}
     client = JevClient(httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))))
     answers = run(client)
     assert answers["capability"].ranking == ["light", "strong"]
@@ -201,14 +203,17 @@ FAILURE_CASES = [
     ("negative-probability", lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": -0.2, "增强": 1.2}), "capability"),
     ("probability-sum-out-of-tolerance", lambda b: b["answers"]["capability"].update(probabilities={"轻量": 0.4, "增强": 0.4}), "capability"),
     ("nan-probability", lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": float("nan")}), "capability"),
-    ("bool-probability", lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": True}), "capability"),
+    # 判别性：bool 与 0.0 求和恰为 1，若去掉 bool 检查会通过 —— 失败只能来自 bool 拒绝。
+    ("bool-probability", lambda b: b["answers"]["capability"].update(probabilities={"轻量": True, "增强": 0.0}), "capability"),
     ("string-probability", lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": "0.2"}), "capability"),
     ("noul-out-of-range", lambda b: b["answers"]["domain"].update(noul=1.5), "domain"),
     ("noul-bool", lambda b: b["answers"]["domain"].update(noul=True), "domain"),
     ("noul-missing", lambda b: b["answers"]["domain"].pop("noul"), "domain"),
     ("answer-type-mismatch", lambda b: b["answers"]["domain"].update(type="score"), "domain"),
     ("score-non-numeric", lambda b: b["answers"]["complexity"].update(score="high"), "complexity"),
-    ("score-bool", lambda b: b["answers"]["complexity"].update(score=True), "complexity"),
+    # 判别性：legend 含 "1" 时，若 True 被当数字会解析成 value=5.0 而不报错；
+    # 失败只能来自 bool 拒绝（而不是 legend 未命中）。
+    ("score-bool", lambda b: b["answers"]["complexity"].update(score=True, legend={"0": 2.0, "1": 5.0}), "complexity"),
     ("score-legend-miss", lambda b: b["answers"]["complexity"].update(score=3.0), "complexity"),
     ("score-legend-missing", lambda b: b["answers"]["complexity"].pop("legend"), "complexity"),
     ("score-legend-value-bool", lambda b: b["answers"]["complexity"]["legend"].update({"2": True}), "complexity"),

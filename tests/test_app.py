@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -6,9 +7,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
+from router.api.routes_trees import build_enable_context
 from router.config import Settings
 from router.routing.graph.model import TargetNode
-from router.routing.graph.validate import validate_graph_structure
+from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
 from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
@@ -100,6 +102,20 @@ def test_shipped_graph_configs_pass_structure_validation():
     for name in ("default_routing_tree.json", "production_routing_tree.json"):
         raw = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
         assert validate_graph_structure(tree_from_dict(raw)) == [], name
+
+
+def test_shipped_graph_configs_pass_enable_validation_with_seeded_catalog(tmp_path):
+    """钉住发布配置引用的模型 id：seed 目录里改名/删除模型会在这里失败，而不只是结构通过。"""
+    conn = connect(str(tmp_path / "shipped.db"))
+    migrate(conn)
+    seed_default(conn)
+    try:
+        context = replace(build_enable_context(conn), jev_available=True)  # JEV 打桩：只校验配置存在性
+    finally:
+        conn.close()
+    for name in ("default_routing_tree.json", "production_routing_tree.json"):
+        raw = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
+        assert validate_graph_for_enable(tree_from_dict(raw), context) == [], name
 
 
 class TryHandler:

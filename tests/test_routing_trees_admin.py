@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.config import Settings
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
-from tests.routing_fixtures import graph_dict, tree_dict
+from tests.routing_fixtures import graph_dict, huge_chain_graph, tree_dict
 
 
 @pytest.fixture
@@ -203,6 +203,23 @@ def test_structure_failures_are_issue_arrays_with_locators(client):
     assert issue["node_id"] == "ghost"
     assert issue["edge_id"] == "e-ghost"
     assert issue["port"] == "in_1"
+
+
+def test_huge_chain_payload_is_422_on_create_and_update(client):
+    """终审 Critical 回归：POST/PUT 1200 节点链必须是 422 + Issue 数组，绝不 500。"""
+    response = create_tree(client, tree_dict("huge", root=huge_chain_graph()))
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert all(set(issue) == ISSUE_KEYS for issue in detail)
+    assert any(issue["code"] == "limit_exceeded" for issue in detail)
+    assert client.get("/admin/trees").json()["trees"] == []
+
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    response = client.put("/admin/trees/main", json={"root": huge_chain_graph()})
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "limit_exceeded" for issue in response.json()["detail"])
+    assert client.get("/admin/trees/main").json()["tree"]["root"]["nodes"][0]["id"] == "start"
 
 
 def test_invalid_timezone_rejected_on_create_and_update(client):

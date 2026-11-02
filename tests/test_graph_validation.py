@@ -11,7 +11,7 @@ from router.routing.graph.validate import (
     validate_graph_structure,
 )
 from router.routing.model import tree_from_dict
-from tests.routing_fixtures import enable_context, graph_dict, tree_dict
+from tests.routing_fixtures import enable_context, graph_dict, huge_chain_graph, tree_dict
 
 EDGE_ISSUE_CODES = {
     "edge_endpoint_missing",
@@ -194,6 +194,17 @@ def test_unknown_input_slot():
     raw = graph_dict()
     raw["edges"][0]["target_port"] = "in_9"
     assert codes(raw) == set()  # 槽位允许稀疏编号（删除不重排，空槽复用）
+    raw = graph_dict()
+    raw["edges"][0]["target_port"] = "in_400"
+    assert codes(raw) == set()  # 槽位编号上限 = 边限额
+    raw = graph_dict()
+    raw["edges"][0]["target_port"] = "in_401"  # 超上限编号不得让控制台物化海量槽位行
+    assert codes(raw) == {"edge_port_missing"}
+    issue = edge_issue(raw, "edge_port_missing")
+    assert issue.node_id == "q" and issue.port == "in_401"
+    raw = graph_dict()
+    raw["edges"][0]["target_port"] = "in_9999"
+    assert codes(raw) == {"edge_port_missing"}
 
 
 def test_edge_into_start_or_condition_has_no_input_slot():
@@ -423,6 +434,19 @@ def test_duplicate_and_nonpositive_priority():
     assert next(issue for issue in structure(raw) if issue.code == "target_priority_invalid").node_id == "t0"
 
 
+def test_non_integer_priority_uses_specific_issue_code():
+    """§5.2：非整数 priority（如 1.5）应报 target_priority_invalid，而不是笼统的 graph_parse_error。"""
+    raw = with_targets(graph_dict(), "t2")
+    raw["nodes"][-1]["priority"] = 1.5
+    assert codes(raw) == {"target_priority_invalid"}
+    issue = next(issue for issue in structure(raw) if issue.code == "target_priority_invalid")
+    assert issue.node_id == "t2"
+    raw = with_targets(graph_dict(), "t2")
+    raw["nodes"][-1]["priority"] = "2"  # 非数字仍属解析错误（解析层保持严格类型）
+    issues = validate_graph_structure(tree_dict(root=raw))
+    assert {issue.code for issue in issues} == {"graph_parse_error"}
+
+
 def test_fallback_missing_or_not_target():
     raw = graph_dict()
     raw["otherwise_target"] = None
@@ -453,6 +477,28 @@ def test_condition_node_config():
     raw = graph_dict()
     raw["nodes"].append({"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"], "position": None})
     assert codes(raw) == set()  # 非空 contains_any 合法
+
+
+def test_blank_condition_keywords_and_periods_are_rejected():
+    """§2.3：contains_any 必须是非空字符串数组；空白项是永不匹配的死条件（终审 Important）。"""
+    for contains_any in ([""], [" "], ["抢修", ""], ["\t"]):
+        raw = graph_dict()
+        raw["nodes"].append({
+            "id": "c", "type": "condition", "source": "text",
+            "contains_any": contains_any, "position": None,
+        })
+        assert codes(raw) == {"condition_config_invalid"}, contains_any
+        issue = next(issue for issue in structure(raw) if issue.code == "condition_config_invalid")
+        assert issue.node_id == "c"
+        assert issue.zh and issue.en
+    for periods in ([""], [" "], ["peak", " "]):
+        raw = graph_dict()
+        raw["nodes"].append({
+            "id": "c", "type": "condition", "source": "periods",
+            "periods": periods, "position": None,
+        })
+        assert codes(raw) == {"condition_config_invalid"}, periods
+        assert next(issue for issue in structure(raw) if issue.code == "condition_config_invalid").node_id == "c"
 
 
 # ─────────────────────────── limits ─────────────────────────────────
@@ -493,6 +539,25 @@ def test_question_limit_exceeded():
     raw["nodes"].pop()
     raw["edges"].pop()
     assert codes(raw) == set()  # 32 个问题合法
+
+
+def test_huge_chain_returns_limit_exceeded_without_recursion():
+    """终审 Critical 回归：1200 节点链必须返回 limit_exceeded，而不是 RecursionError → 500。"""
+    issues = validate_graph_structure(huge_chain_graph())  # raw dict：走完整解析 + 校验入口
+    assert {issue.code for issue in issues} == {"limit_exceeded"}
+    assert all(issue.zh and issue.en and issue.level == "hard" for issue in issues)
+
+
+def test_recursion_error_in_traversal_folds_into_limit_issue(monkeypatch):
+    """防御层：DFS 溢出时追加 limit_exceeded，绝不把 RecursionError 抛给调用方。"""
+    from router.routing.graph import validate as validate_module
+
+    def boom(adjacency):
+        raise RecursionError("simulated deep graph")
+
+    monkeypatch.setattr(validate_module, "_cycle_back_edges", boom)
+    issues = validate_graph_structure(tree_from_dict(tree_dict()))
+    assert {issue.code for issue in issues} == {"limit_exceeded"}
 
 
 # ─────────────────────── determinism / parse ────────────────────────
@@ -575,7 +640,6 @@ def test_decision_service_unavailable_requires_questions():
     tree = tree_from_dict(tree_dict())
     context = EnableContext(
         known_models={"fast"},
-        capabilities={"fast": "简单请求"},
         model_reasoning={"fast": None},
         known_periods={"peak", "normal", "offpeak"},
         jev_available=False,

@@ -21,7 +21,7 @@ from router.routing.graph.engine import GraphExecutionEngine
 from router.store.db import connect
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict
+from tests.routing_fixtures import graph_dict, huge_chain_graph
 from tests.test_graph_engine import (
     POWER_GRAPH,
     SCENARIO_BY_ID,
@@ -470,6 +470,18 @@ def test_try_structure_errors_are_issue_arrays_with_locators(client, app):
     assert issue["node_id"] == "ghost"
     assert issue["edge_id"] == "e-ghost"
     assert issue["port"] == "in_1"
+    assert engine.calls == 0
+
+
+def test_try_huge_chain_returns_422_limit_issue_not_500(client, app):
+    """终审 Critical 回归：1200 节点链的草稿试算必须 422 + Issue 数组，绝不 500。"""
+    engine, *_rest = install_engine(app)
+    response = client.post("/admin/try", json={"root": huge_chain_graph(), "text": "你好"})
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and detail
+    assert all(set(issue) == ISSUE_KEYS for issue in detail)
+    assert any(issue["code"] == "limit_exceeded" for issue in detail)
     assert engine.calls == 0
 
 

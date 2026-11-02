@@ -60,10 +60,18 @@ class EnableContext:
     """启用校验上下文：模型目录、推理档位、时段定义与 JEV 配置存在性（不做在线探测）。"""
 
     known_models: frozenset[str] | set[str] = frozenset()
-    capabilities: Mapping[str, str] = field(default_factory=dict)
-    model_reasoning: Mapping[str, str | None] = field(default_factory=dict)
+    model_reasoning: Mapping[str, Mapping[str, object] | None] = field(default_factory=dict)
     known_periods: frozenset[str] | set[str] = frozenset()
     jev_available: bool = False
+
+
+def _too_deep_issue() -> Issue:
+    """遍历深度溢出（限额内的图不可达）→ limit_exceeded，绝不向调用方抛 RecursionError。"""
+    return Issue(
+        "limit_exceeded",
+        f"图结构过深，遍历超出安全递归深度（节点/边上限 {_LIMIT_NODES}/{_LIMIT_EDGES}）",
+        f"Graph is too deep to traverse safely (limits: {_LIMIT_NODES} nodes / {_LIMIT_EDGES} edges)",
+    )
 
 
 def _finish(issues: list[Issue]) -> list[Issue]:
@@ -172,6 +180,14 @@ def _condition_issue(edge, reason: str) -> Issue:
 
 def validate_graph_structure(value) -> list[Issue]:
     """结构校验（保存/试算/导入）：时区、start、id、端点、槽位、环、条件、节点配置、兜底与限额。"""
+    try:
+        return _validate_structure(value)
+    except RecursionError:
+        # 防御层：即使限额检查被绕过（例如直接构造的深层图），也返回 Issue 数组而不是 500。
+        return _finish([_too_deep_issue()])
+
+
+def _validate_structure(value) -> list[Issue]:
     root, timezone = _coerce(value)
     if root is None:
         return _finish([Issue(
@@ -180,6 +196,22 @@ def validate_graph_structure(value) -> list[Issue]:
             "Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)",
         )])
     issues: list[Issue] = []
+    # 限额必须先于任何图遍历：DFS 深度随节点数增长，超限图的遍历可能先触发 RecursionError。
+    # 节点/边任一超限即提前返回（>400 条边的路径必然 >200 个节点，两者通常同时出现）。
+    if len(root.nodes) > _LIMIT_NODES or len(root.edges) > _LIMIT_EDGES:
+        if len(root.nodes) > _LIMIT_NODES:
+            issues.append(Issue(
+                "limit_exceeded",
+                f"节点数超过上限 {_LIMIT_NODES}（当前 {len(root.nodes)} 个）",
+                f"Too many nodes: limit is {_LIMIT_NODES} (found {len(root.nodes)})",
+            ))
+        if len(root.edges) > _LIMIT_EDGES:
+            issues.append(Issue(
+                "limit_exceeded",
+                f"边数超过上限 {_LIMIT_EDGES}（当前 {len(root.edges)} 条）",
+                f"Too many edges: limit is {_LIMIT_EDGES} (found {len(root.edges)})",
+            ))
+        return _finish(issues)
     if timezone is not None:
         try:
             ZoneInfo(timezone)
@@ -227,20 +259,37 @@ def validate_graph_structure(value) -> list[Issue]:
                     node_id=node.id,
                 ))
         elif isinstance(node, ConditionNode):
-            if node.source == "text" and not node.contains_any:
-                issues.append(Issue(
-                    "condition_config_invalid",
-                    f"条件节点配置非法：source=text 需要非空 contains_any（{node.id}）",
-                    f"Invalid condition node: source=text requires a non-empty contains_any ({node.id})",
-                    node_id=node.id,
-                ))
-            if node.source == "periods" and not node.periods:
-                issues.append(Issue(
-                    "condition_config_invalid",
-                    f"条件节点配置非法：source=periods 需要非空时段列表（{node.id}）",
-                    f"Invalid condition node: source=periods requires a non-empty period list ({node.id})",
-                    node_id=node.id,
-                ))
+            if node.source == "text":
+                if not node.contains_any:
+                    issues.append(Issue(
+                        "condition_config_invalid",
+                        f"条件节点配置非法：source=text 需要非空 contains_any（{node.id}）",
+                        f"Invalid condition node: source=text requires a non-empty contains_any ({node.id})",
+                        node_id=node.id,
+                    ))
+                elif any(not needle.strip() for needle in node.contains_any):
+                    # §2.3 要求 contains_any 是非空字符串数组；空白项是永不匹配的死条件。
+                    issues.append(Issue(
+                        "condition_config_invalid",
+                        f"条件节点配置非法：contains_any 不能含空白关键词（{node.id}）",
+                        f"Invalid condition node: contains_any must not contain blank keywords ({node.id})",
+                        node_id=node.id,
+                    ))
+            if node.source == "periods":
+                if not node.periods:
+                    issues.append(Issue(
+                        "condition_config_invalid",
+                        f"条件节点配置非法：source=periods 需要非空时段列表（{node.id}）",
+                        f"Invalid condition node: source=periods requires a non-empty period list ({node.id})",
+                        node_id=node.id,
+                    ))
+                elif any(not name.strip() for name in node.periods):
+                    issues.append(Issue(
+                        "condition_config_invalid",
+                        f"条件节点配置非法：periods 不能含空白时段名（{node.id}）",
+                        f"Invalid condition node: periods must not contain blank period names ({node.id})",
+                        node_id=node.id,
+                    ))
         elif isinstance(node, QuestionNode):
             if not node.instructions.strip():
                 issues.append(Issue(
@@ -325,24 +374,37 @@ def validate_graph_structure(value) -> list[Issue]:
                             f"Score criteria must be {_CRITERIA_MIN} to {_CRITERIA_MAX} finite numbers: {node.id}",
                             node_id=node.id,
                         ))
-        elif isinstance(node, TargetNode) and node.priority < 1:
-            issues.append(Issue(
-                "target_priority_invalid",
-                f"target priority 必须是正整数：{node.id}",
-                f"Target priority must be a positive integer: {node.id}",
-                node_id=node.id,
-            ))
+        elif isinstance(node, TargetNode):
+            if isinstance(node.priority, bool) or not isinstance(node.priority, int):
+                # 解析层保留原始数字类型，才能把「非整数 priority」映射到 §5.2 专属码
+                # 而不是笼统的 graph_parse_error。
+                issues.append(Issue(
+                    "target_priority_invalid",
+                    f"target priority 必须是整数：{node.id}",
+                    f"Target priority must be an integer: {node.id}",
+                    node_id=node.id,
+                ))
+            elif node.priority < 1:
+                issues.append(Issue(
+                    "target_priority_invalid",
+                    f"target priority 必须是正整数：{node.id}",
+                    f"Target priority must be a positive integer: {node.id}",
+                    node_id=node.id,
+                ))
 
     seen_priorities: set[int] = set()
     for node in sorted((item for item in by_id.values() if isinstance(item, TargetNode)), key=lambda item: item.id):
-        if node.priority in seen_priorities:
+        priority = node.priority
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            continue  # 已在节点循环里报过 target_priority_invalid，不重复报唯一性
+        if priority in seen_priorities:
             issues.append(Issue(
                 "target_priority_invalid",
                 f"target priority 必须唯一：{node.id}",
                 f"Target priority must be unique: {node.id}",
                 node_id=node.id,
             ))
-        seen_priorities.add(node.priority)
+        seen_priorities.add(priority)
 
     for field_name in ("otherwise_target", "error_fallback"):
         ref = getattr(root, field_name)
@@ -436,7 +498,13 @@ def validate_graph_structure(value) -> list[Issue]:
                         node_id=target_id, edge_id=edge.id, port=port,
                     ))
 
-    for node_id, edge_id, port in _cycle_back_edges(back_edges):
+    try:
+        back_edges_found = _cycle_back_edges(back_edges)
+    except RecursionError:
+        # 深度防御：限额检查已保证正常路径不可达；若仍溢出，追加 Issue 继续返回。
+        back_edges_found = []
+        issues.append(_too_deep_issue())
+    for node_id, edge_id, port in back_edges_found:
         issues.append(Issue(
             "edge_cycle",
             f"图中有环：{node_id}",
@@ -480,18 +548,6 @@ def validate_graph_structure(value) -> list[Issue]:
                 node_id=node.id,
             ))
 
-    if len(root.nodes) > _LIMIT_NODES:
-        issues.append(Issue(
-            "limit_exceeded",
-            f"节点数超过上限 {_LIMIT_NODES}（当前 {len(root.nodes)} 个）",
-            f"Too many nodes: limit is {_LIMIT_NODES} (found {len(root.nodes)})",
-        ))
-    if len(root.edges) > _LIMIT_EDGES:
-        issues.append(Issue(
-            "limit_exceeded",
-            f"边数超过上限 {_LIMIT_EDGES}（当前 {len(root.edges)} 条）",
-            f"Too many edges: limit is {_LIMIT_EDGES} (found {len(root.edges)})",
-        ))
     question_count = sum(isinstance(node, QuestionNode) for node in by_id.values())
     if question_count > _LIMIT_QUESTIONS:
         issues.append(Issue(

@@ -16,6 +16,9 @@ from router.routing.graph.model import (
 )
 
 _SLOT_PATTERN = re.compile(r"in_([1-9][0-9]*)")
+#: 槽位编号上限 = 边限额（spec §2.7）：超过它的 in_N 一定无法被合法图引用，
+#: 拒绝后控制台不会按 in_9999 之类编号物化出成千上万行槽位。
+_MAX_SLOT_INDEX = 400
 
 
 @dataclass(frozen=True)
@@ -28,7 +31,12 @@ def slot_sort_key(port: str) -> int:
     if isinstance(port, str):
         match = _SLOT_PATTERN.fullmatch(port)
         if match is not None:
-            return int(match.group(1))
+            number = int(match.group(1))
+            if number <= _MAX_SLOT_INDEX:
+                return number
+            raise ValueError(
+                f"slot index must be <= {_MAX_SLOT_INDEX}, got {port!r}"
+            )
     raise ValueError(f"slot must be in_N with a positive integer N (no leading zeros), got {port!r}")
 
 
@@ -68,6 +76,10 @@ def next_slot(root: GraphRoot, node_id: str) -> str:
     number = 1
     while number in occupied:
         number += 1
+    if number > _MAX_SLOT_INDEX:
+        raise ValueError(
+            f"node {node_id!r} has no free input slot (limit {_MAX_SLOT_INDEX})"
+        )
     return f"in_{number}"
 
 
