@@ -37,6 +37,17 @@ function hardIssues(issues) {
   return issues.filter(issue => issue.level !== 'hint');
 }
 
+function importText(tree) {
+  return JSON.stringify({
+    kind: 'sr-routing-graph',
+    version: 3,
+    name: tree.name == null ? '' : tree.name,
+    timezone: tree.timezone == null ? 'Asia/Shanghai' : tree.timezone,
+    sticky: tree.sticky == null ? { enabled: false, ttl_seconds: 1800 } : tree.sticky,
+    root: tree.root,
+  });
+}
+
 function scoreEdge(condition) {
   return {
     id: 'e-score-value-target-in_2',
@@ -739,4 +750,189 @@ test('parseImport output is behavior-stable across coordinate-only round trips',
   moved.root.nodes.forEach((node, index) => { node.position = { x: index * 13, y: index * 7 }; });
   assert.equal(RTGraph.changeKind(imported.tree, moved), 'layout');
   assert.equal(RTGraph.behaviorCanonical(imported.tree), RTGraph.behaviorCanonical(moved));
+});
+
+/* ── 9. 健壮性回归（Task 9 fix round） ──────────────────────────────── */
+
+test('parseImport rejects null-position coordinates and lays them out', () => {
+  const tree = minimalTree();
+  tree.root.nodes.forEach(node => { node.position = { x: null, y: null }; });
+  const result = RTGraph.parseImport(importText(tree));
+  assert.equal(result.ok, true);
+  for (const node of result.tree.root.nodes) {
+    const position = node.position;
+    assert.equal(Number.isFinite(position.x), true, node.id + '.x');
+    assert.equal(Number.isFinite(position.y), true, node.id + '.y');
+    assert.notEqual(position.x, 0, node.id + '.x must not be null-coerced');
+    assert.notEqual(position.y, 0, node.id + '.y must not be null-coerced');
+  }
+  const laidOut = RTGraph.layoutPositions('dag', result.tree.root);
+  assert.deepEqual(Object.keys(laidOut).sort(), result.tree.root.nodes.map(node => node.id).sort());
+  for (const position of Object.values(laidOut)) {
+    assert.equal(Number.isFinite(position.x), true);
+    assert.equal(Number.isFinite(position.y), true);
+  }
+});
+
+test('parseImport keeps non-object entries for validate instead of dropping them', () => {
+  const tree = minimalTree();
+  tree.root.nodes = [1];
+  tree.root.edges = [1];
+  const result = RTGraph.parseImport(importText(tree));
+  assert.equal(result.ok, true);
+  assert.equal(result.tree.root.nodes.length, 1);
+  assert.equal(result.tree.root.edges.length, 1);
+  assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
+  assert.doesNotThrow(() => RTGraph.behaviorCanonical(result.tree));
+  assert.doesNotThrow(() => RTGraph.layoutPositions('dag', result.tree.root));
+  assert.doesNotThrow(() => RTGraph.serialize(result.tree));
+});
+
+test('canonical comparison tolerates malformed draft fields', () => {
+  const tree = minimalTree();
+  tree.root.nodes.push({
+    id: 'score', type: 'question', question_type: 'score', instructions: '评分。',
+    criteria: 5, position: { x: 0, y: 0 },
+  });
+  tree.root.nodes.push({
+    id: 'choice', type: 'question', question_type: 'choice', instructions: '选择。',
+    options: 5, position: { x: 0, y: 0 },
+  });
+  tree.root.nodes.push({
+    id: 'cond', type: 'condition', source: 'text', contains_any: 5, periods: 5,
+    position: { x: 0, y: 0 },
+  });
+  targetOf(tree.root).models = 5;
+
+  assert.doesNotThrow(() => RTGraph.behaviorCanonical(tree));
+  assert.equal(RTGraph.changeKind(tree, RTGraph.clone(tree)), 'clean');
+  assert.ok(RTGraph.validate(tree).some(issue => issue.code === 'score_criteria_invalid'));
+});
+
+test('prototype-named ids and option keys are not treated as duplicates', () => {
+  const graph = minimalTree().root;
+  graph.nodes.push(
+    { id: 'constructor', type: 'condition', source: 'text', contains_any: ['抢修'], position: { x: 0, y: 0 } },
+    { id: 'other', type: 'condition', source: 'text', contains_any: ['故障'], position: { x: 0, y: 0 } },
+  );
+  assert.equal(
+    RTGraph.validate(graph).some(issue => issue.code === 'duplicate_node_id'),
+    false,
+    'constructor / other must not collide',
+  );
+
+  const optionGraph = minimalTree().root;
+  optionGraph.nodes.push({
+    id: 'choice', type: 'question', question_type: 'choice', instructions: '选择。',
+    options: [
+      { key: 'constructor', label: '构造', capability: '说明' },
+      { key: 'other', label: '其他', capability: '说明' },
+    ],
+    position: { x: 0, y: 0 },
+  });
+  const optionIssues = RTGraph.validate(optionGraph);
+  assert.equal(
+    optionIssues.some(issue => issue.code === 'question_incomplete' && /选项 key 重复/.test(issue.zh)),
+    false,
+    'constructor option key must not collide',
+  );
+});
+
+test('edge_cycle issues carry the offending edge id and slot', () => {
+  const graph = minimalTree().root;
+  graph.nodes.push({ id: 'gate', type: 'logic', operator: 'and', position: { x: 0, y: 0 } });
+  graph.edges.push(
+    { id: 'e-start-gate-in_1', source: 'start', source_port: 'out', target: 'gate', target_port: 'in_1', condition: null },
+    { id: 'e-gate-gate-in_2', source: 'gate', source_port: 'out', target: 'gate', target_port: 'in_2', condition: null },
+  );
+  const cycle = RTGraph.validate(graph).filter(issue => issue.code === 'edge_cycle');
+  assert.equal(cycle.length, 1);
+  assert.equal(cycle[0].node_id, 'gate');
+  assert.equal(cycle[0].edge_id, 'e-gate-gate-in_2');
+  assert.equal(cycle[0].port, 'in_2');
+});
+
+test('serialize round-trip preserves positions, titles and target capability', () => {
+  const tree = minimalTree();
+  const [start, target] = tree.root.nodes;
+  start.title = '入口';
+  start.position = { x: 41, y: 52 };
+  target.title = '兜底目标';
+  target.capability = '兜底说明';
+  target.position = { x: 611, y: 72 };
+
+  const result = RTGraph.parseImport(RTGraph.serialize(tree));
+  assert.equal(result.ok, true);
+  const importedStart = result.tree.root.nodes.find(node => node.id === 'start');
+  const importedTarget = result.tree.root.nodes.find(node => node.id === 'target-1');
+  assert.deepEqual(importedStart.position, { x: 41, y: 52 });
+  assert.equal(importedStart.title, '入口');
+  assert.deepEqual(importedTarget.position, { x: 611, y: 72 });
+  assert.equal(importedTarget.title, '兜底目标');
+  assert.equal(importedTarget.capability, '兜底说明');
+  assert.equal(RTGraph.changeKind(tree, result.tree), 'clean');
+});
+
+test('invalid but present positions are not accepted as coordinates', () => {
+  const tree = minimalTree();
+  const [start, target] = tree.root.nodes;
+  start.position = { x: NaN, y: 5 };
+  target.position = { x: '', y: '' };
+
+  const text = RTGraph.serialize(tree);
+  assert.equal(text.includes('NaN'), false);
+  const exported = JSON.parse(text);
+  assert.equal('position' in exported.root.nodes[0], false);
+  assert.equal('position' in exported.root.nodes[1], false);
+
+  const result = RTGraph.parseImport(text);
+  assert.equal(result.ok, true);
+  for (const node of result.tree.root.nodes) {
+    assert.equal(Number.isFinite(node.position.x), true, node.id + '.x');
+    assert.equal(Number.isFinite(node.position.y), true, node.id + '.y');
+    assert.notEqual(node.position.x, 0, node.id + '.x must not be coerced');
+    assert.notEqual(node.position.y, 0, node.id + '.y must not be coerced');
+  }
+});
+
+test('validate reports duplicate target priorities', () => {
+  const graph = minimalTree().root;
+  graph.nodes.push({
+    id: 'target-2', type: 'target', models: [{ model: 'qwen3-32b' }], priority: 1,
+    strategy: 'least_inflight', position: { x: 0, y: 0 },
+  });
+  const issues = RTGraph.validate(graph).filter(issue => issue.code === 'target_priority_invalid');
+  assert.ok(issues.some(issue => issue.node_id === 'target-2' && /唯一/.test(issue.zh)));
+});
+
+test('validate reports every configured graph limit', () => {
+  const tooManyNodes = minimalTree().root;
+  for (let index = 0; index < RTGraph.LIMITS.nodes; index += 1) {
+    tooManyNodes.nodes.push({
+      id: 'extra-node-' + index, type: 'question', question_type: 'noul',
+      instructions: '是否需要？', position: { x: 0, y: 0 },
+    });
+  }
+  assert.ok(RTGraph.validate(tooManyNodes).some(issue =>
+    issue.code === 'limit_exceeded' && /节点数超过上限/.test(issue.zh)));
+
+  const tooManyEdges = minimalTree().root;
+  for (let index = 0; index < RTGraph.LIMITS.edges; index += 1) {
+    tooManyEdges.edges.push({
+      id: 'extra-edge-' + index, source: 'start', source_port: 'out',
+      target: 'target-1', target_port: 'in_' + (index + 2), condition: null,
+    });
+  }
+  assert.ok(RTGraph.validate(tooManyEdges).some(issue =>
+    issue.code === 'limit_exceeded' && /边数超过上限/.test(issue.zh)));
+
+  const tooManyQuestions = minimalTree().root;
+  for (let index = 0; index < RTGraph.LIMITS.questions + 1; index += 1) {
+    tooManyQuestions.nodes.push({
+      id: 'question-' + index, type: 'question', question_type: 'noul',
+      instructions: '是否需要？', position: { x: 0, y: 0 },
+    });
+  }
+  assert.ok(RTGraph.validate(tooManyQuestions).some(issue =>
+    issue.code === 'limit_exceeded' && /问题节点超过上限/.test(issue.zh)));
 });

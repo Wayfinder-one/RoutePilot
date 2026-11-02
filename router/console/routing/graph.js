@@ -99,7 +99,7 @@
   }
 
   function edgesOf(graph) {
-    return graph && Array.isArray(graph.edges) ? graph.edges : [];
+    return graph && Array.isArray(graph.edges) ? graph.edges.filter(edge => isRecord(edge)) : [];
   }
 
   function slotPorts(node, graphValue) {
@@ -304,7 +304,7 @@
 
   function reaches(graphValue, from, to, seen) {
     if (from === to) return true;
-    const visited = seen || {};
+    const visited = seen || Object.create(null);
     if (visited[from]) return false;
     visited[from] = true;
     return edgesOf(graphValue).filter(edge => edge.source === from)
@@ -528,8 +528,9 @@
       issues.push(issue('graph_parse_error', '存在非法连线（不是对象）', 'Invalid edge entry (not an object)'));
     }
 
-    const byId = {};
-    const duplicates = {};
+    /* 用户数据做 key 的映射一律用无原型对象，避免 constructor / __proto__ 误判。 */
+    const byId = Object.create(null);
+    const duplicates = Object.create(null);
     nodes.forEach(node => {
       if (!isNonEmptyString(node.id)) {
         issues.push(issue('graph_parse_error', '节点缺少非空 id', 'Node is missing a non-empty id'));
@@ -545,7 +546,7 @@
       issues.push(issue('duplicate_node_id', '节点 id 重复：' + id, 'Duplicate node id: ' + id, { node_id: id }));
     });
 
-    const edgeIds = {};
+    const edgeIds = Object.create(null);
     edges.forEach(edge => {
       if (!isNonEmptyString(edge.id)) {
         issues.push(issue('graph_parse_error', '连线缺少非空 id', 'Edge is missing a non-empty id'));
@@ -621,8 +622,8 @@
               { node_id: node.id }
             ));
           }
-          const keys = {};
-          const labels = {};
+          const keys = Object.create(null);
+          const labels = Object.create(null);
           options.forEach(option => {
             if (!isRecord(option)) {
               issues.push(issue('question_incomplete', '选项必须是对象：' + node.id, 'Option must be an object: ' + node.id, { node_id: node.id }));
@@ -691,7 +692,7 @@
       }
     });
 
-    const priorities = {};
+    const priorities = Object.create(null);
     nodes.filter(node => node.type === 'target').forEach(node => {
       if (typeof node.priority !== 'number' || !Number.isInteger(node.priority)) return;
       if (priorities[node.priority]) {
@@ -726,10 +727,15 @@
       }
     });
 
-    const adjacency = {};
-    nodes.forEach(node => { if (isNonEmptyString(node.id)) adjacency[node.id] = []; });
-    const incomingCount = {};
-    const slotGroups = {};
+    const adjacency = Object.create(null);
+    const backAdjacency = Object.create(null);
+    nodes.forEach(node => {
+      if (!isNonEmptyString(node.id)) return;
+      adjacency[node.id] = [];
+      backAdjacency[node.id] = [];
+    });
+    const incomingCount = Object.create(null);
+    const slotGroups = Object.create(null);
     edges.forEach(edge => {
       const source = byId[edge.source];
       const target = byId[edge.target];
@@ -752,6 +758,13 @@
       if (!source || !target) return;
 
       if (adjacency[edge.source]) adjacency[edge.source].push(edge.target);
+      if (backAdjacency[edge.source]) {
+        backAdjacency[edge.source].push({
+          target: edge.target,
+          edge_id: String(edge.id || ''),
+          port: String(edge.target_port || '')
+        });
+      }
       incomingCount[edge.target] = (incomingCount[edge.target] || 0) + 1;
 
       const sourcePort = portOf(source, edge.source_port, graph);
@@ -808,17 +821,22 @@
       });
     });
 
-    /* 环检测：DFS 回边。 */
-    const state = {};
+    /* 环检测：DFS 回边；回边保留 edge_id / 目标槽位，Issue 可定位（§5.1 / §6.10）。 */
+    const state = Object.create(null);
     const backEdges = [];
     function visit(nodeId) {
       state[nodeId] = 1;
-      (adjacency[nodeId] || []).slice().sort().forEach(target => {
-        const current = state[target] || 0;
+      (backAdjacency[nodeId] || []).slice().sort((a, b) => {
+        if (a.target !== b.target) return a.target < b.target ? -1 : 1;
+        if (a.edge_id !== b.edge_id) return a.edge_id < b.edge_id ? -1 : 1;
+        if (a.port !== b.port) return a.port < b.port ? -1 : 1;
+        return 0;
+      }).forEach(edge => {
+        const current = state[edge.target] || 0;
         if (current === 1) {
-          backEdges.push({ node: target, target: target });
+          backEdges.push(edge);
         } else if (current === 0) {
-          visit(target);
+          visit(edge.target);
         }
       });
       state[nodeId] = 2;
@@ -829,9 +847,9 @@
     backEdges.forEach(back => {
       issues.push(issue(
         'edge_cycle',
-        '图中有环：' + back.node,
-        'The graph contains a cycle at ' + back.node,
-        { node_id: back.node }
+        '图中有环：' + back.target,
+        'The graph contains a cycle at ' + back.target,
+        { node_id: back.target, edge_id: back.edge_id, port: back.port }
       ));
     });
 
@@ -859,7 +877,7 @@
     /* 可达性：start 与第 0 阶段 condition 节点都是源（§5.2）。 */
     const sources = nodes.filter(node => node.type === 'start' || node.type === 'condition')
       .map(node => node.id);
-    const reachable = {};
+    const reachable = Object.create(null);
     const queue = sources.slice();
     while (queue.length) {
       const nodeId = queue.pop();
@@ -897,9 +915,9 @@
   }
 
   function questionChainDepth(nodes, adjacency) {
-    const byId = {};
+    const byId = Object.create(null);
     nodes.forEach(node => { if (isNonEmptyString(node.id)) byId[node.id] = node; });
-    const indegree = {};
+    const indegree = Object.create(null);
     Object.keys(byId).forEach(id => { indegree[id] = 0; });
     Object.keys(adjacency).forEach(source => {
       adjacency[source].forEach(target => {
@@ -917,7 +935,7 @@
         if (indegree[target] === 0) queue.push(target);
       });
     }
-    const depth = {};
+    const depth = Object.create(null);
     order.forEach(id => {
       const node = byId[id];
       const preds = Object.keys(adjacency).filter(source => adjacency[source].indexOf(id) >= 0);
@@ -943,7 +961,7 @@
         label: option && option.label,
         capability: option && option.capability
       }));
-      output.criteria = node.criteria == null ? null : node.criteria.slice();
+      output.criteria = Array.isArray(node.criteria) ? node.criteria.slice() : null;
     } else if (node.type === 'logic') {
       output.operator = node.operator;
     } else if (node.type === 'condition') {
@@ -962,8 +980,8 @@
       output.title = node.title == null ? '' : node.title;
       if (node.type === 'target') output.capability = node.capability == null ? '' : node.capability;
       output.position = isRecord(node.position) &&
-        isFiniteNumber(Number(node.position.x)) && isFiniteNumber(Number(node.position.y))
-        ? { x: Number(node.position.x), y: Number(node.position.y) }
+        isFiniteNumber(node.position.x) && isFiniteNumber(node.position.y)
+        ? { x: node.position.x, y: node.position.y }
         : null;
     }
     return output;
@@ -1010,8 +1028,8 @@
       type: 'graph',
       otherwise_target: graph.otherwise_target == null ? null : graph.otherwise_target,
       error_fallback: graph.error_fallback == null ? null : graph.error_fallback,
-      nodes: sortNodes(nodes.map(node => normalizedNode(node, includeDisplay))),
-      edges: sortEdges(edges.map(normalizedEdge))
+      nodes: sortNodes(nodes.filter(node => isRecord(node)).map(node => normalizedNode(node, includeDisplay))),
+      edges: sortEdges(edges.filter(edge => isRecord(edge)).map(normalizedEdge))
     };
   }
 
@@ -1064,8 +1082,8 @@
   function layoutPositions(mode, graphValue) {
     const graph = graphOf(graphValue) || graphValue || { nodes: [], edges: [] };
     const nodes = (Array.isArray(graph.nodes) ? graph.nodes : []).filter(node => isRecord(node) && isNonEmptyString(node.id));
-    const adjacency = {};
-    const indegree = {};
+    const adjacency = Object.create(null);
+    const indegree = Object.create(null);
     nodes.forEach(node => {
       adjacency[node.id] = [];
       indegree[node.id] = 0;
@@ -1076,7 +1094,7 @@
         indegree[edge.target] += 1;
       }
     });
-    const depth = {};
+    const depth = Object.create(null);
     nodes.forEach(node => { depth[node.id] = 0; });
     const queue = Object.keys(indegree).filter(id => indegree[id] === 0).sort();
     for (let cursor = 0; cursor < queue.length; cursor += 1) {
@@ -1087,12 +1105,12 @@
         if (indegree[target] === 0) queue.push(target);
       });
     }
-    const columns = {};
+    const columns = Object.create(null);
     nodes.forEach(node => {
       const column = Number.isFinite(depth[node.id]) ? depth[node.id] : 0;
       (columns[column] = columns[column] || []).push(node);
     });
-    const positions = {};
+    const positions = Object.create(null);
     Object.keys(columns).map(Number).sort((a, b) => a - b).forEach(column => {
       columns[column].sort((a, b) => {
         const orderA = NODE_ORDER[a.type] == null ? 9 : NODE_ORDER[a.type];
@@ -1115,8 +1133,11 @@
     (Array.isArray(rootValue.nodes) ? rootValue.nodes : []).forEach(node => {
       if (!isRecord(node)) return;
       const position = node.position;
-      if (isRecord(position) && isFiniteNumber(Number(position.x)) && isFiniteNumber(Number(position.y))) {
-        node.position = { x: Math.round(Number(position.x)), y: Math.round(Number(position.y)) };
+      if (isRecord(position) && isFiniteNumber(position.x) && isFiniteNumber(position.y)) {
+        node.position = { x: Math.round(position.x), y: Math.round(position.y) };
+      } else {
+        /* 非法坐标不当作已定位：导出时丢弃，导入会按 DAG 重新布局。 */
+        delete node.position;
       }
     });
     return JSON.stringify({
@@ -1149,15 +1170,15 @@
     const graph = clone(raw);
     graph.id = isNonEmptyString(graph.id) ? graph.id : 'root';
     graph.type = 'graph';
-    graph.nodes = graph.nodes.filter(node => isRecord(node));
-    graph.edges = graph.edges.filter(edge => isRecord(edge));
+    /* 非对象条目不做静默丢弃：保留在 tree 中交给 validate 报 graph_parse_error。 */
     if (!graph.otherwise_target && graph.otherwise_target !== null) graph.otherwise_target = null;
     if (!graph.error_fallback && graph.error_fallback !== null) graph.error_fallback = null;
 
     const positions = layoutPositions('dag', graph);
     graph.nodes.forEach(node => {
+      if (!isRecord(node)) return;
       const position = node.position;
-      const valid = isRecord(position) && isFiniteNumber(Number(position.x)) && isFiniteNumber(Number(position.y));
+      const valid = isRecord(position) && isFiniteNumber(position.x) && isFiniteNumber(position.y);
       if (!valid) {
         const fallback = positions[node.id] || { x: 30, y: 30 };
         node.position = { x: fallback.x, y: fallback.y };

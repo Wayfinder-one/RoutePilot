@@ -30,6 +30,7 @@ const TREE_ID = 'power-priority';
 const JEV_MODEL = 'd1-2B';
 const S1_TEXT = '10kV 线路跳闸，请安排抢修工单并做故障定位。';
 const S1_NOW = '2026-11-02T12:00:00+08:00';
+const API_TIMEOUT_MS = 15000;
 
 /* ── 用例注册器 ─────────────────────────────────────────────────────── */
 
@@ -395,15 +396,27 @@ export async function api(method, apiPath, body) {
     init.headers['content-type'] = 'application/json';
     init.body = JSON.stringify(body);
   }
-  const response = await fetch(routerBase + apiPath, init);
-  const text = await response.text();
-  let data = text;
-  try { data = text ? JSON.parse(text) : null; } catch { /* 保留文本 */ }
-  if (!response.ok) {
-    const detail = typeof data === 'string' ? data : JSON.stringify(data);
-    throw new Error(`${method} ${apiPath} → HTTP ${response.status}: ${detail}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  init.signal = controller.signal;
+  try {
+    const response = await fetch(routerBase + apiPath, init);
+    const text = await response.text();
+    let data = text;
+    try { data = text ? JSON.parse(text) : null; } catch { /* 保留文本 */ }
+    if (!response.ok) {
+      const detail = typeof data === 'string' ? data : JSON.stringify(data);
+      throw new Error(`${method} ${apiPath} → HTTP ${response.status}: ${detail}`);
+    }
+    return data;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`${method} ${apiPath} → request timed out after ${API_TIMEOUT_MS}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return data;
 }
 
 const MODEL_PROFILE = {
@@ -465,18 +478,33 @@ async function bootstrap() {
 
 function chromiumExecutable() {
   if (process.env.CHROME) return process.env.CHROME;
-  const cache = path.join(os.homedir(), 'Library/Caches/ms-playwright');
-  if (!fs.existsSync(cache)) return undefined;
+  const caches = [
+    path.join(os.homedir(), 'Library/Caches/ms-playwright'),
+    path.join(os.homedir(), '.cache/ms-playwright')
+  ];
   const candidates = [];
-  for (const entry of fs.readdirSync(cache)) {
-    if (entry.startsWith('chromium-')) {
-      candidates.push(path.join(cache, entry, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'));
-      candidates.push(path.join(cache, entry, 'chrome-linux', 'chrome'));
-      candidates.push(path.join(cache, entry, 'chrome-win', 'chrome.exe'));
-    }
-    if (entry.startsWith('chromium_headless_shell-')) {
-      candidates.push(path.join(cache, entry, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell'));
-      candidates.push(path.join(cache, entry, 'chrome-headless-shell-linux64', 'chrome-headless-shell'));
+  for (const cache of caches) {
+    if (!fs.existsSync(cache)) continue;
+    for (const entry of fs.readdirSync(cache).sort()) {
+      const base = path.join(cache, entry);
+      if (entry.startsWith('chromium-')) {
+        candidates.push(
+          path.join(base, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+          path.join(base, 'chrome-mac-x64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+          path.join(base, 'chrome-mac', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing'),
+          path.join(base, 'chrome-linux', 'chrome'),
+          path.join(base, 'chrome-linux64', 'chrome'),
+          path.join(base, 'chrome-win', 'chrome.exe'),
+          path.join(base, 'chrome-win64', 'chrome.exe')
+        );
+      } else if (entry.startsWith('chromium_headless_shell-')) {
+        candidates.push(
+          path.join(base, 'chrome-headless-shell-mac-arm64', 'chrome-headless-shell'),
+          path.join(base, 'chrome-headless-shell-mac-x64', 'chrome-headless-shell'),
+          path.join(base, 'chrome-headless-shell-linux64', 'chrome-headless-shell'),
+          path.join(base, 'chrome-headless-shell-win64', 'chrome-headless-shell.exe')
+        );
+      }
     }
   }
   return candidates.find(file => fs.existsSync(file));
@@ -676,7 +704,45 @@ test('admin try routes the sample graph through the live decision mock', async (
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
+let teardownPromise = null;
+
+async function teardown() {
+  if (!teardownPromise) {
+    teardownPromise = (async () => {
+      if (browser) {
+        try { await browser.close(); } catch { /* ignore */ }
+        browser = null;
+      }
+      await stopRouter();
+      if (mockServer) {
+        await new Promise(resolve => mockServer.close(resolve));
+        mockServer = null;
+      }
+      if (tempDir) {
+        await fsp.rm(tempDir, { recursive: true, force: true });
+        tempDir = '';
+      }
+    })();
+  }
+  return teardownPromise;
+}
+
+function installSignalHandlers() {
+  let shuttingDown = false;
+  const handle = signal => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`\n[console-qa] ${signal} received, tearing down ...`);
+    teardown()
+      .catch(error => console.error(error && error.stack ? error.stack : error))
+      .finally(() => process.exit(1));
+  };
+  process.once('SIGINT', () => handle('SIGINT'));
+  process.once('SIGTERM', () => handle('SIGTERM'));
+}
+
 async function main() {
+  installSignalHandlers();
   try {
     const repoDb = path.join(ROOT, 'router.db');
     repoDbFingerprint = fs.existsSync(repoDb) ? fs.statSync(repoDb).size + ':' + fs.statSync(repoDb).mtimeMs : null;
@@ -689,19 +755,7 @@ async function main() {
     await startBrowser();
     await runChecks();
   } finally {
-    if (browser) {
-      try { await browser.close(); } catch { /* ignore */ }
-      browser = null;
-    }
-    await stopRouter();
-    if (mockServer) {
-      await new Promise(resolve => mockServer.close(resolve));
-      mockServer = null;
-    }
-    if (tempDir) {
-      await fsp.rm(tempDir, { recursive: true, force: true });
-      tempDir = '';
-    }
+    await teardown();
   }
 }
 
