@@ -34,6 +34,8 @@
   const NODE_TYPES = ['start', 'question', 'logic', 'condition', 'target'];
   const NODE_ORDER = { start: 0, condition: 1, question: 2, logic: 3, target: 4 };
   const REJECT_MESSAGE = '只接受 sr-routing-graph v3（本期不做旧格式兼容与转换）';
+  const PARSE_ERROR_ZH = '图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）';
+  const PARSE_ERROR_EN = 'Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)';
   const HINTS = [
     '比较条件写在输入槽位上：数值线拖进任何布尔槽位后，点条件即可改成 > 0.75 这类阈值，不需要再放比较门。',
     '同一数值端口可以连到同一个判断门的两个槽位，分别写 > 0.3 与 < 0.8，就是区间条件。',
@@ -515,11 +517,7 @@
   function validate(value) {
     const graph = graphOf(value);
     if (!graph) {
-      return finishIssues([issue(
-        'graph_parse_error',
-        '图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）',
-        'Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)'
-      )]);
+      return finishIssues([issue('graph_parse_error', PARSE_ERROR_ZH, PARSE_ERROR_EN)]);
     }
     const issues = [];
     const nodes = graph.nodes.filter(node => isRecord(node));
@@ -1168,7 +1166,13 @@
     }
     const raw = data.root;
     if (!isRecord(raw) || raw.type !== 'graph' || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
-      return { ok: false, error: REJECT_MESSAGE, issues: [] };
+      /* kind/version 正确的 v3 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
+         固定拒绝文案只留给旧 jev / version 2 / 错误 kind。 */
+      return {
+        ok: false,
+        error: PARSE_ERROR_ZH,
+        issues: [issue('graph_parse_error', PARSE_ERROR_ZH, PARSE_ERROR_EN)]
+      };
     }
     const graph = clone(raw);
     graph.id = isNonEmptyString(graph.id) ? graph.id : 'root';

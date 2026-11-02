@@ -32,6 +32,20 @@ const S1_TEXT = '10kV 线路跳闸，请安排抢修工单并做故障定位。'
 const S1_NOW = '2026-11-02T12:00:00+08:00';
 const API_TIMEOUT_MS = 15000;
 
+/* 示例图是 15 节点图的唯一来源：节点/边数、start 坐标、兜底目标都从 fixture 派生，
+   避免 QA 里散落 15 / 20,150 / standard-target 这类字面量。 */
+const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
+const EXAMPLE_NODES = EXAMPLE.nodes.length;
+const EXAMPLE_EDGES = EXAMPLE.edges.length;
+const EXAMPLE_START = EXAMPLE.nodes.find(node => node.id === 'start').position;
+const EXAMPLE_TARGETS = { otherwise: EXAMPLE.otherwise_target, error: EXAMPLE.error_fallback };
+/* 示例图只有 root；envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
+const BASELINE = {
+  name: '电力优先决策组',
+  timezone: 'Asia/Shanghai',
+  sticky: { enabled: true, ttl_seconds: 1800 }
+};
+
 /* ── 用例注册器 ─────────────────────────────────────────────────────── */
 
 const checks = [];
@@ -75,14 +89,15 @@ let repoDbFingerprint = null;
 
 const pageErrors = [];
 const externalRequests = [];
-/* 故意制造的 4xx 会让 Chromium 打印 "Failed to load resource" console error；
-   用例显式声明预期数量后，监听器按数量吞掉这些网络层报错（其余错误照旧失败）。 */
-let expectedHttpStatusErrors = 0;
-function expectHttpStatusError(count) {
-  expectedHttpStatusErrors += count == null ? 1 : count;
+/* 故意制造的 4xx 会让 Chromium 打印 "Failed to load resource" console error。
+   用例必须同时声明精确的请求 URL 与状态码；监听器只吞掉完全匹配的那一条，
+   其他 4xx（哪怕同一次点击里的）仍然记为 console error。 */
+const expectedHttpStatusErrors = [];
+function expectHttpStatusError(matcher) {
+  expectedHttpStatusErrors.push(matcher);
 }
 function resetExpectedHttpStatusErrors() {
-  expectedHttpStatusErrors = 0;
+  expectedHttpStatusErrors.length = 0;
 }
 const mockState = { systemoneCalls: [], chatCalls: [], scenarioCalls: {} };
 
@@ -140,9 +155,8 @@ function sendJson(response, status, body) {
 
 function loadScenarioFixture() {
   const fixture = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
-  const example = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
   const optionKeys = {};
-  (example.nodes || []).forEach(node => {
+  (EXAMPLE.nodes || []).forEach(node => {
     if (node.type === 'question' && node.question_type === 'choice') {
       optionKeys[node.id] = (node.options || []).map(option => option.key);
     }
@@ -472,13 +486,12 @@ async function bootstrap() {
   });
 
   /* 5. 建图并启用（root 原样使用 Task 3 的 graph_power 示例）。 */
-  const example = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
   await api('POST', '/admin/trees', {
     id: TREE_ID,
-    name: '电力优先决策组',
-    timezone: 'Asia/Shanghai',
-    sticky: { enabled: true, ttl_seconds: 1800 },
-    root: example
+    name: BASELINE.name,
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: EXAMPLE
   });
   await api('POST', '/admin/trees/' + TREE_ID + '/enable');
 }
@@ -539,8 +552,12 @@ async function startBrowser() {
   page.on('console', message => {
     if (message.type() !== 'error') return;
     const text = 'console: ' + message.text();
-    if (expectedHttpStatusErrors > 0 && /Failed to load resource|加载资源失败|422/.test(text)) {
-      expectedHttpStatusErrors -= 1;
+    const location = message.location();
+    const url = (location && location.url) || '';
+    const index = expectedHttpStatusErrors.findIndex(entry =>
+      entry.url.test(url) && entry.status.test(message.text()));
+    if (index >= 0) {
+      expectedHttpStatusErrors.splice(index, 1);
       return;
     }
     pageErrors.push(text);
@@ -2130,8 +2147,8 @@ test('Task 11 · logic and target inspectors edit operator, models, reasoning, p
 test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits and reject an invalid timezone', async () => {
   await openCanvas();
   await waitInspectorBranch('graph', 'root');
-  assert.equal(await page.locator('#cvInspectorBody [data-field="name"]').inputValue(), '电力优先决策组');
-  assert.equal(await page.locator('#cvInspectorBody [data-field="timezone"]').inputValue(), 'Asia/Shanghai');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="name"]').inputValue(), BASELINE.name);
+  assert.equal(await page.locator('#cvInspectorBody [data-field="timezone"]').inputValue(), BASELINE.timezone);
   assert.equal(await page.locator('#cvInspectorBody [data-field="sticky"]').isChecked(), true);
   assert.equal(await page.locator('#cvInspectorBody [data-field="stickyTtl"]').inputValue(), '1800');
   assert.equal(await page.locator('#cvInspectorBody [data-field="otherwise"]').inputValue(), 'standard-target');
@@ -2152,8 +2169,8 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
       }
     };
   });
-  assert.deepEqual(limitRows.counts, { nodes: 15, edges: 15, questions: 3 });
-  assert.equal(limitRows.nodes, '15 / 200');
+  assert.deepEqual(limitRows.counts, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, questions: 3 });
+  assert.equal(limitRows.nodes, EXAMPLE_NODES + ' / 200');
   assert.equal(limitRows.edges, '15 / 400');
   assert.equal(limitRows.questions, '3 / 32');
   assert.equal(limitRows.waves, '≤ 8');
@@ -2171,7 +2188,7 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
     return error && !error.hidden && error.textContent.trim().length > 0;
   });
   assert.match((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(), /时区|timezone/i);
-  assert.equal(await page.evaluate(() => window.App.tree.timezone), 'Asia/Shanghai');
+  assert.equal(await page.evaluate(() => window.App.tree.timezone), BASELINE.timezone);
   assert.deepEqual((await appSnapshot()).history, historyBefore);
 
   await page.locator('#cvInspectorBody [data-field="name"]').fill('电力优先决策组 · v2');
@@ -2188,9 +2205,10 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
   assert.equal(snapshot.kind, 'behavior');
   assert.equal(await page.evaluate(() => window.App.graph.error_fallback), 'power-target');
   await page.locator('#cvUndo').click();
-  await page.waitForFunction(() => window.App.tree.name === '电力优先决策组' &&
-    window.App.tree.timezone === 'Asia/Shanghai' && window.App.tree.sticky.enabled === true &&
-    window.App.tree.sticky.ttl_seconds === 1800 && window.App.graph.otherwise_target === 'standard-target');
+  await page.waitForFunction(expected => window.App.tree.name === expected.name &&
+    window.App.tree.timezone === expected.timezone && window.App.tree.sticky.enabled === true &&
+    window.App.tree.sticky.ttl_seconds === expected.sticky.ttl_seconds &&
+    window.App.graph.otherwise_target === 'standard-target', BASELINE);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
 });
 
@@ -2274,7 +2292,7 @@ test('Task 11 · boot unlocks the canvas before catalogues and late catalogue da
     await page.waitForTimeout(250);
     assert.equal(await page.locator('#cvInspectorBody [data-field="title"]').inputValue(), draft,
       'late catalogue refresh wiped an unsaved inspector edit');
-    assert.equal(await page.evaluate(() => window.App.tree.name), '电力优先决策组');
+    assert.equal(await page.evaluate(() => window.App.tree.name), BASELINE.name);
   } finally {
     release();
     await page.unroute('**/admin/models');
@@ -2286,7 +2304,8 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
   await openCanvas();
   let held = null;
   const hung = async route => { held = route; };
-  await page.route(url => url.pathname === '/admin/time-periods' && url.searchParams.has('timeout-probe'), hung);
+  const timeoutProbe = url => url.pathname === '/admin/time-periods' && url.searchParams.has('timeout-probe');
+  await page.route(timeoutProbe, hung);
   try {
     const result = await page.evaluate(async () => {
       const path = '/admin/time-periods?timeout-probe=1';
@@ -2309,7 +2328,7 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
     assert.equal(result.message, result.expected, 'timeout error message is not the localized clear message');
   } finally {
     if (held) { try { await held.abort(); } catch { /* already gone */ } }
-    await page.unroute(url => url.pathname === '/admin/time-periods' && url.searchParams.has('timeout-probe'));
+    await page.unroute(timeoutProbe);
   }
 });
 
@@ -2318,13 +2337,12 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
 /* 每个 Task 12 用例都从同一份服务端基线开始：power-priority 恢复为示例图并启用。
    管理面没有 DELETE /admin/trees/{id}，用例新建的组留在临时库里但保持未启用。 */
 async function ensureBaselineTree() {
-  const example = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
   const restored = await api('PUT', '/admin/trees/' + TREE_ID, {
     id: TREE_ID,
-    name: '电力优先决策组',
-    timezone: 'Asia/Shanghai',
-    sticky: { enabled: true, ttl_seconds: 1800 },
-    root: example
+    name: BASELINE.name,
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: EXAMPLE
   });
   if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
   return (await api('GET', '/admin/trees/' + TREE_ID)).tree;
@@ -2379,7 +2397,7 @@ async function beforeUnloadBlocked() {
   return page.evaluate(() => {
     const event = new Event('beforeunload', { cancelable: true });
     window.dispatchEvent(event);
-    return { prevented: event.defaultPrevented, returnValue: event.returnValue };
+    return event.defaultPrevented;
   });
 }
 
@@ -2471,7 +2489,7 @@ test('Task 12 · save clears dirty while the undo history stays usable', async (
   assert.equal((await serverTree(TREE_ID)).name, '保存后仍可撤销');
 
   await page.locator('#cvUndo').click();
-  await page.waitForFunction(() => window.App.tree.name === '电力优先决策组');
+  await page.waitForFunction(expected => window.App.tree.name === expected, BASELINE.name);
   assert.equal((await dirtyBadge()).kind, 'display', 'undoing a save did not mark the draft dirty again');
 });
 
@@ -2486,7 +2504,7 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
   assert.equal(badge.kind, 'behavior', 'timezone change was not classified as behavior');
   assert.equal(badge.text, await page.evaluate(() => window.t('cv.dirty')));
   await page.locator('#cvUndo').click();
-  await page.waitForFunction(() => window.App.tree.timezone === 'Asia/Shanghai' && window.App.kind() === 'clean');
+  await page.waitForFunction(expected => window.App.tree.timezone === expected && window.App.kind() === 'clean', BASELINE.timezone);
 
   await clickNode('capability');
   await waitInspectorBranch('node', 'capability');
@@ -2530,14 +2548,13 @@ test('Task 12 · unsaved switch-group asks one shared confirmation and beforeunl
     await api('POST', '/admin/trees/' + TREE_ID + '/copy', { id: otherId, name: 'QA 切换组' });
   }
   await openCanvas();
-  let event = await beforeUnloadBlocked();
-  assert.equal(event.prevented, false, 'a clean tree blocked beforeunload');
+  /* clean 草稿不得 preventDefault；dirty 草稿必须 preventDefault（且只在 dirty 时）。 */
+  let blocked = await beforeUnloadBlocked();
+  assert.equal(blocked, false, 'a clean tree blocked beforeunload');
 
   await dragNodeBy('start', 40, 30);
-  event = await beforeUnloadBlocked();
-  assert.equal(event.prevented, true, 'a dirty draft did not block beforeunload');
-  /* Chrome 把 legacy returnValue='' 暴露成取消标志（false / ''）；两者都表示已请求确认。 */
-  assert.equal(Boolean(event.returnValue), false, 'beforeunload did not set the legacy returnValue');
+  blocked = await beforeUnloadBlocked();
+  assert.equal(blocked, true, 'a dirty draft did not prevent the beforeunload default');
 
   const select = page.locator('#cvTreeSelect');
   await select.selectOption(otherId);
@@ -2556,8 +2573,8 @@ test('Task 12 · unsaved switch-group asks one shared confirmation and beforeunl
   await page.waitForFunction(id => window.App.treeId === id && window.App.changeKind === 'clean',
     otherId, { timeout: 8000 });
   assert.equal(await page.evaluate(() => window.App.tree.name), 'QA 切换组');
-  event = await beforeUnloadBlocked();
-  assert.equal(event.prevented, false, 'the clean switched tree still blocked beforeunload');
+  blocked = await beforeUnloadBlocked();
+  assert.equal(blocked, false, 'the clean switched tree still prevented beforeunload');
   await ensureBaselineTree();
 });
 
@@ -2641,6 +2658,77 @@ test('Task 12 · enable auto-saves a dirty draft before calling the enable endpo
   }
 });
 
+test('Task 12 · enabling an already-enabled dirty draft saves it first and never re-enables', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await dragNodeBy('start', 30, 20);
+  const requests = [];
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'PUT' && url.pathname === '/admin/trees/' + TREE_ID) requests.push('save');
+    if (request.method() === 'POST' && /\/admin\/trees\/[^/]+\/enable$/.test(url.pathname)) requests.push('enable');
+  };
+  page.on('request', onRequest);
+  try {
+    await page.locator('#cvEnable').click();
+    await page.waitForFunction(() => window.App.changeKind === 'clean');
+    await waitToastIncludes(await page.evaluate(() => window.t('cv.toastAlreadyEnabled')));
+    await page.waitForTimeout(250);
+    assert.deepEqual(requests, ['save'],
+      'enable short-circuited on an enabled tree before saving its dirty draft');
+    assert.equal((await dirtyBadge()).hidden, true);
+    assert.equal((await serverTree(TREE_ID)).enabled, true);
+  } finally {
+    page.off('request', onRequest);
+    await ensureBaselineTree();
+  }
+});
+
+test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "local"', async () => {
+  const emptyTreeList = async route => {
+    if (route.request().method() !== 'GET') { await route.continue(); return; }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ trees: [], snapshot_revision: '' })
+    });
+  };
+  const treeListRoute = url => url.pathname === '/admin/trees';
+  await page.route(treeListRoute, emptyTreeList);
+  try {
+    await openCanvas();
+    const draft = await page.evaluate(() => ({
+      treeId: window.App.treeId,
+      tree: window.App.tree.id,
+      saved: window.App.saved,
+      kind: window.App.kind(),
+      nodes: window.App.graph.nodes.length
+    }));
+    assert.equal(draft.saved, null);
+    assert.equal(draft.treeId, draft.tree, 'boot fallback envelope id differs from the draft tree id');
+    assert.match(draft.treeId, /^[0-9a-f]{12}$/, 'boot fallback id is not a frontend UUID slice: ' + draft.treeId);
+    assert.notEqual(draft.treeId, 'local');
+    assert.equal(draft.nodes, 2);
+    assert.equal(draft.kind, 'behavior');
+
+    const posted = page.waitForRequest(request =>
+      request.method() === 'POST' && new URL(request.url()).pathname === '/admin/trees');
+    await page.locator('#cvSave').click();
+    const request = await posted;
+    const payload = request.postDataJSON();
+    assert.match(payload.id, /^[0-9a-f]{12}$/, 'POST /admin/trees did not use the UUID-slice id');
+    assert.equal(payload.id, draft.treeId);
+    await page.waitForFunction(id => window.App.changeKind === 'clean' && window.App.treeId === id,
+      draft.treeId, { timeout: 8000 });
+    const listed = (await api('GET', '/admin/trees')).trees.find(tree => tree.id === draft.treeId);
+    assert.ok(listed, 'boot fallback save did not create a tree with the draft id');
+    assert.equal(listed.enabled, false);
+  } finally {
+    await page.unroute(treeListRoute, emptyTreeList);
+    await ensureBaselineTree();
+  }
+});
+
 test('Task 12 · loading the example asks for confirmation and replaces the graph as one undo step', async () => {
   await ensureBaselineTree();
   await openCanvas();
@@ -2663,11 +2751,13 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
   /* 示例是异步 fetch 的：等待它真正替换草稿（示例 start 坐标），不能只看节点数（本来就是 15）。 */
-  await page.waitForFunction(() => {
+  await page.waitForFunction(expected => {
     const node = window.App.graph.nodes.find(item => item.id === 'start');
-    return window.App.graph.nodes.length === 15 && window.App.graph.edges.length === 15 &&
-      node && node.position.x === 20 && node.position.y === 150 && window.App.kind() === 'clean';
-  }, null, { timeout: 8000 });
+    return window.App.graph.nodes.length === expected.nodes &&
+      window.App.graph.edges.length === expected.edges &&
+      node && node.position.x === expected.start.x && node.position.y === expected.start.y &&
+      window.App.kind() === 'clean';
+  }, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, start: EXAMPLE_START }, { timeout: 8000 });
   const loaded = await page.evaluate(() => ({
     kind: window.App.kind(),
     canUndo: window.App.kit.canUndo(),
@@ -2682,13 +2772,73 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
 
   /* 一次撤销必须回到载入前的完整草稿（拖拽后的坐标），而不是半张示例图。 */
   await page.locator('#cvUndo').click();
-  await page.waitForFunction(() => window.App.graph.nodes.length === 15 && window.App.kind() === 'layout');
+  await page.waitForFunction(expected =>
+    window.App.graph.nodes.length === expected && window.App.kind() === 'layout', EXAMPLE_NODES);
   const undone = await page.evaluate(() => {
     const node = window.App.graph.nodes.find(item => item.id === 'start');
     return { x: node.position.x, y: node.position.y };
   });
   assert.deepEqual(undone, { x: moved.x, y: moved.y },
     'loading the example was not a single replace-entire-graph history operation');
+});
+
+test('Task 12 · loading the example from a clean saved draft still confirms before replacing it', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  /* clean 但内容已和示例不同（拖动后保存），让“载入示例”成为一次可见的整图替换。 */
+  const moved = await dragNodeBy('start', 52, 36);
+  await saveNow();
+  assert.equal((await dirtyBadge()).kind, 'clean');
+
+  await page.locator('#cvLoadExample').click();
+  const dialog = await waitConfirmDialog();
+  assert.ok(dialog.includes(await page.evaluate(() => window.t('cv.confirmLoadExample'))),
+    'clean example load did not use the clean confirmation title');
+  assert.ok(dialog.includes(await page.evaluate(() => window.t('cv.confirmLoadExampleClean'))),
+    'clean example load did not explain that the whole graph is replaced');
+  assert.equal(dialog.includes(await page.evaluate(() => window.t('cv.confirmDirtyBody'))), false,
+    'clean example load reused the discard-draft copy');
+
+  await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
+  await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
+  const kept = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return {
+      start: { x: node.position.x, y: node.position.y },
+      kind: window.App.kind(),
+      nodes: window.App.graph.nodes.length
+    };
+  });
+  assert.deepEqual(kept.start, moved, 'cancelling the clean example load changed the draft');
+  assert.equal(kept.kind, 'clean');
+  assert.equal(kept.nodes, EXAMPLE_NODES);
+
+  await page.locator('#cvLoadExample').click();
+  await waitConfirmDialog();
+  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+  await page.waitForFunction(expected => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return window.App.graph.nodes.length === expected.nodes &&
+      window.App.graph.edges.length === expected.edges &&
+      node && node.position.x === expected.start.x && node.position.y === expected.start.y;
+  }, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, start: EXAMPLE_START }, { timeout: 8000 });
+  const loaded = await page.evaluate(() => ({
+    canUndo: window.App.kit.canUndo(),
+    kind: window.App.kind()
+  }));
+  assert.equal(loaded.canUndo, true, 'confirming the example load did not add a history entry');
+  /* 保存后的草稿与示例只差节点坐标，所以内容分类是 layout（整图替换仍算一个历史项）。 */
+  assert.equal(loaded.kind, 'layout',
+    'replacing the saved layout with the example was not classified as a layout change');
+
+  /* 一次撤销回到保存后的拖拽坐标，证明示例载入只产生一个历史项。 */
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(expected => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return node && node.position.x === expected.x && node.position.y === expected.y &&
+      window.App.kind() === 'clean';
+  }, moved, { timeout: 4000 });
+  await ensureBaselineTree();
 });
 
 test('Task 12 · export downloads the complete v3 envelope including timezone and sticky', async () => {
@@ -2700,12 +2850,12 @@ test('Task 12 · export downloads the complete v3 envelope including timezone an
   assert.equal(parsed.kind, 'sr-routing-graph');
   assert.equal(parsed.version, 3);
   assert.equal(parsed.name, baseline.name);
-  assert.equal(parsed.timezone, 'Asia/Shanghai');
-  assert.deepEqual(parsed.sticky, { enabled: true, ttl_seconds: 1800 });
-  assert.equal(parsed.root.nodes.length, 15);
-  assert.equal(parsed.root.edges.length, 15);
-  assert.equal(parsed.root.otherwise_target, 'standard-target');
-  assert.equal(parsed.root.error_fallback, 'light-target');
+  assert.equal(parsed.timezone, BASELINE.timezone);
+  assert.deepEqual(parsed.sticky, BASELINE.sticky);
+  assert.equal(parsed.root.nodes.length, EXAMPLE_NODES);
+  assert.equal(parsed.root.edges.length, EXAMPLE_EDGES);
+  assert.equal(parsed.root.otherwise_target, EXAMPLE_TARGETS.otherwise);
+  assert.equal(parsed.root.error_fallback, EXAMPLE_TARGETS.error);
   assert.equal((await dirtyBadge()).kind, 'clean', 'export mutated the draft');
 });
 
@@ -2724,8 +2874,9 @@ test('Task 12 · importing an exported v3 graph round-trips behavior canonical i
   await page.waitForFunction(() => window.App.saved === null && window.App.graph.nodes.length === 2);
   const newId = await page.evaluate(() => window.App.treeId);
   await setImportPayload(source.text);
-  await page.waitForFunction(() =>
-    window.App.graph.nodes.length === 15 && window.App.graph.edges.length === 15, null, { timeout: 8000 });
+  await page.waitForFunction(expected =>
+    window.App.graph.nodes.length === expected.nodes && window.App.graph.edges.length === expected.edges,
+  { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES }, { timeout: 8000 });
   const imported = await page.evaluate(() => ({
     id: window.App.treeId,
     treeId: window.App.tree.id,
@@ -2739,8 +2890,8 @@ test('Task 12 · importing an exported v3 graph round-trips behavior canonical i
   assert.equal(imported.id, newId, 'import replaced the target group id');
   assert.equal(imported.treeId, newId);
   assert.equal(imported.name, JSON.parse(source.text).name);
-  assert.equal(imported.timezone, 'Asia/Shanghai');
-  assert.deepEqual(imported.sticky, { enabled: true, ttl_seconds: 1800 });
+  assert.equal(imported.timezone, BASELINE.timezone);
+  assert.deepEqual(imported.sticky, BASELINE.sticky);
   assert.equal(imported.canonical, sourceCanonical, 'import round-trip changed the behavior canonical');
   assert.equal(imported.kind, 'behavior');
   assert.equal(imported.canUndo, true);
@@ -2778,7 +2929,7 @@ test('Task 12 · import rejects legacy/version-2 payloads with the fixed copy an
   });
   assert.deepEqual({ x: kept.x, y: kept.y }, keptBefore, 'a rejected legacy import replaced the draft');
   assert.equal(kept.kind, 'layout');
-  assert.equal(await page.evaluate(() => window.App.graph.nodes.length), 15);
+  assert.equal(await page.evaluate(() => window.App.graph.nodes.length), EXAMPLE_NODES);
 
   /* 正确 kind、version=2：同一固定拒绝文案。 */
   await clearToasts();
@@ -2794,24 +2945,69 @@ test('Task 12 · import rejects legacy/version-2 payloads with the fixed copy an
   }), keptBefore, 'a rejected version-2 import replaced the draft');
 });
 
+test('Task 12 · a v3 document with a malformed root reports graph_parse_error and keeps the draft', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await dragNodeBy('start', 34, 22);
+  const draftOf = () => page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return {
+      start: { x: node.position.x, y: node.position.y },
+      kind: window.App.kind(),
+      nodes: window.App.graph.nodes.length,
+      edges: window.App.graph.edges.length
+    };
+  });
+  const kept = await draftOf();
+
+  await clearToasts();
+  await setImportPayload({
+    kind: 'sr-routing-graph',
+    version: 3,
+    name: 'v3 但 root 非法',
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: { type: 'jev', branches: [] }
+  }, 'malformed-v3.json');
+
+  await page.waitForFunction(() =>
+    window.App.issues.some(issue => issue.code === 'graph_parse_error') &&
+    !document.getElementById('cvIssues').hidden, null, { timeout: 8000 });
+  await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
+  const issues = await page.evaluate(() => window.App.issues.map(issue => ({
+    code: issue.code, level: issue.level, zh: issue.zh, en: issue.en,
+    node_id: issue.node_id, edge_id: issue.edge_id, port: issue.port
+  })));
+  assert.deepEqual(issues.map(issue => issue.code), ['graph_parse_error'],
+    'malformed v3 import did not surface a single graph_parse_error');
+  assert.equal(issues[0].level, 'hard');
+  assert.match(issues[0].zh, /图解析失败/);
+  assert.match(issues[0].en, /Graph parse failed/);
+  assert.equal(issues[0].node_id, '');
+  assert.equal(issues[0].edge_id, '');
+  assert.equal(issues[0].port, '');
+  assert.equal(await page.locator('#cvIssues .rtc-issue.is-hard').count(), 1,
+    'the validation bar did not render the parse issue');
+  assert.deepEqual(await draftOf(), kept, 'a malformed v3 import changed the draft');
+});
+
 test('Task 12 · a valid v3 import without positions lays every node out with finite coordinates', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  const example = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
-  const stripped = JSON.parse(JSON.stringify(example));
+  const stripped = JSON.parse(JSON.stringify(EXAMPLE));
   stripped.nodes.forEach(node => { delete node.position; });
   await setImportPayload({
     kind: 'sr-routing-graph',
     version: 3,
-    name: '电力优先决策组',
-    timezone: 'Asia/Shanghai',
-    sticky: { enabled: true, ttl_seconds: 1800 },
+    name: BASELINE.name,
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
     root: stripped
   }, 'missing-positions.json');
-  await page.waitForFunction(() =>
-    window.App.graph.nodes.length === 15 && window.App.graph.nodes.every(node =>
+  await page.waitForFunction(expected =>
+    window.App.graph.nodes.length === expected && window.App.graph.nodes.every(node =>
       node.position && Number.isFinite(node.position.x) && Number.isFinite(node.position.y)),
-  null, { timeout: 8000 });
+  EXAMPLE_NODES, { timeout: 8000 });
   const result = await page.evaluate(() => ({
     kind: window.App.kind(),
     issues: window.App.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code),
@@ -2870,9 +3066,10 @@ test('Task 12 · a failed save blocks enable and 422 issues locate by node/edge/
   await page.locator('#cvLoadExample').click();
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
-  await page.waitForFunction(() => window.App.graph.nodes.length === 15 &&
-    window.App.graph.edges.length === 15 &&
-    window.App.graph.nodes.some(node => node.id === 'deep-target'), null, { timeout: 8000 });
+  await page.waitForFunction(expected => window.App.graph.nodes.length === expected.nodes &&
+    window.App.graph.edges.length === expected.edges &&
+    window.App.graph.nodes.some(node => node.id === 'deep-target'),
+  { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES }, { timeout: 8000 });
   await saveNow();
   assert.equal(await page.evaluate(() => window.App.tree.enabled), false,
     'the fixture tree must start disabled so enable really runs');
@@ -2904,12 +3101,14 @@ test('Task 12 · a failed save blocks enable and 422 issues locate by node/edge/
   page.on('request', onRequest);
   await page.route('**/admin/trees/**', putHandler);
   try {
-    /* 这个 422 是测试故意制造的：允许 Chromium 的网络层 console error 一条。 */
-    expectHttpStatusError(1);
+    /* 只允许这一条故意 422：URL 精确到本用例的新组，状态必须是 422。 */
+    expectHttpStatusError({ url: new RegExp('/admin/trees/' + targetId + '$'), status: /422/ });
     await page.locator('#cvEnable').click();
     await page.waitForFunction(() => window.App.issues.length === 4 &&
       !document.getElementById('cvIssues').hidden, null, { timeout: 8000 });
     await page.waitForTimeout(300);
+    assert.equal(expectedHttpStatusErrors.length, 0,
+      'the scoped 422 console error was not observed at the expected URL/status');
     assert.equal(enableRequests.length, 0, 'enable was sent even though the save failed');
     assert.equal(await page.evaluate(() => window.App.tree.enabled), false);
     assert.deepEqual(await page.evaluate(() => window.App.issues.map(issue => issue.code)),
@@ -2935,10 +3134,11 @@ test('Task 12 · a failed save blocks enable and 422 issues locate by node/edge/
     await waitCondPop('e-clarify-deep');
     assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()),
       { kind: 'edge', id: 'e-clarify-deep' });
-    await page.keyboard.press('Escape');
 
-    /* 图级定位：打开检查器图设置 */
+    /* 图级定位：条件浮层此刻仍开着；定位必须自己关掉它并聚焦检查器图设置。 */
     await page.locator('#cvIssues [data-issue-graph="1"]').first().click();
+    assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
+      'graph-level locate left the condition popup open');
     assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
     assert.equal(await page.evaluate(() =>
       document.getElementById('cvInspector').classList.contains('is-focus')), true);
@@ -2961,15 +3161,16 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
   /* 新建草稿是 2 个节点：必须等示例 root 真正替换后再保存。 */
-  await page.waitForFunction(() => window.App.graph.nodes.length === 15 &&
-    window.App.graph.edges.length === 15 &&
-    window.App.graph.nodes.some(node => node.id === 'deep-target'), null, { timeout: 8000 });
+  await page.waitForFunction(expected => window.App.graph.nodes.length === expected.nodes &&
+    window.App.graph.edges.length === expected.edges &&
+    window.App.graph.nodes.some(node => node.id === 'deep-target'),
+  { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES }, { timeout: 8000 });
   await saveNow();
 
   const savedServer = await serverTree(newId);
   assert.equal(savedServer.enabled, false);
-  assert.equal(savedServer.root.nodes.length, 15);
-  assert.equal(savedServer.root.edges.length, 15);
+  assert.equal(savedServer.root.nodes.length, EXAMPLE_NODES);
+  assert.equal(savedServer.root.edges.length, EXAMPLE_EDGES);
   const revision = savedServer.tree_revision;
 
   await page.locator('#cvEnable').click();
@@ -2991,8 +3192,8 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
   assert.equal(after.treeId, newId, 'refresh booted a different tree than the enabled one');
   assert.equal(after.revision, revision, 'refreshed tree revision differs from the GET revision');
   assert.equal(after.enabled, true);
-  assert.equal(after.nodes, 15);
-  assert.equal(after.edges, 15);
+  assert.equal(after.nodes, EXAMPLE_NODES);
+  assert.equal(after.edges, EXAMPLE_EDGES);
   assert.equal(after.kind, 'clean');
   assert.ok(after.revisionLabel.includes(revision.slice(0, 10)),
     'toolbar revision label does not show the refreshed revision');

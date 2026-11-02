@@ -358,6 +358,9 @@
       App.kit.focusNode(target.id);
       return true;
     }
+    /* 图级定位要聚焦检查器图设置：先关掉可能还开着的输入槽条件浮层，
+       否则浮层会盖住检查器（Task 11 QA 曾需先按 Esc）。 */
+    if (root.RTCondPop && root.RTCondPop.isOpen()) root.RTCondPop.close();
     App.kit.clearSelection();
     focusInspector();
     return true;
@@ -924,19 +927,31 @@
     import: 'cv.confirmImportTitle',
     new: 'cv.confirmNewTitle'
   };
+  /* 载入示例总是确认；clean 草稿没有“丢弃”语义，用只描述替换整张图的文案。 */
+  const CONFIRM_LOAD_EXAMPLE = {
+    title: 'cv.confirmLoadExample',
+    body: 'cv.confirmLoadExampleClean',
+    action: 'cv.confirmLoad'
+  };
 
-  function askDiscard(reason) {
+  function askDiscard(reason, copy) {
     return new Promise(resolve => {
       const modal = $('#cvConfirmModal');
       const body = $('#cvConfirmBody');
       if (!modal || !body) { resolve(true); return; }
       if (confirmState) { confirmState.resolve(false); confirmState = null; }
-      const title = t(CONFIRM_TITLES[reason] || 'cv.confirmSwitchTitle');
+      const text = copy || {
+        title: CONFIRM_TITLES[reason] || 'cv.confirmSwitchTitle',
+        body: 'cv.confirmDirtyBody',
+        action: 'cv.confirmDiscard'
+      };
+      const title = t(text.title);
       body.innerHTML = '<h3>' + esc(title) + '</h3>' +
-        '<p class="rtc-dialog-lead">' + esc(t('cv.confirmDirtyBody')) + '</p>' +
+        '<p class="rtc-dialog-lead">' + esc(t(text.body)) + '</p>' +
         '<div class="rtc-dialog-acts">' +
         '<button type="button" class="btn sm" data-act="confirm-cancel">' + esc(t('cv.confirmCancel')) + '</button>' +
-        '<button type="button" class="btn sm danger" data-act="confirm-discard">' + esc(t('cv.confirmDiscard')) + '</button>' +
+        '<button type="button" class="btn sm ' + (copy ? 'pri' : 'danger') +
+        '" data-act="confirm-discard">' + esc(t(text.action)) + '</button>' +
         '</div>';
       body.setAttribute('aria-label', title);
       modal.hidden = false;
@@ -1034,14 +1049,15 @@
 
   async function enableTree() {
     if (!App.tree) return false;
-    if (App.tree.enabled) {
-      toast(t('cv.toastAlreadyEnabled'), 'warn');
-      return true;
-    }
-    /* 启用前先落盘：保存失败（含 422 issue 数组）绝不发 enable。 */
+    /* 启用前先落盘：保存失败（含 422 issue 数组）绝不发 enable。
+       已启用的组若有 dirty 改动，也要先保存（点击启用 = “保存并启用”）。 */
     if (App.changeKind !== 'clean' || !App.saved) {
       const saved = await saveTree();
       if (!saved) return false;
+    }
+    if (App.tree.enabled) {
+      toast(t('cv.toastAlreadyEnabled'), 'warn');
+      return true;
     }
     try {
       const result = await api.post('/admin/trees/' + encodeURIComponent(App.treeId) + '/enable');
@@ -1103,25 +1119,30 @@
     return raw.replace(/[^a-z0-9]/gi, '').slice(0, 12);
   }
 
+  /* 新建与启动兜底共用：前端 UUID 切片 id，保存时 POST 成新组（不能再用 'local' 占位）。 */
+  function newDraftTree() {
+    const tree = RTGraph.createMinimalTree(defaultModelId());
+    tree.id = newTreeId();
+    tree.name = t('cv.default.name');
+    return tree;
+  }
+
   async function newTree() {
     if (App.changeKind !== 'clean') {
       const discard = await askDiscard('new');
       if (!discard) return false;
     }
-    const tree = RTGraph.createMinimalTree(defaultModelId());
-    tree.id = newTreeId();
-    tree.name = t('cv.default.name');
-    loadTree(tree, false);
+    loadTree(newDraftTree(), false);
     toast(t('cv.toastNewTree'));
     return true;
   }
   App.newTree = newTree;
 
   async function loadExample() {
-    if (App.changeKind !== 'clean') {
-      const discard = await askDiscard('example');
-      if (!discard) return false;
-    }
+    /* 载入示例总是确认：clean 草稿用“替换整张图”文案，dirty 才提示丢弃改动。 */
+    const confirmed = await askDiscard('example',
+      App.changeKind === 'clean' ? CONFIRM_LOAD_EXAMPLE : null);
+    if (!confirmed) return false;
     try {
       const response = await fetch('routing/example.json', { cache: 'no-store' });
       if (!response.ok) throw new Error('HTTP ' + response.status);
@@ -1174,13 +1195,24 @@
      任何失败都保留当前草稿，合法导入作为一次历史操作替换完整 envelope。 */
   function applyImport(text) {
     const result = RTGraph.parseImport(text);
-    if (!result || !result.ok) {
-      const reason = (result && result.error) || 'invalid import';
-      toast(tf('cv.toastImportRejected', { err: reason }), 'error');
+    if (!result) {
+      toast(tf('cv.toastImportRejected', { err: 'invalid import' }), 'error');
       return false;
     }
     const issues = Array.isArray(result.issues) ? result.issues : [];
     const hard = issues.filter(issue => issue.level !== 'hint');
+    /* v3 kind/version 正确但结构非法时 parseImport 也返回 issues：与结构校验走同一展示路径。 */
+    if (!result.ok) {
+      if (hard.length) {
+        App.issues = issues;
+        revealIssues();
+        toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
+      } else {
+        const reason = result.error || 'invalid import';
+        toast(tf('cv.toastImportRejected', { err: reason }), 'error');
+      }
+      return false;
+    }
     if (hard.length) {
       App.issues = issues;
       revealIssues();
@@ -1456,7 +1488,9 @@
   function loadTree(raw, saved) {
     App.tree = normaliseTree(raw);
     App.graph = App.tree.root;
-    App.treeId = raw && raw.id ? raw.id : 'local';
+    /* 服务端树自带 id；新建/启动兜底也必须是前端 UUID 切片 id，不能落成 'local'。 */
+    App.treeId = raw && raw.id ? raw.id : newTreeId();
+    App.tree.id = App.treeId;
     App.saved = saved ? RTGraph.clone(App.tree) : null;
     App.issues = RTGraph.validate(App.tree.root);
     App.replay = null;
@@ -1526,15 +1560,14 @@
         const result = await api.get('/admin/trees/' + encodeURIComponent(enabled.id));
         const tree = result && result.tree;
         if (tree && tree.root) loadTree(tree, true);
-        else loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
+        else loadTree(newDraftTree(), false);
       } else {
-        loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
+        loadTree(newDraftTree(), false);
       }
     } catch (error) {
       App.trees = [];
-      App.treeId = 'local';
       toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
-      loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
+      loadTree(newDraftTree(), false);
     }
     /* 树加载完成即解锁画布与节点库；模型/时段目录只影响检查器选项，不能阻塞建模。 */
     App.booted = true;

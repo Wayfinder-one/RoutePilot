@@ -566,8 +566,6 @@ test('legacy and version-2 imports are rejected with the fixed message', () => {
     JSON.stringify({ kind: 'sr-routing-graph', version: '2', root: { type: 'graph', nodes: [], edges: [] } }),
     JSON.stringify({ version: 3, name: '没有 kind', root: { type: 'graph', nodes: [], edges: [] } }),
     JSON.stringify({ kind: 'jev', version: 3, root: { type: 'jev', branches: [] } }),
-    JSON.stringify({ kind: 'sr-routing-graph', version: 3, root: { type: 'jev', branches: [] } }),
-    JSON.stringify({ kind: 'sr-routing-graph', version: 3, root: { type: 'graph', nodes: {} } }),
   ];
   for (const text of payloads) {
     const result = RTGraph.parseImport(text);
@@ -580,6 +578,28 @@ test('legacy and version-2 imports are rejected with the fixed message', () => {
   assert.equal(malformed.ok, false);
   assert.match(malformed.error, /JSON/);
   assert.equal(RTGraph.parseImport('[]').ok, false);
+});
+
+test('kind/version-correct v3 documents with a malformed root report graph_parse_error', () => {
+  const payloads = [
+    JSON.stringify({ kind: 'sr-routing-graph', version: 3, root: { type: 'jev', branches: [] } }),
+    JSON.stringify({ kind: 'sr-routing-graph', version: 3, root: { type: 'graph', nodes: {} } }),
+    JSON.stringify({ kind: 'sr-routing-graph', version: 3, name: '没有 root' }),
+  ];
+  for (const text of payloads) {
+    const result = RTGraph.parseImport(text);
+    assert.equal(result.ok, false, text);
+    assert.notEqual(result.error, RTGraph.REJECT_MESSAGE, text);
+    assert.equal(result.issues.length, 1, text);
+    const issue = result.issues[0];
+    assert.equal(issue.code, 'graph_parse_error', text);
+    assert.equal(issue.level, 'hard', text);
+    assert.match(issue.zh, /图解析失败/);
+    assert.match(issue.en, /Graph parse failed/);
+    assert.equal(issue.node_id, '');
+    assert.equal(issue.edge_id, '');
+    assert.equal(issue.port, '');
+  }
 });
 
 /* ── 7. 新建 / 删除 / 选项级联 ──────────────────────────────────────── */
