@@ -702,6 +702,497 @@ test('admin try routes the sample graph through the live decision mock', async (
   assert.deepEqual(calls[calls.length - 1].keys.sort(), ['capability', 'domain']);
 });
 
+/* ── Task 10 · 画布骨架 / 视口 / 连线 / 快速创建 / 历史栈 ───────────── */
+
+const MOD = process.platform === 'darwin' ? 'Meta' : 'Control';
+
+async function openCanvas() {
+  await page.goto(routerBase + '/console/routing.html');
+  await page.waitForSelector('#cvStage [data-node-id]', { timeout: 20000 });
+  await page.waitForFunction(() => window.App && window.App.booted && window.App.kit);
+  await page.waitForTimeout(180);
+}
+
+async function appSnapshot() {
+  return page.evaluate(() => ({
+    viewport: window.App.kit.getViewport(),
+    kind: window.App.kind(),
+    nodes: window.App.graph.nodes.map(node => ({
+      id: node.id, type: node.type, question_type: node.question_type || null,
+      operator: node.operator || null, source: node.source || null,
+      position: { x: node.position.x, y: node.position.y }
+    })),
+    edges: window.App.graph.edges.map(edge => ({
+      id: edge.id, source: edge.source, source_port: edge.source_port,
+      target: edge.target, target_port: edge.target_port,
+      condition: edge.condition ? { op: edge.condition.op, value: edge.condition.value } : edge.condition
+    })),
+    selection: window.App.kit.getSelection(),
+    history: { undo: window.App.kit.canUndo(), redo: window.App.kit.canRedo() }
+  }));
+}
+
+async function blankPoint() {
+  return page.evaluate(() => {
+    const stage = document.getElementById('cvStage');
+    const rect = stage.getBoundingClientRect();
+    for (let y = rect.top + 14; y < rect.bottom - 130; y += 22) {
+      for (let x = rect.left + 14; x < rect.right - 14; x += 22) {
+        const el = document.elementFromPoint(x, y);
+        if (!el) continue;
+        if (el.closest('[data-node-id]') || el.closest('.rtc-overlay') || el.closest('.rtc-edge-hit')) continue;
+        if (el !== stage && !stage.contains(el)) continue;
+        return { x: x, y: y };
+      }
+    }
+    return null;
+  });
+}
+
+async function clearToasts() {
+  await page.evaluate(() => { document.getElementById('cvToast').innerHTML = ''; });
+}
+
+async function toastText() {
+  return page.evaluate(() => document.getElementById('cvToast').textContent.replace(/\s+/g, ' ').trim());
+}
+
+async function portPoint(nodeId, portId, dir) {
+  const locator = page.locator(`[data-node-id="${nodeId}"] [data-port-id="${portId}"][data-port-dir="${dir}"]`).first();
+  const box = await locator.boundingBox();
+  assert.ok(box, `port not visible: ${nodeId}.${portId} (${dir})`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+async function dragPort(sourceNode, sourcePort, target, options) {
+  const from = await portPoint(sourceNode, sourcePort, 'out');
+  const opts = options || {};
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(from.x + 26, from.y + 18, { steps: 4 });
+  await page.mouse.move(target.x, target.y, { steps: 10 });
+  if (opts.beforeUp) await opts.beforeUp();
+  await page.mouse.up();
+}
+
+async function clickNode(nodeId) {
+  const box = await page.locator(`[data-node-id="${nodeId}"]`).first().boundingBox();
+  assert.ok(box, `node not visible: ${nodeId}`);
+  await page.mouse.move(box.x + 24, box.y + 12);
+  await page.mouse.down();
+  await page.mouse.up();
+}
+
+async function dragLibraryItem(kind, target) {
+  const item = page.locator(`[data-lib-kind="${kind}"]`);
+  const box = await item.boundingBox();
+  assert.ok(box, `node library item not visible: ${kind}`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x, target.y, { steps: 12 });
+  await page.mouse.up();
+}
+
+test('Task 10 · canvas skeleton renders the graph with no page overflow', async () => {
+  await openCanvas();
+  const metrics = await page.evaluate(() => ({
+    nodes: document.querySelectorAll('#cvStage [data-node-id]').length,
+    edges: document.querySelectorAll('#cvEdges path.rtc-edge').length,
+    groups: document.querySelectorAll('#cvPalBody .rtc-pgroup').length,
+    inspector: !!document.getElementById('cvInspector'),
+    minimap: !!document.getElementById('cvMinimap'),
+    trybar: !!document.getElementById('cvTryBar'),
+    zoom: document.getElementById('cvZoomLabel').textContent,
+    miniNodes: document.querySelectorAll('#cvMinimapSvg .rtc-mini-node').length,
+    miniView: document.querySelectorAll('#cvMinimapSvg .rtc-mini-view').length,
+    historyLimit: window.RTCanvas.HISTORY_LIMIT,
+    scrollW: document.documentElement.scrollWidth,
+    clientW: document.documentElement.clientWidth,
+    scrollH: document.documentElement.scrollHeight,
+    innerH: window.innerHeight
+  }));
+  assert.equal(metrics.nodes, 15);
+  assert.equal(metrics.edges, 15);
+  assert.equal(metrics.groups, 4);
+  assert.ok(metrics.inspector && metrics.minimap && metrics.trybar);
+  assert.match(metrics.zoom, /^\d+%$/);
+  assert.equal(metrics.miniNodes, 15);
+  assert.equal(metrics.miniView, 1);
+  assert.equal(metrics.historyLimit, 100);
+  assert.ok(metrics.scrollW <= metrics.clientW + 1, `horizontal overflow: ${metrics.scrollW} > ${metrics.clientW}`);
+  assert.ok(metrics.scrollH <= metrics.innerH + 1, `vertical page scroll: ${metrics.scrollH} > ${metrics.innerH}`);
+  await screenshot('task10-canvas-1440.png');
+
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.waitForTimeout(160);
+  const narrow = await page.evaluate(() => ({
+    scrollW: document.documentElement.scrollWidth,
+    clientW: document.documentElement.clientWidth,
+    scrollH: document.documentElement.scrollHeight,
+    innerH: window.innerHeight,
+    paletteVisible: document.getElementById('cvPalette').getBoundingClientRect().width > 0,
+    inspectorVisible: document.getElementById('cvInspector').getBoundingClientRect().width > 0
+  }));
+  assert.ok(narrow.scrollW <= narrow.clientW + 1, `1280 horizontal overflow: ${narrow.scrollW} > ${narrow.clientW}`);
+  assert.ok(narrow.scrollH <= narrow.innerH + 1, `1280 page scroll: ${narrow.scrollH} > ${narrow.innerH}`);
+  assert.ok(narrow.paletteVisible && narrow.inspectorVisible);
+  await screenshot('task10-canvas-1280.png');
+  await page.locator('[data-act="zoom-reset"]').click();
+  await page.waitForTimeout(140);
+  await screenshot('task10-canvas-100.png');
+  await page.setViewportSize({ width: 1440, height: 960 });
+});
+
+test('Task 10 · blank drag, space+drag and middle-button drag all pan the viewport', async () => {
+  await openCanvas();
+  const start = await page.evaluate(() => window.App.kit.getViewport());
+  let point = await blankPoint();
+  assert.ok(point, 'no blank canvas point found');
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.down();
+  await page.mouse.move(point.x + 60, point.y + 30, { steps: 6 });
+  await page.mouse.up();
+  let viewport = await page.evaluate(() => window.App.kit.getViewport());
+  assert.ok(Math.abs((viewport.tx - start.tx) - 60) < 2, `blank pan tx ${viewport.tx - start.tx} != 60`);
+  assert.ok(Math.abs((viewport.ty - start.ty) - 30) < 2, `blank pan ty ${viewport.ty - start.ty} != 30`);
+  assert.equal(Math.round(viewport.k * 1000), Math.round(start.k * 1000));
+  assert.equal(await page.evaluate(() => window.App.kind()), 'clean');
+
+  const beforeSpace = viewport;
+  point = await blankPoint();
+  await page.keyboard.down('Space');
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.down();
+  await page.mouse.move(point.x - 40, point.y + 25, { steps: 6 });
+  await page.mouse.up();
+  await page.keyboard.up('Space');
+  viewport = await page.evaluate(() => window.App.kit.getViewport());
+  assert.ok(Math.abs((viewport.tx - beforeSpace.tx) + 40) < 2, `space pan tx ${viewport.tx - beforeSpace.tx} != -40`);
+  assert.ok(Math.abs((viewport.ty - beforeSpace.ty) - 25) < 2, `space pan ty ${viewport.ty - beforeSpace.ty} != 25`);
+
+  const beforeMiddle = viewport;
+  point = await blankPoint();
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.down({ button: 'middle' });
+  await page.mouse.move(point.x + 35, point.y - 20, { steps: 6 });
+  await page.mouse.up({ button: 'middle' });
+  viewport = await page.evaluate(() => window.App.kit.getViewport());
+  assert.ok(Math.abs((viewport.tx - beforeMiddle.tx) - 35) < 2, `middle pan tx ${viewport.tx - beforeMiddle.tx} != 35`);
+  assert.ok(Math.abs((viewport.ty - beforeMiddle.ty) + 20) < 2, `middle pan ty ${viewport.ty - beforeMiddle.ty} != -20`);
+});
+
+test('Task 10 · wheel zoom anchors at the pointer; zoom buttons, 100% reset and fit work', async () => {
+  await openCanvas();
+  const box = await page.locator('#cvStage').boundingBox();
+  const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  const labelBefore = await page.locator('#cvZoomLabel').textContent();
+  const worldBefore = await page.evaluate(([x, y]) => window.App.kit.screenToWorld(x, y), [point.x, point.y]);
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.wheel(0, -240);
+  await page.waitForFunction(previous => document.querySelector('#cvZoomLabel').textContent !== previous, labelBefore);
+  const worldAfter = await page.evaluate(([x, y]) => window.App.kit.screenToWorld(x, y), [point.x, point.y]);
+  assert.ok(Math.abs(worldAfter.x - worldBefore.x) < 1e-6, 'wheel zoom X anchor moved');
+  assert.ok(Math.abs(worldAfter.y - worldBefore.y) < 1e-6, 'wheel zoom Y anchor moved');
+  const labelZoomed = await page.locator('#cvZoomLabel').textContent();
+  assert.notEqual(labelZoomed, labelBefore);
+
+  await page.locator('[data-act="zoom-out"]').click();
+  await page.waitForFunction(previous => document.querySelector('#cvZoomLabel').textContent !== previous, labelZoomed);
+  const labelOut = await page.locator('#cvZoomLabel').textContent();
+  await page.locator('[data-act="zoom-in"]').click();
+  await page.waitForFunction(previous => document.querySelector('#cvZoomLabel').textContent !== previous, labelOut);
+
+  await page.locator('[data-act="zoom-reset"]').click();
+  await page.waitForFunction(() => document.querySelector('#cvZoomLabel').textContent === '100%');
+  await page.locator('[data-act="zoom-fit"]').click();
+  await page.waitForTimeout(120);
+  const inside = await page.evaluate(() => {
+    const stage = document.getElementById('cvStage').getBoundingClientRect();
+    return Array.from(document.querySelectorAll('#cvStage [data-node-id]')).every(el => {
+      const rect = el.getBoundingClientRect();
+      return rect.left >= stage.left - 1 && rect.right <= stage.right + 1 &&
+        rect.top >= stage.top - 1 && rect.bottom <= stage.bottom + 1;
+    });
+  });
+  assert.ok(inside, 'fit left some nodes outside the stage');
+});
+
+test('Task 10 · Esc closes the quick-create overlay before clearing the selection', async () => {
+  await openCanvas();
+  await clickNode('and-power');
+  const selected = await page.evaluate(() => window.App.kit.getSelection());
+  assert.deepEqual(selected, { kind: 'node', id: 'and-power' });
+  const point = await blankPoint();
+  await dragPort('capability', 'prob.easy', point);
+  await page.waitForFunction(() => !document.getElementById('cvQuick').hidden, null, { timeout: 3000 });
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvQuick').isHidden(), true);
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), selected);
+  await page.keyboard.press('Escape');
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
+});
+
+test('Task 10 · node drag redraws edges live and pushes one layout history entry (buttons + keyboard)', async () => {
+  await openCanvas();
+  const path = page.locator('#cvEdges path.rtc-edge[data-edge-id="e-start-capability"]');
+  const originalD = await path.getAttribute('d');
+  const originalPosition = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y };
+  });
+  const box = await page.locator('[data-node-id="start"]').boundingBox();
+  const start = { x: box.x + box.width / 2, y: box.y + 11 };
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x + 70, start.y + 50, { steps: 6 });
+  const duringD = await path.getAttribute('d');
+  assert.notEqual(duringD, originalD, 'edge path did not change during node drag');
+  await page.mouse.up();
+  const movedD = await path.getAttribute('d');
+  assert.notEqual(movedD, originalD, 'edge path did not change after node drag');
+  const movedPosition = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y };
+  });
+  assert.notDeepEqual(movedPosition, originalPosition);
+  const dirty = await page.evaluate(() => ({
+    kind: document.getElementById('cvDirty').dataset.kind,
+    hidden: document.getElementById('cvDirty').hidden,
+    appKind: window.App.kind()
+  }));
+  assert.equal(dirty.hidden, false);
+  assert.equal(dirty.kind, 'layout');
+  assert.equal(dirty.appKind, 'layout');
+  let snapshot = await appSnapshot();
+  assert.deepEqual(snapshot.history, { undo: true, redo: false });
+
+  const expectPosition = async expected => {
+    await page.waitForFunction(value => {
+      const node = window.App.graph.nodes.find(item => item.id === 'start');
+      return node && node.position.x === value.x && node.position.y === value.y;
+    }, expected);
+  };
+
+  await page.locator('#cvUndo').click();
+  await expectPosition(originalPosition);
+  snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'clean');
+  assert.deepEqual(snapshot.history, { undo: false, redo: true });
+
+  await page.locator('#cvRedo').click();
+  await expectPosition(movedPosition);
+
+  await page.keyboard.press(`${MOD}+z`);
+  await expectPosition(originalPosition);
+  await page.keyboard.press(`${MOD}+Shift+z`);
+  await expectPosition(movedPosition);
+});
+
+test('Task 10 · node library creates every group by click and by drag-in', async () => {
+  await openCanvas();
+  const actions = [
+    { kind: 'question-choice', how: 'click', match: node => node.type === 'question' && node.question_type === 'choice' },
+    { kind: 'question-noul', how: 'drag', match: node => node.type === 'question' && node.question_type === 'noul' },
+    { kind: 'logic-and', how: 'click', match: node => node.type === 'logic' && node.operator === 'and' },
+    { kind: 'logic-not', how: 'drag', match: node => node.type === 'logic' && node.operator === 'not' },
+    { kind: 'condition-text', how: 'click', match: node => node.type === 'condition' && node.source === 'text' },
+    { kind: 'condition-periods', how: 'drag', match: node => node.type === 'condition' && node.source === 'periods' },
+    { kind: 'target', how: 'click', match: node => node.type === 'target' },
+    { kind: 'target', how: 'drag', match: node => node.type === 'target' }
+  ];
+  for (const action of actions) {
+    const before = await appSnapshot();
+    if (action.how === 'click') {
+      await page.locator(`[data-lib-kind="${action.kind}"]`).click();
+    } else {
+      const point = await blankPoint();
+      assert.ok(point, 'no blank drop point for node library drag');
+      await dragLibraryItem(action.kind, point);
+    }
+    const after = await appSnapshot();
+    const known = new Set(before.nodes.map(node => node.id));
+    const added = after.nodes.filter(node => !known.has(node.id));
+    assert.equal(added.length, 1, `${action.kind} (${action.how}) added ${added.length} nodes`);
+    assert.ok(action.match(added[0]), `${action.kind} (${action.how}) created ${JSON.stringify(added[0])}`);
+  }
+});
+
+test('Task 10 · a number port dropped on an empty slot creates gt 0.5 and opens the condition editor', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+  const target = await portPoint('and-power', 'in_3', 'in');
+  await dragPort('capability', 'prob.strong', target, {
+    beforeUp: async () => {
+      const classes = await page.evaluate(() => ({
+        empty: document.querySelector('[data-node-id="and-power"] [data-port-id="in_3"]').classList.contains('is-compatible'),
+        occupied: document.querySelector('[data-node-id="and-power"] [data-port-id="in_1"]').classList.contains('is-compatible')
+      }));
+      assert.equal(classes.empty, true, 'empty target slot was not highlighted as compatible');
+      assert.equal(classes.occupied, false, 'occupied slot was highlighted as compatible');
+    }
+  });
+  const after = await appSnapshot();
+  assert.equal(after.edges.length, before.edges.length + 1);
+  const edge = after.edges.find(item => item.target === 'and-power' && item.target_port === 'in_3');
+  assert.ok(edge, 'new edge not found on and-power.in_3');
+  assert.equal(edge.source, 'capability');
+  assert.equal(edge.source_port, 'prob.strong');
+  assert.deepEqual(edge.condition, { op: 'gt', value: 0.5 });
+  const pop = await page.evaluate(() => ({
+    hidden: document.getElementById('cvCondPop').hidden,
+    edgeId: document.getElementById('cvCondPop').dataset.edgeId
+  }));
+  assert.equal(pop.hidden, false, 'condition editor did not open for a numeric edge');
+  assert.equal(pop.edgeId, edge.id);
+
+  await page.locator('#cvUndo').click();
+  let undone = await appSnapshot();
+  assert.equal(undone.edges.length, before.edges.length, 'one undo did not remove the numeric edge');
+  await page.locator('#cvRedo').click();
+  const redone = await appSnapshot();
+  assert.equal(redone.edges.length, before.edges.length + 1, 'redo did not restore the numeric edge');
+});
+
+test('Task 10 · a boolean edge defaults to condition null and does not open the condition editor', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  await dragPort('start', 'out', await portPoint('and-power', 'in_3', 'in'));
+  const after = await appSnapshot();
+  assert.equal(after.edges.length, before.edges.length + 1);
+  const edge = after.edges.find(item => item.target === 'and-power' && item.target_port === 'in_3');
+  assert.ok(edge, 'boolean edge not created');
+  assert.equal(edge.condition, null);
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+});
+
+test('Task 10 · a condition chip opens the condition overlay and Esc closes it', async () => {
+  await openCanvas();
+  const chip = page.locator('#cvNodes [data-cond-edge]').first();
+  const edgeId = await chip.getAttribute('data-cond-edge');
+  await chip.click();
+  const pop = await page.evaluate(() => ({
+    hidden: document.getElementById('cvCondPop').hidden,
+    edgeId: document.getElementById('cvCondPop').dataset.edgeId
+  }));
+  assert.equal(pop.hidden, false);
+  assert.equal(pop.edgeId, edgeId);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+});
+
+test('Task 10 · occupied/self/cycle/duplicate drops toast specific reasons and are not highlighted compatible', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  const cases = [
+    { source: 'capability', port: 'prob.easy', node: 'and-power', slot: 'in_1', pattern: /占用/ },
+    { source: 'capability', port: 'prob.easy', node: 'capability', slot: 'in_2', pattern: /自身/ },
+    { source: 'and-power', port: 'out', node: 'capability', slot: 'in_2', pattern: /环/ },
+    { source: 'start', port: 'out', node: 'capability', slot: 'in_1', pattern: /已存在/ }
+  ];
+  for (const item of cases) {
+    await clearToasts();
+    await dragPort(item.source, item.port, await portPoint(item.node, item.slot, 'in'), {
+      beforeUp: async () => {
+        const compatible = await page.evaluate(([node, slot]) =>
+          document.querySelector(`[data-node-id="${node}"] [data-port-id="${slot}"]`).classList.contains('is-compatible'),
+        [item.node, item.slot]);
+        assert.equal(compatible, false, `${item.node}.${item.slot} should not be compatible`);
+      }
+    });
+    await page.waitForFunction(() => document.getElementById('cvToast').textContent.trim().length > 0, null, { timeout: 3000 });
+    const text = await toastText();
+    assert.match(text, item.pattern, `wrong toast for ${item.source}.${item.port} → ${item.node}.${item.slot}: ${text}`);
+    const now = await appSnapshot();
+    assert.equal(now.edges.length, before.edges.length, 'invalid drop changed the edge count');
+  }
+});
+
+test('Task 10 · output dropped on blank opens quick-create; dropping on an illegal node only cancels', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  const point = await blankPoint();
+  assert.ok(point);
+  await dragPort('capability', 'prob.easy', point);
+  await page.waitForFunction(() => !document.getElementById('cvQuick').hidden, null, { timeout: 3000 });
+  assert.equal(await page.locator('#cvQuick [data-qkind="logic-and"]').count(), 1);
+  await page.locator('#cvQuick [data-qkind="logic-and"]').click();
+  let after = await appSnapshot();
+  assert.equal(after.nodes.length, before.nodes.length + 1);
+  assert.equal(after.edges.length, before.edges.length + 1);
+  const node = after.nodes.find(item => !before.nodes.some(previous => previous.id === item.id));
+  assert.ok(node && node.type === 'logic' && node.operator === 'and');
+  const edge = after.edges.find(item => item.target === node.id);
+  assert.ok(edge, 'quick-created node has no edge');
+  assert.equal(edge.source, 'capability');
+  assert.equal(edge.source_port, 'prob.easy');
+  assert.equal(edge.target_port, 'in_1');
+  assert.deepEqual(edge.condition, { op: 'gt', value: 0.5 });
+
+  await openCanvas();
+  const beforeCancel = await appSnapshot();
+  const nodeBox = await page.locator('[data-node-id="and-power"]').boundingBox();
+  await dragPort('capability', 'prob.easy', { x: nodeBox.x + nodeBox.width / 2, y: nodeBox.y + 12 });
+  await page.waitForTimeout(120);
+  assert.equal(await page.locator('#cvQuick').isHidden(), true);
+  const afterCancel = await appSnapshot();
+  assert.equal(afterCancel.nodes.length, beforeCancel.nodes.length);
+  assert.equal(afterCancel.edges.length, beforeCancel.edges.length);
+});
+
+test('Task 10 · delete confirmation lists affected edges; slots are not renumbered and reuse the smallest hole', async () => {
+  await openCanvas();
+  await clickNode('and-power');
+  let selection = await page.evaluate(() => window.App.kit.getSelection());
+  assert.deepEqual(selection, { kind: 'node', id: 'and-power' });
+  await page.keyboard.press('Delete');
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  assert.equal(await page.locator('#cvDeleteBody li').count(), 3);
+  const dialogText = await page.locator('#cvDeleteBody').innerText();
+  assert.match(dialogText, /capability/);
+  assert.match(dialogText, /domain/);
+  assert.match(dialogText, /power-target/);
+  await page.locator('[data-act="delete-confirm"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-node-id="and-power"]'));
+  let snapshot = await appSnapshot();
+  assert.equal(snapshot.nodes.some(node => node.id === 'and-power'), false);
+  assert.equal(snapshot.edges.filter(edge => edge.source === 'and-power' || edge.target === 'and-power').length, 0);
+
+  await openCanvas();
+  await clickNode('cond-text');
+  await page.keyboard.press('Delete');
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  await page.locator('[data-act="delete-confirm"]').click();
+  await page.waitForFunction(() => !document.querySelector('[data-node-id="cond-text"]'));
+  snapshot = await appSnapshot();
+  let orEdges = snapshot.edges.filter(edge => edge.target === 'or-ctx');
+  assert.equal(orEdges.length, 1);
+  assert.equal(orEdges[0].target_port, 'in_2');
+  assert.equal(orEdges[0].source, 'cond-peak');
+
+  await dragPort('cond-peak', 'out', await portPoint('or-ctx', 'in_1', 'in'));
+  snapshot = await appSnapshot();
+  const reused = snapshot.edges.find(edge => edge.target === 'or-ctx' && edge.target_port === 'in_1');
+  assert.ok(reused, 'new edge did not reuse the freed in_1 slot');
+  assert.equal(reused.source, 'cond-peak');
+  orEdges = snapshot.edges.filter(edge => edge.target === 'or-ctx');
+  assert.equal(orEdges.length, 2);
+  assert.ok(orEdges.some(edge => edge.target_port === 'in_2' && edge.source === 'cond-peak'), 'existing in_2 edge was renumbered');
+});
+
+test('Task 10 · Delete/Backspace do nothing while an input is focused', async () => {
+  await openCanvas();
+  const before = await appSnapshot();
+  await clickNode('and-power');
+  await page.locator('#cvTryInput').click();
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Delete');
+  await page.waitForTimeout(150);
+  assert.equal(await page.locator('#cvDeleteModal').isHidden(), true);
+  const after = await appSnapshot();
+  assert.equal(after.nodes.length, before.nodes.length);
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;

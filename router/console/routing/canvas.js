@@ -1,0 +1,776 @@
+/* RTCanvas · 画布内核（规格 §6.4；移植自原型 canvas-core.js 并产品化）
+   ------------------------------------------------------------------
+   职责：视口平移缩放 / 节点拖拽 / 输出端口拖线（类型 + 合法性校验）/ SVG 贝塞尔边 /
+        选中 / 撤销重做（完整 envelope 快照，上限 100）/ 聚焦定位 / 安全区 fit。
+   不负责：节点卡片、检查器、试算回放、节点库 —— 由 cards.js / app.js 渲染。
+
+   DOM 契约（cards.js 必须遵守）：
+     node: <div class="rtc-node" data-node-id="capability" data-node-type="question">…</div>
+     port: <span class="rtc-port" data-port data-node="capability" data-port-id="prob.strong"
+                 data-port-dir="out" data-port-type="number"></span>
+     slot: <div class="rtc-slot" data-slot="in_1">…port…</div>
+     端口必须带 data-port / data-node / data-port-id / data-port-dir / data-port-type；
+     槽位行带 data-slot（输入端口也带一份，便于只按 data-slot 命中）。
+     节点绝对定位由本模块写 left/top（.rtc-node{position:absolute}）。
+
+   用法：
+     const kit = RTCanvas.create({ stage, world, nodesLayer, svg, graph, callbacks });
+     kit.init();
+     // 页面渲染 cards 后
+     kit.sync(); kit.fit();
+   ------------------------------------------------------------------ */
+(function (root) {
+  'use strict';
+
+  const RTCanvas = (function () {
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+    const MIN_K = 0.3;
+    const MAX_K = 2;
+    const HISTORY_LIMIT = 100;
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+    const noop = () => {};
+    const clone = value => (value == null ? value : JSON.parse(JSON.stringify(value)));
+
+    function create(opts) {
+      const stage = opts.stage;
+      const world = opts.world;
+      const nodesLayer = opts.nodesLayer;
+      const svg = opts.svg;
+      const callbacks = opts.callbacks || {};
+
+      const cb = {
+        onSelect: callbacks.onSelect || noop,
+        onChange: callbacks.onChange || noop,
+        onInvalid: callbacks.onInvalid || noop,
+        onQuickCreate: callbacks.onQuickCreate || (() => false),
+        onViewport: callbacks.onViewport || noop,
+        onRestore: callbacks.onRestore || noop,
+        onEdgeCreated: callbacks.onEdgeCreated || noop,
+        onDeleteRequest: callbacks.onDeleteRequest || noop,
+        onEscape: callbacks.onEscape || (() => false),
+        onHistory: callbacks.onHistory || noop,
+        getTree: callbacks.getTree || (() => clone(graph)),
+        onClearReplay: callbacks.onClearReplay || noop
+      };
+
+      /* 当前 root graph；App 会在恢复历史/重载时整体替换，所以必须是可变引用。 */
+      let graph = opts.graph || { id: 'root', type: 'graph', nodes: [], edges: [] };
+
+      const vp = { k: 1, tx: 0, ty: 0 };
+      let sel = { kind: null, id: null };
+      let drag = null;
+      let tempPath = null;
+      let spaceDown = false;
+      const undoStack = [];
+      const redoStack = [];
+      let edgeEls = Object.create(null);
+      let portEls = [];
+
+      function stageRect() { return stage.getBoundingClientRect(); }
+
+      function screenToWorld(clientX, clientY) {
+        const rect = stageRect();
+        return {
+          x: (clientX - rect.left - vp.tx) / vp.k,
+          y: (clientY - rect.top - vp.ty) / vp.k
+        };
+      }
+
+      /* ── 节点 / 端口元素 ─────────────────────────────────────── */
+      function nodeEl(id) {
+        const all = nodesLayer.querySelectorAll('[data-node-id]');
+        for (let index = 0; index < all.length; index += 1) {
+          if (all[index].dataset.nodeId === id) return all[index];
+        }
+        return null;
+      }
+
+      function portEl(nodeId, portId) {
+        for (let index = 0; index < portEls.length; index += 1) {
+          const el = portEls[index];
+          if (el.dataset.node === nodeId && el.dataset.portId === portId) return el;
+        }
+        return null;
+      }
+
+      function portAnchor(nodeId, portId) {
+        const el = portEl(nodeId, portId);
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        const box = stageRect();
+        return {
+          x: (rect.left + rect.width / 2 - box.left - vp.tx) / vp.k,
+          y: (rect.top + rect.height / 2 - box.top - vp.ty) / vp.k
+        };
+      }
+
+      function reindexPorts() {
+        portEls = Array.prototype.slice.call(nodesLayer.querySelectorAll('[data-port]'));
+      }
+
+      /* ── 视口 ─────────────────────────────────────────────────── */
+      function applyViewport() {
+        world.style.transform = 'translate(' + vp.tx + 'px,' + vp.ty + 'px) scale(' + vp.k + ')';
+        cb.onViewport({ k: vp.k, tx: vp.tx, ty: vp.ty });
+      }
+
+      function zoomTo(k, anchor) {
+        const next = clamp(k, MIN_K, MAX_K);
+        const rect = stageRect();
+        const point = anchor || { x: rect.width / 2, y: rect.height / 2 };
+        const before = { x: (point.x - vp.tx) / vp.k, y: (point.y - vp.ty) / vp.k };
+        vp.k = next;
+        vp.tx = point.x - before.x * vp.k;
+        vp.ty = point.y - before.y * vp.k;
+        applyViewport();
+      }
+
+      function zoomBy(factor) {
+        const rect = stageRect();
+        zoomTo(vp.k * factor, { x: rect.width / 2, y: rect.height / 2 });
+      }
+
+      function setZoom(k) {
+        const rect = stageRect();
+        zoomTo(k, { x: rect.width / 2, y: rect.height / 2 });
+      }
+
+      function getViewport() { return { k: vp.k, tx: vp.tx, ty: vp.ty }; }
+
+      /* 安全区：避开左上节点库、右上检查器、底部缩放条 / 小地图 / 试算台。 */
+      function overlayRect(el) {
+        if (!el || el.hidden || !el.getClientRects().length) return null;
+        const box = stageRect();
+        const rect = el.getBoundingClientRect();
+        return {
+          left: rect.left - box.left,
+          top: rect.top - box.top,
+          right: rect.right - box.left,
+          bottom: rect.bottom - box.top
+        };
+      }
+
+      function safeArea(pad) {
+        const rect = stageRect();
+        const gap = pad == null ? 14 : pad;
+        let left = gap;
+        let top = gap;
+        let right = rect.width - gap;
+        let bottom = rect.height - gap;
+        const palette = overlayRect(document.getElementById('cvPalette'));
+        if (palette) left = Math.max(left, palette.right + 14);
+        const inspector = overlayRect(document.getElementById('cvInspector'));
+        if (inspector) right = Math.min(right, inspector.left - 14);
+        ['cvZoom', 'cvTryBar', 'cvMinimap'].forEach(id => {
+          const bar = overlayRect(document.getElementById(id));
+          if (bar) bottom = Math.min(bottom, bar.top - 14);
+        });
+        if (right - left < 220) { left = gap; right = rect.width - gap; }
+        if (bottom - top < 180) { top = gap; bottom = rect.height - gap; }
+        return { x: left, y: top, w: right - left, h: bottom - top };
+      }
+
+      function fit(paddingOrOptions) {
+        const options = typeof paddingOrOptions === 'number'
+          ? { padding: paddingOrOptions }
+          : (paddingOrOptions || {});
+        const pad = options.padding == null ? 20 : options.padding;
+        const maxScale = options.maxScale == null ? 1.25 : options.maxScale;
+        if (!graph.nodes.length) return;
+        const area = safeArea(12);
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        graph.nodes.forEach(node => {
+          const el = nodeEl(node.id);
+          const width = el ? el.offsetWidth : 200;
+          const height = el ? el.offsetHeight : 100;
+          minX = Math.min(minX, node.position.x);
+          minY = Math.min(minY, node.position.y);
+          maxX = Math.max(maxX, node.position.x + width);
+          maxY = Math.max(maxY, node.position.y + height);
+        });
+        const width = Math.max(1, maxX - minX);
+        const height = Math.max(1, maxY - minY);
+        const k = clamp(Math.min((area.w - pad * 2) / width, (area.h - pad * 2) / height), MIN_K, maxScale);
+        vp.k = k;
+        vp.tx = area.x + area.w / 2 - (minX + width / 2) * k;
+        vp.ty = area.y + area.h / 2 - (minY + height / 2) * k;
+        applyViewport();
+      }
+
+      function focusNode(id, options) {
+        const node = graph.nodes.find(item => item.id === id);
+        if (!node) return;
+        const el = nodeEl(id);
+        const rect = stageRect();
+        const k = clamp((options && options.scale) || Math.max(vp.k, 0.85), MIN_K, MAX_K);
+        vp.k = k;
+        vp.tx = rect.width / 2 - (node.position.x + (el ? el.offsetWidth : 200) / 2) * k;
+        vp.ty = rect.height / 2 - (node.position.y + (el ? el.offsetHeight : 100) / 2) * k;
+        applyViewport();
+        select('node', id);
+      }
+
+      function focusEdge(id) {
+        const edge = graph.edges.find(item => item.id === id);
+        if (!edge) return;
+        const a = portAnchor(edge.source, edge.source_port);
+        const b = portAnchor(edge.target, edge.target_port);
+        if (!a || !b) return;
+        const rect = stageRect();
+        vp.tx = rect.width / 2 - ((a.x + b.x) / 2) * vp.k;
+        vp.ty = rect.height / 2 - ((a.y + b.y) / 2) * vp.k;
+        applyViewport();
+        select('edge', id);
+      }
+
+      /* ── 边渲染 ───────────────────────────────────────────────── */
+      function bezierPath(a, b) {
+        const curve = Math.max(34, Math.abs(b.x - a.x) * 0.45);
+        return 'M' + a.x + ',' + a.y + ' C' + (a.x + curve) + ',' + a.y +
+          ' ' + (b.x - curve) + ',' + b.y + ' ' + b.x + ',' + b.y;
+      }
+
+      function renderEdges() {
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        edgeEls = Object.create(null);
+        graph.edges.forEach(edge => {
+          const a = portAnchor(edge.source, edge.source_port);
+          const b = portAnchor(edge.target, edge.target_port);
+          if (!a || !b) return;
+          const d = bezierPath(a, b);
+          const kind = root.RTGraph.edgeType(edge, graph);
+
+          const hit = document.createElementNS(SVG_NS, 'path');
+          hit.setAttribute('d', d);
+          hit.setAttribute('class', 'rtc-edge-hit');
+          hit.setAttribute('data-edge-id', edge.id);
+          hit.dataset.edgeKind = kind;
+          svg.appendChild(hit);
+
+          const path = document.createElementNS(SVG_NS, 'path');
+          path.setAttribute('d', d);
+          path.setAttribute('data-edge-id', edge.id);
+          path.dataset.edgeKind = kind;
+          path.setAttribute('class', 'rtc-edge' +
+            (sel.kind === 'edge' && sel.id === edge.id ? ' is-selected' : ''));
+          svg.appendChild(path);
+          edgeEls[edge.id] = { path: path, hit: hit };
+        });
+        if (tempPath) svg.appendChild(tempPath);
+      }
+
+      function applySelectionClasses() {
+        Array.prototype.forEach.call(nodesLayer.querySelectorAll('[data-node-id]'), el => {
+          el.classList.toggle('is-selected', sel.kind === 'node' && el.dataset.nodeId === sel.id);
+        });
+        Object.keys(edgeEls).forEach(id => {
+          edgeEls[id].path.classList.toggle('is-selected', sel.kind === 'edge' && sel.id === id);
+        });
+      }
+
+      function selectionExists() {
+        if (sel.kind === 'node') return !!graph.nodes.find(node => node.id === sel.id);
+        if (sel.kind === 'edge') return !!graph.edges.find(edge => edge.id === sel.id);
+        return false;
+      }
+
+      function sync() {
+        graph.nodes.forEach(node => {
+          const el = nodeEl(node.id);
+          if (!el) return;
+          el.style.left = Math.round(node.position.x) + 'px';
+          el.style.top = Math.round(node.position.y) + 'px';
+        });
+        reindexPorts();
+        if (sel.kind && !selectionExists()) sel = { kind: null, id: null };
+        renderEdges();
+        applySelectionClasses();
+      }
+
+      function attachGraph(next) {
+        if (next && next !== graph) graph = next;
+      }
+
+      function setGraph(next, options) {
+        graph = next || { id: 'root', type: 'graph', nodes: [], edges: [] };
+        sel = { kind: null, id: null };
+        if (!options || options.resetHistory !== false) resetHistory();
+        sync();
+      }
+
+      /* ── 选中 / 历史 ──────────────────────────────────────────── */
+      function select(kind, id, silent) {
+        sel = { kind: kind, id: id };
+        applySelectionClasses();
+        if (!silent) cb.onSelect({ kind: kind, id: id });
+      }
+
+      function clearSelection() { select(null, null); }
+
+      function getSelection() { return { kind: sel.kind, id: sel.id }; }
+
+      function notifyHistory() { cb.onHistory(canUndo(), canRedo()); }
+
+      function canUndo() { return undoStack.length > 0; }
+
+      function canRedo() { return redoStack.length > 0; }
+
+      function pushHistory(before, after, kind) {
+        if (!before || !after) return;
+        undoStack.push({
+          before: clone(before),
+          after: clone(after),
+          kind: kind || 'behavior'
+        });
+        if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+        redoStack.length = 0;
+        notifyHistory();
+      }
+
+      function undo() {
+        const entry = undoStack.pop();
+        if (!entry) return false;
+        redoStack.push(entry);
+        cb.onRestore(clone(entry.before), 'undo', entry.kind);
+        notifyHistory();
+        return true;
+      }
+
+      function redo() {
+        const entry = redoStack.pop();
+        if (!entry) return false;
+        undoStack.push(entry);
+        cb.onRestore(clone(entry.after), 'redo', entry.kind);
+        notifyHistory();
+        return true;
+      }
+
+      function resetHistory() {
+        undoStack.length = 0;
+        redoStack.length = 0;
+        notifyHistory();
+      }
+
+      function clearReplay() {
+        if (svg) {
+          svg.classList.remove('is-replay');
+          Array.prototype.forEach.call(svg.querySelectorAll('.is-true,.is-false,.is-unknown,.is-num'), el => {
+            el.classList.remove('is-true', 'is-false', 'is-unknown', 'is-num');
+          });
+        }
+        cb.onClearReplay();
+      }
+
+      /* ── 连线 ─────────────────────────────────────────────────── */
+      function addEdge(draft) {
+        const before = cb.getTree();
+        const check = root.RTGraph.canConnect(graph, draft);
+        if (!check.ok) { cb.onInvalid(check.reason, draft); return null; }
+        const result = root.RTGraph.addEdge(graph, draft);
+        if (!result.ok) { cb.onInvalid(result.reason, draft); return null; }
+        pushHistory(before, cb.getTree(), 'behavior');
+        sync();
+        cb.onChange('connect');
+        cb.onEdgeCreated(result.edge);
+        return result.edge;
+      }
+
+      /* 供后续任务使用的无历史包装（App.change 内部调用即可）。 */
+      function removeNode(id) {
+        const result = root.RTGraph.removeNode(graph, id);
+        if (!result.ok) return result;
+        sel = { kind: null, id: null };
+        sync();
+        return result;
+      }
+
+      function removeEdge(id) {
+        const result = root.RTGraph.removeEdge(graph, id);
+        if (!result.ok) return result;
+        sel = { kind: null, id: null };
+        sync();
+        return result;
+      }
+
+      /* ── 指针交互 ─────────────────────────────────────────────── */
+      function isInteractive(target) {
+        return !!target.closest('input,button,select,textarea,a,[contenteditable="true"],[data-no-drag]');
+      }
+
+      function typingInField(event) {
+        const el = event.target;
+        if (!el) return false;
+        const tag = el.tagName;
+        return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;
+      }
+
+      function startPanDrag(event, keepSelection) {
+        drag = {
+          type: 'pan',
+          startX: event.clientX,
+          startY: event.clientY,
+          tx: vp.tx,
+          ty: vp.ty,
+          keepSelection: !!keepSelection
+        };
+        drag.moved = false;
+        stage.setPointerCapture(event.pointerId);
+      }
+
+      function onPointerDown(event) {
+        if (event.button === 2) return;
+        const target = event.target;
+        if (event.button === 1 || spaceDown) {
+          event.preventDefault();
+          startPanDrag(event, true);
+          return;
+        }
+        const port = target.closest('[data-port]');
+        if (port && port.dataset.portDir === 'out') {
+          event.preventDefault();
+          startEdgeDrag(event, port);
+          return;
+        }
+        const owner = target.closest('[data-node-id]');
+        if (owner && !isInteractive(target) && !(port && port.dataset.portDir === 'in')) {
+          event.preventDefault();
+          select('node', owner.dataset.nodeId, true);
+          startNodeDrag(event, owner.dataset.nodeId, owner);
+          return;
+        }
+        if (owner && isInteractive(target)) {
+          /* 卡片里的按钮/输入控件自己处理交互，不要落成空白平移。 */
+          return;
+        }
+        if (port) {
+          if (owner) select('node', owner.dataset.nodeId);
+          return;
+        }
+        const edgeHit = target.closest('.rtc-edge-hit');
+        if (edgeHit) {
+          event.preventDefault();
+          select('edge', edgeHit.dataset.edgeId);
+          return;
+        }
+        event.preventDefault();
+        startPanDrag(event, false);
+      }
+
+      function startNodeDrag(event, nodeId, el) {
+        const node = graph.nodes.find(item => item.id === nodeId);
+        if (!node || !el) return;
+        drag = {
+          type: 'node',
+          nodeId: nodeId,
+          el: el,
+          startX: event.clientX,
+          startY: event.clientY,
+          originX: node.position.x,
+          originY: node.position.y,
+          before: cb.getTree(),
+          moved: false
+        };
+        stage.setPointerCapture(event.pointerId);
+      }
+
+      function startEdgeDrag(event, port) {
+        const draft = { source: port.dataset.node, source_port: port.dataset.portId };
+        drag = {
+          type: 'edge',
+          draft: draft,
+          startX: event.clientX,
+          startY: event.clientY,
+          before: cb.getTree(),
+          moved: false
+        };
+        tempPath = document.createElementNS(SVG_NS, 'path');
+        tempPath.setAttribute('class', 'rtc-edge-temp');
+        svg.appendChild(tempPath);
+        highlightCompatible(draft);
+        stage.setPointerCapture(event.pointerId);
+      }
+
+      function highlightCompatible(draft) {
+        portEls.forEach(el => {
+          if (el.dataset.portDir !== 'in') return;
+          const candidate = {
+            source: draft.source,
+            source_port: draft.source_port,
+            target: el.dataset.node,
+            target_port: el.dataset.portId
+          };
+          const ok = root.RTGraph.canConnect(graph, candidate).ok;
+          el.classList.toggle('is-compatible', ok);
+          el.classList.toggle('is-incompatible', !ok);
+          const slot = el.parentElement && el.parentElement.closest('[data-slot]');
+          if (slot) {
+            slot.classList.toggle('is-compatible', ok);
+            slot.classList.toggle('is-incompatible', !ok);
+          }
+        });
+      }
+
+      function clearCompatible() {
+        portEls.forEach(el => {
+          el.classList.remove('is-compatible', 'is-incompatible');
+          const slot = el.parentElement && el.parentElement.closest('[data-slot]');
+          if (slot) slot.classList.remove('is-compatible', 'is-incompatible');
+        });
+      }
+
+      function updateTempPath(event) {
+        if (!drag || drag.type !== 'edge' || !tempPath) return;
+        const a = portAnchor(drag.draft.source, drag.draft.source_port);
+        const b = screenToWorld(event.clientX, event.clientY);
+        if (a) tempPath.setAttribute('d', bezierPath(a, b));
+      }
+
+      function onPointerMove(event) {
+        if (!drag) return;
+        if (drag.type === 'pan') {
+          const dx = event.clientX - drag.startX;
+          const dy = event.clientY - drag.startY;
+          if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true;
+          vp.tx = drag.tx + dx;
+          vp.ty = drag.ty + dy;
+          applyViewport();
+          return;
+        }
+        if (drag.type === 'node') {
+          const dx = (event.clientX - drag.startX) / vp.k;
+          const dy = (event.clientY - drag.startY) / vp.k;
+          if (!drag.moved && Math.abs(event.clientX - drag.startX) + Math.abs(event.clientY - drag.startY) > 2) {
+            drag.moved = true;
+          }
+          const node = graph.nodes.find(item => item.id === drag.nodeId);
+          if (node) {
+            node.position.x = drag.originX + dx;
+            node.position.y = drag.originY + dy;
+            drag.el.style.left = Math.round(node.position.x) + 'px';
+            drag.el.style.top = Math.round(node.position.y) + 'px';
+            renderEdges();
+          }
+          return;
+        }
+        if (drag.type === 'edge') {
+          drag.moved = true;
+          updateTempPath(event);
+        }
+      }
+
+      function findInputPort(el) {
+        const port = el.closest('[data-port][data-port-dir="in"]');
+        if (port) return port;
+        const slot = el.closest('[data-slot]');
+        if (slot) return slot.querySelector('[data-port][data-port-dir="in"]');
+        return null;
+      }
+
+      function insideStage(clientX, clientY) {
+        const rect = stageRect();
+        return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+      }
+
+      function overOverlay(el) {
+        return !!(el && el.closest && el.closest('.rtc-overlay'));
+      }
+
+      function finishEdgeDrag(event, finished) {
+        const target = document.elementFromPoint(event.clientX, event.clientY);
+        const inPort = target ? findInputPort(target) : null;
+        const stagePoint = screenToWorld(event.clientX, event.clientY);
+        if (inPort) {
+          const draft = {
+            source: finished.draft.source,
+            source_port: finished.draft.source_port,
+            target: inPort.dataset.node,
+            target_port: inPort.dataset.portId
+          };
+          const check = root.RTGraph.canConnect(graph, draft);
+          if (check.ok) addEdge(draft);
+          else cb.onInvalid(check.reason, draft);
+          return;
+        }
+        /* 落在已有节点（含它自己的端口）上：静默取消，不弹快速创建。 */
+        if (target && target.closest('[data-node-id]')) return;
+        /* 落回节点库 / 检查器 / 缩放条等浮层：静默取消。 */
+        if (!insideStage(event.clientX, event.clientY) || overOverlay(target)) return;
+        const handled = cb.onQuickCreate({
+          sourceNodeId: finished.draft.source,
+          sourcePort: finished.draft.source_port,
+          x: stagePoint.x,
+          y: stagePoint.y,
+          clientX: event.clientX,
+          clientY: event.clientY
+        });
+        if (!handled) cb.onInvalid('连线已取消：请松手在兼容的输入端口上', finished.draft);
+      }
+
+      function onPointerUp(event) {
+        if (!drag) return;
+        const finished = drag;
+        drag = null;
+        try { stage.releasePointerCapture(event.pointerId); } catch (error) { /* ignore */ }
+
+        if (finished.type === 'pan') {
+          if (!finished.moved && !finished.keepSelection) select(null, null);
+          return;
+        }
+        if (finished.type === 'node') {
+          if (finished.moved) {
+            pushHistory(finished.before, cb.getTree(), 'layout');
+            cb.onChange('layout');
+          }
+          cb.onSelect(getSelection());
+          return;
+        }
+        if (finished.type === 'edge') {
+          finishEdgeDrag(event, finished);
+          if (tempPath && tempPath.parentNode) tempPath.parentNode.removeChild(tempPath);
+          tempPath = null;
+          clearCompatible();
+        }
+      }
+
+      function onPointerCancel(event) {
+        if (!drag) return;
+        if (drag.type === 'edge') {
+          if (tempPath && tempPath.parentNode) tempPath.parentNode.removeChild(tempPath);
+          tempPath = null;
+          clearCompatible();
+        }
+        drag = null;
+        try { stage.releasePointerCapture(event.pointerId); } catch (error) { /* ignore */ }
+      }
+
+      function onWheel(event) {
+        if (event.target.closest && event.target.closest('[data-scrollable]')) return;
+        event.preventDefault();
+        const rect = stageRect();
+        const anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+        const factor = Math.exp(-event.deltaY * 0.0014);
+        zoomTo(vp.k * factor, anchor);
+      }
+
+      function onKeyDown(event) {
+        if (event.code === 'Space' && !typingInField(event)) {
+          if (!spaceDown) {
+            spaceDown = true;
+            stage.classList.add('is-space-pan');
+          }
+          event.preventDefault();
+          return;
+        }
+        if (event.key === 'Escape') {
+          if (cb.onEscape()) return;
+          if (drag && drag.type === 'edge') {
+            if (tempPath && tempPath.parentNode) tempPath.parentNode.removeChild(tempPath);
+            tempPath = null;
+            drag = null;
+            clearCompatible();
+            return;
+          }
+          if (sel.kind) select(null, null);
+          return;
+        }
+        if (typingInField(event)) return;
+        if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === 'z') {
+          event.preventDefault();
+          if (event.shiftKey) redo(); else undo();
+          return;
+        }
+        if (event.key === 'Delete' || event.key === 'Backspace') {
+          if (!sel.kind) return;
+          event.preventDefault();
+          cb.onDeleteRequest({ kind: sel.kind, id: sel.id });
+        }
+      }
+
+      function onKeyUp(event) {
+        if (event.code === 'Space') {
+          spaceDown = false;
+          stage.classList.remove('is-space-pan');
+        }
+      }
+
+      function onWindowBlur() {
+        spaceDown = false;
+        stage.classList.remove('is-space-pan');
+      }
+
+      /* ── 初始化 / 销毁 ────────────────────────────────────────── */
+      function init() {
+        svg.setAttribute('width', '8000');
+        svg.setAttribute('height', '5000');
+        svg.setAttribute('viewBox', '0 0 8000 5000');
+        svg.style.position = 'absolute';
+        svg.style.left = '0';
+        svg.style.top = '0';
+        svg.style.overflow = 'visible';
+        svg.style.pointerEvents = 'none';
+        applyViewport();
+        stage.addEventListener('pointerdown', onPointerDown);
+        stage.addEventListener('pointermove', onPointerMove);
+        stage.addEventListener('pointerup', onPointerUp);
+        stage.addEventListener('pointercancel', onPointerCancel);
+        stage.addEventListener('wheel', onWheel, { passive: false });
+        document.addEventListener('keydown', onKeyDown);
+        document.addEventListener('keyup', onKeyUp);
+        window.addEventListener('blur', onWindowBlur);
+      }
+
+      function destroy() {
+        stage.removeEventListener('pointerdown', onPointerDown);
+        stage.removeEventListener('pointermove', onPointerMove);
+        stage.removeEventListener('pointerup', onPointerUp);
+        stage.removeEventListener('pointercancel', onPointerCancel);
+        stage.removeEventListener('wheel', onWheel);
+        document.removeEventListener('keydown', onKeyDown);
+        document.removeEventListener('keyup', onKeyUp);
+        window.removeEventListener('blur', onWindowBlur);
+      }
+
+      return {
+        init: init,
+        destroy: destroy,
+        sync: sync,
+        renderEdges: renderEdges,
+        attachGraph: attachGraph,
+        setGraph: setGraph,
+        getGraph: function () { return graph; },
+        select: select,
+        clearSelection: clearSelection,
+        getSelection: getSelection,
+        pushHistory: pushHistory,
+        undo: undo,
+        redo: redo,
+        canUndo: canUndo,
+        canRedo: canRedo,
+        resetHistory: resetHistory,
+        addEdge: addEdge,
+        removeNode: removeNode,
+        removeEdge: removeEdge,
+        fit: fit,
+        zoomBy: zoomBy,
+        setZoom: setZoom,
+        focusNode: focusNode,
+        focusEdge: focusEdge,
+        getViewport: getViewport,
+        screenToWorld: screenToWorld,
+        clearReplay: clearReplay,
+        nodeEl: nodeEl,
+        portEl: portEl,
+        edgeEl: id => (edgeEls[id] ? edgeEls[id].path : null),
+        safeArea: safeArea
+      };
+    }
+
+    return { create: create, MIN_K: MIN_K, MAX_K: MAX_K, HISTORY_LIMIT: HISTORY_LIMIT };
+  })();
+
+  root.RTCanvas = RTCanvas;
+  if (typeof module !== 'undefined' && module.exports) module.exports = RTCanvas;
+})(typeof window !== 'undefined' ? window : globalThis);
