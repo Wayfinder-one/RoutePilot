@@ -10,6 +10,7 @@
    shows the error instead). */
 const api = {
   TOKEN_KEY: 'sr_admin_token',
+  TIMEOUT_MS: 15000,
   _bouncing: false,
   token() { return localStorage.getItem(this.TOKEN_KEY) || ''; },
   setToken(t) {
@@ -35,23 +36,44 @@ const api = {
     if (body !== undefined && body !== null) headers['Content-Type'] = 'application/json';
     const tok = this.token();
     if (tok) headers['Authorization'] = 'Bearer ' + tok;
-    const r = await fetch(path, {
-      method,
-      headers: Object.keys(headers).length ? headers : undefined,
-      body: body === undefined || body === null ? undefined : JSON.stringify(body),
-    });
-    if (r.status === 401) {
-      this.setToken('');
-      if (!(opts && opts.noBounce)) this.toLogin();
+    /* 管理面请求必须有上限：挂起的 /admin/models 不能冻结画布启动。 */
+    const timeoutMs = opts && Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : this.TIMEOUT_MS;
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+    try {
+      const r = await fetch(path, {
+        method,
+        headers: Object.keys(headers).length ? headers : undefined,
+        body: body === undefined || body === null ? undefined : JSON.stringify(body),
+        signal: controller ? controller.signal : undefined,
+      });
+      if (r.status === 401) {
+        this.setToken('');
+        if (!(opts && opts.noBounce)) this.toLogin();
+      }
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        const e = new Error(r.status);
+        e.status = r.status;
+        e.detail = data.detail;
+        throw e;
+      }
+      return data;
+    } catch (cause) {
+      if (controller && controller.signal.aborted) {
+        const seconds = Math.round(timeoutMs / 1000);
+        const e = new Error(typeof tf === 'function'
+          ? tf('api.timeout', { seconds: seconds, path: path })
+          : 'Request timed out after ' + seconds + 's: ' + path);
+        e.status = 0;
+        e.timeout = true;
+        e.cause = cause;
+        throw e;
+      }
+      throw cause;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
-      const e = new Error(r.status);
-      e.status = r.status;
-      e.detail = data.detail;
-      throw e;
-    }
-    return data;
   },
   get(p) { return this.req('GET', p); },
   put(p, b) { return this.req('PUT', p, b); },

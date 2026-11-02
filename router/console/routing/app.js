@@ -200,6 +200,25 @@
   let libDrag = null;
   let ghost = null;
   let toastSeq = 0;
+  /* 检查器里有未提交输入：焦点仍在表单控件内，或本次渲染后发生过 input/change。 */
+  let inspectorDirty = false;
+
+  function inspectorEditing() {
+    if (inspectorDirty) return true;
+    const body = document.getElementById('cvInspectorBody');
+    const active = document.activeElement;
+    return !!(body && active && body.contains(active) &&
+      /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName || ''));
+  }
+
+  function bindInspectorEditState() {
+    const body = document.getElementById('cvInspectorBody');
+    if (!body || body.dataset.editBound === '1') return;
+    body.dataset.editBound = '1';
+    const mark = () => { inspectorDirty = true; };
+    body.addEventListener('input', mark);
+    body.addEventListener('change', mark);
+  }
 
   /* ── 渲染：节点库 ─────────────────────────────────────────────── */
   function renderPalette() {
@@ -242,6 +261,8 @@
     if (!root.RTInspector || typeof root.RTInspector.render !== 'function') return;
     const selection = App.kit ? App.kit.getSelection() : App.selection;
     root.RTInspector.render(selection);
+    /* 新 DOM 里没有未提交输入；只有下一次 input/change 才会重新置脏。 */
+    inspectorDirty = false;
   }
 
   /* ── 渲染：校验条 ─────────────────────────────────────────────── */
@@ -1074,6 +1095,7 @@
   }
 
   function bindEvents() {
+    bindInspectorEditState();
     bindToolbar();
     bindViewport();
     bindPalette();
@@ -1124,13 +1146,16 @@
       toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
       loadTree(RTGraph.createMinimalTree(defaultModelId()), false);
     }
-    await Promise.all([modelsReady, periodsReady]);
-    /* 模型/时段目录晚到：重绘一次让检查器的下拉框拿到最新选项。 */
-    if (App.tree) {
-      renderAll();
-      refreshDirty();
-    }
+    /* 树加载完成即解锁画布与节点库；模型/时段目录只影响检查器选项，不能阻塞建模。 */
     App.booted = true;
+    await Promise.all([modelsReady, periodsReady]);
+    if (!App.tree) return;
+    /* 模型/时段目录晚到：重绘一次让检查器的下拉框拿到最新选项。
+       若用户正在检查器里编辑，跳过这次重绘（下一次选择/保存自然带上新目录），
+       否则会清掉还没提交的输入。 */
+    if (inspectorEditing()) return;
+    renderAll();
+    refreshDirty();
   }
 
   boot();

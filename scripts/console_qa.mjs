@@ -1448,6 +1448,11 @@ test('Task 11 · numeric condition editors expose six operators in both entries,
     return edge && edge.condition && edge.condition.op === 'lte' && edge.condition.value === 0.42;
   }, edgeId);
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+  const focusedEdge = await page.evaluate(() => {
+    const active = document.activeElement;
+    return active && active.dataset ? (active.dataset.condEdge || '') : '';
+  });
+  assert.equal(focusedEdge, edgeId, 'condition confirm did not return focus to the re-rendered condition chip');
   const chipText = (await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim();
   assert.equal(chipText, '≤ 0.42');
   let snapshot = await appSnapshot();
@@ -1464,6 +1469,37 @@ test('Task 11 · numeric condition editors expose six operators in both entries,
   await clickEdge(edgeId);
   await waitInspectorBranch('edge', edgeId);
   assert.equal(await page.locator('#cvInspectorBody [data-ins-branch="edge"]').getAttribute('data-edge-type'), 'number');
+  const typeLabel = await page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#cvInspectorBody .rtc-ins-row'));
+    const row = rows.find(item => item.querySelector('span') &&
+      item.querySelector('span').textContent.trim() === window.t('cv.ins.type'));
+    return row && row.querySelector('b') ? row.querySelector('b').textContent.trim() : '';
+  });
+  assert.equal(typeLabel, await page.evaluate(() => window.t('cv.ins.typeNumber')),
+    'edge inspector did not label the rendered edge type');
+
+  /* Bad numbers must be rejected through the inspector entry too (same contract). */
+  const inspectorHistoryBefore = (await appSnapshot()).history;
+  for (const raw of ['', '   ', 'NaN', 'Infinity', '1e10', '-1000000001', 'abc']) {
+    await page.locator('#cvInspectorBody [data-cond-field="op"]').selectOption('gt');
+    await page.locator('#cvInspectorBody [data-cond-field="value"]').fill(raw);
+    await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
+    const message = (await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim();
+    const expected = await page.evaluate(key => window.t(key),
+      raw.trim() === '' ? 'cv.cond.needValue' : 'cv.cond.badValue');
+    assert.equal(message, expected, `inspector accepted/reworded bad threshold ${JSON.stringify(raw)}`);
+    assert.deepEqual(await edgeOf(edgeId), {
+      id: edgeId,
+      source: 'capability',
+      source_port: 'prob.strong',
+      target: 'and-power',
+      target_port: 'in_1',
+      condition: { op: 'gt', value: 0.65 }
+    }, `inspector bad threshold ${JSON.stringify(raw)} wrote the condition`);
+    assert.deepEqual((await appSnapshot()).history, inspectorHistoryBefore,
+      'a rejected inspector condition entered the history stack');
+  }
+
   await page.locator('#cvInspectorBody [data-cond-field="op"]').selectOption('neq');
   await page.locator('#cvInspectorBody [data-cond-field="value"]').fill('0.7');
   await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
@@ -1500,6 +1536,10 @@ test('Task 11 · boolean conditions toggle = true / = false from both entries wi
   await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
+  assert.equal(await page.evaluate(() => {
+    const active = document.activeElement;
+    return active && active.dataset ? (active.dataset.condEdge || '') : '';
+  }), edgeId, 'Esc did not return focus to the condition chip');
   assert.equal((await edgeOf(edgeId)).condition, null);
   assert.equal((await appSnapshot()).kind, 'clean');
 
@@ -1546,7 +1586,14 @@ test('Task 11 · selected edge inspector shows both ends, type, condition and de
   assert.match(text, /and-power/);
   assert.match(text, /in_1/);
   assert.match(text, /> 0\.65/);
-  assert.ok(await page.evaluate(() => window.t('cv.ins.typeNumber')).then(label => label.length > 0));
+  const typeLabel = await page.evaluate(() => {
+    const rows = Array.from(document.querySelectorAll('#cvInspectorBody .rtc-ins-row'));
+    const row = rows.find(item => item.querySelector('span') &&
+      item.querySelector('span').textContent.trim() === window.t('cv.ins.type'));
+    return row && row.querySelector('b') ? row.querySelector('b').textContent.trim() : '';
+  });
+  assert.equal(typeLabel, await page.evaluate(() => window.t('cv.ins.typeNumber')),
+    'numeric edge inspector did not label the edge type');
 
   await page.locator('#cvInspectorBody [data-act="ins-delete-edge"]').click();
   await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
@@ -1601,6 +1648,13 @@ test('Task 11 · validate-bar edge and graph issues locate and open the same con
   await page.locator('#cvIssuesBtn').click();
   if (await page.locator('#cvIssues').isHidden()) await page.locator('#cvIssuesBtn').click();
   await page.locator('#cvIssues [data-issue-graph="1"]').first().click();
+  assert.equal(await page.evaluate(() =>
+    document.getElementById('cvInspector').classList.contains('is-focus')), true,
+  'graph issue locate did not light up the inspector');
+  assert.equal(await page.evaluate(() => {
+    const style = getComputedStyle(document.getElementById('cvInspector'));
+    return style.outlineStyle + ' ' + style.outlineWidth;
+  }), 'solid 2px', 'is-focus has no visible token-based focus ring');
   await waitInspectorBranch('graph', 'root');
   assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
   await page.locator('#cvInspectorBody [data-field="otherwise"]').selectOption('standard-target');
@@ -1627,6 +1681,38 @@ test('Task 11 · NOT shows one slot row, AND/OR show all rows and logic issues l
     'a new AND gate must render both input rows');
   assert.equal(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot').count(), 3,
     'AND renders its two occupied rows plus the next free slot');
+  assert.equal(await page.locator('#cvNodes [data-node-id="or-ctx"]').getAttribute('data-operator'), 'or');
+  const orRows = page.locator('#cvNodes [data-node-id="or-ctx"] .rtc-slot');
+  assert.equal(await orRows.count(), 3, 'OR renders its two occupied rows plus the next free slot');
+  assert.match(await orRows.nth(0).innerText(), /cond-text/);
+  assert.match(await orRows.nth(0).innerText(), /in_1/);
+  assert.match(await orRows.nth(1).innerText(), /cond-peak/);
+  assert.match(await orRows.nth(1).innerText(), /in_2/);
+  assert.equal(await orRows.nth(2).locator('.rtc-slot-add').count(), 1,
+    'the third OR row is the next empty slot');
+
+  /* The AND node was just created (selected + centered): clear selection and pan it
+     far off-center so the locate click is the only reason it becomes selected/centered. */
+  await page.evaluate(() => {
+    window.App.kit.clearSelection();
+    window.App.kit.zoomBy(0.5);
+  });
+  const blank = await blankPoint();
+  assert.ok(blank, 'no blank stage point available for panning');
+  await page.mouse.move(blank.x, blank.y);
+  await page.mouse.down();
+  await page.mouse.move(blank.x - 320, blank.y + 190, { steps: 10 });
+  await page.mouse.up();
+  await page.evaluate(() => window.App.kit.clearSelection());
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
+  const offCenter = await page.evaluate(id => {
+    const stage = document.getElementById('cvStage').getBoundingClientRect();
+    const rect = document.querySelector(`[data-node-id="${id}"]`).getBoundingClientRect();
+    return Math.hypot(
+      rect.left + rect.width / 2 - (stage.left + stage.width / 2),
+      rect.top + rect.height / 2 - (stage.top + stage.height / 2));
+  }, andId);
+  assert.ok(offCenter > 120, `AND node was not moved off-center before locate: ${offCenter}px`);
 
   await openIssuesPanel();
   await page.locator(`#cvIssues [data-issue-node="${andId}"]`).first().click();
@@ -1751,6 +1837,7 @@ test('Task 11 · option key rename syncs selected/prob source ports and conflict
   });
   const conflict = (await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim();
   assert.match(conflict, /已存在|already exists/i);
+  assert.match(conflict, /strong/, 'conflict message does not name the blocking option key');
   let snapshot = await appSnapshot();
   assert.deepEqual(snapshot.history, historyBefore, 'conflicting rename pushed history');
   assert.equal(await page.evaluate(() => !!window.RTGraph.findNode(window.App.graph, 'capability')
@@ -1775,6 +1862,116 @@ test('Task 11 · option key rename syncs selected/prob source ports and conflict
   assert.equal(await page.evaluate(() => window.RTGraph.findNode(window.App.graph, 'capability')
     .options.some(option => option.key === 'easy')), true);
   assert.equal(snapshot.edges.some(edge => edge.source_port === 'selected.light'), false);
+});
+
+test('Task 11 · swapping two option keys in one save renames every row and follows source ports', async () => {
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+
+  /* easy→strong and strong→light in the same save: every final key is unique, but
+     row 1's new key is still held by row 2 until it moves. Two-phase rename must win. */
+  await page.locator('#cvInspectorBody [data-opt-row="easy"] [data-opt-field="key"]').fill('strong');
+  await page.locator('#cvInspectorBody [data-opt-row="strong"] [data-opt-field="key"]').fill('light');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'capability');
+    return node && node.options[0].key === 'strong' && node.options[2].key === 'light';
+  }, null, { timeout: 4000 });
+  assert.equal(await page.locator('#cvInspectorBody [data-ins-error]').isHidden(), true,
+    'valid two-key swap was rejected');
+
+  const snapshot = await appSnapshot();
+  assert.equal(snapshot.kind, 'behavior');
+  assert.equal(JSON.stringify(snapshot).includes('__opt_tmp'), false,
+    'temporary rename keys leaked into the graph');
+  const edgeById = Object.fromEntries(snapshot.edges.map(edge => [edge.id, edge]));
+  assert.equal(edgeById['e-selected-easy-light'].source_port, 'selected.strong',
+    'renamed easy row did not follow to selected.strong');
+  assert.equal(edgeById['e-cap-strong-and-power'].source_port, 'prob.light',
+    'renamed strong row did not follow to prob.light');
+  assert.equal(edgeById['e-cap-strong-and-power'].condition.value, 0.65,
+    'swap changed an unrelated condition');
+  assert.equal(edgeById['e-cap-strong-not'].source_port, 'prob.light');
+  assert.equal(edgeById['e-selected-strong-strong'].source_port, 'selected.light');
+  assert.equal(edgeById['e-selected-standard-standard'].source_port, 'selected.standard');
+
+  const options = await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'capability').options)));
+  assert.deepEqual(options.map(option => option.key), ['strong', 'standard', 'light']);
+  assert.equal(options[0].label, '轻量模型', 'label did not stay with the renamed easy row');
+  assert.equal(options[2].label, '增强模型', 'label did not stay with the renamed strong row');
+  const ports = await page.evaluate(() => window.RTGraph.portsOf(
+    window.RTGraph.findNode(window.App.graph, 'capability'), window.App.graph).map(port => port.id));
+  assert.ok(ports.includes('selected.strong') && ports.includes('prob.strong'));
+  assert.ok(ports.includes('selected.light') && ports.includes('prob.light'));
+  assert.equal(ports.includes('selected.easy'), false);
+  assert.equal(await page.locator('#cvNodes [data-node-id="capability"] [data-optkey="strong"]').count(), 1);
+  assert.equal(await page.locator('#cvNodes [data-node-id="capability"] [data-optkey="light"]').count(), 1);
+  assert.deepEqual((await appSnapshot()).history, { undo: true, redo: false },
+    'two-key swap must be exactly one history entry');
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => {
+    const node = window.RTGraph.findNode(window.App.graph, 'capability');
+    return node && node.options[0].key === 'easy' && node.options[2].key === 'strong';
+  });
+  const restored = await appSnapshot();
+  assert.equal(restored.edges.find(edge => edge.id === 'e-selected-easy-light').source_port, 'selected.easy');
+  assert.equal(restored.edges.find(edge => edge.id === 'e-selected-strong-strong').source_port, 'selected.strong');
+  assert.equal(restored.edges.find(edge => edge.id === 'e-cap-strong-and-power').source_port, 'prob.strong');
+  assert.deepEqual(restored.history, { undo: false, redo: true });
+});
+
+test('Task 11 · inspector save and delete bind to the rendered branch, not a silently moved kit selection', async () => {
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  /* Move the kit selection without re-rendering the inspector: the rendered form
+     still belongs to capability, so save/delete must use capability's id. */
+  await page.evaluate(() => window.App.kit.select('node', 'cond-text', true));
+  assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: 'node', id: 'cond-text' });
+  const condTextBefore = await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'cond-text'))));
+  const draft = '只写入渲染时绑定的 capability 节点。';
+  await page.locator('#cvInspectorBody [data-field="instructions"]').fill(draft);
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForFunction(value => {
+    const node = window.RTGraph.findNode(window.App.graph, 'capability');
+    return node && node.instructions.indexOf(value) >= 0;
+  }, draft);
+  assert.deepEqual(await page.evaluate(() => JSON.parse(JSON.stringify(
+    window.RTGraph.findNode(window.App.graph, 'cond-text')))), condTextBefore,
+  'inspector save wrote to the silently moved kit selection');
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'capability')
+    .instructions.indexOf('只写入') < 0);
+
+  /* Option delete resolves the node id from the rendered branch as well. */
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  await page.evaluate(() => window.App.kit.select('node', 'cond-text', true));
+  await page.locator('#cvInspectorBody [data-opt-row="strong"] [data-act="opt-delete"]').click();
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  const optionDialog = await page.locator('#cvDeleteBody').innerText();
+  assert.match(optionDialog, /capability/);
+  assert.match(optionDialog, /selected\.strong/);
+  assert.match(optionDialog, /prob\.strong/);
+  await page.locator('[data-act="delete-cancel"]').click();
+
+  /* Edge delete lists the rendered edge even when the kit selection points at another. */
+  await clickEdge('e-cap-strong-and-power');
+  await waitInspectorBranch('edge', 'e-cap-strong-and-power');
+  await page.evaluate(() => window.App.kit.select('edge', 'e-selected-easy-light', true));
+  await page.locator('#cvInspectorBody [data-act="ins-delete-edge"]').click();
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
+  const edgeDialog = await page.locator('#cvDeleteBody').innerText();
+  assert.match(edgeDialog, /and-power/);
+  assert.match(edgeDialog, /in_1/);
+  await page.locator('[data-act="delete-cancel"]').click();
+  assert.equal(await page.locator('#cvDeleteModal').isHidden(), true);
+  assert.equal(await page.evaluate(() => window.App.graph.edges
+    .filter(edge => edge.id === 'e-cap-strong-and-power').length), 1);
 });
 
 test('Task 11 · question and condition inspectors edit instructions, options, keywords, periods and criteria', async () => {
@@ -1860,6 +2057,10 @@ test('Task 11 · logic and target inspectors edit operator, models, reasoning, p
   await openCanvas();
   await clickNode('and-power');
   await waitInspectorBranch('node', 'and-power');
+  const noopHistory = (await appSnapshot()).history;
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await page.waitForTimeout(50);
+  assert.deepEqual((await appSnapshot()).history, noopHistory, 'no-op node save pushed history');
   await page.locator('#cvInspectorBody [data-field="operator"]').selectOption('or');
   await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
   await page.waitForFunction(() => window.RTGraph.findNode(window.App.graph, 'and-power').operator === 'or');
@@ -1920,11 +2121,32 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
   assert.equal(await page.locator('#cvInspectorBody [data-field="stickyTtl"]').inputValue(), '1800');
   assert.equal(await page.locator('#cvInspectorBody [data-field="otherwise"]').inputValue(), 'standard-target');
   assert.equal(await page.locator('#cvInspectorBody [data-field="errorFallback"]').inputValue(), 'light-target');
-  const limits = await page.locator('#cvInspectorBody').innerText();
-  assert.match(limits, /200/);
-  assert.match(limits, /400/);
-  assert.match(limits, /32/);
-  assert.match(limits, /8/);
+  const limitRows = await page.evaluate(() => {
+    const read = name => {
+      const row = document.querySelector('#cvInspectorBody [data-limit="' + name + '"] b');
+      return row ? row.textContent.trim() : null;
+    };
+    const graph = window.App.graph;
+    return {
+      nodes: read('nodes'), edges: read('edges'),
+      questions: read('questions'), waves: read('waves'),
+      counts: {
+        nodes: graph.nodes.length,
+        edges: graph.edges.length,
+        questions: graph.nodes.filter(node => node.type === 'question').length
+      }
+    };
+  });
+  assert.deepEqual(limitRows.counts, { nodes: 15, edges: 15, questions: 3 });
+  assert.equal(limitRows.nodes, '15 / 200');
+  assert.equal(limitRows.edges, '15 / 400');
+  assert.equal(limitRows.questions, '3 / 32');
+  assert.equal(limitRows.waves, '≤ 8');
+
+  const noopHistory = (await appSnapshot()).history;
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForTimeout(50);
+  assert.deepEqual((await appSnapshot()).history, noopHistory, 'no-op graph save pushed history');
 
   const historyBefore = (await appSnapshot()).history;
   await page.locator('#cvInspectorBody [data-field="timezone"]').fill('Mars/Phobos');
@@ -2003,6 +2225,77 @@ test('Task 11 · Backspace inside editor inputs is safe, all overlays close with
   await openIssuesPanel();
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#cvIssues').isHidden(), true);
+});
+
+test('Task 11 · boot unlocks the canvas before catalogues and late catalogue data does not wipe inspector edits', async () => {
+  let release = () => {};
+  const gate = new Promise(resolve => { release = resolve; });
+  const hold = async route => { await gate; await route.continue(); };
+  await page.route('**/admin/models', hold);
+  await page.route('**/admin/time-periods', hold);
+  try {
+    await page.goto(routerBase + '/console/routing.html');
+    await page.waitForSelector('#cvStage [data-node-id]', { timeout: 20000 });
+    await page.waitForFunction(() => window.App && window.App.booted && window.App.tree);
+    assert.equal(await page.evaluate(() => window.App.models.length), 0,
+      'catalogue resolved before the test released it');
+
+    /* Palette creation must work while models/periods are still pending. */
+    const before = await appSnapshot();
+    await page.locator('[data-lib-kind="logic-not"]').click();
+    await page.waitForFunction(count => window.App.graph.nodes.length === count + 1, before.nodes.length,
+      { timeout: 4000 });
+    assert.equal((await appSnapshot()).nodes.length, before.nodes.length + 1,
+      'palette creation was blocked by the pending catalogues');
+
+    /* Type, blur, then let the catalogues settle: the unsaved draft must survive. */
+    await page.evaluate(() => window.App.kit.select('node', 'capability'));
+    await waitInspectorBranch('node', 'capability');
+    const draft = '目录晚到不能清掉这段未保存输入';
+    await page.locator('#cvInspectorBody [data-field="title"]').fill(draft);
+    await page.locator('#cvInspectorBody [data-field="title"]').evaluate(element => element.blur());
+    release();
+    await page.waitForFunction(() => window.App.models.length > 0 && window.App.periods.length > 0);
+    await page.waitForTimeout(250);
+    assert.equal(await page.locator('#cvInspectorBody [data-field="title"]').inputValue(), draft,
+      'late catalogue refresh wiped an unsaved inspector edit');
+    assert.equal(await page.evaluate(() => window.App.tree.name), '电力优先决策组');
+  } finally {
+    release();
+    await page.unroute('**/admin/models');
+    await page.unroute('**/admin/time-periods');
+  }
+});
+
+test('Task 11 · admin API timeout rejects a hung request with a clear localized error', async () => {
+  await openCanvas();
+  let held = null;
+  const hung = async route => { held = route; };
+  await page.route(url => url.pathname === '/admin/time-periods' && url.searchParams.has('timeout-probe'), hung);
+  try {
+    const result = await page.evaluate(async () => {
+      const path = '/admin/time-periods?timeout-probe=1';
+      try {
+        await api.req('GET', path, undefined, { timeoutMs: 1000 });
+        return { threw: false };
+      } catch (error) {
+        return {
+          threw: true,
+          timeout: error.timeout === true,
+          status: error.status,
+          message: error.message,
+          expected: tf('api.timeout', { seconds: 1, path: path })
+        };
+      }
+    });
+    assert.equal(result.threw, true, 'hung admin request did not reject');
+    assert.equal(result.timeout, true, 'timeout error is not marked: ' + result.message);
+    assert.equal(result.status, 0);
+    assert.equal(result.message, result.expected, 'timeout error message is not the localized clear message');
+  } finally {
+    if (held) { try { await held.abort(); } catch { /* already gone */ } }
+    await page.unroute(url => url.pathname === '/admin/time-periods' && url.searchParams.has('timeout-probe'));
+  }
 });
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */

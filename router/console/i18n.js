@@ -17,6 +17,7 @@ const I18N = {
     'nav.users': '用户管理', 'nav.logout': '退出', 'nav.service': '服务令牌',
     'common.delete': '删除', 'common.save': '保存',
     'common.loading': '加载中…', 'common.saved': '已保存',
+    'api.timeout': '请求超时（{seconds} 秒）：{path}',
     'common.cancel': '取消', 'common.close': '关闭', 'common.none': '无',
     /* ── overview ── */
     'ov.sub': '线上流量、JEV 置信度与调度结果一屏掌握',
@@ -363,6 +364,7 @@ const I18N = {
     'nav.users': 'Users', 'nav.logout': 'Sign out', 'nav.service': 'service token',
     'common.delete': 'Delete', 'common.save': 'Save',
     'common.loading': 'Loading…', 'common.saved': 'Saved',
+    'api.timeout': 'Request timed out after {seconds}s: {path}',
     'common.cancel': 'Cancel', 'common.close': 'Close', 'common.none': 'none',
     /* ── overview ── */
     'ov.sub': 'Traffic, JEV confidence and scheduling outcomes at a glance',

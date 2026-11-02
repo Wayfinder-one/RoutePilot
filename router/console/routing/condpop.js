@@ -228,14 +228,43 @@
       '</div></div></form>';
   }
 
+  function triggerInfo(pop) {
+    const active = document.activeElement;
+    if (!active || active === document.body || active === pop || typeof active.focus !== 'function') return null;
+    if (active.closest && active.closest('#cvCondPop')) return null;
+    return {
+      element: active,
+      condEdge: active.dataset ? (active.dataset.condEdge || '') : ''
+    };
+  }
+
+  /* 关闭后把焦点还给触发元素（a11y §6.11）。确认条件会触发 App.change →
+     renderAll 重绘卡片，触发 chip 可能已被替换；按 data-cond-edge 重新定位。 */
+  function restoreTrigger(info) {
+    if (!info) return;
+    let target = info.element && info.element.isConnected ? info.element : null;
+    if (!target && info.condEdge) {
+      target = Array.from(document.querySelectorAll('[data-cond-edge]'))
+        .find(el => el.dataset.condEdge === info.condEdge) || null;
+    }
+    if (target && typeof target.focus === 'function' && target !== document.activeElement) {
+      target.focus({ preventScroll: true });
+    }
+  }
+
   function open(edgeId, anchor) {
     const edge = edgeOf(edgeId);
     if (!edge) return false;
     const pop = element();
     if (!pop) return false;
+    const trigger = triggerInfo(pop);
     paint(edge);
     pop.hidden = false;
-    state = { edgeId: edgeId, original: clone(edge.condition == null ? null : edge.condition) };
+    state = {
+      edgeId: edgeId,
+      original: clone(edge.condition == null ? null : edge.condition),
+      trigger: trigger
+    };
     position(pop, anchor);
     const type = edgeType(edge);
     const focus = pop.querySelector(type === 'number' ? '[data-cond-field="value"]' : '[data-cond-field="bool"]');
@@ -245,11 +274,13 @@
 
   function close() {
     const pop = element();
+    const restore = state ? state.trigger : null;
     if (pop) {
       pop.hidden = true;
       if (state) delete pop.dataset.edgeId;
     }
     state = null;
+    restoreTrigger(restore);
   }
 
   function isOpen() {
@@ -272,7 +303,7 @@
     }
   }
 
-  /* 打开时保存副本；取消/Esc 不写。这里不做额外恢复动作，草稿本来就没被改过。 */
+  /* 打开时保存副本；取消/Esc 不写，关闭时把焦点还给触发元素。 */
   function cancel() {
     close();
   }

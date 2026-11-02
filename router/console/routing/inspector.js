@@ -5,8 +5,10 @@
      · edge  → 两端只读 + 类型 + 条件表单（复用 RTCondPop） + 删除
      · graph → 名称 / 时区 / 粘性 / otherwise_target / error_fallback + 限额
    所有写入走 App.change：一次表单提交 = 一个历史项，不在 keystroke 上写草稿。
-   选项 key 改名在提交前用探针快照预演（renameOptionKey），冲突时留在编辑器并给出
-   具体原因；删除节点/边/选项交给 App.requestDelete 的确认框（级联清单在那里生成）。
+   选项 key 改名在提交前用探针快照预演（renameOptionKey）：先改到唯一临时 key
+   再落到最终 key，因此同一次保存里的互换也能成功；冲突时留在编辑器并给出具体原因。
+   提交/删除以本次渲染写在 data-ins-branch / data-ins-id 上的目标为准（旧调用方回退
+   kit 选中）；删除节点/边/选项交给 App.requestDelete 的确认框（级联清单在那里生成）。
    ------------------------------------------------------------------ */
 (function (root) {
   'use strict';
@@ -38,6 +40,18 @@
     const current = app();
     if (current && current.kit) return current.kit.getSelection();
     return (current && current.selection) || { kind: null, id: null };
+  }
+
+  /* 提交/删除以「当前渲染出来的分支」为准：render(selection) 把目标写在
+     data-ins-branch / data-ins-id 上，避免 kit 选中在渲染后被静默改动时
+     保存或删除写错节点。没有分支标记的旧调用方仍回退到 kit 选中。 */
+  function branchTarget(element) {
+    const branch = element && element.closest ? element.closest('[data-ins-branch]') : null;
+    if (branch && branch.dataset.insBranch && branch.dataset.insId) {
+      return { kind: branch.dataset.insBranch, id: branch.dataset.insId };
+    }
+    const selected = selectionOf();
+    return { kind: selected.kind, id: selected.id };
   }
 
   function findModel(id) {
@@ -125,7 +139,8 @@
 
   function optionRowHTML(option, orig) {
     const key = option.key == null ? '' : String(option.key);
-    return '<div class="rtc-opt-edit" data-opt-row="' + esc(key) + '" data-opt-orig="' + esc(orig) + '">' +
+    return '<div class="rtc-opt-edit" data-opt-row="' + esc(key) + '" data-opt-orig="' + esc(orig) +
+      '" data-opt-key="' + esc(orig) + '">' +
       '<div class="field-row">' +
       '<label class="field">' + esc(t('cv.ins.optionKey')) +
       '<input type="text" data-opt-field="key" value="' + esc(key) + '" aria-label="' + esc(t('cv.ins.optionKey')) + '"></label>' +
@@ -393,9 +408,15 @@
 
   /* ── 提交：节点 ─────────────────────────────────────────────────── */
 
+  /* 两阶段改名：先把所有变更行改成唯一临时 key，再统一落到最终 key。
+     这样同一次保存里的 key 互换（easy→strong、strong→light）不会因为
+     「新 key 仍被后一行占用」而误报：只要最终 key 集合唯一就能成功。
+     预校验负责空 key / 空白 / 句点 / 最终重复；阶段 2 的失败是真冲突，
+     优先点名占用最终 key 的选项。 */
   function applyOptionRows(treeRoot, node, rows) {
     const keys = Object.create(null);
     const labels = Object.create(null);
+    const options = node.options || [];
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
       const key = row.key.trim();
@@ -410,6 +431,37 @@
       if (labels[label]) return error(tf('cv.ins.errOptionLabelDup', { label: label }));
       labels[label] = true;
       if (!row.capability.trim()) return error(t('cv.ins.errOptionCapability'));
+      if (row.orig && !options.some(option => option && option.key === row.orig)) {
+        return error(t('cv.ins.errOptionRename'));
+      }
+    }
+    const plan = rows.filter(row => row.orig && row.orig !== row.key.trim());
+    const reserved = Object.create(null);
+    options.forEach(option => { if (option && option.key) reserved[option.key] = true; });
+    rows.forEach(row => { reserved[row.key.trim()] = true; });
+    let tempSeq = 0;
+    const nextTempKey = () => {
+      let key;
+      do { tempSeq += 1; key = '__opt_tmp_' + tempSeq; } while (reserved[key]);
+      reserved[key] = true;
+      return key;
+    };
+    /* 阶段 1：变更行旧 key → 唯一临时 key，避免新 key 被尚未改名的行占用。 */
+    for (let index = 0; index < plan.length; index += 1) {
+      const temp = nextTempKey();
+      plan[index].temp = temp;
+      const renamed = root.RTGraph.renameOptionKey(treeRoot, node.id, plan[index].orig, temp);
+      if (!renamed.ok) return error(t('cv.ins.errOptionRename'));
+    }
+    /* 阶段 2：临时 key → 最终 key；最终 key 已被占用时给出具体占用 key。 */
+    for (let index = 0; index < plan.length; index += 1) {
+      const key = plan[index].key.trim();
+      const renamed = root.RTGraph.renameOptionKey(treeRoot, node.id, plan[index].temp, key);
+      if (!renamed.ok) {
+        const blocker = (node.options || []).find(option => option && option.key === key);
+        if (blocker) return error(tf('cv.ins.errOptionKeyExists', { key: key }));
+        return error(t('cv.ins.errOptionRename'));
+      }
     }
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index];
@@ -417,16 +469,10 @@
       const label = row.label.trim();
       const capability = row.capability.trim();
       if (row.orig) {
-        if (row.orig !== key) {
-          const renamed = root.RTGraph.renameOptionKey(treeRoot, node.id, row.orig, key);
-          /* 上面的预校验已覆盖空 key / 空白 / 句点 / 冲突；走到这里说明节点已失效。 */
-          if (!renamed.ok) return error(t('cv.ins.errOptionRename'));
-        }
         const option = (node.options || []).find(item => item && item.key === key);
-        if (option) {
-          option.label = label;
-          option.capability = capability;
-        }
+        if (!option) return error(t('cv.ins.errOptionRename'));
+        option.label = label;
+        option.capability = capability;
       } else {
         node.options = node.options || [];
         node.options.push({ key: key, label: label, capability: capability });
@@ -496,9 +542,9 @@
 
   function submitNode(form) {
     const current = app();
-    const selected = current.kit.getSelection();
-    if (selected.kind !== 'node') return error(t('cv.ins.nodeMissing'));
-    const node = nodeOf(selected.id);
+    const target = branchTarget(form);
+    if (target.kind !== 'node') return error(t('cv.ins.nodeMissing'));
+    const node = nodeOf(target.id);
     if (!node) return error(t('cv.ins.nodeMissing'));
     const values = {
       title: fieldValue(form, 'title'),
@@ -515,26 +561,33 @@
         .map(input => input.value)
     };
     const probe = clone(current.tree);
-    const check = applyNodeValues(probe.root, selected.id, values);
+    const check = applyNodeValues(probe.root, target.id, values);
     if (!check.ok) return check;
+    const before = node;
+    const after = root.RTGraph.findNode(probe.root, target.id);
+    /* no-op 提交不产生历史项（与 RTCondPop 的 sameCondition 跳过一致）。 */
+    if (before && after &&
+        root.RTGraph.stableStringify(before) === root.RTGraph.stableStringify(after)) {
+      return { ok: true, changed: false };
+    }
     current.change('behavior', tree => {
-      applyNodeValues(tree.root, selected.id, values);
+      applyNodeValues(tree.root, target.id, values);
     });
-    return { ok: true };
+    return { ok: true, changed: true };
   }
 
   /* ── 提交：边（复用 RTCondPop 唯一提交路径） ─────────────────────── */
 
   function submitEdge(form) {
     const current = app();
-    const selected = current.kit.getSelection();
-    if (selected.kind !== 'edge') return error(t('cv.cond.edgeMissing'));
-    const edge = (current.graph.edges || []).find(item => item && item.id === selected.id);
+    const target = branchTarget(form);
+    if (target.kind !== 'edge') return error(t('cv.cond.edgeMissing'));
+    const edge = (current.graph.edges || []).find(item => item && item.id === target.id);
     if (!edge) return error(t('cv.cond.edgeMissing'));
     const draft = root.RTCondPop.readForm(form, edge);
     if (!draft.ok) return draft;
     const result = root.RTCondPop.validateAndCommit(edge.id, draft.condition);
-    return result.ok ? { ok: true } : result;
+    return result.ok ? { ok: true, changed: result.changed !== false } : result;
   }
 
   /* ── 提交：图设置 ───────────────────────────────────────────────── */
@@ -564,6 +617,24 @@
     if (otherwise && targetIds.indexOf(otherwise) < 0) return error(t('cv.ins.errFallback'));
     if (errorFallback && targetIds.indexOf(errorFallback) < 0) return error(t('cv.ins.errFallback'));
     const sticky = { enabled: !!fieldValue(form, 'sticky'), ttl_seconds: ttl };
+    const committed = {
+      name: name,
+      timezone: timezone,
+      sticky: sticky,
+      otherwise: otherwise,
+      errorFallback: errorFallback
+    };
+    const previous = {
+      name: current.tree.name,
+      timezone: current.tree.timezone,
+      sticky: current.tree.sticky,
+      otherwise: graph.otherwise_target,
+      errorFallback: graph.error_fallback
+    };
+    /* no-op 提交不产生历史项（与 RTCondPop 的 sameCondition 跳过一致）。 */
+    if (root.RTGraph.stableStringify(previous) === root.RTGraph.stableStringify(committed)) {
+      return { ok: true, changed: false };
+    }
     current.change('behavior', tree => {
       tree.name = name;
       tree.timezone = timezone;
@@ -571,7 +642,7 @@
       tree.root.otherwise_target = otherwise;
       tree.root.error_fallback = errorFallback;
     });
-    return { ok: true };
+    return { ok: true, changed: true };
   }
 
   function showError(form, message) {
@@ -600,13 +671,13 @@
     if (!action || !action.closest('#cvInspectorBody')) return;
     const name = action.dataset.act;
     const current = app();
-    const selected = current.kit.getSelection();
+    const target = branchTarget(action);
     if (name === 'ins-delete-node') {
-      if (selected.kind === 'node') current.requestDelete({ kind: 'node', id: selected.id });
+      if (target.kind === 'node' && target.id) current.requestDelete({ kind: 'node', id: target.id });
       return;
     }
     if (name === 'ins-delete-edge') {
-      if (selected.kind === 'edge') current.requestDelete({ kind: 'edge', id: selected.id });
+      if (target.kind === 'edge' && target.id) current.requestDelete({ kind: 'edge', id: target.id });
       return;
     }
     if (name === 'opt-add') {
@@ -632,8 +703,10 @@
         row.parentNode.removeChild(row);
         return;
       }
-      if (selected.kind !== 'node') return;
-      current.requestDelete({ kind: 'option', nodeId: selected.id, key: row.dataset.optOrig });
+      const nodeId = target.kind === 'node' ? target.id : '';
+      const key = row.dataset.optKey || row.dataset.optOrig;
+      if (!nodeId || !key) return;
+      current.requestDelete({ kind: 'option', nodeId: nodeId, key: key });
       return;
     }
     if (name === 'model-add') {

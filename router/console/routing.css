@@ -506,6 +506,13 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
   background: var(--panel); border: 1px solid var(--line);
   border-radius: 12px; box-shadow: var(--shadow-lg);
   overflow: hidden; z-index: 22;
+  transition: box-shadow .18s ease, outline-color .18s ease;
+}
+/* 校验条定位图级问题时短暂点亮检查器（app.js 添加 900ms 的 is-focus）。 */
+.rtc-inspector.is-focus {
+  outline: 2px solid var(--indigo-line);
+  outline-offset: -2px;
+  box-shadow: 0 0 0 4px var(--indigo-soft), var(--shadow-lg);
 }
 .rtc-insp-h {
   flex: none; display: flex; align-items: center; gap: 7px;
