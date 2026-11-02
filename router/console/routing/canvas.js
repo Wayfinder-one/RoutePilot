@@ -67,6 +67,8 @@
       let drag = null;
       let tempPath = null;
       let spaceDown = false;
+      /* 试算在途时锁编辑：仍允许平移/缩放/选中，禁止拖节点、拖线和删除。 */
+      let locked = false;
       const undoStack = [];
       const redoStack = [];
       let edgeEls = Object.create(null);
@@ -337,6 +339,7 @@
       }
 
       function undo() {
+        if (locked) return false;
         const entry = undoStack.pop();
         if (!entry) return false;
         redoStack.push(entry);
@@ -346,6 +349,7 @@
       }
 
       function redo() {
+        if (locked) return false;
         const entry = redoStack.pop();
         if (!entry) return false;
         undoStack.push(entry);
@@ -370,8 +374,22 @@
         cb.onClearReplay();
       }
 
+      function setLocked(value) {
+        locked = !!value;
+        stage.classList.toggle('is-locked', locked);
+        if (locked) {
+          if (drag && drag.type === 'edge') {
+            if (tempPath && tempPath.parentNode) tempPath.parentNode.removeChild(tempPath);
+            tempPath = null;
+            clearCompatible();
+          }
+          drag = null;
+        }
+      }
+
       /* ── 连线 ─────────────────────────────────────────────────── */
       function addEdge(draft) {
+        if (locked) return null;
         const before = cb.getTree();
         const check = root.RTGraph.canConnect(graph, draft);
         if (!check.ok) { cb.onInvalid(check.reason, draft); return null; }
@@ -386,6 +404,7 @@
 
       /* 供后续任务使用的无历史包装（App.change 内部调用即可）。 */
       function removeNode(id) {
+        if (locked) return { ok: false, reason: t('cv.tryEditBlocked') };
         const result = root.RTGraph.removeNode(graph, id);
         if (!result.ok) return result;
         sel = { kind: null, id: null };
@@ -394,6 +413,7 @@
       }
 
       function removeEdge(id) {
+        if (locked) return { ok: false, reason: t('cv.tryEditBlocked') };
         const result = root.RTGraph.removeEdge(graph, id);
         if (!result.ok) return result;
         sel = { kind: null, id: null };
@@ -435,6 +455,15 @@
           return;
         }
         const port = target.closest('[data-port]');
+        const ownerEl = target.closest('[data-node-id]');
+        if (locked) {
+          /* 只读：输出端口不启动连线，节点只选中不拖动；空白/边仍可平移与选中。 */
+          if (port && port.dataset.portDir === 'out') return;
+          if (ownerEl && !isInteractive(target) && !(port && port.dataset.portDir === 'in')) {
+            select('node', ownerEl.dataset.nodeId, true);
+            return;
+          }
+        }
         if (port && port.dataset.portDir === 'out') {
           event.preventDefault();
           startEdgeDrag(event, port);
@@ -685,12 +714,13 @@
         }
         if (typingInField(event)) return;
         if ((event.metaKey || event.ctrlKey) && String(event.key).toLowerCase() === 'z') {
+          if (locked) return;
           event.preventDefault();
           if (event.shiftKey) redo(); else undo();
           return;
         }
         if (event.key === 'Delete' || event.key === 'Backspace') {
-          if (!sel.kind) return;
+          if (locked || !sel.kind) return;
           event.preventDefault();
           cb.onDeleteRequest({ kind: sel.kind, id: sel.id });
         }
@@ -769,6 +799,8 @@
         getViewport: getViewport,
         screenToWorld: screenToWorld,
         clearReplay: clearReplay,
+        setLocked: setLocked,
+        isLocked: () => locked,
         nodeEl: nodeEl,
         portEl: portEl,
         edgeEl: id => (edgeEls[id] ? edgeEls[id].path : null),

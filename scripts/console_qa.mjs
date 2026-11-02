@@ -3201,6 +3201,719 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
   await ensureBaselineTree();
 });
 
+/* ── Task 13 · 真实试算 / trace-only 回放 / 轨迹抽屉 / 波次布局 ─────── */
+
+/* 样例输入是「文本 + 固定 now」的请求预设：断言用 fixture 的文本/时间，
+   但答案永远从实时 /admin/try 读，QA 不把 fixture answers 传给页面。 */
+const TRY_SAMPLES = FIXTURE.scenarios.map(scenario => ({
+  id: scenario.id,
+  name: scenario.name,
+  text: scenario.text,
+  now: scenario.now
+}));
+
+async function prepareTryCanvas() {
+  await ensureBaselineTree();
+  await openCanvas();
+  const treeId = await page.evaluate(() => window.App.treeId);
+  if (treeId !== TREE_ID) {
+    await page.evaluate(id => window.App.selectTree(id), TREE_ID);
+    await page.waitForFunction(id => window.App.treeId === id && window.App.booted,
+      TREE_ID, { timeout: 10000 });
+  }
+  await page.waitForFunction(() => window.App && !window.App.tryRunning);
+}
+
+async function waitTryResult(expected) {
+  await page.waitForFunction(want => {
+    const replay = window.App.replay;
+    if (!replay || window.App.tryRunning) return false;
+    if (!want) return true;
+    if (want.text != null && replay.text !== want.text) return false;
+    if (want.now !== undefined && (replay.now || null) !== want.now) return false;
+    return true;
+  }, expected || null, { timeout: 15000 });
+}
+
+async function runTrySample(index) {
+  const sample = TRY_SAMPLES[index];
+  assert.ok(sample, `missing scenario fixture at index ${index}`);
+  await page.locator(`[data-try-sample="${index}"]`).click();
+  await waitTryResult({ text: sample.text, now: sample.now });
+  return sample;
+}
+
+async function runTryManual(text) {
+  await page.locator('#cvTryInput').fill(text);
+  await page.locator('#cvTryRun').click();
+  await waitTryResult({ text: text });
+}
+
+/* 一次性读取回放数据 + 卡片/边/结论/抽屉的 DOM 状态；所有断言都基于
+   页面公开状态（App.replay / data-* / class），不猜内部实现。 */
+async function trySnapshot() {
+  return page.evaluate(() => {
+    const replay = window.App.replay;
+    if (!replay) return null;
+    const nodeEl = id => document.querySelector(`#cvNodes [data-node-id="${id}"]`);
+    const textOf = (el, sel) => {
+      if (!el) return '';
+      const target = el.querySelector(sel);
+      return target ? target.textContent.replace(/\s+/g, ' ').trim() : '';
+    };
+    const nodeInfo = id => {
+      const el = nodeEl(id);
+      if (!el) return null;
+      const live = {};
+      Array.prototype.forEach.call(el.querySelectorAll('[data-live]'), item => {
+        live[item.dataset.live] = item.textContent.trim();
+      });
+      return {
+        replay: el.dataset.replay || '',
+        replayKind: el.dataset.replayKind || '',
+        classes: el.className,
+        state: textOf(el, '.rtc-card-h [data-live="state"]'),
+        foot: textOf(el, '.rtc-tfoot [data-live="state"]'),
+        gate: textOf(el, '.rtc-gate'),
+        selectedOptions: Array.prototype.map.call(el.querySelectorAll('.rtc-opt.is-sel'),
+          row => row.dataset.optkey),
+        keywordClasses: Array.prototype.map.call(el.querySelectorAll('.rtc-kw'),
+          chip => chip.className),
+        live: live
+      };
+    };
+    const slotInfo = (nodeId, port) => {
+      const row = document.querySelector(
+        `#cvNodes [data-node-id="${nodeId}"] .rtc-slot[data-slot="${port}"]`);
+      if (!row) return null;
+      const live = row.querySelector('.rtc-live');
+      return {
+        classes: row.className,
+        status: row.dataset.status || '',
+        edge: row.dataset.edge || '',
+        live: live ? live.textContent.trim() : ''
+      };
+    };
+    const edges = {};
+    Array.prototype.forEach.call(document.querySelectorAll('#cvEdges path.rtc-edge'), path => {
+      edges[path.dataset.edgeId] = path.className.baseVal;
+    });
+    return {
+      id: replay.id,
+      text: replay.text,
+      now: replay.now,
+      final: replay.final ? {
+        target_id: replay.final.target_id,
+        kind: replay.final.kind,
+        selection_reason: replay.final.selection_reason,
+        model: replay.final.model,
+        priority: replay.final.priority,
+        candidates: replay.final.candidates
+      } : null,
+      waves: replay.waves.map(wave => ({
+        wave: wave.wave,
+        questions: wave.questions,
+        duration_ms: wave.duration_ms,
+        failed: wave.failed,
+        error: wave.error
+      })),
+      nodeStates: replay.nodeStates,
+      edgeStates: replay.edgeStates,
+      candidates: replay.candidates,
+      nodes: {
+        start: nodeInfo('start'),
+        capability: nodeInfo('capability'),
+        domain: nodeInfo('domain'),
+        clarify: nodeInfo('clarify'),
+        'and-power': nodeInfo('and-power'),
+        'or-ctx': nodeInfo('or-ctx'),
+        'not-cap': nodeInfo('not-cap'),
+        'and-follow': nodeInfo('and-follow'),
+        'cond-text': nodeInfo('cond-text'),
+        'cond-peak': nodeInfo('cond-peak'),
+        'power-target': nodeInfo('power-target'),
+        'strong-target': nodeInfo('strong-target'),
+        'deep-target': nodeInfo('deep-target'),
+        'standard-target': nodeInfo('standard-target'),
+        'light-target': nodeInfo('light-target')
+      },
+      slots: {
+        andPowerIn1: slotInfo('and-power', 'in_1'),
+        andPowerIn2: slotInfo('and-power', 'in_2'),
+        deepIn1: slotInfo('deep-target', 'in_1'),
+        clarifyIn1: slotInfo('clarify', 'in_1'),
+        powerIn1: slotInfo('power-target', 'in_1')
+      },
+      edges: edges,
+      svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
+      resultHidden: document.getElementById('cvTryResult').hidden,
+      resultText: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
+      resultFinal: document.getElementById('cvTryResult').dataset.final || '',
+      resultKind: document.getElementById('cvTryResult').dataset.kind || '',
+      hudHidden: document.getElementById('cvReplayHud').hidden,
+      hudText: document.getElementById('cvReplayHud').textContent.replace(/\s+/g, ' ').trim(),
+      hudTitles: Array.prototype.map.call(
+        document.querySelectorAll('#cvReplayHud [data-hud-wave]'),
+        el => el.getAttribute('title') || ''),
+      drawerHidden: document.getElementById('cvTraceDrawer').hidden,
+      drawerWaveCount: document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave').length,
+      drawerWaveTexts: Array.prototype.map.call(
+        document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave'),
+        el => el.textContent.replace(/\s+/g, ' ').trim()),
+      drawerText: document.getElementById('cvTraceDrawer').textContent.replace(/\s+/g, ' ').trim(),
+      running: window.App.tryRunning,
+      runDisabled: document.getElementById('cvTryRun').disabled,
+      topRunDisabled: document.getElementById('cvTryBtn').disabled,
+      palCollapsed: document.getElementById('cvPalette').classList.contains('is-collapsed'),
+      inspCollapsed: document.getElementById('cvInspector').classList.contains('is-collapsed')
+    };
+  });
+}
+
+function assertIncludes(haystack, needle, message) {
+  assert.ok(String(haystack).indexOf(needle) >= 0,
+    `${message || 'missing text'} (wanted ${JSON.stringify(needle)} in ${JSON.stringify(String(haystack).slice(0, 400))})`);
+}
+
+test('Task 13 · a running try disables both run buttons, blocks canvas edits and keeps panels collapsed', async () => {
+  await prepareTryCanvas();
+  const before = await page.evaluate(() => ({
+    position: Object.assign({}, window.App.graph.nodes.find(node => node.id === 'start').position),
+    undo: window.App.kit.canUndo(),
+    nodes: window.App.graph.nodes.length
+  }));
+  let release = null;
+  const gate = new Promise(resolve => { release = resolve; });
+  const tryMatcher = url => url.pathname === '/admin/try';
+  await page.route(tryMatcher, async route => {
+    await gate;
+    await route.continue();
+  });
+  try {
+    await page.locator('[data-try-sample="0"]').click();
+    await page.waitForFunction(() => window.App.tryRunning === true, null, { timeout: 5000 });
+    const loading = await page.evaluate(() => ({
+      running: window.App.tryRunning,
+      runDisabled: document.getElementById('cvTryRun').disabled,
+      topDisabled: document.getElementById('cvTryBtn').disabled,
+      runText: document.getElementById('cvTryRun').textContent.trim(),
+      expectedRunText: window.t('cv.tryRunning'),
+      palCollapsed: document.getElementById('cvPalette').classList.contains('is-collapsed'),
+      inspCollapsed: document.getElementById('cvInspector').classList.contains('is-collapsed')
+    }));
+    assert.equal(loading.running, true);
+    assert.equal(loading.runDisabled, true, 'run button stayed enabled during the request');
+    assert.equal(loading.topDisabled, true, 'top-bar try button stayed enabled during the request');
+    assert.equal(loading.runText, loading.expectedRunText, 'run button does not show the localized loading copy');
+    assert.equal(loading.palCollapsed, true, 'node library did not auto-collapse for the run');
+    assert.equal(loading.inspCollapsed, true, 'inspector did not auto-collapse for the run');
+
+    /* 请求在途时拖节点必须被拒绝：位置、历史栈和节点数都不能变。 */
+    const box = await page.locator('[data-node-id="start"]').first().boundingBox();
+    assert.ok(box, 'start node not visible');
+    await page.mouse.move(box.x + 24, box.y + 10);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 84, box.y + 58, { steps: 8 });
+    await page.mouse.up();
+    await page.waitForTimeout(140);
+    const during = await page.evaluate(() => ({
+      position: Object.assign({}, window.App.graph.nodes.find(node => node.id === 'start').position),
+      undo: window.App.kit.canUndo(),
+      nodes: window.App.graph.nodes.length
+    }));
+    assert.deepEqual(during.position, before.position, 'dragging a node mutated the draft during the run');
+    assert.equal(during.undo, before.undo, 'dragging a node pushed history during the run');
+    assert.equal(during.nodes, before.nodes);
+  } finally {
+    /* gate 释放后请求继续；保留路由（已 resolve 的 gate 不再阻塞后续用例）。 */
+    release();
+  }
+  await waitTryResult({ text: TRY_SAMPLES[0].text });
+  const after = await page.evaluate(() => ({
+    running: window.App.tryRunning,
+    runDisabled: document.getElementById('cvTryRun').disabled,
+    topDisabled: document.getElementById('cvTryBtn').disabled,
+    replay: !!window.App.replay,
+    palCollapsed: document.getElementById('cvPalette').classList.contains('is-collapsed'),
+    inspCollapsed: document.getElementById('cvInspector').classList.contains('is-collapsed')
+  }));
+  assert.equal(after.running, false);
+  assert.equal(after.runDisabled, false, 'run button stayed disabled after the result');
+  assert.equal(after.topDisabled, false);
+  assert.equal(after.replay, true);
+  assert.equal(after.palCollapsed, true, 'node library expanded again after the run');
+  assert.equal(after.inspCollapsed, true, 'inspector expanded again after the run');
+
+  /* 用户仍可手动再展开两个面板（规格 §0-10：结束保持收起，可再展开）。 */
+  await page.locator('#cvPalToggle').click();
+  await page.locator('#cvInspToggle').click();
+  await page.waitForFunction(() => !document.getElementById('cvPalette').classList.contains('is-collapsed') &&
+    !document.getElementById('cvInspector').classList.contains('is-collapsed'));
+});
+
+test('Task 13 · five chips mirror the mock scenarios and answers follow the live draft', async () => {
+  await prepareTryCanvas();
+  const samples = await page.evaluate(() => window.RTTryRun.samples());
+  assert.equal(samples.length, TRY_SAMPLES.length);
+  samples.forEach((sample, index) => {
+    assert.equal(sample.text, TRY_SAMPLES[index].text, `chip ${index} text drifted from the mock scenario`);
+    assert.equal(sample.now, TRY_SAMPLES[index].now, `chip ${index} now drifted from the fixture`);
+  });
+  const labels = await page.evaluate(() => Array.prototype.map.call(
+    document.querySelectorAll('#cvTryChips [data-try-sample]'), el => el.textContent.trim()));
+  assert.deepEqual(labels, TRY_SAMPLES.map(sample => sample.name));
+
+  await runTrySample(0);
+  let snap = await trySnapshot();
+  assert.equal(snap.final.target_id, 'power-target');
+  assert.equal(snap.now, TRY_SAMPLES[0].now, 'sample run did not send the fixed scenario now');
+
+  /* 改当前草稿的阈值后重跑：服务端按新草稿求值，power 链不再命中。 */
+  await page.evaluate(() => {
+    window.App.change('behavior', tree => {
+      const edge = tree.root.edges.find(item => item.id === 'e-domain-and-power');
+      edge.condition = { op: 'gt', value: 0.99 };
+    });
+  });
+  assert.equal(await page.evaluate(() => window.App.replay), null,
+    'editing the draft after a result did not clear the replay');
+  await runTrySample(0);
+  snap = await trySnapshot();
+  assert.equal(snap.final.target_id, 'strong-target', 'the rerun did not use the edited threshold');
+  assert.equal(snap.nodes['power-target'].replay, 'not-triggered');
+  assert.equal(snap.nodes['strong-target'].replay, 'final');
+  assert.deepEqual(snap.final.candidates.map(candidate => candidate.target_id), ['strong-target']);
+});
+
+test('Task 13 · s1 replay shows two true slots, gate values and p1 beating p3', async () => {
+  await prepareTryCanvas();
+  await runTrySample(0);
+  const snap = await trySnapshot();
+  assert.equal(snap.final.target_id, 'power-target');
+  assert.equal(snap.final.kind, 'target');
+  assert.equal(snap.final.selection_reason, 'target');
+  assert.equal(snap.final.model, 'qwen3.8-flash-sft');
+  assert.deepEqual(snap.final.candidates, [
+    { target_id: 'power-target', priority: 1, via_node: 'and-power', via_port: 'in_1', wave: 1 },
+    { target_id: 'strong-target', priority: 3, via_node: 'capability', via_port: 'in_1', wave: 1 }
+  ]);
+  assert.deepEqual(snap.waves.map(wave => wave.questions.sort()), [['capability', 'domain']]);
+  assert.equal(snap.resultHidden, false, 'conclusion panel stayed hidden');
+  assert.equal(snap.resultFinal, 'power-target');
+  assertIncludes(snap.resultText, 'power-target', 'conclusion does not name the final target');
+  assertIncludes(snap.resultText, 'strong-target', 'conclusion does not show the rival candidate');
+  assertIncludes(snap.resultText, 'p1', 'conclusion lost the winner priority');
+  assertIncludes(snap.resultText, 'p3', 'conclusion lost the rival priority');
+
+  /* 槽位：两个 true 槽位 + 条件文本都在卡片上。 */
+  assert.equal(snap.slots.andPowerIn1.status, 'true');
+  assertIncludes(snap.slots.andPowerIn1.classes, 'is-true');
+  assertIncludes(snap.slots.andPowerIn1.live, '0.84');
+  assertIncludes(snap.slots.andPowerIn1.live, 'true');
+  assert.equal(snap.slots.andPowerIn2.status, 'true');
+  assertIncludes(snap.slots.andPowerIn2.live, '0.92');
+  assert.equal(snap.slots.powerIn1.status, 'true');
+
+  /* 门三值、问题概率/selected、P(yes)、条件节点。 */
+  assert.equal(snap.nodes['and-power'].gate, 'true');
+  assert.equal(snap.nodes['or-ctx'].gate, 'true');
+  assert.equal(snap.nodes['not-cap'].gate, 'false');
+  assert.equal(snap.nodes['and-follow'].gate, 'false');
+  assert.deepEqual(snap.nodes.capability.selectedOptions, ['strong']);
+  assert.equal(snap.nodes.capability.live['prob.strong'], '0.84');
+  assert.equal(snap.nodes.capability.live.p_top, '0.84');
+  assert.equal(snap.nodes.capability.live.margin, '0.72');
+  assert.equal(snap.nodes.domain.live.yes, '0.92');
+  assert.equal(snap.nodes.domain.live.no, '0.08');
+  assert.equal(snap.nodes['cond-text'].replay, 'hit');
+  assert.equal(snap.nodes['cond-peak'].replay, 'miss');
+  assertIncludes(snap.nodes['cond-text'].state, await page.evaluate(() => window.t('cv.tryHit')));
+
+  /* target 命中/候选/未触发 + 边高亮 + 波次头条件。 */
+  assert.equal(snap.nodes['power-target'].replay, 'final');
+  assertIncludes(snap.nodes['power-target'].foot, 'p1');
+  assert.equal(snap.nodes['strong-target'].replay, 'candidate');
+  assertIncludes(snap.nodes['strong-target'].foot, 'p3');
+  assert.equal(snap.nodes['light-target'].replay, 'not-triggered');
+  assert.equal(snap.svgReplay, true);
+  assertIncludes(snap.edges['e-cap-strong-and-power'], 'is-true');
+  assertIncludes(snap.edges['e-selected-strong-strong'], 'is-true');
+  assertIncludes(snap.edges['e-selected-easy-light'], 'is-false');
+  assert.equal(snap.hudHidden, false, 'replay HUD is hidden');
+  assert.equal(snap.hudTitles.length, 1);
+  assertIncludes(snap.hudTitles[0], '0.84');
+  assertIncludes(snap.hudTitles[0], '> 0.65');
+  assertIncludes(snap.hudTitles[0], '> 0.7');
+});
+
+test('Task 13 · s2 leaves the untriggered clarify question at 未触发 instead of zero', async () => {
+  await prepareTryCanvas();
+  await runTrySample(1);
+  const snap = await trySnapshot();
+  assert.equal(snap.final.target_id, 'light-target');
+  assert.equal(snap.final.kind, 'target');
+  assert.deepEqual(snap.final.candidates.map(candidate => candidate.target_id), ['light-target']);
+  assert.equal(snap.waves.length, 1);
+  assert.equal(snap.nodeStates.clarify.status, 'not-triggered');
+  assert.equal(snap.nodeStates.clarify.wave, null);
+  assert.equal(snap.nodeStates.clarify.ports, null);
+  assert.equal(snap.nodes.clarify.replay, 'not-triggered');
+  const notTriggered = await page.evaluate(() => window.t('cv.tryNotTriggered'));
+  assert.equal(snap.nodes.clarify.state, notTriggered);
+  assert.equal(snap.nodes.clarify.live.yes, '—', 'untriggered P(yes) was rendered as 0');
+  assert.equal(snap.nodes.clarify.live.no, '—', 'untriggered P(no) was rendered as 0');
+  assert.equal(snap.nodes.capability.selectedOptions.length, 1);
+  assert.equal(snap.nodes.capability.selectedOptions[0], 'easy');
+  assert.equal(snap.nodes['light-target'].replay, 'final');
+});
+
+test('Task 13 · s3/s4 replay two waves and the clarify slot condition hits', async () => {
+  await prepareTryCanvas();
+  await runTrySample(2);
+  let snap = await trySnapshot();
+  assert.equal(snap.waves.length, 2);
+  assert.deepEqual(snap.waves[0].questions.sort(), ['capability', 'domain']);
+  assert.deepEqual(snap.waves[1].questions, ['clarify']);
+  assert.equal(snap.waves[1].failed, false);
+  assert.ok(snap.waves[1].duration_ms > 0, 'second wave has no duration');
+  assert.equal(snap.final.target_id, 'deep-target');
+  assert.deepEqual(snap.final.candidates.map(candidate => candidate.target_id), ['deep-target', 'standard-target']);
+  assert.equal(snap.nodeStates.clarify.status, 'done');
+  assert.equal(snap.nodeStates.clarify.wave, 2);
+  assert.equal(snap.slots.deepIn1.status, 'true');
+  assertIncludes(snap.slots.deepIn1.live, '0.74');
+  assertIncludes(snap.edges['e-clarify-deep'], 'is-true');
+  assert.equal(snap.nodes['deep-target'].replay, 'final');
+  assert.equal(snap.hudTitles.length, 2);
+  assertIncludes(snap.hudTitles[1], '0.74');
+  assertIncludes(snap.hudTitles[1], '> 0.6');
+
+  await runTrySample(3);
+  snap = await trySnapshot();
+  assert.equal(snap.waves.length, 2);
+  assert.equal(snap.final.target_id, 'deep-target');
+  assertIncludes(snap.slots.deepIn1.live, '0.83');
+  assert.equal(snap.nodes['deep-target'].replay, 'final');
+});
+
+test('Task 13 · s5 voids the failed wave, clears candidates and paints the amber error path', async () => {
+  await prepareTryCanvas();
+  await runTrySample(4);
+  const snap = await trySnapshot();
+  assert.equal(snap.final.kind, 'error_fallback');
+  assert.equal(snap.final.target_id, 'light-target');
+  assert.equal(snap.final.selection_reason, 'error_fallback');
+  assert.deepEqual(snap.final.candidates, []);
+  assert.deepEqual(snap.candidates, []);
+  assert.equal(snap.waves.length, 1);
+  assert.equal(snap.waves[0].failed, true);
+  assert.ok(snap.waves[0].error, 'failed wave has no error text');
+  assert.equal(snap.nodes['light-target'].replay, 'fallback');
+  assertIncludes(snap.nodes['light-target'].classes, 'is-fallback');
+  ['power-target', 'strong-target', 'deep-target', 'standard-target'].forEach(id => {
+    assert.equal(snap.nodes[id].replay, 'not-triggered', `${id} was not voided by the failed wave`);
+  });
+  const errorEdges = Object.keys(snap.edges).filter(id => snap.edges[id].indexOf('is-error-path') >= 0);
+  assert.ok(errorEdges.length >= 2, 'error fallback path is not highlighted');
+  assert.equal(snap.resultKind, 'error_fallback');
+  assertIncludes(snap.resultText, 'light-target');
+  assertIncludes(snap.resultText, await page.evaluate(() => window.t('cv.tryKind.error')));
+});
+
+test('Task 13 · a failed /admin/try toasts the api error and fabricates no replay', async () => {
+  await prepareTryCanvas();
+  const matcher = url => url.pathname === '/admin/try';
+  await page.route(matcher, route => route.fulfill({
+    status: 503,
+    contentType: 'application/json',
+    body: JSON.stringify({ detail: 'routing backend unavailable' })
+  }));
+  try {
+    expectHttpStatusError({ url: /\/admin\/try$/, status: /503/ });
+    await page.locator('[data-try-sample="0"]').click();
+    await page.waitForFunction(() => {
+      const host = document.getElementById('cvToast');
+      return !!host && host.textContent.indexOf('routing backend unavailable') >= 0;
+    }, null, { timeout: 10000 });
+    await page.waitForTimeout(250);
+    const after = await page.evaluate(() => ({
+      replay: window.App.replay,
+      running: window.App.tryRunning,
+      runDisabled: document.getElementById('cvTryRun').disabled,
+      resultHidden: document.getElementById('cvTryResult').hidden,
+      hudHidden: document.getElementById('cvReplayHud').hidden,
+      svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
+      finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
+      lastToast: window.App.lastToast
+    }));
+    assert.equal(after.replay, null, 'a failed request fabricated a replay result');
+    assert.equal(after.running, false);
+    assert.equal(after.runDisabled, false, 'the run button stayed disabled after a failed request');
+    assert.equal(after.resultHidden, true);
+    assert.equal(after.hudHidden, true);
+    assert.equal(after.svgReplay, false);
+    assert.equal(after.finalNodes, 0);
+    assertIncludes(after.lastToast, 'routing backend unavailable');
+  } finally {
+    resetExpectedHttpStatusErrors();
+    await page.unroute(matcher);
+  }
+});
+
+test('Task 13 · drawer shows wave cards and slot rows; a slot row selects its edge and opens the condition editor', async () => {
+  await prepareTryCanvas();
+  await runTrySample(0);
+  assert.equal(await page.evaluate(() => document.getElementById('cvTraceDrawer').hidden), true,
+    'drawer should stay closed until the user opens it');
+  await page.locator('#cvTryDrawerBtn').click();
+  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
+  const drawer = await trySnapshot();
+  assert.equal(drawer.drawerHidden, false);
+  assert.equal(drawer.drawerWaveCount, 1, 'drawer must show one wave card per executed wave');
+  const waveText = drawer.drawerWaveTexts[0];
+  assertIncludes(waveText, await page.evaluate(() => window.tf('cv.tryWave', { n: 1 })));
+  assertIncludes(waveText, await page.evaluate(() => window.tf('cv.tryWaveQuestions', { n: 2 })));
+  assertIncludes(waveText, 'ms');
+  assertIncludes(waveText, '0.84');
+  assertIncludes(waveText, '> 0.65');
+  const row = page.locator('#cvTraceDrawer [data-trace-edge="e-cap-strong-and-power"]')
+    .filter({ hasText: '0.84' }).first();
+  assert.equal(await row.count(), 1, 'drawer has no slot row for the and-power in_1 edge');
+  const rowText = await row.innerText();
+  assertIncludes(rowText, '0.84');
+  assertIncludes(rowText, '> 0.65');
+  assertIncludes(rowText, 'true');
+  await row.click();
+  await page.waitForFunction(() => {
+    const selection = window.App.kit.getSelection();
+    return selection.kind === 'edge' && selection.id === 'e-cap-strong-and-power';
+  });
+  assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), false,
+    'clicking a slot row did not open the condition popup');
+  assert.equal(await page.evaluate(() => window.RTCondPop.currentEdgeId()), 'e-cap-strong-and-power');
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.getElementById('cvCondPop').hidden === true);
+  await page.locator('#cvTraceDrawer [data-try-act="drawer-close"]').click();
+  await page.waitForFunction(() => document.getElementById('cvTraceDrawer').hidden === true);
+  assert.equal(await page.evaluate(() => !!window.App.replay), true,
+    'closing the drawer cleared the replay');
+});
+
+test('Task 13 · rerun reuses the run now, clear restores the editable canvas and manual runs send no now', async () => {
+  await prepareTryCanvas();
+  await runTrySample(0);
+  const first = await page.evaluate(() => ({
+    id: window.App.replay.id,
+    target: window.App.replay.final.target_id,
+    now: window.App.replay.now
+  }));
+  assert.equal(first.now, TRY_SAMPLES[0].now);
+  await page.locator('#cvTryRerun').click();
+  await page.waitForFunction(previous => {
+    const replay = window.App.replay;
+    return replay && !window.App.tryRunning && replay.id !== previous;
+  }, first.id, { timeout: 15000 });
+  const second = await page.evaluate(() => ({
+    id: window.App.replay.id,
+    target: window.App.replay.final.target_id,
+    now: window.App.replay.now,
+    text: window.App.replay.text
+  }));
+  assert.notEqual(second.id, first.id, 'rerun did not produce a new result');
+  assert.equal(second.target, first.target, 'rerun changed the conclusion');
+  assert.equal(second.now, first.now, 'rerun did not keep the scenario now');
+  assert.equal(second.text, TRY_SAMPLES[0].text);
+
+  await page.locator('#cvTryClear').click();
+  const cleared = await page.evaluate(() => ({
+    replay: window.App.replay,
+    resultHidden: document.getElementById('cvTryResult').hidden,
+    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
+    hudHidden: document.getElementById('cvReplayHud').hidden,
+    svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
+    finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
+    trueEdges: document.querySelectorAll('#cvEdges .rtc-edge.is-true').length,
+    runDisabled: document.getElementById('cvTryRun').disabled
+  }));
+  assert.equal(cleared.replay, null);
+  assert.equal(cleared.resultHidden, true);
+  assert.equal(cleared.drawerHidden, true);
+  assert.equal(cleared.hudHidden, true);
+  assert.equal(cleared.svgReplay, false, 'clearing replay left the SVG replay class');
+  assert.equal(cleared.finalNodes, 0, 'clearing replay left final node classes');
+  assert.equal(cleared.trueEdges, 0, 'clearing replay left highlighted edges');
+  assert.equal(cleared.runDisabled, false);
+
+  await runTryManual(TRY_SAMPLES[0].text);
+  assert.equal(await page.evaluate(() => window.App.replay.now), null,
+    'a manual run must not send a fixed now');
+  assert.equal((await trySnapshot()).final.target_id, 'power-target');
+});
+
+test('Task 13 · any edit after a result clears the replay immediately', async () => {
+  await prepareTryCanvas();
+  await runTrySample(2);
+  assert.equal(await page.evaluate(() => !!window.App.replay), true);
+  await dragNodeBy('start', 58, 34);
+  const after = await page.evaluate(() => ({
+    replay: window.App.replay,
+    resultHidden: document.getElementById('cvTryResult').hidden,
+    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
+    hudHidden: document.getElementById('cvReplayHud').hidden,
+    svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
+    finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
+    kind: window.App.kind()
+  }));
+  assert.equal(after.replay, null, 'dragging a node did not clear the replay state');
+  assert.equal(after.resultHidden, true);
+  assert.equal(after.drawerHidden, true);
+  assert.equal(after.hudHidden, true);
+  assert.equal(after.svgReplay, false);
+  assert.equal(after.finalNodes, 0);
+  assert.equal(after.kind, 'layout');
+});
+
+test('Task 13 · layoutByWaves only writes positions and preserves behavior canonical', async () => {
+  await prepareTryCanvas();
+  await runTrySample(2);
+  const before = await page.evaluate(() => ({
+    canonical: window.RTGraph.behaviorCanonical(window.App.tree),
+    positions: Object.fromEntries(window.App.graph.nodes.map(node => [node.id, {
+      x: node.position.x, y: node.position.y
+    }])),
+    undo: window.App.kit.canUndo()
+  }));
+  const moved = await page.evaluate(() => window.RTTryRun.layoutByWaves());
+  assert.equal(moved, true, 'layoutByWaves refused to run with a replay result');
+  const after = await page.evaluate(() => ({
+    canonical: window.RTGraph.behaviorCanonical(window.App.tree),
+    kind: window.App.kind(),
+    replay: window.App.replay,
+    nodes: Object.fromEntries(window.App.graph.nodes.map(node => [node.id, {
+      x: node.position.x, y: node.position.y
+    }])),
+    undo: window.App.kit.canUndo()
+  }));
+  assert.equal(after.canonical, before.canonical, 'wave layout changed behavior canonical');
+  assert.equal(after.kind, 'layout', 'wave layout was recorded as a behavior change');
+  assert.equal(after.replay, null, 'wave layout edit did not clear the stale replay');
+  assert.equal(after.undo, true, 'wave layout did not push a history entry');
+  const changed = Object.keys(before.positions).some(id =>
+    before.positions[id].x !== after.nodes[id].x || before.positions[id].y !== after.nodes[id].y);
+  assert.equal(changed, true, 'wave layout did not move any node');
+
+  const x = id => after.nodes[id].x;
+  const y = id => after.nodes[id].y;
+  assert.equal(x('start'), x('cond-text'));
+  assert.equal(x('cond-text'), x('cond-peak'));
+  assert.equal(x('capability'), x('domain'));
+  assert.equal(x('capability'), x('and-power'));
+  assert.equal(x('and-power'), x('not-cap'));
+  assert.equal(x('and-power'), x('and-follow'));
+  assert.equal(x('and-follow'), x('standard-target'));
+  assert.equal(x('clarify'), x('deep-target'));
+  assert.ok(x('capability') > x('start'));
+  assert.ok(x('clarify') > x('capability'));
+  const untriggered = ['light-target', 'power-target', 'strong-target'];
+  untriggered.forEach(id => {
+    assert.equal(x(id), x('light-target'), `${id} is not in the untriggered column`);
+  });
+  assert.ok(x('light-target') > x('clarify'), 'untriggered column is not after every wave column');
+  const untriggeredOrder = untriggered.slice().sort((a, b) => y(a) - y(b));
+  assert.deepEqual(untriggeredOrder, untriggered, 'untriggered column is not sorted by node id');
+  const column = ['capability', 'domain', 'and-power', 'not-cap', 'and-follow', 'standard-target']
+    .sort((a, b) => y(a) - y(b));
+  assert.deepEqual(column, column.slice().sort(),
+    'a wave column is not sorted by node id (same column must be id-ascending)');
+
+  await page.locator('#cvUndo').click();
+  await page.waitForFunction(previous => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return Math.abs(node.position.x - previous.x) < 0.01 && Math.abs(node.position.y - previous.y) < 0.01;
+  }, before.positions.start);
+});
+
+test('Task 13 · replay is trace-only: local condition evaluation is never called', async () => {
+  await prepareTryCanvas();
+  const installed = await page.evaluate(() => {
+    window.__rtEvalCalls = 0;
+    window.__rtEvalOriginal = window.RTGraph.evaluateCondition;
+    window.RTGraph.evaluateCondition = function () {
+      window.__rtEvalCalls += 1;
+      throw new Error('replay must never evaluate conditions locally');
+    };
+    try {
+      window.RTGraph.evaluateCondition({}, {}, 1);
+      return false;
+    } catch (error) {
+      /* 探针本身会计一次；清零后才是回放期间的调用次数。 */
+      window.__rtEvalCalls = 0;
+      return true;
+    }
+  });
+  assert.equal(installed, true, 'the evaluateCondition guard was not installed');
+  try {
+    await runTrySample(2);
+    const proof = await page.evaluate(() => ({
+      calls: window.__rtEvalCalls,
+      final: window.App.replay.final.target_id,
+      waves: window.App.replay.waves.length,
+      clarify: window.App.replay.nodeStates.clarify.status,
+      deepSlot: window.App.replay.edgeStates['e-clarify-deep'].status,
+      resultHidden: document.getElementById('cvTryResult').hidden,
+      finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length
+    }));
+    assert.equal(proof.calls, 0, 'replay called RTGraph.evaluateCondition behind the trace');
+    assert.equal(proof.final, 'deep-target', 'trace-only replay did not finish');
+    assert.equal(proof.waves, 2);
+    assert.equal(proof.clarify, 'done');
+    assert.equal(proof.deepSlot, 'true');
+    assert.equal(proof.resultHidden, false);
+    assert.ok(proof.finalNodes >= 1);
+  } finally {
+    await page.evaluate(() => {
+      window.RTGraph.evaluateCondition = window.__rtEvalOriginal;
+      delete window.__rtEvalOriginal;
+      delete window.__rtEvalCalls;
+    });
+  }
+});
+
+test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async () => {
+  await prepareTryCanvas();
+  await runTrySample(0);
+  await page.locator('#cvTryDrawerBtn').click();
+  await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+  const english = await page.evaluate(() => {
+    window.setLang('en');
+    return {
+      lang: document.documentElement.lang,
+      result: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
+      drawer: document.getElementById('cvTraceDrawer').textContent.replace(/\s+/g, ' ').trim(),
+      hud: document.getElementById('cvReplayHud').textContent.replace(/\s+/g, ' ').trim(),
+      clear: document.getElementById('cvTryClear').textContent.trim(),
+      finalLabel: window.t('cv.tryFinal'),
+      drawerLabel: window.t('cv.tryDrawer'),
+      waveLabel: window.tf('cv.tryWave', { n: 1 }),
+      rawKey: /cv\.[a-zA-Z]/.test(document.getElementById('cvTryResult').textContent +
+        document.getElementById('cvTraceDrawer').textContent +
+        document.getElementById('cvReplayHud').textContent)
+    };
+  });
+  assert.equal(english.lang, 'en');
+  assert.equal(english.clear, await page.evaluate(() => window.t('cv.tryClear')));
+  assertIncludes(english.result, english.finalLabel);
+  assertIncludes(english.drawer, english.drawerLabel);
+  assertIncludes(english.drawer, english.waveLabel);
+  assert.equal(english.rawKey, false, 'replay UI leaked raw i18n keys in English');
+  assert.notEqual(english.finalLabel, 'cv.tryFinal');
+  await page.evaluate(() => window.setLang('zh'));
+  await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+  assert.equal(await page.evaluate(() => !!window.App.replay), true,
+    'language switch dropped the replay');
+  await screenshot('task13-replay-s3-drawer.png');
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;

@@ -746,12 +746,226 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-dialog-acts .danger { color: var(--red); border-color: var(--red-line); background: var(--red-soft); }
 .rtc-dialog-acts .danger:hover { background: var(--red); color: var(--panel); }
 
-/* ── 轨迹抽屉占位 ─────────────────────────────────────────────── */
-.rtc-drawer {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 160;
-  min-height: 120px; background: var(--panel);
-  border-top: 1px solid var(--line); box-shadow: var(--shadow-lg);
+/* ── 检查器折叠（试算运行时自动收起，可手动再展开） ──────────── */
+.rtc-insp-toggle {
+  margin-left: auto; flex: none; width: 20px; height: 20px; border: 0;
+  border-radius: 5px; background: transparent; color: var(--text-3);
+  display: grid; place-items: center;
 }
+.rtc-insp-toggle:hover { background: var(--panel-2); color: var(--text); }
+.rtc-insp-toggle .rtc-ic { width: 11px; height: 11px; transform: rotate(90deg); }
+.rtc-inspector.is-collapsed { width: 210px; max-height: none; }
+.rtc-inspector.is-collapsed .rtc-insp-body { display: none; }
+.rtc-inspector.is-collapsed .rtc-insp-toggle .rtc-ic { transform: rotate(-90deg); }
+
+/* ── 回放状态（cards / slots / edges / gates） ─────────────────── */
+.rtc-node.is-replay { transition: opacity .12s, border-color .12s, box-shadow .12s; }
+.rtc-node.is-replay.is-final {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px var(--green-soft), var(--shadow);
+}
+.rtc-node.is-replay.is-fallback {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-soft), var(--shadow);
+}
+.rtc-node.is-replay.is-cand { border-color: var(--indigo-line); box-shadow: var(--shadow); }
+.rtc-node.is-replay.is-dim { opacity: .6; }
+.rtc-node.is-replay.is-fail {
+  border-color: var(--red-line);
+  box-shadow: 0 0 0 3px var(--red-soft), var(--shadow);
+}
+.rtc-node.is-replay.is-unknown { border-style: dashed; }
+
+.rtc-slot.is-true { background: color-mix(in srgb, var(--green) 7%, transparent); }
+.rtc-slot.is-true .rtc-live { color: var(--green); font-weight: 700; }
+.rtc-slot.is-false { background: color-mix(in srgb, var(--text) 3%, transparent); }
+.rtc-slot.is-false .rtc-live { color: var(--text-3); }
+.rtc-slot.is-unknown .rtc-live {
+  border: 1px dashed var(--line-2); border-radius: 3px; padding: 0 3px; color: var(--text-3);
+}
+.rtc-slot.is-invalid { background: var(--amber-soft); }
+.rtc-slot.is-invalid .rtc-live { color: var(--amber); font-weight: 700; }
+.rtc-slot.is-error-path { background: var(--amber-soft); }
+
+.rtc-gate.is-ok {
+  color: var(--green); border-style: solid; border-color: var(--green-line);
+  background: var(--green-soft);
+}
+.rtc-gate.is-false {
+  color: var(--text-2); border-style: solid; border-color: var(--line-2);
+  background: var(--panel-2);
+}
+.rtc-gate.is-unk { color: var(--text-3); border-style: dashed; }
+
+.rtc-opt.is-sel { background: var(--green-soft); }
+.rtc-opt.is-sel .rtc-opt-n b { color: var(--green); }
+.rtc-opt-p {
+  margin-left: auto; flex: none; font-family: var(--mono);
+  font-size: 8.5px; color: var(--text-3);
+}
+.rtc-opt.is-sel .rtc-opt-p { color: var(--green); font-weight: 700; }
+.rtc-kw.is-hit { border-color: var(--green-line); background: var(--green-soft); color: var(--green); }
+.rtc-kw.is-miss { opacity: .42; text-decoration: line-through; }
+
+.rtc-edge.is-true { stroke-opacity: 1; stroke-width: 2.6; }
+.rtc-edge.is-true[data-edge-kind="boolean"] { stroke: var(--green); }
+.rtc-edge.is-true[data-edge-kind="number"] { stroke: var(--green); stroke-dasharray: none; }
+.rtc-edge.is-false { stroke-opacity: .22; }
+.rtc-edge.is-unknown { stroke-opacity: .45; stroke-dasharray: 2 6; }
+.rtc-edge.is-invalid { stroke: var(--amber); }
+.rtc-edge.is-error-path {
+  stroke: var(--amber) !important; stroke-opacity: 1 !important;
+  stroke-width: 2.8 !important; stroke-dasharray: 6 4 !important;
+}
+
+.rtc-spin {
+  width: 10px; height: 10px; display: inline-block; margin-right: 5px;
+  border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  vertical-align: -1px; animation: rtc-spin .7s linear infinite;
+}
+@keyframes rtc-spin { to { transform: rotate(360deg); } }
+
+/* ── 试算结论（试算台内展开） ─────────────────────────────────── */
+.rtc-trybar { display: flex; flex-direction: column; max-height: min(46vh, 380px); }
+.rtc-try-res {
+  margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow: auto;
+}
+.rtc-try-res-h { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.rtc-try-kind {
+  flex: none; border-radius: 4px; padding: 0 5px; line-height: 16px;
+  font-size: 8.5px; font-weight: 700; border: 1px solid var(--line-2); color: var(--text-2);
+  background: var(--panel-2);
+}
+.rtc-try-kind.is-ok { color: var(--green); border-color: var(--green-line); background: var(--green-soft); }
+.rtc-try-kind.is-cand { color: var(--indigo); border-color: var(--indigo-line); background: var(--indigo-soft); }
+.rtc-try-kind.is-fb { color: var(--amber); border-color: var(--amber-line); background: var(--amber-soft); }
+.rtc-try-lbl { font-size: 8.5px; color: var(--text-3); }
+.rtc-try-final {
+  font-family: var(--mono); font-size: 12px; font-weight: 750;
+  color: var(--text); max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-try-sub, .rtc-try-meta {
+  font-family: var(--mono); font-size: 8.5px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-try-acts { margin-left: auto; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.rtc-try-acts .btn { font-size: 9px; padding: 2px 6px; }
+.rtc-try-cmp {
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+  font-size: 9px; color: var(--text-2);
+}
+.rtc-try-cmp-l { font-size: 8px; font-weight: 750; letter-spacing: .06em; color: var(--text-3); }
+.rtc-try-cand {
+  display: inline-flex; align-items: center; gap: 3px;
+  border: 1px solid var(--line); border-radius: 5px; padding: 0 4px;
+  font-family: var(--mono); font-size: 8.5px; color: var(--text-2); background: var(--panel);
+}
+.rtc-try-cand i { font-style: normal; color: var(--text-3); font-size: 8px; }
+.rtc-try-cand.is-win { border-color: var(--green-line); background: var(--green-soft); color: var(--green); }
+.rtc-try-cand.is-win i { color: var(--green); }
+.rtc-try-op { color: var(--text-3); font-size: 9px; }
+.rtc-try-pick { font-family: var(--mono); font-size: 8.5px; color: var(--indigo); font-weight: 700; }
+.rtc-try-none { font-size: 9px; color: var(--text-3); }
+.rtc-try-reason {
+  font-size: 9px; line-height: 1.45; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ── 回放 HUD（顶部波次胶囊；title 带命中槽位条件） ───────────── */
+.rtc-hud {
+  position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+  z-index: 24; display: flex; align-items: center; gap: 5px; flex-wrap: nowrap;
+  max-width: calc(100% - 660px); overflow: hidden;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 99px;
+  box-shadow: var(--shadow); padding: 4px 10px; font-size: 9.5px; color: var(--text-2);
+}
+.rtc-hud-tt { font-size: 8px; font-weight: 750; letter-spacing: .08em; color: var(--indigo); flex: none; }
+.rtc-hud-wave {
+  flex: none; border: 1px solid var(--line); border-radius: 99px; padding: 0 6px;
+  background: var(--panel-2); font-family: var(--mono); font-size: 8.5px;
+  white-space: nowrap; cursor: help;
+}
+.rtc-hud-wave.is-failed { border-color: var(--amber-line); background: var(--amber-soft); color: var(--amber); }
+.rtc-hud-final { flex: none; font-family: var(--mono); font-size: 8.5px; font-weight: 700; color: var(--green); }
+.rtc-hud-final.is-failed { color: var(--amber); }
+
+/* ── 轨迹抽屉（左侧波次卡 + 右侧逐行轨迹） ────────────────────── */
+.rtc-drawer {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 140;
+  max-height: 42vh; display: flex; flex-direction: column;
+  background: var(--panel); border-top: 1px solid var(--line); box-shadow: var(--shadow-lg);
+}
+.rtc-drawer-h {
+  flex: none; display: flex; align-items: center; gap: 8px;
+  padding: 7px 14px; border-bottom: 1px solid var(--line);
+}
+.rtc-dw-tt { font-size: 12px; font-weight: 750; letter-spacing: -.01em; }
+.rtc-dw-sub {
+  font-family: var(--mono); font-size: 9px; color: var(--text-3);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-dw-close { margin-left: auto; flex: none; }
+.rtc-drawer-body {
+  flex: 1; min-height: 0; display: grid; grid-template-columns: 330px minmax(0, 1fr);
+}
+.rtc-drawer-waves {
+  min-height: 0; overflow: auto; padding: 8px 10px;
+  background: var(--panel-2); border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.rtc-dw-wave {
+  flex: none; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); padding: 6px 8px;
+}
+.rtc-dw-wave.is-failed { border-color: var(--amber-line); background: var(--amber-soft); }
+.rtc-dw-wave-h { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; }
+.rtc-dw-badge {
+  margin-left: auto; border: 1px solid var(--line-2); border-radius: 4px; padding: 0 4px;
+  line-height: 14px; font-size: 8px; font-weight: 650; color: var(--text-3); background: var(--panel-2);
+}
+.rtc-dw-badge.is-failed { color: var(--amber); border-color: var(--amber-line); background: var(--panel); }
+.rtc-dw-wave-m { font-family: var(--mono); font-size: 8.5px; color: var(--text-3); margin-top: 2px; }
+.rtc-dw-wave-e { font-size: 8.5px; line-height: 1.4; color: var(--amber); margin-top: 3px; word-break: break-word; }
+.rtc-dw-cond-h {
+  margin-top: 4px; font-size: 8px; font-weight: 750; letter-spacing: .06em;
+  color: var(--text-3); text-transform: uppercase;
+}
+.rtc-dw-cond {
+  font-family: var(--mono); font-size: 8px; line-height: 1.5; color: var(--green);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-drawer-rows { min-height: 0; overflow: auto; padding: 0 0 6px; }
+.rtc-dw-group {
+  position: sticky; top: 0; z-index: 1; background: var(--panel);
+  padding: 4px 12px; border-bottom: 1px solid var(--line);
+  font-size: 8.5px; font-weight: 750; letter-spacing: .07em;
+  text-transform: uppercase; color: var(--text-3);
+}
+.rtc-dw-row {
+  display: grid; grid-template-columns: 56px 124px minmax(0, 1fr); gap: 8px;
+  padding: 3px 12px; border-bottom: 1px dashed var(--line);
+  font-size: 9.5px; align-items: baseline;
+}
+.rtc-dw-row.is-clickable { cursor: pointer; }
+.rtc-dw-row.is-clickable:hover { background: var(--indigo-soft); }
+.rtc-dw-k { font-size: 8px; font-weight: 700; color: var(--text-3); white-space: nowrap; }
+.rtc-dw-n {
+  font-family: var(--mono); font-size: 8.5px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-dw-t {
+  font-family: var(--mono); font-size: 8.5px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.rtc-dw-row--slot .rtc-dw-t { color: var(--teal); }
+.rtc-dw-row--gate .rtc-dw-t { color: var(--violet); }
+.rtc-dw-row--question .rtc-dw-t { color: var(--indigo); }
+.rtc-dw-row--final .rtc-dw-t, .rtc-dw-row--fallback .rtc-dw-t { color: var(--green); font-weight: 700; }
+.rtc-dw-row--fallback .rtc-dw-t { color: var(--amber); }
+
+/* 抽屉打开时把试算台上移，避免互相遮挡。 */
+body.has-drawer .rtc-trybar { bottom: calc(42vh + 12px); max-height: calc(58vh - 40px); }
 
 /* ── toast / drag ghost ───────────────────────────────────────── */
 .rtc-toasts {

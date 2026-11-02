@@ -101,6 +101,10 @@
       <div class="rtc-insp-h">
         <span class="rtc-insp-tt" data-i18n="cv.inspector"></span>
         <span class="rtc-insp-sub" id="cvInspectorSub">root</span>
+        <button type="button" class="rtc-insp-toggle" id="cvInspToggle"
+          data-i18n-aria="cv.inspectorToggle" title="折叠 / 展开检查器" aria-expanded="true">
+          <svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg>
+        </button>
       </div>
       <div class="rtc-insp-body" id="cvInspectorBody" data-scrollable></div>
     </aside>
@@ -127,7 +131,7 @@
       <svg id="cvMinimapSvg" viewBox="0 0 168 104" aria-hidden="true"></svg>
     </div>
 
-    <!-- 底部居中 · 试算台（Task 12/13 接入） -->
+    <!-- 底部居中 · 试算台（Task 13：输入 + 样例 + 运行 + 结论） -->
     <section class="rtc-trybar rtc-overlay" id="cvTryBar" data-overlay data-i18n-aria="cv.try">
       <div class="rtc-try-row">
         <span class="rtc-try-ico"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg></span>
@@ -135,7 +139,12 @@
         <button type="button" class="btn sm pri" id="cvTryRun" data-i18n="cv.tryRun">运行试算</button>
       </div>
       <div class="rtc-try-chips" id="cvTryChips"></div>
+      <!-- 试算结论（成功后展开） -->
+      <div class="rtc-try-res" id="cvTryResult" hidden></div>
     </section>
+
+    <!-- 回放 HUD · 当前运行的波次胶囊（波次头带命中槽位条件 tooltip） -->
+    <div class="rtc-hud" id="cvReplayHud" hidden></div>
   </div>
 </main>
 

@@ -146,6 +146,7 @@
         '<span class="rtc-ico">' + icon('start') + '</span>' +
         '<span class="rtc-start-txt"><b>' + esc(t('cv.card.start')) + '</b>' +
         '<span>' + esc(t('cv.card.startOut')) + '</span></span>' +
+        '<span class="rtc-live" data-live="state"></span>' +
         portHTML(node, port, { side: 'right' }) +
         '</div>');
     }
@@ -158,7 +159,8 @@
         const prob = byId('prob.' + option.key);
         return '<div class="rtc-opt" data-optkey="' + esc(option.key) + '">' +
           '<div class="rtc-opt-l">' +
-          '<span class="rtc-opt-n"><b>' + esc(option.label) + '</b></span>' +
+          '<span class="rtc-opt-n"><b>' + esc(option.label) + '</b>' +
+          '<span class="rtc-opt-p" data-live="prob.' + esc(option.key) + '">—</span></span>' +
           '<span class="rtc-opt-c" title="' + esc(option.capability) + '">' + esc(snippet(option.capability, 42)) + '</span>' +
           '</div>' +
           '<div class="rtc-oports">' +

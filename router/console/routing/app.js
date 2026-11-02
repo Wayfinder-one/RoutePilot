@@ -189,6 +189,8 @@
     booted: false,
     lastToast: '',
     palCollapsed: false,
+    inspCollapsed: false,
+    tryRunning: false,
     palSearch: '',
     mini: null,
     kind: function () { return this.changeKind; }
@@ -343,6 +345,25 @@
     setTimeout(() => inspector.classList.remove('is-focus'), 900);
   }
 
+  /* 试算运行前自动收起节点库与检查器；结束后保持收起，用户可手动展开（§0-10）。 */
+  function applyInspectorCollapsed() {
+    const inspector = $('#cvInspector');
+    if (!inspector) return;
+    inspector.classList.toggle('is-collapsed', !!App.inspCollapsed);
+    const toggle = $('#cvInspToggle');
+    if (toggle) toggle.setAttribute('aria-expanded', String(!App.inspCollapsed));
+  }
+
+  function collapsePanels() {
+    App.palCollapsed = true;
+    renderPalette();
+    const search = $('#cvPalSearch');
+    if (search) search.disabled = true;
+    App.inspCollapsed = true;
+    applyInspectorCollapsed();
+  }
+  App.collapsePanels = collapsePanels;
+
   function locateIssue(issue) {
     const target = issueTarget(issue);
     if (!target) return false;
@@ -470,19 +491,27 @@
     renderMinimap();
     updateToolbar();
     if (root.RTCondPop && root.RTCondPop.isOpen && root.RTCondPop.isOpen()) root.RTCondPop.refresh();
+    /* 语言切换/重绘后重新点亮回放；apply 只读 trace，不重新求值。 */
+    if (App.replay && root.RTTryRun && root.RTTryRun.apply) root.RTTryRun.apply(App.replay);
   }
+  App.render = renderAll;
 
   function updateToolbar() {
     const undo = $('#cvUndo');
     const redo = $('#cvRedo');
     if (undo) {
-      undo.disabled = !(App.kit && App.kit.canUndo());
+      undo.disabled = App.tryRunning || !(App.kit && App.kit.canUndo());
       undo.title = t('cv.undoTitle');
     }
     if (redo) {
-      redo.disabled = !(App.kit && App.kit.canRedo());
+      redo.disabled = App.tryRunning || !(App.kit && App.kit.canRedo());
       redo.title = t('cv.redoTitle');
     }
+    ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvLoadExample', 'cvImport', 'cvExport', 'cvTryBtn']
+      .forEach(id => {
+        const button = document.getElementById(id);
+        if (button) button.disabled = !!App.tryRunning;
+      });
     const enableLabel = $('#cvEnableLabel');
     const enabled = !!(App.tree && App.tree.enabled);
     if (enableLabel) enableLabel.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
@@ -518,16 +547,28 @@
     if (clean) clean.hidden = kind !== 'clean';
     updateToolbar();
   }
+  App.updateToolbar = updateToolbar;
 
   /* ── 历史 / 编辑入口 ─────────────────────────────────────────── */
+  /* 任何一次编辑/恢复都先清掉回放：陈旧高亮不能再指向旧结果（§6.8）。 */
+  function dropReplay() {
+    App.replay = null;
+    if (root.RTTryRun && typeof root.RTTryRun.reset === 'function') root.RTTryRun.reset();
+  }
+
   function change(kind, mutate) {
+    if (App.tryRunning) {
+      toast(t('cv.tryEditBlocked'), 'warn');
+      return false;
+    }
     const before = RTGraph.clone(App.tree);
     mutate(App.tree);
     App.kit.pushHistory(before, RTGraph.clone(App.tree), kind);
     App.issues = RTGraph.validate(App.tree.root);
-    App.replay = null;
+    dropReplay();
     renderAll();
     refreshDirty();
+    return true;
   }
   App.change = change;
 
@@ -535,7 +576,7 @@
     App.tree = envelope;
     App.graph = App.tree.root;
     App.issues = RTGraph.validate(App.tree.root);
-    App.replay = null;
+    dropReplay();
     renderAll();
     refreshDirty();
     toast(action === 'undo' ? t('cv.toastUndo') : t('cv.toastRedo'));
@@ -543,7 +584,7 @@
 
   function afterCanvasChange() {
     App.issues = RTGraph.validate(App.tree.root);
-    App.replay = null;
+    dropReplay();
     renderAll();
     refreshDirty();
   }
@@ -567,6 +608,7 @@
 
   /* ── 删除确认（节点 / 边 / choice 选项共用级联清单） ──────────── */
   function requestDelete(selection) {
+    if (App.tryRunning) { toast(t('cv.tryEditBlocked'), 'warn'); return; }
     if (!selection || !selection.kind) return;
     const modal = $('#cvDeleteModal');
     if (!modal) return;
@@ -757,7 +799,7 @@
 
   /* ── 节点库创建（点击 / 拖入） ───────────────────────────────── */
   function createFromLibrary(kind, position) {
-    if (!App.booted) return;
+    if (!App.booted || App.tryRunning) return;
     let created = null;
     change('behavior', tree => {
       created = makeNode(kind, position, tree.root);
@@ -845,6 +887,7 @@
   function onLibraryDown(event) {
     const item = event.target.closest('[data-lib-kind]');
     if (!item || event.button !== 0) return;
+    if (App.tryRunning) return;
     if (!App.booted) {
       toast(t('cv.toastNotReady'), 'warn');
       return;
@@ -1009,7 +1052,7 @@
 
   /* 保存 payload 只含完整 envelope 字段：不发送 enabled / tree_revision / updated_at。 */
   async function saveTree() {
-    if (!App.tree || saving) return false;
+    if (!App.tree || saving || App.tryRunning) return false;
     saving = true;
     const isNew = !App.saved;
     const payload = {
@@ -1048,7 +1091,7 @@
   App.saveTree = saveTree;
 
   async function enableTree() {
-    if (!App.tree) return false;
+    if (!App.tree || App.tryRunning) return false;
     /* 启用前先落盘：保存失败（含 422 issue 数组）绝不发 enable。
        已启用的组若有 dirty 改动，也要先保存（点击启用 = “保存并启用”）。 */
     if (App.changeKind !== 'clean' || !App.saved) {
@@ -1090,7 +1133,7 @@
   App.enableTree = enableTree;
 
   async function selectTree(id) {
-    if (!id || id === App.treeId) return false;
+    if (!id || id === App.treeId || App.tryRunning) return false;
     if (App.changeKind !== 'clean') {
       const discard = await askDiscard('switch');
       if (!discard) return false;
@@ -1260,7 +1303,7 @@
 
   /* 自动整理：DAG 分层只写 position；fit 走画布安全区（避开节点库/检查器/小地图/试算台）。 */
   function autoLayout() {
-    if (!App.graph) return false;
+    if (!App.graph || App.tryRunning) return false;
     const positions = RTGraph.layoutPositions('dag', App.graph);
     const moved = (App.graph.nodes || []).some(node => {
       const next = positions[node.id];
@@ -1350,6 +1393,7 @@
     nodesLayer.addEventListener('click', event => {
       const chip = event.target.closest('[data-cond-edge]');
       if (!chip) return;
+      if (App.tryRunning) return;
       if (root.RTCondPop) root.RTCondPop.open(chip.dataset.condEdge);
     });
   }
@@ -1393,37 +1437,10 @@
     if (importFile) importFile.addEventListener('change', onImportFile);
   }
 
-  const TRY_SAMPLES = [
-    { label: 'cv.trySample1', text: 'cv.trySample1Text' },
-    { label: 'cv.trySample2', text: 'cv.trySample2Text' },
-    { label: 'cv.trySample3', text: 'cv.trySample3Text' },
-    { label: 'cv.trySample4', text: 'cv.trySample4Text' },
-    { label: 'cv.trySample5', text: 'cv.trySample5Text' }
-  ];
-
-  function renderTrySamples() {
-    const chips = $('#cvTryChips');
-    if (!chips) return;
-    chips.innerHTML = TRY_SAMPLES.map((sample, index) =>
-      '<button type="button" class="rtc-trychip" data-try-sample="' + index + '">' +
-      esc(t(sample.label)) + '</button>').join('');
-    const input = $('#cvTryInput');
-    if (input) input.placeholder = t('cv.tryPlaceholder');
-  }
-
+  /* 试算台、样例 chips、回放与轨迹抽屉全部由 tryrun.js 实现（Task 13）。 */
   function bindTryBar() {
-    renderTrySamples();
-    $('#cvTryChips').addEventListener('click', event => {
-      const chip = event.target.closest('[data-try-sample]');
-      if (!chip) return;
-      const sample = TRY_SAMPLES[Number(chip.dataset.trySample)];
-      if (sample) $('#cvTryInput').value = t(sample.text);
-    });
-    $('#cvTryRun').addEventListener('click', () => toast(t('cv.task13')));
-    const tryButton = $('#cvTryBtn');
-    if (tryButton) tryButton.addEventListener('click', () => toast(t('cv.task13')));
+    if (root.RTTryRun && typeof root.RTTryRun.init === 'function') root.RTTryRun.init();
   }
-
   function bindTreeSelectOptions() {
     const select = $('#cvTreeSelect');
     if (!select) return;
@@ -1493,7 +1510,7 @@
     App.tree.id = App.treeId;
     App.saved = saved ? RTGraph.clone(App.tree) : null;
     App.issues = RTGraph.validate(App.tree.root);
-    App.replay = null;
+    dropReplay();
     App.quick = null;
     if (App.kit) App.kit.setGraph(App.graph, { resetHistory: true });
     bindTreeSelectOptions();
@@ -1511,11 +1528,22 @@
     bindTreeSelectOptions();
   }
 
+  function bindInspectorToggle() {
+    const toggle = $('#cvInspToggle');
+    if (!toggle) return;
+    toggle.addEventListener('click', () => {
+      App.inspCollapsed = !App.inspCollapsed;
+      applyInspectorCollapsed();
+    });
+    applyInspectorCollapsed();
+  }
+
   function bindEvents() {
     bindInspectorEditState();
     bindToolbar();
     bindViewport();
     bindPalette();
+    bindInspectorToggle();
     bindStageCards();
     bindTreeSelect();
     bindOverlays();
@@ -1530,7 +1558,7 @@
       root.onLangChange(() => {
         if (!App.booted) return;
         renderPalette();
-        renderTrySamples();
+        if (root.RTTryRun && typeof root.RTTryRun.refresh === 'function') root.RTTryRun.refresh();
         renderAll();
         refreshDirty();
       });
