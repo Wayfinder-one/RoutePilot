@@ -8,14 +8,16 @@ RoutePilot is an OpenAI-compatible model routing proxy. Routing policy is config
 
 | | |
 |---|---|
-| Status | Graph v3 runtime (M1 complete, 2026-11-02). The canvas, real `/v1` routing chain, `/admin/try` dry-run and request logging all run on graph v3. |
-| Design spec | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md` (local only, not published) |
-| Console prototype | `docs/od-design/routing-canvas-2026-11-02/index.html` (Direction A · Canvas-first; local only, not published) |
+| Status | Graph v3 runtime delivered (M1–M3, 2026-11-02). The canvas, real `/v1` routing chain, `/admin/try` dry-run and request logging all run on graph v3. |
+| Design spec | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md` (tracked in this repository) |
+| Console prototype | `docs/od-design/routing-canvas-2026-11-02/index.html` (Direction A · Canvas-first; design prototype, local only) |
 | Config format | `sr-routing-graph` v3. Legacy routing trees are not converted; see [Upgrading a legacy database](#upgrading-a-legacy-database). |
 
 ## Decision canvas
 
-![RoutePilot decision canvas](assets/routepilot/canvas.png)
+Screenshot from the running console (`1440×960`, captured by `scripts/console_qa.mjs`):
+
+![RoutePilot decision canvas](docs/od-design/routing-canvas-2026-11-02/implementation-qa/canvas-default-1440.png)
 
 ### Nodes
 
@@ -64,11 +66,15 @@ unknown never activates a question or target; a slot condition on unknown evalua
 
 ### Dry-run replay
 
-![Dry-run replay](assets/routepilot/replay.png)
+Screenshot from the running console:
+
+![Dry-run replay](docs/od-design/routing-canvas-2026-11-02/implementation-qa/s1-replay-1440.png)
 
 ## Condition editing
 
-![Condition editing](assets/routepilot/condition.png)
+Screenshot from the running console:
+
+![Condition editing](docs/od-design/routing-canvas-2026-11-02/implementation-qa/condition-editing-1440.png)
 
 - Drag a numeric wire into any boolean slot: a default `> 0.5` condition is created and the editor opens.
 - Click a slot condition chip: edit operator and threshold (numeric) or `= true / = false` (boolean).
@@ -98,9 +104,17 @@ prototypes (not the shipped console). Open them directly via `file://`:
 - Direction A: `docs/od-design/routing-canvas-2026-11-02/drafts/index-a.html`
 - Directions B / C: `drafts/index-b.html`, `drafts/index-c.html`
 
-Validation error state:
+The images below are design-prototype renders (prototype-only chrome and a “Prototype” chip),
+not the shipped console. The product screenshots above are captured from the running console
+by `scripts/console_qa.mjs`.
 
-![Validation errors](assets/routepilot/errors.png)
+![Design prototype · decision canvas](assets/routepilot/canvas.png)
+
+![Design prototype · dry-run replay](assets/routepilot/replay.png)
+
+![Design prototype · condition editing](assets/routepilot/condition.png)
+
+![Design prototype · validation error state](assets/routepilot/errors.png)
 
 ## Runtime responsibilities
 
@@ -212,12 +226,23 @@ Console QA (standard command; starts its own temp database, mock services and Ch
 needs no running server and makes no external requests):
 
 ```bash
+npm install
 npm run check:console
 ```
 
 This runs the pure-function Node tests (`scripts/console_graph_test.mjs`) and the Playwright
 acceptance matrix (`scripts/console_qa.mjs`, ends with `ALL PASS (<n>)`). A local Playwright
 Chromium is resolved from the usual cache; set `CHROME=/path/to/chrome` to override it.
+
+Screenshot writes are opt-in so a normal run leaves the repository clean. Regenerate the
+committed QA evidence with:
+
+```bash
+QA_SCREENSHOTS=1 npm run check:console
+```
+
+Without the flag the run prints `screenshots: skipped (set QA_SCREENSHOTS=1)` and does not
+touch `docs/od-design/routing-canvas-2026-11-02/implementation-qa/*.png`.
 
 Design-prototype QA (local, not part of the shipped console):
 
@@ -233,7 +258,7 @@ router/console/          console static pages
 configs/                 example decision groups
 scripts/                 console QA (committed by convention) and local ops scripts
 tests/                   tests
-docs/                    design docs and prototypes (not committed by convention)
+docs/                    design specs, QA screenshots and local prototypes (specs/QA images tracked)
 assets/routepilot/       README screenshots
 ```
 

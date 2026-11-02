@@ -16,11 +16,21 @@ const OUTCOME = {
   cancelled: { key: 'logs.out.cancelled', tone: 'warn', chip: 'warn' },
   incomplete: { key: 'logs.out.incomplete', tone: '', chip: 'warn' },
 };
+/* Graph v3 selection_reason enum: target | sticky | otherwise | error_fallback.
+   "fallback" is the pre-graph value and stays accepted so old in-memory rows
+   still count until the process restarts. */
+const FALLBACK_REASONS = ['otherwise', 'error_fallback', 'fallback'];
+const isFallback = record => FALLBACK_REASONS.indexOf(record.selection_reason) >= 0;
+const fallbackLabel = record => {
+  if (record.selection_reason === 'error_fallback') return 'logs.reason.errorFallback';
+  if (record.selection_reason === 'otherwise') return 'logs.reason.otherwise';
+  return 'logs.reason.fallback';
+};
 const FILTERS = {
   all: () => true,
   jev: record => record.jev_top != null,
   sticky: record => !!record.sticky_hit,
-  fallback: record => record.selection_reason === 'fallback',
+  fallback: isFallback,
 };
 
 function ms(value) {
@@ -37,7 +47,7 @@ function shown() {
 /* ── summary strip ─────────────────────────────────────────────── */
 function renderStats() {
   const sticky = requests.filter(record => record.sticky_hit).length;
-  const fallback = requests.filter(record => record.selection_reason === 'fallback').length;
+  const fallback = requests.filter(isFallback).length;
   const timed = requests.map(record => Number(record.latency_ms)).filter(Number.isFinite);
   const average = timed.length ? timed.reduce((sum, value) => sum + value, 0) / timed.length : null;
   const cards = [
@@ -76,8 +86,8 @@ function rowHtml(record, open) {
   if (hasConfidence) chips.push(`<span class="lg-chip jev">JEV ${pct(record.jev_top)}</span>`);
   if (record.fallback_reason) {
     chips.push(`<span class="lg-chip fallback" title="${esc(record.fallback_reason)}">${esc(record.fallback_reason)}</span>`);
-  } else if (record.selection_reason === 'fallback') {
-    chips.push(`<span class="lg-chip fallback">${esc(t('logs.reason.fallback'))}</span>`);
+  } else if (isFallback(record)) {
+    chips.push(`<span class="lg-chip fallback">${esc(t(fallbackLabel(record)))}</span>`);
   }
   return `<button type="button" class="lg-row" aria-expanded="${open}" aria-controls="detail-${esc(record.id)}"
       title="${esc(text)}">

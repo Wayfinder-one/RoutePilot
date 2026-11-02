@@ -449,6 +449,12 @@
       function onPointerDown(event) {
         if (event.button === 2) return;
         const target = event.target;
+        /* 点击画布本体把焦点从旧控件移走：否则后续 Delete/Backspace 会落在
+           旧的按钮/链接上（交互元素守卫会正确地忽略它，但用户想删的是画布）。 */
+        if (!isInteractive(target) && !target.closest('.rtc-overlay')) {
+          const active = document.activeElement;
+          if (active && active !== document.body && typeof active.blur === 'function') active.blur();
+        }
         if (event.button === 1 || spaceDown) {
           event.preventDefault();
           startPanDrag(event, true);
@@ -721,6 +727,9 @@
         }
         if (event.key === 'Delete' || event.key === 'Backspace') {
           if (locked || !sel.kind) return;
+          /* 焦点在按钮/链接等交互元素上时，Delete/Backspace 是控件自己的键，
+             不能在背后删掉当前选中的节点或边（a11y §6.11）。 */
+          if (isInteractive(event.target) || isInteractiveElement(document.activeElement)) return;
           event.preventDefault();
           cb.onDeleteRequest({ kind: sel.kind, id: sel.id });
         }

@@ -145,10 +145,12 @@
       close();
       return { ok: true, changed: false };
     }
-    app.change('behavior', tree => {
+    /* App.change() 在运行锁/保存锁下返回 false：绝不能当作「已保存」关掉浮层。 */
+    const committed = app.change('behavior', tree => {
       const target = (tree.root.edges || []).find(item => item && item.id === edgeId);
       if (target) target.condition = clone(check.condition);
     });
+    if (committed === false) return error(t('cv.saveBlocked'));
     close();
     return { ok: true, changed: true };
   }

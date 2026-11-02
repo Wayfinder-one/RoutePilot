@@ -31,6 +31,9 @@ const JEV_MODEL = 'd1-2B';
 const S1_TEXT = '10kV 线路跳闸，请安排抢修工单并做故障定位。';
 const S1_NOW = '2026-11-02T12:00:00+08:00';
 const API_TIMEOUT_MS = 15000;
+/* Screenshot writes are opt-in: a plain `npm run check:console` must not dirty
+   the committed evidence PNGs. Regenerate with QA_SCREENSHOTS=1. */
+const WRITE_SHOTS = process.env.QA_SCREENSHOTS === '1';
 
 /* 示例图是 15 节点图的唯一来源：节点/边数、start 坐标、兜底目标都从 fixture 派生，
    避免 QA 里散落 15 / 20,150 / standard-target 这类字面量。 */
@@ -59,6 +62,9 @@ export async function runChecks() {
   /* QA_ONLY 只用于本地定位单条用例；标准命令不设置它，仍跑完整矩阵。 */
   const filter = process.env.QA_ONLY ? new RegExp(process.env.QA_ONLY) : null;
   let ran = 0;
+  console.log(WRITE_SHOTS
+    ? 'screenshots: enabled (QA_SCREENSHOTS=1)'
+    : 'screenshots: skipped (set QA_SCREENSHOTS=1)');
   for (const check of checks) {
     if (filter && !filter.test(check.name)) continue;
     ran += 1;
@@ -68,6 +74,11 @@ export async function runChecks() {
     } catch (error) {
       failures.push(`${check.name}: ${error.stack || error}`);
     }
+  }
+  try {
+    assertRepoDbUnchanged();
+  } catch (error) {
+    failures.push(String(error && error.message ? error.message : error));
   }
   if (pageErrors.length) {
     failures.push('browser pageerror/console error:\n' + pageErrors.join('\n'));
@@ -107,8 +118,22 @@ function resetExpectedHttpStatusErrors() {
 const mockState = { systemoneCalls: [], chatCalls: [], scenarioCalls: {} };
 
 export async function screenshot(name) {
+  if (!WRITE_SHOTS) return;
   await fsp.mkdir(SHOT_DIR, { recursive: true });
   await page.screenshot({ path: path.join(SHOT_DIR, name) });
+}
+
+/* 仓库里的 router.db 必须与运行前完全一致：QA 只能写临时库。 */
+function repoDbSignature() {
+  const repoDb = path.join(ROOT, 'router.db');
+  if (!fs.existsSync(repoDb)) return null;
+  const stat = fs.statSync(repoDb);
+  return stat.size + ':' + stat.mtimeMs;
+}
+
+function assertRepoDbUnchanged() {
+  assert.equal(repoDbSignature(), repoDbFingerprint,
+    'the QA run modified the repository router.db (expected the temp database only)');
 }
 
 /* ── 通用工具 ───────────────────────────────────────────────────────── */
@@ -580,8 +605,7 @@ test('router service is ready on an isolated database', async () => {
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), { ok: true });
   assert.equal(fs.existsSync(path.join(tempDir, 'router.db')), true);
-  const repoDb = path.join(ROOT, 'router.db');
-  assert.equal(fs.existsSync(repoDb) ? fs.statSync(repoDb).size + ':' + fs.statSync(repoDb).mtimeMs : null, repoDbFingerprint);
+  assertRepoDbUnchanged();
 });
 
 test('graph.js is served as a browser script', async () => {
@@ -3041,24 +3065,22 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
     root: { type: 'jev', branches: [] }
   }, 'malformed-v3.json');
 
-  await page.waitForFunction(() =>
-    window.App.issues.some(issue => issue.code === 'graph_parse_error') &&
-    !document.getElementById('cvIssues').hidden, null, { timeout: 8000 });
   await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
   const issues = await page.evaluate(() => window.App.issues.map(issue => ({
     code: issue.code, level: issue.level, zh: issue.zh, en: issue.en,
     node_id: issue.node_id, edge_id: issue.edge_id, port: issue.port
   })));
-  assert.deepEqual(issues.map(issue => issue.code), ['graph_parse_error'],
-    'malformed v3 import did not surface a single graph_parse_error');
-  assert.equal(issues[0].level, 'hard');
-  assert.match(issues[0].zh, /图解析失败/);
-  assert.match(issues[0].en, /Graph parse failed/);
-  assert.equal(issues[0].node_id, '');
-  assert.equal(issues[0].edge_id, '');
-  assert.equal(issues[0].port, '');
-  assert.equal(await page.locator('#cvIssues .rtc-issue.is-hard').count(), 1,
-    'the validation bar did not render the parse issue');
+  /* 被拒文件的 Issue 不能留在校验条：否则「定位」会指向草稿里不存在的节点。
+     校验条恢复为当前草稿的 4 条提示（§5.3）。 */
+  assert.deepEqual(issues.map(issue => issue.code), ['hint', 'hint', 'hint', 'hint'],
+    'a malformed v3 import leaked its parse issue into the draft validation bar');
+  assert.equal(issues.every(issue => issue.level === 'hint'), true);
+  assert.deepEqual(issues.map(issue => [issue.node_id, issue.edge_id]),
+    [['', ''], ['', ''], ['', ''], ['', '']]);
+  assert.equal(await page.locator('#cvIssues .rtc-issue.is-hard').count(), 0,
+    'the validation bar rendered the rejected file as a hard issue');
+  assert.equal(await page.locator('#cvIssues [data-locate]').count(), 0,
+    'the rejected file left locatable issues pointing at draft nodes');
   assert.deepEqual(await draftOf(), kept, 'a malformed v3 import changed the draft');
 });
 
@@ -3175,16 +3197,23 @@ test('7.4-15-validation-bar-and-locate', async () => {
     /* 只允许这一条故意 422：URL 精确到本用例的新组，状态必须是 422。 */
     expectHttpStatusError({ url: new RegExp('/admin/trees/' + targetId + '$'), status: /422/ });
     await page.locator('#cvEnable').click();
-    await page.waitForFunction(() => window.App.issues.length === 4 &&
+    await page.waitForFunction(() => window.App.issues.length === 8 &&
       !document.getElementById('cvIssues').hidden, null, { timeout: 8000 });
     await page.waitForTimeout(300);
     assert.equal(expectedHttpStatusErrors.length, 0,
       'the scoped 422 console error was not observed at the expected URL/status');
     assert.equal(enableRequests.length, 0, 'enable was sent even though the save failed');
     assert.equal(await page.evaluate(() => window.App.tree.enabled), false);
-    assert.deepEqual(await page.evaluate(() => window.App.issues.map(issue => issue.code)),
+    assert.deepEqual(await page.evaluate(() => window.App.issues.filter(issue => issue.level !== 'hint')
+      .map(issue => issue.code)),
       ['invalid_timezone', 'question_incomplete', 'numeric_edge_condition_invalid', 'fallback_missing']);
-    assert.equal(await page.evaluate(() => window.App.issues.every(issue => issue.level === 'hard')), true);
+    /* §5.3：服务端 4 个错误必须与当前草稿的 4 条提示合并显示。 */
+    assert.equal(await page.evaluate(() => window.App.issues.filter(issue => issue.level === 'hint').length),
+      4, 'the 422 issues dropped the 4 RTGraph hints');
+    assert.equal(await page.evaluate(() => window.RTGraph.validate(window.App.tree.root)
+      .filter(issue => issue.level === 'hint').length), 4);
+    assert.equal(await page.evaluate(() => window.App.issues.every(issue =>
+      issue.level === 'hint' || issue.level === 'hard')), true);
 
     /* 节点定位：选中并居中 */
     await page.locator('#cvIssues [data-issue-node="capability"]').click();
@@ -3217,6 +3246,19 @@ test('7.4-15-validation-bar-and-locate', async () => {
     assert.equal(await page.evaluate(() =>
       document.getElementById('cvInspector').classList.contains('is-focus')), true);
     await waitInspectorBranch('graph', 'root');
+
+    /* Task 14：试算/收起会把检查器折叠起来；图级定位必须重新展开图设置，
+       否则「定位」只把焦点送进一个不可见的面板。 */
+    await page.evaluate(() => window.App.collapsePanels());
+    await page.waitForFunction(() =>
+      document.getElementById('cvInspector').classList.contains('is-collapsed'));
+    await page.locator('#cvIssues [data-issue-graph="1"]').first().click();
+    assert.equal(await page.evaluate(() =>
+      document.getElementById('cvInspector').classList.contains('is-collapsed')), false,
+    'graph-level locate left the collapsed inspector hidden');
+    await waitInspectorBranch('graph', 'root');
+    assert.equal(await page.evaluate(() =>
+      document.getElementById('cvInspector').classList.contains('is-focus')), true);
   } finally {
     resetExpectedHttpStatusErrors();
     page.off('request', onRequest);
@@ -4566,6 +4608,10 @@ test('200-node-400-edge-smoke', async () => {
       targetIn: graph.edges.filter(edge => edge.target.charAt(0) === 't').length,
       domNodes: document.querySelectorAll('#cvStage [data-node-id]').length,
       domEdges: document.querySelectorAll('#cvEdges path.rtc-edge').length,
+      logicInputs: graph.nodes.filter(node => node.type === 'logic').map(node => ({
+        id: node.id,
+        inputs: graph.edges.filter(edge => edge.target === node.id).length
+      })),
       hard: window.App.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code),
       limit: window.App.issues.filter(issue => issue.code === 'limit_exceeded').length,
       priorities: graph.nodes.filter(node => node.type === 'target')
@@ -4579,6 +4625,11 @@ test('200-node-400-edge-smoke', async () => {
   assert.equal(counts.startOut, 32);
   assert.equal(counts.questionIn, 32);
   assert.equal(counts.logicIn, 196);
+  /* 不只看总数：每个 OR 门必须恰好 2 条输入，生成器的取模错误不会被 196 掩盖。 */
+  assert.equal(counts.logicInputs.length, 98);
+  const wrongGates = counts.logicInputs.filter(gate => gate.inputs !== 2);
+  assert.deepEqual(wrongGates, [],
+    'OR gates with a slot count other than 2: ' + JSON.stringify(wrongGates.slice(0, 5)));
   assert.equal(counts.targetIn, 172);
   assert.equal(counts.domNodes, 200, 'the DOM did not render 200 node cards');
   assert.equal(counts.domEdges, 400, 'the DOM did not render 400 edge paths');
@@ -4688,6 +4739,18 @@ test('condition-only-question-is-valid', async () => {
   assert.equal(saved.root.edges.length, 2);
   assert.match(saved.tree_revision, /^[0-9a-f]{64}$/);
   assert.equal(saved.root.otherwise_target, 'target-cond');
+
+  /* 只由第 0 阶段条件触发的问题也必须能被真链路执行：启用后走 /admin/try。 */
+  await api('POST', '/admin/trees/' + encodeURIComponent(treeId) + '/enable');
+  const tried = await api('POST', '/admin/try', {
+    tree_id: treeId,
+    text: '10kV 线路故障，请安排抢修。',
+    now: S1_NOW
+  });
+  assert.equal(tried.outcome.type, 'hit', 'a condition-only question did not route');
+  assert.equal(tried.outcome.target_id, 'target-cond',
+    'the condition-only question did not reach its selected.easy target');
+  assert.equal(tried.outcome.waves.length, 1, 'the condition-only graph needed more than one wave');
   await ensureBaselineTree();
 });
 
@@ -4760,6 +4823,237 @@ test('try-uses-draft-timezone-and-sticky', async () => {
     await page.evaluate(() => window.RTTryRun.clear()).catch(() => {});
     await ensureBaselineTree();
   }
+});
+
+/* ── Task 14 · final acceptance hardening ───────────────────────────── */
+
+test('Task 14 · a malformed v3 import with non-array fields is rejected before applying', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const draftOf = () => page.evaluate(() => ({
+    nodes: window.App.graph.nodes.map(node => node.id),
+    edges: window.App.graph.edges.map(edge => edge.id),
+    models: window.App.graph.nodes.find(node => node.type === 'target').models,
+    kind: window.App.kind()
+  }));
+  const kept = await draftOf();
+  await clearToasts();
+
+  /* models: 5 曾在 cards.js 里直接 .map 崩溃：parseImport 必须在应用前拒绝。 */
+  const malformed = JSON.parse(JSON.stringify(EXAMPLE));
+  malformed.nodes.find(node => node.type === 'target').models = 5;
+  const probe = await page.evaluate(payload => {
+    const result = window.RTGraph.parseImport(JSON.stringify(payload));
+    return {
+      ok: result.ok,
+      error: result.error,
+      codes: (result.issues || []).map(issue => issue.code),
+      zh: (result.issues || []).map(issue => issue.zh).join(' ')
+    };
+  }, {
+    kind: 'sr-routing-graph', version: 3, name: '非法 models',
+    timezone: BASELINE.timezone, sticky: BASELINE.sticky, root: malformed
+  });
+  assert.equal(probe.ok, false, 'parseImport accepted a non-array models field');
+  assert.ok(probe.codes.includes('graph_parse_error'), 'missing graph_parse_error issue');
+  assert.match(probe.zh, /models/);
+
+  await setImportPayload({
+    kind: 'sr-routing-graph', version: 3, name: '非法 models',
+    timezone: BASELINE.timezone, sticky: BASELINE.sticky, root: malformed
+  }, 'malformed-models.json');
+  await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
+  assert.deepEqual(await draftOf(), kept, 'a rejected malformed v3 import changed the draft');
+  assert.equal(await page.evaluate(() => window.App.issues.every(issue => issue.level === 'hint')), true,
+    'the rejected file leaked hard issues into the current draft validation bar');
+});
+
+test('Task 14 · the only start node cannot be deleted', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await clearToasts();
+  await clickNode('start');
+  await page.waitForFunction(() => window.App.kit.getSelection().kind === 'node' &&
+    window.App.kit.getSelection().id === 'start');
+  const before = await page.evaluate(() => ({
+    nodes: window.App.graph.nodes.length,
+    undo: window.App.kit.canUndo()
+  }));
+  await page.keyboard.press('Delete');
+  await waitToastIncludes(await page.evaluate(() => window.t('cv.deleteStartBlocked')));
+  assert.equal(await page.evaluate(() => document.getElementById('cvDeleteModal').hidden), true,
+    'the delete dialog opened for the start node');
+  assert.deepEqual(await page.evaluate(() => ({
+    nodes: window.App.graph.nodes.length,
+    hasStart: window.App.graph.nodes.some(node => node.id === 'start'),
+    undo: window.App.kit.canUndo()
+  })), { nodes: before.nodes, hasStart: true, undo: before.undo },
+  'a start-node delete mutated the draft or pushed history');
+
+  /* 检查器删除按钮走同一个 requestDelete 守卫。 */
+  await clearToasts();
+  await waitInspectorBranch('node', 'start');
+  await page.locator('#cvInspectorBody [data-act="ins-delete-node"]').click();
+  await waitToastIncludes(await page.evaluate(() => window.t('cv.deleteStartBlocked')));
+  assert.equal(await page.evaluate(() => document.getElementById('cvDeleteModal').hidden), true,
+    'the inspector delete button opened the dialog for the start node');
+});
+
+test('Task 14 · an in-flight run rejects condition and inspector saves instead of closing as success', async () => {
+  await prepareTryCanvas();
+  const edgeId = 'e-cap-strong-and-power';
+  const original = await page.evaluate(id => {
+    window.App.kit.select('edge', id);
+    window.RTCondPop.open(id);
+    return window.App.graph.edges.find(edge => edge.id === id).condition;
+  }, edgeId);
+  assert.deepEqual(original, { op: 'gt', value: 0.65 });
+
+  let release = null;
+  const gate = new Promise(resolve => { release = resolve; });
+  const matcher = url => url.pathname === '/admin/try';
+  await page.route(matcher, async route => { await gate; await route.continue(); });
+  try {
+    await page.locator('[data-try-sample="0"]').click();
+    await page.waitForFunction(() => window.App.tryRunning === true, null, { timeout: 5000 });
+    assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
+      'starting a run left the condition editor open');
+
+    /* 运行锁下仍强行打开并确认：change() 返回 false，浮层必须保持打开并报错。 */
+    const conditionResult = await page.evaluate(id => {
+      window.RTCondPop.open(id);
+      const pop = document.getElementById('cvCondPop');
+      pop.querySelector('[data-cond-field="value"]').value = '0.91';
+      pop.querySelector('form').dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      const box = pop.querySelector('[data-cond-error]');
+      return {
+        hidden: pop.hidden,
+        error: box ? box.textContent : '',
+        errorHidden: box ? box.hidden : true,
+        value: window.App.graph.edges.find(edge => edge.id === id).condition.value
+      };
+    }, edgeId);
+    assert.equal(conditionResult.hidden, false, 'the condition editor closed on a rejected save');
+    assert.equal(conditionResult.value, 0.65, 'a rejected condition edit mutated the draft');
+    assert.equal(conditionResult.errorHidden, false, 'no inline condition error was shown');
+    assert.equal(conditionResult.error, await page.evaluate(() => window.t('cv.saveBlocked')));
+
+    /* 检查器走同一条 App.change 守卫，也必须内联报错且不写草稿。 */
+    const inspectorResult = await page.evaluate(() => {
+      window.App.kit.select('node', 'capability');
+      const body = document.getElementById('cvInspectorBody');
+      const form = body.querySelector('[data-ins-form="node"]');
+      form.querySelector('[data-field="instructions"]').value = '运行中不应写入的文本';
+      form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      const box = body.querySelector('[data-ins-error]');
+      return {
+        error: box ? box.textContent : '',
+        hidden: box ? box.hidden : true,
+        instructions: window.App.graph.nodes.find(node => node.id === 'capability').instructions
+      };
+    });
+    assert.equal(inspectorResult.hidden, false, 'the inspector did not show an inline error');
+    assert.equal(inspectorResult.error, await page.evaluate(() => window.t('cv.saveBlocked')));
+    assert.notEqual(inspectorResult.instructions, '运行中不应写入的文本',
+      'a rejected inspector save mutated the draft');
+  } finally {
+    release();
+  }
+  await waitTryResult({ text: TRY_SAMPLES[0].text });
+  await page.evaluate(() => window.RTCondPop.close());
+  await page.unroute(matcher);
+});
+
+test('Task 14 · an in-flight save is busy, blocks switching and discards a stale envelope', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await dragNodeBy('start', 22, 12);
+  let release = null;
+  const gate = new Promise(resolve => { release = resolve; });
+  const matcher = url => url.pathname === '/admin/trees/' + TREE_ID;
+  await page.route(matcher, async route => { await gate; await route.continue(); });
+  try {
+    await page.locator('#cvSave').click();
+    await page.waitForFunction(() => window.App.saving === true, null, { timeout: 5000 });
+    const busy = await page.evaluate(() => ({
+      saving: window.App.saving,
+      disabled: document.getElementById('cvSave').disabled,
+      ariaBusy: document.getElementById('cvSave').getAttribute('aria-busy'),
+      label: document.querySelector('#cvSave span[data-i18n]').textContent,
+      expectedLabel: window.t('cv.saving'),
+      newDisabled: document.getElementById('cvNewTree').disabled,
+      importDisabled: document.getElementById('cvImport').disabled
+    }));
+    assert.equal(busy.saving, true);
+    assert.equal(busy.disabled, true, 'the save button stayed enabled while saving');
+    assert.equal(busy.ariaBusy, 'true', 'the save button did not expose aria-busy');
+    assert.equal(busy.label, busy.expectedLabel, 'the save button did not show the busy label');
+    assert.equal(busy.newDisabled, true, 'New stayed enabled while saving');
+    assert.equal(busy.importDisabled, true, 'Import stayed enabled while saving');
+
+    /* 保存回包落地前切换草稿必须被拒绝。 */
+    const switched = await page.evaluate(() => window.App.selectTree('other-tree'));
+    assert.equal(switched, false, 'selectTree allowed a switch while saving');
+    assert.equal(await page.evaluate(() => window.App.lastToast),
+      await page.evaluate(() => window.t('cv.toastSavingBlocked')));
+
+    /* 即使有代码绕过 selectTree 直接 loadTree，旧回包也不能写进新草稿。 */
+    const raced = await page.evaluate(() => {
+      const other = window.RTGraph.createMinimalTree('qwen3-8b');
+      other.id = 'stale-race';
+      other.name = 'raced tree';
+      window.App.loadTree(other, true);
+      return { id: window.App.treeId, name: window.App.tree.name };
+    });
+    assert.deepEqual(raced, { id: 'stale-race', name: 'raced tree' });
+    release();
+    await page.waitForFunction(() => window.App.saving === false, null, { timeout: 8000 });
+    const after = await page.evaluate(() => ({
+      id: window.App.treeId,
+      name: window.App.tree.name,
+      revision: window.App.tree.tree_revision || '',
+      savedId: window.App.saved && window.App.saved.id
+    }));
+    assert.deepEqual(after, { id: 'stale-race', name: 'raced tree', revision: '', savedId: 'stale-race' },
+      'a stale save envelope was applied to the freshly loaded draft');
+  } finally {
+    release();
+  }
+  await page.unroute(matcher);
+  await ensureBaselineTree();
+});
+
+test('Task 14 · New, Import and Load example stay inert until the canvas is booted', async () => {
+  let release = () => {};
+  const gate = new Promise(resolve => { release = resolve; });
+  const hold = async route => {
+    await gate;
+    try { await route.continue(); } catch (error) { /* the test already unrouted it */ }
+  };
+  await page.route('**/admin/trees', hold);
+  try {
+    await page.goto(routerBase + '/console/routing.html');
+    await page.waitForFunction(() => window.App && window.App.kit && !window.App.booted,
+      null, { timeout: 10000 });
+    const notReady = await page.evaluate(() => window.t('cv.toastNotReady'));
+    for (const id of ['cvNewTree', 'cvImport', 'cvLoadExample']) {
+      await clearToasts();
+      await page.locator('#' + id).click();
+      await waitToastIncludes(notReady);
+      assert.equal(await page.evaluate(() => window.App.tree), null,
+        `#${id} mutated the draft before boot`);
+      assert.equal(await page.evaluate(() => document.getElementById('cvConfirmModal').hidden), true,
+        `#${id} opened a confirm dialog before boot`);
+    }
+    /* 早到的 change() 是安全的 false，不 clone(null)、不抛异常。 */
+    const changeResult = await page.evaluate(() =>
+      window.App.change('behavior', () => { throw new Error('mutate must not run before boot'); }));
+    assert.equal(changeResult, false, 'change() before boot did not return false');
+  } finally {
+    release();
+  }
+  await page.waitForFunction(() => window.App.booted && window.App.tree, null, { timeout: 15000 });
+  await page.unroute('**/admin/trees');
 });
 
 test('7.4-20-responsive-keyboard-and-visual', async () => {
@@ -4860,6 +5154,19 @@ test('7.4-20-responsive-keyboard-and-visual', async () => {
   }));
   assert.equal(initial.inside, true, 'the delete dialog did not move focus inside');
   assert.equal(initial.act, 'delete-cancel');
+  /* 真正的环绕：从 confirm 按 Tab 回到 cancel，从 cancel 按 Shift+Tab 回到
+     confirm。只来回按 Tab/Shift+Tab 而不跨过首尾，证明不了焦点陷阱。 */
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.act), 'delete-confirm',
+    'Tab from the cancel button did not reach the confirm button');
+  await page.keyboard.press('Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.act), 'delete-cancel',
+    'Tab from the last control did not wrap forward to the first');
+  await page.keyboard.press('Shift+Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.act), 'delete-confirm',
+    'Shift+Tab from the first control did not wrap backward to the last');
+  await page.keyboard.press('Shift+Tab');
+  assert.equal(await page.evaluate(() => document.activeElement.dataset.act), 'delete-cancel');
   for (let index = 0; index < 5; index += 1) {
     await page.keyboard.press('Tab');
     assert.equal(await page.evaluate(() =>
@@ -4977,6 +5284,8 @@ async function teardown() {
         await fsp.rm(tempDir, { recursive: true, force: true });
         tempDir = '';
       }
+      /* runChecks 已断言一次；teardown 再验一次，覆盖中途抛错的路径。 */
+      assertRepoDbUnchanged();
     })();
   }
   return teardownPromise;
@@ -4999,8 +5308,7 @@ function installSignalHandlers() {
 async function main() {
   installSignalHandlers();
   try {
-    const repoDb = path.join(ROOT, 'router.db');
-    repoDbFingerprint = fs.existsSync(repoDb) ? fs.statSync(repoDb).size + ':' + fs.statSync(repoDb).mtimeMs : null;
+    repoDbFingerprint = repoDbSignature();
     mockServer = await startMock();
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rt-console-qa-'));
     const port = await freePort();

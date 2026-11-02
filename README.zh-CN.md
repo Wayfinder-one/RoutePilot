@@ -8,14 +8,16 @@ RoutePilot 是 OpenAI 兼容的模型路由代理。路由策略由一张通用�
 
 | | |
 |---|---|
-| 项目状态 | graph v3 运行时（M1 完成，2026-11-02）；画布、`/v1` 真链路、`/admin/try` 试算与请求日志均已按 graph v3 工作 |
-| 设计文档 | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md`（仅本地保留，不随仓库发布） |
-| 控制台原型 | `docs/od-design/routing-canvas-2026-11-02/index.html`（方向 A · 画布优先；仅本地保留，不随仓库发布） |
+| 项目状态 | graph v3 运行时已交付（M1–M3，2026-11-02）；画布、`/v1` 真链路、`/admin/try` 试算与请求日志均已按 graph v3 工作 |
+| 设计文档 | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md`（随仓库入库） |
+| 控制台原型 | `docs/od-design/routing-canvas-2026-11-02/index.html`（方向 A · 画布优先；设计原型，仅本地保留） |
 | 配置格式 | `sr-routing-graph` v3；旧版路由树不自动转换，见[从旧数据库升级](#从旧数据库升级) |
 
 ## 决策画布
 
-![RoutePilot 决策画布](assets/routepilot/canvas.png)
+以下截图来自实际运行的控制台（`1440×960`，由 `scripts/console_qa.mjs` 采集）：
+
+![RoutePilot 决策画布](docs/od-design/routing-canvas-2026-11-02/implementation-qa/canvas-default-1440.png)
 
 ### 节点
 
@@ -64,11 +66,15 @@ unknown 不触发任何问题或 target；比较条件遇 unknown 结果为 unkn
 
 ### 试算回放
 
-![试算回放](assets/routepilot/replay.png)
+以下截图来自实际运行的控制台：
+
+![试算回放](docs/od-design/routing-canvas-2026-11-02/implementation-qa/s1-replay-1440.png)
 
 ## 条件编辑
 
-![条件编辑](assets/routepilot/condition.png)
+以下截图来自实际运行的控制台：
+
+![条件编辑](docs/od-design/routing-canvas-2026-11-02/implementation-qa/condition-editing-1440.png)
 
 - 数值线拖入任意布尔槽位：自动生成默认条件 `> 0.5` 并打开条件编辑。
 - 点槽位条件 chip：修改算子与阈值（数值线）或 `= true / = false`（布尔线）。
@@ -95,9 +101,16 @@ unknown 不触发任何问题或 target；比较条件遇 unknown 结果为 unkn
 - 方向 A：`docs/od-design/routing-canvas-2026-11-02/drafts/index-a.html`
 - 方向 B / C：同目录 `drafts/index-b.html`、`drafts/index-c.html`
 
-校验错误态：
+下面这些图是设计原型渲染（带原型专用 chrome 与 Prototype 标识），不是线上控制台；
+上方产品章节的截图由 `scripts/console_qa.mjs` 从实际运行的控制台采集。
 
-![校验错误](assets/routepilot/errors.png)
+![设计原型 · 决策画布](assets/routepilot/canvas.png)
+
+![设计原型 · 试算回放](assets/routepilot/replay.png)
+
+![设计原型 · 条件编辑](assets/routepilot/condition.png)
+
+![设计原型 · 校验错误态](assets/routepilot/errors.png)
 
 ## 运行时职责
 
@@ -208,12 +221,22 @@ ROUTER_JEV_API_KEY= \
 控制台 QA（标准命令；自带临时数据库、mock 服务与 Chromium，不需要预启服务、不访问外网）：
 
 ```bash
+npm install
 npm run check:console
 ```
 
 依次运行纯函数 Node 测试（`scripts/console_graph_test.mjs`）与 Playwright 验收矩阵
 （`scripts/console_qa.mjs`，末行输出 `ALL PASS (<n>)`）。Chromium 从本地 Playwright 缓存解析，
 可用 `CHROME=/path/to/chrome` 覆盖。
+
+截图写入是可选步骤，普通运行不会改动仓库里的证据图。需要重新生成时：
+
+```bash
+QA_SCREENSHOTS=1 npm run check:console
+```
+
+不带该变量时运行会输出 `screenshots: skipped (set QA_SCREENSHOTS=1)`，且不会写入
+`docs/od-design/routing-canvas-2026-11-02/implementation-qa/*.png`。
 
 设计原型 QA（本地，不属于线上控制台）：
 
@@ -229,7 +252,7 @@ router/console/          控制台静态页
 configs/                 示例决策组
 scripts/                 控制台 QA（按约定入库）与本地运维脚本
 tests/                   测试
-docs/                    设计文档、原型（按约定不入库）
+docs/                    设计文档、QA 截图与本地原型（文档与 QA 截图已入库）
 assets/routepilot/       README 截图
 ```
 

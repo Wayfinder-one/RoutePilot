@@ -62,9 +62,14 @@ def main() -> int:
     if "--dry-run" in sys.argv:
         print(f"would remove {len(dead)} keys")
         return 0
-    print("DEBUG dead:", len(dead), "left:", len([k for k in dead if ("'" + k + "'") in new]))
     I18N.write_text(new, encoding="utf-8")
     print(f"removed {len(dead)} dead keys")
+    leftover, _ = dead_keys()
+    if leftover:
+        print(f"still dead after prune: {len(leftover)}", file=sys.stderr)
+        for key in leftover:
+            print(f"  {key}", file=sys.stderr)
+        return 1
     return 0
 
 

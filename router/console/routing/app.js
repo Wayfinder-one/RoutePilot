@@ -191,6 +191,7 @@
     palCollapsed: false,
     inspCollapsed: false,
     tryRunning: false,
+    saving: false,
     palSearch: '',
     mini: null,
     kind: function () { return this.changeKind; }
@@ -382,6 +383,10 @@
     /* 图级定位要聚焦检查器图设置：先关掉可能还开着的输入槽条件浮层，
        否则浮层会盖住检查器（Task 11 QA 曾需先按 Esc）。 */
     if (root.RTCondPop && root.RTCondPop.isOpen()) root.RTCondPop.close();
+    /* 试算/收起会把检查器折叠起来：图级定位必须重新展开，否则焦点落在
+       一个不可见的「图设置」上，用户看不到修复入口（Task 14 QA）。 */
+    App.inspCollapsed = false;
+    applyInspectorCollapsed();
     App.kit.clearSelection();
     focusInspector();
     return true;
@@ -499,19 +504,28 @@
   function updateToolbar() {
     const undo = $('#cvUndo');
     const redo = $('#cvRedo');
+    const busy = !!App.tryRunning || saving;
     if (undo) {
-      undo.disabled = App.tryRunning || !(App.kit && App.kit.canUndo());
+      undo.disabled = busy || !(App.kit && App.kit.canUndo());
       undo.title = t('cv.undoTitle');
     }
     if (redo) {
-      redo.disabled = App.tryRunning || !(App.kit && App.kit.canRedo());
+      redo.disabled = busy || !(App.kit && App.kit.canRedo());
       redo.title = t('cv.redoTitle');
     }
     ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvLoadExample', 'cvImport', 'cvExport', 'cvTryBtn']
       .forEach(id => {
         const button = document.getElementById(id);
-        if (button) button.disabled = !!App.tryRunning;
+        if (button) button.disabled = busy;
       });
+    /* 保存/启用请求在途：顶栏必须可见地进入忙碌态，双击不会再发第二个请求。 */
+    const save = $('#cvSave');
+    if (save) {
+      save.setAttribute('aria-busy', String(!!saving));
+      save.classList.toggle('is-saving', !!saving);
+      const label = save.querySelector('span[data-i18n]');
+      if (label) label.textContent = saving ? t('cv.saving') : t('cv.save');
+    }
     const enableLabel = $('#cvEnableLabel');
     const enabled = !!(App.tree && App.tree.enabled);
     if (enableLabel) enableLabel.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
@@ -557,6 +571,9 @@
   }
 
   function change(kind, mutate) {
+    /* 画布还没装配好（boot 早期 / 服务端树缺失）时不能改：clone(null)/mutate
+       会抛错，调用方也拿不到明确的 false。 */
+    if (!App.tree) return false;
     if (App.tryRunning) {
       toast(t('cv.tryEditBlocked'), 'warn');
       return false;
@@ -667,6 +684,11 @@
     if (selection.kind === 'node') {
       const node = RTGraph.findNode(graph, selection.id);
       if (!node) return;
+      /* start 是图入口且节点库不能再创建：允许删除会让草稿永久无法启用。 */
+      if (node.type === 'start') {
+        toast(t('cv.deleteStartBlocked'), 'warn');
+        return;
+      }
       edges = (graph.edges || []).filter(edge => edge.source === selection.id || edge.target === selection.id);
       title = tf('cv.deleteNode', { id: selection.id });
     } else if (selection.kind === 'edge') {
@@ -1085,6 +1107,25 @@
     return issues.length ? issues : null;
   }
 
+  /* §5.3：校验条永远显示「N 个错误 · 4 条提示」。服务端 422 只回错误数组，
+     提示仍来自当前草稿的 RTGraph.validate。 */
+  function draftHints() {
+    if (!App.tree) return [];
+    return RTGraph.validate(App.tree.root).filter(issue => issue.level === 'hint');
+  }
+
+  function mergeIssues(issues) {
+    const hard = (Array.isArray(issues) ? issues : []).filter(issue => issue && issue.level !== 'hint');
+    return hard.concat(draftHints());
+  }
+
+  /* 导入被拒后不能保留被拒文件的 Issue：定位按钮会把用户带到不存在的节点。
+     重新校验当前草稿（4 条提示随之恢复）。 */
+  function restoreDraftIssues() {
+    App.issues = App.tree ? RTGraph.validate(App.tree.root) : [];
+    renderIssues();
+  }
+
   function upsertTree(tree) {
     if (!tree) return;
     const list = App.trees || [];
@@ -1117,7 +1158,13 @@
   async function saveTree() {
     if (!App.tree || saving || App.tryRunning) return false;
     saving = true;
+    App.saving = true;
+    /* 请求发出前记住目标草稿：若期间草稿被切走，回包必须整份丢弃，
+       不能把旧组的 id/name/revision/enabled 盖到另一张图上。 */
+    const targetTree = App.tree;
+    const targetId = App.treeId;
     const isNew = !App.saved;
+    updateToolbar();
     const payload = {
       id: App.treeId,
       name: String(App.tree.name == null ? '' : App.tree.name).trim(),
@@ -1129,6 +1176,7 @@
       const result = isNew
         ? await api.post('/admin/trees', payload)
         : await api.put('/admin/trees/' + encodeURIComponent(App.treeId), payload);
+      if (App.tree !== targetTree || App.treeId !== targetId) return false;
       applySavedResponse(result);
       App.issues = RTGraph.validate(App.tree.root);
       /* 在检查器里还有未提交输入时不做整页重绘（复用 boot 的焦点保护）。 */
@@ -1138,9 +1186,10 @@
       toast(t('cv.toastSaved'));
       return true;
     } catch (error) {
+      if (App.tree !== targetTree || App.treeId !== targetId) return false;
       const issues = serverIssues(error);
       if (issues) {
-        App.issues = issues;
+        App.issues = mergeIssues(issues);
         revealIssues();
         toast(tf('cv.toastSaveIssues', { n: issues.length }), 'error');
       } else {
@@ -1149,12 +1198,14 @@
       return false;
     } finally {
       saving = false;
+      App.saving = false;
+      updateToolbar();
     }
   }
   App.saveTree = saveTree;
 
   async function enableTree() {
-    if (!App.tree || App.tryRunning) return false;
+    if (!App.tree || App.tryRunning || saving) return false;
     /* 启用前先落盘：保存失败（含 422 issue 数组）绝不发 enable。
        已启用的组若有 dirty 改动，也要先保存（点击启用 = “保存并启用”）。 */
     if (App.changeKind !== 'clean' || !App.saved) {
@@ -1165,13 +1216,21 @@
       toast(t('cv.toastAlreadyEnabled'), 'warn');
       return true;
     }
+    const targetTree = App.tree;
+    const targetId = App.treeId;
+    saving = true;
+    App.saving = true;
+    updateToolbar();
     try {
       const result = await api.post('/admin/trees/' + encodeURIComponent(App.treeId) + '/enable');
+      if (App.tree !== targetTree || App.treeId !== targetId) return false;
       if (result && Array.isArray(result.trees)) App.trees = result.trees;
       if (result && result.snapshot_revision != null) App.snapshotRevision = result.snapshot_revision;
       App.tree.enabled = true;
       if (App.saved) App.saved.enabled = true;
       bindTreeSelectOptions();
+      /* 启用成功后重新校验当前草稿：服务端只回新 revision，Issue 条不能停在旧状态。 */
+      App.issues = RTGraph.validate(App.tree.root);
       if (inspectorEditing()) {
         renderIssues();
         refreshDirty();
@@ -1182,21 +1241,31 @@
       toast(t('cv.toastEnabled'));
       return true;
     } catch (error) {
+      if (App.tree !== targetTree || App.treeId !== targetId) return false;
       const issues = serverIssues(error);
       if (issues) {
-        App.issues = issues;
+        App.issues = mergeIssues(issues);
         revealIssues();
         toast(tf('cv.toastEnableIssues', { n: issues.length }), 'error');
       } else {
         toast(tf('cv.toastEnableFail', { err: apiErrText(error) }), 'error');
       }
       return false;
+    } finally {
+      saving = false;
+      App.saving = false;
+      updateToolbar();
     }
   }
   App.enableTree = enableTree;
 
   async function selectTree(id) {
     if (!id || id === App.treeId || App.tryRunning) return false;
+    /* 保存回包还没落地就把草稿切走，会让“旧回包写新图”的竞态变得可达。 */
+    if (saving) {
+      toast(t('cv.toastSavingBlocked'), 'warn');
+      return false;
+    }
     if (App.changeKind !== 'clean') {
       const discard = await askDiscard('switch');
       if (!discard) return false;
@@ -1244,6 +1313,13 @@
   }
   App.newTree = newTree;
 
+  /* 导入/载入示例替换整张图后回到「看得见全图」的视口（保持检查器/节点库安全区）。 */
+  function fitAfterReplace() {
+    if (!App.kit || typeof App.kit.fit !== 'function') return;
+    App.kit.fit({ padding: 24 });
+    renderMinimap();
+  }
+
   async function loadExample() {
     /* 载入示例总是确认：clean 草稿用“替换整张图”文案，dirty 才提示丢弃改动。 */
     const confirmed = await askDiscard('example',
@@ -1258,7 +1334,8 @@
         throw new Error('invalid example graph');
       }
       /* 一次历史操作替换整张图；envelope 的 id/enabled/name/timezone/sticky 保持不变。 */
-      change('behavior', tree => { tree.root = clone(example); });
+      if (change('behavior', tree => { tree.root = clone(example); }) === false) return false;
+      fitAfterReplace();
       toast(t('cv.toastExampleLoaded'));
       return true;
     } catch (error) {
@@ -1302,16 +1379,18 @@
   function applyImport(text) {
     const result = RTGraph.parseImport(text);
     if (!result) {
+      restoreDraftIssues();
       toast(tf('cv.toastImportRejected', { err: 'invalid import' }), 'error');
       return false;
     }
     const issues = Array.isArray(result.issues) ? result.issues : [];
     const hard = issues.filter(issue => issue.level !== 'hint');
-    /* v3 kind/version 正确但结构非法时 parseImport 也返回 issues：与结构校验走同一展示路径。 */
+    /* v3 kind/version 正确但结构非法时 parseImport 也返回 issues：与结构校验走同一展示路径。
+       被拒文件的 Issue 不落到校验条（否则定位按钮会指向草稿里不存在的节点）：
+       校验条恢复为当前草稿的 4 条提示，拒绝原因只通过 toast 呈现。 */
     if (!result.ok) {
+      restoreDraftIssues();
       if (hard.length) {
-        App.issues = issues;
-        revealIssues();
         toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
       } else {
         const reason = result.error || 'invalid import';
@@ -1320,17 +1399,17 @@
       return false;
     }
     if (hard.length) {
-      App.issues = issues;
-      revealIssues();
+      restoreDraftIssues();
       toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
       return false;
     }
-    change('behavior', tree => {
+    if (change('behavior', tree => {
       tree.name = result.tree.name;
       tree.timezone = result.tree.timezone;
       tree.sticky = RTGraph.clone(result.tree.sticky);
       tree.root = RTGraph.clone(result.tree.root);
-    });
+    }) === false) return false;
+    fitAfterReplace();
     toast(t('cv.toastImported'));
     return true;
   }
@@ -1395,10 +1474,19 @@
       if (!App.kit.redo()) toast(t('cv.toastNothingRedo'), 'warn');
     });
     $('#cvAutoLayout').addEventListener('click', autoLayout);
+    /* boot 完成（App.tree 已装配）前，替换整张图的入口一律拒绝：
+       newTree/loadExample/import 都会写草稿，此时 change() 没有可操作对象。 */
+    const requireBooted = action => function () {
+      if (!App.booted) {
+        toast(t('cv.toastNotReady'), 'warn');
+        return false;
+      }
+      return action.apply(null, arguments);
+    };
     const actions = {
-      cvNewTree: newTree,
-      cvLoadExample: loadExample,
-      cvImport: openImport,
+      cvNewTree: requireBooted(newTree),
+      cvLoadExample: requireBooted(loadExample),
+      cvImport: requireBooted(openImport),
       cvExport: exportTree,
       cvSave: saveTree,
       cvEnable: enableTree

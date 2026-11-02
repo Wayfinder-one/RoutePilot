@@ -51,6 +51,9 @@
 
   const clone = value => JSON.parse(JSON.stringify(value));
   const P = (id, dir, type, extra) => Object.assign({ id, dir, type }, extra);
+  /* 这些节点字段的线上契约是数组；对象/数字会让卡片渲染 .map 直接抛错，
+     因此 validate 视为结构错误（graph_parse_error），parseImport 据此拒绝。 */
+  const ARRAY_NODE_FIELDS = ['models', 'options', 'contains_any', 'periods'];
 
   function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -569,6 +572,19 @@
     }
 
     nodes.forEach(node => {
+      /* 字段类型属于结构契约：非数组的同名字段先报 graph_parse_error，
+         避免后续 renderAll 在 cards.js 里 .map 崩溃（半应用状态）。 */
+      ARRAY_NODE_FIELDS.forEach(field => {
+        if (Object.prototype.hasOwnProperty.call(node, field) && !Array.isArray(node[field])) {
+          const id = String(node.id == null ? '' : node.id);
+          issues.push(issue(
+            'graph_parse_error',
+            '节点字段 ' + field + ' 必须是数组（' + id + '）',
+            'Node field ' + field + ' must be an array (' + id + ')',
+            { node_id: id }
+          ));
+        }
+      });
       if (NODE_TYPES.indexOf(node.type) < 0) {
         issues.push(issue(
           'unknown_node_type',
@@ -1202,7 +1218,13 @@
       },
       root: graph
     };
-    return { ok: true, tree: tree, issues: validate(graph) };
+    const issues = validate(graph);
+    /* 结构错误在应用前拒绝：非对象节点/边或非数组字段会让 renderAll 半途崩溃，
+       必须让 applyImport 拿到 ok:false 而不是一个「带 Issue 的成功」。 */
+    if (issues.some(item => item.code === 'graph_parse_error')) {
+      return { ok: false, error: PARSE_ERROR_ZH, issues: issues };
+    }
+    return { ok: true, tree: tree, issues: issues };
   }
 
   /* ── 9. 新建最小图 ─────────────────────────────────────────────────── */

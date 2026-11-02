@@ -1032,6 +1032,10 @@
       /* 收起面板/重绘/锁画布都在 try 内：任一步抛错也必须走 finally 释放运行锁。 */
       hideResultPanels();
       collapsePanels();
+      /* 运行锁会拒绝所有 App.change()：条件浮层若还开着，确认只会得到
+         false。先关掉它，避免用户以为「确认成功」而实际草稿未变。 */
+      if (root.RTCondPop && typeof root.RTCondPop.isOpen === 'function' &&
+          root.RTCondPop.isOpen()) root.RTCondPop.close();
       removeReplayClasses();
       if (typeof appObj.render === 'function') appObj.render();
       setBusy(true);

@@ -351,7 +351,7 @@ test('canConnect tolerates malformed edge entries kept by import instead of thro
     kind: 'sr-routing-graph', version: 3, name: 'x', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 }, root: graph,
   }));
-  assert.equal(imported.ok, true);
+  assert.equal(imported.ok, false, 'non-object edges made parseImport return ok');
   assert.equal(hardIssues(imported.issues).some(issue => issue.code === 'graph_parse_error'), true,
     'malformed edge entries must still surface as a validation issue');
 });
@@ -810,16 +810,34 @@ test('changeKind separates display fields from behavior fields', () => {
 
 test('behaviorCanonical orders nodes by id and edges by slot number', () => {
   const tree = minimalTree();
+  const graph = tree.root;
+  graph.nodes.push(
+    { id: 'target-0', type: 'target', models: [{ model: 'qwen3-8b' }], priority: 2, position: { x: 0, y: 0 } },
+    { id: 'target-2', type: 'target', models: [{ model: 'qwen3-8b' }], priority: 3, position: { x: 0, y: 0 } },
+  );
+  const slot = (target, port, id) => ({
+    id, source: 'start', source_port: 'out', target, target_port: port, condition: null,
+  });
+  /* 数组顺序故意打乱：target 升序 → 槽位号数值升序（in_10 排在 in_2 之后）。 */
+  graph.edges.unshift(
+    slot('target-2', 'in_10', 'e-target-2'),
+    slot('target-1', 'in_2', 'e-target-1-in-2'),
+    slot('target-0', 'in_1', 'e-target-0'),
+  );
   const canonical = RTGraph.behaviorCanonical(tree);
   assert.equal(typeof canonical, 'string');
   const payload = JSON.parse(canonical);
   assert.equal(payload.timezone, tree.timezone);
   assert.deepEqual(payload.sticky, { enabled: false, ttl_seconds: 1800 });
   assert.equal(payload.root.type, 'graph');
-  assert.deepEqual(payload.root.nodes.map(node => node.id), ['start', 'target-1']);
+  assert.deepEqual(payload.root.nodes.map(node => node.id),
+    ['start', 'target-0', 'target-1', 'target-2']);
+  assert.deepEqual(payload.root.edges.map(edge => edge.target + ':' + edge.target_port),
+    ['target-0:in_1', 'target-1:in_1', 'target-1:in_2', 'target-2:in_10'],
+    'canonical edges are not sorted by target then numeric slot');
   assert.equal('position' in payload.root.nodes[0], false);
   assert.equal('title' in payload.root.nodes[0], false);
-  assert.equal('capability' in payload.root.nodes[1], false);
+  assert.equal('capability' in payload.root.nodes[2], false);
   assert.equal('id' in payload.root.edges[0], false);
 
   for (const node of payload.root.nodes) {
@@ -862,18 +880,41 @@ test('parseImport rejects null-position coordinates and lays them out', () => {
   }
 });
 
-test('parseImport keeps non-object entries for validate instead of dropping them', () => {
+test('parseImport rejects non-object node and edge entries before applying', () => {
   const tree = minimalTree();
   tree.root.nodes = [1];
   tree.root.edges = [1];
   const result = RTGraph.parseImport(importText(tree));
-  assert.equal(result.ok, true);
-  assert.equal(result.tree.root.nodes.length, 1);
-  assert.equal(result.tree.root.edges.length, 1);
-  assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
-  assert.doesNotThrow(() => RTGraph.behaviorCanonical(result.tree));
-  assert.doesNotThrow(() => RTGraph.layoutPositions('dag', result.tree.root));
-  assert.doesNotThrow(() => RTGraph.serialize(result.tree));
+  assert.equal(result.ok, false, 'parseImport accepted non-object node/edge entries');
+  assert.match(result.error, /图解析失败/, 'the rejection must use graph_parse_error copy');
+  assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error' &&
+    issue.level === 'hard'));
+  assert.equal('tree' in result, false, 'a rejected import still returned a tree to apply');
+});
+
+test('parseImport rejects non-array node fields (models/options/contains_any/periods) before applying', () => {
+  const cases = [
+    tree => { targetOf(tree.root).models = 5; },
+    tree => { tree.root.nodes.push({ id: 'q', type: 'question', question_type: 'choice', instructions: '选。', options: 5 }); },
+    tree => { tree.root.nodes.push({ id: 'c', type: 'condition', source: 'text', contains_any: 5 }); },
+    tree => { tree.root.nodes.push({ id: 'p', type: 'condition', source: 'periods', periods: 5 }); },
+  ];
+  for (const mutate of cases) {
+    const tree = minimalTree();
+    mutate(tree);
+    const result = RTGraph.parseImport(importText(tree));
+    assert.equal(result.ok, false, 'parseImport accepted a non-array node field');
+    assert.match(result.error, /图解析失败/, 'the rejection must use graph_parse_error copy');
+    assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error' &&
+      issue.level === 'hard'), 'missing hard graph_parse_error issue');
+    assert.equal('tree' in result, false, 'a rejected import still returned a tree to apply');
+  }
+
+  /* validate 本身也必须报结构错误（服务端 422 数组与本地校验共用同一码）。 */
+  const malformed = minimalTree();
+  targetOf(malformed.root).models = 5;
+  assert.ok(RTGraph.validate(malformed.root).some(issue =>
+    issue.code === 'graph_parse_error' && /models/.test(issue.zh)));
 });
 
 test('canonical comparison tolerates malformed draft fields', () => {
@@ -993,34 +1034,133 @@ test('validate reports duplicate target priorities', () => {
   assert.ok(issues.some(issue => issue.node_id === 'target-2' && /唯一/.test(issue.zh)));
 });
 
-test('validate reports every configured graph limit', () => {
-  const tooManyNodes = minimalTree().root;
-  for (let index = 0; index < RTGraph.LIMITS.nodes; index += 1) {
-    tooManyNodes.nodes.push({
-      id: 'extra-node-' + index, type: 'question', question_type: 'noul',
-      instructions: '是否需要？', position: { x: 0, y: 0 },
-    });
-  }
-  assert.ok(RTGraph.validate(tooManyNodes).some(issue =>
-    issue.code === 'limit_exceeded' && /节点数超过上限/.test(issue.zh)));
+test('validate enforces limit boundaries exactly (200/201 nodes, 400/401 edges, 32/33 questions)', () => {
+  const limitIssues = (graph, pattern) =>
+    RTGraph.validate(graph).filter(issue => issue.code === 'limit_exceeded' && pattern.test(issue.zh));
 
-  const tooManyEdges = minimalTree().root;
-  for (let index = 0; index < RTGraph.LIMITS.edges; index += 1) {
-    tooManyEdges.edges.push({
-      id: 'extra-edge-' + index, source: 'start', source_port: 'out',
-      target: 'target-1', target_port: 'in_' + (index + 2), condition: null,
-    });
-  }
-  assert.ok(RTGraph.validate(tooManyEdges).some(issue =>
-    issue.code === 'limit_exceeded' && /边数超过上限/.test(issue.zh)));
+  const withNodes = count => {
+    const graph = minimalTree().root;
+    for (let index = graph.nodes.length; index < count; index += 1) {
+      graph.nodes.push({
+        id: 'filler-node-' + index, type: 'condition', source: 'text',
+        contains_any: ['故障'], position: { x: 0, y: 0 },
+      });
+    }
+    assert.equal(graph.nodes.length, count);
+    return graph;
+  };
+  assert.equal(withNodes(RTGraph.LIMITS.nodes).nodes.length, 200);
+  assert.equal(limitIssues(withNodes(RTGraph.LIMITS.nodes), /节点数超过上限/).length, 0,
+    'exactly 200 nodes must be allowed');
+  assert.equal(limitIssues(withNodes(RTGraph.LIMITS.nodes + 1), /节点数超过上限/).length, 1,
+    '201 nodes must be flagged');
 
-  const tooManyQuestions = minimalTree().root;
-  for (let index = 0; index < RTGraph.LIMITS.questions + 1; index += 1) {
-    tooManyQuestions.nodes.push({
-      id: 'question-' + index, type: 'question', question_type: 'noul',
-      instructions: '是否需要？', position: { x: 0, y: 0 },
-    });
+  const withEdges = count => {
+    const graph = minimalTree().root;
+    while (graph.edges.length < count) {
+      graph.edges.push({
+        id: 'filler-edge-' + graph.edges.length, source: 'start', source_port: 'out',
+        target: 'target-1', target_port: 'in_' + (graph.edges.length + 1), condition: null,
+      });
+    }
+    assert.equal(graph.edges.length, count);
+    return graph;
+  };
+  assert.equal(withEdges(RTGraph.LIMITS.edges).edges.length, 400);
+  assert.equal(limitIssues(withEdges(RTGraph.LIMITS.edges), /边数超过上限/).length, 0,
+    'exactly 400 edges must be allowed');
+  assert.equal(limitIssues(withEdges(RTGraph.LIMITS.edges + 1), /边数超过上限/).length, 1,
+    '401 edges must be flagged');
+
+  const withQuestions = count => {
+    const graph = minimalTree().root;
+    for (let index = 0; index < count; index += 1) {
+      graph.nodes.push({
+        id: 'question-' + index, type: 'question', question_type: 'noul',
+        instructions: '是否需要？', position: { x: 0, y: 0 },
+      });
+    }
+    return graph;
+  };
+  assert.equal(withQuestions(RTGraph.LIMITS.questions).nodes.filter(node => node.type === 'question').length, 32);
+  assert.equal(limitIssues(withQuestions(RTGraph.LIMITS.questions), /问题节点超过上限/).length, 0,
+    'exactly 32 questions must be allowed');
+  assert.equal(limitIssues(withQuestions(RTGraph.LIMITS.questions + 1), /问题节点超过上限/).length, 1,
+    '33 questions must be flagged');
+});
+
+test('validate allows an 8-wave question chain and flags a 9th wave', () => {
+  const chainGraph = count => {
+    const graph = minimalTree().root;
+    graph.nodes = [graph.nodes.find(node => node.type === 'start')];
+    graph.edges = [];
+    let source = { node: 'start', port: 'out' };
+    for (let index = 1; index <= count; index += 1) {
+      const id = 'q' + index;
+      graph.nodes.push({
+        id, type: 'question', question_type: 'choice',
+        instructions: '第 ' + index + ' 波问题。',
+        options: [
+          { key: 'easy', label: '轻量', capability: '简单问答' },
+          { key: 'strong', label: '增强', capability: '复杂分析' },
+        ],
+        position: { x: 0, y: 0 },
+      });
+      graph.edges.push({
+        id: 'e-in-' + index, source: source.node, source_port: source.port,
+        target: id, target_port: 'in_1', condition: null,
+      });
+      source = { node: id, port: 'selected.easy' };
+    }
+    return graph;
+  };
+  const chainIssues = graph =>
+    RTGraph.validate(graph).filter(issue => issue.code === 'limit_exceeded' && /问题链/.test(issue.zh));
+  assert.deepEqual(chainIssues(chainGraph(RTGraph.LIMITS.waves)), [],
+    'exactly 8 question waves must be allowed');
+  const tooDeep = chainIssues(chainGraph(RTGraph.LIMITS.waves + 1));
+  assert.equal(tooDeep.length, 1, 'a 9-wave chain must be flagged');
+  assert.match(tooDeep[0].zh, /9 波/);
+});
+
+/* ── 10. 计算日志 / 时间路径静态契约（Task 14） ─────────────────────── */
+
+test('logs fallback filter and trace labels cover the graph v3 enum and events', () => {
+  const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
+  const logs = read('logs.js');
+  /* selection_reason 新枚举：target | sticky | otherwise | error_fallback。 */
+  assert.match(logs, /FALLBACK_REASONS = \['otherwise', 'error_fallback'/,
+    'logs fallback filter does not know the graph v3 enum');
+  assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
+    'logs still uses the pre-graph fallback enum');
+  assert.match(logs, /logs\.reason\.errorFallback/);
+  assert.match(logs, /logs\.reason\.otherwise/);
+
+  const trace = read('trace.js');
+  const events = ['time', 'window', 'condition', 'slot', 'gate', 'activate', 'wave',
+    'question', 'fallback', 'final', 'sticky_hit', 'scheduled'];
+  for (const event of events) {
+    assert.match(trace, new RegExp("\\b" + event + ": 'logs\\.ev\\."),
+      'trace.js has no label mapping for graph v3 event ' + event);
   }
-  assert.ok(RTGraph.validate(tooManyQuestions).some(issue =>
-    issue.code === 'limit_exceeded' && /问题节点超过上限/.test(issue.zh)));
+  const fields = ['tokens_before', 'tokens_after', 'truncated', 'source', 'matched',
+    'source_port', 'raw', 'condition', 'status', 'edge_id', 'operator', 'inputs',
+    'via_port', 'questions', 'failed', 'ports', 'selected', 'p_top',
+    'margin', 'usage', 'target_id', 'reason', 'kind', 'candidates', 'priority',
+    'model', 'dry_run'];
+  for (const field of fields) {
+    assert.ok(trace.includes("'" + field + "'"),
+      'trace.js does not render graph v3 field ' + field);
+  }
+  /* duration_ms 由 step 头部统一渲染（事件级计时），不需要重复进 FIELDS。 */
+  assert.match(trace, /event\.duration_ms/, 'trace.js lost the duration_ms timing');
+
+  /* 新增 label 必须在 zh / en 两份词典里都有，否则中文日志会退回原始 key。 */
+  const i18n = read('i18n.js');
+  const keys = trace.match(/logs\.(?:ev|field)\.[A-Za-z]+/g) || [];
+  assert.ok(keys.length > 20);
+  for (const key of new Set(keys)) {
+    const occurrences = i18n.split("'" + key + "'").length - 1;
+    assert.equal(occurrences, 2, 'i18n key ' + key + ' is not defined in both zh and en');
+  }
 });

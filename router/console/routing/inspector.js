@@ -570,9 +570,10 @@
         root.RTGraph.stableStringify(before) === root.RTGraph.stableStringify(after)) {
       return { ok: true, changed: false };
     }
-    current.change('behavior', tree => {
+    /* App.change() 在运行锁/保存锁下返回 false：留在编辑器并报错，不能假成功。 */
+    if (current.change('behavior', tree => {
       applyNodeValues(tree.root, target.id, values);
-    });
+    }) === false) return error(t('cv.saveBlocked'));
     return { ok: true, changed: true };
   }
 
@@ -635,13 +636,13 @@
     if (root.RTGraph.stableStringify(previous) === root.RTGraph.stableStringify(committed)) {
       return { ok: true, changed: false };
     }
-    current.change('behavior', tree => {
+    if (current.change('behavior', tree => {
       tree.name = name;
       tree.timezone = timezone;
       tree.sticky = sticky;
       tree.root.otherwise_target = otherwise;
       tree.root.error_fallback = errorFallback;
-    });
+    }) === false) return error(t('cv.saveBlocked'));
     return { ok: true, changed: true };
   }
 
@@ -653,15 +654,37 @@
     box.hidden = false;
   }
 
+  function fieldNameOf(element) {
+    if (!element || !element.dataset) return '';
+    return element.dataset.field || element.dataset.insField ||
+      element.dataset.optField || element.dataset.modelField || '';
+  }
+
+  /* 成功提交后整段检查器会重绘：把焦点放回同名控件（没有同名控件时回到该分支
+     第一个输入框），键盘用户不必 Tab 重找。 */
+  function restoreFocus(kind, fieldName) {
+    const body = document.getElementById('cvInspectorBody');
+    if (!body) return;
+    const branch = body.querySelector('[data-ins-branch="' + kind + '"]') || body;
+    const controls = Array.prototype.slice.call(
+      branch.querySelectorAll('[data-field],[data-ins-field],[data-opt-field],[data-model-field]')
+    ).filter(el => !el.disabled && el.getClientRects().length > 0);
+    const match = fieldName ? controls.find(el => fieldNameOf(el) === fieldName) : null;
+    const target = match || controls[0];
+    if (target && typeof target.focus === 'function') target.focus({ preventScroll: true });
+  }
+
   function onSubmit(event) {
     const form = event.target.closest('[data-ins-form]');
     if (!form) return;
     event.preventDefault();
     const kind = form.dataset.insForm;
+    const fieldName = fieldNameOf(document.activeElement);
     const result = kind === 'node' ? submitNode(form)
       : kind === 'edge' ? submitEdge(form)
         : submitGraph(form);
     if (!result.ok) showError(form, result.message);
+    else restoreFocus(kind, fieldName);
   }
 
   /* ── 交互 ───────────────────────────────────────────────────────── */

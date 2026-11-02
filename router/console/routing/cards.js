@@ -154,7 +154,7 @@
     function choiceCard(graph, node) {
       const ports = RTGraph.portsOf(node, graph);
       const byId = id => ports.find(port => port.id === id);
-      const rows = (node.options || []).map(option => {
+      const rows = (Array.isArray(node.options) ? node.options : []).filter(option => option && typeof option === 'object').map(option => {
         const selected = byId('selected.' + option.key);
         const prob = byId('prob.' + option.key);
         return '<div class="rtc-opt" data-optkey="' + esc(option.key) + '">' +
@@ -234,8 +234,10 @@
       const port = RTGraph.portsOf(node, graph).find(item => item.dir === 'out');
       const isText = node.source === 'text';
       const chips = isText
-        ? (node.contains_any || []).map(word => '<span class="rtc-kw" data-kw="' + esc(word) + '">' + esc(word) + '</span>').join('')
-        : (node.periods || []).map(period => '<span class="rtc-kw" data-period="' + esc(period) + '">' + esc(period) + '</span>').join('');
+        ? (Array.isArray(node.contains_any) ? node.contains_any : [])
+          .map(word => '<span class="rtc-kw" data-kw="' + esc(word) + '">' + esc(word) + '</span>').join('')
+        : (Array.isArray(node.periods) ? node.periods : [])
+          .map(period => '<span class="rtc-kw" data-period="' + esc(period) + '">' + esc(period) + '</span>').join('');
       return nodeWrap(node, 'condition',
         header(node, {
           icon: 'condition',
@@ -249,10 +251,12 @@
     }
 
     function targetCard(graph, node) {
-      const models = (node.models || []).map(item => {
-        const reasoning = item && item.reasoning ? ' · ' + item.reasoning : '';
-        return (item && item.model ? item.model : '—') + reasoning;
-      });
+      const models = (Array.isArray(node.models) ? node.models : [])
+        .filter(item => item && typeof item === 'object')
+        .map(item => {
+          const reasoning = item && item.reasoning ? ' · ' + item.reasoning : '';
+          return (item && item.model ? item.model : '—') + reasoning;
+        });
       return nodeWrap(node, 'target',
         '<div class="rtc-card-h">' +
         '<span class="rtc-ico">' + icon('target') + '</span>' +
@@ -288,8 +292,9 @@
 
     function render(graph, layer) {
       if (!layer) return 0;
-      layer.innerHTML = (graph.nodes || []).map(node => nodeCard(graph, node)).join('');
-      return (graph.nodes || []).length;
+      const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes.filter(node => node && typeof node === 'object') : [];
+      layer.innerHTML = nodes.map(node => nodeCard(graph, node)).join('');
+      return nodes.length;
     }
 
     return {
