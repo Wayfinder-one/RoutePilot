@@ -1,3 +1,16 @@
+from router.routing.graph.validate import EnableContext
+
+
+def enable_context():
+    return EnableContext(
+        known_models={"fast"},
+        capabilities={"fast": "简单请求"},
+        model_reasoning={"fast": None},
+        known_periods={"peak", "normal", "offpeak"},
+        jev_available=True,
+    )
+
+
 def graph_dict():
     return {
         "id": "root", "type": "graph",

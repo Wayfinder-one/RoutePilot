@@ -1,0 +1,194 @@
+{
+  "periods": [
+    {
+      "name": "peak",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "08:00",
+      "end": "11:00"
+    },
+    {
+      "name": "normal",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "11:00",
+      "end": "18:00"
+    },
+    {
+      "name": "offpeak",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "18:00",
+      "end": "08:00"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "s1",
+      "name": "电网抢修",
+      "title": "电网故障抢修",
+      "text": "10kV 线路跳闸，请安排抢修工单并做故障定位。",
+      "period": "normal",
+      "hint": "两个槽位条件都命中 AND → priority 压过 selected 直连",
+      "answers": {
+        "capability": {
+          "probs": {
+            "easy": 0.04,
+            "standard": 0.12,
+            "strong": 0.84
+          }
+        },
+        "domain": {
+          "yes": 0.92
+        }
+      },
+      "expected": {
+        "status": "ok",
+        "final": "power-target",
+        "candidates": 2,
+        "waves": 1
+      },
+      "now": "2026-11-02T12:00:00+08:00"
+    },
+    {
+      "id": "s2",
+      "name": "翻译一句话",
+      "title": "翻译一句话",
+      "text": "把这段话翻译成英文：设备巡检完成。",
+      "period": "offpeak",
+      "hint": "selected.easy 直连轻量模型；未触发问题保持 unknown，不当作 0",
+      "answers": {
+        "capability": {
+          "probs": {
+            "easy": 0.86,
+            "standard": 0.13,
+            "strong": 0.01
+          }
+        },
+        "domain": {
+          "yes": 0.04
+        }
+      },
+      "expected": {
+        "status": "ok",
+        "final": "light-target",
+        "candidates": 1,
+        "waves": 1
+      },
+      "now": "2026-11-02T23:30:00+08:00"
+    },
+    {
+      "id": "s3",
+      "name": "抢修工单模板",
+      "title": "抢修工单模板",
+      "text": "帮我生成一份抢修工单模板。",
+      "period": "peak",
+      "hint": "置信度不高 + 关键词/高峰 → 第 2 波追问；clarify.yes > 0.60 直接触发深推理目标",
+      "answers": {
+        "capability": {
+          "probs": {
+            "easy": 0.28,
+            "standard": 0.46,
+            "strong": 0.26
+          }
+        },
+        "domain": {
+          "yes": 0.38
+        },
+        "clarify": {
+          "yes": 0.74
+        }
+      },
+      "expected": {
+        "status": "ok",
+        "final": "deep-target",
+        "candidates": 2,
+        "waves": 2
+      },
+      "now": "2026-11-02T09:00:00+08:00"
+    },
+    {
+      "id": "s4",
+      "name": "低置信度追问",
+      "title": "低置信度追问",
+      "text": "停电了，但我不确定该找谁处理。",
+      "period": "normal",
+      "hint": "NOT + OR 触发第 2 波；target 槽位条件直接命中",
+      "answers": {
+        "capability": {
+          "probs": {
+            "easy": 0.41,
+            "standard": 0.37,
+            "strong": 0.22
+          }
+        },
+        "domain": {
+          "yes": 0.55
+        },
+        "clarify": {
+          "yes": 0.83
+        }
+      },
+      "expected": {
+        "status": "ok",
+        "final": "deep-target",
+        "candidates": 2,
+        "waves": 2
+      },
+      "now": "2026-11-02T12:00:00+08:00"
+    },
+    {
+      "id": "s5",
+      "name": "服务超时",
+      "title": "决策服务超时",
+      "text": "帮我写一份月度运维总结。",
+      "period": "offpeak",
+      "hint": "任一决策波次失败 → 整波作废，走 error_fallback",
+      "answers": {
+        "capability": {
+          "probs": {
+            "easy": 0.62,
+            "standard": 0.3,
+            "strong": 0.08
+          }
+        },
+        "domain": {
+          "yes": 0.18
+        }
+      },
+      "fail": {
+        "wave": 1,
+        "kind": "timeout",
+        "message": "/v1/systemone 请求超时（3000ms）"
+      },
+      "expected": {
+        "status": "error",
+        "final": "light-target",
+        "candidates": 0,
+        "waves": 1
+      },
+      "now": "2026-11-02T23:30:00+08:00"
+    }
+  ]
+}

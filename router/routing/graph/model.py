@@ -15,9 +15,15 @@ class Position:
     def __post_init__(self):
         for name in ("x", "y"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"position.{name} must be a finite number")
-            object.__setattr__(self, name, float(value))
+            try:
+                value = float(value)
+            except OverflowError:
+                raise ValueError(f"position.{name} must be a finite number") from None
+            if not math.isfinite(value):
+                raise ValueError(f"position.{name} must be a finite number")
+            object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)
@@ -96,9 +102,15 @@ class Condition:
             if not isinstance(self.value, bool):
                 raise ValueError(f"condition.value must be a boolean for op is, got {self.value!r}")
             return
-        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)) or not math.isfinite(self.value):
+        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
             raise ValueError(f"condition.value must be a finite number for op {self.op}, got {self.value!r}")
-        object.__setattr__(self, "value", float(self.value))
+        try:
+            value = float(self.value)
+        except OverflowError:
+            raise ValueError(f"condition.value must be a finite number for op {self.op}, got {self.value!r}") from None
+        if not math.isfinite(value):
+            raise ValueError(f"condition.value must be a finite number for op {self.op}, got {self.value!r}")
+        object.__setattr__(self, "value", value)
 
 
 @dataclass(frozen=True)
@@ -145,9 +157,15 @@ def _display(raw: dict, kind: str) -> str | None:
 
 
 def _number(value, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{field} must be a finite number")
-    return float(value)
+    try:
+        value = float(value)
+    except OverflowError:
+        raise ValueError(f"{field} must be a finite number") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be a finite number")
+    return value
 
 
 def _position(raw: dict, kind: str) -> Position | None:

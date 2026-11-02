@@ -325,6 +325,33 @@ def test_tree_envelope_strict():
     assert tree.root.otherwise_target == "missing-target"
 
 
+def test_huge_int_raises_value_error():
+    """溢出量级的整数必须报 ValueError（契约），而不是 OverflowError（Task 2 复审发现）。"""
+    raw = graph_dict()
+    raw["nodes"][0]["position"] = {"x": 10 ** 400, "y": 0}
+    with pytest.raises(ValueError, match="finite"):
+        tree_from_dict(tree_dict(root=raw))
+    raw = graph_dict()
+    raw["edges"][0]["condition"] = {"op": "gt", "value": 10 ** 400}
+    with pytest.raises(ValueError, match="finite"):
+        tree_from_dict(tree_dict(root=raw))
+    raw = graph_dict()
+    raw["nodes"].append({
+        "id": "sc", "type": "question", "question_type": "score",
+        "instructions": "评分", "position": None, "criteria": [1, 10 ** 400],
+    })
+    with pytest.raises(ValueError, match="finite"):
+        tree_from_dict(tree_dict(root=raw))
+    raw = graph_dict()
+    raw["nodes"][0]["position"] = {"x": 10 ** 400, "y": 0}
+    try:
+        tree_from_dict(tree_dict(root=raw))
+    except ValueError:
+        pass
+    except OverflowError as error:  # pragma: no cover - 回归护栏
+        raise AssertionError(f"expected ValueError, got OverflowError: {error}")
+
+
 def test_public_surface_reexports():
     from router.routing.graph import Edge as package_edge
     from router.routing.model import (
