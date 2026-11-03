@@ -1164,3 +1164,36 @@ test('logs fallback filter and trace labels cover the graph v3 enum and events',
     assert.equal(occurrences, 2, 'i18n key ' + key + ' is not defined in both zh and en');
   }
 });
+
+test('review-slot-cap-rejects-in-9999-without-materializing-rows', () => {
+  const tree = minimalTree();
+  const target = targetOf(tree.root);
+  tree.root.edges[0].target_port = 'in_9999';
+
+  const issues = hardIssues(RTGraph.validate(tree.root));
+  assert.ok(issues.some(issue => issue.code === 'edge_port_missing' && issue.port === 'in_9999'));
+  assert.equal(RTGraph.portsOf(target, tree.root).length, 1);
+  assert.equal(RTGraph.portOf(target, 'in_9999', tree.root), null);
+
+  tree.root.edges[0].target_port = 'in_400';
+  const validIssues = hardIssues(RTGraph.validate(tree.root));
+  assert.equal(validIssues.some(issue => issue.code === 'edge_port_missing'), false);
+  assert.equal(RTGraph.portsOf(target, tree.root).length, 400);
+  assert.ok(RTGraph.portOf(target, 'in_400', tree.root));
+  assert.equal(RTGraph.portOf(target, 'in_401', tree.root), null);
+});
+
+test('review-next-slot-uses-in-400-then-reports-exhaustion', () => {
+  const tree = minimalTree();
+  const target = targetOf(tree.root);
+  tree.root.edges = Array.from({ length: 399 }, (_, index) => ({
+    id: 'e-' + (index + 1), source: 'start', source_port: 'out',
+    target: target.id, target_port: 'in_' + (index + 1), condition: null,
+  }));
+  assert.equal(RTGraph.nextSlot(tree.root, target.id), 'in_400');
+  tree.root.edges.push({
+    id: 'e-400', source: 'start', source_port: 'out',
+    target: target.id, target_port: 'in_400', condition: null,
+  });
+  assert.equal(RTGraph.nextSlot(tree.root, target.id), null);
+});

@@ -69,7 +69,9 @@
 
   function slotIndex(port) {
     const match = /^in_([1-9][0-9]*)$/.exec(typeof port === 'string' ? port : '');
-    return match ? Number(match[1]) : null;
+    if (!match) return null;
+    const index = Number(match[1]);
+    return Number.isSafeInteger(index) && index <= LIMITS.edges ? index : null;
   }
 
   function slotSortKey(port) {
@@ -118,7 +120,7 @@
       const index = slotIndex(port);
       if (index !== null) maxUsed = Math.max(maxUsed, index);
     });
-    const total = Math.max(minSlots, maxUsed + 1);
+    const total = Math.min(LIMITS.edges, Math.max(minSlots, maxUsed + 1));
     const isOr = node.type === 'question' || node.type === 'target';
     const slots = [];
     for (let index = 1; index <= total; index += 1) {
@@ -358,10 +360,10 @@
     const used = edgesOf(graphValue)
       .filter(edge => edge.target === nodeId)
       .map(edge => edge.target_port);
-    for (let index = 1; index < LIMITS.nodes * 2; index += 1) {
+    for (let index = 1; index <= LIMITS.edges; index += 1) {
       if (used.indexOf('in_' + index) < 0) return 'in_' + index;
     }
-    return 'in_1';
+    return null;
   }
 
   function addEdge(graphValue, draft) {

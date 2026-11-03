@@ -5310,6 +5310,30 @@ test('7.4-21-chinese-product-and-actionable-errors', async () => {
   assert.equal(issue.port, 'in_1');
 });
 
+test('review-slot-limit-import-preserves-draft', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const before = await page.evaluate(() => ({
+    nodes: window.App.graph.nodes.map(node => node.id),
+    edges: window.App.graph.edges.map(edge => [edge.id, edge.target_port]),
+    slots: document.querySelectorAll('#cvNodes .rtc-slot').length,
+  }));
+  const root = JSON.parse(JSON.stringify(EXAMPLE));
+  root.edges[0].target_port = 'in_9999';
+  await clearToasts();
+  await setImportPayload({
+    kind: 'sr-routing-graph', version: 3, name: '非法槽位',
+    timezone: BASELINE.timezone, sticky: BASELINE.sticky, root,
+  }, 'invalid-slot-in-9999.json');
+  await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
+  const after = await page.evaluate(() => ({
+    nodes: window.App.graph.nodes.map(node => node.id),
+    edges: window.App.graph.edges.map(edge => [edge.id, edge.target_port]),
+    slots: document.querySelectorAll('#cvNodes .rtc-slot').length,
+  }));
+  assert.deepEqual(after, before, 'invalid slot import replaced the draft or allocated new slot rows');
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
