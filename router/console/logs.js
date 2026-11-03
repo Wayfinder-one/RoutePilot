@@ -84,9 +84,7 @@ function rowHtml(record, open) {
     chips.push(`<span class="lg-chip sticky">${esc(t('logs.reason.sticky'))}</span>`);
   }
   if (hasConfidence) chips.push(`<span class="lg-chip jev">JEV ${pct(record.jev_top)}</span>`);
-  if (record.fallback_reason) {
-    chips.push(`<span class="lg-chip fallback" title="${esc(record.fallback_reason)}">${esc(record.fallback_reason)}</span>`);
-  } else if (isFallback(record)) {
+  if (isFallback(record)) {
     chips.push(`<span class="lg-chip fallback">${esc(t(fallbackLabel(record)))}</span>`);
   }
   return `<button type="button" class="lg-row" aria-expanded="${open}" aria-controls="detail-${esc(record.id)}"
@@ -120,6 +118,49 @@ function factHtml(label, value, mono) {
   return `<div class="lg-fact"><div class="k">${esc(label)}</div><div class="v${mono ? ' mono' : ''}">${value}</div></div>`;
 }
 
+/* ── decision summary: answer "why this model" in three compact rows ──
+   The raw engine trace and low-frequency facts stay folded below; the
+   default view only carries what a reviewer needs at a glance. */
+function summaryHtml(record) {
+  const trace = Array.isArray(record.trace) ? record.trace : [];
+  const waves = trace.filter(event => event && event.event === 'wave');
+  const final = trace.find(event => event && event.event === 'final');
+  const candidates = final && Array.isArray(final.candidates) ? final.candidates : [];
+  const rounds = Number.isFinite(Number(record.waves)) ? Number(record.waves) : waves.length;
+  const reason = record.selection_reason;
+  const reasonKey = reason === 'error_fallback' ? 'logs.reason.errorFallback'
+    : reason === 'otherwise' ? 'logs.reason.otherwise'
+      : reason === 'sticky' ? 'logs.reason.sticky' : null;
+  const head = [
+    `<span class="lg-sum-model">→ ${esc(record.model || '—')}</span>`,
+    record.target_id ? `<span class="lg-sum-target">${esc(record.target_id)}</span>` : '',
+    reasonKey ? `<span class="lg-chip fallback">${esc(t(reasonKey))}</span>` : '',
+    `<span class="lg-sum-kv">${esc(t('logs.sum.rounds'))}<b>${esc(String(rounds))}</b></span>`,
+    `<span class="lg-sum-kv">${esc(t('logs.f.routing'))}<b>${esc(ms(record.routing_ms))}</b></span>`,
+    record.sticky_hit ? `<span class="lg-chip sticky">${esc(t('logs.f.stickyHit'))}</span>` : '',
+  ].filter(Boolean).join('');
+  const candRow = `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.sum.candidates'))}</span>${
+    candidates.length
+      ? `<span class="lg-cands">${candidates.map(item =>
+        `<span class="lg-cand${item.target_id === record.target_id ? ' win' : ''}">` +
+        `<b>${esc(item.target_id)}</b>` +
+        `<i>${esc(t('logs.field.priority'))} ${esc(String(item.priority))}</i>` +
+        `<i>${esc(tf('logs.sum.round', { n: item.wave }))}</i>` +
+        `<i>${esc(t('logs.sum.via'))} ${esc(item.via_node || '—')}</i></span>`).join('')}</span>`
+      : `<span class="mut">${esc(t('logs.sum.noCandidates'))}</span>`
+  }</div>`;
+  const waveRow = waves.length
+    ? `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.ev.wave'))}</span><span class="lg-waves">${
+      waves.map(item =>
+        `<span class="lg-wave${item.failed ? ' bad' : ''}">` +
+        `<b>${esc(tf('logs.sum.round', { n: item.wave }))}</b>` +
+        `<i>${esc((item.questions || []).join(', ') || '—')}</i>` +
+        `<i>${esc(item.failed ? t('logs.field.failed') : ms(item.duration_ms))}</i></span>`).join('')
+    }</span></div>`
+    : '';
+  return `<section class="lg-block lg-sum"><div class="lg-sum-head">${head}</div>${candRow}${waveRow}</section>`;
+}
+
 function detailHtml(record) {
   const facts = [
     factHtml(t('logs.f.time'), esc(fmtTime(record.ts)), true),
@@ -146,14 +187,22 @@ function detailHtml(record) {
     ? probBars(record.jev_probabilities) : '';
   const reasoning = String(record.reasoning || '').trim();
   const warning = String(record.reasoning_warning || '').trim();
+  const traceCount = Array.isArray(record.trace) ? record.trace.length : 0;
 
   return `<div class="lg-expand-in">
+    ${summaryHtml(record)}
     ${prompt ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.prompt'))}</div><div class="lg-prompt">${esc(prompt)}</div></section>` : ''}
-    <section class="lg-block"><div class="lg-sec-h">${esc(t('logs.facts'))}</div><div class="lg-facts">${facts.join('')}</div></section>
     ${probabilities ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.probs'))}</div><div class="lg-probs">${probabilities}</div></section>` : ''}
-    <section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.trace'))}</div><div class="lg-trace"></div></section>
     ${reasoning ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.reasoning'))}</div><div class="lg-quote">${esc(reasoning)}</div></section>` : ''}
     ${warning ? `<div class="lg-note"><b>${esc(t('logs.reasoningWarning'))}</b>${esc(warning)}</div>` : ''}
+    <details class="lg-more lg-more--trace">
+      <summary>${esc(tf('logs.rawTrace', { n: traceCount }))}</summary>
+      <div class="lg-trace" data-trace></div>
+    </details>
+    <details class="lg-more">
+      <summary>${esc(t('logs.facts'))}</summary>
+      <div class="lg-facts">${facts.join('')}</div>
+    </details>
   </div>`;
 }
 
@@ -165,12 +214,23 @@ function itemHtml(record) {
   </article>`;
 }
 
-/* The time path is only built the first time a row opens. */
+/* The raw time path is only built when its <details> is expanded. */
 function paintTrace(item, record) {
   const host = item.querySelector('.lg-trace');
   if (!host || host.dataset.ready === '1') return;
   SRTrace.render(host, record.trace);
   host.dataset.ready = '1';
+}
+
+function bindTrace(item) {
+  const details = item.querySelector('details.lg-more--trace');
+  if (!details || details.dataset.bound === '1') return;
+  details.dataset.bound = '1';
+  details.addEventListener('toggle', () => {
+    if (!details.open) return;
+    const record = requests.find(entry => entry.id === item.dataset.id);
+    if (record) paintTrace(item, record);
+  });
 }
 
 function render() {
@@ -180,9 +240,11 @@ function render() {
   renderTabs();
   $('#list').innerHTML = rows.map(itemHtml).join('')
     || `<div class="lg-list-empty"><b>${esc(t(requests.length ? 'logs.emptyFilter' : 'logs.empty'))}</b></div>`;
-  document.querySelectorAll('#list .lg-item.open').forEach(item => {
+  document.querySelectorAll('#list .lg-item').forEach(item => {
     const record = requests.find(entry => entry.id === item.dataset.id);
-    if (record) paintTrace(item, record);
+    if (!record) return;
+    bindTrace(item);
+    if (item.classList.contains('open')) paintTrace(item, record);
   });
 }
 

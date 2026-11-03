@@ -92,8 +92,11 @@ const SRTrace = (() => {
     if (event.timezone) out.push([t('logs.field.tz'), event.timezone]);
     FIELDS.forEach(([field, labelKey]) => {
       const value = event[field];
-      /* raw/value 的 null（unknown）也是一条有意义的证据；其他空字段省略。 */
-      if (value == null && field !== 'raw' && field !== 'value') return;
+      /* 只有槽位/门/条件事件里 raw/value 的 null（unknown）是有意义证据；
+         其他事件缺字段一律省略，避免整条时间线被 “上游值 —” 噪音淹没。 */
+      const nullIsEvidence = (field === 'raw' || field === 'value') &&
+        ['slot', 'gate', 'condition'].indexOf(event.event) >= 0;
+      if (value == null && !nullIsEvidence) return;
       if (value === '') return;
       out.push([t(labelKey), display(field, value)]);
     });

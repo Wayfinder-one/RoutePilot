@@ -1288,3 +1288,27 @@ test('review-import-rejects-invalid-envelope-values-before-normalization', () =>
   assert.equal(accepted.tree.timezone, 'UTC');
   assert.deepEqual(accepted.tree.sticky, { enabled: true, ttl_seconds: 60 });
 });
+
+test('logs detail keeps a compact decision summary and folds the raw trace', () => {
+  const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
+  const logs = read('logs.js');
+  /* 默认视图：决策摘要（候选/波次）+ 折叠的原始轨迹与事实。 */
+  assert.match(logs, /logs\.sum\.candidates/);
+  assert.match(logs, /logs\.sum\.rounds/);
+  assert.match(logs, /logs\.sum\.noCandidates/);
+  assert.match(logs, /logs\.rawTrace/);
+  assert.match(logs, /<details class="lg-more lg-more--trace">/,
+    'raw trace is not folded behind a details element');
+  assert.doesNotMatch(logs, /logs\.sec\.trace/, 'the old always-open trace section is back');
+
+  const trace = read('trace.js');
+  assert.match(trace, /nullIsEvidence/, 'trace.js lost the null-evidence guard for slot/gate/condition');
+
+  /* 新增 key 必须在 zh / en 两份词典里都存在。 */
+  const i18n = read('i18n.js');
+  for (const key of ['logs.sum.rounds', 'logs.sum.candidates', 'logs.sum.round',
+    'logs.sum.via', 'logs.sum.noCandidates', 'logs.rawTrace']) {
+    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
+      'i18n key ' + key + ' is not defined in both zh and en');
+  }
+});
