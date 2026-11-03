@@ -27,7 +27,8 @@ const SRTrace = (() => {
   function conditionText(value) {
     if (!value || typeof value !== 'object') return stringify(value);
     if (!value.op) return stringify(value.value);
-    const symbol = OP_SYMBOL[value.op] || value.op;
+    const symbol = Object.prototype.hasOwnProperty.call(OP_SYMBOL, value.op)
+      ? OP_SYMBOL[value.op] : value.op;
     return symbol + ' ' + stringify(value.value);
   }
 

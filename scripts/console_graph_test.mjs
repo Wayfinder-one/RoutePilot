@@ -1324,8 +1324,12 @@ test('logs detail keeps a compact decision summary and folds the decision path',
 
   const trace = read('trace.js');
   assert.doesNotMatch(trace, /nullIsEvidence/, 'stale null-evidence guard is back');
-  assert.match(trace, /logs\.kp\.unknown/, 'trace.js lost the unknown status label');
-  assert.match(trace, /OP_SYMBOL/, 'trace.js lost the local operator symbol map');
+  assert.match(trace, /return t\('logs\.kp\.unknown'\)/, 'trace.js lost the unknown status label');
+  /* 符号映射必须给出真实符号，而不是只留一个标识符。 */
+  for (const [op, symbol] of [['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'], ['eq', '='], ['neq', '≠']]) {
+    assert.ok(trace.includes(op + ": '" + symbol + "'"),
+      'trace.js operator map is missing ' + op + ' → ' + symbol);
+  }
 
   /* 新增 key 必须在 zh / en 两份词典里都存在。 */
   const i18n = read('i18n.js');
