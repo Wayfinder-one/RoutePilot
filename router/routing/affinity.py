@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 from router.routing.types import session_digest
 
-
 @dataclass
 class _Entry:
     model: str
