@@ -71,13 +71,13 @@ def three_answer_graph() -> dict:
              "instructions": "是否需要电力知识？", "position": {"x": 180, "y": 40}},
             {"id": "q-score", "type": "question", "question_type": "score",
              "instructions": "难度评分", "criteria": [1, 10], "position": {"x": 180, "y": 160}},
-            {"id": "t-choice", "type": "target", "priority": 1, "title": "轻量目标",
+            {"id": "t-choice", "type": "target", "priority": 4, "title": "轻量目标",
              "models": [{"model": "qwen3-8b", "reasoning": None}], "position": {"x": 420, "y": -80}},
-            {"id": "t-noul", "type": "target", "priority": 2,
+            {"id": "t-noul", "type": "target", "priority": 3,
              "models": [{"model": "qwen3-32b", "reasoning": None}], "position": {"x": 420, "y": 40}},
-            {"id": "t-score", "type": "target", "priority": 3,
+            {"id": "t-score", "type": "target", "priority": 2,
              "models": [{"model": "deepseek-v3", "reasoning": None}], "position": {"x": 420, "y": 160}},
-            {"id": "safe", "type": "target", "priority": 4,
+            {"id": "safe", "type": "target", "priority": 1,
              "models": [{"model": "qwen3-8b", "reasoning": None}], "position": {"x": 420, "y": 280}},
         ],
         "edges": [
@@ -353,9 +353,9 @@ def test_try_serializes_all_answer_types_and_complete_outcome(client, app):
     assert outcome["selection_reason"] == "target"
     assert outcome["fallback_reason"] is None
     assert outcome["candidates"] == [
-        {"target_id": "t-choice", "priority": 1, "via_node": "q-choice", "via_port": "in_1", "wave": 1},
-        {"target_id": "t-noul", "priority": 2, "via_node": "q-noul", "via_port": "in_1", "wave": 1},
-        {"target_id": "t-score", "priority": 3, "via_node": "q-score", "via_port": "in_1", "wave": 1},
+        {"target_id": "t-choice", "priority": 4, "via_node": "q-choice", "via_port": "in_1", "wave": 1},
+        {"target_id": "t-noul", "priority": 3, "via_node": "q-noul", "via_port": "in_1", "wave": 1},
+        {"target_id": "t-score", "priority": 2, "via_node": "q-score", "via_port": "in_1", "wave": 1},
     ]
     assert outcome["waves"] == [{
         "wave": 1,

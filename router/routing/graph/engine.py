@@ -274,7 +274,7 @@ class GraphExecutionEngine:
                 trace=trace,
             )
 
-        # 7. final target: error_fallback after failure, else min priority, else otherwise.
+        # 7. final target: error_fallback after failure, else highest priority, else otherwise.
         if failed:
             target = self._required_target(nodes, root.error_fallback, "error_fallback")
             kind = "error_fallback"
@@ -282,14 +282,14 @@ class GraphExecutionEngine:
             fallback_reason: str | None = "error_fallback"
             final_candidates: tuple[Candidate, ...] = ()
         elif candidates:
-            winner = min(candidates.values(), key=lambda item: (item.priority, item.target_id))
+            final_candidates = tuple(sorted(
+                candidates.values(), key=lambda item: (-item.priority, item.target_id),
+            ))
+            winner = final_candidates[0]
             target = nodes[winner.target_id]
             kind = "target"
             selection_reason = "target"
             fallback_reason = None
-            final_candidates = tuple(
-                sorted(candidates.values(), key=lambda item: (item.priority, item.target_id))
-            )
         else:
             target = self._required_target(nodes, root.otherwise_target, "otherwise")
             kind = "otherwise"
