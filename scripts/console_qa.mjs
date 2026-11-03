@@ -5365,6 +5365,30 @@ test('review-import-contract-rejects-before-draft-replacement', async () => {
   }
 });
 
+test('review-import-envelope-types-preserve-draft', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const base = await page.evaluate(() => window.RTGraph.createMinimalTree('qwen3.8-flash-sft'));
+  const kept = await page.evaluate(() => JSON.stringify(window.App.tree));
+  const invalid = [];
+  const badSticky = JSON.parse(JSON.stringify(base));
+  badSticky.sticky.enabled = 'yes';
+  invalid.push(badSticky);
+  const badTimezone = JSON.parse(JSON.stringify(base));
+  badTimezone.timezone = 123;
+  invalid.push(badTimezone);
+
+  for (const tree of invalid) {
+    await clearToasts();
+    await setImportPayload({
+      kind: 'sr-routing-graph', version: 3, name: tree.name,
+      timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
+    }, 'invalid-envelope-value.json');
+    await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
+    assert.equal(await page.evaluate(() => JSON.stringify(window.App.tree)), kept);
+  }
+});
+
 test('review-pointer-cancel-restores-node-without-history', async () => {
   await ensureBaselineTree();
   await openCanvas();

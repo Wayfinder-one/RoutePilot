@@ -1258,3 +1258,33 @@ test('review-next-slot-uses-in-400-then-reports-exhaustion', () => {
   });
   assert.equal(RTGraph.nextSlot(tree.root, target.id), null);
 });
+
+test('review-import-rejects-invalid-envelope-values-before-normalization', () => {
+  const cases = [
+    ['sticky-enabled-string', tree => { tree.sticky.enabled = 'yes'; }],
+    ['sticky-ttl-string', tree => { tree.sticky.ttl_seconds = 'bad'; }],
+    ['sticky-ttl-zero', tree => { tree.sticky.ttl_seconds = 0; }],
+    ['sticky-array', tree => { tree.sticky = []; }],
+    ['timezone-number', tree => { tree.timezone = 123; }],
+    ['name-number', tree => { tree.name = 123; }],
+  ];
+  for (const [name, mutate] of cases) {
+    const tree = minimalTree();
+    mutate(tree);
+    const result = RTGraph.parseImport(importText(tree));
+    assert.equal(result.ok, false, name + ' was accepted');
+    assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'),
+      name + ' did not return graph_parse_error: ' + JSON.stringify(result.issues));
+    assert.equal(result.tree, undefined, name + ' returned a normalized tree after rejection');
+  }
+
+  const valid = minimalTree();
+  valid.name = '合法 envelope';
+  valid.timezone = 'UTC';
+  valid.sticky = { enabled: true, ttl_seconds: 60 };
+  const accepted = RTGraph.parseImport(importText(valid));
+  assert.equal(accepted.ok, true, JSON.stringify(accepted.issues));
+  assert.equal(accepted.tree.name, '合法 envelope');
+  assert.equal(accepted.tree.timezone, 'UTC');
+  assert.deepEqual(accepted.tree.sticky, { enabled: true, ttl_seconds: 60 });
+});

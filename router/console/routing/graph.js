@@ -590,12 +590,30 @@
     });
     if (value !== graph && isRecord(value) && isRecord(value.root)) {
       addUnknownFields(value, ENVELOPE_FIELDS, 'tree', issues, '');
-      if (isRecord(value.sticky)) {
-        addUnknownFields(value.sticky, ['enabled', 'ttl_seconds'], 'sticky', issues, '');
+      if (typeof value.name !== 'string') {
+        issues.push(issue('graph_parse_error', 'tree.name 必须是字符串', 'tree.name must be a string'));
       }
-      if (!isTimeZone(value.timezone)) {
-        issues.push(issue('invalid_timezone', '时区非法：' + String(value.timezone),
-          'Invalid timezone: ' + String(value.timezone)));
+      if (!isNonEmptyString(value.timezone)) {
+        issues.push(issue('graph_parse_error', 'timezone 必须是非空字符串', 'timezone must be a nonempty string'));
+      } else if (!isTimeZone(value.timezone)) {
+        issues.push(issue('invalid_timezone', '时区非法：' + value.timezone,
+          'Invalid timezone: ' + value.timezone));
+      }
+      if (!isRecord(value.sticky)) {
+        issues.push(issue('graph_parse_error', 'sticky 必须是对象', 'sticky must be an object'));
+      } else {
+        addUnknownFields(value.sticky, ['enabled', 'ttl_seconds'], 'sticky', issues, '');
+        if (Object.prototype.hasOwnProperty.call(value.sticky, 'enabled') &&
+            typeof value.sticky.enabled !== 'boolean') {
+          issues.push(issue('graph_parse_error', 'sticky.enabled 必须是 boolean',
+            'sticky.enabled must be a boolean'));
+        }
+        if (Object.prototype.hasOwnProperty.call(value.sticky, 'ttl_seconds') &&
+            (!Number.isInteger(value.sticky.ttl_seconds) ||
+             value.sticky.ttl_seconds < 1 || value.sticky.ttl_seconds > 31536000)) {
+          issues.push(issue('graph_parse_error', 'sticky.ttl_seconds 必须是 [1,31536000] 内的整数',
+            'sticky.ttl_seconds must be an integer in [1,31536000]'));
+        }
       }
     }
   }
@@ -1301,12 +1319,10 @@
       }
     });
 
-    /* sticky 原样保留到校验之后：未知字段必须先被 validate 的白名单拒绝，
-       不能在归一化时被静默丢弃。 */
-    const rawSticky = isRecord(data.sticky) ? data.sticky : {};
+    const rawSticky = data.sticky === undefined || data.sticky === null ? {} : data.sticky;
     const tree = {
-      name: typeof data.name === 'string' ? data.name : '',
-      timezone: isNonEmptyString(data.timezone) ? data.timezone : 'Asia/Shanghai',
+      name: data.name === undefined ? '' : data.name,
+      timezone: data.timezone === undefined ? 'Asia/Shanghai' : data.timezone,
       sticky: rawSticky,
       root: graph
     };
@@ -1321,7 +1337,7 @@
     /* 合法输入通过校验后再归一 sticky。 */
     tree.sticky = {
       enabled: rawSticky.enabled === true,
-      ttl_seconds: isFiniteNumber(Number(rawSticky.ttl_seconds)) ? Number(rawSticky.ttl_seconds) : 1800
+      ttl_seconds: rawSticky.ttl_seconds === undefined ? 1800 : rawSticky.ttl_seconds
     };
     return { ok: true, tree: tree, issues: issues };
   }
