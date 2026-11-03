@@ -5365,6 +5365,33 @@ test('review-import-contract-rejects-before-draft-replacement', async () => {
   }
 });
 
+test('review-pointer-cancel-restores-node-without-history', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const original = await page.evaluate(() => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return { x: node.position.x, y: node.position.y, kind: window.App.kind() };
+  });
+  const box = await page.locator('[data-node-id="start"]').boundingBox();
+  const point = { x: box.x + box.width / 2, y: box.y + 11 };
+  await page.mouse.move(point.x, point.y);
+  await page.mouse.down();
+  await page.mouse.move(point.x + 70, point.y + 50, { steps: 6 });
+  await page.locator('#cvStage').dispatchEvent('pointercancel', {
+    pointerId: 1, pointerType: 'mouse', clientX: point.x + 70, clientY: point.y + 50,
+  });
+  await page.mouse.up();
+  await page.waitForFunction(expected => {
+    const node = window.App.graph.nodes.find(item => item.id === 'start');
+    return node.position.x === expected.x && node.position.y === expected.y;
+  }, original);
+  const after = await page.evaluate(() => ({
+    kind: window.App.kind(), undo: window.App.kit.canUndo(), redo: window.App.kit.canRedo(),
+  }));
+  assert.equal(original.kind, 'clean');
+  assert.deepEqual(after, { kind: 'clean', undo: false, redo: false });
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;

@@ -374,6 +374,18 @@
         cb.onClearReplay();
       }
 
+      /* 拖拽取消（pointercancel / 试算锁）：恢复拖拽前坐标与卡片、边，不产生历史或 dirty。 */
+      function rollbackNodeDrag(activeDrag) {
+        if (!activeDrag || activeDrag.type !== 'node') return;
+        const node = graph.nodes.find(item => item.id === activeDrag.nodeId);
+        if (!node) return;
+        node.position.x = activeDrag.originX;
+        node.position.y = activeDrag.originY;
+        activeDrag.el.style.left = Math.round(activeDrag.originX) + 'px';
+        activeDrag.el.style.top = Math.round(activeDrag.originY) + 'px';
+        renderEdges();
+      }
+
       function setLocked(value) {
         locked = !!value;
         stage.classList.toggle('is-locked', locked);
@@ -383,6 +395,7 @@
             tempPath = null;
             clearCompatible();
           }
+          rollbackNodeDrag(drag);
           drag = null;
         }
       }
@@ -683,6 +696,7 @@
           tempPath = null;
           clearCompatible();
         }
+        rollbackNodeDrag(drag);
         drag = null;
         try { stage.releasePointerCapture(event.pointerId); } catch (error) { /* ignore */ }
       }
