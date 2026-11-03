@@ -1156,11 +1156,17 @@ test('logs decision path keeps only key judgments and value outputs', () => {
       'trace.js still maps removed event ' + event);
   }
   assert.match(trace, /count\(trace\)/, 'trace.js lost SRTrace.count');
+  /* 引擎的第四种状态 invalid 必须显示为「非法」并用红点，不能折叠成未定。 */
+  assert.match(trace, /status === 'invalid'/, 'trace.js lost the invalid status mapping');
+  assert.match(trace, /return 'bad'/, 'trace.js lost the red dot for invalid statuses');
+  const css = read('shared.css');
+  assert.match(css, /\.lg-step\[data-kind="bad"\]/, 'shared.css lost the invalid-status dot');
 
   /* 新标签必须在 zh / en 两份词典里都有。 */
   const i18n = read('i18n.js');
   for (const key of ['logs.kp.title', 'logs.kp.slot', 'logs.kp.gate', 'logs.kp.condition',
     'logs.kp.question', 'logs.kp.final', 'logs.kp.hit', 'logs.kp.miss', 'logs.kp.unknown',
+    'logs.kp.invalid',
     'logs.kp.matched', 'logs.kp.source', 'logs.kp.sourceText', 'logs.kp.sourcePeriods',
     'logs.kp.valueOutput', 'logs.kp.candidates']) {
     assert.equal(i18n.split("'" + key + "'").length - 1, 2,

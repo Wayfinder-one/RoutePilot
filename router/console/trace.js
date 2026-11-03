@@ -40,12 +40,14 @@ const SRTrace = (() => {
   function statusText(status) {
     if (status === 'true' || status === true) return t('logs.kp.hit');
     if (status === 'false' || status === false) return t('logs.kp.miss');
+    if (status === 'invalid') return t('logs.kp.invalid');
     return t('logs.kp.unknown');
   }
 
-  /* 绿点 = 判断为真；灰点 = 判断为假（明确结论，不是异常）；琥珀 = 未定。 */
+  /* 绿点 = 判断为真；灰点 = 判断为假（明确结论）；琥珀 = 未定；红点 = 非法值。 */
   function tone(event) {
     if (!event) return '';
+    if (event.status === 'invalid') return 'bad';
     if (event.status === 'unknown' || event.value === null) return 'warn';
     if (event.status === 'false' || event.value === false) return '';
     return 'ok';
