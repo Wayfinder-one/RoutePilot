@@ -5,10 +5,11 @@ import json
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
-from router.api.upstream import Backend, load_backends
+from router.api.upstream import Backend, load_backends, model_reasoning_from_db
 from router.jev.config import JevConfigRepo, JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
@@ -18,16 +19,15 @@ from router.jev.window import (
     MIN_INPUT_TOKENS,
 )
 from router.routing.conditions import TimePeriod
+from router.routing.graph.validate import EnableContext, validate_graph_for_enable
 from router.routing.model import (
     RoutingTree,
     canonical_json,
     tree_behavior_dict,
     tree_revision_of,
 )
-from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo, _tx, record_revision
-from router.store.routing_trees import RoutingTreeRepo
-
-REVISION_SNAPSHOT = "snapshot"
+from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
+from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
 
 
 @dataclass(frozen=True)
@@ -140,37 +140,100 @@ def read_jev_window(conn) -> tuple[int, int]:
     return input_tokens, context_tokens
 
 
-def load_snapshot(conn) -> RoutingSnapshot:
-    active = next((tree for tree in RoutingTreeRepo(conn).list() if tree.enabled), None)
-    periods = [TimePeriod.from_dict(period) for period in TimePeriodRepo(conn).load()]
-    capabilities = {row["id"]: _capability(row) for row in ModelRepo(conn).list()}
+def build_enable_context(conn) -> EnableContext:
+    models = ModelRepo(conn).list()
+    return EnableContext(
+        known_models={row["id"] for row in models},
+        model_reasoning=model_reasoning_from_db(conn),
+        known_periods={row["name"] for row in TimePeriodRepo(conn).load()},
+        jev_available=JevConfigRepo(conn).load() is not None,
+    )
+
+
+def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
+    if tree is not None:
+        try:
+            issues = validate_graph_for_enable(tree, build_enable_context(conn))
+        except RecursionError as exc:
+            raise GraphStorageError("active graph exceeds safe validation depth") from exc
+        if issues:
+            codes = ",".join(sorted({issue.code for issue in issues}))
+            raise GraphStorageError(f"invalid active graph: {codes}")
     input_tokens, context_tokens = read_jev_window(conn)
-    snapshot = build_snapshot(
-        tree=active,
+    return build_snapshot(
+        tree=tree,
         backends=load_backends(conn),
-        time_periods=periods,
+        time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
         jev=JevConfigRepo(conn).load(),
-        capabilities=capabilities,
+        capabilities={row["id"]: _capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
     )
-    with _tx(conn):
-        record_revision(conn, REVISION_SNAPSHOT, snapshot.content)
-    return snapshot
+
+
+def load_snapshot(conn, trees: RoutingTreeRepo) -> RoutingSnapshot:
+    return build_snapshot_for_tree(conn, trees.active())
+
+
+@dataclass(frozen=True)
+class PreparedSnapshot:
+    snapshot: RoutingSnapshot
+    fingerprint: tuple[str | None, str]
 
 
 class SnapshotPublisher:
-    def __init__(self, app):
+    def __init__(self, app, trees: RoutingTreeRepo):
         self.app = app
+        self.trees = trees
         self._lock = threading.RLock()
+        self._fingerprint: tuple[str | None, str] | None = None
+        self._loaded_at = ""
+        self._last_error = ""
 
     @contextmanager
     def locked(self):
         with self._lock:
             yield self
 
+    def prepare(self, conn, tree: RoutingTree | None,
+                fingerprint: tuple[str | None, str]) -> PreparedSnapshot:
+        return PreparedSnapshot(build_snapshot_for_tree(conn, tree), fingerprint)
+
+    def publish(self, prepared: PreparedSnapshot) -> RoutingSnapshot:
+        with self._lock:
+            self.app.state.snapshot = prepared.snapshot
+            self._fingerprint = prepared.fingerprint
+            self._loaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._last_error = ""
+            return prepared.snapshot
+
     def refresh(self, conn) -> RoutingSnapshot:
         with self._lock:
-            snapshot = load_snapshot(conn)
-            self.app.state.snapshot = snapshot
-            return snapshot
+            try:
+                fingerprint = self.trees.fingerprint()
+                prepared = PreparedSnapshot(load_snapshot(conn, self.trees), fingerprint)
+                if self.trees.fingerprint() != fingerprint:
+                    raise GraphChangedDuringLoad("graph changed while building snapshot")
+                return self.publish(prepared)
+            except Exception as exc:
+                self._last_error = str(exc)
+                raise
+
+    def refresh_if_changed(self, conn) -> RoutingSnapshot | None:
+        with self._lock:
+            if self._fingerprint is not None and self.trees.fingerprint() == self._fingerprint:
+                # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
+                self._last_error = ""
+                return self.app.state.snapshot
+            return self.refresh(conn)
+
+    def status(self) -> dict:
+        fingerprint = self._fingerprint or (None, "")
+        return {
+            "ready": self.app.state.snapshot is not None,
+            "stale": bool(self._last_error),
+            "active_id": fingerprint[0],
+            "document_sha256": fingerprint[1],
+            "loaded_at": self._loaded_at,
+            "last_load_error": self._last_error,
+        }
