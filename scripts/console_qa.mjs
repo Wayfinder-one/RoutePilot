@@ -5389,6 +5389,45 @@ test('review-import-envelope-types-preserve-draft', async () => {
   }
 });
 
+test('review-jev-window-save-error-uses-window-message', async () => {
+  const detail = 'window save rejected by QA';
+  await page.route('**/admin/jev/window', async route => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({
+        status: 422,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+  expectHttpStatusError({ url: /\/admin\/jev\/window$/, status: /422/ });
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() =>
+      document.getElementById('winContext').value === '4096' &&
+      document.getElementById('winInput').value === '1024');
+    await page.locator('#saveWindow').click();
+    await page.waitForFunction(expected =>
+      document.getElementById('windowMsg').textContent.includes(expected), detail);
+    assert.equal(await page.locator('#saveMsg').textContent(), '');
+    assert.equal(expectedHttpStatusErrors.length, 0,
+      'the expected window PUT 422 was not observed');
+
+    await page.unroute('**/admin/jev/window');
+    const savedResponse = page.waitForResponse(response =>
+      response.url().endsWith('/admin/jev/window') &&
+      response.request().method() === 'PUT' && response.status() === 200);
+    await page.locator('#saveWindow').click();
+    assert.equal((await savedResponse).status(), 200);
+    await page.waitForFunction(() => document.getElementById('windowMsg').textContent === '');
+  } finally {
+    await page.unroute('**/admin/jev/window');
+    resetExpectedHttpStatusErrors();
+  }
+});
+
 test('review-pointer-cancel-restores-node-without-history', async () => {
   await ensureBaselineTree();
   await openCanvas();

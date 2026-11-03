@@ -119,7 +119,7 @@ $('#saveWindow').addEventListener('click', async () => {
     windowLimits = body;
     renderWindow(body);
     toast(t('models.window.saved'));
-  } catch (error) { $('#saveMsg').textContent = apiErrText(error); }
+  } catch (error) { $('#windowMsg').textContent = apiErrText(error); }
 });
 
 window.onLangChange = () => renderWindow(windowLimits);
