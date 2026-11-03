@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = (
     """
@@ -33,23 +33,6 @@ SCHEMA = (
         start TEXT NOT NULL,
         end TEXT NOT NULL
     )
-    """,
-    """
-    CREATE TABLE routing_trees (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
-        root TEXT NOT NULL,
-        tree_revision TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    )
-    """,
-    """
-    CREATE UNIQUE INDEX idx_routing_trees_single_enabled
-        ON routing_trees(enabled) WHERE enabled = 1
-    """,
-    """
-    CREATE INDEX idx_routing_trees_updated ON routing_trees(updated_at, id)
     """,
     """
     CREATE TABLE jev_config (
@@ -221,7 +204,11 @@ def _create_current_schema(conn: sqlite3.Connection) -> None:
 def _upgrade_v1_to_v2(conn: sqlite3.Connection) -> None:
     if "waves" not in _column_names(conn, "request_logs"):
         conn.execute("ALTER TABLE request_logs ADD COLUMN waves INTEGER")
-    conn.execute("INSERT INTO schema_migrations VALUES (?)", (SCHEMA_VERSION,))
+    conn.execute("INSERT INTO schema_migrations VALUES (?)", (2,))
+
+
+def _upgrade_v2_to_v3(conn: sqlite3.Connection) -> None:
+    conn.execute("INSERT INTO schema_migrations VALUES (?)", (3,))
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -238,13 +225,29 @@ def migrate(conn: sqlite3.Connection) -> None:
             raise RuntimeError("unsupported database contents; use a new database")
         _in_transaction(conn, lambda: _create_current_schema(conn))
         return
-    if applied != 1 or not {"routing_trees", "request_logs"} <= tables:
-        raise RuntimeError("unsupported database contents; use a new database")
-    legacy = legacy_tree_ids(conn)
-    if legacy:
-        raise RuntimeError(
-            "legacy routing trees require explicit reset; back up the database, then "
-            "DELETE FROM routing_trees if these old routing configs are no longer needed: "
-            + ", ".join(legacy)
-        )
-    _in_transaction(conn, lambda: _upgrade_v1_to_v2(conn))
+    if applied == 1:
+        if not {"routing_trees", "request_logs"} <= tables:
+            raise RuntimeError("unsupported database contents; use a new database")
+        legacy = legacy_tree_ids(conn)
+        if legacy:
+            raise RuntimeError(
+                "legacy routing trees require explicit reset; back up the database, then "
+                "DELETE FROM routing_trees if these old routing configs are no longer needed: "
+                + ", ".join(legacy)
+            )
+        _in_transaction(conn, lambda: _upgrade_v1_to_v2(conn))
+        applied = 2
+        tables = _table_names(conn)
+    if applied == 2:
+        if not {"routing_trees", "request_logs"} <= tables:
+            raise RuntimeError("unsupported database contents; use a new database")
+        legacy = legacy_tree_ids(conn)
+        if legacy:
+            raise RuntimeError(
+                "legacy routing trees require explicit reset; back up the database, then "
+                "DELETE FROM routing_trees if these old routing configs are no longer needed: "
+                + ", ".join(legacy)
+            )
+        _in_transaction(conn, lambda: _upgrade_v2_to_v3(conn))
+        return
+    raise RuntimeError("unsupported database contents; use a new database")

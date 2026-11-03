@@ -135,7 +135,7 @@ def row_counts(app) -> dict:
     try:
         return {
             table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("routing_trees", "changes", "config_revisions", "request_logs")
+            for table in ("changes", "config_revisions", "request_logs")
         }
     finally:
         conn.close()

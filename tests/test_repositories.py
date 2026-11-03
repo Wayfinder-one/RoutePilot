@@ -38,7 +38,8 @@ def test_seed_is_idempotent_and_creates_no_routing_tree(conn):
     seed_default(conn)
     assert len(ModelRepo(conn).list()) == 5
     assert len(TimePeriodRepo(conn).load()) == 3
-    assert conn.execute("SELECT COUNT(*) FROM routing_trees").fetchone()[0] == 0
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "routing_trees" not in tables
 
 
 def test_time_periods_validate_and_roundtrip(conn):
