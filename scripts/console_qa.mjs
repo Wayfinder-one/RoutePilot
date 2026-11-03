@@ -830,8 +830,12 @@ async function dragPort(sourceNode, sourcePort, target, options) {
   const opts = options || {};
   await page.mouse.move(from.x, from.y);
   await page.mouse.down();
+  /* 空槽位只在拖线期间显示：目标坐标必须在 mousedown 之后再取。 */
   await page.mouse.move(from.x + 26, from.y + 18, { steps: 4 });
-  await page.mouse.move(target.x, target.y, { steps: 10 });
+  const point = target && typeof target.node === 'string' && typeof target.port === 'string'
+    ? await portPoint(target.node, target.port, 'in')
+    : target;
+  await page.mouse.move(point.x, point.y, { steps: 10 });
   if (opts.beforeUp) await opts.beforeUp();
   await page.mouse.up();
 }
@@ -919,6 +923,7 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
     return {
       id: id ? id.textContent.trim() : '',
       addChips: document.querySelectorAll('#cvNodes .rtc-slot-add').length,
+      display: getComputedStyle(row).display,
       border: getComputedStyle(row).borderTopStyle,
       title: row.getAttribute('title') || ''
     };
@@ -926,6 +931,7 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
   assert.ok(emptySlot, 'empty slot placeholder missing');
   assert.match(emptySlot.id, /^in_\d+$/);
   assert.equal(emptySlot.addChips, 0, 'canvas must not offer slot-add chips (inspector owns adding)');
+  assert.equal(emptySlot.display, 'none', 'empty slots must stay hidden at rest');
   assert.equal(emptySlot.border, 'dashed');
   assert.match(emptySlot.title, /检查器|inspector/);
   const english = await page.evaluate(() => {
@@ -1166,7 +1172,7 @@ test('7.4-05-numeric-default-and-boolean-true', async () => {
   await openCanvas();
   const before = await appSnapshot();
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
-  const target = await portPoint('and-power', 'in_3', 'in');
+  const target = { node: 'and-power', port: 'in_3' };
   await dragPort('capability', 'prob.strong', target, {
     beforeUp: async () => {
       const classes = await page.evaluate(() => ({
@@ -1202,7 +1208,7 @@ test('7.4-05-numeric-default-and-boolean-true', async () => {
 
   /* 布尔线的默认条件：null（= true），且不打开条件浮层。 */
   await openCanvas();
-  await dragPort('start', 'out', await portPoint('capability', 'in_2', 'in'));
+  await dragPort('start', 'out', { node: 'capability', port: 'in_2' });
   const booleanEdge = (await appSnapshot()).edges.find(item =>
     item.source === 'start' && item.target === 'capability' && item.target_port === 'in_2');
   assert.ok(booleanEdge, 'boolean edge was not created');
@@ -1215,7 +1221,7 @@ test('7.4-05-numeric-default-and-boolean-true', async () => {
 test('Task 10 · a boolean edge defaults to condition null and does not open the condition editor', async () => {
   await openCanvas();
   const before = await appSnapshot();
-  await dragPort('start', 'out', await portPoint('and-power', 'in_3', 'in'));
+  await dragPort('start', 'out', { node: 'and-power', port: 'in_3' });
   const after = await appSnapshot();
   assert.equal(after.edges.length, before.edges.length + 1);
   const edge = after.edges.find(item => item.target === 'and-power' && item.target_port === 'in_3');
@@ -1243,7 +1249,7 @@ test('Task 10 · a noul question output connects to an AND gate slot', async () 
   }, idsBefore);
   assert.ok(andId, 'AND gate was not created from the library');
 
-  await dragPort('domain', 'yes', await portPoint(andId, 'in_1', 'in'));
+  await dragPort('domain', 'yes', { node: andId, port: 'in_1' });
   const edge = (await appSnapshot()).edges.find(item =>
     item.source === 'domain' && item.source_port === 'yes' &&
     item.target === andId && item.target_port === 'in_1');
@@ -1298,7 +1304,7 @@ test('7.4-04-port-type-and-reject-reasons', async () => {
   ];
   for (const item of cases) {
     await clearToasts();
-    await dragPort(item.source, item.port, await portPoint(item.node, item.slot, 'in'), {
+    await dragPort(item.source, item.port, { node: item.node, port: item.slot }, {
       beforeUp: async () => {
         const compatible = await page.evaluate(([node, slot]) =>
           document.querySelector(`[data-node-id="${node}"] [data-port-id="${slot}"]`).classList.contains('is-compatible'),
@@ -1395,7 +1401,7 @@ test('7.4-10-delete-confirm-and-slot-reuse', async () => {
   assert.equal(orEdges[0].target_port, 'in_2');
   assert.equal(orEdges[0].source, 'cond-peak');
 
-  await dragPort('cond-peak', 'out', await portPoint('or-ctx', 'in_1', 'in'));
+  await dragPort('cond-peak', 'out', { node: 'or-ctx', port: 'in_1' });
   snapshot = await appSnapshot();
   const reused = snapshot.edges.find(edge => edge.target === 'or-ctx' && edge.target_port === 'in_1');
   assert.ok(reused, 'new edge did not reuse the freed in_1 slot');
@@ -1904,7 +1910,7 @@ test('7.4-08-logic-slot-rows', async () => {
 
 test('7.4-09-question-target-rows', async () => {
   await openCanvas();
-  await dragPort('cond-text', 'out', await portPoint('capability', 'in_2', 'in'));
+  await dragPort('cond-text', 'out', { node: 'capability', port: 'in_2' });
   await page.waitForFunction(() => window.App.graph.edges.some(edge =>
     edge.target === 'capability' && edge.target_port === 'in_2'));
 
@@ -1929,7 +1935,7 @@ test('7.4-09-question-target-rows', async () => {
     return row && row.querySelector('[data-cond-edge]').textContent.trim() === '= false';
   });
 
-  await dragPort('cond-text', 'out', await portPoint('strong-target', 'in_2', 'in'));
+  await dragPort('cond-text', 'out', { node: 'strong-target', port: 'in_2' });
   await page.waitForFunction(() => window.App.graph.edges.some(edge =>
     edge.target === 'strong-target' && edge.target_port === 'in_2'));
   assert.equal(await page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slot').count(), 3);
@@ -5275,7 +5281,7 @@ test('7.4-21-chinese-product-and-actionable-errors', async () => {
   /* 具体可操作：被占用槽位的拒绝点名「空槽位 / 下一个 in_N」，且不落边。 */
   await clearToasts();
   const before = (await appSnapshot()).edges.length;
-  await dragPort('capability', 'prob.easy', await portPoint('and-power', 'in_1', 'in'));
+  await dragPort('capability', 'prob.easy', { node: 'and-power', port: 'in_1' });
   await waitToastIncludes('空槽位');
   const occupied = await toastText();
   assert.match(occupied, /占用|已连接/);
@@ -5312,6 +5318,41 @@ test('7.4-21-chinese-product-and-actionable-errors', async () => {
   assert.equal(issue.edge, 'e-clarify-deep');
   assert.equal(issue.node, 'deep-target');
   assert.equal(issue.port, 'in_1');
+});
+
+test('review-empty-slots-hidden-until-drag', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const hidden = await page.evaluate(() => {
+    const ghosts = Array.from(document.querySelectorAll('#cvNodes .rtc-slot--ghost'));
+    return {
+      count: ghosts.length,
+      visible: ghosts.filter(row => getComputedStyle(row).display !== 'none').length
+    };
+  });
+  assert.ok(hidden.count > 0, 'test precondition: expected at least one empty slot in the graph');
+  assert.equal(hidden.visible, 0, 'empty slots must be hidden at rest');
+  const from = await portPoint('capability', 'prob.easy', 'out');
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  await page.mouse.move(from.x + 24, from.y + 12, { steps: 4 });
+  const during = await page.evaluate(() => {
+    const ghosts = Array.from(document.querySelectorAll('#cvNodes .rtc-slot--ghost'));
+    return {
+      visible: ghosts.filter(row => getComputedStyle(row).display !== 'none').length,
+      stage: document.getElementById('cvStage').classList.contains('is-edge-drag')
+    };
+  });
+  assert.ok(during.stage, 'edge drag state was not set');
+  assert.ok(during.visible > 0, 'empty slots were not revealed while dragging an edge');
+  await page.mouse.up();
+  const after = await page.evaluate(() => ({
+    visible: Array.from(document.querySelectorAll('#cvNodes .rtc-slot--ghost'))
+      .filter(row => getComputedStyle(row).display !== 'none').length,
+    stage: document.getElementById('cvStage').classList.contains('is-edge-drag')
+  }));
+  assert.equal(after.visible, 0, 'empty slots stayed visible after the drag ended');
+  assert.equal(after.stage, false, 'edge drag state was not cleared');
 });
 
 test('review-inspector-adds-input-connection', async () => {

@@ -386,6 +386,11 @@
         renderEdges();
       }
 
+      /* 空槽位只在连线拖拽期间作为放置目标出现（静止时不展示，见 cards.js）。 */
+      function setEdgeDragVisual(active) {
+        stage.classList.toggle('is-edge-drag', !!active);
+      }
+
       function setLocked(value) {
         locked = !!value;
         stage.classList.toggle('is-locked', locked);
@@ -395,6 +400,7 @@
             tempPath = null;
             clearCompatible();
           }
+          setEdgeDragVisual(false);
           rollbackNodeDrag(drag);
           drag = null;
         }
@@ -543,6 +549,7 @@
         tempPath = document.createElementNS(SVG_NS, 'path');
         tempPath.setAttribute('class', 'rtc-edge-temp');
         svg.appendChild(tempPath);
+        setEdgeDragVisual(true);
         highlightCompatible(draft);
         stage.setPointerCapture(event.pointerId);
       }
@@ -686,6 +693,7 @@
           if (tempPath && tempPath.parentNode) tempPath.parentNode.removeChild(tempPath);
           tempPath = null;
           clearCompatible();
+          setEdgeDragVisual(false);
         }
       }
 
@@ -695,6 +703,7 @@
           if (tempPath && tempPath.parentNode) tempPath.parentNode.removeChild(tempPath);
           tempPath = null;
           clearCompatible();
+          setEdgeDragVisual(false);
         }
         rollbackNodeDrag(drag);
         drag = null;

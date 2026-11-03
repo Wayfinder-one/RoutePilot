@@ -76,7 +76,7 @@
     function slotRow(graph, node, port) {
       const edge = incomingEdge(graph, node.id, port.id);
       if (!edge) {
-        return '<div class="rtc-slot is-empty" data-slot="' + esc(port.id) + '"' +
+        return '<div class="rtc-slot is-empty rtc-slot--ghost" data-slot="' + esc(port.id) + '"' +
           ' title="' + esc(tf('cv.slot.addTitle', { slot: port.id })) + '">' +
           portHTML(node, port, { side: 'left' }) +
           '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +

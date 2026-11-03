@@ -354,6 +354,10 @@ body.is-try-running .rtc-stage.is-locked::after {
   color: var(--text-3);
 }
 .rtc-slot.is-empty .rtc-slot-id { color: var(--text-3); letter-spacing: .03em; }
+/* 空槽位不是「已存在」的连接：静止时不展示，只有从输出端口拖线时才作为放置目标出现。 */
+.rtc-slot--ghost { display: none; }
+.rtc-stage.is-edge-drag .rtc-slot--ghost { display: flex; }
+
 .rtc-slot.is-empty .rtc-port { opacity: .5; background: var(--panel); border: 1px solid var(--line-2); box-shadow: none; }
 .rtc-cond {
   flex: none; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
