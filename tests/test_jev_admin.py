@@ -1,3 +1,4 @@
+import asyncio
 import json
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -101,3 +102,27 @@ def test_test_endpoint_calls_real_configured_http_service(tmp_path):
 def test_test_endpoint_requires_configuration(tmp_path):
     client, _ = make_client(tmp_path)
     assert client.post("/admin/jev/test", json={}).status_code == 422
+
+
+def test_test_endpoint_huge_probability_returns_502_not_500(tmp_path):
+    body = {
+        "answers": {
+            "route": {
+                "type": "choice",
+                "probabilities": {"候选 A": 10 ** 1000, "候选 B": 1.0},
+            }
+        }
+    }
+
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    client, app = make_client(tmp_path, handler=handler)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        assert client.put("/admin/jev", json=payload()).status_code == 200
+        response = client.post("/admin/jev/test", json={"text": "测试连接"})
+        assert response.status_code == 502, response.text
+        assert "route" in response.json()["detail"]
+    finally:
+        asyncio.run(app.state.http.aclose())

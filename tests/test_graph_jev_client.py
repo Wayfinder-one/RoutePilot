@@ -219,6 +219,18 @@ FAILURE_CASES = [
     ("score-legend-value-bool", lambda b: b["answers"]["complexity"]["legend"].update({"2": True}), "complexity"),
     ("score-legend-value-nan", lambda b: b["answers"]["complexity"]["legend"].update({"2": float("nan")}), "complexity"),
     ("answers-not-an-object", lambda b: b.update(answers=[]), "capability"),
+    (
+        "huge-probability",
+        lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": 10 ** 1000, "增强": 1.0}),
+        "capability",
+    ),
+    ("huge-noul", lambda b: b["answers"]["domain"].update(noul=10 ** 1000), "domain"),
+    ("huge-score-index", lambda b: b["answers"]["complexity"].update(score=10 ** 1000), "complexity"),
+    (
+        "huge-score-legend-value",
+        lambda b: b["answers"]["complexity"]["legend"].update({"2": 10 ** 1000}),
+        "complexity",
+    ),
 ]
 
 

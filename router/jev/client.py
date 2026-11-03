@@ -28,7 +28,10 @@ def _finite_number(value, what: str) -> float:
     """拒绝 bool 与非有限数值，返回 float（用于 DecisionQuestion 构造期校验）。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{what} must be a finite number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise ValueError(f"{what} must be a finite number") from exc
     if not math.isfinite(number):
         raise ValueError(f"{what} must be a finite number")
     return number
@@ -138,7 +141,10 @@ def _wire_number(value, what: str) -> float:
     """wire 数值：拒绝 bool，要求 int/float 且有限。"""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise JevError(f"{what} must be a finite number, got {type(value).__name__}")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError as exc:
+        raise JevError(f"{what} must be a finite number") from exc
     if not math.isfinite(number):
         raise JevError(f"{what} must be a finite number")
     return number
@@ -156,7 +162,10 @@ def _probabilities(raw, options: tuple[JevCandidate, ...]) -> dict[str, float]:
         value = raw[label]
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise JevError("JEV probabilities must be numbers")
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise JevError("JEV probabilities must be finite and nonnegative") from exc
         if not math.isfinite(number) or number < 0:
             raise JevError("JEV probabilities must be finite and nonnegative")
         values.append(number)
