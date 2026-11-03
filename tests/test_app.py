@@ -1,21 +1,20 @@
+import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
 
 import httpx
-import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.api.routes_trees import build_enable_context
-from router.config import Settings
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
 from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, tree_dict
+from tests.routing_fixtures import graph_dict, test_settings, tree_dict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JEV_ENV = {"jev_url": "http://jev.test", "jev_model": "NeoHorse-Jev-4B"}
@@ -40,7 +39,7 @@ def direct_graph(models=("qwen3-8b",)):
 
 
 def test_health_console_and_empty_tree_boot(tmp_path):
-    app = create_app(Settings(db_path=str(tmp_path / "v3.db")))
+    app = create_app(test_settings(tmp_path))
     client = TestClient(app)
     assert client.get("/healthz").json() == {"ok": True}
     assert client.get("/console/index.html").status_code == 200
@@ -53,20 +52,37 @@ def test_health_console_and_empty_tree_boot(tmp_path):
 
 
 def prepare_active_tree(tmp_path, raw):
-    path = str(tmp_path / "v3.db")
-    conn = connect(path)
+    settings = test_settings(tmp_path)
+    conn = connect(settings.db_path)
     migrate(conn)
     seed_default(conn)
-    repo = RoutingTreeRepo(conn)
+    conn.close()
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
     repo.create(tree_from_dict(raw))
     repo.enable("main")
-    conn.close()
-    return path
+    return settings
+
+
+def test_missing_snapshot_is_not_ready_and_disabled_snapshot_is_ready(tmp_path):
+    settings = test_settings(tmp_path)
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    (repo.root / "current").write_text("missing\n", encoding="utf-8")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/readyz").status_code == 503
+        assert client.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hello"}],
+        }).status_code == 503
+        (repo.root / "current").write_bytes(b"")
+        asyncio.run(app.state.graph_reloader.poll_once())
+        assert client.get("/readyz").status_code == 200
 
 
 def test_startup_accepts_valid_direct_target(tmp_path):
-    path = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
-    app = create_app(Settings(db_path=path))
+    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    app = create_app(settings)
     assert app.state.snapshot.tree_id == "main"
     targets = [node for node in app.state.snapshot.tree.root.nodes if isinstance(node, TargetNode)]
     assert [(node.id, [item.model for item in node.models]) for node in targets] == [
@@ -74,25 +90,31 @@ def test_startup_accepts_valid_direct_target(tmp_path):
     ]
 
 
-def test_startup_refuses_invalid_active_tree(tmp_path):
+def test_startup_with_invalid_active_tree_is_not_ready(tmp_path):
     raw = tree_dict(root=direct_graph())
     del raw["root"]["error_fallback"]
-    path = prepare_active_tree(tmp_path, raw)
-    with pytest.raises(RuntimeError, match="fallback_missing"):
-        create_app(Settings(db_path=path))
+    settings = prepare_active_tree(tmp_path, raw)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.get("/readyz").status_code == 503
+        response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "no_valid_snapshot"
 
 
-def test_graph_tree_with_questions_without_service_config_is_not_enabled(tmp_path):
+def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path):
     raw = tree_dict(root=graph_dict())
     raw["root"]["nodes"][2]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
-    path = prepare_active_tree(tmp_path, raw)
-    with pytest.raises(RuntimeError, match="decision_service_unavailable"):
-        create_app(Settings(db_path=path))
+    settings = prepare_active_tree(tmp_path, raw)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        ready = client.get("/readyz")
+        assert ready.status_code == 503
+        assert "decision_service_unavailable" in ready.json()["last_load_error"]
 
 
 def test_environment_jev_config_is_seeded_once(tmp_path):
-    path = str(tmp_path / "v3.db")
-    settings = Settings(db_path=path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
+    settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
     app = create_app(settings)
     assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
     assert app.state.snapshot.jev.api_key == "secret"
@@ -145,8 +167,8 @@ def question_graph(model="qwen3-8b"):
 
 def composed_try_app(tmp_path, handler):
     """真实组合根：engine/jev_client/breaker 全部由 create_app 构造，测试不注入 engine。"""
-    path = prepare_active_tree(tmp_path, tree_dict(root=question_graph()))
-    return create_app(Settings(db_path=path, **JEV_ENV), transport=httpx.MockTransport(handler))
+    settings = prepare_active_tree(tmp_path, tree_dict(root=question_graph()))
+    return create_app(replace(settings, **JEV_ENV), transport=httpx.MockTransport(handler))
 
 
 def test_try_through_app_composition_routes_graph(tmp_path):

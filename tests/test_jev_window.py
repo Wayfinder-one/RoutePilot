@@ -24,6 +24,7 @@ from router.routing.snapshot import build_snapshot, read_jev_window
 from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
 from router.store.repositories import SettingsRepo
+from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import tree_dict
 
 
@@ -133,6 +134,8 @@ def make_client(tmp_path):
     conn.close()
     app = FastAPI()
     app.state.settings = SimpleNamespace(db_path=path)
+    app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
+    app.state.graph_repo.initialize()
     app.state.publisher = Publisher()
     app.include_router(jev_router, prefix="/admin")
     return TestClient(app), app, path

@@ -2,12 +2,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.config import Settings
+from tests.routing_fixtures import test_settings
 
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(create_app(Settings(db_path=str(tmp_path / "v3.db"))))
+    return TestClient(create_app(test_settings(tmp_path)))
 
 
 def test_overview_and_request_stats_use_current_log_contract(client):

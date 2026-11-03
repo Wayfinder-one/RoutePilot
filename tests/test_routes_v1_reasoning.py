@@ -6,9 +6,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.config import Settings
+from router.api.upstream import load_backends
+from router.jev.config import JevConfigRepo
+from router.routing.conditions import TimePeriod
+from router.routing.snapshot import _capability, build_snapshot, read_jev_window
 from router.store.db import connect
-from tests.routing_fixtures import tree_dict
+from router.store.repositories import ModelRepo, TimePeriodRepo
+from router.store.routing_trees import GraphStorageError
+from tests.routing_fixtures import test_settings, tree_dict
 
 TEXT = "今天天气怎么样"
 
@@ -35,7 +40,7 @@ def harness(tmp_path, *, streaming=False):
         return httpx.Response(200, json={"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
 
     transport = StreamingTransport() if streaming else httpx.MockTransport(handler)
-    app = create_app(Settings(db_path=str(tmp_path / "v3.db")), transport=transport)
+    app = create_app(test_settings(tmp_path), transport=transport)
     return SimpleNamespace(app=app, client=TestClient(app), requests=transport.requests if streaming else requests)
 
 
@@ -62,6 +67,7 @@ def activate(client, level=None):
     body = {"id": raw["id"], "name": raw["name"], "root": raw["root"], "sticky": raw["sticky"], "timezone": raw["timezone"]}
     existing = client.get("/admin/trees/default-tree")
     if existing.status_code == 200:
+        body["base_document_sha256"] = existing.json()["tree"]["document_sha256"]
         response = client.put("/admin/trees/default-tree", json=body)
     else:
         response = client.post("/admin/trees", json=body)
@@ -141,7 +147,20 @@ def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
     conn = connect(h.app.state.settings.db_path)
     with conn:
         conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'", (json.dumps({"reasoning": {"efforts": {"off": None, "low": "low"}}}),))
-    h.app.state.publisher.refresh(conn)
+    stale_tree = h.app.state.snapshot.tree
+    with pytest.raises(GraphStorageError):
+        h.app.state.publisher.refresh(conn)
+    assert h.app.state.snapshot.tree is stale_tree
+    input_tokens, context_tokens = read_jev_window(conn)
+    h.app.state.snapshot = build_snapshot(
+        tree=stale_tree,
+        backends=load_backends(conn),
+        time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
+        jev=JevConfigRepo(conn).load(),
+        capabilities={row["id"]: _capability(row) for row in ModelRepo(conn).list()},
+        jev_input_tokens=input_tokens,
+        jev_context_tokens=context_tokens,
+    )
     conn.close()
     response = chat(h.client, reasoning_effort="client")
     assert response.status_code == 200

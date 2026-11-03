@@ -50,8 +50,9 @@ def test_time_periods_validate_and_roundtrip(conn):
         repo.save([{"name": "坏", "days": [7], "start": "25:00", "end": "09:00"}])
 
 
-def test_model_references_finds_every_target_in_saved_trees(conn):
-    repo = RoutingTreeRepo(conn)
+def test_model_references_finds_every_target_in_saved_trees(conn, tmp_path):
+    repo = RoutingTreeRepo(tmp_path / "routing-graph")
+    repo.initialize()
     raw = tree_dict(root=pool_graph(("fast", "strong-a")))
     saved = repo.create(tree_from_dict(raw))
     refs = model_references(repo.list(), "strong-a")

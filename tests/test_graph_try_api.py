@@ -14,14 +14,13 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.config import Settings
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.window import MIN_INPUT_TOKENS, estimate_tokens
 from router.routing.graph.engine import GraphExecutionEngine
 from router.store.db import connect
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, huge_chain_graph
+from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings
 from tests.test_graph_engine import (
     POWER_GRAPH,
     SCENARIO_BY_ID,
@@ -43,7 +42,7 @@ def handler(request: httpx.Request) -> httpx.Response:
 def app(tmp_path):
     return create_app(
         # 预置决策服务配置：graph 引擎要求 snapshot.jev 存在（网络调用由 FakeJev 接管）。
-        Settings(db_path=str(tmp_path / "try.db"), jev_url="http://jev.test", jev_model="d1-2B"),
+        test_settings(tmp_path, jev_url="http://jev.test", jev_model="d1-2B"),
         transport=httpx.MockTransport(handler),
     )
 

@@ -8,15 +8,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.config import Settings
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
-from tests.routing_fixtures import graph_dict, huge_chain_graph, tree_dict
+from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings, tree_dict
 
 
 @pytest.fixture
 def app(tmp_path):
     return create_app(
-        Settings(db_path=str(tmp_path / "v3.db")),
+        test_settings(tmp_path),
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"answers": {}})),
     )
 
@@ -29,6 +28,13 @@ def client(app):
 def create_tree(client, raw):
     payload = {key: value for key, value in raw.items() if key != "enabled"}
     return client.post("/admin/trees", json=payload)
+
+
+def save_tree(client, payload, tree_id="main"):
+    current = client.get(f"/admin/trees/{tree_id}").json()["tree"]
+    body = dict(payload)
+    body["base_document_sha256"] = current["document_sha256"]
+    return client.put(f"/admin/trees/{tree_id}", json=body)
 
 
 def graph_with_model(model="qwen3-8b"):
@@ -49,6 +55,23 @@ def configure_jev(client):
         "state_template": DEFAULT_STATE_TEMPLATE,
     })
     assert response.status_code == 200, response.text
+
+
+def test_stale_browser_save_returns_409_and_keeps_file(client):
+    create_payload = tree_dict()
+    create_payload.pop("enabled")
+    created = client.post("/admin/trees", json=create_payload).json()["tree"]
+    payload = tree_dict()
+    payload.pop("enabled")
+    payload["base_document_sha256"] = created["document_sha256"]
+    payload["name"] = "第一次修改"
+    assert client.put("/admin/trees/main", json=payload).status_code == 200
+
+    payload["name"] = "过期修改"
+    conflict = client.put("/admin/trees/main", json=payload)
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "graph_conflict"
+    assert client.get("/admin/trees/main").json()["tree"]["name"] == "第一次修改"
 
 
 def test_graph_crud_roundtrip_copy_enable_disable(client, app):
@@ -76,7 +99,7 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     updated_root = copy.deepcopy(saved["root"])
     updated_root["nodes"][1]["instructions"] = "重新选择能力"
     updated_root["nodes"][-1]["position"] = {"x": 400, "y": 200}
-    response = client.put("/admin/trees/main", json={"name": "改名", "root": updated_root})
+    response = save_tree(client, {"name": "改名", "root": updated_root})
     assert response.status_code == 200, response.text
     saved = client.get("/admin/trees/main").json()["tree"]
     assert saved["name"] == "改名"
@@ -110,7 +133,7 @@ def test_closed_save_skips_enable_validation_but_enabled_save_uses_it(client, ap
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
 
     # 关闭状态：只做结构校验，未知模型可保存
-    response = client.put("/admin/trees/main", json={"root": graph_with_model("ghost")})
+    response = save_tree(client, {"root": graph_with_model("ghost")})
     assert response.status_code == 200, response.text
     response = client.post("/admin/trees/main/enable")
     assert response.status_code == 422
@@ -121,18 +144,18 @@ def test_closed_save_skips_enable_validation_but_enabled_save_uses_it(client, ap
     for node in root["nodes"]:
         if node["type"] == "target":
             node["models"] = []
-    assert client.put("/admin/trees/main", json={"root": root}).status_code == 200
+    assert save_tree(client, {"root": root}).status_code == 200
     response = client.post("/admin/trees/main/enable")
     assert response.status_code == 422
     codes = {issue["code"] for issue in response.json()["detail"]}
     assert "target_models_required" in codes
 
-    assert client.put("/admin/trees/main", json={"root": graph_with_model()}).status_code == 200
+    assert save_tree(client, {"root": graph_with_model()}).status_code == 200
     assert client.post("/admin/trees/main/enable").status_code == 200
     published = app.state.snapshot.snapshot_revision
 
     # 已启用组保存：按启用校验（未知模型 / 空模型 / 结构错误均 422）
-    response = client.put("/admin/trees/main", json={"root": graph_with_model("ghost")})
+    response = save_tree(client, {"root": graph_with_model("ghost")})
     assert response.status_code == 422
     assert any(issue["code"] == "unknown_model" for issue in response.json()["detail"])
     assert app.state.snapshot.snapshot_revision == published
@@ -141,13 +164,13 @@ def test_closed_save_skips_enable_validation_but_enabled_save_uses_it(client, ap
     for node in root["nodes"]:
         if node["type"] == "target":
             node["models"] = []
-    response = client.put("/admin/trees/main", json={"root": root})
+    response = save_tree(client, {"root": root})
     assert response.status_code == 422
     assert any(issue["code"] == "target_models_required" for issue in response.json()["detail"])
 
     root = graph_with_model()
     root["nodes"] = [node for node in root["nodes"] if node["type"] != "start"]
-    response = client.put("/admin/trees/main", json={"root": root})
+    response = save_tree(client, {"root": root})
     assert response.status_code == 422
     assert any(issue["code"] == "start_count" for issue in response.json()["detail"])
     assert app.state.snapshot.snapshot_revision == published
@@ -216,7 +239,7 @@ def test_huge_chain_payload_is_422_on_create_and_update(client):
     assert client.get("/admin/trees").json()["trees"] == []
 
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
-    response = client.put("/admin/trees/main", json={"root": huge_chain_graph()})
+    response = save_tree(client, {"root": huge_chain_graph()})
     assert response.status_code == 422, response.text
     assert any(issue["code"] == "limit_exceeded" for issue in response.json()["detail"])
     assert client.get("/admin/trees/main").json()["tree"]["root"]["nodes"][0]["id"] == "start"
@@ -232,7 +255,7 @@ def test_invalid_timezone_rejected_on_create_and_update(client):
     assert client.get("/admin/trees").json()["trees"] == []
 
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
-    response = client.put("/admin/trees/main", json={"timezone": "Mars/Olympus"})
+    response = save_tree(client, {"timezone": "Mars/Olympus"})
     assert response.status_code == 422
     assert any(issue["code"] == "invalid_timezone" for issue in response.json()["detail"])
     assert client.get("/admin/trees/main").json()["tree"]["timezone"] == "Asia/Shanghai"

@@ -7,28 +7,42 @@ snapshot、不写粘性、不计 inflight。
 """
 from __future__ import annotations
 
+import hashlib
+import logging
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from router.api.deps import get_conn
-from router.api.upstream import load_backends, model_reasoning_from_db
+from router.api.deps import get_conn, get_tree_repo
+from router.api.upstream import load_backends
 from router.jev.client import ChoiceAnswer, NoulAnswer, ScoreAnswer
 from router.jev.config import JevConfigRepo
 from router.routing.conditions import TimePeriod
+from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import (
-    EnableContext,
     Issue,
     validate_graph_for_enable,
     validate_graph_structure,
 )
 from router.routing.model import RoutingTree, Sticky, graph_to_dict, tree_from_dict, tree_to_dict
-from router.routing.snapshot import _capability, build_snapshot, read_jev_window
+from router.routing.snapshot import (
+    _capability,
+    build_enable_context,
+    build_snapshot,
+    read_jev_window,
+)
 from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
-from router.store.repositories import ChangeRepo, ModelRepo, TimePeriodRepo, _now_iso, _uid, write_transaction
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.repositories import ChangeRepo, ModelRepo, TimePeriodRepo, _now_iso, _uid
+from router.store.routing_trees import (
+    GraphAlreadyExistsError,
+    GraphConflictError,
+    RoutingTreeRepo,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -84,48 +98,53 @@ def _parse_tree(raw: dict) -> RoutingTree:
         _raise_issues([_parse_issue(exc)])
 
 
-def _tree_or_404(conn: sqlite3.Connection, tree_id: str) -> RoutingTree:
-    tree = RoutingTreeRepo(conn).get(tree_id)
+def _tree_or_404(trees: RoutingTreeRepo, tree_id: str) -> RoutingTree:
+    tree = trees.get(tree_id)
     if tree is None:
         raise HTTPException(404, detail=f"unknown tree {tree_id}")
     return tree
 
 
-def active_tree(conn: sqlite3.Connection) -> RoutingTree | None:
-    return next((tree for tree in RoutingTreeRepo(conn).list() if tree.enabled), None)
+def active_tree(trees: RoutingTreeRepo) -> RoutingTree | None:
+    return trees.active()
 
 
-def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
-    """启用校验上下文：模型目录、推理档位、时段定义与决策服务配置存在性。"""
-    models = ModelRepo(conn).list()
-    return EnableContext(
-        known_models={row["id"] for row in models},
-        model_reasoning=model_reasoning_from_db(conn),
-        known_periods={period["name"] for period in TimePeriodRepo(conn).load()},
-        jev_available=JevConfigRepo(conn).load() is not None,
-    )
-
-
-def active_tree_issues(conn: sqlite3.Connection):
-    tree = active_tree(conn)
+def active_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo):
+    tree = active_tree(trees)
     return [] if tree is None else _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
+
+
+def _record_graph_change(conn: sqlite3.Connection, action: str, detail: dict) -> None:
+    try:
+        with conn:
+            ChangeRepo(conn).record(_now_iso(), "tree", {"action": action, **detail})
+    except sqlite3.Error:
+        logger.exception("graph change committed but audit write failed: %s", action)
 
 
 def _published_revision(request: Request) -> str:
     return getattr(request.app.state.snapshot, "snapshot_revision", "")
 
 
-def _trees_payload(conn: sqlite3.Connection, request: Request) -> dict:
-    return {"trees": [tree_to_dict(tree) for tree in RoutingTreeRepo(conn).list()], "snapshot_revision": _published_revision(request)}
+def _trees_payload(request: Request, trees: RoutingTreeRepo) -> dict:
+    return {
+        "trees": [tree_to_dict(tree) for tree in trees.list()],
+        "snapshot_revision": _published_revision(request),
+        "graph_status": request.app.state.publisher.status(),
+    }
 
 
 @router.get("/trees")
-def get_trees(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    return _trees_payload(conn, request)
+def get_trees(request: Request, trees: RoutingTreeRepo = Depends(get_tree_repo)):
+    return _trees_payload(request, trees)
 
 
 @router.post("/trees", status_code=201)
-def create_tree(body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def create_tree(
+    body: dict, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     if "enabled" in body:
         raise HTTPException(422, detail="use enable/disable operations")
     tree = _parse_tree({
@@ -138,31 +157,34 @@ def create_tree(body: dict, request: Request, conn: sqlite3.Connection = Depends
     if issues:
         _raise_issues(issues)
     publisher = request.app.state.publisher
-    try:
-        with publisher.locked():
-            with write_transaction(conn):
-                created = RoutingTreeRepo(conn).create(tree)
-                ChangeRepo(conn).record(_now_iso(), "tree", {"action": "create", "id": tree.id})
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, detail=f"tree {tree.id} already exists") from None
+    with publisher.locked():
+        try:
+            created = trees.create(tree)
+        except GraphAlreadyExistsError:
+            raise HTTPException(409, detail=f"tree {tree.id} already exists") from None
+        _record_graph_change(conn, "create", {"id": tree.id})
     return {"tree": tree_to_dict(created), "snapshot_revision": _published_revision(request)}
 
 
 @router.get("/trees/{tree_id}")
-def get_tree(tree_id: str, conn: sqlite3.Connection = Depends(get_conn)):
-    return {"tree": tree_to_dict(_tree_or_404(conn, tree_id))}
+def get_tree(tree_id: str, trees: RoutingTreeRepo = Depends(get_tree_repo)):
+    return {"tree": tree_to_dict(_tree_or_404(trees, tree_id))}
 
 
 @router.put("/trees/{tree_id}")
-def update_tree(tree_id: str, body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def update_tree(
+    tree_id: str, body: dict, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     if "enabled" in body:
         raise HTTPException(422, detail="use enable/disable operations")
     if "id" in body and body["id"] != tree_id:
         raise HTTPException(422, detail="tree id mismatch")
     publisher = request.app.state.publisher
     with publisher.locked():
-        current = _tree_or_404(conn, tree_id)
-        # 行上的 enabled 是唯一权威：持久化文档必须与行一致（enable 只能走专用端点）。
+        current = _tree_or_404(trees, tree_id)
+        # enabled 是外部状态：持久化文档必须与 current 一致（enable 只能走专用端点）。
         tree = _parse_tree({
             "id": tree_id,
             "name": _clean_name(body.get("name", current.name)),
@@ -171,64 +193,102 @@ def update_tree(tree_id: str, body: dict, request: Request, conn: sqlite3.Connec
             "sticky": body.get("sticky", {"enabled": current.sticky.enabled, "ttl_seconds": current.sticky.ttl_seconds}),
             "timezone": body.get("timezone", current.timezone),
         })
+        base_document_sha256 = body.get("base_document_sha256")
+        if not isinstance(base_document_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", base_document_sha256):
+            raise HTTPException(409, detail={
+                "code": "graph_conflict",
+                "actual_document_sha256": current.document_sha256,
+            })
         if current.enabled:
             issues = _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
         else:
             issues = _safe_validate(validate_graph_structure, tree)
         if issues:
             _raise_issues(issues)
-        with write_transaction(conn):
-            updated = RoutingTreeRepo(conn).update(tree)
-            ChangeRepo(conn).record(_now_iso(), "tree", {"action": "update", "id": tree_id, "tree_revision": updated.tree_revision})
+
+        candidate = None
         if current.enabled:
-            publisher.refresh(conn)
-        return {"tree": tree_to_dict(updated), "snapshot_revision": _published_revision(request), "warnings": []}
+            fingerprint = (tree.id, hashlib.sha256(graph_document_bytes(tree)).hexdigest())
+            candidate = publisher.prepare(conn, tree, fingerprint)
+        try:
+            updated = trees.update(tree, base_document_sha256=base_document_sha256)
+        except GraphConflictError as exc:
+            raise HTTPException(409, detail={
+                "code": "graph_conflict",
+                "actual_document_sha256": exc.actual_document_sha256,
+            }) from None
+        if candidate is not None:
+            publisher.publish(candidate)
+        _record_graph_change(conn, "update", {"id": tree_id, "tree_revision": updated.tree_revision})
+        return {
+            "tree": tree_to_dict(updated),
+            "snapshot_revision": _published_revision(request),
+            "graph_status": publisher.status(),
+            "warnings": [],
+        }
 
 
 @router.post("/trees/{tree_id}/copy", status_code=201)
-def copy_tree(tree_id: str, body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def copy_tree(
+    tree_id: str, body: dict, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     new_id = _clean_id(body.get("id"))
     new_name = _clean_name(body.get("name"))
     publisher = request.app.state.publisher
-    try:
-        with publisher.locked():
-            _tree_or_404(conn, tree_id)
-            with write_transaction(conn):
-                # 仓储按完整文档复制（position/title/capability 一并保留），并强制关闭。
-                copied = RoutingTreeRepo(conn).copy(tree_id, new_id, new_name)
-                ChangeRepo(conn).record(_now_iso(), "tree", {"action": "copy", "source": tree_id, "id": new_id})
-    except KeyError:
-        raise HTTPException(404, detail=f"unknown tree {tree_id}") from None
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, detail=f"tree {new_id} already exists") from None
+    with publisher.locked():
+        _tree_or_404(trees, tree_id)
+        try:
+            copied = trees.copy(tree_id, new_id, new_name)
+        except KeyError:
+            raise HTTPException(404, detail=f"unknown tree {tree_id}") from None
+        except GraphAlreadyExistsError:
+            raise HTTPException(409, detail=f"tree {new_id} already exists") from None
+        _record_graph_change(conn, "copy", {"source": tree_id, "id": new_id})
     return {"tree": tree_to_dict(copied), "snapshot_revision": _published_revision(request)}
 
 
 @router.post("/trees/{tree_id}/enable")
-def enable_tree(tree_id: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def enable_tree(
+    tree_id: str, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     publisher = request.app.state.publisher
     with publisher.locked():
-        tree = _tree_or_404(conn, tree_id)
+        tree = _tree_or_404(trees, tree_id)
         issues = _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
         if issues:
             _raise_issues(issues)
-        with write_transaction(conn):
-            RoutingTreeRepo(conn).enable(tree_id)
-            ChangeRepo(conn).record(_now_iso(), "tree", {"action": "enable", "id": tree_id})
-        publisher.refresh(conn)
-        return _trees_payload(conn, request)
+        enabled_tree = replace(tree, enabled=True)
+        fingerprint = (tree.id, tree.document_sha256)
+        candidate = publisher.prepare(conn, enabled_tree, fingerprint)
+        try:
+            trees.enable(tree_id)
+        except KeyError:
+            raise HTTPException(404, detail=f"unknown tree {tree_id}") from None
+        publisher.publish(candidate)
+        _record_graph_change(conn, "enable", {"id": tree_id})
+        return _trees_payload(request, trees)
 
 
 @router.post("/trees/{tree_id}/disable")
-def disable_tree(tree_id: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def disable_tree(
+    tree_id: str, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     publisher = request.app.state.publisher
     with publisher.locked():
-        _tree_or_404(conn, tree_id)
-        with write_transaction(conn):
-            RoutingTreeRepo(conn).disable(tree_id)
-            ChangeRepo(conn).record(_now_iso(), "tree", {"action": "disable", "id": tree_id})
-        publisher.refresh(conn)
-        return _trees_payload(conn, request)
+        _tree_or_404(trees, tree_id)
+        candidate = publisher.prepare(conn, None, (None, "")) if trees.active_id() == tree_id else None
+        if not trees.disable(tree_id):
+            raise HTTPException(404, detail=f"unknown tree {tree_id}")
+        if candidate is not None:
+            publisher.publish(candidate)
+        _record_graph_change(conn, "disable", {"id": tree_id})
+        return _trees_payload(request, trees)
 
 
 def draft_tree(body: dict, stored: RoutingTree | None) -> RoutingTree:
@@ -315,13 +375,17 @@ def _wave_payload(wave) -> dict:
 
 
 @router.post("/try")
-async def try_tree(body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+async def try_tree(
+    body: dict, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     tree_id = body.get("tree_id")
     stored = None
     if tree_id is not None:
         if not isinstance(tree_id, str) or not tree_id:
             raise HTTPException(422, detail="try tree_id must be a nonempty string")
-        stored = _tree_or_404(conn, tree_id)
+        stored = _tree_or_404(trees, tree_id)
     tree = draft_tree(body, stored)
     text = body.get("text")
     if not isinstance(text, str):

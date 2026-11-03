@@ -11,6 +11,7 @@ from router.api.routes_jev import router
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo
 from router.store.db import connect, migrate
+from router.store.routing_trees import RoutingTreeRepo
 
 
 class Publisher:
@@ -42,6 +43,8 @@ def make_client(tmp_path, handler=None, requests=None):
     transport = httpx.MockTransport(handler or default_handler)
     app = FastAPI()
     app.state.settings = SimpleNamespace(db_path=path)
+    app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
+    app.state.graph_repo.initialize()
     app.state.http = httpx.AsyncClient(transport=transport)
     app.state.jev_client = JevClient(app.state.http)
     app.state.publisher = Publisher()

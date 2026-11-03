@@ -223,6 +223,8 @@ async def chat_completions(request: Request):
         return _error("invalid_session_id", 400)
 
     snapshot = request.app.state.snapshot
+    if snapshot is None:
+        return _error("no_valid_snapshot", 503)
     routing_started = time.monotonic()
     try:
         decision = await request.app.state.engine.route(

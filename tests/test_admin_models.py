@@ -16,10 +16,10 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.api.upstream import load_backends
-from router.config import Settings
 from router.reasoning import FORMAT_IDS, LEVELS
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
+from tests.routing_fixtures import test_settings
 
 OPENAI_REASONING = {"reasoning": {
     "efforts": {"off": None, "low": "low", "high": "high"},
@@ -28,8 +28,7 @@ OPENAI_REASONING = {"reasoning": {
 
 def make_app(tmp_path, handler=None):
     transport = httpx.MockTransport(handler) if handler is not None else None
-    return create_app(Settings(db_path=str(tmp_path / "t.db")),
-                      transport=transport)
+    return create_app(test_settings(tmp_path, db_path=str(tmp_path / "t.db")), transport=transport)
 
 
 @pytest.fixture
