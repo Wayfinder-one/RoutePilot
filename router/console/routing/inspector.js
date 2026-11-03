@@ -119,6 +119,79 @@
     return element.value;
   }
 
+  /* ── 输入槽位（规格 §2.5：槽位不是节点显式字段，入边决定占用） ──
+     画布卡片不再提供「+ 槽位」入口；添加输入槽位 = 在检查器里新增一条入边。 */
+  function slotSourceLabel(graph, edge) {
+    const source = root.RTGraph.findNode(graph, edge.source);
+    const port = source ? root.RTGraph.portOf(source, edge.source_port, graph) : null;
+    let label = edge.source_port;
+    if (port) label = port.short && port.short !== 'true' ? port.short : port.id;
+    return edge.source + ' · ' + label;
+  }
+
+  function slotPortOptions(graph, node) {
+    const groups = [];
+    (graph.nodes || []).forEach(item => {
+      if (!item || item.id === node.id) return;
+      const ports = root.RTGraph.portsOf(item, graph).filter(port => port.dir === 'out');
+      if (!ports.length) return;
+      groups.push('<optgroup label="' + esc(item.title || item.id) + '">' +
+        ports.map(port => {
+          const typeLabel = port.type === 'number' ? t('cv.ins.typeNumber') : t('cv.ins.typeBoolean');
+          return '<option value="' + esc(JSON.stringify([item.id, port.id])) + '">' +
+            esc(port.label || port.id) + ' (' + esc(typeLabel) + ')</option>';
+        }).join('') + '</optgroup>');
+    });
+    return groups.join('');
+  }
+
+  function slotsSection(node) {
+    const current = app();
+    const graph = current && current.graph;
+    if (!graph) return '';
+    const ports = root.RTGraph.portsOf(node, graph).filter(port => port.slot);
+    if (!ports.length) return '';
+    const hasSource = (graph.nodes || []).some(item => item && item.id !== node.id &&
+      root.RTGraph.portsOf(item, graph).some(port => port.dir === 'out'));
+    const rows = ports.map(port => {
+      const edge = (graph.edges || []).find(item => item && item.target === node.id && item.target_port === port.id);
+      if (!edge) {
+        return '<div class="rtc-ins-slot-wrap" data-slot-wrap="' + esc(port.id) + '">' +
+          '<div class="rtc-ins-slot" data-slot-row="' + esc(port.id) + '">' +
+          '<span class="rtc-ins-slot-id">' + esc(port.id) + '</span>' +
+          '<span class="rtc-ins-slot-empty">' + esc(t(hasSource ? 'cv.ins.slotEmpty' : 'cv.ins.slotNoSource')) + '</span>' +
+          (hasSource
+            ? '<button type="button" class="btn sm ghost" data-act="ins-slot-add" data-slot="' + esc(port.id) + '">' +
+              esc(t('cv.ins.slotAdd')) + '</button>'
+            : '') +
+          '</div>' +
+          (hasSource
+            ? '<div class="rtc-ins-slot-picker" data-slot-picker="' + esc(port.id) + '" hidden>' +
+              '<label class="field">' + esc(t('cv.ins.slotSource')) +
+              '<select data-slot-source aria-label="' + esc(t('cv.ins.slotSource')) + '">' +
+              slotPortOptions(graph, node) + '</select></label>' +
+              '<button type="button" class="btn sm pri" data-act="ins-slot-create" data-slot="' + esc(port.id) + '">' +
+              esc(t('cv.ins.slotConfirm')) + '</button></div>'
+            : '') +
+          '</div>';
+      }
+      return '<div class="rtc-ins-slot" data-slot-wrap="' + esc(port.id) + '" data-slot-row="' + esc(port.id) + '">' +
+        '<span class="rtc-ins-slot-id">' + esc(port.id) + '</span>' +
+        '<span class="rtc-ins-slot-src" title="' + esc(edge.source + '.' + edge.source_port) + '">' +
+        esc(slotSourceLabel(graph, edge)) + '</span>' +
+        '<span class="rtc-ins-slot-cond">' + esc(conditionText(edge)) + '</span>' +
+        '<button type="button" class="btn sm ghost" data-act="ins-slot-edit" data-edge="' + esc(edge.id) + '">' +
+        esc(t('cv.ins.slotEdit')) + '</button>' +
+        '<button type="button" class="btn sm ghost" data-act="ins-slot-remove" data-edge="' + esc(edge.id) + '">' +
+        esc(t('cv.ins.slotRemove')) + '</button></div>';
+    }).join('');
+    const note = (node.type === 'question' || node.type === 'target') && ports.length > 1
+      ? '<div class="rtc-ins-note">' + esc(t('cv.slot.orNote')) + '</div>'
+      : '';
+    return '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.slots')) + '</div>' +
+      '<div class="rtc-ins-slots">' + rows + '</div>' + note + '</div>';
+  }
+
   function optionRows(form) {
     return Array.from(form.querySelectorAll('[data-opt-row]')).map(row => ({
       orig: row.dataset.optOrig || '',
@@ -279,7 +352,7 @@
       '" data-ins-node-type="' + esc(node.type) + '">' +
       '<div class="rtc-ins-acts"><button type="button" class="btn sm danger" data-act="ins-delete-node">' +
       esc(t('cv.ins.deleteNode')) + '</button></div>' +
-      '<form data-ins-form="node" novalidate>' + fieldsForNode(node) +
+      '<form data-ins-form="node" novalidate>' + slotsSection(node) + fieldsForNode(node) +
       formTail('ins-save-node') + '</form></div>';
   }
 
@@ -695,6 +768,44 @@
     }
     if (name === 'ins-delete-edge') {
       if (target.kind === 'edge' && target.id) current.requestDelete({ kind: 'edge', id: target.id });
+      return;
+    }
+    if (name === 'ins-slot-add') {
+      const wrap = action.closest('[data-slot-wrap]');
+      const picker = wrap && wrap.querySelector('[data-slot-picker]');
+      if (!picker) return;
+      picker.hidden = false;
+      action.hidden = true;
+      const select = picker.querySelector('[data-slot-source]');
+      if (select) select.focus();
+      return;
+    }
+    if (name === 'ins-slot-create') {
+      const wrap = action.closest('[data-slot-wrap]');
+      const select = wrap && wrap.querySelector('[data-slot-source]');
+      const value = select ? String(select.value || '') : '';
+      if (!value || target.kind !== 'node' || !target.id) return;
+      let parts = null;
+      try { parts = JSON.parse(value); } catch (error) { parts = null; }
+      if (!Array.isArray(parts) || parts.length !== 2 || !parts[0] || !parts[1]) return;
+      if (!current.kit || typeof current.kit.addEdge !== 'function') return;
+      current.kit.addEdge({
+        source: parts[0],
+        source_port: parts[1],
+        target: target.id,
+        target_port: action.dataset.slot
+      });
+      return;
+    }
+    if (name === 'ins-slot-edit') {
+      const edgeId = action.dataset.edge;
+      if (!edgeId || !root.RTCondPop) return;
+      root.RTCondPop.open(edgeId, action.closest('[data-slot-row]') || action);
+      return;
+    }
+    if (name === 'ins-slot-remove') {
+      const edgeId = action.dataset.edge;
+      if (edgeId) current.requestDelete({ kind: 'edge', id: edgeId });
       return;
     }
     if (name === 'opt-add') {

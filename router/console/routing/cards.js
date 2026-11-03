@@ -80,7 +80,6 @@
           ' title="' + esc(tf('cv.slot.addTitle', { slot: port.id })) + '">' +
           portHTML(node, port, { side: 'left' }) +
           '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +
-          '<span class="rtc-slot-add">' + esc(t('cv.slot.add')) + '</span>' +
           '</div>';
       }
       const kind = RTGraph.edgeType(edge, graph);

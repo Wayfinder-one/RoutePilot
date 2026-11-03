@@ -916,19 +916,18 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
     const row = document.querySelector('#cvNodes .rtc-slot.is-empty');
     if (!row) return null;
     const id = row.querySelector('.rtc-slot-id');
-    const add = row.querySelector('.rtc-slot-add');
     return {
       id: id ? id.textContent.trim() : '',
-      add: add ? add.textContent.trim() : '',
+      addChips: document.querySelectorAll('#cvNodes .rtc-slot-add').length,
       border: getComputedStyle(row).borderTopStyle,
       title: row.getAttribute('title') || ''
     };
   });
   assert.ok(emptySlot, 'empty slot placeholder missing');
   assert.match(emptySlot.id, /^in_\d+$/);
-  assert.equal(emptySlot.add, await page.evaluate(() => window.t('cv.slot.add')));
+  assert.equal(emptySlot.addChips, 0, 'canvas must not offer slot-add chips (inspector owns adding)');
   assert.equal(emptySlot.border, 'dashed');
-  assert.ok(emptySlot.title.length > 0, 'empty slot placeholder lacks a next-slot tooltip');
+  assert.match(emptySlot.title, /检查器|inspector/);
   const english = await page.evaluate(() => {
     window.setLang('en');
     const node = document.querySelector('[data-node-id="and-power"]');
@@ -1838,7 +1837,9 @@ test('7.4-08-logic-slot-rows', async () => {
   assert.match(await orRows.nth(0).innerText(), /in_1/);
   assert.match(await orRows.nth(1).innerText(), /cond-peak/);
   assert.match(await orRows.nth(1).innerText(), /in_2/);
-  assert.equal(await orRows.nth(2).locator('.rtc-slot-add').count(), 1,
+  assert.equal(await orRows.nth(2).locator('.rtc-slot-add').count(), 0,
+    'empty slot rows no longer render an add chip');
+  assert.match(await orRows.nth(2).getAttribute('title'), /检查器|inspector/,
     'the third OR row is the next empty slot');
 
   /* The AND node was just created (selected + centered): clear selection and pan it
@@ -5308,6 +5309,36 @@ test('7.4-21-chinese-product-and-actionable-errors', async () => {
   assert.equal(issue.edge, 'e-clarify-deep');
   assert.equal(issue.node, 'deep-target');
   assert.equal(issue.port, 'in_1');
+});
+
+test('review-inspector-adds-input-connection', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  /* 画布不再提供「+ 槽位」入口；新增输入槽位（= 新增入边）在检查器完成。 */
+  assert.equal(await page.locator('#cvNodes .rtc-slot-add').count(), 0,
+    'canvas still renders a slot-add affordance');
+  await clickNode('and-power');
+  const picker = '[data-ins-branch="node"] [data-slot-wrap="in_3"]';
+  await page.locator(picker + ' [data-act="ins-slot-add"]').click();
+  const select = page.locator(picker + ' [data-slot-source]');
+  assert.equal(await select.isVisible(), true, 'inspector slot picker did not open');
+  await screenshot('inspector-slots-1440.png');
+  await select.selectOption({ index: 0 });
+  await page.locator(picker + ' [data-act="ins-slot-create"]').click();
+  await page.waitForFunction(() => window.App.graph.edges.some(edge =>
+    edge.target === 'and-power' && edge.target_port === 'in_3'));
+  const edge = await page.evaluate(() => window.App.graph.edges.find(item =>
+    item.target === 'and-power' && item.target_port === 'in_3'));
+  assert.ok(edge, 'inspector did not create the input connection');
+  assert.equal(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"].is-empty').count(), 0,
+    'canvas slot row did not become occupied');
+  assert.match(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"]').innerText(), /start/,
+    'canvas slot row does not show the new source');
+  const badge = await dirtyBadge();
+  assert.equal(badge.hidden, false, 'inspector connection did not mark the draft dirty');
+  assert.equal(badge.appKind, 'behavior');
+  assert.equal(await page.evaluate(() => window.App.kit.canUndo()), true,
+    'inspector connection did not produce one history entry');
 });
 
 test('review-slot-limit-import-preserves-draft', async () => {
