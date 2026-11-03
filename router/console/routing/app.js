@@ -1149,6 +1149,7 @@
     App.tree.enabled = !!savedTree.enabled;
     App.tree.tree_revision = savedTree.tree_revision || '';
     App.tree.updated_at = savedTree.updated_at || '';
+    App.tree.document_sha256 = savedTree.document_sha256 || '';
     App.treeId = App.tree.id;
     App.saved = clone(savedTree);
     App.snapshotRevision = result.snapshot_revision != null
@@ -1177,6 +1178,7 @@
       sticky: RTGraph.clone(App.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
       root: RTGraph.clone(App.tree.root)
     };
+    if (!isNew) payload.base_document_sha256 = App.saved.document_sha256 || '';
     try {
       const result = isNew
         ? await api.post('/admin/trees', payload)
@@ -1192,6 +1194,10 @@
       return true;
     } catch (error) {
       if (App.tree !== targetTree || App.treeId !== targetId) return false;
+      if (error && error.status === 409 && error.detail && error.detail.code === 'graph_conflict') {
+        toast(t('cv.toastSaveConflict'), 'error');
+        return false;
+      }
       const issues = serverIssues(error);
       if (issues) {
         App.issues = mergeIssues(issues);

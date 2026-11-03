@@ -2486,8 +2486,16 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
 
 /* 每个 Task 12 用例都从同一份服务端基线开始：power-priority 恢复为示例图并启用。
    管理面没有 DELETE /admin/trees/{id}，用例新建的组留在临时库里但保持未启用。 */
+async function putTree(id, payload) {
+  const current = await serverTree(id);
+  return api('PUT', '/admin/trees/' + encodeURIComponent(id), {
+    ...payload,
+    base_document_sha256: current.document_sha256,
+  });
+}
+
 async function ensureBaselineTree() {
-  const restored = await api('PUT', '/admin/trees/' + TREE_ID, {
+  const restored = await putTree(TREE_ID, {
     id: TREE_ID,
     name: BASELINE.name,
     timezone: BASELINE.timezone,
@@ -2641,6 +2649,43 @@ test('Task 12 · save clears dirty while the undo history stays usable', async (
   await page.locator('#cvUndo').click();
   await page.waitForFunction(expected => window.App.tree.name === expected, BASELINE.name);
   assert.equal((await dirtyBadge()).kind, 'display', 'undoing a save did not mark the draft dirty again');
+});
+
+test('shared graph · stale save keeps the local draft and reports a conflict', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await clearToasts();
+  const baseline = await serverTree(TREE_ID);
+  let sentBase = '';
+  const matcher = '**/admin/trees/' + TREE_ID;
+  await page.route(matcher, async route => {
+    if (route.request().method() === 'PUT') {
+      sentBase = route.request().postDataJSON().base_document_sha256;
+      await route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: { code: 'graph_conflict', actual_document_sha256: 'f'.repeat(64) } }),
+      });
+      return;
+    }
+    await route.continue();
+  });
+  try {
+    expectHttpStatusError({ url: new RegExp('/admin/trees/' + TREE_ID + '$'), status: /409/ });
+    await page.evaluate(() => window.App.change('display', tree => { tree.name = '保留这份本地草稿'; }));
+    await page.locator('#cvSave').click();
+    await page.waitForFunction(() => document.getElementById('cvToast').textContent.includes('其他修改'));
+    assert.match(await toastText(), /其他修改/);
+    assert.equal(sentBase, baseline.document_sha256);
+    assert.equal(await page.evaluate(() => window.App.tree.name), '保留这份本地草稿');
+    assert.notEqual(await page.evaluate(() => window.App.changeKind), 'clean');
+    assert.equal(await page.evaluate(() => window.App.saved.document_sha256), baseline.document_sha256);
+    assert.equal(expectedHttpStatusErrors.length, 0);
+  } finally {
+    resetExpectedHttpStatusErrors();
+    await page.unroute(matcher);
+    await ensureBaselineTree();
+  }
 });
 
 test('Task 12 · timezone/sticky are behavior while title/capability/name are display changes', async () => {
