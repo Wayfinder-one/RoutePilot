@@ -201,6 +201,8 @@ flowchart LR
 
 - Kubernetes 需要 ReadWriteMany PVC；RWX/NFS 上不要共享 SQLite。
 - Docker 需要把同一个 NFS 导出目录挂载到每个容器；写入者的 SQLite 留在本地存储。
+- 图文件和 `current` 由原子临时文件生成，权限为 `0600`。所有 writer/reader 容器必须使用相同数值 UID（示例 10001，可使用部署实际的同一 UID）；仅相同 GID 或 `fsGroup` 不能读取 `0600` 文件，不同 UID 的副本不受支持。
+- Kubernetes 两个 Deployment 的 Pod `securityContext` 均设置相同的 `runAsUser`/`runAsGroup`；Docker 容器使用相同的 `--user UID:GID`。共享目录及其 `graphs` 子目录必须允许该 UID 遍历，writer 可创建和替换文件，reader 以只读挂载使用同一目录。
 - 写入是原子的。过期保存返回 409 `graph_conflict`；导入只修改草稿。没有图历史版本和回滚。
 - `/healthz` 是存活检查。`/readyz` 表示该副本是否已有初始快照；503 表示未就绪。后续加载失败时，已有快照继续服务并返回 `"stale": true`。
 - 迁移：先备份，再运行 `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`。输出目录必须不存在。普通启动不会删除旧 SQLite 图；确认不再需要后再单独清理。

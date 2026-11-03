@@ -202,6 +202,8 @@ in-memory snapshot; if a file is invalid, the previous snapshot keeps serving an
 
 - Kubernetes: use a ReadWriteMany PVC; do not share SQLite on NFS/RWX.
 - Docker: mount the same NFS export into every container. Keep SQLite on local storage for the writer.
+- Graph files and `current` are created through atomic temporary files with mode `0600`. Every writer/reader container must use the same numeric UID (10001 is an example; deployments may use another shared UID). Matching only the GID or `fsGroup` cannot grant access to mode-`0600` files; replicas with different UIDs are unsupported.
+- Set the same `runAsUser`/`runAsGroup` in both Kubernetes pod `securityContext`s and the same `--user UID:GID` for Docker containers. The shared directory and `graphs` subdirectory must be traversable by that UID; only the writer needs create/replace access, while readers mount the same directory read-only.
 - Writes are atomic. A stale save returns 409 `graph_conflict`; imports only change the draft. There is no graph version history or rollback.
 - `/healthz` is the liveness probe. `/readyz` reports whether this replica has an initial snapshot; 503 means not ready. After a later reload failure, an existing snapshot continues serving with `"stale": true`.
 - Migration: back up first, then run `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`. The output directory must not exist. Normal startup never deletes old SQLite graphs; clean them only after explicit confirmation.
