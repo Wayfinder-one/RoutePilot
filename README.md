@@ -1,37 +1,96 @@
 # RoutePilot
 
-> Built and maintained by Sandlake · Copyright © 2026 Sandlake. All rights reserved.
+RoutePilot is an OpenAI-compatible routing proxy for LLM traffic. Every request runs through a versioned decision graph made of request conditions, decision-service questions, logic gates, and model targets. The same graph is edited, validated, dry-run, and published in the built-in console.
 
 English | [简体中文](README.zh-CN.md)
 
-RoutePilot is an OpenAI-compatible model routing proxy. Routing policy is configured on a generic decision graph: questions, logic gates, request conditions and model targets are nodes; comparison conditions live on the input slots of logic gates.
+![RoutePilot decision canvas](assets/routepilot/en/routing-canvas.png)
 
-| | |
-|---|---|
-| Status | Graph v3 runtime delivered (M1–M3, 2026-11-02). The canvas, real `/v1` routing chain, `/admin/try` dry-run and request logging all run on graph v3. |
-| Design spec | `docs/superpowers/specs/2026-11-02-generic-decision-tree-design.md` (tracked in this repository) |
-| Console prototype | `docs/od-design/routing-canvas-2026-11-02/index.html` (Direction A · Canvas-first; design prototype, local only) |
-| Config format | `sr-routing-graph` v3. Legacy routing trees are not converted; see [Upgrading a legacy database](#upgrading-a-legacy-database). |
+## Highlights
 
-## Decision canvas
+- **Visual routing policy.** Build branching policies on a canvas instead of writing if/else chains. Nodes, wires, conditions, validation, layout, undo/redo, and graph import/export are all first-class.
+- **OpenAI-compatible entry point.** `POST /v1/chat/completions` supports JSON and SSE streaming, with the selected model returned in response headers.
+- **Decision-service driven.** Choice, yes/no, and score questions are batched per wave and sent to a `systemone`-compatible decision service. Answers activate downstream questions, gates, and targets.
+- **Deterministic target selection.** Activated targets compete by priority; the largest number wins. A normal empty result uses `otherwise_target`, while a failed decision wave uses `error_fallback`.
+- **Sticky sessions and load balancing.** Reuse a model per tree revision and target, then pick a backend with `least_inflight`. Failed backends are removed by a circuit breaker.
+- **Dry-run before publishing.** `/admin/try` runs the same graph executor with the same trace format without touching affinity, in-flight counts, or upstream generation models.
+- **Operations built in.** Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, config revisions, audit history, and role-based users.
+- **Bilingual console.** Chinese and English UI, with admin and viewer roles.
 
-Screenshot from the running console (`1440×960`, captured by `scripts/console_qa.mjs`):
+## How a request is routed
 
-![RoutePilot decision canvas](docs/od-design/routing-canvas-2026-11-02/implementation-qa/canvas-default-1440.png)
+```mermaid
+flowchart LR
+  C[Client] --> V["/v1/chat/completions"]
+  V --> G[Graph executor]
+  G <--> J["Decision service /v1/systemone"]
+  G --> T["Target selection<br/>priority · otherwise · error"]
+  T --> A[Session affinity]
+  A --> L["least_inflight<br/>+ circuit breaker"]
+  L --> U[Upstream model]
+  G -. trace .-> R[(Request ledger)]
+```
+
+1. Load the immutable routing snapshot and evaluate request conditions (time period / text keywords).
+2. Activate the first wave of questions. All questions in one wave are merged into one decision-service call.
+3. Update numeric ports and `selected` ports, then re-evaluate every downstream slot condition and logic gate.
+4. Repeat wave by wave until no new question is activated.
+5. Choose the highest-priority active target. If none activated, use `otherwise_target`; if a decision call failed, use `error_fallback`.
+6. Apply session affinity, select a backend with `least_inflight`, and proxy the request upstream. Failures open the circuit breaker for that model.
+
+`unknown` never activates a question or target. Numeric comparisons with an unknown value stay unknown.
+
+## Console
+
+![Overview](assets/routepilot/en/overview.png)
+
+The console is the control plane for the router:
+
+- **Overview** — request volume, route distribution, JEV confidence, sticky hits, active decision group.
+- **Decision groups** — canvas editor, graph settings, node/edge inspector, validation, dry-run, import/export.
+- **Calc Log** — recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, and a replayable trace.
+- **JEV Model** — decision-service endpoint, model, prompt/state template, connection test, context and input-token window.
+- **Models & Settings** — model registry, upstream model ids, providers, reasoning declarations, capability notes.
+- **Users** — admin/viewer accounts, password changes, role and status management.
+
+### Canvas
+
+![Decision canvas](assets/routepilot/en/routing-canvas.png)
+
+- Drag nodes from the library, pan/zoom, auto-layout, undo/redo.
+- Draw typed wires; numeric outputs create a default condition when dropped into a boolean slot.
+- Every input slot is an OR input with its own edge condition.
+- Drag an output to empty canvas to quick-create a compatible node.
+- Save and enable are separate; dirty and layout-only states are visible.
+- Target cards show the target display name, model list, fallback roles, and scheduling strategy.
+
+### Dry-run replay
+
+![Dry-run replay](assets/routepilot/en/try-run.png)
+
+Dry-run highlights the winning path wave by wave, shows candidates and priorities, and exposes the full trace. It uses the same executor as production routing but does not consume affinity, in-flight capacity, or an upstream model call.
+
+### Decision log
+
+![Calculation log](assets/routepilot/en/logs.png)
+
+Each row expands into a compact decision summary, candidate list, wave timing, request text, JEV probabilities, model reasoning, and the raw trace. The ledger is written asynchronously to SQLite; the page reads the latest 20 records from the in-process ring.
+
+## Decision graph
 
 ### Nodes
 
 | Type | Purpose | Inputs | Outputs |
 |---|---|---|---|
 | `start` | Request entry; always true | — | boolean |
-| `question` | One decision-service question; `choice` / `noul` / `score` | Boolean slots `in_1..in_n` (OR) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
-| `logic` | Logic gate; `and` / `or` / `not` | Boolean slots `in_1..in_n`; one edge + condition per slot | boolean (three-valued) |
-| `condition` | Request condition: time period / text keyword | — | boolean |
-| `target` | Model target (model, reasoning tier, priority, least_inflight) | Boolean slots `in_1..in_n` (OR) | — |
+| `question` | Decision-service question: `choice`, `noul`, or `score` | Boolean slots `in_1..in_n` (OR) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
+| `logic` | Three-valued logic gate: `and`, `or`, `not` | Boolean slots `in_1..in_n`, one edge + condition per slot | boolean |
+| `condition` | Request condition: time period or text keywords | — | boolean |
+| `target` | Model target: models, reasoning tiers, priority, strategy | Boolean slots `in_1..in_n` (OR) | — |
 
-### Input conditions
+### Conditions
 
-Every input port is a boolean input slot. Conditions are stored on the edge:
+Conditions live on edges, not on nodes:
 
 ```json
 {
@@ -46,87 +105,92 @@ Every input port is a boolean input slot. Conditions are stored on the edge:
 
 | Upstream output | Condition | Evaluation |
 |---|---|---|
-| number | Required: `gt` / `gte` / `lt` / `lte` / `eq` / `neq` + finite threshold | Compare upstream value with threshold; unknown propagates as unknown |
-| boolean | Optional: `null` (equivalent to `= true`) or `{ "op": "is", "value": true\|false }` | Boolean expectation |
+| number | `gt` / `gte` / `lt` / `lte` / `eq` / `neq` + finite threshold | Compare values; unknown propagates as unknown |
+| boolean | `null` (same as `= true`) or `{ "op": "is", "value": true \| false }` | Boolean expectation |
 
-- One output may feed multiple slots; each slot has its own condition. Two slots of the same AND gate with `> 0.3` / `< 0.8` implement a range condition.
-- Each input slot takes at most one edge. Slot IDs `in_1..in_N` are stable; deleted edges free their slot for reuse.
-- NOT has exactly 1 slot; AND / OR require at least 2. Multiple slots on question / target are OR.
+- One output can feed multiple slots; each slot has its own condition.
+- Two slots of an AND gate can express a range such as `> 0.3` and `< 0.8`.
+- Each input slot accepts at most one edge. Slot numbers stay stable; deleted slots can be reused.
+- `not` has exactly one slot. `and` / `or` require at least two. Question and target slots are OR.
 
-### Execution
+### Execution rules
 
-1. Read an immutable RoutingSnapshot, evaluate request conditions, truncate the request text once.
-2. The start node activates the first wave of questions; questions in one wave are merged into a single `/v1/systemone` call.
-3. After each wave, update numeric ports and `selected`, then evaluate all downstream slot conditions and logic gates.
-4. True signals activate further questions and targets; repeat until no new question is activated.
-5. When multiple targets are active, pick the highest priority (larger number wins); fall back to `otherwise_target` when nothing activates, and to `error_fallback` on decision failure.
-6. After reaching the target, apply session affinity; select a backend inside the target with `least_inflight`.
+- Questions are executed in waves; one wave = one decision-service call.
+- A failed wave voids the whole round: no ports are filled and all candidates from that round are discarded.
+- Target priorities must be unique. **Larger number wins.**
+- `otherwise_target` is used when execution completes normally with zero active targets.
+- `error_fallback` is used when a decision call fails, times out, or returns an invalid answer.
+- Both fallbacks must point to an existing target; they may point to the same target.
 
-unknown never activates a question or target; a slot condition on unknown evaluates to unknown. Enable limits: ≤ 200 nodes, ≤ 400 edges, ≤ 32 questions, ≤ 8 question waves.
+### Limits
 
-### Dry-run replay
+| Item | Limit |
+|---|---:|
+| Nodes | 200 |
+| Edges | 400 |
+| Question nodes | 32 |
+| Longest question chain | 8 waves |
+| Options per choice question | 255 |
+| Score criteria | 2–10 finite values |
 
-Screenshot from the running console:
+### Graph document
 
-![Dry-run replay](docs/od-design/routing-canvas-2026-11-02/implementation-qa/s1-replay-1440.png)
+The canvas imports and exports a single JSON envelope:
 
-## Condition editing
+```json
+{
+  "kind": "sr-routing-graph",
+  "version": 3,
+  "name": "Default routing",
+  "timezone": "Asia/Shanghai",
+  "sticky": { "enabled": true, "ttl_seconds": 1800 },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "otherwise_target": "safe-target",
+    "error_fallback": "safe-target",
+    "nodes": [],
+    "edges": []
+  }
+}
+```
 
-Screenshot from the running console:
+## Models and reasoning
 
-![Condition editing](docs/od-design/routing-canvas-2026-11-02/implementation-qa/condition-editing-1440.png)
+The model registry maps a **model slot** used by the graph to an **upstream model id** and a provider. A target can hold several model slots; `least_inflight` picks among them.
 
-- Drag a numeric wire into any boolean slot: a default `> 0.5` condition is created and the editor opens.
-- Click a slot condition chip: edit operator and threshold (numeric) or `= true / = false` (boolean).
-- Conditions are stored on the edge. Condition edits change the behavior revision; moving nodes does not.
-- Selecting an edge or slot shows source, target, line type and condition in the inspector.
+![Models and settings](assets/routepilot/en/models.png)
 
-## Console
+Providers define the OpenAI-compatible base URL, API-key environment variable, and reasoning dialect. Model profiles can declare:
 
-The console (`/console/routing.html`, entry `/console/`) is the real canvas-first editor: it
-loads the enabled graph, edits the draft, saves/enables it through `/admin/trees`, and
-dry-runs the draft through `/admin/try` before publishing.
+- reasoning support and a default level;
+- a map from RoutePilot levels (`off`, `on`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to provider-specific wire values;
+- capability notes and catalog metadata.
 
-- Drag / click to create nodes; pan and zoom; drag nodes; draw edges with type validation.
-- Quick create: drop an output wire on empty canvas to create a compatible node by source type.
-- Input slot rows on logic gates / questions / targets: source, condition, live replay value.
-- Save / enable, unsaved-change and layout-only badges, undo/redo, delete confirmation, auto layout.
-- Dry-run 5 samples (grid repair / translation / work order / low-confidence follow-up / timeout)
-  with wave-by-wave replay, trace drawer and layout-by-waves.
-- Validation error navigation, v3 import/export (legacy formats are rejected with a fixed message).
+Supported reasoning dialects include OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai, Together, string-thinking, and Ant Ling. If a requested level is not supported, the request is sent without reasoning injection and the response carries `x-sr-reasoning-warning`.
 
-### Design prototypes
+## Decision service (JEV)
 
-Direction A “Canvas-first” is the confirmed direction; the files below are the local design
-prototypes (not the shipped console). Open them directly via `file://`:
+![JEV model settings](assets/routepilot/en/jev.png)
 
-- Gallery: `docs/od-design/routing-canvas-2026-11-02/index.html`
-- Direction A: `docs/od-design/routing-canvas-2026-11-02/drafts/index-a.html`
-- Directions B / C: `drafts/index-b.html`, `drafts/index-c.html`
+The decision service exposes `POST /v1/systemone` and is typically served by NeoHorse / vLLM. Configure it in the console:
 
-The images below are design-prototype renders (prototype-only chrome and a “Prototype” chip),
-not the shipped console. The product screenshots above are captured from the running console
-by `scripts/console_qa.mjs`.
+- base URL, model name, API key, timeout;
+- default instructions and state template (must contain `{request}`);
+- connection test with two fixed candidates;
+- service context budget and input truncation limit. Oversized input is truncated head/tail instead of returning a 4xx/5xx.
 
-![Design prototype · decision canvas](assets/routepilot/canvas.png)
+Environment variables can seed the decision-service config on first start only; the database remains the source of truth afterward.
 
-![Design prototype · dry-run replay](assets/routepilot/replay.png)
+## Access and operations
 
-![Design prototype · condition editing](assets/routepilot/condition.png)
-
-![Design prototype · validation error state](assets/routepilot/errors.png)
-
-## Runtime responsibilities
-
-| Component | Responsibility |
-|---|---|
-| Graph Executor | Wave-based graph execution: questions, conditions, logic gates, target activation; three-valued state and trace |
-| DecisionService client | Calls NeoHorse `/v1/systemone`; strict response validation |
-| SessionAffinity | After reaching a target, reuse the model for the same tree revision + target; TTL/LRU configurable |
-| LoadBalancer | `least_inflight` backend selection inside a target; count covers the full upstream lifecycle |
-| CircuitBreaker | Remove tripped backends; return 503 `no_available_backend` when none is available |
-
-Dry-run uses the same executor without writing affinity, increasing in-flight counts or calling upstream generation models. Current runtime mode is a single uvicorn worker; affinity and in-flight state are in-process.
+- Email/password login with scrypt password hashing and opaque bearer sessions.
+- `admin` can edit graphs, models, JEV settings, users, and settings. `viewer` is read-only and cannot manage users.
+- The last active admin cannot be demoted, disabled, or deleted.
+- Every user and configuration change is recorded in the audit log.
+- Graph revisions are content-addressed and retained for traceability.
+- Runtime state is SQLite (WAL). Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI.
+- The current runtime uses a single uvicorn worker. Session affinity and in-flight counts are in-process, so multi-worker deployments require an external shared state layer.
 
 ## Quick start
 
@@ -134,88 +198,77 @@ Dry-run uses the same executor without writing affinity, increasing in-flight co
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-ROUTER_DB=/tmp/routepilot.db .venv/bin/python -m router
-```
-
-Default listener: `127.0.0.1:8400`; console: `http://127.0.0.1:8400/console/`. On first production start, a default admin account is seeded into an empty users table; change the password immediately. Set `ROUTER_USER_AUTH=0` for local development to disable `/admin` authentication.
-
-## Upgrading a legacy database
-
-The graph runtime persists the complete decision graph in `routing_trees.root`. A database whose routing trees still contain the pre-graph payload (for example `root.type = "jev"`) is **not converted automatically**. The new version refuses to start, keeps the schema at v1 and reports:
-
-```
-legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: <tree ids>
-```
-
-1. Stop the old service.
-2. Back up the database:
-
-   ```bash
-   sqlite3 router.db ".backup 'router.db-pre-graph-v3'"
-   ```
-
-3. Start the new version once. It stops before changing the schema and names the legacy tree ids.
-4. Only after confirming that the old routing configurations are no longer needed, delete them:
-
-   ```bash
-   sqlite3 router.db "DELETE FROM routing_trees"
-   ```
-
-5. Start the new version again. The migration adds `request_logs.waves`, records schema version 2 and keeps existing request-log rows with `waves = NULL`.
-
-The reset deletes the old routing configuration only. Models, providers, users, sessions, decision-service settings and request logs are kept. There is no automatic conversion of legacy trees, so rebuild any policy you still need on the canvas and enable it again.
-
-- The production graph config shipped with this release (`configs/production_routing_tree.json`) replaces the old production policy and retires its `power` and `image` options (both were `qwen3-32b` placeholders). Operators who still need those categories must re-add them as question options and targets on the canvas after upgrading.
-- Target priority semantics are **higher number wins**. Graphs authored under the previous smaller-wins rule must invert their target priorities to keep the same winner; the shipped graph configs and example already use the new rule.
-
-## Decision service
-
-The decision service exposes `POST /v1/systemone`. Configure it on the console “JEV Models” page, or seed it via environment variables on first start.
-
-```bash
+# Local development: authentication disabled
 ROUTER_DB=/tmp/routepilot.db \
-ROUTER_JEV_URL=http://127.0.0.1:30104 \
-ROUTER_JEV_MODEL=d1-2B \
-ROUTER_JEV_API_KEY= \
+ROUTER_USER_AUTH=0 \
 .venv/bin/python -m router
 ```
 
-- `ROUTER_JEV_URL` and `ROUTER_JEV_MODEL` must be provided together. Existing database configuration is not overwritten by environment variables.
-- Input window: service context budget (`-c / --parallel`) and input truncation limit are configurable. Oversized input is truncated head/tail; no 4xx/5xx is returned.
-- Connection test performs a real call to the decision service without changing routing state.
+Open `http://127.0.0.1:8400/console/`. The API root redirects there.
 
-## API
+For a protected deployment:
 
-| Path | Purpose |
-|---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible routing entry (non-streaming / SSE) |
-| `GET/POST/PUT/DELETE /admin/trees` | Decision group CRUD, enable, copy |
-| `POST /admin/try` | Dry-run trial (same executor) |
-| `GET/POST /admin/models` | Model catalog and providers |
-| `GET/PUT /admin/jev`, `/admin/jev/window` | Decision service config and context window |
-| `GET /admin/time-periods` | Named time periods (referenced by request-condition nodes) |
+```bash
+ROUTER_DB=/var/lib/routepilot/router.db \
+ROUTER_HOST=0.0.0.0 \
+ROUTER_PORT=8400 \
+ROUTER_ADMIN_EMAIL=admin@example.com \
+ROUTER_ADMIN_PASSWORD='change-me-now' \
+.venv/bin/python -m router
+```
 
-Errors:
+The first start against an empty users table seeds the admin account. Change the password after signing in.
 
-- No active tree: 503 `no_active_tree`.
-- All target backends unavailable: 503 `no_available_backend`.
-- Decision failure / timeout / invalid response: `error_fallback`.
-- Upstream 4xx: status and body passthrough; upstream 5xx / network error: 502 and circuit-breaker failure.
-- Streaming terminal states: `completed / upstream_error / client_disconnected / cancelled / incomplete`.
-
-## Environment variables
+## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ROUTER_DB` | `router.db` | SQLite path |
-| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | Listener |
-| `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | empty | Seed decision service on first start |
-| `ROUTER_JEV_API_KEY` | empty | Optional decision service key |
-| `ROUTER_JEV_TIMEOUT` | `10` | Decision service request timeout (s) |
-| `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Affinity LRU capacity |
-| `ROUTER_USER_AUTH` | `1` in production | Console authentication |
-| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | seeded on first start | Admin account |
-| `ROUTER_SESSION_TTL_HOURS` | `168` | Console session TTL |
+| `ROUTER_DB` | `router.db` | SQLite database path |
+| `ROUTER_HOST` | `127.0.0.1` | Listener host |
+| `ROUTER_PORT` | `8400` | Listener port |
+| `ROUTER_JEV_URL` | empty | Decision-service base URL; seeds the database on first start |
+| `ROUTER_JEV_MODEL` | empty | Decision-service model; must be set with `ROUTER_JEV_URL` |
+| `ROUTER_JEV_API_KEY` | empty | Optional decision-service key |
+| `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout, seconds |
+| `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity |
+| `ROUTER_USER_AUTH` | `true` | Enable console authentication |
+| `ROUTER_ADMIN_EMAIL` | `admin@test.com` | First-run admin email |
+| `ROUTER_ADMIN_PASSWORD` | seed value | First-run admin password; set this explicitly before the first start |
+| `ROUTER_SESSION_TTL_HOURS` | `168` | Console session lifetime |
+
+## API
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI-compatible routing entry; JSON or SSE |
+| `GET /healthz` | Liveness probe |
+| `POST /admin/login` / `POST /admin/logout` | Console session |
+| `GET /admin/me` / `POST /admin/me/password` | Current user and self-service password change |
+| `GET/POST /admin/trees`, `GET/PUT/DELETE /admin/trees/{id}` | Decision-group CRUD |
+| `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Decision-group lifecycle |
+| `POST /admin/try` | Dry-run against a draft graph |
+| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry |
+| `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets and upstream model discovery |
+| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Provider configuration |
+| `GET/PUT /admin/jev`, `POST /admin/jev/test` | Decision-service settings |
+| `GET/PUT /admin/jev/window` | JEV context and input-token window |
+| `GET/PUT /admin/time-periods` | Named time periods |
+| `GET /admin/requests/recent`, `GET /admin/requests/stats` | Live request ring and logger stats |
+| `GET /admin/overview`, `GET /admin/changes`, `GET/PUT /admin/settings` | Overview, audit history, settings |
+| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | User management |
+
+### Errors
+
+| Status | Error | Meaning |
+|---|---|---|
+| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | Malformed request body |
+| 413 | `request_too_large` | Body exceeds 10 MiB |
+| 502 | `upstream_error` | Upstream 5xx or network failure |
+| 503 | `no_active_tree` | No enabled decision group |
+| 503 | `no_available_backend` | All backends for the chosen target are unavailable |
+| 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure |
+
+Upstream 4xx responses are passed through with their status and body.
 
 ## Tests
 
@@ -223,44 +276,30 @@ Errors:
 .venv/bin/python -m pytest tests/ -q
 ```
 
-Console QA (standard command; starts its own temp database, mock services and Chromium, so it
-needs no running server and makes no external requests):
-
 ```bash
 npm install
 npm run check:console
 ```
 
-This runs the pure-function Node tests (`scripts/console_graph_test.mjs`) and the Playwright
-acceptance matrix (`scripts/console_qa.mjs`, ends with `ALL PASS (<n>)`). A local Playwright
-Chromium is resolved from the usual cache; set `CHROME=/path/to/chrome` to override it.
+`check:console` runs the graph contract tests and the Playwright acceptance matrix against a temporary database, mock decision service, and mock upstream. It needs no running server and makes no external requests. Set `CHROME=/path/to/chrome` if Chromium is not found in the usual cache.
 
-Screenshot writes are opt-in so a normal run leaves the repository clean. Regenerate the
-committed QA evidence with:
-
-```bash
-QA_SCREENSHOTS=1 npm run check:console
-```
-
-Without the flag the run prints `screenshots: skipped (set QA_SCREENSHOTS=1)` and does not
-touch `docs/od-design/routing-canvas-2026-11-02/implementation-qa/*.png`.
-
-Design-prototype QA (local, not part of the shipped console):
-
-```bash
-cd docs/od-design/routing-canvas-2026-11-02 && node qa.js
-```
-
-## Layout
+## Project layout
 
 ```
-router/                  server (FastAPI, routing engine, admin API)
-router/console/          console static pages
-configs/                 example decision groups
-scripts/                 console QA (committed by convention) and local ops scripts
-tests/                   tests
-docs/                    design specs, QA screenshots and local prototypes (specs/QA images tracked)
-assets/routepilot/       README screenshots
+router/
+  api/                 FastAPI app, admin/v1 routes, upstream proxy, request logger
+  routing/
+    graph/             graph model, validation, executor, ports
+    affinity.py        session affinity
+    scheduler.py       least_inflight load balancer and leases
+    snapshot.py        immutable routing snapshots
+  jev/                 decision-service client, config, input window
+  store/               SQLite schema, repositories, routing-tree persistence
+  console/             static bilingual console
+configs/               example decision groups and demo cases
+tests/                 pytest suite
+scripts/               graph contract tests and Playwright QA
+assets/routepilot/     README screenshots
 ```
 
 ---
