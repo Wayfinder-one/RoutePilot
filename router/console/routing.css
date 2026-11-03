@@ -402,6 +402,14 @@ body.is-try-running .rtc-stage.is-locked::after {
   font-family: var(--mono); font-size: 8px; color: var(--text-3);
   line-height: 1.5; white-space: nowrap; overflow: hidden;
 }
+.rtc-tmeta + .rtc-tmeta { margin-top: 1px; }
+.rtc-tmeta--roles { gap: 5px; padding-bottom: 1px; }
+.rtc-fb {
+  font-family: var(--sans); font-size: 8.5px; font-weight: 700;
+  border: 1px solid; border-radius: 4px; padding: 0 5px; line-height: 14px;
+}
+.rtc-fb--otherwise { color: var(--amber); background: var(--amber-soft); border-color: var(--amber-line); }
+.rtc-fb--error { color: var(--red); background: var(--red-soft); border-color: var(--red-line); }
 .rtc-tcap-inline { overflow: hidden; text-overflow: ellipsis; color: var(--text-2); }
 .rtc-tfoot {
   display: flex; align-items: center; gap: 6px; height: 21px;

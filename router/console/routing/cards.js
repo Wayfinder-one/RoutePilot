@@ -57,6 +57,15 @@
       }
     }
 
+    function strategyLabel(value) {
+      const strategy = value || 'least_inflight';
+      const key = strategy === 'least_inflight'
+        ? 'cv.strategy.least_inflight'
+        : 'cv.strategy.' + strategy;
+      const label = t(key);
+      return label === key ? strategy : label;
+    }
+
     function portHTML(node, port, options) {
       if (!port) return '';
       const opts = options || {};
@@ -282,21 +291,31 @@
           const reasoning = item && item.reasoning ? ' · ' + item.reasoning : '';
           return (item && item.model ? item.model : '—') + reasoning;
         });
+      const roles = [];
+      if (graph.otherwise_target === node.id) {
+        roles.push('<span class="rtc-fb rtc-fb--otherwise" title="' +
+          esc(t('cv.card.otherwiseTitle')) + '">' + esc(t('cv.card.otherwise')) + '</span>');
+      }
+      if (graph.error_fallback === node.id) {
+        roles.push('<span class="rtc-fb rtc-fb--error" title="' +
+          esc(t('cv.card.errorFallbackTitle')) + '">' + esc(t('cv.card.errorFallback')) + '</span>');
+      }
       return nodeWrap(node, 'target',
         '<div class="rtc-card-h">' +
         '<span class="rtc-ico">' + icon('target') + '</span>' +
-        '<b class="rtc-tname" title="' + esc(node.id) + '">' + esc(models[0] || node.id) + '</b>' +
+        '<b class="rtc-tname" title="' + esc(node.id) + '">' + esc(nodeName(node, graph)) + '</b>' +
         '<span class="rtc-prio">priority p' + esc(node.priority) + '</span>' +
         '</div>' +
         '<div class="rtc-tbody">' +
+        (roles.length ? '<div class="rtc-tmeta rtc-tmeta--roles">' + roles.join('') + '</div>' : '') +
         '<div class="rtc-tmeta"><span>' + esc(models.join(' / ') || t('cv.card.noModels')) + '</span></div>' +
-        '<div class="rtc-tmeta"><span>' + esc(node.strategy || 'least_inflight') + '</span>' +
+        '<div class="rtc-tmeta"><span>' + esc(strategyLabel(node.strategy)) + '</span>' +
         (node.capability ? '<span class="rtc-tcap-inline" title="' + esc(node.capability) + '">' + esc(snippet(node.capability, 38)) + '</span>' : '') +
         '</div>' +
         '</div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-tfoot"><span class="rtc-tstate" data-live="state">' +
-        esc(node.strategy || 'least_inflight') + ' · ' + esc(t('cv.card.noRun')) + '</span></div>');
+        esc(t('cv.card.noRun')) + '</span></div>');
     }
 
     function nodeCard(graph, node) {
@@ -326,6 +345,7 @@
       render: render,
       nodeCard: nodeCard,
       nodeName: nodeName,
+      strategyLabel: strategyLabel,
       portHTML: portHTML,
       snippet: snippet,
       escape: esc

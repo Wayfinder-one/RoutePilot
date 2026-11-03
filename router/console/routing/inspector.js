@@ -337,7 +337,8 @@
     const values = ['least_inflight'];
     if (selected && values.indexOf(selected) < 0) values.push(selected);
     return values.map(value => '<option value="' + esc(value) + '"' +
-      (value === selected ? ' selected' : '') + '>' + esc(value) + '</option>').join('');
+      (value === selected ? ' selected' : '') + '>' +
+      esc(root.RTCards.strategyLabel ? root.RTCards.strategyLabel(value) : value) + '</option>').join('');
   }
 
   function formTail(saveAction, extraActions) {
@@ -403,9 +404,17 @@
     const limits = root.RTGraph.LIMITS;
     const targets = (graph.nodes || []).filter(node => node.type === 'target');
     const targetOptions = selected => '<option value="">' + esc(t('cv.ins.none')) + '</option>' +
-      targets.map(node => '<option value="' + esc(node.id) + '"' +
-        (node.id === selected ? ' selected' : '') + ' title="' + esc(node.id) + '">' +
-        esc(root.RTCards.nodeName(node, graph)) + '</option>').join('');
+      targets.map(node => {
+        const models = (Array.isArray(node.models) ? node.models : [])
+          .filter(item => item && typeof item === 'object' && item.model)
+          .map(item => item.model + (item.reasoning ? ' · ' + item.reasoning : ''));
+        const modelText = models.join(' / ') || t('cv.card.noModels');
+        const name = root.RTCards.nodeName(node, graph);
+        return '<option value="' + esc(node.id) + '"' +
+          (node.id === selected ? ' selected' : '') +
+          ' title="' + esc(node.id + ' · ' + modelText) + '">' +
+          esc(name + ' · ' + modelText) + '</option>';
+      }).join('');
     const zones = COMMON_TIMEZONES.slice();
     try {
       if (typeof Intl.supportedValuesOf === 'function') {

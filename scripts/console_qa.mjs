@@ -5597,6 +5597,39 @@ test('review-pointer-cancel-restores-node-without-history', async () => {
   assert.deepEqual(after, { kind: 'clean', undo: false, redo: false });
 });
 
+test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+
+  const otherwiseCard = page.locator('#cvNodes [data-node-id="standard-target"]');
+  const otherwiseText = await otherwiseCard.innerText();
+  assert.match(await otherwiseCard.locator('.rtc-tname').textContent(), /模型目标-\d+/,
+    'target card header still shows only the model name');
+  assert.match(await otherwiseCard.locator('.rtc-tbody').innerText(), /deepseek-v3/,
+    'target card body does not show its model');
+  assert.equal((otherwiseText.match(/最少在途请求/g) || []).length, 1,
+    'target card renders the strategy more than once');
+  assert.match(otherwiseText, /正常兜底/);
+  assert.doesNotMatch(otherwiseText, /错误兜底/);
+
+  const errorCard = page.locator('#cvNodes [data-node-id="light-target"]');
+  assert.match(await errorCard.innerText(), /错误兜底/);
+
+  await waitInspectorBranch('graph', 'root');
+  assert.match(
+    (await page.locator('#cvInspectorBody [data-field="otherwise"] option:checked').textContent()).trim(),
+    /模型目标-\d+ · deepseek-v3/);
+  assert.match(
+    (await page.locator('#cvInspectorBody [data-field="errorFallback"] option:checked').textContent()).trim(),
+    /模型目标-\d+ · qwen3-8b/);
+
+  await clickNode('standard-target');
+  await waitInspectorBranch('node', 'standard-target');
+  assert.equal(
+    (await page.locator('#cvInspectorBody [data-field="strategy"] option:checked').textContent()).trim(),
+    '最少在途请求');
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
