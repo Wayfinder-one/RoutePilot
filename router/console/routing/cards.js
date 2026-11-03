@@ -160,7 +160,6 @@
           '<div class="rtc-opt-l">' +
           '<span class="rtc-opt-n"><b>' + esc(option.label) + '</b>' +
           '<span class="rtc-opt-p" data-live="prob.' + esc(option.key) + '">—</span></span>' +
-          '<span class="rtc-opt-c" title="' + esc(option.capability) + '">' + esc(snippet(option.capability, 42)) + '</span>' +
           '</div>' +
           '<div class="rtc-oports">' +
           '<span class="rtc-oport">' + portHTML(node, selected, { side: 'right' }) + '<i>' + esc(t('cv.card.selected')) + '</i></span>' +

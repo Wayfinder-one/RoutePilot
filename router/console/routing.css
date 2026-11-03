@@ -296,10 +296,6 @@ body.is-try-running .rtc-stage.is-locked::after {
 .rtc-opt-l { display: flex; flex-direction: column; gap: 1px; min-width: 0; width: 100%; }
 .rtc-opt-n { display: flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 650; min-width: 0; }
 .rtc-opt-n b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rtc-opt-c {
-  font-size: 8.5px; color: var(--text-3); line-height: 1.4;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
 .rtc-oports {
   position: absolute; right: 5px; top: 0; bottom: 0;
   display: flex; align-items: center; gap: 8px;
