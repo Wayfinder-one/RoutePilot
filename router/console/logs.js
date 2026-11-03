@@ -119,7 +119,7 @@ function factHtml(label, value, mono) {
 }
 
 /* ── decision summary: answer "why this model" in three compact rows ──
-   The raw engine trace and low-frequency facts stay folded below; the
+   The decision path and low-frequency facts stay folded below; the
    default view only carries what a reviewer needs at a glance. */
 function summaryHtml(record) {
   const trace = Array.isArray(record.trace) ? record.trace : [];
@@ -150,7 +150,7 @@ function summaryHtml(record) {
       : `<span class="mut">${esc(t('logs.sum.noCandidates'))}</span>`
   }</div>`;
   const waveRow = waves.length
-    ? `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.ev.wave'))}</span><span class="lg-waves">${
+    ? `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.sum.rounds'))}</span><span class="lg-waves">${
       waves.map(item =>
         `<span class="lg-wave${item.failed ? ' bad' : ''}">` +
         `<b>${esc(tf('logs.sum.round', { n: item.wave }))}</b>` +
@@ -187,7 +187,7 @@ function detailHtml(record) {
     ? probBars(record.jev_probabilities) : '';
   const reasoning = String(record.reasoning || '').trim();
   const warning = String(record.reasoning_warning || '').trim();
-  const traceCount = Array.isArray(record.trace) ? record.trace.length : 0;
+  const traceCount = SRTrace.count(record.trace);
 
   return `<div class="lg-expand-in">
     ${summaryHtml(record)}
@@ -196,7 +196,7 @@ function detailHtml(record) {
     ${reasoning ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.reasoning'))}</div><div class="lg-quote">${esc(reasoning)}</div></section>` : ''}
     ${warning ? `<div class="lg-note"><b>${esc(t('logs.reasoningWarning'))}</b>${esc(warning)}</div>` : ''}
     <details class="lg-more lg-more--trace">
-      <summary>${esc(tf('logs.rawTrace', { n: traceCount }))}</summary>
+      <summary>${esc(tf('logs.kp.title', { n: traceCount }))}</summary>
       <div class="lg-trace" data-trace></div>
     </details>
     <details class="lg-more">

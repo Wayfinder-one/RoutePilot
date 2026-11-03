@@ -1,59 +1,18 @@
-/* Routing time-path renderer for the calculation-log detail panel.
-   Input is one request record's `trace` (list of engine events, oldest
-   first); output is a vertical timeline. Rendering is read-only — the log
-   page owns selection and layout. */
+/* Routing decision-path renderer for the calculation-log detail panel.
+   Only key judgments (slot/gate/condition) and value outputs
+   (question/final) are shown; wave/window/scheduled/activate/sticky events
+   belong to the summary area above. Each case lists the fields it needs, so
+   the old nullIsEvidence guard (null raw/value only for slot/gate/condition)
+   is superseded. Rendering is read-only — the log page owns selection and
+   layout. */
 const SRTrace = (() => {
-  /* Graph-v3 executor events plus the pre-graph names that can still exist in
-     the in-memory ring from an older process. Unknown events deliberately
-     fall back to their raw token instead of disappearing. */
+  /* 保留的关键点事件；其余事件不渲染（用户明确选择不留完整事件入口）。 */
+  const KEEP = ['slot', 'gate', 'condition', 'question', 'final'];
   const LABELS = {
-    time: 'logs.ev.time', window: 'logs.ev.window', jev_input_window: 'logs.ev.window',
-    condition: 'logs.ev.condition', slot: 'logs.ev.slot', gate: 'logs.ev.gate',
-    activate: 'logs.ev.activate', wave: 'logs.ev.wave', question: 'logs.ev.question',
-    final: 'logs.ev.final', fallback: 'logs.ev.fallback', sticky_hit: 'logs.ev.sticky',
-    scheduled: 'logs.ev.scheduled', jev_choice: 'logs.ev.jev',
-    branch_selected: 'logs.ev.branch', branch_skipped: 'logs.ev.branchSkip',
-    branch_otherwise: 'logs.ev.branchOther',
+    slot: 'logs.kp.slot', gate: 'logs.kp.gate', condition: 'logs.kp.condition',
+    question: 'logs.kp.question', final: 'logs.kp.final',
   };
-  /* Tones drive the timeline dot: green = decided, amber = degraded,
-     red = error. Anything unknown keeps the neutral dot. */
-  const TONES = {
-    scheduled: 'ok', sticky_hit: 'ok', branch_skipped: 'warn',
-    fallback: 'warn', jev_choice: 'ok', final: 'ok', gate: 'ok',
-    activate: 'ok', condition: 'ok', question: 'ok',
-  };
-  /* Event fields worth showing, in a stable order, with an i18n label key. */
-  const FIELDS = [
-    ['wave', 'logs.field.wave'],
-    ['node_id', 'logs.field.node'], ['port', 'logs.field.port'],
-    ['source', 'logs.field.source'], ['source_port', 'logs.field.sourcePort'],
-    ['via_port', 'logs.field.viaPort'], ['edge_id', 'logs.field.edge'],
-    ['operator', 'logs.field.operator'], ['status', 'logs.field.status'],
-    ['raw', 'logs.field.raw'], ['condition', 'logs.field.condition'],
-    ['value', 'logs.field.value'], ['inputs', 'logs.field.inputs'],
-    ['questions', 'logs.field.questions'], ['matched', 'logs.field.matched'],
-    ['ports', 'logs.field.ports'],
-    ['selected', 'logs.field.selected'], ['selected_key', 'logs.field.selected'],
-    ['p_top', 'logs.field.pTop'], ['margin', 'logs.field.margin'],
-    ['usage', 'logs.field.usage'], ['failed', 'logs.field.failed'],
-    ['model', 'logs.field.model'], ['target_id', 'logs.field.target'],
-    ['kind', 'logs.field.kind'], ['candidates', 'logs.field.candidates'],
-    ['priority', 'logs.field.priority'], ['reason', 'logs.field.reason'],
-    ['dry_run', 'logs.field.dryRun'], ['error', 'logs.field.error'],
-    ['input_tokens_limit', 'logs.field.limit'],
-    ['tokens_before', 'logs.field.before'], ['tokens_after', 'logs.field.after'],
-    ['truncated', 'logs.field.truncated'],
-    ['policy_path', 'logs.field.path'], ['child_id', 'logs.field.child'],
-  ];
 
-  function tone(event) {
-    if (event.error || event.reason === 'jev_error') return 'bad';
-    if (event.event === 'fallback') return 'warn';
-    if ((event.event === 'window' || event.event === 'jev_input_window') && event.truncated) return 'warn';
-    return TONES[event.event] || '';
-  }
-
-  /* Long structured fields (inputs/ports/candidates) stay one line. */
   function stringify(value) {
     let text;
     if (typeof value === 'object' && value !== null) {
@@ -61,7 +20,7 @@ const SRTrace = (() => {
     } else {
       text = String(value);
     }
-    return text.length > 220 ? text.slice(0, 217) + '…' : text;
+    return text.length > 120 ? text.slice(0, 117) + '…' : text;
   }
 
   function conditionText(value) {
@@ -71,54 +30,107 @@ const SRTrace = (() => {
     return symbol + ' ' + stringify(value.value);
   }
 
-  function display(field, value) {
-    if (field === 'p_top' || field === 'margin') return pct(value);
-    if (field === 'condition') return conditionText(value);
-    if (field === 'raw' || field === 'value') {
-      if (value === true) return 'true';
-      if (value === false) return 'false';
-      if (value == null) return '—';
-    }
-    if (field === 'questions' && Array.isArray(value)) return value.join(', ');
-    if (field === 'matched' && Array.isArray(value)) return value.join(', ');
-    return stringify(value);
+  function pctText(value) {
+    if (value == null || value === '') return '—';
+    const number = Number(value);
+    return Number.isFinite(number) ? Math.round(number * 100) + '%' : stringify(value);
   }
 
-  function pairs(event) {
+  function statusText(status) {
+    if (status === 'true' || status === true) return t('logs.kp.hit');
+    if (status === 'false' || status === false) return t('logs.kp.miss');
+    return t('logs.kp.unknown');
+  }
+
+  function tone(event) {
+    return event && (event.status === 'unknown' || event.value === null) ? 'warn' : 'ok';
+  }
+
+  /* 每类关键点只取需要的字段；缺失字段不渲染。 */
+  function chips(event) {
     const out = [];
-    if (Array.isArray(event.active_periods) && event.active_periods.length) {
-      out.push([t('logs.field.periods'), event.active_periods.join(', ')]);
+    const push = (label, value) => {
+      if (value == null || value === '') return;
+      out.push(`<span class="lg-ev"><b>${esc(label)}</b>${esc(value)}</span>`);
+    };
+    const node = event.node_id ? String(event.node_id) : '';
+    switch (event.event) {
+      case 'slot': {
+        push(t('logs.field.node'), node + (event.port ? '.' + String(event.port) : ''));
+        if (event.condition != null) push(t('logs.field.condition'), conditionText(event.condition));
+        push(t('logs.field.raw'), event.raw == null ? '—' : stringify(event.raw));
+        push(t('logs.field.status'), statusText(event.status));
+        break;
+      }
+      case 'gate': {
+        push(t('logs.field.node'), node);
+        push(t('logs.field.operator'), String(event.operator || ''));
+        if (Array.isArray(event.inputs)) {
+          push(t('logs.field.inputs'), event.inputs.map(item => statusText(item && item.status)).join(' / '));
+        }
+        push(t('logs.field.value'),
+          event.value === true ? 'true' : event.value === false ? 'false' : statusText(event.value));
+        break;
+      }
+      case 'condition': {
+        push(t('logs.field.node'), node);
+        push(t('logs.kp.source'),
+          t(event.source === 'periods' ? 'logs.kp.sourcePeriods' : 'logs.kp.sourceText'));
+        if (Array.isArray(event.matched)) {
+          push(t('logs.kp.matched'), event.matched.length ? event.matched.join(', ') : '—');
+        }
+        push(t('logs.field.value'), event.value === true ? 'true' : 'false');
+        break;
+      }
+      case 'question': {
+        push(t('logs.field.node'), node);
+        if (event.selected != null) {
+          push(t('logs.field.selected'), String(event.selected));
+          push(t('logs.field.pTop'), pctText(event.p_top));
+          push(t('logs.field.margin'), pctText(event.margin));
+        } else if (event.ports && typeof event.ports === 'object') {
+          const entries = Object.entries(event.ports)
+            .filter(([key]) => ['yes', 'no', 'value'].indexOf(key) >= 0);
+          if (entries.length) {
+            push(t('logs.kp.valueOutput'), entries.map(([key, value]) =>
+              key + ' ' + (key === 'value' ? stringify(value) : pctText(value))).join(' · '));
+          }
+        }
+        break;
+      }
+      case 'final': {
+        push(t('logs.field.target'), String(event.target_id || '—'));
+        push(t('logs.field.kind'), String(event.kind || ''));
+        if (event.priority != null) push(t('logs.field.priority'), String(event.priority));
+        if (Array.isArray(event.candidates)) push(t('logs.kp.candidates'), String(event.candidates.length));
+        break;
+      }
+      default:
+        break;
     }
-    if (event.timezone) out.push([t('logs.field.tz'), event.timezone]);
-    FIELDS.forEach(([field, labelKey]) => {
-      const value = event[field];
-      /* 只有槽位/门/条件事件里 raw/value 的 null（unknown）是有意义证据；
-         其他事件缺字段一律省略，避免整条时间线被 “上游值 —” 噪音淹没。 */
-      const nullIsEvidence = (field === 'raw' || field === 'value') &&
-        ['slot', 'gate', 'condition'].indexOf(event.event) >= 0;
-      if (value == null && !nullIsEvidence) return;
-      if (value === '') return;
-      out.push([t(labelKey), display(field, value)]);
-    });
     return out;
   }
 
-  function stepHtml(event, index) {
-    const kind = event.event || 'event';
-    const label = LABELS[kind] ? t(LABELS[kind]) : kind;
-    const timing = event.duration_ms != null ? Math.round(event.duration_ms) + 'ms' : '';
-    const chips = pairs(event)
-      .map(([key, value]) => `<span class="lg-ev"><b>${esc(key)}</b>${esc(value)}</span>`)
-      .join('');
+  function stepHtml(event) {
+    const label = LABELS[event.event] ? t(LABELS[event.event]) : event.event;
+    const body = chips(event);
     return `<li class="lg-step" data-kind="${esc(tone(event))}">
-      <div class="lg-step-h"><span class="lg-step-n">${index + 1}</span><b>${esc(label)}</b><span class="lg-step-t">${esc(timing)}</span></div>
-      ${chips ? `<div class="lg-step-d">${chips}</div>` : ''}
+      <div class="lg-step-h"><b>${esc(label)}</b></div>
+      ${body.length ? `<div class="lg-step-d">${body.join('')}</div>` : ''}
     </li>`;
   }
 
+  function kept(trace) {
+    return (Array.isArray(trace) ? trace : [])
+      .filter(event => event && KEEP.indexOf(event.event) >= 0);
+  }
+
   return {
+    count(trace) {
+      return kept(trace).length;
+    },
     render(host, trace) {
-      const events = Array.isArray(trace) ? trace : [];
+      const events = kept(trace);
       host.innerHTML = events.length
         ? `<ol class="lg-timeline">${events.map(stepHtml).join('')}</ol>`
         : `<div class="lg-none">${esc(t('logs.traceEmpty'))}</div>`;

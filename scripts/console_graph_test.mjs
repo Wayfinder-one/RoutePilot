@@ -1125,44 +1125,54 @@ test('validate allows an 8-wave question chain and flags a 9th wave', () => {
 
 /* ── 10. 计算日志 / 时间路径静态契约（Task 14） ─────────────────────── */
 
-test('logs fallback filter and trace labels cover the graph v3 enum and events', () => {
+test('logs fallback filter knows the graph v3 enum', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
-  /* selection_reason 新枚举：target | sticky | otherwise | error_fallback。 */
   assert.match(logs, /FALLBACK_REASONS = \['otherwise', 'error_fallback'/,
     'logs fallback filter does not know the graph v3 enum');
   assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
     'logs still uses the pre-graph fallback enum');
   assert.match(logs, /logs\.reason\.errorFallback/);
   assert.match(logs, /logs\.reason\.otherwise/);
+});
 
+test('logs decision path keeps only key judgments and value outputs', () => {
+  const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const trace = read('trace.js');
-  const events = ['time', 'window', 'condition', 'slot', 'gate', 'activate', 'wave',
-    'question', 'fallback', 'final', 'sticky_hit', 'scheduled'];
-  for (const event of events) {
-    assert.match(trace, new RegExp("\\b" + event + ": 'logs\\.ev\\."),
-      'trace.js has no label mapping for graph v3 event ' + event);
+  /* 白名单：只保留 5 类关键点事件。 */
+  assert.match(trace, /const KEEP = \['slot', 'gate', 'condition', 'question', 'final'\]/,
+    'trace.js lost the key-point whitelist');
+  for (const event of ['slot', 'gate', 'condition', 'question', 'final']) {
+    assert.match(trace, new RegExp("\\b" + event + ": 'logs\\.kp\\."),
+      'trace.js has no key-point label for ' + event);
   }
-  const fields = ['tokens_before', 'tokens_after', 'truncated', 'source', 'matched',
-    'source_port', 'raw', 'condition', 'status', 'edge_id', 'operator', 'inputs',
-    'via_port', 'questions', 'failed', 'ports', 'selected', 'p_top',
-    'margin', 'usage', 'target_id', 'reason', 'kind', 'candidates', 'priority',
-    'model', 'dry_run'];
-  for (const field of fields) {
-    assert.ok(trace.includes("'" + field + "'"),
-      'trace.js does not render graph v3 field ' + field);
+  /* 其余事件不再映射，也不再渲染。 */
+  for (const event of ['time', 'window', 'wave', 'activate', 'scheduled', 'sticky_hit', 'fallback']) {
+    assert.doesNotMatch(trace, new RegExp("\\b" + event + ": 'logs\\."),
+      'trace.js still maps removed event ' + event);
   }
-  /* duration_ms 由 step 头部统一渲染（事件级计时），不需要重复进 FIELDS。 */
-  assert.match(trace, /event\.duration_ms/, 'trace.js lost the duration_ms timing');
+  assert.match(trace, /count\(trace\)/, 'trace.js lost SRTrace.count');
 
-  /* 新增 label 必须在 zh / en 两份词典里都有，否则中文日志会退回原始 key。 */
+  /* 新标签必须在 zh / en 两份词典里都有。 */
   const i18n = read('i18n.js');
-  const keys = trace.match(/logs\.(?:ev|field)\.[A-Za-z]+/g) || [];
-  assert.ok(keys.length > 20);
-  for (const key of new Set(keys)) {
-    const occurrences = i18n.split("'" + key + "'").length - 1;
-    assert.equal(occurrences, 2, 'i18n key ' + key + ' is not defined in both zh and en');
+  for (const key of ['logs.kp.title', 'logs.kp.slot', 'logs.kp.gate', 'logs.kp.condition',
+    'logs.kp.question', 'logs.kp.final', 'logs.kp.hit', 'logs.kp.miss', 'logs.kp.unknown',
+    'logs.kp.matched', 'logs.kp.source', 'logs.kp.sourceText', 'logs.kp.sourcePeriods',
+    'logs.kp.valueOutput', 'logs.kp.candidates']) {
+    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
+      'i18n key ' + key + ' is not defined in both zh and en');
   }
+  /* 已删除的键不能残留。 */
+  for (const key of ['logs.ev.time', 'logs.ev.window', 'logs.ev.wave', 'logs.ev.activate',
+    'logs.ev.scheduled', 'logs.ev.sticky', 'logs.ev.fallback', 'logs.ev.slot',
+    'logs.ev.gate', 'logs.ev.condition', 'logs.ev.question', 'logs.ev.final', 'logs.rawTrace']) {
+    assert.equal(i18n.split("'" + key + "'").length - 1, 0,
+      'removed i18n key still defined: ' + key);
+  }
+
+  const logs = read('logs.js');
+  assert.match(logs, /logs\.kp\.title/, 'logs.js does not use the decision-path title');
+  assert.match(logs, /SRTrace\.count\(/, 'logs.js does not count key points');
 });
 
 function attachQuestion(tree, questionType) {
@@ -1296,7 +1306,7 @@ test('logs detail keeps a compact decision summary and folds the raw trace', () 
   assert.match(logs, /logs\.sum\.candidates/);
   assert.match(logs, /logs\.sum\.rounds/);
   assert.match(logs, /logs\.sum\.noCandidates/);
-  assert.match(logs, /logs\.rawTrace/);
+  assert.match(logs, /logs\.kp\.title/);
   assert.match(logs, /<details class="lg-more lg-more--trace">/,
     'raw trace is not folded behind a details element');
   assert.doesNotMatch(logs, /logs\.sec\.trace/, 'the old always-open trace section is back');
@@ -1307,7 +1317,7 @@ test('logs detail keeps a compact decision summary and folds the raw trace', () 
   /* 新增 key 必须在 zh / en 两份词典里都存在。 */
   const i18n = read('i18n.js');
   for (const key of ['logs.sum.rounds', 'logs.sum.candidates', 'logs.sum.round',
-    'logs.sum.via', 'logs.sum.noCandidates', 'logs.rawTrace']) {
+    'logs.sum.via', 'logs.sum.noCandidates', 'logs.kp.title']) {
     assert.equal(i18n.split("'" + key + "'").length - 1, 2,
       'i18n key ' + key + ' is not defined in both zh and en');
   }
