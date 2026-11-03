@@ -597,10 +597,23 @@ body.modal-open{overflow:hidden}
 
 /* ══ user management / auth (2026-10-26) ══════════════════════════════ */
 /* [hidden] must win over the component display rules below (label.field etc.) */
-label.field[hidden],.login-form[hidden],#mePill[hidden],.userbox[hidden]{display:none}
-/* signed-in chip in the top bar (nav.js): email + role + sign out */
-.userbox{display:flex;align-items:center;gap:6px}
+label.field[hidden],.login-form[hidden],#mePill[hidden],.userbox[hidden],.usermenu[hidden]{display:none}
+/* signed-in user control in the top bar (nav.js): trigger + dropdown menu */
+.userbox{position:relative;display:flex;align-items:center}
+.user-trigger{display:flex;align-items:center;gap:6px;border:1px solid var(--line);
+  background:var(--panel);border-radius:999px;padding:4px 10px;cursor:pointer;color:var(--text);font-size:12px}
+.user-trigger:hover{background:var(--panel-2)}
+.u-ico{font-size:13px;line-height:1}
+.u-caret{font-size:10px;color:var(--text-2)}
 .user-email{max-width:220px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.usermenu{position:absolute;top:calc(100% + 6px);right:0;min-width:160px;z-index:60;
+  display:flex;flex-direction:column;gap:2px;padding:6px;border-radius:10px;
+  background:var(--panel);border:1px solid var(--line);
+  box-shadow:0 8px 24px rgba(15,23,42,.12)}
+.usermenu a,.usermenu button{display:block;width:100%;text-align:left;border:0;background:none;
+  padding:8px 10px;border-radius:7px;font-size:13px;color:var(--text-2);cursor:pointer;white-space:nowrap}
+.usermenu a:hover,.usermenu button:hover{background:var(--panel-2);color:var(--text)}
+.usermenu a.on{background:var(--indigo-soft);color:var(--indigo);font-weight:650}
 #logoutBtn{white-space:nowrap}
 
 /* login page: centered card, no main nav */

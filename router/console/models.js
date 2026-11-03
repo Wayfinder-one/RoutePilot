@@ -41,7 +41,7 @@ function uniqueSlot(base, taken) {
 
 /* ── state ───────────────────────────────────────────────────────────── */
 const STATE = {
-  models: [], providers: [], settings: {}, jev: {}, window: null,
+  models: [], providers: [], settings: {}, jev: {},
   catalog: null,            // GET /admin/model-catalog, null when unavailable
   formats: [],              // [{id, zh, en}]
 };
@@ -194,75 +194,11 @@ function armDelete(btn) {
   return false;
 }
 
+/* header pill only; the JEV summary card lives on jev.html now */
 function renderEngine(config) {
   config = config || {};
   const pill = $('#enginePill');
   if (pill) pill.innerHTML = `<span class="dot" style="color:var(--indigo)"></span>JEV <b>${esc(config.model || '—')}</b>`;
-  const card = $('#engineCard');
-  if (!card) return;
-  card.innerHTML = `<div class="col-h">JEV<span class="pill indigo">${esc(config.model || '—')}</span></div>
-    <div class="bar-row"><span class="bl">${esc(config.base_url || '—')}</span></div>
-    <div class="footnote"><a href="jev.html">${t('nav.jev')} →</a></div>`;
-}
-
-
-/* ── 上下文长度（JEV 输入窗口） ─────────────────────────────────────── */
-const WINDOW_CONTEXT_PRESETS = [2048, 4096, 8192, 16384];
-const WINDOW_INPUT_PRESETS = [512, 1024, 2048, 4096];
-
-function windowValues() {
-  return {
-    context: parseInt(($('#winContext') || {}).value, 10),
-    input: parseInt(($('#winInput') || {}).value, 10),
-  };
-}
-
-function windowProblem(values, limits) {
-  const { context, input } = values;
-  const minContext = (limits && limits.min_context_tokens) || 512;
-  const minInput = (limits && limits.min_input_tokens) || 256;
-  const max = (limits && limits.max_tokens) || 131072;
-  if (!Number.isInteger(context) || context < minContext || context > max)
-    return tf('models.window.badContext', { min: minContext, max });
-  if (!Number.isInteger(input) || input < minInput || input > max)
-    return tf('models.window.badInput', { min: minInput, max });
-  if (input > context) return t('models.window.badRelation');
-  return '';
-}
-
-function paintWindowMsg() {
-  const values = windowValues();
-  const problem = windowProblem(values, STATE.window);
-  const msg = $('#windowMsg');
-  if (msg) msg.textContent = problem || '';
-  const save = $('#saveWindow');
-  if (save) save.disabled = !!problem;
-}
-
-function presetButtons(container, values, onPick) {
-  if (!container) return;
-  container.innerHTML = values.map(v => `<button class="btn sm" data-story="${v}">${v}</button>`).join(' ');
-  container.querySelectorAll('[data-story]').forEach(btn => {
-    btn.addEventListener('click', () => onPick(parseInt(btn.dataset.story, 10)));
-  });
-}
-
-function renderWindow(windowConfig) {
-  const cfg = windowConfig || {};
-  const context = cfg.context_tokens || 4096;
-  const input = cfg.input_tokens || 1024;
-  const setVal = (sel, val) => { const el = $(sel); if (el) el.value = val; };
-  setVal('#winContext', context);
-  setVal('#winInput', input);
-  const pill = $('#windowPill');
-  if (pill) pill.innerHTML = `<b>${input}</b> / ${context} token`;
-  presetButtons($('#winContextPresets'), WINDOW_CONTEXT_PRESETS, v => { setVal('#winContext', v); paintWindowMsg(); });
-  presetButtons($('#winInputPresets'), WINDOW_INPUT_PRESETS, v => { setVal('#winInput', v); paintWindowMsg(); });
-  ['#winContext', '#winInput'].forEach(sel => {
-    const el = $(sel);
-    if (el) el.addEventListener('input', paintWindowMsg);
-  });
-  paintWindowMsg();
 }
 
 /* ── model registry ──────────────────────────────────────────────────── */
@@ -1034,14 +970,13 @@ async function fetchAvailableModels() {
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function boot() {
   let m = { models: [] }, prov = { providers: [] }, set = { settings: {} };
-  let jevBody = { config: null }, catalog = null, winBody = null;
+  let jevBody = { config: null }, catalog = null;
   try {
-    [m, prov, set, jevBody, catalog, winBody] = await Promise.all([
+    [m, prov, set, jevBody, catalog] = await Promise.all([
       api.get('/admin/models'),
       api.get('/admin/providers'),
       api.get('/admin/settings'),
       api.get('/admin/jev').catch(() => ({ config: null })),
-      api.get('/admin/jev/window').catch(() => null),
       api.get('/admin/model-catalog').catch(() => null),
     ]);
   } catch (e) {
@@ -1053,9 +988,7 @@ async function boot() {
   STATE.jev = jevBody.config || {};
   STATE.catalog = catalog && Array.isArray(catalog.providers) ? catalog : null;
   STATE.formats = catalog && Array.isArray(catalog.formats) ? catalog.formats : [];
-  STATE.window = winBody || null;
   renderEngine(STATE.jev);
-  renderWindow(STATE.window);
   renderModels();
   renderProviders();
   renderSettings(STATE.settings);
@@ -1231,31 +1164,13 @@ $('#saveSettings').addEventListener('click', async () => {
     toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + errText(e));
   }
 });
-$('#saveWindow').addEventListener('click', async () => {
-  const values = windowValues();
-  const problem = windowProblem(values, STATE.window);
-  if (problem) { toast(problem); return; }
-  try {
-    const body = await api.put('/admin/jev/window', {
-      context_tokens: values.context,
-      input_tokens: values.input,
-    });
-    STATE.window = body;
-    renderWindow(STATE.window);
-    toast(t('models.window.saved'));
-  } catch (e) {
-    toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + errText(e));
-  }
-});
 window.onLangChange = () => {
   // Capture the open modals BEFORE re-rendering: the language switch rebuilds
   // their DOM, so unsaved input would be lost (the capture/restore patches
   // keep the draft, not the DOM).
   if (modal && modal.tab === 'custom') captureCustom();
   if (provModal) captureProvModal();
-  STATE.window = winBody || null;
   renderEngine(STATE.jev);
-  renderWindow(STATE.window);
   renderModels();
   renderProviders();
   renderSettings(STATE.settings);

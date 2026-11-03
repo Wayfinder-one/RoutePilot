@@ -8,5 +8,13 @@
 <label class="field" style="margin-top:10px"><span data-i18n="jev.instructions"></span><textarea id="instructions" rows="4"></textarea></label>
 <label class="field" style="margin-top:10px"><span data-i18n="jev.template"></span><textarea id="stateTemplate" rows="5"></textarea></label>
 <div style="margin-top:12px"><button class="btn pri" id="saveJev" data-i18n="common.save"></button></div><div id="saveMsg" class="footnote"></div>
-</section><section class="card"><div class="col-h" data-i18n="jev.test"></div><p class="mut" data-i18n="jev.testHint"></p><textarea id="testText" rows="5" style="width:100%"></textarea><button class="btn pri" id="testJev" style="margin-top:10px" data-i18n="jev.testRun"></button><div id="testOut" class="try-out"></div></section></div></main>
+</section><section class="card"><div class="col-h" data-i18n="jev.test"></div><p class="mut" data-i18n="jev.testHint"></p><textarea id="testText" rows="5" style="width:100%"></textarea><button class="btn pri" id="testJev" style="margin-top:10px" data-i18n="jev.testRun"></button><div id="testOut" class="try-out"></div></section></div>
+<div class="card" id="windowCard" style="margin-top:12px">
+<div class="col-h"><span data-i18n="models.window.title"></span><span class="pill indigo" id="windowPill"></span></div>
+<div class="set-row"><span class="mut win-label" data-i18n="models.window.context"></span><input id="winContext" class="s-val" type="number" min="512" max="131072" step="1" style="max-width:120px"><span class="mut">token</span><span class="win-presets" id="winContextPresets"></span></div>
+<div class="set-row"><span class="mut win-label" data-i18n="models.window.input"></span><input id="winInput" class="s-val" type="number" min="256" max="131072" step="1" style="max-width:120px"><span class="mut">token</span><span class="win-presets" id="winInputPresets"></span></div>
+<div class="footnote" data-i18n="models.window.hint"></div>
+<div class="addrow" style="margin-top:8px"><span class="modal-msg" id="windowMsg"></span><button class="btn pri sm push-right" id="saveWindow" data-i18n="models.window.save"></button></div>
+</div>
+</main>
 <script src="i18n.js"></script><script src="nav.js"></script><script src="api.js"></script><script src="shared.js"></script><script src="jev.js"></script></body></html>
