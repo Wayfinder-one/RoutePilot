@@ -60,3 +60,12 @@ def test_document_rejects_non_v3_and_unknown_outer_fields(field, value):
     document[field] = value
     with pytest.raises(ValueError):
         load(json.dumps(document).encode())
+
+
+@pytest.mark.parametrize("field", ["kind", "version", "name", "timezone", "sticky", "root"])
+def test_document_rejects_every_missing_outer_field(field):
+    document = graph_document(tree_from_dict(tree_dict()))
+    del document[field]
+
+    with pytest.raises(ValueError):
+        load(json.dumps(document).encode())

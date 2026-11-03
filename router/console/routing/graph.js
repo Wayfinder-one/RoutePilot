@@ -1291,6 +1291,20 @@
         issues: [issue('graph_parse_error', text, 'Import envelope has unknown fields: ' + unknownImportFields.join(', '))],
       };
     }
+    const missingImportFields = IMPORT_FIELDS
+      .filter(field => !Object.prototype.hasOwnProperty.call(data, field)).sort();
+    if (missingImportFields.length) {
+      const fields = missingImportFields.join(', ');
+      return {
+        ok: false,
+        error: PARSE_ERROR_ZH,
+        issues: [issue(
+          'graph_parse_error',
+          '图解析失败：导入 envelope 缺少必需字段：' + fields,
+          'Graph parse failed: import envelope is missing required fields: ' + fields
+        )]
+      };
+    }
     const raw = data.root;
     if (!isRecord(raw) || raw.type !== 'graph' || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
       /* kind/version 正确的 v3 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
@@ -1319,10 +1333,10 @@
       }
     });
 
-    const rawSticky = data.sticky === undefined || data.sticky === null ? {} : data.sticky;
+    const rawSticky = data.sticky === null ? {} : data.sticky;
     const tree = {
-      name: data.name === undefined ? '' : data.name,
-      timezone: data.timezone === undefined ? 'Asia/Shanghai' : data.timezone,
+      name: data.name,
+      timezone: data.timezone,
       sticky: rawSticky,
       root: graph
     };

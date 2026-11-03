@@ -1229,6 +1229,19 @@ test('review-import-rejects-unknown-fields-at-every-contract-layer', () => {
   assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
 });
 
+test('review-import-rejects-missing-required-envelope-fields', () => {
+  for (const field of ['name', 'timezone', 'sticky', 'root']) {
+    const envelope = JSON.parse(importText(minimalTree()));
+    delete envelope[field];
+    const result = RTGraph.parseImport(JSON.stringify(envelope));
+    assert.equal(result.ok, false, field);
+    assert.equal(result.issues.length, 1, field);
+    assert.equal(result.issues[0].code, 'graph_parse_error', field);
+    assert.match(result.issues[0].zh, /图解析失败/, field);
+    assert.match(result.issues[0].en, /Graph parse failed/, field);
+  }
+});
+
 test('review-import-rejects-invalid-envelope-timezone', () => {
   const tree = minimalTree();
   tree.timezone = 'Mars/Olympus';

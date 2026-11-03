@@ -36,16 +36,19 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
         raise ValueError("graph document must be an object")
     if raw.get("kind") != KIND or isinstance(raw.get("version"), bool) or raw.get("version") != VERSION:
         raise ValueError("only sr-routing-graph v3 is accepted")
+    missing = sorted(FIELDS - set(raw))
+    if missing:
+        raise ValueError(f"missing graph document fields: {', '.join(missing)}")
     unknown = sorted(set(raw) - FIELDS)
     if unknown:
         raise ValueError(f"unknown graph document fields: {', '.join(unknown)}")
     tree = tree_from_dict({
         "id": tree_id,
-        "name": raw.get("name", ""),
+        "name": raw["name"],
         "enabled": enabled,
-        "timezone": raw.get("timezone", "Asia/Shanghai"),
-        "sticky": raw.get("sticky"),
-        "root": raw.get("root"),
+        "timezone": raw["timezone"],
+        "sticky": raw["sticky"],
+        "root": raw["root"],
         "updated_at": updated_at,
     })
     return replace(

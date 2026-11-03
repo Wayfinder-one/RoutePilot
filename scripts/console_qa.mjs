@@ -3164,6 +3164,27 @@ test('7.4-14-import-export-v3-only', async () => {
   }), keptBefore, 'a rejected version-2 import replaced the draft');
 });
 
+test('shared graph · missing required envelope field keeps the draft', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const draft = () => page.evaluate(() => ({
+    name: window.App.tree.name,
+    timezone: window.App.tree.timezone,
+    sticky: window.App.tree.sticky,
+    kind: window.App.kind(),
+    nodes: window.App.graph.nodes.length,
+    edges: window.App.graph.edges.length
+  }));
+  const before = await draft();
+  const document = JSON.parse((await exportViaUi()).text);
+  delete document.sticky;
+
+  await setImportPayload(document, 'missing-sticky.json');
+  await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
+
+  assert.deepEqual(await draft(), before, 'a document missing sticky replaced the local draft');
+});
+
 test('Task 12 · a v3 document with a malformed root reports graph_parse_error and keeps the draft', async () => {
   await ensureBaselineTree();
   await openCanvas();
