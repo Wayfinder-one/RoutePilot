@@ -89,6 +89,7 @@ class RoutingTree:
     timezone: str = "Asia/Shanghai"
     tree_revision: str = ""
     updated_at: str = ""
+    document_sha256: str = ""
 
 
 def _unknown(kind: str, raw: dict, allowed: set[str]) -> None:
@@ -121,7 +122,7 @@ def _sticky_from_dict(raw) -> Sticky:
 def tree_from_dict(raw) -> RoutingTree:
     if not isinstance(raw, dict):
         raise ValueError("tree must be an object")
-    _unknown("tree", raw, {"id", "name", "enabled", "timezone", "sticky", "root", "tree_revision", "updated_at"})
+    _unknown("tree", raw, {"id", "name", "enabled", "timezone", "sticky", "root", "tree_revision", "updated_at", "document_sha256"})
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
@@ -134,6 +135,7 @@ def tree_from_dict(raw) -> RoutingTree:
         timezone=_text(raw.get("timezone", "Asia/Shanghai"), "timezone"),
         tree_revision=_text(raw.get("tree_revision", ""), "tree_revision", empty=True),
         updated_at=_text(raw.get("updated_at", ""), "updated_at", empty=True),
+        document_sha256=_text(raw.get("document_sha256", ""), "document_sha256", empty=True),
     )
 
 
@@ -161,6 +163,7 @@ def tree_to_dict(tree: RoutingTree) -> dict:
         **tree_storage_dict(tree),
         "tree_revision": tree.tree_revision,
         "updated_at": tree.updated_at,
+        "document_sha256": tree.document_sha256,
     }
 
 
