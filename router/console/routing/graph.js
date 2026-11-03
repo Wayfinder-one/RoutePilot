@@ -519,6 +519,87 @@
     }));
   }
 
+  /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
+  const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root'];
+  const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision', 'updated_at'];
+  const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'otherwise_target', 'error_fallback'];
+  const NODE_FIELDS = {
+    start: ['id', 'type', 'title', 'position'],
+    question: ['id', 'type', 'question_type', 'instructions', 'title', 'options', 'criteria', 'position'],
+    logic: ['id', 'type', 'operator', 'title', 'position'],
+    condition: ['id', 'type', 'source', 'contains_any', 'periods', 'title', 'position'],
+    target: ['id', 'type', 'models', 'priority', 'strategy', 'capability', 'title', 'position'],
+  };
+  const EDGE_FIELDS = ['id', 'source', 'source_port', 'target', 'target_port', 'condition'];
+  const QUESTION_TYPES = ['choice', 'noul', 'score'];
+
+  function isTimeZone(value) {
+    if (!isNonEmptyString(value)) return false;
+    try {
+      new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
+      return true;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function addUnknownFields(value, allowed, label, issues, nodeId) {
+    if (!isRecord(value)) return;
+    const unknown = Object.keys(value).filter(key => allowed.indexOf(key) < 0).sort();
+    if (!unknown.length) return;
+    issues.push(issue(
+      'graph_parse_error',
+      label + ' 含未知字段：' + unknown.join(', '),
+      label + ' has unknown fields: ' + unknown.join(', '),
+      { node_id: nodeId || '' }
+    ));
+  }
+
+  function validateContract(value, graph, issues) {
+    addUnknownFields(graph, ROOT_FIELDS, 'graph', issues, '');
+    graph.nodes.filter(isRecord).forEach(node => {
+      const allowed = Object.prototype.hasOwnProperty.call(NODE_FIELDS, node.type) ? NODE_FIELDS[node.type] : null;
+      if (allowed) addUnknownFields(node, allowed, node.type + ' node', issues, String(node.id || ''));
+      if (isRecord(node.position)) {
+        addUnknownFields(node.position, ['x', 'y'], 'position', issues, String(node.id || ''));
+      }
+      if (node.type === 'question' && QUESTION_TYPES.indexOf(node.question_type) < 0) {
+        issues.push(issue('graph_parse_error', '未知问题类型：' + String(node.question_type),
+          'Unknown question type: ' + String(node.question_type), { node_id: String(node.id || '') }));
+      }
+      if (node.type === 'condition' && ['text', 'periods'].indexOf(node.source) < 0) {
+        issues.push(issue('graph_parse_error', '未知条件来源：' + String(node.source),
+          'Unknown condition source: ' + String(node.source), { node_id: String(node.id || '') }));
+      }
+      if (node.type === 'target' && node.strategy != null && node.strategy !== 'least_inflight') {
+        issues.push(issue('graph_parse_error', 'target.strategy 必须为 least_inflight',
+          'target.strategy must be least_inflight', { node_id: String(node.id || '') }));
+      }
+      (Array.isArray(node.options) ? node.options : []).filter(isRecord).forEach(option => {
+        addUnknownFields(option, ['key', 'label', 'capability'], 'question option', issues, String(node.id || ''));
+      });
+      (Array.isArray(node.models) ? node.models : []).filter(isRecord).forEach(model => {
+        addUnknownFields(model, ['model', 'reasoning'], 'target model', issues, String(node.id || ''));
+      });
+    });
+    graph.edges.filter(isRecord).forEach(edge => {
+      addUnknownFields(edge, EDGE_FIELDS, 'edge', issues, String(edge.target || ''));
+      if (isRecord(edge.condition)) {
+        addUnknownFields(edge.condition, ['op', 'value'], 'edge condition', issues, String(edge.target || ''));
+      }
+    });
+    if (value !== graph && isRecord(value) && isRecord(value.root)) {
+      addUnknownFields(value, ENVELOPE_FIELDS, 'tree', issues, '');
+      if (isRecord(value.sticky)) {
+        addUnknownFields(value.sticky, ['enabled', 'ttl_seconds'], 'sticky', issues, '');
+      }
+      if (!isTimeZone(value.timezone)) {
+        issues.push(issue('invalid_timezone', '时区非法：' + String(value.timezone),
+          'Invalid timezone: ' + String(value.timezone)));
+      }
+    }
+  }
+
   function validate(value) {
     const graph = graphOf(value);
     if (!graph) {
@@ -533,6 +614,7 @@
     if (edges.length !== graph.edges.length) {
       issues.push(issue('graph_parse_error', '存在非法连线（不是对象）', 'Invalid edge entry (not an object)'));
     }
+    validateContract(value, graph, issues);
 
     /* 用户数据做 key 的映射一律用无原型对象，避免 constructor / __proto__ 误判。 */
     const byId = Object.create(null);
@@ -589,7 +671,7 @@
       });
       if (NODE_TYPES.indexOf(node.type) < 0) {
         issues.push(issue(
-          'unknown_node_type',
+          'graph_parse_error',
           '未知节点类型：' + String(node.type) + '（本期只支持 start / question / logic / condition / target）',
           'Unknown node type: ' + String(node.type),
           { node_id: String(node.id || '') }
@@ -1182,6 +1264,15 @@
     if (!isRecord(data) || data.kind !== KIND || data.version !== VERSION) {
       return { ok: false, error: REJECT_MESSAGE, issues: [] };
     }
+    const unknownImportFields = Object.keys(data).filter(key => IMPORT_FIELDS.indexOf(key) < 0).sort();
+    if (unknownImportFields.length) {
+      const text = '导入 envelope 含未知字段：' + unknownImportFields.join(', ');
+      return {
+        ok: false,
+        error: text,
+        issues: [issue('graph_parse_error', text, 'Import envelope has unknown fields: ' + unknownImportFields.join(', '))],
+      };
+    }
     const raw = data.root;
     if (!isRecord(raw) || raw.type !== 'graph' || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
       /* kind/version 正确的 v3 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
@@ -1210,22 +1301,28 @@
       }
     });
 
-    const sticky = isRecord(data.sticky) ? data.sticky : {};
+    /* sticky 原样保留到校验之后：未知字段必须先被 validate 的白名单拒绝，
+       不能在归一化时被静默丢弃。 */
+    const rawSticky = isRecord(data.sticky) ? data.sticky : {};
     const tree = {
       name: typeof data.name === 'string' ? data.name : '',
       timezone: isNonEmptyString(data.timezone) ? data.timezone : 'Asia/Shanghai',
-      sticky: {
-        enabled: sticky.enabled === true,
-        ttl_seconds: isFiniteNumber(Number(sticky.ttl_seconds)) ? Number(sticky.ttl_seconds) : 1800
-      },
+      sticky: rawSticky,
       root: graph
     };
-    const issues = validate(graph);
+    const issues = validate(tree);
     /* 结构错误在应用前拒绝：非对象节点/边或非数组字段会让 renderAll 半途崩溃，
        必须让 applyImport 拿到 ok:false 而不是一个「带 Issue 的成功」。 */
-    if (issues.some(item => item.code === 'graph_parse_error')) {
-      return { ok: false, error: PARSE_ERROR_ZH, issues: issues };
-    }
+    /* 拒绝文案：存在 graph_parse_error 时沿用固定解析失败文案（既有测试与
+       toast 依赖它），其余硬错误（如 invalid_timezone）用其首条 Issue 文案。 */
+    const parseError = issues.find(item => item.code === 'graph_parse_error');
+    const hard = parseError || issues.find(item => item.level !== 'hint');
+    if (hard) return { ok: false, error: parseError ? PARSE_ERROR_ZH : hard.zh, issues: issues };
+    /* 合法输入通过校验后再归一 sticky。 */
+    tree.sticky = {
+      enabled: rawSticky.enabled === true,
+      ttl_seconds: isFiniteNumber(Number(rawSticky.ttl_seconds)) ? Number(rawSticky.ttl_seconds) : 1800
+    };
     return { ok: true, tree: tree, issues: issues };
   }
 
@@ -1296,6 +1393,7 @@
     defaultCondition: defaultCondition,
     evaluateCondition: evaluateCondition,
     canConnect: canConnect,
+    isTimeZone: isTimeZone,
     nextSlot: nextSlot,
     addEdge: addEdge,
     removeEdge: removeEdge,

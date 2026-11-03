@@ -5334,6 +5334,37 @@ test('review-slot-limit-import-preserves-draft', async () => {
   assert.deepEqual(after, before, 'invalid slot import replaced the draft or allocated new slot rows');
 });
 
+test('review-import-contract-rejects-before-draft-replacement', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const base = await page.evaluate(() => window.RTGraph.createMinimalTree('qwen3.8-flash-sft'));
+  const kept = await page.evaluate(() => JSON.stringify(window.App.tree));
+  const invalid = [];
+  const badType = JSON.parse(JSON.stringify(base));
+  badType.root.nodes.push({ id: 'q-review', type: 'question', question_type: 'unsupported', instructions: '非法类型' });
+  badType.root.edges.push({
+    id: 'e-q-review', source: 'start', source_port: 'out',
+    target: 'q-review', target_port: 'in_1', condition: null,
+  });
+  invalid.push(badType);
+  const unknown = JSON.parse(JSON.stringify(base));
+  unknown.root.legacy = true;
+  invalid.push(unknown);
+  const badZone = JSON.parse(JSON.stringify(base));
+  badZone.timezone = 'Mars/Olympus';
+  invalid.push(badZone);
+
+  for (const tree of invalid) {
+    await clearToasts();
+    await setImportPayload({
+      kind: 'sr-routing-graph', version: 3, name: tree.name,
+      timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
+    }, 'invalid-contract.json');
+    await waitToastIncludes(await page.evaluate(n => window.tf('cv.toastImportIssues', { n }), 1));
+    assert.equal(await page.evaluate(() => JSON.stringify(window.App.tree)), kept);
+  }
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;

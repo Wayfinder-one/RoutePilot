@@ -424,7 +424,7 @@ test('validate reports structural problems with locatable codes', () => {
 
   const issues = RTGraph.validate(graph);
   const codes = codesOf(issues);
-  assert.ok(codes.includes('unknown_node_type'));
+  assert.ok(codes.includes('graph_parse_error'));
   assert.ok(codes.includes('duplicate_node_id'));
   assert.ok(codes.includes('start_count'));
   assert.ok(issues.some(issue => issue.code === 'slot_conflict' && issue.node_id === target.id && issue.port === 'in_1' && issue.edge_id));
@@ -1165,35 +1165,63 @@ test('logs fallback filter and trace labels cover the graph v3 enum and events',
   }
 });
 
-test('review-slot-cap-rejects-in-9999-without-materializing-rows', () => {
+function attachQuestion(tree, questionType) {
+  tree.root.nodes.push({
+    id: 'q-review', type: 'question', question_type: questionType,
+    instructions: '审查导入契约',
+  });
+  tree.root.edges.push({
+    id: 'e-start-q-review', source: 'start', source_port: 'out',
+    target: 'q-review', target_port: 'in_1', condition: null,
+  });
+}
+
+test('review-import-rejects-unsupported-question-type', () => {
   const tree = minimalTree();
-  const target = targetOf(tree.root);
-  tree.root.edges[0].target_port = 'in_9999';
-
-  const issues = hardIssues(RTGraph.validate(tree.root));
-  assert.ok(issues.some(issue => issue.code === 'edge_port_missing' && issue.port === 'in_9999'));
-  assert.equal(RTGraph.portsOf(target, tree.root).length, 1);
-  assert.equal(RTGraph.portOf(target, 'in_9999', tree.root), null);
-
-  tree.root.edges[0].target_port = 'in_400';
-  const validIssues = hardIssues(RTGraph.validate(tree.root));
-  assert.equal(validIssues.some(issue => issue.code === 'edge_port_missing'), false);
-  assert.equal(RTGraph.portsOf(target, tree.root).length, 400);
-  assert.ok(RTGraph.portOf(target, 'in_400', tree.root));
-  assert.equal(RTGraph.portOf(target, 'in_401', tree.root), null);
+  attachQuestion(tree, 'unsupported');
+  const result = RTGraph.parseImport(importText(tree));
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
 });
 
-test('review-next-slot-uses-in-400-then-reports-exhaustion', () => {
+test('review-import-rejects-unknown-fields-at-every-contract-layer', () => {
+  const cases = [
+    tree => { tree.root.unexpected = true; },
+    tree => { tree.root.nodes[0].legacy = true; },
+    tree => { tree.root.edges[0].legacy = true; },
+    tree => { targetOf(tree.root).models[0].upstream = 'legacy-upstream'; },
+    tree => { tree.root.nodes[0].position.z = 1; },
+    tree => { tree.sticky.legacy = true; },
+  ];
+  for (const mutate of cases) {
+    const tree = minimalTree();
+    mutate(tree);
+    const result = RTGraph.parseImport(importText(tree));
+    assert.equal(result.ok, false);
+    assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
+  }
+  const text = importText(minimalTree());
+  const envelope = JSON.parse(text);
+  envelope.legacy = true;
+  const result = RTGraph.parseImport(JSON.stringify(envelope));
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
+});
+
+test('review-import-rejects-invalid-envelope-timezone', () => {
   const tree = minimalTree();
-  const target = targetOf(tree.root);
-  tree.root.edges = Array.from({ length: 399 }, (_, index) => ({
-    id: 'e-' + (index + 1), source: 'start', source_port: 'out',
-    target: target.id, target_port: 'in_' + (index + 1), condition: null,
+  tree.timezone = 'Mars/Olympus';
+  const result = RTGraph.parseImport(importText(tree));
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some(issue => issue.code === 'invalid_timezone'));
+});
+
+test('review-import-keeps-valid-v3-example-accepted', () => {
+  const result = RTGraph.parseImport(JSON.stringify({
+    kind: 'sr-routing-graph', version: 3, name: '合法示例',
+    timezone: 'Asia/Shanghai', sticky: { enabled: false, ttl_seconds: 1800 },
+    root: readExample(),
   }));
-  assert.equal(RTGraph.nextSlot(tree.root, target.id), 'in_400');
-  tree.root.edges.push({
-    id: 'e-400', source: 'start', source_port: 'out',
-    target: target.id, target_port: 'in_400', condition: null,
-  });
-  assert.equal(RTGraph.nextSlot(tree.root, target.id), null);
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  assert.equal(hardIssues(result.issues).length, 0);
 });

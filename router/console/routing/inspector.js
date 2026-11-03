@@ -594,13 +594,7 @@
   /* ── 提交：图设置 ───────────────────────────────────────────────── */
 
   function isTimeZone(value) {
-    if (!value) return false;
-    try {
-      new Intl.DateTimeFormat('en-US', { timeZone: value }).format(new Date());
-      return true;
-    } catch (error) {
-      return false;
-    }
+    return root.RTGraph.isTimeZone(value);
   }
 
   function submitGraph(form) {
