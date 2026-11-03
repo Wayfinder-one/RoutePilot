@@ -23,7 +23,7 @@ RoutePilot v3 目前的部署方式是「rsync 代码 + venv + systemd」（`scr
 | k8s 集群 | 192.168.95.76 的单节点集群（master01），不是 163 |
 | 验证深度 | 真实部署验证：`/healthz`、`/v1` 真实路由、控制台、PVC 持久化 |
 | 生命周期 | 验证完即卸载（teardown 脚本），验收无痕 |
-| litestream | v1 容器形态不带 sidecar（longhorn 3 副本已覆盖卷级冗余） |
+| litestream | v1 容器形态不带 sidecar（范围选择；longhorn PVC 单节点、SC `numberOfReplicas=1`，只保证 pod 重建/同节点重挂时卷仍在，**不提供节点级冗余**） |
 | 方案选型 | 方案 A：单镜像 + compose + 原生 k8s manifests（不用 helm） |
 
 ## 2. 目标与非目标
@@ -52,7 +52,7 @@ RoutePilot v3 目前的部署方式是「rsync 代码 + venv + systemd」（`scr
 | 76 宿主机 docker | `/usr/bin/docker`，`daemon.json` 已含 `192.168.95.133:30002` insecure registry | 直接在 76 上 build + push |
 | 76 containerd | `certs.d/192.168.95.133:30002` 配了 pull/push | k8s 可直接拉 Harbor 镜像 |
 | k8s 版本 | v1.28.15，单节点 `master01` | manifests 用原生 YAML |
-| StorageClass | `longhorn`（默认，3 副本）、`local-path`、`nfs-storageclass` | PVC 用 longhorn |
+| StorageClass | `longhorn`（默认 SC；本集群 `numberOfReplicas=1`、单节点）、`local-path`、`nfs-storageclass` | PVC 用 longhorn |
 | 上游 LLM | svc `sandlake-inference`：ClusterIP `10.233.43.73:8080`（节点与 pod 内均实测可达）；上游模型 `admin-inference-qwen06b`（`/v1/models` 实查）。**NodePort 31808 当前 connection refused，不可用** | k8s 形态走 svc DNS；compose 形态走 ClusterIP |
 | JEV 端点 | 宿主机 llama-server `0.0.0.0:30104` | pod/容器走 `http://192.168.95.76:30104` |
 | NodePort 占用 | 30080/30090/31808/31809/31992-31998/32549 | **30400 空闲** |
@@ -172,8 +172,8 @@ docs/
 1. `docker ps -a`：无 routepilot 容器；`docker compose ls` 无该项目。
 2. `/opt/routepilot-container/` 不存在。
 3. `kubectl get namespace routepilot` → NotFound；`kubectl get svc -A | grep 30400` → 空。
-4. 宿主机 `ss -tlnp` 无 8401 监听；`curl -m2 127.0.0.1:30400` 拒绝。
-5. longhorn 无 `pvc-routepilot` 残留卷。
+4. 宿主机 `ss -tlnp` 无 8401 监听；30400 必须**外部探测**（`curl -m2 http://192.168.95.76:30400/healthz` 拒绝）——本集群 NodePort 仅 iptables 编程、节点本机不可达，节点本机 curl 会误判。
+5. longhorn/PV 无残留：删除前记录 PV 名（`kubectl -n routepilot get pvc routepilot-data -o jsonpath='{.spec.volumeName}'`），删除后 `kubectl get pv <name>` → NotFound（longhorn 卷名是 `pvc-<uuid>`，不能按名字 grep）。
 6. `systemctl is-active smart-router-v3 litestream` = active；8400 正常服务。
 7. Harbor 镜像默认保留（复验用）；`--purge` 后 tag 删除。
 

@@ -28,6 +28,16 @@
 - **脚本约定**：全部 `set -euo pipefail`；对 76 的操作走 `ssh root@192.168.95.76`（BatchMode）；脚本可从 Mac 工作目录直接执行。
 - **上游模型名不写死**：`SR_UPSTREAM_MODEL` 可被环境变量覆盖，默认 `admin-inference-qwen06b`；若冒烟 404，用 `ssh root@192.168.95.76 'kubectl -n default get modelserving'` 实查当前在跑的名字。
 
+## 执行偏差记录（2026-11-03 实测，实施时采用；以 `scripts/docker/` 实际文件为准）
+
+1. **镜像内运维脚本与 main 代码不兼容（D1）**：本计划假设镜像内 `scripts/apply_default_routing_tree.py` 可直接 exec，但该脚本是工作树（feat 分支）版本：`import router.routing.document`（main 无此模块）、读 `document_sha256`（main API 无此键）、要求 `--tree-id`（计划命令未给）。实际实现：两个部署脚本用**内联 stdlib heredoc**（镜像内 `tree_from_dict` 校验 → 登录 → create-or-update → enable）替代，`configure_upstream.py` 不受影响（main 兼容）。
+2. **Harbor `sandlake-deploy` 为私有项目**：76 的 containerd `certs.d` 无 auth 块，匿名拉取必 `ErrImagePull`。实际实现：`01-secret.yaml` 增加 `routepilot-harbor`（dockerconfigjson，从 76 的 `/root/.docker/config.json` 过滤单 registry）+ `03-deployment.yaml` `imagePullSecrets`。
+3. **NodePort 端口检查**：本集群 NodePort 仅 iptables 编程，**节点本机不可达**（外部可达；31808 同因已死）。`ss -tln` 看不见 NodePort，`deploy-k8s.sh` 的 30400 预检只能抓非 k8s 占用者；真实冲突由 `kubectl apply` 显式失败兜底。无痕验收必须外部探测。
+4. **容器内 upstream 预检**：`deploy-k8s.sh` 在 `wait_healthz` 后、init 前增加了 `kubectl exec` 的 `urlopen($UPSTREAM_BASE/models)` 预检（与 compose 形态对齐）。
+5. **longhorn 副本数**：本集群 StorageClass `longhorn` 的 `numberOfReplicas=1`、单节点——PVC 只保证 pod 重建/同节点重挂，不提供节点级冗余。
+6. **`--purge` 与静默失败**：`teardown.sh --purge` 未实跑（镜像保留）；已知限制——purge 成功后 404 会 `die`（非幂等）、`|| true` 会掩盖 compose down / namespace delete 失败（本次由 live state 独立证实无残留）。
+7. **PV 残留检查**：longhorn 卷名是 `pvc-<uuid>`，裸 `grep routepilot` 是空检查；改为删除前记录 PV 名、删除后 `kubectl get pv <name>` NotFound。
+
 ---
 
 ### Task 1: 构建链（Dockerfile + .dockerignore + docker-build.sh + 镜像自测）
@@ -613,7 +623,7 @@ Expected（全部出现即通过）：
 - `smoke: OK (x-sr-model: ...)`；
 - 末行 `OK: k8s form live at http://192.168.95.76:30400`。
 
-失败排查：ImagePullBackOff → `ssh root@192.168.95.76 'kubectl -n routepilot describe pod -l app=routepilot'`（镜像 tag 是否已 push；Harbor 凭据在 containerd certs.d 已配，通常无需处理）；PVC Pending → `kubectl -n routepilot get pvc`（longhorn 为默认 SC，一般即时 Bound）。
+失败排查：ImagePullBackOff → `ssh root@192.168.95.76 'kubectl -n routepilot describe pod -l app=routepilot'`（镜像 tag 是否已 push；**Harbor `sandlake-deploy` 是私有项目，containerd 无 auth，匿名拉取必 ErrImagePull**——需 `imagePullSecret`，见 01-secret.yaml `routepilot-harbor`；实施时已按此修复）；PVC Pending → `kubectl -n routepilot get pvc`（longhorn 为默认 SC，一般即时 Bound）。
 
 - [ ] **Step 5: PVC 持久化验证（对应 spec V5）**
 
@@ -704,12 +714,15 @@ ssh root@192.168.95.76 'ls -d /opt/routepilot-container /opt/routepilot-k8s /opt
 # 3. namespace 与 NodePort 回收
 ssh root@192.168.95.76 'kubectl get namespace routepilot 2>&1 | tail -1; kubectl get svc -A -o json | python3 -c "import json,sys; print([s[\"metadata\"][\"name\"] for s in json.load(sys.stdin)[\"items\"] if 30400 in [p.get(\"nodePort\") for p in s[\"spec\"].get(\"ports\",[])]])"'
 #    Expected: NotFound + []
-# 4. 宿主端口已释放
-ssh root@192.168.95.76 'ss -tln | grep -E ":(8401|30400) " | wc -l'
+# 4. 宿主端口已释放（30400 必须外部探——本集群 NodePort 仅 iptables 编程、节点本机不可达）
+ssh root@192.168.95.76 'ss -tln | grep -E ":8401 " | wc -l'
 #    Expected: 0
-# 5. longhorn 无残留卷
-ssh root@192.168.95.76 'kubectl -n longhorn-system get volumes.longhorn.io 2>/dev/null | grep -i routepilot | wc -l'
-#    Expected: 0
+curl -s -o /dev/null -w '%{http_code}\n' -m 5 http://192.168.95.76:30400/healthz
+#    Expected: 000（拒绝）
+# 5. longhorn/PV 无残留（卷名是 pvc-<uuid>，裸 grep 名字是空检查）
+#    删除前先记录 PV 名：kubectl -n routepilot get pvc routepilot-data -o jsonpath='{.spec.volumeName}'
+ssh root@192.168.95.76 'kubectl get pv <删除前记录的PV名> 2>&1 | tail -1'
+#    Expected: NotFound
 # 6. systemd 现网无损
 ssh root@192.168.95.76 'systemctl is-active smart-router-v3 litestream; curl -fsS -m 5 http://127.0.0.1:8400/healthz'
 #    Expected: 两行 active + {"ok":true}
