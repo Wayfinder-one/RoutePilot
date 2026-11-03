@@ -221,11 +221,15 @@ class SnapshotPublisher:
 
     def refresh_if_changed(self, conn) -> RoutingSnapshot | None:
         with self._lock:
-            if self._fingerprint is not None and self.trees.fingerprint() == self._fingerprint:
-                # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
-                self._last_error = ""
-                return self.app.state.snapshot
-            return self.refresh(conn)
+            try:
+                if self._fingerprint is not None and self.trees.fingerprint() == self._fingerprint:
+                    # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
+                    self._last_error = ""
+                    return self.app.state.snapshot
+                return self.refresh(conn)
+            except Exception as exc:
+                self._last_error = str(exc)
+                raise
 
     def status(self) -> dict:
         fingerprint = self._fingerprint or (None, "")

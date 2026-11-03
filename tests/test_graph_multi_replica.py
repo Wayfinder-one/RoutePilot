@@ -82,3 +82,21 @@ def test_reader_loads_writer_change_and_survives_failures(tmp_path):
         os.replace(path.with_suffix(".test-tmp"), path)
         asyncio.run(reader_app.state.graph_reloader.poll_once())
         assert reader.get("/readyz").json()["stale"] is False
+
+        pointer = Path(settings.graph_dir) / "current"
+        pointer.unlink()
+        asyncio.run(reader_app.state.graph_reloader.poll_once())
+        unavailable = reader.get("/readyz")
+        assert unavailable.status_code == 200
+        assert unavailable.json()["stale"] is True
+        assert "current pointer is unavailable" in unavailable.json()["last_load_error"]
+        assert reader.post("/v1/chat/completions", json={
+            "messages": [{"role": "user", "content": "hello"}],
+        }).status_code == 200
+
+        pointer.write_text("main\n", encoding="utf-8")
+        asyncio.run(reader_app.state.graph_reloader.poll_once())
+        recovered = reader.get("/readyz")
+        assert recovered.status_code == 200
+        assert recovered.json()["stale"] is False
+        assert recovered.json()["last_load_error"] == ""

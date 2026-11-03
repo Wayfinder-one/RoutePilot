@@ -119,6 +119,38 @@ def test_bad_new_file_keeps_old_snapshot_and_recovers_after_repair(conn, repo, a
     assert app.state.publisher.status()["stale"] is False
 
 
+@pytest.mark.parametrize(
+    ("relative_path", "error_message"),
+    [
+        ("current", "current pointer is unavailable"),
+        ("graphs/main.json", "active graph is unavailable: main"),
+    ],
+)
+def test_first_fingerprint_read_failure_marks_stale_and_recovers(
+    conn, repo, app, relative_path, error_message,
+):
+    original = app.state.snapshot
+    path = repo.root / relative_path
+    content = path.read_bytes()
+    path.unlink()
+
+    with pytest.raises(GraphStorageError, match=error_message):
+        app.state.publisher.refresh_if_changed(conn)
+
+    assert app.state.snapshot is original
+    status = app.state.publisher.status()
+    assert status["ready"] is True
+    assert status["stale"] is True
+    assert error_message in status["last_load_error"]
+
+    path.write_bytes(content)
+    app.state.publisher.refresh_if_changed(conn)
+    recovered = app.state.publisher.status()
+    assert recovered["stale"] is False
+    assert recovered["last_load_error"] == ""
+    assert recovered["document_sha256"] == status["document_sha256"]
+
+
 def test_worker_polls_once_and_skips_unchanged_fingerprint(conn, repo, app, monkeypatch):
     calls = 0
     import router.routing.snapshot as snapshot_module
