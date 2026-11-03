@@ -1227,6 +1227,52 @@ test('Task 10 · a boolean edge defaults to condition null and does not open the
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
 });
 
+test('Task 10 · a noul question output connects to an AND gate slot', async () => {
+  await openCanvas();
+  /* 复现用户反馈：noul 的 yes/no 输出端口拖到与门空槽位必须能建立数值连线。 */
+  const domainBox = await page.locator('[data-node-id="domain"]').boundingBox();
+  assert.ok(domainBox, 'domain node not visible');
+  const idsBefore = await page.evaluate(() => window.App.graph.nodes.map(node => node.id));
+  await dragLibraryItem('logic-and', {
+    x: domainBox.x + domainBox.width + 220,
+    y: domainBox.y + 120,
+  });
+  const andId = await page.evaluate(ids => {
+    const created = window.App.graph.nodes.filter(node =>
+      node.type === 'logic' && node.operator === 'and' && !ids.includes(node.id));
+    return created.length ? created[created.length - 1].id : null;
+  }, idsBefore);
+  assert.ok(andId, 'AND gate was not created from the library');
+
+  await dragPort('domain', 'yes', await portPoint(andId, 'in_1', 'in'));
+  const edge = (await appSnapshot()).edges.find(item =>
+    item.source === 'domain' && item.source_port === 'yes' &&
+    item.target === andId && item.target_port === 'in_1');
+  assert.ok(edge, 'noul yes → AND in_1 edge was not created');
+  assert.deepEqual(edge.condition, { op: 'gt', value: 0.5 }, 'numeric edge did not default to gt 0.5');
+  const chipText = await page.locator(`#cvNodes [data-cond-edge="${edge.id}"]`).textContent();
+  assert.equal(chipText.replace(/\s+/g, ''), '>0.5');
+
+  /* 几何回归：汇总行输出端口必须吸附卡片右缘（不能回到行内左侧被误读成开关）。 */
+  const portGeo = await page.evaluate(() => {
+    const card = document.querySelector('[data-node-id="domain"]').getBoundingClientRect();
+    const port = document.querySelector(
+      '[data-node-id="domain"] [data-port-id="yes"][data-port-dir="out"]').getBoundingClientRect();
+    return { cardRight: card.right, portCx: port.x + port.width / 2 };
+  });
+  assert.ok(Math.abs(portGeo.cardRight - portGeo.portCx) <= 9,
+    `noul yes port is not on the card right edge (card ${portGeo.cardRight}, port ${portGeo.portCx})`);
+  const optPortGeo = await page.evaluate(() => {
+    const card = document.querySelector('[data-node-id="capability"]').getBoundingClientRect();
+    const port = document.querySelector(
+      '[data-node-id="capability"] [data-port-id="selected.easy"][data-port-dir="out"]').getBoundingClientRect();
+    const cardCx = card.x + card.width / 2;
+    return { cardRight: card.right, portCx: port.x + port.width / 2, cardCx };
+  });
+  assert.ok(optPortGeo.portCx > optPortGeo.cardCx,
+    'choice option output port is not in the right-edge zone');
+});
+
 test('Task 10 · a condition chip opens the condition overlay and Esc closes it', async () => {
   await openCanvas();
   const chip = page.locator('#cvNodes [data-cond-edge]').first();

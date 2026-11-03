@@ -268,15 +268,17 @@ body.is-try-running .rtc-stage.is-locked::after {
 }
 .rtc-qfoot--rows { flex-direction: column; align-items: stretch; gap: 2px; background: var(--panel); }
 .rtc-sump {
+  position: relative;
   display: inline-flex; align-items: center; gap: 3px;
   border: 1px solid var(--line); background: var(--panel);
-  border-radius: 99px; padding: 0 6px; min-width: 0;
+  border-radius: 99px; padding: 0 16px 0 6px; min-width: 0;
   font-size: 8px; color: var(--text-3);
 }
 .rtc-sump i { font-style: normal; font-family: var(--mono); font-size: 8px; color: var(--text-3); }
 .rtc-sump b { margin-left: auto; font-family: var(--mono); font-size: 8.5px; font-weight: 650; color: var(--text-2); }
-.rtc-sump .rtc-port { position: relative; right: auto; top: auto; transform: none; margin: 0; }
-.rtc-sump .rtc-port.is-compatible { transform: scale(1.4); }
+/* 输出端口吸附卡片右缘（基础 .rtc-port--right 提供 absolute 定位）：
+   之前的行内方块会被误读成开关，用户找不到拖拽源。 */
+.rtc-sump .rtc-port.is-compatible { transform: translateY(-50%) scale(1.5); }
 .rtc-criteria {
   font-family: var(--mono); font-size: 8px; color: var(--text-3);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -302,12 +304,13 @@ body.is-try-running .rtc-stage.is-locked::after {
   display: flex; align-items: center; gap: 8px;
 }
 .rtc-oport {
-  position: relative; display: flex; align-items: center; gap: 2px;
+  position: relative; display: flex; align-items: center;
+  flex-direction: row-reverse; gap: 4px;
   font-style: normal;
 }
 .rtc-oport i { font-style: normal; font-size: 7.5px; color: var(--text-3); }
-.rtc-oport .rtc-port { position: relative; right: auto; top: auto; transform: none; margin: 0; }
-.rtc-oport .rtc-port.is-compatible { transform: scale(1.4); }
+.rtc-oport .rtc-port { position: static; transform: none; margin: 0; }
+.rtc-oport .rtc-port.is-compatible { transform: scale(1.5); }
 
 /* 判断门 */
 .rtc-card-sym {
