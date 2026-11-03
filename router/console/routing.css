@@ -178,7 +178,8 @@ body.is-try-running .rtc-stage.is-locked::after {
 /* ── 边 ───────────────────────────────────────────────────────── */
 .rtc-edge { fill: none; stroke-linecap: round; stroke-linejoin: round; }
 .rtc-edge[data-edge-kind="boolean"] { stroke: var(--indigo); stroke-width: 2; stroke-opacity: .82; }
-.rtc-edge[data-edge-kind="number"] { stroke: var(--teal); stroke-width: 2.2; stroke-dasharray: 2 5; stroke-opacity: .95; }
+/* 数值线：实线 + 青色（与数值端口同色系），虚线会被误读为“未完成/非法”。 */
+.rtc-edge[data-edge-kind="number"] { stroke: var(--teal); stroke-width: 2.2; stroke-opacity: .95; }
 .rtc-edge.is-selected { stroke-width: 2.8; stroke-opacity: 1; filter: drop-shadow(0 0 4px var(--indigo-line)); }
 .rtc-edge[data-edge-kind="number"].is-selected { stroke: var(--teal); filter: drop-shadow(0 0 4px var(--teal)); }
 .rtc-edge-hit { fill: none; stroke: transparent; stroke-width: 16; pointer-events: stroke; cursor: pointer; }
@@ -640,8 +641,8 @@ body.is-try-running .rtc-stage.is-locked::after {
   padding: 4px 8px; font-size: 9px; color: var(--text-3);
 }
 .rtc-legend span { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
-.rtc-ln { display: inline-block; width: 18px; height: 0; border-top: 2px dashed var(--teal); flex: none; }
-.rtc-ln--bool { border-top-style: solid; border-top-color: var(--indigo); }
+.rtc-ln { display: inline-block; width: 18px; height: 0; border-top: 2px solid var(--teal); flex: none; }
+.rtc-ln--bool { border-top-color: var(--indigo); }
 
 /* ── 小地图 ───────────────────────────────────────────────────── */
 .rtc-minimap {
