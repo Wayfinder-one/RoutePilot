@@ -170,7 +170,7 @@
       const marginPort = byId('margin');
       return nodeWrap(node, 'choice',
         header(node, { icon: 'question', badge: t('cv.card.choice') }) +
-        '<div class="rtc-instr" title="' + esc(node.instructions || '') + '">' + esc(snippet(node.instructions, 66)) + '</div>' +
+        '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-opts">' + rows + '</div>' +
         '<div class="rtc-qfoot">' +
@@ -187,7 +187,7 @@
       const no = ports.find(port => port.id === 'no');
       return nodeWrap(node, 'noul',
         header(node, { icon: 'question', badge: t('cv.card.noul') }) +
-        '<div class="rtc-instr" title="' + esc(node.instructions || '') + '">' + esc(snippet(node.instructions, 66)) + '</div>' +
+        '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-qfoot rtc-qfoot--rows">' +
         '<span class="rtc-sump">' + portHTML(node, yes, { side: 'right' }) +
@@ -202,7 +202,7 @@
       const levels = Array.isArray(node.criteria) ? node.criteria.join(' / ') : '';
       return nodeWrap(node, 'score',
         header(node, { icon: 'question', badge: t('cv.card.score') }) +
-        '<div class="rtc-instr" title="' + esc(node.instructions || '') + '">' + esc(snippet(node.instructions, 66)) + '</div>' +
+        '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-qfoot rtc-qfoot--rows">' +
         '<span class="rtc-sump">' + portHTML(node, value, { side: 'right' }) +

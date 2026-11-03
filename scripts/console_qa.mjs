@@ -5320,6 +5320,48 @@ test('7.4-21-chinese-product-and-actionable-errors', async () => {
   assert.equal(issue.port, 'in_1');
 });
 
+test('review-long-instruction-is-clamped-without-overlap', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const long = '你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明选择最合适的模型。'.repeat(4);
+  await page.evaluate(text => {
+    window.App.change('behavior', tree => {
+      window.RTGraph.findNode(tree.root, 'capability').instructions = text;
+    });
+  }, long);
+  const metrics = await page.evaluate(() => {
+    const card = document.querySelector('[data-node-id="capability"]');
+    const instr = card.querySelector('.rtc-instr');
+    const inner = instr.querySelector('.rtc-instr-t');
+    const slot = card.querySelector('.rtc-slot');
+    const cs = getComputedStyle(inner);
+    const instrBox = instr.getBoundingClientRect();
+    const innerBox = inner.getBoundingClientRect();
+    const instrStyle = getComputedStyle(instr);
+    return {
+      clamp: String(cs.webkitLineClamp || cs.lineClamp || ''),
+      overflow: cs.overflow,
+      title: instr.getAttribute('title') || '',
+      innerH: innerBox.height,
+      innerScrollH: inner.scrollHeight,
+      lineH: parseFloat(instrStyle.lineHeight),
+      instrBottom: instrBox.bottom,
+      slotTop: slot ? slot.getBoundingClientRect().top : null
+    };
+  });
+  assert.equal(metrics.clamp, '2', 'instruction clamp is not two lines');
+  assert.equal(metrics.overflow, 'hidden');
+  assert.ok(metrics.innerH <= metrics.lineH * 2 + 1,
+    `instruction exceeds two lines (${metrics.innerH}px > ${metrics.lineH * 2}px)`);
+  assert.ok(metrics.innerScrollH > metrics.innerH,
+    'instruction was not actually truncated (no clipped content)');
+  assert.ok(metrics.title.length > 66, 'full instruction is not reachable via the title tooltip');
+  if (metrics.slotTop != null) {
+    assert.ok(metrics.instrBottom <= metrics.slotTop + 0.5,
+      'instruction text overlaps the slot row');
+  }
+});
+
 test('review-empty-slots-hidden-until-drag', async () => {
   await ensureBaselineTree();
   await openCanvas();

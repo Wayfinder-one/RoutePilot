@@ -258,6 +258,10 @@ body.is-try-running .rtc-stage.is-locked::after {
 .rtc-live:empty { display: none; }
 .rtc-instr {
   padding: 0 11px 4px; font-size: 10.5px; line-height: 1.5; color: var(--text-2);
+}
+/* clamp 必须落在内层块上：卡片容器是 flex/绝对定位上下文时，直接放在
+   .rtc-instr 上会被 blockify 成 flow-root，-webkit-line-clamp 失效（无省略号）。 */
+.rtc-instr-t {
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
   overflow: hidden; word-break: break-word;
 }
