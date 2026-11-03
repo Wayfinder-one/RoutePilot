@@ -47,7 +47,7 @@ def test_s1_two_slots_feed_and_power_beats_selected_strong():
     assert [call["keys"] for call in jev.calls] == [["capability", "domain"]]
     assert decision.waves == (WaveTrace(1, ("capability", "domain"), 12.0, False, None),)
     assert decision.candidates == (
-        Candidate("power-target", 1, "and-power", "in_1", 1),
+        Candidate("power-target", 5, "and-power", "in_1", 1),
         Candidate("strong-target", 3, "capability", "in_1", 1),
     )
     assert decision.target.id == "power-target"
@@ -59,7 +59,7 @@ def test_s1_two_slots_feed_and_power_beats_selected_strong():
     assert balancer.calls[-1]["preferred"] is None
     assert decision.sticky_hit is False
     final_event = next(event for event in decision.trace if event["event"] == "final")
-    assert final_event["priority"] == 1
+    assert final_event["priority"] == 5
     assert [candidate["target_id"] for candidate in final_event["candidates"]] == ["power-target", "strong-target"]
 
 
@@ -67,7 +67,7 @@ def test_s2_selected_easy_directs_to_light_and_untouched_clarify_stays_unknown()
     decision, jev, balancer, _affinity = run_scenario("s2")
 
     assert [call["keys"] for call in jev.calls] == [["capability", "domain"]]
-    assert decision.candidates == (Candidate("light-target", 5, "capability", "in_1", 1),)
+    assert decision.candidates == (Candidate("light-target", 1, "capability", "in_1", 1),)
     assert decision.target.id == "light-target"
     assert decision.model == "qwen3-8b"
     assert decision.reasoning == "low"
@@ -85,8 +85,8 @@ def test_s3_second_wave_only_asks_clarify_then_deep_target_wins():
         WaveTrace(2, ("clarify",), 12.0, False, None),
     )
     assert decision.candidates == (
-        Candidate("deep-target", 2, "clarify", "in_1", 2),
-        Candidate("standard-target", 4, "capability", "in_1", 1),
+        Candidate("deep-target", 4, "clarify", "in_1", 2),
+        Candidate("standard-target", 2, "capability", "in_1", 1),
     )
     assert decision.target.id == "deep-target"
     assert decision.model == "deepseek-v3"
@@ -104,8 +104,8 @@ def test_s4_not_or_follow_up_then_deep_target_wins():
     assert [call["keys"] for call in jev.calls] == [["capability", "domain"], ["clarify"]]
     assert len(decision.waves) == 2
     assert decision.candidates == (
-        Candidate("deep-target", 2, "clarify", "in_1", 2),
-        Candidate("light-target", 5, "capability", "in_1", 1),
+        Candidate("deep-target", 4, "clarify", "in_1", 2),
+        Candidate("light-target", 1, "capability", "in_1", 1),
     )
     assert decision.target.id == "deep-target"
     assert decision.model == "deepseek-v3"
@@ -146,7 +146,7 @@ def test_s5_failed_wave_voids_everything_and_uses_error_fallback():
     final_event = next(event for event in decision.trace if event["event"] == "final")
     assert final_event["kind"] == "error_fallback"
     assert final_event["target_id"] == "light-target"
-    assert final_event["priority"] == 5
+    assert final_event["priority"] == 1
     assert final_event["candidates"] == []
     # 失败波不回填任何问题端口，也不产生 question 事件。
     assert not [event for event in decision.trace if event["event"] == "question"]

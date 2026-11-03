@@ -45,7 +45,7 @@
         "id": "fast-target",
         "type": "target",
         "title": "轻量模型",
-        "priority": 1,
+        "priority": 4,
         "position": {"x": 520, "y": 40},
         "models": [
           {"model": "qwen3-8b", "reasoning": null}
@@ -55,7 +55,7 @@
         "id": "standard-target",
         "type": "target",
         "title": "标准模型",
-        "priority": 2,
+        "priority": 3,
         "position": {"x": 520, "y": 160},
         "models": [
           {"model": "deepseek-v3", "reasoning": null}
@@ -65,7 +65,7 @@
         "id": "strong-target",
         "type": "target",
         "title": "增强模型",
-        "priority": 3,
+        "priority": 2,
         "position": {"x": 520, "y": 280},
         "models": [
           {"model": "qwen3-32b", "reasoning": null}
@@ -75,7 +75,7 @@
         "id": "safe-target",
         "type": "target",
         "title": "安全兜底",
-        "priority": 4,
+        "priority": 1,
         "position": {"x": 520, "y": 400},
         "models": [
           {"model": "qwen3-8b", "reasoning": null}

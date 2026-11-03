@@ -390,9 +390,9 @@ def test_trace_events_follow_spec_schema_and_order():
     assert set(final_event) == {"event", "target_id", "kind", "candidates", "priority"}
     assert final_event["target_id"] == "power-target"
     assert final_event["kind"] == "target"
-    assert final_event["priority"] == 1
+    assert final_event["priority"] == 5
     assert final_event["candidates"] == [
-        {"target_id": "power-target", "priority": 1, "via_node": "and-power", "via_port": "in_1", "wave": 1},
+        {"target_id": "power-target", "priority": 5, "via_node": "and-power", "via_port": "in_1", "wave": 1},
         {"target_id": "strong-target", "priority": 3, "via_node": "capability", "via_port": "in_1", "wave": 1},
     ]
     assert scheduled_event == {"event": "scheduled", "model": "qwen3.8-flash-sft", "reason": "target", "dry_run": False}
@@ -750,7 +750,7 @@ def test_node_and_edge_reordering_do_not_change_result():
     ]
     assert [candidate.target_id for candidate in reordered.candidates] == ["power-target", "strong-target"]
     assert reordered.candidates == (
-        Candidate("power-target", 1, "and-power", "in_1", 1),
+        Candidate("power-target", 5, "and-power", "in_1", 1),
         Candidate("strong-target", 3, "capability", "in_1", 1),
     )
 
@@ -893,3 +893,40 @@ def test_multiple_true_slots_use_smallest_numeric_slot_as_via():
         if event["event"] == "activate" and event["node_id"] == "t"
     )
     assert activation["via_port"] == "in_1"
+
+
+# ---------------------------------------------------------------------------
+# 优先级语义：数字越大越优先，候选按 priority 降序
+# ---------------------------------------------------------------------------
+
+
+def test_higher_priority_number_wins_and_candidates_sort_descending():
+    nodes = [
+        node("start", "start"),
+        node("q", "question", question_type="choice", instructions="选择能力",
+             options=choice_options("easy", "strong")),
+        node("t-low", "target", priority=1, models=[{"model": "deepseek-v3"}]),
+        node("t-high", "target", priority=5, models=[{"model": "qwen3-32b"}]),
+    ]
+    edges = [
+        edge("e-start-q", "start", "out", "q", "in_1"),
+        edge("e-q-low", "q", "selected.strong", "t-low", "in_1"),
+        edge("e-q-high", "q", "selected.strong", "t-high", "in_1"),
+    ]
+    decision, _jev, _balancer, _affinity = run_custom(
+        nodes, edges,
+        otherwise_target="t-low",
+        error_fallback="t-low",
+        scenario={"answers": {"q": {"probs": {"easy": 0.1, "strong": 0.9}}}},
+    )
+
+    assert decision.target.id == "t-high"
+    assert decision.candidates == (
+        Candidate("t-high", 5, "q", "in_1", 1),
+        Candidate("t-low", 1, "q", "in_1", 1),
+    )
+    final_event = next(event for event in decision.trace if event["event"] == "final")
+    assert final_event["priority"] == 5
+    assert [candidate["target_id"] for candidate in final_event["candidates"]] == [
+        "t-high", "t-low",
+    ]

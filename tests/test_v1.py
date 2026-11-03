@@ -145,10 +145,10 @@ def two_question_graph():
              "instructions": "是否需要电力业务知识？", "position": {"x": 180, "y": 40}},
             {"id": "and-power", "type": "logic", "operator": "and",
              "position": {"x": 400, "y": -40}},
-            _target("power-target", 1, ("power",)),
+            _target("power-target", 4, ("power",)),
             _target("strong-target", 2, ("strong-a", "strong-b")),
-            _target("fast-target", 3, ("fast",)),
-            _target("safe", 4, ("safe",)),
+            _target("fast-target", 2, ("fast",)),
+            _target("safe", 1, ("safe",)),
         ],
         [
             _edge("e-start-cap", "start", "out", "q-cap", "in_1"),
@@ -194,7 +194,7 @@ def two_wave_graph():
 
 
 def priority_graph():
-    """selected.strong 同时激活 p1 power-target 与 p2 strong-target。"""
+    """selected.strong 同时激活 p4 power-target 与 p3 strong-target（数字越大越优先）。"""
     return _graph(
         [
             _start(),
@@ -204,10 +204,10 @@ def priority_graph():
                  {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
                  {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
              ]},
-            _target("power-target", 1, ("power",)),
-            _target("strong-target", 2, ("strong-a",)),
-            _target("fast-target", 3, ("fast",)),
-            _target("safe", 4, ("safe",)),
+            _target("power-target", 4, ("power",)),
+            _target("strong-target", 3, ("strong-a",)),
+            _target("fast-target", 2, ("fast",)),
+            _target("safe", 1, ("safe",)),
         ],
         [
             _edge("e-start-q", "start", "out", "q", "in_1"),

@@ -40,7 +40,7 @@
         "id": "fast-target",
         "type": "target",
         "title": "轻量模型",
-        "priority": 1,
+        "priority": 3,
         "position": {"x": 520, "y": 40},
         "models": [
           {"model": "qwen3-8b", "reasoning": null}
@@ -60,7 +60,7 @@
         "id": "safe-target",
         "type": "target",
         "title": "安全兜底",
-        "priority": 3,
+        "priority": 1,
         "position": {"x": 520, "y": 320},
         "models": [
           {"model": "qwen3-8b", "reasoning": null}

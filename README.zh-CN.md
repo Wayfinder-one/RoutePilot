@@ -59,7 +59,7 @@ RoutePilot 是 OpenAI 兼容的模型路由代理。路由策略由一张通用�
 2. 开始节点激活第一批问题；同一波问题合并为一次 `/v1/systemone` 调用。
 3. 波次返回后更新数值端口与 `selected`，求值所有下游槽位条件与判断门。
 4. true 信号激活后续问题与 target；重复直到没有新问题。
-5. 多个 target 同时激活时取 priority 最小者；无候选用 `otherwise_target`，决策失败用 `error_fallback`。
+5. 多个 target 同时激活时取 priority 最大者（数字越大越优先）；无候选用 `otherwise_target`，决策失败用 `error_fallback`。
 6. 到达 target 后应用会话粘性；target 内按 `least_inflight` 选择后端。
 
 unknown 不触发任何问题或 target；比较条件遇 unknown 结果为 unknown。启用限制：节点 ≤ 200、边 ≤ 400、问题 ≤ 32、最长问题链 ≤ 8 波。
@@ -162,6 +162,7 @@ legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: 
 该重置只删除旧的路由配置；模型、提供方、用户、会话、决策服务配置和请求日志都会保留。旧树不会被自动转换，仍需要的策略请在画布上重建后重新启用。
 
 - 本版本随附的生产 graph 配置（`configs/production_routing_tree.json`）替换旧生产策略时，下线了旧的 `power`、`image` 选项（两者原本都是 `qwen3-32b` 占位）。仍需要这两个类别的运维方，升级后需在画布上重新添加为问题选项与目标节点。
+- target priority 语义为**数字越大越优先**。按旧规则（越小越优先）保存的图需要反转各 target 的 priority 才能保持原有胜出结果；随附配置与示例图已按新规则更新。
 
 ## 决策服务
 

@@ -81,12 +81,12 @@
   }
 
   function nextPriority(graph) {
-    const used = Object.create(null);
-    (graph.nodes || []).forEach(node => {
-      if (node.type === 'target' && Number.isInteger(node.priority)) used[node.priority] = true;
-    });
     let priority = 1;
-    while (used[priority]) priority += 1;
+    (graph.nodes || []).forEach(node => {
+      if (node.type === 'target' && Number.isInteger(node.priority) && node.priority >= priority) {
+        priority = node.priority + 1;
+      }
+    });
     return priority;
   }
 

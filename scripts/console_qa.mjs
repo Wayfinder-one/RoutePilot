@@ -3766,7 +3766,7 @@ test('7.4-17-replay-slots-gates-targets-priority', async () => {
   assert.equal(snap.final.selection_reason, 'target');
   assert.equal(snap.final.model, 'qwen3.8-flash-sft');
   assert.deepEqual(snap.final.candidates, [
-    { target_id: 'power-target', priority: 1, via_node: 'and-power', via_port: 'in_1', wave: 1 },
+    { target_id: 'power-target', priority: 5, via_node: 'and-power', via_port: 'in_1', wave: 1 },
     { target_id: 'strong-target', priority: 3, via_node: 'capability', via_port: 'in_1', wave: 1 }
   ]);
   assert.deepEqual(snap.waves.map(wave => wave.questions.sort()), [['capability', 'domain']]);
@@ -3774,7 +3774,7 @@ test('7.4-17-replay-slots-gates-targets-priority', async () => {
   assert.equal(snap.resultFinal, 'power-target');
   assertIncludes(snap.resultText, 'power-target', 'conclusion does not name the final target');
   assertIncludes(snap.resultText, 'strong-target', 'conclusion does not show the rival candidate');
-  assertIncludes(snap.resultText, 'p1', 'conclusion lost the winner priority');
+  assertIncludes(snap.resultText, 'p5', 'conclusion lost the winner priority');
   assertIncludes(snap.resultText, 'p3', 'conclusion lost the rival priority');
 
   /* 槽位：两个 true 槽位 + 条件文本都在卡片上。 */
@@ -3803,7 +3803,7 @@ test('7.4-17-replay-slots-gates-targets-priority', async () => {
 
   /* target 命中/候选/未触发 + 边高亮 + 波次头条件。 */
   assert.equal(snap.nodes['power-target'].replay, 'final');
-  assertIncludes(snap.nodes['power-target'].foot, 'p1');
+  assertIncludes(snap.nodes['power-target'].foot, 'p5');
   assert.equal(snap.nodes['strong-target'].replay, 'candidate');
   assertIncludes(snap.nodes['strong-target'].foot, 'p3');
   assert.equal(snap.nodes['light-target'].replay, 'not-triggered');
@@ -4436,7 +4436,7 @@ test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async ()
   await page.waitForSelector('#cvTraceDrawer:not([hidden])');
   const chinese = await page.evaluate(() => ({
     result: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
-    priorityMeta: window.tf('cv.tryPriorityMeta', { priority: 1 })
+    priorityMeta: window.tf('cv.tryPriorityMeta', { priority: 5 })
   }));
   assertIncludes(chinese.result, chinese.priorityMeta, 'result meta still hardcodes priority');
   const english = await page.evaluate(() => {
@@ -4450,7 +4450,7 @@ test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async ()
       finalLabel: window.t('cv.tryFinal'),
       drawerLabel: window.t('cv.tryDrawer'),
       waveLabel: window.tf('cv.tryWave', { n: 1 }),
-      priorityMeta: window.tf('cv.tryPriorityMeta', { priority: 1 }),
+      priorityMeta: window.tf('cv.tryPriorityMeta', { priority: 5 }),
       drawerAria: document.getElementById('cvTraceDrawer').getAttribute('aria-label'),
       inspectorTitle: document.getElementById('cvInspToggle').title,
       paletteTitle: document.getElementById('cvPalToggle').title,
@@ -4539,6 +4539,9 @@ test('quick-create-compatible-node', async () => {
   assert.equal(after.edges.length, before.edges.length + 1);
   const created = after.nodes.find(node => !before.nodes.some(previous => previous.id === node.id));
   assert.equal(created.type, 'target');
+  assert.equal(await page.evaluate(id =>
+    window.RTGraph.findNode(window.App.graph, id).priority, created.id), 6,
+  'a new target must take max(priority) + 1 under higher-wins');
   const edge = after.edges.find(item => item.target === created.id);
   assert.equal(edge.source, 'capability');
   assert.equal(edge.source_port, 'prob.easy');

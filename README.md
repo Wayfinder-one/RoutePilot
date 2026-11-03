@@ -59,7 +59,7 @@ Every input port is a boolean input slot. Conditions are stored on the edge:
 2. The start node activates the first wave of questions; questions in one wave are merged into a single `/v1/systemone` call.
 3. After each wave, update numeric ports and `selected`, then evaluate all downstream slot conditions and logic gates.
 4. True signals activate further questions and targets; repeat until no new question is activated.
-5. When multiple targets are active, pick the smallest priority; fall back to `otherwise_target` when nothing activates, and to `error_fallback` on decision failure.
+5. When multiple targets are active, pick the highest priority (larger number wins); fall back to `otherwise_target` when nothing activates, and to `error_fallback` on decision failure.
 6. After reaching the target, apply session affinity; select a backend inside the target with `least_inflight`.
 
 unknown never activates a question or target; a slot condition on unknown evaluates to unknown. Enable limits: ≤ 200 nodes, ≤ 400 edges, ≤ 32 questions, ≤ 8 question waves.
@@ -166,6 +166,7 @@ legacy routing trees require explicit reset; ... DELETE FROM routing_trees ...: 
 The reset deletes the old routing configuration only. Models, providers, users, sessions, decision-service settings and request logs are kept. There is no automatic conversion of legacy trees, so rebuild any policy you still need on the canvas and enable it again.
 
 - The production graph config shipped with this release (`configs/production_routing_tree.json`) replaces the old production policy and retires its `power` and `image` options (both were `qwen3-32b` placeholders). Operators who still need those categories must re-add them as question options and targets on the canvas after upgrading.
+- Target priority semantics are **higher number wins**. Graphs authored under the previous smaller-wins rule must invert their target priorities to keep the same winner; the shipped graph configs and example already use the new rule.
 
 ## Decision service
 
