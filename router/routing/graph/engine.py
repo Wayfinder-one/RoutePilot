@@ -336,8 +336,8 @@ class GraphExecutionEngine:
                 allowed_models=available,
                 touch=not dry_run,
             )
-            if hit in available:
-                preferred = hit
+            if hit is not None and hit[1] == target.id and hit[0] in available:
+                preferred = hit[0]
                 sticky_hit = True
                 selection_reason = "sticky"
 
@@ -353,6 +353,7 @@ class GraphExecutionEngine:
             self.affinity.put(
                 request.session_id,
                 model,
+                target_id=target.id,
                 tree_revision=snapshot.tree_revision,
                 policy_path=policy_path,
                 ttl_seconds=tree.sticky.ttl_seconds,

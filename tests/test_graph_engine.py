@@ -109,10 +109,11 @@ class RecordingAffinity(SessionAffinity):
             touch=touch,
         )
 
-    def put(self, session_id, model, *, tree_revision, policy_path, ttl_seconds):
+    def put(self, session_id, model, *, target_id, tree_revision, policy_path, ttl_seconds):
         self.puts.append({
             "session_id": session_id,
             "model": model,
+            "target_id": target_id,
             "tree_revision": tree_revision,
             "policy_path": policy_path,
             "ttl_seconds": ttl_seconds,
@@ -120,6 +121,7 @@ class RecordingAffinity(SessionAffinity):
         return super().put(
             session_id,
             model,
+            target_id=target_id,
             tree_revision=tree_revision,
             policy_path=policy_path,
             ttl_seconds=ttl_seconds,
@@ -581,6 +583,7 @@ def test_second_request_executes_questions_then_applies_sticky():
     assert first.selection_reason == "target"
     assert first.sticky_hit is False
     assert affinity.puts and affinity.puts[-1]["policy_path"] == "power-target"
+    assert affinity.puts[-1]["target_id"] == "power-target"
     first.release()
 
     second, jev2, _balancer2, _affinity2 = run_scenario(
@@ -930,3 +933,44 @@ def test_higher_priority_number_wins_and_candidates_sort_descending():
     assert [candidate["target_id"] for candidate in final_event["candidates"]] == [
         "t-high", "t-low",
     ]
+
+
+def test_sticky_shared_model_keeps_original_target_reasoning():
+    nodes = [
+        node("start", "start"),
+        node("q", "question", question_type="choice", instructions="选择能力",
+             options=choice_options("easy", "strong")),
+        node("t-low", "target", priority=1,
+             models=[{"model": "qwen3-8b", "reasoning": "low"}]),
+        node("t-high", "target", priority=5,
+             models=[{"model": "qwen3-8b", "reasoning": "high"}]),
+    ]
+    edges = [
+        edge("e-start-q", "start", "out", "q", "in_1"),
+        edge("e-q-low", "q", "selected.easy", "t-low", "in_1"),
+        edge("e-q-high", "q", "selected.strong", "t-high", "in_1"),
+    ]
+    scenario = {"answers": {"q": {"probs": {"easy": 0.1, "strong": 0.9}}}}
+    affinity = RecordingAffinity()
+    balancer = RecordingBalancer()
+    options = dict(
+        otherwise_target="t-low", error_fallback="t-low", scenario=scenario,
+        sticky={"enabled": True, "ttl_seconds": 60}, session_id="shared-model",
+        affinity=affinity, balancer=balancer,
+    )
+
+    first, _jev1, _balancer1, _affinity1 = run_custom(nodes, edges, **options)
+    assert first.target.id == "t-high"
+    assert first.model == "qwen3-8b"
+    assert first.reasoning == "high"
+    assert affinity.puts[-1]["target_id"] == "t-high"
+    first.release()
+
+    second, _jev2, _balancer2, _affinity2 = run_custom(nodes, edges, **options)
+    assert second.target.id == "t-high"
+    assert second.model == "qwen3-8b"
+    assert second.reasoning == "high"
+    assert second.sticky_hit is True
+    assert second.selection_reason == "sticky"
+    assert balancer.calls[-1]["preferred"] == "qwen3-8b"
+    second.release()
