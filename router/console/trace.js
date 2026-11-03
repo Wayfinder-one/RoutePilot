@@ -1,10 +1,8 @@
 /* Routing decision-path renderer for the calculation-log detail panel.
    Only key judgments (slot/gate/condition) and value outputs
    (question/final) are shown; wave/window/scheduled/activate/sticky events
-   belong to the summary area above. Each case lists the fields it needs, so
-   the old nullIsEvidence guard (null raw/value only for slot/gate/condition)
-   is superseded. Rendering is read-only — the log page owns selection and
-   layout. */
+   belong to the summary area above. Each case lists the fields it needs.
+   Rendering is read-only — the log page owns selection and layout. */
 const SRTrace = (() => {
   /* 保留的关键点事件；其余事件不渲染（用户明确选择不留完整事件入口）。 */
   const KEEP = ['slot', 'gate', 'condition', 'question', 'final'];
@@ -23,10 +21,13 @@ const SRTrace = (() => {
     return text.length > 120 ? text.slice(0, 117) + '…' : text;
   }
 
+  /* 日志页不加载 routing/graph.js（没有 RTGraph），条件符号必须自带映射。 */
+  const OP_SYMBOL = { gt: '>', gte: '≥', lt: '<', lte: '≤', eq: '=', neq: '≠' };
+
   function conditionText(value) {
     if (!value || typeof value !== 'object') return stringify(value);
     if (!value.op) return stringify(value.value);
-    const symbol = (typeof RTGraph !== 'undefined' && RTGraph.OP && RTGraph.OP[value.op]) || value.op;
+    const symbol = OP_SYMBOL[value.op] || value.op;
     return symbol + ' ' + stringify(value.value);
   }
 
@@ -42,8 +43,12 @@ const SRTrace = (() => {
     return t('logs.kp.unknown');
   }
 
+  /* 绿点 = 判断为真；灰点 = 判断为假（明确结论，不是异常）；琥珀 = 未定。 */
   function tone(event) {
-    return event && (event.status === 'unknown' || event.value === null) ? 'warn' : 'ok';
+    if (!event) return '';
+    if (event.status === 'unknown' || event.value === null) return 'warn';
+    if (event.status === 'false' || event.value === false) return '';
+    return 'ok';
   }
 
   /* 每类关键点只取需要的字段；缺失字段不渲染。 */
@@ -79,7 +84,8 @@ const SRTrace = (() => {
         if (Array.isArray(event.matched)) {
           push(t('logs.kp.matched'), event.matched.length ? event.matched.join(', ') : '—');
         }
-        push(t('logs.field.value'), event.value === true ? 'true' : 'false');
+        push(t('logs.field.value'),
+          event.value === true ? 'true' : event.value === false ? 'false' : statusText(event.value));
         break;
       }
       case 'question': {

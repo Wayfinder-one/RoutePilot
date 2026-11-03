@@ -1142,9 +1142,13 @@ test('logs decision path keeps only key judgments and value outputs', () => {
   /* 白名单：只保留 5 类关键点事件。 */
   assert.match(trace, /const KEEP = \['slot', 'gate', 'condition', 'question', 'final'\]/,
     'trace.js lost the key-point whitelist');
-  for (const event of ['slot', 'gate', 'condition', 'question', 'final']) {
-    assert.match(trace, new RegExp("\\b" + event + ": 'logs\\.kp\\."),
-      'trace.js has no key-point label for ' + event);
+  const KEPT = {
+    slot: 'logs.kp.slot', gate: 'logs.kp.gate', condition: 'logs.kp.condition',
+    question: 'logs.kp.question', final: 'logs.kp.final',
+  };
+  for (const [event, key] of Object.entries(KEPT)) {
+    assert.match(trace, new RegExp("\\b" + event + ": '" + key.split('.').join('\\.') + "'"),
+      'trace.js maps ' + event + ' to the wrong key-point label');
   }
   /* 其余事件不再映射，也不再渲染。 */
   for (const event of ['time', 'window', 'wave', 'activate', 'scheduled', 'sticky_hit', 'fallback']) {
@@ -1164,7 +1168,8 @@ test('logs decision path keeps only key judgments and value outputs', () => {
   }
   /* 已删除的键不能残留。 */
   for (const key of ['logs.ev.time', 'logs.ev.window', 'logs.ev.wave', 'logs.ev.activate',
-    'logs.ev.scheduled', 'logs.ev.sticky', 'logs.ev.fallback', 'logs.ev.slot',
+    'logs.ev.scheduled', 'logs.ev.sticky', 'logs.ev.fallback', 'logs.ev.jev',
+    'logs.ev.branch', 'logs.ev.branchSkip', 'logs.ev.branchOther', 'logs.ev.slot',
     'logs.ev.gate', 'logs.ev.condition', 'logs.ev.question', 'logs.ev.final', 'logs.rawTrace']) {
     assert.equal(i18n.split("'" + key + "'").length - 1, 0,
       'removed i18n key still defined: ' + key);
@@ -1299,24 +1304,26 @@ test('review-import-rejects-invalid-envelope-values-before-normalization', () =>
   assert.deepEqual(accepted.tree.sticky, { enabled: true, ttl_seconds: 60 });
 });
 
-test('logs detail keeps a compact decision summary and folds the raw trace', () => {
+test('logs detail keeps a compact decision summary and folds the decision path', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
-  /* 默认视图：决策摘要（候选/波次）+ 折叠的原始轨迹与事实。 */
+  /* 默认视图：决策摘要（候选/波次）+ 折叠的决策过程与事实。 */
   assert.match(logs, /logs\.sum\.candidates/);
   assert.match(logs, /logs\.sum\.rounds/);
   assert.match(logs, /logs\.sum\.noCandidates/);
   assert.match(logs, /logs\.kp\.title/);
   assert.match(logs, /<details class="lg-more lg-more--trace">/,
-    'raw trace is not folded behind a details element');
+    'decision path is not folded behind a details element');
   assert.doesNotMatch(logs, /logs\.sec\.trace/, 'the old always-open trace section is back');
 
   const trace = read('trace.js');
-  assert.match(trace, /nullIsEvidence/, 'trace.js lost the null-evidence guard for slot/gate/condition');
+  assert.doesNotMatch(trace, /nullIsEvidence/, 'stale null-evidence guard is back');
+  assert.match(trace, /logs\.kp\.unknown/, 'trace.js lost the unknown status label');
+  assert.match(trace, /OP_SYMBOL/, 'trace.js lost the local operator symbol map');
 
   /* 新增 key 必须在 zh / en 两份词典里都存在。 */
   const i18n = read('i18n.js');
-  for (const key of ['logs.sum.rounds', 'logs.sum.candidates', 'logs.sum.round',
+  for (const key of ['logs.sum.rounds', 'logs.sum.waves', 'logs.sum.candidates', 'logs.sum.round',
     'logs.sum.via', 'logs.sum.noCandidates', 'logs.kp.title']) {
     assert.equal(i18n.split("'" + key + "'").length - 1, 2,
       'i18n key ' + key + ' is not defined in both zh and en');

@@ -150,7 +150,7 @@ function summaryHtml(record) {
       : `<span class="mut">${esc(t('logs.sum.noCandidates'))}</span>`
   }</div>`;
   const waveRow = waves.length
-    ? `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.sum.rounds'))}</span><span class="lg-waves">${
+    ? `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.sum.waves'))}</span><span class="lg-waves">${
       waves.map(item =>
         `<span class="lg-wave${item.failed ? ' bad' : ''}">` +
         `<b>${esc(tf('logs.sum.round', { n: item.wave }))}</b>` +

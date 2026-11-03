@@ -338,7 +338,6 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
   background:var(--panel);border:1.5px solid var(--line-2)}
 .lg-step[data-kind="ok"]::before{border-color:var(--green);background:var(--green)}
 .lg-step[data-kind="warn"]::before{border-color:var(--amber);background:var(--amber)}
-.lg-step[data-kind="bad"]::before{border-color:var(--red);background:var(--red)}
 .lg-step-h{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:650;line-height:1.35}
 .lg-step-d{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
 .lg-more--trace[open] .lg-trace{max-height:260px;overflow:auto;padding-right:2px}
