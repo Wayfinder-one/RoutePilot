@@ -126,7 +126,7 @@
     const port = source ? root.RTGraph.portOf(source, edge.source_port, graph) : null;
     let label = edge.source_port;
     if (port) label = port.short && port.short !== 'true' ? port.short : port.id;
-    return edge.source + ' · ' + label;
+    return (source ? root.RTCards.nodeName(source, graph) : edge.source) + ' · ' + label;
   }
 
   function slotPortOptions(graph, node) {
@@ -367,10 +367,12 @@
       '<form data-ins-form="edge" novalidate>' +
       '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.edge')) + '</div>' +
       '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.source')) + '</span><b title="' +
-      esc(edge.source + '.' + edge.source_port) + '">' + esc((source ? source.id : edge.source) + ' · ' +
+      esc(edge.source + '.' + edge.source_port) + '">' +
+      esc((source ? root.RTCards.nodeName(source, graph) : edge.source) + ' · ' +
         portLabel(source, edge.source_port)) + '</b></div>' +
       '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.target')) + '</span><b title="' +
-      esc(edge.target + '.' + edge.target_port) + '">' + esc((target ? target.id : edge.target) + ' · ' +
+      esc(edge.target + '.' + edge.target_port) + '">' +
+      esc((target ? root.RTCards.nodeName(target, graph) : edge.target) + ' · ' +
         edge.target_port) + '</b></div>' +
       '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.type')) + '</span><b>' + esc(typeLabel) + '</b></div>' +
       '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.condition')) + '</span><b data-edge-condition>' +
@@ -402,7 +404,8 @@
     const targets = (graph.nodes || []).filter(node => node.type === 'target');
     const targetOptions = selected => '<option value="">' + esc(t('cv.ins.none')) + '</option>' +
       targets.map(node => '<option value="' + esc(node.id) + '"' +
-        (node.id === selected ? ' selected' : '') + '>' + esc(node.id) + '</option>').join('');
+        (node.id === selected ? ' selected' : '') + ' title="' + esc(node.id) + '">' +
+        esc(root.RTCards.nodeName(node, graph)) + '</option>').join('');
     const zones = COMMON_TIMEZONES.slice();
     try {
       if (typeof Intl.supportedValuesOf === 'function') {
@@ -463,7 +466,7 @@
       const node = nodeOf(selected.id);
       if (node) {
         body.innerHTML = nodeBranch(node);
-        if (sub) sub.textContent = node.id;
+        if (sub) sub.textContent = root.RTCards.nodeName(node, current.graph);
         return;
       }
     }

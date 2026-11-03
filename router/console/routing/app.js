@@ -690,7 +690,7 @@
         return;
       }
       edges = (graph.edges || []).filter(edge => edge.source === selection.id || edge.target === selection.id);
-      title = tf('cv.deleteNode', { id: selection.id });
+      title = tf('cv.deleteNode', { id: RTCards.nodeName(node, graph) });
     } else if (selection.kind === 'edge') {
       const edge = (graph.edges || []).find(item => item.id === selection.id);
       if (!edge) return;
@@ -713,7 +713,12 @@
       const condition = type === 'number' || (edge.condition && edge.condition.op === 'is')
         ? ' · ' + RTGraph.conditionLabel(edge, graph)
         : '';
-      return '<li>' + esc(edge.source + ' · ' + edge.source_port + ' → ' + edge.target + ' · ' + edge.target_port + condition) + '</li>';
+      const sourceNode = RTGraph.findNode(graph, edge.source);
+      const targetNode = RTGraph.findNode(graph, edge.target);
+      const sourceName = sourceNode ? RTCards.nodeName(sourceNode, graph) : edge.source;
+      const targetName = targetNode ? RTCards.nodeName(targetNode, graph) : edge.target;
+      return '<li>' + esc(sourceName + ' · ' + edge.source_port + ' → ' +
+        targetName + ' · ' + edge.target_port + condition) + '</li>';
     }).join('');
     const body = $('#cvDeleteBody');
     body.innerHTML = '<h3>' + esc(t('cv.deleteTitle')) + '</h3>' +

@@ -26,6 +26,37 @@
       return value.length > length ? value.slice(0, length) + '…' : value;
     }
 
+    /* 中文显示名：优先用户填写的 title，否则按类型生成（同类节点多于一个时带序号）。
+       原始 id 仍保留在 tooltip 与 data 属性里，便于排障与定位。 */
+    function nodeName(node, graph) {
+      if (!node || typeof node !== 'object') return '';
+      const title = typeof node.title === 'string' ? node.title.trim() : '';
+      if (title && title !== node.id) return title;
+      const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+      const withIndex = (base, sameKind) => {
+        const peers = nodes.filter(item => item && sameKind(item));
+        return peers.length > 1 ? base + '-' + (peers.indexOf(node) + 1) : base;
+      };
+      switch (node.type) {
+        case 'start':
+          return t('cv.name.start');
+        case 'question':
+          return withIndex(t('cv.name.question.' + (node.question_type || 'choice')),
+            item => item.type === 'question' && item.question_type === node.question_type);
+        case 'logic':
+          return withIndex(t('cv.name.logic.' + (node.operator || 'and')),
+            item => item.type === 'logic' && item.operator === node.operator);
+        case 'condition':
+          return withIndex(t('cv.name.condition.' + (node.source || 'text')),
+            item => item.type === 'condition' && item.source === node.source);
+        case 'target':
+          /* 目标卡自身展示模型名；名称用于引用（回放/弹窗/槽位来源），带序号区分。 */
+          return withIndex(t('cv.name.target'), item => item.type === 'target');
+        default:
+          return node.id;
+      }
+    }
+
     function portHTML(node, port, options) {
       if (!port) return '';
       const opts = options || {};
@@ -49,7 +80,7 @@
       const port = source ? RTGraph.portOf(source, edge.source_port, graph) : null;
       let label = edge.source_port;
       if (port) label = port.short && port.short !== 'true' ? port.short : port.id;
-      return edge.source + ' · ' + label;
+      return (source ? nodeName(source, graph) : edge.source) + ' · ' + label;
     }
 
     function sourceTitle(edge) {
@@ -108,11 +139,7 @@
     function slotsHTML(graph, node) {
       const slots = visibleSlots(graph, node);
       if (!slots.length) return '';
-      /* question / target 的多槽位是 OR 语义（规格 §2.6），卡片上明确标注。 */
-      const note = (node.type === 'question' || node.type === 'target') && slots.length > 1
-        ? '<div class="rtc-slots-note">' + esc(t('cv.slot.orNote')) + '</div>'
-        : '';
-      return '<div class="rtc-slots">' + slots.map(port => slotRow(graph, node, port)).join('') + '</div>' + note;
+      return '<div class="rtc-slots">' + slots.map(port => slotRow(graph, node, port)).join('') + '</div>';
     }
 
     function header(node, options) {
@@ -169,7 +196,7 @@
       const topPort = byId('p_top');
       const marginPort = byId('margin');
       return nodeWrap(node, 'choice',
-        header(node, { icon: 'question', badge: t('cv.card.choice') }) +
+        header(node, { icon: 'question', badge: t('cv.card.choice'), title: nodeName(node, graph) }) +
         '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-opts">' + rows + '</div>' +
@@ -186,7 +213,7 @@
       const yes = ports.find(port => port.id === 'yes');
       const no = ports.find(port => port.id === 'no');
       return nodeWrap(node, 'noul',
-        header(node, { icon: 'question', badge: t('cv.card.noul') }) +
+        header(node, { icon: 'question', badge: t('cv.card.noul'), title: nodeName(node, graph) }) +
         '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-qfoot rtc-qfoot--rows">' +
@@ -201,7 +228,7 @@
       const value = RTGraph.portsOf(node, graph).find(port => port.id === 'value');
       const levels = Array.isArray(node.criteria) ? node.criteria.join(' / ') : '';
       return nodeWrap(node, 'score',
-        header(node, { icon: 'question', badge: t('cv.card.score') }) +
+        header(node, { icon: 'question', badge: t('cv.card.score'), title: nodeName(node, graph) }) +
         '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
         slotsHTML(graph, node) +
         '<div class="rtc-qfoot rtc-qfoot--rows">' +
@@ -298,6 +325,7 @@
     return {
       render: render,
       nodeCard: nodeCard,
+      nodeName: nodeName,
       portHTML: portHTML,
       snippet: snippet,
       escape: esc

@@ -13,6 +13,12 @@
   const t = key => root.t(key);
   const tf = (key, vars) => root.tf(key, vars);
   const esc = value => root.RTCards.escape(value);
+  /* 画布上节点用中文显示名；抽屉里同样显示名称，原始 id 留在 tooltip。 */
+  const nodeName = id => {
+    const graph = app() && app().graph;
+    const node = graph && root.RTGraph ? root.RTGraph.findNode(graph, id) : null;
+    return node && root.RTCards ? root.RTCards.nodeName(node, graph) : (id || '—');
+  };
   const clone = value => (value == null ? value : JSON.parse(JSON.stringify(value)));
 
   /* 五个样例 = 文本 + 固定 now。文本与 tests/fixtures/graph_scenarios.json 完全一致，
@@ -676,13 +682,13 @@
       const fallbackKey = final.kind === 'error_fallback' ? 'cv.try.errorFallback' : 'cv.try.otherwiseTarget';
       return '<span class="rtc-try-none">' + esc(t('cv.tryNoCandidates')) + '</span>' +
         '<span class="rtc-try-op">→</span>' +
-        '<span class="rtc-try-pick">' + esc(t(fallbackKey)) + ' ' + esc(final.target_id) + '</span>';
+        '<span class="rtc-try-pick">' + esc(t(fallbackKey)) + ' ' + esc(nodeName(final.target_id)) + '</span>';
     }
     return final.candidates.map((candidate, index) =>
       (index ? '<span class="rtc-try-op">&lt;</span>' : '') +
       '<span class="rtc-try-cand' + (candidate.target_id === final.target_id ? ' is-win' : '') + '"' +
       ' data-candidate="' + esc(candidate.target_id) + '" data-priority="' + esc(candidate.priority) + '">' +
-      esc(candidate.target_id) + '<i>p' + esc(candidate.priority) + '</i></span>').join('') +
+      esc(nodeName(candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i></span>').join('') +
       '<span class="rtc-try-op">→</span><span class="rtc-try-pick">' +
       esc(tf('cv.tryPick', { target: final.target_id })) + '</span>';
   }
@@ -709,7 +715,7 @@
       '<div class="rtc-try-res-h">' +
         '<span class="rtc-try-kind is-' + kindClass + '">' + esc(finalKindLabel(replay)) + '</span>' +
         '<span class="rtc-try-lbl">' + esc(t('cv.tryFinal')) + '</span>' +
-        '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' + esc(final.target_id) + '</b>' +
+        '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' + esc(nodeName(final.target_id)) + '</b>' +
         '<span class="rtc-try-sub">' + (final.model ? esc(final.model) + ' · ' : '') +
           esc(tf('cv.tryPriorityMeta', { priority: final.priority })) + ' · ' + esc(selectionReason(replay)) + '</span>' +
         '<span class="rtc-try-meta">' +
@@ -740,7 +746,7 @@
   function waveConditionTitle(replay, wave) {
     const rows = waveSlotRows(replay, wave);
     if (!rows.length) return t('cv.tryNoHitSlot');
-    return rows.map(row => row.node_id + '.' + row.port + ' ' + slotLine(row))
+    return rows.map(row => nodeName(row.node_id) + '.' + row.port + ' ' + slotLine(row))
       .join(t('cv.trySepClause'));
   }
 
@@ -761,7 +767,7 @@
       esc(wave.failed ? t('cv.tryWaveFailed') : ms(wave.duration_ms)) + '</span>').join('');
     host.innerHTML = '<span class="rtc-hud-tt">' + esc(t('cv.tryHud')) + '</span>' + waves +
       '<span class="rtc-hud-final' + (replay.final.kind === 'error_fallback' ? ' is-failed' : '') + '">→ ' +
-      esc(replay.final.target_id) + '</span>';
+      esc(nodeName(replay.final.target_id)) + '</span>';
   }
 
   function rowLabel(kind) {
@@ -846,7 +852,7 @@
         (edgeId ? ' data-trace-edge="' + esc(edgeId) + '"' : '') +
         (nodeId ? ' data-trace-node="' + esc(nodeId) + '"' : '') + keyboard + '>' +
         '<span class="rtc-dw-k">' + esc(rowLabel(row.kind)) + '</span>' +
-        '<span class="rtc-dw-n" title="' + esc(nodeId) + '">' + esc(nodeId || '—') + '</span>' +
+        '<span class="rtc-dw-n" title="' + esc(nodeId) + '">' + esc(nodeName(nodeId)) + '</span>' +
         '<span class="rtc-dw-t">' + esc(rowText(row)) + '</span>' +
         '</div>';
     });
@@ -888,7 +894,7 @@
         (conds.length
           ? '<div class="rtc-dw-cond-h">' + esc(t('cv.tryWaveConditions')) + '</div>' +
             conds.slice(0, 8).map(row => '<div class="rtc-dw-cond">' +
-              esc(row.node_id + '.' + row.port + ' ' + slotLine(row)) + '</div>').join('')
+              esc(nodeName(row.node_id) + '.' + row.port + ' ' + slotLine(row)) + '</div>').join('')
           : '') +
         '</div>';
     }).join('');

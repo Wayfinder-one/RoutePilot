@@ -206,7 +206,13 @@
     const pop = element();
     if (!pop) return;
     const type = edgeType(edge);
-    const path = edge.source + '.' + edge.source_port + ' → ' + edge.target + '.' + edge.target_port;
+    const graph = root.App && root.App.graph;
+    const nameOf = id => {
+      const node = graph && root.RTGraph ? root.RTGraph.findNode(graph, id) : null;
+      return node && root.RTCards ? root.RTCards.nodeName(node, graph) : id;
+    };
+    const path = nameOf(edge.source) + '.' + edge.source_port + ' → ' +
+      nameOf(edge.target) + '.' + edge.target_port;
     pop.dataset.edgeId = edge.id;
     pop.dataset.edgeType = type;
     pop.setAttribute('role', 'dialog');

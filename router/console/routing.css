@@ -630,7 +630,6 @@ body.is-try-running .rtc-stage.is-locked::after {
 .rtc-model-edit { display: flex; align-items: flex-end; gap: 6px; }
 .rtc-model-edit .field { flex: 1; min-width: 0; margin-top: 0; }
 .rtc-model-edit .btn { flex: none; }
-.rtc-slots-note { margin: 1px 0 3px; font-size: 8.5px; line-height: 1.4; color: var(--text-3); }
 
 /* ── 缩放条 / 图例 ────────────────────────────────────────────── */
 .rtc-zoom { position: absolute; left: 20px; bottom: 18px; z-index: 23; display: flex; flex-direction: column; gap: 5px; }

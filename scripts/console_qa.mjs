@@ -1380,9 +1380,9 @@ test('7.4-10-delete-confirm-and-slot-reuse', async () => {
   await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
   assert.equal(await page.locator('#cvDeleteBody li').count(), 3);
   const dialogText = await page.locator('#cvDeleteBody').innerText();
-  assert.match(dialogText, /capability/);
-  assert.match(dialogText, /domain/);
-  assert.match(dialogText, /power-target/);
+  assert.match(dialogText, /单选题/);
+  assert.match(dialogText, /是否问题-1/);
+  assert.match(dialogText, /模型目标-2/);
   await page.locator('[data-act="delete-confirm"]').click();
   await page.waitForFunction(() => !document.querySelector('[data-node-id="and-power"]'));
   let snapshot = await appSnapshot();
@@ -1471,9 +1471,9 @@ test('Task 10 · edge delete confirm lists the edge, removes it and undo restore
   await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
   assert.equal(await page.locator('#cvDeleteBody li').count(), 1);
   const dialogText = await page.locator('#cvDeleteBody').innerText();
-  assert.match(dialogText, /capability/);
+  assert.match(dialogText, /单选题/);
   assert.match(dialogText, /selected\.strong/);
-  assert.match(dialogText, /strong-target/);
+  assert.match(dialogText, /模型目标-3/);
   assert.match(dialogText, /in_1/);
 
   await page.locator('[data-act="delete-confirm"]').click();
@@ -1736,9 +1736,9 @@ test('7.4-07-selected-edge-inspector', async () => {
   await clickEdge(edgeId);
   await waitInspectorBranch('edge', edgeId);
   const text = await page.locator('#cvInspectorBody').innerText();
-  assert.match(text, /capability/);
+  assert.match(text, /单选题/);
   assert.match(text, /prob\.strong/);
-  assert.match(text, /and-power/);
+  assert.match(text, /与门-2/);
   assert.match(text, /in_1/);
   assert.match(text, /> 0\.65/);
   const typeLabel = await page.evaluate(() => {
@@ -1754,9 +1754,9 @@ test('7.4-07-selected-edge-inspector', async () => {
   await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
   assert.equal(await page.locator('#cvDeleteBody li').count(), 1);
   const dialog = await page.locator('#cvDeleteBody').innerText();
-  assert.match(dialog, /capability/);
+  assert.match(dialog, /单选题/);
   assert.match(dialog, /prob\.strong/);
-  assert.match(dialog, /and-power/);
+  assert.match(dialog, /与门-2/);
   assert.match(dialog, /in_1/);
   await page.locator('[data-act="delete-confirm"]').click();
   await page.waitForFunction(id => !window.App.graph.edges.some(edge => edge.id === id), edgeId);
@@ -1839,9 +1839,9 @@ test('7.4-08-logic-slot-rows', async () => {
   assert.equal(await page.locator('#cvNodes [data-node-id="or-ctx"]').getAttribute('data-operator'), 'or');
   const orRows = page.locator('#cvNodes [data-node-id="or-ctx"] .rtc-slot');
   assert.equal(await orRows.count(), 3, 'OR renders its two occupied rows plus the next free slot');
-  assert.match(await orRows.nth(0).innerText(), /cond-text/);
+  assert.match(await orRows.nth(0).innerText(), /文本条件/);
   assert.match(await orRows.nth(0).innerText(), /in_1/);
-  assert.match(await orRows.nth(1).innerText(), /cond-peak/);
+  assert.match(await orRows.nth(1).innerText(), /时段条件/);
   assert.match(await orRows.nth(1).innerText(), /in_2/);
   assert.equal(await orRows.nth(2).locator('.rtc-slot-add').count(), 0,
     'empty slot rows no longer render an add chip');
@@ -1915,15 +1915,13 @@ test('7.4-09-question-target-rows', async () => {
     edge.target === 'capability' && edge.target_port === 'in_2'));
 
   assert.equal(await page.locator('#cvNodes [data-node-id="capability"] .rtc-slot').count(), 3);
-  const expectedNote = await page.evaluate(() => window.t('cv.slot.orNote'));
-  assert.ok(expectedNote.length > 0);
-  const note = await page.locator('#cvNodes [data-node-id="capability"] .rtc-slots-note').textContent();
-  assert.equal(note.trim(), expectedNote);
+  assert.equal(await page.locator('#cvNodes [data-node-id="capability"] .rtc-slots-note').count(), 0,
+    'the OR explanation note is still rendered on the card');
   const rows = page.locator('#cvNodes [data-node-id="capability"] .rtc-slot');
-  assert.match(await rows.nth(0).innerText(), /start/);
+  assert.match(await rows.nth(0).innerText(), /开始/);
   assert.match(await rows.nth(0).innerText(), /in_1/);
   assert.equal((await rows.nth(0).locator('[data-cond-edge]').textContent()).trim(), '= true');
-  assert.match(await rows.nth(1).innerText(), /cond-text/);
+  assert.match(await rows.nth(1).innerText(), /文本条件/);
   assert.equal((await rows.nth(1).locator('[data-cond-edge]').textContent()).trim(), '= true');
 
   await rows.nth(1).locator('[data-cond-edge]').click();
@@ -1939,11 +1937,38 @@ test('7.4-09-question-target-rows', async () => {
   await page.waitForFunction(() => window.App.graph.edges.some(edge =>
     edge.target === 'strong-target' && edge.target_port === 'in_2'));
   assert.equal(await page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slot').count(), 3);
-  const targetNote = await page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slots-note').textContent();
-  assert.equal(targetNote.trim(), expectedNote);
+  assert.equal(await page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slots-note').count(), 0,
+    'the OR explanation note is still rendered on the target card');
   const targetRows = page.locator('#cvNodes [data-node-id="strong-target"] .rtc-slot');
-  assert.match(await targetRows.nth(0).innerText(), /selected\.strong|capability/);
-  assert.match(await targetRows.nth(1).innerText(), /cond-text/);
+  assert.match(await targetRows.nth(0).innerText(), /单选题|置信度/);
+  assert.match(await targetRows.nth(1).innerText(), /文本条件/);
+});
+
+test('review-chinese-node-names', async () => {
+  await openCanvas();
+  const names = await page.evaluate(() => {
+    const title = id => {
+      const card = document.querySelector('#cvNodes [data-node-id="' + id + '"] .rtc-title');
+      return card ? card.textContent.trim() : null;
+    };
+    const firstSlot = document.querySelector('#cvNodes [data-node-id="capability"] .rtc-slot');
+    return {
+      capability: title('capability'),
+      domain: title('domain'),
+      clarify: title('clarify'),
+      slotSource: firstSlot ? firstSlot.innerText : '',
+      idTooltip: document.querySelector('#cvNodes [data-node-id="capability"] .rtc-title').getAttribute('title'),
+    };
+  });
+  assert.equal(names.capability, '单选题', 'choice question card title is not Chinese');
+  assert.equal(names.domain, '是否问题-1', 'first noul card title is not Chinese');
+  assert.equal(names.clarify, '是否问题-2', 'second noul card title is not Chinese');
+  assert.match(names.slotSource, /开始/, 'slot source label is not Chinese');
+  assert.equal(names.idTooltip, 'capability', 'raw node id is not kept in the tooltip');
+
+  await clickNode('capability');
+  await page.waitForFunction(() =>
+    document.getElementById('cvInspectorSub').textContent.trim() === '单选题');
 });
 
 test('option-delete-cascades-edges', async () => {
@@ -1956,8 +1981,8 @@ test('option-delete-cascades-edges', async () => {
   const dialog = await page.locator('#cvDeleteBody').innerText();
   assert.match(dialog, /selected\.strong/);
   assert.match(dialog, /prob\.strong/);
-  assert.match(dialog, /strong-target/);
-  assert.match(dialog, /and-power/);
+  assert.match(dialog, /模型目标-3/);
+  assert.match(dialog, /与门-2/);
   await page.locator('[data-act="delete-confirm"]').click();
   await page.waitForFunction(() => !window.App.graph.nodes.find(node => node.id === 'capability')
     .options.some(option => option.key === 'strong'));
@@ -2111,7 +2136,7 @@ test('Task 11 · inspector save and delete bind to the rendered branch, not a si
   await page.locator('#cvInspectorBody [data-opt-row="strong"] [data-act="opt-delete"]').click();
   await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
   const optionDialog = await page.locator('#cvDeleteBody').innerText();
-  assert.match(optionDialog, /capability/);
+  assert.match(optionDialog, /单选题/);
   assert.match(optionDialog, /selected\.strong/);
   assert.match(optionDialog, /prob\.strong/);
   await page.locator('[data-act="delete-cancel"]').click();
@@ -2123,7 +2148,7 @@ test('Task 11 · inspector save and delete bind to the rendered branch, not a si
   await page.locator('#cvInspectorBody [data-act="ins-delete-edge"]').click();
   await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden, null, { timeout: 3000 });
   const edgeDialog = await page.locator('#cvDeleteBody').innerText();
-  assert.match(edgeDialog, /and-power/);
+  assert.match(edgeDialog, /与门-2/);
   assert.match(edgeDialog, /in_1/);
   await page.locator('[data-act="delete-cancel"]').click();
   assert.equal(await page.locator('#cvDeleteModal').isHidden(), true);
@@ -4018,7 +4043,7 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
   assertIncludes(snap.slots.lightIn1.classes, 'is-error-path',
     'the fallback target slot row did not join the amber chain');
   assert.equal(snap.resultKind, 'error_fallback');
-  assertIncludes(snap.resultText, 'light-target');
+  assertIncludes(snap.resultText, '模型目标-5');
   assertIncludes(snap.resultText, await page.evaluate(() => window.t('cv.tryKind.error')));
   await screenshot('s5-fallback-amber-1440.png');
 
@@ -5418,7 +5443,7 @@ test('review-inspector-adds-input-connection', async () => {
   assert.ok(edge, 'inspector did not create the input connection');
   assert.equal(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"].is-empty').count(), 0,
     'canvas slot row did not become occupied');
-  assert.match(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"]').innerText(), /start/,
+  assert.match(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"]').innerText(), /开始/,
     'canvas slot row does not show the new source');
   const badge = await dirtyBadge();
   assert.equal(badge.hidden, false, 'inspector connection did not mark the draft dirty');

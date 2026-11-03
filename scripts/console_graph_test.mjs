@@ -1339,3 +1339,23 @@ test('logs detail keeps a compact decision summary and folds the decision path',
       'i18n key ' + key + ' is not defined in both zh and en');
   }
 });
+
+test('review-chinese-node-names-contract', () => {
+  const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
+  const cards = read('routing/cards.js');
+  assert.match(cards, /function nodeName\(node, graph\)/, 'cards.js lost the Chinese node names');
+  assert.match(cards, /nodeName: nodeName/, 'cards.js does not expose nodeName');
+  assert.match(cards, /cv\.name\.question\./, 'question cards do not use the Chinese name labels');
+  for (const file of ['routing/inspector.js', 'routing/condpop.js', 'routing/tryrun.js']) {
+    assert.match(read(file), /RTCards\.nodeName\(/, file + ' does not use the Chinese node names');
+  }
+  /* 卡片不再渲染 OR 说明（说明仅保留在检查器里）。 */
+  assert.doesNotMatch(cards, /cv\.slot\.orNote/, 'card still renders the OR note');
+  const i18n = read('i18n.js');
+  for (const key of ['cv.name.start', 'cv.name.question.choice', 'cv.name.question.noul',
+    'cv.name.question.score', 'cv.name.logic.and', 'cv.name.logic.or', 'cv.name.logic.not',
+    'cv.name.condition.text', 'cv.name.condition.periods', 'cv.name.target']) {
+    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
+      'i18n key ' + key + ' is not defined in both zh and en');
+  }
+});
