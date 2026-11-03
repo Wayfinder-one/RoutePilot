@@ -55,6 +55,7 @@ class RoutingEngine:
         allowed_models = available(targets)
         path_text = "/".join(policy_path)
         preferred = None
+        preferred_target_id = None
         if tree.sticky.enabled and request.session_id:
             candidate = self.affinity.get(
                 request.session_id,
@@ -63,14 +64,17 @@ class RoutingEngine:
                 allowed_models=allowed_models,
                 touch=not dry_run,
             )
-            if candidate in allowed_models:
-                preferred = candidate
+            if candidate is not None and candidate[0] in allowed_models:
+                preferred, preferred_target_id = candidate
         target = None
         answer = None
         sticky_hit = False
         fallback_reason = None
         if preferred is not None:
-            target = next(target for target in targets if preferred in self._models((target,), snapshot))
+            target = next(
+                target for target in targets
+                if target.id == preferred_target_id and preferred in self._models((target,), snapshot)
+            )
             selection_reason = "sticky"
             sticky_hit = True
             trace.append({"event": "sticky_hit", "model": preferred, "policy_path": path_text})
@@ -93,6 +97,7 @@ class RoutingEngine:
             self.affinity.put(
                 request.session_id,
                 model,
+                target_id=target.id,
                 tree_revision=snapshot.tree_revision,
                 policy_path=path_text,
                 ttl_seconds=tree.sticky.ttl_seconds,
