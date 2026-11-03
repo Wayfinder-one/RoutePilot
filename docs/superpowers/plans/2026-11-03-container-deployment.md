@@ -19,7 +19,7 @@
 - **环境事实（2026-11-03 实测，可直接依赖）**：
   - 76 上 docker 已配 Harbor insecure registry，且 `/root/.docker/config.json` 已有 `192.168.95.133:30002` 登录凭据（push 无需再 login）。
   - 76 上 `docker compose` = v5.1.1，`rsync` 可用。
-  - 上游 LLM：svc `sandlake-inference`（ClusterIP `10.233.43.73:8080`），从节点和 pod 内都可达；上游模型名 **`admin-inference-qwen06b`**（`/v1/models` 实查）。NodePort 31808 当前 **connection refused，不可用，不要用**。
+  - 上游 LLM：svc `sandlake-inference`（ClusterIP `10.233.43.73:8080`），从节点和 pod 内都可达；上游模型名 **`admin-inference-qwen06b`**（`/v1/models` 实查）。NodePort 31808 **节点本机 connection refused、集群外 200**（不要依赖）。
   - JEV 端点：宿主机 llama-server `http://192.168.95.76:30104`，模型 `d1-2B`（现网 systemd 同款配置）。
   - NodePort **30400 空闲**；宿主机 8401 空闲（8400 被 systemd 占用）。
   - admin 登录：`admin@test.com` / `1qaz@WSX`（空库首启种子；运维脚本读 `SR_ADMIN_EMAIL`/`SR_ADMIN_PASSWORD`）。
@@ -32,7 +32,7 @@
 
 1. **镜像内运维脚本与 main 代码不兼容（D1）**：本计划假设镜像内 `scripts/apply_default_routing_tree.py` 可直接 exec，但该脚本是工作树（feat 分支）版本：`import router.routing.document`（main 无此模块）、读 `document_sha256`（main API 无此键）、要求 `--tree-id`（计划命令未给）。实际实现：两个部署脚本用**内联 stdlib heredoc**（镜像内 `tree_from_dict` 校验 → 登录 → create-or-update → enable）替代，`configure_upstream.py` 不受影响（main 兼容）。
 2. **Harbor `sandlake-deploy` 为私有项目**：76 的 containerd `certs.d` 无 auth 块，匿名拉取必 `ErrImagePull`。实际实现：`01-secret.yaml` 增加 `routepilot-harbor`（dockerconfigjson，从 76 的 `/root/.docker/config.json` 过滤单 registry）+ `03-deployment.yaml` `imagePullSecrets`。
-3. **NodePort 端口检查**：本集群 NodePort 仅 iptables 编程，**节点本机不可达**（外部可达；31808 同因已死）。`ss -tln` 看不见 NodePort，`deploy-k8s.sh` 的 30400 预检只能抓非 k8s 占用者；真实冲突由 `kubectl apply` 显式失败兜底。无痕验收必须外部探测。
+3. **NodePort 端口检查**：本集群 NodePort 仅 iptables 编程，**节点本机不可达**（外部可达；31808 同因：节点本机不可达、集群外 200）。`ss -tln` 看不见 NodePort，`deploy-k8s.sh` 的 30400 预检只能抓非 k8s 占用者；真实冲突由 `kubectl apply` 显式失败兜底。无痕验收必须外部探测。
 4. **容器内 upstream 预检**：`deploy-k8s.sh` 在 `wait_healthz` 后、init 前增加了 `kubectl exec` 的 `urlopen($UPSTREAM_BASE/models)` 预检（与 compose 形态对齐）。
 5. **longhorn 副本数**：本集群 StorageClass `longhorn` 的 `numberOfReplicas=1`、单节点——PVC 只保证 pod 重建/同节点重挂，不提供节点级冗余。
 6. **`--purge` 与静默失败**：`teardown.sh --purge` 未实跑（镜像保留）；已知限制——purge 成功后 404 会 `die`（非幂等）、`|| true` 会掩盖 compose down / namespace delete 失败（本次由 live state 独立证实无残留）。
@@ -51,7 +51,7 @@
 - Consumes: 仓库根的 `requirements.txt`、`router/`、`configs/`、`scripts/configure_upstream.py`、`scripts/apply_default_routing_tree.py`；76 的 docker + Harbor 凭据。
 - Produces: Harbor 镜像 `192.168.95.133:30002/sandlake-deploy/routepilot:<tag>`（Task 2/3 部署时按 tag 引用）；构建脚本 `docker-build.sh [tag] [ssh-target]`。
 
-- [ ] **Step 1: 写 Dockerfile**
+- [x] **Step 1: 写 Dockerfile**
 
 创建 `scripts/docker/Dockerfile`，内容如下（完整照抄）：
 
@@ -89,7 +89,7 @@ EXPOSE 8400
 ENTRYPOINT ["python", "-m", "router"]
 ```
 
-- [ ] **Step 2: 写 .dockerignore**
+- [x] **Step 2: 写 .dockerignore**
 
 创建 `scripts/docker/.dockerignore`，内容如下：
 
@@ -119,7 +119,7 @@ scripts
 !scripts/apply_default_routing_tree.py
 ```
 
-- [ ] **Step 3: 写 docker-build.sh**
+- [x] **Step 3: 写 docker-build.sh**
 
 创建 `scripts/docker/docker-build.sh`，内容如下：
 
@@ -181,12 +181,12 @@ echo "==> OK: $REPO:$TAG"
 
 然后 `chmod +x scripts/docker/docker-build.sh`。
 
-- [ ] **Step 4: 语法检查**
+- [x] **Step 4: 语法检查**
 
 Run: `bash -n scripts/docker/docker-build.sh && echo SYNTAX-OK`
 Expected: `SYNTAX-OK`
 
-- [ ] **Step 5: 真实构建 + 推送 + 自测**
+- [x] **Step 5: 真实构建 + 推送 + 自测**
 
 Run: `scripts/docker/docker-build.sh`
 Expected（全部出现即通过）：
@@ -212,7 +212,7 @@ Expected（全部出现即通过）：
 - Consumes: Task 1 的 Harbor 镜像（tag 参数，默认 `latest`）；76 上 `docker compose` v5。
 - Produces: `lib.sh` 的 `log` / `die` / `wait_healthz <base> <tries>` / `smoke <base>`（Task 3、4 复用，签名原样）；compose 形态运行在 `http://192.168.95.76:8401`；部署目录 `/opt/routepilot-container/`。
 
-- [ ] **Step 1: 写 lib.sh（共享函数）**
+- [x] **Step 1: 写 lib.sh（共享函数）**
 
 创建 `scripts/docker/lib.sh`：
 
@@ -256,7 +256,7 @@ smoke() {  # $1 = base url — healthz + console page + real /v1 routing
 }
 ```
 
-- [ ] **Step 2: 写 compose.yml 与 env 模板**
+- [x] **Step 2: 写 compose.yml 与 env 模板**
 
 创建 `scripts/docker/compose.yml`：
 
@@ -296,7 +296,7 @@ ROUTER_ADMIN_EMAIL=admin@test.com
 ROUTER_ADMIN_PASSWORD=1qaz@WSX
 ```
 
-- [ ] **Step 3: 写 compose-up.sh**
+- [x] **Step 3: 写 compose-up.sh**
 
 创建 `scripts/docker/compose-up.sh`：
 
@@ -365,12 +365,12 @@ log "OK: compose form live at $BASE (teardown: scripts/docker/teardown.sh)"
 
 `chmod +x scripts/docker/lib.sh scripts/docker/compose-up.sh`。
 
-- [ ] **Step 4: 语法检查**
+- [x] **Step 4: 语法检查**
 
 Run: `bash -n scripts/docker/lib.sh && bash -n scripts/docker/compose-up.sh && echo SYNTAX-OK`
 Expected: `SYNTAX-OK`
 
-- [ ] **Step 5: 真实部署 + 冒烟（对应 spec V2/V3）**
+- [x] **Step 5: 真实部署 + 冒烟（对应 spec V2/V3）**
 
 Run: `scripts/docker/compose-up.sh`
 Expected（全部出现即通过）：
@@ -401,7 +401,7 @@ Expected（全部出现即通过）：
 - Consumes: Task 1 镜像；Task 2 的 `lib.sh`（`log`/`die`/`wait_healthz`/`smoke`，签名不变）。
 - Produces: 76 集群 namespace `routepilot`（Deployment/Service NodePort 30400/PVC `routepilot-data`/Secret `routepilot-admin`）；服务地址 `http://192.168.95.76:30400`。
 
-- [ ] **Step 1: 写 manifests**
+- [x] **Step 1: 写 manifests**
 
 创建 `scripts/docker/k8s/00-namespace.yaml`：
 
@@ -526,7 +526,7 @@ spec:
       nodePort: 30400
 ```
 
-- [ ] **Step 2: 写 deploy-k8s.sh**
+- [x] **Step 2: 写 deploy-k8s.sh**
 
 创建 `scripts/docker/deploy-k8s.sh`：
 
@@ -596,7 +596,7 @@ log "OK: k8s form live at $BASE (teardown: scripts/docker/teardown.sh)"
 
 `chmod +x scripts/docker/deploy-k8s.sh`。
 
-- [ ] **Step 3: 语法 + manifest 校验**
+- [x] **Step 3: 语法 + manifest 校验**
 
 Run: `bash -n scripts/docker/deploy-k8s.sh && echo SYNTAX-OK`
 Expected: `SYNTAX-OK`
@@ -613,7 +613,7 @@ ssh root@192.168.95.76 'kubectl apply -f /tmp/rp-render/00-namespace.yaml && \
 ```
 Expected: namespace `routepilot` created；随后 4 行 `configured (server dry run)` 或 `created (server dry run)`（secret/pvc/deployment/service）。报字段错误时先修 manifest 再继续。
 
-- [ ] **Step 4: 真实部署 + 冒烟（对应 spec V4）**
+- [x] **Step 4: 真实部署 + 冒烟（对应 spec V4）**
 
 Run: `scripts/docker/deploy-k8s.sh`
 Expected（全部出现即通过）：
@@ -625,7 +625,7 @@ Expected（全部出现即通过）：
 
 失败排查：ImagePullBackOff → `ssh root@192.168.95.76 'kubectl -n routepilot describe pod -l app=routepilot'`（镜像 tag 是否已 push；**Harbor `sandlake-deploy` 是私有项目，containerd 无 auth，匿名拉取必 ErrImagePull**——需 `imagePullSecret`，见 01-secret.yaml `routepilot-harbor`；实施时已按此修复）；PVC Pending → `kubectl -n routepilot get pvc`（longhorn 为默认 SC，一般即时 Bound）。
 
-- [ ] **Step 5: PVC 持久化验证（对应 spec V5）**
+- [x] **Step 5: PVC 持久化验证（对应 spec V5）**
 
 Run:
 ```bash
@@ -649,7 +649,7 @@ Expected: `PERSIST-OK`，且 `enabled=True`、revision 前后一致。
 - Consumes: Task 2/3 已知的部署痕迹位置（`/opt/routepilot-container/`、`/opt/routepilot-k8s/`、`/opt/routepilot-docker-context/`、namespace `routepilot`、镜像 repo `sandlake-deploy/routepilot`）。
 - Produces: `teardown.sh [--purge]`；`--purge` 时连 Harbor 仓库一并删除（凭据取 76 上 `/root/.docker/config.json` 的 base64 auth）。
 
-- [ ] **Step 1: 写 teardown.sh**
+- [x] **Step 1: 写 teardown.sh**
 
 创建 `scripts/docker/teardown.sh`：
 
@@ -690,17 +690,17 @@ log "teardown: done (systemd smart-router-v3 untouched)"
 
 `chmod +x scripts/docker/teardown.sh`。
 
-- [ ] **Step 2: 语法检查**
+- [x] **Step 2: 语法检查**
 
 Run: `bash -n scripts/docker/teardown.sh && echo SYNTAX-OK`
 Expected: `SYNTAX-OK`
 
-- [ ] **Step 3: 执行卸载（对应 spec V7）**
+- [x] **Step 3: 执行卸载（对应 spec V7）**
 
 Run: `scripts/docker/teardown.sh`
 Expected: 各段日志正常，无报错；末行 `teardown: done`。
 
-- [ ] **Step 4: 无痕验收（spec §10 七项逐条核对）**
+- [x] **Step 4: 无痕验收（spec §10 七项逐条核对）**
 
 逐条执行并核对预期（任何一条不符都要修复后重跑 teardown）：
 
@@ -742,7 +742,7 @@ ssh root@192.168.95.76 'docker images 192.168.95.133:30002/sandlake-deploy/route
 - Consumes: Task 1–4 的脚本与验收结果；spec §9 验收表。
 - Produces: 完整操作手册（下次验证可直接照做）。
 
-- [ ] **Step 1: 写操作手册**
+- [x] **Step 1: 写操作手册**
 
 创建 `docs/容器部署-2026-11-03.md`，结构如下（每节都要写实内容，引用实际脚本路径与实测结果）：
 
@@ -783,13 +783,13 @@ scripts/docker/teardown.sh（--purge 连 Harbor 仓库删除）
 
 ## 踩坑与边界（按实际遇到补）
 - ROUTER_JEV_URL/ROUTER_JEV_MODEL 必须成对（app.py:94）。
-- NodePort 31808 当前 connection refused，上游不要走它。
+- NodePort 31808 节点本机 connection refused（集群外 200），上游不要依赖它。
 - .env 已存在则不覆盖；改 tag 需先删 /opt/routepilot-container/.env。
 - 运维脚本读 SR_ADMIN_* 而非 ROUTER_ADMIN_*（Secret 里的名字）。
 - 集群模型漂移时用 kubectl 实查后以 SR_UPSTREAM_MODEL 重跑。
 ```
 
-- [ ] **Step 2: 现网基线复核（spec V6）**
+- [x] **Step 2: 现网基线复核（spec V6）**
 
 Run:
 ```bash
@@ -797,17 +797,17 @@ ssh root@192.168.95.76 'systemctl is-active smart-router-v3 litestream && curl -
 ```
 Expected: `active`、`active`、`{"ok":true}`、`v1:200`（若上游漂移导致非 200，记录现状即可——属既有上游问题，不是本计划引入；在手册「踩坑」节补一行）。
 
-- [ ] **Step 3: 本地测试基线（spec V8）**
+- [x] **Step 3: 本地测试基线（spec V8）**
 
 Run: `.venv/bin/python -m pytest -q 2>&1 | tail -3`
 Expected: 与 main 基线一致（2026-11-03 为 `580 passed` 量级），**0 failed**。本计划未改应用代码，任何 FAIL 都说明误改了文件，需要回查。
 
-- [ ] **Step 4: 确认 git 状态干净（部署物零入库）**
+- [x] **Step 4: 确认 git 状态干净（部署物零入库）**
 
 Run: `git status --porcelain | grep -E "scripts/docker|容器部署" ; git log --oneline -3`
 Expected: grep 无输出（scripts/docker/ 与 docs/容器部署-2026-11-03.md 被 .gitignore 忽略）；最近提交只有 spec 与 plan 两个 docs 提交。
 
-- [ ] **Step 5: 手册补记实测结果**
+- [x] **Step 5: 手册补记实测结果**
 
 把 Task 2–4 的关键实测输出（tree revision、x-sr-model 值、V5 持久化前后一致、卸载无痕清单结果）补进 `docs/容器部署-2026-11-03.md` 对应小节，形成可复核的验收记录。
 

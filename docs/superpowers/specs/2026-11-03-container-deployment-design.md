@@ -1,7 +1,7 @@
 # 容器化部署设计（一次性验证形态）
 
 日期：2026-11-03
-状态：设计已确认，待实施
+状态：已实施并完成一次性验证（2026-11-03；两形态已卸载、无痕验收通过）。执行中发现的偏差与修正见 plan 的「执行偏差记录」与 `docs/容器部署-2026-11-03.md`。
 
 ## 1. 背景与决策
 
@@ -50,10 +50,10 @@ RoutePilot v3 目前的部署方式是「rsync 代码 + venv + systemd」（`scr
 | 事实 | 值 | 对设计的影响 |
 |---|---|---|
 | 76 宿主机 docker | `/usr/bin/docker`，`daemon.json` 已含 `192.168.95.133:30002` insecure registry | 直接在 76 上 build + push |
-| 76 containerd | `certs.d/192.168.95.133:30002` 配了 pull/push | k8s 可直接拉 Harbor 镜像 |
+| 76 containerd | `certs.d/192.168.95.133:30002` 配了 pull/push 但**无 auth 块**；`sandlake-deploy` 项目私有 | k8s 拉取需 `imagePullSecret`（实施时新增 `routepilot-harbor`） |
 | k8s 版本 | v1.28.15，单节点 `master01` | manifests 用原生 YAML |
 | StorageClass | `longhorn`（默认 SC；本集群 `numberOfReplicas=1`、单节点）、`local-path`、`nfs-storageclass` | PVC 用 longhorn |
-| 上游 LLM | svc `sandlake-inference`：ClusterIP `10.233.43.73:8080`（节点与 pod 内均实测可达）；上游模型 `admin-inference-qwen06b`（`/v1/models` 实查）。**NodePort 31808 当前 connection refused，不可用** | k8s 形态走 svc DNS；compose 形态走 ClusterIP |
+| 上游 LLM | svc `sandlake-inference`：ClusterIP `10.233.43.73:8080`（节点与 pod 内均实测可达）；上游模型 `admin-inference-qwen06b`（`/v1/models` 实查）。NodePort 31808 **节点本机 connection refused、集群外 200**（不要依赖） | k8s 形态走 svc DNS；compose 形态走 ClusterIP |
 | JEV 端点 | 宿主机 llama-server `0.0.0.0:30104` | pod/容器走 `http://192.168.95.76:30104` |
 | NodePort 占用 | 30080/30090/31808/31809/31992-31998/32549 | **30400 空闲** |
 | 宿主端口占用 | 8400（systemd router）、30104（llama-server） | compose 用 **8401** |
@@ -70,7 +70,7 @@ scripts/docker/
 ├── env.compose.example         # compose 环境变量模板
 ├── k8s/
 │   ├── 00-namespace.yaml       # namespace routepilot
-│   ├── 01-secret.yaml          # admin 邮箱/密码
+│   ├── 01-secret.yaml          # admin 邮箱/密码 + Harbor pull secret
 │   ├── 02-pvc.yaml             # longhorn 5Gi
 │   ├── 03-deployment.yaml      # 单副本 + Recreate + 探针
 │   └── 04-service.yaml         # NodePort 30400
@@ -131,7 +131,7 @@ docs/
     - `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` 来自 Secret `routepilot-admin`
   - volume：PVC `routepilot-data`（longhorn 5Gi，RWO）挂 `/data`
 - Service：`NodePort 30400` → targetPort 8400。
-- Secret：`routepilot-admin`（`stringData` 明文，验证环境与 systemd 形态同值）。
+- Secret：`routepilot-admin`（`stringData` 明文，验证环境与 systemd 形态同值）；另有 `routepilot-harbor`（`kubernetes.io/dockerconfigjson`，从 76 的 docker config 过滤单 registry 生成，供 `imagePullSecrets` 使用）。
 - 集群内初始化：`kubectl -n routepilot exec deploy/routepilot -- python
   scripts/apply_default_routing_tree.py …`，上游通过 `configure_upstream.py` 挂
   `http://sandlake-inference.sandlake.svc.cluster.local:8080/v1`。
@@ -163,7 +163,7 @@ docs/
 | V5 | PVC 持久化 | `kubectl delete pod` 后新 pod 就绪，`/admin/trees` 树仍在、revision 不变 |
 | V6 | 共存 | 全程 `systemctl is-active smart-router-v3` = active，8400 服务正常 |
 | V7 | `teardown.sh` | 见 §10 无痕清单 |
-| V8 | 本地基线 | 应用代码零改动，`pytest` 结果与基线一致 |
+| V8 | 本地基线 | 应用代码零改动，`pytest` 结果与基线一致（本次实测 617 passed / 1 warning / 0 failed；基线 580，多出部分为并发分支新增测试） |
 
 ## 10. 卸载与无痕标准
 
