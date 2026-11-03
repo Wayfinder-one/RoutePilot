@@ -188,9 +188,22 @@ flowchart LR
 - `admin` 可编辑决策图、模型、JEV、用户和设置；`viewer` 只读，不能管理用户。
 - 最后一个有效管理员不能被降级、禁用或删除。
 - 用户和配置变更写入审计历史。
-- 决策图修订按内容寻址并保留，便于追溯。
-- 运行时数据保存在 SQLite（WAL）。请求日志异步落库，同时保留 20 条进程内环形缓冲供页面实时读取。
-- 当前运行时使用单个 uvicorn worker。会话粘性和在途计数保存在进程内，多 worker 部署需要额外的共享状态层。
+- 每个图文件用 SHA-256 内容哈希做保存冲突和重载判断；不保留图历史版本。
+- 控制面状态（模型、提供方、用户、日志、设置）保存在 SQLite（WAL）；决策图保存在共享 JSON 文件。请求日志异步落库，同时保留 20 条进程内环形缓冲供页面实时读取。
+- 会话粘性和在途计数仍在进程内。多个 Router 副本可以共享图文件，但跨副本的会话/在途一致性需要额外的共享状态层。
+
+## 共享图存储与多副本
+
+决策图不再保存在 SQLite。每个决策组是一个 v3 导出文档，位于
+`ROUTER_GRAPH_DIR/graphs/{tree_id}.json`；`ROUTER_GRAPH_DIR/current` 只保存启用组 ID。
+管理 API 只有一个写入者。其余副本使用 `ROUTER_GRAPH_WRITER=false`，只读挂载同一目录，并每 2 秒轮询。
+副本先构建候选快照，成功后才替换内存快照；文件非法时旧快照继续服务，`/readyz` 报告 stale。
+
+- Kubernetes 需要 ReadWriteMany PVC；RWX/NFS 上不要共享 SQLite。
+- Docker 需要把同一个 NFS 导出目录挂载到每个容器；写入者的 SQLite 留在本地存储。
+- 写入是原子的。过期保存返回 409 `graph_conflict`；导入只修改草稿。没有图历史版本和回滚。
+- `/healthz` 是存活检查。`/readyz` 表示该副本是否已有初始快照；503 表示未就绪。后续加载失败时，已有快照继续服务并返回 `"stale": true`。
+- 迁移：先备份，再运行 `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`。输出目录必须不存在。普通启动不会删除旧 SQLite 图；确认不再需要后再单独清理。
 
 ## 快速开始
 
@@ -200,6 +213,7 @@ python3.11 -m venv .venv
 
 # 本地开发：关闭登录
 ROUTER_DB=/tmp/routepilot.db \
+ROUTER_GRAPH_DIR=/tmp/routepilot-graph \
 ROUTER_USER_AUTH=0 \
 .venv/bin/python -m router
 ```
@@ -210,6 +224,7 @@ ROUTER_USER_AUTH=0 \
 
 ```bash
 ROUTER_DB=/var/lib/routepilot/router.db \
+ROUTER_GRAPH_DIR=/var/lib/routepilot/graph \
 ROUTER_HOST=0.0.0.0 \
 ROUTER_PORT=8400 \
 ROUTER_ADMIN_EMAIL=admin@example.com \
@@ -223,7 +238,9 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
-| `ROUTER_DB` | `router.db` | SQLite 数据库路径 |
+| `ROUTER_DB` | `router.db` | SQLite 控制面数据库路径 |
+| `ROUTER_GRAPH_DIR` | `./routing-graph` | 图文件和启用指针的共享目录 |
+| `ROUTER_GRAPH_WRITER` | `true` | 是否允许本实例写图文件；只能有一个写入者 |
 | `ROUTER_HOST` | `127.0.0.1` | 监听地址 |
 | `ROUTER_PORT` | `8400` | 监听端口 |
 | `ROUTER_JEV_URL` | 空 | 决策服务 base URL；首次启动时写入数据库 |
@@ -242,6 +259,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 |---|---|
 | `POST /v1/chat/completions` | OpenAI 兼容路由入口；JSON 或 SSE |
 | `GET /healthz` | 存活检查 |
+| `GET /readyz` | 初始快照就绪检查；该副本没有快照时返回 503 |
 | `POST /admin/login` / `POST /admin/logout` | 控制台会话 |
 | `GET /admin/me` / `POST /admin/me/password` | 当前用户与自助改密 |
 | `GET/POST /admin/trees`、`GET/PUT/DELETE /admin/trees/{id}` | 决策组 CRUD |
@@ -264,6 +282,11 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | 请求体格式非法 |
 | 413 | `request_too_large` | 请求体超过 10 MiB |
 | 502 | `upstream_error` | 上游 5xx 或网络失败 |
+| 409 | `graph_conflict` | 草稿加载后图已被修改；需重新加载并对齐修改 |
+| 409 | `graph_already_exists` | 决策组 ID 已被占用 |
+| 503 | `graph_read_only` | 本副本是只读副本；请在唯一写入者上操作 |
+| 503 | `graph_storage_error` | 共享图存储读取失败 |
+| 503 | `no_valid_snapshot` | 该副本还没有初始快照 |
 | 503 | `no_active_tree` | 没有启用的决策组 |
 | 503 | `no_available_backend` | 目标下所有后端都不可用 |
 | 503 | `routing_failed` / `routing_invariant_violation` | 内部路由失败 |
@@ -294,7 +317,7 @@ router/
     scheduler.py       least_inflight 负载均衡与租约
     snapshot.py        不可变路由快照
   jev/                 决策服务客户端、配置、输入窗口
-  store/               SQLite schema、仓储、路由树持久化
+  store/               SQLite schema/仓储与共享图文件仓储
   console/             双语静态控制台
 configs/               示例决策组与演示用例
 tests/                 pytest 测试

@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+from pathlib import Path
 
-from router.store.graph_migration import export_sqlite_graphs
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from router.store.graph_migration import export_sqlite_graphs  # noqa: E402
 
 
 def main() -> int:

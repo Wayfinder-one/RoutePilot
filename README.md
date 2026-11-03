@@ -188,9 +188,23 @@ Environment variables can seed the decision-service config on first start only; 
 - `admin` can edit graphs, models, JEV settings, users, and settings. `viewer` is read-only and cannot manage users.
 - The last active admin cannot be demoted, disabled, or deleted.
 - Every user and configuration change is recorded in the audit log.
-- Graph revisions are content-addressed and retained for traceability.
-- Runtime state is SQLite (WAL). Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI.
-- The current runtime uses a single uvicorn worker. Session affinity and in-flight counts are in-process, so multi-worker deployments require an external shared state layer.
+- Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
+- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI.
+- Session affinity and in-flight counts remain process-local. Multiple router replicas can share graph files, but cross-replica session/in-flight consistency requires an external shared state layer.
+
+## Shared graph storage and replicas
+
+Decision graphs are not stored in SQLite. Each group is one v3 export document at
+`ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains only the enabled group id.
+The admin API has a single writer. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the same
+directory read-only, and poll every 2 seconds. A replica builds a candidate snapshot before replacing its
+in-memory snapshot; if a file is invalid, the previous snapshot keeps serving and `/readyz` reports stale.
+
+- Kubernetes: use a ReadWriteMany PVC; do not share SQLite on NFS/RWX.
+- Docker: mount the same NFS export into every container. Keep SQLite on local storage for the writer.
+- Writes are atomic. A stale save returns 409 `graph_conflict`; imports only change the draft. There is no graph version history or rollback.
+- `/healthz` is the liveness probe. `/readyz` reports whether this replica has an initial snapshot; 503 means not ready. After a later reload failure, an existing snapshot continues serving with `"stale": true`.
+- Migration: back up first, then run `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`. The output directory must not exist. Normal startup never deletes old SQLite graphs; clean them only after explicit confirmation.
 
 ## Quick start
 
@@ -200,6 +214,7 @@ python3.11 -m venv .venv
 
 # Local development: authentication disabled
 ROUTER_DB=/tmp/routepilot.db \
+ROUTER_GRAPH_DIR=/tmp/routepilot-graph \
 ROUTER_USER_AUTH=0 \
 .venv/bin/python -m router
 ```
@@ -210,6 +225,7 @@ For a protected deployment:
 
 ```bash
 ROUTER_DB=/var/lib/routepilot/router.db \
+ROUTER_GRAPH_DIR=/var/lib/routepilot/graph \
 ROUTER_HOST=0.0.0.0 \
 ROUTER_PORT=8400 \
 ROUTER_ADMIN_EMAIL=admin@example.com \
@@ -223,7 +239,9 @@ The first start against an empty users table seeds the admin account. Change the
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ROUTER_DB` | `router.db` | SQLite database path |
+| `ROUTER_DB` | `router.db` | SQLite control-plane database path |
+| `ROUTER_GRAPH_DIR` | `./routing-graph` | Shared directory for graph files and the enabled pointer |
+| `ROUTER_GRAPH_WRITER` | `true` | Allow this instance to write graph files; run exactly one writer |
 | `ROUTER_HOST` | `127.0.0.1` | Listener host |
 | `ROUTER_PORT` | `8400` | Listener port |
 | `ROUTER_JEV_URL` | empty | Decision-service base URL; seeds the database on first start |
@@ -242,6 +260,7 @@ The first start against an empty users table seeds the admin account. Change the
 |---|---|
 | `POST /v1/chat/completions` | OpenAI-compatible routing entry; JSON or SSE |
 | `GET /healthz` | Liveness probe |
+| `GET /readyz` | Initial-snapshot readiness; 503 until this replica has one |
 | `POST /admin/login` / `POST /admin/logout` | Console session |
 | `GET /admin/me` / `POST /admin/me/password` | Current user and self-service password change |
 | `GET/POST /admin/trees`, `GET/PUT/DELETE /admin/trees/{id}` | Decision-group CRUD |
@@ -264,6 +283,11 @@ The first start against an empty users table seeds the admin account. Change the
 | 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | Malformed request body |
 | 413 | `request_too_large` | Body exceeds 10 MiB |
 | 502 | `upstream_error` | Upstream 5xx or network failure |
+| 409 | `graph_conflict` | The graph changed after this draft was loaded; reload and reconcile |
+| 409 | `graph_already_exists` | A graph id is already in use |
+| 503 | `graph_read_only` | This replica is a reader; enable writes on the single writer |
+| 503 | `graph_storage_error` | Shared graph storage could not be read |
+| 503 | `no_valid_snapshot` | This replica has no initial snapshot yet |
 | 503 | `no_active_tree` | No enabled decision group |
 | 503 | `no_available_backend` | All backends for the chosen target are unavailable |
 | 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure |
@@ -294,7 +318,7 @@ router/
     scheduler.py       least_inflight load balancer and leases
     snapshot.py        immutable routing snapshots
   jev/                 decision-service client, config, input window
-  store/               SQLite schema, repositories, routing-tree persistence
+  store/               SQLite schema/repositories and the shared graph-file repository
   console/             static bilingual console
 configs/               example decision groups and demo cases
 tests/                 pytest suite

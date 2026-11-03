@@ -1,5 +1,5 @@
 import asyncio
-import json
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.api.routes_trees import build_enable_context
+from router.routing.document import parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
 from router.routing.model import tree_from_dict
@@ -120,10 +121,20 @@ def test_environment_jev_config_is_seeded_once(tmp_path):
     assert app.state.snapshot.jev.api_key == "secret"
 
 
-def test_shipped_graph_configs_pass_structure_validation():
+def shipped_graph(name):
+    content = (REPO_ROOT / "configs" / name).read_bytes()
+    return parse_graph_document(
+        content,
+        tree_id="default-jev",
+        enabled=False,
+        updated_at="",
+        document_sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def test_shipped_configs_are_v3_export_documents():
     for name in ("default_routing_tree.json", "production_routing_tree.json"):
-        raw = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
-        assert validate_graph_structure(tree_from_dict(raw)) == [], name
+        assert validate_graph_structure(shipped_graph(name)) == [], name
 
 
 def test_shipped_graph_configs_pass_enable_validation_with_seeded_catalog(tmp_path):
@@ -136,8 +147,7 @@ def test_shipped_graph_configs_pass_enable_validation_with_seeded_catalog(tmp_pa
     finally:
         conn.close()
     for name in ("default_routing_tree.json", "production_routing_tree.json"):
-        raw = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
-        assert validate_graph_for_enable(tree_from_dict(raw), context) == [], name
+        assert validate_graph_for_enable(shipped_graph(name), context) == [], name
 
 
 class TryHandler:

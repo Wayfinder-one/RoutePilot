@@ -385,6 +385,7 @@ async function startRouter(port) {
     env: {
       ...process.env,
       ROUTER_DB: path.join(tempDir, 'router.db'),
+      ROUTER_GRAPH_DIR: path.join(tempDir, 'routing-graph'),
       ROUTER_HOST: '127.0.0.1',
       ROUTER_PORT: String(port),
       ROUTER_USER_AUTH: '0',
