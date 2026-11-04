@@ -316,6 +316,7 @@ async def chat_completions(request: Request):
         return fail("routing_failed", 503, "graph", "routing failed")
     routing_ms = (time.monotonic() - routing_started) * 1000.0
     backend = snapshot.backends.get(decision.model)
+    # 防御性不变式：正常引擎不可达，decision.model 必来自同一快照的 backends；真到达时无请求记录。
     if backend is None:
         decision.release()
         return _error("no_available_backend", 503)
