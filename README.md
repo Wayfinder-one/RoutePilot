@@ -74,7 +74,7 @@ Dry-run highlights the winning path wave by wave, shows candidates and prioritie
 
 ![Calculation log](assets/routepilot/en/logs.png)
 
-Each row expands into a compact decision summary, candidate list, wave timing, request text, JEV probabilities, model reasoning, and the raw trace. The ledger is written asynchronously to SQLite; the page reads the latest 20 records from the in-process ring, and a restart hydrates that ring with the latest 20 persisted ledger rows. Request text and raw traces remain available only for live records.
+Each expanded row shows the calculation process directly in stages: input preparation, initial computation, per-round JEV, candidates & final pick, model scheduling, and the execution result; every slot and technical detail expands on demand instead of cluttering the default view. A routing failure (`routing_error`) keeps the partial process up to that point: the failed round's candidates are marked voided, the request falls to the error fallback, and sticky reads "Not checked" when it was never consulted. Legacy records without a scheduling snapshot and restored ledger rows after a restart state plainly that the detail is absent rather than fabricating it. SQLite still stores only the ledger fields — no request text, trace, per-round answers, or node labels; the page reads the last 20 live records from an in-process ring, so calculation detail is replica-local: there is no cross-replica log aggregation and no long-term trace persistence.
 
 ## Decision graph
 
