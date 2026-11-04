@@ -185,8 +185,13 @@ def test_put_window_rejects_invalid(tmp_path, payload):
 # ── 路由引擎：截断生效 + trace ─────────────────────────────────────────
 
 class Lease:
-    def __init__(self, model):
+    def __init__(self, model, models=()):
         self.model = model
+        self.selection = {
+            "available_models": list(models),
+            "unavailable": {},
+            "inflight": {name: 0 for name in models},
+        }
 
     def release(self):
         pass
@@ -196,8 +201,15 @@ class Balancer:
     def available(self, models):
         return list(models)
 
+    def selection(self, models):
+        return {
+            "available_models": list(models),
+            "unavailable": {},
+            "inflight": {name: 0 for name in models},
+        }
+
     def acquire(self, models, *, preferred=None, dry_run=False):
-        return Lease(preferred or models[0])
+        return Lease(preferred or models[0], models)
 
 
 class Affinity:

@@ -33,7 +33,9 @@ def test_scenario_matrix_matches_fixture_expectations(scenario_id):
         assert decision.selection_reason == "target"
         assert decision.fallback_reason is None
     assert decision.trace[-1]["event"] == "scheduled"
-    assert decision.trace[-2]["event"] == "final"
+    # Task 2 起引擎在 final 与 scheduled 之间补发 schedule 事件；本矩阵无 session_id，
+    # sticky 读被跳过，尾序恒为 final → schedule → scheduled。
+    assert [event["event"] for event in decision.trace[-3:]] == ["final", "schedule", "scheduled"]
 
 
 def test_five_scenario_final_target_matrix_is_power_light_deep_deep_light():
