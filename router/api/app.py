@@ -109,6 +109,7 @@ def _seed_jev(conn, settings: Settings) -> None:
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
+    requestlog = RequestLogger(settings)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
@@ -116,10 +117,9 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         if settings.user_auth:
             UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
         _seed_jev(conn, settings)
+        requestlog.hydrate_recent(conn)
     finally:
         conn.close()
-
-    requestlog = RequestLogger(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

@@ -74,7 +74,7 @@ Dry-run highlights the winning path wave by wave, shows candidates and prioritie
 
 ![Calculation log](assets/routepilot/en/logs.png)
 
-Each row expands into a compact decision summary, candidate list, wave timing, request text, JEV probabilities, model reasoning, and the raw trace. The ledger is written asynchronously to SQLite; the page reads the latest 20 records from the in-process ring.
+Each row expands into a compact decision summary, candidate list, wave timing, request text, JEV probabilities, model reasoning, and the raw trace. The ledger is written asynchronously to SQLite; the page reads the latest 20 records from the in-process ring, and a restart hydrates that ring with the latest 20 persisted ledger rows. Request text and raw traces remain available only for live records.
 
 ## Decision graph
 
@@ -189,7 +189,7 @@ Environment variables can seed the decision-service config on first start only; 
 - The last active admin cannot be demoted, disabled, or deleted.
 - Every user and configuration change is recorded in the audit log.
 - Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
-- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI.
+- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail.
 - Session affinity and in-flight counts remain process-local. Multiple router replicas can share graph files, but cross-replica session/in-flight consistency requires an external shared state layer.
 
 ## Shared graph storage and replicas

@@ -68,6 +68,27 @@ class RequestLogger:
     def recent_requests(self, limit: int = RECENT_LIMIT) -> list[dict]:
         return list(reversed(self.recent))[:max(0, limit)]
 
+    def hydrate_recent(self, conn: sqlite3.Connection) -> None:
+        """Warm the ring with the persisted tail after a process restart.
+
+        SQLite intentionally stores only the ledger whitelist. Restored rows
+        therefore have no request text, trace, answers or probabilities; the
+        console renders those details as absent until a new live request arrives.
+        """
+        if self.recent:
+            return
+        rows = conn.execute(
+            "SELECT * FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT ?",
+            (RECENT_LIMIT,),
+        ).fetchall()
+        for row in reversed(rows):
+            record = {column: row[column] for column in LOG_COLUMNS}
+            total_ms = record.get("total_ms")
+            record["latency_ms"] = (
+                total_ms if total_ms is not None else record.get("routing_ms")
+            )
+            self.recent.append(record)
+
     def confidence_histogram(self) -> list[dict]:
         return [
             {"lo": index / CONF_BUCKETS, "hi": (index + 1) / CONF_BUCKETS, "count": count}

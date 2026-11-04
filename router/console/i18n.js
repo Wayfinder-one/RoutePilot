@@ -26,7 +26,7 @@ const I18N = {
     'ov.confidence': 'JEV 最高概率分布',
     'ov.go.logs': '查看计算日志 →',
     /* ── logs (calculation log · decision ledger) ── */
-    'logs.sub': '每条请求的决策、置信度与时间路径 · 最近 20 条（仅内存）',
+    'logs.sub': '每条请求的决策、置信度与时间路径 · 最近 20 条（重启后回填，详情仅限实时记录）',
     'logs.refresh': '刷新', 'logs.empty': '还没有请求。去决策组试算，或通过 /v1/chat/completions 发一条请求。',
     'logs.emptyFilter': '没有符合这个筛选的请求。',
     'logs.filter.all': '全部', 'logs.filter.jev': 'JEV 选择',
@@ -486,7 +486,7 @@ const I18N = {
     'ov.confidence': 'JEV top-probability distribution',
     'ov.go.logs': 'Open calculation log →',
     /* ── logs (decision ledger) ── */
-    'logs.sub': 'Decision, confidence and time path per request · last 20 (memory only)',
+    'logs.sub': 'Decision, confidence and time path per request · last 20 (restored after restart; detail only for live records)',
     'logs.refresh': 'Refresh', 'logs.empty': 'No requests yet. Try in the decision group, or send one via /v1/chat/completions.',
     'logs.emptyFilter': 'No request matches this filter.',
     'logs.filter.all': 'All', 'logs.filter.jev': 'JEV pick',
