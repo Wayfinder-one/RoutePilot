@@ -72,8 +72,9 @@ class RequestLogger:
         """Warm the ring with the persisted tail after a process restart.
 
         SQLite intentionally stores only the ledger whitelist. Restored rows
-        therefore have no request text, trace, answers or probabilities; the
-        console renders those details as absent until a new live request arrives.
+        therefore have no request text, trace, answers, node_labels or
+        probabilities; the console renders those details as absent until a new
+        live request arrives.
         """
         if self.recent:
             return

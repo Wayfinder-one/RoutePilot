@@ -549,6 +549,127 @@ def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream
         assert har.upstream_models == []
         assert app.state.balancer.inflight("power") == 0
         assert app.state.balancer.inflight("strong-a") == 0
+        record = recent(app)
+        assert record["outcome_state"] == "routing_error"
+        assert record["error_class"] == "no_available_backend"
+        assert [event["event"] for event in record["trace"][-2:]] == ["schedule", "routing_error"]
+        assert record["trace"][-2]["unavailable"] == {"power": "breaker_open"}
+        assert record["trace"][-1]["stage"] == "schedule"
+        assert record["routing_ms"] > 0
+        assert record["total_ms"] >= record["routing_ms"]
+
+    asyncio.run(scenario())
+
+
+# ── node labels / routing failure logs ────────────────────────────────
+
+
+def test_live_log_uses_node_titles_from_the_serving_snapshot(tmp_path):
+    async def scenario():
+        root = switch_graph()
+        next(item for item in root["nodes"] if item["id"] == "q")["title"] = "能力选择"
+        app = make_app(tmp_path, Harness({"q": choice()}), root=root)
+        response = await post(app)
+
+        assert response.status_code == 200
+        record = recent(app)
+        assert record["node_labels"]["q"] == {"title": "能力选择", "type": "question"}
+        assert record["node_labels"]["fast-target"]["type"] == "target"
+        assert any(event["event"] == "schedule" for event in record["trace"])
+
+    asyncio.run(scenario())
+
+
+def test_no_active_tree_creates_a_routing_error_log(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500), active=False)
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "no_active_tree"
+        record = recent(app)
+        assert record["outcome_state"] == "routing_error"
+        assert record["error_class"] == "no_active_tree"
+        assert record["trace"][-1] == {
+            "event": "routing_error",
+            "stage": "graph",
+            "error_class": "no_active_tree",
+            "message": "no routing tree is enabled",
+        }
+        assert record["node_labels"] == {}
+        assert record["model"] is None
+
+    asyncio.run(scenario())
+
+
+def test_invalid_json_does_not_create_a_calculation_log(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://router.test",
+        ) as client:
+            response = await client.post(
+                "/v1/chat/completions", content="{",
+                headers={"content-type": "application/json"},
+            )
+        assert response.status_code == 400
+        assert app.state.requestlog.recent_requests() == []
+
+    asyncio.run(scenario())
+
+
+def test_invariant_failure_keeps_partial_graph_trace(tmp_path):
+    async def scenario():
+        root = _graph([_start()], [], error="ghost")
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=root)
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "routing_invariant_violation"
+        record = recent(app)
+        assert record["outcome_state"] == "routing_error"
+        assert [event["event"] for event in record["trace"][:2]] == ["time", "window"]
+        assert record["trace"][-1]["error_class"] == "routing_invariant_violation"
+        assert record["trace"][-1]["stage"] == "graph"
+
+    asyncio.run(scenario())
+
+
+def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
+    class BrokenEngine:
+        async def route(self, snapshot, request, *, trace_sink=None):
+            trace_sink.append({
+                "event": "time", "active_periods": [], "timezone": "Asia/Shanghai",
+            })
+            raise ValueError("sensitive internal detail")
+
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
+        app.state.engine = BrokenEngine()
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "routing_failed"
+        record = recent(app)
+        assert record["error_class"] == "routing_failed"
+        assert record["trace"][-1]["message"] == "routing failed"
+        assert "sensitive internal detail" not in str(record)
+
+    asyncio.run(scenario())
+
+
+def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
+        app.state.snapshot = None
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "no_valid_snapshot"
+        record = recent(app)
+        assert record["node_labels"] == {}
+        assert record["trace"][-1]["stage"] == "snapshot"
+        assert record["trace"][-1]["error_class"] == "no_valid_snapshot"
 
     asyncio.run(scenario())
 

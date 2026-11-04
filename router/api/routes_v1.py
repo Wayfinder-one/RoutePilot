@@ -15,7 +15,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from router.api.routes_trees import _answer_payload
 from router.jev.client import ChoiceAnswer
 from router.reasoning import ReasoningError, apply_reasoning
-from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest
+from router.routing.graph.model import ConditionNode, LogicNode, QuestionNode, StartNode, TargetNode
+from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest, session_digest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -27,7 +28,8 @@ OUTCOME_UPSTREAM_ERROR = "upstream_error"
 OUTCOME_CLIENT_DISCONNECTED = "client_disconnected"
 OUTCOME_CANCELLED = "cancelled"
 OUTCOME_INCOMPLETE = "incomplete"
-OUTCOME_STATES = (OUTCOME_COMPLETED, OUTCOME_UPSTREAM_ERROR, OUTCOME_CLIENT_DISCONNECTED, OUTCOME_CANCELLED, OUTCOME_INCOMPLETE)
+OUTCOME_ROUTING_ERROR = "routing_error"
+OUTCOME_STATES = (OUTCOME_COMPLETED, OUTCOME_UPSTREAM_ERROR, OUTCOME_CLIENT_DISCONNECTED, OUTCOME_CANCELLED, OUTCOME_INCOMPLETE, OUTCOME_ROUTING_ERROR)
 
 
 def _last_user_text(messages: list) -> str:
@@ -39,6 +41,28 @@ def _last_user_text(messages: list) -> str:
             if isinstance(content, list):
                 return " ".join(part.get("text", "") for part in content if isinstance(part, dict))
     return ""
+
+
+_NODE_TYPES = (
+    (StartNode, "start"),
+    (QuestionNode, "question"),
+    (ConditionNode, "condition"),
+    (LogicNode, "logic"),
+    (TargetNode, "target"),
+)
+
+
+def _node_labels(snapshot) -> dict:
+    if snapshot is None or snapshot.tree is None:
+        return {}
+    labels = {}
+    for node in snapshot.tree.root.nodes:
+        node_type = next(
+            (name for node_class, name in _NODE_TYPES if isinstance(node, node_class)),
+            "unknown",
+        )
+        labels[node.id] = {"title": node.title, "type": node_type}
+    return labels
 
 
 def _error(message: str, status_code: int) -> JSONResponse:
@@ -185,6 +209,7 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
         "routing_ms": routing_ms,
         "latency_ms": (time.monotonic() - started) * 1000.0,
         "trace": list(decision.trace),
+        "node_labels": _node_labels(snapshot),
         "upstream_model": None,
         "upstream_status": None,
         "upstream_ms": None,
@@ -195,6 +220,35 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
         "total_tokens": None,
         "error_class": None,
         "outcome_state": OUTCOME_INCOMPLETE,
+    }
+
+
+def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
+                            routing_ms, total_ms):
+    return {
+        "id": uuid.uuid4().hex,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "text": text,
+        "decision": "route",
+        "model": None,
+        "target_id": None,
+        "tree_id": getattr(snapshot, "tree_id", None),
+        "tree_revision": getattr(snapshot, "tree_revision", None),
+        "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
+        "policy_path": None,
+        "selection_reason": None,
+        "sticky_hit": 0,
+        "session_hash": session_digest(session_id),
+        "jev_model": snapshot.jev.model if snapshot is not None and snapshot.jev else None,
+        "waves": sum(event.get("event") == "wave" for event in trace),
+        "answers": {},
+        "routing_ms": routing_ms,
+        "latency_ms": total_ms,
+        "total_ms": total_ms,
+        "trace": trace,
+        "node_labels": _node_labels(snapshot),
+        "outcome_state": OUTCOME_ROUTING_ERROR,
+        "error_class": error_class,
     }
 
 
@@ -222,32 +276,51 @@ async def chat_completions(request: Request):
     if len(session_id) > 256:
         return _error("invalid_session_id", 400)
 
+    text = _last_user_text(messages)
+    requestlog = request.app.state.requestlog
+    routing_started = time.monotonic()
+    trace: list[dict] = []
+
+    def fail(error_class, status_code, stage, message):
+        routing_ms = (time.monotonic() - routing_started) * 1000.0
+        total_ms = (time.monotonic() - started) * 1000.0
+        trace.append({
+            "event": "routing_error",
+            "stage": stage,
+            "error_class": error_class,
+            "message": message,
+        })
+        requestlog.enqueue(_routing_failure_record(
+            snapshot, text, session_id, trace,
+            error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
+        ))
+        return _error(error_class, status_code)
+
     snapshot = request.app.state.snapshot
     if snapshot is None:
-        return _error("no_valid_snapshot", 503)
-    routing_started = time.monotonic()
+        return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
     try:
         decision = await request.app.state.engine.route(
             snapshot,
-            RoutingRequest(text=_last_user_text(messages), session_id=session_id),
+            RoutingRequest(text=text, session_id=session_id),
+            trace_sink=trace,
         )
-    except NoActiveTreeError:
-        return _error("no_active_tree", 503)
-    except NoAvailableBackend:
-        return _error("no_available_backend", 503)
-    except RoutingMiss:
-        return _error("routing_invariant_violation", 503)
+    except NoActiveTreeError as exc:
+        return fail("no_active_tree", 503, "graph", str(exc))
+    except NoAvailableBackend as exc:
+        return fail("no_available_backend", 503, "schedule", str(exc))
+    except RoutingMiss as exc:
+        return fail("routing_invariant_violation", 503, "graph", str(exc))
     except Exception:
         logger.exception("routing failed")
-        return _error("routing_failed", 503)
+        return fail("routing_failed", 503, "graph", "routing failed")
     routing_ms = (time.monotonic() - routing_started) * 1000.0
     backend = snapshot.backends.get(decision.model)
     if backend is None:
         decision.release()
         return _error("no_available_backend", 503)
     upstream_body, reasoning_warning = prepare_upstream_request(body, backend, decision.reasoning)
-    requestlog = request.app.state.requestlog
-    record = _decision_record(request, decision, snapshot, body, _last_user_text(messages), reasoning_warning, routing_ms, started)
+    record = _decision_record(request, decision, snapshot, body, text, reasoning_warning, routing_ms, started)
     requestlog.enqueue(record)
     outcome = _OutcomeRecorder(requestlog, record, started)
     breaker = request.app.state.breaker

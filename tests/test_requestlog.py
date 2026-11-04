@@ -131,7 +131,7 @@ def test_waves_persists_but_answers_text_and_trace_stay_in_memory(tmp_path):
     assert stored["waves"] == 2
     for forbidden in (
         "text", "trace", "answers", "jev_probabilities", "fallback_reason",
-        "session_id", "latency_ms", "reasoning_warning",
+        "session_id", "latency_ms", "reasoning_warning", "node_labels",
     ):
         assert forbidden not in stored
     assert log.recent_requests(1)[0]["answers"] == answers
@@ -148,3 +148,17 @@ def test_log_columns_are_the_sqlite_whitelist(tmp_path):
     assert set(LOG_COLUMNS) == columns
     assert "waves" in LOG_COLUMNS
     assert not {"answers", "text", "trace", "session_id", "jev_probabilities"} & set(LOG_COLUMNS)
+
+
+def test_routing_error_uses_existing_ledger_columns(tmp_path):
+    log = make_log(tmp_path)
+    item = record(1, outcome_state="routing_error", error_class="no_available_backend", model=None)
+    log.enqueue(item)
+    asyncio.run(log.flush())
+
+    stored = rows(log)[0]
+    assert stored["outcome_state"] == "routing_error"
+    assert stored["error_class"] == "no_available_backend"
+    assert stored["model"] is None
+    assert "trace" not in stored
+    assert "node_labels" not in stored
