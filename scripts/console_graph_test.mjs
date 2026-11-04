@@ -10,6 +10,7 @@ import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
 const RTGraph = require('../router/console/routing/graph.js');
+const SRTrace = require('../router/console/trace.js');
 
 const EXAMPLE_URL = new URL('../router/console/routing/example.json', import.meta.url);
 
@@ -1382,4 +1383,71 @@ test('review-chinese-node-names-contract', () => {
     assert.equal(i18n.split("'" + key + "'").length - 1, 2,
       'i18n key ' + key + ' is not defined in both zh and en');
   }
+});
+
+/* ── 11. 计算日志纯视图模型（Task 4：SRTrace.build / label / hasJev） ─ */
+
+test('calculation log model groups real execution order without dropping slots', () => {
+  const trace = [
+    { event: 'time', active_periods: ['白天'], timezone: 'Asia/Shanghai' },
+    { event: 'window', tokens_before: 20, tokens_after: 20, truncated: false },
+    { event: 'condition', node_id: 'c', source: 'text', matched: ['抢修'], value: true },
+    { event: 'slot', wave: 0, node_id: 'q', port: 'in_1', source: 'start', source_port: 'out', raw: true, condition: null, status: 'true' },
+    { event: 'activate', wave: 0, node_id: 'q', via_port: 'in_1' },
+    { event: 'wave', wave: 1, questions: ['q'], duration_ms: 12, failed: false, error: null },
+    { event: 'question', wave: 1, node_id: 'q', ports: { value: 7.5 }, duration_ms: 12, usage: { input_tokens: 20 } },
+    { event: 'slot', wave: 1, node_id: 't', port: 'in_1', source: 'q', source_port: 'value', raw: 7.5, condition: { op: 'gt', value: 5 }, status: 'true' },
+    { event: 'activate', wave: 1, node_id: 't', via_port: 'in_1' },
+    { event: 'final', target_id: 't', kind: 'target', priority: 1, candidates: [{ target_id: 't', priority: 1, via_node: 'q', via_port: 'in_1', wave: 1 }] },
+    { event: 'schedule', target_id: 't', strategy: 'least_inflight', configured_models: ['fast'], registered_models: ['fast'], available_models: ['fast'], unavailable: {}, inflight: { fast: 0 }, sticky: { status: 'disabled', preferred_model: null } },
+    { event: 'scheduled', model: 'fast', reason: 'target', dry_run: false },
+  ];
+  const model = SRTrace.build(trace, { q: { title: '严重度', type: 'question' } });
+
+  assert.equal(model.input.time.timezone, 'Asia/Shanghai');
+  assert.equal(model.phases.length, 2);
+  assert.equal(model.phases[0].wave, 0);
+  assert.equal(model.phases[1].wave, 1);
+  assert.equal(model.phases[0].slots.length, 1);
+  assert.equal(model.phases[1].slots[0].raw, 7.5);
+  assert.equal(model.phases[1].questions[0].ports.value, 7.5);
+  assert.equal(model.final.candidates.length, 1);
+  assert.equal(model.schedule.sticky.status, 'disabled');
+  assert.equal(model.scheduled.model, 'fast');
+  assert.equal(SRTrace.label({ q: { title: '严重度' } }, 'q'), '严重度');
+  assert.equal(SRTrace.label({}, 'q'), 'q');
+});
+
+test('calculation log JEV filter includes noul score and failed waves', () => {
+  assert.equal(SRTrace.hasJev({ trace: [{ event: 'question', ports: { yes: 0.8, no: 0.2 } }] }), true);
+  assert.equal(SRTrace.hasJev({ trace: [{ event: 'question', ports: { value: 4 } }] }), true);
+  assert.equal(SRTrace.hasJev({ trace: [{ event: 'wave', failed: true }] }), true);
+  assert.equal(SRTrace.hasJev({ waves: 1 }), true);
+  assert.equal(SRTrace.hasJev({ trace: [{ event: 'condition', value: true }] }), false);
+});
+
+test('calculation log model keeps failures separate from final selection', () => {
+  const model = SRTrace.build([
+    { event: 'final', target_id: 'safe', kind: 'error_fallback', candidates: [], priority: 1 },
+    { event: 'routing_error', stage: 'schedule', error_class: 'no_available_backend', message: 'none' },
+  ], {});
+  assert.equal(model.final.kind, 'error_fallback');
+  assert.equal(model.error.error_class, 'no_available_backend');
+});
+
+test('calculation log model distinguishes failed waves from normal no-candidate fallback', () => {
+  const failed = SRTrace.build([
+    { event: 'wave', wave: 1, questions: ['q'], duration_ms: 5, failed: true, error: 'timeout' },
+    { event: 'fallback', target_id: 'safe', reason: 'timeout' },
+    { event: 'final', target_id: 'safe', kind: 'error_fallback', candidates: [], priority: 1 },
+  ], {});
+  const otherwise = SRTrace.build([
+    { event: 'final', target_id: 'safe', kind: 'otherwise', candidates: [], priority: 1 },
+  ], {});
+
+  assert.equal(failed.phases[0].waveEvent.failed, true);
+  assert.equal(failed.fallback.reason, 'timeout');
+  assert.equal(failed.final.kind, 'error_fallback');
+  assert.equal(otherwise.fallback, null);
+  assert.equal(otherwise.final.kind, 'otherwise');
 });

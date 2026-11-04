@@ -134,6 +134,75 @@ const SRTrace = (() => {
       .filter(event => event && KEEP.indexOf(event.event) >= 0);
   }
 
+  /* 纯视图模型：只读归组，不改事件对象、不碰 DOM（渲染交给调用方）。 */
+  function build(trace, nodeLabels) {
+    const model = {
+      labels: nodeLabels && typeof nodeLabels === 'object' ? nodeLabels : {},
+      input: { time: null, window: null },
+      phases: [],
+      fallback: null,
+      final: null,
+      schedule: null,
+      stickyHit: null,
+      scheduled: null,
+      error: null,
+    };
+    let current = null;
+
+    /* 按 wave 建唯一阶段；wave 0 收纳窗口期内的关键点。 */
+    function ensurePhase(wave) {
+      const number = Number.isFinite(Number(wave)) ? Number(wave) : 0;
+      let phase = model.phases.find(item => item.wave === number);
+      if (!phase) {
+        phase = {
+          wave: number,
+          waveEvent: null,
+          conditions: [],
+          gates: [],
+          questions: [],
+          slots: [],
+          activations: [],
+        };
+        model.phases.push(phase);
+      }
+      return phase;
+    }
+
+    (Array.isArray(trace) ? trace : []).forEach(event => {
+      if (!event || typeof event !== 'object') return;
+      switch (event.event) {
+        case 'time': model.input.time = event; break;
+        case 'window': model.input.window = event; break;
+        case 'condition': current = ensurePhase(0); current.conditions.push(event); break;
+        case 'gate': current = ensurePhase(event.wave); current.gates.push(event); break;
+        case 'slot': current = ensurePhase(event.wave); current.slots.push(event); break;
+        case 'activate': current = ensurePhase(event.wave); current.activations.push(event); break;
+        case 'wave': current = ensurePhase(event.wave); current.waveEvent = event; break;
+        case 'question': current = ensurePhase(event.wave); current.questions.push(event); break;
+        case 'fallback': model.fallback = event; current = null; break;
+        case 'final': model.final = event; current = null; break;
+        case 'schedule': model.schedule = event; current = null; break;
+        case 'sticky_hit': model.stickyHit = event; current = null; break;
+        case 'scheduled': model.scheduled = event; current = null; break;
+        case 'routing_error': model.error = event; current = null; break;
+        default: break;
+      }
+    });
+    return model;
+  }
+
+  function label(nodeLabels, id) {
+    const key = id == null ? '' : String(id);
+    const item = nodeLabels && nodeLabels[key];
+    return item && item.title ? String(item.title) : key || '—';
+  }
+
+  function hasJev(record) {
+    const trace = Array.isArray(record.trace) ? record.trace : [];
+    return trace.some(event => event && (event.event === 'wave' || event.event === 'question')) ||
+      record.jev_top != null || !!record.jev_model || Number(record.waves) > 0;
+  }
+
   return {
     count(trace) {
       return kept(trace).length;
@@ -144,5 +213,10 @@ const SRTrace = (() => {
         ? `<ol class="lg-timeline">${events.map(stepHtml).join('')}</ol>`
         : `<div class="lg-none">${esc(t('logs.traceEmpty'))}</div>`;
     },
+    build,
+    label,
+    hasJev,
   };
 })();
+
+if (typeof module !== 'undefined' && module.exports) module.exports = SRTrace;
