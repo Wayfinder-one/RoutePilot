@@ -18,7 +18,9 @@ class RoutingMiss(RuntimeError):
 
 
 class NoAvailableBackend(RuntimeError):
-    pass
+    def __init__(self, message, *, selection=None):
+        super().__init__(message)
+        self.selection = selection or {}
 
 
 @dataclass(frozen=True)

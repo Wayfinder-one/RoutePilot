@@ -61,3 +61,42 @@ def test_preferred_model_must_still_be_available():
     lease = balancer.acquire(["a", "b"], preferred="b")
     assert lease.model == "b"
     lease.release()
+
+
+def test_selection_snapshot_is_taken_before_increment():
+    balancer = LoadBalancer()
+    held = balancer.acquire(["a", "b"])
+    preview = balancer.acquire(["a", "b"], dry_run=True)
+
+    assert held.model == "a"
+    assert preview.model == "b"
+    assert preview.selection == {
+        "available_models": ["a", "b"],
+        "unavailable": {},
+        "inflight": {"a": 1, "b": 0},
+    }
+    assert balancer.inflight("a") == 1
+    assert balancer.inflight("b") == 0
+    preview.release()
+    held.release()
+
+
+def test_selection_snapshot_is_available_when_acquire_fails():
+    balancer = LoadBalancer(Breaker({"a"}))
+    with pytest.raises(NoAvailableBackend) as caught:
+        balancer.acquire(["a", "b"], preferred="a")
+
+    assert caught.value.selection == {
+        "available_models": ["b"],
+        "unavailable": {"a": "breaker_open"},
+        "inflight": {"a": 0, "b": 0},
+    }
+
+
+def test_selection_probe_uses_the_same_lock_and_filter_rules():
+    balancer = LoadBalancer(Breaker({"a"}))
+    assert balancer.selection(["a", "b", "b"]) == {
+        "available_models": ["b"],
+        "unavailable": {"a": "breaker_open"},
+        "inflight": {"a": 0, "b": 0},
+    }
