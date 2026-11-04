@@ -5790,6 +5790,61 @@ test('calculation-log separates routing failure and legacy schedule fallback', a
   }
 });
 
+test('calculation-log-summary-separates-final-kind-from-sticky', async () => {
+  const matcher = '**/admin/requests/recent';
+  const makeRecord = (id, kind, sticky) => ({
+    id,
+    ts: '2026-11-04T10:00:00+08:00',
+    text: id,
+    model: 'fast',
+    target_id: 'safe',
+    node_labels: { safe: { title: '安全目标', type: 'target' } },
+    selection_reason: sticky ? 'sticky' : kind === 'target' ? 'target' : 'error_fallback',
+    sticky_hit: sticky ? 1 : 0,
+    outcome_state: 'completed',
+    routing_ms: 4,
+    total_ms: 10,
+    waves: 1,
+    trace: [
+      { event: 'final', target_id: 'safe', kind, candidates: [], priority: 1 },
+      { event: 'scheduled', model: 'fast', reason: sticky ? 'sticky' : kind === 'target' ? 'target' : 'error_fallback', dry_run: false },
+    ],
+  });
+  await page.route(matcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ requests: [
+      makeRecord('target-sticky', 'target', true),
+      makeRecord('otherwise', 'otherwise', false),
+      makeRecord('error-sticky', 'error_fallback', true),
+    ] }),
+  }));
+
+  try {
+    await page.goto(routerBase + '/console/logs.html');
+    const expected = await page.evaluate(() => ({
+      target: window.t('logs.reason.target'),
+      sticky: window.t('logs.reason.sticky'),
+      otherwise: window.t('logs.reason.otherwise'),
+      error: window.t('logs.reason.errorFallback'),
+    }));
+    for (const id of ['target-sticky', 'otherwise', 'error-sticky']) {
+      await page.locator(`.lg-item[data-id="${id}"] .lg-row`).click();
+    }
+
+    const targetSticky = await page.locator('.lg-item[data-id="target-sticky"] .lg-sum').innerText();
+    const otherwise = await page.locator('.lg-item[data-id="otherwise"] .lg-sum').innerText();
+    const errorSticky = await page.locator('.lg-item[data-id="error-sticky"] .lg-sum').innerText();
+    assertIncludes(targetSticky, expected.target);
+    assertIncludes(targetSticky, expected.sticky);
+    assertIncludes(otherwise, expected.otherwise);
+    assertIncludes(errorSticky, expected.error);
+    assertIncludes(errorSticky, expected.sticky);
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
 test('calculation-log mobile keeps the main conclusion within the viewport', async () => {
   await page.setViewportSize({ width: 390, height: 844 });
   try {

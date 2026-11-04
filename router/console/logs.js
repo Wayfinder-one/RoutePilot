@@ -122,15 +122,31 @@ function summaryHtml(record) {
   const waves = trace.filter(event => event && event.event === 'wave');
   const rounds = Number.isFinite(Number(record.waves)) ? Number(record.waves) : waves.length;
   const reason = record.selection_reason;
-  const reasonKey = reason === 'sticky' || record.sticky_hit ? 'logs.reason.sticky'
-    : isFallback(record) ? 'logs.reason.fallback' : 'logs.reason.target';
-  const reasonTone = reasonKey === 'logs.reason.sticky' ? ' sticky'
-    : reasonKey === 'logs.reason.fallback' ? ' fallback' : '';
+  const final = trace.reduce(
+    (found, event) => event && event.event === 'final' ? event : found,
+    null,
+  );
+  const finalKind = final && final.kind;
+  let reasonKey = null;
+  if (finalKind === 'target') reasonKey = 'logs.reason.target';
+  else if (finalKind === 'otherwise') reasonKey = 'logs.reason.otherwise';
+  else if (finalKind === 'error_fallback') reasonKey = 'logs.reason.errorFallback';
+  else if (record.selection_reason === 'target') reasonKey = 'logs.reason.target';
+  else if (isFallback(record)) reasonKey = 'logs.reason.fallback';
+
+  const reasonTone = reasonKey === 'logs.reason.otherwise' ||
+    reasonKey === 'logs.reason.errorFallback' || reasonKey === 'logs.reason.fallback'
+    ? ' fallback' : '';
+  const stickyChip = record.outcome_state !== 'routing_error' &&
+    (record.selection_reason === 'sticky' || record.sticky_hit)
+    ? `<span class="lg-chip sticky">${esc(t('logs.reason.sticky'))}</span>` : '';
   const head = [
     `<span class="lg-sum-model">→ ${esc(record.model || '—')}</span>`,
     `<span class="lg-sum-target">${esc(SRTrace.label(record.node_labels, record.target_id))}</span>`,
-    record.outcome_state === 'routing_error' ? ''
+    record.outcome_state === 'routing_error' || !reasonKey
+      ? ''
       : `<span class="lg-chip${reasonTone}">${esc(t(reasonKey))}</span>`,
+    stickyChip,
     `<span class="lg-sum-kv">${esc(t('logs.field.rounds'))}<b>${esc(String(rounds))}</b></span>`,
     `<span class="lg-sum-kv">${esc(t('logs.f.routing'))}<b>${esc(ms(record.routing_ms))}</b></span>`,
     `<span class="lg-sum-kv">${esc(t('logs.f.total'))}<b>${esc(ms(latencyValue(record)))}</b></span>`,

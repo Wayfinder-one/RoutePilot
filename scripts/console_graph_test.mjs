@@ -1145,7 +1145,11 @@ test('logs fallback filter knows the graph v3 enum', () => {
   assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
     'logs still uses the pre-graph fallback enum');
   assert.match(logs, /logs\.reason\.fallback/);
-  assert.doesNotMatch(logs, /logs\.reason\.(otherwise|errorFallback)/);
+  const i18n = read('i18n.js');
+  for (const key of ['logs.reason.otherwise', 'logs.reason.errorFallback']) {
+    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
+      'i18n key ' + key + ' is not defined in both zh and en');
+  }
 });
 
 test('calculation log detail shows the process inline and keeps technical facts folded', () => {
