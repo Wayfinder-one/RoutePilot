@@ -5712,6 +5712,37 @@ test('calculation-log renders staged process from a real request', async () => {
   assertIncludes(await open.innerText(), 'qwen3.8-flash-sft');
 });
 
+test('calculation-log-phase-order-matches-engine', async () => {
+  await api('POST', '/v1/chat/completions', {
+    model: 'ignored',
+    messages: [{ role: 'user', content: S1_TEXT }],
+    stream: false,
+  });
+  await page.goto(routerBase + '/console/logs.html');
+  await page.locator('.lg-row').first().click();
+
+  async function kinds(wave) {
+    return page.locator(`.lg-item.open .lg-phase[data-wave="${wave}"] > .lg-judgments`).evaluate(host =>
+      Array.from(host.children).map(element => {
+        if (element.classList.contains('lg-question')) return 'question';
+        if (element.classList.contains('lg-judgment-row')) return 'gate';
+        if (element.classList.contains('lg-slots')) return 'slots';
+        if (element.classList.contains('lg-activation')) return 'activate';
+        return 'other';
+      }).filter(kind => kind !== 'other'));
+  }
+
+  const initial = await kinds(0);
+  const firstWave = await kinds(1);
+  assert.ok(initial.includes('slots') && initial.includes('activate'));
+  assert.ok(initial.indexOf('slots') < initial.indexOf('activate'));
+  assert.ok(firstWave.includes('question'));
+  assert.ok(firstWave.includes('gate'));
+  assert.ok(firstWave.indexOf('question') < firstWave.indexOf('gate'));
+  assert.ok(firstWave.indexOf('gate') < firstWave.indexOf('slots'));
+  assert.ok(firstWave.indexOf('slots') < firstWave.indexOf('activate'));
+});
+
 test('calculation-log exposes every slot only on demand', async () => {
   await page.goto(routerBase + '/console/logs.html');
   await page.locator('.lg-row').first().click();

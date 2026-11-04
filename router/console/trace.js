@@ -182,8 +182,8 @@ const SRTrace = (() => {
   }
 
   function activateHtml(event, labels) {
-    return judgment(label(labels, event.node_id),
-      `<small>${esc(t('logs.field.activated'))} · via ${esc(text(event.via_port))}</small>`);
+    return `<div class="lg-activation">${judgment(label(labels, event.node_id),
+      `<small>${esc(t('logs.field.activated'))} · via ${esc(text(event.via_port))}</small>`)}</div>`;
   }
 
   /* 激活引用键：wave:nodeId:port —— activate 通过 node_id + via_port 引用槽位。 */
@@ -235,13 +235,18 @@ const SRTrace = (() => {
     const title = phase.wave === 0 ? esc(t('logs.initial')) : esc(tf('logs.wave', { n: phase.wave }));
     const failed = !!(phase.waveEvent && phase.waveEvent.failed);
     const error = failed && phase.waveEvent.error ? esc(stringify(phase.waveEvent.error)) : '';
-    const items = [
+    /* 引擎真实顺序：初始为条件→门→槽位→激活，JEV 轮次为问题→门→槽位→激活。 */
+    const items = (phase.wave === 0 ? [
       phase.conditions.map(event => conditionHtml(event, labels)).join(''),
       phase.gates.map(event => gateHtml(event, labels)).join(''),
-      phase.questions.map(event => questionHtml(event, labels)).join(''),
-      phase.activations.map(event => activateHtml(event, labels)).join(''),
       slotGroupHtml(phase, labels),
-    ].filter(Boolean).join('');
+      phase.activations.map(event => activateHtml(event, labels)).join(''),
+    ] : [
+      phase.questions.map(event => questionHtml(event, labels)).join(''),
+      phase.gates.map(event => gateHtml(event, labels)).join(''),
+      slotGroupHtml(phase, labels),
+      phase.activations.map(event => activateHtml(event, labels)).join(''),
+    ]).filter(Boolean).join('');
     return `<section class="lg-phase${failed ? ' bad' : ''}" data-wave="${esc(phase.wave)}">
       <div class="lg-phase-h"><b>${title}</b>
         ${failed ? `<span class="lg-wave-fail">${esc(t('logs.failedWave'))}${error ? ' · ' + error : ''}</span>` : ''}
