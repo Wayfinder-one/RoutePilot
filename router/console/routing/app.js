@@ -802,7 +802,6 @@
       id: App.graph.id || 'root', type: 'graph',
       nodes: (App.graph.nodes || []).concat([probe]),
       edges: App.graph.edges || [],
-      otherwise_target: App.graph.otherwise_target,
       error_fallback: App.graph.error_fallback
     };
     const targetPort = RTGraph.nextSlot(tmp, '__quick_probe');

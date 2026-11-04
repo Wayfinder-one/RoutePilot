@@ -21,7 +21,7 @@ def pool_graph(models):
             "id": "e-start-pool", "source": "start", "source_port": "out",
             "target": "pool", "target_port": "in_1", "condition": None,
         }],
-        "otherwise_target": "pool", "error_fallback": "pool",
+        "error_fallback": "pool",
     }
 
 

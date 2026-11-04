@@ -11,7 +11,7 @@ English | [简体中文](README.zh-CN.md)
 - **Visual routing policy.** Build branching policies on a canvas instead of writing if/else chains. Nodes, wires, conditions, validation, layout, undo/redo, and graph import/export are all first-class.
 - **OpenAI-compatible entry point.** `POST /v1/chat/completions` supports JSON and SSE streaming, with the selected model returned in response headers.
 - **Decision-service driven.** Choice, yes/no, and score questions are batched per wave and sent to a `systemone`-compatible decision service. Answers activate downstream questions, gates, and targets.
-- **Deterministic target selection.** Activated targets compete by priority; the largest number wins. A normal empty result uses `otherwise_target`, while a failed decision wave uses `error_fallback`.
+- **Deterministic target selection.** Activated targets compete by priority; the largest number wins. Both a normal empty result and a failed decision wave use the single fallback model, `error_fallback`.
 - **Sticky sessions and load balancing.** Reuse a model per tree revision and target, then pick a backend with `least_inflight`. Failed backends are removed by a circuit breaker.
 - **Dry-run before publishing.** `/admin/try` runs the same graph executor with the same trace format without touching affinity, in-flight counts, or upstream generation models.
 - **Operations built in.** Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, config revisions, audit history, and role-based users.
@@ -24,7 +24,7 @@ flowchart LR
   C[Client] --> V["/v1/chat/completions"]
   V --> G[Graph executor]
   G <--> J["Decision service /v1/systemone"]
-  G --> T["Target selection<br/>priority · otherwise · error"]
+  G --> T["Target selection<br/>priority · fallback"]
   T --> A[Session affinity]
   A --> L["least_inflight<br/>+ circuit breaker"]
   L --> U[Upstream model]
@@ -35,7 +35,7 @@ flowchart LR
 2. Activate the first wave of questions. All questions in one wave are merged into one decision-service call.
 3. Update numeric ports and `selected` ports, then re-evaluate every downstream slot condition and logic gate.
 4. Repeat wave by wave until no new question is activated.
-5. Choose the highest-priority active target. If none activated, use `otherwise_target`; if a decision call failed, use `error_fallback`.
+5. Choose the highest-priority active target. If none activated, or if a decision call failed, use the fallback model `error_fallback`.
 6. Apply session affinity, select a backend with `least_inflight`, and proxy the request upstream. Failures open the circuit breaker for that model.
 
 `unknown` never activates a question or target. Numeric comparisons with an unknown value stay unknown.
@@ -118,9 +118,9 @@ Conditions live on edges, not on nodes:
 - Questions are executed in waves; one wave = one decision-service call.
 - A failed wave voids the whole round: no ports are filled and all candidates from that round are discarded.
 - Target priorities must be unique. **Larger number wins.**
-- `otherwise_target` is used when execution completes normally with zero active targets.
-- `error_fallback` is used when a decision call fails, times out, or returns an invalid answer.
-- Both fallbacks must point to an existing target; they may point to the same target.
+- `error_fallback` is used when execution completes normally with zero active targets.
+- The same `error_fallback` is used when a decision call fails, times out, or returns an invalid answer.
+- The fallback model must point to an existing target.
 
 ### Limits
 
@@ -147,7 +147,6 @@ The canvas imports and exports a single JSON envelope:
   "root": {
     "id": "root",
     "type": "graph",
-    "otherwise_target": "safe-target",
     "error_fallback": "safe-target",
     "nodes": [],
     "edges": []
@@ -189,7 +188,7 @@ Environment variables can seed the decision-service config on first start only; 
 - The last active admin cannot be demoted, disabled, or deleted.
 - Every user and configuration change is recorded in the audit log.
 - Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
-- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail.
+- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail. Legacy `otherwise_target` in old graph files is read as the unified fallback and is normalized to `error_fallback` on save.
 - Session affinity and in-flight counts remain process-local. Multiple router replicas can share graph files, but cross-replica session/in-flight consistency requires an external shared state layer.
 
 ## Shared graph storage and replicas

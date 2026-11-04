@@ -3,7 +3,7 @@
    render(selection)：
      · node  → 按节点类型生成配置字段（问题/选项/关键词/时段/算子/模型/priority…）
      · edge  → 两端只读 + 类型 + 条件表单（复用 RTCondPop） + 删除
-     · graph → 名称 / 时区 / 粘性 / otherwise_target / error_fallback + 限额
+     · graph → 名称 / 时区 / 粘性 / 兜底模型 + 限额
    所有写入走 App.change：一次表单提交 = 一个历史项，不在 keystroke 上写草稿。
    选项 key 改名在提交前用探针快照预演（renameOptionKey）：先改到唯一临时 key
    再落到最终 key，因此同一次保存里的互换也能成功；冲突时留在编辑器并给出具体原因。
@@ -444,11 +444,8 @@
       '<input type="number" min="1" step="1" data-field="stickyTtl" value="' +
       esc(sticky.ttl_seconds == null ? 1800 : sticky.ttl_seconds) + '" aria-label="' +
       esc(t('cv.ins.stickyTtl')) + '"></label>' +
-      '<label class="field">' + esc(t('cv.ins.otherwise')) +
-      '<select data-field="otherwise" aria-label="' + esc(t('cv.ins.otherwise')) + '">' +
-      targetOptions(graph.otherwise_target) + '</select></label>' +
-      '<label class="field">' + esc(t('cv.ins.errorFallback')) +
-      '<select data-field="errorFallback" aria-label="' + esc(t('cv.ins.errorFallback')) + '">' +
+      '<label class="field">' + esc(t('cv.ins.fallback')) +
+      '<select data-field="fallback" aria-label="' + esc(t('cv.ins.fallback')) + '">' +
       targetOptions(graph.error_fallback) + '</select></label></div>' +
       '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.limits')) + '</div>' +
       limitRow('nodes', nodes, limits.nodes) + limitRow('edges', edges, limits.edges) +
@@ -692,24 +689,20 @@
     const ttl = Number(fieldValue(form, 'stickyTtl'));
     if (!Number.isInteger(ttl) || ttl < 1) return error(t('cv.ins.errStickyTtl'));
     const targetIds = (graph.nodes || []).filter(node => node.type === 'target').map(node => node.id);
-    const otherwise = String(fieldValue(form, 'otherwise') || '') || null;
-    const errorFallback = String(fieldValue(form, 'errorFallback') || '') || null;
-    if (otherwise && targetIds.indexOf(otherwise) < 0) return error(t('cv.ins.errFallback'));
-    if (errorFallback && targetIds.indexOf(errorFallback) < 0) return error(t('cv.ins.errFallback'));
+    const fallback = String(fieldValue(form, 'fallback') || '') || null;
+    if (fallback && targetIds.indexOf(fallback) < 0) return error(t('cv.ins.errFallback'));
     const sticky = { enabled: !!fieldValue(form, 'sticky'), ttl_seconds: ttl };
     const committed = {
       name: name,
       timezone: timezone,
       sticky: sticky,
-      otherwise: otherwise,
-      errorFallback: errorFallback
+      fallback: fallback
     };
     const previous = {
       name: current.tree.name,
       timezone: current.tree.timezone,
       sticky: current.tree.sticky,
-      otherwise: graph.otherwise_target,
-      errorFallback: graph.error_fallback
+      fallback: graph.error_fallback
     };
     /* no-op 提交不产生历史项（与 RTCondPop 的 sameCondition 跳过一致）。 */
     if (root.RTGraph.stableStringify(previous) === root.RTGraph.stableStringify(committed)) {
@@ -719,8 +712,7 @@
       tree.name = name;
       tree.timezone = timezone;
       tree.sticky = sticky;
-      tree.root.otherwise_target = otherwise;
-      tree.root.error_fallback = errorFallback;
+      tree.root.error_fallback = fallback;
     }) === false) return error(t('cv.saveBlocked'));
     return { ok: true, changed: true };
   }

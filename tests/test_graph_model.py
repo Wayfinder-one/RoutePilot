@@ -321,7 +321,7 @@ def test_behavior_changes_change_revision():
     changed["root"]["nodes"][1]["options"][0]["label"] = "轻量档"
     assert tree_revision_of(tree_from_dict(changed)) != base
     changed = tree_dict()
-    changed["root"]["otherwise_target"] = None
+    changed["root"]["error_fallback"] = "other"
     assert tree_revision_of(tree_from_dict(changed)) != base
     changed = tree_dict()
     changed["root"]["edges"][1]["target_port"] = "in_2"
@@ -361,9 +361,23 @@ def test_tree_envelope_strict():
     with pytest.raises(ValueError, match="graph"):
         tree_from_dict({**tree_dict(), "root": None})
     raw = tree_dict()
-    raw["root"]["otherwise_target"] = "missing-target"
+    raw["root"]["error_fallback"] = "missing-target"
     tree = tree_from_dict(raw)
-    assert tree.root.otherwise_target == "missing-target"
+    assert tree.root.error_fallback == "missing-target"
+
+
+def test_legacy_otherwise_target_is_read_as_the_unified_fallback():
+    raw = tree_dict()
+    raw["root"].pop("error_fallback")
+    raw["root"]["otherwise_target"] = "safe"
+    tree = tree_from_dict(raw)
+    assert tree.root.error_fallback == "safe"
+    assert "otherwise_target" not in tree_storage_dict(tree)["root"]
+
+    # The canonical error_fallback wins when a legacy file carries both.
+    raw = tree_dict()
+    raw["root"]["otherwise_target"] = "other"
+    assert tree_from_dict(raw).root.error_fallback == "safe"
 
 
 def test_huge_int_raises_value_error():

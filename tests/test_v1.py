@@ -1,7 +1,7 @@
 """`/v1/chat/completions` 真链路：MockTransport 分流 `/v1/systemone` 与假 OpenAI 上游。
 
-覆盖 M1 验收矩阵（spec §7.2）：selected 直连、数值 AND、两波追问、otherwise、
-error_fallback（缺答案 key / 非法概率 / timeout）、同波合并一次调用、粘性二次请求
+覆盖 M1 验收矩阵（spec §7.2）：selected 直连、数值 AND、两波追问、统一兜底模型、
+决策失败（缺答案 key / 非法概率 / timeout）、同波合并一次调用、粘性二次请求
 仍然执行被激活的问题再 preferred 调度、移动节点不改变 revision、首选 target 熔断
 返回 503 且不调用次优上游、流式/非流式/取消的 lease 释放、SQLite waves 与内存
 answers 的边界，以及 `x-sr-selection` 取值集合。
@@ -82,9 +82,9 @@ def _edge(edge_id, source, source_port, target, target_port, condition=None):
             "target": target, "target_port": target_port, "condition": condition}
 
 
-def _graph(nodes, edges, *, otherwise="safe", error="safe"):
+def _graph(nodes, edges, *, error="safe"):
     return {"id": "root", "type": "graph", "nodes": nodes, "edges": edges,
-            "otherwise_target": otherwise, "error_fallback": error}
+            "error_fallback": error}
 
 
 def switch_graph():
@@ -110,7 +110,7 @@ def switch_graph():
     )
 
 
-def otherwise_graph():
+def no_target_graph():
     """只有 selected.fast 连到 target；选 strong 时没有任何 target 激活。"""
     graph = switch_graph()
     graph["edges"] = [
@@ -125,7 +125,6 @@ def direct_graph():
     return _graph(
         [_start(), _target("direct", 1, ("safe",))],
         [_edge("e-start-direct", "start", "out", "direct", "in_1")],
-        otherwise="direct",
         error="direct",
     )
 
@@ -410,18 +409,18 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
     asyncio.run(scenario())
 
 
-def test_otherwise_target_when_no_target_activates(tmp_path):
+def test_fallback_model_when_no_target_activates(tmp_path):
     async def scenario():
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
-        app = make_app(tmp_path, har, root=otherwise_graph())
+        app = make_app(tmp_path, har, root=no_target_graph())
         response = await post(app)
         assert response.status_code == 200
-        assert response.headers["x-sr-selection"] == "otherwise"
+        assert response.headers["x-sr-selection"] == "error_fallback"
         assert response.headers["x-sr-model"] == "safe"
         assert har.upstream_models == ["safe"]
         record = recent(app)
-        assert record["selection_reason"] == "otherwise"
-        assert record["fallback_reason"] == "otherwise"
+        assert record["selection_reason"] == "error_fallback"
+        assert record["fallback_reason"] == "error_fallback"
         assert record["jev_choice"] == "strong"
         await flush(app)
         conn = connect(app.state.settings.db_path)

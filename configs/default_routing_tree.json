@@ -94,7 +94,6 @@
         "condition": null
       }
     ],
-    "otherwise_target": "safe-target",
     "error_fallback": "safe-target"
   }
 }

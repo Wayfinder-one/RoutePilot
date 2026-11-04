@@ -5,7 +5,7 @@
 
    约束：
    · 只做纯函数（不读 DOM、不读 window.MOCK、不发请求），可被 node 直测；
-   · 所有函数显式接收 graph（root：{id,type,nodes,edges,otherwise_target,error_fallback}）
+   · 所有函数显式接收 graph（root：{id,type,nodes,edges,error_fallback}）
      或完整 envelope（{name,timezone,sticky,root}）；
    · 算法移植自 docs/od-design/routing-canvas-2026-11-02/mock.js，但去掉了固定场景与组状态。
    ------------------------------------------------------------------ */
@@ -417,12 +417,10 @@
       if (edge.source === nodeId || edge.target === nodeId) removed.unshift(graphValue.edges.splice(cursor, 1)[0]);
     }
     const fallbackCleared = [];
-    ['otherwise_target', 'error_fallback'].forEach(field => {
-      if (graphValue[field] === nodeId) {
-        graphValue[field] = null;
-        fallbackCleared.push(field);
-      }
-    });
+    if (graphValue.error_fallback === nodeId) {
+      graphValue.error_fallback = null;
+      fallbackCleared.push('error_fallback');
+    }
     return { ok: true, node: node, edges: removed, fallbackCleared: fallbackCleared };
   }
 
@@ -522,6 +520,7 @@
   /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
   const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root'];
   const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision', 'updated_at'];
+  /* otherwise_target stays readable for pre-merge v3 imports, then is removed. */
   const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'otherwise_target', 'error_fallback'];
   const NODE_FIELDS = {
     start: ['id', 'type', 'title', 'position'],
@@ -825,26 +824,22 @@
       priorities[node.priority] = true;
     });
 
-    ['otherwise_target', 'error_fallback'].forEach(field => {
-      const ref = graph[field];
-      if (!isNonEmptyString(ref)) {
-        issues.push(issue(
-          'fallback_missing',
-          field + ' 未配置：' + (field === 'otherwise_target'
-            ? '正常执行结束但没有 target 激活时需要兜底目标'
-            : '决策调用失败或超时、整波作废时需要兜底目标'),
-          field + ' is not configured: a fallback target is required',
-          { port: field }
-        ));
-        return;
-      }
-      const node = byId[ref];
+    const fallback = graph.error_fallback;
+    if (!isNonEmptyString(fallback)) {
+      issues.push(issue(
+        'fallback_missing',
+        '兜底模型未配置：没有 target 激活或决策失败时需要兜底目标',
+        'Fallback model is not configured: a fallback target is required when no target activates or a decision fails',
+        { port: 'error_fallback' }
+      ));
+    } else {
+      const node = byId[fallback];
       if (!node) {
-        issues.push(issue('fallback_missing', field + ' 指向的节点不存在：' + ref, field + ' points to a missing node: ' + ref, { node_id: ref, port: field }));
+        issues.push(issue('fallback_missing', '兜底模型指向的节点不存在：' + fallback, 'Fallback model points to a missing node: ' + fallback, { node_id: fallback, port: 'error_fallback' }));
       } else if (node.type !== 'target') {
-        issues.push(issue('fallback_missing', field + ' 必须指向 target 节点：' + ref, field + ' must point to a target node: ' + ref, { node_id: ref, port: field }));
+        issues.push(issue('fallback_missing', '兜底模型必须指向 target 节点：' + fallback, 'Fallback model must point to a target node: ' + fallback, { node_id: fallback, port: 'error_fallback' }));
       }
-    });
+    }
 
     const adjacency = Object.create(null);
     const backAdjacency = Object.create(null);
@@ -1145,7 +1140,6 @@
     const edges = Array.isArray(graph.edges) ? graph.edges : [];
     return {
       type: 'graph',
-      otherwise_target: graph.otherwise_target == null ? null : graph.otherwise_target,
       error_fallback: graph.error_fallback == null ? null : graph.error_fallback,
       nodes: sortNodes(nodes.filter(node => isRecord(node)).map(node => normalizedNode(node, includeDisplay))),
       edges: sortEdges(edges.filter(edge => isRecord(edge)).map(normalizedEdge))
@@ -1318,8 +1312,12 @@
     const graph = clone(raw);
     graph.id = isNonEmptyString(graph.id) ? graph.id : 'root';
     graph.type = 'graph';
+    /* 旧 v3 图可能仍带 otherwise_target：读取时折叠为统一兜底，写回时不再输出。 */
+    if (graph.error_fallback == null && isNonEmptyString(graph.otherwise_target)) {
+      graph.error_fallback = graph.otherwise_target;
+    }
+    delete graph.otherwise_target;
     /* 非对象条目不做静默丢弃：保留在 tree 中交给 validate 报 graph_parse_error。 */
-    if (!graph.otherwise_target && graph.otherwise_target !== null) graph.otherwise_target = null;
     if (!graph.error_fallback && graph.error_fallback !== null) graph.error_fallback = null;
 
     const positions = layoutPositions('dag', graph);
@@ -1388,7 +1386,6 @@
             condition: null
           }
         ],
-        otherwise_target: 'target-1',
         error_fallback: 'target-1'
       }
     };

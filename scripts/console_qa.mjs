@@ -41,7 +41,7 @@ const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
 const EXAMPLE_NODES = EXAMPLE.nodes.length;
 const EXAMPLE_EDGES = EXAMPLE.edges.length;
 const EXAMPLE_START = EXAMPLE.nodes.find(node => node.id === 'start').position;
-const EXAMPLE_TARGETS = { otherwise: EXAMPLE.otherwise_target, error: EXAMPLE.error_fallback };
+const EXAMPLE_TARGETS = { fallback: EXAMPLE.error_fallback };
 /* 示例图只有 root；envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
 const BASELINE = {
   name: '电力优先决策组',
@@ -742,7 +742,7 @@ test('bootstrap registers catalog, periods, decision service and the enabled pow
   assert.equal(tree.enabled, true);
   assert.equal(tree.root.nodes.length, 15);
   assert.equal(tree.root.edges.length, 15);
-  assert.equal(tree.root.otherwise_target, 'standard-target');
+  assert.equal(tree.root.otherwise_target, undefined);
   assert.equal(tree.root.error_fallback, 'light-target');
   assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
 });
@@ -1798,7 +1798,7 @@ test('Task 11 · validate-bar edge and graph issues locate and open the same con
 
   /* Graph-level issue opens graph settings and can be fixed there. */
   await page.evaluate(() => {
-    window.App.change('behavior', tree => { tree.root.otherwise_target = null; });
+    window.App.change('behavior', tree => { tree.root.error_fallback = null; });
   });
   await page.waitForFunction(() => window.App.issues.some(issue => issue.code === 'fallback_missing'));
   await page.locator('#cvIssuesBtn').click();
@@ -1813,12 +1813,12 @@ test('Task 11 · validate-bar edge and graph issues locate and open the same con
   }), 'solid 2px', 'is-focus has no visible token-based focus ring');
   await waitInspectorBranch('graph', 'root');
   assert.deepEqual(await page.evaluate(() => window.App.kit.getSelection()), { kind: null, id: null });
-  await page.locator('#cvInspectorBody [data-field="otherwise"]').selectOption('standard-target');
+  await page.locator('#cvInspectorBody [data-field="fallback"]').selectOption('standard-target');
   await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
   await page.waitForFunction(() => !window.App.issues.some(issue => issue.code === 'fallback_missing'));
-  assert.equal(await page.evaluate(() => window.App.graph.otherwise_target), 'standard-target');
+  assert.equal(await page.evaluate(() => window.App.graph.error_fallback), 'standard-target');
   await page.locator('#cvUndo').click();
-  await page.waitForFunction(() => window.App.graph.otherwise_target === null);
+  await page.waitForFunction(() => window.App.graph.error_fallback === null);
 });
 
 test('7.4-08-logic-slot-rows', async () => {
@@ -2302,8 +2302,7 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
   assert.equal(await page.locator('#cvInspectorBody [data-field="timezone"]').inputValue(), BASELINE.timezone);
   assert.equal(await page.locator('#cvInspectorBody [data-field="sticky"]').isChecked(), true);
   assert.equal(await page.locator('#cvInspectorBody [data-field="stickyTtl"]').inputValue(), '1800');
-  assert.equal(await page.locator('#cvInspectorBody [data-field="otherwise"]').inputValue(), 'standard-target');
-  assert.equal(await page.locator('#cvInspectorBody [data-field="errorFallback"]').inputValue(), 'light-target');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="fallback"]').inputValue(), 'light-target');
   const limitRows = await page.evaluate(() => {
     const read = name => {
       const row = document.querySelector('#cvInspectorBody [data-limit="' + name + '"] b');
@@ -2346,12 +2345,11 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
   await page.locator('#cvInspectorBody [data-field="timezone"]').fill('UTC');
   await page.locator('#cvInspectorBody [data-field="sticky"]').uncheck();
   await page.locator('#cvInspectorBody [data-field="stickyTtl"]').fill('900');
-  await page.locator('#cvInspectorBody [data-field="otherwise"]').selectOption('power-target');
-  await page.locator('#cvInspectorBody [data-field="errorFallback"]').selectOption('power-target');
+  await page.locator('#cvInspectorBody [data-field="fallback"]').selectOption('power-target');
   await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
   await page.waitForFunction(() => window.App.tree.name === '电力优先决策组 · v2' &&
     window.App.tree.timezone === 'UTC' && window.App.tree.sticky.enabled === false &&
-    window.App.tree.sticky.ttl_seconds === 900 && window.App.graph.otherwise_target === 'power-target');
+    window.App.tree.sticky.ttl_seconds === 900 && window.App.graph.error_fallback === 'power-target');
   const snapshot = await appSnapshot();
   assert.equal(snapshot.kind, 'behavior');
   assert.equal(await page.evaluate(() => window.App.graph.error_fallback), 'power-target');
@@ -2359,7 +2357,7 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
   await page.waitForFunction(expected => window.App.tree.name === expected.name &&
     window.App.tree.timezone === expected.timezone && window.App.tree.sticky.enabled === true &&
     window.App.tree.sticky.ttl_seconds === expected.sticky.ttl_seconds &&
-    window.App.graph.otherwise_target === 'standard-target', BASELINE);
+    window.App.graph.error_fallback === 'light-target', BASELINE);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
 });
 
@@ -2785,8 +2783,7 @@ test('minimal-new-group-template', async () => {
     kind: window.App.kind(),
     types: window.App.graph.nodes.map(node => node.type).sort(),
     edges: window.App.graph.edges.map(edge => [edge.source, edge.source_port, edge.target, edge.target_port]),
-    otherwise: window.App.graph.otherwise_target,
-    errorFallback: window.App.graph.error_fallback,
+    fallback: window.App.graph.error_fallback,
     target: (window.App.graph.nodes.find(node => node.type === 'target') || {}).id,
     finite: window.App.graph.nodes.every(node =>
       window.RTGraph && node.position && Number.isFinite(node.position.x) && Number.isFinite(node.position.y))
@@ -2796,8 +2793,7 @@ test('minimal-new-group-template', async () => {
   assert.deepEqual(draft.types, ['start', 'target']);
   assert.equal(draft.edges.length, 1);
   assert.deepEqual(draft.edges[0], ['start', 'out', draft.target, 'in_1']);
-  assert.equal(draft.otherwise, draft.target, 'otherwise fallback does not point at the target');
-  assert.equal(draft.errorFallback, draft.target, 'error fallback does not point at the target');
+  assert.equal(draft.fallback, draft.target, 'fallback model does not point at the target');
   assert.equal(draft.finite, true, 'new tree nodes have no finite coordinates');
 
   await saveNow();
@@ -3059,8 +3055,8 @@ test('Task 12 · export downloads the complete v3 envelope including timezone an
   assert.deepEqual(parsed.sticky, BASELINE.sticky);
   assert.equal(parsed.root.nodes.length, EXAMPLE_NODES);
   assert.equal(parsed.root.edges.length, EXAMPLE_EDGES);
-  assert.equal(parsed.root.otherwise_target, EXAMPLE_TARGETS.otherwise);
-  assert.equal(parsed.root.error_fallback, EXAMPLE_TARGETS.error);
+  assert.equal(parsed.root.otherwise_target, undefined);
+  assert.equal(parsed.root.error_fallback, EXAMPLE_TARGETS.fallback);
   assert.equal((await dirtyBadge()).kind, 'clean', 'export mutated the draft');
 });
 
@@ -3316,7 +3312,7 @@ test('7.4-15-validation-bar-and-locate', async () => {
     { code: 'invalid_timezone', level: 'hard', zh: '时区无效（QA）', en: 'Invalid timezone (QA)', node_id: '', edge_id: '', port: '' },
     { code: 'question_incomplete', level: 'hard', zh: '问题节点不完整（QA）', en: 'Incomplete question (QA)', node_id: 'capability', edge_id: '', port: '' },
     { code: 'numeric_edge_condition_invalid', level: 'hard', zh: '槽位条件非法（QA）', en: 'Invalid slot condition (QA)', node_id: 'deep-target', edge_id: 'e-clarify-deep', port: 'in_1' },
-    { code: 'fallback_missing', level: 'hard', zh: '兜底缺失（QA）', en: 'Missing fallback (QA)', node_id: '', edge_id: '', port: 'otherwise_target' }
+    { code: 'fallback_missing', level: 'hard', zh: '兜底缺失（QA）', en: 'Missing fallback (QA)', node_id: '', edge_id: '', port: 'error_fallback' }
   ];
   const enableRequests = [];
   const onRequest = request => {
@@ -4111,7 +4107,7 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
     'the fallback target slot row did not join the amber chain');
   assert.equal(snap.resultKind, 'error_fallback');
   assertIncludes(snap.resultText, '模型目标-5');
-  assertIncludes(snap.resultText, await page.evaluate(() => window.t('cv.tryKind.error')));
+  assertIncludes(snap.resultText, await page.evaluate(() => window.t('cv.tryKind.fallback')));
   await screenshot('s5-fallback-amber-1440.png');
 
   /* 清除 s5 后琥珀/非法 class 必须一条不剩（旧用例只清过 s1）。 */
@@ -4681,7 +4677,7 @@ test('200-node-400-edge-smoke', async () => {
     const G = window.RTGraph;
     const graph = {
       id: 'root', type: 'graph', nodes: [], edges: [],
-      otherwise_target: 't67', error_fallback: 't67'
+      error_fallback: 't67'
     };
     graph.nodes.push({ id: 'start', type: 'start' });
     graph.nodes.push({ id: 'cond', type: 'condition', source: 'text', contains_any: ['故障'] });
@@ -4764,7 +4760,7 @@ test('200-node-400-edge-smoke', async () => {
       limit: window.App.issues.filter(issue => issue.code === 'limit_exceeded').length,
       priorities: graph.nodes.filter(node => node.type === 'target')
         .map(node => node.priority).sort((a, b) => a - b),
-      fallbacks: [graph.otherwise_target, graph.error_fallback]
+      fallbacks: [graph.error_fallback]
     };
   });
   assert.deepEqual(counts.byType, { start: 1, condition: 1, question: 32, logic: 98, target: 68 });
@@ -4784,7 +4780,7 @@ test('200-node-400-edge-smoke', async () => {
   assert.equal(counts.limit, 0, 'the 200/400 graph reported limit_exceeded');
   assert.deepEqual(counts.hard, [], 'the extreme graph failed structural validation');
   assert.deepEqual(counts.priorities, Array.from({ length: 68 }, (_, index) => index + 1));
-  assert.deepEqual(counts.fallbacks, ['t67', 't67']);
+  assert.deepEqual(counts.fallbacks, ['t67']);
 
   /* 平移 / 滚轮缩放 / fit 仍有响应；不设置任何未经验证的帧率指标。 */
   const center = await page.evaluate(() => {
@@ -4858,7 +4854,6 @@ test('condition-only-question-is-valid', async () => {
           target: 'target-cond', target_port: 'in_1', condition: null
         }
       ],
-      otherwise_target: 'target-cond',
       error_fallback: 'target-cond'
     }
   };
@@ -4886,7 +4881,7 @@ test('condition-only-question-is-valid', async () => {
   assert.equal(saved.root.nodes.length, 4);
   assert.equal(saved.root.edges.length, 2);
   assert.match(saved.tree_revision, /^[0-9a-f]{64}$/);
-  assert.equal(saved.root.otherwise_target, 'target-cond');
+  assert.equal(saved.root.error_fallback, 'target-cond');
 
   /* 只由第 0 阶段条件触发的问题也必须能被真链路执行：启用后走 /admin/try。 */
   await api('POST', '/admin/trees/' + encodeURIComponent(treeId) + '/enable');
@@ -5676,18 +5671,14 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
     'target card body does not show its model');
   assert.equal((otherwiseText.match(/最少在途请求/g) || []).length, 1,
     'target card renders the strategy more than once');
-  assert.match(otherwiseText, /正常兜底/);
-  assert.doesNotMatch(otherwiseText, /错误兜底/);
+  assert.doesNotMatch(otherwiseText, /兜底模型/);
 
   const errorCard = page.locator('#cvNodes [data-node-id="light-target"]');
-  assert.match(await errorCard.innerText(), /错误兜底/);
+  assert.match(await errorCard.innerText(), /兜底模型/);
 
   await waitInspectorBranch('graph', 'root');
   assert.match(
-    (await page.locator('#cvInspectorBody [data-field="otherwise"] option:checked').textContent()).trim(),
-    /模型目标-\d+ · deepseek-v3/);
-  assert.match(
-    (await page.locator('#cvInspectorBody [data-field="errorFallback"] option:checked').textContent()).trim(),
+    (await page.locator('#cvInspectorBody [data-field="fallback"] option:checked').textContent()).trim(),
     /模型目标-\d+ · qwen3-8b/);
 
   await clickNode('standard-target');

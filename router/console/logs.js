@@ -16,16 +16,11 @@ const OUTCOME = {
   cancelled: { key: 'logs.out.cancelled', tone: 'warn', chip: 'warn' },
   incomplete: { key: 'logs.out.incomplete', tone: '', chip: 'warn' },
 };
-/* Graph v3 selection_reason enum: target | sticky | otherwise | error_fallback.
-   "fallback" is the pre-graph value and stays accepted so old in-memory rows
-   still count until the process restarts. */
+/* Graph v3 selection_reason enum: target | sticky | error_fallback.
+   "otherwise" and "fallback" remain accepted for historical ledger rows. */
 const FALLBACK_REASONS = ['otherwise', 'error_fallback', 'fallback'];
 const isFallback = record => FALLBACK_REASONS.indexOf(record.selection_reason) >= 0;
-const fallbackLabel = record => {
-  if (record.selection_reason === 'error_fallback') return 'logs.reason.errorFallback';
-  if (record.selection_reason === 'otherwise') return 'logs.reason.otherwise';
-  return 'logs.reason.fallback';
-};
+const fallbackLabel = () => 'logs.reason.fallback';
 const FILTERS = {
   all: () => true,
   jev: record => record.jev_top != null,
@@ -128,9 +123,8 @@ function summaryHtml(record) {
   const candidates = final && Array.isArray(final.candidates) ? final.candidates : [];
   const rounds = Number.isFinite(Number(record.waves)) ? Number(record.waves) : waves.length;
   const reason = record.selection_reason;
-  const reasonKey = reason === 'error_fallback' ? 'logs.reason.errorFallback'
-    : reason === 'otherwise' ? 'logs.reason.otherwise'
-      : reason === 'sticky' ? 'logs.reason.sticky' : null;
+  const reasonKey = reason === 'sticky' ? 'logs.reason.sticky'
+    : isFallback(record) ? 'logs.reason.fallback' : null;
   const head = [
     `<span class="lg-sum-model">→ ${esc(record.model || '—')}</span>`,
     record.target_id ? `<span class="lg-sum-target">${esc(record.target_id)}</span>` : '',

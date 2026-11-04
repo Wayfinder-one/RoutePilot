@@ -58,7 +58,7 @@ def direct_graph(reasoning=None):
             "id": "e-start-direct", "source": "start", "source_port": "out",
             "target": "direct", "target_port": "in_1", "condition": None,
         }],
-        "otherwise_target": "direct", "error_fallback": "direct",
+        "error_fallback": "direct",
     }
 
 

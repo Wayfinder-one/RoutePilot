@@ -105,7 +105,7 @@ def test_v1_upgrade_keeps_existing_graph_trees(tmp_path):
         "sticky": {"enabled": False, "ttl_seconds": 1800},
         "root": {
             "id": "root", "type": "graph", "nodes": [{"id": "start", "type": "start"}],
-            "edges": [], "otherwise_target": None, "error_fallback": None,
+            "edges": [], "error_fallback": None,
         },
     })
     old.execute(
@@ -136,7 +136,7 @@ def test_v2_upgrade_to_v3_keeps_graph_rows_logs_and_waves(tmp_path):
         "sticky": {"enabled": False, "ttl_seconds": 1800},
         "root": {
             "id": "root", "type": "graph", "nodes": [{"id": "start", "type": "start"}],
-            "edges": [], "otherwise_target": None, "error_fallback": None,
+            "edges": [], "error_fallback": None,
         },
     })
     old.execute(

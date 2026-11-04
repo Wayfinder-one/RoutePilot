@@ -406,33 +406,32 @@ def _validate_structure(value) -> list[Issue]:
             ))
         seen_priorities.add(priority)
 
-    for field_name in ("otherwise_target", "error_fallback"):
-        ref = getattr(root, field_name)
-        if not ref:
+    ref = root.error_fallback
+    if not ref:
+        issues.append(Issue(
+            "fallback_missing",
+            "兜底模型未配置：没有 target 激活或决策失败时需要兜底目标",
+            "Fallback model is not configured: a fallback target is required when no target activates or a decision fails",
+            port="error_fallback",
+        ))
+    else:
+        node = by_id.get(ref)
+        if node is None:
             issues.append(Issue(
                 "fallback_missing",
-                f"{field_name} 未配置：{'正常执行结束但没有 target 激活时' if field_name == 'otherwise_target' else '决策调用失败或超时、整波作废时'}需要兜底目标",
-                f"{field_name} is not configured: a fallback target is required",
-                port=field_name,
+                f"兜底模型指向的节点不存在：{ref}",
+                f"Fallback model points to a missing node: {ref}",
+                node_id=ref,
+                port="error_fallback",
             ))
-        else:
-            node = by_id.get(ref)
-            if node is None:
-                issues.append(Issue(
-                    "fallback_missing",
-                    f"{field_name} 指向的节点不存在：{ref}",
-                    f"{field_name} points to a missing node: {ref}",
-                    node_id=ref,
-                    port=field_name,
-                ))
-            elif not isinstance(node, TargetNode):
-                issues.append(Issue(
-                    "fallback_missing",
-                    f"{field_name} 必须指向 target 节点：{ref}",
-                    f"{field_name} must point to a target node: {ref}",
-                    node_id=ref,
-                    port=field_name,
-                ))
+        elif not isinstance(node, TargetNode):
+            issues.append(Issue(
+                "fallback_missing",
+                f"兜底模型必须指向 target 节点：{ref}",
+                f"Fallback model must point to a target node: {ref}",
+                node_id=ref,
+                port="error_fallback",
+            ))
 
     adjacency: dict[str, list[str]] = {node_id: [] for node_id in by_id}
     preds: dict[str, list[str]] = {node_id: [] for node_id in by_id}

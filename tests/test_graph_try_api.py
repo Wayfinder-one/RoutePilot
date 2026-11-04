@@ -93,7 +93,7 @@ def three_answer_graph() -> dict:
             {"id": "e-score-target", "source": "q-score", "source_port": "value",
              "target": "t-score", "target_port": "in_1", "condition": {"op": "gte", "value": 5}},
         ],
-        "otherwise_target": "safe", "error_fallback": "safe",
+        "error_fallback": "safe",
     }
 
 
@@ -460,7 +460,7 @@ def test_try_structure_errors_are_issue_arrays_with_locators(client, app):
             {"id": "e-ghost", "source": "start", "source_port": "out",
              "target": "ghost", "target_port": "in_1", "condition": None},
         ],
-        "otherwise_target": "safe", "error_fallback": "safe",
+        "error_fallback": "safe",
     }
     response = client.post("/admin/try", json={"root": broken, "text": "你好"})
     assert response.status_code == 422, response.text

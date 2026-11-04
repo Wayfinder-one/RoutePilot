@@ -400,7 +400,6 @@ test('phase-0 conditions count as reachability sources for questions', () => {
       { id: 'e1', source: 'start', source_port: 'out', target: 'target', target_port: 'in_1', condition: null },
       { id: 'e2', source: 'cond', source_port: 'out', target: 'q', target_port: 'in_1', condition: null },
     ],
-    otherwise_target: 'target',
     error_fallback: 'target',
   };
   assert.equal(codesOf(RTGraph.validate(graph)).includes('question_unreachable'), false);
@@ -419,8 +418,7 @@ test('validate reports structural problems with locatable codes', () => {
     id: 'e-dup-slot', source: 'start', source_port: 'out',
     target: target.id, target_port: 'in_1', condition: null,
   });
-  graph.otherwise_target = null;
-  graph.error_fallback = 'missing-target';
+  graph.error_fallback = null;
 
   const issues = RTGraph.validate(graph);
   const codes = codesOf(issues);
@@ -428,8 +426,9 @@ test('validate reports structural problems with locatable codes', () => {
   assert.ok(codes.includes('duplicate_node_id'));
   assert.ok(codes.includes('start_count'));
   assert.ok(issues.some(issue => issue.code === 'slot_conflict' && issue.node_id === target.id && issue.port === 'in_1' && issue.edge_id));
-  assert.ok(issues.some(issue => issue.code === 'fallback_missing' && issue.port === 'otherwise_target'));
-  assert.ok(issues.some(issue => issue.code === 'fallback_missing' && issue.node_id === 'missing-target'));
+  assert.ok(issues.some(issue => issue.code === 'fallback_missing' && issue.port === 'error_fallback'));
+  graph.error_fallback = 'missing-target';
+  assert.ok(RTGraph.validate(graph).some(issue => issue.code === 'fallback_missing' && issue.node_id === 'missing-target'));
   assert.ok(issues.every(issue => typeof issue.zh === 'string' && issue.zh.length > 0));
   assert.ok(issues.every(issue => typeof issue.en === 'string' && issue.en.length > 0));
 });
@@ -550,7 +549,7 @@ test('serialize and parseImport round-trip the complete envelope', () => {
   assert.equal(result.tree.name, tree.name);
   assert.equal(result.tree.timezone, tree.timezone);
   assert.deepEqual(result.tree.sticky, tree.sticky);
-  assert.deepEqual(result.tree.root.otherwise_target, 'standard-target');
+  assert.equal(result.tree.root.otherwise_target, undefined);
   assert.deepEqual(result.tree.root.error_fallback, 'light-target');
   assert.equal(hardIssues(result.issues).length, 0);
   assert.equal(result.issues.filter(issue => issue.level === 'hint').length, 4);
@@ -604,6 +603,18 @@ test('kind/version-correct v3 documents with a malformed root report graph_parse
 
 /* ── 7. 新建 / 删除 / 选项级联 ──────────────────────────────────────── */
 
+test('legacy otherwise_target import collapses into the unified fallback', () => {
+  const raw = JSON.parse(RTGraph.serialize(minimalTree()));
+  const target = raw.root.nodes.find(node => node.type === 'target').id;
+  delete raw.root.error_fallback;
+  raw.root.otherwise_target = target;
+  const result = RTGraph.parseImport(JSON.stringify(raw));
+  assert.equal(result.ok, true);
+  assert.equal(result.tree.root.error_fallback, target);
+  assert.equal(result.tree.root.otherwise_target, undefined);
+  assert.equal(RTGraph.serialize(result.tree).includes('otherwise_target'), false);
+});
+
 test('createMinimalTree builds a saveable start-to-target graph', () => {
   const tree = minimalTree();
   const graph = tree.root;
@@ -617,7 +628,7 @@ test('createMinimalTree builds a saveable start-to-target graph', () => {
   assert.equal(targets[0].priority, 1);
   assert.deepEqual(targets[0].models, [{ model: 'qwen3-8b' }]);
   assert.equal(targets[0].strategy, 'least_inflight');
-  assert.equal(graph.otherwise_target, targets[0].id);
+  assert.equal(graph.otherwise_target, undefined);
   assert.equal(graph.error_fallback, targets[0].id);
   assert.equal(graph.edges.length, 1);
   assert.equal(graph.edges[0].source, 'start');
@@ -648,9 +659,9 @@ test('removeNode atomically removes the node, its edges and fallback references'
   assert.equal(removedTarget.ok, true);
   assert.equal(graph.nodes.some(node => node.id === target.id), false);
   assert.equal(graph.edges.length, 0);
-  assert.equal(graph.otherwise_target, null);
+  assert.equal(graph.otherwise_target, undefined);
   assert.equal(graph.error_fallback, null);
-  assert.ok(removedTarget.fallbackCleared.includes('otherwise_target'));
+  assert.ok(removedTarget.fallbackCleared.includes('error_fallback'));
 
   const missing = RTGraph.removeNode(graph, 'no-such-node');
   assert.equal(missing.ok, false);
@@ -1132,8 +1143,8 @@ test('logs fallback filter knows the graph v3 enum', () => {
     'logs fallback filter does not know the graph v3 enum');
   assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
     'logs still uses the pre-graph fallback enum');
-  assert.match(logs, /logs\.reason\.errorFallback/);
-  assert.match(logs, /logs\.reason\.otherwise/);
+  assert.match(logs, /logs\.reason\.fallback/);
+  assert.doesNotMatch(logs, /logs\.reason\.(otherwise|errorFallback)/);
 });
 
 test('logs decision path keeps only key judgments and value outputs', () => {

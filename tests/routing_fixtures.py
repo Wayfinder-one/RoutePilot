@@ -38,7 +38,7 @@ def graph_dict():
             {"id": "e-start-q", "source": "start", "source_port": "out", "target": "q", "target_port": "in_1", "condition": None},
             {"id": "e-q-safe", "source": "q", "source_port": "selected.easy", "target": "safe", "target_port": "in_1", "condition": None},
         ],
-        "otherwise_target": "safe", "error_fallback": "safe",
+        "error_fallback": "safe",
     }
 
 
@@ -60,7 +60,6 @@ def huge_chain_graph(count=1200):
         "id": "root", "type": "graph",
         "nodes": [{"id": "n0", "type": "start"}],
         "edges": [],
-        "otherwise_target": f"n{count - 1}",
         "error_fallback": f"n{count - 1}",
     }
     for index in range(1, count):

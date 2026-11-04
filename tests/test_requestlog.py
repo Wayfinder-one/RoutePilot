@@ -124,7 +124,7 @@ def test_waves_persists_but_answers_text_and_trace_stay_in_memory(tmp_path):
             "probabilities": {"fast": 0.2, "strong": 0.8},
         },
     }
-    item = record(1, waves=2, answers=answers, fallback_reason="otherwise")
+    item = record(1, waves=2, answers=answers, fallback_reason="error_fallback")
     log.enqueue(item)
     asyncio.run(log.flush())
     stored = rows(log)[0]

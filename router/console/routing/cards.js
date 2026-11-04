@@ -292,13 +292,9 @@
           return (item && item.model ? item.model : '—') + reasoning;
         });
       const roles = [];
-      if (graph.otherwise_target === node.id) {
-        roles.push('<span class="rtc-fb rtc-fb--otherwise" title="' +
-          esc(t('cv.card.otherwiseTitle')) + '">' + esc(t('cv.card.otherwise')) + '</span>');
-      }
       if (graph.error_fallback === node.id) {
-        roles.push('<span class="rtc-fb rtc-fb--error" title="' +
-          esc(t('cv.card.errorFallbackTitle')) + '">' + esc(t('cv.card.errorFallback')) + '</span>');
+        roles.push('<span class="rtc-fb rtc-fb--fallback" title="' +
+          esc(t('cv.card.fallbackTitle')) + '">' + esc(t('cv.card.fallback')) + '</span>');
       }
       return nodeWrap(node, 'target',
         '<div class="rtc-card-h">' +

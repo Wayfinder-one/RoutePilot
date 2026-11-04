@@ -237,7 +237,7 @@ def test_put_model_rejects_unknown_provider(client, app):
         conn.close()
 
 
-def _direct_graph(models, *, node_id="direct", otherwise="direct"):
+def _direct_graph(models, *, node_id="direct", fallback="direct"):
     """start → target 的 graph v3 根；用于模型引用/推理档位回归。"""
     return {
         "id": "root", "type": "graph",
@@ -251,7 +251,7 @@ def _direct_graph(models, *, node_id="direct", otherwise="direct"):
             "id": f"e-start-{node_id}", "source": "start", "source_port": "out",
             "target": node_id, "target_port": "in_1", "condition": None,
         }],
-        "otherwise_target": otherwise, "error_fallback": otherwise,
+        "error_fallback": fallback,
     }
 
 
@@ -286,7 +286,7 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
             {"id": "e-q-deep", "source": "q", "source_port": "selected.deep",
              "target": "deep-target", "target_port": "in_1", "condition": None},
         ],
-        "otherwise_target": "deep-target", "error_fallback": "deep-target",
+        "error_fallback": "deep-target",
     }
     created = client.post("/admin/trees", json={
         "id": "nl-ref", "name": "NL Ref", "root": nl_root})
@@ -507,7 +507,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 # --------------------------------------------------------------------------- #
 def _reasoning_tree_root(level="high"):
     return _direct_graph((("qwen3-8b", level),), node_id="reasoning-target",
-                         otherwise="reasoning-target")
+                         fallback="reasoning-target")
 
 
 def _declare_high(client):

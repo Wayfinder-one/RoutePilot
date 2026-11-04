@@ -47,12 +47,12 @@
     sticky_hit: 'cv.tryRow.sticky', scheduled: 'cv.tryRow.scheduled'
   };
   const KIND_KEYS = {
-    target: 'cv.tryKind.target', otherwise: 'cv.tryKind.otherwise',
-    error_fallback: 'cv.tryKind.error', sticky: 'cv.tryKind.sticky'
+    target: 'cv.tryKind.target', otherwise: 'cv.tryKind.fallback',
+    error_fallback: 'cv.tryKind.fallback', sticky: 'cv.tryKind.sticky'
   };
   const SELECTION_KEYS = {
     target: 'cv.trySelection.target', sticky: 'cv.trySelection.sticky',
-    otherwise: 'cv.trySelection.otherwise', error_fallback: 'cv.trySelection.error_fallback'
+    otherwise: 'cv.trySelection.fallback', error_fallback: 'cv.trySelection.fallback'
   };
 
   let state = null;        /* 最近一次回放（与 App.replay 同一对象） */
@@ -664,7 +664,7 @@
       const failed = replay.waves.find(wave => wave.failed);
       return t('cv.tryErrorPath') + (failed && failed.error ? ' · ' + failed.error : '');
     }
-    if (final.kind === 'otherwise') return t('cv.tryOtherwiseReason');
+    if (final.kind === 'otherwise') return t('cv.tryFallbackReason');
     if (final.candidates.length > 1) {
       const winner = final.candidates.find(candidate => candidate.target_id === final.target_id) || final.candidates[0];
       const rival = final.candidates.find(candidate => candidate.target_id !== final.target_id);
@@ -679,10 +679,9 @@
   function candidateChips(replay) {
     const final = replay.final;
     if (!final.candidates.length) {
-      const fallbackKey = final.kind === 'error_fallback' ? 'cv.try.errorFallback' : 'cv.try.otherwiseTarget';
       return '<span class="rtc-try-none">' + esc(t('cv.tryNoCandidates')) + '</span>' +
         '<span class="rtc-try-op">→</span>' +
-        '<span class="rtc-try-pick">' + esc(t(fallbackKey)) + ' ' + esc(nodeName(final.target_id)) + '</span>';
+        '<span class="rtc-try-pick">' + esc(t('cv.tryFallback')) + ' ' + esc(nodeName(final.target_id)) + '</span>';
     }
     return final.candidates.map((candidate, index) =>
       (index ? '<span class="rtc-try-op">&lt;</span>' : '') +

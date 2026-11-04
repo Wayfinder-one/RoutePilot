@@ -128,7 +128,6 @@ class GraphRoot:
     id: str
     nodes: tuple[GraphNode, ...] = ()
     edges: tuple[Edge, ...] = ()
-    otherwise_target: str | None = None
     error_fallback: str | None = None
 
 
@@ -323,17 +322,22 @@ def _edge_from_dict(raw) -> Edge:
     )
 
 
-def _target_ref(raw: dict, field: str) -> str | None:
-    value = raw.get(field)
+def _fallback_ref(raw: dict) -> str | None:
+    value = raw.get("error_fallback")
+    if value is None:
+        # v3 files written before the fallback merge used otherwise_target for
+        # normal no-target completion. Read it as the unified fallback, but
+        # never emit it again.
+        value = raw.get("otherwise_target")
     if value is None:
         return None
-    return _text(value, f"graph {field}")
+    return _text(value, "graph error_fallback")
 
 
 def graph_from_dict(raw) -> GraphRoot:
     if not isinstance(raw, dict):
         raise ValueError("graph must be an object")
-    _unknown("graph", raw, {"id", "type", "nodes", "edges", "otherwise_target", "error_fallback"})
+    _unknown("graph", raw, {"id", "type", "nodes", "edges", "error_fallback", "otherwise_target"})
     if raw.get("type") != "graph":
         raise ValueError(f"graph.type must be 'graph', got {raw.get('type')!r}")
     nodes = raw.get("nodes", [])
@@ -346,8 +350,7 @@ def graph_from_dict(raw) -> GraphRoot:
         _text(raw.get("id"), "graph id"),
         tuple(_node_from_dict(node) for node in nodes),
         tuple(_edge_from_dict(edge) for edge in edges),
-        _target_ref(raw, "otherwise_target"),
-        _target_ref(raw, "error_fallback"),
+        _fallback_ref(raw),
     )
 
 
@@ -406,7 +409,6 @@ def graph_to_dict(root: GraphRoot) -> dict:
         "type": "graph",
         "nodes": [_node_to_dict(node) for node in root.nodes],
         "edges": [_edge_to_dict(edge) for edge in root.edges],
-        "otherwise_target": root.otherwise_target,
         "error_fallback": root.error_fallback,
     }
 
@@ -459,7 +461,6 @@ def graph_behavior_dict(root: GraphRoot) -> dict:
 
     return {
         "type": "graph",
-        "otherwise_target": root.otherwise_target,
         "error_fallback": root.error_fallback,
         "nodes": [_node_behavior_dict(node) for node in sorted(root.nodes, key=lambda node: node.id)],
         "edges": [_edge_behavior_dict(edge) for edge in sorted(

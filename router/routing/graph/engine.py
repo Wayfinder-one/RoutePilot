@@ -274,7 +274,9 @@ class GraphExecutionEngine:
                 trace=trace,
             )
 
-        # 7. final target: error_fallback after failure, else highest priority, else otherwise.
+        # 7. One fallback target handles both a failed wave and a normal run
+        # with no activated target. The trace kind keeps the cause for replay,
+        # while the public selection reason is always error_fallback.
         if failed:
             target = self._required_target(nodes, root.error_fallback, "error_fallback")
             kind = "error_fallback"
@@ -291,10 +293,10 @@ class GraphExecutionEngine:
             selection_reason = "target"
             fallback_reason = None
         else:
-            target = self._required_target(nodes, root.otherwise_target, "otherwise")
+            target = self._required_target(nodes, root.error_fallback, "error_fallback")
             kind = "otherwise"
-            selection_reason = "otherwise"
-            fallback_reason = "otherwise"
+            selection_reason = "error_fallback"
+            fallback_reason = "error_fallback"
             final_candidates = ()
         if failed:
             # 失败原因先于 final 记录（§3.9 事件顺序：fallback → final）。

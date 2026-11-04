@@ -139,7 +139,7 @@ def power_tree(*, root=None, sticky=None):
     })
 
 
-def custom_tree(nodes, edges, *, otherwise_target, error_fallback, sticky=None):
+def custom_tree(nodes, edges, *, error_fallback, sticky=None):
     return tree_from_dict({
         "id": "custom",
         "name": "",
@@ -151,7 +151,6 @@ def custom_tree(nodes, edges, *, otherwise_target, error_fallback, sticky=None):
             "type": "graph",
             "nodes": nodes,
             "edges": edges,
-            "otherwise_target": otherwise_target,
             "error_fallback": error_fallback,
         },
     })
@@ -203,7 +202,6 @@ def run_custom(
     nodes,
     edges,
     *,
-    otherwise_target,
     error_fallback,
     scenario=None,
     sticky=None,
@@ -217,7 +215,6 @@ def run_custom(
     tree = custom_tree(
         nodes,
         edges,
-        otherwise_target=otherwise_target,
         error_fallback=error_fallback,
         sticky=sticky,
     )
@@ -310,14 +307,14 @@ def test_wave_guard_rejects_more_than_32_waves():
     nodes.append(node("sink", "target", priority=1, models=[{"model": "qwen3-8b", "reasoning": None}]))
     with pytest.raises(RoutingMiss, match="32 waves"):
         run_custom(
-            nodes, edges, otherwise_target="sink", error_fallback="sink",
+            nodes, edges, error_fallback="sink",
             scenario={"answers": answers},
         )
 
 
 def test_invalid_fallback_target_raises_routing_miss():
-    with pytest.raises(RoutingMiss, match="otherwise"):
-        run_custom([node("start", "start")], [], otherwise_target="ghost", error_fallback="ghost")
+    with pytest.raises(RoutingMiss, match="error_fallback"):
+        run_custom([node("start", "start")], [], error_fallback="ghost")
 
 
 # ---------------------------------------------------------------------------
@@ -493,7 +490,6 @@ def test_and_false_and_or_true_are_determined_early_and_never_flip():
     ]
     decision, _jev, _balancer, _affinity = run_custom(
         nodes, edges,
-        otherwise_target="t-and",
         error_fallback="t-and",
         scenario={"answers": {"q": {"probs": {"easy": 0.9, "strong": 0.1}}}},
         text="命中",
@@ -542,7 +538,6 @@ def test_missing_answer_in_wave_voids_prior_candidates_and_falls_back():
     ]
     decision, jev, _balancer, _affinity = run_custom(
         nodes, edges,
-        otherwise_target="target-safe",
         error_fallback="target-safe",
         # q2 的答案缺失：FakeJev 在第 2 波抛错。
         scenario={"answers": {"q1": {"probs": {"easy": 0.3, "strong": 0.7}}}},
@@ -607,7 +602,7 @@ def test_second_request_executes_questions_then_applies_sticky():
 
 
 # ---------------------------------------------------------------------------
-# 不变式 5：otherwise/error_fallback 的 sticky 保留原 fallback_reason
+# 不变式 5：统一兜底的 sticky 保留原 fallback_reason
 # ---------------------------------------------------------------------------
 
 
@@ -635,7 +630,7 @@ def test_error_fallback_sticky_keeps_fallback_reason():
     second.release()
 
 
-def test_otherwise_sticky_keeps_fallback_reason():
+def test_no_candidate_fallback_sticky_keeps_cause():
     nodes = [
         node("start", "start"),
         node("t-safe", "target", priority=1, models=[{"model": "deepseek-v3"}]),
@@ -646,7 +641,6 @@ def test_otherwise_sticky_keeps_fallback_reason():
 
     first, jev, _balancer, _affinity = run_custom(
         nodes, [],
-        otherwise_target="t-safe",
         error_fallback="t-safe",
         sticky=tree_sticky,
         session_id="otherwise-session",
@@ -654,8 +648,8 @@ def test_otherwise_sticky_keeps_fallback_reason():
         balancer=balancer,
     )
     assert jev.calls == []
-    assert first.selection_reason == "otherwise"
-    assert first.fallback_reason == "otherwise"
+    assert first.selection_reason == "error_fallback"
+    assert first.fallback_reason == "error_fallback"
     assert first.candidates == ()
     final_event = next(event for event in first.trace if event["event"] == "final")
     assert final_event["kind"] == "otherwise"
@@ -664,7 +658,6 @@ def test_otherwise_sticky_keeps_fallback_reason():
 
     second, _jev2, _balancer2, _affinity2 = run_custom(
         nodes, [],
-        otherwise_target="t-safe",
         error_fallback="t-safe",
         sticky=tree_sticky,
         session_id="otherwise-session",
@@ -673,7 +666,7 @@ def test_otherwise_sticky_keeps_fallback_reason():
     )
     assert second.selection_reason == "sticky"
     assert second.sticky_hit is True
-    assert second.fallback_reason == "otherwise"
+    assert second.fallback_reason == "error_fallback"
     assert second.model == "deepseek-v3"
     second.release()
 
@@ -791,14 +784,14 @@ def test_preferred_target_circuit_open_does_not_fall_to_next_priority():
     assert balancer.calls == []
 
 
-def test_otherwise_target_without_backend_fails_closed():
+def test_fallback_model_without_backend_fails_closed():
     nodes = [
         node("start", "start"),
         node("t-safe", "target", priority=1, models=[{"model": "unregistered-model"}]),
     ]
     balancer = RecordingBalancer()
     with pytest.raises(NoAvailableBackend):
-        run_custom(nodes, [], otherwise_target="t-safe", error_fallback="t-safe", balancer=balancer)
+        run_custom(nodes, [], error_fallback="t-safe", balancer=balancer)
     assert balancer.calls == []
 
 
@@ -821,7 +814,6 @@ def test_score_question_fills_value_and_feeds_numeric_gate():
     ]
     decision, _jev, _balancer, _affinity = run_custom(
         nodes, edges,
-        otherwise_target="t-safe",
         error_fallback="t-safe",
         scenario={"answers": {"q": {"value": 7.5}}},
     )
@@ -854,7 +846,7 @@ def test_wave_with_partial_answers_is_voided_without_filling_ports():
         edge("e-start-q1", "start", "out", "q1", "in_1"),
         edge("e-start-q2", "start", "out", "q2", "in_1"),
     ]
-    tree = custom_tree(nodes, edges, otherwise_target="t-safe", error_fallback="t-safe")
+    tree = custom_tree(nodes, edges, error_fallback="t-safe")
     balancer = RecordingBalancer()
     engine = GraphExecutionEngine(_PartialJev(), RecordingAffinity(), balancer)
     decision = asyncio.run(engine.route(
@@ -886,7 +878,6 @@ def test_multiple_true_slots_use_smallest_numeric_slot_as_via():
     ]
     decision, _jev, _balancer, _affinity = run_custom(
         nodes, edges,
-        otherwise_target="t-safe",
         error_fallback="t-safe",
         text="命中",
     )
@@ -918,7 +909,6 @@ def test_higher_priority_number_wins_and_candidates_sort_descending():
     ]
     decision, _jev, _balancer, _affinity = run_custom(
         nodes, edges,
-        otherwise_target="t-low",
         error_fallback="t-low",
         scenario={"answers": {"q": {"probs": {"easy": 0.1, "strong": 0.9}}}},
     )
@@ -954,7 +944,7 @@ def test_sticky_shared_model_keeps_original_target_reasoning():
     affinity = RecordingAffinity()
     balancer = RecordingBalancer()
     options = dict(
-        otherwise_target="t-low", error_fallback="t-low", scenario=scenario,
+        error_fallback="t-low", scenario=scenario,
         sticky={"enabled": True, "ttl_seconds": 60}, session_id="shared-model",
         affinity=affinity, balancer=balancer,
     )

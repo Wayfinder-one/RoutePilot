@@ -22,7 +22,7 @@ def direct_tree(model):
             "id": "e-start-target", "source": "start", "source_port": "out",
             "target": "target", "target_port": "in_1", "condition": None,
         }],
-        "otherwise_target": "target", "error_fallback": "target",
+        "error_fallback": "target",
     }
     return tree_dict(root=root)
 

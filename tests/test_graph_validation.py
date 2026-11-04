@@ -92,7 +92,6 @@ def question_chain_raw(length):
             "condition": None if previous == "start" else {"op": "gt", "value": 0.5},
         })
         previous = f"q{index}"
-    raw["otherwise_target"] = "sink"
     raw["error_fallback"] = "sink"
     return raw
 
@@ -449,13 +448,10 @@ def test_non_integer_priority_uses_specific_issue_code():
 
 def test_fallback_missing_or_not_target():
     raw = graph_dict()
-    raw["otherwise_target"] = None
-    assert codes(raw) == {"fallback_missing"}
-    issue = next(issue for issue in structure(raw) if issue.code == "fallback_missing")
-    assert issue.port == "otherwise_target"
-    raw = graph_dict()
     raw["error_fallback"] = None
     assert codes(raw) == {"fallback_missing"}
+    issue = next(issue for issue in structure(raw) if issue.code == "fallback_missing")
+    assert issue.port == "error_fallback"
     raw = graph_dict()
     raw["error_fallback"] = "q"  # 指向 question，不是 target
     assert codes(raw) == {"fallback_missing"}
@@ -507,7 +503,7 @@ def test_blank_condition_keywords_and_periods_are_rejected():
 def test_node_limit_exceeded():
     raw = {"id": "root", "type": "graph", "nodes": [
         {"id": "start", "type": "start", "position": None},
-    ], "edges": [], "otherwise_target": "t0", "error_fallback": "t0"}
+    ], "edges": [], "error_fallback": "t0"}
     for index in range(200):  # 共 201 个节点 > 200
         raw["nodes"].append({
             "id": f"t{index}", "type": "target", "priority": index + 1,
@@ -521,7 +517,7 @@ def test_node_limit_exceeded():
 def test_question_limit_exceeded():
     raw = {"id": "root", "type": "graph", "nodes": [
         {"id": "start", "type": "start", "position": None},
-    ], "edges": [], "otherwise_target": "sink", "error_fallback": "sink"}
+    ], "edges": [], "error_fallback": "sink"}
     raw["nodes"].append({
         "id": "sink", "type": "target", "priority": 1, "position": None,
         "models": [{"model": "fast", "reasoning": None}],
