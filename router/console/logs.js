@@ -129,7 +129,8 @@ function summaryHtml(record) {
   const head = [
     `<span class="lg-sum-model">→ ${esc(record.model || '—')}</span>`,
     `<span class="lg-sum-target">${esc(SRTrace.label(record.node_labels, record.target_id))}</span>`,
-    `<span class="lg-chip${reasonTone}">${esc(t(reasonKey))}</span>`,
+    record.outcome_state === 'routing_error' ? ''
+      : `<span class="lg-chip${reasonTone}">${esc(t(reasonKey))}</span>`,
     `<span class="lg-sum-kv">${esc(t('logs.field.rounds'))}<b>${esc(String(rounds))}</b></span>`,
     `<span class="lg-sum-kv">${esc(t('logs.f.routing'))}<b>${esc(ms(record.routing_ms))}</b></span>`,
     `<span class="lg-sum-kv">${esc(t('logs.f.total'))}<b>${esc(ms(latencyValue(record)))}</b></span>`,

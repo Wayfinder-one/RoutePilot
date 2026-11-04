@@ -98,7 +98,7 @@ const SRTrace = (() => {
     const periods = Array.isArray(time.active_periods) ? listText(time.active_periods) : DASH;
     const tokens = (win.tokens_before == null && win.tokens_after == null)
       ? DASH
-      : `${text(win.tokens_before)} → ${text(win.tokens_after)}` +
+      : `${esc(text(win.tokens_before))} → ${esc(text(win.tokens_after))}` +
         (win.truncated ? ` · ${esc(t('logs.f.truncated'))}` : '');
     const prompt = String(record.text || '');
     return `<section class="lg-input"><div class="lg-sec-h">${esc(t('logs.input'))}</div>
