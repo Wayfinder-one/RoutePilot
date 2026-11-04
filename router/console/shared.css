@@ -242,12 +242,13 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .th-input{width:62px}
 .kbdhint{position:fixed;right:22px;bottom:8px;font-size:10.5px;color:var(--text-3);display:flex;gap:10px;z-index:5;pointer-events:none}
 .kbdhint kbd{font-family:var(--mono);border:1px solid var(--line-2);border-bottom-width:2px;border-radius:4px;padding:0 4px;background:#fff;font-size:10px}
-/* ── logs page ───────────────────────────────── */
-/* ── logs page: disclosure list ──────────────────────────────────────
-   One row per request, one row tall at rest. Clicking a row opens its
-   decision evidence inline underneath — no side panel, no navigation.
-   The row carries the verdict (model, outcome, latency, evidence chips);
-   the expanded block carries the proof (facts, probabilities, time path). */
+/* ── logs page: disclosure list + staged calculation view ───────────
+   One row per request, one row tall at rest. Clicking a row opens it
+   inline underneath — no side panel, no navigation. The row carries the
+   verdict (model, outcome, latency, evidence chips); the expanded block
+   carries the compact decision summary, the staged calculation process
+   (input → waves → candidates → schedule → failure), the execution
+   result and folded technical facts. */
 .lg-page{max-width:1440px}
 .lg-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px}
 .lg-stat{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:11px 14px 12px}
@@ -311,8 +312,6 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .lg-expand-in{display:flex;flex-direction:column;gap:16px;padding:14px 15px 16px}
 .lg-block{min-width:0}
 .lg-sec-h{font-size:10px;font-weight:700;letter-spacing:.07em;color:var(--text-3);margin-bottom:6px;text-transform:uppercase}
-.lg-prompt{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 11px;
-  font-size:12.5px;line-height:1.65;white-space:pre-wrap;word-break:break-word;max-width:900px}
 .lg-facts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px 20px}
 .lg-fact{min-width:0}
 .lg-fact .k{font-size:10px;color:var(--text-3);letter-spacing:.02em}
@@ -320,6 +319,17 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .lg-fact .v.mono{font-family:var(--mono);font-size:11.5px;font-weight:500}
 .lg-ok{color:var(--green);font-weight:700}
 
+/* staged calculation process: input → waves → candidates → schedule → failure */
+.lg-process{display:flex;flex-direction:column;gap:10px}
+.lg-phase{border-top:1px solid var(--line);padding-top:10px;min-width:0}
+.lg-phase-h{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;font-weight:700}
+.lg-phase.bad .lg-phase-h{color:var(--red)}
+.lg-judgments{display:flex;flex-direction:column;gap:5px;margin-top:7px}
+.lg-judgment{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;font-size:11.5px}
+.lg-judgment small{color:var(--text-3);font-family:var(--mono)}
+.lg-judgment b{font-weight:650;color:var(--text-2)}
+.lg-judgment-row{display:flex;flex-direction:column;gap:3px;min-width:0}
+.lg-question{display:flex;flex-direction:column;gap:4px;min-width:0}
 .lg-probs{display:flex;flex-direction:column;gap:6px;max-width:460px}
 .lg-prob{display:grid;grid-template-columns:118px minmax(0,1fr) 38px;align-items:center;gap:9px}
 .lg-prob .k{font-size:11.5px;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -329,50 +339,40 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
 .lg-prob.sel .k{color:var(--text);font-weight:650}
 .lg-prob.sel .track i{background:var(--indigo)}
 .lg-prob.sel .v{color:var(--indigo);font-weight:650}
-
-.lg-timeline{list-style:none;margin:0;padding:0 0 0 15px;position:relative}
-.lg-timeline::before{content:"";position:absolute;left:4px;top:6px;bottom:8px;width:1px;background:var(--line-2)}
-.lg-step{position:relative;padding-bottom:9px}
-.lg-step:last-child{padding-bottom:0}
-.lg-step::before{content:"";position:absolute;left:-14px;top:4px;width:7px;height:7px;border-radius:99px;
-  background:var(--panel);border:1.5px solid var(--line-2)}
-.lg-step[data-kind="ok"]::before{border-color:var(--green);background:var(--green)}
-.lg-step[data-kind="warn"]::before{border-color:var(--amber);background:var(--amber)}
-.lg-step[data-kind="bad"]::before{border-color:var(--red);background:var(--red)}
-.lg-step-h{display:flex;align-items:center;gap:6px;font-size:11.5px;font-weight:650;line-height:1.35}
-.lg-step-d{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
-.lg-more--trace[open] .lg-trace{max-height:260px;overflow:auto;padding-right:2px}
-.lg-ev{font-family:var(--mono);font-size:10px;border:1px solid var(--line);background:var(--panel-2);
-  border-radius:5px;padding:0 5px;color:var(--text-2);max-width:100%;
-  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.lg-ev b{font-weight:400;color:var(--text-3);margin-right:4px}
-.lg-none{border:1px dashed var(--line-2);border-radius:9px;padding:12px;text-align:center;
-  font-size:11px;color:var(--text-3);background:var(--panel-2)}
-.lg-quote{border-left:2px solid var(--line-2);padding:2px 0 2px 10px;font-size:11.5px;line-height:1.7;
-  color:var(--text-2);white-space:pre-wrap;word-break:break-word;max-height:150px;overflow:auto;max-width:900px}
-.lg-note{display:flex;flex-direction:column;gap:2px;border:1px solid var(--amber-line);background:var(--amber-soft);
-  border-radius:9px;padding:7px 10px;font-size:11px;line-height:1.55;color:var(--amber)}
-.lg-note b{font-weight:700}
-/* decision summary: three compact rows, everything raw folds below */
+.lg-slot-all{margin-top:7px}
+.lg-slot-all summary,.lg-sub summary{cursor:pointer;font-size:10.5px;color:var(--text-3)}
+.lg-slot-all summary:hover,.lg-sub summary:hover{color:var(--text-2)}
+.lg-sub{margin-top:3px}
+.lg-slot-row{display:grid;grid-template-columns:minmax(120px,1fr) minmax(180px,2fr);gap:4px 10px;padding:5px 0;border-top:1px dashed var(--line)}
+.lg-slot-row small{grid-column:1/-1;color:var(--text-3)}
+.lg-slot-defaults,.lg-slot-all ul{list-style:none;margin:6px 0 0;padding:0}
+.lg-slot-defaults .lg-slot-row:first-child,.lg-slot-all ul .lg-slot-row:first-child{border-top:0}
+.lg-fulltext{margin-top:5px;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:8px 10px;
+  font-size:11.5px;line-height:1.65;white-space:pre-wrap;word-break:break-word;max-width:900px}
+.lg-inputs{display:flex;flex-direction:column;gap:3px;margin-top:4px;font-family:var(--mono);
+  font-size:10.5px;color:var(--text-2);word-break:break-word}
+.lg-candidate-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:7px}
+.lg-candidate-table th,.lg-candidate-table td{text-align:left;padding:6px;border-bottom:1px solid var(--line)}
+.lg-candidate-row.win{background:var(--green-soft)}
+.lg-candidate-row.win td:last-child{color:var(--green);font-weight:650}
+.lg-schedule,.lg-execution{border-top:1px solid var(--line);padding-top:10px}
+.lg-execution{min-width:0}
+.lg-prompt-clamp{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+/* 路由失败是唯一的红色失败块；其他降级一律用 .lg-note 的琥珀色。 */
+.lg-fail{border:1px solid var(--red-line);background:var(--red-soft);border-radius:10px;
+  padding:9px 11px;color:var(--red);font-size:11.5px;min-width:0}
+.lg-fail .lg-sec-h{color:var(--red)}
+.lg-fail .lg-judgment small{color:var(--red);opacity:.75}
+/* decision summary: one compact line, everything raw lives below */
 .lg-sum{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-bottom:10px}
 .lg-sum-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .lg-sum-model{font-size:13px;font-weight:700}
 .lg-sum-target{font-family:var(--mono);font-size:10.5px;color:var(--text-3)}
 .lg-sum-kv{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;color:var(--text-3)}
 .lg-sum-kv b{font-family:var(--mono);font-weight:600;color:var(--text-2)}
-.lg-sum-row{display:flex;gap:8px;margin-top:7px;align-items:baseline}
-.lg-sum-k{flex:none;font-size:10.5px;color:var(--text-3);min-width:34px}
-.lg-cands,.lg-waves{display:flex;flex-wrap:wrap;gap:6px}
-.lg-cand{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);
-  border-radius:8px;padding:2px 8px;font-size:10.5px}
-.lg-cand b{font-weight:650;color:var(--text-2)}
-.lg-cand i{font-style:normal;font-family:var(--mono);font-size:9.5px;color:var(--text-3)}
-.lg-cand.win{border-color:var(--green-line);background:var(--green-soft)}
-.lg-wave{display:inline-flex;align-items:center;gap:6px;border:1px dashed var(--line-2);border-radius:8px;
-  padding:2px 8px;font-size:10.5px;color:var(--text-2)}
-.lg-wave b{font-weight:650}
-.lg-wave i{font-style:normal;font-family:var(--mono);font-size:9.5px;color:var(--text-3)}
-.lg-wave.bad{border-color:var(--red-line);background:var(--red-soft)}
+.lg-note{display:flex;flex-direction:column;gap:2px;border:1px solid var(--amber-line);background:var(--amber-soft);
+  border-radius:9px;padding:7px 10px;font-size:11px;line-height:1.55;color:var(--amber)}
+.lg-note b{font-weight:700}
 .lg-more{margin-top:10px;border-top:1px solid var(--line);padding-top:8px}
 .lg-more summary{cursor:pointer;font-size:11px;font-weight:600;color:var(--text-2);list-style:none;
   display:flex;align-items:center;gap:6px;outline:none}
@@ -393,6 +393,11 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
   .lg-row{gap:7px;padding:9px 11px}
   .lg-lat{display:none}
   .lg-model{min-width:0;font-size:10.5px;padding-left:8px}
+  .lg-slot-row{grid-template-columns:1fr}
+  .lg-slot-row small{grid-column:1}
+  .lg-candidate-table thead{display:none}
+  .lg-candidate-row{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+  .lg-candidate-row td{display:block;border-bottom:0;padding:3px 6px}
 }
 @media (max-width:760px){
   .lg-seg{flex:1 1 100%;max-width:100%;overflow-x:auto;scrollbar-width:none}

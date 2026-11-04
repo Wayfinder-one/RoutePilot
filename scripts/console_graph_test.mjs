@@ -1148,54 +1148,21 @@ test('logs fallback filter knows the graph v3 enum', () => {
   assert.doesNotMatch(logs, /logs\.reason\.(otherwise|errorFallback)/);
 });
 
-test('logs decision path keeps only key judgments and value outputs', () => {
+test('calculation log detail shows the process inline and keeps technical facts folded', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
-  const trace = read('trace.js');
-  /* 白名单：只保留 5 类关键点事件。 */
-  assert.match(trace, /const KEEP = \['slot', 'gate', 'condition', 'question', 'final'\]/,
-    'trace.js lost the key-point whitelist');
-  const KEPT = {
-    slot: 'logs.kp.slot', gate: 'logs.kp.gate', condition: 'logs.kp.condition',
-    question: 'logs.kp.question', final: 'logs.kp.final',
-  };
-  for (const [event, key] of Object.entries(KEPT)) {
-    assert.match(trace, new RegExp("\\b" + event + ": '" + key.split('.').join('\\.') + "'"),
-      'trace.js maps ' + event + ' to the wrong key-point label');
-  }
-  /* 其余事件不再映射，也不再渲染。 */
-  for (const event of ['time', 'window', 'wave', 'activate', 'scheduled', 'sticky_hit', 'fallback']) {
-    assert.doesNotMatch(trace, new RegExp("\\b" + event + ": 'logs\\."),
-      'trace.js still maps removed event ' + event);
-  }
-  assert.match(trace, /count\(trace\)/, 'trace.js lost SRTrace.count');
-  /* 引擎的第四种状态 invalid 必须显示为「非法」并用红点，不能折叠成未定。 */
-  assert.match(trace, /status === 'invalid'/, 'trace.js lost the invalid status mapping');
-  assert.match(trace, /return 'bad'/, 'trace.js lost the red dot for invalid statuses');
-  const css = read('shared.css');
-  assert.match(css, /\.lg-step\[data-kind="bad"\]/, 'shared.css lost the invalid-status dot');
-
-  /* 新标签必须在 zh / en 两份词典里都有。 */
-  const i18n = read('i18n.js');
-  for (const key of ['logs.kp.title', 'logs.kp.slot', 'logs.kp.gate', 'logs.kp.condition',
-    'logs.kp.question', 'logs.kp.final', 'logs.kp.hit', 'logs.kp.miss', 'logs.kp.unknown',
-    'logs.kp.invalid',
-    'logs.kp.matched', 'logs.kp.source', 'logs.kp.sourceText', 'logs.kp.sourcePeriods',
-    'logs.kp.valueOutput', 'logs.kp.candidates']) {
-    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
-      'i18n key ' + key + ' is not defined in both zh and en');
-  }
-  /* 已删除的键不能残留。 */
-  for (const key of ['logs.ev.time', 'logs.ev.window', 'logs.ev.wave', 'logs.ev.activate',
-    'logs.ev.scheduled', 'logs.ev.sticky', 'logs.ev.fallback', 'logs.ev.jev',
-    'logs.ev.branch', 'logs.ev.branchSkip', 'logs.ev.branchOther', 'logs.ev.slot',
-    'logs.ev.gate', 'logs.ev.condition', 'logs.ev.question', 'logs.ev.final', 'logs.rawTrace']) {
-    assert.equal(i18n.split("'" + key + "'").length - 1, 0,
-      'removed i18n key still defined: ' + key);
-  }
-
   const logs = read('logs.js');
-  assert.match(logs, /logs\.kp\.title/, 'logs.js does not use the decision-path title');
-  assert.match(logs, /SRTrace\.count\(/, 'logs.js does not count key points');
+  const trace = read('trace.js');
+
+  assert.match(logs, /class="lg-process" data-trace/);
+  assert.match(logs, /SRTrace\.render\(host, record\)/);
+  assert.doesNotMatch(logs, /lg-more--trace/);
+  assert.doesNotMatch(logs, /logs\.sec\.probs/);
+  assert.match(logs, /routing_error/);
+  assert.match(logs, /SRTrace\.hasJev/);
+  assert.match(trace, /function render\(host, record\)/);
+  assert.match(trace, /event\.status === 'invalid'/);
+  assert.match(trace, /op === 'is'/);
+  assert.match(trace, /via_port/);
 });
 
 function attachQuestion(tree, questionType) {
@@ -1333,36 +1300,6 @@ test('review-import-rejects-invalid-envelope-values-before-normalization', () =>
   assert.equal(accepted.tree.name, '合法 envelope');
   assert.equal(accepted.tree.timezone, 'UTC');
   assert.deepEqual(accepted.tree.sticky, { enabled: true, ttl_seconds: 60 });
-});
-
-test('logs detail keeps a compact decision summary and folds the decision path', () => {
-  const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
-  const logs = read('logs.js');
-  /* 默认视图：决策摘要（候选/波次）+ 折叠的决策过程与事实。 */
-  assert.match(logs, /logs\.sum\.candidates/);
-  assert.match(logs, /logs\.sum\.rounds/);
-  assert.match(logs, /logs\.sum\.noCandidates/);
-  assert.match(logs, /logs\.kp\.title/);
-  assert.match(logs, /<details class="lg-more lg-more--trace">/,
-    'decision path is not folded behind a details element');
-  assert.doesNotMatch(logs, /logs\.sec\.trace/, 'the old always-open trace section is back');
-
-  const trace = read('trace.js');
-  assert.doesNotMatch(trace, /nullIsEvidence/, 'stale null-evidence guard is back');
-  assert.match(trace, /return t\('logs\.kp\.unknown'\)/, 'trace.js lost the unknown status label');
-  /* 符号映射必须给出真实符号，而不是只留一个标识符。 */
-  for (const [op, symbol] of [['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'], ['eq', '='], ['neq', '≠']]) {
-    assert.ok(trace.includes(op + ": '" + symbol + "'"),
-      'trace.js operator map is missing ' + op + ' → ' + symbol);
-  }
-
-  /* 新增 key 必须在 zh / en 两份词典里都存在。 */
-  const i18n = read('i18n.js');
-  for (const key of ['logs.sum.rounds', 'logs.sum.waves', 'logs.sum.candidates', 'logs.sum.round',
-    'logs.sum.via', 'logs.sum.noCandidates', 'logs.kp.title']) {
-    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
-      'i18n key ' + key + ' is not defined in both zh and en');
-  }
 });
 
 test('review-chinese-node-names-contract', () => {

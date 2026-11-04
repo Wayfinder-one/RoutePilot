@@ -1,9 +1,12 @@
-/* Calculation log — a disclosure list.
+/* Calculation log — a disclosure list with a staged calculation view.
    Each row is one request and stays one glance wide (model, outcome,
-   latency, evidence chips). Clicking a row opens its decision evidence
-   inline, below the row: request text, facts, JEV probabilities, time path
-   and reasoning. Rows do not navigate elsewhere and never become a side
-   panel; several rows can stay open so two decisions can be compared. */
+   latency, evidence chips). Clicking a row opens it inline, below the row:
+   a compact decision summary, the staged calculation process (input →
+   initial computation → JEV waves → candidates → schedule → failure),
+   the execution result, and folded technical facts. Rows do not navigate
+   elsewhere and never become a side panel; several rows can stay open so
+   two decisions can be compared, and the process is painted lazily —
+   only for rows that are actually opened. */
 const $ = selector => document.querySelector(selector);
 let requests = [];
 let filter = 'all';
@@ -15,15 +18,25 @@ const OUTCOME = {
   client_disconnected: { key: 'logs.out.disconnected', tone: 'warn', chip: 'warn' },
   cancelled: { key: 'logs.out.cancelled', tone: 'warn', chip: 'warn' },
   incomplete: { key: 'logs.out.incomplete', tone: '', chip: 'warn' },
+  routing_error: { key: 'logs.out.routing', tone: 'bad', chip: 'bad' },
 };
 /* Graph v3 selection_reason enum: target | sticky | error_fallback.
    "otherwise" and "fallback" remain accepted for historical ledger rows. */
 const FALLBACK_REASONS = ['otherwise', 'error_fallback', 'fallback'];
 const isFallback = record => FALLBACK_REASONS.indexOf(record.selection_reason) >= 0;
 const fallbackLabel = () => 'logs.reason.fallback';
+/* 统一耗时口径：行、统计卡和摘要都走这一个取值函数。 */
+function latencyValue(record) {
+  for (const key of ['total_ms', 'latency_ms', 'routing_ms']) {
+    const raw = record[key];
+    const value = Number(raw);
+    if (raw != null && raw !== '' && Number.isFinite(value)) return value;
+  }
+  return null;
+}
 const FILTERS = {
   all: () => true,
-  jev: record => record.jev_top != null,
+  jev: record => SRTrace.hasJev(record),
   sticky: record => !!record.sticky_hit,
   fallback: isFallback,
 };
@@ -43,7 +56,7 @@ function shown() {
 function renderStats() {
   const sticky = requests.filter(record => record.sticky_hit).length;
   const fallback = requests.filter(isFallback).length;
-  const timed = requests.map(record => Number(record.latency_ms)).filter(Number.isFinite);
+  const timed = requests.map(latencyValue).filter(Number.isFinite);
   const average = timed.length ? timed.reduce((sum, value) => sum + value, 0) / timed.length : null;
   const cards = [
     ['logs.stat.requests', String(requests.length), ''],
@@ -88,7 +101,7 @@ function rowHtml(record, open) {
     <span class="lg-time">${esc(fmtTime(record.ts))}</span>
     <span class="lg-text">${text ? esc(text) : `<span class="mut">${esc(t('logs.noText'))}</span>`}</span>
     ${chips.join('')}
-    <span class="lg-lat">${esc(ms(record.latency_ms))}</span>
+    <span class="lg-lat">${esc(ms(latencyValue(record)))}</span>
     <span class="lg-model"><span class="ar" aria-hidden="true">→</span>${esc(record.model || '—')}</span>
     <span class="lg-chev" aria-hidden="true">›</span>
     <span class="sr-only">${esc(outcome ? t(outcome.key) : '')}</span>
@@ -96,106 +109,81 @@ function rowHtml(record, open) {
 }
 
 /* ── expanded evidence ─────────────────────────────────────────── */
-function probBars(values) {
-  const entries = Object.entries(values).sort((a, b) => Number(b[1]) - Number(a[1]));
-  const top = entries.length ? Number(entries[0][1]) : 0;
-  return entries.map(([key, value]) => {
-    const width = Math.max(2, Math.round(Number(value) * 100));
-    return `<div class="lg-prob${Number(value) === top ? ' sel' : ''}">
-      <span class="k" title="${esc(key)}">${esc(key)}</span>
-      <span class="track"><i style="width:${width}%"></i></span>
-      <span class="v">${pct(value)}</span>
-    </div>`;
-  }).join('');
-}
-
 function factHtml(label, value, mono) {
   return `<div class="lg-fact"><div class="k">${esc(label)}</div><div class="v${mono ? ' mono' : ''}">${value}</div></div>`;
 }
 
-/* ── decision summary: answer "why this model" in three compact rows ──
-   The decision path and low-frequency facts stay folded below; the
-   default view only carries what a reviewer needs at a glance. */
+/* ── compact decision summary: one glance, everything raw below ──
+   Final model, target display name, selection type, routing latency,
+   JEV rounds and total latency. Candidates/waves/probabilities live in
+   the staged process section instead of repeating here. */
 function summaryHtml(record) {
   const trace = Array.isArray(record.trace) ? record.trace : [];
   const waves = trace.filter(event => event && event.event === 'wave');
-  const final = trace.find(event => event && event.event === 'final');
-  const candidates = final && Array.isArray(final.candidates) ? final.candidates : [];
   const rounds = Number.isFinite(Number(record.waves)) ? Number(record.waves) : waves.length;
   const reason = record.selection_reason;
-  const reasonKey = reason === 'sticky' ? 'logs.reason.sticky'
-    : isFallback(record) ? 'logs.reason.fallback' : null;
+  const reasonKey = reason === 'sticky' || record.sticky_hit ? 'logs.reason.sticky'
+    : isFallback(record) ? 'logs.reason.fallback' : 'logs.reason.target';
+  const reasonTone = reasonKey === 'logs.reason.sticky' ? ' sticky'
+    : reasonKey === 'logs.reason.fallback' ? ' fallback' : '';
   const head = [
     `<span class="lg-sum-model">→ ${esc(record.model || '—')}</span>`,
-    record.target_id ? `<span class="lg-sum-target">${esc(record.target_id)}</span>` : '',
-    reasonKey ? `<span class="lg-chip fallback">${esc(t(reasonKey))}</span>` : '',
-    `<span class="lg-sum-kv">${esc(t('logs.sum.rounds'))}<b>${esc(String(rounds))}</b></span>`,
+    `<span class="lg-sum-target">${esc(SRTrace.label(record.node_labels, record.target_id))}</span>`,
+    `<span class="lg-chip${reasonTone}">${esc(t(reasonKey))}</span>`,
+    `<span class="lg-sum-kv">${esc(t('logs.field.rounds'))}<b>${esc(String(rounds))}</b></span>`,
     `<span class="lg-sum-kv">${esc(t('logs.f.routing'))}<b>${esc(ms(record.routing_ms))}</b></span>`,
-    record.sticky_hit ? `<span class="lg-chip sticky">${esc(t('logs.f.stickyHit'))}</span>` : '',
+    `<span class="lg-sum-kv">${esc(t('logs.f.total'))}<b>${esc(ms(latencyValue(record)))}</b></span>`,
   ].filter(Boolean).join('');
-  const candRow = `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.sum.candidates'))}</span>${
-    candidates.length
-      ? `<span class="lg-cands">${candidates.map(item =>
-        `<span class="lg-cand${item.target_id === record.target_id ? ' win' : ''}">` +
-        `<b>${esc(item.target_id)}</b>` +
-        `<i>${esc(t('logs.field.priority'))} ${esc(String(item.priority))}</i>` +
-        `<i>${esc(tf('logs.sum.round', { n: item.wave }))}</i>` +
-        `<i>${esc(t('logs.sum.via'))} ${esc(item.via_node || '—')}</i></span>`).join('')}</span>`
-      : `<span class="mut">${esc(t('logs.sum.noCandidates'))}</span>`
-  }</div>`;
-  const waveRow = waves.length
-    ? `<div class="lg-sum-row"><span class="lg-sum-k">${esc(t('logs.sum.waves'))}</span><span class="lg-waves">${
-      waves.map(item =>
-        `<span class="lg-wave${item.failed ? ' bad' : ''}">` +
-        `<b>${esc(tf('logs.sum.round', { n: item.wave }))}</b>` +
-        `<i>${esc((item.questions || []).join(', ') || '—')}</i>` +
-        `<i>${esc(item.failed ? t('logs.field.failed') : ms(item.duration_ms))}</i></span>`).join('')
-    }</span></div>`
-    : '';
-  return `<section class="lg-block lg-sum"><div class="lg-sum-head">${head}</div>${candRow}${waveRow}</section>`;
+  return `<section class="lg-block lg-sum"><div class="lg-sum-head">${head}</div></section>`;
+}
+
+/* ── execution result: what the chosen upstream did ────────────── */
+function executionHtml(record) {
+  const outcome = OUTCOME[record.outcome_state];
+  return `<section class="lg-block lg-execution"><div class="lg-sec-h">${esc(t('logs.execution'))}</div>
+    <div class="lg-facts">
+      ${factHtml(t('logs.f.upstreamModel'), esc(record.upstream_model || '—'), true)}
+      ${factHtml(t('logs.f.upstreamStatus'), esc(record.upstream_status == null ? '—' : String(record.upstream_status)), true)}
+      ${factHtml(t('logs.f.upstreamMs'), esc(ms(record.upstream_ms)), true)}
+      ${factHtml(t('logs.f.ttft'), esc(ms(record.ttft_ms)), true)}
+      ${factHtml(t('logs.f.total'), esc(ms(record.total_ms)), true)}
+      ${factHtml(t('logs.f.tokensIn'), esc(record.prompt_tokens == null ? '—' : String(record.prompt_tokens)), true)}
+      ${factHtml(t('logs.f.tokensOut'), esc(record.completion_tokens == null ? '—' : String(record.completion_tokens)), true)}
+      ${factHtml(t('logs.f.tokensTotal'), esc(record.total_tokens == null ? '—' : String(record.total_tokens)), true)}
+      ${factHtml(t('logs.f.outcome'), esc(t(outcome ? outcome.key : 'logs.out.incomplete')))}
+    </div>
+  </section>`;
+}
+
+/* ── folded technical facts: ids/revisions/session live here ───── */
+function technicalFacts(record) {
+  const reasoning = String(record.reasoning || '').trim();
+  const warning = String(record.reasoning_warning || '').trim();
+  return [
+    factHtml(t('logs.f.id'), esc(record.id || '—'), true),
+    factHtml(t('logs.f.time'), esc(fmtTime(record.ts)), true),
+    factHtml(t('logs.f.tree'), esc(record.tree_id || '—'), true),
+    factHtml(t('logs.f.treeRev'), esc(record.tree_revision == null ? '—' : String(record.tree_revision)), true),
+    factHtml(t('logs.f.snapshot'), esc(record.snapshot_revision == null ? '—' : String(record.snapshot_revision)), true),
+    factHtml(t('logs.f.policy'), esc(record.policy_path || '—'), true),
+    factHtml(t('logs.f.session'), esc(record.session_hash || '—'), true),
+    factHtml(t('logs.f.jevModel'), esc(record.jev_model || '—'), true),
+    factHtml(t('logs.sec.reasoning'), esc(reasoning || '—')),
+    factHtml(t('logs.reasoningWarning'), esc(warning || '—')),
+  ];
 }
 
 function detailHtml(record) {
-  const facts = [
-    factHtml(t('logs.f.time'), esc(fmtTime(record.ts)), true),
-    factHtml(t('logs.f.routing'), esc(ms(record.routing_ms)), true),
-    factHtml(t('logs.f.sticky'), record.sticky_hit
-      ? `<span class="lg-ok">${esc(t('logs.f.stickyHit'))}</span>`
-      : `<span class="mut">${esc(t('logs.f.stickyMiss'))}</span>`),
-    factHtml(t('logs.f.tree'), esc(record.tree_id || '—')),
-    factHtml(t('logs.f.snapshot'), esc(String(record.snapshot_revision || '—').slice(0, 12)), true),
-    factHtml(t('logs.f.policy'), esc(record.policy_path || '—'), true),
-  ];
-  if (record.total_tokens != null) {
-    facts.push(factHtml(t('logs.f.tokens'), `${Number(record.prompt_tokens || 0)} → ${Number(record.total_tokens)}`, true));
-  }
-  if (record.upstream_status != null) {
-    facts.push(factHtml(t('logs.f.upstream'), `${esc(String(record.upstream_status))} · ${esc(ms(record.upstream_ms))}`, true));
-  }
-  if (record.fallback_reason) {
-    facts.push(factHtml(t('logs.f.fallback'), esc(record.fallback_reason), true));
-  }
-
-  const prompt = String(record.text || '').trim();
-  const probabilities = record.jev_probabilities && Object.keys(record.jev_probabilities).length
-    ? probBars(record.jev_probabilities) : '';
-  const reasoning = String(record.reasoning || '').trim();
-  const warning = String(record.reasoning_warning || '').trim();
-  const traceCount = SRTrace.count(record.trace);
-
+  const hasTrace = Array.isArray(record.trace);
   return `<div class="lg-expand-in">
     ${summaryHtml(record)}
-    ${prompt ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.prompt'))}</div><div class="lg-prompt">${esc(prompt)}</div></section>` : ''}
-    ${probabilities ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.probs'))}</div><div class="lg-probs">${probabilities}</div></section>` : ''}
-    ${reasoning ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.reasoning'))}</div><div class="lg-quote">${esc(reasoning)}</div></section>` : ''}
-    ${warning ? `<div class="lg-note"><b>${esc(t('logs.reasoningWarning'))}</b>${esc(warning)}</div>` : ''}
-    <details class="lg-more lg-more--trace">
-      <summary>${esc(tf('logs.kp.title', { n: traceCount }))}</summary>
-      <div class="lg-trace" data-trace></div>
-    </details>
+    ${hasTrace
+      ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.process'))}</div><div class="lg-process" data-trace></div></section>`
+      : `<div class="lg-note">${esc(t('logs.historyDetail'))}</div>`}
+    ${record.outcome_state === 'routing_error' ? '' : executionHtml(record)}
     <details class="lg-more">
-      <summary>${esc(t('logs.facts'))}</summary>
-      <div class="lg-facts">${facts.join('')}</div>
+      <summary>${esc(t('logs.technical'))}</summary>
+      <div class="lg-facts">${technicalFacts(record).join('')}</div>
     </details>
   </div>`;
 }
@@ -208,23 +196,12 @@ function itemHtml(record) {
   </article>`;
 }
 
-/* The raw time path is only built when its <details> is expanded. */
+/* The staged process is only built when its row is opened. */
 function paintTrace(item, record) {
-  const host = item.querySelector('.lg-trace');
+  const host = item.querySelector('[data-trace]');
   if (!host || host.dataset.ready === '1') return;
-  SRTrace.render(host, record.trace);
+  SRTrace.render(host, record);
   host.dataset.ready = '1';
-}
-
-function bindTrace(item) {
-  const details = item.querySelector('details.lg-more--trace');
-  if (!details || details.dataset.bound === '1') return;
-  details.dataset.bound = '1';
-  details.addEventListener('toggle', () => {
-    if (!details.open) return;
-    const record = requests.find(entry => entry.id === item.dataset.id);
-    if (record) paintTrace(item, record);
-  });
 }
 
 function render() {
@@ -237,7 +214,6 @@ function render() {
   document.querySelectorAll('#list .lg-item').forEach(item => {
     const record = requests.find(entry => entry.id === item.dataset.id);
     if (!record) return;
-    bindTrace(item);
     if (item.classList.contains('open')) paintTrace(item, record);
   });
 }

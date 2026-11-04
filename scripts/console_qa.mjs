@@ -5688,6 +5688,119 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
     '最少在途请求');
 });
 
+/* ── 计算日志：分阶段计算视图（Task 5） ─────────────────────────────── */
+
+test('calculation-log renders staged process from a real request', async () => {
+  await api('POST', '/v1/chat/completions', {
+    model: 'ignored',
+    messages: [{ role: 'user', content: S1_TEXT }],
+    stream: false,
+  });
+  await page.goto(routerBase + '/console/logs.html');
+  await page.waitForSelector('.lg-row');
+  await page.locator('.lg-row').first().click();
+  await page.waitForSelector('.lg-item.open .lg-process');
+
+  const open = page.locator('.lg-item.open');
+  assert.equal(await open.locator('.lg-phase[data-wave="0"]').count(), 1);
+  assert.equal(await open.locator('.lg-phase[data-wave="1"]').count(), 1);
+  assert.equal(await open.locator('.lg-question').count(), 2);
+  assert.equal(await open.locator('.lg-candidate-row').count(), 2);
+  assert.equal(await open.locator('.lg-schedule').count(), 1);
+  assert.equal(await open.locator('.lg-execution').count(), 1);
+  assertIncludes(await open.innerText(), 'power-target');
+  assertIncludes(await open.innerText(), 'qwen3.8-flash-sft');
+});
+
+test('calculation-log exposes every slot only on demand', async () => {
+  await page.goto(routerBase + '/console/logs.html');
+  await page.locator('.lg-row').first().click();
+  const phase = page.locator('.lg-item.open .lg-phase[data-wave="0"]');
+  assert.equal(await phase.locator('.lg-slot-all[open]').count(), 0);
+  await phase.locator('.lg-slot-all > summary').click();
+  assert.equal(await phase.locator('.lg-slot-all .lg-slot-row').count(), EXAMPLE_EDGES);
+});
+
+test('calculation-log keeps two request details open together', async () => {
+  await api('POST', '/v1/chat/completions', {
+    model: 'ignored', messages: [{ role: 'user', content: S1_TEXT }], stream: false,
+  });
+  await page.goto(routerBase + '/console/logs.html');
+  await page.locator('.lg-row').nth(0).click();
+  await page.locator('.lg-row').nth(1).click();
+  assert.equal(await page.locator('.lg-item.open').count(), 2);
+});
+
+test('calculation-log restored row states that detail is absent', async () => {
+  const matcher = '**/admin/requests/recent';
+  await page.route(matcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ requests: [{
+      id: 'restored', ts: '2026-11-04T10:00:00+08:00', text: '',
+      model: 'fast', outcome_state: 'completed', total_ms: 1200,
+      routing_ms: 4, waves: 1,
+    }] }),
+  }));
+  try {
+    await page.goto(routerBase + '/console/logs.html');
+    await page.locator('.lg-row').first().click();
+    const expected = await page.evaluate(() => window.t('logs.historyDetail'));
+    assertIncludes(await page.locator('.lg-item.open').innerText(), expected);
+    assertIncludes(await page.locator('.lg-item.open .lg-lat').innerText(), '1.20s');
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
+test('calculation-log separates routing failure and legacy schedule fallback', async () => {
+  const matcher = '**/admin/requests/recent';
+  await page.route(matcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ requests: [
+      {
+        id: 'failed', ts: '2026-11-04T10:00:00+08:00', text: '失败请求',
+        model: null, outcome_state: 'routing_error', error_class: 'no_available_backend',
+        routing_ms: 4, total_ms: 4, trace: [{
+          event: 'routing_error', stage: 'schedule',
+          error_class: 'no_available_backend', message: 'none',
+        }],
+      },
+      {
+        id: 'legacy', ts: '2026-11-04T10:00:01+08:00', text: '旧记录',
+        model: 'fast', outcome_state: 'completed', routing_ms: 4, total_ms: 10,
+        trace: [
+          { event: 'final', target_id: 'safe', kind: 'target', candidates: [], priority: 1 },
+          { event: 'scheduled', model: 'fast', reason: 'target', dry_run: false },
+        ],
+      },
+    ] }),
+  }));
+  try {
+    await page.goto(routerBase + '/console/logs.html');
+    await page.locator('.lg-item[data-id="failed"] .lg-row').click();
+    assert.equal(await page.locator('.lg-item[data-id="failed"] .lg-execution').count(), 0);
+    assertIncludes(await page.locator('.lg-item[data-id="failed"]').innerText(), 'no_available_backend');
+    await page.locator('.lg-item[data-id="legacy"] .lg-row').click();
+    const expected = await page.evaluate(() => window.t('logs.noSchedule'));
+    assertIncludes(await page.locator('.lg-item[data-id="legacy"]').innerText(), expected);
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
+test('calculation-log mobile keeps the main conclusion within the viewport', async () => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  try {
+    await page.goto(routerBase + '/console/logs.html');
+    await page.locator('.lg-row').first().click();
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+  } finally {
+    await page.setViewportSize({ width: 1280, height: 800 });
+  }
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
