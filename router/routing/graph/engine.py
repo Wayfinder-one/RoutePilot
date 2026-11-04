@@ -116,7 +116,9 @@ class GraphExecutionEngine:
         *,
         now: datetime | None = None,
         dry_run: bool = False,
+        trace_sink: list[dict] | None = None,
     ) -> RoutingDecision:
+        trace: list[dict] = [] if trace_sink is None else trace_sink
         if snapshot.tree is None:
             raise NoActiveTreeError("no routing tree is enabled")
         tree = snapshot.tree
@@ -145,9 +147,7 @@ class GraphExecutionEngine:
         else:
             local_now = now.astimezone(timezone)
         active_periods = matching_periods(local_now, list(snapshot.time_periods))
-        trace: list[dict] = [
-            {"event": "time", "active_periods": active_periods, "timezone": tree.timezone},
-        ]
+        trace.append({"event": "time", "active_periods": active_periods, "timezone": tree.timezone})
         window = apply_window(request.text, snapshot.jev_input_tokens)
         trace.append({
             "event": "window",
@@ -322,15 +322,43 @@ class GraphExecutionEngine:
             "priority": target.priority,
         })
 
-        # 8. sticky (read only after the graph decided) → acquire → write affinity.
+        # 8. sticky (read only after the graph decided) → schedule → acquire → write affinity.
+        configured_models = [item.model for item in target.models]
         models = [item.model for item in target.models if item.model in snapshot.backends]
-        available = list(self.balancer.available(models))
-        if not available:
-            raise NoAvailableBackend(f"target {target.id!r} has no available backend")
+        unregistered = {
+            model: "unregistered" for model in configured_models if model not in snapshot.backends
+        }
         policy_path = target.id
         preferred: str | None = None
         sticky_hit = False
+        if not tree.sticky.enabled:
+            sticky_status = "disabled"
+        elif not request.session_id:
+            sticky_status = "no_session"
+        else:
+            sticky_status = "not_checked"
+
+        def append_schedule(selection):
+            trace.append({
+                "event": "schedule",
+                "target_id": target.id,
+                "strategy": target.strategy,
+                "configured_models": list(configured_models),
+                "registered_models": list(models),
+                "available_models": list(selection.get("available_models", [])),
+                "unavailable": {**unregistered, **selection.get("unavailable", {})},
+                "inflight": dict(selection.get("inflight", {})),
+                "sticky": {"status": sticky_status, "preferred_model": preferred},
+            })
+
+        initial_selection = self.balancer.selection(models)
+        available = list(initial_selection["available_models"])
+        if not available:
+            append_schedule(initial_selection)
+            raise NoAvailableBackend(f"target {target.id!r} has no available backend")
+
         if tree.sticky.enabled and request.session_id:
+            sticky_status = "miss"
             hit = self.affinity.get(
                 request.session_id,
                 tree_revision=snapshot.tree_revision,
@@ -341,9 +369,15 @@ class GraphExecutionEngine:
             if hit is not None and hit[1] == target.id and hit[0] in available:
                 preferred = hit[0]
                 sticky_hit = True
+                sticky_status = "hit"
                 selection_reason = "sticky"
 
-        lease = self.balancer.acquire(available, preferred=preferred, dry_run=dry_run)
+        try:
+            lease = self.balancer.acquire(models, preferred=preferred, dry_run=dry_run)
+        except NoAvailableBackend as exc:
+            append_schedule(exc.selection)
+            raise
+        append_schedule(lease.selection)
         model = lease.model
         reasoning = next(
             (item.reasoning for item in target.models if item.model == model),

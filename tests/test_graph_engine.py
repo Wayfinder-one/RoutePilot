@@ -179,21 +179,20 @@ def run_scenario(
     text=None,
     now=None,
     input_tokens=1024,
+    trace_sink=None,
 ):
     scenario = SCENARIO_BY_ID[scenario_id]
     jev = FakeJev(scenario)
     balancer = RecordingBalancer() if balancer is None else balancer
     affinity = RecordingAffinity() if affinity is None else affinity
     engine = GraphExecutionEngine(jev, affinity, balancer)
-    snapshot = make_snapshot(
-        power_tree() if tree is None else tree,
-        input_tokens=input_tokens,
-    )
+    snapshot = make_snapshot(power_tree() if tree is None else tree, input_tokens=input_tokens)
     decision = asyncio.run(engine.route(
         snapshot,
         RoutingRequest(scenario["text"] if text is None else text, session_id=session_id),
         now=datetime.fromisoformat(scenario["now"]) if now is None else now,
         dry_run=dry_run,
+        trace_sink=trace_sink,
     ))
     return decision, jev, balancer, affinity
 
@@ -211,6 +210,7 @@ def run_custom(
     session_id="",
     balancer=None,
     affinity=None,
+    trace_sink=None,
 ):
     tree = custom_tree(
         nodes,
@@ -227,6 +227,7 @@ def run_custom(
         RoutingRequest(text, session_id=session_id),
         now=now,
         dry_run=dry_run,
+        trace_sink=trace_sink,
     ))
     return decision, jev, balancer, affinity
 
@@ -317,6 +318,16 @@ def test_invalid_fallback_target_raises_routing_miss():
         run_custom([node("start", "start")], [], error_fallback="ghost")
 
 
+def test_invalid_fallback_leaves_partial_trace_in_external_sink():
+    trace = []
+    with pytest.raises(RoutingMiss, match="error_fallback"):
+        run_custom(
+            [node("start", "start")], [], error_fallback="ghost", trace_sink=trace,
+        )
+    assert [event["event"] for event in trace[:2]] == ["time", "window"]
+    assert not any(event["event"] == "routing_error" for event in trace)
+
+
 # ---------------------------------------------------------------------------
 # trace 契约（§3.9）
 # ---------------------------------------------------------------------------
@@ -383,8 +394,8 @@ def test_trace_events_follow_spec_schema_and_order():
     assert choice_event["ports"]["p_top"] == 0.84
     assert choice_event["ports"]["margin"] == 0.72
 
-    final_event = events[-2]
-    scheduled_event = events[-1]
+    final_event = next(event for event in events if event["event"] == "final")
+    scheduled_event = next(event for event in events if event["event"] == "scheduled")
     assert final_event["event"] == "final"
     assert set(final_event) == {"event", "target_id", "kind", "candidates", "priority"}
     assert final_event["target_id"] == "power-target"
@@ -430,6 +441,44 @@ def test_window_is_applied_once_and_conditions_use_truncated_text(monkeypatch):
     )
     assert condition["matched"] == []
     assert condition["value"] is False
+
+
+# ---------------------------------------------------------------------------
+# schedule 调度事件：调度器实际快照 + 事件顺序 + 失败部分 trace
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_trace_uses_actual_selection_and_preserves_event_order():
+    decision, _jev, _balancer, _affinity = run_scenario("s1")
+    schedule = next(event for event in decision.trace if event["event"] == "schedule")
+
+    assert schedule == {
+        "event": "schedule",
+        "target_id": "power-target",
+        "strategy": "least_inflight",
+        "configured_models": ["qwen3.8-flash-sft"],
+        "registered_models": ["qwen3.8-flash-sft"],
+        "available_models": ["qwen3.8-flash-sft"],
+        "unavailable": {},
+        "inflight": {"qwen3.8-flash-sft": 0},
+        "sticky": {"status": "disabled", "preferred_model": None},
+    }
+    assert [event["event"] for event in decision.trace[-3:]] == [
+        "final", "schedule", "scheduled",
+    ]
+
+
+def test_schedule_trace_marks_no_session_and_sticky_miss():
+    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
+    no_session, *_rest = run_scenario("s1", tree=tree)
+    miss, *_rest = run_scenario("s1", tree=tree, session_id="new-session")
+
+    assert next(e for e in no_session.trace if e["event"] == "schedule")["sticky"] == {
+        "status": "no_session", "preferred_model": None,
+    }
+    assert next(e for e in miss.trace if e["event"] == "schedule")["sticky"] == {
+        "status": "miss", "preferred_model": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +646,7 @@ def test_second_request_executes_questions_then_applies_sticky():
     assert affinity.gets[-1]["allowed_models"] == ["qwen3.8-flash-sft"]
     sticky_events = [event for event in second.trace if event["event"] == "sticky_hit"]
     assert sticky_events == [{"event": "sticky_hit", "model": "qwen3.8-flash-sft"}]
-    assert [event["event"] for event in second.trace[-3:]] == ["final", "sticky_hit", "scheduled"]
+    assert [event["event"] for event in second.trace[-4:]] == ["final", "schedule", "sticky_hit", "scheduled"]
     second.release()
 
 
@@ -793,6 +842,26 @@ def test_fallback_model_without_backend_fails_closed():
     with pytest.raises(NoAvailableBackend):
         run_custom(nodes, [], error_fallback="t-safe", balancer=balancer)
     assert balancer.calls == []
+
+
+def test_no_available_backend_keeps_schedule_trace_without_acquire_or_affinity_read():
+    trace = []
+    balancer = RecordingBalancer(_OpenBreaker("qwen3.8-flash-sft"))
+    affinity = RecordingAffinity()
+    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
+
+    with pytest.raises(NoAvailableBackend):
+        run_scenario(
+            "s1", tree=tree, session_id="session-1", balancer=balancer,
+            affinity=affinity, trace_sink=trace,
+        )
+
+    assert balancer.calls == []
+    assert affinity.gets == []
+    assert trace[-1]["event"] == "schedule"
+    assert trace[-1]["available_models"] == []
+    assert trace[-1]["unavailable"] == {"qwen3.8-flash-sft": "breaker_open"}
+    assert trace[-1]["sticky"] == {"status": "not_checked", "preferred_model": None}
 
 
 # ---------------------------------------------------------------------------
