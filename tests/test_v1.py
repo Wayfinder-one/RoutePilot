@@ -557,6 +557,10 @@ def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream
         assert record["trace"][-1]["stage"] == "schedule"
         assert record["routing_ms"] > 0
         assert record["total_ms"] >= record["routing_ms"]
+        assert record["target_id"] == "power-target"
+        assert record["selection_reason"] == "target"
+        assert record["policy_path"] == "power-target"
+        assert record["fallback_reason"] is None
 
     asyncio.run(scenario())
 
@@ -598,6 +602,10 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         }
         assert record["node_labels"] == {}
         assert record["model"] is None
+        assert record["target_id"] is None
+        assert record["selection_reason"] is None
+        assert record["policy_path"] is None
+        assert record["fallback_reason"] is None
 
     asyncio.run(scenario())
 
@@ -631,6 +639,49 @@ def test_invariant_failure_keeps_partial_graph_trace(tmp_path):
         assert [event["event"] for event in record["trace"][:2]] == ["time", "window"]
         assert record["trace"][-1]["error_class"] == "routing_invariant_violation"
         assert record["trace"][-1]["stage"] == "graph"
+        assert record["target_id"] is None
+        assert record["selection_reason"] is None
+        assert record["policy_path"] is None
+        assert record["fallback_reason"] is None
+
+    asyncio.run(scenario())
+
+
+def test_no_candidate_schedule_failure_preserves_fallback_target(tmp_path):
+    async def scenario():
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(tmp_path, har, root=no_target_graph())
+        for _ in range(app.state.breaker.threshold):
+            app.state.breaker.failure("safe")
+
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "no_available_backend"
+        assert har.upstream_models == []
+        record = recent(app)
+        final = next(event for event in record["trace"] if event["event"] == "final")
+        assert final["kind"] == "otherwise"
+        assert record["outcome_state"] == "routing_error"
+        assert record["target_id"] == "safe"
+        assert record["selection_reason"] == "error_fallback"
+        assert record["policy_path"] == "safe"
+        assert record["fallback_reason"] == "error_fallback"
+
+        await flush(app)
+        conn = connect(app.state.settings.db_path)
+        try:
+            row = dict(conn.execute(
+                "SELECT target_id, selection_reason, policy_path, outcome_state FROM request_logs"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row == {
+            "target_id": "safe",
+            "selection_reason": "error_fallback",
+            "policy_path": "safe",
+            "outcome_state": "routing_error",
+        }
 
     asyncio.run(scenario())
 

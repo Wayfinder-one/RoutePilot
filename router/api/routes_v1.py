@@ -225,18 +225,39 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
 
 def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
                             routing_ms, total_ms):
+    # 调度失败 ≠ 图没有决策：恢复 trace 中最后一个 final 的目标元数据；
+    # 无 final（图前失败）时保持 None，不从 sticky/schedule 推断成功结论。
+    final = next(
+        (
+            event for event in reversed(trace)
+            if isinstance(event, dict) and event.get("event") == "final"
+        ),
+        None,
+    )
+    target_id = final.get("target_id") if final is not None else None
+    final_kind = final.get("kind") if final is not None else None
+    if final_kind == "target":
+        selection_reason = "target"
+        fallback_reason = None
+    elif final_kind in {"otherwise", "error_fallback"}:
+        selection_reason = "error_fallback"
+        fallback_reason = "error_fallback"
+    else:
+        selection_reason = None
+        fallback_reason = None
     return {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "text": text,
         "decision": "route",
         "model": None,
-        "target_id": None,
+        "target_id": target_id,
         "tree_id": getattr(snapshot, "tree_id", None),
         "tree_revision": getattr(snapshot, "tree_revision", None),
         "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
-        "policy_path": None,
-        "selection_reason": None,
+        "policy_path": target_id,
+        "selection_reason": selection_reason,
+        "fallback_reason": fallback_reason,
         "sticky_hit": 0,
         "session_hash": session_digest(session_id),
         "jev_model": snapshot.jev.model if snapshot is not None and snapshot.jev else None,
