@@ -3,10 +3,15 @@ from __future__ import annotations
 import copy
 import json
 import math
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from router.jev.client import DecisionQuestion, JevCandidate
+from router.jev.client import DecisionQuestion, JevCandidate, _wire_question
 from router.routing.model import tree_from_dict
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -144,3 +149,84 @@ def build_g3_tree():
     return tree_from_dict({"id": "g3", "name": "G3", "enabled": True,
                            "root": {"id": "root", "type": "graph", "nodes": nodes, "edges": edges,
                                     "error_fallback": "t-error"}})
+
+
+@dataclass
+class ResponseRecord:
+    stage: str
+    status: int | None
+    body: dict | None
+    error: str | None
+    duration_ms: float
+    input_tokens: int | None
+
+
+class BudgetExceeded(RuntimeError): pass
+class SpikeAbort(RuntimeError): pass
+
+
+class SpikeTransport:
+    def __init__(self, base_url, model, *, api_key="", timeout=20.0,
+                 max_requests=2000, sleep_seconds=0.02):
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
+        self.timeout = timeout
+        self.max_requests = max_requests
+        self.sleep_seconds = sleep_seconds
+        self.count = 0
+        self.stage_counts = {}
+        self._consecutive_5xx = 0
+        self._lock = threading.Lock()
+
+    def post(self, state: str, questions: Mapping[str, DecisionQuestion], stage: str) -> ResponseRecord:
+        if not questions:
+            raise ValueError("questions must not be empty")
+        with self._lock:
+            if self.count >= self.max_requests:
+                raise BudgetExceeded(f"request cap {self.max_requests} reached")
+            self.count += 1
+            self.stage_counts[stage] = self.stage_counts.get(stage, 0) + 1
+        wire = {key: _wire_question(question) for key, question in questions.items()}
+        payload = {"model": self.model, "state": state, "questions": wire}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        request = urllib.request.Request(
+            self.base_url + "/v1/systemone",
+            data=json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+            headers=headers, method="POST",
+        )
+        started = time.monotonic()
+        status = None
+        body = None
+        error = None
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                status = response.status
+                body = json.loads(response.read())
+                if not isinstance(body, dict):
+                    raise ValueError("response body must be an object")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            error = f"HTTP {exc.code}"
+            try:
+                parsed = json.loads(exc.read())
+                body = parsed if isinstance(parsed, dict) else None
+            except ValueError:
+                body = None
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            error = type(exc).__name__
+        duration = (time.monotonic() - started) * 1000
+        with self._lock:
+            self._consecutive_5xx = self._consecutive_5xx + 1 if status is not None and 500 <= status < 600 else 0
+            should_abort = self._consecutive_5xx >= 2
+        if self.sleep_seconds:
+            time.sleep(self.sleep_seconds)
+        if should_abort:
+            raise SpikeAbort("two consecutive 5xx responses")
+        usage = body.get("usage", {}) if isinstance(body, dict) else {}
+        input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
+        if isinstance(input_tokens, bool) or not isinstance(input_tokens, int):
+            input_tokens = None
+        return ResponseRecord(stage, status, body, error, duration, input_tokens)

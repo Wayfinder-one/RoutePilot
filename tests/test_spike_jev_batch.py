@@ -1,9 +1,16 @@
+import json
+import urllib.error
+from io import BytesIO
 from pathlib import Path
 
 import pytest
 
 from router.routing.graph.validate import EnableContext, validate_graph_for_enable
 from scripts.spike_jev_batch import (
+    BudgetExceeded,
+    ResponseRecord,
+    SpikeAbort,
+    SpikeTransport,
     build_g3_tree,
     build_question_groups,
     load_samples,
@@ -55,3 +62,52 @@ def test_load_samples_validates_and_applies_limit(tmp_path):
     assert len(loaded) == 60
     assert [item.id for item in loaded[:2]] == ["s0", "s1"]
     assert len(load_samples(path, 1)) == 1
+
+
+class FakeHTTPResponse:
+    def __init__(self, body, status=200):
+        self.body = json.dumps(body).encode()
+        self.status = status
+
+    def __enter__(self): return self
+    def __exit__(self, *args): return False
+    def read(self): return self.body
+
+
+def success_body():
+    return {"answers": {"urgent": {"type": "noul", "noul": 0.6}},
+            "usage": {"input_tokens": 123, "output_tokens": 0}}
+
+
+def test_transport_sends_wire_and_never_needs_to_log_key(monkeypatch):
+    captured = {}
+    def fake_urlopen(request, timeout):
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["payload"] = json.loads(request.data)
+        return FakeHTTPResponse(success_body())
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    transport = SpikeTransport("http://jev.test", "d1-2B", api_key="secret", sleep_seconds=0)
+    record = transport.post("state", {"urgent": build_question_groups()["G1"]["urgent"]}, "test")
+    assert isinstance(record, ResponseRecord) and record.input_tokens == 123
+    assert captured["authorization"] == "Bearer secret"
+    assert captured["payload"]["questions"]["urgent"] == {"type": "noul", "instructions": "这条用户请求描述的告警或故障是否紧急，是否需要立即处置？"}
+
+
+def test_transport_stops_on_second_consecutive_5xx(monkeypatch):
+    def fail(request, timeout):
+        raise urllib.error.HTTPError(request.full_url, 500, "boom", None, BytesIO(b"{}"))
+    monkeypatch.setattr("urllib.request.urlopen", fail)
+    transport = SpikeTransport("http://jev.test", "d1-2B", sleep_seconds=0)
+    question = {"urgent": build_question_groups()["G1"]["urgent"]}
+    transport.post("state", question, "test")
+    with pytest.raises(SpikeAbort):
+        transport.post("state", question, "test")
+    assert transport.count == 2
+
+
+def test_transport_rejects_request_before_io_at_cap(monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args: (_ for _ in ()).throw(AssertionError("network used")))
+    transport = SpikeTransport("http://jev.test", "d1-2B", max_requests=0, sleep_seconds=0)
+    with pytest.raises(BudgetExceeded):
+        transport.post("state", {"urgent": build_question_groups()["G1"]["urgent"]}, "test")
+    assert transport.count == 0
