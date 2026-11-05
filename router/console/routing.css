@@ -373,6 +373,7 @@ body.is-try-running .rtc-stage.is-locked::after {
   background: color-mix(in srgb, var(--teal) 7%, var(--panel));
 }
 .rtc-cond.is-num:hover { border-color: var(--teal); }
+.rtc-cond.is-static { cursor: default; }
 .rtc-slot .rtc-live { margin-left: 2px; }
 
 /* 请求条件 */

@@ -95,21 +95,7 @@
   }
 
   function conditionText(edge) {
-    if (!edge) return '';
-    const graph = app().graph;
-    const type = root.RTGraph.edgeType(edge, graph);
-    const condition = edge.condition;
-    if (type === 'boolean') {
-      if (condition == null) return '= true';
-      if (condition.op === 'is' && typeof condition.value === 'boolean') {
-        return condition.value ? '= true' : '= false';
-      }
-      return t('cv.cond.invalid');
-    }
-    if (!condition) return t('cv.cond.unset');
-    const symbol = root.RTGraph.OP[condition.op];
-    if (!symbol || !Number.isFinite(Number(condition.value))) return t('cv.cond.invalid');
-    return symbol + ' ' + Number(condition.value);
+    return root.RTCondPop.conditionText(edge);
   }
 
   function fieldValue(form, name) {
@@ -180,8 +166,10 @@
         '<span class="rtc-ins-slot-src" title="' + esc(edge.source + '.' + edge.source_port) + '">' +
         esc(slotSourceLabel(graph, edge)) + '</span>' +
         '<span class="rtc-ins-slot-cond">' + esc(conditionText(edge)) + '</span>' +
-        '<button type="button" class="btn sm ghost" data-act="ins-slot-edit" data-edge="' + esc(edge.id) + '">' +
-        esc(t('cv.ins.slotEdit')) + '</button>' +
+        (root.RTCondPop.canEditCondition(edge)
+          ? '<button type="button" class="btn sm ghost" data-act="ins-slot-edit" data-edge="' + esc(edge.id) + '">' +
+            esc(t('cv.ins.slotEdit')) + '</button>'
+          : '') +
         '<button type="button" class="btn sm ghost" data-act="ins-slot-remove" data-edge="' + esc(edge.id) + '">' +
         esc(t('cv.ins.slotRemove')) + '</button></div>';
     }).join('');
@@ -341,11 +329,14 @@
       esc(root.RTCards.strategyLabel ? root.RTCards.strategyLabel(value) : value) + '</option>').join('');
   }
 
-  function formTail(saveAction, extraActions) {
+  function formTail(saveAction, extraActions, showSave = true) {
     return '<div class="rtc-ins-error" data-ins-error role="alert" hidden></div>' +
       '<div class="rtc-dialog-acts">' + (extraActions || '') +
-      '<button type="submit" class="btn sm pri" data-act="' + saveAction + '">' +
-      esc(t('cv.ins.save')) + '</button></div>';
+      (showSave
+        ? '<button type="submit" class="btn sm pri" data-act="' + saveAction + '">' +
+          esc(t('cv.ins.save')) + '</button>'
+        : '') +
+      '</div>';
   }
 
   function nodeBranch(node) {
@@ -363,6 +354,7 @@
     const target = root.RTGraph.findNode(graph, edge.target);
     const type = root.RTGraph.edgeType(edge, graph);
     const typeLabel = type === 'number' ? t('cv.ins.typeNumber') : t('cv.ins.typeBoolean');
+    const editable = root.RTCondPop.canEditCondition(edge);
     return '<div class="rtc-ins" data-ins-branch="edge" data-ins-id="' + esc(edge.id) +
       '" data-edge-type="' + esc(type) + '">' +
       '<form data-ins-form="edge" novalidate>' +
@@ -383,7 +375,7 @@
       '<div class="rtc-cond-error" data-cond-error role="alert" hidden></div></div>' +
       formTail('ins-save-edge',
         '<button type="button" class="btn sm danger" data-act="ins-delete-edge">' +
-        esc(t('cv.ins.deleteEdge')) + '</button>') +
+        esc(t('cv.ins.deleteEdge')) + '</button>', editable) +
       '</form></div>';
   }
 

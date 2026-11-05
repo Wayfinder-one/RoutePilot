@@ -253,7 +253,7 @@
     }
     if (condition == null) return null;
     if (condition.op !== 'is' || typeof condition.value !== 'boolean') {
-      return '布尔输入条件只能是 = true 或 = false';
+      return '布尔输入条件只支持默认通过与取反';
     }
     return null;
   }

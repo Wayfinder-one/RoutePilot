@@ -1213,8 +1213,12 @@ test('7.4-05-numeric-default-and-boolean-true', async () => {
   const booleanEdge = (await appSnapshot()).edges.find(item =>
     item.source === 'start' && item.target === 'capability' && item.target_port === 'in_2');
   assert.ok(booleanEdge, 'boolean edge was not created');
-  assert.equal(booleanEdge.condition, null, 'boolean edge did not default to null (= true)');
-  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${booleanEdge.id}"]`).textContent()).trim(), '= true');
+  assert.equal(booleanEdge.condition, null, 'boolean edge did not default to null (passes through)');
+  const startSlot = page.locator(`#cvNodes [data-edge="${booleanEdge.id}"]`);
+  assert.equal(await startSlot.locator('[data-cond-edge]').count(), 0);
+  assert.equal((await startSlot.locator('[data-start-condition]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.startAlways')));
+  assert.equal(await page.evaluate(id => window.RTCondPop.open(id), booleanEdge.id), false);
   assert.equal(await page.locator('#cvCondPop').isHidden(), true,
     'boolean edge opened the comparison editor');
 });
@@ -1228,8 +1232,11 @@ test('Task 10 · a boolean edge defaults to condition null and does not open the
   const edge = after.edges.find(item => item.target === 'and-power' && item.target_port === 'in_3');
   assert.ok(edge, 'boolean edge not created');
   assert.equal(edge.condition, null);
-  const chipText = await page.locator(`#cvNodes [data-cond-edge="${edge.id}"]`).textContent();
-  assert.equal(chipText.trim(), '= true');
+  const startSlot = page.locator(`#cvNodes [data-edge="${edge.id}"]`);
+  assert.equal(await startSlot.locator('[data-cond-edge]').count(), 0);
+  assert.equal((await startSlot.locator('[data-start-condition]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.startAlways')));
+  assert.equal(await page.evaluate(id => window.RTCondPop.open(id), edge.id), false);
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
 });
 
@@ -1926,9 +1933,11 @@ test('7.4-09-question-target-rows', async () => {
   const rows = page.locator('#cvNodes [data-node-id="capability"] .rtc-slot');
   assert.match(await rows.nth(0).innerText(), /开始/);
   assert.match(await rows.nth(0).innerText(), /in_1/);
-  assert.equal((await rows.nth(0).locator('[data-cond-edge]').textContent()).trim(), '= true');
+  assert.equal((await rows.nth(0).locator('[data-start-condition]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.startAlways')));
   assert.match(await rows.nth(1).innerText(), /文本条件/);
-  assert.equal((await rows.nth(1).locator('[data-cond-edge]').textContent()).trim(), '= true');
+  assert.equal((await rows.nth(1).locator('[data-cond-edge]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.direct')));
 
   await rows.nth(1).locator('[data-cond-edge]').click();
   await waitCondPop(await rows.nth(1).locator('[data-cond-edge]').getAttribute('data-cond-edge'));
@@ -1936,7 +1945,7 @@ test('7.4-09-question-target-rows', async () => {
   await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
   await page.waitForFunction(() => {
     const row = document.querySelectorAll('#cvNodes [data-node-id="capability"] .rtc-slot')[1];
-    return row && row.querySelector('[data-cond-edge]').textContent.trim() === '= false';
+    return row && row.querySelector('[data-cond-edge]').textContent.trim() === window.t('cv.cond.negated');
   });
 
   await dragPort('cond-text', 'out', { node: 'strong-target', port: 'in_2' });
@@ -5890,6 +5899,73 @@ test('calculation-log mobile keeps the main conclusion within the viewport', asy
   } finally {
     await page.setViewportSize({ width: 1280, height: 800 });
   }
+});
+
+test('boolean start is read-only and legacy negation needs an explicit clear', async () => {
+  await openCanvas();
+  const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
+  let slot = page.locator(`#cvNodes [data-edge="${startEdge.id}"]`);
+  assert.equal(await slot.locator('[data-cond-edge]').count(), 0);
+  assert.equal(await slot.locator('[data-start-condition]').count(), 1);
+  await screenshot('boolean-start-readonly-1440.png');
+
+  await clickEdge(startEdge.id);
+  await waitInspectorBranch('edge', startEdge.id);
+  assert.equal(await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').count(), 0);
+  assert.equal(await page.locator('#cvInspectorBody [data-cond-field="negate"]').count(), 0);
+
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      const edge = tree.root.edges.find(item => item.id === id);
+      edge.condition = { op: 'is', value: false };
+    });
+  }, startEdge.id);
+  slot = page.locator(`#cvNodes [data-edge="${startEdge.id}"]`);
+  assert.equal((await slot.locator('[data-cond-edge]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.negated')));
+  await slot.locator('[data-cond-edge]').click();
+  await waitCondPop(startEdge.id);
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="negate"]').isChecked(), true);
+  await page.locator('#cvCondPop [data-cond-field="negate"]').uncheck();
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
+  await waitEdgeCondition(startEdge.id, null);
+  assert.equal(await slot.locator('[data-cond-edge]').count(), 0);
+  assert.equal((await slot.locator('[data-start-condition]').textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.startAlways')));
+  await page.locator('#cvUndo').click();
+  await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
+});
+
+test('replay condition labels use direct, negated and start-only text', async () => {
+  await prepareTryCanvas();
+  const edges = (await appSnapshot()).edges;
+  const startEdge = edges.find(edge => edge.source === 'start');
+  const conditionEdge = edges.find(edge => edge.source === 'cond-text');
+  await runTrySample(0);
+  assert.match(await page.locator(`#cvNodes [data-edge="${startEdge.id}"]`).getAttribute('title'),
+    /总是通过/);
+  assert.doesNotMatch(await page.locator(`#cvNodes [data-edge="${startEdge.id}"]`).getAttribute('title'),
+    /= true/);
+
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(item => item.id === id).condition = { op: 'is', value: false };
+    });
+  }, conditionEdge.id);
+  await runTrySample(0);
+  const negatedTitle = await page.locator(`#cvNodes [data-edge="${conditionEdge.id}"]`).getAttribute('title');
+  assert.match(negatedTitle, /取反/);
+  assert.doesNotMatch(negatedTitle, /= false/);
+
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(item => item.id === id).condition = null;
+    });
+  }, conditionEdge.id);
+  await runTrySample(0);
+  const directTitle = await page.locator(`#cvNodes [data-edge="${conditionEdge.id}"]`).getAttribute('title');
+  assert.match(directTitle, /直接通过/);
+  assert.doesNotMatch(directTitle, /= true/);
 });
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */

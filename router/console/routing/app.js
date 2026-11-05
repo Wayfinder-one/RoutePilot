@@ -711,7 +711,7 @@
     const rows = edges.map(edge => {
       const type = RTGraph.edgeType(edge, graph);
       const condition = type === 'number' || (edge.condition && edge.condition.op === 'is')
-        ? ' · ' + RTGraph.conditionLabel(edge, graph)
+        ? ' · ' + root.RTCondPop.conditionText(edge)
         : '';
       const sourceNode = RTGraph.findNode(graph, edge.source);
       const targetNode = RTGraph.findNode(graph, edge.target);
