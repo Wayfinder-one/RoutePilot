@@ -171,6 +171,9 @@ def test_put_window_persists_and_refreshes_snapshot(tmp_path):
         {"context_tokens": 100},                           # 低于下限
         {"context_tokens": 999999},                        # 超上限
         {"input_tokens": "abc"},                           # 非整数
+        {"input_tokens": "++1"},                           # 多个符号不能触发未捕获的 ValueError
+        {"context_tokens": "+-1"},                         # 混合符号同上
+        {"input_tokens": "²"},                             # isdigit 接受但 int 不接受
         {"input_tokens": True},                            # bool 不是整数
         {"unknown": 1},                                    # 未知字段
     ],

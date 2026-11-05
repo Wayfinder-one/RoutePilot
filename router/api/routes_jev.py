@@ -114,7 +114,10 @@ def _coerce_tokens(value, field: str) -> int:
     if isinstance(value, float) and value.is_integer():
         return int(value)
     if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
-        return int(value.strip())
+        try:
+            return int(value.strip())
+        except ValueError:
+            pass
     raise HTTPException(422, detail=f"{field} 必须是整数")
 
 
