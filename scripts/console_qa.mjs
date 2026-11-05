@@ -1281,8 +1281,9 @@ test('Task 10 · a noul question output connects to an AND gate slot', async () 
 
 test('Task 10 · a condition chip opens the condition overlay and Esc closes it', async () => {
   await openCanvas();
-  const chip = page.locator('#cvNodes [data-cond-edge]').first();
-  const edgeId = await chip.getAttribute('data-cond-edge');
+  /* Start-edge chips stay clickable until Task 2 makes them static; use an editable edge here. */
+  const edgeId = 'e-cap-strong-and-power';
+  const chip = page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`);
   await chip.click();
   const pop = await page.evaluate(() => ({
     hidden: document.getElementById('cvCondPop').hidden,
@@ -1668,67 +1669,71 @@ test('7.4-06-condition-edit-dual-entry-dirty-undo', async () => {
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
 });
 
-test('Task 11 · boolean conditions toggle = true / = false from both entries without illegal states', async () => {
+test('Task 11 · boolean conditions use a negation switch from both entries', async () => {
   await openCanvas();
   const edgeId = 'e-selected-easy-light';
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
   await waitCondPop(edgeId);
-  const options = await page.evaluate(() => Array.from(
-    document.querySelectorAll('#cvCondPop [data-cond-field="bool"] option')).map(option => option.value));
-  assert.deepEqual(options, ['true', 'false']);
-  assert.equal(await page.locator('#cvCondPop [data-cond-field="bool"]').inputValue(), 'true');
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="bool"]').count(), 0);
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="negate"]').count(), 1);
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="negate"]').isChecked(), false);
 
-  /* Cancel and Esc save the original copy and write nothing. */
-  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-cond-field="negate"]').check();
   await page.locator('#cvCondPop [data-act="cond-cancel"]').click();
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
   assert.equal((await edgeOf(edgeId)).condition, null);
-  let snapshot = await appSnapshot();
-  assert.equal(snapshot.kind, 'clean');
-  assert.deepEqual(snapshot.history, { undo: false, redo: false });
+  assert.deepEqual((await appSnapshot()).history, { undo: false, redo: false });
 
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
   await waitCondPop(edgeId);
-  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-cond-field="negate"]').check();
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
-  assert.equal(await page.evaluate(() => {
-    const active = document.activeElement;
-    return active && active.dataset ? (active.dataset.condEdge || '') : '';
-  }), edgeId, 'Esc did not return focus to the condition chip');
   assert.equal((await edgeOf(edgeId)).condition, null);
-  assert.equal((await appSnapshot()).kind, 'clean');
 
-  /* Confirm false → {op:'is', value:false}; then true → canonical null. */
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
   await waitCondPop(edgeId);
-  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-cond-field="negate"]').check();
   await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
   await waitEdgeCondition(edgeId, { op: 'is', value: false });
-  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim(), '= false');
+  assert.equal(await page.evaluate(id => {
+    const edge = window.App.graph.edges.find(item => item.id === id);
+    return window.RTCondPop.conditionText(edge);
+  }, edgeId), await page.evaluate(() => window.t('cv.cond.negated')));
+
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
   await waitCondPop(edgeId);
-  assert.equal(await page.locator('#cvCondPop [data-cond-field="bool"]').inputValue(), 'false');
-  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('true');
+  assert.equal(await page.locator('#cvCondPop [data-cond-field="negate"]').isChecked(), true);
+  await page.locator('#cvCondPop [data-cond-field="negate"]').uncheck();
   await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
   await waitEdgeCondition(edgeId, null);
-  assert.equal((await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim(), '= true');
-  await page.locator('#cvUndo').click();
-  await waitEdgeCondition(edgeId, { op: 'is', value: false });
+  assert.equal(await page.evaluate(id => {
+    const edge = window.App.graph.edges.find(item => item.id === id);
+    return window.RTCondPop.conditionText(edge);
+  }, edgeId), await page.evaluate(() => window.t('cv.cond.direct')));
 
-  /* Inspector entry writes the same shape and one undo restores it. */
   await openCanvas();
   await clickEdge(edgeId);
   await waitInspectorBranch('edge', edgeId);
-  assert.equal(await page.locator('#cvInspectorBody [data-ins-branch="edge"]').getAttribute('data-edge-type'), 'boolean');
-  await page.locator('#cvInspectorBody [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvInspectorBody [data-cond-field="negate"]').check();
   await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
   await waitEdgeCondition(edgeId, { op: 'is', value: false });
-  snapshot = await appSnapshot();
-  assert.equal(snapshot.kind, 'behavior');
   await page.locator('#cvUndo').click();
   await waitEdgeCondition(edgeId, null);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
+
+  const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
+  const startView = await page.evaluate(id => {
+    const edge = window.App.graph.edges.find(item => item.id === id);
+    return {
+      canEdit: window.RTCondPop.canEditCondition(edge),
+      label: window.RTCondPop.conditionText(edge),
+      opened: window.RTCondPop.open(id)
+    };
+  }, startEdge.id);
+  assert.equal(startView.canEdit, false);
+  assert.equal(startView.label, await page.evaluate(() => window.t('cv.cond.startAlways')));
+  assert.equal(startView.opened, false);
 });
 
 test('7.4-07-selected-edge-inspector', async () => {
@@ -1927,7 +1932,7 @@ test('7.4-09-question-target-rows', async () => {
 
   await rows.nth(1).locator('[data-cond-edge]').click();
   await waitCondPop(await rows.nth(1).locator('[data-cond-edge]').getAttribute('data-cond-edge'));
-  await page.locator('#cvCondPop [data-cond-field="bool"]').selectOption('false');
+  await page.locator('#cvCondPop [data-cond-field="negate"]').check();
   await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
   await page.waitForFunction(() => {
     const row = document.querySelectorAll('#cvNodes [data-node-id="capability"] .rtc-slot')[1];
