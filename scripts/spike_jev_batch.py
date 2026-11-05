@@ -210,6 +210,12 @@ class SpikeTransport:
         self._consecutive_transport_errors = 0
         self._lock = threading.Lock()
 
+    def reset_breaker(self):
+        """C1：清零连续失败计数；隔离探测不得继承上一请求的熔断状态，也不得给后续阶段留计数。"""
+        with self._lock:
+            self._consecutive_5xx = 0
+            self._consecutive_transport_errors = 0
+
     def post(self, state: str, questions: Mapping[str, DecisionQuestion], stage: str) -> ResponseRecord:
         if not questions:
             raise ValueError("questions must not be empty")
@@ -386,10 +392,31 @@ def _call(transport, cache, key, *, stage, state, questions, sample_id, group, p
     return cache[key]
 
 
+def _redact_artifact(value, api_key):
+    """Important：原始响应体可能回显 Authorization/bearer；递归把 key 替换为 ***。
+
+    只替换字符串值（dict key 保持原样），数字等非字符串原样返回，保证产物仍可 JSON 序列化。
+    """
+    if not api_key:
+        return value
+    if isinstance(value, str):
+        return value.replace(api_key, "***")
+    if isinstance(value, dict):
+        return {key: _redact_artifact(item, api_key) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_artifact(item, api_key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_artifact(item, api_key) for item in value)
+    return value
+
+
 def call_document(cached):
     metadata = {key: value for key, value in cached.items() if key != "response"}
-    return {**metadata, **cached["response"].__dict__,
-            "error": _safe_error(cached["response"].error)}
+    document = {**metadata, **cached["response"].__dict__,
+                "error": _safe_error(cached["response"].error)}
+    # Important：calls 必须保留完整 ResponseRecord（方案要求含 body），而 body/error 可能
+    # 回显 API key；在唯一出口统一递归脱敏，equivalence.json 及任何 calls 消费者都拿到干净值。
+    return _redact_artifact(document, _ARTIFACT_KEY)
 
 
 def _question_node(key, question):
@@ -983,6 +1010,26 @@ def _scan_n(transport, state, questions, repeats):
     }
 
 
+def _scan_abort_entry(questions, repeats, error):
+    """C1：探测被熔断时的占位 entry；没有响应样本，所有延迟/用量字段为 None/空。"""
+    return {
+        "question_count": len(questions),
+        "requests": repeats,
+        "p50_ms": None,
+        "p95_ms": None,
+        "max_ms": None,
+        "input_tokens": _token_stats([], repeats),
+        "http_errors": 0,
+        "transport_errors": 0,
+        "timeouts": 0,
+        "answer_errors": 0,
+        "errors": 1,
+        "error_rate": 1.0,
+        "status": None,
+        "error": _safe_error(error),
+    }
+
+
 def _prefix_tree(tree, question_count):
     """G3 的前 question_count 问前缀图：保留 start/q1..qN、激活边和 error_fallback target。"""
     if isinstance(question_count, bool) or not isinstance(question_count, int) or question_count < 1:
@@ -1198,15 +1245,30 @@ def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers
         # 安全偏离方案字面：超窗 N 只发 1 次探测（单次 5xx 无法满足两连击熔断），不参与 pass 判定。
         predicted = estimate_tokens(state + "\n" + canonical_questions(questions))
         if predicted > context_tokens:
-            entry = _scan_n(transport, state, questions, 1)
+            # C1：探测前清零连续失败计数。上一个 N（尤其 N=16）的 5xx 会留下 _consecutive_5xx=1，
+            # 若探测也 5xx，就会叠成“两连击”并在探测处误中止整轮。
+            reset_breaker = getattr(transport, "reset_breaker", None)
+            if callable(reset_breaker):
+                reset_breaker()
+            try:
+                entry = _scan_n(transport, state, questions, 1)
+            except SpikeAbort:
+                # 防御：即使探测自身被熔断也不能废掉整轮；记录 status=None/error=spike_abort，
+                # 不重新抛出。BudgetExceeded 是预算控制信号，必须照常上抛。
+                entry = _scan_abort_entry(questions, 1, "spike_abort")
+            finally:
+                # C1：探测的 5xx（或防御捕获的 abort）不得给后续并发阶段留下已点亮的计数器。
+                if callable(reset_breaker):
+                    reset_breaker()
             entry.update({
                 "requests": 1,
                 "skipped_repeats": scan_repeats - 1,
                 "expected_over_context": True,
                 "predicted_wire_est_tokens": predicted,
                 "pass": None,
-                "status": "over_context_probe",
             })
+            # 正常探测（含单次 5xx）标记为 over_context_probe；被防御捕获的 abort 保留 status=None。
+            entry.setdefault("status", "over_context_probe")
         else:
             entry = _scan_n(transport, state, questions, scan_repeats)
             entry.update({
