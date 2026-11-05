@@ -417,3 +417,88 @@ def test_capacity_observations_use_the_posted_rendered_state():
         assert row["wire_est_tokens"] == spike.estimate_tokens(rendered + "\n" + canonical)
         # 模板开销必须计入：用它估算裸 state_text 会系统性偏小。
         assert row["wire_est_tokens"] > spike.estimate_tokens(state_text + "\n" + canonical)
+
+
+def test_over_context_probe_cannot_inherit_consecutive_5xx(monkeypatch):
+    """C1：N=16 的 5xx 不得与 N=32 探测叠成两连击；探测 5xx 也不能给后续阶段留计数。"""
+    import scripts.spike_jev_batch as spike
+
+    posted_question_counts = []
+
+    def answers_from(payload):
+        answers = {}
+        for key, wire in payload["questions"].items():
+            if wire["type"] == "choice":
+                labels = list(wire["criteria"])
+                answers[key] = {
+                    "type": "choice",
+                    "probabilities": {label: 1.0 if index == 0 else 0.0
+                                      for index, label in enumerate(labels)},
+                }
+            elif wire["type"] == "noul":
+                answers[key] = {"type": "noul", "noul": 0.6}
+            else:
+                answers[key] = {
+                    "type": "score", "score": 0,
+                    "legend": {str(index): value
+                               for index, value in enumerate(wire["criteria"])},
+                }
+        return {"answers": answers, "usage": {"input_tokens": 100}}
+
+    def fake_urlopen(request, timeout):
+        payload = json.loads(request.data)
+        count = len(payload["questions"])
+        posted_question_counts.append(count)
+        # N=16 扫描留下 _consecutive_5xx=1；N=32 探测若继承该计数就会被误判为两连击。
+        if count in (16, 32):
+            raise urllib.error.HTTPError(request.full_url, 500, "boom", None, BytesIO(b"{}"))
+        return FakeHTTPResponse(answers_from(payload))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    transport = SpikeTransport("http://jev.test", "d1-2B", sleep_seconds=0)
+    capacity = spike.run_capacity(
+        transport, build_question_groups(), build_g3_tree(),
+        scan_repeats=1, rounds=1, workers=1)
+
+    # 扫描恰好 N=1,2,4,8,16 + 1 次探测，且没有 SpikeAbort 逃逸（否则 run_capacity 会抛异常）。
+    assert posted_question_counts[:6] == [1, 2, 4, 8, 16, 32]
+    assert transport.stage_counts["H2-scan"] == 6
+    probe = capacity["scan"]["by_n"]["32"]
+    assert probe["requests"] == 1
+    assert probe["status"] == "over_context_probe"
+    assert probe["expected_over_context"] is True
+    assert probe["http_errors"] == 1
+    assert probe["errors"] == 1
+    assert probe["zero_errors"] is False
+
+
+def test_call_document_redacts_api_key_from_body_and_error(monkeypatch):
+    """Important：calls 保留完整 ResponseRecord（含 body），但任何位置的 key 都要变成 ***。"""
+    import scripts.spike_jev_batch as spike
+
+    secret = "sk-SECRET-ABC"
+    cached = {
+        "sample_id": "s1", "group": "G1", "path": "A", "question_id": "*",
+        "question_count": 1, "state_est_tokens": 10, "wire_est_tokens": 20,
+        "response": ResponseRecord(
+            "H1-A", 500,
+            {"error": "Authorization: Bearer " + secret,
+             "echo": {"nested": ["token=" + secret, 7]},
+             "usage": {"input_tokens": 5}},
+            "server echoed " + secret, 1.0, 5),
+    }
+
+    monkeypatch.setattr(spike, "_ARTIFACT_KEY", secret)
+    document = spike.call_document(cached)
+    serialized = json.dumps(document, ensure_ascii=False)
+    assert secret not in serialized
+    assert "***" in serialized
+    assert document["body"]["error"] == "Authorization: Bearer ***"
+    assert document["body"]["echo"]["nested"][0] == "token=***"
+    assert document["body"]["echo"]["nested"][1] == 7
+    assert document["error"] == "server echoed ***"
+
+    # 空 key（未配置密钥）时 body 明文原样透传，脱敏不得改动正常产物。
+    monkeypatch.setattr(spike, "_ARTIFACT_KEY", "")
+    passthrough = spike.call_document(cached)
+    assert passthrough["body"] == cached["response"].body
