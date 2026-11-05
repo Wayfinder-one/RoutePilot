@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import copy
 import hashlib
 import json
 import math
+import os
+import sys
 import threading
 import time
 import urllib.error
@@ -24,7 +27,7 @@ from router.jev.client import (
     parse_answer,
 )
 from router.jev.config import DEFAULT_STATE_TEMPLATE, JevSettings
-from router.jev.window import estimate_tokens
+from router.jev.window import apply_window, estimate_tokens
 from router.routing.affinity import SessionAffinity
 from router.routing.graph.conditions import evaluate_condition
 from router.routing.graph.engine import GraphExecutionEngine
@@ -142,8 +145,8 @@ def build_question_groups():
     }
 
 
-def build_g3_tree():
-    default, logic, _ = _source_trees()
+def _g3_tree_dict():
+    """G3 fixture 的原始 dict：既用于建图，也原样写进 g3-graph.json。"""
     default_raw = _load_json("configs/default_routing_tree.json")["root"]
     logic_raw = _load_json("configs/cases/case-logic.json")["root"]
     choice = next(node for node in default_raw["nodes"] if node.get("id") == "capability")
@@ -166,9 +169,13 @@ def build_g3_tree():
         {"id": "e4", "source": "q4", "source_port": "value", "target": "t-review", "target_port": "in_1", "condition": {"op": "gt", "value": 4}},
         {"id": "e5", "source": "q4", "source_port": "value", "target": "t-normal", "target_port": "in_1", "condition": {"op": "lte", "value": 4}},
     ]
-    return tree_from_dict({"id": "g3", "name": "G3", "enabled": True,
-                           "root": {"id": "root", "type": "graph", "nodes": nodes, "edges": edges,
-                                    "error_fallback": "t-error"}})
+    return {"id": "g3", "name": "G3", "enabled": True,
+            "root": {"id": "root", "type": "graph", "nodes": nodes, "edges": edges,
+                     "error_fallback": "t-error"}}
+
+
+def build_g3_tree():
+    return tree_from_dict(_g3_tree_dict())
 
 
 @dataclass
@@ -1203,3 +1210,718 @@ def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers
         else "fail"
     )
     return {"scan": scan, "concurrency": concurrency}
+
+
+_CONTEXT_TOKENS = 4096
+_INPUT_TOKENS = 2048
+_MIN_INPUT_TOKENS = 256
+_DEFAULT_SAFETY = 128
+_H3_RESERVE = 200
+_COVERAGE_STATES = (256, 1024, 2048)
+_COVERAGE_COUNTS = (1, 2, 4, 8)
+_COVERAGE_GROUPS = ("G1", "G2")
+_BOUNDARY_TARGETS = (("near", 3900), ("at", 4096), ("over", 4352))
+_H3_COVERAGE_STAGE = "H3-coverage"
+_H3_BOUNDARY_STAGE = "H3-boundary"
+_H3_PROBE_STAGE = "H3-probe"
+_API_KEY_ENV = "ROUTER_JEV_API_KEY"
+# 合成文本只描述“用于测量窗口预算”，不含任何用户请求内容。
+_SYNTHETIC_CLAUSE = "这是用于测量决策服务窗口预算的合成文本，不含任何真实用户数据。"
+
+
+@dataclass(frozen=True)
+class BudgetDecision:
+    enabled: bool
+    effective_context: int
+    state_budget: int
+    raw_overhead: int
+
+
+def window_budget(context, input_tokens, raw_overhead, calibration, safety):
+    if min(context, input_tokens, raw_overhead) < 0 or calibration < 1 or safety < 0:
+        raise ValueError("invalid budget arguments")
+    effective = math.floor((context - safety) / calibration)
+    return BudgetDecision(
+        enabled=raw_overhead + 256 <= effective,
+        effective_context=effective,
+        state_budget=min(input_tokens, effective - raw_overhead),
+        raw_overhead=raw_overhead,
+    )
+
+
+def calibrate_budget(records, safety=128):
+    usable = [dict(item) for item in records
+              if item.get("status") == 200 and isinstance(item.get("input_tokens"), int)
+              and item["input_tokens"] > 0
+              and isinstance(item.get("wire_est_tokens"), int) and item["wire_est_tokens"] > 0]
+    if not usable:
+        raise ValueError("no usable token observations")
+    calibration = max(1.0, max(item["input_tokens"] / item["wire_est_tokens"] for item in usable))
+    return {"calibration": calibration, "safety": safety, "records": usable,
+            "max_est_over_actual": max(item["wire_est_tokens"] / item["input_tokens"] for item in usable)}
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+
+
+def _state_bucket(tokens):
+    if tokens <= (_COVERAGE_STATES[0] + _COVERAGE_STATES[1]) // 2:
+        return _COVERAGE_STATES[0]
+    if tokens <= (_COVERAGE_STATES[1] + _COVERAGE_STATES[2]) // 2:
+        return _COVERAGE_STATES[1]
+    return _COVERAGE_STATES[2]
+
+
+def _count_bucket(count):
+    return count if count in _COVERAGE_COUNTS else None
+
+
+def _coverage_cells(observations):
+    cells = []
+    for group in _COVERAGE_GROUPS:
+        for state in _COVERAGE_STATES:
+            for count in _COVERAGE_COUNTS:
+                matches = [
+                    row for row in observations
+                    if row.get("group") == group
+                    and isinstance(row.get("state_est_tokens"), int)
+                    and _state_bucket(row["state_est_tokens"]) == state
+                    and _count_bucket(row.get("question_count")) == count
+                    and row.get("status") == 200
+                    and isinstance(row.get("input_tokens"), int)
+                ]
+                cells.append({
+                    "group": group, "state_tokens": state, "question_count": count,
+                    "covered": bool(matches), "source": "reused" if matches else "missing",
+                    "observations": len(matches),
+                    "refs": [
+                        {"source": item.get("source"), "stage": item.get("stage"),
+                         "sample_id": item.get("sample_id"),
+                         "state_est_tokens": item.get("state_est_tokens"),
+                         "input_tokens": item.get("input_tokens")}
+                        for item in matches[:3]
+                    ],
+                    "fill": None,
+                })
+    return cells
+
+
+def _observations_from_calls(calls):
+    rows = []
+    for call in calls:
+        rows.append({
+            "source": "H1", "stage": call.get("stage"), "sample_id": call.get("sample_id"),
+            "group": call.get("group"), "path": call.get("path"),
+            "question_id": call.get("question_id"), "question_count": call.get("question_count"),
+            "state_est_tokens": call.get("state_est_tokens"),
+            "wire_est_tokens": call.get("wire_est_tokens"),
+            "status": call.get("status"), "input_tokens": call.get("input_tokens"),
+            "duration_ms": call.get("duration_ms"), "error": call.get("error"),
+        })
+    return rows
+
+
+def _observations_from_capacity(capacity, groups):
+    scan = (capacity or {}).get("scan") or {}
+    state_text = scan.get("state_text")
+    state_est = scan.get("state_est_tokens")
+    rows = []
+    if not isinstance(state_text, str):
+        return rows
+    for key, entry in (scan.get("by_n") or {}).items():
+        n = int(key)
+        questions = expand_questions(groups["G2"], n)
+        wire_est = estimate_tokens(state_text + "\n" + canonical_questions(questions))
+        for value in (entry.get("input_tokens") or {}).get("values") or []:
+            rows.append({
+                "source": "H2", "stage": _CAPACITY_SCAN_STAGE, "sample_id": None,
+                "group": "G2", "path": "scan", "question_id": "*",
+                "question_count": n, "state_est_tokens": state_est,
+                "wire_est_tokens": wire_est, "status": 200, "input_tokens": value,
+                "duration_ms": None, "error": None,
+            })
+    return rows
+
+
+def _observation_from_cached(cached, *, source):
+    return {
+        "source": source, "stage": cached["response"].stage, "sample_id": cached["sample_id"],
+        "group": cached["group"], "path": cached["path"], "question_id": cached["question_id"],
+        "question_count": cached["question_count"], "state_est_tokens": cached["state_est_tokens"],
+        "wire_est_tokens": cached["wire_est_tokens"], "status": cached["response"].status,
+        "input_tokens": cached["response"].input_tokens,
+        "duration_ms": cached["response"].duration_ms, "error": cached["response"].error,
+    }
+
+
+def _synthetic_text(target_state_tokens):
+    """生成 state 估算恰为 target_state_tokens 的非敏感合成文本。"""
+    if isinstance(target_state_tokens, bool) or not isinstance(target_state_tokens, int) \
+            or target_state_tokens < 1:
+        raise ValueError("target_state_tokens must be a positive integer")
+    base_tokens = estimate_tokens(DEFAULT_STATE_TEMPLATE.format(request=""))
+    needed = target_state_tokens - base_tokens
+    if needed <= 0:
+        return ""
+    clause = _SYNTHETIC_CLAUSE
+    text = (clause * math.ceil(needed / len(clause)))[:needed]
+    while text and estimate_tokens(DEFAULT_STATE_TEMPLATE.format(request=text)) > target_state_tokens:
+        text = text[:-1]
+    tokens = estimate_tokens(DEFAULT_STATE_TEMPLATE.format(request=text))
+    if tokens != target_state_tokens:
+        raise ValueError(f"synthetic text estimates {tokens} tokens, expected {target_state_tokens}")
+    return text
+
+
+def _raw_overhead(questions):
+    return estimate_tokens(canonical_questions(questions) + "\n"
+                           + DEFAULT_STATE_TEMPLATE.format(request=""))
+
+
+def _windowed_payload(text, questions, *, context_tokens, input_tokens, calibration, safety):
+    """按生产窗口公式给出一次请求的窗口化 state 与预测值。"""
+    raw_overhead = _raw_overhead(questions)
+    decision = window_budget(context_tokens, input_tokens, raw_overhead, calibration, safety)
+    raw_state_est = estimate_tokens(render_state(text))
+    post_window_est = raw_overhead + min(raw_state_est, decision.state_budget)
+    gate_passed = bool(decision.enabled) and post_window_est <= decision.effective_context
+    payload = {
+        "raw_overhead": raw_overhead,
+        "raw_state_est_tokens": raw_state_est,
+        "raw_total_est_tokens": raw_state_est + raw_overhead,
+        "effective_context": decision.effective_context,
+        "state_budget": decision.state_budget,
+        "enabled": bool(decision.enabled),
+        "post_window_est": post_window_est,
+        "gate_passed": gate_passed,
+        "truncated": False,
+        "sent_state_est_tokens": None,
+        "state": None,
+    }
+    if gate_passed:
+        windowed = apply_window(text, decision.state_budget)
+        state = render_state(windowed.text)
+        payload["truncated"] = bool(windowed.truncated)
+        payload["state"] = state
+        payload["sent_state_est_tokens"] = estimate_tokens(state)
+    return payload
+
+
+def _public_payload(payload):
+    """请求记录只保留可序列化的预测值，不落 state 原文。"""
+    return {key: value for key, value in payload.items() if key != "state"}
+
+
+def _gate_check(entry, calibration, context_tokens, input_tokens, safety):
+    """用最终 CALIBRATION 复核一次正常请求是否会被窗口公式拦截。"""
+    raw_overhead = entry.get("raw_overhead")
+    state_est = entry.get("sent_state_est_tokens")
+    if not isinstance(state_est, int):
+        state_est = entry.get("raw_state_est_tokens")
+    if not isinstance(raw_overhead, int) or not isinstance(state_est, int):
+        return False
+    decision = window_budget(context_tokens, input_tokens, raw_overhead, calibration, safety)
+    post_window_est = raw_overhead + min(state_est, decision.state_budget)
+    return bool(decision.enabled) and post_window_est <= decision.effective_context
+
+
+def _observation_label(row):
+    return "/".join(str(row.get(key)) for key in ("source", "group", "question_id", "stage"))
+
+
+def _error_message(record):
+    body = record.body
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("type")
+        elif isinstance(error, str):
+            message = error
+        else:
+            message = body.get("detail") or body.get("message")
+        if isinstance(message, str) and message:
+            return message[:300]
+    return record.error[:300] if record.error else None
+
+
+def _run_coverage_fill(transport, cache, groups, rows, cells, *, context_tokens, input_tokens,
+                       calibration, safety, spent, reserve):
+    """按覆盖矩阵补齐缺失组合；返回 (请求记录, 已用额度)。"""
+    requests = []
+    for cell in cells:
+        if cell["covered"]:
+            continue
+        if spent >= reserve:
+            cell["fill"] = {"sent": False, "status": None, "reason": "reserve exhausted"}
+            requests.append({"group": cell["group"], "question_count": cell["question_count"],
+                             "target_state_tokens": cell["state_tokens"], "status": None,
+                             "error": "reserve exhausted", "gate_passed": None,
+                             "skipped": True, "route_usable": True,
+                             "intentional_over_limit": False})
+            continue
+        questions = expand_questions(groups[cell["group"]], cell["question_count"])
+        text = _synthetic_text(cell["state_tokens"])
+        payload = _windowed_payload(text, questions, context_tokens=context_tokens,
+                                    input_tokens=input_tokens, calibration=calibration,
+                                    safety=safety)
+        entry = {"group": cell["group"], "question_count": cell["question_count"],
+                 "target_state_tokens": cell["state_tokens"], "route_usable": True,
+                 "intentional_over_limit": False, **_public_payload(payload),
+                 "wire_est_tokens": None, "status": None, "error": None,
+                 "input_tokens": None, "duration_ms": None}
+        if payload["gate_passed"]:
+            cached = _call(
+                transport, cache,
+                ("H3", "coverage", cell["group"], cell["question_count"], cell["state_tokens"]),
+                stage=_H3_COVERAGE_STAGE, state=payload["state"], questions=questions,
+                sample_id=f"synthetic-{cell['group']}-{cell['state_tokens']}-{cell['question_count']}",
+                group=cell["group"], path="H3-coverage", question_id="*",
+            )
+            spent += 1
+            record = cached["response"]
+            entry.update({
+                "status": record.status, "error": record.error,
+                "input_tokens": record.input_tokens,
+                "wire_est_tokens": cached["wire_est_tokens"],
+                "sent_state_est_tokens": cached["state_est_tokens"],
+                "duration_ms": record.duration_ms,
+            })
+            rows.append(_observation_from_cached(cached, source="H3-coverage"))
+        else:
+            entry["error"] = "window gate intercepted"
+        cell["fill"] = {"sent": payload["gate_passed"], "status": entry["status"],
+                        "source": "synthetic",
+                        "sent_state_est_tokens": entry["sent_state_est_tokens"]}
+        if entry["status"] == 200:
+            cell["covered"] = True
+            cell["source"] = "synthetic"
+        requests.append(entry)
+    return requests, spent
+
+
+def run_budget(transport, groups, tree, *, observations=(), cache=None,
+               context_tokens=_CONTEXT_TOKENS, input_tokens=_INPUT_TOKENS,
+               safety=_DEFAULT_SAFETY, reserve=_H3_RESERVE):
+    """H3：复用 H1/H2 token 观测做校准，补齐覆盖矩阵，验证窗口公式与 4096 边界。"""
+    if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
+        raise ValueError("reserve must be a nonnegative integer")
+    if context_tokens < _MIN_INPUT_TOKENS or input_tokens < _MIN_INPUT_TOKENS:
+        raise ValueError("context_tokens and input_tokens must be >= 256")
+    for name in _COVERAGE_GROUPS + ("G3",):
+        if name not in groups:
+            raise ValueError(f"unknown question group {name!r}")
+    tree_ids = {node.id for node in tree.root.nodes if isinstance(node, QuestionNode)}
+    if set(groups["G3"]) != tree_ids:
+        raise ValueError("G3 question group does not match the routing tree")
+
+    cache = {} if cache is None else cache
+    rows = [dict(item) for item in observations]
+    counts = {"reused_observations": len(rows), "coverage_requests": 0,
+              "boundary_requests": 0, "probe_requests": 0, "route_usable_samples": 0}
+    fail_reasons = []
+    conditional_reasons = []
+    spent = 0
+
+    cells = _coverage_cells(rows)
+    try:
+        provisional = calibrate_budget(rows, safety=safety)["calibration"]
+    except ValueError:
+        provisional = 1.0
+
+    coverage_requests, spent = _run_coverage_fill(
+        transport, cache, groups, rows, cells, context_tokens=context_tokens,
+        input_tokens=input_tokens, calibration=provisional, safety=safety,
+        spent=spent, reserve=reserve,
+    )
+    counts["coverage_requests"] = spent
+
+    calibration = None
+    try:
+        calibration = calibrate_budget(rows, safety=safety)
+    except ValueError as exc:
+        fail_reasons.append(f"calibration: {exc}")
+    coefficient = calibration["calibration"] if calibration else 1.0
+    g3_raw_overhead = _raw_overhead(groups["G3"])
+    decision = window_budget(context_tokens, input_tokens, g3_raw_overhead, coefficient, safety)
+
+    intercepts = []
+    for entry in coverage_requests:
+        if entry.get("skipped"):
+            continue
+        entry["final_gate_passed"] = _gate_check(
+            entry, coefficient, context_tokens, input_tokens, safety)
+        if not entry["final_gate_passed"]:
+            intercepts.append(entry)
+
+    boundaries = []
+    for kind, target in _BOUNDARY_TARGETS:
+        state_target = max(1, target - g3_raw_overhead)
+        text = _synthetic_text(state_target)
+        payload = _windowed_payload(text, groups["G3"], context_tokens=context_tokens,
+                                    input_tokens=input_tokens, calibration=coefficient,
+                                    safety=safety)
+        entry = {"kind": kind, "target_total_tokens": target,
+                 "target_state_tokens": state_target, "route_usable": True,
+                 "intentional_over_limit": False, **_public_payload(payload),
+                 "wire_est_tokens": None, "status": None, "error": None,
+                 "input_tokens": None, "duration_ms": None}
+        entry["identified_over_context"] = entry["raw_total_est_tokens"] > context_tokens
+        entry["identified_over_effective"] = entry["raw_total_est_tokens"] > decision.effective_context
+        if payload["gate_passed"] and spent < reserve:
+            cached = _call(
+                transport, cache, ("H3", "boundary", kind), stage=_H3_BOUNDARY_STAGE,
+                state=payload["state"], questions=groups["G3"],
+                sample_id=f"synthetic-boundary-{kind}", group="G3",
+                path="H3-boundary", question_id="*",
+            )
+            spent += 1
+            record = cached["response"]
+            entry.update({
+                "status": record.status, "error": record.error,
+                "input_tokens": record.input_tokens,
+                "wire_est_tokens": cached["wire_est_tokens"],
+                "sent_state_est_tokens": cached["state_est_tokens"],
+                "duration_ms": record.duration_ms,
+            })
+            rows.append(_observation_from_cached(cached, source="H3-boundary"))
+        else:
+            entry["error"] = (
+                "window gate intercepted" if not payload["gate_passed"] else "reserve exhausted")
+            if payload["gate_passed"]:
+                conditional_reasons.append(f"reserve exhausted before boundary {kind}")
+        entry["final_gate_passed"] = _gate_check(
+            entry, coefficient, context_tokens, input_tokens, safety)
+        if not entry["final_gate_passed"]:
+            intercepts.append(entry)
+        boundaries.append(entry)
+    counts["boundary_requests"] = sum(1 for entry in boundaries if entry["status"] is not None)
+
+    probe = None
+    over_target = _BOUNDARY_TARGETS[-1][1]
+    raw_text = _synthetic_text(max(1, over_target - g3_raw_overhead))
+    raw_state = render_state(raw_text)
+    raw_state_est = estimate_tokens(raw_state)
+    ratio = calibration["max_est_over_actual"] if calibration else 1.0
+    raw_total_est = raw_state_est + g3_raw_overhead
+    actual_lower_bound = raw_total_est / ratio if ratio > 0 else raw_total_est
+    prediction = {
+        "raw_state_est_tokens": raw_state_est,
+        "raw_total_est_tokens": raw_total_est,
+        "est_over_actual_upper": ratio,
+        "predicted_actual_lower_bound": actual_lower_bound,
+        "predicted_over_context": raw_total_est > context_tokens,
+        "predicted_over_effective": raw_total_est > decision.effective_context,
+        "expected": "error" if actual_lower_bound > context_tokens else "uncertain",
+    }
+    probe = {"kind": "over_raw_probe", "intentional_over_limit": True, "route_usable": False,
+             "excluded_from_route_usable": True, "sent": False,
+             "excluded_reason": "intentional_over_limit", "prediction": prediction,
+             "status": None, "error": None, "error_code": None, "error_message": None,
+             "input_tokens": None, "wire_est_tokens": None, "state_est_tokens": None,
+             "duration_ms": None, "prediction_matched": None}
+    if spent >= reserve:
+        conditional_reasons.append("reserve exhausted before over-limit probe")
+    if spent < reserve:
+        cached = _call(
+            transport, cache, ("H3", "probe", "over"), stage=_H3_PROBE_STAGE,
+            state=raw_state, questions=groups["G3"],
+            sample_id="synthetic-over-limit-probe", group="G3",
+            path="H3-probe", question_id="*",
+        )
+        spent += 1
+        record = cached["response"]
+        if prediction["expected"] == "error":
+            matched = record.status is not None and record.status >= 400
+        else:
+            matched = record.status is not None
+        probe.update({
+            "sent": True, "status": record.status, "error": record.error,
+            "error_code": record.status, "error_message": _error_message(record),
+            "input_tokens": record.input_tokens, "wire_est_tokens": cached["wire_est_tokens"],
+            "state_est_tokens": cached["state_est_tokens"],
+            "accepted_by_server": record.status == 200,
+            "duration_ms": record.duration_ms, "prediction_matched": matched,
+        })
+        rows.append(_observation_from_cached(cached, source="H3-probe"))
+        if record.status is None:
+            conditional_reasons.append(
+                "over-limit probe produced no HTTP status; error body not verified")
+        elif prediction["expected"] == "error" and record.status == 200:
+            conditional_reasons.append(
+                "over-limit probe was accepted although the calibrated lower bound exceeds context")
+
+    for entry in coverage_requests + boundaries + [probe]:
+        est = entry.get("wire_est_tokens")
+        actual = entry.get("input_tokens")
+        if isinstance(est, int) and isinstance(actual, int) and est > 0:
+            entry["upper_bound_tokens"] = est * coefficient + safety
+            entry["within_upper_bound"] = actual <= entry["upper_bound_tokens"]
+
+    violations = []
+    missing_usage = 0
+    for row in rows:
+        if row.get("status") == 200 and not isinstance(row.get("input_tokens"), int):
+            missing_usage += 1
+        est = row.get("wire_est_tokens")
+        actual = row.get("input_tokens")
+        if isinstance(est, int) and isinstance(actual, int) and est > 0:
+            row["upper_bound_tokens"] = est * coefficient + safety
+            row["within_upper_bound"] = actual <= row["upper_bound_tokens"]
+            if not row["within_upper_bound"]:
+                violations.append(row)
+    if violations:
+        fail_reasons.append(
+            f"{len(violations)} observation(s) above calibrated upper bound "
+            f"({_observation_label(violations[0])})")
+    if missing_usage:
+        conditional_reasons.append(
+            f"{missing_usage} successful observation(s) missing usage.input_tokens")
+
+    counts["probe_requests"] = 1 if probe["sent"] else 0
+    counts["route_usable_samples"] = (
+        sum(1 for entry in coverage_requests if entry["status"] == 200)
+        + sum(1 for entry in boundaries if entry["status"] == 200))
+    counts["h3_requests"] = spent
+    counts["reserve_used"] = spent
+    counts["reserve_remaining"] = reserve - spent
+    counts["intentional_over_limit"] = counts["probe_requests"]
+    if spent > reserve:
+        fail_reasons.append(f"H3 used {spent} requests, above reserve {reserve}")
+
+    if intercepts:
+        fail_reasons.append(
+            f"{len(intercepts)} normal request(s) must be intercepted by the window formula")
+    for entry in coverage_requests + boundaries:
+        if entry.get("status") is not None and entry["status"] != 200:
+            fail_reasons.append(
+                f"{entry.get('kind') or entry.get('group')} normal request returned "
+                f"status {entry['status']}")
+    reused_cells = sum(1 for cell in cells if cell["observations"] > 0)
+    filled_cells = sum(1 for cell in cells if cell["source"] == "synthetic" and cell["covered"])
+    covered_cells = sum(1 for cell in cells if cell["covered"])
+    incomplete = len(cells) - covered_cells
+    if incomplete:
+        conditional_reasons.append(f"{incomplete} coverage cell(s) not measured")
+
+    if fail_reasons:
+        status = "fail"
+    elif conditional_reasons:
+        status = "conditional"
+    else:
+        status = "pass"
+
+    coverage = {
+        "states": list(_COVERAGE_STATES), "counts": list(_COVERAGE_COUNTS),
+        "groups": list(_COVERAGE_GROUPS), "cells": cells,
+        "total_cells": len(cells), "covered_cells": covered_cells,
+        "reused_cells": reused_cells, "synthetic_cells": filled_cells,
+        "complete": incomplete == 0, "requests": coverage_requests,
+    }
+    formula = {
+        "context_tokens": context_tokens, "input_tokens": input_tokens, "safety": safety,
+        "calibration": coefficient, "raw_overhead": g3_raw_overhead,
+        "effective_context": decision.effective_context,
+        "state_budget": decision.state_budget, "enabled": bool(decision.enabled),
+        "min_input_tokens": _MIN_INPUT_TOKENS,
+        "effective_context_formula": "floor((context_tokens - SAFETY) / CALIBRATION)",
+        "state_budget_formula": "min(input_tokens, effective_context - raw_overhead)",
+        "enabled_formula": "raw_overhead + MIN_INPUT_TOKENS <= effective_context",
+        "post_window_formula": "raw_overhead + min(state_est_tokens, state_budget)",
+        "intercept_condition": "enabled is False or post_window_est > effective_context",
+        "wire_serialization": "json.dumps(..., ensure_ascii=False, separators=(',', ':'))",
+        "token_estimator": "router.jev.window.estimate_tokens",
+        "boundary_targets": [{"kind": kind, "total_tokens": total}
+                             for kind, total in _BOUNDARY_TARGETS],
+    }
+    return {
+        "status": status,
+        "fail_reasons": fail_reasons,
+        "conditional_reasons": conditional_reasons,
+        "formula": formula,
+        "calibration": calibration,
+        "coverage": coverage,
+        "boundaries": boundaries,
+        "probes": [probe],
+        "observations": rows,
+        "counts": counts,
+        "reserve": {"limit": reserve, "used": spent, "remaining": reserve - spent},
+    }
+
+
+def _capacity_status(capacity):
+    scan = (capacity or {}).get("scan") or {}
+    concurrency = (capacity or {}).get("concurrency") or {}
+    if scan.get("status") == "pass" and concurrency.get("status") == "pass":
+        return "pass"
+    return "fail"
+
+
+def _safe_message(exc, api_key=""):
+    """异常信息脱敏：不出现 Authorization header 或 API key。"""
+    message = str(exc)
+    if api_key:
+        message = message.replace(api_key, "***")
+    for marker in ("Authorization:", "Bearer "):
+        head, separator, _ = message.partition(marker)
+        if separator:
+            message = head + marker + "***"
+    return message[:500]
+
+
+def _build_parser():
+    parser = argparse.ArgumentParser(
+        prog="spike_jev_batch",
+        description="JEV 多问题批量 spike：H1 等价性 / H2 容量 / H3 预算；--dry-run 只打印请求计划。",
+    )
+    parser.add_argument("--url", default="http://127.0.0.1:30104")
+    parser.add_argument("--model", default="d1-2B")
+    parser.add_argument("--samples", required=True)
+    parser.add_argument("--scenario", choices=sorted(SCENARIOS), default="all")
+    parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--max-requests", type=int, default=2000)
+    parser.add_argument("--out-dir", default=str(ROOT / "artifacts" / "jev-batch-spike"))
+    parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--dry-run", action="store_true")
+    return parser
+
+
+def _graph_document(groups):
+    return {
+        "tree": _g3_tree_dict(),
+        "questions": {name: json.loads(canonical_questions(value))
+                      for name, value in groups.items()},
+        "wire": {
+            "serialization": "json.dumps(..., ensure_ascii=False, separators=(',', ':'))",
+            "token_estimator": "router.jev.window.estimate_tokens",
+            "state_template": DEFAULT_STATE_TEMPLATE,
+        },
+    }
+
+
+def main(argv=None):
+    args = _build_parser().parse_args(argv)
+    if args.repeats != 2:
+        print("--repeats 只接受 2（保留该参数以兼容方案命令，不翻倍 A/B）", file=sys.stderr)
+        return 2
+    if args.limit < 0 or args.max_requests < 1 or not 0 < args.timeout <= 120:
+        print("--limit 必须 >=0，--max-requests 必须 >=1，--timeout 必须在 (0,120]", file=sys.stderr)
+        return 2
+    try:
+        samples = load_samples(Path(args.samples), args.limit)
+        plan = plan_request_budget(len(samples), args.scenario)
+    except (OSError, ValueError) as exc:
+        print(f"样本或参数错误：{exc}", file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "planned_requests": plan.total,
+        "by_stage": {"h1": plan.h1, "repeats": plan.repeats, "scan": plan.scan,
+                     "concurrency": plan.concurrency, "reserve": plan.reserve},
+        "max_requests": args.max_requests,
+    }, ensure_ascii=False))
+    if plan.total > args.max_requests:
+        print(f"计划请求数 {plan.total} 超过 --max-requests {args.max_requests}", file=sys.stderr)
+        return 2
+    if args.dry_run:
+        return 0
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache = {}
+    api_key = os.environ.get(_API_KEY_ENV, "")
+    transport = None
+    statuses = {"equivalence": "not_run", "capacity": "not_run", "budget": "not_run"}
+    started_at = datetime.now().astimezone()
+    parameters = {
+        "url": args.url, "model": args.model, "scenario": args.scenario,
+        "samples": str(args.samples), "sample_count": len(samples), "limit": args.limit,
+        "repeats": args.repeats, "max_requests": args.max_requests,
+        "out_dir": str(out_dir), "timeout": args.timeout,
+        "context_tokens": _CONTEXT_TOKENS, "input_tokens": _INPUT_TOKENS,
+        "safety": _DEFAULT_SAFETY, "h3_reserve": plan.reserve,
+        "api_key_env": _API_KEY_ENV, "api_key_present": bool(api_key),
+    }
+    try:
+        groups = build_question_groups()
+        tree = build_g3_tree()
+        transport = SpikeTransport(args.url, args.model, api_key=api_key,
+                                   timeout=args.timeout, max_requests=args.max_requests)
+        # 首个产物必须是图，方便失败后仍能核对本轮使用的 G3 画布。
+        write_json(out_dir / "g3-graph.json", _graph_document(groups))
+        equivalence = None
+        capacity = None
+        if args.scenario in {"all", "equivalence"}:
+            warmup = None
+            if args.scenario == "all":
+                warmup = run_equivalence(samples[:20], groups, tree, transport, cache=cache,
+                                         group_names=("G1", "G2"), repeat_samples=20)
+            equivalence = run_equivalence(samples, groups, tree, transport, cache=cache,
+                                          group_names=("G1", "G2", "G3"), repeat_samples=20)
+            if warmup is not None:
+                equivalence["warmup"] = {
+                    "samples": len(samples[:20]), "groups": ["G1", "G2"],
+                    "requests": len(warmup["calls"]), "summary": warmup["summary"],
+                }
+            statuses["equivalence"] = equivalence["summary"]["status"]
+            write_json(out_dir / "equivalence.json", equivalence)
+        if args.scenario in {"all", "capacity"}:
+            capacity = run_capacity(transport, groups, tree)
+            statuses["capacity"] = _capacity_status(capacity)
+            write_json(out_dir / "capacity.json", capacity)
+        if args.scenario in {"all", "budget"}:
+            observations = []
+            if equivalence is not None:
+                observations.extend(_observations_from_calls(equivalence["calls"]))
+            if capacity is not None:
+                observations.extend(_observations_from_capacity(capacity, groups))
+            budget_doc = run_budget(transport, groups, tree, observations=observations,
+                                    cache=cache, reserve=plan.reserve)
+            statuses["budget"] = budget_doc["status"]
+            write_json(out_dir / "budget.json", budget_doc)
+    except Exception as exc:
+        message = _safe_message(exc, api_key)
+        write_json(out_dir / "summary.json", {
+            "status": "fail",
+            "statuses": statuses,
+            "planned_requests": plan.total,
+            "actual_requests": transport.count if transport is not None else 0,
+            "stage_counts": dict(transport.stage_counts) if transport is not None else {},
+            "parameters": parameters,
+            "error": {"type": type(exc).__name__, "message": message},
+            "started_at": started_at.isoformat(),
+            "finished_at": datetime.now().astimezone().isoformat(),
+        })
+        print(f"执行失败：{type(exc).__name__}: {message}", file=sys.stderr)
+        return 2
+    if any(value == "fail" for value in statuses.values()):
+        overall = "fail"
+    elif any(value == "conditional" for value in statuses.values()):
+        overall = "conditional"
+    else:
+        overall = "pass"
+    write_json(out_dir / "summary.json", {
+        "status": overall,
+        "statuses": statuses,
+        "planned_requests": plan.total,
+        "actual_requests": transport.count,
+        "stage_counts": dict(transport.stage_counts),
+        "parameters": parameters,
+        "requests": {"planned": plan.total, "actual": transport.count,
+                     "stage_counts": dict(transport.stage_counts),
+                     "reserve": {"limit": plan.reserve}},
+        "artifacts": ["g3-graph.json", "equivalence.json", "capacity.json",
+                      "budget.json", "summary.json"],
+        "started_at": started_at.isoformat(),
+        "finished_at": datetime.now().astimezone().isoformat(),
+    })
+    print(json.dumps({
+        "status": overall, "statuses": statuses, "planned_requests": plan.total,
+        "actual_requests": transport.count,
+    }, ensure_ascii=False))
+    return 0 if overall == "pass" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
