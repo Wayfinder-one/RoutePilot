@@ -16,11 +16,14 @@ from scripts.spike_jev_batch import (
     build_g3_tree,
     build_question_groups,
     condition_passes,
+    expand_questions,
     load_samples,
+    percentile,
     plan_request_budget,
     replay_g3,
     route_outcome,
     run_equivalence,
+    run_live_g3,
     threshold_records,
     wilson_interval,
 )
@@ -204,3 +207,43 @@ def test_threshold_records_keep_gt_and_gte_separate():
     gte = next(row for row in rows if row["op"] == "gte" and row["threshold"] == 0.5)
     assert gt["flipped"] is True
     assert gte["flipped"] is False
+
+
+def test_percentile_uses_nearest_rank():
+    assert percentile([10, 20, 30, 40], 0.5) == 20
+    assert percentile([10, 20, 30, 40], 0.95) == 40
+
+
+def test_expand_questions_has_unique_ids_and_stable_shapes():
+    source = build_question_groups()["G2"]
+    expanded = expand_questions(source, 8)
+    assert list(expanded) == [f"q{i}" for i in range(1, 9)]
+    assert [q.question_type for q in expanded.values()] == [
+        "choice", "score", "noul", "choice", "score", "noul", "choice", "score"
+    ]
+
+
+class EarlyStopTransport:
+    def __init__(self):
+        self.count = 0
+
+    def post(self, state, questions, stage):
+        self.count += 1
+        assert list(questions) == ["q1"]
+        question = questions["q1"]
+        probabilities = {
+            item.label: 0.1 if item.key == "strong" else 0.9
+            for item in question.options
+        }
+        return ResponseRecord(stage, 200, {
+            "answers": {"q1": {"type": "choice", "probabilities": probabilities}},
+            "usage": {"input_tokens": 100},
+        }, None, 1.0, 100)
+
+
+def test_live_current_path_stops_after_failed_activation_condition():
+    fake = EarlyStopTransport()
+    decision, records = run_live_g3(build_g3_tree(), "文本", fake)
+    assert fake.count == 1
+    assert len(records) == 1
+    assert tuple(decision.answers) == ("q1",)
