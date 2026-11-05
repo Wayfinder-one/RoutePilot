@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import math
@@ -9,10 +10,26 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 
-from router.jev.client import DecisionQuestion, JevCandidate, _wire_question
+from router.api.upstream import Backend
+from router.jev.client import (
+    DecisionQuestion,
+    JevCandidate,
+    JevError,
+    _wire_question,
+    parse_answer,
+)
+from router.jev.config import JevSettings
+from router.routing.affinity import SessionAffinity
+from router.routing.graph.conditions import evaluate_condition
+from router.routing.graph.engine import GraphExecutionEngine
+from router.routing.graph.model import Condition, Edge, QuestionNode
 from router.routing.model import tree_from_dict
+from router.routing.scheduler import LoadBalancer
+from router.routing.snapshot import build_snapshot
+from router.routing.types import RoutingRequest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = {"all", "equivalence", "capacity", "budget"}
@@ -230,3 +247,84 @@ class SpikeTransport:
         if isinstance(input_tokens, bool) or not isinstance(input_tokens, int):
             input_tokens = None
         return ResponseRecord(stage, status, body, error, duration, input_tokens)
+
+
+def typed_answer(key, question, record):
+    if record.status != 200 or record.body is None:
+        raise JevError(record.error or f"HTTP {record.status}")
+    return parse_answer(key, question, record.body, record.duration_ms)
+
+
+def g3_snapshot(tree):
+    backend = Backend(url="http://mock.test", headers={}, upstream_name="mock", provider="mock")
+    return build_snapshot(
+        tree=tree, backends={"mock": backend}, time_periods=[],
+        jev=JevSettings("http://jev.test", "d1-2B"), capabilities={},
+        jev_input_tokens=2048, jev_context_tokens=4096,
+    )
+
+
+class ReplayJev:
+    def __init__(self, records, all_questions, strict_all):
+        self.records = records
+        self.all_questions = all_questions
+        self.strict_all = strict_all
+
+    async def choose_many(self, settings, text, questions):
+        if self.strict_all:
+            if set(self.records) != set(self.all_questions):
+                raise JevError("packed record keys do not match G3")
+            parsed = {
+                key: typed_answer(key, question, self.records[key])
+                for key, question in self.all_questions.items()
+            }
+            return {key: parsed[key] for key in questions}
+        return {
+            key: typed_answer(key, question, self.records[key])
+            for key, question in questions.items()
+        }
+
+
+def replay_g3(tree, text, records, *, strict_all):
+    all_questions = {
+        node.id: _as_decision(node) for node in tree.root.nodes
+        if isinstance(node, QuestionNode)
+    }
+    engine = GraphExecutionEngine(
+        ReplayJev(records, all_questions, strict_all), SessionAffinity(), LoadBalancer()
+    )
+    decision = asyncio.run(engine.route(
+        g3_snapshot(tree), RoutingRequest(text),
+        now=datetime.fromisoformat("2026-11-05T12:00:00+08:00"), dry_run=True,
+    ))
+    decision.release()
+    return decision
+
+
+def route_outcome(decision, http_requests):
+    return {
+        "target": decision.target_id,
+        "candidates": [item.target_id for item in decision.candidates],
+        "activated": tuple(decision.answers),
+        "failed": any(wave.failed for wave in decision.waves),
+        "http_requests": http_requests,
+    }
+
+
+def condition_passes(node: QuestionNode, port, op, threshold, value):
+    edge = Edge("metric", node.id, port, "metric", "in_1", Condition(op, threshold))
+    result = evaluate_condition(edge, node, value)
+    if result.status not in {"true", "false"}:
+        raise ValueError(f"invalid metric condition: {result.reason or result.status}")
+    return result.value
+
+
+def wilson_interval(failures, total):
+    if total <= 0 or not 0 <= failures <= total:
+        raise ValueError("require total > 0 and 0 <= failures <= total")
+    z = 1.96
+    p = failures / total
+    denominator = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / denominator
+    half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denominator
+    return max(0.0, center - half), min(1.0, center + half)
