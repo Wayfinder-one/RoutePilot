@@ -13,8 +13,12 @@ from scripts.spike_jev_batch import (
     SpikeTransport,
     build_g3_tree,
     build_question_groups,
+    condition_passes,
     load_samples,
     plan_request_budget,
+    replay_g3,
+    route_outcome,
+    wilson_interval,
 )
 
 
@@ -111,3 +115,39 @@ def test_transport_rejects_request_before_io_at_cap(monkeypatch):
     with pytest.raises(BudgetExceeded):
         transport.post("state", {"urgent": build_question_groups()["G1"]["urgent"]}, "test")
     assert transport.count == 0
+
+
+def test_wilson_zero_flip_still_has_nonzero_upper_bound():
+    low, high = wilson_interval(0, 100)
+    assert low == 0.0
+    assert high == pytest.approx(0.036994807476, abs=1e-12)
+    with pytest.raises(ValueError):
+        wilson_interval(1, 0)
+
+
+def test_condition_gt_and_gte_are_not_merged():
+    tree = build_g3_tree()
+    q3 = next(node for node in tree.root.nodes if node.id == "q3")
+    assert condition_passes(q3, "yes", "gt", 0.5, 0.5) is False
+    assert condition_passes(q3, "yes", "gte", 0.5, 0.5) is True
+
+
+def test_strict_a_validates_all_but_c_ignores_inactive_failures():
+    question = build_question_groups()["G3"]["q1"]
+    probabilities = {
+        candidate.label: 0.1 if candidate.key == "strong" else 0.9
+        for candidate in question.options
+    }
+    q1 = ResponseRecord("test", 200, {
+        "answers": {"q1": {"type": "choice", "probabilities": probabilities}},
+        "usage": {"input_tokens": 10},
+    }, None, 1.0, 10)
+    failed = ResponseRecord("test", 500, None, "HTTP 500", 1.0, None)
+    records = {"q1": q1, "q2": failed, "q3": failed, "q4": failed}
+    tree = build_g3_tree()
+    c_decision = replay_g3(tree, "文本", records, strict_all=False)
+    a_decision = replay_g3(tree, "文本", records, strict_all=True)
+    assert route_outcome(c_decision, len(c_decision.waves))["activated"] == ("q1",)
+    assert route_outcome(c_decision, len(c_decision.waves))["failed"] is False
+    assert route_outcome(a_decision, 1)["failed"] is True
+    assert route_outcome(a_decision, 1)["target"] == "t-error"
