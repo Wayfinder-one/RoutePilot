@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -828,3 +829,377 @@ def run_equivalence(samples, groups, tree, transport, *, cache=None,
         "summary": _equivalence_summary(
             samples, names, comparisons, threshold_rows, routes, invalid, repeats),
     }
+
+
+_CAPACITY_CLAUSE = "用户反馈生产环境的模型路由偶发超时，请结合告警等级和影响范围判断处理优先级。"
+_CAPACITY_TEXT_REPEATS = 10
+_SCAN_NS = (1, 2, 4, 8, 16, 32)
+_SCAN_PASS_NS = (1, 2, 4, 8)
+_CONCURRENCY_NS = (2, 4)
+_CAPACITY_SCAN_STAGE = "H2-scan"
+_CAPACITY_A_STAGE = "H2-A"
+_QPS_FLOOR = 0.7
+
+
+def percentile(values, q):
+    if not values or not 0 < q <= 1:
+        raise ValueError("values must be nonempty and q in (0,1]")
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+
+def expand_questions(questions, n):
+    if not 1 <= n <= 32:
+        raise ValueError("n must be in 1..32")
+    source = list(questions.values())
+    return {f"q{i}": source[(i - 1) % len(source)] for i in range(1, n + 1)}
+
+
+class LiveJev:
+    def __init__(self, transport, state, stage="H2-B"):
+        self.transport = transport
+        self.state = state
+        self.stage = stage
+        self.records = []
+        self.abort = None
+
+    async def choose_many(self, settings, text, questions):
+        try:
+            record = self.transport.post(self.state, questions, self.stage)
+        except (BudgetExceeded, SpikeAbort) as exc:
+            # 引擎会把波次内的所有异常吞成 error_fallback；预算/中止必须留给调用方。
+            self.abort = exc
+            raise
+        self.records.append(record)
+        return {key: typed_answer(key, question, record) for key, question in questions.items()}
+
+
+def run_live_g3(tree, text, transport):
+    live = LiveJev(transport, render_state(text))
+    engine = GraphExecutionEngine(live, SessionAffinity(), LoadBalancer())
+    decision = asyncio.run(engine.route(
+        g3_snapshot(tree), RoutingRequest(text),
+        now=datetime.fromisoformat("2026-11-05T12:00:00+08:00"), dry_run=True,
+    ))
+    decision.release()
+    if live.abort is not None:
+        raise live.abort
+    return decision, live.records
+
+
+def _capacity_state():
+    text = _CAPACITY_CLAUSE * _CAPACITY_TEXT_REPEATS
+    state = render_state(text)
+    tokens = estimate_tokens(state)
+    if not 300 <= tokens <= 500:
+        raise ValueError(f"capacity state estimates {tokens} tokens, expected 300..500")
+    return text, state, tokens
+
+
+def _record_error_kind(record):
+    if record.status == 200 and record.error is None:
+        return None
+    error = (record.error or "").lower()
+    if "timeout" in error or "timed out" in error:
+        return "timeout"
+    if record.status is None or record.status == 200:
+        return "transport"
+    return "http"
+
+
+def _token_stats(values, expected):
+    present = [value for value in values if isinstance(value, int) and not isinstance(value, bool)]
+    return {
+        "observed": len(present),
+        "missing": expected - len(present),
+        "values": present,
+        "min": min(present) if present else None,
+        "p50": percentile(present, 0.5) if present else None,
+        "p95": percentile(present, 0.95) if present else None,
+        "max": max(present) if present else None,
+        "mean": (sum(present) / len(present)) if present else None,
+    }
+
+
+def _scan_n(transport, state, questions, repeats):
+    records = [transport.post(state, questions, _CAPACITY_SCAN_STAGE) for _ in range(repeats)]
+    latencies = [record.duration_ms for record in records]
+    kinds = [_record_error_kind(record) for record in records]
+    answer_errors = 0
+    for record, kind in zip(records, kinds):
+        if kind is not None:
+            continue
+        try:
+            for key, question in questions.items():
+                typed_answer(key, question, record)
+        except JevError:
+            answer_errors += 1
+    errors = sum(1 for kind in kinds if kind is not None) + answer_errors
+    return {
+        "question_count": len(questions),
+        "requests": repeats,
+        "p50_ms": percentile(latencies, 0.5),
+        "p95_ms": percentile(latencies, 0.95),
+        "max_ms": max(latencies),
+        "input_tokens": _token_stats([record.input_tokens for record in records], repeats),
+        "http_errors": sum(1 for kind in kinds if kind == "http"),
+        "transport_errors": sum(1 for kind in kinds if kind == "transport"),
+        "timeouts": sum(1 for kind in kinds if kind == "timeout"),
+        "answer_errors": answer_errors,
+        "errors": errors,
+        "error_rate": errors / repeats,
+    }
+
+
+def _prefix_tree(tree, question_count):
+    """G3 的前 question_count 问前缀图：保留 start/q1..qN、激活边和 error_fallback target。"""
+    if isinstance(question_count, bool) or not isinstance(question_count, int) or question_count < 1:
+        raise ValueError("question_count must be a positive integer")
+    fallback = tree.root.error_fallback
+    if not fallback:
+        raise ValueError("tree has no error_fallback target")
+    nodes_by_id = {node.id: node for node in tree.root.nodes}
+    keep = ["start"] + [f"q{i}" for i in range(1, question_count + 1)] + [fallback]
+    missing = [node_id for node_id in keep if node_id not in nodes_by_id]
+    if missing:
+        raise ValueError(f"tree is missing node {missing[0]!r}")
+    nodes = tuple(nodes_by_id[node_id] for node_id in keep)
+    edges = [edge for edge in tree.root.edges if edge.source == "start" and edge.target == "q1"]
+    for index in range(2, question_count + 1):
+        edges.extend(
+            edge for edge in tree.root.edges
+            if edge.source == f"q{index - 1}" and edge.target == f"q{index}"
+        )
+    if len(edges) < question_count:
+        raise ValueError("tree has no activation edge for every prefix question")
+    return replace(tree, root=replace(tree.root, nodes=nodes, edges=tuple(edges)))
+
+
+def _packed_canvas(transport, state, questions, index):
+    started = time.monotonic()
+    record = transport.post(state, questions, _CAPACITY_A_STAGE)
+    answered = 0
+    error = None
+    if record.status == 200:
+        for key, question in questions.items():
+            try:
+                typed_answer(key, question, record)
+            except JevError:
+                continue
+            answered += 1
+        if answered < len(questions):
+            error = f"incomplete answers {answered}/{len(questions)}"
+    else:
+        error = record.error or f"HTTP {record.status}"
+    latency_ms = (time.monotonic() - started) * 1000
+    return {
+        "index": index,
+        "latency_ms": latency_ms,
+        "question_count": answered,
+        "request_count": 1,
+        "error": error,
+    }
+
+
+def _serial_canvas(tree, text, transport, index):
+    started = time.monotonic()
+    decision, records = run_live_g3(tree, text, transport)
+    latency_ms = (time.monotonic() - started) * 1000
+    failed = [wave for wave in decision.waves if wave.failed]
+    error = (failed[-1].error or "wave failed") if failed else None
+    if not records:
+        error = error or "no requests produced"
+    if len(decision.waves) == len(records):
+        successful = [record for wave, record in zip(decision.waves, records) if not wave.failed]
+    else:
+        successful = [record for record in records if record.status == 200]
+    answered = 0
+    for record in successful:
+        if record.status == 200 and isinstance(record.body, dict):
+            answers = record.body.get("answers")
+            if isinstance(answers, dict):
+                answered += len(answers)
+    return {
+        "index": index,
+        "latency_ms": latency_ms,
+        "question_count": answered,
+        "request_count": len(records),
+        "error": error,
+    }
+
+
+def _run_round(worker, workers):
+    started = time.monotonic()
+    futures = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(worker, index) for index in range(workers)]
+        try:
+            canvases = [future.result() for future in as_completed(futures)]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
+    canvases.sort(key=lambda canvas: canvas["index"])
+    return canvases, time.monotonic() - started
+
+
+def _concurrency_stats(canvases, round_walls, planned_n, rounds, workers):
+    latencies = [canvas["latency_ms"] for canvas in canvases]
+    wall_seconds = sum(round_walls)
+    question_count = sum(canvas["question_count"] for canvas in canvases)
+    request_count = sum(canvas["request_count"] for canvas in canvases)
+    error_count = sum(1 for canvas in canvases if canvas["error"] is not None)
+    return {
+        "planned_question_count": planned_n * rounds * workers,
+        "canvas_count": len(canvases),
+        "wall_seconds": wall_seconds,
+        "round_wall_seconds": list(round_walls),
+        "request_count": request_count,
+        "question_count": question_count,
+        "questions_per_second": (question_count / wall_seconds) if wall_seconds > 0 else None,
+        "requests_per_second": (request_count / wall_seconds) if wall_seconds > 0 else None,
+        "canvas_p50_ms": percentile(latencies, 0.5) if latencies else None,
+        "canvas_p95_ms": percentile(latencies, 0.95) if latencies else None,
+        "canvas_max_ms": max(latencies) if latencies else None,
+        "error_count": error_count,
+        "error_rate": (error_count / len(canvases)) if canvases else None,
+        "canvases": canvases,
+    }
+
+
+def _comparison(a, b):
+    b_qps = b["questions_per_second"]
+    b_p95 = b["canvas_p95_ms"]
+    a_qps = a["questions_per_second"]
+    a_p95 = a["canvas_p95_ms"]
+    if b_qps is None or b_p95 is None:
+        floor = None
+        qps_ok = False
+        p95_ok = False
+        qps_ratio = None
+        p95_ratio = None
+    else:
+        floor = _QPS_FLOOR * b_qps
+        qps_ok = a_qps is not None and a_qps >= floor
+        p95_ok = a_p95 is not None and a_p95 <= b_p95
+        qps_ratio = (a_qps / b_qps) if b_qps > 0 and a_qps is not None else None
+        p95_ratio = (a_p95 / b_p95) if b_p95 > 0 and a_p95 is not None else None
+    passed = bool(qps_ok and p95_ok)
+    return {
+        "questions_per_second_floor": floor,
+        "questions_per_second_ratio": qps_ratio,
+        "questions_per_second_ok": bool(qps_ok),
+        "canvas_p95_ratio": p95_ratio,
+        "canvas_p95_ok": bool(p95_ok),
+        "baseline_error_count": b["error_count"],
+        "baseline_error_rate": b["error_rate"],
+        "baseline_has_errors": b["error_count"] > 0,
+        "pass": passed,
+        "status": "pass" if passed else "fail",
+    }
+
+
+def _run_packed_rounds(transport, state, questions, rounds, workers):
+    canvases = []
+    round_walls = []
+    for round_index in range(rounds):
+        def worker(index, questions=questions):
+            return _packed_canvas(transport, state, questions, index)
+        round_canvases, wall_seconds = _run_round(worker, workers)
+        for canvas in round_canvases:
+            canvas["round"] = round_index
+        canvases.extend(round_canvases)
+        round_walls.append(wall_seconds)
+    return canvases, round_walls
+
+
+def _run_serial_rounds(tree, text, transport, rounds, workers):
+    canvases = []
+    round_walls = []
+    for round_index in range(rounds):
+        def worker(index, tree=tree):
+            return _serial_canvas(tree, text, transport, index)
+        round_canvases, wall_seconds = _run_round(worker, workers)
+        for canvas in round_canvases:
+            canvas["round"] = round_index
+        canvases.extend(round_canvases)
+        round_walls.append(wall_seconds)
+    return canvases, round_walls
+
+
+def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers=8):
+    if isinstance(scan_repeats, bool) or not isinstance(scan_repeats, int) or scan_repeats < 1:
+        raise ValueError("scan_repeats must be a positive integer")
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+        raise ValueError("rounds must be a positive integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("workers must be a positive integer")
+    for name in ("G2", "G3"):
+        if name not in groups:
+            raise ValueError(f"unknown question group {name!r}")
+    tree_question_ids = {node.id for node in tree.root.nodes if isinstance(node, QuestionNode)}
+    if set(groups["G3"]) != tree_question_ids:
+        raise ValueError("G3 question group does not match the routing tree")
+
+    text, state, state_tokens = _capacity_state()
+
+    scan = {
+        "state_text": text,
+        "state_est_tokens": state_tokens,
+        "scan_repeats": scan_repeats,
+        "ns": list(_SCAN_NS),
+        "pass_rule": "n<=8: errors==0 and p95_ms<=2*baseline_p95_ms; n>8: record-only",
+        "by_n": {},
+    }
+    for n in _SCAN_NS:
+        questions = expand_questions(groups["G2"], n)
+        scan["by_n"][str(n)] = _scan_n(transport, state, questions, scan_repeats)
+    baseline_p95 = scan["by_n"]["1"]["p95_ms"]
+    scan["baseline_p95_ms"] = baseline_p95
+    for n in _SCAN_NS:
+        entry = scan["by_n"][str(n)]
+        if n <= 8:
+            entry["p95_limit_ms"] = 2 * baseline_p95
+            entry["p95_within_limit"] = entry["p95_ms"] <= 2 * baseline_p95
+            entry["zero_errors"] = entry["errors"] == 0
+            entry["pass"] = entry["zero_errors"] and entry["p95_within_limit"]
+            entry["status"] = "pass" if entry["pass"] else "fail"
+        else:
+            entry["p95_limit_ms"] = None
+            entry["p95_within_limit"] = None
+            entry["zero_errors"] = entry["errors"] == 0
+            entry["pass"] = None
+            entry["status"] = "recorded"
+    failed_n = [n for n in _SCAN_PASS_NS if not scan["by_n"][str(n)]["pass"]]
+    scan["failed_n"] = failed_n
+    scan["status"] = "pass" if not failed_n else "fail"
+
+    concurrency = {
+        "rounds": rounds,
+        "workers": workers,
+        "ns": list(_CONCURRENCY_NS),
+        "pass_rule": (
+            "questions_per_second >= 0.7 * serial baseline and "
+            "canvas_p95_ms <= serial baseline canvas_p95_ms"
+        ),
+        "by_n": {},
+    }
+    prefix_tree = _prefix_tree(tree, 2)
+    for n in _CONCURRENCY_NS:
+        questions = expand_questions(groups["G3"], n)
+        a_canvases, a_rounds = _run_packed_rounds(transport, state, questions, rounds, workers)
+        a_stats = _concurrency_stats(a_canvases, a_rounds, n, rounds, workers)
+        b_tree = prefix_tree if n == 2 else tree
+        b_canvases, b_rounds = _run_serial_rounds(b_tree, text, transport, rounds, workers)
+        b_stats = _concurrency_stats(b_canvases, b_rounds, n, rounds, workers)
+        concurrency["by_n"][str(n)] = {
+            "n": n,
+            "packed": a_stats,
+            "serial": b_stats,
+            "comparison": _comparison(a_stats, b_stats),
+        }
+    concurrency["status"] = (
+        "pass" if all(item["comparison"]["pass"] for item in concurrency["by_n"].values())
+        else "fail"
+    )
+    return {"scan": scan, "concurrency": concurrency}
