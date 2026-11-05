@@ -119,6 +119,29 @@ def test_transport_stops_on_second_consecutive_5xx(monkeypatch):
     assert transport.count == 2
 
 
+def test_transport_aborts_on_third_consecutive_transport_error_and_resets(monkeypatch):
+    """I3：连续 3 次 URLError/超时即中止；中间任何一个 HTTP 响应都会重置计数。"""
+    calls = {"n": 0}
+
+    def flaky(request, timeout):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            return FakeHTTPResponse(success_body())
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", flaky)
+    transport = SpikeTransport("http://jev.test", "d1-2B", sleep_seconds=0)
+    question = {"urgent": build_question_groups()["G1"]["urgent"]}
+    transport.post("state", question, "test")   # transport error 1
+    transport.post("state", question, "test")   # transport error 2
+    transport.post("state", question, "test")   # HTTP 200 -> 计数清零
+    transport.post("state", question, "test")   # transport error 1（清零后重新计数）
+    transport.post("state", question, "test")   # transport error 2
+    with pytest.raises(SpikeAbort):
+        transport.post("state", question, "test")  # transport error 3 -> abort
+    assert transport.count == 6
+
+
 def test_transport_rejects_request_before_io_at_cap(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", lambda *args: (_ for _ in ()).throw(AssertionError("network used")))
     transport = SpikeTransport("http://jev.test", "d1-2B", max_requests=0, sleep_seconds=0)
@@ -281,15 +304,17 @@ class ScriptedH1Transport:
                               None, 1.0, 100)
 
 
-def test_h1_invalid_comparison_fails_and_is_kept_in_invalid_comparisons():
+def test_h1_invalid_comparison_is_conditional_and_kept_in_invalid_comparisons():
     samples = [Sample(f"s{i}", f"文本{i}", "short") for i in range(4)]
     fake = ScriptedH1Transport(
         drop=lambda stage, state, key: stage == "H1-A" and "文本0" in state and key == "urgent")
     result = run_equivalence(samples, build_question_groups(), build_g3_tree(), fake,
                              cache={}, group_names=("G1",), repeat_samples=0)
     summary = result["summary"]
-    assert summary["status"] == "fail"
-    assert any("invalid comparison" in reason for reason in summary["fail_reasons"])
+    assert summary["status"] == "conditional"
+    assert summary["fail_reasons"] == []
+    assert summary["noise_ok"] is False
+    assert any("invalid comparison" in reason for reason in summary["conditional_reasons"])
     assert [(row["sample_id"], row["group"], row["question_id"], row["kind"])
             for row in result["invalid_comparisons"]] == [("s0", "G1", "urgent", "a_b")]
     assert result["invalid_comparisons"][0]["a_error"] is not None

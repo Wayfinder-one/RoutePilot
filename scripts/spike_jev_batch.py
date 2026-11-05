@@ -207,6 +207,7 @@ class SpikeTransport:
         self.count = 0
         self.stage_counts = {}
         self._consecutive_5xx = 0
+        self._consecutive_transport_errors = 0
         self._lock = threading.Lock()
 
     def post(self, state: str, questions: Mapping[str, DecisionQuestion], stage: str) -> ResponseRecord:
@@ -224,7 +225,10 @@ class SpikeTransport:
             headers["Authorization"] = "Bearer " + self.api_key
         request = urllib.request.Request(
             self.base_url + "/v1/systemone",
-            data=json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+            # Minor 2：紧凑分隔符，与 budget.json 的 wire_serialization 及 canonical_questions 的
+            # wire 估算口径一致（默认分隔符会多出空格，使记录的序列化方式失真）。
+            data=json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                            allow_nan=False).encode("utf-8"),
             headers=headers, method="POST",
         )
         started = time.monotonic()
@@ -249,12 +253,22 @@ class SpikeTransport:
             error = type(exc).__name__
         duration = (time.monotonic() - started) * 1000
         with self._lock:
+            # I3 安全新增（超出方案字面）：连接失败/超时（status is None）连续 3 次即中止。
+            # 否则错 URL 或挂死服务会用 20s 超时逐个烧穿 2000 次预算；任一 HTTP 响应（含 4xx/5xx）
+            # 都重置该计数，原有“连续两个 5xx”规则保持不变。
+            if status is None:
+                self._consecutive_transport_errors += 1
+            else:
+                self._consecutive_transport_errors = 0
             self._consecutive_5xx = self._consecutive_5xx + 1 if status is not None and 500 <= status < 600 else 0
-            should_abort = self._consecutive_5xx >= 2
+            should_abort_5xx = self._consecutive_5xx >= 2
+            should_abort_transport = self._consecutive_transport_errors >= 3
         if self.sleep_seconds:
             time.sleep(self.sleep_seconds)
-        if should_abort:
+        if should_abort_5xx:
             raise SpikeAbort("two consecutive 5xx responses")
+        if should_abort_transport:
+            raise SpikeAbort("three consecutive transport errors")
         usage = body.get("usage", {}) if isinstance(body, dict) else {}
         input_tokens = usage.get("input_tokens") if isinstance(usage, dict) else None
         if isinstance(input_tokens, bool) or not isinstance(input_tokens, int):
@@ -623,7 +637,11 @@ def _equivalence_summary(samples, names, comparisons, threshold_rows, routes, in
     fail_reasons = []
     conditional_reasons = []
     if invalid:
-        fail_reasons.append(f"{len(invalid)} invalid comparison(s)")
+        # I4：任一侧解析失败（解析/传输噪声）只造成证据缺口，不再直接判 fail；真正的分歧
+        # （数值/argmax/selected/翻转率/G3 路由差异）仍走下面的 fail_reasons。pass 仍要求 invalid 为空，
+        # 因为该原因会进入 conditional_reasons。
+        conditional_reasons.append(
+            f"{len(invalid)} invalid comparison(s) from unparseable side (evidence gap)")
     if max_ab is None:
         conditional_reasons.append("no valid probability comparisons")
     elif max_ab > _AB_TOLERANCE:
@@ -662,6 +680,9 @@ def _equivalence_summary(samples, names, comparisons, threshold_rows, routes, in
             fail_reasons.append(f"G3 target agreement {g3['target_same']}/{g3['samples']}")
         if g3["candidates_rate"] < 1.0:
             fail_reasons.append(f"G3 candidates agreement {g3['candidates_same']}/{g3['samples']}")
+        if g3["activated_rate"] < 1.0:
+            # I4：最终评审把 activated 序列不一致也列为真实分歧（方案字面只写 target/candidates）。
+            fail_reasons.append(f"G3 activated agreement {g3['activated_same']}/{g3['samples']}")
         if g3["new_error_fallbacks"]:
             fail_reasons.append(f"{g3['new_error_fallbacks']} new error_fallback route(s)")
     if max_repeat is None:
@@ -987,7 +1008,6 @@ def _prefix_tree(tree, question_count):
 
 
 def _packed_canvas(transport, state, questions, index):
-    started = time.monotonic()
     record = transport.post(state, questions, _CAPACITY_A_STAGE)
     answered = 0
     error = None
@@ -1002,7 +1022,8 @@ def _packed_canvas(transport, state, questions, index):
             error = f"incomplete answers {answered}/{len(questions)}"
     else:
         error = _safe_error(record.error) or f"HTTP {record.status}"
-    latency_ms = (time.monotonic() - started) * 1000
+    # I2：画布延迟取 record.duration_ms（transport 在记录后才 sleep），不再用含节流的墙钟。
+    latency_ms = record.duration_ms
     return {
         "index": index,
         "latency_ms": latency_ms,
@@ -1013,9 +1034,11 @@ def _packed_canvas(transport, state, questions, index):
 
 
 def _serial_canvas(tree, text, transport, index):
-    started = time.monotonic()
     decision, records = run_live_g3(tree, text, transport)
-    latency_ms = (time.monotonic() - started) * 1000
+    # I2：与 packed 同口径，画布延迟 = 各波 record.duration_ms 之和（throttle-free）。
+    # 这里选择纯 duration_ms 求和，不额外加本地引擎开销，也不做“墙钟减去 request_count*sleep_seconds”
+    # 的修正：引擎开销在真实请求前可忽略，且自定义/测试 transport 不一定有 sleep_seconds。
+    latency_ms = sum(record.duration_ms for record in records)
     failed = [wave for wave in decision.waves if wave.failed]
     error = (_safe_error(failed[-1].error) or "wave failed") if failed else None
     if not records:
@@ -1138,13 +1161,16 @@ def _run_serial_rounds(tree, text, transport, rounds, workers):
     return canvases, round_walls
 
 
-def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers=8):
+def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers=8,
+                 context_tokens=4096):
     if isinstance(scan_repeats, bool) or not isinstance(scan_repeats, int) or scan_repeats < 1:
         raise ValueError("scan_repeats must be a positive integer")
     if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
         raise ValueError("rounds must be a positive integer")
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
         raise ValueError("workers must be a positive integer")
+    if isinstance(context_tokens, bool) or not isinstance(context_tokens, int) or context_tokens < 1:
+        raise ValueError("context_tokens must be a positive integer")
     for name in ("G2", "G3"):
         if name not in groups:
             raise ValueError(f"unknown question group {name!r}")
@@ -1159,16 +1185,46 @@ def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers
         "state_est_tokens": state_tokens,
         "scan_repeats": scan_repeats,
         "ns": list(_SCAN_NS),
-        "pass_rule": "n<=8: errors==0 and p95_ms<=2*baseline_p95_ms; n>8: record-only",
+        "context_tokens": context_tokens,
+        "pass_rule": ("n<=8: errors==0 and p95_ms<=2*baseline_p95_ms; n>8: record-only; "
+                      "predicted>context: single probe, pass=null"),
         "by_n": {},
     }
     for n in _SCAN_NS:
         questions = expand_questions(groups["G2"], n)
-        scan["by_n"][str(n)] = _scan_n(transport, state, questions, scan_repeats)
+        # C1：按实际上送的 wire（state 已由 _capacity_state 渲染，口径与 _call 的 wire_est_tokens 一致）
+        # 预测 token。方案字面要求所有 N 都打 scan_repeats 次，但 N=32 约 5110 token > 4096 生产上下文：
+        # 若服务端对超窗请求返回 5xx，20 次连发会触发“连续两个 5xx 即中止”并废掉整轮一次性 2000 预算。
+        # 安全偏离方案字面：超窗 N 只发 1 次探测（单次 5xx 无法满足两连击熔断），不参与 pass 判定。
+        predicted = estimate_tokens(state + "\n" + canonical_questions(questions))
+        if predicted > context_tokens:
+            entry = _scan_n(transport, state, questions, 1)
+            entry.update({
+                "requests": 1,
+                "skipped_repeats": scan_repeats - 1,
+                "expected_over_context": True,
+                "predicted_wire_est_tokens": predicted,
+                "pass": None,
+                "status": "over_context_probe",
+            })
+        else:
+            entry = _scan_n(transport, state, questions, scan_repeats)
+            entry.update({
+                "expected_over_context": False,
+                "predicted_wire_est_tokens": predicted,
+            })
+        scan["by_n"][str(n)] = entry
     baseline_p95 = scan["by_n"]["1"]["p95_ms"]
     scan["baseline_p95_ms"] = baseline_p95
     for n in _SCAN_NS:
         entry = scan["by_n"][str(n)]
+        if entry.get("expected_over_context"):
+            # C1：超窗 N 只有 1 个探测样本，p95/错误率通过规则对它不适用；保留 over_context_probe 状态，
+            # 不把“只记录”写成 pass（方案 Task 5 第 2 条）。
+            entry["p95_limit_ms"] = None
+            entry["p95_within_limit"] = None
+            entry["zero_errors"] = entry["errors"] == 0
+            continue
         if n <= 8:
             entry["p95_limit_ms"] = 2 * baseline_p95
             entry["p95_within_limit"] = entry["p95_ms"] <= 2 * baseline_p95
@@ -1189,6 +1245,10 @@ def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers
         "rounds": rounds,
         "workers": workers,
         "ns": list(_CONCURRENCY_NS),
+        # I2：canvas 延迟由各画布 record.duration_ms 汇总（packed=单请求，serial=各波求和），
+        # 不含 transport 的请求间 sleep；round wall 仍保留用于吞吐分母。
+        "sleep_seconds": float(getattr(transport, "sleep_seconds", 0.0) or 0.0),
+        "canvas_latency_source": "duration_ms_sum",
         "pass_rule": (
             "questions_per_second >= 0.7 * serial baseline and "
             "canvas_p95_ms <= serial baseline canvas_p95_ms"
@@ -1213,7 +1273,10 @@ def run_capacity(transport, groups, tree, *, scan_repeats=20, rounds=10, workers
         "pass" if all(item["comparison"]["pass"] for item in concurrency["by_n"].values())
         else "fail"
     )
-    return {"scan": scan, "concurrency": concurrency}
+    capacity = {"scan": scan, "concurrency": concurrency}
+    # Minor 5：capacity.json 自带总体 status，与 summary.statuses["capacity"] 共用同一判定函数。
+    capacity["status"] = _capacity_status(capacity)
+    return capacity
 
 
 _CONTEXT_TOKENS = 4096
@@ -1267,7 +1330,18 @@ def calibrate_budget(records, safety=128):
 
 def write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    text = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    # Minor 3：先写同目录临时文件再 os.replace，进程崩溃/被杀时目标文件要么是旧完整版本，
+    # 要么是新完整版本，不会留下截断的 JSON 产物。
+    temp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _state_bucket(tokens):
@@ -1451,8 +1525,9 @@ def _error_message(record):
         else:
             message = body.get("detail") or body.get("message")
         if isinstance(message, str) and message:
-            return _safe_message(message)[:300]
-    return _safe_message(record.error)[:300] if record.error else None
+            # Minor 1：该文本直接进 budget.json，必须与其他产物字符串一样按 _ARTIFACT_KEY 脱敏。
+            return _safe_message(message, _ARTIFACT_KEY)[:300]
+    return _safe_error(record.error)[:300] if record.error else None
 
 
 def _run_coverage_fill(transport, cache, groups, rows, cells, *, context_tokens, input_tokens,
@@ -1834,6 +1909,8 @@ def main(argv=None):
         return 2
     try:
         samples = load_samples(Path(args.samples), args.limit)
+        # Minor 4：记录样本文件 sha256，执行报告可据此核对本轮实际使用的样本。
+        samples_sha256 = hashlib.sha256(Path(args.samples).read_bytes()).hexdigest()
         plan = plan_request_budget(len(samples), args.scenario)
     except (OSError, ValueError) as exc:
         print(f"样本或参数错误：{exc}", file=sys.stderr)
@@ -1859,13 +1936,17 @@ def main(argv=None):
     started_at = datetime.now().astimezone()
     parameters = {
         "url": args.url, "model": args.model, "scenario": args.scenario,
-        "samples": str(args.samples), "sample_count": len(samples), "limit": args.limit,
+        "samples": str(args.samples), "samples_sha256": samples_sha256,
+        "sample_count": len(samples), "limit": args.limit,
         "repeats": args.repeats, "max_requests": args.max_requests,
         "out_dir": str(out_dir), "timeout": args.timeout,
         "context_tokens": _CONTEXT_TOKENS, "input_tokens": _INPUT_TOKENS,
         "safety": _DEFAULT_SAFETY, "h3_reserve": plan.reserve,
         "api_key_env": _API_KEY_ENV, "api_key_present": bool(api_key),
     }
+    # I1：记录本轮已成功落盘的阶段产物；异常路径据此为未产出的阶段写 aborted 占位，
+    # 保证 Task 7 的五文件核验在 abort/异常后仍可执行（已写文件保持原样，不伪造阶段数据）。
+    written = set()
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         groups = build_question_groups()
@@ -1874,6 +1955,7 @@ def main(argv=None):
                                    timeout=args.timeout, max_requests=args.max_requests)
         # 首个产物必须是图，方便失败后仍能核对本轮使用的 G3 画布。
         write_json(out_dir / "g3-graph.json", _graph_document(groups))
+        written.add("g3-graph.json")
         equivalence = None
         capacity = None
         if args.scenario in {"all", "equivalence"}:
@@ -1890,10 +1972,12 @@ def main(argv=None):
                 }
             statuses["equivalence"] = equivalence["summary"]["status"]
             write_json(out_dir / "equivalence.json", equivalence)
+            written.add("equivalence.json")
         if args.scenario in {"all", "capacity"}:
-            capacity = run_capacity(transport, groups, tree)
+            capacity = run_capacity(transport, groups, tree, context_tokens=_CONTEXT_TOKENS)
             statuses["capacity"] = _capacity_status(capacity)
             write_json(out_dir / "capacity.json", capacity)
+            written.add("capacity.json")
         if args.scenario in {"all", "budget"}:
             observations = []
             if equivalence is not None:
@@ -1904,8 +1988,18 @@ def main(argv=None):
                                     cache=cache, reserve=plan.reserve)
             statuses["budget"] = budget_doc["status"]
             write_json(out_dir / "budget.json", budget_doc)
+            written.add("budget.json")
     except Exception as exc:
         message = _safe_message(exc, api_key)
+        # I1：五个产物必须齐齐存在；未写出的阶段只写 abort 标记（含脱敏原因），已有产物不覆盖。
+        aborted = {"status": "aborted", "reason": message}
+        for name in ("g3-graph.json", "equivalence.json", "capacity.json", "budget.json"):
+            if name in written:
+                continue
+            try:
+                write_json(out_dir / name, aborted)
+            except OSError:
+                pass
         summary = {
             "status": "fail",
             "statuses": statuses,
