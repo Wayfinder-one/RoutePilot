@@ -22,7 +22,7 @@ LOG_COLUMNS = (
     "session_hash", "jev_model", "jev_choice", "jev_top", "jev_margin",
     "jev_ms", "reasoning", "routing_ms", "upstream_model", "upstream_status",
     "upstream_ms", "ttft_ms", "total_ms", "prompt_tokens", "completion_tokens",
-    "total_tokens", "outcome_state", "error_class",
+    "total_tokens", "outcome_state", "error_class", "waves",
 )
 
 _LOG_INSERT = (
@@ -67,6 +67,28 @@ class RequestLogger:
 
     def recent_requests(self, limit: int = RECENT_LIMIT) -> list[dict]:
         return list(reversed(self.recent))[:max(0, limit)]
+
+    def hydrate_recent(self, conn: sqlite3.Connection) -> None:
+        """Warm the ring with the persisted tail after a process restart.
+
+        SQLite intentionally stores only the ledger whitelist. Restored rows
+        therefore have no request text, trace, answers, node_labels or
+        probabilities; the console renders those details as absent until a new
+        live request arrives.
+        """
+        if self.recent:
+            return
+        rows = conn.execute(
+            "SELECT * FROM request_logs ORDER BY ts DESC, rowid DESC LIMIT ?",
+            (RECENT_LIMIT,),
+        ).fetchall()
+        for row in reversed(rows):
+            record = {column: row[column] for column in LOG_COLUMNS}
+            total_ms = record.get("total_ms")
+            record["latency_ms"] = (
+                total_ms if total_ms is not None else record.get("routing_ms")
+            )
+            self.recent.append(record)
 
     def confidence_histogram(self) -> list[dict]:
         return [

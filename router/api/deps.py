@@ -15,3 +15,7 @@ def get_conn(request: Request) -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         conn.close()
+
+
+def get_tree_repo(request: Request):
+    return request.app.state.graph_repo

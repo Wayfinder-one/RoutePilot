@@ -1,7 +1,8 @@
 from datetime import datetime
 
-from router.routing.conditions import TimePeriod, matching_periods, when_matches
-from router.routing.model import When
+import pytest
+
+from router.routing.conditions import TimePeriod, matching_periods
 
 
 def test_overnight_period_preserves_current_weekday_semantics():
@@ -19,14 +20,14 @@ def test_period_end_is_exclusive_and_equal_start_end_means_all_day():
     assert matching_periods(datetime(2026, 10, 31, 18, 0), [weekend]) == ["周末"]
 
 
-def test_when_periods_are_or_and_empty_condition_matches():
-    assert when_matches(When(periods=("白天", "夜间")), ["夜间"]) is True
-    assert when_matches(When(periods=("白天",)), ["周末"]) is False
-    assert when_matches(None, []) is True
-
-
-def test_invalid_period_name_raises_value_error():
-    import pytest
-
+def test_period_roundtrip_and_validation():
+    period = TimePeriod.from_dict({"name": "夜间", "days": [0], "start": "18:00", "end": "09:00"})
+    assert period.to_dict() == {"name": "夜间", "days": [0], "start": "18:00", "end": "09:00"}
     with pytest.raises(ValueError):
         TimePeriod.from_dict({"name": 3, "days": [0], "start": "09:00", "end": "18:00"})
+    with pytest.raises(ValueError):
+        TimePeriod("坏", (7,), "09:00", "18:00")
+    with pytest.raises(ValueError):
+        TimePeriod("坏", (0,), "25:00", "18:00")
+    with pytest.raises(ValueError):
+        TimePeriod("坏", (0, 0), "09:00", "18:00")

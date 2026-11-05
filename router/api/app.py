@@ -15,11 +15,19 @@ from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import JevConfigRepo, JevSettings
 from router.routing.affinity import SessionAffinity
-from router.routing.engine import RoutingEngine
+from router.routing.graph.engine import GraphExecutionEngine
+from router.routing.reloader import GraphReloadWorker
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
 from router.store.repositories import SessionRepo, UserRepo, seed_default
+from router.store.routing_trees import (
+    GraphAlreadyExistsError,
+    GraphConflictError,
+    GraphReadOnlyError,
+    GraphStorageError,
+    RoutingTreeRepo,
+)
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 logger = logging.getLogger(__name__)
@@ -101,6 +109,7 @@ def _seed_jev(conn, settings: Settings) -> None:
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
+    requestlog = RequestLogger(settings)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
@@ -108,24 +117,18 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         if settings.user_auth:
             UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
         _seed_jev(conn, settings)
-        from router.api.routes_trees import active_tree_issues
-        issues = active_tree_issues(conn)
-        if issues:
-            raise RuntimeError(
-                "refusing to start: invalid active routing tree: "
-                + ", ".join(sorted({issue.code for issue in issues}))
-            )
+        requestlog.hydrate_recent(conn)
     finally:
         conn.close()
-
-    requestlog = RequestLogger(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await requestlog.start()
+        await app.state.graph_reloader.start()
         try:
             yield
         finally:
+            await app.state.graph_reloader.close()
             await requestlog.close()
             await app.state.http.aclose()
 
@@ -136,15 +139,49 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.balancer = LoadBalancer(app.state.breaker)
     app.state.affinity = SessionAffinity(max_entries=settings.session_max_entries)
     app.state.jev_client = JevClient(app.state.http)
-    app.state.engine = RoutingEngine(app.state.jev_client, app.state.affinity, app.state.balancer)
+    app.state.engine = GraphExecutionEngine(
+        app.state.jev_client, app.state.affinity, app.state.balancer,
+    )
     app.state.requestlog = requestlog
-    app.state.publisher = SnapshotPublisher(app)
 
+    app.state.graph_repo = RoutingTreeRepo(settings.graph_dir, writer=settings.graph_writer)
+    if settings.graph_writer:
+        app.state.graph_repo.initialize()
+    app.state.snapshot = None
+    app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     conn = connect(settings.db_path)
     try:
         app.state.publisher.refresh(conn)
+    except GraphStorageError:
+        logger.exception("initial graph snapshot is unavailable")
     finally:
         conn.close()
+    app.state.graph_reloader = GraphReloadWorker(app)
+
+    @app.exception_handler(GraphConflictError)
+    async def graph_conflict_handler(request: Request, exc: GraphConflictError):
+        return JSONResponse(status_code=409, content={"detail": {
+            "code": "graph_conflict",
+            "actual_document_sha256": exc.actual_document_sha256,
+        }})
+
+    @app.exception_handler(GraphAlreadyExistsError)
+    async def graph_exists_handler(request: Request, exc: GraphAlreadyExistsError):
+        return JSONResponse(status_code=409, content={"detail": {
+            "code": "graph_already_exists",
+            "tree_id": str(exc),
+        }})
+
+    @app.exception_handler(GraphReadOnlyError)
+    async def graph_read_only_handler(request: Request, exc: GraphReadOnlyError):
+        return JSONResponse(status_code=503, content={"detail": {"code": "graph_read_only"}})
+
+    @app.exception_handler(GraphStorageError)
+    async def graph_storage_handler(request: Request, exc: GraphStorageError):
+        return JSONResponse(status_code=503, content={"detail": {
+            "code": "graph_storage_error",
+            "message": str(exc),
+        }})
 
     _install_admin_auth(app, settings)
 
@@ -155,6 +192,11 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     @app.get("/healthz")
     def healthz():
         return {"ok": True}
+
+    @app.get("/readyz")
+    def readyz():
+        status = app.state.publisher.status()
+        return JSONResponse(status_code=200 if status["ready"] else 503, content=status)
 
     @app.middleware("http")
     async def console_nocache(request: Request, call_next):

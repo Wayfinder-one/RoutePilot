@@ -4,6 +4,8 @@ from router.config import Settings
 def test_defaults():
     settings = Settings.from_env()
     assert settings.db_path == "router.db"
+    assert settings.graph_dir == "./routing-graph"
+    assert settings.graph_writer is True
     assert settings.port == 8400
     assert settings.jev_url == ""
     assert settings.jev_model == ""
@@ -14,6 +16,8 @@ def test_defaults():
 
 def test_env_override(monkeypatch):
     monkeypatch.setenv("ROUTER_DB", "/tmp/v3.db")
+    monkeypatch.setenv("ROUTER_GRAPH_DIR", "/tmp/routing-graph")
+    monkeypatch.setenv("ROUTER_GRAPH_WRITER", "0")
     monkeypatch.setenv("ROUTER_PORT", "9000")
     monkeypatch.setenv("ROUTER_JEV_URL", "http://jev.test")
     monkeypatch.setenv("ROUTER_JEV_MODEL", "NeoHorse-Jev-4B")
@@ -22,6 +26,8 @@ def test_env_override(monkeypatch):
     monkeypatch.setenv("ROUTER_SESSION_MAX_ENTRIES", "123")
     settings = Settings.from_env()
     assert settings.db_path == "/tmp/v3.db"
+    assert settings.graph_dir == "/tmp/routing-graph"
+    assert settings.graph_writer is False
     assert settings.port == 9000
     assert settings.jev_url == "http://jev.test"
     assert settings.jev_model == "NeoHorse-Jev-4B"

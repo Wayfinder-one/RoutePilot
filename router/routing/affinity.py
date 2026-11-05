@@ -11,6 +11,7 @@ from router.routing.types import session_digest
 @dataclass
 class _Entry:
     model: str
+    target_id: str
     tree_revision: str
     policy_path: str
     ttl_seconds: int
@@ -30,7 +31,7 @@ class SessionAffinity:
         with self._lock:
             return len(self._entries)
 
-    def get(self, session_id: str, *, tree_revision: str, policy_path: str, allowed_models: list[str], touch: bool = True) -> str | None:
+    def get(self, session_id: str, *, tree_revision: str, policy_path: str, allowed_models: list[str], touch: bool = True) -> tuple[str, str] | None:
         if not session_id:
             return None
         key = session_digest(session_id)
@@ -50,9 +51,9 @@ class SessionAffinity:
             if touch:
                 entry.expires_at = now + entry.ttl_seconds
                 self._entries.move_to_end(key)
-            return entry.model
+            return entry.model, entry.target_id
 
-    def put(self, session_id: str, model: str, *, tree_revision: str, policy_path: str, ttl_seconds: int) -> None:
+    def put(self, session_id: str, model: str, *, target_id: str, tree_revision: str, policy_path: str, ttl_seconds: int) -> None:
         if not session_id:
             return
         if ttl_seconds < 1:
@@ -61,6 +62,7 @@ class SessionAffinity:
         with self._lock:
             self._entries[key] = _Entry(
                 model=model,
+                target_id=target_id,
                 tree_revision=tree_revision,
                 policy_path=policy_path,
                 ttl_seconds=ttl_seconds,

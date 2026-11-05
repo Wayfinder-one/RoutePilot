@@ -1,9 +1,10 @@
-/* Shared top bar: brand, page nav, signed-in user chip, language toggle.
+/* Shared top bar: brand, page nav, signed-in user dropdown, language toggle.
 
-   The user chip ("邮箱 + 角色 + 退出") and the admin-only 用户管理 item come
-   from GET /admin/me, fetched once per page. Both start hidden so a viewer
-   never sees admin UI flash in; an older backend without /admin/me simply
-   leaves the bar in its previous form (no chip, no users item). The fetch is
+   The top-right user control ("头像 + 邮箱 + 角色") and the admin-only 用户管理
+   item come from GET /admin/me, fetched once per page. Both start hidden so a
+   viewer never sees admin UI flash in; clicking the user control opens a
+   dropdown with 用户管理 (admin) and 退出. An older backend without /admin/me
+   simply leaves the bar in its previous form (no user control). The fetch is
    deferred to DOMContentLoaded because nav.js loads *before* api.js. */
 (function () {
   const page = document.body.dataset.page;
@@ -15,13 +16,21 @@
      <nav>${pages.map(p =>
        `<a href="${p === 'overview' ? 'index' : p}.html"
            class="${p === page ? 'on' : ''}" data-i18n="nav.${p}"></a>`).join('')}
-       <a href="users.html" id="navUsers" class="${page === 'users' ? 'on' : ''}"
-          data-i18n="nav.users" hidden></a></nav>
+   <a href="users.html" id="navUsers" class="${page === 'users' ? 'on' : ''}"
+      data-i18n="nav.users" hidden></a></nav>
      <span class="spacer"></span>
      <span class="userbox" id="userBox" hidden>
-       <span class="pill user-email" id="userEmail"></span>
-       <span class="pill" id="userRole"></span>
-       <button class="btn ghost sm" id="logoutBtn" data-i18n="nav.logout"></button>
+       <button class="user-trigger" id="userTrigger" aria-haspopup="true" aria-expanded="false">
+         <span class="u-ico" aria-hidden="true">👤</span>
+         <span class="pill user-email" id="userEmail"></span>
+         <span class="pill" id="userRole"></span>
+         <span class="u-caret" aria-hidden="true">▾</span>
+       </button>
+       <div class="usermenu" id="userMenu" hidden>
+         <a href="users.html" id="menuUsers" class="${page === 'users' ? 'on' : ''}"
+            data-i18n="nav.users" hidden></a>
+         <button id="logoutBtn" data-i18n="nav.logout"></button>
+       </div>
      </span>
      <span class="langtog">
        <button data-lang="zh" onclick="setLang('zh')">中文</button>
@@ -45,7 +54,7 @@
   function paintUser() {
     if (!me) return;
     const box = document.getElementById('userBox');
-    const link = document.getElementById('navUsers');
+    const menuUsers = document.getElementById('menuUsers');
     const email = document.getElementById('userEmail');
     const role = document.getElementById('userRole');
     if (!box || !email || !role) return;
@@ -55,10 +64,30 @@
     role.textContent = me.role === 'admin' ? t('users.roleAdmin') : t('users.roleViewer');
     role.classList.toggle('indigo', me.role === 'admin');
     box.hidden = false;
-    if (link) link.hidden = me.role !== 'admin';
+    if (menuUsers) menuUsers.hidden = me.role !== 'admin';
+  }
+
+  function toggleMenu(open) {
+    const menu = document.getElementById('userMenu');
+    const trigger = document.getElementById('userTrigger');
+    if (!menu || !trigger) return;
+    const show = open == null ? menu.hidden : open;
+    menu.hidden = !show;
+    trigger.setAttribute('aria-expanded', show ? 'true' : 'false');
   }
 
   function initUser() {
+    const trigger = document.getElementById('userTrigger');
+    if (trigger) trigger.addEventListener('click', e => {
+      e.stopPropagation();
+      toggleMenu();
+    });
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.userbox')) toggleMenu(false);
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') toggleMenu(false);
+    });
     const logout = document.getElementById('logoutBtn');
     if (logout) logout.addEventListener('click', async () => {
       logout.disabled = true;

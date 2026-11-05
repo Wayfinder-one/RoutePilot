@@ -5,8 +5,9 @@ import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from router.api.deps import get_conn
-from router.jev.client import JevCandidate, JevClient, JevError
+from router.api.deps import get_conn, get_tree_repo
+from router.api.routes_trees import active_tree_issues
+from router.jev.client import ChoiceAnswer, DecisionQuestion, JevCandidate, JevClient, JevError
 from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
@@ -22,6 +23,7 @@ from router.jev.window import (
 )
 from router.routing.snapshot import read_jev_window
 from router.store.repositories import ChangeRepo, SettingsRepo, _now_iso
+from router.store.routing_trees import RoutingTreeRepo
 
 router = APIRouter()
 
@@ -39,7 +41,11 @@ def get_jev(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 @router.put("/jev")
-def put_jev(body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def put_jev(
+    body: dict, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     allowed = {"base_url", "model", "api_key", "timeout_seconds", "instructions", "state_template"}
     if set(body) - allowed:
         raise HTTPException(422, detail="unknown JEV config fields")
@@ -62,6 +68,9 @@ def put_jev(body: dict, request: Request, conn: sqlite3.Connection = Depends(get
     with publisher.locked():
         repo.save(settings)
         ChangeRepo(conn).record(_now_iso(), "jev", {"action": "save", "model": settings.model})
+        issues = active_tree_issues(conn, trees)
+        if issues:
+            raise HTTPException(422, detail=[dict(issue.__dict__) for issue in issues])
         publisher.refresh(conn)
     return _public(settings)
 
@@ -80,7 +89,11 @@ async def test_jev(body: dict, request: Request, conn: sqlite3.Connection = Depe
     )
     client = getattr(request.app.state, "jev_client", None) or JevClient(request.app.state.http)
     try:
-        answer = await client.choose(settings, text, candidates)
+        question = DecisionQuestion("choice", settings.instructions, candidates)
+        answers = await client.choose_many(settings, text, {"route": question})
+        answer = answers["route"]
+        if not isinstance(answer, ChoiceAnswer):
+            raise HTTPException(502, detail="JEV route answer is not choice")
     except JevError as exc:
         raise HTTPException(502, detail=str(exc)) from exc
     return {
@@ -120,7 +133,11 @@ def get_jev_window(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 @router.put("/jev/window")
-def put_jev_window(body: dict, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def put_jev_window(
+    body: dict, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     """保存输入窗口配置。
 
     - context_tokens：JEV 服务每请求上下文预算（= llama.cpp -c/--parallel），512..131072；
@@ -158,5 +175,8 @@ def put_jev_window(body: dict, request: Request, conn: sqlite3.Connection = Depe
                 "context_tokens": context_tokens,
                 "input_tokens": input_tokens,
             })
+        issues = active_tree_issues(conn, trees)
+        if issues:
+            raise HTTPException(422, detail=[dict(issue.__dict__) for issue in issues])
         publisher.refresh(conn)
     return get_jev_window(conn)

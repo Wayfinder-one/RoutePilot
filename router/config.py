@@ -12,6 +12,8 @@ def _flag(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class Settings:
     db_path: str = "router.db"
+    graph_dir: str = "./routing-graph"
+    graph_writer: bool = True
     host: str = "127.0.0.1"
     port: int = 8400
     jev_url: str = ""
@@ -28,6 +30,8 @@ class Settings:
     def from_env() -> "Settings":
         return Settings(
             db_path=os.environ.get("ROUTER_DB", "router.db"),
+            graph_dir=os.environ.get("ROUTER_GRAPH_DIR", "./routing-graph"),
+            graph_writer=_flag("ROUTER_GRAPH_WRITER", True),
             host=os.environ.get("ROUTER_HOST", "127.0.0.1"),
             port=int(os.environ.get("ROUTER_PORT", "8400")),
             jev_url=os.environ.get("ROUTER_JEV_URL", ""),

@@ -9,7 +9,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from router.api.deps import get_conn
+from router.api.deps import get_conn, get_tree_repo
 from router.api.routes_trees import active_tree_issues
 from router.api.upstream import parse_profile_text
 from router.presets import PROVIDER_PRESETS
@@ -104,8 +104,8 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
     return json.dumps(validated, ensure_ascii=False)
 
 
-def _check_active_tree(conn: sqlite3.Connection) -> None:
-    issues = active_tree_issues(conn)
+def _check_active_tree(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> None:
+    issues = active_tree_issues(conn, trees)
     if issues:
         raise HTTPException(422, detail=[dict(issue.__dict__) for issue in issues])
 
@@ -154,7 +154,11 @@ class ModelCreateIn(ModelIn):
 
 
 @router.post("/models", status_code=201)
-def post_model(body: ModelCreateIn, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def post_model(
+    body: ModelCreateIn, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     model_id = body.id.strip()
     if not _ID_RE.match(model_id):
         raise HTTPException(422, detail="invalid model id")
@@ -169,14 +173,18 @@ def post_model(body: ModelCreateIn, request: Request, conn: sqlite3.Connection =
         with write_transaction(conn):
             if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
                 raise HTTPException(409, detail=f"model {model_id} 已存在")
-            _check_active_tree(conn)
+            _check_active_tree(conn, trees)
             ChangeRepo(conn).record(_now_iso(), "model", {"action": "create", "id": model_id, "upstream": upstream, "provider": provider, "profile": body.profile})
         publisher.refresh(conn)
     return {"ok": True, "model": _public_model(ModelRepo(conn).get(model_id), provider_row.get("reasoning_format") or "openai")}
 
 
 @router.put("/models/{model_id}")
-def put_model(model_id: str, body: ModelIn, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def put_model(
+    model_id: str, body: ModelIn, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     if ModelRepo(conn).get(model_id) is None:
         raise HTTPException(404, detail=f"unknown model {model_id}")
     upstream = _clean_text(body.upstream, "upstream", max_len=200) if body.upstream is not None else None
@@ -190,7 +198,7 @@ def put_model(model_id: str, body: ModelIn, request: Request, conn: sqlite3.Conn
     with publisher.locked():
         with write_transaction(conn):
             ModelRepo(conn).update(model_id, upstream=upstream, provider=provider, profile=profile)
-            _check_active_tree(conn)
+            _check_active_tree(conn, trees)
             ChangeRepo(conn).record(_now_iso(), "model", {"action": "update", "id": model_id, "upstream": body.upstream, "provider": body.provider, "profile": body.profile})
         publisher.refresh(conn)
     row = ModelRepo(conn).get(model_id)
@@ -198,12 +206,16 @@ def put_model(model_id: str, body: ModelIn, request: Request, conn: sqlite3.Conn
 
 
 @router.delete("/models/{model_id}")
-def delete_model(model_id: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def delete_model(
+    model_id: str, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     publisher = request.app.state.publisher
     with publisher.locked():
         if ModelRepo(conn).get(model_id) is None:
             raise HTTPException(404, detail=f"unknown model {model_id}")
-        refs = model_references(RoutingTreeRepo(conn).list(), model_id)
+        refs = model_references(trees.list(), model_id)
         if refs:
             raise HTTPException(409, detail={"message": f"model {model_id} 被路由树引用", "references": refs})
         with write_transaction(conn):
@@ -232,7 +244,11 @@ class ProviderIn(BaseModel):
 
 
 @router.put("/providers/{name}")
-def put_provider(name: str, body: ProviderIn, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+def put_provider(
+    name: str, body: ProviderIn, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
     if not _ID_RE.match(name):
         raise HTTPException(422, detail="invalid provider name")
     base_url = _clean_base_url(body.base_url)
@@ -247,7 +263,7 @@ def put_provider(name: str, body: ProviderIn, request: Request, conn: sqlite3.Co
     with publisher.locked():
         with write_transaction(conn):
             ProviderRepo(conn).upsert(name, base_url, key_env=key_env, reasoning_format=body.reasoning_format, api_key=api_key)
-            _check_active_tree(conn)
+            _check_active_tree(conn, trees)
             ChangeRepo(conn).record(_now_iso(), "provider", {
                 "action": "upsert", "name": name, "base_url": base_url,
                 "key_env": key_env if key_env is not None else (existing or {}).get("key_env", ""),

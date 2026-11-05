@@ -11,8 +11,12 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+# 与 /admin/try 共用答案序列化契约：完整 answers 只进内存 ring / 试算响应，不进 SQLite。
+from router.api.routes_trees import _answer_payload
+from router.jev.client import ChoiceAnswer
 from router.reasoning import ReasoningError, apply_reasoning
-from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest
+from router.routing.graph.model import ConditionNode, LogicNode, QuestionNode, StartNode, TargetNode
+from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest, session_digest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -27,88 +31,6 @@ OUTCOME_INCOMPLETE = "incomplete"
 OUTCOME_ROUTING_ERROR = "routing_error"
 OUTCOME_STATES = (OUTCOME_COMPLETED, OUTCOME_UPSTREAM_ERROR, OUTCOME_CLIENT_DISCONNECTED, OUTCOME_CANCELLED, OUTCOME_INCOMPLETE, OUTCOME_ROUTING_ERROR)
 
-OUTCOME_DISPLAY = {
-    OUTCOME_COMPLETED: {"zh": "已完成", "en": "Completed"},
-    OUTCOME_UPSTREAM_ERROR: {"zh": "上游错误", "en": "Upstream error"},
-    OUTCOME_CLIENT_DISCONNECTED: {"zh": "客户端断开", "en": "Client disconnected"},
-    OUTCOME_CANCELLED: {"zh": "已取消", "en": "Cancelled"},
-    OUTCOME_INCOMPLETE: {"zh": "进行中", "en": "In progress"},
-    OUTCOME_ROUTING_ERROR: {"zh": "路由失败", "en": "Routing failed"},
-}
-
-
-def _label(zh: str, en: str) -> dict[str, str]:
-    return {"zh": zh, "en": en}
-
-
-def _milliseconds(value) -> str:
-    return "—" if value is None else f"{round(value)}ms"
-
-
-def _display_fields(record: dict) -> None:
-    """Keep UI metadata in the in-memory record, outside the SQLite ledger."""
-    record["metrics"] = [
-        [_label("上游", "Upstream"), record.get("upstream_status")],
-        [_label("路由耗时", "Routing"), _milliseconds(record.get("routing_ms"))],
-        [_label("总耗时", "Total"), _milliseconds(record.get("total_ms"))],
-    ]
-    record["fields"] = [
-        [_label("请求 ID", "Request ID"), record.get("id")],
-        [_label("决策组", "Decision group"), record.get("tree_id")],
-        [_label("快照", "Snapshot"), record.get("snapshot_revision")],
-        [_label("策略路径", "Policy path"), record.get("policy_path")],
-        [_label("会话哈希", "Session hash"), record.get("session_hash")],
-        [_label("JEV 模型", "JEV model"), record.get("jev_model")],
-        [_label("首 token 耗时", "Time to first token"), _milliseconds(record.get("ttft_ms"))],
-        [_label("Token 总数", "Total tokens"), record.get("total_tokens")],
-        [_label("上游模型", "Upstream model"), record.get("upstream_model")],
-    ]
-
-
-def _result_event(record: dict) -> dict:
-    state = record["outcome_state"]
-    status = OUTCOME_DISPLAY[state]
-    return {
-        "event": "request_outcome", "phase": "outcome",
-        "label": _label("执行结果", "Execution result"),
-        "cell": status, "summary": status,
-        "facts": [[_label("模型", "Model"), record.get("model") or "—"],
-                  [_label("上游状态", "Upstream status"), record.get("upstream_status") or "—"],
-                  [_label("总耗时 ms", "Total ms"), round(record["total_ms"]) if record.get("total_ms") is not None else "—"]],
-        "tone": "bad" if state == OUTCOME_UPSTREAM_ERROR else "warn" if state in (OUTCOME_CANCELLED, OUTCOME_CLIENT_DISCONNECTED) else "hit",
-        "outcome_state": state,
-    }
-
-
-def _routing_failure_record(request: Request, snapshot, text: str, trace: list[dict],
-                            started: float, routing_started: float, error_code: str) -> None:
-    elapsed = (time.monotonic() - started) * 1000.0
-    record = {
-        "id": uuid.uuid4().hex,
-        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "text": text,
-        "decision": "route",
-        "model": None,
-        "tree_id": getattr(snapshot, "tree_id", None),
-        "tree_revision": getattr(snapshot, "tree_revision", None),
-        "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
-        "routing_ms": (time.monotonic() - routing_started) * 1000.0,
-        "latency_ms": elapsed,
-        "total_ms": elapsed,
-        "outcome_state": OUTCOME_ROUTING_ERROR,
-        "error_class": error_code,
-        "route_label": _label("路由中止", "Routing stopped"),
-        "trace": [*trace, {
-            "event": "routing_error", "phase": "routing_error",
-            "label": _label("路由中止", "Routing stopped"),
-            "cell": "FAIL", "summary": OUTCOME_DISPLAY[OUTCOME_ROUTING_ERROR],
-            "facts": [[_label("原因", "Reason"), error_code]],
-            "tone": "bad", "error_code": error_code,
-        }],
-    }
-    _display_fields(record)
-    request.app.state.requestlog.enqueue(record)
-
 
 def _last_user_text(messages: list) -> str:
     for message in reversed(messages):
@@ -119,6 +41,28 @@ def _last_user_text(messages: list) -> str:
             if isinstance(content, list):
                 return " ".join(part.get("text", "") for part in content if isinstance(part, dict))
     return ""
+
+
+_NODE_TYPES = (
+    (StartNode, "start"),
+    (QuestionNode, "question"),
+    (ConditionNode, "condition"),
+    (LogicNode, "logic"),
+    (TargetNode, "target"),
+)
+
+
+def _node_labels(snapshot) -> dict:
+    if snapshot is None or snapshot.tree is None:
+        return {}
+    labels = {}
+    for node in snapshot.tree.root.nodes:
+        node_type = next(
+            (name for node_class, name in _NODE_TYPES if isinstance(node, node_class)),
+            "unknown",
+        )
+        labels[node.id] = {"title": node.title, "type": node_type}
+    return labels
 
 
 def _error(message: str, status_code: int) -> JSONResponse:
@@ -181,8 +125,6 @@ class _OutcomeRecorder:
             "outcome_state": outcome_state,
             **_usage_fields(usage),
         })
-        self.record["trace"].append(_result_event(self.record))
-        _display_fields(self.record)
         self.requestlog.enqueue_result(self.record)
         return True
 
@@ -223,11 +165,23 @@ class _SseUsage:
             self.usage = value["usage"]
 
 
+def _first_wave_choice(decision):
+    """第一波按 node_id 排序后的首个 ChoiceAnswer（日志兼容列，spec §3.8）。"""
+    first_wave = decision.waves[0] if decision.waves else None
+    if first_wave is None:
+        return None
+    for node_id in sorted(first_wave.questions):
+        answer = decision.answers.get(node_id)
+        if isinstance(answer, ChoiceAnswer):
+            return answer
+    return None
+
+
 def _decision_record(request: Request, decision, snapshot, body, text: str,
                      reasoning_warning, routing_ms: float, started: float) -> dict:
-    answer = decision.jev_answer
-    jev_event = next((event for event in decision.trace if event.get("event") == "jev_choice"), None)
-    record = {
+    first_wave = decision.waves[0] if decision.waves else None
+    answer = _first_wave_choice(decision)
+    return {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
         "text": text,
@@ -242,17 +196,20 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
         "fallback_reason": decision.fallback_reason,
         "sticky_hit": 1 if decision.sticky_hit else 0,
         "session_hash": decision.session_hash,
-        "jev_model": snapshot.jev.model if jev_event is not None and snapshot.jev else None,
+        "jev_model": snapshot.jev.model if first_wave is not None and snapshot.jev else None,
         "jev_choice": answer.selected_key if answer else None,
         "jev_top": answer.p_top if answer else None,
         "jev_margin": answer.margin if answer else None,
-        "jev_ms": answer.duration_ms if answer else (jev_event or {}).get("duration_ms"),
-        "jev_probabilities": answer.probabilities if answer else None,
+        "jev_ms": first_wave.duration_ms if first_wave is not None else None,
+        "jev_probabilities": dict(answer.probabilities) if answer else None,
+        "waves": len(decision.waves),
+        "answers": {node_id: _answer_payload(value) for node_id, value in decision.answers.items()},
         "reasoning": decision.reasoning,
         "reasoning_warning": reasoning_warning,
         "routing_ms": routing_ms,
         "latency_ms": (time.monotonic() - started) * 1000.0,
         "trace": list(decision.trace),
+        "node_labels": _node_labels(snapshot),
         "upstream_model": None,
         "upstream_status": None,
         "upstream_ms": None,
@@ -263,15 +220,57 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
         "total_tokens": None,
         "error_class": None,
         "outcome_state": OUTCOME_INCOMPLETE,
-        "route_label": {
-            "sticky": _label("粘性命中", "Sticky route"),
-            "fallback": _label("兜底路由", "Fallback route"),
-            "jev": _label("JEV 选择", "JEV selection"),
-            "direct": _label("直接路由", "Direct route"),
-        }.get(decision.selection_reason, _label("模型调度", "Model scheduling")),
     }
-    _display_fields(record)
-    return record
+
+
+def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
+                            routing_ms, total_ms):
+    # 调度失败 ≠ 图没有决策：恢复 trace 中最后一个 final 的目标元数据；
+    # 无 final（图前失败）时保持 None，不从 sticky/schedule 推断成功结论。
+    final = next(
+        (
+            event for event in reversed(trace)
+            if isinstance(event, dict) and event.get("event") == "final"
+        ),
+        None,
+    )
+    target_id = final.get("target_id") if final is not None else None
+    final_kind = final.get("kind") if final is not None else None
+    if final_kind == "target":
+        selection_reason = "target"
+        fallback_reason = None
+    elif final_kind in {"otherwise", "error_fallback"}:
+        selection_reason = "error_fallback"
+        fallback_reason = "error_fallback"
+    else:
+        selection_reason = None
+        fallback_reason = None
+    return {
+        "id": uuid.uuid4().hex,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "text": text,
+        "decision": "route",
+        "model": None,
+        "target_id": target_id,
+        "tree_id": getattr(snapshot, "tree_id", None),
+        "tree_revision": getattr(snapshot, "tree_revision", None),
+        "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
+        "policy_path": target_id,
+        "selection_reason": selection_reason,
+        "fallback_reason": fallback_reason,
+        "sticky_hit": 0,
+        "session_hash": session_digest(session_id),
+        "jev_model": snapshot.jev.model if snapshot is not None and snapshot.jev else None,
+        "waves": sum(event.get("event") == "wave" for event in trace),
+        "answers": {},
+        "routing_ms": routing_ms,
+        "latency_ms": total_ms,
+        "total_ms": total_ms,
+        "trace": trace,
+        "node_labels": _node_labels(snapshot),
+        "outcome_state": OUTCOME_ROUTING_ERROR,
+        "error_class": error_class,
+    }
 
 
 @router.post("/chat/completions")
@@ -298,37 +297,51 @@ async def chat_completions(request: Request):
     if len(session_id) > 256:
         return _error("invalid_session_id", 400)
 
-    snapshot = request.app.state.snapshot
-    routing_started = time.monotonic()
     text = _last_user_text(messages)
-    partial_trace: list[dict] = []
+    requestlog = request.app.state.requestlog
+    routing_started = time.monotonic()
+    trace: list[dict] = []
+
+    def fail(error_class, status_code, stage, message):
+        routing_ms = (time.monotonic() - routing_started) * 1000.0
+        total_ms = (time.monotonic() - started) * 1000.0
+        trace.append({
+            "event": "routing_error",
+            "stage": stage,
+            "error_class": error_class,
+            "message": message,
+        })
+        requestlog.enqueue(_routing_failure_record(
+            snapshot, text, session_id, trace,
+            error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
+        ))
+        return _error(error_class, status_code)
+
+    snapshot = request.app.state.snapshot
+    if snapshot is None:
+        return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
     try:
         decision = await request.app.state.engine.route(
             snapshot,
             RoutingRequest(text=text, session_id=session_id),
-            trace_sink=partial_trace,
+            trace_sink=trace,
         )
-    except NoActiveTreeError:
-        _routing_failure_record(request, snapshot, text, partial_trace, started, routing_started, "no_active_tree")
-        return _error("no_active_tree", 503)
-    except NoAvailableBackend:
-        _routing_failure_record(request, snapshot, text, partial_trace, started, routing_started, "no_available_backend")
-        return _error("no_available_backend", 503)
-    except RoutingMiss:
-        _routing_failure_record(request, snapshot, text, partial_trace, started, routing_started, "routing_invariant_violation")
-        return _error("routing_invariant_violation", 503)
+    except NoActiveTreeError as exc:
+        return fail("no_active_tree", 503, "graph", str(exc))
+    except NoAvailableBackend as exc:
+        return fail("no_available_backend", 503, "schedule", str(exc))
+    except RoutingMiss as exc:
+        return fail("routing_invariant_violation", 503, "graph", str(exc))
     except Exception:
         logger.exception("routing failed")
-        _routing_failure_record(request, snapshot, text, partial_trace, started, routing_started, "routing_failed")
-        return _error("routing_failed", 503)
+        return fail("routing_failed", 503, "graph", "routing failed")
     routing_ms = (time.monotonic() - routing_started) * 1000.0
     backend = snapshot.backends.get(decision.model)
+    # 防御性不变式：正常引擎不可达，decision.model 必来自同一快照的 backends；真到达时无请求记录。
     if backend is None:
         decision.release()
-        _routing_failure_record(request, snapshot, text, partial_trace, started, routing_started, "no_available_backend")
         return _error("no_available_backend", 503)
     upstream_body, reasoning_warning = prepare_upstream_request(body, backend, decision.reasoning)
-    requestlog = request.app.state.requestlog
     record = _decision_record(request, decision, snapshot, body, text, reasoning_warning, routing_ms, started)
     requestlog.enqueue(record)
     outcome = _OutcomeRecorder(requestlog, record, started)

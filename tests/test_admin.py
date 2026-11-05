@@ -1,13 +1,17 @@
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.config import Settings
+from router.api.requestlog import RequestLogger
+from router.store.db import connect, migrate
+from tests.routing_fixtures import test_settings
 
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(create_app(Settings(db_path=str(tmp_path / "v3.db"))))
+    return TestClient(create_app(test_settings(tmp_path)))
 
 
 def test_overview_and_request_stats_use_current_log_contract(client):
@@ -52,3 +56,30 @@ def test_model_provider_and_settings_writes_still_publish(client):
 def test_request_recent_returns_memory_ring(client):
     body = client.get("/admin/requests/recent").json()
     assert body == {"requests": []}
+
+
+def test_startup_hydrates_recent_request_logs_from_sqlite(tmp_path):
+    settings = test_settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    conn.close()
+    log = RequestLogger(settings)
+    log.enqueue({
+        "id": "historical-1",
+        "ts": "2026-11-03T18:59:00+08:00",
+        "decision": "route",
+        "model": "fast",
+        "routing_ms": 12.0,
+    })
+    asyncio.run(log.flush())
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        body = client.get("/admin/requests/recent").json()
+        stats = client.get("/admin/requests/stats").json()
+
+    assert [item["id"] for item in body["requests"]] == ["historical-1"]
+    assert body["requests"][0]["latency_ms"] == 12.0
+    assert "text" not in body["requests"][0]
+    assert "trace" not in body["requests"][0]
+    assert stats["ring_size"] == 1

@@ -12,10 +12,10 @@ from fastapi.testclient import TestClient
 
 from router import auth
 from router.api.app import create_app
-from router.config import Settings
 from router.store.db import connect, migrate
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
                                        UserRepo)
+from tests.routing_fixtures import test_settings
 
 # --------------------------------------------------------------------------- #
 # Task 1：口令哈希 / email 规范化 / UserRepo / SessionRepo
@@ -86,9 +86,9 @@ def test_seed_admin_only_when_empty(conn):
 
 def test_seed_admin_uses_configured_email(tmp_path):
     db = str(tmp_path / "t.db")
-    create_app(Settings(db_path=db, user_auth=True,
-                        admin_email="root@example.com",
-                        admin_password="root-pass-1"))
+    create_app(test_settings(tmp_path, db_path=db, user_auth=True,
+                             admin_email="root@example.com",
+                             admin_password="root-pass-1"))
 
     def rows():
         c = connect(db)
@@ -101,9 +101,9 @@ def test_seed_admin_uses_configured_email(tmp_path):
     assert [u["email"] for u in users] == ["root@example.com"]
     assert users[0]["role"] == "admin"
     # 再次启动（幂等）：不重复插入、不覆盖已经改过的密码
-    create_app(Settings(db_path=db, user_auth=True,
-                        admin_email="root@example.com",
-                        admin_password="changed-pass-2"))
+    create_app(test_settings(tmp_path, db_path=db, user_auth=True,
+                             admin_email="root@example.com",
+                             admin_password="changed-pass-2"))
     conn = connect(db)
     try:
         users = UserRepo(conn).list()
@@ -115,7 +115,7 @@ def test_seed_admin_uses_configured_email(tmp_path):
         conn.close()
     # user_auth=False 不 seed（连哈希都不做：这是给旧行为部署的兼容路径）
     db2 = str(tmp_path / "legacy.db")
-    create_app(Settings(db_path=db2, user_auth=False))
+    create_app(test_settings(tmp_path, db_path=db2, user_auth=False))
     conn = connect(db2)
     try:
         assert UserRepo(conn).list() == []
@@ -234,8 +234,8 @@ def test_update_and_delete(conn):
 # --------------------------------------------------------------------------- #
 def api_client(tmp_path, *, name="api.db", user_auth=True, **overrides):
     """TestClient with the login-based /admin gate (user_auth=True by default)."""
-    settings = Settings(db_path=str(tmp_path / name), user_auth=user_auth,
-                        **overrides)
+    settings = test_settings(tmp_path, db_path=str(tmp_path / name), user_auth=user_auth,
+                             **overrides)
     return TestClient(create_app(settings))
 
 
@@ -534,8 +534,7 @@ def test_cannot_delete_last_active_admin(tmp_path):
     的请求方验证 —— 它没有 user row，self 检查不适用，能真正打到 last-admin 分支。
     （会话模式下 actor 自己就是一个 admin：删别人时至少还有 2 个 active admin，
     最后一个只能是自己，会先被 "cannot delete yourself" 拦住。）"""
-    c = TestClient(create_app(Settings(db_path=str(tmp_path / "last.db"),
-                                        user_auth=False)))
+    c = TestClient(create_app(test_settings(tmp_path, user_auth=False)))
     admin = c.post("/admin/users", json={"email": "solo@test.com",
                                          "password": "solo-pass-1",
                                          "role": "admin"}).json()["user"]
@@ -672,7 +671,7 @@ def test_responses_never_contain_password_hash(tmp_path):
 def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
     """ROUTER_USER_AUTH=0 + 空 token = 2026-10-26 之前的行为：/admin 完全开放。"""
     db = str(tmp_path / "legacy.db")
-    c = TestClient(create_app(Settings(db_path=db, user_auth=False)))
+    c = TestClient(create_app(test_settings(tmp_path, db_path=db, user_auth=False)))
     assert c.get("/admin/models").status_code == 200
     assert c.put("/admin/settings", json={"a": "b"}).status_code == 200
     assert c.get("/admin/users").json() == {"users": []}
@@ -691,7 +690,7 @@ def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
         conn.close()
 
     # 开放模式不看 Authorization 头（静态 token 已移除，也没有会话概念）
-    c2 = TestClient(create_app(Settings(db_path=str(tmp_path / "legacy2.db"),
-                                        user_auth=False)))
+    c2 = TestClient(create_app(test_settings(tmp_path, db_path=str(tmp_path / "legacy2.db"),
+                                             user_auth=False)))
     assert c2.get("/admin/models",
                   headers={"Authorization": "Bearer whatever"}).status_code == 200

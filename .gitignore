@@ -15,6 +15,7 @@ __pycache__/
 venv/
 
 # ---- 运行时数据 ----
+/routing-graph/
 *.db
 *.db-wal
 *.db-shm
