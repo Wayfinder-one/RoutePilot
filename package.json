@@ -1,0 +1,6 @@
+{
+  "name": "routepilot-console",
+  "private": true,
+  "devDependencies": { "playwright-core": "^1.40.0" },
+  "scripts": { "check:console": "node --test scripts/console_graph_test.mjs && node scripts/console_qa.mjs" }
+}
