@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 
+from router.jev.client import NoulAnswer
 from router.routing.graph.validate import EnableContext, validate_graph_for_enable
 from scripts.spike_jev_batch import (
     BudgetExceeded,
     ResponseRecord,
+    Sample,
     SpikeAbort,
     SpikeTransport,
     build_g3_tree,
@@ -18,6 +20,8 @@ from scripts.spike_jev_batch import (
     plan_request_budget,
     replay_g3,
     route_outcome,
+    run_equivalence,
+    threshold_records,
     wilson_interval,
 )
 
@@ -151,3 +155,52 @@ def test_strict_a_validates_all_but_c_ignores_inactive_failures():
     assert route_outcome(c_decision, len(c_decision.waves))["failed"] is False
     assert route_outcome(a_decision, 1)["failed"] is True
     assert route_outcome(a_decision, 1)["target"] == "t-error"
+
+
+class FakeH1Transport:
+    def __init__(self):
+        self.count = 0
+
+    def post(self, state, questions, stage):
+        self.count += 1
+        answers = {}
+        for key, question in questions.items():
+            if question.question_type == "choice":
+                labels = [item.label for item in question.options]
+                probabilities = {label: 0.7 / 1 if i == 0 else 0.3 / (len(labels) - 1)
+                                 for i, label in enumerate(labels)}
+                answers[key] = {"type": "choice", "probabilities": probabilities}
+            elif question.question_type == "noul":
+                answers[key] = {"type": "noul", "noul": 0.6}
+            else:
+                answers[key] = {"type": "score", "score": 0,
+                                "legend": {str(i): value for i, value in enumerate(question.criteria)}}
+        return ResponseRecord(stage, 200, {"answers": answers, "usage": {"input_tokens": 100}},
+                              None, 1.0, 100)
+
+
+def test_small_and_full_share_cache_without_repeating_requests():
+    samples = [Sample(f"s{i}", f"文本{i}", "short") for i in range(60)]
+    groups = build_question_groups()
+    tree = build_g3_tree()
+    fake = FakeH1Transport()
+    cache = {}
+    run_equivalence(samples[:20], groups, tree, fake, cache=cache,
+                    group_names=("G1", "G2"), repeat_samples=20)
+    assert fake.count == 20 * 7 + 20 * 2
+    second = run_equivalence(samples, groups, tree, fake, cache=cache,
+                             group_names=("G1", "G2", "G3"), repeat_samples=20)
+    assert fake.count == 60 * 12 + 20 * 3
+    assert len(second["routes"]) == 60
+    assert all(row["a_http_requests"] == 1 for row in second["routes"])
+
+
+def test_threshold_records_keep_gt_and_gte_separate():
+    question = build_question_groups()["G1"]["urgent"]
+    a = NoulAnswer(0.5, 0.5, {}, 0.0)
+    b = NoulAnswer(0.5001, 0.4999, {}, 0.0)
+    rows = threshold_records("s1", "G1", "urgent", question, a, b)
+    gt = next(row for row in rows if row["op"] == "gt" and row["threshold"] == 0.5)
+    gte = next(row for row in rows if row["op"] == "gte" and row["threshold"] == 0.5)
+    assert gt["flipped"] is True
+    assert gte["flipped"] is False
