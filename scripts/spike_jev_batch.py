@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import json
 import math
 import threading
@@ -21,7 +22,8 @@ from router.jev.client import (
     _wire_question,
     parse_answer,
 )
-from router.jev.config import JevSettings
+from router.jev.config import DEFAULT_STATE_TEMPLATE, JevSettings
+from router.jev.window import estimate_tokens
 from router.routing.affinity import SessionAffinity
 from router.routing.graph.conditions import evaluate_condition
 from router.routing.graph.engine import GraphExecutionEngine
@@ -328,3 +330,501 @@ def wilson_interval(failures, total):
     center = (p + z * z / (2 * total)) / denominator
     half = z * math.sqrt(p * (1 - p) / total + z * z / (4 * total * total)) / denominator
     return max(0.0, center - half), min(1.0, center + half)
+
+
+PROB_THRESHOLDS = (0.5, 0.6, 0.65, 0.7)
+SCORE_THRESHOLDS = (4.0, 8.0)
+OPS = ("gt", "gte", "lt", "lte", "eq", "neq")
+
+_AB_TOLERANCE = 0.02
+_FLIP_TOLERANCE = 0.005
+
+
+def render_state(text):
+    return DEFAULT_STATE_TEMPLATE.format(request=text)
+
+
+def canonical_questions(questions):
+    return json.dumps({key: _wire_question(value) for key, value in questions.items()},
+                      ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _call(transport, cache, key, *, stage, state, questions, sample_id, group, path, question_id):
+    if key not in cache:
+        record = transport.post(state, questions, stage)
+        cache[key] = {
+            "sample_id": sample_id, "group": group, "path": path, "question_id": question_id,
+            "question_count": len(questions), "state_est_tokens": estimate_tokens(state),
+            "wire_est_tokens": estimate_tokens(state + "\n" + canonical_questions(questions)),
+            "response": record,
+        }
+    return cache[key]
+
+
+def call_document(cached):
+    metadata = {key: value for key, value in cached.items() if key != "response"}
+    return {**metadata, **cached["response"].__dict__}
+
+
+def _question_node(key, question):
+    from router.routing.graph.model import QuestionOption
+    return QuestionNode(key, question.question_type, question.instructions,
+                        options=tuple(QuestionOption(x.key, x.label, x.capability) for x in question.options),
+                        criteria=question.criteria)
+
+
+def _a_before_b(sample_id, group):
+    """按 sha256(sample:group) 的奇偶交错 A/B 请求顺序，只影响发送次序。"""
+    digest = hashlib.sha256(f"{sample_id}:{group}".encode("utf-8")).digest()
+    return digest[0] % 2 == 0
+
+
+def _metric_values(question, answer):
+    if question.question_type == "choice":
+        return ({f"prob.{option.key}": answer.probabilities[option.key] for option in question.options},
+                PROB_THRESHOLDS)
+    if question.question_type == "noul":
+        return {"yes": answer.yes}, PROB_THRESHOLDS
+    if question.question_type == "score":
+        return {"value": answer.value}, SCORE_THRESHOLDS
+    raise ValueError(f"unsupported question type {question.question_type!r}")
+
+
+def threshold_records(sample_id, group, question_id, question, a, b):
+    node = _question_node(question_id, question)
+    a_values, thresholds = _metric_values(question, a)
+    b_values, b_thresholds = _metric_values(question, b)
+    if thresholds != b_thresholds:
+        raise ValueError("both answers must belong to the same question type")
+    rows = []
+    for port, a_value in a_values.items():
+        b_value = b_values[port]
+        for op in OPS:
+            for threshold in thresholds:
+                rows.append({
+                    "sample_id": sample_id, "group": group, "question_id": question_id,
+                    "port": port, "op": op, "threshold": threshold,
+                    "a_value": a_value, "b_value": b_value,
+                    "flipped": condition_passes(node, port, op, threshold, a_value)
+                    != condition_passes(node, port, op, threshold, b_value),
+                })
+    return rows
+
+
+def _comparison_row(sample_id, group, question_id, question, a, b):
+    a_values, _ = _metric_values(question, a)
+    b_values, _ = _metric_values(question, b)
+    ports = {
+        port: {"a": a_value, "b": b_values[port], "delta": a_value - b_values[port]}
+        for port, a_value in a_values.items()
+    }
+    deltas = [abs(item["delta"]) for item in ports.values()]
+    row = {
+        "sample_id": sample_id, "group": group, "question_id": question_id,
+        "question_type": question.question_type,
+        "is_probability": question.question_type != "score",
+        "ports": ports,
+        "max_abs_delta": max(deltas),
+        "mean_abs_delta": sum(deltas) / len(deltas),
+    }
+    if question.question_type == "choice":
+        row.update({
+            "a_selected": a.selected_key, "b_selected": b.selected_key,
+            "selected_same": a.selected_key == b.selected_key,
+            "a_margin": a.margin, "b_margin": b.margin,
+        })
+    elif question.question_type == "score":
+        row.update({"a_selected": a.value, "b_selected": b.value,
+                    "selected_same": a.value == b.value})
+    else:
+        row.update({"a_selected": None, "b_selected": None, "selected_same": None})
+    return row
+
+
+def _repeat_row(sample_id, group, question_id, question, b, repeat):
+    b_values, _ = _metric_values(question, b)
+    repeat_values, _ = _metric_values(question, repeat)
+    ports = {
+        port: {"b": b_value, "repeat": repeat_values[port], "delta": repeat_values[port] - b_value}
+        for port, b_value in b_values.items()
+    }
+    deltas = [abs(item["delta"]) for item in ports.values()]
+    return {
+        "sample_id": sample_id, "group": group, "question_id": question_id,
+        "question_type": question.question_type,
+        "is_probability": question.question_type != "score",
+        "ports": ports,
+        "max_abs_delta": max(deltas),
+        "mean_abs_delta": sum(deltas) / len(deltas),
+    }
+
+
+def _repeat_question(questions):
+    for question_id, question in questions.items():
+        if question.question_type == "noul":
+            return question_id, question
+    question_id = next(iter(questions))
+    return question_id, questions[question_id]
+
+
+def _mean(values):
+    values = list(values)
+    return sum(values) / len(values) if values else None
+
+
+def _threshold_stats(flips, total):
+    if total <= 0:
+        return {"flips": 0, "total": 0, "rate": None, "wilson_low": None, "wilson_high": None}
+    low, high = wilson_interval(flips, total)
+    return {"flips": flips, "total": total, "rate": flips / total,
+            "wilson_low": low, "wilson_high": high}
+
+
+def _rows_stats(rows):
+    return _threshold_stats(sum(1 for row in rows if row["flipped"]), len(rows))
+
+
+def _aggregate_thresholds(rows):
+    buckets = {}
+    for row in rows:
+        key = (row["group"], row["question_id"], row["port"], row["op"], row["threshold"])
+        bucket = buckets.setdefault(key, {"flips": 0, "total": 0})
+        bucket["flips"] += 1 if row["flipped"] else 0
+        bucket["total"] += 1
+    aggregated = []
+    for key in sorted(buckets, key=lambda item: (item[0], item[1], item[2], OPS.index(item[3]), item[4])):
+        group, question_id, port, op, threshold = key
+        aggregated.append({
+            "group": group, "question_id": question_id, "port": port, "op": op,
+            "threshold": threshold, **_threshold_stats(buckets[key]["flips"], buckets[key]["total"]),
+        })
+    return aggregated
+
+
+def _group_summary(rows, repeat_rows):
+    choice = [row for row in rows if row["question_type"] == "choice"]
+    noul = [row for row in rows if row["question_type"] == "noul"]
+    score = [row for row in rows if row["question_type"] == "score"]
+    probability_deltas = [abs(item["delta"]) for row in rows if row["is_probability"]
+                          for item in row["ports"].values()]
+    score_deltas = [abs(item["delta"]) for row in score for item in row["ports"].values()]
+    repeat_probability_deltas = [abs(item["delta"]) for row in repeat_rows if row["is_probability"]
+                                 for item in row["ports"].values()]
+    repeat_score_deltas = [abs(item["delta"]) for row in repeat_rows if not row["is_probability"]
+                           for item in row["ports"].values()]
+    choice_deltas = [abs(item["delta"]) for row in choice for item in row["ports"].values()]
+    noul_deltas = [abs(item["delta"]) for row in noul for item in row["ports"].values()]
+    argmax_same = sum(1 for row in choice if row["selected_same"])
+    selected_same = sum(1 for row in score if row["selected_same"])
+    return {
+        "samples": len({row["sample_id"] for row in rows}),
+        "questions": len({row["question_id"] for row in rows}),
+        "valid_comparisons": len(rows),
+        "max_ab": max(probability_deltas) if probability_deltas else None,
+        "mean_ab": _mean(probability_deltas),
+        "choice": {
+            "count": len(choice),
+            "max_abs_delta": max(choice_deltas) if choice_deltas else None,
+            "mean_abs_delta": _mean(choice_deltas),
+            "argmax_same": argmax_same,
+            "argmax_rate": (argmax_same / len(choice)) if choice else None,
+        },
+        "noul": {
+            "count": len(noul),
+            "max_abs_delta": max(noul_deltas) if noul_deltas else None,
+            "mean_abs_delta": _mean(noul_deltas),
+        },
+        "score": {
+            "count": len(score),
+            "max_abs_delta": max(score_deltas) if score_deltas else None,
+            "mean_abs_delta": _mean(score_deltas),
+            "selected_same": selected_same,
+            "selected_rate": (selected_same / len(score)) if score else None,
+        },
+        "repeat_count": len(repeat_rows),
+        "max_repeat": max(repeat_probability_deltas) if repeat_probability_deltas else None,
+        "max_repeat_score": max(repeat_score_deltas) if repeat_score_deltas else None,
+    }
+
+
+def _equivalence_summary(samples, names, comparisons, threshold_rows, routes, invalid, repeats):
+    groups = {}
+    for name in names:
+        summary = _group_summary(
+            [row for row in comparisons if row["group"] == name],
+            [row for row in repeats if row["group"] == name],
+        )
+        summary["invalid_comparisons"] = sum(1 for row in invalid if row["group"] == name)
+        groups[name] = summary
+
+    probability_deltas = [abs(item["delta"]) for row in comparisons if row["is_probability"]
+                          for item in row["ports"].values()]
+    max_ab = max(probability_deltas) if probability_deltas else None
+    repeat_deltas = [abs(item["delta"]) for row in repeats if row["is_probability"]
+                     for item in row["ports"].values()]
+    max_repeat = max(repeat_deltas) if repeat_deltas else None
+    repeat_score_deltas = [abs(item["delta"]) for row in repeats if not row["is_probability"]
+                           for item in row["ports"].values()]
+
+    choice_rows = [row for row in comparisons if row["question_type"] == "choice"]
+    score_rows = [row for row in comparisons if row["question_type"] == "score"]
+    argmax_same = sum(1 for row in choice_rows if row["selected_same"])
+    selected_same = sum(1 for row in score_rows if row["selected_same"])
+
+    strata = {}
+    for bucket in sorted({sample.length_bucket for sample in samples}):
+        ids = {sample.id for sample in samples if sample.length_bucket == bucket}
+        rows = [row for row in threshold_rows if row["sample_id"] in ids]
+        strata[bucket] = {"samples": len(ids), **_rows_stats(rows)}
+
+    boundary_tags = sorted({tag for sample in samples for tag in sample.boundary_tags})
+    boundary = {}
+    for tag in boundary_tags:
+        ids = {sample.id for sample in samples if tag in sample.boundary_tags}
+        boundary[tag] = {"samples": len(ids), **_rows_stats(
+            [row for row in threshold_rows if row["sample_id"] in ids])}
+    tagged_ids = {sample.id for sample in samples if sample.boundary_tags}
+    boundary_overall = {"samples": len(tagged_ids), **_rows_stats(
+        [row for row in threshold_rows if row["sample_id"] in tagged_ids])}
+    empty_boundary_classes = [tag for tag in boundary_tags if boundary[tag]["total"] == 0]
+
+    g3_rows = [row for row in routes if row["group"] == "G3"]
+    if g3_rows:
+        g3 = {
+            "samples": len(g3_rows),
+            "target_same": sum(1 for row in g3_rows if row["target_same"]),
+            "target_rate": sum(1 for row in g3_rows if row["target_same"]) / len(g3_rows),
+            "candidates_same": sum(1 for row in g3_rows if row["candidates_same"]),
+            "candidates_rate": sum(1 for row in g3_rows if row["candidates_same"]) / len(g3_rows),
+            "activated_same": sum(1 for row in g3_rows if row["activated_same"]),
+            "activated_rate": sum(1 for row in g3_rows if row["activated_same"]) / len(g3_rows),
+            "new_error_fallbacks": sum(1 for row in g3_rows if row["new_error_fallback"]),
+            "a_http_requests": sum(row["a_http_requests"] for row in g3_rows),
+            "c_http_requests": sum(row["c_http_requests"] for row in g3_rows),
+        }
+    else:
+        g3 = None
+
+    noise_ok = (max_repeat is not None and max_ab is not None
+                and max_repeat <= _AB_TOLERANCE and max_ab <= _AB_TOLERANCE)
+
+    fail_reasons = []
+    conditional_reasons = []
+    if invalid:
+        fail_reasons.append(f"{len(invalid)} invalid comparison(s)")
+    if max_ab is None:
+        conditional_reasons.append("no valid probability comparisons")
+    elif max_ab > _AB_TOLERANCE:
+        fail_reasons.append(f"max_ab {max_ab:.6f} > {_AB_TOLERANCE}")
+    if not choice_rows:
+        conditional_reasons.append("no choice comparisons")
+    elif argmax_same != len(choice_rows):
+        fail_reasons.append(f"argmax agreement {argmax_same}/{len(choice_rows)}")
+    if not score_rows:
+        conditional_reasons.append("no score comparisons")
+    elif selected_same != len(score_rows):
+        fail_reasons.append(f"score selected agreement {selected_same}/{len(score_rows)}")
+    for bucket, stats in strata.items():
+        if stats["total"] == 0:
+            conditional_reasons.append(f"length bucket {bucket!r} has no threshold judgments")
+        elif stats["rate"] > _FLIP_TOLERANCE:
+            fail_reasons.append(
+                f"length bucket {bucket!r} flip rate {stats['rate']:.6f} > {_FLIP_TOLERANCE}")
+    for tag, stats in boundary.items():
+        if stats["total"] == 0:
+            conditional_reasons.append(f"boundary class {tag!r} has no threshold judgments")
+        elif stats["rate"] > _FLIP_TOLERANCE:
+            fail_reasons.append(
+                f"boundary class {tag!r} flip rate {stats['rate']:.6f} > {_FLIP_TOLERANCE}")
+    if not boundary_tags:
+        conditional_reasons.append("no boundary classes present")
+    elif boundary_overall["total"] == 0:
+        conditional_reasons.append("boundary subset has no threshold judgments")
+    elif boundary_overall["rate"] > _FLIP_TOLERANCE:
+        fail_reasons.append(
+            f"boundary subset flip rate {boundary_overall['rate']:.6f} > {_FLIP_TOLERANCE}")
+    if g3 is None:
+        conditional_reasons.append("G3 route comparison not measured")
+    else:
+        if g3["target_rate"] < 1.0:
+            fail_reasons.append(f"G3 target agreement {g3['target_same']}/{g3['samples']}")
+        if g3["candidates_rate"] < 1.0:
+            fail_reasons.append(f"G3 candidates agreement {g3['candidates_same']}/{g3['samples']}")
+        if g3["new_error_fallbacks"]:
+            fail_reasons.append(f"{g3['new_error_fallbacks']} new error_fallback route(s)")
+    if max_repeat is None:
+        conditional_reasons.append("no repeat baseline observations")
+    elif max_repeat > _AB_TOLERANCE:
+        conditional_reasons.append(f"max_repeat {max_repeat:.6f} > {_AB_TOLERANCE}")
+
+    if fail_reasons:
+        status = "fail"
+    elif conditional_reasons:
+        status = "conditional"
+    else:
+        status = "pass"
+
+    return {
+        "status": status,
+        "fail_reasons": fail_reasons,
+        "conditional_reasons": conditional_reasons,
+        "noise_ok": noise_ok,
+        "max_ab": max_ab,
+        "mean_ab": _mean(probability_deltas),
+        "argmax_rate": (argmax_same / len(choice_rows)) if choice_rows else None,
+        "selected_rate": (selected_same / len(score_rows)) if score_rows else None,
+        "max_repeat": max_repeat,
+        "max_repeat_score": max(repeat_score_deltas) if repeat_score_deltas else None,
+        "groups": groups,
+        "strata": strata,
+        "boundary": boundary,
+        "boundary_overall": boundary_overall,
+        "boundary_classes": boundary_tags,
+        "empty_boundary_classes": empty_boundary_classes,
+        "g3": g3,
+        "repeat": {
+            "observations": len(repeats),
+            "max_abs_delta": max_repeat,
+            "mean_abs_delta": _mean(repeat_deltas),
+        },
+    }
+
+
+def run_equivalence(samples, groups, tree, transport, *, cache=None,
+                    group_names=("G1", "G2", "G3"), repeat_samples=20):
+    samples = list(samples)
+    cache = {} if cache is None else cache
+    names = tuple(group_names)
+    unknown = [name for name in names if name not in groups]
+    if unknown:
+        raise ValueError(f"unknown question group {unknown[0]!r}")
+    if isinstance(repeat_samples, bool) or not isinstance(repeat_samples, int) or repeat_samples < 0:
+        raise ValueError("repeat_samples must be a nonnegative integer")
+    tree_question_ids = {node.id for node in tree.root.nodes if isinstance(node, QuestionNode)}
+    if "G3" in names and set(groups["G3"]) != tree_question_ids:
+        raise ValueError("G3 question group does not match the routing tree")
+
+    comparisons = []
+    threshold_rows = []
+    routes = []
+    invalid = []
+    repeats = []
+
+    for index, sample in enumerate(samples):
+        state = render_state(sample.text)
+        for name in names:
+            questions = groups[name]
+            a_cached = None
+            b_cached = None
+            order = ("A", "B") if _a_before_b(sample.id, name) else ("B", "A")
+            for step in order:
+                if step == "A":
+                    a_cached = _call(
+                        transport, cache, (sample.id, name, "A", "*"), stage="H1-A",
+                        state=state, questions=questions, sample_id=sample.id, group=name,
+                        path="A", question_id="*",
+                    )
+                else:
+                    b_cached = {
+                        question_id: _call(
+                            transport, cache, (sample.id, name, "B", question_id), stage="H1-B",
+                            state=state, questions={question_id: question}, sample_id=sample.id,
+                            group=name, path="B", question_id=question_id,
+                        )
+                        for question_id, question in questions.items()
+                    }
+            a_record = a_cached["response"]
+            b_records = {
+                question_id: cached["response"] for question_id, cached in b_cached.items()
+            }
+
+            a_answers = {}
+            a_errors = {}
+            b_answers = {}
+            b_errors = {}
+            for question_id, question in questions.items():
+                try:
+                    a_answers[question_id] = typed_answer(question_id, question, a_record)
+                except JevError as exc:
+                    a_errors[question_id] = str(exc)
+                try:
+                    b_answers[question_id] = typed_answer(question_id, question, b_records[question_id])
+                except JevError as exc:
+                    b_errors[question_id] = str(exc)
+                if question_id in a_answers and question_id in b_answers:
+                    comparisons.append(_comparison_row(
+                        sample.id, name, question_id, question,
+                        a_answers[question_id], b_answers[question_id],
+                    ))
+                    threshold_rows.extend(threshold_records(
+                        sample.id, name, question_id, question,
+                        a_answers[question_id], b_answers[question_id],
+                    ))
+                else:
+                    invalid.append({
+                        "sample_id": sample.id, "group": name, "question_id": question_id,
+                        "kind": "a_b", "a_path": "A", "b_path": "B",
+                        "a_error": a_errors.get(question_id), "b_error": b_errors.get(question_id),
+                    })
+
+            if name == "G3":
+                a_decision = replay_g3(
+                    tree, sample.text, {question_id: a_record for question_id in questions},
+                    strict_all=True,
+                )
+                b_decision = replay_g3(tree, sample.text, dict(b_records), strict_all=False)
+                a_outcome = route_outcome(a_decision, 1)
+                c_outcome = route_outcome(b_decision, len(b_decision.waves))
+                fallback = tree.root.error_fallback
+                routes.append({
+                    "sample_id": sample.id, "group": name,
+                    "a": a_outcome, "b": c_outcome,
+                    "target_same": a_outcome["target"] == c_outcome["target"],
+                    "candidates_same": a_outcome["candidates"] == c_outcome["candidates"],
+                    "activated_same": a_outcome["activated"] == c_outcome["activated"],
+                    "a_http_requests": 1,
+                    "c_http_requests": len(b_decision.waves),
+                    "new_error_fallback": (
+                        fallback is not None
+                        and a_outcome["target"] == fallback
+                        and c_outcome["target"] != fallback
+                    ),
+                })
+
+            if index < repeat_samples:
+                repeat_id, repeat_question = _repeat_question(questions)
+                repeat_record = _call(
+                    transport, cache, (sample.id, name, "repeat", repeat_id), stage="H1-repeat",
+                    state=state, questions={repeat_id: repeat_question}, sample_id=sample.id,
+                    group=name, path="repeat", question_id=repeat_id,
+                )["response"]
+                try:
+                    repeat_answer = typed_answer(repeat_id, repeat_question, repeat_record)
+                    repeat_error = None
+                except JevError as exc:
+                    repeat_answer = None
+                    repeat_error = str(exc)
+                if repeat_id in b_answers and repeat_answer is not None:
+                    repeats.append(_repeat_row(
+                        sample.id, name, repeat_id, repeat_question,
+                        b_answers[repeat_id], repeat_answer,
+                    ))
+                else:
+                    invalid.append({
+                        "sample_id": sample.id, "group": name, "question_id": repeat_id,
+                        "kind": "repeat", "a_path": "B", "b_path": "repeat",
+                        "a_error": b_errors.get(repeat_id), "b_error": repeat_error,
+                    })
+
+    return {
+        "calls": [call_document(cached) for cached in cache.values()],
+        "comparisons": comparisons,
+        "thresholds": {
+            "records": threshold_rows,
+            "aggregated": _aggregate_thresholds(threshold_rows),
+        },
+        "routes": routes,
+        "invalid_comparisons": invalid,
+        "summary": _equivalence_summary(
+            samples, names, comparisons, threshold_rows, routes, invalid, repeats),
+    }
