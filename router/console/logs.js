@@ -1,196 +1,216 @@
-/* Calculation log — a disclosure list.
-   Each row is one request and stays one glance wide (model, outcome,
-   latency, evidence chips). Clicking a row opens its decision evidence
-   inline, below the row: request text, facts, JEV probabilities, time path
-   and reasoning. Rows do not navigate elsewhere and never become a side
-   panel; several rows can stay open so two decisions can be compared. */
+/* Calculation log: render only phases present in trace. */
 const $ = selector => document.querySelector(selector);
 let requests = [];
 let filter = 'all';
 const openIds = new Set();
-
+const TONES = { '': 0, hit: 1, warn: 2, bad: 3 };
 const OUTCOME = {
-  completed: { key: 'logs.out.completed', tone: 'ok', chip: null },
-  upstream_error: { key: 'logs.out.upstream', tone: 'bad', chip: 'bad' },
-  client_disconnected: { key: 'logs.out.disconnected', tone: 'warn', chip: 'warn' },
-  cancelled: { key: 'logs.out.cancelled', tone: 'warn', chip: 'warn' },
-  incomplete: { key: 'logs.out.incomplete', tone: '', chip: 'warn' },
+  completed: ['logs.out.completed', 'hit'],
+  routing_error: ['logs.out.routing', 'bad'],
+  upstream_error: ['logs.out.upstream', 'bad'],
+  client_disconnected: ['logs.out.disconnected', 'warn'],
+  cancelled: ['logs.out.cancelled', 'warn'],
+  incomplete: ['logs.out.incomplete', ''],
 };
-const FILTERS = {
-  all: () => true,
-  jev: record => record.jev_top != null,
-  sticky: record => !!record.sticky_hit,
-  fallback: record => record.selection_reason === 'fallback',
-};
-
+function display(value) {
+  if (value == null || value === '') return '—';
+  if (typeof value === 'object' && !Array.isArray(value))
+    return display(value[LANG] ?? value.zh ?? value.en ?? '—');
+  return String(value);
+}
+function safe(value) { return esc(display(value)); }
 function ms(value) {
   if (value == null || value === '') return '—';
-  const number = Number(value);
-  if (!Number.isFinite(number)) return '—';
-  return number >= 1000 ? (number / 1000).toFixed(2) + 's' : Math.round(number) + 'ms';
+  const n = Number(value);
+  return Number.isFinite(n) ? (n >= 1000 ? (n / 1000).toFixed(2) + 's' : Math.round(n) + 'ms') : '—';
 }
-
-function shown() {
-  return requests.filter(FILTERS[filter] || FILTERS.all);
+function events(record) {
+  return Array.isArray(record.trace) ? record.trace.filter(e => e && typeof e === 'object') : [];
 }
-
-/* ── summary strip ─────────────────────────────────────────────── */
-function renderStats() {
-  const sticky = requests.filter(record => record.sticky_hit).length;
-  const fallback = requests.filter(record => record.selection_reason === 'fallback').length;
-  const timed = requests.map(record => Number(record.latency_ms)).filter(Number.isFinite);
-  const average = timed.length ? timed.reduce((sum, value) => sum + value, 0) / timed.length : null;
-  const cards = [
-    ['logs.stat.requests', String(requests.length), ''],
-    ['logs.stat.sticky', String(sticky), sticky ? 'ok' : ''],
-    ['logs.stat.fallback', String(fallback), fallback ? 'warn' : ''],
-    ['logs.stat.latency', ms(average), ''],
-  ];
-  $('#stats').innerHTML = cards.map(([key, value, tone]) =>
-    `<div class="lg-stat ${tone}"><div class="n">${esc(value)}</div><div class="l">${esc(t(key))}</div></div>`).join('');
+/* Migration adapter for the events emitted before the display contract. */
+const LEGACY = {
+  time: ['time', 'logs.ev.time'], branch_selected: ['branch', 'logs.ev.branch'],
+  branch_skipped: ['branch', 'logs.ev.branchSkip'], branch_otherwise: ['branch', 'logs.ev.branchOther'],
+  jev_input_window: ['jev-input', 'logs.ev.window'], jev_choice: ['jev', 'logs.ev.jev'],
+  sticky_hit: ['sticky', 'logs.ev.sticky'], fallback: ['fallback', 'logs.ev.fallback'],
+  scheduled: ['schedule', 'logs.ev.scheduled'], routing_error: ['error', 'logs.out.routing'],
+};
+const LEGACY_FACTS = ['active_periods', 'timezone', 'model', 'target_id', 'child_id',
+  'node_id', 'selected_key', 'p_top', 'margin', 'reason', 'error', 'tokens_before',
+  'tokens_after', 'input_tokens_limit', 'truncated', 'duration_ms'];
+function legacy(event, hasConditionalMiss) {
+  const kind = String(event.event || 'event');
+  // Old engines emitted a timezone even for a direct route. A skipped branch
+  // proves that a configured time condition was evaluated without a match.
+  const emptyTime = kind === 'time' && (!Array.isArray(event.active_periods) || !event.active_periods.length);
+  if (emptyTime && !hasConditionalMiss) return null;
+  const [phase, key] = LEGACY[kind] || [kind, null];
+  const facts = LEGACY_FACTS.filter(name => event[name] != null && event[name] !== '')
+    .map(name => [name, Array.isArray(event[name]) ? event[name].join(', ') : String(event[name])]);
+  const tone = kind === 'routing_error' || event.error ? 'bad'
+    : kind === 'fallback' || (kind === 'jev_input_window' && event.truncated) ? 'warn'
+    : kind === 'scheduled' || kind === 'sticky_hit' ? 'hit' : '';
+  return { phase, label: key ? t(key) : kind,
+    cell: emptyTime ? t('logs.timeNone') : event.model ?? event.selected_key ?? event.reason ?? kind,
+    summary: emptyTime ? t('logs.timeNone') : event.reason ?? event.model ?? event.selected_key ?? (key ? t(key) : kind),
+    facts, tone };
 }
-
-/* ── filter tabs ───────────────────────────────────────────────── */
+function stages(record) {
+  const groups = new Map();
+  const hasConditionalMiss = events(record).some(e => e.event === 'branch_skipped');
+  events(record).forEach(event => {
+    const item = event.phase ? event : legacy(event, hasConditionalMiss);
+    if (!item) return;
+    const id = String(item.phase);
+    if (!groups.has(id)) groups.set(id, { id, label: item.label ?? id, cell: '—',
+      summary: '—', facts: [], tone: '', count: 0 });
+    const group = groups.get(id);
+    group.count += 1;
+    if (item.label != null) group.label = item.label;
+    if (item.cell != null && item.cell !== '') group.cell = item.cell;
+    if (item.summary != null && item.summary !== '') {
+      group.summary = item.summary;
+      group.facts = Array.isArray(item.facts) ? item.facts.slice(0, 3) : [];
+    }
+    const tone = Object.prototype.hasOwnProperty.call(TONES, item.tone) ? item.tone : '';
+    if (TONES[tone] > TONES[group.tone]) group.tone = tone;
+  });
+  return [...groups.values()];
+}
+const FILTERS = {
+  all: () => true,
+  jev: record => events(record).some(e => e.event === 'jev_choice' || e.phase === 'jev' || e.phase === 'jev-choice'),
+  sticky: record => events(record).some(e => e.event === 'sticky_hit' || e.phase === 'sticky'),
+  fallback: record => events(record).some(e => e.event === 'fallback' || e.phase === 'fallback'),
+  error: record => record.outcome_state === 'routing_error' || record.outcome_state === 'upstream_error',
+};
+function renderKpis() {
+  const timed = requests.map(r => Number(r.total_ms ?? r.latency_ms)).filter(Number.isFinite);
+  const average = timed.length ? timed.reduce((a, b) => a + b, 0) / timed.length : null;
+  const items = [['logs.stat.requests', requests.length, ''],
+    ['logs.filter.jev', requests.filter(FILTERS.jev).length, 'hit'],
+    ['logs.stat.fallback', requests.filter(FILTERS.fallback).length, 'warn'],
+    ['logs.filter.error', requests.filter(FILTERS.error).length, 'bad'],
+    ['logs.stat.latency', ms(average), '']];
+  $('#kpis').innerHTML = items.map(([key, value, tone]) =>
+    '<span class="lg-kpi ' + tone + '"><b>' + safe(value) + '</b><small>' + esc(t(key)) + '</small></span>').join('');
+}
 function renderTabs() {
   document.querySelectorAll('#filter button').forEach(button => {
     const key = button.dataset.filter;
-    const count = requests.filter(FILTERS[key] || FILTERS.all).length;
     button.setAttribute('aria-pressed', String(key === filter));
-    button.innerHTML = `${esc(t('logs.filter.' + key))}<span class="c">${count}</span>`;
+    button.innerHTML = esc(t('logs.filter.' + key)) + '<span class="c">' + requests.filter(FILTERS[key]).length + '</span>';
   });
 }
-
-/* ── rows ──────────────────────────────────────────────────────── */
-function rowHtml(record, open) {
-  const outcome = OUTCOME[record.outcome_state] || null;
+function renderSpread() {
+  const counts = new Map();
+  requests.forEach(record => {
+    const path = stages(record);
+    const tone = path.some(s => s.tone === 'bad') ? 'bad' : path.some(s => s.tone === 'warn') ? 'warn' : '';
+    const key = path.length + '|' + tone;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  $('#spread').innerHTML = '<strong>' + esc(t('logs.spread')) + '</strong>' +
+    [...counts].sort((a, b) => Number(a[0].split('|')[0]) - Number(b[0].split('|')[0]))
+      .map(([key, count]) => {
+        const [number, tone] = key.split('|');
+        return '<span class="lg-shape ' + tone + '">' + esc(tf('logs.stages', {count: number})) +
+          '<b>' + count + '</b></span>';
+      }).join('');
+}
+function chainHtml(path) {
+  if (!path.length) return '<span class="lg-path-empty">' + esc(t('logs.traceEmpty')) + '</span>';
+  const description = path.map(s => display(s.label) + ': ' + display(s.summary)).join(' → ');
+  return '<span class="lg-chain" role="img" aria-label="' + esc(description) + '">' +
+    path.map((stage, index) => (index ? '<span class="lg-sep" aria-hidden="true">›</span>' : '') +
+      '<span class="lg-node ' + stage.tone + '" title="' + safe(stage.label) + ' · ' + safe(stage.summary) + '">' +
+      '<em>' + safe(stage.label) + '</em><b>' + safe(stage.cell) + '</b></span>').join('') + '</span>';
+}
+function rowHtml(record, path, open) {
+  const [status, tone] = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
   const text = String(record.text || '').replace(/\s+/g, ' ').trim();
-  const chips = [];
-  const hasConfidence = record.jev_top != null;
-  /* Only anomalies get a word in the row; success is the green dot. */
-  if (outcome && outcome.chip) {
-    chips.push(`<span class="lg-chip ${outcome.chip}">${esc(t(outcome.key))}</span>`);
-  }
-  if (record.sticky_hit || record.selection_reason === 'sticky') {
-    chips.push(`<span class="lg-chip sticky">${esc(t('logs.reason.sticky'))}</span>`);
-  }
-  if (hasConfidence) chips.push(`<span class="lg-chip jev">JEV ${pct(record.jev_top)}</span>`);
-  if (record.fallback_reason) {
-    chips.push(`<span class="lg-chip fallback" title="${esc(record.fallback_reason)}">${esc(record.fallback_reason)}</span>`);
-  } else if (record.selection_reason === 'fallback') {
-    chips.push(`<span class="lg-chip fallback">${esc(t('logs.reason.fallback'))}</span>`);
-  }
-  return `<button type="button" class="lg-row" aria-expanded="${open}" aria-controls="detail-${esc(record.id)}"
-      title="${esc(text)}">
-    <span class="lg-dot ${outcome ? outcome.tone : ''}" aria-hidden="true"></span>
-    <span class="lg-time">${esc(fmtTime(record.ts))}</span>
-    <span class="lg-text">${text ? esc(text) : `<span class="mut">${esc(t('logs.noText'))}</span>`}</span>
-    ${chips.join('')}
-    <span class="lg-lat">${esc(ms(record.latency_ms))}</span>
-    <span class="lg-model"><span class="ar" aria-hidden="true">→</span>${esc(record.model || '—')}</span>
-    <span class="lg-chev" aria-hidden="true">›</span>
-    <span class="sr-only">${esc(outcome ? t(outcome.key) : '')}</span>
-  </button>`;
+  return '<button type="button" class="lg-row" aria-expanded="' + open +
+    '" aria-controls="detail-' + safe(record.id) + '" title="' + esc(text) + '">' +
+    '<span class="lg-time"><span class="lg-dot ' + tone + '" aria-hidden="true"></span>' +
+    esc(fmtTime(record.ts)) + '</span>' +
+    '<span class="lg-text">' + (text ? esc(text) : esc(t('logs.noText'))) + '</span>' +
+    chainHtml(path) + '<span class="lg-model">→ ' + safe(record.model) + '</span>' +
+    '<span class="lg-lat">' + esc(ms(record.total_ms ?? record.latency_ms)) + '</span>' +
+    '<span class="lg-chev" aria-hidden="true">›</span><span class="sr-only">' +
+    esc(t(status)) + '</span></button>';
 }
-
-/* ── expanded evidence ─────────────────────────────────────────── */
-function probBars(values) {
-  const entries = Object.entries(values).sort((a, b) => Number(b[1]) - Number(a[1]));
-  const top = entries.length ? Number(entries[0][1]) : 0;
-  return entries.map(([key, value]) => {
-    const width = Math.max(2, Math.round(Number(value) * 100));
-    return `<div class="lg-prob${Number(value) === top ? ' sel' : ''}">
-      <span class="k" title="${esc(key)}">${esc(key)}</span>
-      <span class="track"><i style="width:${width}%"></i></span>
-      <span class="v">${pct(value)}</span>
-    </div>`;
-  }).join('');
+function pairsHtml(items, className) {
+  return (Array.isArray(items) ? items : []).filter(pair => Array.isArray(pair) && pair.length >= 2)
+    .map(([key, value]) => '<span class="' + className + '"><b>' + safe(key) + '</b>' + safe(value) + '</span>').join('');
 }
-
-function factHtml(label, value, mono) {
-  return `<div class="lg-fact"><div class="k">${esc(label)}</div><div class="v${mono ? ' mono' : ''}">${value}</div></div>`;
+function stageHtml(stage, index) {
+  const branch = stage.tone === 'warn' || stage.tone === 'bad' ? ' branch' : '';
+  return '<div class="lg-stage ' + stage.tone + branch + '">' +
+    '<div class="lg-rail-cell"><span class="lg-pin">' + (index + 1) + '</span></div>' +
+    '<div class="lg-stage-name"><b>' + safe(stage.label) + '</b><small>' + safe(stage.id) +
+    ' · ' + esc(tf('logs.eventCount', {count: stage.count})) + '</small></div>' +
+    '<div class="lg-judge" title="' + safe(stage.summary) + '">' + safe(stage.summary) + '</div>' +
+    '<div class="lg-evidence">' + (pairsHtml(stage.facts, 'lg-evidence-pair') || '—') + '</div>' +
+    '<div class="lg-stage-count">' + stage.count + '</div></div>';
 }
-
-function detailHtml(record) {
-  const facts = [
-    factHtml(t('logs.f.time'), esc(fmtTime(record.ts)), true),
-    factHtml(t('logs.f.routing'), esc(ms(record.routing_ms)), true),
-    factHtml(t('logs.f.sticky'), record.sticky_hit
-      ? `<span class="lg-ok">${esc(t('logs.f.stickyHit'))}</span>`
-      : `<span class="mut">${esc(t('logs.f.stickyMiss'))}</span>`),
-    factHtml(t('logs.f.tree'), esc(record.tree_id || '—')),
-    factHtml(t('logs.f.snapshot'), esc(String(record.snapshot_revision || '—').slice(0, 12)), true),
-    factHtml(t('logs.f.policy'), esc(record.policy_path || '—'), true),
-  ];
-  if (record.total_tokens != null) {
-    facts.push(factHtml(t('logs.f.tokens'), `${Number(record.prompt_tokens || 0)} → ${Number(record.total_tokens)}`, true));
-  }
-  if (record.upstream_status != null) {
-    facts.push(factHtml(t('logs.f.upstream'), `${esc(String(record.upstream_status))} · ${esc(ms(record.upstream_ms))}`, true));
-  }
-  if (record.fallback_reason) {
-    facts.push(factHtml(t('logs.f.fallback'), esc(record.fallback_reason), true));
-  }
-
-  const prompt = String(record.text || '').trim();
-  const probabilities = record.jev_probabilities && Object.keys(record.jev_probabilities).length
-    ? probBars(record.jev_probabilities) : '';
-  const reasoning = String(record.reasoning || '').trim();
-  const warning = String(record.reasoning_warning || '').trim();
-
-  return `<div class="lg-expand-in">
-    ${prompt ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.prompt'))}</div><div class="lg-prompt">${esc(prompt)}</div></section>` : ''}
-    <section class="lg-block"><div class="lg-sec-h">${esc(t('logs.facts'))}</div><div class="lg-facts">${facts.join('')}</div></section>
-    ${probabilities ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.probs'))}</div><div class="lg-probs">${probabilities}</div></section>` : ''}
-    <section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.trace'))}</div><div class="lg-trace"></div></section>
-    ${reasoning ? `<section class="lg-block"><div class="lg-sec-h">${esc(t('logs.sec.reasoning'))}</div><div class="lg-quote">${esc(reasoning)}</div></section>` : ''}
-    ${warning ? `<div class="lg-note"><b>${esc(t('logs.reasoningWarning'))}</b>${esc(warning)}</div>` : ''}
-  </div>`;
+function legacyFields(record) {
+  const keys = [['id', 'logs.f.id'], ['tree_id', 'logs.f.tree'], ['snapshot_revision', 'logs.f.snapshot'],
+    ['policy_path', 'logs.f.policy'], ['session_hash', 'logs.f.session'], ['jev_model', 'logs.f.jevModel'],
+    ['upstream_status', 'logs.f.upstream'], ['total_tokens', 'logs.f.tokens']];
+  return keys.filter(([key]) => record[key] != null).map(([key, label]) => [t(label), record[key]]);
 }
-
-function itemHtml(record) {
-  const open = openIds.has(record.id);
-  return `<article class="lg-item${open ? ' open' : ''}" data-id="${esc(record.id)}">
-    ${rowHtml(record, open)}
-    <div class="lg-expand" id="detail-${esc(record.id)}"${open ? '' : ' hidden'}>${detailHtml(record)}</div>
-  </article>`;
+function detailHtml(record, path) {
+  const status = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
+  const route = record.route_label ?? (record.selection_reason ? t('logs.reason.' + record.selection_reason) : t(status[0]));
+  const metrics = Array.isArray(record.metrics) ? record.metrics :
+    [[t('logs.f.routing'), ms(record.routing_ms)], [t('logs.stat.latency'), ms(record.total_ms ?? record.latency_ms)]];
+  const fields = Array.isArray(record.fields) ? record.fields : legacyFields(record);
+  return '<div class="lg-detail-head"><span class="lg-route">' + safe(route) + '</span>' +
+    '<span class="lg-status ' + status[1] + '">' + esc(t(status[0])) + '</span>' +
+    '<span class="lg-detail-metrics">' + pairsHtml(metrics, 'lg-metric') + '</span></div>' +
+    '<div class="lg-rail" role="group" aria-label="' + esc(t('logs.sec.trace')) + '">' +
+    '<div class="lg-rail-head" aria-hidden="true"><span></span><span>' + esc(t('logs.stage')) +
+    '</span><span>' + esc(t('logs.summary')) + '</span><span>' + esc(t('logs.evidence')) +
+    '</span><span>' + esc(t('logs.events')) + '</span></div>' +
+    (path.length ? path.map(stageHtml).join('') : '<div class="lg-none">' + esc(t('logs.traceEmpty')) + '</div>') +
+    '</div><details class="lg-raw"><summary>' + esc(t('logs.raw')) + '</summary>' +
+    '<div class="lg-raw-grid">' + (pairsHtml(fields, 'lg-raw-pair') || '—') + '</div></details>';
 }
-
-/* The time path is only built the first time a row opens. */
-function paintTrace(item, record) {
-  const host = item.querySelector('.lg-trace');
-  if (!host || host.dataset.ready === '1') return;
-  SRTrace.render(host, record.trace);
-  host.dataset.ready = '1';
+function paintDetail(item, record) {
+  const panel = item.querySelector('.lg-expand');
+  if (!panel || panel.dataset.ready === '1') return;
+  panel.innerHTML = detailHtml(record, stages(record));
+  panel.dataset.ready = '1';
 }
-
 function render() {
-  const rows = shown();
-  $('#countPill').innerHTML = `${rows.length}<span class="mut"> / ${requests.length}</span>`;
-  renderStats();
-  renderTabs();
-  $('#list').innerHTML = rows.map(itemHtml).join('')
-    || `<div class="lg-list-empty"><b>${esc(t(requests.length ? 'logs.emptyFilter' : 'logs.empty'))}</b></div>`;
+  const rows = requests.filter(FILTERS[filter] || FILTERS.all);
+  $('#countPill').textContent = rows.length + ' / ' + requests.length;
+  renderKpis(); renderTabs(); renderSpread();
+  $('#list').innerHTML = rows.map(record => {
+    const open = openIds.has(record.id);
+    return '<article class="lg-item' + (open ? ' open' : '') + '" data-id="' + safe(record.id) + '">' +
+      rowHtml(record, stages(record), open) + '<div class="lg-expand" id="detail-' +
+      safe(record.id) + '"' + (open ? '' : ' hidden') + '></div></article>';
+  }).join('') || '<div class="lg-list-empty">' +
+    esc(t(requests.length ? 'logs.emptyFilter' : 'logs.empty')) + '</div>';
   document.querySelectorAll('#list .lg-item.open').forEach(item => {
     const record = requests.find(entry => entry.id === item.dataset.id);
-    if (record) paintTrace(item, record);
+    if (record) paintDetail(item, record);
   });
 }
-
-/* ── events ────────────────────────────────────────────────────── */
 function toggle(item) {
   const id = item.dataset.id;
   const opening = !openIds.has(id);
   if (opening) openIds.add(id); else openIds.delete(id);
   item.classList.toggle('open', opening);
-  const button = item.querySelector('.lg-row');
+  item.querySelector('.lg-row').setAttribute('aria-expanded', String(opening));
   const panel = item.querySelector('.lg-expand');
-  if (button) button.setAttribute('aria-expanded', String(opening));
-  if (panel) panel.hidden = !opening;
-  if (!opening) return;
-  const record = requests.find(entry => entry.id === id);
-  if (record) paintTrace(item, record);
+  panel.hidden = !opening;
+  if (opening) {
+    const record = requests.find(entry => entry.id === id);
+    if (record) paintDetail(item, record);
+  }
 }
-
 $('#refresh').addEventListener('click', load);
 $('#filter').addEventListener('click', event => {
   const button = event.target.closest('button[data-filter]');
@@ -202,24 +222,18 @@ $('#list').addEventListener('click', event => {
   const row = event.target.closest('.lg-row');
   if (row) toggle(row.closest('.lg-item'));
 });
-
 async function load() {
   try {
-    const [logs, jev] = await Promise.all([api.get('/admin/requests/recent'), api.get('/admin/jev')]);
-    requests = logs.requests || [];
-    for (const id of Array.from(openIds)) {
-      if (!requests.some(record => record.id === id)) openIds.delete(id);
-    }
-    $('#taggerPill').textContent = (jev.config && jev.config.model) || 'JEV';
+    const data = await api.get('/admin/requests/recent');
+    requests = Array.isArray(data.requests) ? data.requests : [];
+    for (const id of openIds) if (!requests.some(record => record.id === id)) openIds.delete(id);
     render();
   } catch (error) {
     requests = [];
     openIds.clear();
-    $('#countPill').textContent = '0';
-    $('#stats').innerHTML = '';
-    $('#list').innerHTML = `<div class="lg-list-empty"><b>${esc(apiErrText(error))}</b></div>`;
+    render();
+    $('#list').innerHTML = '<div class="lg-list-empty">' + esc(apiErrText(error)) + '</div>';
   }
 }
-
 window.onLangChange = render;
 load();

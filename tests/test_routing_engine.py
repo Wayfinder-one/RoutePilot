@@ -10,7 +10,7 @@ from router.routing.conditions import TimePeriod
 from router.routing.engine import RoutingEngine
 from router.routing.model import tree_from_dict
 from router.routing.snapshot import build_snapshot
-from router.routing.types import NoActiveTreeError, RoutingRequest
+from router.routing.types import NoActiveTreeError, RoutingMiss, RoutingRequest
 from tests.routing_fixtures import jev_dict, target_dict, tree_dict
 
 
@@ -90,6 +90,9 @@ def test_direct_target_skips_jev_and_releases_lease():
     assert decision.model == "standard"
     assert decision.selection_reason == "direct"
     assert jev.calls == []
+    assert [event["phase"] for event in decision.trace] == ["schedule"]
+    assert all({"phase", "label", "cell", "summary", "facts", "tone"} <= event.keys()
+               for event in decision.trace)
     lease = decision.lease
     decision.release()
     decision.release()
@@ -167,11 +170,29 @@ def test_time_branch_runs_before_sticky_and_jev():
     day = route(engine, snap, now=datetime(2026, 10, 29, 12, 0))
     assert day.model == "standard"
     assert day.sticky_hit is False
+    assert next(event for event in day.trace if event["event"] == "branch_otherwise")["tone"] == ""
     night = route(engine, snap, now=datetime(2026, 10, 29, 23, 0))
     assert night.model == "strong-a"
     assert night.sticky_hit is True
     assert night.policy_path == "root/night-choice"
     assert jev.calls == []
+    assert night.trace[0]["phase"] == "time"
+
+
+def test_route_trace_sink_keeps_partial_events_on_failure():
+    root = {
+        "id": "root", "type": "branch",
+        "children": [{**target_dict("night", ("standard",)), "when": {"periods": ["夜间"]}}],
+    }
+    engine = RoutingEngine(Jev(answer()), Affinity(), Balancer())
+    emitted = []
+    with pytest.raises(RoutingMiss):
+        asyncio.run(engine.route(snapshot(tree_dict(root=root)), RoutingRequest("请求"),
+                                 now=datetime(2026, 10, 29, 12, 0), trace_sink=emitted))
+    assert [event["event"] for event in emitted] == ["time", "branch_skipped"]
+    assert emitted[1]["tone"] == ""
+    assert all({"phase", "label", "cell", "summary", "facts", "tone"} <= event.keys()
+               for event in emitted)
 
 
 def test_dry_run_does_not_write_affinity_or_acquire_inflight():

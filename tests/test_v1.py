@@ -14,6 +14,7 @@ from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevS
 from router.routing.affinity import SessionAffinity
 from router.routing.conditions import TimePeriod
 from router.routing.engine import RoutingEngine
+from router.routing.types import RoutingMiss
 from router.routing.model import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import build_snapshot
@@ -93,6 +94,10 @@ def test_concurrent_sessions_use_least_inflight_then_stick_to_their_models(tmp_p
         assert third_record["sticky_hit"] == 1
         assert third_record["selection_reason"] == "sticky"
         assert third_record["outcome_state"] == "completed"
+        assert third_record["route_label"]["en"] == "Sticky route"
+        assert third_record["trace"][-1]["event"] == "request_outcome"
+        assert third_record["trace"][-1]["tone"] == "hit"
+        assert [item[0]["en"] for item in third_record["metrics"]] == ["Upstream", "Routing", "Total"]
 
     asyncio.run(scenario())
 
@@ -133,6 +138,41 @@ def test_no_active_tree_fails_before_any_http_call(tmp_path):
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_active_tree"
         assert calls == []
+        records = app.state.requestlog.recent_requests()
+        assert len(records) == 1
+        assert records[0]["outcome_state"] == "routing_error"
+        assert records[0]["trace"][-1]["event"] == "routing_error"
+        assert records[0]["trace"][-1]["facts"][0][1] == "no_active_tree"
+        await app.state.requestlog.flush()
+        conn = connect(app.state.settings.db_path)
+        saved = conn.execute("SELECT outcome_state, error_class FROM request_logs").fetchone()
+        conn.close()
+        assert tuple(saved) == ("routing_error", "no_active_tree")
+
+    asyncio.run(scenario())
+
+
+def test_routing_failure_retains_partial_trace_without_exposing_exception(tmp_path):
+    app = make_app(tmp_path, lambda request: httpx.Response(500))
+
+    class FailingEngine:
+        async def route(self, snapshot, routing_request, *, trace_sink):
+            trace_sink.append({"event": "branch_selected", "phase": "condition",
+                               "label": {"zh": "条件", "en": "Condition"},
+                               "cell": "A", "summary": "A", "facts": [], "tone": "hit"})
+            raise RoutingMiss("private internal detail")
+
+    app.state.engine = FailingEngine()
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://router.test") as client:
+            response = await client.post("/v1/chat/completions", json=payload("secret request"))
+        assert response.status_code == 503
+        record = app.state.requestlog.recent_requests(1)[0]
+        assert record["outcome_state"] == "routing_error"
+        assert [event["event"] for event in record["trace"]] == ["branch_selected", "routing_error"]
+        assert "private internal detail" not in str(record)
+        assert record["trace"][-1]["tone"] == "bad"
 
     asyncio.run(scenario())
 
@@ -160,6 +200,8 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         record = app.state.requestlog.recent_requests(1)[0]
         assert record["outcome_state"] == "completed"
         assert record["total_tokens"] == 3
+        assert len(app.state.requestlog.recent_requests()) == 1
+        assert [event["event"] for event in record["trace"]].count("request_outcome") == 1
 
     asyncio.run(scenario())
 
@@ -173,6 +215,9 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
         assert response.status_code == 502
         assert app.state.balancer.inflight("standard") == 0
         assert app.state.requestlog.recent_requests(1)[0]["outcome_state"] == "upstream_error"
+        event = app.state.requestlog.recent_requests(1)[0]["trace"][-1]
+        assert event["event"] == "request_outcome"
+        assert event["tone"] == "bad"
 
     asyncio.run(scenario())
 
