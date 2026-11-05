@@ -18,26 +18,29 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
-from router.api.upstream import Backend
-from router.jev.client import (
+ROOT = Path(__file__).resolve().parents[1]
+
+sys.path.insert(0, str(ROOT))
+
+from router.api.upstream import Backend  # noqa: E402
+from router.jev.client import (  # noqa: E402
     DecisionQuestion,
     JevCandidate,
     JevError,
     _wire_question,
     parse_answer,
 )
-from router.jev.config import DEFAULT_STATE_TEMPLATE, JevSettings
-from router.jev.window import apply_window, estimate_tokens
-from router.routing.affinity import SessionAffinity
-from router.routing.graph.conditions import evaluate_condition
-from router.routing.graph.engine import GraphExecutionEngine
-from router.routing.graph.model import Condition, Edge, QuestionNode
-from router.routing.model import tree_from_dict
-from router.routing.scheduler import LoadBalancer
-from router.routing.snapshot import build_snapshot
-from router.routing.types import RoutingRequest
+from router.jev.config import DEFAULT_STATE_TEMPLATE, JevSettings  # noqa: E402
+from router.jev.window import apply_window, estimate_tokens  # noqa: E402
+from router.routing.affinity import SessionAffinity  # noqa: E402
+from router.routing.graph.conditions import evaluate_condition  # noqa: E402
+from router.routing.graph.engine import GraphExecutionEngine  # noqa: E402
+from router.routing.graph.model import Condition, Edge, QuestionNode  # noqa: E402
+from router.routing.model import tree_from_dict  # noqa: E402
+from router.routing.scheduler import LoadBalancer  # noqa: E402
+from router.routing.snapshot import build_snapshot  # noqa: E402
+from router.routing.types import RoutingRequest  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = {"all", "equivalence", "capacity", "budget"}
 
 
