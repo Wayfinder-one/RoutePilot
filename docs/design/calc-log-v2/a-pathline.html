@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>方案 A · 路径条 | 计算日志重设计</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="skin.css">
+<style>
+/* 方案 A · 路径条 —— 结构差异只在「行内 7 段链」，皮肤全部来自 skin.css */
+.kpis{display:inline-flex;align-items:center;flex-wrap:wrap;max-width:100%;border:1px solid var(--line);
+  background:var(--panel);border-radius:var(--r-md);box-shadow:var(--shadow);overflow:hidden}
+.kpi{display:inline-flex;align-items:baseline;gap:6px;padding:5px 11px;border-right:1px solid var(--line)}
+.kpi:last-child{border-right:0}
+.kpi b{font-family:var(--mono);font-size:13px;font-weight:650;font-variant-numeric:tabular-nums}
+.kpi small{font-size:10.5px;color:var(--text-3)}
+.kpi.ok b{color:var(--indigo)} .kpi.warn b{color:var(--amber)} .kpi.bad b{color:var(--red)}
+.toolbar{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.count{font-family:var(--mono);font-size:11px;color:var(--text-3)}
+.hint{font-size:10.5px;color:var(--text-3)}
+.thead{display:grid;grid-template-columns:62px minmax(180px,1.05fr) minmax(560px,2.5fr) 122px 58px 18px;gap:10px;
+  padding:6px 13px;margin-bottom:8px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);
+  font-family:var(--mono);font-size:9px;font-weight:650;letter-spacing:.08em;color:var(--text-3);text-transform:uppercase}
+.thead .chainhead{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));text-align:center}
+.list{display:flex;flex-direction:column;gap:8px}
+.item{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);overflow:hidden}
+.item:hover{border-color:var(--line-2)}
+.item.open{border-color:var(--indigo-line);box-shadow:var(--shadow-lg)}
+.row{display:grid;grid-template-columns:62px minmax(180px,1.05fr) minmax(560px,2.5fr) 122px 58px 18px;
+  align-items:center;gap:10px;width:100%;min-height:42px;padding:7px 13px;border:0;background:transparent;text-align:left}
+.row:hover{background:var(--panel-2)}
+.dot{display:inline-block;width:6px;height:6px;border-radius:99px;background:var(--green);margin-right:5px;vertical-align:1px}
+.dot.warn{background:var(--amber)} .dot.bad,.dot.halt{background:var(--red)}
+.time{font-family:var(--mono);font-size:10.5px;color:var(--text-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2);font-size:12.5px}
+.item.open .text{color:var(--text);font-weight:600}
+.model{font-family:var(--mono);font-size:10.5px;font-weight:600;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.model em{font-style:normal;color:var(--text-3);margin-right:4px}
+.lat{font-family:var(--mono);font-size:10.5px;color:var(--text-3);text-align:right;font-variant-numeric:tabular-nums}
+.chev{font-size:15px;color:var(--text-3);text-align:center;transition:transform var(--dur) var(--ease)}
+.item.open .chev{transform:rotate(90deg);color:var(--indigo)}
+/* 记忆点：行内 7 段路径链 */
+.chain{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));align-items:center;min-width:0}
+.node{position:relative;display:flex;align-items:center;gap:4px;min-width:0;padding:1px 5px;height:22px;
+  border:1px solid var(--line);border-left:0;background:var(--panel)}
+.node:first-child{border-left:1px solid var(--line);border-radius:5px 0 0 5px}
+.node:last-child{border-radius:0 5px 5px 0}
+.node b{font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:-.02em;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;color:var(--text-2);font-variant-numeric:tabular-nums}
+.node+.node::before{content:"";position:absolute;left:-1px;top:50%;width:1px;height:9px;background:var(--line-2);transform:translateY(-50%)}
+.node.hit{border-color:var(--indigo-line);background:var(--indigo-soft)}
+.node.hit b{color:var(--indigo)}
+.node.skip{background:repeating-linear-gradient(135deg,transparent,transparent 3px,rgba(91,98,112,.055) 3px,rgba(91,98,112,.055) 4px)}
+.node.skip b{color:var(--text-3);font-weight:400}
+.node.warn{border-color:var(--amber-line);background:var(--amber-soft)} .node.warn b{color:var(--amber)}
+.node.bad,.node.halt{border-color:var(--red-line);background:var(--red-soft)} .node.bad b,.node.halt b{color:var(--red)}
+.row:hover .node.hit{background:#e6eaff;border-color:var(--indigo-line)}
+.item.open .node.hit{box-shadow:inset 0 -2px 0 var(--indigo)}
+/* 展开：逐阶段证据表，无卡片套卡片 */
+.expand{border-top:1px solid var(--line);background:var(--panel-2);padding:9px 13px 11px 24px}
+.expand[hidden]{display:none}
+.expand-top{display:flex;align-items:center;gap:10px;margin-bottom:6px;flex-wrap:wrap}
+.route{font-size:11.5px;font-weight:700}
+.route::before{content:"";display:inline-block;width:14px;height:2px;background:var(--indigo);vertical-align:3px;margin-right:7px}
+.tags{display:flex;gap:5px;flex-wrap:wrap}
+.tag{font-family:var(--mono);font-size:9.5px;padding:1px 7px;border:1px solid var(--line-2);border-radius:99px;color:var(--text-2);background:var(--panel)}
+.tag.warn{color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)}
+.tag.bad{color:var(--red);border-color:var(--red-line);background:var(--red-soft)}
+.evi{width:100%;border-collapse:collapse;table-layout:fixed;font-size:11px}
+.evi th{text-align:left;font-family:var(--mono);font-size:9px;font-weight:650;letter-spacing:.08em;color:var(--text-3);
+  text-transform:uppercase;padding:3px 8px 3px 0;border-bottom:1px solid var(--line-2)}
+.evi td{padding:4px 8px 4px 0;border-bottom:1px solid var(--line);vertical-align:top;color:var(--text-2)}
+.evi tr:last-child td{border-bottom:0}
+.evi .st{width:104px;font-weight:650;color:var(--text);white-space:nowrap}
+.evi .st em{font-style:normal;font-family:var(--mono);font-size:9px;color:var(--text-3);margin-right:6px}
+.evi .vd{width:190px;font-family:var(--mono);font-size:10px;font-weight:600}
+.evi .vd.warn{color:var(--amber)} .evi .vd.bad,.evi .vd.halt{color:var(--red)}
+.evi .ms{width:54px;text-align:right;font-family:var(--mono);font-size:10px;color:var(--text-3)}
+.evi .ev{color:var(--text-3);line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.evi .ev span{display:inline-block;margin-right:12px;white-space:nowrap;max-width:31%;
+  overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
+.evi .ev b{font-weight:650;color:var(--text-2);margin-right:3px}
+.evi .ev b::after{content:"·";color:var(--text-3);margin-left:3px}
+.evi tr.bad .st{color:var(--red)} .evi tr.warn .st{color:var(--amber)}
+.raw{margin-top:6px;border-top:1px solid var(--line);padding-top:5px}
+.raw summary{cursor:pointer;list-style:none;font-family:var(--mono);font-size:9.5px;color:var(--text-3);min-height:22px;display:flex;align-items:center;gap:6px}
+.raw summary::-webkit-details-marker{display:none}
+.raw summary::before{content:"+";font-size:12px;color:var(--indigo)}
+.raw[open] summary::before{content:"−"}
+.raw summary:hover{color:var(--text)}
+.raw-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:2px 16px;padding:5px 0 2px;font-family:var(--mono);font-size:10px}
+.raw-grid div{display:flex;gap:7px;min-width:0}
+.raw-grid span{color:var(--text-3);min-width:78px}
+.raw-grid b{font-weight:500;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{padding:22px;text-align:center;color:var(--text-3);font-size:11.5px;border:1px dashed var(--line-2);border-radius:var(--r-lg);background:var(--panel)}
+.item.reveal{transition-delay:calc(160ms + var(--i,0) * 35ms)}
+@media(max-width:1320px){
+  .thead,.row{grid-template-columns:58px minmax(140px,1fr) minmax(470px,2.3fr) 110px 52px 16px;gap:7px}
+  .node i{display:none} .node b{font-size:9px}
+}
+@media(max-width:1080px){
+  .thead,.row{grid-template-columns:56px minmax(120px,1fr) 268px 100px 48px 14px;gap:7px}
+  .node{padding:0;justify-content:center;border-color:transparent;background:transparent!important}
+  .node b{display:none}
+  .node::after{content:"";width:8px;height:8px;border-radius:50%;background:var(--line-2);border:1px solid var(--text-3)}
+  .node.skip::after{background:transparent}
+  .node.hit::after{background:var(--indigo);border-color:var(--indigo)}
+  .node.warn::after{background:var(--amber);border-color:var(--amber)}
+  .node.bad::after,.node.halt::after{background:var(--red);border-color:var(--red)}
+  .chain{position:relative;isolation:isolate}
+  .node+.node::before{left:-1px;width:100%;height:1px;top:50%;background:var(--line-2);z-index:-1}
+  .raw-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .evi .ms{display:none}
+}
+@media(max-width:680px){
+  .thead,.row{grid-template-columns:52px minmax(90px,1fr) 82px 14px;gap:6px}
+  .thead span:nth-child(3),.thead span:nth-child(5),.chain,.lat{display:none}
+  .model{grid-column:3} .evi .vd{width:auto} .evi .ev{display:none} .hint{display:none}
+  .seg{overflow-x:auto;max-width:100%}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="mark">SR</span><span>RoutePilot</span></div>
+  <nav aria-label="主导航">
+    <a href="#">概览</a><a href="#">决策组</a><a href="#" class="on" aria-current="page">计算日志</a><a href="#">JEV 模型</a><a href="#">模型与设置</a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="pill">NeoHorse-JEV-4B</span>
+  <span class="switch" aria-label="切换方案"><a class="on" href="a-pathline.html">A</a><a class="" href="b-audit-rail.html">B</a><a class="" href="c-trace-matrix.html">C</a></span>
+  <button class="btn sm" id="refresh" type="button">刷新</button></header>
+
+<div class="pagehead">
+  <div>
+    <div class="crumb">计算日志</div>
+    <h1>计算日志<span class="sub">最近 20 条 · 折叠行即完整计算路径</span></h1>
+  </div>
+  <div class="headmeta"><span class="kpis" id="kpis" aria-live="polite"></span></div>
+</div>
+
+<main class="page">
+  <div class="toolbar">
+    <div class="seg" id="filter" role="group" aria-label="筛选">
+      <button type="button" data-filter="all" data-label="全部">全部</button>
+      <button type="button" data-filter="jev" data-label="JEV 选择">JEV 选择</button>
+      <button type="button" data-filter="sticky" data-label="粘性命中">粘性命中</button>
+      <button type="button" data-filter="fallback" data-label="兜底">兜底</button>
+      <button type="button" data-filter="error" data-label="异常">异常</button>
+    </div>
+    <span class="count" id="count"></span>
+    <span class="spacer"></span>
+    <span class="hint">点击行展开阶段依据 · 可多开 · 列为固定阶段</span>
+  </div>
+
+  <div class="thead" aria-hidden="true">
+    <span>时间</span><span>请求文本</span>
+    <span class="chainhead" id="chainhead"></span>
+    <span style="text-align:right">模型</span><span style="text-align:right">耗时</span><span></span>
+  </div>
+  <section class="list" id="list" aria-label="请求列表"></section>
+
+  <details class="note">
+    <summary>方案 A · 设计注记（点击展开）</summary>
+    <p><b>解决什么</b>：把计算路径从「展开后纵向堆叠的 section」提到折叠行内。每行一条 7 段链 <code>输入 › 条件 › 门 › JEV › 候选 › 调度 › 模型</code>，命中为 indigo 实块、跳过为斜纹虚块、中止为红块 —— 不点开就能横向比较 20 条请求谁走了兜底、谁在 JEV 轮失败。</p>
+    <p><b>删掉了什么</b>：4 张统计卡改为标题右侧一行 KPI；执行结果的 9 项事实、技术信息的 10 项 id / 版本 / 会话哈希全部收进单行「原始字段」；沿用现有控制台的 13px 白卡与 8px 卡间距，行高保持 42px，但删掉卡片内部的区块堆叠。</p>
+    <p><b>展开后只剩</b>：逐阶段证据表（阶段 / 判定 / 依据 / 耗时），只列真正发生过的阶段。阶段值由 <code>derivePath(record)</code> 从生产 trace 事件直接派生，不是手工写的示意文字。</p>
+    <p><b>取舍</b>：路径链吃掉约 560px 宽度，窄屏（&lt;1080px）降级为 7 个着色圆点、&lt;680px 隐藏链，只留 时间 / 文本 / 模型。适合巡检与快速定位，不适合逐事件排障（那是方案 C 的职责）。</p>
+  </details>
+</main>
+
+<script src="data.js"></script>
+<script>
+const $ = selector => document.querySelector(selector);
+let filter = 'all';
+const openIds = new Set(['r-8841']);   // 预展开一条，直接看到证据表形态
+
+/* 表头 = 与行内链严格同栅格的 7 个阶段缩写，避免「看不出列是什么」。 */
+$('#chainhead').innerHTML = STAGES.map((stage, index) =>
+  `<span>${String(index + 1).padStart(2, '0')} ${esc(stage.abbr)}</span>`).join('');
+
+function renderKpis() {
+  const timed = TRACE_LOGS.map(record => record.total_ms).filter(value => Number.isFinite(Number(value)));
+  const avg = timed.length ? timed.reduce((sum, value) => sum + value, 0) / timed.length : null;
+  const cards = [
+    ['请求', TRACE_LOGS.length, ''],
+    ['JEV', TRACE_LOGS.filter(FILTERS.jev).length, 'ok'],
+    ['兜底', TRACE_LOGS.filter(FILTERS.fallback).length, 'warn'],
+    ['异常', TRACE_LOGS.filter(FILTERS.error).length, 'bad'],
+    ['平均耗时', msText(avg), ''],
+  ];
+  $('#kpis').innerHTML = cards.map(([label, value, tone]) =>
+    `<span class="kpi ${tone}"><b>${esc(value)}</b><small>${esc(label)}</small></span>`).join('');
+}
+
+function renderTabs() {
+  document.querySelectorAll('#filter button').forEach(button => {
+    const key = button.dataset.filter;
+    button.setAttribute('aria-pressed', String(key === filter));
+    button.innerHTML = `${esc(button.dataset.label)}<span class="c">${TRACE_LOGS.filter(FILTERS[key]).length}</span>`;
+  });
+}
+
+/* 路径链：每个节点显示阶段序号 + 由 trace 派生出的短判定值。 */
+function chainHtml(stages) {
+  return `<span class="chain" role="img" aria-label="${esc(stages.map(stage => stage.name + ':' + stage.value).join(' → '))}">` +
+    stages.map(stage =>
+      `<span class="node ${esc(stage.tone)}" title="${esc(stage.name)} · ${esc(stage.value)}"><b>${esc(stage.cell)}</b></span>`).join('') +
+    `</span>`;
+}
+
+function evidenceHtml(record, stages) {
+  const rows = stages.filter(stage => !stage.skipped || stage.halted).map(stage => {
+    const evidence = stage.evidence.length
+      ? stage.evidence.slice(0, 3).map(([key, value]) => `<span><b>${esc(key)}</b>${esc(value)}</span>`).join('')
+      : '<span>未经过该阶段</span>';
+    return `<tr class="${esc(stage.tone)}">
+      <td class="st"><em>${String(stages.indexOf(stage) + 1).padStart(2, '0')}</em>${esc(stage.name)}</td>
+      <td class="vd ${esc(stage.tone)}">${esc(stage.value)}</td>
+      <td class="ev">${evidence}</td>
+      <td class="ms">${stage.ms == null ? '' : esc(stage.ms) + 'ms'}</td></tr>`;
+  }).join('');
+  const raw = [
+    ['请求 ID', record.id], ['决策组', record.tree_id + ' r' + record.tree_revision],
+    ['快照版本', 'r' + record.snapshot_revision], ['策略路径', record.policy_path],
+    ['会话哈希', record.session_hash], ['JEV 模型', record.jev_model],
+    ['路由耗时', msText(record.routing_ms)], ['总耗时', msText(record.total_ms)],
+    ['上游状态', dash(record.upstream_status)], ['首 token', msText(record.ttft_ms)],
+    ['Token 合计', dash(record.total_tokens)], ['轮次', dash(record.waves)],
+  ];
+  return `<div class="expand-top">
+      <span class="route">${esc(routeLabel(record))}</span>
+      <span class="tags">
+        <span class="tag">${esc(OUTCOME_LABEL[record.outcome] || '—')}</span>
+        ${record.jev_top != null ? `<span class="tag">JEV ${pct(record.jev_top)}</span>` : ''}
+        ${stages.some(stage => stage.tone === 'warn') ? '<span class="tag warn">路径降级</span>' : ''}
+        ${stages.some(stage => stage.tone === 'bad' || stage.tone === 'halt') ? '<span class="tag bad">路径中止</span>' : ''}
+      </span>
+    </div>
+    <table class="evi">
+      <thead><tr><th>阶段</th><th>判定</th><th>依据</th><th class="ms">耗时</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <details class="raw"><summary>原始字段 / RAW FIELDS</summary>
+      <div class="raw-grid">${raw.map(([key, value]) =>
+        `<div><span>${esc(key)}</span><b title="${esc(dash(value))}">${esc(dash(value))}</b></div>`).join('')}</div>
+    </details>`;
+}
+
+function rowHtml(record, stages, open) {
+  const tone = OUTCOME_TONE[record.outcome] || '';
+  return `<button type="button" class="row" aria-expanded="${open}" aria-controls="detail-${esc(record.id)}" title="${esc(record.text)}">
+    <span class="time"><span class="dot ${esc(tone)}${record.outcome === 'routing_error' ? ' halt' : ''}" aria-hidden="true"></span>${clock(record.ts)}</span>
+    <span class="text">${esc(record.text)}</span>
+    ${chainHtml(stages)}
+    <span class="model"><em>→</em>${esc(record.model || '—')}</span>
+    <span class="lat">${esc(msText(record.total_ms))}</span>
+    <span class="chev" aria-hidden="true">›</span>
+  </button>`;
+}
+
+function render() {
+  const rows = TRACE_LOGS.filter(FILTERS[filter]);
+  $('#count').textContent = `${rows.length} / ${TRACE_LOGS.length}`;
+  renderKpis(); renderTabs();
+  $('#list').innerHTML = rows.length ? rows.map((record, index) => {
+    const open = openIds.has(record.id);
+    return `<article class="item reveal${open ? ' open' : ''}" data-id="${esc(record.id)}" style="--i:${index}">
+      ${rowHtml(record, derivePath(record), open)}
+      <div class="expand" id="detail-${esc(record.id)}"${open ? '' : ' hidden'}>${evidenceHtml(record, derivePath(record))}</div>
+    </article>`;
+  }).join('') : '<div class="empty">没有符合这个筛选的请求。</div>';
+  requestAnimationFrame(() => document.querySelectorAll('#list .reveal').forEach(node => node.classList.add('in')));
+}
+
+$('#filter').addEventListener('click', event => {
+  const button = event.target.closest('button[data-filter]');
+  if (!button || button.dataset.filter === filter) return;
+  filter = button.dataset.filter;
+  render();
+});
+$('#list').addEventListener('click', event => {
+  const row = event.target.closest('.row');
+  if (!row) return;
+  const item = row.closest('.item');
+  const opening = !openIds.has(item.dataset.id);
+  if (opening) openIds.add(item.dataset.id); else openIds.delete(item.dataset.id);
+  item.classList.toggle('open', opening);
+  row.setAttribute('aria-expanded', String(opening));
+  item.querySelector('.expand').hidden = !opening;
+});
+$('#refresh').addEventListener('click', render);
+render();
+</script>
+</body>
+</html>

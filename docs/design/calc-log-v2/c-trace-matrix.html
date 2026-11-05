@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>方案 C · 追踪矩阵 | 计算日志重设计</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="skin.css">
+<style>
+/* 方案 C · 追踪矩阵 —— 结构差异在「请求 × 阶段矩阵」，皮肤来自 skin.css */
+.kpis{display:inline-flex;align-items:center;flex-wrap:wrap;max-width:100%;border:1px solid var(--line);
+  background:var(--panel);border-radius:var(--r-md);box-shadow:var(--shadow);overflow:hidden}
+.kpi{padding:5px 11px;border-right:1px solid var(--line);font-family:var(--mono);font-size:9.5px;color:var(--text-3);letter-spacing:.05em;white-space:nowrap}
+.kpi:last-child{border-right:0}
+.kpi b{font-size:13px;font-weight:700;color:var(--text);margin-right:5px;font-variant-numeric:tabular-nums}
+.kpi.ok b{color:var(--indigo)} .kpi.warn b{color:var(--amber)} .kpi.bad b{color:var(--red)}
+.cmdbar{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.prompt{display:none}
+.cmdbar .hint{font-family:var(--mono);font-size:10px;color:var(--text-3);margin-left:auto}
+.cols{display:grid;grid-template-columns:60px minmax(160px,1.25fr) repeat(7,minmax(74px,.62fr)) 66px 92px;gap:0;align-items:center}
+.mhead{padding:6px 0;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);
+  font-family:var(--mono);font-size:9px;font-weight:650;letter-spacing:.08em;color:var(--text-3);text-transform:uppercase}
+.mhead>span{padding:0 8px;border-right:1px solid var(--line);white-space:nowrap;overflow:hidden}
+.mhead>span:last-child{border-right:0}
+.mhead .st{text-align:center}
+.mhead .st b{color:var(--indigo);font-weight:700;margin-right:4px}
+.list{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);overflow:hidden}
+.rec{border-bottom:1px solid var(--line)}
+.rec:last-child{border-bottom:0}
+.rec:hover{background:var(--panel-2)}
+.rec.on{background:var(--indigo-soft)}
+.row{display:grid;grid-template-columns:60px minmax(160px,1.25fr) repeat(7,minmax(74px,.62fr)) 66px 92px;
+  align-items:center;width:100%;min-height:30px;padding:0;border:0;background:transparent;text-align:left}
+.time{font-family:var(--mono);font-size:10px;color:var(--text-3);padding:0 8px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.time::before{content:"";display:inline-block;width:6px;height:6px;border-radius:99px;background:var(--green);margin-right:6px;vertical-align:1px}
+.time.warn::before{background:var(--amber)} .time.bad::before{background:var(--red)}
+.req{font-size:11.5px;color:var(--text-2);padding:0 8px;border-right:1px solid var(--line);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.rec.on .req{color:var(--text)}
+/* 格子：值即路径；空格 = 没走过 */
+.cell{font-family:var(--mono);font-size:10px;font-weight:500;padding:0 7px;height:30px;display:flex;align-items:center;
+  border-right:1px solid var(--line);color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-variant-numeric:tabular-nums;transition:background var(--dur),color var(--dur),box-shadow var(--dur)}
+.cell.skip{color:var(--text-3);justify-content:center}
+.cell.halt{color:var(--red);justify-content:center;background:var(--red-soft)}
+.cell.warn{color:var(--amber);background:var(--amber-soft)}
+.cell.bad{color:var(--red);background:var(--red-soft)}
+.cell.model{color:var(--text);font-weight:650}
+.cell.model.bad{color:var(--red)}
+/* 记忆点：选中行 7 格连成一条 indigo 横带 */
+.rec.on .cell:not(.skip):not(.halt){background:var(--indigo-soft);color:var(--indigo);box-shadow:inset 0 -2px 0 var(--indigo)}
+.rec.on .cell.warn{background:var(--amber-soft);color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber)}
+.rec.on .cell.bad,.rec.on .cell.halt{background:var(--red-soft);color:var(--red);box-shadow:inset 0 -2px 0 var(--red)}
+.rec.on .cell.skip{color:var(--text-3)}
+.lat{font-family:var(--mono);font-size:10px;color:var(--text-3);text-align:right;padding:0 8px;border-right:1px solid var(--line)}
+/* 耗时地图：路由亮段 + 上游暗段 */
+.bar{display:flex;align-items:center;gap:5px;padding:0 8px}
+.bar .track{position:relative;flex:1;height:6px;border-radius:99px;background:#eceef2;overflow:hidden}
+.bar .track i{position:absolute;left:0;top:0;bottom:0;background:var(--indigo-line)}
+.bar .track em{position:absolute;top:0;bottom:0;background:var(--indigo)}
+.bar small{font-family:var(--mono);font-size:8.5px;color:var(--text-3);min-width:26px;text-align:right}
+.mob{display:none}
+/* 展开：逐事件流，沿用控制台的 mono 面板 */
+.trace{border-top:1px dashed var(--line-2);background:var(--panel-2);padding:9px 13px 11px 22px}
+.trace[hidden]{display:none}
+.trace-h{display:flex;align-items:center;gap:9px;margin-bottom:6px;flex-wrap:wrap;font-family:var(--mono);font-size:9.5px;color:var(--text-3)}
+.trace-h b{color:var(--indigo);font-weight:700}
+.trace-h .tag{border:1px solid var(--line-2);border-radius:99px;padding:1px 7px;color:var(--text-2);background:var(--panel)}
+.trace-h .tag.warn{color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)}
+.trace-h .tag.bad{color:var(--red);border-color:var(--red-line);background:var(--red-soft)}
+.events{font-family:var(--mono);font-size:10.5px;line-height:1.65;max-height:210px;overflow-y:auto;padding-right:8px}
+.events .ln{display:flex;gap:9px}
+.events .ln .ix{color:var(--text-3);flex:none;width:20px;text-align:right}
+.events .ln .ev{color:var(--text-2);flex:none;width:118px;font-weight:650}
+.events .ln .dt{color:var(--text-3);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.events .ln.hit .ev{color:var(--indigo)}
+.events .ln.warn .ev{color:var(--amber)}
+.events .ln.bad .ev,.events .ln.bad .dt{color:var(--red)}
+.events::-webkit-scrollbar{width:6px} .events::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:99px}
+.trace-foot{margin-top:6px;padding-top:6px;border-top:1px solid var(--line);
+  font-family:var(--mono);font-size:9.5px;color:var(--text-3);display:flex;gap:16px;flex-wrap:wrap}
+.trace-foot b{color:var(--text-2);font-weight:600}
+.status{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:10px;padding:6px 12px;background:var(--panel);
+  border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);
+  font-family:var(--mono);font-size:9.5px;color:var(--text-3);letter-spacing:.04em}
+.status b{color:var(--indigo);font-weight:650}
+.rec.reveal{transition-delay:calc(150ms + var(--i,0) * 30ms)}
+@media(max-width:1400px){
+  .cols,.mhead,.row{grid-template-columns:56px minmax(130px,1fr) repeat(7,minmax(64px,.6fr)) 58px 72px}
+  .cell{font-size:9.5px;padding:0 5px}
+  .bar small{display:none}
+}
+@media(max-width:1120px){
+  .cols,.mhead,.row{grid-template-columns:54px minmax(120px,1fr) repeat(3,minmax(72px,.7fr)) 58px 72px}
+  .mhead>span[data-c="0"],.mhead>span[data-c="1"],.mhead>span[data-c="2"],.mhead>span[data-c="5"],
+  .cell[data-c="0"],.cell[data-c="1"],.cell[data-c="2"],.cell[data-c="5"]{display:none}
+  .cmdbar .hint{display:none}
+}
+@media(max-width:760px){
+  .mhead{display:none}
+  .row{grid-template-columns:52px minmax(0,1fr) 62px;min-height:44px;padding:4px 0}
+  .cell,.lat,.bar{display:none!important}
+  .req{border-right:0;white-space:normal;font-size:11px;line-height:1.4}
+  .mob{display:block;grid-column:2/3;font-family:var(--mono);font-size:9px;color:var(--text-3);margin-top:2px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .rec.on .mob{color:var(--indigo)}
+  .time{align-self:start;padding-top:2px}
+  .trace{padding-left:12px}
+  .events .ln .ev{width:96px}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="mark">SR</span><span>RoutePilot</span></div>
+  <nav aria-label="主导航">
+    <a href="#">概览</a><a href="#">决策组</a><a href="#" class="on" aria-current="page">计算日志</a><a href="#">JEV 模型</a><a href="#">模型与设置</a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="pill">NeoHorse-JEV-4B</span>
+  <span class="switch" aria-label="切换方案"><a class="" href="a-pathline.html">A</a><a class="" href="b-audit-rail.html">B</a><a class="on" href="c-trace-matrix.html">C</a></span>
+  <button class="btn sm" id="refresh" type="button">刷新</button></header>
+
+<div class="pagehead">
+  <div>
+    <div class="crumb">计算日志</div>
+    <h1>计算日志<span class="sub">7 阶段 × 20 条 · 空格即未经过</span></h1>
+  </div>
+  <div class="headmeta"><span class="kpis" id="kpis" aria-live="polite"></span></div>
+</div>
+
+<main class="page">
+
+  <div class="cmdbar">
+    <span class="prompt">calc-log --view matrix</span>
+    <div class="seg" id="filter" role="group" aria-label="筛选">
+      <button type="button" data-filter="all" data-label="全部">全部</button>
+      <button type="button" data-filter="jev" data-label="JEV 选择">JEV 选择</button>
+      <button type="button" data-filter="sticky" data-label="粘性命中">粘性命中</button>
+      <button type="button" data-filter="fallback" data-label="兜底">兜底</button>
+      <button type="button" data-filter="error" data-label="异常">异常</button>
+    </div>
+    <span class="spacer"></span>
+    <span class="hint">↑↓ 切换 · ENTER 展开 · ESC 收起</span>
+  </div>
+
+  <div class="mhead cols" id="mhead" aria-hidden="true"></div>
+  <section class="list" id="list" aria-label="请求矩阵"></section>
+
+  <div class="status">
+    <span>记录 <b id="count"></b></span>
+    <span>选中 <b id="selected">—</b></span>
+    <span>阶段 <b>07</b></span>
+    <span class="spacer"></span>
+    <span>事件类型 <b>trace.js · 14 类</b></span>
+  </div>
+
+  <details class="note">
+    <summary>方案 C · 设计注记（点击展开）</summary>
+    <p><b>解决什么</b>：行 = 请求，列 = 七段固定阶段。每格直接写由 trace 派生出的判定值（<code>812tok</code>、<code>2/3</code>、<code>92%</code>、<code>p1</code>、<code>兜底</code>），空格子 <code>·</code> 就是「没走过」，中止格 <code>×</code> 就是「断在哪」。选中行 7 格连成一条 indigo 横带，横向比较 20 条路径的差异不需要点开任何东西。</p>
+    <p><b>删掉了什么</b>：统计卡、行内 chips、四列事实网格、纵向 section。所有次要字段收进末行的状态栏与展开后的事件流。行高 30px，一屏可放 20 条。</p>
+    <p><b>展开后只剩</b>：原始 trace 的逐事件流（<code>time → window → condition → wave → question → final → schedule → scheduled</code>），带序号、事件名与关键键值，供排障时逐行核对；失败事件标红。</p>
+    <p><b>取舍</b>：矩阵列宽在窄屏需要收敛；换来最高信息密度与最强横向可比性。三版共用 skin.css，视觉与现有控制台一致。窄屏 &lt;1120px 只保留 JEV / 候选 / 模型三段，&lt;760px 降级为「请求 + 路径摘要」列表。</p>
+  </details>
+</main>
+
+<script src="data.js"></script>
+<script>
+const $ = selector => document.querySelector(selector);
+let filter = 'all';
+let selected = 'r-8841';
+
+function renderKpis() {
+  const timed = TRACE_LOGS.map(record => record.total_ms).filter(value => Number.isFinite(Number(value)));
+  const avg = timed.reduce((sum, value) => sum + value, 0) / timed.length;
+  const cards = [
+    ['REQ', TRACE_LOGS.length, ''], ['JEV', TRACE_LOGS.filter(FILTERS.jev).length, 'ok'],
+    ['FALLBACK', TRACE_LOGS.filter(FILTERS.fallback).length, 'warn'],
+    ['ERROR', TRACE_LOGS.filter(FILTERS.error).length, 'bad'], ['AVG', msText(avg), ''],
+  ];
+  $('#kpis').innerHTML = cards.map(([label, value, tone]) =>
+    `<span class="kpi ${tone}"><b>${esc(value)}</b>${esc(label)}</span>`).join('');
+}
+
+function renderHead() {
+  $('#mhead').innerHTML = `<span>时间</span><span>请求文本</span>` +
+    STAGES.map((stage, index) =>
+      `<span class="st" data-c="${index}"><b>${String(index + 1).padStart(2, '0')}</b>${esc(stage.key)}</span>`).join('') +
+    `<span style="text-align:right">总耗时</span><span>耗时分布</span>`;
+}
+
+function renderTabs() {
+  document.querySelectorAll('#filter button').forEach(button => {
+    const key = button.dataset.filter;
+    button.setAttribute('aria-pressed', String(key === filter));
+    button.innerHTML = `${esc(button.dataset.label)}<span class="c">${TRACE_LOGS.filter(FILTERS[key]).length}</span>`;
+  });
+}
+
+const maxTotal = Math.max(...TRACE_LOGS.map(record => Number(record.total_ms) || 0));
+function barHtml(record) {
+  const total = Number(record.total_ms) || 0;
+  const width = Math.max(3, Math.round(total / maxTotal * 100));
+  const routing = Math.min(100, Math.round((Number(record.routing_ms) || 0) / (total || 1) * 100));
+  return `<span class="bar"><span class="track" style="width:100%">
+      <i style="width:${width}%"></i><em style="width:${Math.max(2, Math.round(width * routing / 100))}%"></em>
+    </span><small>${esc(Math.round((Number(record.routing_ms) || 0)))}ms</small></span>`;
+}
+
+function traceHtml(record) {
+  const events = eventLines(record);
+  const lines = events.map(line =>
+    `<div class="ln ${esc(line.tone)}"><span class="ix">${String(line.index).padStart(2, '0')}</span>` +
+    `<span class="ev">${line.index === events.length ? '└─' : '├─'} ${esc(line.name)}</span>` +
+    `<span class="dt" title="${esc(line.detail)}">${esc(line.detail || '—')}</span></div>`).join('');
+  const stages = derivePath(record);
+  return `<div class="trace-h"><b>▸ 原始事件流</b>
+      <span>${esc(record.id.toUpperCase())} · ${esc(clock(record.ts))}</span>
+      <span class="tag">${esc(routeLabel(record))}</span>
+      <span class="tag ${stages.some(stage => stage.tone === 'warn') ? 'warn' : stages.some(stage => stage.tone === 'bad' || stage.tone === 'halt') ? 'bad' : ''}">${esc(OUTCOME_LABEL[record.outcome])}</span>
+    </div>
+    <div class="events">${lines}</div>
+    <div class="trace-foot">
+      <span>TREE <b>${esc(record.tree_id)} r${esc(record.tree_revision)}</b></span>
+      <span>SNAPSHOT <b>r${esc(record.snapshot_revision)}</b></span>
+      <span>POLICY <b>${esc(record.policy_path)}</b></span>
+      <span>SESSION <b>${esc(dash(record.session_hash))}</b></span>
+      <span>ROUTING <b>${esc(msText(record.routing_ms))}</b></span>
+      <span>TTFT <b>${esc(msText(record.ttft_ms))}</b></span>
+      <span>TOKENS <b>${esc(dash(record.total_tokens))}</b></span>
+    </div>`;
+}
+
+function rowHtml(record, index) {
+  const stages = derivePath(record);
+  const tone = OUTCOME_TONE[record.outcome] || '';
+  const on = record.id === selected;
+  const cells = stages.map((stage, cellIndex) =>
+    `<span class="cell ${esc(stage.tone)}${cellIndex === 6 ? ' model' : ''}" data-c="${cellIndex}"
+       title="${esc(stage.name)} · ${esc(stage.value)}">${esc(stage.cell)}</span>`).join('');
+  const mobile = stages.filter(stage => !stage.skipped).map(stage => stage.abbr || stage.name).join(' › ');
+  return `<article class="rec reveal${on ? ' on' : ''}" data-id="${esc(record.id)}" style="--i:${index}">
+    <button type="button" class="row" aria-expanded="${on}" aria-controls="trace-${esc(record.id)}" title="${esc(record.text)}">
+      <span class="time ${esc(tone)}">${clock(record.ts)}</span>
+      <span class="req">${esc(record.text)}<span class="mob">${esc(mobile)}</span></span>
+      ${cells}
+      <span class="lat">${esc(msText(record.total_ms))}</span>
+      ${barHtml(record)}
+    </button>
+    <div class="trace" id="trace-${esc(record.id)}"${on ? '' : ' hidden'}>${on ? traceHtml(record) : ''}</div>
+  </article>`;
+}
+
+function render() {
+  const rows = TRACE_LOGS.filter(FILTERS[filter]);
+  $('#count').textContent = `${rows.length} / ${TRACE_LOGS.length}`;
+  $('#selected').textContent = rows.some(record => record.id === selected) ? selected.toUpperCase() : '—';
+  renderKpis(); renderHead(); renderTabs();
+  $('#list').innerHTML = rows.length ? rows.map(rowHtml).join('')
+    : '<div style="padding:20px;color:var(--muted);font-family:var(--mono);font-size:11px">// 没有符合筛选的记录</div>';
+  requestAnimationFrame(() => document.querySelectorAll('#list .reveal').forEach(node => node.classList.add('in')));
+}
+
+function select(id) {
+  selected = selected === id ? null : id;
+  render();
+}
+function step(delta) {
+  const rows = TRACE_LOGS.filter(FILTERS[filter]);
+  if (!rows.length) return;
+  const index = rows.findIndex(record => record.id === selected);
+  selected = rows[(index + delta + rows.length) % rows.length].id;
+  render();
+}
+$('#filter').addEventListener('click', event => {
+  const button = event.target.closest('button[data-filter]');
+  if (!button || button.dataset.filter === filter) return;
+  filter = button.dataset.filter;
+  render();
+});
+$('#list').addEventListener('click', event => {
+  const row = event.target.closest('.row');
+  if (row) select(row.closest('.rec').dataset.id);
+});
+$('#refresh').addEventListener('click', render);
+document.addEventListener('keydown', event => {
+  if (event.target.closest('input,summary')) return;
+  if (event.key === 'ArrowDown') { event.preventDefault(); step(1); }
+  if (event.key === 'ArrowUp') { event.preventDefault(); step(-1); }
+  if (event.key === 'Escape' && selected) { selected = null; render(); }
+});
+render();
+</script>
+</body>
+</html>

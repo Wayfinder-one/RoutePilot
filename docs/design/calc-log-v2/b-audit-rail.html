@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>方案 B · 折叠轨道 | 计算日志重设计</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="skin.css">
+<style>
+/* ══════════════════════════════════════════════════════════════
+   方案 B（定稿方向）· 折叠轨道
+   A 的列表交互 + B 的详情质量：20 条是一行一条的折叠行，点击行内联展开
+   七段审计轨道。行内链看路径形状，展开轨道看每阶段判定与依据。
+   皮肤全部来自 skin.css，与现有控制台一致。
+   ══════════════════════════════════════════════════════════════ */
+.kpis{display:inline-flex;align-items:center;flex-wrap:wrap;max-width:100%;border:1px solid var(--line);
+  background:var(--panel);border-radius:var(--r-md);box-shadow:var(--shadow);overflow:hidden}
+.kpi{display:inline-flex;align-items:baseline;gap:6px;padding:5px 11px;border-right:1px solid var(--line)}
+.kpi:last-child{border-right:0}
+.kpi b{font-family:var(--mono);font-size:13px;font-weight:650;font-variant-numeric:tabular-nums}
+.kpi small{font-size:10.5px;color:var(--text-3)}
+.kpi.ok b{color:var(--indigo)} .kpi.warn b{color:var(--amber)} .kpi.bad b{color:var(--red)}
+.toolbar{display:flex;align-items:center;gap:10px;margin-bottom:9px;flex-wrap:wrap}
+.count{font-family:var(--mono);font-size:11px;color:var(--text-3)}
+.hint{font-size:10.5px;color:var(--text-3)}
+.spread{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:9px;padding:6px 11px;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow);
+  font-family:var(--mono);font-size:10px;color:var(--text-3)}
+.spread>strong{font-weight:650;font-size:10.5px;color:var(--text-2);margin-right:4px}
+.spread .sp{border:1px solid var(--line-2);border-radius:99px;padding:2px 8px;background:var(--panel-2)}
+.spread .sp b{color:var(--text);font-weight:700;margin-left:4px}
+.spread .sp.indigo{border-color:var(--indigo-line);background:var(--indigo-soft);color:var(--indigo)}
+.spread .sp.warn{border-color:var(--amber-line);background:var(--amber-soft);color:var(--amber)}
+.spread .sp.bad{border-color:var(--red-line);background:var(--red-soft);color:var(--red)}
+.thead{display:grid;grid-template-columns:62px minmax(180px,1.05fr) minmax(560px,2.5fr) 122px 58px 18px;gap:10px;
+  padding:6px 13px;margin-bottom:8px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);
+  font-family:var(--mono);font-size:9px;font-weight:650;letter-spacing:.08em;color:var(--text-3);text-transform:uppercase}
+.thead .chainhead{display:block;text-align:left}
+
+/* ── 折叠行：与方案 A 完全一致的一行摘要 ─────────────────────── */
+.list{display:flex;flex-direction:column;gap:8px}
+.item{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);overflow:hidden}
+.item:hover{border-color:var(--line-2)}
+.item.open{border-color:var(--indigo-line);box-shadow:var(--shadow-lg)}
+.row{display:grid;grid-template-columns:62px minmax(180px,1.05fr) minmax(560px,2.5fr) 122px 58px 18px;
+  align-items:center;gap:10px;width:100%;min-height:42px;padding:7px 13px;border:0;background:transparent;text-align:left}
+.row:hover{background:var(--panel-2)}
+.dot{display:inline-block;width:6px;height:6px;border-radius:99px;background:var(--green);margin-right:5px;vertical-align:1px}
+.dot.warn{background:var(--amber)} .dot.bad,.dot.halt{background:var(--red)}
+.time{font-family:var(--mono);font-size:10.5px;color:var(--text-3);font-variant-numeric:tabular-nums;white-space:nowrap}
+.text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-2);font-size:12.5px}
+.item.open .text{color:var(--text);font-weight:600}
+.model{font-family:var(--mono);font-size:10.5px;font-weight:600;text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.model em{font-style:normal;color:var(--text-3);margin-right:4px}
+.lat{font-family:var(--mono);font-size:10.5px;color:var(--text-3);text-align:right;font-variant-numeric:tabular-nums}
+.chev{font-size:15px;color:var(--text-3);text-align:center;transition:transform var(--dur) var(--ease)}
+.item.open .chev{transform:rotate(90deg);color:var(--indigo)}
+/* 行内链：阶段数由 trace 中实际出现的事件决定，不预留空位、不按列对齐 */
+.chain{display:flex;align-items:center;gap:0;min-width:0;overflow:hidden}
+.node{display:inline-flex;align-items:center;gap:5px;flex:none;max-width:150px;height:22px;
+  padding:1px 7px;border:1px solid var(--line);border-radius:5px;background:var(--panel)}
+.node em{font-style:normal;font-size:9px;color:var(--text-3);white-space:nowrap;flex:none}
+.node b{font-family:var(--mono);font-size:9.5px;font-weight:600;letter-spacing:-.02em;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;color:var(--text-2);font-variant-numeric:tabular-nums}
+.sep{flex:none;color:var(--text-3);font-size:11px;padding:0 4px}
+.node.hit{border-color:var(--indigo-line);background:var(--indigo-soft)}
+.node.hit b{color:var(--indigo)}
+.node.warn{border-color:var(--amber-line);background:var(--amber-soft)}
+.node.warn b{color:var(--amber)}
+.node.bad{border-color:var(--red-line);background:var(--red-soft)}
+.node.bad b{color:var(--red)}
+.row:hover .node.hit{border-color:var(--indigo)}
+.item.open .node.hit{box-shadow:inset 0 -2px 0 var(--indigo)}
+
+/* ── 展开：B 的七段审计轨道 ──────────────────────────────────── */
+.detail{border-top:1px solid var(--line);background:var(--panel-2);padding:9px 13px 11px 17px}
+.detail[hidden]{display:none}
+.detail-head{display:flex;align-items:center;gap:9px;margin:0 0 8px 6px;flex-wrap:wrap}
+.route{font-size:11.5px;font-weight:700}
+.route::before{content:"";display:inline-block;width:14px;height:2px;background:var(--indigo);vertical-align:3px;margin-right:7px}
+.tag{font-family:var(--mono);font-size:9.5px;padding:1px 7px;border:1px solid var(--line-2);border-radius:99px;color:var(--text-2);background:var(--panel)}
+.tag.warn{color:var(--amber);border-color:var(--amber-line);background:var(--amber-soft)}
+.tag.bad{color:var(--red);border-color:var(--red-line);background:var(--red-soft)}
+.detail-kv{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--text-3);white-space:nowrap}
+.detail-kv b{color:var(--text-2);font-weight:600;margin-left:3px}
+.rail{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+.rail-head{display:grid;grid-template-columns:44px 120px minmax(140px,1fr) minmax(200px,1.6fr) 52px;
+  padding:5px 0;border-bottom:1px solid var(--line);background:var(--panel-2);
+  font-family:var(--mono);font-size:9px;font-weight:650;letter-spacing:.08em;color:var(--text-3);text-transform:uppercase}
+.rail-head span{padding-left:9px}
+.stage{display:grid;grid-template-columns:44px 120px minmax(140px,1fr) minmax(200px,1.6fr) 52px;
+  border-bottom:1px solid var(--line);min-height:38px}
+.stage:last-child{border-bottom:0}
+.stage>div{padding:6px 9px;min-width:0;border-right:1px solid var(--line)}
+.stage>div:last-child{border-right:0}
+/* 记忆点：左侧贯穿竖轨 + 降级失败处分叉线 */
+.rail-cell{position:relative;padding:0!important;overflow:visible}
+.rail-cell::before{content:"";position:absolute;left:17px;top:0;bottom:0;width:2px;background:var(--indigo-line)}
+.rail-head+.stage .rail-cell::before{top:19px}
+.stage:last-child .rail-cell::before{bottom:calc(100% - 19px)}
+.pin{position:absolute;left:10px;top:11px;width:16px;height:16px;border:2px solid var(--indigo);border-radius:50%;
+  background:var(--panel);z-index:1;display:grid;place-items:center;font-family:var(--mono);font-size:8px;
+  font-weight:700;color:var(--indigo)}
+.num{font-family:var(--mono);font-size:14px;font-weight:700;letter-spacing:-.03em;color:var(--text-3);line-height:1.1}
+.name{font-weight:650;font-size:11.5px}
+.name small{display:block;font-family:var(--mono);font-size:9px;font-weight:500;color:var(--text-3);letter-spacing:.05em;margin-top:1px}
+.judge{font-family:var(--mono);font-size:11.5px;font-weight:700;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.judge.warn{color:var(--amber)} .judge.bad,.judge.halt{color:var(--red)}
+.evs{font-size:10.5px;color:var(--text-2);line-height:1.45;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.evs span{display:inline-block;margin-right:10px;white-space:nowrap;max-width:32%;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
+.evs b{font-weight:650;color:var(--text)}
+.evs b::after{content:"·";color:var(--text-3);margin-left:3px}
+.ms{font-family:var(--mono);font-size:10px;color:var(--text-3);text-align:right;font-variant-numeric:tabular-nums}
+/* 跳过 / 中止压成 22px，不产生空白 */
+.stage.skip,.stage.halt{min-height:22px;background:var(--panel-2)}
+.stage.skip>div,.stage.halt>div{padding-top:2px;padding-bottom:2px;border-right-color:transparent}
+.stage.skip .rail-cell::before{background:repeating-linear-gradient(180deg,var(--line-2) 0 3px,transparent 3px 7px)}
+.stage.skip .pin{border-color:var(--line-2);background:var(--panel);width:10px;height:10px;left:13px;top:6px;border-width:1.5px;font-size:0}
+.stage.skip .num{font-size:10px;color:var(--text-3)}
+.stage.skip .name{font-size:10.5px;font-weight:500;color:var(--text-3)}
+.stage.skip .name small,.stage.skip .judge,.stage.skip .evs{display:none}
+.stage.skip .skipmark{grid-column:3/5;font-family:var(--mono);font-size:9.5px;color:var(--text-3);padding:3px 9px}
+.stage.halt .rail-cell::before{background:var(--red-line)}
+.stage.halt .pin{border-color:var(--red);background:var(--red-soft);color:var(--red);width:13px;height:13px;left:12px;top:5px;font-size:0}
+.stage.halt .num,.stage.halt .name{color:var(--red)}
+.stage.halt .name{font-size:10.5px}
+.stage.halt .haltmark{grid-column:3/5;font-family:var(--mono);font-size:9.5px;font-weight:650;color:var(--red);padding:3px 9px}
+.stage.branch .rail-cell::after{content:"";position:absolute;left:17px;top:19px;width:18px;height:2px;background:var(--red);z-index:2}
+.stage.branch.warn .rail-cell::after{background:var(--amber)}
+.stage.branch .judge{box-shadow:inset 0 -2px 0 var(--red-line)}
+.stage.bad .num,.stage.bad .name{color:var(--red)}
+.raw{margin:7px 0 0 6px;border-top:1px solid var(--line);padding-top:5px}
+.raw summary{cursor:pointer;list-style:none;font-family:var(--mono);font-size:9.5px;color:var(--text-3);
+  min-height:22px;display:flex;align-items:center;gap:6px}
+.raw summary::-webkit-details-marker{display:none}
+.raw summary::before{content:"+";font-size:12px;color:var(--indigo)}
+.raw[open] summary::before{content:"−"}
+.raw summary:hover{color:var(--text)}
+.raw-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:2px 16px;padding:5px 0 2px;font-family:var(--mono);font-size:10px}
+.raw-grid div{display:flex;gap:6px;min-width:0}
+.raw-grid span{color:var(--text-3);min-width:62px}
+.raw-grid b{font-weight:500;color:var(--text-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{padding:22px;text-align:center;color:var(--text-3);font-size:11.5px;border:1px dashed var(--line-2);border-radius:var(--r-lg);background:var(--panel)}
+.item.reveal{transition-delay:calc(150ms + var(--i,0) * 32ms)}
+
+@media(max-width:1320px){
+  .thead,.row{grid-template-columns:58px minmax(140px,1fr) minmax(470px,2.3fr) 110px 52px 16px;gap:7px}
+  .node b{font-size:9px}
+  .raw-grid{grid-template-columns:repeat(4,minmax(0,1fr))}
+}
+@media(max-width:1080px){
+  .thead,.row{grid-template-columns:56px minmax(120px,1fr) 268px 100px 48px 14px;gap:7px}
+  .chain{overflow-x:auto;scrollbar-width:none}
+  .chain::-webkit-scrollbar{display:none}
+  .node{padding:1px 5px;max-width:112px}
+  .node em{display:none}
+  .sep{padding:0 2px}
+  .rail-head,.stage{grid-template-columns:38px 108px minmax(120px,1fr) 46px}
+  .rail-head span:nth-child(4),.stage .evs{display:none}
+  .stage.skip .skipmark,.stage.halt .haltmark{grid-column:3/4}
+  .raw-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+}
+@media(max-width:680px){
+  .thead,.row{grid-template-columns:52px minmax(90px,1fr) 82px 14px;gap:6px}
+  .thead span:nth-child(3),.thead span:nth-child(5),.chain,.lat{display:none}
+  .model{grid-column:3}
+  .hint{display:none}
+  .seg{overflow-x:auto;max-width:100%}
+  .detail{padding-left:10px;padding-right:10px}
+  .detail-kv{margin-left:0;width:100%}
+  .rail-head,.stage{grid-template-columns:32px 92px minmax(0,1fr)}
+  .rail-head span:last-child,.ms{display:none}
+  .rail-cell::before{left:13px}.pin{left:6px}
+  .stage.branch .rail-cell::after{left:13px;width:12px}
+  .raw-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="mark">SR</span><span>RoutePilot</span></div>
+  <nav aria-label="主导航">
+    <a href="#">概览</a><a href="#">决策组</a><a href="#" class="on" aria-current="page">计算日志</a><a href="#">JEV 模型</a><a href="#">模型与设置</a>
+  </nav>
+  <span class="spacer"></span>
+  <span class="pill">NeoHorse-JEV-4B</span>
+  <span class="switch" aria-label="切换方案"><a href="a-pathline.html">A</a><a class="on" href="b-audit-rail.html">B</a><a href="c-trace-matrix.html">C</a></span>
+  <button class="btn sm" id="refresh" type="button">刷新</button>
+</header>
+
+<div class="pagehead">
+  <div>
+    <div class="crumb">计算日志</div>
+    <h1>计算日志<span class="sub">最近 20 条 · 阶段由实际事件生成，未配置的功能不占位</span></h1>
+  </div>
+  <div class="headmeta"><span class="kpis" id="kpis" aria-live="polite"></span></div>
+</div>
+
+<main class="page">
+  <div class="toolbar">
+    <div class="seg" id="filter" role="group" aria-label="筛选">
+      <button type="button" data-filter="all" data-label="全部">全部</button>
+      <button type="button" data-filter="jev" data-label="JEV 选择">JEV 选择</button>
+      <button type="button" data-filter="sticky" data-label="粘性命中">粘性命中</button>
+      <button type="button" data-filter="fallback" data-label="兜底">兜底</button>
+      <button type="button" data-filter="error" data-label="异常">异常</button>
+    </div>
+    <span class="count" id="count"></span>
+    <span class="spacer"></span>
+    <span class="hint">点击行展开阶段依据 · 可多开</span>
+  </div>
+
+  <div class="spread" id="spread" aria-label="20 条请求的路径分布"></div>
+
+  <div class="thead" aria-hidden="true">
+    <span>时间</span><span>请求文本</span>
+    <span class="chainhead" id="chainhead"></span>
+    <span style="text-align:right">模型</span><span style="text-align:right">耗时</span><span></span>
+  </div>
+  <section class="list" id="list" aria-label="请求列表"></section>
+
+  <details class="note">
+    <summary>方案 B · 定稿方向说明（点击展开）</summary>
+    <p><b>本轮改动</b>：按评审意见，把「最近 20 条」从顶部索引带改成与方案 A 一致的<b>折叠行列表</b> —— 一行一条请求，点击行<b>内联展开</b>，可多开、不跳转、不重排其他行。展开内容仍是 B 的七段审计轨道。</p>
+    <p><b>事件驱动，不是固定栅格</b>：阶段集合完全来自 trace 中实际出现的事件，<b>没配置的功能不产生节点、不预留空位</b>。第 1 条是「默认决策组」样本，没有时间段 / 条件 / JEV 配置，trace 里就没有对应事件，因此只显示 <code>Token 窗口 → 模型调度 → 执行结果</code> 三段，不会出现「白天」「Asia/Shanghai」这类凭空补出来的字段。</p>
+    <p><b>两层路径，不重复</b>：折叠行内是动态阶段链（阶段名 + 判定值，数量按请求而变）；展开后是轨道明细（每阶段的摘要、依据、事件数），失败阶段从轨道向右<b>分叉红线</b>。行负责「哪条走了兜底」，轨道负责「为什么」。</p>
+    <p><b>后端契约（落地时唯一一次改造）</b>：每个 trace 事件附带 <code>phase</code>（阶段 id）、<code>label</code>、<code>cell</code>、<code>summary</code>、<code>facts</code>、<code>tone</code>。前端只做分组与投影，<b>不 import 任何功能名</b>；以后新增信号 / 阶段，只要后端按契约推事件，日志零改动。历史未自描述事件走一次性兼容映射（复用旧摘要），属迁移适配层。</p>
+    <p><b>删掉了什么</b>：4 张统计卡、原 B 的索引带与结论横幅、执行结果 9 项与技术信息 10 项（收进单行「原始字段」）。不再有「跳过阶段」这种占位行 —— 没发生的阶段根本不画。</p>
+    <p><b>取舍</b>：20 行 + 一条展开约 1450px，比原 B 的「一屏一条」长，但换回列表巡检与多条并排比对能力。窄屏 &lt;1080px 行内链降级为 7 个着色圆点，&lt;680px 隐藏链；轨道同步收窄。</p>
+  </details>
+</main>
+
+<script src="data.js"></script>
+<script>
+const $ = selector => document.querySelector(selector);
+let filter = 'all';
+const openIds = new Set(['r-8842']);   // 默认展开「默认决策组」样本，验证无多余阶段
+
+/* 表头 = 与行内链严格同栅格的 7 个阶段缩写。 */
+$('#chainhead').textContent = '计算路径 · 按实际事件生成';
+
+function renderKpis() {
+  const timed = TRACE_LOGS.map(record => record.total_ms).filter(value => Number.isFinite(Number(value)));
+  const avg = timed.reduce((sum, value) => sum + value, 0) / timed.length;
+  const cards = [
+    ['请求', TRACE_LOGS.length, ''],
+    ['JEV', TRACE_LOGS.filter(FILTERS.jev).length, 'ok'],
+    ['兜底', TRACE_LOGS.filter(FILTERS.fallback).length, 'warn'],
+    ['异常', TRACE_LOGS.filter(FILTERS.error).length, 'bad'],
+    ['平均耗时', msText(avg), ''],
+  ];
+  $('#kpis').innerHTML = cards.map(([label, value, tone]) =>
+    `<span class="kpi ${tone}"><b>${esc(value)}</b><small>${esc(label)}</small></span>`).join('');
+}
+
+function renderTabs() {
+  document.querySelectorAll('#filter button').forEach(button => {
+    const key = button.dataset.filter;
+    button.setAttribute('aria-pressed', String(key === filter));
+    button.innerHTML = `${esc(button.dataset.label)}<span class="c">${TRACE_LOGS.filter(FILTERS[key]).length}</span>`;
+  });
+}
+
+/* 全局路径分布：只按阶段数与阶段状态分类，不 import 任何业务 reason。 */
+function shapeOf(record) {
+  const stages = deriveStages(record);
+  const bad = stages.some(stage => stage.tone === 'bad');
+  const warn = stages.some(stage => stage.tone === 'warn');
+  return [stages.length + ' 阶段', bad ? 'bad' : warn ? 'warn' : 'indigo'];
+}
+function renderSpread() {
+  const counts = new Map();
+  TRACE_LOGS.forEach(record => {
+    const [name, tone] = shapeOf(record);
+    const key = name + '|' + tone;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  const sorted = [...counts].sort((a, b) => parseInt(a[0], 10) - parseInt(b[0], 10));
+  $('#spread').innerHTML = '<strong>阶段数分布</strong>' + sorted.map(([key, count]) => {
+    const [name, tone] = key.split('|');
+    return `<span class="sp ${esc(tone)}">${esc(name)}<b>${count}</b></span>`;
+  }).join('');
+}
+
+/* ── 折叠行 ─────────────────────────────────────────────────── */
+function chainHtml(stages) {
+  return `<span class="chain" role="img" aria-label="${esc(stages.map(stage => stage.label + ':' + stage.summary).join(' → '))}">` +
+    stages.map((stage, index) =>
+      `${index ? '<span class="sep" aria-hidden="true">›</span>' : ''}` +
+      `<span class="node ${esc(stage.tone)}" title="${esc(stage.label)} · ${esc(stage.summary)}">
+         <em>${esc(stage.label)}</em><b>${esc(stage.cell)}</b></span>`).join('') +
+    `</span>`;
+}
+function rowHtml(record, stages, open) {
+  const tone = OUTCOME_TONE[record.outcome] || '';
+  return `<button type="button" class="row" aria-expanded="${open}" aria-controls="detail-${esc(record.id)}" title="${esc(record.text)}">
+    <span class="time"><span class="dot ${esc(tone)}${record.outcome === 'routing_error' ? ' halt' : ''}" aria-hidden="true"></span>${clock(record.ts)}</span>
+    <span class="text">${esc(record.text)}</span>
+    ${chainHtml(stages)}
+    <span class="model"><em>→</em>${esc(record.model || '—')}</span>
+    <span class="lat">${esc(msText(record.total_ms))}</span>
+    <span class="chev" aria-hidden="true">›</span>
+  </button>`;
+}
+
+/* ── 展开：七段审计轨道 ─────────────────────────────────────── */
+/* 通用投影：只认识 label / summary / facts / tone / count，不认识任何具体功能。 */
+function stageHtml(stage, index) {
+  const branch = stage.tone === 'warn' || stage.tone === 'bad' ? 'branch' : '';
+  const facts = (stage.facts || []).slice(0, 3).map(([key, value]) =>
+    `<span><b>${esc(key)}</b>${esc(value)}</span>`).join('') || '<span>—</span>';
+  return `<div class="stage ${esc(branch)} ${esc(stage.tone)}">
+    <div class="rail-cell"><span class="pin">${index + 1}</span></div>
+    <div><div class="num">${String(index + 1).padStart(2, '0')}</div>
+      <div class="name">${esc(stage.label)}<small>${esc(stage.id)} · ${stage.count} 事件</small></div></div>
+    <div class="judge ${esc(stage.tone)}" title="${esc(stage.summary)}">${esc(stage.summary)}</div>
+    <div class="evs">${facts}</div>
+    <div class="ms">${stage.count}</div>
+  </div>`;
+}
+
+function detailHtml(record, stages) {
+  const raw = [
+    ['请求 ID', record.id], ['决策组', record.tree_id], ['快照', 'r' + record.snapshot_revision],
+    ['策略路径', record.policy_path], ['会话哈希', record.session_hash],
+    ['JEV 模型', record.jev_model], ['路由耗时', msText(record.routing_ms)],
+    ['首 token', msText(record.ttft_ms)], ['上游状态', dash(record.upstream_status)],
+    ['Token', dash(record.total_tokens)],
+  ];
+  return `<div class="detail-head">
+      <span class="route">${esc(routeLabel(record))}</span>
+      <span class="tags">
+        <span class="tag">${esc(OUTCOME_LABEL[record.outcome] || '—')}</span>
+        ${record.jev_top != null ? `<span class="tag">JEV ${pct(record.jev_top)}</span>` : ''}
+        ${stages.some(stage => stage.tone === 'warn') ? '<span class="tag warn">路径降级</span>' : ''}
+        ${stages.some(stage => stage.tone === 'bad') ? '<span class="tag bad">路径中止</span>' : ''}
+      </span>
+      <span class="detail-kv">上游 <b>${dash(record.upstream_status)}</b> · 路由 <b>${esc(msText(record.routing_ms))}</b>
+        · 总耗时 <b>${esc(msText(record.total_ms))}</b> · 轮次 <b>${dash(record.waves)}</b></span>
+    </div>
+    <div class="rail">
+      <div class="rail-head" aria-hidden="true"><span>轨</span><span>阶段</span><span>摘要</span><span>依据</span><span style="text-align:right">事件</span></div>
+      ${stages.map((stage, index) => stageHtml(stage, index)).join('')}
+    </div>
+    <details class="raw"><summary>原始字段 / RAW</summary>
+      <div class="raw-grid">${raw.map(([key, value]) =>
+        `<div><span>${esc(key)}</span><b title="${esc(dash(value))}">${esc(dash(value))}</b></div>`).join('')}</div>
+    </details>`;
+}
+
+/* 轨道只在首次打开时构建，与生产 logs.js 的懒渲染一致。 */
+function paintDetail(item, record) {
+  const host = item.querySelector('.detail-slot');
+  if (!host || host.dataset.ready === '1') return;
+  host.innerHTML = detailHtml(record, deriveStages(record));
+  host.dataset.ready = '1';
+}
+
+function render() {
+  const rows = TRACE_LOGS.filter(FILTERS[filter]);
+  $('#count').textContent = `${rows.length} / ${TRACE_LOGS.length}`;
+  renderKpis(); renderTabs(); renderSpread();
+  $('#list').innerHTML = rows.length ? rows.map((record, index) => {
+    const open = openIds.has(record.id);
+    return `<article class="item reveal${open ? ' open' : ''}" data-id="${esc(record.id)}" style="--i:${index}">
+      ${rowHtml(record, deriveStages(record), open)}
+      <div class="detail detail-slot" id="detail-${esc(record.id)}"${open ? '' : ' hidden'}></div>
+    </article>`;
+  }).join('') : '<div class="empty">没有符合这个筛选的请求。</div>';
+  document.querySelectorAll('#list .item.open').forEach(item => {
+    const record = TRACE_LOGS.find(entry => entry.id === item.dataset.id);
+    if (record) paintDetail(item, record);
+  });
+  requestAnimationFrame(() => document.querySelectorAll('#list .reveal').forEach(node => node.classList.add('in')));
+}
+
+function toggle(item) {
+  const id = item.dataset.id;
+  const opening = !openIds.has(id);
+  if (opening) openIds.add(id); else openIds.delete(id);
+  item.classList.toggle('open', opening);
+  const button = item.querySelector('.row');
+  const panel = item.querySelector('.detail');
+  if (button) button.setAttribute('aria-expanded', String(opening));
+  if (panel) panel.hidden = !opening;
+  if (!opening) return;
+  const record = TRACE_LOGS.find(entry => entry.id === id);
+  if (record) paintDetail(item, record);
+}
+
+$('#filter').addEventListener('click', event => {
+  const button = event.target.closest('button[data-filter]');
+  if (!button || button.dataset.filter === filter) return;
+  filter = button.dataset.filter;
+  render();
+});
+$('#list').addEventListener('click', event => {
+  const row = event.target.closest('.row');
+  if (row) toggle(row.closest('.item'));
+});
+$('#refresh').addEventListener('click', render);
+render();
+</script>
+</body>
+</html>
