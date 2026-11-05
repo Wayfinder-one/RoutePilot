@@ -361,3 +361,34 @@ def test_dry_run_prints_budget_without_network(tmp_path, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["planned_requests"] == 1740
     assert not (tmp_path / "out").exists()
+
+
+def test_capacity_observations_use_the_posted_rendered_state():
+    """H2 发送的是 render_state(state_text)，校准观测必须用同一份 wire 定义。"""
+    import scripts.spike_jev_batch as spike
+
+    class RecordingTransport(ScriptedH1Transport):
+        def __init__(self):
+            super().__init__()
+            self.states = []
+
+        def post(self, state, questions, stage):
+            self.states.append(state)
+            return super().post(state, questions, stage)
+
+    groups = build_question_groups()
+    transport = RecordingTransport()
+    capacity = spike.run_capacity(
+        transport, groups, build_g3_tree(), scan_repeats=1, rounds=1, workers=1)
+    state_text = capacity["scan"]["state_text"]
+    rendered = spike.render_state(state_text)
+    assert transport.states and all(state == rendered for state in transport.states)
+    rows = spike._observations_from_capacity(capacity, groups)
+    assert rows
+    for row in rows:
+        questions = expand_questions(groups["G2"], row["question_count"])
+        canonical = spike.canonical_questions(questions)
+        assert row["state_est_tokens"] == spike.estimate_tokens(rendered)
+        assert row["wire_est_tokens"] == spike.estimate_tokens(rendered + "\n" + canonical)
+        # 模板开销必须计入：用它估算裸 state_text 会系统性偏小。
+        assert row["wire_est_tokens"] > spike.estimate_tokens(state_text + "\n" + canonical)

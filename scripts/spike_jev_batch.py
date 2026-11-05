@@ -374,7 +374,8 @@ def _call(transport, cache, key, *, stage, state, questions, sample_id, group, p
 
 def call_document(cached):
     metadata = {key: value for key, value in cached.items() if key != "response"}
-    return {**metadata, **cached["response"].__dict__}
+    return {**metadata, **cached["response"].__dict__,
+            "error": _safe_error(cached["response"].error)}
 
 
 def _question_node(key, question):
@@ -757,11 +758,11 @@ def run_equivalence(samples, groups, tree, transport, *, cache=None,
                 try:
                     a_answers[question_id] = typed_answer(question_id, question, a_record)
                 except JevError as exc:
-                    a_errors[question_id] = str(exc)
+                    a_errors[question_id] = _safe_error(str(exc))
                 try:
                     b_answers[question_id] = typed_answer(question_id, question, b_records[question_id])
                 except JevError as exc:
-                    b_errors[question_id] = str(exc)
+                    b_errors[question_id] = _safe_error(str(exc))
                 if question_id in a_answers and question_id in b_answers:
                     comparisons.append(_comparison_row(
                         sample.id, name, question_id, question,
@@ -814,7 +815,7 @@ def run_equivalence(samples, groups, tree, transport, *, cache=None,
                     repeat_error = None
                 except JevError as exc:
                     repeat_answer = None
-                    repeat_error = str(exc)
+                    repeat_error = _safe_error(str(exc))
                 if repeat_id in b_answers and repeat_answer is not None:
                     repeats.append(_repeat_row(
                         sample.id, name, repeat_id, repeat_question,
@@ -1000,7 +1001,7 @@ def _packed_canvas(transport, state, questions, index):
         if answered < len(questions):
             error = f"incomplete answers {answered}/{len(questions)}"
     else:
-        error = record.error or f"HTTP {record.status}"
+        error = _safe_error(record.error) or f"HTTP {record.status}"
     latency_ms = (time.monotonic() - started) * 1000
     return {
         "index": index,
@@ -1016,7 +1017,7 @@ def _serial_canvas(tree, text, transport, index):
     decision, records = run_live_g3(tree, text, transport)
     latency_ms = (time.monotonic() - started) * 1000
     failed = [wave for wave in decision.waves if wave.failed]
-    error = (failed[-1].error or "wave failed") if failed else None
+    error = (_safe_error(failed[-1].error) or "wave failed") if failed else None
     if not records:
         error = error or "no requests produced"
     if len(decision.waves) == len(records):
@@ -1321,7 +1322,7 @@ def _observations_from_calls(calls):
             "state_est_tokens": call.get("state_est_tokens"),
             "wire_est_tokens": call.get("wire_est_tokens"),
             "status": call.get("status"), "input_tokens": call.get("input_tokens"),
-            "duration_ms": call.get("duration_ms"), "error": call.get("error"),
+            "duration_ms": call.get("duration_ms"), "error": _safe_error(call.get("error")),
         })
     return rows
 
@@ -1329,14 +1330,18 @@ def _observations_from_calls(calls):
 def _observations_from_capacity(capacity, groups):
     scan = (capacity or {}).get("scan") or {}
     state_text = scan.get("state_text")
-    state_est = scan.get("state_est_tokens")
     rows = []
     if not isinstance(state_text, str):
         return rows
+    # H2 实际发送的是 render_state(state_text)（_scan_n 收到的 state，见 _call），
+    # wire 估算必须用同一份渲染文本，否则每条观测都漏掉模板开销，CALIBRATION 被抬高、
+    # 上界不再可靠；state_est_tokens 也统一用渲染后的估算。
+    state = render_state(state_text)
+    state_est = estimate_tokens(state)
     for key, entry in (scan.get("by_n") or {}).items():
         n = int(key)
         questions = expand_questions(groups["G2"], n)
-        wire_est = estimate_tokens(state_text + "\n" + canonical_questions(questions))
+        wire_est = estimate_tokens(state + "\n" + canonical_questions(questions))
         for value in (entry.get("input_tokens") or {}).get("values") or []:
             rows.append({
                 "source": "H2", "stage": _CAPACITY_SCAN_STAGE, "sample_id": None,
@@ -1355,7 +1360,8 @@ def _observation_from_cached(cached, *, source):
         "question_count": cached["question_count"], "state_est_tokens": cached["state_est_tokens"],
         "wire_est_tokens": cached["wire_est_tokens"], "status": cached["response"].status,
         "input_tokens": cached["response"].input_tokens,
-        "duration_ms": cached["response"].duration_ms, "error": cached["response"].error,
+        "duration_ms": cached["response"].duration_ms,
+        "error": _safe_error(cached["response"].error),
     }
 
 
@@ -1445,8 +1451,8 @@ def _error_message(record):
         else:
             message = body.get("detail") or body.get("message")
         if isinstance(message, str) and message:
-            return message[:300]
-    return record.error[:300] if record.error else None
+            return _safe_message(message)[:300]
+    return _safe_message(record.error)[:300] if record.error else None
 
 
 def _run_coverage_fill(transport, cache, groups, rows, cells, *, context_tokens, input_tokens,
@@ -1485,7 +1491,7 @@ def _run_coverage_fill(transport, cache, groups, rows, cells, *, context_tokens,
             spent += 1
             record = cached["response"]
             entry.update({
-                "status": record.status, "error": record.error,
+                "status": record.status, "error": _safe_error(record.error),
                 "input_tokens": record.input_tokens,
                 "wire_est_tokens": cached["wire_est_tokens"],
                 "sent_state_est_tokens": cached["state_est_tokens"],
@@ -1582,7 +1588,7 @@ def run_budget(transport, groups, tree, *, observations=(), cache=None,
             spent += 1
             record = cached["response"]
             entry.update({
-                "status": record.status, "error": record.error,
+                "status": record.status, "error": _safe_error(record.error),
                 "input_tokens": record.input_tokens,
                 "wire_est_tokens": cached["wire_est_tokens"],
                 "sent_state_est_tokens": cached["state_est_tokens"],
@@ -1640,14 +1646,17 @@ def run_budget(transport, groups, tree, *, observations=(), cache=None,
         else:
             matched = record.status is not None
         probe.update({
-            "sent": True, "status": record.status, "error": record.error,
+            "sent": True, "status": record.status, "error": _safe_error(record.error),
             "error_code": record.status, "error_message": _error_message(record),
             "input_tokens": record.input_tokens, "wire_est_tokens": cached["wire_est_tokens"],
             "state_est_tokens": cached["state_est_tokens"],
             "accepted_by_server": record.status == 200,
             "duration_ms": record.duration_ms, "prediction_matched": matched,
         })
-        rows.append(_observation_from_cached(cached, source="H3-probe"))
+        # 主动超限的 probe 观测同样带排除标记，产物里才能审计“为何不计入路由可用样本”。
+        probe_row = _observation_from_cached(cached, source="H3-probe")
+        probe_row.update({"intentional_over_limit": True, "route_usable": False})
+        rows.append(probe_row)
         if record.status is None:
             conditional_reasons.append(
                 "over-limit probe produced no HTTP status; error body not verified")
@@ -1761,6 +1770,9 @@ def _capacity_status(capacity):
     return "fail"
 
 
+_ARTIFACT_KEY = ""
+
+
 def _safe_message(exc, api_key=""):
     """异常信息脱敏：不出现 Authorization header 或 API key。"""
     message = str(exc)
@@ -1771,6 +1783,13 @@ def _safe_message(exc, api_key=""):
         if separator:
             message = head + marker + "***"
     return message[:500]
+
+
+def _safe_error(value):
+    """写进产物的 error 文本统一脱敏；None 保持 None，避免变成字符串 "None"。"""
+    if value is None:
+        return None
+    return _safe_message(value, _ARTIFACT_KEY)
 
 
 def _build_parser():
@@ -1805,6 +1824,7 @@ def _graph_document(groups):
 
 
 def main(argv=None):
+    global _ARTIFACT_KEY
     args = _build_parser().parse_args(argv)
     if args.repeats != 2:
         print("--repeats 只接受 2（保留该参数以兼容方案命令，不翻倍 A/B）", file=sys.stderr)
@@ -1831,9 +1851,9 @@ def main(argv=None):
         return 0
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
     cache = {}
     api_key = os.environ.get(_API_KEY_ENV, "")
+    _ARTIFACT_KEY = api_key
     transport = None
     statuses = {"equivalence": "not_run", "capacity": "not_run", "budget": "not_run"}
     started_at = datetime.now().astimezone()
@@ -1847,6 +1867,7 @@ def main(argv=None):
         "api_key_env": _API_KEY_ENV, "api_key_present": bool(api_key),
     }
     try:
+        out_dir.mkdir(parents=True, exist_ok=True)
         groups = build_question_groups()
         tree = build_g3_tree()
         transport = SpikeTransport(args.url, args.model, api_key=api_key,
@@ -1885,7 +1906,7 @@ def main(argv=None):
             write_json(out_dir / "budget.json", budget_doc)
     except Exception as exc:
         message = _safe_message(exc, api_key)
-        write_json(out_dir / "summary.json", {
+        summary = {
             "status": "fail",
             "statuses": statuses,
             "planned_requests": plan.total,
@@ -1895,7 +1916,13 @@ def main(argv=None):
             "error": {"type": type(exc).__name__, "message": message},
             "started_at": started_at.isoformat(),
             "finished_at": datetime.now().astimezone().isoformat(),
-        })
+        }
+        try:
+            write_json(out_dir / "summary.json", summary)
+        except OSError:
+            # 输出目录本身无法创建/写入时 summary 落不了盘，但仍须按契约以 2 退出，
+            # 不能把 mkdir/write 的 OSError 变成未捕获 traceback。
+            pass
         print(f"执行失败：{type(exc).__name__}: {message}", file=sys.stderr)
         return 2
     if any(value == "fail" for value in statuses.values()):
