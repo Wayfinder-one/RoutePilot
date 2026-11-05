@@ -16,6 +16,7 @@ venv/
 
 # ---- 运行时数据 ----
 /routing-graph/
+/artifacts/jev-batch-spike/
 *.db
 *.db-wal
 *.db-shm
