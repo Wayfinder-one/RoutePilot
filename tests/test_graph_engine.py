@@ -332,20 +332,26 @@ def test_invalid_fallback_leaves_partial_trace_in_external_sink():
 # trace 契约（§3.9）
 # ---------------------------------------------------------------------------
 
+DISPLAY_KEYS = {"phase", "label", "cell", "summary", "facts", "tone"}
+
+
+def machine_event(event):
+    return {key: value for key, value in event.items() if key not in DISPLAY_KEYS}
+
 
 def test_trace_events_follow_spec_schema_and_order():
     decision, _jev, _balancer, _affinity = run_scenario("s1")
     events = decision.trace
 
-    assert events[0] == {"event": "time", "active_periods": ["normal"], "timezone": "Asia/Shanghai"}
+    assert machine_event(events[0]) == {"event": "time", "active_periods": ["normal"], "timezone": "Asia/Shanghai"}
     assert events[1]["event"] == "window"
-    assert set(events[1]) == {"event", "tokens_before", "tokens_after", "truncated"}
+    assert set(events[1]) - DISPLAY_KEYS == {"event", "tokens_before", "tokens_after", "truncated"}
     assert events[1]["truncated"] is False
 
     condition_events = [event for event in events if event["event"] == "condition"]
     assert [event["node_id"] for event in condition_events] == ["cond-peak", "cond-text"]
     for event in condition_events:
-        assert set(event) == {"event", "node_id", "source", "matched", "value"}
+        assert set(event) - DISPLAY_KEYS == {"event", "node_id", "source", "matched", "value"}
         assert isinstance(event["value"], bool)
 
     slot_events = [event for event in events if event["event"] == "slot"]
@@ -353,7 +359,7 @@ def test_trace_events_follow_spec_schema_and_order():
     assert len(slot_events) == 2 * len(POWER_GRAPH["edges"])
     assert [event["wave"] for event in slot_events if event["wave"] == 0]
     for event in slot_events:
-        assert set(event) == {
+        assert set(event) - DISPLAY_KEYS == {
             "event", "wave", "edge_id", "node_id", "port",
             "source", "source_port", "raw", "condition", "status",
         }
@@ -363,19 +369,19 @@ def test_trace_events_follow_spec_schema_and_order():
     gate_events = [event for event in events if event["event"] == "gate"]
     assert gate_events
     for event in gate_events:
-        assert set(event) == {"event", "wave", "node_id", "operator", "inputs", "value"}
+        assert set(event) - DISPLAY_KEYS == {"event", "wave", "node_id", "operator", "inputs", "value"}
         for item in event["inputs"]:
             assert set(item) == {"port", "raw", "condition", "status"}
 
     activate_events = [event for event in events if event["event"] == "activate"]
     assert activate_events
     for event in activate_events:
-        assert set(event) == {"event", "wave", "node_id", "via_port"}
+        assert set(event) - DISPLAY_KEYS == {"event", "wave", "node_id", "via_port"}
 
     wave_events = [event for event in events if event["event"] == "wave"]
     assert wave_events
     for event in wave_events:
-        assert set(event) == {"event", "wave", "questions", "duration_ms", "failed", "error"}
+        assert set(event) - DISPLAY_KEYS == {"event", "wave", "questions", "duration_ms", "failed", "error"}
 
     question_events = [event for event in events if event["event"] == "question"]
     assert [event["node_id"] for event in question_events] == ["capability", "domain"]
@@ -384,7 +390,7 @@ def test_trace_events_follow_spec_schema_and_order():
         assert event["duration_ms"] == 12.0
         assert event["usage"] == {"input_tokens": 20}
     choice_event = next(event for event in question_events if event["node_id"] == "capability")
-    assert set(choice_event) == {
+    assert set(choice_event) - DISPLAY_KEYS == {
         "event", "wave", "node_id", "ports", "duration_ms", "usage",
         "selected", "p_top", "margin",
     }
@@ -397,7 +403,7 @@ def test_trace_events_follow_spec_schema_and_order():
     final_event = next(event for event in events if event["event"] == "final")
     scheduled_event = next(event for event in events if event["event"] == "scheduled")
     assert final_event["event"] == "final"
-    assert set(final_event) == {"event", "target_id", "kind", "candidates", "priority"}
+    assert set(final_event) - DISPLAY_KEYS == {"event", "target_id", "kind", "candidates", "priority"}
     assert final_event["target_id"] == "power-target"
     assert final_event["kind"] == "target"
     assert final_event["priority"] == 5
@@ -405,7 +411,36 @@ def test_trace_events_follow_spec_schema_and_order():
         {"target_id": "power-target", "priority": 5, "via_node": "and-power", "via_port": "in_1", "wave": 1},
         {"target_id": "strong-target", "priority": 3, "via_node": "capability", "via_port": "in_1", "wave": 1},
     ]
-    assert scheduled_event == {"event": "scheduled", "model": "qwen3.8-flash-sft", "reason": "target", "dry_run": False}
+    assert machine_event(scheduled_event) == {"event": "scheduled", "model": "qwen3.8-flash-sft", "reason": "target", "dry_run": False}
+
+    for event in events:
+        assert DISPLAY_KEYS <= set(event)
+        assert isinstance(event["phase"], str) and event["phase"]
+        assert isinstance(event["facts"], list)
+        assert all(isinstance(fact, list) and len(fact) == 2 for fact in event["facts"])
+        assert event["tone"] in {"", "hit", "warn", "bad"}
+    assert next(event for event in events if event["event"] == "wave")["phase"] == "jev-wave-1"
+    assert next(event for event in events if event["event"] == "slot" and event["wave"] == 0)["phase"] == "initial"
+    assert events[0]["phase"] == "period"
+    assert next(event for event in condition_events if event["source"] == "periods")["phase"] == "period"
+
+
+def test_direct_route_does_not_invent_time_or_jev_display_stages():
+    decision, *_ = run_custom(
+        [
+            node("start", "start"),
+            node("direct", "target", priority=1, models=[{"model": "qwen3-8b", "reasoning": None}]),
+        ],
+        [edge("direct-edge", "start", "out", "direct", "in_1")],
+        error_fallback="direct",
+    )
+    assert not any(event["phase"] == "period" for event in decision.trace)
+    assert not any(event["phase"].startswith("jev-wave-") for event in decision.trace)
+    assert not any(
+        fact[0] in ({"zh": "时区", "en": "Timezone"}, {"zh": "耗时", "en": "Duration"})
+        for event in decision.trace for fact in event["facts"]
+    )
+    assert [event["event"] for event in decision.trace[-3:]] == ["final", "schedule", "scheduled"]
 
 
 def test_window_is_applied_once_and_conditions_use_truncated_text(monkeypatch):
@@ -452,7 +487,7 @@ def test_schedule_trace_uses_actual_selection_and_preserves_event_order():
     decision, _jev, _balancer, _affinity = run_scenario("s1")
     schedule = next(event for event in decision.trace if event["event"] == "schedule")
 
-    assert schedule == {
+    assert machine_event(schedule) == {
         "event": "schedule",
         "target_id": "power-target",
         "strategy": "least_inflight",
@@ -645,7 +680,8 @@ def test_second_request_executes_questions_then_applies_sticky():
     assert affinity.gets[-1]["policy_path"] == "power-target"
     assert affinity.gets[-1]["allowed_models"] == ["qwen3.8-flash-sft"]
     sticky_events = [event for event in second.trace if event["event"] == "sticky_hit"]
-    assert sticky_events == [{"event": "sticky_hit", "model": "qwen3.8-flash-sft"}]
+    assert [machine_event(event) for event in sticky_events] == [{"event": "sticky_hit", "model": "qwen3.8-flash-sft"}]
+    assert sticky_events[0]["phase"] == "sticky"
     assert [event["event"] for event in second.trace[-4:]] == ["final", "schedule", "sticky_hit", "scheduled"]
     second.release()
 
