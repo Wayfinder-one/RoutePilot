@@ -53,6 +53,40 @@
     return root.RTGraph.edgeType(edge, graph);
   }
 
+  function isStartEdge(edge) {
+    const graph = root.App && root.App.graph;
+    const source = edge && root.RTGraph.findNode(graph, edge.source);
+    return !!(source && source.type === 'start');
+  }
+
+  function canEditCondition(edge) {
+    if (!edge) return false;
+    if (edgeType(edge) === 'number') return true;
+    return !isStartEdge(edge) || edge.condition != null;
+  }
+
+  function conditionLabel(condition, { start = false } = {}) {
+    if (condition == null) return t(start ? 'cv.cond.startAlways' : 'cv.cond.direct');
+    if (condition.op === 'is' && typeof condition.value === 'boolean') {
+      if (condition.value === false) return t('cv.cond.negated');
+      return t(start ? 'cv.cond.startAlways' : 'cv.cond.direct');
+    }
+    const symbol = root.RTGraph.OP[condition.op];
+    if (symbol && Number.isFinite(Number(condition.value))) {
+      return symbol + ' ' + Number(condition.value);
+    }
+    return t('cv.cond.invalid');
+  }
+
+  function conditionText(edge) {
+    if (!edge) return '';
+    if (edgeType(edge) === 'number') {
+      if (!edge.condition) return t('cv.cond.unset');
+      return conditionLabel(edge.condition, { start: false });
+    }
+    return conditionLabel(edge.condition, { start: isStartEdge(edge) });
+  }
+
   function booleanValueOf(condition) {
     if (condition == null) return true;
     if (condition && condition.op === 'is' && typeof condition.value === 'boolean') return condition.value;
@@ -89,12 +123,14 @@
         '" aria-label="' + esc(t('cv.condValue')) + '"></label>' +
         '</div>';
     }
-    const truthy = booleanValueOf(condition);
-    return '<label class="field"><span>' + esc(t('cv.condBool')) + '</span>' +
-      '<select data-cond-field="bool" aria-label="' + esc(t('cv.condBool')) + '">' +
-      '<option value="true"' + (truthy !== false ? ' selected' : '') + '>' + esc(t('cv.condTrue')) + '</option>' +
-      '<option value="false"' + (truthy === false ? ' selected' : '') + '>' + esc(t('cv.condFalse')) + '</option>' +
-      '</select></label>';
+    if (!canEditCondition(edge)) {
+      return '<p class="rtc-cond-readonly" data-start-condition>' +
+        esc(t('cv.cond.startAlways')) + '</p>';
+    }
+    const negated = booleanValueOf(condition) === false;
+    return '<label class="field rtc-cond-negate">' +
+      '<input type="checkbox" data-cond-field="negate" aria-label="' + esc(t('cv.condNegate')) + '"' +
+      (negated ? ' checked' : '') + '><span>' + esc(t('cv.condNegate')) + '</span></label>';
   }
 
   /* 读取表单 → draft；不写草稿。scope 可以是元素或选择器。 */
@@ -110,9 +146,10 @@
       if (!result.ok) return error(messageFor(result));
       return { ok: true, condition: result.condition };
     }
-    const boolElement = container.querySelector('[data-cond-field="bool"]');
-    const wanted = !boolElement || boolElement.value === 'true';
-    return { ok: true, condition: wanted ? null : { op: 'is', value: false } };
+    if (!canEditCondition(edge)) return { ok: true, condition: null };
+    const negateElement = container.querySelector('[data-cond-field="negate"]');
+    const negated = !!(negateElement && negateElement.checked);
+    return { ok: true, condition: negated ? { op: 'is', value: false } : null };
   }
 
   function normaliseCondition(edge, condition) {
@@ -263,6 +300,7 @@
   function open(edgeId, anchor) {
     const edge = edgeOf(edgeId);
     if (!edge) return false;
+    if (!canEditCondition(edge)) return false;
     const pop = element();
     if (!pop) return false;
     const trigger = triggerInfo(pop);
@@ -275,7 +313,9 @@
     };
     position(pop, anchor);
     const type = edgeType(edge);
-    const focus = pop.querySelector(type === 'number' ? '[data-cond-field="value"]' : '[data-cond-field="bool"]');
+    const focus = pop.querySelector(
+      type === 'number' ? '[data-cond-field="value"]' : '[data-cond-field="negate"]'
+    );
     if (focus) focus.focus();
     return true;
   }
@@ -306,7 +346,9 @@
     paint(edge);
     if (hadFocus) {
       const type = edgeType(edge);
-      const focus = pop.querySelector(type === 'number' ? '[data-cond-field="value"]' : '[data-cond-field="bool"]');
+      const focus = pop.querySelector(
+        type === 'number' ? '[data-cond-field="value"]' : '[data-cond-field="negate"]'
+      );
       if (focus) focus.focus();
     }
   }
@@ -364,6 +406,10 @@
     cancel: cancel,
     isOpen: isOpen,
     refresh: refresh,
+    isStartEdge: isStartEdge,
+    canEditCondition: canEditCondition,
+    conditionLabel: conditionLabel,
+    conditionText: conditionText,
     formHTML: formHTML,
     readForm: readForm,
     normaliseCondition: normaliseCondition,
