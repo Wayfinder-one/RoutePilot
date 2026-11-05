@@ -150,10 +150,12 @@ function chainHtml(path) {
 function rowHtml(record, path, open) {
   const [status, tone] = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
   const text = String(record.text || '').replace(/\s+/g, ' ').trim();
+  const timestamp = fmtTime(record.ts);
+  const clock = timestamp.split(' ')[0];
   return '<button type="button" class="lg-row" aria-expanded="' + open +
     '" aria-controls="detail-' + safe(record.id) + '" title="' + esc(text) + '">' +
-    '<span class="lg-time"><span class="lg-dot ' + tone + '" aria-hidden="true"></span>' +
-    esc(fmtTime(record.ts)) + '</span>' +
+    '<span class="lg-time" title="' + esc(timestamp) + '" aria-label="' + esc(timestamp) + '"><span class="lg-dot ' + tone + '" aria-hidden="true"></span>' +
+    esc(clock) + '</span>' +
     '<span class="lg-text">' + (text ? esc(text) : esc(t('logs.noText'))) + '</span>' +
     chainHtml(path) + '<span class="lg-model">→ ' + safe(record.model) + '</span>' +
     '<span class="lg-lat">' + esc(ms(record.total_ms ?? record.latency_ms)) + '</span>' +

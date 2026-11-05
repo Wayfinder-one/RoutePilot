@@ -709,7 +709,7 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
 .lg-thead{padding:6px 13px;margin-bottom:8px;background:var(--panel);border:1px solid var(--line);
   border-radius:10px;font-family:var(--mono);font-size:9px;font-weight:650;color:var(--text-3)}
 .lg-row{padding:7px 13px;min-height:43px}
-.lg-time{white-space:nowrap}
+.lg-time{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lg-time .lg-dot{display:inline-block;margin-right:5px;vertical-align:1px}
 .lg-dot.hit{background:var(--green)}
 .lg-model{display:block;min-width:0;padding:0;border:0;text-align:right;text-overflow:ellipsis;
@@ -786,6 +786,7 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
   .lg-evidence{display:block;grid-column:2 / -1;grid-row:2;white-space:normal;overflow:visible}
 }
 @media(max-width:700px){
+  .lg-time{font-size:9px}
   .headmeta .lg-kpis{order:2;width:100%}
   .lg-thead,.lg-row{grid-template-columns:55px minmax(0,1fr) 85px 14px;gap:6px}
   .lg-thead span:nth-child(3),.lg-thead span:nth-child(5),.lg-lat{display:none}
