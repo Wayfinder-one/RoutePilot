@@ -15,9 +15,11 @@ from scripts.spike_jev_batch import (
     SpikeTransport,
     build_g3_tree,
     build_question_groups,
+    calibrate_budget,
     condition_passes,
     expand_questions,
     load_samples,
+    main,
     percentile,
     plan_request_budget,
     replay_g3,
@@ -26,6 +28,7 @@ from scripts.spike_jev_batch import (
     run_live_g3,
     threshold_records,
     wilson_interval,
+    window_budget,
 )
 
 
@@ -326,3 +329,35 @@ def test_h1_zero_flip_aggregated_threshold_keeps_wilson_high():
                     and row["op"] == "gt" and row["threshold"] == 0.5)
     assert noul_row["flips"] == 0 and noul_row["total"] == 4
     assert noul_row["wilson_high"] > 0.0
+
+
+def test_window_budget_includes_calibration_safety_and_minimum_input():
+    enabled = window_budget(4096, 2048, raw_overhead=512, calibration=1.25, safety=128)
+    assert enabled.effective_context == 3174
+    assert enabled.enabled is True
+    assert enabled.state_budget == 2048
+    disabled = window_budget(4096, 2048, raw_overhead=2919, calibration=1.25, safety=128)
+    assert disabled.enabled is False
+    assert disabled.state_budget < 256
+
+
+def test_calibration_is_an_upper_bound_not_mean_fit():
+    result = calibrate_budget([
+        {"status": 200, "wire_est_tokens": 100, "input_tokens": 110},
+        {"status": 200, "wire_est_tokens": 200, "input_tokens": 180},
+    ])
+    assert result["calibration"] == 1.1
+    assert result["safety"] == 128
+    assert all(item["input_tokens"] <= item["wire_est_tokens"] * result["calibration"] + result["safety"]
+               for item in result["records"])
+
+
+def test_dry_run_prints_budget_without_network(tmp_path, capsys):
+    samples = tmp_path / "samples.jsonl"
+    rows = [{"id": f"s{i}", "text": "文本", "length_bucket": "short", "boundary_tags": []} for i in range(60)]
+    samples.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    code = main(["--samples", str(samples), "--scenario", "all", "--dry-run", "--out-dir", str(tmp_path / "out")])
+    assert code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["planned_requests"] == 1740
+    assert not (tmp_path / "out").exists()
