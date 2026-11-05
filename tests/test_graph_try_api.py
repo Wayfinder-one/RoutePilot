@@ -21,6 +21,13 @@ from router.store.db import connect
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings
+
+
+_DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone"}
+
+
+def _machine_event(event):
+    return {key: value for key, value in event.items() if key not in _DISPLAY_FIELDS}
 from tests.test_graph_engine import (
     POWER_GRAPH,
     SCENARIO_BY_ID,
@@ -363,7 +370,7 @@ def test_try_serializes_all_answer_types_and_complete_outcome(client, app):
         "failed": False,
         "error": None,
     }]
-    assert body["trace"][-1] == {
+    assert _machine_event(body["trace"][-1]) == {
         "event": "scheduled", "model": "qwen3-8b", "reason": "target", "dry_run": True,
     }
     assert body["draft"] is True
@@ -398,7 +405,7 @@ def test_try_fixed_peak_scenario_matches_engine(client, app):
     assert len(body["outcome"]["waves"]) == expected["waves"] == 2
     assert body["outcome"]["selection_reason"] == "target"
     assert body["outcome"]["fallback_reason"] is None
-    assert body["trace"][0] == {
+    assert _machine_event(body["trace"][0]) == {
         "event": "time", "active_periods": ["peak"], "timezone": "Asia/Shanghai",
     }
     assert body["trace"][-1]["event"] == "scheduled"

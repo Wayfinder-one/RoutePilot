@@ -339,6 +339,15 @@ def test_selected_target_uses_real_systemone_chain(tmp_path):
         }
         assert record["waves"] == 1
         assert record["answers"]["q"]["probabilities"]["fast"] == pytest.approx(0.9)
+        assert record["route_label"] == {"zh": "目标命中", "en": "Target selected"}
+        assert [pair[0]["en"] for pair in record["metrics"]] == ["Upstream", "Routing", "Total", "Waves"]
+        assert record["metrics"][0][1] == 200
+        assert record["metrics"][3][1] == 1
+        assert record["fields"][0] == [{"zh": "请求 ID", "en": "Request ID"}, record["id"]]
+        assert [event["event"] for event in record["trace"]].count("request_outcome") == 1
+        assert record["trace"][-1]["phase"] == "outcome"
+        assert record["trace"][-1]["tone"] == "hit"
+        assert len(app.state.requestlog.recent_requests()) == 1
         assert app.state.balancer.inflight("fast") == 0
 
     asyncio.run(scenario())
@@ -371,7 +380,7 @@ def test_numeric_and_merges_two_questions_into_one_systemone_call(tmp_path):
         conn.close()
         assert row["waves"] == 1
         assert row["jev_choice"] == "strong"
-        assert set(LOG_COLUMNS) & {"answers", "trace", "text"} == set()
+        assert set(LOG_COLUMNS) & {"answers", "trace", "text", "route_label", "metrics", "fields"} == set()
         assert "answers" in recent(app) and "trace" in recent(app)
         assert app.state.balancer.inflight("power") == 0
 
@@ -421,6 +430,7 @@ def test_fallback_model_when_no_target_activates(tmp_path):
         record = recent(app)
         assert record["selection_reason"] == "error_fallback"
         assert record["fallback_reason"] == "error_fallback"
+        assert record["route_label"] == {"zh": "默认目标兜底", "en": "Default target fallback"}
         assert record["jev_choice"] == "strong"
         await flush(app)
         conn = connect(app.state.settings.db_path)
@@ -594,12 +604,18 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         record = recent(app)
         assert record["outcome_state"] == "routing_error"
         assert record["error_class"] == "no_active_tree"
-        assert record["trace"][-1] == {
-            "event": "routing_error",
-            "stage": "graph",
-            "error_class": "no_active_tree",
-            "message": "no routing tree is enabled",
+        failure = record["trace"][-1]
+        assert {key: failure[key] for key in ("event", "stage", "error_class", "message")} == {
+            "event": "routing_error", "stage": "graph",
+            "error_class": "no_active_tree", "message": "no routing tree is enabled",
         }
+        assert failure["phase"] == "routing_error"
+        assert failure["label"] == {"zh": "路由中止", "en": "Routing stopped"}
+        assert failure["facts"] == [[{"zh": "原因", "en": "Reason"}, "no_active_tree"]]
+        assert failure["tone"] == "bad"
+        assert record["route_label"] == {"zh": "路由中止", "en": "Routing stopped"}
+        assert not any(event["event"] == "request_outcome" for event in record["trace"])
+        assert len(app.state.requestlog.recent_requests()) == 1
         assert record["node_labels"] == {}
         assert record["model"] is None
         assert record["target_id"] is None
@@ -771,8 +787,31 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert record["outcome_state"] == "completed"
         assert record["total_tokens"] == 3
         assert record["answers"] == {}
+        assert record["trace"][-1]["event"] == "request_outcome"
+        assert record["fields"][-1][1] == 3
 
     asyncio.run(scenario())
+
+
+def test_terminal_result_is_appended_only_once():
+    import time
+    from router.api.routes_v1 import _OutcomeRecorder
+
+    class Logger:
+        def __init__(self):
+            self.results = []
+
+        def enqueue_result(self, record):
+            self.results.append(record)
+
+    logger = Logger()
+    record = {"trace": [], "model": "safe", "routing_ms": 2.0, "waves": 0}
+    outcome = _OutcomeRecorder(logger, record, time.monotonic())
+    assert outcome.finish(outcome_state="completed", upstream_status=200) is True
+    assert outcome.finish(outcome_state="upstream_error", upstream_status=503) is False
+    assert len(logger.results) == 1
+    assert [event["event"] for event in record["trace"]] == ["request_outcome"]
+    assert record["trace"][0]["outcome_state"] == "completed"
 
 
 def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
@@ -784,7 +823,10 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
         response = await post(app)
         assert response.status_code == 502
         assert app.state.balancer.inflight("safe") == 0
-        assert recent(app)["outcome_state"] == "upstream_error"
+        record = recent(app)
+        assert record["outcome_state"] == "upstream_error"
+        assert record["trace"][-1]["event"] == "request_outcome"
+        assert record["trace"][-1]["tone"] == "bad"
 
     asyncio.run(scenario())
 
