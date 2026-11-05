@@ -247,3 +247,82 @@ def test_live_current_path_stops_after_failed_activation_condition():
     assert fake.count == 1
     assert len(records) == 1
     assert tuple(decision.answers) == ("q1",)
+
+
+class ScriptedH1Transport:
+    """确定性的 H1 假传输：可丢某条答案制造 invalid，也可只让 repeat 路径漂移。"""
+
+    def __init__(self, *, drop=None, repeat_shift=0.0):
+        self.count = 0
+        self.drop = drop
+        self.repeat_shift = repeat_shift
+
+    def post(self, state, questions, stage):
+        self.count += 1
+        answers = {}
+        for key, question in questions.items():
+            if self.drop is not None and self.drop(stage, state, key):
+                continue
+            if question.question_type == "choice":
+                labels = [item.label for item in question.options]
+                probabilities = {label: 0.7 if i == 0 else 0.3 / (len(labels) - 1)
+                                 for i, label in enumerate(labels)}
+                answers[key] = {"type": "choice", "probabilities": probabilities}
+            elif question.question_type == "noul":
+                shift = self.repeat_shift if stage == "H1-repeat" else 0.0
+                answers[key] = {"type": "noul", "noul": 0.6 + shift}
+            else:
+                answers[key] = {"type": "score", "score": 0,
+                                "legend": {str(i): value for i, value in enumerate(question.criteria)}}
+        return ResponseRecord(stage, 200, {"answers": answers, "usage": {"input_tokens": 100}},
+                              None, 1.0, 100)
+
+
+def test_h1_invalid_comparison_fails_and_is_kept_in_invalid_comparisons():
+    samples = [Sample(f"s{i}", f"文本{i}", "short") for i in range(4)]
+    fake = ScriptedH1Transport(
+        drop=lambda stage, state, key: stage == "H1-A" and "文本0" in state and key == "urgent")
+    result = run_equivalence(samples, build_question_groups(), build_g3_tree(), fake,
+                             cache={}, group_names=("G1",), repeat_samples=0)
+    summary = result["summary"]
+    assert summary["status"] == "fail"
+    assert any("invalid comparison" in reason for reason in summary["fail_reasons"])
+    assert [(row["sample_id"], row["group"], row["question_id"], row["kind"])
+            for row in result["invalid_comparisons"]] == [("s0", "G1", "urgent", "a_b")]
+    assert result["invalid_comparisons"][0]["a_error"] is not None
+    assert summary["groups"]["G1"]["valid_comparisons"] == 7
+    assert summary["groups"]["G1"]["invalid_comparisons"] == 1
+
+
+def test_h1_repeat_drift_above_tolerance_is_conditional_with_noise_off():
+    samples = [Sample(f"s{i}", f"文本{i}", "short") for i in range(4)]
+    fake = ScriptedH1Transport(repeat_shift=0.05)
+    result = run_equivalence(samples, build_question_groups(), build_g3_tree(), fake,
+                             cache={}, group_names=("G1",), repeat_samples=4)
+    summary = result["summary"]
+    assert summary["max_ab"] == 0.0
+    assert summary["max_repeat"] == pytest.approx(0.05)
+    assert summary["repeat"]["observations"] == 4
+    assert summary["noise_ok"] is False
+    assert summary["fail_reasons"] == []
+    assert any("max_repeat" in reason for reason in summary["conditional_reasons"])
+    assert summary["status"] == "conditional"
+
+
+def test_h1_zero_flip_aggregated_threshold_keeps_wilson_high():
+    samples = [Sample(f"s{i}", f"文本{i}", "short") for i in range(4)]
+    result = run_equivalence(samples, build_question_groups(), build_g3_tree(),
+                             ScriptedH1Transport(), cache={},
+                             group_names=("G1", "G2"), repeat_samples=0)
+    aggregated = result["thresholds"]["aggregated"]
+    assert aggregated
+    for row in aggregated:
+        assert row["flips"] == 0
+        assert row["rate"] == 0.0
+        assert row["wilson_low"] == 0.0
+        assert row["wilson_high"] > 0.0
+    noul_row = next(row for row in aggregated if row["group"] == "G1"
+                    and row["question_id"] == "urgent" and row["port"] == "yes"
+                    and row["op"] == "gt" and row["threshold"] == 0.5)
+    assert noul_row["flips"] == 0 and noul_row["total"] == 4
+    assert noul_row["wilson_high"] > 0.0
