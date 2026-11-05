@@ -86,10 +86,7 @@
   }
 
   function conditionText(condition) {
-    if (condition === null || condition === undefined) return '= true';
-    if (condition.op === 'is') return condition.value === true ? '= true' : '= false';
-    const symbol = { gt: '>', gte: '≥', lt: '<', lte: '≤', eq: '=', neq: '≠' }[condition.op] || condition.op;
-    return symbol + ' ' + num(condition.value);
+    return root.RTCondPop.conditionLabel(condition, { start: false });
   }
 
   function statusText(status) {
@@ -99,9 +96,14 @@
   }
 
   function slotLine(slot) {
+    const graph = app() && app().graph;
+    const edge = graph && (graph.edges || []).find(item => item && item.id === slot.edge_id);
+    const label = edge
+      ? root.RTCondPop.conditionText(edge)
+      : root.RTCondPop.conditionLabel(slot.condition, { start: false });
     const pieces = [rawText(slot.raw)];
-    if (slot.condition !== undefined && slot.condition !== null) pieces.push(conditionText(slot.condition));
-    else if (typeof slot.raw === 'boolean') pieces.push('= true');
+    if (slot.condition !== undefined && slot.condition !== null) pieces.push(label);
+    else if (typeof slot.raw === 'boolean') pieces.push(label);
     pieces.push('→', statusText(slot.status));
     return pieces.join(' ');
   }
@@ -787,7 +789,7 @@
       case 'gate': {
         const inputs = (row.inputs || []).map(input =>
           input.port + ' ' + rawText(input.raw) + ' ' +
-          (input.condition ? conditionText(input.condition) : '= true') + ' → ' + statusText(input.status))
+          (input.condition ? conditionText(input.condition) : root.RTCondPop.conditionLabel(null)) + ' → ' + statusText(input.status))
           .join(t('cv.trySepClause'));
         return tf('cv.tryGateRow', { operator: row.operator, inputs: inputs, value: String(row.value) });
       }

@@ -97,20 +97,7 @@
     }
 
     function conditionText(graph, edge) {
-      const type = RTGraph.edgeType(edge, graph);
-      const condition = edge.condition;
-      if (type === 'boolean') {
-        if (condition == null) return '= true';
-        if (condition.op === 'is' && typeof condition.value === 'boolean') {
-          return condition.value ? '= true' : '= false';
-        }
-        return t('cv.cond.invalid');
-      }
-      if (condition == null) return t('cv.cond.unset');
-      const op = RTGraph.OP[condition.op];
-      const value = Number(condition.value);
-      if (!op || !Number.isFinite(value)) return t('cv.cond.invalid');
-      return op + ' ' + value;
+      return root.RTCondPop.conditionText(edge);
     }
 
     function slotRow(graph, node, port) {
@@ -123,15 +110,20 @@
           '</div>';
       }
       const kind = RTGraph.edgeType(edge, graph);
+      const editable = root.RTCondPop.canEditCondition(edge);
+      const conditionControl = editable
+        ? '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
+          ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
+          ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
+          esc(conditionText(graph, edge)) + '</button>'
+        : '<span class="rtc-cond is-static" data-start-condition>' +
+          esc(conditionText(graph, edge)) + '</span>';
       return '<div class="rtc-slot' + (kind === 'number' ? ' is-num' : '') + '"' +
         ' data-slot="' + esc(port.id) + '" data-edge="' + esc(edge.id) + '">' +
         portHTML(node, port, { side: 'left' }) +
         '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +
         '<span class="rtc-slot-src" title="' + esc(sourceTitle(edge)) + '">' + esc(sourceLabel(graph, edge)) + '</span>' +
-        '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
-        ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
-        ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
-        esc(conditionText(graph, edge)) + '</button>' +
+        conditionControl +
         '<span class="rtc-live" data-live="slot.' + esc(port.id) + '"></span>' +
         '</div>';
     }
