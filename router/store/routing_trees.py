@@ -29,7 +29,6 @@ class GraphAlreadyExistsError(GraphStorageError):
 class GraphChangedDuringLoad(GraphStorageError):
     pass
 
-
 class GraphConflictError(GraphStorageError):
     def __init__(self, actual_document_sha256: str | None):
         super().__init__("graph_conflict")
