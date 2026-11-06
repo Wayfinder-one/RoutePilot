@@ -667,6 +667,51 @@ test('console pages each load through one native module entry', async () => {
   await waitFor(() => document.documentElement.lang === 'zh-CN');
 });
 
+test('login language toggle is module-bound and really switches', async () => {
+  const html = await (await fetch(routerBase + '/console/login.html')).text();
+  /* setLang 是模块导出，不是页面全局：login.html 不能再出现 inline 调用。 */
+  assert.doesNotMatch(html, /onclick\s*=\s*["'][^"']*\bsetLang\b/i,
+    'login.html still calls setLang from an inline handler');
+
+  /* QA 会话已登录（ROUTER_USER_AUTH=0），login.js 会直接回首页；
+     只把 /admin/me 变成 401，才能留在登录页验证按钮绑定。 */
+  const meMatcher = '**/admin/me';
+  expectHttpStatusError({ url: /\/admin\/me$/, status: /401/ });
+  await page.route(meMatcher, route => route.fulfill({
+    status: 401,
+    contentType: 'application/json',
+    body: JSON.stringify({ detail: 'unauthorized' })
+  }));
+  const before = pageErrors.length;
+  try {
+    await page.goto(routerBase + '/console/login.html');
+    await page.waitForSelector('#loginForm:not([hidden])', { timeout: 15000 });
+    await page.locator('.langtog button[data-lang="en"]').click();
+    await page.waitForFunction(() => document.documentElement.lang === 'en');
+    const english = await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return {
+        title: document.title,
+        expectedTitle: t('login.title') + ' · RoutePilot',
+        submit: document.getElementById('loginSubmit').textContent,
+        expectedSubmit: t('login.submit'),
+        active: document.querySelector('.langtog button.on').dataset.lang
+      };
+    });
+    assert.equal(english.title, english.expectedTitle, 'the login title did not repaint in English');
+    assert.equal(english.submit, english.expectedSubmit, 'the login form did not repaint in English');
+    assert.equal(english.active, 'en', 'the login language toggle did not mark the active language');
+
+    await page.locator('.langtog button[data-lang="zh"]').click();
+    await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+  } finally {
+    await page.unroute(meMatcher);
+    resetExpectedHttpStatusErrors();
+  }
+  assert.equal(pageErrors.length, before, 'login language toggle raised a page error: ' +
+    pageErrors.slice(before).join(' | '));
+});
+
 test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
   const state = '【待判断的用户请求】\n' + S1_TEXT + '\n\n【任务】请选择最合适处理这条请求的模型。';
   const response = await fetch(mockBase + '/v1/systemone', {
@@ -4654,11 +4699,15 @@ const RTTryRun = await import('/console/routing/tryrun.js');
     const { app, store } = await import('/console/routing/app.js');
 const RTTryRun = await import('/console/routing/tryrun.js');
 
-    app.tryRunning = true;
+    /* app.tryRunning 是只读 getter：旧写法赋值会被静默丢弃，用例永远绿。
+       必须走 store 的 setter，并在 reset() 之前证明锁真的上了。 */
+    store.setTryRunning(true);
+    const lockWasSet = app.tryRunning === true;
     app.kit.setLocked(true);
     document.body.classList.add('is-try-running');
     RTTryRun.reset();
     const snapshot = {
+      lockWasSet: lockWasSet,
       running: app.tryRunning,
       locked: app.kit.isLocked(),
       stageLocked: document.getElementById('cvStage').classList.contains('is-locked'),
@@ -4666,9 +4715,12 @@ const RTTryRun = await import('/console/routing/tryrun.js');
       inputDisabled: document.getElementById('cvTryInput').disabled
 };
     app.render();
+    /* 断言失败也不要把运行锁漏给后续用例。 */
+    if (store.tryRunning) store.setTryRunning(false);
     return snapshot;
 
 });
+  assert.equal(stranded.lockWasSet, true, 'the run lock was never set before reset()');
   assert.equal(stranded.running, false, 'reset() left App.tryRunning stuck');
   assert.equal(stranded.locked, false, 'reset() left the canvas kit locked');
   assert.equal(stranded.stageLocked, false, 'reset() left stage.is-locked');
@@ -5489,31 +5541,66 @@ const { setLang, t, tf } = await import('/console/i18n.js');
 });
 
 test('7.4-18-replay-data-from-admin-try', async () => {
-  await prepareTryCanvas();
-  /* 回放唯一数据源必须是 /admin/try 的 trace：tryrun.js 不得引用本地求值函数。
-     ESM 命名空间是只读的，旧用例的 window 级 monkeypatch 不再可用；这里改用
-     源码级证明（同一约束）+ 下方 trace-only 回放结果断言。 */
-  const tryRunSource = fs.readFileSync(path.join(ROOT, 'router/console/routing/tryrun.js'), 'utf8');
-  assert.doesNotMatch(tryRunSource, /\.evaluateCondition\s*\(/,
-    'replay module calls local condition evaluation');
-  await runTrySample(2);
-  const proof = await page.evaluate(async () => {
-    const { app } = await import('/console/routing/app.js');
-    return ({
-      final: app.replay.final.target_id,
-      waves: app.replay.waves.length,
-      clarify: app.replay.nodeStates.clarify.status,
-      deepSlot: app.replay.edgeStates['e-clarify-deep'].status,
-      resultHidden: document.getElementById('cvTryResult').hidden,
-      finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length
+  /* 回放唯一数据源必须是 /admin/try 的 trace。ESM 命名空间是只读的，旧用例对
+     window.RTGraph 的 monkeypatch 已不可用；这里改为在“浏览器实际加载的”
+     graph.js 函数体里埋计数探针：回放期间任何直接 / 解构 / 别名调用都会经过它。
+     源码正则只作为补充（它只证明文本，不证明运行行为）。 */
+  const graphMatcher = '**/console/routing/graph.js';
+  let instrumented = false;
+  await page.route(graphMatcher, async route => {
+    const response = await route.fetch();
+    let body = await response.text();
+    const marker = 'function evaluateCondition(edge, graphValue, value) {';
+    if (body.includes(marker)) {
+      instrumented = true;
+      body = body.replace(marker, marker +
+        '\n  globalThis.__rtEvalCalls = (globalThis.__rtEvalCalls || 0) + 1;');
+    }
+    await route.fulfill({ response, body });
+  });
+  try {
+    await prepareTryCanvas();
+    assert.equal(instrumented, true,
+      'could not instrument evaluateCondition in the served graph.js');
+    /* 探针自检：主动调用一次必须计数，再清零，证明回放期间读到的 0 不是
+       “探针根本没装上”的假绿。 */
+    const probe = await page.evaluate(async () => {
+      const RTGraph = await import('/console/routing/graph.js');
+      const before = globalThis.__rtEvalCalls || 0;
+      RTGraph.evaluateCondition({ condition: null }, { nodes: [], edges: [] }, true);
+      const after = globalThis.__rtEvalCalls || 0;
+      globalThis.__rtEvalCalls = 0;
+      return { before: before, after: after };
+    });
+    assert.equal(probe.after, probe.before + 1, 'the evaluateCondition probe did not count a call');
+
+    const tryRunSource = fs.readFileSync(path.join(ROOT, 'router/console/routing/tryrun.js'), 'utf8');
+    assert.doesNotMatch(tryRunSource, /\.evaluateCondition\s*\(/,
+      'replay module calls local condition evaluation');
+    await runTrySample(2);
+    const proof = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return ({
+        calls: globalThis.__rtEvalCalls || 0,
+        final: app.replay.final.target_id,
+        waves: app.replay.waves.length,
+        clarify: app.replay.nodeStates.clarify.status,
+        deepSlot: app.replay.edgeStates['e-clarify-deep'].status,
+        resultHidden: document.getElementById('cvTryResult').hidden,
+        finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length
 });
 });
-  assert.equal(proof.final, 'deep-target', 'trace-only replay did not finish');
-  assert.equal(proof.waves, 2);
-  assert.equal(proof.clarify, 'done');
-  assert.equal(proof.deepSlot, 'true');
-  assert.equal(proof.resultHidden, false);
-  assert.ok(proof.finalNodes >= 1);
+    assert.equal(proof.calls, 0,
+      'replay evaluated conditions locally (evaluateCondition ran behind the trace)');
+    assert.equal(proof.final, 'deep-target', 'trace-only replay did not finish');
+    assert.equal(proof.waves, 2);
+    assert.equal(proof.clarify, 'done');
+    assert.equal(proof.deepSlot, 'true');
+    assert.equal(proof.resultHidden, false);
+    assert.ok(proof.finalNodes >= 1);
+  } finally {
+    await page.unroute(graphMatcher);
+  }
 });
 
 test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async () => {
@@ -6327,6 +6414,80 @@ const RTGraph = await import('/console/routing/graph.js');
 }
   await page.unroute(matcher);
   await ensureBaselineTree();
+});
+
+test('Task 8 · out-of-order tree switches keep the newest selection', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const baseline = await serverTree(TREE_ID);
+  const treeFor = (id, name) => Object.assign({}, JSON.parse(JSON.stringify(baseline)), { id, name });
+  const OLD_ID = 'qa-switch-old';
+  const NEW_ID = 'qa-switch-new';
+  const matcher = url => url.pathname === '/admin/trees/' + OLD_ID ||
+    url.pathname === '/admin/trees/' + NEW_ID;
+  const pending = [];
+  await page.route(matcher, async route => {
+    if (route.request().method() !== 'GET') { await route.continue(); return; }
+    pending.push({
+      id: decodeURIComponent(route.request().url().split('/').pop()),
+      route: route,
+      done: false
+    });
+  });
+  try {
+    await page.evaluate(async ids => {
+      const { app } = await import('/console/routing/app.js');
+      /* 不 await：两次选择必须同时在途，才能制造逆序回包。 */
+      window.__switchRace = [app.selectTree(ids[0]), app.selectTree(ids[1])];
+    }, [OLD_ID, NEW_ID]);
+    const deadline = Date.now() + 5000;
+    while (pending.length < 2 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(pending.map(item => item.id), [OLD_ID, NEW_ID],
+      'the two tree switches were not issued in order');
+
+    /* 新选择先回包，旧选择后回包：旧回包必须被 loadSeq 丢弃。 */
+    await pending[1].route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ tree: treeFor(NEW_ID, 'newer selection') })
+    });
+    pending[1].done = true;
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return app.treeId === id;
+    }, NEW_ID, { timeout: 5000 });
+    await pending[0].route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ tree: treeFor(OLD_ID, 'older selection') })
+    });
+    pending[0].done = true;
+
+    const results = await page.evaluate(async () => {
+      const values = await Promise.all(window.__switchRace);
+      delete window.__switchRace;
+      return values;
+    });
+    const after = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return { id: app.treeId, name: app.tree.name };
+    });
+    assert.deepEqual(results, [false, true],
+      'a stale tree switch did not report itself as discarded');
+    assert.deepEqual(after, { id: NEW_ID, name: 'newer selection' },
+      'a slower older tree response overwrote the newer selection');
+  } finally {
+    for (const item of pending) {
+      if (item.done) continue;
+      item.done = true;
+      try { await item.route.abort(); } catch (error) { /* already gone */ }
+    }
+    await page.unroute(matcher);
+    await ensureBaselineTree();
+    await openCanvas();
+  }
 });
 
 test('Task 14 · New, Import and Load example stay inert until the canvas is booted', async () => {

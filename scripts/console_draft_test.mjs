@@ -18,12 +18,15 @@ function storeWith(model) {
 test('change records one undo entry and redo is cleared', () => {
   const store = new DraftStore();
   store.load(createMinimalTree('qwen3-8b'));
-  store.undoStack.push({ before: clone(store.tree), after: clone(store.tree), kind: 'display' });
-  assert.equal(store.change('behavior', tree => { tree.name = 'changed'; }), true);
-  assert.equal(store.tree.name, 'changed');
-  assert.equal(store.redoStack.length, 0);
+  /* 不再手工塞一条假历史：若 change() 不记历史，下面的 undoStack 断言会直接失败。 */
+  assert.equal(store.change('behavior', tree => { tree.name = 'one'; }), true);
+  assert.equal(store.undoStack.length, 1);
   assert.equal(store.undo(), true);
-  assert.notEqual(store.tree.name, 'changed');
+  assert.equal(store.redoStack.length, 1);
+  assert.equal(store.change('behavior', tree => { tree.name = 'two'; }), true);
+  assert.equal(store.redoStack.length, 0, 'a new change did not clear the redo stack');
+  assert.equal(store.undoStack.length, 1);
+  assert.equal(store.tree.name, 'two');
 });
 
 test('change is a no-op without a loaded tree or while locked', () => {
@@ -43,6 +46,28 @@ test('change is a no-op without a loaded tree or while locked', () => {
   assert.equal(saving.change('behavior', tree => { tree.name = 'y'; }), false);
   assert.equal(saving.tree.name, '新决策组');
   assert.equal(saving.undoStack.length, 0);
+
+  /* 保存锁同样拒绝 undo/redo（draft.js 的两处 return false），且不得消耗栈。 */
+  const locked = storeWith();
+  assert.equal(locked.change('behavior', tree => { tree.name = 'one'; }), true);
+  assert.equal(locked.change('behavior', tree => { tree.name = 'two'; }), true);
+  assert.equal(locked.undo(), true);
+  assert.equal(locked.undoStack.length, 1);
+  assert.equal(locked.redoStack.length, 1);
+  const current = locked.tree;
+  const name = locked.tree.name;
+
+  locked.setSaving(true);
+  assert.equal(locked.undo(), false, 'undo ran while a save was in flight');
+  assert.equal(locked.redo(), false, 'redo ran while a save was in flight');
+  assert.equal(locked.undoStack.length, 1, 'a blocked undo consumed the undo stack');
+  assert.equal(locked.redoStack.length, 1, 'a blocked redo consumed the redo stack');
+  assert.equal(locked.tree, current, 'a blocked undo/redo replaced the draft');
+  assert.equal(locked.tree.name, name);
+
+  locked.setSaving(false);
+  assert.equal(locked.redo(), true);
+  assert.equal(locked.tree.name, 'two');
 });
 
 test('change snapshots before/after so later mutations do not leak into history', () => {
@@ -131,10 +156,16 @@ test('markSaved replaces the baseline and resets the dirty kind', () => {
   assert.equal(store.markSaved(server), true);
   assert.equal(store.saved.name, '服务端名称');
   assert.equal(store.saved.tree_revision, 'abc123');
-  /* 基线替换是整体替换：调用方随后再改 tree 不应回写到 saved。 */
+  /* 基线按值保存：即使调用方传的就是当前草稿本身，之后改 tree 也不能回写 saved。
+     如果 markSaved 只存引用，下面的 saved.name 会跟着变成“基线之后的修改”。 */
   store.tree.name = '再次本地修改';
   assert.equal(store.saved.name, '服务端名称');
   assert.equal(store.dirtyKind, 'display');
+
+  assert.equal(store.markSaved(store.tree), true);
+  assert.equal(store.saved.name, '再次本地修改');
+  store.tree.name = '基线之后的修改';
+  assert.equal(store.saved.name, '再次本地修改', 'markSaved kept a live reference to the draft');
 
   store.markSaved(clone(store.tree));
   assert.equal(store.dirtyKind, 'clean');

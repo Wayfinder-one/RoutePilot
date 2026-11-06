@@ -1332,12 +1332,19 @@ test('review-chinese-node-names-contract', () => {
   assert.match(cards, /cv\.name\.question\./, 'question cards do not use the Chinese name labels');
   /* ESM：inspector / tryrun 直接从 cards.js 导入 nodeName；condpop 由
      configureCondPop({ nodeName }) 注入，避免与 cards.js 形成循环依赖。 */
-  assert.match(read('routing/inspector.js'), /import \{[^}]*\bnodeName\b[^}]*\} from '\.\/cards\.js'/,
-    'routing/inspector.js does not use the Chinese node names');
-  assert.match(read('routing/tryrun.js'), /nodeName as nodeNameOf/,
-    'routing/tryrun.js does not use the Chinese node names');
-  assert.match(read('routing/condpop.js'), /nodeNameOf/,
-    'routing/condpop.js does not use the Chinese node names');
+  /* 断言 import 语句而不是裸名字：纯格式化（换行/引号/空格）不应让用例误红。 */
+  assert.match(read('routing/inspector.js'),
+    /import\s*\{[^}]*\bnodeName\b[^}]*\}\s*from\s*['"]\.\/cards\.js['"]/,
+    'routing/inspector.js does not import nodeName from cards.js');
+  assert.match(read('routing/tryrun.js'),
+    /import\s*\{[^}]*\bnodeName\s+as\s+nodeNameOf\b[^}]*\}\s*from\s*['"]\.\/cards\.js['"]/,
+    'routing/tryrun.js does not import nodeName from cards.js');
+  /* 必须是调用点，不能靠 import/定义本身蒙混过关。 */
+  assert.match(read('routing/condpop.js'), /\bnodeNameOf\(node, graph\)/,
+    'routing/condpop.js does not call the injected node-name helper');
+  assert.match(read('routing/app.js'),
+    /configureCondPop\(\{[^}]*\bnodeName:\s*nodeName\b[^}]*\}\)/,
+    'app.js does not inject nodeName into configureCondPop');
   /* 卡片不再渲染 OR 说明（说明仅保留在检查器里）。 */
   assert.doesNotMatch(cards, /cv\.slot\.orNote/, 'card still renders the OR note');
   const i18n = read('i18n.js');
