@@ -21,7 +21,7 @@ class Settings:
     jev_api_key: str = ""
     jev_timeout: float = 10.0
     session_max_entries: int = 10000
-    user_auth: bool = False
+    user_auth: bool = True
     admin_email: str = "admin@test.com"
     admin_password: str = "1qaz@WSX"
     session_ttl_hours: int = 168

@@ -41,7 +41,7 @@ function uniqueSlot(base, taken) {
 
 /* ── state ───────────────────────────────────────────────────────────── */
 const STATE = {
-  models: [], providers: [], settings: {}, jev: {},
+  models: [], providers: [], jev: {},
   catalog: null,            // GET /admin/model-catalog, null when unavailable
   formats: [],              // [{id, zh, en}]
 };
@@ -284,30 +284,6 @@ async function deleteProvider(name) {
   } catch (e) {
     toast(t('models.prov.ref') + ' · ' + errText(e), 3600);
   }
-}
-
-/* ── runtime settings (/admin/settings; pipeline_version is read-only) ─ */
-function renderSettings(settings) {
-  const rows = Object.entries(settings || {})
-    .filter(([k]) => k !== 'pipeline_version')
-    .map(([k, v]) => `<div class="set-row">
-        <input class="s-key" value="${esc(k)}" style="max-width:190px">
-        <input class="s-val" value="${esc(v)}">
-        <button class="del" data-del-setting title="${t('common.delete')}">✕</button>
-      </div>`).join('');
-  const ver = settings && settings.pipeline_version
-    ? `<div class="footnote">${t('models.pipelineversion')}：<b class="mono">${esc(settings.pipeline_version)}</b></div>` : '';
-  $('#settingsRows').innerHTML = rows + ver;
-  $$('[data-del-setting]').forEach(b =>
-    b.addEventListener('click', () => b.closest('.set-row').remove()));
-}
-function readSettings() {
-  const out = {};
-  $$('#settingsRows .set-row').forEach(row => {
-    const k = row.querySelector('.s-key').value.trim();
-    if (k) out[k] = row.querySelector('.s-val').value;
-  });
-  return out;
 }
 
 /* ══ model modal: preset tab ══════════════════════════════════════════ */
@@ -969,13 +945,12 @@ async function fetchAvailableModels() {
 
 /* ── boot ────────────────────────────────────────────────────────────── */
 async function boot() {
-  let m = { models: [] }, prov = { providers: [] }, set = { settings: {} };
+  let m = { models: [] }, prov = { providers: [] };
   let jevBody = { config: null }, catalog = null;
   try {
-    [m, prov, set, jevBody, catalog] = await Promise.all([
+    [m, prov, jevBody, catalog] = await Promise.all([
       api.get('/admin/models'),
       api.get('/admin/providers'),
-      api.get('/admin/settings'),
       api.get('/admin/jev').catch(() => ({ config: null })),
       api.get('/admin/model-catalog').catch(() => null),
     ]);
@@ -984,14 +959,12 @@ async function boot() {
   }
   STATE.models = m.models || [];
   STATE.providers = prov.providers || [];
-  STATE.settings = set.settings || {};
   STATE.jev = jevBody.config || {};
   STATE.catalog = catalog && Array.isArray(catalog.providers) ? catalog : null;
   STATE.formats = catalog && Array.isArray(catalog.formats) ? catalog.formats : [];
   renderEngine(STATE.jev);
   renderModels();
   renderProviders();
-  renderSettings(STATE.settings);
 }
 
 /* ── wiring (delegated; rendered children are replaced often) ────────── */
@@ -1143,27 +1116,6 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && closeTopModal()) e.preventDefault();
 });
 
-/* ── runtime settings ────────────────────────────────────────────────── */
-$('#addSetting').addEventListener('click', () => {
-  const wrap = document.createElement('div');
-  wrap.className = 'set-row';
-  wrap.innerHTML = `<input class="s-key" placeholder="key" style="max-width:190px">
-    <input class="s-val" placeholder="value">
-    <button class="del" data-del-setting>✕</button>`;
-  wrap.querySelector('[data-del-setting]').addEventListener('click', () => wrap.remove());
-  $('#settingsRows').prepend(wrap);
-});
-$('#saveSettings').addEventListener('click', async () => {
-  try {
-    await api.put('/admin/settings', readSettings());
-    const body = await api.get('/admin/settings');
-    STATE.settings = body.settings || {};
-    renderSettings(STATE.settings);
-    toast(t('common.saved'));
-  } catch (e) {
-    toast((LANG === 'zh' ? '保存失败: ' : 'save failed: ') + errText(e));
-  }
-});
 window.onLangChange = () => {
   // Capture the open modals BEFORE re-rendering: the language switch rebuilds
   // their DOM, so unsaved input would be lost (the capture/restore patches
@@ -1173,7 +1125,6 @@ window.onLangChange = () => {
   renderEngine(STATE.jev);
   renderModels();
   renderProviders();
-  renderSettings(STATE.settings);
   if (modal) renderModelModal();
   if (provModal) renderProvModal();
 };

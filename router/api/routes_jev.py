@@ -6,7 +6,8 @@ import sqlite3
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from router.api.deps import get_conn, get_tree_repo
-from router.api.routes_trees import active_tree_issues
+from router.control.config import ConfigurationService, ValidationFailed
+from router.control.validation import active_tree_issues
 from router.jev.client import ChoiceAnswer, DecisionQuestion, JevCandidate, JevClient, JevError
 from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
@@ -22,7 +23,7 @@ from router.jev.window import (
     MIN_INPUT_TOKENS,
 )
 from router.routing.snapshot import read_jev_window
-from router.store.repositories import ChangeRepo, SettingsRepo, _now_iso
+from router.store.repositories import ChangeRepo, SettingsRepo, now_iso
 from router.store.routing_trees import RoutingTreeRepo
 
 router = APIRouter()
@@ -64,14 +65,11 @@ def put_jev(
         )
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        repo.save(settings)
-        ChangeRepo(conn).record(_now_iso(), "jev", {"action": "save", "model": settings.model})
-        issues = active_tree_issues(conn, trees)
-        if issues:
-            raise HTTPException(422, detail=[dict(issue.__dict__) for issue in issues])
-        publisher.refresh(conn)
+    service = ConfigurationService(conn, trees, request.app.state.publisher)
+    try:
+        service.save_jev(settings)
+    except ValidationFailed as exc:
+        raise HTTPException(422, detail=[dict(issue.__dict__) for issue in exc.issues]) from exc
     return _public(settings)
 
 
@@ -170,7 +168,7 @@ def put_jev_window(
         with conn:
             repo.set("jev_context_tokens", str(context_tokens))
             repo.set("jev_input_tokens", str(input_tokens))
-            ChangeRepo(conn).record(_now_iso(), "jev_window", {
+            ChangeRepo(conn).record(now_iso(), "jev_window", {
                 "action": "window",
                 "context_tokens": context_tokens,
                 "input_tokens": input_tokens,

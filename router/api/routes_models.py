@@ -10,15 +10,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from router.api.deps import get_conn, get_tree_repo
-from router.api.routes_trees import active_tree_issues
 from router.api.upstream import parse_profile_text
+from router.control.validation import active_tree_issues
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import FORMATS, FORMAT_IDS, LEVELS, ReasoningError, normalize_reasoning, validate_model_profile
 from router.store.repositories import (
     ChangeRepo,
     ModelRepo,
     ProviderRepo,
-    _now_iso,
+    now_iso,
     model_ids_using_provider,
     model_references,
     write_transaction,
@@ -174,7 +174,7 @@ def post_model(
             if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
                 raise HTTPException(409, detail=f"model {model_id} 已存在")
             _check_active_tree(conn, trees)
-            ChangeRepo(conn).record(_now_iso(), "model", {"action": "create", "id": model_id, "upstream": upstream, "provider": provider, "profile": body.profile})
+            ChangeRepo(conn).record(now_iso(), "model", {"action": "create", "id": model_id, "upstream": upstream, "provider": provider, "profile": body.profile})
         publisher.refresh(conn)
     return {"ok": True, "model": _public_model(ModelRepo(conn).get(model_id), provider_row.get("reasoning_format") or "openai")}
 
@@ -199,7 +199,7 @@ def put_model(
         with write_transaction(conn):
             ModelRepo(conn).update(model_id, upstream=upstream, provider=provider, profile=profile)
             _check_active_tree(conn, trees)
-            ChangeRepo(conn).record(_now_iso(), "model", {"action": "update", "id": model_id, "upstream": body.upstream, "provider": body.provider, "profile": body.profile})
+            ChangeRepo(conn).record(now_iso(), "model", {"action": "update", "id": model_id, "upstream": body.upstream, "provider": body.provider, "profile": body.profile})
         publisher.refresh(conn)
     row = ModelRepo(conn).get(model_id)
     return {"ok": True, "model": _public_model(row, _provider_formats(conn).get(row["provider"], "openai"))}
@@ -220,7 +220,7 @@ def delete_model(
             raise HTTPException(409, detail={"message": f"model {model_id} 被路由树引用", "references": refs})
         with write_transaction(conn):
             ModelRepo(conn).delete(model_id)
-            ChangeRepo(conn).record(_now_iso(), "model", {"action": "delete", "id": model_id})
+            ChangeRepo(conn).record(now_iso(), "model", {"action": "delete", "id": model_id})
         publisher.refresh(conn)
     return {"ok": True, "deleted": model_id}
 
@@ -264,7 +264,7 @@ def put_provider(
         with write_transaction(conn):
             ProviderRepo(conn).upsert(name, base_url, key_env=key_env, reasoning_format=body.reasoning_format, api_key=api_key)
             _check_active_tree(conn, trees)
-            ChangeRepo(conn).record(_now_iso(), "provider", {
+            ChangeRepo(conn).record(now_iso(), "provider", {
                 "action": "upsert", "name": name, "base_url": base_url,
                 "key_env": key_env if key_env is not None else (existing or {}).get("key_env", ""),
                 "reasoning_format": body.reasoning_format or (existing or {}).get("reasoning_format", "openai"),
@@ -285,7 +285,7 @@ def delete_provider(name: str, request: Request, conn: sqlite3.Connection = Depe
             raise HTTPException(409, detail={"message": "provider 被模型引用", "models": used_by})
         with write_transaction(conn):
             ProviderRepo(conn).delete(name)
-            ChangeRepo(conn).record(_now_iso(), "provider", {"action": "delete", "name": name})
+            ChangeRepo(conn).record(now_iso(), "provider", {"action": "delete", "name": name})
         publisher.refresh(conn)
     return {"ok": True, "deleted": name}
 
