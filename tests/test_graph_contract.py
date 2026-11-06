@@ -36,6 +36,10 @@ REQUIRED_FIXTURES = {
     "invalid-old-otherwise-target",
     "invalid-choice-single-option",
     "invalid-numeric-condition-missing",
+    "valid-condition-periods",
+    "valid-small-float-threshold",
+    "valid-envelope-variation",
+    "valid-old-field-control",
 }
 
 FIXTURES = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -120,6 +124,35 @@ def test_fixture_set_covers_the_contract_matrix() -> None:
     old_field_root = BY_NAME["invalid-old-otherwise-target"]["document"]["root"]
     assert old_field_root["otherwise_target"] == "target-a", (
         "the old-field fixture must exercise the rejected otherwise_target key"
+    )
+
+    # 补充契约面：periods 条件、浮点指数阈值、信封取值变化与旧字段正向对照。
+    condition_nodes = [
+        node for root in roots for node in root["nodes"] if node["type"] == "condition"
+    ]
+    assert any(
+        node.get("source") == "periods" and node.get("periods")
+        for node in condition_nodes
+    ), "no periods-source condition in the valid fixture set"
+    thresholds = [
+        condition["value"] for condition in conditions
+        if condition is not None and condition["op"] in NUMERIC_OPS
+        and isinstance(condition["value"], (int, float))
+        and not isinstance(condition["value"], bool)
+    ]
+    assert any(0 < abs(value) < 1e-4 for value in thresholds), (
+        "no sub-1e-4 numeric threshold in the valid fixture set"
+    )
+    envelope = BY_NAME["valid-envelope-variation"]["document"]
+    assert envelope["timezone"] != "Asia/Shanghai"
+    assert envelope["sticky"] == {"enabled": False, "ttl_seconds": 600}
+    assert envelope["root"]["error_fallback"] == "target-a"
+    old_document = BY_NAME["invalid-old-otherwise-target"]["document"]
+    control_document = BY_NAME["valid-old-field-control"]["document"]
+    expected_control = json.loads(json.dumps(old_document))
+    del expected_control["root"]["otherwise_target"]
+    assert control_document == expected_control, (
+        "the positive control must be the rejected document without otherwise_target"
     )
 
 

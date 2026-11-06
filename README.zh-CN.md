@@ -42,10 +42,10 @@ flowchart LR
 
 ## 架构与边界
 
-- **API 层。** `router/api/` 只解析请求 DTO、把领域异常映射为 HTTP 状态/Issue，并转发上游响应；admin 路由不直接写控制面状态。
+- **API 层。** `router/api/` 只解析请求 DTO、把领域异常映射为 HTTP 状态/Issue，并转发上游响应；配置类与决策图类 admin 路由不直接写控制面状态，账号与会话路由（`/admin/login`、`/admin/logout`、`/admin/users`、`/admin/me`）直接调用 `UserRepo`/`SessionRepo`/`ChangeRepo`。
 - **控制面服务。** `router/control/` 承载写用例。`GraphService` 按顺序完成校验 → 准备候选快照 → 在单写入者锁内写图文件 → 复核文档哈希 → 发布快照 → 写审计；草稿过期时返回 409，不覆盖他人修改。
 - **路由领域。** `router/routing/graph/`（模型、校验、条件、端口、编译拓扑、执行器）是纯领域代码，不依赖 FastAPI 或 SQLite。`router/routing/service.py` 只做单向编排：求值 → 调度。
-- **快照装配。** `router/routing/snapshot.py` 读取启用图、模型目录、时段与 JEV 配置，构建不可变的 `RoutingSnapshot`；未通过启用校验的图不会被编译或发布。
+- **快照装配。** `router/routing/snapshot.py` 读取启用图、模型目录、时段与 JEV 配置，构建不可变的 `RoutingSnapshot`；未通过启用校验的图不会被编译进已发布快照，`/admin/try` 草稿路径只把启用级问题作为 warning 返回，并编译一份不会替换已发布快照的草稿快照。
 - **控制台。** `router/console/` 是原生 ES Modules：每个页面只有一个 `<script type="module">` 入口，模块之间通过显式 import 与 store 交换状态，不使用 `window.*` 应用全局，也没有 CommonJS。
 - **编译拓扑。** `compile_graph()` 在每次发布时一次性索引节点、排序边并生成入边/端口映射；请求热路径读取 `snapshot.require_compiled()`，不重建索引，也不访问 SQLite。
 - **请求账本。** 事件循环只把行写入有界内存队列和环形缓冲；每 2 秒一次性投影白名单列并在线程池（`asyncio.to_thread`）写库。写失败只丢弃该批并累加 `ledger_write_failures`，不阻塞请求。
@@ -165,7 +165,7 @@ flowchart LR
 }
 ```
 
-只接受 `sr-routing-graph` v3。旧版 version 2、非 v3 的 `kind`、未知节点类型、未知的信封/节点/边字段（包括已删除的 `otherwise_target`）都会在替换草稿或已发布快照之前被拒绝；结构性拒绝以 `graph_parse_error` 呈现，控制台在应用导入前执行同一套校验。`tree_revision` 是 `{timezone, sticky, root}` 规范化 JSON 的 SHA-256：节点按 id 排序，边按 (target, slot, source, source_port) 排序，因此 Python 服务端与 ES Modules 控制台计算出相同的行为哈希。展示/布局编辑——标题、目标的 capability 说明、坐标、节点/边数组顺序、边 id——都不会改变它。
+只接受 `sr-routing-graph` v3。旧版 version 2、非 v3 的 `kind`、未知节点类型、未知的信封/节点/边字段（包括已删除的 `otherwise_target`）都会在替换草稿或已发布快照之前被拒绝；结构性拒绝以 `graph_parse_error` 呈现，控制台在应用导入前执行同一套校验。`tree_revision` 是 `{timezone, sticky, root}` 规范化 JSON 的 SHA-256：节点按 id 排序，边按 (target, slot, source, source_port) 排序，因此 Python 服务端与 ES Modules 控制台得到相同的行为规范形式；控制台用它判定编辑类型，`tree_revision` 本身由服务端下发。展示/布局编辑——标题、目标的 capability 说明、坐标、节点/边数组顺序、边 id——都不会改变它。
 
 ## 模型与推理
 

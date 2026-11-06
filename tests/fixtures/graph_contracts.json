@@ -285,5 +285,120 @@
     },
     "issue_codes": ["numeric_edge_condition_missing"],
     "behavior_sha256": null
+  },
+  {
+    "name": "valid-condition-periods",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "contract-periods",
+      "timezone": "Asia/Shanghai",
+      "sticky": {"enabled": true, "ttl_seconds": 1800},
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start"},
+          {"id": "cond-period", "type": "condition", "source": "periods", "periods": ["peak", "night"]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1}
+        ],
+        "edges": [
+          {"id": "e-start-a", "source": "start", "source_port": "out", "target": "target-a", "target_port": "in_1", "condition": null},
+          {"id": "e-cond-a", "source": "cond-period", "source_port": "out", "target": "target-a", "target_port": "in_2", "condition": null}
+        ],
+        "error_fallback": "target-a"
+      }
+    },
+    "issue_codes": [],
+    "behavior_sha256": "5cab197441518df207605063869452974db637f1c46f9b051382343f737bfba3"
+  },
+  {
+    "name": "valid-small-float-threshold",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "contract-small-float",
+      "timezone": "Asia/Shanghai",
+      "sticky": {"enabled": true, "ttl_seconds": 1800},
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求打分。", "criteria": [1e-05, 5, 9]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1}
+        ],
+        "edges": [
+          {"id": "e-start-score", "source": "start", "source_port": "out", "target": "q-score", "target_port": "in_1", "condition": null},
+          {"id": "e-score-a", "source": "q-score", "source_port": "value", "target": "target-a", "target_port": "in_1", "condition": {"op": "gt", "value": 1e-05}}
+        ],
+        "error_fallback": "target-a"
+      }
+    },
+    "issue_codes": [],
+    "behavior_sha256": "fbba3918d095ab400c89975ee56c197ce9c49937d9102859140cbfebf5d68620"
+  },
+  {
+    "name": "valid-envelope-variation",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "contract-envelope",
+      "timezone": "Europe/Berlin",
+      "sticky": {"enabled": false, "ttl_seconds": 600},
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start"},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1}
+        ],
+        "edges": [
+          {"id": "e-start-a", "source": "start", "source_port": "out", "target": "target-a", "target_port": "in_1", "condition": null}
+        ],
+        "error_fallback": "target-a"
+      }
+    },
+    "issue_codes": [],
+    "behavior_sha256": "553fef0f60f1f75c358eb28b1b5839462d865a85ea0b9b08212a08fc5715bed8"
+  },
+  {
+    "name": "valid-old-field-control",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "contract",
+      "timezone": "Asia/Shanghai",
+      "sticky": {"enabled": true, "ttl_seconds": 1800},
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
+          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}}
+        ],
+        "edges": [
+          {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
+          {"id": "e-cond-gate", "source": "cond-text", "source_port": "out", "target": "gate-and", "target_port": "in_2", "condition": {"op": "is", "value": true}},
+          {"id": "e-gate-choice", "source": "gate-and", "source_port": "out", "target": "q-choice", "target_port": "in_1", "condition": null},
+          {"id": "e-choice-fast-a", "source": "q-choice", "source_port": "selected.fast", "target": "target-a", "target_port": "in_1", "condition": null},
+          {"id": "e-choice-strong-b", "source": "q-choice", "source_port": "selected.strong", "target": "target-b", "target_port": "in_1", "condition": {"op": "is", "value": true}},
+          {"id": "e-choice-prob-noul", "source": "q-choice", "source_port": "prob.strong", "target": "q-noul", "target_port": "in_1", "condition": {"op": "gt", "value": 0.65}},
+          {"id": "e-choice-fast-score", "source": "q-choice", "source_port": "selected.fast", "target": "q-score", "target_port": "in_1", "condition": null},
+          {"id": "e-noul-yes-a", "source": "q-noul", "source_port": "yes", "target": "target-a", "target_port": "in_2", "condition": {"op": "gte", "value": 0.5}},
+          {"id": "e-noul-no-b", "source": "q-noul", "source_port": "no", "target": "target-b", "target_port": "in_2", "condition": {"op": "lte", "value": 0.5}},
+          {"id": "e-score-value-b", "source": "q-score", "source_port": "value", "target": "target-b", "target_port": "in_3", "condition": {"op": "lte", "value": 8.5}}
+        ],
+        "error_fallback": "target-b"
+      }
+    },
+    "issue_codes": [],
+    "behavior_sha256": "37f7afb853e826e6487cd0504f65c97a35e1db684ddb1538dfef1303109644d2"
   }
 ]
