@@ -8,7 +8,7 @@
 
 **Tech Stack:** 原生 JavaScript、CSS、Node test、Playwright `scripts/console_qa.mjs`、Python i18n lint；不新增依赖。
 
-**Starting Point:** 当前分支已经包含 `a1846ba` 和 `6378c2a`。本计划只处理其审核发现，不重复实现取反开关或开始边只读功能。
+**Starting Point:** 本文件 Task 1–4 已在 `d484fbd`、`e9a13c7`、`f44fa16`、`c7c4519` 落地，保留为原始实施记录，不要重复执行。2026-11-06 审查发现的普通 gate/fallback 覆盖缺口和焦点注释问题，只执行接续计划 `docs/superpowers/plans/2026-11-06-boolean-edge-review-follow-up.md`。
 
 ## Assumptions
 

@@ -284,7 +284,7 @@
   }
 
   /* 关闭后把焦点还给触发元素（a11y §6.11）。确认条件会触发 App.change →
-     renderAll 重绘卡片，触发 chip 可能已被替换；按 data-cond-edge 重新定位。 */
+     renderAll 重绘卡片；按条件 edge id 重新定位可编辑 chip 或静态开始边。 */
   function restoreTrigger(info) {
     if (!info) return;
     let target = info.element && info.element.isConnected ? info.element : null;

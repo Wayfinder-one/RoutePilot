@@ -6155,6 +6155,92 @@ test('gate replay labels a start input as always passing', async () => {
   assert.doesNotMatch(text, /= (?:true|false)/);
 });
 
+test('gate replay labels direct and negated boolean inputs', async () => {
+  await prepareTryCanvas();
+
+  async function gateText() {
+    await page.locator('#cvTryDrawerBtn').click();
+    await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+    const row = page.locator(
+      '#cvTraceDrawer .rtc-dw-row--gate[data-trace-node="or-ctx"]'
+    );
+    assert.equal(await row.count(), 1);
+    return row.innerText();
+  }
+
+  await runTrySample(0);
+  const direct = await gateText();
+  assert.match(direct, /in_1[^；]*直接通过/);
+  assert.doesNotMatch(direct, /= (?:true|false)/);
+
+  await page.evaluate(() => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(item => item.id === 'e-cond-text-or').condition = {
+        op: 'is', value: false
+      };
+    });
+  });
+  try {
+    await runTrySample(0);
+    const negated = await gateText();
+    assert.match(negated, /in_1[^；]*取反/);
+    assert.doesNotMatch(negated, /in_1[^；]*直接通过/);
+    assert.doesNotMatch(negated, /= (?:true|false)/);
+  } finally {
+    await page.locator('#cvUndo').click();
+    await waitEdgeCondition('e-cond-text-or', null);
+  }
+});
+
+test('gate replay falls back to trace conditions for missing edges', async () => {
+  await prepareTryCanvas();
+  const matcher = url => url.pathname === '/admin/try';
+  /* 拦截回调里只记录，断言放到 runTrySample 之后：否则缺失 gate 会以
+     “请求中止 + 超时”呈现，而不是可读的 assertion message。 */
+  let gateFound = false;
+  await page.route(matcher, async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    /* wire trace 用 `event` 字段标事件类型（engine.py trace.append），不是 `kind`。 */
+    const gate = body.trace.find(item =>
+      item.event === 'gate' && item.node_id === 'or-ctx');
+    gateFound = !!gate;
+    if (gate) {
+      gate.inputs = [
+        { port: 'in_trace_direct', raw: true, condition: null, status: 'true' },
+        {
+          port: 'in_trace_negated', raw: true,
+          condition: { op: 'is', value: false }, status: 'false'
+        }
+      ];
+      gate.value = true;
+    }
+    await route.fulfill({
+      response,
+      contentType: 'application/json',
+      body: JSON.stringify(body)
+    });
+  });
+
+  try {
+    await runTrySample(0);
+    assert.ok(gateFound, 'real try response did not contain the or-ctx gate');
+    await page.locator('#cvTryDrawerBtn').click();
+    await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+    const row = page.locator(
+      '#cvTraceDrawer .rtc-dw-row--gate[data-trace-node="or-ctx"]'
+    );
+    assert.equal(await row.count(), 1);
+    const text = await row.innerText();
+    assert.match(text, /in_trace_direct true 直接通过 → true/);
+    assert.match(text, /in_trace_negated true 取反 → false/);
+    assert.doesNotMatch(text, /in_trace_(?:direct|negated)[^；]*总是通过/);
+    assert.doesNotMatch(text, /= (?:true|false)/);
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
