@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
+from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings, tree_dict
 
 
@@ -276,3 +277,53 @@ def test_enable_switches_single_active_tree(client, app):
 
     assert client.post("/admin/trees/b/disable").status_code == 200
     assert app.state.snapshot.tree is None
+
+
+def test_enable_publishes_candidate_snapshot_exactly_once(app, client, monkeypatch):
+    """Task 2 契约（Task 1 review carry-forward）：启用图必须且只能发布**一次**
+    候选快照 —— 走真实 SnapshotPublisher，禁止提交后再 refresh 的第二次发布。"""
+    configure_jev(client)
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    publisher = app.state.publisher
+    before_revision = app.state.snapshot.snapshot_revision
+    published = []
+    real_publish = publisher.publish
+
+    def counting_publish(prepared):
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(publisher, "publish", counting_publish)
+
+    response = client.post("/admin/trees/main/enable")
+
+    assert response.status_code == 200, response.text
+    assert len(published) == 1
+    assert app.state.snapshot.tree_id == "main"
+    assert app.state.snapshot.snapshot_revision != before_revision
+    assert response.json()["snapshot_revision"] == app.state.snapshot.snapshot_revision
+    status = publisher.status()
+    assert status["active_id"] == "main" and status["stale"] is False
+    # 候选快照指纹与文件一致：发布内容 = 刚写入的文档（内存替换，无文件操作）
+    repo = RoutingTreeRepo(app.state.settings.graph_dir)
+    assert status["document_sha256"] == repo.fingerprint()[1]
+
+
+def test_tree_dtos_reject_unknown_fields(client):
+    """Task 2 Step 3：graph 写用例的 DTO 同样 ``extra="forbid"``。
+
+    旧实现用 ``dict`` body 并在路由里挑字段，未知字段被静默忽略（dry-run 甚至
+    照常返回 200）；现在必须在进入 GraphService 之前 422。"""
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    cases = [
+        ("post", "/admin/trees", {"id": "extra-tree", "name": "X", "root": graph_with_model()}),
+        ("put", "/admin/trees/main", {"name": "X"}),
+        ("post", "/admin/trees/main/copy", {"id": "copy-x", "name": "X"}),
+        ("post", "/admin/try", {"root": graph_with_model(), "text": "hi"}),
+    ]
+    for method, path, payload in cases:
+        response = getattr(client, method)(path, json={**payload, "bogus": 1})
+        assert response.status_code == 422, (path, response.text)
+        assert any(item["type"] == "extra_forbidden"
+                   for item in response.json()["detail"]), path
+    assert client.get("/admin/trees/extra-tree").status_code == 404

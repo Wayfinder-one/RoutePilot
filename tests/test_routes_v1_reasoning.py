@@ -9,7 +9,7 @@ from router.api.app import create_app
 from router.api.upstream import load_backends
 from router.jev.config import JevConfigRepo
 from router.routing.conditions import TimePeriod
-from router.routing.snapshot import _capability, build_snapshot, read_jev_window
+from router.routing.snapshot import build_snapshot, model_capability, read_jev_window
 from router.store.db import connect
 from router.store.repositories import ModelRepo, TimePeriodRepo
 from router.store.routing_trees import GraphStorageError
@@ -157,7 +157,7 @@ def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
         backends=load_backends(conn),
         time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
         jev=JevConfigRepo(conn).load(),
-        capabilities={row["id"]: _capability(row) for row in ModelRepo(conn).list()},
+        capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
     )

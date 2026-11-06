@@ -12,6 +12,14 @@ from fastapi.staticfiles import StaticFiles
 from router.api.requestlog import RequestLogger
 from router.api.upstream import CircuitBreaker
 from router.config import Settings
+from router.control.config import (
+    AlreadyExists,
+    ConfigurationService,
+    MissingError,
+    ReferencedByError,
+    ValidationFailed,
+)
+from router.control.validation import issues_payload
 from router.jev.client import JevClient
 from router.jev.config import JevConfigRepo, JevSettings
 from router.routing.affinity import SessionAffinity
@@ -93,19 +101,30 @@ def _install_admin_auth(app: FastAPI, settings: Settings) -> None:
         return _unauthorized()
 
 
-def _seed_jev(conn, settings: Settings) -> None:
+def _seed_jev(conn, state) -> None:
+    """boot 种子：环境配置的 JEV 决策服务经真实 ConfigurationService.save_jev 落库。
+
+    与路由层写用例同一次序（校验活动图 → 提交 → 候选发布，发布为纯内存替换），
+    不再"先提交后校验"。活动图在校验失败时保持旧 boot 的降级语义：不中止启动，
+    仅跳过本次种子（差别：未通过校验的配置不再残留数据库）。"""
     if JevConfigRepo(conn).load() is not None:
         return
+    settings = state.settings
     if not settings.jev_url and not settings.jev_model:
         return
     if not settings.jev_url or not settings.jev_model:
         raise RuntimeError("ROUTER_JEV_URL and ROUTER_JEV_MODEL must be configured together")
-    JevConfigRepo(conn).save(JevSettings(
+    seed = JevSettings(
         base_url=settings.jev_url,
         model=settings.jev_model,
         api_key=settings.jev_api_key,
         timeout_seconds=settings.jev_timeout,
-    ))
+    )
+    service = ConfigurationService(conn, state.graph_repo, state.publisher)
+    try:
+        service.save_jev(seed)
+    except (ValidationFailed, GraphStorageError):
+        logger.exception("boot jev seeding skipped: active graph rejected the context")
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
@@ -116,7 +135,6 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         seed_default(conn)
         if settings.user_auth:
             UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
-        _seed_jev(conn, settings)
         requestlog.hydrate_recent(conn)
     finally:
         conn.close()
@@ -151,6 +169,8 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     conn = connect(settings.db_path)
     try:
+        # boot 种子位于 publisher 构造之后：同类服务同一写路径（校验 → 提交 → 发布）。
+        _seed_jev(conn, app.state)
         app.state.publisher.refresh(conn)
     except GraphStorageError:
         logger.exception("initial graph snapshot is unavailable")
@@ -182,6 +202,24 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
             "code": "graph_storage_error",
             "message": str(exc),
         }})
+
+    # 服务层异常 → HTTP 的统一映射（Task 2）：ValidationFailed/引用冲突/缺失
+    # 由服务抛出，这里构成唯一映射点；路由层只做 DTO 解析与最小 try 包装。
+    @app.exception_handler(ValidationFailed)
+    async def validation_failed_handler(request: Request, exc: ValidationFailed):
+        return JSONResponse(status_code=422, content={"detail": issues_payload(exc.issues)})
+
+    @app.exception_handler(MissingError)
+    async def missing_error_handler(request: Request, exc: MissingError):
+        return JSONResponse(status_code=404, content={"detail": exc.message})
+
+    @app.exception_handler(AlreadyExists)
+    async def already_exists_handler(request: Request, exc: AlreadyExists):
+        return JSONResponse(status_code=409, content={"detail": exc.message})
+
+    @app.exception_handler(ReferencedByError)
+    async def referenced_by_error_handler(request: Request, exc: ReferencedByError):
+        return JSONResponse(status_code=409, content={"detail": exc.detail})
 
     _install_admin_auth(app, settings)
 

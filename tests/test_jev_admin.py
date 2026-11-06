@@ -1,6 +1,7 @@
 import asyncio
 import json
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -169,6 +170,19 @@ def test_test_endpoint_huge_probability_returns_502_not_500(tmp_path):
         asyncio.run(app.state.http.aclose())
 
 
+def test_explicit_null_field_is_validated_not_treated_as_absent(tmp_path):
+    """DTO 迁移不得把「显式 null」误当成「缺省继承」：null 仍走值校验 → 422。"""
+    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.put("/admin/jev", json=payload()).status_code == 200
+
+        response = client.put("/admin/jev", json={"model": None})
+
+        assert response.status_code == 422, response.text
+        assert client.get("/admin/jev").json()["config"]["model"] == "NeoHorse-Jev-4B"
+
+
 def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
     settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
     app = create_app(settings)
@@ -189,3 +203,49 @@ def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
     conn.close()
     assert app.state.snapshot.snapshot_revision == before
     assert app.state.snapshot.jev is None
+
+
+def _graph_tree_files(settings):
+    """图目录的全部文件字节：用于证明 publish 是纯内存替换（不触碰文件）。"""
+    root = Path(settings.graph_dir)
+    return {path.relative_to(root).as_posix(): path.read_bytes()
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatch):
+    """Task 2 契约（Task 1 review carry-forward）：真实 SnapshotPublisher 上，
+    ConfigurationService 写用例 = 提交恰在 publish 之前、发布恰好一次，且发布
+    本身是纯内存替换（不写数据库、不写图文件）。"""
+    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    app = create_app(settings)
+    publisher = app.state.publisher
+    before = app.state.snapshot.snapshot_revision
+    files_before = _graph_tree_files(settings)
+    published = []
+    real_publish = publisher.publish
+
+    def counting_publish(prepared):
+        # 发布前复核提交可见性：候选快照绝不能依赖尚未提交的写入。
+        probe = connect(settings.db_path)
+        try:
+            assert JevConfigRepo(probe).load().model == "NeoHorse-Jev-4B"
+        finally:
+            probe.close()
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(publisher, "publish", counting_publish)
+
+    with TestClient(app) as client:
+        response = client.put("/admin/jev", json=payload())
+
+    assert response.status_code == 200, response.text
+    assert len(published) == 1
+    assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
+    assert app.state.snapshot.snapshot_revision != before
+    assert app.state.snapshot.tree_id == "main"          # 内存替换未丢活动树
+    status = publisher.status()
+    assert status["ready"] and status["stale"] is False
+    repo = RoutingTreeRepo(settings.graph_dir)
+    assert status["document_sha256"] == repo.fingerprint()[1]
+    assert _graph_tree_files(settings) == files_before
