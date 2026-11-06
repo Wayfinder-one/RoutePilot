@@ -4,7 +4,6 @@ import sqlite3
 import pytest
 
 from router.store.db import SCHEMA, SCHEMA_VERSION, connect, migrate
-from router.store.repositories import ConfigRevisionRepo
 
 WAVES_LINE = "        waves INTEGER,\n"
 
@@ -37,6 +36,27 @@ def build_v2_database(path):
     return conn
 
 
+CONFIG_REVISIONS_DDL = (
+    "CREATE TABLE config_revisions ("
+    "id INTEGER PRIMARY KEY, kind TEXT NOT NULL, sha256 TEXT NOT NULL, "
+    "content TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(kind, sha256))",
+    "CREATE INDEX idx_config_revisions_kind ON config_revisions(kind, id)",
+)
+
+
+def build_v3_database(path):
+    """Create a v3 database: current schema plus the retired config_revisions ledger."""
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+    for statement in SCHEMA:
+        conn.execute(statement)
+    for statement in CONFIG_REVISIONS_DDL:
+        conn.execute(statement)
+    conn.execute("INSERT INTO schema_migrations VALUES (3)")
+    conn.commit()
+    return conn
+
+
 def column_names(conn, table):
     return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
 
@@ -45,28 +65,28 @@ def schema_version(conn):
     return conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
 
 
-def test_v3_schema_is_current_only_idempotent_and_wal(tmp_path):
+def test_v4_schema_is_current_only_idempotent_and_wal(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
     migrate(conn)
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {
         "models", "providers", "time_periods", "jev_config",
-        "request_logs", "config_revisions", "changes", "settings", "users",
+        "request_logs", "changes", "settings", "users",
         "user_sessions", "breaker", "schema_migrations",
     } <= tables
     assert "routing_trees" not in tables
     assert not {"keyword_groups", "sessions", "stations", "nodes", "requests", "request_ledger", "evals"} & tables
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     conn.close()
 
 
-def test_empty_database_is_created_directly_at_v3_with_waves(tmp_path):
+def test_empty_database_is_created_directly_at_v4_with_waves(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
-    assert schema_version(conn) == 3
+    assert schema_version(conn) == 4
     assert "waves" in column_names(conn, "request_logs")
     assert "routing_trees" not in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
@@ -85,7 +105,7 @@ def test_v1_upgrade_adds_waves_and_keeps_old_log_rows(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 3
+    assert schema_version(conn) == 4
     assert "waves" in column_names(conn, "request_logs")
     row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
     assert row["id"] == "old-row"
@@ -93,7 +113,7 @@ def test_v1_upgrade_adds_waves_and_keeps_old_log_rows(tmp_path):
     assert row["outcome_state"] == "completed"
     assert row["waves"] is None
     migrate(conn)
-    assert schema_version(conn) == 3
+    assert schema_version(conn) == 4
     conn.close()
 
 
@@ -118,13 +138,13 @@ def test_v1_upgrade_keeps_existing_graph_trees(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 3
+    assert schema_version(conn) == 4
     assert "waves" in column_names(conn, "request_logs")
     assert conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
     conn.close()
 
 
-def test_v2_upgrade_to_v3_keeps_graph_rows_logs_and_waves(tmp_path):
+def test_v2_upgrade_to_v4_keeps_graph_rows_logs_and_waves(tmp_path):
     path = str(tmp_path / "v2.db")
     old = build_v2_database(path)
     old.execute(
@@ -149,7 +169,7 @@ def test_v2_upgrade_to_v3_keeps_graph_rows_logs_and_waves(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 3
+    assert schema_version(conn) == 4
     assert conn.execute("SELECT waves FROM request_logs WHERE id = 'v2-row'").fetchone()[0] == 2
     assert conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
     conn.close()
@@ -239,14 +259,38 @@ def test_unversioned_nonempty_database_is_rejected(tmp_path):
     conn.close()
 
 
-def test_config_revisions_are_append_only_and_deduped(tmp_path):
-    conn = connect(str(tmp_path / "v3.db"))
+def test_v3_upgrade_drops_empty_config_revisions_and_records_v4(tmp_path):
+    path = str(tmp_path / "v3.db")
+    old = build_v3_database(path)
+    assert old.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 0
+    old.close()
+
+    conn = connect(path)
     migrate(conn)
-    repo = ConfigRevisionRepo(conn)
-    first = repo.record("tree", '{"root":1}')
-    assert repo.record("tree", '{"root":1}') == first
-    second = repo.record("tree", '{"root":2}')
-    assert second != first
-    assert repo.get("tree", first)["content"] == '{"root":1}'
-    assert repo.latest("tree")["sha256"] == second
+    assert schema_version(conn) == 4
+    objects = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    assert "config_revisions" not in objects
+    assert "idx_config_revisions_kind" not in objects
+    assert {"models", "providers", "request_logs", "changes", "users"} <= objects
+    migrate(conn)
+    assert schema_version(conn) == 4
+    conn.close()
+
+
+def test_v3_upgrade_refuses_nonempty_config_revisions(tmp_path):
+    path = str(tmp_path / "v3.db")
+    old = build_v3_database(path)
+    old.execute(
+        "INSERT INTO config_revisions (kind, sha256, content, created_at) "
+        "VALUES ('tree', ?, '{\"root\":1}', '2026-11-01T10:00:00+08:00')",
+        ("a" * 64,),
+    )
+    old.commit()
+    old.close()
+
+    conn = connect(path)
+    with pytest.raises(RuntimeError, match="export"):
+        migrate(conn)
+    assert schema_version(conn) == 3
+    assert conn.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 1
     conn.close()

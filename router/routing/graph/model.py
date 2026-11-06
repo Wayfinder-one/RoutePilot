@@ -310,11 +310,6 @@ def _edge_from_dict(raw) -> Edge:
 def _fallback_ref(raw: dict) -> str | None:
     value = raw.get("error_fallback")
     if value is None:
-        # v3 files written before the fallback merge used otherwise_target for
-        # normal no-target completion. Read it as the unified fallback, but
-        # never emit it again.
-        value = raw.get("otherwise_target")
-    if value is None:
         return None
     return text_field(value, "graph error_fallback")
 
@@ -323,7 +318,7 @@ def graph_from_dict(raw) -> GraphRoot:
     if not isinstance(raw, dict):
         raise ValueError("graph must be an object")
     reject_unknown_fields(
-        "graph", raw, {"id", "type", "nodes", "edges", "error_fallback", "otherwise_target"},
+        "graph", raw, {"id", "type", "nodes", "edges", "error_fallback"},
     )
     if raw.get("type") != "graph":
         raise ValueError(f"graph.type must be 'graph', got {raw.get('type')!r}")

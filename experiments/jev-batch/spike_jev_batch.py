@@ -18,7 +18,14 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+# The experiment lives outside the product tree; locate the repository root by
+# walking up until the router package and the project manifest are both found,
+# so the script keeps working from any nesting depth.
+ROOT = next(
+    parent for parent in Path(__file__).resolve().parents
+    if (parent / "router" / "__init__.py").is_file()
+    and (parent / "pyproject.toml").is_file()
+)
 
 sys.path.insert(0, str(ROOT))
 

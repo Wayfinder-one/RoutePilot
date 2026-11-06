@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 import uuid
@@ -21,10 +20,6 @@ def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def sha256_text(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
 @contextmanager
 def write_transaction(conn: sqlite3.Connection):
     conn.execute("BEGIN IMMEDIATE")
@@ -43,15 +38,6 @@ def transaction(conn: sqlite3.Connection):
         return
     with conn:
         yield
-
-
-def record_revision(conn: sqlite3.Connection, kind: str, content: str) -> str:
-    sha = sha256_text(content)
-    conn.execute(
-        "INSERT OR IGNORE INTO config_revisions (kind, sha256, content, created_at) VALUES (?, ?, ?, ?)",
-        (kind, sha, content, now_iso()),
-    )
-    return sha
 
 
 DEFAULT_MODELS = [
@@ -80,29 +66,6 @@ def seed_default(conn: sqlite3.Connection) -> None:
                 (model_id, upstream, provider, json.dumps(profile)),
             )
         settings.set("catalog_seeded", "1")
-
-
-class ConfigRevisionRepo:
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
-
-    def record(self, kind: str, content: str) -> str:
-        with transaction(self.conn):
-            return record_revision(self.conn, kind, content)
-
-    def get(self, kind: str, sha256: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT id, kind, sha256, content, created_at FROM config_revisions WHERE kind = ? AND sha256 = ?",
-            (kind, sha256),
-        ).fetchone()
-        return dict(row) if row else None
-
-    def latest(self, kind: str) -> dict | None:
-        row = self.conn.execute(
-            "SELECT id, kind, sha256, content, created_at FROM config_revisions WHERE kind = ? ORDER BY id DESC LIMIT 1",
-            (kind,),
-        ).fetchone()
-        return dict(row) if row else None
 
 
 class ModelRepo:

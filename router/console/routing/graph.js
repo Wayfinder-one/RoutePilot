@@ -516,8 +516,7 @@ function hintIssues() {
 /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
 const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root'];
 const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision', 'updated_at'];
-/* otherwise_target stays readable for pre-merge v3 imports, then is removed. */
-const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'otherwise_target', 'error_fallback'];
+const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'error_fallback'];
 const NODE_FIELDS = {
   start: ['id', 'type', 'title', 'position'],
   question: ['id', 'type', 'question_type', 'instructions', 'title', 'options', 'criteria', 'position'],
@@ -1308,11 +1307,6 @@ function parseImport(text) {
   const graph = clone(raw);
   graph.id = isNonEmptyString(graph.id) ? graph.id : 'root';
   graph.type = 'graph';
-  /* 旧 v3 图可能仍带 otherwise_target：读取时折叠为统一兜底，写回时不再输出。 */
-  if (graph.error_fallback == null && isNonEmptyString(graph.otherwise_target)) {
-    graph.error_fallback = graph.otherwise_target;
-  }
-  delete graph.otherwise_target;
   /* 非对象条目不做静默丢弃：保留在 tree 中交给 validate 报 graph_parse_error。 */
   if (!graph.error_fallback && graph.error_fallback !== null) graph.error_fallback = null;
 

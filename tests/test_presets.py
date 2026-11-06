@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from router import presets
-from router.presets import PROVIDER_PRESETS, get_preset, provider_ids
+from router.presets import PROVIDER_PRESETS
 from router.reasoning import FORMATS, FORMAT_IDS, LEVELS
 
 # ---------------------------------------------------------------- 契约常量
@@ -66,6 +66,10 @@ MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+~-]{0,199}$")
 
 def _all_providers() -> list[dict]:
     return list(PROVIDER_PRESETS)
+
+
+def _provider_ids() -> tuple[str, ...]:
+    return tuple(provider["id"] for provider in PROVIDER_PRESETS)
 
 
 def _all_models() -> list[tuple[dict, dict]]:
@@ -114,16 +118,14 @@ def test_catalog_is_pure_data_module():
 
 
 def test_provider_breadth_and_order():
-    ids = list(provider_ids())
+    ids = list(_provider_ids())
     assert MIN_PROVIDERS <= len(ids) <= MAX_PROVIDERS, ids
     assert len(set(ids)) == len(ids), f"提供方 id 重复：{ids}"
     missing = set(REQUIRED_PROVIDER_IDS) - set(ids)
     assert not missing, f"缺少契约要求的提供方：{sorted(missing)}"
-    # provider_ids() 必须与目录顺序一致。
-    assert ids == [provider["id"] for provider in PROVIDER_PRESETS]
 
 
-@pytest.mark.parametrize("provider", _all_providers(), ids=provider_ids())
+@pytest.mark.parametrize("provider", _all_providers(), ids=_provider_ids())
 def test_provider_entry(provider):
     assert isinstance(provider, dict)
     assert set(provider) == PROVIDER_FIELDS, set(provider) ^ PROVIDER_FIELDS
@@ -158,7 +160,7 @@ def test_provider_entry(provider):
 
 # ---------------------------------------------------------------- 模型结构
 
-@pytest.mark.parametrize("provider", _all_providers(), ids=provider_ids())
+@pytest.mark.parametrize("provider", _all_providers(), ids=_provider_ids())
 def test_models_per_provider(provider):
     models = list(provider["models"])
     low = PROVIDER_MIN_MODELS_OVERRIDES.get(provider["id"], MIN_MODELS)
@@ -339,16 +341,7 @@ def test_format_override_only_where_verifiable():
     }
 
 
-# ------------------------------------------------------------------ 辅助函数与规模
-
-def test_helper_functions():
-    assert provider_ids() == tuple(provider["id"] for provider in PROVIDER_PRESETS)
-    deepseek = get_preset("deepseek")
-    assert deepseek is not None
-    assert deepseek["reasoning_format"] == "deepseek"
-    assert get_preset("no-such-provider") is None
-    assert get_preset("") is None
-
+# ------------------------------------------------------------------ 规模
 
 def test_catalog_size():
     total = sum(len(provider["models"]) for provider in PROVIDER_PRESETS)

@@ -994,18 +994,5 @@ PROVIDER_PRESETS: tuple[dict, ...] = (
 )
 
 
-def provider_ids() -> tuple[str, ...]:
-    """内置目录里的提供方 id，按目录顺序。"""
-    return tuple(p["id"] for p in PROVIDER_PRESETS)
-
-
-def get_preset(provider_id: str) -> dict | None:
-    """按 id 取一个提供方预置；未收录返回 None。"""
-    for preset in PROVIDER_PRESETS:
-        if preset["id"] == provider_id:
-            return preset
-    return None
-
-
 #: id -> 预置（同一份数据的索引；播种与控制台读的是同一处定义）。
 PRESET_BY_ID: dict[str, dict] = {p["id"]: p for p in PROVIDER_PRESETS}

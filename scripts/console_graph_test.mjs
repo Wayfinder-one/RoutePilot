@@ -562,7 +562,6 @@ test('serialize and parseImport round-trip the complete envelope', () => {
   assert.equal(result.tree.name, tree.name);
   assert.equal(result.tree.timezone, tree.timezone);
   assert.deepEqual(result.tree.sticky, tree.sticky);
-  assert.equal(result.tree.root.otherwise_target, undefined);
   assert.deepEqual(result.tree.root.error_fallback, 'light-target');
   assert.equal(hardIssues(result.issues).length, 0);
   assert.equal(result.issues.filter(issue => issue.level === 'hint').length, 4);
@@ -616,16 +615,16 @@ test('kind/version-correct v3 documents with a malformed root report graph_parse
 
 /* ── 7. 新建 / 删除 / 选项级联 ──────────────────────────────────────── */
 
-test('legacy otherwise_target import collapses into the unified fallback', () => {
+test('otherwise_target import is rejected as an unknown field', () => {
   const raw = JSON.parse(RTGraph.serialize(minimalTree()));
-  const target = raw.root.nodes.find(node => node.type === 'target').id;
-  delete raw.root.error_fallback;
-  raw.root.otherwise_target = target;
+  raw.root.otherwise_target = raw.root.error_fallback;
   const result = RTGraph.parseImport(JSON.stringify(raw));
-  assert.equal(result.ok, true);
-  assert.equal(result.tree.root.error_fallback, target);
-  assert.equal(result.tree.root.otherwise_target, undefined);
-  assert.equal(RTGraph.serialize(result.tree).includes('otherwise_target'), false);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /未知字段/);
+  const issue = result.issues.find(item => item.code === 'graph_parse_error');
+  assert.ok(issue);
+  assert.match(issue.zh, /graph 含未知字段：otherwise_target/);
+  assert.match(issue.en, /graph has unknown fields: otherwise_target/);
 });
 
 test('createMinimalTree builds a saveable start-to-target graph', () => {
@@ -641,7 +640,6 @@ test('createMinimalTree builds a saveable start-to-target graph', () => {
   assert.equal(targets[0].priority, 1);
   assert.deepEqual(targets[0].models, [{ model: 'qwen3-8b' }]);
   assert.equal(targets[0].strategy, 'least_inflight');
-  assert.equal(graph.otherwise_target, undefined);
   assert.equal(graph.error_fallback, targets[0].id);
   assert.equal(graph.edges.length, 1);
   assert.equal(graph.edges[0].source, 'start');
@@ -672,7 +670,6 @@ test('removeNode atomically removes the node, its edges and fallback references'
   assert.equal(removedTarget.ok, true);
   assert.equal(graph.nodes.some(node => node.id === target.id), false);
   assert.equal(graph.edges.length, 0);
-  assert.equal(graph.otherwise_target, undefined);
   assert.equal(graph.error_fallback, null);
   assert.ok(removedTarget.fallbackCleared.includes('error_fallback'));
 
