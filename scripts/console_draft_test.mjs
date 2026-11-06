@@ -167,6 +167,17 @@ test('markSaved replaces the baseline and resets the dirty kind', () => {
   store.tree.name = '基线之后的修改';
   assert.equal(store.saved.name, '再次本地修改', 'markSaved kept a live reference to the draft');
 
+  /* 替换而不是合并：新基线缺少 tree_revision 时，上一版基线的字段不能残留。 */
+  const withRevision = clone(store.tree);
+  withRevision.tree_revision = 'abc123';
+  assert.equal(store.markSaved(withRevision), true);
+  assert.equal(store.saved.tree_revision, 'abc123');
+  const withoutRevision = clone(store.tree);
+  delete withoutRevision.tree_revision;
+  assert.equal(store.markSaved(withoutRevision), true);
+  assert.equal('tree_revision' in store.saved, false,
+    'markSaved merged into the previous baseline instead of replacing it');
+
   store.markSaved(clone(store.tree));
   assert.equal(store.dirtyKind, 'clean');
 });
