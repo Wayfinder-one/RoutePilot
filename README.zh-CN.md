@@ -323,7 +323,7 @@ npm run check:console
 
 - `pytest` 只收集 `tests/`（`pyproject.toml` 的 `testpaths`）：单元测试与 FastAPI 集成测试；不启动浏览器或路由器，也不会收集 `experiments/`。
 - `node --test` 运行纯 ES Module 套件：图/规范化行为、草稿状态，以及 `tests/fixtures/graph_contracts.json` 的跨运行时契约 fixture；后者断言与 Python 相同的 issue code 与行为哈希。
-- `npm run check:console` 运行上述两个 Node 套件，外加在临时数据库、模拟决策服务和模拟上游上的 Playwright 验收矩阵。截图默认关闭；设置 `QA_SCREENSHOTS=1` 才会重新生成证据图。`QA_ONLY=<正则>` 可选择用例，单个页面模块也可独立运行，例如 `node scripts/console_qa/canvas.mjs`（另有 `inspector`、`tryrun`、`logs`、`models`）。如果找不到 Chromium，可设置 `CHROME=/path/to/chrome`。
+- `npm run check:console` 运行上述三个 Node 套件（图、草稿、图契约），外加在临时数据库、模拟决策服务和模拟上游上的 Playwright 验收矩阵。截图默认关闭；设置 `QA_SCREENSHOTS=1` 才会重新生成证据图。`QA_ONLY=<正则>` 可选择用例，单个页面模块也可独立运行，例如 `node scripts/console_qa/canvas.mjs`（另有 `inspector`、`tryrun`、`logs`、`models`）。如果找不到 Chromium，可设置 `CHROME=/path/to/chrome`。
 - `scripts/i18n_dead_keys.py` 检查每个词典 key 仍被引用。
 
 `experiments/jev-batch/` 是独立实验，不随产品发布，默认测试也不会收集：

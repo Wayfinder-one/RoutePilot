@@ -120,8 +120,11 @@ class ConfigurationService:
             raise ValidationFailed(issues)
 
     def _prepared_snapshot(self):
-        return self.publisher.prepare(
-            self.conn, self.trees.active(), self.trees.fingerprint())
+        # 必须先取指纹再读树：两次读取之间图若被改写，_recheck_fingerprint 会看到
+        # 不匹配并重建一次。反过来（先读树、后取指纹）会产出（过期树, 当前指纹），
+        # 复核只看指纹标签，于是把过期树当最新快照发布出去。
+        fingerprint = self.trees.fingerprint()
+        return self.publisher.prepare(self.conn, self.trees.active(), fingerprint)
 
     def save_jev(self, settings: JevSettings) -> None:
         self._write_and_publish(lambda conn: self._save_jev_in_tx(settings))

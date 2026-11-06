@@ -251,6 +251,59 @@ def test_publish_refuses_when_fingerprint_keeps_changing(tmp_path):
         conn.close()
 
 
+class _SwappingTrees:
+    """最小树仓库桩：底层文档在两次读取之间被改写，模拟磁盘竞态。
+
+    真实 ``RoutingTreeRepo.fingerprint()`` 与 ``active()`` 是两次独立读取；
+    这里让文档恰好在这两次读取之间换掉（``swap_after`` 次读取后生效），
+    于是「先读树、后读指纹」会拿到（过期树, 当前指纹）这一自相矛盾的候选。
+    """
+
+    def __init__(self, before, after, *, swap_after=1):
+        self._document = before              # ((tree_id, sha256), tree)
+        self._after = after
+        self._reads = 0
+        self._swap_after = swap_after
+        self.calls = []
+
+    def _read(self, name):
+        fingerprint, tree = self._document
+        self.calls.append(name)
+        self._reads += 1
+        if self._reads >= self._swap_after:
+            self._document = self._after
+        return fingerprint, tree
+
+    def fingerprint(self):
+        return self._read("fingerprint")[0]
+
+    def active(self):
+        return self._read("active")[1]
+
+
+def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
+    """指纹必须先于树读取：两次读取之间图变了，绝不能把过期树配当前指纹发布。"""
+    doc_a = (("tree-a", "sha-a"), SimpleNamespace(id="doc-a"))
+    doc_b = (("tree-b", "sha-b"), SimpleNamespace(id="doc-b"))
+    conn = _fresh_conn(tmp_path)
+    try:
+        publisher = Publisher()
+        trees = _SwappingTrees(doc_a, doc_b)
+        service = ConfigurationService(conn, trees, publisher)
+
+        service._write_and_publish(lambda _conn: service._prepared_snapshot())
+
+        assert len(publisher.published) == 1
+        published = publisher.published[0]
+        # 重考发现「树过期、指纹是当前」，用当前文档重建一次；绝不发布
+        # (doc-a 的树, doc-b 的指纹) 这种自相矛盾的快照。
+        assert published.tree is doc_b[1]
+        assert published.fingerprint == doc_b[0]
+        assert trees.calls[:2] == ["fingerprint", "active"]
+    finally:
+        conn.close()
+
+
 # ── 真实组合根：写事务回滚契约（与服务层 save_window 同型）──────────────
 
 
