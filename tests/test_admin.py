@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.api.requestlog import RequestLogger
+from router.request_logging import RequestLogger
 from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.routing_trees import RoutingTreeRepo
@@ -129,7 +129,7 @@ def test_startup_hydrates_recent_request_logs_from_sqlite(tmp_path):
     conn = connect(settings.db_path)
     migrate(conn)
     conn.close()
-    log = RequestLogger(settings)
+    log = RequestLogger(settings.db_path)
     log.enqueue({
         "id": "historical-1",
         "ts": "2026-11-03T18:59:00+08:00",

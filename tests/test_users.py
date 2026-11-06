@@ -5,13 +5,16 @@
 前面是仓储/原语级用例（直接开会话连接），后面是 API 级用例（TestClient）。
 """
 
+import asyncio
 import json
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
 
 from router import auth
 from router.api.app import create_app
+from router.maintenance import MaintenanceWorker
 from router.store.db import connect, migrate
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
                                        UserRepo)
@@ -176,6 +179,51 @@ def test_session_expired_returns_none(conn):
     sessions.purge_expired()
     assert sessions.user_for_token(token_ok) is not None
     assert conn.execute("SELECT COUNT(*) FROM user_sessions").fetchone()[0] == 1
+
+
+def test_maintenance_run_once_purges_expired_sessions(tmp_path, monkeypatch):
+    """Step 4: the hourly worker really deletes expired rows, keeps live ones,
+    and does the database work on a worker thread (never on the event loop)."""
+    db = str(tmp_path / "maintenance.db")
+    conn = connect(db)
+    migrate(conn)
+    try:
+        user = UserRepo(conn).create("purge@test.com", "password-1")
+        sessions = SessionRepo(conn)
+        live_token, _ = sessions.create(user["id"], 168)
+        dead_token, _ = sessions.create(user["id"], -1)
+        # a row that expired long before this process started
+        conn.execute(
+            "INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at) "
+            "VALUES ('stale-hash', ?, '2020-01-01T00:00:00+08:00', "
+            "'2020-01-01T00:00:01+08:00')", (user["id"],))
+        assert conn.execute("SELECT COUNT(*) FROM user_sessions").fetchone()[0] == 3
+    finally:
+        conn.close()
+
+    worker = MaintenanceWorker(db)
+    real_purge = worker._purge_expired
+    threads = []
+
+    def recording_purge():
+        threads.append(threading.current_thread())
+        real_purge()
+
+    monkeypatch.setattr(worker, "_purge_expired", recording_purge)
+    asyncio.run(worker.run_once())
+
+    # The purge ran off the event-loop thread.
+    assert threads and threads[0] is not threading.current_thread()
+
+    conn = connect(db)
+    try:
+        hashes = [row["token_hash"] for row in conn.execute(
+            "SELECT token_hash FROM user_sessions")]
+        assert hashes == [auth.session_token_hash(live_token)]
+        assert auth.session_token_hash(dead_token) not in hashes
+        assert SessionRepo(conn).user_for_token(live_token) is not None
+    finally:
+        conn.close()
 
 
 def test_session_disabled_user_returns_none(conn):

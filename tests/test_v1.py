@@ -16,11 +16,11 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from router.api.requestlog import LOG_COLUMNS, RequestLogger
 from router.api.routes_v1 import router
 from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
+from router.request_logging import LOG_COLUMNS, RequestLogger
 from router.routing.affinity import SessionAffinity
 from router.routing.graph.engine import GraphExecutionEngine
 from router.routing.model import tree_from_dict
@@ -236,7 +236,7 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
     app.state.engine = GraphExecutionEngine(
         app.state.jev_client, app.state.affinity, app.state.balancer,
     )
-    app.state.requestlog = RequestLogger(app.state.settings)
+    app.state.requestlog = RequestLogger(app.state.settings.db_path)
     backends = {
         model: Backend(
             url=f"http://{model}.test/v1/chat/completions",
