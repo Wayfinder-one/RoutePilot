@@ -5,10 +5,13 @@ This module keeps only the HTTP-facing request work:
 1. request size / JSON / ``messages`` / session validation,
 2. one ``RoutingService.route()`` call and its exception mapping,
 3. initial request-record construction (machine fields),
-4. one ``UpstreamProxy`` call for the upstream exchange.
+4. one ``UpstreamProxy`` call for the upstream exchange, and the framework
+   response around the proxy's neutral result.
 
 Presentation lives in ``request_presenter``/``trace_presenter``; transport and
-lease ownership live in ``router.upstream.proxy``.
+lease ownership live in ``router.upstream.proxy``.  The proxy never builds a
+framework response: it returns ``ProxyResult``/``ProxyStream`` and this module
+renders them.
 """
 from __future__ import annotations
 
@@ -19,7 +22,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from router.api.request_presenter import (
     OUTCOME_INCOMPLETE,
@@ -38,7 +41,12 @@ from router.routing.types import (
     RoutingRequest,
     session_digest,
 )
-from router.upstream.proxy import UpstreamProxy, prepare_upstream_request
+from router.upstream.proxy import (
+    ProxyResult,
+    ProxyStream,
+    UpstreamProxy,
+    prepare_upstream_request,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -48,6 +56,12 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 
 def _error(message: str, status_code: int) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"message": message}})
+
+
+def _json_response(result: ProxyResult) -> JSONResponse:
+    """Render a neutral proxy result; the JSON bytes stay Starlette's canonical ones."""
+    return JSONResponse(status_code=result.status_code, content=result.content,
+                        headers=result.headers)
 
 
 def _last_user_text(messages: list) -> str:
@@ -255,12 +269,21 @@ async def chat_completions(request: Request):
         headers["x-sr-reasoning"] = decision.reasoning
     proxy = UpstreamProxy(request.app.state.http, request.app.state.breaker)
     if body.get("stream"):
-        return await proxy.stream(
+        streamed = await proxy.stream(
             backend=backend, body=upstream_body, headers=headers,
-            model=decision.model, outcome=outcome, request=request,
+            model=decision.model, outcome=outcome,
+            is_disconnected=request.is_disconnected,
             release=decision.release,
         )
-    return await proxy.send(
+        if isinstance(streamed, ProxyStream):
+            # ``streamed.body`` owns the upstream response and the lease; the
+            # server closes that iterator, so the route releases nothing.
+            return StreamingResponse(
+                streamed.body, status_code=streamed.status_code,
+                media_type=streamed.media_type, headers=streamed.headers,
+            )
+        return _json_response(streamed)
+    return _json_response(await proxy.send(
         backend=backend, body=upstream_body, headers=headers,
         model=decision.model, outcome=outcome, release=decision.release,
-    )
+    ))
