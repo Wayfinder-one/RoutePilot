@@ -11,6 +11,10 @@
 
 ``start()`` 会先 await 一次同步再启动后台循环，因此 app 启动阶段就加载完共享
 quarantine，之后才接收流量。默认间隔沿用拆分前 ``db_sync_seconds`` 的 30s。
+
+可见性上界是 **双向** 的：推送与导入都搭同一轮 tick，所以"本副本打开 → 其它副本
+可见"与"本副本恢复 → 其它副本解除"端到端各自最坏都要两轮，约 2×
+``interval_seconds``。
 """
 
 from __future__ import annotations
@@ -79,12 +83,19 @@ class BreakerSyncWorker:
                 model, state[0], now_wall - (now_mono - state[1]))
             self._written[model] = state
 
-        for model in [model for model in self._written if model not in local]:
+        # Models that recovered (``success()``) since the last tick. ``shared``
+        # was read BEFORE these deletes, so its rows are stale precisely for
+        # these models; re-importing them below would undo the recovery. That
+        # is not hypothetical: a long streaming request calls ``success()``
+        # after the circuit opened, and a re-imported fresh ``opened_at`` would
+        # hard-block the model again for up to ``half_open_after``.
+        cleared = {model for model in self._written if model not in local}
+        for model in cleared:
             self.store.clear(model)
             self._written.pop(model, None)
 
         for model, (failures, opened_at) in shared.items():
-            if model in local:
+            if model in local or model in cleared:
                 continue                      # local state is already latched
             imported = self.breaker.import_state(model, failures, opened_at)
             if imported is not None:
