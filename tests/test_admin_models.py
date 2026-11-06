@@ -598,11 +598,114 @@ def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Task 2 Step 1：服务层回滚契约 —— 校验失败必须同时保住 DB、审计与快照
+# --------------------------------------------------------------------------- #
+def test_model_update_rolls_back_when_active_graph_becomes_invalid(client, app):
+    """brief 逐字场景：非法提供方写入返回 422，快照不得被替换。"""
+    before = app.state.snapshot.snapshot_revision
+    response = client.put("/admin/models/qwen3-8b", json={"provider": "missing-provider"})
+    assert response.status_code == 422
+    assert app.state.snapshot.snapshot_revision == before
+
+
+def test_rejected_reasoning_write_keeps_snapshot_revision_and_audit_clean(app, client):
+    """服务层写用例同型：in-tx 校验失败 → 数据库/审计/候选发布三者皆未发生。
+
+    与 tests/test_jev_admin 的失败保存契约一致，这里覆盖模型写用例。"""
+    _declare_high(client)
+    _activate_reasoning_tree(client)
+    changes = {row["detail"]["action"] for row in
+               client.get("/admin/changes").json()["changes"]}
+    before_revision = app.state.snapshot.snapshot_revision
+
+    response = _declare_low_only(client)
+
+    assert response.status_code == 422, response.text
+    assert {row["detail"]["action"] for row in
+            client.get("/admin/changes").json()["changes"]} == changes
+    assert app.state.snapshot.snapshot_revision == before_revision
+
+
+def test_failed_provider_upsert_changes_neither_row_nor_snapshot(app, client):
+    """提供方写用例的同一契约：启用校验失败 → 数据库行/审计/快照都不得变化。
+
+    与 tests/test_jev_window 的失败窗口契约同型：浏览活动图引用的模型后，
+    任何提供方写都必须 422 且不落库。"""
+    _declare_high(client)
+    _activate_reasoning_tree(client)
+    conn = connect(app.state.settings.db_path)
+    try:
+        conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
+        conn.commit()
+        base_url_before = dict(
+            conn.execute("SELECT * FROM providers WHERE name = 'local'").fetchone())["base_url"]
+    finally:
+        conn.close()
+    before_revision = app.state.snapshot.snapshot_revision
+
+    response = client.put("/admin/providers/local", json={"base_url": "http://x/v1"})
+
+    assert response.status_code == 422, response.text
+    issue_codes = {issue["code"] for issue in response.json()["detail"]}
+    assert "unknown_model" in issue_codes
+    conn = connect(app.state.settings.db_path)
+    try:
+        row = dict(conn.execute("SELECT * FROM providers WHERE name = 'local'").fetchone())
+        audit = conn.execute(
+            "SELECT COUNT(*) FROM changes WHERE kind = 'provider'").fetchone()[0]
+    finally:
+        conn.close()
+    assert row["base_url"] == base_url_before
+    assert audit == 0
+    assert app.state.snapshot.snapshot_revision == before_revision
+
+
+def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
+    """删除被引用模型 → 409，且该用例不产生审计行、不改变快照 revision。"""
+    assert client.post("/admin/trees", json={
+        "id": "ref-tree", "name": "Ref",
+        "root": _direct_graph((("qwen3-8b", None),))}).status_code == 201
+    before_revision = app.state.snapshot.snapshot_revision
+
+    response = client.delete("/admin/models/qwen3-8b")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["message"] == "model qwen3-8b 被路由树引用"
+    conn = connect(app.state.settings.db_path)
+    try:
+        audit = conn.execute(
+            "SELECT COUNT(*) FROM changes WHERE kind = 'model'").fetchone()[0]
+    finally:
+        conn.close()
+    assert audit == 0
+    assert app.state.snapshot.snapshot_revision == before_revision
+
+
+@pytest.mark.parametrize(("method", "path", "payload"), [
+    ("post", "/admin/models", {"id": "extra-model", "upstream": "u", "provider": "local"}),
+    ("put", "/admin/models/qwen3-8b", {"upstream": "u"}),
+    ("put", "/admin/providers/local", {"base_url": "http://x/v1"}),
+])
+def test_model_and_provider_dtos_reject_unknown_fields(client, method, path, payload):
+    """Task 2 Step 3：请求 DTO 的 ``ConfigDict(extra="forbid")`` 取代手写白名单。
+
+    旧实现把 body 当 dict：未知字段被静默忽略，写入照常发生；现在必须在进入
+    写用例之前 422，且不留下任何数据库副作用。"""
+    response = getattr(client, method)(path, json={**payload, "bogus": 1})
+
+    assert response.status_code == 422, response.text
+    assert any(item["type"] == "extra_forbidden" for item in response.json()["detail"])
+    assert "extra-model" not in {
+        model["id"] for model in client.get("/admin/models").json()["models"]}
+
+
+# --------------------------------------------------------------------------- #
 # delete-model: the reference check and the delete share the publish lock
+# (the scan lives in the ConfigurationService write path now — Task 2)
 # --------------------------------------------------------------------------- #
 def _instrument_delete_lock(app, client, monkeypatch):
     """Record whether ``model_references`` is called while the lock is held."""
-    from router.api import routes_models
+    from router.control import config as control_config
 
     publisher = app.state.publisher
     real_locked = publisher.locked
@@ -622,14 +725,14 @@ def _instrument_delete_lock(app, client, monkeypatch):
 
     monkeypatch.setattr(publisher, "locked", recording_locked)
 
-    real_references = routes_models.model_references
+    real_references = control_config.model_references
 
     def recording_references(trees, model_id):
         trace.append("check")
         assert state["inside"], "reference check must run inside the publish lock"
         return real_references(trees, model_id)
 
-    monkeypatch.setattr(routes_models, "model_references", recording_references)
+    monkeypatch.setattr(control_config, "model_references", recording_references)
     return trace
 
 

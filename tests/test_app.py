@@ -7,7 +7,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.api.routes_trees import build_enable_context
+from router.control.validation import build_enable_context
 from router.routing.document import parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure

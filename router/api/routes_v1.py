@@ -12,8 +12,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # 与 /admin/try 共用答案序列化契约：完整 answers 只进内存 ring / 试算响应，不进 SQLite。
-from router.api.routes_trees import _answer_payload
 from router.jev.client import ChoiceAnswer
+from router.jev.serialization import answer_to_dict
 from router.reasoning import ReasoningError, apply_reasoning
 from router.routing.graph.model import ConditionNode, LogicNode, QuestionNode, StartNode, TargetNode
 from router.routing.types import NoActiveTreeError, NoAvailableBackend, RoutingMiss, RoutingRequest, session_digest
@@ -285,7 +285,7 @@ def _decision_record(request: Request, decision, snapshot, body, text: str,
         "jev_ms": first_wave.duration_ms if first_wave is not None else None,
         "jev_probabilities": dict(answer.probabilities) if answer else None,
         "waves": len(decision.waves),
-        "answers": {node_id: _answer_payload(value) for node_id, value in decision.answers.items()},
+        "answers": {node_id: answer_to_dict(value) for node_id, value in decision.answers.items()},
         "reasoning": decision.reasoning,
         "reasoning_warning": reasoning_warning,
         "routing_ms": routing_ms,

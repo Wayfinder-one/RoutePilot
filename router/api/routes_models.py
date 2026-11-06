@@ -7,22 +7,14 @@ import sqlite3
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from router.api.deps import get_conn, get_tree_repo
 from router.api.upstream import parse_profile_text
-from router.control.validation import active_tree_issues
+from router.control.config import ConfigurationService
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import FORMATS, FORMAT_IDS, LEVELS, ReasoningError, normalize_reasoning, validate_model_profile
-from router.store.repositories import (
-    ChangeRepo,
-    ModelRepo,
-    ProviderRepo,
-    now_iso,
-    model_ids_using_provider,
-    model_references,
-    write_transaction,
-)
+from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import RoutingTreeRepo
 
 router = APIRouter()
@@ -104,10 +96,9 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
     return json.dumps(validated, ensure_ascii=False)
 
 
-def _check_active_tree(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> None:
-    issues = active_tree_issues(conn, trees)
-    if issues:
-        raise HTTPException(422, detail=[dict(issue.__dict__) for issue in issues])
+def _service(request: Request, conn: sqlite3.Connection, trees: RoutingTreeRepo):
+    """ConfigurationService 只由 API 在解析 DTO 后构造；写用例本体见 router.control.config。"""
+    return ConfigurationService(conn, trees, request.app.state.publisher)
 
 
 @router.get("/model-catalog")
@@ -144,6 +135,8 @@ def get_models(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 class ModelIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     upstream: str | None = None
     provider: str | None = None
     profile: str | dict | None = None
@@ -168,14 +161,10 @@ def post_model(
     provider = _clean_text(body.provider, "provider", max_len=64)
     provider_row = _require_provider(conn, provider)
     profile = _validated_profile(body.profile, provider_row.get("reasoning_format") or "openai")
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        with write_transaction(conn):
-            if not ModelRepo(conn).create(model_id, upstream, provider, profile or "{}"):
-                raise HTTPException(409, detail=f"model {model_id} 已存在")
-            _check_active_tree(conn, trees)
-            ChangeRepo(conn).record(now_iso(), "model", {"action": "create", "id": model_id, "upstream": upstream, "provider": provider, "profile": body.profile})
-        publisher.refresh(conn)
+    _service(request, conn, trees).create_model(
+        model_id=model_id, upstream=upstream, provider=provider,
+        profile_text=profile, audit_profile=body.profile,
+    )
     return {"ok": True, "model": _public_model(ModelRepo(conn).get(model_id), provider_row.get("reasoning_format") or "openai")}
 
 
@@ -194,13 +183,10 @@ def put_model(
     existing = ModelRepo(conn).get(model_id)
     effective_provider = provider or existing["provider"]
     profile = _validated_profile(body.profile, _provider_formats(conn).get(effective_provider, "openai")) if body.profile is not None else None
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        with write_transaction(conn):
-            ModelRepo(conn).update(model_id, upstream=upstream, provider=provider, profile=profile)
-            _check_active_tree(conn, trees)
-            ChangeRepo(conn).record(now_iso(), "model", {"action": "update", "id": model_id, "upstream": body.upstream, "provider": body.provider, "profile": body.profile})
-        publisher.refresh(conn)
+    _service(request, conn, trees).update_model(
+        model_id=model_id, upstream=upstream, provider=provider, profile_text=profile,
+        audit_upstream=body.upstream, audit_provider=body.provider, audit_profile=body.profile,
+    )
     row = ModelRepo(conn).get(model_id)
     return {"ok": True, "model": _public_model(row, _provider_formats(conn).get(row["provider"], "openai"))}
 
@@ -211,17 +197,7 @@ def delete_model(
     conn: sqlite3.Connection = Depends(get_conn),
     trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        if ModelRepo(conn).get(model_id) is None:
-            raise HTTPException(404, detail=f"unknown model {model_id}")
-        refs = model_references(trees.list(), model_id)
-        if refs:
-            raise HTTPException(409, detail={"message": f"model {model_id} 被路由树引用", "references": refs})
-        with write_transaction(conn):
-            ModelRepo(conn).delete(model_id)
-            ChangeRepo(conn).record(now_iso(), "model", {"action": "delete", "id": model_id})
-        publisher.refresh(conn)
+    _service(request, conn, trees).delete_model(model_id)
     return {"ok": True, "deleted": model_id}
 
 
@@ -237,6 +213,8 @@ def get_providers(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 class ProviderIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     base_url: str
     key_env: str | None = None
     reasoning_format: str | None = None
@@ -258,39 +236,23 @@ def put_provider(
     if body.reasoning_format is not None and body.reasoning_format not in FORMAT_IDS:
         raise HTTPException(422, detail="invalid reasoning_format")
     api_key = body.api_key.strip() if body.api_key is not None else None
-    existing = ProviderRepo(conn).get(name)
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        with write_transaction(conn):
-            ProviderRepo(conn).upsert(name, base_url, key_env=key_env, reasoning_format=body.reasoning_format, api_key=api_key)
-            _check_active_tree(conn, trees)
-            ChangeRepo(conn).record(now_iso(), "provider", {
-                "action": "upsert", "name": name, "base_url": base_url,
-                "key_env": key_env if key_env is not None else (existing or {}).get("key_env", ""),
-                "reasoning_format": body.reasoning_format or (existing or {}).get("reasoning_format", "openai"),
-                "api_key": "unchanged" if api_key is None else "cleared" if api_key == "" else "set",
-            })
-        publisher.refresh(conn)
+    _service(request, conn, trees).upsert_provider(
+        name=name, base_url=base_url, key_env=key_env,
+        reasoning_format=body.reasoning_format, api_key=api_key,
+    )
     return {"ok": True, "provider": _public_provider(ProviderRepo(conn).get(name))}
 
 
 @router.delete("/providers/{name}")
-def delete_provider(name: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    publisher = request.app.state.publisher
-    with publisher.locked():
-        if ProviderRepo(conn).get(name) is None:
-            raise HTTPException(404, detail=f"unknown provider {name}")
-        used_by = model_ids_using_provider(conn, name)
-        if used_by:
-            raise HTTPException(409, detail={"message": "provider 被模型引用", "models": used_by})
-        with write_transaction(conn):
-            ProviderRepo(conn).delete(name)
-            ChangeRepo(conn).record(now_iso(), "provider", {"action": "delete", "name": name})
-        publisher.refresh(conn)
+def delete_provider(name: str, request: Request, conn: sqlite3.Connection = Depends(get_conn),
+                    trees: RoutingTreeRepo = Depends(get_tree_repo)):
+    _service(request, conn, trees).delete_provider(name)
     return {"ok": True, "deleted": name}
 
 
 class FetchModelsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     provider: str | None = None
     base_url: str | None = None
     key_env: str | None = None

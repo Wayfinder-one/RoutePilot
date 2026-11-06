@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
-from router.api.upstream import Backend, load_backends, model_reasoning_from_db
+from router.api.upstream import Backend, load_backends
+from router.control.validation import build_enable_context
 from router.jev.config import JevConfigRepo, JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
@@ -19,7 +20,7 @@ from router.jev.window import (
     MIN_INPUT_TOKENS,
 )
 from router.routing.conditions import TimePeriod
-from router.routing.graph.validate import EnableContext, validate_graph_for_enable
+from router.routing.graph.validate import validate_graph_for_enable
 from router.routing.model import (
     RoutingTree,
     canonical_json,
@@ -48,7 +49,11 @@ class RoutingSnapshot:
         return self.tree.id if self.tree is not None else None
 
 
-def _capability(row: dict) -> str:
+def model_capability(row: dict) -> str:
+    """models 行 → capability 文本（profile.capability，缺省空串）。
+
+    公开入口：启动快照、草稿试算快照共用同一读取规则（原私有名 `_capability`）。
+    """
     profile = row.get("profile")
     if isinstance(profile, str):
         try:
@@ -140,16 +145,6 @@ def read_jev_window(conn) -> tuple[int, int]:
     return input_tokens, context_tokens
 
 
-def build_enable_context(conn) -> EnableContext:
-    models = ModelRepo(conn).list()
-    return EnableContext(
-        known_models={row["id"] for row in models},
-        model_reasoning=model_reasoning_from_db(conn),
-        known_periods={row["name"] for row in TimePeriodRepo(conn).load()},
-        jev_available=JevConfigRepo(conn).load() is not None,
-    )
-
-
 def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
     if tree is not None:
         try:
@@ -165,7 +160,7 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
         backends=load_backends(conn),
         time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
         jev=JevConfigRepo(conn).load(),
-        capabilities={row["id"]: _capability(row) for row in ModelRepo(conn).list()},
+        capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
     )

@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from router.api.app import create_app
 from router.api.routes_jev import router as jev_router
 from router.api.upstream import Backend
 from router.jev.client import ChoiceAnswer
@@ -25,7 +26,8 @@ from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import tree_dict
+from tests.routing_fixtures import test_settings, tree_dict
+
 
 
 # ── window 单元测试 ────────────────────────────────────────────────────
@@ -116,15 +118,20 @@ def test_read_jev_window_ignores_garbage(tmp_path):
 # ── admin API ──────────────────────────────────────────────────────────
 
 class Publisher:
+    """SnapshotPublisher 桩：save_window 走 locked/prepare/publish 契约（Task 2）。"""
+
     def __init__(self):
-        self.refreshes = 0
+        self.published = []
 
     @contextmanager
     def locked(self):
         yield self
 
-    def refresh(self, conn):
-        self.refreshes += 1
+    def prepare(self, conn, tree, fingerprint):
+        return (tree, fingerprint)
+
+    def publish(self, prepared):
+        self.published.append(prepared)
 
 
 def make_client(tmp_path):
@@ -151,11 +158,11 @@ def test_get_window_returns_defaults(tmp_path):
     assert body["min_input_tokens"] == MIN_INPUT_TOKENS
 
 
-def test_put_window_persists_and_refreshes_snapshot(tmp_path):
+def test_put_window_persists_and_publishes_snapshot(tmp_path):
     client, app, path = make_client(tmp_path)
     body = client.put("/admin/jev/window", json={"context_tokens": 8192, "input_tokens": 2048}).json()
     assert (body["context_tokens"], body["input_tokens"]) == (8192, 2048)
-    assert app.state.publisher.refreshes == 1
+    assert len(app.state.publisher.published) == 1
     conn = connect(path)
     try:
         assert read_jev_window(conn) == (2048, 8192)
@@ -173,13 +180,88 @@ def test_put_window_persists_and_refreshes_snapshot(tmp_path):
         {"input_tokens": "abc"},                           # 非整数
         {"input_tokens": True},                            # bool 不是整数
         {"unknown": 1},                                    # 未知字段
+        {"context_tokens": None, "input_tokens": 2048},    # 显式 null 不是"缺省"，必须 422
     ],
 )
 def test_put_window_rejects_invalid(tmp_path, payload):
     client, app, _ = make_client(tmp_path)
     resp = client.put("/admin/jev/window", json=payload)
     assert resp.status_code == 422, resp.text
-    assert app.state.publisher.refreshes == 0
+    assert app.state.publisher.published == []
+
+
+# ── 真实组合根：写事务回滚契约（与服务层 save_window 同型）──────────────
+
+
+def direct_graph():
+    """start → target(qwen3-8b)：无问题节点，不需要决策服务即可启用。"""
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "direct", "type": "target", "priority": 1,
+             "models": [{"model": "qwen3-8b", "reasoning": None}]},
+        ],
+        "edges": [{
+            "id": "e-start-direct", "source": "start", "source_port": "out",
+            "target": "direct", "target_port": "in_1", "condition": None,
+        }],
+        "error_fallback": "direct",
+    }
+
+
+def _window_tree_app(tmp_path):
+    """真实 create_app + 已启用图：enable 校验失败时 DB/审计/快照都不得变化。"""
+    settings = test_settings(tmp_path)
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    repo.create(tree_from_dict(tree_dict(root=direct_graph())))
+    repo.enable("main")
+    app = create_app(settings)
+    return app, TestClient(app)
+
+
+def test_failed_window_save_changes_neither_db_audit_nor_snapshot(tmp_path):
+    app, client = _window_tree_app(tmp_path)
+    conn = connect(app.state.settings.db_path)
+    try:
+        conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
+        conn.commit()
+    finally:
+        conn.close()
+    before_revision = app.state.snapshot.snapshot_revision
+    before_window = (app.state.snapshot.jev_input_tokens, app.state.snapshot.jev_context_tokens)
+
+    response = client.put("/admin/jev/window", json={"context_tokens": 8192, "input_tokens": 2048})
+
+    assert response.status_code == 422, response.text
+    issue_codes = {issue["code"] for issue in response.json()["detail"]}
+    assert "unknown_model" in issue_codes
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert read_jev_window(conn) == before_window
+        assert conn.execute(
+            "SELECT COUNT(*) FROM changes WHERE kind = 'jev_window'").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert (app.state.snapshot.jev_input_tokens, app.state.snapshot.jev_context_tokens) == before_window
+
+
+def test_put_window_publishes_candidate_snapshot_with_new_values(tmp_path):
+    settings = test_settings(tmp_path)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        before = app.state.snapshot.snapshot_revision
+
+        response = client.put("/admin/jev/window", json={"context_tokens": 8192, "input_tokens": 2048})
+
+        assert response.status_code == 200, response.text
+        assert app.state.snapshot.jev_input_tokens == 2048
+        assert app.state.snapshot.jev_context_tokens == 8192
+        assert app.state.snapshot.snapshot_revision != before
+        body = response.json()
+        assert (body["input_tokens"], body["context_tokens"]) == (2048, 8192)
 
 
 # ── 路由引擎：截断生效 + trace ─────────────────────────────────────────
