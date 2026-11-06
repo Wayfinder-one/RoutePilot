@@ -6067,6 +6067,28 @@ test('replay condition labels use direct, negated and start-only text', async ()
   assert.doesNotMatch(directTitle, /= true/);
 });
 
+test('gate replay labels a start input as always passing', async () => {
+  await prepareTryCanvas();
+  await page.evaluate(() => {
+    window.App.change('behavior', tree => {
+      const result = window.RTGraph.addEdge(tree.root, {
+        source: 'start', source_port: 'out', target: 'or-ctx', target_port: 'in_3'
+      });
+      if (!result.ok) throw new Error(result.reason || 'failed to add start gate input');
+    });
+  });
+  await runTrySample(0);
+  await page.locator('#cvTryDrawerBtn').click();
+  await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+
+  const gate = page.locator('#cvTraceDrawer .rtc-dw-row--gate').filter({ hasText: 'in_3' });
+  assert.equal(await gate.count(), 1);
+  const text = await gate.innerText();
+  assert.match(text, /in_3[^；]*总是通过/);
+  assert.doesNotMatch(text, /in_3[^；]*直接通过/);
+  assert.doesNotMatch(text, /= (?:true|false)/);
+});
+
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
