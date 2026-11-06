@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import threading
@@ -9,7 +10,6 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
-from router.api.upstream import Backend, load_backends
 from router.control.validation import build_enable_context
 from router.jev.config import JevConfigRepo, JevSettings
 from router.jev.window import (
@@ -29,6 +29,7 @@ from router.routing.model import (
 )
 from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
+from router.upstream.catalog import Backend, load_backends
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,17 @@ def model_capability(row: dict) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _snapshot_backend(backend: Backend) -> Backend:
+    """Detach a backend's mutable leaves before publishing it.
+
+    ``Backend`` is frozen, but ``headers`` / ``reasoning`` are dicts. Copying
+    them here means the MappingProxy only wraps snapshot-owned values, never
+    mutable state still reachable from a live catalog result.
+    """
+    return replace(backend, headers=dict(backend.headers),
+                   reasoning=copy.deepcopy(backend.reasoning))
+
+
 def _backend_document(backends: Mapping[str, Backend]) -> list[dict]:
     return [
         {
@@ -92,7 +104,9 @@ def build_snapshot(
     revision = tree_revision_of(tree) if tree is not None else ""
     if tree is not None and tree.tree_revision != revision:
         tree = replace(tree, tree_revision=revision)
-    backend_map = MappingProxyType(dict(backends))
+    backend_map = MappingProxyType({
+        model_id: _snapshot_backend(backend)
+        for model_id, backend in backends.items()})
     period_tuple = tuple(time_periods)
     capability_map = MappingProxyType(dict(capabilities))
     document = {

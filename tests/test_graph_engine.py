@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from router.api.upstream import Backend
 from router.jev.client import (
     ChoiceAnswer,
     JevError,
@@ -36,6 +35,7 @@ from router.routing.types import (
     RoutingRequest,
     WaveTrace,
 )
+from router.upstream.catalog import Backend
 
 FIXTURES = Path(__file__).parent / "fixtures"
 POWER_GRAPH = json.loads((FIXTURES / "graph_power.json").read_text(encoding="utf-8"))

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 from dataclasses import dataclass
 
 #: 合法档位 id（顺序 = UI 的固定展示顺序；具体模型只展示自己声明的档位）。
@@ -238,6 +239,96 @@ def _strip_client_fields(body: dict) -> dict:
     return body
 
 
+def apply_openai(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    # off：wire 是字符串才发送（例如 "none"），null 则只剥离不注入
+    if level != "off":
+        body["reasoning_effort"] = wire
+    elif isinstance(wire, str) and wire:
+        body["reasoning_effort"] = wire
+
+
+def apply_deepseek(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    if level != "off":
+        body["thinking"] = {"type": "enabled"}
+        if sre:
+            body["reasoning_effort"] = wire if wire is not None else level
+    else:
+        body["thinking"] = {"type": "disabled"}
+
+
+def apply_qwen(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    body["enable_thinking"] = level != "off"
+
+
+def apply_qwen_template(body: dict, level: str, wire: str | None,
+                        sre: bool) -> None:
+    ctk = body.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+    ctk["enable_thinking"] = level != "off"
+    body["chat_template_kwargs"] = ctk
+
+
+def apply_openrouter(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    on = level != "off"
+    body["reasoning"] = {"effort": (wire if wire is not None else level)
+                         if on else (wire if isinstance(wire, str) and wire
+                                     else "none")}
+
+
+def apply_zai(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    if level != "off":
+        body["thinking"] = {"type": "enabled", "clear_thinking": False}
+        if sre:
+            body["reasoning_effort"] = wire if wire is not None else level
+    else:
+        body["thinking"] = {"type": "disabled"}
+
+
+def apply_together(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    if level != "off":
+        body["reasoning"] = {"enabled": True}
+        if sre:
+            body["reasoning_effort"] = wire if wire is not None else level
+    else:
+        body["reasoning"] = {"enabled": False}
+
+
+def apply_string_thinking(body: dict, level: str, wire: str | None,
+                          sre: bool) -> None:
+    on = level != "off"
+    body["thinking"] = wire if on else (
+        wire if isinstance(wire, str) and wire else "none")
+
+
+def apply_ant_ling(body: dict, level: str, wire: str | None, sre: bool) -> None:
+    if level != "off":                      # off 只剥离不发送
+        body["reasoning"] = {"effort": wire}
+
+
+@dataclass(frozen=True)
+class ReasoningWriter:
+    """一种 format 的完整注册项：元数据 + 上行写入行为。"""
+
+    spec: FormatSpec
+    apply: Callable[[dict, str, str | None, bool], None]
+
+
+#: format -> writer。``spec`` 必须复用 ``FORMATS`` 里的同一条元数据；
+#: 行为函数只负责把已校验过的档位写进（已深拷贝的）请求体，不再做校验。
+REASONING_WRITERS: dict[str, ReasoningWriter] = {
+    "openai": ReasoningWriter(FORMATS["openai"], apply_openai),
+    "deepseek": ReasoningWriter(FORMATS["deepseek"], apply_deepseek),
+    "qwen": ReasoningWriter(FORMATS["qwen"], apply_qwen),
+    "qwen-chat-template": ReasoningWriter(FORMATS["qwen-chat-template"], apply_qwen_template),
+    "openrouter": ReasoningWriter(FORMATS["openrouter"], apply_openrouter),
+    "zai": ReasoningWriter(FORMATS["zai"], apply_zai),
+    "together": ReasoningWriter(FORMATS["together"], apply_together),
+    "string-thinking": ReasoningWriter(FORMATS["string-thinking"], apply_string_thinking),
+    "ant-ling": ReasoningWriter(FORMATS["ant-ling"], apply_ant_ling),
+}
+
+
 def apply_reasoning(body: dict, capability: dict, level: str) -> dict:
     """按能力声明把档位写进请求体（先剥离客户端异构字段）；返回新 dict。
 
@@ -250,9 +341,10 @@ def apply_reasoning(body: dict, capability: dict, level: str) -> dict:
             or not capability.get("supported"):
         raise ReasoningError("模型未声明/不支持推理")
     fmt = capability.get("format")
-    if fmt not in FORMATS:
+    writer = REASONING_WRITERS.get(fmt) if isinstance(fmt, str) else None
+    if writer is None:
         raise ReasoningError(f"未知推理协议 format {fmt!r}")
-    spec = FORMATS[fmt]
+    spec = writer.spec
     efforts = {e.get("id"): e.get("wire")
                for e in capability.get("efforts") or []
                if isinstance(e, dict)}
@@ -269,50 +361,5 @@ def apply_reasoning(body: dict, capability: dict, level: str) -> dict:
         capability.get("supports_reasoning_effort", True))
 
     out = _strip_client_fields(copy.deepcopy(body))
-    on = level != "off"
-    if fmt == "openai":
-        # off：wire 是字符串才发送（例如 "none"），null 则只剥离不注入
-        if on:
-            out["reasoning_effort"] = wire
-        elif isinstance(wire, str) and wire:
-            out["reasoning_effort"] = wire
-    elif fmt == "deepseek":
-        if on:
-            out["thinking"] = {"type": "enabled"}
-            if sre:
-                out["reasoning_effort"] = wire if wire is not None else level
-        else:
-            out["thinking"] = {"type": "disabled"}
-    elif fmt == "qwen":
-        out["enable_thinking"] = on
-    elif fmt == "qwen-chat-template":
-        ctk = out.get("chat_template_kwargs")
-        if not isinstance(ctk, dict):
-            ctk = {}
-        ctk["enable_thinking"] = on
-        out["chat_template_kwargs"] = ctk
-    elif fmt == "openrouter":
-        out["reasoning"] = {"effort": (wire if wire is not None else level)
-                            if on else (wire if isinstance(wire, str) and wire
-                                        else "none")}
-    elif fmt == "zai":
-        if on:
-            out["thinking"] = {"type": "enabled", "clear_thinking": False}
-            if sre:
-                out["reasoning_effort"] = wire if wire is not None else level
-        else:
-            out["thinking"] = {"type": "disabled"}
-    elif fmt == "together":
-        if on:
-            out["reasoning"] = {"enabled": True}
-            if sre:
-                out["reasoning_effort"] = wire if wire is not None else level
-        else:
-            out["reasoning"] = {"enabled": False}
-    elif fmt == "string-thinking":
-        out["thinking"] = wire if on else (
-            wire if isinstance(wire, str) and wire else "none")
-    elif fmt == "ant-ling":
-        if on:                              # off 只剥离不发送
-            out["reasoning"] = {"effort": wire}
+    writer.apply(out, level, wire, sre)
     return out

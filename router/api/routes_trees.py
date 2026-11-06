@@ -17,7 +17,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from router.api.deps import get_conn, get_tree_repo
-from router.api.upstream import load_backends
 from router.control.graphs import GraphPatch, GraphService, graph_parse_failed
 from router.control.validation import issues_payload, tree_issues
 from router.jev.config import JevConfigRepo
@@ -33,6 +32,7 @@ from router.routing.snapshot import (
 from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
 from router.store.repositories import ModelRepo, TimePeriodRepo, new_id
 from router.store.routing_trees import RoutingTreeRepo
+from router.upstream.catalog import load_backends
 
 router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

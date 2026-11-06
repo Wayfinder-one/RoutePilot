@@ -22,7 +22,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 sys.path.insert(0, str(ROOT))
 
-from router.api.upstream import Backend  # noqa: E402
 from router.jev.client import (  # noqa: E402
     DecisionQuestion,
     JevCandidate,
@@ -40,6 +39,7 @@ from router.routing.model import tree_from_dict  # noqa: E402
 from router.routing.scheduler import LoadBalancer  # noqa: E402
 from router.routing.snapshot import build_snapshot  # noqa: E402
 from router.routing.types import RoutingRequest  # noqa: E402
+from router.upstream.catalog import Backend  # noqa: E402
 
 SCENARIOS = {"all", "equivalence", "capacity", "budget"}
 
