@@ -6067,6 +6067,72 @@ test('replay condition labels use direct, negated and start-only text', async ()
   assert.doesNotMatch(directTitle, /= true/);
 });
 
+test('boolean deletion and connection feedback use the new labels', async () => {
+  await openCanvas();
+  const edgeId = 'e-selected-easy-light';
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(item => item.id === id).condition = { op: 'is', value: false };
+    });
+  }, edgeId);
+  await clickEdge(edgeId);
+  await waitInspectorBranch('edge', edgeId);
+  await page.locator('#cvInspectorBody [data-act="ins-delete-edge"]').click();
+  await page.waitForFunction(() => !document.getElementById('cvDeleteModal').hidden);
+  const deletion = await page.locator('#cvDeleteBody').innerText();
+  assert.match(deletion, /取反/);
+  assert.doesNotMatch(deletion, /= (?:true|false)/);
+  await page.locator('#cvDeleteBody [data-act="delete-cancel"]').click();
+  await page.waitForFunction(() => document.getElementById('cvDeleteModal').hidden);
+
+  await openCanvas();
+  await clearToasts();
+  await dragPort('cond-text', 'out', { node: 'capability', port: 'in_2' });
+  const expected = await page.evaluate(() => window.t('cv.toastBoolDefault'));
+  await waitToastIncludes(expected);
+  assert.doesNotMatch(await toastText(), /= (?:true|false)/);
+});
+
+test('numeric unset and English boolean condition labels stay explicit', async () => {
+  await openCanvas();
+  const numericEdge = 'e-clarify-deep';
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(item => item.id === id).condition = null;
+    });
+  }, numericEdge);
+  assert.equal(
+    (await page.locator(`#cvNodes [data-cond-edge="${numericEdge}"]`).textContent()).trim(),
+    await page.evaluate(() => window.t('cv.cond.unset'))
+  );
+
+  await openCanvas();
+  await page.evaluate(() => window.setLang('en'));
+  try {
+    const edges = (await appSnapshot()).edges;
+    const startEdge = edges.find(edge => edge.source === 'start');
+    const directEdge = edges.find(edge => edge.id === 'e-cond-text-or');
+    assert.equal(
+      (await page.locator(`#cvNodes [data-edge="${startEdge.id}"] [data-start-condition]`).textContent()).trim(),
+      'Always passes'
+    );
+    const chip = page.locator(`#cvNodes [data-cond-edge="${directEdge.id}"]`);
+    assert.equal((await chip.textContent()).trim(), 'Pass through');
+    await chip.click();
+    await waitCondPop(directEdge.id);
+    assert.equal(
+      (await page.locator('#cvCondPop .rtc-cond-negate span').textContent()).trim(),
+      'Negate'
+    );
+    assert.equal(await page.locator('#cvCondPop [data-cond-field="bool"]').count(), 0);
+    await screenshot('en-boolean-condition-1440.png');
+  } finally {
+    await page.keyboard.press('Escape');
+    await page.evaluate(() => window.setLang('zh'));
+    await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+  }
+});
+
 test('gate replay labels a start input as always passing', async () => {
   await prepareTryCanvas();
   await page.evaluate(() => {
