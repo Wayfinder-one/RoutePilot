@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.jev.config import JevConfigRepo
 from router.routing.conditions import TimePeriod
+from router.routing.graph.compiled import compile_graph
 from router.routing.snapshot import build_snapshot, model_capability, read_jev_window
 from router.store.db import connect
 from router.store.repositories import ModelRepo, TimePeriodRepo
@@ -160,6 +161,7 @@ def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
         capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
+        compiled=compile_graph(stale_tree.root),
     )
     conn.close()
     response = chat(h.client, reasoning_effort="client")

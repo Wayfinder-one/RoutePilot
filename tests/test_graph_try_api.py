@@ -16,7 +16,9 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.window import MIN_INPUT_TOKENS, estimate_tokens
-from router.routing.graph.engine import GraphExecutionEngine
+from router.routing.graph.evaluator import GraphEvaluator
+from router.routing.scheduling import ModelScheduler
+from router.routing.service import RoutingService
 from router.store.db import connect
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
@@ -28,7 +30,7 @@ _DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone"}
 
 def _machine_event(event):
     return {key: value for key, value in event.items() if key not in _DISPLAY_FIELDS}
-from tests.test_graph_engine import (
+from tests.test_graph_evaluator import (
     POWER_GRAPH,
     SCENARIO_BY_ID,
     SCENARIO_DATA,
@@ -113,18 +115,20 @@ THREE_ANSWERS = {
 }
 
 
-class CapturingEngine:
-    """记录每次 route 的 snapshot（合并结果），其余委托真实 graph 引擎。"""
+class CapturingService:
+    """记录每次 route 的 snapshot（合并结果），其余委托真实组合根。"""
 
     def __init__(self, inner):
         self.inner = inner
         self.snapshots = []
         self.calls = 0
 
-    async def route(self, snapshot, request, *, now=None, dry_run=False):
+    async def route(self, snapshot, request, *, now=None, dry_run=False, trace_sink=None):
         self.calls += 1
         self.snapshots.append(snapshot)
-        return await self.inner.route(snapshot, request, now=now, dry_run=dry_run)
+        return await self.inner.route(
+            snapshot, request, now=now, dry_run=dry_run, trace_sink=trace_sink,
+        )
 
 
 def install_engine(app, scenario=None):
@@ -133,8 +137,10 @@ def install_engine(app, scenario=None):
     balancer = RecordingBalancer(app.state.breaker)
     app.state.affinity = affinity
     app.state.balancer = balancer
-    app.state.engine = CapturingEngine(GraphExecutionEngine(jev, affinity, balancer))
-    return app.state.engine, jev, balancer, affinity
+    app.state.routing_service = CapturingService(
+        RoutingService(GraphEvaluator(jev), ModelScheduler(affinity, balancer)),
+    )
+    return app.state.routing_service, jev, balancer, affinity
 
 
 def row_counts(app) -> dict:

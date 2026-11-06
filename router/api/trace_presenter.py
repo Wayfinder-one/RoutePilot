@@ -1,7 +1,7 @@
-"""Human-readable facts attached to graph trace events at emission time.
+"""Human-readable facts attached to trace events at the API boundary.
 
 Machine fields remain the routing/replay contract.  These optional fields let
-the console render new graph events without interpreting routing internals.
+the console render graph events without the evaluator knowing about UI text.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def _phase(wave: int) -> tuple[str, dict[str, str]]:
     return f"jev-wave-{wave}", _text(f"JEV 第 {wave} 轮", f"JEV wave {wave}")
 
 
-def describe_graph_event(event: dict, *, has_time_period: bool) -> dict:
+def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
     """Return one enriched event; never mutate its machine fields."""
     kind = event["event"]
     phase = "initial"
@@ -165,3 +165,17 @@ def describe_graph_event(event: dict, *, has_time_period: bool) -> dict:
         "facts": facts,
         "tone": tone,
     }
+
+
+def present_trace(events: list[dict]) -> list[dict]:
+    """Present raw machine events, leaving already-presented events untouched."""
+    has_time_period = any(
+        event.get("event") == "condition" and event.get("source") == "periods"
+        for event in events
+    )
+    return [
+        event if "phase" in event else present_trace_event(
+            event, has_time_period=has_time_period,
+        )
+        for event in events
+    ]

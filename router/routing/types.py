@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from router.jev.client import JevAnswer
@@ -66,16 +66,13 @@ class RoutingDecision:
     waves: tuple[WaveTrace, ...]
     answers: Mapping[str, JevAnswer]
     fallback_reason: str | None
-    _released: bool = field(default=False, init=False, repr=False)
 
     @property
     def target_id(self) -> str:
         return self.target.id
 
     def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
+        # ``Lease.release`` is the single idempotent release point.
         self.lease.release()
 
 
