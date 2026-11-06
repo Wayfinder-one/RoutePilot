@@ -26,7 +26,11 @@ const REQUIRED_FIXTURES = [
   'invalid-empty-graph',
   'invalid-old-otherwise-target',
   'invalid-choice-single-option',
-  'invalid-numeric-condition-missing'
+  'invalid-numeric-condition-missing',
+  'valid-condition-periods',
+  'valid-small-float-threshold',
+  'valid-envelope-variation',
+  'valid-old-field-control'
 ];
 const BY_NAME = new Map(FIXTURES.map(fixture => [fixture.name, fixture]));
 
@@ -119,6 +123,29 @@ test('graph contract fixtures cover choice/noul/score, boolean/numeric edges and
     'target-a',
     'the old-field fixture must exercise the rejected otherwise_target key'
   );
+
+  /* 补充契约面：periods 条件、浮点指数阈值、信封取值变化与旧字段正向对照。 */
+  const conditionNodes = roots.flatMap(root =>
+    root.nodes.filter(node => node.type === 'condition'));
+  assert.ok(conditionNodes.some(node =>
+    node.source === 'periods' && Array.isArray(node.periods) && node.periods.length > 0),
+  'no periods-source condition in the valid fixture set');
+  assert.ok(conditions.some(condition => condition !== null &&
+    NUMERIC_OPS.has(condition.op) && typeof condition.value === 'number' &&
+    Math.abs(condition.value) > 0 && Math.abs(condition.value) < 1e-4),
+  'no sub-1e-4 numeric threshold in the valid fixture set');
+
+  const envelope = BY_NAME.get('valid-envelope-variation').document;
+  assert.notEqual(envelope.timezone, 'Asia/Shanghai');
+  assert.deepEqual(envelope.sticky, { enabled: false, ttl_seconds: 600 });
+  assert.equal(envelope.root.error_fallback, 'target-a');
+
+  const oldDocument = BY_NAME.get('invalid-old-otherwise-target').document;
+  const controlDocument = BY_NAME.get('valid-old-field-control').document;
+  const expectedControl = JSON.parse(JSON.stringify(oldDocument));
+  delete expectedControl.root.otherwise_target;
+  assert.deepEqual(controlDocument, expectedControl,
+    'the positive control must be the rejected document without otherwise_target');
 });
 
 for (const fixture of FIXTURES) {

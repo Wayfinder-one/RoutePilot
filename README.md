@@ -42,10 +42,10 @@ flowchart LR
 
 ## Architecture and boundaries
 
-- **API layer.** `router/api/` parses request DTOs, maps domain exceptions to HTTP status/issues, and proxies the upstream response. Admin routes never write control-plane state directly.
+- **API layer.** `router/api/` parses request DTOs, maps domain exceptions to HTTP status/issues, and proxies the upstream response. Configuration and graph admin routes never write control-plane state directly; the account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
 - **Control-plane services.** `router/control/` owns the write use cases. `GraphService` validates, prepares a candidate snapshot, writes the graph file under the single-writer lock, re-checks the document hash, publishes the snapshot, and records the audit entry in that order; a stale draft returns 409 instead of overwriting.
 - **Routing domain.** `router/routing/graph/` (model, validation, conditions, ports, compiled topology, executor) is pure: it imports neither FastAPI nor SQLite. `router/routing/service.py` runs exactly one direction, evaluate → schedule.
-- **Snapshot assembly.** `router/routing/snapshot.py` reads the enabled graph, model catalog, periods, and JEV settings, then builds an immutable `RoutingSnapshot`; a tree that fails enable validation is never compiled or published.
+- **Snapshot assembly.** `router/routing/snapshot.py` reads the enabled graph, model catalog, periods, and JEV settings, then builds an immutable `RoutingSnapshot`; a tree that fails enable validation is never compiled into the published snapshot, and the `/admin/try` draft path reports those enable issues as warnings while compiling a draft snapshot that never replaces the published one.
 - **Console.** `router/console/` is native ES Modules: every page has one `<script type="module">` entry, and modules exchange state through explicit imports and stores, with no `window.*` application globals and no CommonJS.
 - **Compiled topology.** `compile_graph()` indexes nodes, sorts edges, and builds incoming/port maps once per published graph. The request path reads `snapshot.require_compiled()` and never rebuilds an index or opens SQLite.
 - **Request ledger.** The event loop only enqueues rows into a bounded in-memory queue and ring; a 2-second flush projects the whitelisted columns and writes them on a worker thread (`asyncio.to_thread`). A failed write drops that batch and increments `ledger_write_failures` without blocking requests.
@@ -165,7 +165,7 @@ The canvas imports and exports a single JSON envelope:
 }
 ```
 
-Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types, and unknown envelope/node/edge fields (including the retired `otherwise_target`) are rejected before they can replace a draft or a published snapshot; structural rejections surface as `graph_parse_error`, and the console runs the same validation before it applies an import. `tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, with nodes sorted by id and edges by (target, slot, source, source_port), so the Python server and the ES-module console compute the same behavior hash. Display/layout edits — titles, a target's capability note, positions, node/edge array order, edge ids — do not change it.
+Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types, and unknown envelope/node/edge fields (including the retired `otherwise_target`) are rejected before they can replace a draft or a published snapshot; structural rejections surface as `graph_parse_error`, and the console runs the same validation before it applies an import. `tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, with nodes sorted by id and edges by (target, slot, source, source_port), so the Python server and the ES-module console produce the same canonical behavior form; the console uses it to classify edits, and `tree_revision` itself comes from the server. Display/layout edits — titles, a target's capability note, positions, node/edge array order, edge ids — do not change it.
 
 ## Models and reasoning
 
