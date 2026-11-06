@@ -5723,15 +5723,16 @@ test('calculation-log renders staged process from a real request', async () => {
   await page.goto(routerBase + '/console/logs.html');
   await page.waitForSelector('.lg-row');
   await page.locator('.lg-row').first().click();
-  await page.waitForSelector('.lg-item.open .lg-process');
+  await page.waitForSelector('.lg-item.open .lg-rail');
 
   const open = page.locator('.lg-item.open');
-  assert.equal(await open.locator('.lg-phase[data-wave="0"]').count(), 1);
-  assert.equal(await open.locator('.lg-phase[data-wave="1"]').count(), 1);
-  assert.equal(await open.locator('.lg-question').count(), 2);
-  assert.equal(await open.locator('.lg-candidate-row').count(), 2);
-  assert.equal(await open.locator('.lg-schedule').count(), 1);
-  assert.equal(await open.locator('.lg-execution').count(), 1);
+  /* 图 v3 展示契约：只渲染 trace 里实际出现的阶段，阶段 id 即引擎的 phase。 */
+  const phases = (await open.locator('.lg-stage-name small').allInnerTexts())
+    .map(text => text.split(' · ')[0]);
+  assert.deepEqual(phases,
+    ['period', 'initial', 'condition', 'jev-wave-1', 'final', 'schedule', 'outcome']);
+  assert.equal(await open.locator('.lg-stage').count(), 7);
+  assert.equal(await open.locator('.lg-status').count(), 1);
   assertIncludes(await open.innerText(), 'power-target');
   assertIncludes(await open.innerText(), 'qwen3.8-flash-sft');
 });
@@ -5744,36 +5745,30 @@ test('calculation-log-phase-order-matches-engine', async () => {
   });
   await page.goto(routerBase + '/console/logs.html');
   await page.locator('.lg-row').first().click();
+  await page.waitForSelector('.lg-item.open .lg-rail');
+  const phases = (await page.locator('.lg-item.open .lg-stage-name small').allInnerTexts())
+    .map(text => text.split(' · ')[0]);
+  const at = phase => phases.indexOf(phase);
 
-  async function kinds(wave) {
-    return page.locator(`.lg-item.open .lg-phase[data-wave="${wave}"] > .lg-judgments`).evaluate(host =>
-      Array.from(host.children).map(element => {
-        if (element.classList.contains('lg-question')) return 'question';
-        if (element.classList.contains('lg-judgment-row')) return 'gate';
-        if (element.classList.contains('lg-slots')) return 'slots';
-        if (element.classList.contains('lg-activation')) return 'activate';
-        return 'other';
-      }).filter(kind => kind !== 'other'));
-  }
-
-  const initial = await kinds(0);
-  const firstWave = await kinds(1);
-  assert.ok(initial.includes('slots') && initial.includes('activate'));
-  assert.ok(initial.indexOf('slots') < initial.indexOf('activate'));
-  assert.ok(firstWave.includes('question'));
-  assert.ok(firstWave.includes('gate'));
-  assert.ok(firstWave.indexOf('question') < firstWave.indexOf('gate'));
-  assert.ok(firstWave.indexOf('gate') < firstWave.indexOf('slots'));
-  assert.ok(firstWave.indexOf('slots') < firstWave.indexOf('activate'));
+  /* 阶段顺序 = 引擎 trace 的首现顺序，不允许按配置重新排序或合成。 */
+  assert.ok(at('initial') >= 0 && at('condition') > at('initial'));
+  assert.ok(at('jev-wave-1') > at('condition'));
+  assert.ok(at('final') > at('jev-wave-1'));
+  assert.ok(at('schedule') > at('final'));
+  assert.ok(at('outcome') > at('schedule'));
 });
 
-test('calculation-log exposes every slot only on demand', async () => {
+test('calculation-log renders every trace stage inline', async () => {
   await page.goto(routerBase + '/console/logs.html');
   await page.locator('.lg-row').first().click();
-  const phase = page.locator('.lg-item.open .lg-phase[data-wave="0"]');
-  assert.equal(await phase.locator('.lg-slot-all[open]').count(), 0);
-  await phase.locator('.lg-slot-all > summary').click();
-  assert.equal(await phase.locator('.lg-slot-all .lg-slot-row').count(), EXAMPLE_EDGES);
+  await page.waitForSelector('.lg-item.open .lg-rail');
+  const open = page.locator('.lg-item.open');
+
+  /* 阶段全部直接展开，不再有按需展开的槽位折叠区；只有技术事实保留在 <details> 里。 */
+  assert.ok(await open.locator('.lg-stage').count() > 0);
+  assert.equal(await open.locator('.lg-rail details').count(), 0);
+  assert.equal(await open.locator('details.lg-raw').count(), 1);
+  assert.equal(await open.locator('details.lg-raw').getAttribute('open'), null);
 });
 
 test('calculation-log keeps two request details open together', async () => {
@@ -5800,7 +5795,8 @@ test('calculation-log restored row states that detail is absent', async () => {
   try {
     await page.goto(routerBase + '/console/logs.html');
     await page.locator('.lg-row').first().click();
-    const expected = await page.evaluate(() => window.t('logs.historyDetail'));
+    /* 图 v3 不再区分「历史记录」：没有 trace 的记录统一显示 traceEmpty。 */
+    const expected = await page.evaluate(() => window.t('logs.traceEmpty'));
     assertIncludes(await page.locator('.lg-item.open').innerText(), expected);
     assertIncludes(await page.locator('.lg-item.open .lg-lat').innerText(), '1.20s');
   } finally {
@@ -5836,16 +5832,21 @@ test('calculation-log separates routing failure and legacy schedule fallback', a
     await page.goto(routerBase + '/console/logs.html');
     await page.locator('.lg-item[data-id="failed"] .lg-row').click();
     assert.equal(await page.locator('.lg-item[data-id="failed"] .lg-execution').count(), 0);
-    assertIncludes(await page.locator('.lg-item[data-id="failed"]').innerText(), 'no_available_backend');
+    /* 图 v3 用 trace 事件分阶段渲染：路由失败落成 bad 状态 + routing_error 阶段，
+       不再显示旧的「执行结果」分节或 error_class 明细。 */
+    const routingFailed = await page.evaluate(() => window.t('logs.out.routing'));
+    assertIncludes(await page.locator('.lg-item[data-id="failed"]').innerText(), routingFailed);
+    assert.equal(await page.locator('.lg-item[data-id="failed"] .lg-status.bad').count(), 1);
     await page.locator('.lg-item[data-id="legacy"] .lg-row').click();
-    const expected = await page.evaluate(() => window.t('logs.noSchedule'));
-    assertIncludes(await page.locator('.lg-item[data-id="legacy"]').innerText(), expected);
+    const scheduled = await page.evaluate(() => window.t('logs.ev.scheduled'));
+    assertIncludes(await page.locator('.lg-item[data-id="legacy"]').innerText(), scheduled);
+    assert.equal(await page.locator('.lg-item[data-id="legacy"] .lg-status.bad').count(), 0);
   } finally {
     await page.unroute(matcher);
   }
 });
 
-test('calculation-log-summary-separates-final-kind-from-sticky', async () => {
+test('calculation-log route label keeps sticky separate from final kind', async () => {
   const matcher = '**/admin/requests/recent';
   const makeRecord = (id, kind, sticky) => ({
     id,
@@ -5878,23 +5879,21 @@ test('calculation-log-summary-separates-final-kind-from-sticky', async () => {
   try {
     await page.goto(routerBase + '/console/logs.html');
     const expected = await page.evaluate(() => ({
-      target: window.t('logs.reason.target'),
       sticky: window.t('logs.reason.sticky'),
-      otherwise: window.t('logs.reason.otherwise'),
       error: window.t('logs.reason.errorFallback'),
     }));
     for (const id of ['target-sticky', 'otherwise', 'error-sticky']) {
       await page.locator(`.lg-item[data-id="${id}"] .lg-row`).click();
     }
 
-    const targetSticky = await page.locator('.lg-item[data-id="target-sticky"] .lg-sum').innerText();
-    const otherwise = await page.locator('.lg-item[data-id="otherwise"] .lg-sum').innerText();
-    const errorSticky = await page.locator('.lg-item[data-id="error-sticky"] .lg-sum').innerText();
-    assertIncludes(targetSticky, expected.target);
-    assertIncludes(targetSticky, expected.sticky);
-    assertIncludes(otherwise, expected.otherwise);
-    assertIncludes(errorSticky, expected.error);
-    assertIncludes(errorSticky, expected.sticky);
+    const routeOf = id => page.locator(`.lg-item[data-id="${id}"] .lg-route`).innerText();
+    /* route 标签取自 selection_reason：粘性命中优先于最终 kind。 */
+    assert.equal(await routeOf('target-sticky'), expected.sticky);
+    assert.equal(await routeOf('otherwise'), expected.error);
+    assert.equal(await routeOf('error-sticky'), expected.sticky);
+    /* 最终目标 kind 仍保留在阶段依据里，不会被 route 标签吞掉。 */
+    assertIncludes(await page.locator('.lg-item[data-id="otherwise"]').innerText(), 'otherwise');
+    assertIncludes(await page.locator('.lg-item[data-id="error-sticky"]').innerText(), 'error_fallback');
   } finally {
     await page.unroute(matcher);
   }
