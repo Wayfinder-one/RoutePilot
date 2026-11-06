@@ -1,7 +1,10 @@
-"""GraphExecutionEngine：三值定点、确定性槽位、波次、候选、粘性与统一 trace。
+"""GraphEvaluator：三值定点、确定性槽位、波次、候选与机器 trace。
 
-本文件同时提供五场景矩阵测试（test_graph_scenarios.py）复用的测试替身：
-FakeJev（brief 逐字版本）、RecordingBalancer、RecordingAffinity 与 snapshot 构造。
+本文件同时提供五场景矩阵测试（test_graph_scenarios.py）与草稿试算测试
+（test_graph_try_api.py）复用的测试替身：FakeJev、RecordingBalancer、
+RecordingAffinity，以及 snapshot/tree 构造与组合根 helper。
+求值断言直接读 GraphOutcome；粘性、熔断、dry-run、inflight 等调度断言在
+test_routing_service.py。
 """
 from __future__ import annotations
 
@@ -23,14 +26,16 @@ from router.jev.window import apply_window
 from router.routing.affinity import SessionAffinity
 from router.routing.conditions import TimePeriod
 from router.routing.graph.conditions import UNKNOWN
-from router.routing.graph.engine import GraphExecutionEngine, combine_gate
-from router.routing.tree import tree_from_dict
+from router.routing.graph.compiled import compile_graph
+from router.routing.graph.evaluator import GraphEvaluator, GraphOutcome, combine_gate
 from router.routing.scheduler import LoadBalancer
+from router.routing.scheduling import ModelScheduler
+from router.routing.service import RoutingService
 from router.routing.snapshot import build_snapshot
+from router.routing.tree import tree_from_dict
 from router.routing.types import (
     Candidate,
     NoActiveTreeError,
-    NoAvailableBackend,
     RoutingMiss,
     RoutingRequest,
     WaveTrace,
@@ -48,6 +53,7 @@ BACKENDS = {
     for model in MODELS
 }
 NOW = datetime.fromisoformat("2026-11-02T12:00:00+08:00")
+DISPLAY_KEYS = {"phase", "label", "cell", "summary", "facts", "tone"}
 
 
 class FakeJev:
@@ -61,7 +67,10 @@ class FakeJev:
             raise JevError(self.scenario["fail"].get("message", "timeout"))
         result = {}
         for node_id, question in questions.items():
-            fixture = self.scenario["answers"][node_id]
+            fixture = self.scenario["answers"].get(node_id)
+            if fixture is None:
+                # 缺失答案属于 JEV 失败，必须由求值层转成失败波次。
+                raise JevError(f"JEV response is missing answer for {node_id!r}")
             if question.question_type == "choice":
                 probabilities = fixture["probs"]
                 ranking = sorted(probabilities, key=lambda key: -probabilities[key])
@@ -157,20 +166,46 @@ def custom_tree(nodes, edges, *, error_fallback, sticky=None):
 
 
 def make_snapshot(tree=None, *, backends=None, periods=None, jev=True, input_tokens=1024):
+    tree = power_tree() if tree is None else tree
     return build_snapshot(
-        tree=power_tree() if tree is None else tree,
+        tree=tree,
         backends=BACKENDS if backends is None else backends,
         time_periods=list(PERIODS if periods is None else periods),
         jev=JevSettings("http://jev.test", "d1-2B") if jev else None,
         capabilities={},
         jev_input_tokens=input_tokens,
         jev_context_tokens=4096,
+        compiled=compile_graph(tree.root),
     )
+
+
+def run_evaluate(
+    scenario_id,
+    *,
+    tree=None,
+    text=None,
+    now=None,
+    input_tokens=1024,
+    trace_sink=None,
+):
+    """求值层入口：直接返回 GraphOutcome + 本次求值写入的机器事件。"""
+    scenario = SCENARIO_BY_ID[scenario_id]
+    jev = FakeJev(scenario)
+    snapshot = make_snapshot(power_tree() if tree is None else tree, input_tokens=input_tokens)
+    trace = [] if trace_sink is None else trace_sink
+    outcome = asyncio.run(GraphEvaluator(jev).evaluate(
+        snapshot,
+        RoutingRequest(scenario["text"] if text is None else text),
+        now=datetime.fromisoformat(scenario["now"]) if now is None else now,
+        trace_sink=trace,
+    ))
+    return outcome, jev, trace
 
 
 def run_scenario(
     scenario_id,
     *,
+    scenario=None,
     tree=None,
     dry_run=False,
     session_id="",
@@ -181,13 +216,14 @@ def run_scenario(
     input_tokens=1024,
     trace_sink=None,
 ):
-    scenario = SCENARIO_BY_ID[scenario_id]
+    """组合根入口：真实 GraphEvaluator + ModelScheduler，供路由/试算测试复用。"""
+    scenario = SCENARIO_BY_ID[scenario_id] if scenario is None else scenario
     jev = FakeJev(scenario)
     balancer = RecordingBalancer() if balancer is None else balancer
     affinity = RecordingAffinity() if affinity is None else affinity
-    engine = GraphExecutionEngine(jev, affinity, balancer)
+    service = RoutingService(GraphEvaluator(jev), ModelScheduler(affinity, balancer))
     snapshot = make_snapshot(power_tree() if tree is None else tree, input_tokens=input_tokens)
-    decision = asyncio.run(engine.route(
+    decision = asyncio.run(service.route(
         snapshot,
         RoutingRequest(scenario["text"] if text is None else text, session_id=session_id),
         now=datetime.fromisoformat(scenario["now"]) if now is None else now,
@@ -195,6 +231,29 @@ def run_scenario(
         trace_sink=trace_sink,
     ))
     return decision, jev, balancer, affinity
+
+
+def evaluate_custom(
+    nodes,
+    edges,
+    *,
+    error_fallback,
+    scenario=None,
+    sticky=None,
+    text="",
+    now=NOW,
+    trace_sink=None,
+):
+    tree = custom_tree(nodes, edges, error_fallback=error_fallback, sticky=sticky)
+    jev = FakeJev(scenario or {"answers": {}})
+    trace = [] if trace_sink is None else trace_sink
+    outcome = asyncio.run(GraphEvaluator(jev).evaluate(
+        make_snapshot(tree, periods=[]),
+        RoutingRequest(text),
+        now=now,
+        trace_sink=trace,
+    ))
+    return outcome, jev, trace
 
 
 def run_custom(
@@ -212,17 +271,12 @@ def run_custom(
     affinity=None,
     trace_sink=None,
 ):
-    tree = custom_tree(
-        nodes,
-        edges,
-        error_fallback=error_fallback,
-        sticky=sticky,
-    )
+    tree = custom_tree(nodes, edges, error_fallback=error_fallback, sticky=sticky)
     jev = FakeJev(scenario or {"answers": {}})
     balancer = RecordingBalancer() if balancer is None else balancer
     affinity = RecordingAffinity() if affinity is None else affinity
-    engine = GraphExecutionEngine(jev, affinity, balancer)
-    decision = asyncio.run(engine.route(
+    service = RoutingService(GraphEvaluator(jev), ModelScheduler(affinity, balancer))
+    decision = asyncio.run(service.route(
         make_snapshot(tree, periods=[]),
         RoutingRequest(text, session_id=session_id),
         now=now,
@@ -278,21 +332,30 @@ def test_combine_gate_three_valued_truth_tables():
 
 
 # ---------------------------------------------------------------------------
-# 终局异常路径（终审补充）
+# 终局异常路径
 # ---------------------------------------------------------------------------
 
 
-def test_route_without_active_tree_raises_no_active_tree():
-    engine = GraphExecutionEngine(FakeJev({"answers": {}}), RecordingAffinity(), RecordingBalancer())
+def test_evaluate_without_active_tree_raises_no_active_tree():
+    evaluator = GraphEvaluator(FakeJev({"answers": {}}))
     snapshot = build_snapshot(
         tree=None, backends=BACKENDS, time_periods=[], jev=None, capabilities={},
     )
     with pytest.raises(NoActiveTreeError):
-        asyncio.run(engine.route(snapshot, RoutingRequest("你好"), now=NOW))
+        asyncio.run(evaluator.evaluate(snapshot, RoutingRequest("你好"), now=NOW))
+
+
+def test_evaluate_requires_compiled_snapshot_without_rebuilding_topology():
+    from dataclasses import replace
+
+    snapshot = replace(make_snapshot(), compiled=None)
+    evaluator = GraphEvaluator(FakeJev({"answers": {}}))
+    with pytest.raises(RoutingMiss, match="compiled graph"):
+        asyncio.run(evaluator.evaluate(snapshot, RoutingRequest("你好"), now=NOW))
 
 
 def test_wave_guard_rejects_more_than_32_waves():
-    """_MAX_WAVES 防御：33 连问链（校验层本应拦截，引擎仍须自保）在 32 波后 RoutingMiss。"""
+    """_MAX_WAVES 防御：33 连问链（校验层本应拦截，求值层仍须自保）在 32 波后 RoutingMiss。"""
     count = 33
     nodes = [node("start", "start")]
     edges = [edge("e0", "start", "out", "q1", "in_1")]
@@ -307,7 +370,7 @@ def test_wave_guard_rejects_more_than_32_waves():
             ))
     nodes.append(node("sink", "target", priority=1, models=[{"model": "qwen3-8b", "reasoning": None}]))
     with pytest.raises(RoutingMiss, match="32 waves"):
-        run_custom(
+        evaluate_custom(
             nodes, edges, error_fallback="sink",
             scenario={"answers": answers},
         )
@@ -315,13 +378,13 @@ def test_wave_guard_rejects_more_than_32_waves():
 
 def test_invalid_fallback_target_raises_routing_miss():
     with pytest.raises(RoutingMiss, match="error_fallback"):
-        run_custom([node("start", "start")], [], error_fallback="ghost")
+        evaluate_custom([node("start", "start")], [], error_fallback="ghost")
 
 
 def test_invalid_fallback_leaves_partial_trace_in_external_sink():
     trace = []
     with pytest.raises(RoutingMiss, match="error_fallback"):
-        run_custom(
+        evaluate_custom(
             [node("start", "start")], [], error_fallback="ghost", trace_sink=trace,
         )
     assert [event["event"] for event in trace[:2]] == ["time", "window"]
@@ -329,37 +392,29 @@ def test_invalid_fallback_leaves_partial_trace_in_external_sink():
 
 
 # ---------------------------------------------------------------------------
-# trace 契约（§3.9）
+# trace 契约（§3.9）：求值层只发机器事件
 # ---------------------------------------------------------------------------
-
-DISPLAY_KEYS = {"phase", "label", "cell", "summary", "facts", "tone"}
-
-
-def machine_event(event):
-    return {key: value for key, value in event.items() if key not in DISPLAY_KEYS}
 
 
 def test_trace_events_follow_spec_schema_and_order():
-    decision, _jev, _balancer, _affinity = run_scenario("s1")
-    events = decision.trace
+    outcome, _jev, events = run_evaluate("s1")
 
-    assert machine_event(events[0]) == {"event": "time", "active_periods": ["normal"], "timezone": "Asia/Shanghai"}
+    assert events[0] == {"event": "time", "active_periods": ["normal"], "timezone": "Asia/Shanghai"}
     assert events[1]["event"] == "window"
-    assert set(events[1]) - DISPLAY_KEYS == {"event", "tokens_before", "tokens_after", "truncated"}
+    assert set(events[1]) == {"event", "tokens_before", "tokens_after", "truncated"}
     assert events[1]["truncated"] is False
 
     condition_events = [event for event in events if event["event"] == "condition"]
     assert [event["node_id"] for event in condition_events] == ["cond-peak", "cond-text"]
     for event in condition_events:
-        assert set(event) - DISPLAY_KEYS == {"event", "node_id", "source", "matched", "value"}
+        assert set(event) == {"event", "node_id", "source", "matched", "value"}
         assert isinstance(event["value"], bool)
 
     slot_events = [event for event in events if event["event"] == "slot"]
     # 两轮（第 0 轮 + 第 1 波后）每轮全部 15 条边各一条。
     assert len(slot_events) == 2 * len(POWER_GRAPH["edges"])
-    assert [event["wave"] for event in slot_events if event["wave"] == 0]
     for event in slot_events:
-        assert set(event) - DISPLAY_KEYS == {
+        assert set(event) == {
             "event", "wave", "edge_id", "node_id", "port",
             "source", "source_port", "raw", "condition", "status",
         }
@@ -369,19 +424,19 @@ def test_trace_events_follow_spec_schema_and_order():
     gate_events = [event for event in events if event["event"] == "gate"]
     assert gate_events
     for event in gate_events:
-        assert set(event) - DISPLAY_KEYS == {"event", "wave", "node_id", "operator", "inputs", "value"}
+        assert set(event) == {"event", "wave", "node_id", "operator", "inputs", "value"}
         for item in event["inputs"]:
             assert set(item) == {"port", "raw", "condition", "status"}
 
     activate_events = [event for event in events if event["event"] == "activate"]
     assert activate_events
     for event in activate_events:
-        assert set(event) - DISPLAY_KEYS == {"event", "wave", "node_id", "via_port"}
+        assert set(event) == {"event", "wave", "node_id", "via_port"}
 
     wave_events = [event for event in events if event["event"] == "wave"]
     assert wave_events
     for event in wave_events:
-        assert set(event) - DISPLAY_KEYS == {"event", "wave", "questions", "duration_ms", "failed", "error"}
+        assert set(event) == {"event", "wave", "questions", "duration_ms", "failed", "error"}
 
     question_events = [event for event in events if event["event"] == "question"]
     assert [event["node_id"] for event in question_events] == ["capability", "domain"]
@@ -390,7 +445,7 @@ def test_trace_events_follow_spec_schema_and_order():
         assert event["duration_ms"] == 12.0
         assert event["usage"] == {"input_tokens": 20}
     choice_event = next(event for event in question_events if event["node_id"] == "capability")
-    assert set(choice_event) - DISPLAY_KEYS == {
+    assert set(choice_event) == {
         "event", "wave", "node_id", "ports", "duration_ms", "usage",
         "selected", "p_top", "margin",
     }
@@ -400,10 +455,9 @@ def test_trace_events_follow_spec_schema_and_order():
     assert choice_event["ports"]["p_top"] == 0.84
     assert choice_event["ports"]["margin"] == 0.72
 
-    final_event = next(event for event in events if event["event"] == "final")
-    scheduled_event = next(event for event in events if event["event"] == "scheduled")
+    final_event = events[-1]
     assert final_event["event"] == "final"
-    assert set(final_event) - DISPLAY_KEYS == {"event", "target_id", "kind", "candidates", "priority"}
+    assert set(final_event) == {"event", "target_id", "kind", "candidates", "priority"}
     assert final_event["target_id"] == "power-target"
     assert final_event["kind"] == "target"
     assert final_event["priority"] == 5
@@ -411,22 +465,32 @@ def test_trace_events_follow_spec_schema_and_order():
         {"target_id": "power-target", "priority": 5, "via_node": "and-power", "via_port": "in_1", "wave": 1},
         {"target_id": "strong-target", "priority": 3, "via_node": "capability", "via_port": "in_1", "wave": 1},
     ]
-    assert machine_event(scheduled_event) == {"event": "scheduled", "model": "qwen3.8-flash-sft", "reason": "target", "dry_run": False}
 
-    for event in events:
-        assert DISPLAY_KEYS <= set(event)
-        assert isinstance(event["phase"], str) and event["phase"]
-        assert isinstance(event["facts"], list)
-        assert all(isinstance(fact, list) and len(fact) == 2 for fact in event["facts"])
-        assert event["tone"] in {"", "hit", "warn", "bad"}
-    assert next(event for event in events if event["event"] == "wave")["phase"] == "jev-wave-1"
-    assert next(event for event in events if event["event"] == "slot" and event["wave"] == 0)["phase"] == "initial"
-    assert events[0]["phase"] == "period"
-    assert next(event for event in condition_events if event["source"] == "periods")["phase"] == "period"
+    # 求值层没有 display 字段，也不发出任何调度事件。
+    assert all(set(event).isdisjoint(DISPLAY_KEYS) for event in events)
+    assert not any(event["event"] in {"schedule", "scheduled", "sticky_hit"} for event in events)
+
+    assert outcome.kind == "target"
+    assert outcome.selection_reason == "target"
+    assert outcome.fallback_reason is None
+    assert outcome.failure_reason is None
+    assert [candidate.target_id for candidate in outcome.candidates] == ["power-target", "strong-target"]
 
 
-def test_direct_route_does_not_invent_time_or_jev_display_stages():
-    decision, *_ = run_custom(
+def test_evaluator_has_no_sticky_lease_or_scheduled_surface():
+    evaluator = GraphEvaluator(FakeJev(SCENARIO_BY_ID["s1"]))
+    assert not hasattr(evaluator, "affinity")
+    assert not hasattr(evaluator, "balancer")
+
+    outcome, _jev, events = run_evaluate("s1")
+    assert isinstance(outcome, GraphOutcome)
+    assert not hasattr(outcome, "lease")
+    assert not hasattr(outcome, "model")
+    assert not any(event["event"] in {"schedule", "scheduled", "sticky_hit"} for event in events)
+
+
+def test_direct_evaluation_emits_only_graph_stages():
+    outcome, _jev, events = evaluate_custom(
         [
             node("start", "start"),
             node("direct", "target", priority=1, models=[{"model": "qwen3-8b", "reasoning": None}]),
@@ -434,86 +498,45 @@ def test_direct_route_does_not_invent_time_or_jev_display_stages():
         [edge("direct-edge", "start", "out", "direct", "in_1")],
         error_fallback="direct",
     )
-    assert not any(event["phase"] == "period" for event in decision.trace)
-    assert not any(event["phase"].startswith("jev-wave-") for event in decision.trace)
-    assert not any(
-        fact[0] in ({"zh": "时区", "en": "Timezone"}, {"zh": "耗时", "en": "Duration"})
-        for event in decision.trace for fact in event["facts"]
-    )
-    assert [event["event"] for event in decision.trace[-3:]] == ["final", "schedule", "scheduled"]
+    assert outcome.target.id == "direct"
+    assert [event["event"] for event in events[-1:]] == ["final"]
+    assert not any(event["event"] in {"schedule", "scheduled", "sticky_hit"} for event in events)
 
 
 def test_window_is_applied_once_and_conditions_use_truncated_text(monkeypatch):
-    from router.routing.graph import engine as engine_module
+    from router.routing.graph import evaluator as evaluator_module
 
-    real_apply_window = engine_module.apply_window
+    real_apply_window = evaluator_module.apply_window
     calls = []
 
     def counting_apply_window(text, input_tokens):
         calls.append((text, input_tokens))
         return real_apply_window(text, input_tokens)
 
-    monkeypatch.setattr(engine_module, "apply_window", counting_apply_window)
+    monkeypatch.setattr(evaluator_module, "apply_window", counting_apply_window)
 
     long_text = "无关铺垫" * 500 + "抢修" + "收尾说明" * 500
     expected_window = apply_window(long_text, 256)
     assert expected_window.truncated is True
     assert "抢修" not in expected_window.text
 
-    decision, jev, _balancer, _affinity = run_scenario(
+    outcome, jev, events = run_evaluate(
         "s1", text=long_text, input_tokens=256, now=NOW,
     )
     assert len(calls) == 1
     assert jev.calls[0]["text"] == expected_window.text
 
-    window_event = next(event for event in decision.trace if event["event"] == "window")
+    window_event = next(event for event in events if event["event"] == "window")
     assert window_event["truncated"] is True
     assert window_event["tokens_before"] == expected_window.tokens_before
     assert window_event["tokens_after"] == expected_window.tokens_after
     condition = next(
-        event for event in decision.trace
+        event for event in events
         if event["event"] == "condition" and event["node_id"] == "cond-text"
     )
     assert condition["matched"] == []
     assert condition["value"] is False
-
-
-# ---------------------------------------------------------------------------
-# schedule 调度事件：调度器实际快照 + 事件顺序 + 失败部分 trace
-# ---------------------------------------------------------------------------
-
-
-def test_schedule_trace_uses_actual_selection_and_preserves_event_order():
-    decision, _jev, _balancer, _affinity = run_scenario("s1")
-    schedule = next(event for event in decision.trace if event["event"] == "schedule")
-
-    assert machine_event(schedule) == {
-        "event": "schedule",
-        "target_id": "power-target",
-        "strategy": "least_inflight",
-        "configured_models": ["qwen3.8-flash-sft"],
-        "registered_models": ["qwen3.8-flash-sft"],
-        "available_models": ["qwen3.8-flash-sft"],
-        "unavailable": {},
-        "inflight": {"qwen3.8-flash-sft": 0},
-        "sticky": {"status": "disabled", "preferred_model": None},
-    }
-    assert [event["event"] for event in decision.trace[-3:]] == [
-        "final", "schedule", "scheduled",
-    ]
-
-
-def test_schedule_trace_marks_no_session_and_sticky_miss():
-    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
-    no_session, *_rest = run_scenario("s1", tree=tree)
-    miss, *_rest = run_scenario("s1", tree=tree, session_id="new-session")
-
-    assert next(e for e in no_session.trace if e["event"] == "schedule")["sticky"] == {
-        "status": "no_session", "preferred_model": None,
-    }
-    assert next(e for e in miss.trace if e["event"] == "schedule")["sticky"] == {
-        "status": "miss", "preferred_model": None,
-    }
+    assert outcome.target.id == "power-target"
 
 
 # ---------------------------------------------------------------------------
@@ -522,16 +545,16 @@ def test_schedule_trace_marks_no_session_and_sticky_miss():
 
 
 def test_untriggered_question_ports_stay_unknown_not_zero_or_false():
-    decision, _jev, _balancer, _affinity = run_scenario("s1")
+    outcome, _jev, events = run_evaluate("s1")
 
-    assert "clarify" not in decision.answers
-    assert [event["node_id"] for event in decision.trace if event["event"] == "question"] == ["capability", "domain"]
+    assert "clarify" not in outcome.answers
+    assert [event["node_id"] for event in events if event["event"] == "question"] == ["capability", "domain"]
     assert not [
-        event for event in decision.trace
+        event for event in events
         if event["event"] == "activate" and event["node_id"] == "clarify"
     ]
     clarify_slots = [
-        event for event in decision.trace
+        event for event in events
         if event["event"] == "slot" and event["node_id"] == "clarify"
     ]
     # 第 0 轮上游门未定 → 槽位 unknown（不是 false/0）；后续轮次门确定 false 是正常三值结果。
@@ -540,7 +563,7 @@ def test_untriggered_question_ports_stay_unknown_not_zero_or_false():
     assert clarify_slots[0]["raw"] is None
     # 未执行的问题从不写 question 事件/端口，因此 yes/no 不会以 0/false 出现。
     clarify_ports = [
-        event["ports"] for event in decision.trace
+        event["ports"] for event in events
         if event["event"] == "question" and event["node_id"] == "clarify"
     ]
     assert clarify_ports == []
@@ -572,14 +595,14 @@ def test_and_false_and_or_true_are_determined_early_and_never_flip():
         edge("e-or-target", "or-gate", "out", "t-or", "in_1"),
         edge("e-and-target", "and-gate", "out", "t-and", "in_1"),
     ]
-    decision, _jev, _balancer, _affinity = run_custom(
+    outcome, _jev, events = evaluate_custom(
         nodes, edges,
         error_fallback="t-and",
         scenario={"answers": {"q": {"probs": {"easy": 0.9, "strong": 0.1}}}},
         text="命中",
     )
 
-    gates = {event["node_id"]: event for event in decision.trace if event["event"] == "gate"}
+    gates = {event["node_id"]: event for event in events if event["event"] == "gate"}
     # OR 在第 0 轮就因为一个 true 确定（另一个输入还是 unknown）。
     assert gates["or-gate"]["wave"] == 0
     assert gates["or-gate"]["value"] is True
@@ -589,11 +612,11 @@ def test_and_false_and_or_true_are_determined_early_and_never_flip():
     assert gates["and-gate"]["value"] is False
     assert any(item["status"] == "unknown" for item in gates["and-gate"]["inputs"])
     # 门一旦确定不重复计算，也不会被后续波次反转。
-    assert len([event for event in decision.trace if event["event"] == "gate"]) == 2
-    assert decision.target.id == "t-or"
-    assert [candidate.target_id for candidate in decision.candidates] == ["t-or"]
+    assert len([event for event in events if event["event"] == "gate"]) == 2
+    assert outcome.target.id == "t-or"
+    assert [candidate.target_id for candidate in outcome.candidates] == ["t-or"]
     and_slots = [
-        event for event in decision.trace
+        event for event in events
         if event["event"] == "slot" and event["node_id"] == "t-and"
     ]
     assert and_slots and all(event["status"] == "false" for event in and_slots)
@@ -620,194 +643,31 @@ def test_missing_answer_in_wave_voids_prior_candidates_and_falls_back():
         edge("e-q1-q2", "q1", "prob.strong", "q2", "in_1", {"op": "gt", "value": 0.65}),
         edge("e-q2-b", "q2", "yes", "target-b", "in_1", {"op": "gt", "value": 0.5}),
     ]
-    decision, jev, _balancer, _affinity = run_custom(
+    outcome, jev, events = evaluate_custom(
         nodes, edges,
         error_fallback="target-safe",
-        # q2 的答案缺失：FakeJev 在第 2 波抛错。
+        # q2 的答案缺失：FakeJev 在第 2 波抛 JevError。
         scenario={"answers": {"q1": {"probs": {"easy": 0.3, "strong": 0.7}}}},
     )
 
     assert [call["keys"] for call in jev.calls] == [["q1"], ["q2"]]
-    assert len(decision.waves) == 2
-    assert decision.waves[0].failed is False
-    assert decision.waves[1].failed is True
-    assert decision.waves[1].questions == ("q2",)
+    assert len(outcome.waves) == 2
+    assert outcome.waves[0].failed is False
+    assert outcome.waves[1].failed is True
+    assert outcome.waves[1].questions == ("q2",)
     # 第一波确实激活过 target-a，但失败后整波作废，最终 candidates 清空。
     assert any(
         event["event"] == "activate" and event["node_id"] == "target-a"
-        for event in decision.trace
+        for event in events
     )
-    assert decision.candidates == ()
-    assert decision.target.id == "target-safe"
-    assert decision.selection_reason == "error_fallback"
-    assert decision.fallback_reason == "error_fallback"
-    final_event = next(event for event in decision.trace if event["event"] == "final")
+    assert outcome.candidates == ()
+    assert outcome.target.id == "target-safe"
+    assert outcome.fallback_reason == "error_fallback"
+    assert outcome.failure_reason == outcome.waves[1].error
+    assert outcome.kind == "error_fallback"
+    final_event = events[-1]
     assert final_event["kind"] == "error_fallback"
     assert final_event["candidates"] == []
-
-
-# ---------------------------------------------------------------------------
-# 不变式 4：第二次请求仍执行被激活问题，再应用 sticky
-# ---------------------------------------------------------------------------
-
-
-def test_second_request_executes_questions_then_applies_sticky():
-    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
-    affinity = RecordingAffinity()
-    balancer = RecordingBalancer()
-
-    first, _jev1, _balancer1, _affinity1 = run_scenario(
-        "s1", tree=tree, affinity=affinity, balancer=balancer, session_id="session-1",
-    )
-    assert first.selection_reason == "target"
-    assert first.sticky_hit is False
-    assert affinity.puts and affinity.puts[-1]["policy_path"] == "power-target"
-    assert affinity.puts[-1]["target_id"] == "power-target"
-    first.release()
-
-    second, jev2, _balancer2, _affinity2 = run_scenario(
-        "s1", tree=tree, affinity=affinity, balancer=balancer, session_id="session-1",
-    )
-    # sticky 不跳过 JEV：第二次仍然执行了被激活的两个问题。
-    assert len(jev2.calls) == 1
-    assert [event["node_id"] for event in second.trace if event["event"] == "question"] == ["capability", "domain"]
-    assert second.sticky_hit is True
-    assert second.selection_reason == "sticky"
-    assert second.model == first.model == "qwen3.8-flash-sft"
-    assert second.policy_path == "power-target"
-    assert balancer.calls[-1]["preferred"] == "qwen3.8-flash-sft"
-    assert affinity.gets[-1]["touch"] is True
-    assert affinity.gets[-1]["policy_path"] == "power-target"
-    assert affinity.gets[-1]["allowed_models"] == ["qwen3.8-flash-sft"]
-    sticky_events = [event for event in second.trace if event["event"] == "sticky_hit"]
-    assert [machine_event(event) for event in sticky_events] == [{"event": "sticky_hit", "model": "qwen3.8-flash-sft"}]
-    assert sticky_events[0]["phase"] == "sticky"
-    assert [event["event"] for event in second.trace[-4:]] == ["final", "schedule", "sticky_hit", "scheduled"]
-    second.release()
-
-
-# ---------------------------------------------------------------------------
-# 不变式 5：统一兜底的 sticky 保留原 fallback_reason
-# ---------------------------------------------------------------------------
-
-
-def test_error_fallback_sticky_keeps_fallback_reason():
-    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
-    affinity = RecordingAffinity()
-    balancer = RecordingBalancer()
-
-    first, _jev, _balancer, _affinity = run_scenario(
-        "s5", tree=tree, affinity=affinity, balancer=balancer, session_id="fallback-session",
-    )
-    assert first.selection_reason == "error_fallback"
-    assert first.fallback_reason == "error_fallback"
-    assert first.target.id == "light-target"
-    first.release()
-
-    second, _jev2, _balancer2, _affinity2 = run_scenario(
-        "s5", tree=tree, affinity=affinity, balancer=balancer, session_id="fallback-session",
-    )
-    assert second.selection_reason == "sticky"
-    assert second.sticky_hit is True
-    assert second.fallback_reason == "error_fallback"
-    assert second.target.id == "light-target"
-    assert second.model == "qwen3-8b"
-    second.release()
-
-
-def test_no_candidate_fallback_sticky_keeps_cause():
-    nodes = [
-        node("start", "start"),
-        node("t-safe", "target", priority=1, models=[{"model": "deepseek-v3"}]),
-    ]
-    tree_sticky = {"enabled": True, "ttl_seconds": 60}
-    affinity = RecordingAffinity()
-    balancer = RecordingBalancer()
-
-    first, jev, _balancer, _affinity = run_custom(
-        nodes, [],
-        error_fallback="t-safe",
-        sticky=tree_sticky,
-        session_id="otherwise-session",
-        affinity=affinity,
-        balancer=balancer,
-    )
-    assert jev.calls == []
-    assert first.selection_reason == "error_fallback"
-    assert first.fallback_reason == "error_fallback"
-    assert first.candidates == ()
-    final_event = next(event for event in first.trace if event["event"] == "final")
-    assert final_event["kind"] == "otherwise"
-    assert final_event["candidates"] == []
-    first.release()
-
-    second, _jev2, _balancer2, _affinity2 = run_custom(
-        nodes, [],
-        error_fallback="t-safe",
-        sticky=tree_sticky,
-        session_id="otherwise-session",
-        affinity=affinity,
-        balancer=balancer,
-    )
-    assert second.selection_reason == "sticky"
-    assert second.sticky_hit is True
-    assert second.fallback_reason == "error_fallback"
-    assert second.model == "deepseek-v3"
-    second.release()
-
-
-# ---------------------------------------------------------------------------
-# 不变式 6：dry-run 无副作用，trace 与 decision 一致
-# ---------------------------------------------------------------------------
-
-
-def test_dry_run_writes_nothing_and_trace_matches_decision():
-    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
-    affinity = RecordingAffinity()
-    balancer = RecordingBalancer()
-
-    decision, jev, _balancer, _affinity = run_scenario(
-        "s1", tree=tree, dry_run=True, session_id="dry-session",
-        affinity=affinity, balancer=balancer,
-    )
-    assert len(jev.calls) == 1
-    assert affinity.puts == []
-    assert affinity.gets and affinity.gets[-1]["touch"] is False
-    assert balancer.calls[-1]["dry_run"] is True
-    assert all(balancer.inflight(model) == 0 for model in MODELS)
-    scheduled = [event for event in decision.trace if event["event"] == "scheduled"]
-    assert scheduled[-1]["dry_run"] is True
-
-    final_event = next(event for event in decision.trace if event["event"] == "final")
-    assert final_event["candidates"] == [
-        {
-            "target_id": candidate.target_id,
-            "priority": candidate.priority,
-            "via_node": candidate.via_node,
-            "via_port": candidate.via_port,
-            "wave": candidate.wave,
-        }
-        for candidate in decision.candidates
-    ]
-    wave_events = [event for event in decision.trace if event["event"] == "wave"]
-    assert [
-        (event["wave"], tuple(event["questions"]), event["failed"], event["error"])
-        for event in wave_events
-    ] == [
-        (wave.wave, wave.questions, wave.failed, wave.error)
-        for wave in decision.waves
-    ]
-    assert [(wave.wave, wave.questions) for wave in decision.waves] == [(1, ("capability", "domain"))]
-    assert {(event["wave"], event["node_id"], event["via_port"])
-            for event in decision.trace if event["event"] == "activate"} == {
-        (0, "capability", "in_1"),
-        (0, "domain", "in_1"),
-        (1, "power-target", "in_1"),
-        (1, "strong-target", "in_1"),
-    }
-    decision.release()
-    decision.release()
-    assert all(balancer.inflight(model) == 0 for model in MODELS)
 
 
 # ---------------------------------------------------------------------------
@@ -816,13 +676,13 @@ def test_dry_run_writes_nothing_and_trace_matches_decision():
 
 
 def test_node_and_edge_reordering_do_not_change_result():
-    baseline, _jev, _balancer, _affinity = run_scenario("s1")
+    baseline, _jev, _baseline_events = run_evaluate("s1")
     reversed_root = {
         **POWER_GRAPH,
         "nodes": list(reversed(POWER_GRAPH["nodes"])),
         "edges": list(reversed(POWER_GRAPH["edges"])),
     }
-    reordered, _jev2, _balancer2, _affinity2 = run_scenario("s1", tree=power_tree(root=reversed_root))
+    reordered, _jev2, reordered_events = run_evaluate("s1", tree=power_tree(root=reversed_root))
 
     assert reordered.target.id == baseline.target.id == "power-target"
     assert reordered.candidates == baseline.candidates
@@ -835,69 +695,17 @@ def test_node_and_edge_reordering_do_not_change_result():
         Candidate("strong-target", 3, "capability", "in_1", 1),
     )
 
-    def ordering(decision):
+    def ordering(events):
         return [
             (event["event"], event.get("node_id"), event.get("port"), event.get("status"))
-            for event in decision.trace
+            for event in events
             if event["event"] in {"slot", "gate", "activate", "question"}
         ]
 
-    assert ordering(reordered) == ordering(baseline)
-    assert [event["node_id"] for event in reordered.trace if event["event"] == "question"] == [
+    assert ordering(reordered_events) == ordering(_baseline_events)
+    assert [event["node_id"] for event in reordered_events if event["event"] == "question"] == [
         "capability", "domain",
     ]
-
-
-# ---------------------------------------------------------------------------
-# 不变式 8：首选 target 熔断 → NoAvailableBackend，不改选次优 priority
-# ---------------------------------------------------------------------------
-
-
-class _OpenBreaker:
-    def __init__(self, *models):
-        self.open_models = set(models)
-
-    def is_open(self, model):
-        return model in self.open_models
-
-
-def test_preferred_target_circuit_open_does_not_fall_to_next_priority():
-    balancer = RecordingBalancer(_OpenBreaker("qwen3.8-flash-sft"))
-    with pytest.raises(NoAvailableBackend):
-        run_scenario("s1", balancer=balancer)
-    # 只在最终 target 内调度；没有任何 acquire 尝试，更不会改选 strong-target(p3)。
-    assert balancer.calls == []
-
-
-def test_fallback_model_without_backend_fails_closed():
-    nodes = [
-        node("start", "start"),
-        node("t-safe", "target", priority=1, models=[{"model": "unregistered-model"}]),
-    ]
-    balancer = RecordingBalancer()
-    with pytest.raises(NoAvailableBackend):
-        run_custom(nodes, [], error_fallback="t-safe", balancer=balancer)
-    assert balancer.calls == []
-
-
-def test_no_available_backend_keeps_schedule_trace_without_acquire_or_affinity_read():
-    trace = []
-    balancer = RecordingBalancer(_OpenBreaker("qwen3.8-flash-sft"))
-    affinity = RecordingAffinity()
-    tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
-
-    with pytest.raises(NoAvailableBackend):
-        run_scenario(
-            "s1", tree=tree, session_id="session-1", balancer=balancer,
-            affinity=affinity, trace_sink=trace,
-        )
-
-    assert balancer.calls == []
-    assert affinity.gets == []
-    assert trace[-1]["event"] == "schedule"
-    assert trace[-1]["available_models"] == []
-    assert trace[-1]["unavailable"] == {"qwen3.8-flash-sft": "breaker_open"}
-    assert trace[-1]["sticky"] == {"status": "not_checked", "preferred_model": None}
 
 
 # ---------------------------------------------------------------------------
@@ -917,15 +725,15 @@ def test_score_question_fills_value_and_feeds_numeric_gate():
         edge("e-start-q", "start", "out", "q", "in_1"),
         edge("e-q-high", "q", "value", "t-high", "in_1", {"op": "gt", "value": 5}),
     ]
-    decision, _jev, _balancer, _affinity = run_custom(
+    outcome, _jev, events = evaluate_custom(
         nodes, edges,
         error_fallback="t-safe",
         scenario={"answers": {"q": {"value": 7.5}}},
     )
-    question_event = next(event for event in decision.trace if event["event"] == "question")
+    question_event = next(event for event in events if event["event"] == "question")
     assert question_event["ports"] == {"value": 7.5}
-    assert decision.target.id == "t-high"
-    assert decision.candidates == (Candidate("t-high", 1, "q", "in_1", 1),)
+    assert outcome.target.id == "t-high"
+    assert outcome.candidates == (Candidate("t-high", 1, "q", "in_1", 1),)
 
 
 class _PartialJev:
@@ -952,21 +760,20 @@ def test_wave_with_partial_answers_is_voided_without_filling_ports():
         edge("e-start-q2", "start", "out", "q2", "in_1"),
     ]
     tree = custom_tree(nodes, edges, error_fallback="t-safe")
-    balancer = RecordingBalancer()
-    engine = GraphExecutionEngine(_PartialJev(), RecordingAffinity(), balancer)
-    decision = asyncio.run(engine.route(
+    trace = []
+    outcome = asyncio.run(GraphEvaluator(_PartialJev()).evaluate(
         make_snapshot(tree, periods=[]),
         RoutingRequest("请求"),
         now=NOW,
+        trace_sink=trace,
     ))
-    assert len(decision.waves) == 1
-    assert decision.waves[0].failed is True
-    assert decision.waves[0].questions == ("q1", "q2")
-    assert decision.answers == {}
-    assert not [event for event in decision.trace if event["event"] == "question"]
-    assert decision.candidates == ()
-    assert decision.target.id == "t-safe"
-    decision.release()
+    assert len(outcome.waves) == 1
+    assert outcome.waves[0].failed is True
+    assert outcome.waves[0].questions == ("q1", "q2")
+    assert outcome.answers == {}
+    assert not [event for event in trace if event["event"] == "question"]
+    assert outcome.candidates == ()
+    assert outcome.target.id == "t-safe"
 
 
 def test_multiple_true_slots_use_smallest_numeric_slot_as_via():
@@ -981,14 +788,14 @@ def test_multiple_true_slots_use_smallest_numeric_slot_as_via():
         edge("e-start-t", "start", "out", "t", "in_2"),
         edge("e-cond-t", "cond", "out", "t", "in_1"),
     ]
-    decision, _jev, _balancer, _affinity = run_custom(
+    outcome, _jev, events = evaluate_custom(
         nodes, edges,
         error_fallback="t-safe",
         text="命中",
     )
-    assert decision.candidates == (Candidate("t", 1, "cond", "in_1", 0),)
+    assert outcome.candidates == (Candidate("t", 1, "cond", "in_1", 0),)
     activation = next(
-        event for event in decision.trace
+        event for event in events
         if event["event"] == "activate" and event["node_id"] == "t"
     )
     assert activation["via_port"] == "in_1"
@@ -1012,60 +819,19 @@ def test_higher_priority_number_wins_and_candidates_sort_descending():
         edge("e-q-low", "q", "selected.strong", "t-low", "in_1"),
         edge("e-q-high", "q", "selected.strong", "t-high", "in_1"),
     ]
-    decision, _jev, _balancer, _affinity = run_custom(
+    outcome, _jev, events = evaluate_custom(
         nodes, edges,
         error_fallback="t-low",
         scenario={"answers": {"q": {"probs": {"easy": 0.1, "strong": 0.9}}}},
     )
 
-    assert decision.target.id == "t-high"
-    assert decision.candidates == (
+    assert outcome.target.id == "t-high"
+    assert outcome.candidates == (
         Candidate("t-high", 5, "q", "in_1", 1),
         Candidate("t-low", 1, "q", "in_1", 1),
     )
-    final_event = next(event for event in decision.trace if event["event"] == "final")
+    final_event = events[-1]
     assert final_event["priority"] == 5
     assert [candidate["target_id"] for candidate in final_event["candidates"]] == [
         "t-high", "t-low",
     ]
-
-
-def test_sticky_shared_model_keeps_original_target_reasoning():
-    nodes = [
-        node("start", "start"),
-        node("q", "question", question_type="choice", instructions="选择能力",
-             options=choice_options("easy", "strong")),
-        node("t-low", "target", priority=1,
-             models=[{"model": "qwen3-8b", "reasoning": "low"}]),
-        node("t-high", "target", priority=5,
-             models=[{"model": "qwen3-8b", "reasoning": "high"}]),
-    ]
-    edges = [
-        edge("e-start-q", "start", "out", "q", "in_1"),
-        edge("e-q-low", "q", "selected.easy", "t-low", "in_1"),
-        edge("e-q-high", "q", "selected.strong", "t-high", "in_1"),
-    ]
-    scenario = {"answers": {"q": {"probs": {"easy": 0.1, "strong": 0.9}}}}
-    affinity = RecordingAffinity()
-    balancer = RecordingBalancer()
-    options = dict(
-        error_fallback="t-low", scenario=scenario,
-        sticky={"enabled": True, "ttl_seconds": 60}, session_id="shared-model",
-        affinity=affinity, balancer=balancer,
-    )
-
-    first, _jev1, _balancer1, _affinity1 = run_custom(nodes, edges, **options)
-    assert first.target.id == "t-high"
-    assert first.model == "qwen3-8b"
-    assert first.reasoning == "high"
-    assert affinity.puts[-1]["target_id"] == "t-high"
-    first.release()
-
-    second, _jev2, _balancer2, _affinity2 = run_custom(nodes, edges, **options)
-    assert second.target.id == "t-high"
-    assert second.model == "qwen3-8b"
-    assert second.reasoning == "high"
-    assert second.sticky_hit is True
-    assert second.selection_reason == "sticky"
-    assert balancer.calls[-1]["preferred"] == "qwen3-8b"
-    second.release()

@@ -22,9 +22,12 @@ from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.request_logging import LOG_COLUMNS, RequestLogger
 from router.routing.affinity import SessionAffinity
-from router.routing.graph.engine import GraphExecutionEngine
+from router.routing.graph.compiled import compile_graph
+from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.tree import tree_from_dict
 from router.routing.scheduler import LoadBalancer
+from router.routing.scheduling import ModelScheduler
+from router.routing.service import RoutingService
 from router.routing.snapshot import build_snapshot
 from router.store.db import connect, migrate
 from router.upstream.breaker import CircuitBreaker
@@ -233,8 +236,9 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
     app.state.balancer = RecordingBalancer(app.state.breaker)
     app.state.affinity = SessionAffinity()
     app.state.jev_client = JevClient(app.state.http)
-    app.state.engine = GraphExecutionEngine(
-        app.state.jev_client, app.state.affinity, app.state.balancer,
+    app.state.routing_service = RoutingService(
+        GraphEvaluator(app.state.jev_client),
+        ModelScheduler(app.state.affinity, app.state.balancer),
     )
     app.state.requestlog = RequestLogger(app.state.settings.db_path)
     backends = {
@@ -254,6 +258,7 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
     app.state.snapshot = build_snapshot(
         tree=tree, backends=backends, time_periods=[],
         jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+        compiled=compile_graph(tree.root) if tree is not None else None,
     )
     app.include_router(router, prefix="/v1")
     return app
@@ -519,13 +524,15 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
                 "x": node["position"]["x"] + 40,
                 "y": node["position"]["y"] + 40,
             }
+        moved_tree = tree_from_dict(tree_dict(
+            "main", root=moved,
+            sticky={"enabled": True, "ttl_seconds": 1800},
+        ))
         moved_snapshot = build_snapshot(
-            tree=tree_from_dict(tree_dict(
-                "main", root=moved,
-                sticky={"enabled": True, "ttl_seconds": 1800},
-            )),
+            tree=moved_tree,
             backends=app.state.snapshot.backends, time_periods=[],
             jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+            compiled=compile_graph(moved_tree.root),
         )
         assert moved_snapshot.tree_revision == first_revision
         app.state.snapshot = moved_snapshot
@@ -713,7 +720,7 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
 
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
-        app.state.engine = BrokenEngine()
+        app.state.routing_service = BrokenEngine()
         response = await post(app)
 
         assert response.status_code == 503

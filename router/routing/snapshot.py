@@ -24,6 +24,7 @@ from router.routing.graph.compiled import CompiledGraph, compile_graph
 from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
+from router.routing.types import RoutingMiss
 from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
 from router.upstream.catalog import Backend, load_backends
@@ -47,6 +48,20 @@ class RoutingSnapshot:
     @property
     def tree_id(self) -> str | None:
         return self.tree.id if self.tree is not None else None
+
+    def require_compiled(self) -> CompiledGraph:
+        """Return the immutable topology compiled for this snapshot.
+
+        Snapshots published for an enabled graph always carry one.  A caller
+        that built a snapshot by hand must pass ``compile_graph(root)``; this
+        error makes the missing step explicit instead of silently rebuilding
+        per-request indexes.
+        """
+        if self.compiled is None:
+            raise RoutingMiss(
+                "snapshot has no compiled graph; build it with compile_graph(root)"
+            )
+        return self.compiled
 
 
 def model_capability(row: dict) -> str:

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from router.api.deps import get_conn, get_tree_repo
+from router.api.trace_presenter import present_trace
 from router.control.graphs import GraphPatch, GraphService, graph_parse_failed
 from router.control.validation import issues_payload, tree_issues
 from router.jev.config import JevConfigRepo
@@ -311,12 +312,15 @@ async def try_tree(
     # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
     warnings = issues_payload(tree_issues(conn, tree))
     snapshot = _try_snapshot(conn, tree)
+    trace: list[dict] = []
     try:
-        decision = await request.app.state.engine.route(
-            snapshot, RoutingRequest(text=text, session_id=session_id), now=now, dry_run=True
+        decision = await request.app.state.routing_service.route(
+            snapshot, RoutingRequest(text=text, session_id=session_id),
+            now=now, dry_run=True, trace_sink=trace,
         )
     except (RoutingMiss, NoAvailableBackend) as exc:
         raise HTTPException(503, detail=str(exc)) from exc
+    trace[:] = present_trace(trace)
     try:
         return {
             "outcome": {

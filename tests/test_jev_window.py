@@ -18,7 +18,8 @@ from router.jev.window import (
     apply_window,
     estimate_tokens,
 )
-from router.routing.graph.engine import GraphExecutionEngine
+from router.routing.graph.compiled import compile_graph
+from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.tree import tree_from_dict
 from router.routing.snapshot import build_snapshot, read_jev_window
 from router.routing.types import RoutingRequest
@@ -266,42 +267,6 @@ def test_put_window_publishes_candidate_snapshot_with_new_values(tmp_path):
 
 # ── 路由引擎：截断生效 + trace ─────────────────────────────────────────
 
-class Lease:
-    def __init__(self, model, models=()):
-        self.model = model
-        self.selection = {
-            "available_models": list(models),
-            "unavailable": {},
-            "inflight": {name: 0 for name in models},
-        }
-
-    def release(self):
-        pass
-
-
-class Balancer:
-    def available(self, models):
-        return list(models)
-
-    def selection(self, models):
-        return {
-            "available_models": list(models),
-            "unavailable": {},
-            "inflight": {name: 0 for name in models},
-        }
-
-    def acquire(self, models, *, preferred=None, dry_run=False):
-        return Lease(preferred or models[0], models)
-
-
-class Affinity:
-    def get(self, *args, **kwargs):
-        return None
-
-    def put(self, *args, **kwargs):
-        pass
-
-
 class GraphJev:
     """Graph v3 决策服务替身：一次 choose_many 返回本波全部问题答案。"""
 
@@ -321,41 +286,47 @@ class GraphJev:
 
 def _snapshot(*, input_tokens=MIN_INPUT_TOKENS, context_tokens=DEFAULT_CONTEXT_TOKENS):
     jev_settings = JevSettings("http://jev.test", "d1-2B", "", 5, DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE)
+    tree = tree_from_dict(tree_dict(enabled=True))
     return build_snapshot(
-        tree=tree_from_dict(tree_dict(enabled=True)),
+        tree=tree,
         backends={"fast": Backend(url="http://fast.test", headers={}, upstream_name="fast")},
         time_periods=[],
         jev=jev_settings,
         capabilities={"fast": "简单请求"},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
+        compiled=compile_graph(tree.root),
     )
 
 
-def test_engine_truncates_jev_input_and_traces_it():
+def test_evaluator_truncates_jev_input_and_traces_it():
     snap = _snapshot(input_tokens=MIN_INPUT_TOKENS)
     jev = GraphJev()
-    engine = GraphExecutionEngine(jev, Affinity(), Balancer())
-    long_text = "国网营销数字化改造项目背景。" * 500
-    decision = asyncio.run(engine.route(snap, RoutingRequest(long_text, session_id="s1"), dry_run=False))
+    trace = []
+    asyncio.run(GraphEvaluator(jev).evaluate(
+        snap, RoutingRequest("国网营销数字化改造项目背景。" * 500, session_id="s1"),
+        trace_sink=trace,
+    ))
 
     sent = jev.calls[0]["text"]
     assert estimate_tokens(sent) <= MIN_INPUT_TOKENS
-    window_events = [item for item in decision.trace if item["event"] == "window"]
+    window_events = [item for item in trace if item["event"] == "window"]
     assert len(window_events) == 1
     assert window_events[0]["truncated"] is True
     assert window_events[0]["tokens_before"] > MIN_INPUT_TOKENS
 
 
-def test_engine_leaves_short_input_alone():
+def test_evaluator_leaves_short_input_alone():
     snap = _snapshot()
     jev = GraphJev()
-    engine = GraphExecutionEngine(jev, Affinity(), Balancer())
-    decision = asyncio.run(engine.route(snap, RoutingRequest("你好", session_id="s2"), dry_run=False))
+    trace = []
+    asyncio.run(GraphEvaluator(jev).evaluate(
+        snap, RoutingRequest("你好", session_id="s2"), trace_sink=trace,
+    ))
 
     assert jev.calls[0]["text"] == "你好"
     # 冻结契约：window 事件总会发出，未截断时 truncated=False 且 token 前后一致。
-    window_events = [item for item in decision.trace if item["event"] == "window"]
+    window_events = [item for item in trace if item["event"] == "window"]
     assert len(window_events) == 1
     assert window_events[0]["truncated"] is False
     assert window_events[0]["tokens_before"] == window_events[0]["tokens_after"]

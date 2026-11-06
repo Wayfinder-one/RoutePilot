@@ -1,19 +1,26 @@
-"""Graph v3 execution engine: three-valued fixed point, deterministic slots, waves.
+"""Graph evaluation: three-valued fixed point, deterministic slots, waves.
 
-The engine is a pure decision pipeline over an immutable ``RoutingSnapshot``:
-condition nodes are evaluated once, logic gates converge before every activation
-scan, every edge slot is re-evaluated (and traced) once per round, and all
-questions activated in the same round are merged into one ``choose_many`` call.
+``GraphEvaluator`` is a pure decision pipeline over an immutable
+``RoutingSnapshot``.  It owns graph semantics only: condition initialisation,
+gate fixed points, slot traces, question activation, wave staging, candidate
+priority and target selection.  It never reads session affinity, never acquires
+a lease and never emits scheduling/presentation events.
+
 A failed wave voids the whole round (no port fills, all candidates discarded)
-and routes to ``error_fallback``.
+and routes to ``error_fallback``.  JEV calls catch only ``JevError``; a
+programming defect (for example a malformed question built from an invalid
+graph) propagates unchanged.
 
-Trace events are the console replay contract defined in spec §3.9.
+Trace events are the console replay contract defined in spec §3.9.  They carry
+machine fields only; human-readable presentation is applied at the API edge.
 """
 from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from zoneinfo import ZoneInfo
 
 from router.jev.client import (
@@ -36,33 +43,46 @@ from router.routing.graph.model import (
     StartNode,
     TargetNode,
 )
-from router.routing.graph.ports import output_ports, slot_sort_key
-from router.routing.graph.trace_display import describe_graph_event
 from router.routing.snapshot import RoutingSnapshot
 from router.routing.types import (
     Candidate,
     NoActiveTreeError,
-    NoAvailableBackend,
-    RoutingDecision,
     RoutingMiss,
     RoutingRequest,
     WaveTrace,
-    session_digest,
 )
 
 _MAX_WAVES = 32
 _ANSWER_TYPES = {"choice": ChoiceAnswer, "noul": NoulAnswer, "score": ScoreAnswer}
 
 
-class _TraceEmitter:
-    """Decorate events as they enter the caller-owned trace list."""
+@dataclass(frozen=True)
+class GraphOutcome:
+    """The complete graph decision before any scheduling concern.
 
-    def __init__(self, events: list[dict], *, has_time_period: bool):
-        self.events = events
-        self.has_time_period = has_time_period
+    ``fallback_reason`` keeps the externally visible value (``error_fallback``)
+    for both a failed wave and a normal run without an activated target.
+    ``failure_reason`` is diagnostics only (the failed wave's error text).
+    """
 
-    def append(self, event: dict) -> None:
-        self.events.append(describe_graph_event(event, has_time_period=self.has_time_period))
+    target: TargetNode
+    candidates: tuple[Candidate, ...]
+    waves: tuple[WaveTrace, ...]
+    answers: Mapping[str, JevAnswer]
+    fallback_reason: str | None
+    failure_reason: str | None
+
+    @property
+    def kind(self) -> str:
+        """Trace ``final`` kind: failed wave / activated target / no candidate."""
+        if self.failure_reason is not None:
+            return "error_fallback"
+        return "target" if self.candidates else "otherwise"
+
+    @property
+    def selection_reason(self) -> str:
+        """Public selection reason before sticky is applied."""
+        return "target" if self.fallback_reason is None else "error_fallback"
 
 
 def combine_gate(operator, values):
@@ -115,45 +135,27 @@ def _answer_ports(node: QuestionNode, answer: JevAnswer) -> dict:
     raise JevError(f"unsupported JEV answer type {type(answer).__name__}")
 
 
-class GraphExecutionEngine:
-    def __init__(self, jev_client, affinity, balancer):
+class GraphEvaluator:
+    def __init__(self, jev_client):
         self.jev_client = jev_client
-        self.affinity = affinity
-        self.balancer = balancer
 
-    async def route(
+    async def evaluate(
         self,
         snapshot: RoutingSnapshot,
         request: RoutingRequest,
         *,
         now: datetime | None = None,
-        dry_run: bool = False,
         trace_sink: list[dict] | None = None,
-    ) -> RoutingDecision:
+    ) -> GraphOutcome:
         events: list[dict] = [] if trace_sink is None else trace_sink
         if snapshot.tree is None:
             raise NoActiveTreeError("no routing tree is enabled")
         tree = snapshot.tree
-        root = tree.root
-        nodes = {node.id: node for node in root.nodes}
-        has_time_period = bool(snapshot.time_periods) and any(
-            isinstance(node, ConditionNode) and node.source == "periods"
-            for node in nodes.values()
-        )
-        trace = _TraceEmitter(events, has_time_period=has_time_period)
-        node_order = sorted(nodes)
-        sorted_edges = sorted(
-            root.edges,
-            key=lambda edge: (
-                edge.target,
-                slot_sort_key(edge.target_port),
-                edge.source,
-                edge.source_port,
-            ),
-        )
-        incoming: dict[str, list[Edge]] = {node_id: [] for node_id in node_order}
-        for edge in sorted_edges:
-            incoming[edge.target].append(edge)
+        compiled = snapshot.require_compiled()
+        nodes = compiled.nodes
+        node_order = compiled.node_order
+        sorted_edges = compiled.edges
+        incoming = compiled.incoming
 
         # 1. time / window: apply_window runs exactly once per request.
         timezone = ZoneInfo(tree.timezone)
@@ -164,9 +166,9 @@ class GraphExecutionEngine:
         else:
             local_now = now.astimezone(timezone)
         active_periods = matching_periods(local_now, list(snapshot.time_periods))
-        trace.append({"event": "time", "active_periods": active_periods, "timezone": tree.timezone})
+        events.append({"event": "time", "active_periods": active_periods, "timezone": tree.timezone})
         window = apply_window(request.text, snapshot.jev_input_tokens)
-        trace.append({
+        events.append({
             "event": "window",
             "tokens_before": window.tokens_before,
             "tokens_after": window.tokens_after,
@@ -175,7 +177,7 @@ class GraphExecutionEngine:
 
         # 2. initialise every output port to UNKNOWN (None); start.out is the sole true seed.
         ports: dict[str, dict[str, object]] = {
-            node_id: {port.name: None for port in output_ports(nodes[node_id])}
+            node_id: {port_name: None for port_name in compiled.ports[node_id]}
             for node_id in node_order
         }
         for node_id in node_order:
@@ -193,7 +195,7 @@ class GraphExecutionEngine:
                 matched = [name for name in node.periods if name in active_periods]
             value = bool(matched)
             ports[node_id]["out"] = value
-            trace.append({
+            events.append({
                 "event": "condition",
                 "node_id": node_id,
                 "source": node.source,
@@ -214,16 +216,16 @@ class GraphExecutionEngine:
         wave = 0
         self._resolve_gates(
             wave=wave, nodes=nodes, node_order=node_order, incoming=incoming,
-            ports=ports, gates=gates, trace=trace,
+            ports=ports, gates=gates, events=events,
         )
         round_results = self._trace_slots(
-            wave=wave, nodes=nodes, edges=sorted_edges, ports=ports, trace=trace,
+            wave=wave, nodes=nodes, edges=sorted_edges, ports=ports, events=events,
         )
         queue = self._activate(
             wave=wave, nodes=nodes, node_order=node_order, incoming=incoming,
             round_results=round_results, candidates=candidates,
             activated_questions=activated_questions, executed_questions=executed_questions,
-            trace=trace,
+            events=events,
         )
 
         # 6. wave loop: one merged decision call per wave, then another fixed-point round.
@@ -242,11 +244,11 @@ class GraphExecutionEngine:
                 staged_ports, staged_answers = self._stage_answers(
                     queue, nodes, questions, raw_answers,
                 )
-            except Exception as exc:  # whole wave is void on any failure
+            except JevError as exc:  # only JEV failures void the wave; defects propagate
                 duration_ms = (time.monotonic() - started) * 1000
                 reason = str(exc) or type(exc).__name__
                 waves.append(WaveTrace(wave, tuple(queue), duration_ms, True, reason))
-                trace.append({
+                events.append({
                     "event": "wave",
                     "wave": wave,
                     "questions": list(queue),
@@ -265,7 +267,7 @@ class GraphExecutionEngine:
                 answers[node_id] = staged_answers[node_id]
                 executed_questions.add(node_id)
             waves.append(WaveTrace(wave, tuple(queue), duration_ms, False, None))
-            trace.append({
+            events.append({
                 "event": "wave",
                 "wave": wave,
                 "questions": list(queue),
@@ -274,30 +276,29 @@ class GraphExecutionEngine:
                 "error": None,
             })
             for node_id in queue:
-                trace.append(self._question_event(
+                events.append(self._question_event(
                     wave, nodes[node_id], staged_answers[node_id], staged_ports[node_id],
                 ))
             self._resolve_gates(
                 wave=wave, nodes=nodes, node_order=node_order, incoming=incoming,
-                ports=ports, gates=gates, trace=trace,
+                ports=ports, gates=gates, events=events,
             )
             round_results = self._trace_slots(
-                wave=wave, nodes=nodes, edges=sorted_edges, ports=ports, trace=trace,
+                wave=wave, nodes=nodes, edges=sorted_edges, ports=ports, events=events,
             )
             queue = self._activate(
                 wave=wave, nodes=nodes, node_order=node_order, incoming=incoming,
                 round_results=round_results, candidates=candidates,
                 activated_questions=activated_questions, executed_questions=executed_questions,
-                trace=trace,
+                events=events,
             )
 
         # 7. One fallback target handles both a failed wave and a normal run
         # with no activated target. The trace kind keeps the cause for replay,
         # while the public selection reason is always error_fallback.
         if failed:
-            target = self._required_target(nodes, root.error_fallback, "error_fallback")
+            target = self._required_target(nodes, tree.root.error_fallback, "error_fallback")
             kind = "error_fallback"
-            selection_reason = "error_fallback"
             fallback_reason: str | None = "error_fallback"
             final_candidates: tuple[Candidate, ...] = ()
         elif candidates:
@@ -307,22 +308,20 @@ class GraphExecutionEngine:
             winner = final_candidates[0]
             target = nodes[winner.target_id]
             kind = "target"
-            selection_reason = "target"
             fallback_reason = None
         else:
-            target = self._required_target(nodes, root.error_fallback, "error_fallback")
+            target = self._required_target(nodes, tree.root.error_fallback, "error_fallback")
             kind = "otherwise"
-            selection_reason = "error_fallback"
             fallback_reason = "error_fallback"
             final_candidates = ()
         if failed:
             # 失败原因先于 final 记录（§3.9 事件顺序：fallback → final）。
-            trace.append({
+            events.append({
                 "event": "fallback",
                 "target_id": target.id,
                 "reason": failure_reason,
             })
-        trace.append({
+        events.append({
             "event": "final",
             "target_id": target.id,
             "kind": kind,
@@ -338,104 +337,18 @@ class GraphExecutionEngine:
             ],
             "priority": target.priority,
         })
-
-        # 8. sticky (read only after the graph decided) → schedule → acquire → write affinity.
-        configured_models = [item.model for item in target.models]
-        models = [item.model for item in target.models if item.model in snapshot.backends]
-        unregistered = {
-            model: "unregistered" for model in configured_models if model not in snapshot.backends
-        }
-        policy_path = target.id
-        preferred: str | None = None
-        sticky_hit = False
-        if not tree.sticky.enabled:
-            sticky_status = "disabled"
-        elif not request.session_id:
-            sticky_status = "no_session"
-        else:
-            sticky_status = "not_checked"
-
-        def append_schedule(selection):
-            trace.append({
-                "event": "schedule",
-                "target_id": target.id,
-                "strategy": target.strategy,
-                "configured_models": list(configured_models),
-                "registered_models": list(models),
-                "available_models": list(selection.get("available_models", [])),
-                "unavailable": {**unregistered, **selection.get("unavailable", {})},
-                "inflight": dict(selection.get("inflight", {})),
-                "sticky": {"status": sticky_status, "preferred_model": preferred},
-            })
-
-        initial_selection = self.balancer.selection(models)
-        available = list(initial_selection["available_models"])
-        if not available:
-            append_schedule(initial_selection)
-            raise NoAvailableBackend(f"target {target.id!r} has no available backend")
-
-        if tree.sticky.enabled and request.session_id:
-            sticky_status = "miss"
-            hit = self.affinity.get(
-                request.session_id,
-                tree_revision=snapshot.tree_revision,
-                policy_path=policy_path,
-                allowed_models=available,
-                touch=not dry_run,
-            )
-            if hit is not None and hit[1] == target.id and hit[0] in available:
-                preferred = hit[0]
-                sticky_hit = True
-                sticky_status = "hit"
-                selection_reason = "sticky"
-
-        try:
-            lease = self.balancer.acquire(models, preferred=preferred, dry_run=dry_run)
-        except NoAvailableBackend as exc:
-            append_schedule(exc.selection)
-            raise
-        append_schedule(lease.selection)
-        model = lease.model
-        reasoning = next(
-            (item.reasoning for item in target.models if item.model == model),
-            None,
-        )
-        if sticky_hit:
-            trace.append({"event": "sticky_hit", "model": model})
-        if tree.sticky.enabled and request.session_id and not dry_run:
-            self.affinity.put(
-                request.session_id,
-                model,
-                target_id=target.id,
-                tree_revision=snapshot.tree_revision,
-                policy_path=policy_path,
-                ttl_seconds=tree.sticky.ttl_seconds,
-            )
-        trace.append({
-            "event": "scheduled",
-            "model": model,
-            "reason": selection_reason,
-            "dry_run": dry_run,
-        })
-        return RoutingDecision(
-            model=model,
+        return GraphOutcome(
             target=target,
-            reasoning=reasoning,
-            policy_path=policy_path,
-            trace=events,
-            sticky_hit=sticky_hit,
-            selection_reason=selection_reason,
-            session_hash=session_digest(request.session_id),
-            lease=lease,
             candidates=final_candidates,
             waves=tuple(waves),
-            answers=dict(answers),
+            answers=MappingProxyType(dict(answers)),
             fallback_reason=fallback_reason,
+            failure_reason=failure_reason,
         )
 
     # ------------------------------------------------------------------ internals
 
-    def _resolve_gates(self, *, wave, nodes, node_order, incoming, ports, gates, trace):
+    def _resolve_gates(self, *, wave, nodes, node_order, incoming, ports, gates, events):
         """Fixed-point three-valued gate evaluation until no gate changes."""
         changed = True
         while changed:
@@ -461,7 +374,7 @@ class GraphExecutionEngine:
                     continue
                 gates[node_id] = bool(value)
                 ports[node_id]["out"] = bool(value)
-                trace.append({
+                events.append({
                     "event": "gate",
                     "wave": wave,
                     "node_id": node_id,
@@ -471,14 +384,14 @@ class GraphExecutionEngine:
                 })
                 changed = True
 
-    def _trace_slots(self, *, wave, nodes, edges, ports, trace) -> dict[tuple[str, str], ConditionResult]:
+    def _trace_slots(self, *, wave, nodes, edges, ports, events) -> dict[tuple[str, str], ConditionResult]:
         """Evaluate every edge slot once for this round and write one trace event each."""
         results: dict[tuple[str, str], ConditionResult] = {}
         for edge in edges:
             raw = ports[edge.source][edge.source_port]
             result = evaluate_condition(edge, nodes[edge.source], raw)
             results[(edge.target, edge.target_port)] = result
-            trace.append({
+            events.append({
                 "event": "slot",
                 "wave": wave,
                 "edge_id": edge.id,
@@ -494,7 +407,7 @@ class GraphExecutionEngine:
 
     def _activate(
         self, *, wave, nodes, node_order, incoming, round_results, candidates,
-        activated_questions, executed_questions, trace,
+        activated_questions, executed_questions, events,
     ) -> list[str]:
         """Activate questions/targets whose OR slots contain at least one true slot."""
         queue: list[str] = []
@@ -508,7 +421,7 @@ class GraphExecutionEngine:
                     continue
                 activated_questions.add(node_id)
                 queue.append(node_id)
-                trace.append({
+                events.append({
                     "event": "activate",
                     "wave": wave,
                     "node_id": node_id,
@@ -527,7 +440,7 @@ class GraphExecutionEngine:
                     via_port=via.target_port,
                     wave=wave,
                 )
-                trace.append({
+                events.append({
                     "event": "activate",
                     "wave": wave,
                     "node_id": node_id,
@@ -536,7 +449,7 @@ class GraphExecutionEngine:
         return queue
 
     @staticmethod
-    def _first_true_slot(edges: list[Edge], round_results) -> Edge | None:
+    def _first_true_slot(edges, round_results) -> Edge | None:
         # ``edges`` is sorted by target slot number, so ties resolve to the smallest slot.
         for edge in edges:
             if round_results[(edge.target, edge.target_port)].value is True:

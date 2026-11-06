@@ -11,6 +11,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from router.api.trace_presenter import present_trace
 # 与 /admin/try 共用答案序列化契约：完整 answers 只进内存 ring / 试算响应，不进 SQLite。
 from router.jev.client import ChoiceAnswer
 from router.jev.serialization import answer_to_dict
@@ -403,6 +404,7 @@ async def chat_completions(request: Request):
             "facts": [[_label("原因", "Reason"), error_class]],
             "tone": "bad",
         })
+        trace[:] = present_trace(trace)
         requestlog.enqueue(_routing_failure_record(
             snapshot, text, session_id, trace,
             error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
@@ -413,7 +415,7 @@ async def chat_completions(request: Request):
     if snapshot is None:
         return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
     try:
-        decision = await request.app.state.engine.route(
+        decision = await request.app.state.routing_service.route(
             snapshot,
             RoutingRequest(text=text, session_id=session_id),
             trace_sink=trace,
@@ -434,6 +436,7 @@ async def chat_completions(request: Request):
         decision.release()
         return _error("no_available_backend", 503)
     upstream_body, reasoning_warning = prepare_upstream_request(body, backend, decision.reasoning)
+    trace[:] = present_trace(trace)
     record = _decision_record(request, decision, snapshot, body, text, reasoning_warning, routing_ms, started)
     requestlog.enqueue(record)
     outcome = _OutcomeRecorder(requestlog, record, started)

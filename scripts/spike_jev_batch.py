@@ -31,12 +31,11 @@ from router.jev.client import (  # noqa: E402
 )
 from router.jev.config import DEFAULT_STATE_TEMPLATE, JevSettings  # noqa: E402
 from router.jev.window import apply_window, estimate_tokens  # noqa: E402
-from router.routing.affinity import SessionAffinity  # noqa: E402
 from router.routing.graph.conditions import evaluate_condition  # noqa: E402
-from router.routing.graph.engine import GraphExecutionEngine  # noqa: E402
+from router.routing.graph.compiled import compile_graph  # noqa: E402
+from router.routing.graph.evaluator import GraphEvaluator  # noqa: E402
 from router.routing.graph.model import Condition, Edge, QuestionNode  # noqa: E402
 from router.routing.tree import tree_from_dict  # noqa: E402
-from router.routing.scheduler import LoadBalancer  # noqa: E402
 from router.routing.snapshot import build_snapshot  # noqa: E402
 from router.routing.types import RoutingRequest  # noqa: E402
 from router.upstream.catalog import Backend  # noqa: E402
@@ -294,6 +293,7 @@ def g3_snapshot(tree):
         tree=tree, backends={"mock": backend}, time_periods=[],
         jev=JevSettings("http://jev.test", "d1-2B"), capabilities={},
         jev_input_tokens=2048, jev_context_tokens=4096,
+        compiled=compile_graph(tree.root),
     )
 
 
@@ -323,23 +323,19 @@ def replay_g3(tree, text, records, *, strict_all):
         node.id: _as_decision(node) for node in tree.root.nodes
         if isinstance(node, QuestionNode)
     }
-    engine = GraphExecutionEngine(
-        ReplayJev(records, all_questions, strict_all), SessionAffinity(), LoadBalancer()
-    )
-    decision = asyncio.run(engine.route(
+    evaluator = GraphEvaluator(ReplayJev(records, all_questions, strict_all))
+    return asyncio.run(evaluator.evaluate(
         g3_snapshot(tree), RoutingRequest(text),
-        now=datetime.fromisoformat("2026-11-05T12:00:00+08:00"), dry_run=True,
+        now=datetime.fromisoformat("2026-11-05T12:00:00+08:00"),
     ))
-    decision.release()
-    return decision
 
 
-def route_outcome(decision, http_requests):
+def route_outcome(outcome, http_requests):
     return {
-        "target": decision.target_id,
-        "candidates": [item.target_id for item in decision.candidates],
-        "activated": tuple(decision.answers),
-        "failed": any(wave.failed for wave in decision.waves),
+        "target": outcome.target.id,
+        "candidates": [item.target_id for item in outcome.candidates],
+        "activated": tuple(outcome.answers),
+        "failed": any(wave.failed for wave in outcome.waves),
         "http_requests": http_requests,
     }
 
@@ -935,15 +931,13 @@ class LiveJev:
 
 def run_live_g3(tree, text, transport):
     live = LiveJev(transport, render_state(text))
-    engine = GraphExecutionEngine(live, SessionAffinity(), LoadBalancer())
-    decision = asyncio.run(engine.route(
+    outcome = asyncio.run(GraphEvaluator(live).evaluate(
         g3_snapshot(tree), RoutingRequest(text),
-        now=datetime.fromisoformat("2026-11-05T12:00:00+08:00"), dry_run=True,
+        now=datetime.fromisoformat("2026-11-05T12:00:00+08:00"),
     ))
-    decision.release()
     if live.abort is not None:
         raise live.abort
-    return decision, live.records
+    return outcome, live.records
 
 
 def _capacity_state():
@@ -1081,17 +1075,17 @@ def _packed_canvas(transport, state, questions, index):
 
 
 def _serial_canvas(tree, text, transport, index):
-    decision, records = run_live_g3(tree, text, transport)
+    outcome, records = run_live_g3(tree, text, transport)
     # I2：与 packed 同口径，画布延迟 = 各波 record.duration_ms 之和（throttle-free）。
     # 这里选择纯 duration_ms 求和，不额外加本地引擎开销，也不做“墙钟减去 request_count*sleep_seconds”
     # 的修正：引擎开销在真实请求前可忽略，且自定义/测试 transport 不一定有 sleep_seconds。
     latency_ms = sum(record.duration_ms for record in records)
-    failed = [wave for wave in decision.waves if wave.failed]
+    failed = [wave for wave in outcome.waves if wave.failed]
     error = (_safe_error(failed[-1].error) or "wave failed") if failed else None
     if not records:
         error = error or "no requests produced"
-    if len(decision.waves) == len(records):
-        successful = [record for wave, record in zip(decision.waves, records) if not wave.failed]
+    if len(outcome.waves) == len(records):
+        successful = [record for wave, record in zip(outcome.waves, records) if not wave.failed]
     else:
         successful = [record for record in records if record.status == 200]
     answered = 0

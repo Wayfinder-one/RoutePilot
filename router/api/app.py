@@ -23,9 +23,11 @@ from router.jev.config import JevConfigRepo, JevSettings
 from router.maintenance import MaintenanceWorker
 from router.request_logging import RequestLogger
 from router.routing.affinity import SessionAffinity
-from router.routing.graph.engine import GraphExecutionEngine
+from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.reloader import GraphReloadWorker
 from router.routing.scheduler import LoadBalancer
+from router.routing.scheduling import ModelScheduler
+from router.routing.service import RoutingService
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
 from router.store.repositories import SessionRepo, UserRepo, seed_default
@@ -172,8 +174,9 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.balancer = LoadBalancer(app.state.breaker)
     app.state.affinity = SessionAffinity(max_entries=settings.session_max_entries)
     app.state.jev_client = JevClient(app.state.http)
-    app.state.engine = GraphExecutionEngine(
-        app.state.jev_client, app.state.affinity, app.state.balancer,
+    app.state.routing_service = RoutingService(
+        GraphEvaluator(app.state.jev_client),
+        ModelScheduler(app.state.affinity, app.state.balancer),
     )
     app.state.requestlog = requestlog
 
