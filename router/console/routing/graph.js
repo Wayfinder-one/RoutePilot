@@ -1447,7 +1447,6 @@ export {
   graphOf,
   findNode,
   portsOf,
-  portsOf as ports,
   portOf,
   portDesc,
   nodeLabel,

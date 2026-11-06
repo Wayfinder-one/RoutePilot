@@ -5,7 +5,7 @@
     "playwright-core": "^1.40.0"
   },
   "scripts": {
-    "check:console": "node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs && node scripts/console_qa.mjs"
+    "check:console": "node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs && node scripts/console_qa.mjs"
   },
   "type": "module"
 }

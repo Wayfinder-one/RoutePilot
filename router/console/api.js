@@ -124,7 +124,6 @@ function esc(s) {
     .replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 function fmt(x) { return x == null || x === '' ? '—' : Number(x).toFixed(2); }
-function pct(x) { return x == null || x === '' ? '—' : Math.round(100 * Number(x)) + '%'; }
 function fmtTime(ts) {
   if (!ts) return '—';
   const d = new Date(ts);
