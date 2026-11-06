@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from router.api.issue_presenter import present_issue
 from router.jev.config import JevConfigRepo
 from router.routing.graph.validate import EnableContext, Issue, validate_graph_for_enable
 from router.routing.tree import RoutingTree
@@ -26,8 +27,24 @@ def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
 
 
 def issues_payload(issues) -> list[dict]:
-    """Issue 列表 → spec §5 的 422 载荷（dict of __dict__，全站唯一映射）。"""
-    return [dict(issue.__dict__) for issue in issues]
+    """Issue 列表 → spec §5 的 422 载荷（dict of 双语字段 + 机器定位）。
+
+    Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成，
+    控制台收到的键集合与重构前一致。
+    """
+    payload = []
+    for issue in issues:
+        message = present_issue(issue)
+        payload.append({
+            "code": issue.code,
+            "zh": message["zh"],
+            "en": message["en"],
+            "node_id": issue.node_id,
+            "edge_id": issue.edge_id,
+            "port": issue.port,
+            "level": issue.level,
+        })
+    return payload
 
 
 def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:

@@ -2,6 +2,13 @@
 
 Machine fields remain the routing/replay contract.  These optional fields let
 the console render graph events without the evaluator knowing about UI text.
+
+``has_time_period`` describes the *snapshot* (does this run have configured
+time periods at all?), so callers pass ``bool(snapshot.time_periods)``.  When
+it is omitted we fall back to inferring it from period-condition events, which
+keeps direct unit callers working but loses the information for graphs whose
+period conditions never get evaluated (a display-only edge case for
+``/admin/try`` drafts).
 """
 from __future__ import annotations
 
@@ -155,6 +162,11 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             _fact("原因", "Reason", event["reason"]),
         ]
         tone = "hit"
+    elif kind == "routing_error":
+        phase, label = "routing_error", _text("路由中止", "Routing stopped")
+        cell = summary = _text("路由失败", "Routing failed")
+        facts = [_fact("原因", "Reason", event["error_class"])]
+        tone = "bad"
 
     return {
         **event,
@@ -167,12 +179,17 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
     }
 
 
-def present_trace(events: list[dict]) -> list[dict]:
-    """Present raw machine events, leaving already-presented events untouched."""
-    has_time_period = any(
-        event.get("event") == "condition" and event.get("source") == "periods"
-        for event in events
-    )
+def present_trace(events: list[dict], *, has_time_period: bool | None = None) -> list[dict]:
+    """Present raw machine events, leaving already-presented events untouched.
+
+    ``has_time_period`` is the snapshot fact (``bool(snapshot.time_periods)``);
+    ``None`` infers it from period-condition events for direct callers.
+    """
+    if has_time_period is None:
+        has_time_period = any(
+            event.get("event") == "condition" and event.get("source") == "periods"
+            for event in events
+        )
     return [
         event if "phase" in event else present_trace_event(
             event, has_time_period=has_time_period,

@@ -571,3 +571,25 @@ def test_try_no_available_backend_is_still_503(client, app):
     assert engine.calls == 1
     assert app.state.snapshot.snapshot_revision == before_snapshot
     assert row_counts(app) == before_counts
+
+
+# ── 展示层（Task 7）：/admin/try 与 /v1 共用同一 trace presenter ────────
+
+
+def test_try_trace_events_carry_presentation_fields(client, app):
+    _engine, _jev, _balancer, _affinity = install_engine(app)
+
+    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": "抢修工单"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["trace"]
+    for event in body["trace"]:
+        assert _DISPLAY_FIELDS <= set(event), event["event"]
+        for field in ("label", "summary"):
+            assert event[field]["zh"] and event[field]["en"]
+        assert event["cell"] not in (None, "")
+        assert isinstance(event["facts"], list)
+        assert event["phase"]
+    assert body["trace"][-1]["event"] == "scheduled"
+    assert body["trace"][-1]["phase"] == "schedule"

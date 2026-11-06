@@ -5804,7 +5804,7 @@ test('calculation-log restored row states that detail is absent', async () => {
   }
 });
 
-test('calculation-log separates routing failure and legacy schedule fallback', async () => {
+test('calculation-log separates routing failure from a complete trace', async () => {
   const matcher = '**/admin/requests/recent';
   await page.route(matcher, route => route.fulfill({
     status: 200,
@@ -5816,14 +5816,31 @@ test('calculation-log separates routing failure and legacy schedule fallback', a
         routing_ms: 4, total_ms: 4, trace: [{
           event: 'routing_error', stage: 'schedule',
           error_class: 'no_available_backend', message: 'none',
+          phase: 'routing_error',
+          label: { zh: '路由中止', en: 'Routing stopped' },
+          cell: { zh: '路由失败', en: 'Routing failed' },
+          summary: { zh: '路由失败', en: 'Routing failed' },
+          facts: [[{ zh: '原因', en: 'Reason' }, 'no_available_backend']],
+          tone: 'bad',
         }],
       },
       {
-        id: 'legacy', ts: '2026-11-04T10:00:01+08:00', text: '旧记录',
+        id: 'scheduled', ts: '2026-11-04T10:00:01+08:00', text: '完整记录',
         model: 'fast', outcome_state: 'completed', routing_ms: 4, total_ms: 10,
+        route_label: { zh: '目标命中', en: 'Target selected' },
         trace: [
-          { event: 'final', target_id: 'safe', kind: 'target', candidates: [], priority: 1 },
-          { event: 'scheduled', model: 'fast', reason: 'target', dry_run: false },
+          { event: 'final', target_id: 'safe', kind: 'target', candidates: [], priority: 1,
+            phase: 'final',
+            label: { zh: '目标判定', en: 'Target selected' },
+            cell: { zh: '目标命中', en: 'Target matched' },
+            summary: { zh: '最终选择目标 safe。', en: 'Selected target safe.' },
+            facts: [[{ zh: '目标', en: 'Target' }, 'safe']], tone: 'hit' },
+          { event: 'scheduled', model: 'fast', reason: 'target', dry_run: false,
+            phase: 'schedule',
+            label: { zh: '模型调度', en: 'Model scheduling' },
+            cell: 'fast',
+            summary: { zh: '最终调度模型 fast。', en: 'Scheduled model fast.' },
+            facts: [[{ zh: '模型', en: 'Model' }, 'fast']], tone: 'hit' },
         ],
       },
     ] }),
@@ -5832,73 +5849,67 @@ test('calculation-log separates routing failure and legacy schedule fallback', a
     await page.goto(routerBase + '/console/logs.html');
     await page.locator('.lg-item[data-id="failed"] .lg-row').click();
     assert.equal(await page.locator('.lg-item[data-id="failed"] .lg-execution').count(), 0);
-    /* 图 v3 用 trace 事件分阶段渲染：路由失败落成 bad 状态 + routing_error 阶段，
-       不再显示旧的「执行结果」分节或 error_class 明细。 */
+    /* 服务端 presenter 已给出 phase 与文案；控制台只渲染这些字段。 */
     const routingFailed = await page.evaluate(() => window.t('logs.out.routing'));
     assertIncludes(await page.locator('.lg-item[data-id="failed"]').innerText(), routingFailed);
     assert.equal(await page.locator('.lg-item[data-id="failed"] .lg-status.bad').count(), 1);
-    await page.locator('.lg-item[data-id="legacy"] .lg-row').click();
-    const scheduled = await page.evaluate(() => window.t('logs.ev.scheduled'));
-    assertIncludes(await page.locator('.lg-item[data-id="legacy"]').innerText(), scheduled);
-    assert.equal(await page.locator('.lg-item[data-id="legacy"] .lg-status.bad').count(), 0);
+    await page.locator('.lg-item[data-id="scheduled"] .lg-row').click();
+    assertIncludes(await page.locator('.lg-item[data-id="scheduled"]').innerText(), '模型调度');
+    assert.equal(await page.locator('.lg-item[data-id="scheduled"] .lg-status.bad').count(), 0);
   } finally {
     await page.unroute(matcher);
   }
 });
-
-test('calculation-log route label keeps sticky separate from final kind', async () => {
+test('calculation-log renders the server route label verbatim', async () => {
   const matcher = '**/admin/requests/recent';
-  const makeRecord = (id, kind, sticky) => ({
+  const finalEvent = {
+    event: 'final', target_id: 'safe', kind: 'target', candidates: [], priority: 1,
+    phase: 'final',
+    label: { zh: '目标判定', en: 'Target selected' },
+    cell: { zh: '目标命中', en: 'Target matched' },
+    summary: { zh: '最终选择目标 safe。', en: 'Selected target safe.' },
+    facts: [[{ zh: '目标', en: 'Target' }, 'safe']], tone: 'hit',
+  };
+  const makeRecord = (id, routeLabel) => ({
     id,
     ts: '2026-11-04T10:00:00+08:00',
     text: id,
     model: 'fast',
     target_id: 'safe',
-    node_labels: { safe: { title: '安全目标', type: 'target' } },
-    selection_reason: sticky ? 'sticky' : kind === 'target' ? 'target' : 'error_fallback',
-    sticky_hit: sticky ? 1 : 0,
+    selection_reason: 'target',
+    sticky_hit: 0,
     outcome_state: 'completed',
     routing_ms: 4,
     total_ms: 10,
     waves: 1,
-    trace: [
-      { event: 'final', target_id: 'safe', kind, candidates: [], priority: 1 },
-      { event: 'scheduled', model: 'fast', reason: sticky ? 'sticky' : kind === 'target' ? 'target' : 'error_fallback', dry_run: false },
-    ],
+    route_label: routeLabel,
+    trace: [finalEvent],
   });
   await page.route(matcher, route => route.fulfill({
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify({ requests: [
-      makeRecord('target-sticky', 'target', true),
-      makeRecord('otherwise', 'otherwise', false),
-      makeRecord('error-sticky', 'error_fallback', true),
+      makeRecord('affinity', { zh: '会话粘性直达', en: 'Session affinity' }),
+      makeRecord('fallback', { zh: '默认目标兜底', en: 'Default target fallback' }),
     ] }),
   }));
 
   try {
     await page.goto(routerBase + '/console/logs.html');
-    const expected = await page.evaluate(() => ({
-      sticky: window.t('logs.reason.sticky'),
-      error: window.t('logs.reason.errorFallback'),
-    }));
-    for (const id of ['target-sticky', 'otherwise', 'error-sticky']) {
+    for (const id of ['affinity', 'fallback']) {
       await page.locator(`.lg-item[data-id="${id}"] .lg-row`).click();
     }
 
     const routeOf = id => page.locator(`.lg-item[data-id="${id}"] .lg-route`).innerText();
-    /* route 标签取自 selection_reason：粘性命中优先于最终 kind。 */
-    assert.equal(await routeOf('target-sticky'), expected.sticky);
-    assert.equal(await routeOf('otherwise'), expected.error);
-    assert.equal(await routeOf('error-sticky'), expected.sticky);
-    /* 最终目标 kind 仍保留在阶段依据里，不会被 route 标签吞掉。 */
-    assertIncludes(await page.locator('.lg-item[data-id="otherwise"]').innerText(), 'otherwise');
-    assertIncludes(await page.locator('.lg-item[data-id="error-sticky"]').innerText(), 'error_fallback');
+    /* route_label 由服务端 presenter 生成，控制台不再按 selection_reason 猜测。 */
+    assert.equal(await routeOf('affinity'), { zh: '会话粘性直达', en: 'Session affinity' }.zh);
+    assert.equal(await routeOf('fallback'), { zh: '默认目标兜底', en: 'Default target fallback' }.zh);
+    /* 阶段依据仍来自 presenter 给出的 facts。 */
+    assertIncludes(await page.locator('.lg-item[data-id="affinity"]').innerText(), '目标判定');
   } finally {
     await page.unroute(matcher);
   }
 });
-
 test('calculation-log mobile keeps the main conclusion within the viewport', async () => {
   await page.setViewportSize({ width: 390, height: 844 });
   try {

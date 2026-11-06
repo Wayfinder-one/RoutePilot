@@ -320,7 +320,7 @@ async def try_tree(
         )
     except (RoutingMiss, NoAvailableBackend) as exc:
         raise HTTPException(503, detail=str(exc)) from exc
-    trace[:] = present_trace(trace)
+    trace[:] = present_trace(trace, has_time_period=bool(snapshot.time_periods))
     try:
         return {
             "outcome": {

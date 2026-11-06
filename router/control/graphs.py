@@ -53,11 +53,7 @@ UNSET = _Unset()
 
 
 def graph_parse_failed(exc: Exception) -> list[Issue]:
-    return [Issue(
-        "graph_parse_error",
-        f"图解析失败：root 不符合 sr-routing-graph v3 结构（{exc}）",
-        f"Graph parse failed: root does not conform to the sr-routing-graph v3 structure ({exc})",
-    )]
+    return [Issue("graph_parse_error", params={"detail": str(exc)})]
 
 
 @dataclass(frozen=True)

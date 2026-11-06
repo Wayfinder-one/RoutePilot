@@ -803,7 +803,7 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
 
 def test_terminal_result_is_appended_only_once():
     import time
-    from router.api.routes_v1 import _OutcomeRecorder
+    from router.api.request_presenter import OutcomeRecorder
 
     class Logger:
         def __init__(self):
@@ -814,7 +814,7 @@ def test_terminal_result_is_appended_only_once():
 
     logger = Logger()
     record = {"trace": [], "model": "safe", "routing_ms": 2.0, "waves": 0}
-    outcome = _OutcomeRecorder(logger, record, time.monotonic())
+    outcome = OutcomeRecorder(logger, record, time.monotonic())
     assert outcome.finish(outcome_state="completed", upstream_status=200) is True
     assert outcome.finish(outcome_state="upstream_error", upstream_status=503) is False
     assert len(logger.results) == 1
@@ -857,8 +857,8 @@ def test_cancellation_during_upstream_records_terminal_state_and_releases(tmp_pa
     asyncio.run(scenario())
 
 
-def test_stream_disconnect_releases_lease(tmp_path):
-    from router.api.routes_v1 import _relay
+def test_stream_disconnect_does_not_count_as_upstream_failure(tmp_path):
+    from router.upstream.proxy import UpstreamProxy
 
     class Response:
         status_code = 200
@@ -873,6 +873,19 @@ def test_stream_disconnect_releases_lease(tmp_path):
         async def aclose(self):
             self.closed = True
 
+    class Breaker:
+        """Records breaker calls; a disconnect must not reach failure()."""
+
+        def __init__(self):
+            self.failures = []
+            self.successes = []
+
+        def failure(self, model):
+            self.failures.append(model)
+
+        def success(self, model):
+            self.successes.append(model)
+
     class Outcome:
         def finish(self, **kwargs):
             self.kwargs = kwargs
@@ -882,14 +895,98 @@ def test_stream_disconnect_releases_lease(tmp_path):
         outcome = Outcome()
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
-        generator = _relay(response, outcome=outcome, request=None, backend=backend,
-                           upstream_started=0.0, upstream_ms=1.0,
-                           on_release=lambda: released.append(True))
+        proxy = UpstreamProxy(client=None, breaker=Breaker())
+        generator = proxy._relay(response, model="safe", outcome=outcome, request=None,
+                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
+                                 release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
         await generator.aclose()
         assert response.closed is True
         assert released == [True]
         assert outcome.kwargs["outcome_state"] == "client_disconnected"
+        assert proxy.breaker.failures == []  # client disconnect is not an upstream fault
+
+    asyncio.run(scenario())
+
+
+def test_mid_stream_upstream_error_counts_in_breaker(tmp_path):
+    from router.upstream.proxy import UpstreamProxy
+
+    class Response:
+        status_code = 200
+
+        def __init__(self):
+            self.closes = 0
+
+        async def aiter_raw(self):
+            yield b"data: first\n\n"
+            raise httpx.ReadError("upstream stream died")
+
+        async def aclose(self):
+            self.closes += 1
+
+    class Outcome:
+        def finish(self, **kwargs):
+            self.kwargs = kwargs
+
+    async def scenario():
+        response = Response()
+        outcome = Outcome()
+        released = []
+        backend = Backend(url="", headers={}, upstream_name="safe")
+        proxy = UpstreamProxy(client=None, breaker=CircuitBreaker(threshold=1))
+        generator = proxy._relay(response, model="safe", outcome=outcome, request=None,
+                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
+                                 release=lambda: released.append(True))
+        assert await generator.__anext__() == b"data: first\n\n"
+        with pytest.raises(httpx.ReadError):
+            await generator.__anext__()
+        assert proxy.breaker.is_open("safe") is True
+        assert outcome.kwargs["outcome_state"] == "upstream_error"
+        assert response.closes == 1
+        assert released == [True]
+
+    asyncio.run(scenario())
+
+
+def test_stream_generator_closes_response_and_releases_lease_once(tmp_path):
+    from router.upstream.proxy import UpstreamProxy
+
+    class Response:
+        status_code = 200
+
+        def __init__(self):
+            self.closes = 0
+
+        async def aiter_raw(self):
+            yield b"data: a\n\n"
+            yield b"data: b\n\n"
+
+        async def aclose(self):
+            self.closes += 1
+
+    class Breaker:
+        def failure(self, model):
+            raise AssertionError("a clean stream must not trip the breaker")
+
+    class Outcome:
+        def finish(self, **kwargs):
+            self.kwargs = kwargs
+
+    async def scenario():
+        response = Response()
+        outcome = Outcome()
+        released = []
+        backend = Backend(url="", headers={}, upstream_name="safe")
+        proxy = UpstreamProxy(client=None, breaker=Breaker())
+        generator = proxy._relay(response, model="safe", outcome=outcome, request=None,
+                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
+                                 release=lambda: released.append(True))
+        chunks = [chunk async for chunk in generator]
+        assert chunks == [b"data: a\n\n", b"data: b\n\n"]
+        assert response.closes == 1
+        assert released == [True]
+        assert outcome.kwargs["outcome_state"] == "completed"
 
     asyncio.run(scenario())
 
