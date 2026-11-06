@@ -39,13 +39,13 @@
   const HINTS = [
     '比较条件写在输入槽位上：数值线拖进任何布尔槽位后，点条件即可改成 > 0.75 这类阈值，不需要再放比较门。',
     '同一数值端口可以连到同一个判断门的两个槽位，分别写 > 0.3 与 < 0.8，就是区间条件。',
-    '布尔槽位不写条件等价于 = true；要反向判断可以把条件改成 = false，或显式加 NOT 门。',
+    '布尔槽位不写条件即为直接通过；要反向判断可以开启取反，或显式加 NOT 门。',
     '条件阈值 0.65 / 0.70 / 0.60 是示例值：上线前请按实际问题独立校准。'
   ];
   const HINT_EN = [
     'Comparison conditions live on input slots: drop a numeric edge into any boolean slot and edit the threshold (for example > 0.75); no separate comparison node is needed.',
     'Fan the same numeric output into two slots of one AND gate with > 0.3 and < 0.8 to express a range condition.',
-    'A boolean slot without a condition means = true; use = false (or an explicit NOT gate) for the opposite test.',
+    'A boolean slot without a condition passes through directly; enable negation (or add an explicit NOT gate) for the opposite test.',
     'Thresholds 0.65 / 0.70 / 0.60 are examples: calibrate them for the real questions before enabling the graph.'
   ];
 
@@ -131,7 +131,7 @@
         slot: true,
         occupied: used.indexOf(id) >= 0,
         desc: isOr
-          ? '布尔输入槽位（多个槽位按 OR）。数值线需要配置比较条件；布尔线可缺省 = true。'
+          ? '布尔输入槽位（多个槽位按 OR）。数值线需要配置比较条件；布尔线默认直接通过。'
           : '布尔输入槽位，先按条件求值，再参与 ' + (LOGIC[node.operator] ? LOGIC[node.operator].name : '逻辑') + '；数值线必须配置比较条件。'
       }));
     }

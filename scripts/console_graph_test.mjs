@@ -160,6 +160,20 @@ test('boolean conditions default to true and support is false', () => {
   assert.equal(status(null, undefined), 'unknown');
 });
 
+test('boolean condition guidance uses pass-through and negation terminology', () => {
+  const graph = exampleGraph();
+  const hints = RTGraph.validate(graph).filter(issue => issue.level === 'hint');
+  const capability = RTGraph.findNode(graph, 'capability');
+  const input = RTGraph.portOf(capability, 'in_1', graph);
+  const text = hints.map(issue => issue.zh + '\n' + issue.en).join('\n') + '\n' + input.desc;
+
+  assert.doesNotMatch(text, /= (?:true|false)/);
+  assert.match(text, /直接通过/);
+  assert.match(text, /取反/);
+  assert.match(text, /pass(?:es)? through/i);
+  assert.match(text, /negat/i);
+});
+
 test('unknown upstream values propagate as unknown, never as false', () => {
   const graph = minimalTree().root;
   graph.nodes.push({
