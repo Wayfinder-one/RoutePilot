@@ -15,6 +15,13 @@ from tests.test_graph_engine import (
 )
 
 
+_DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone"}
+
+
+def _machine_event(event):
+    return {key: value for key, value in event.items() if key not in _DISPLAY_FIELDS}
+
+
 @pytest.mark.parametrize("scenario_id", ["s1", "s2", "s3", "s4", "s5"])
 def test_scenario_matrix_matches_fixture_expectations(scenario_id):
     scenario = SCENARIO_BY_ID[scenario_id]
@@ -95,7 +102,7 @@ def test_s3_second_wave_only_asks_clarify_then_deep_target_wins():
     assert decision.reasoning == "high"
     assert isinstance(decision.answers["clarify"], NoulAnswer)
     assert decision.answers["clarify"].yes == 0.74
-    assert decision.trace[-1] == {
+    assert _machine_event(decision.trace[-1]) == {
         "event": "scheduled", "model": "deepseek-v3", "reason": "target", "dry_run": False,
     }
 
@@ -115,7 +122,9 @@ def test_s4_not_or_follow_up_then_deep_target_wins():
         event for event in decision.trace
         if event["event"] == "activate" and event["node_id"] == "clarify"
     ]
-    assert clarify_activations == [{"event": "activate", "wave": 1, "node_id": "clarify", "via_port": "in_1"}]
+    assert [_machine_event(event) for event in clarify_activations] == [
+        {"event": "activate", "wave": 1, "node_id": "clarify", "via_port": "in_1"}
+    ]
 
 
 def test_s5_failed_wave_voids_everything_and_uses_error_fallback():
@@ -140,7 +149,7 @@ def test_s5_failed_wave_voids_everything_and_uses_error_fallback():
     assert wave_event["error"] == scenario["fail"]["message"]
     assert wave_event["questions"] == ["capability", "domain"]
     fallback_event = next(event for event in decision.trace if event["event"] == "fallback")
-    assert fallback_event == {
+    assert _machine_event(fallback_event) == {
         "event": "fallback",
         "target_id": "light-target",
         "reason": scenario["fail"]["message"],
@@ -152,6 +161,6 @@ def test_s5_failed_wave_voids_everything_and_uses_error_fallback():
     assert final_event["candidates"] == []
     # 失败波不回填任何问题端口，也不产生 question 事件。
     assert not [event for event in decision.trace if event["event"] == "question"]
-    assert decision.trace[-1] == {
+    assert _machine_event(decision.trace[-1]) == {
         "event": "scheduled", "model": "qwen3-8b", "reason": "error_fallback", "dry_run": False,
     }

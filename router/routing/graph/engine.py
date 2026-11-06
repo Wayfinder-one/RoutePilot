@@ -37,6 +37,7 @@ from router.routing.graph.model import (
     TargetNode,
 )
 from router.routing.graph.ports import output_ports, slot_sort_key
+from router.routing.graph.trace_display import describe_graph_event
 from router.routing.snapshot import RoutingSnapshot
 from router.routing.types import (
     Candidate,
@@ -51,6 +52,17 @@ from router.routing.types import (
 
 _MAX_WAVES = 32
 _ANSWER_TYPES = {"choice": ChoiceAnswer, "noul": NoulAnswer, "score": ScoreAnswer}
+
+
+class _TraceEmitter:
+    """Decorate events as they enter the caller-owned trace list."""
+
+    def __init__(self, events: list[dict], *, has_time_period: bool):
+        self.events = events
+        self.has_time_period = has_time_period
+
+    def append(self, event: dict) -> None:
+        self.events.append(describe_graph_event(event, has_time_period=self.has_time_period))
 
 
 def combine_gate(operator, values):
@@ -118,12 +130,17 @@ class GraphExecutionEngine:
         dry_run: bool = False,
         trace_sink: list[dict] | None = None,
     ) -> RoutingDecision:
-        trace: list[dict] = [] if trace_sink is None else trace_sink
+        events: list[dict] = [] if trace_sink is None else trace_sink
         if snapshot.tree is None:
             raise NoActiveTreeError("no routing tree is enabled")
         tree = snapshot.tree
         root = tree.root
         nodes = {node.id: node for node in root.nodes}
+        has_time_period = bool(snapshot.time_periods) and any(
+            isinstance(node, ConditionNode) and node.source == "periods"
+            for node in nodes.values()
+        )
+        trace = _TraceEmitter(events, has_time_period=has_time_period)
         node_order = sorted(nodes)
         sorted_edges = sorted(
             root.edges,
@@ -405,7 +422,7 @@ class GraphExecutionEngine:
             target=target,
             reasoning=reasoning,
             policy_path=policy_path,
-            trace=trace,
+            trace=events,
             sticky_hit=sticky_hit,
             selection_reason=selection_reason,
             session_hash=session_digest(request.session_id),

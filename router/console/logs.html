@@ -14,33 +14,35 @@
     <h1><span data-i18n="nav.logs"></span><span class="sub" data-i18n="logs.sub"></span></h1>
   </div>
   <div class="headmeta">
-    <span class="pill" id="taggerPill"></span>
+    <div class="lg-kpis" id="kpis" aria-live="polite"></div>
     <button class="btn sm" id="refresh" data-i18n="logs.refresh"></button>
   </div>
 </div>
 <main class="page lg-page">
-  <!-- summary: what the last 20 requests did, readable without opening anything -->
-  <section class="lg-stats" id="stats" aria-live="polite"></section>
-
   <div class="lg-toolbar">
-    <div class="lg-seg" id="filter" role="group" aria-label="filter">
+    <div class="lg-seg" id="filter" role="group" data-i18n-aria="logs.filterLabel">
       <button type="button" data-filter="all" data-i18n="logs.filter.all"></button>
       <button type="button" data-filter="jev" data-i18n="logs.filter.jev"></button>
       <button type="button" data-filter="sticky" data-i18n="logs.filter.sticky"></button>
       <button type="button" data-filter="fallback" data-i18n="logs.filter.fallback"></button>
+      <button type="button" data-filter="error" data-i18n="logs.filter.error"></button>
     </div>
     <span class="pill" id="countPill"></span>
     <span class="lg-spacer"></span>
     <span class="lg-hint" data-i18n="logs.expand"></span>
   </div>
-
+  <div class="lg-spread" id="spread"></div>
+  <div class="lg-thead" aria-hidden="true">
+    <span data-i18n="logs.f.time"></span><span data-i18n="logs.request"></span>
+    <span data-i18n="logs.path"></span><span data-i18n="logs.model"></span>
+    <span data-i18n="logs.stat.latency"></span><span></span>
+  </div>
   <section class="lg-list" id="list"></section>
 </main>
 <script src="i18n.js"></script>
 <script src="nav.js"></script>
 <script src="api.js"></script>
 <script src="shared.js"></script>
-<script src="trace.js"></script>
 <script src="logs.js"></script>
 </body>
 </html>
