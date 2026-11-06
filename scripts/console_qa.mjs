@@ -5,13 +5,16 @@
    scripts/console_qa/{canvas,inspector,tryrun,logs,models}.mjs，各模块只调用
    本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
 
-   console_qa.mjs 顶部保留的 8 条用例是基座自检（健康检查 / 原生 ESM / mock wire
-   shape / bootstrap / 真实 /admin/try），不属于任何页面模块。
+   console_qa.mjs 顶部保留的 9 条用例是基座自检（健康检查 / 原生 ESM / 单模块入口 /
+   登录页语言开关 / mock wire shape / mock 故障注入 / mock 上游 OpenAI 格式 /
+   bootstrap 目录与初始图 / 真实 /admin/try），不属于任何页面模块。
 
    Usage: node scripts/console_qa.mjs            # 全量（= npm run check:console）
           QA_ONLY=<regex> node scripts/console_qa.mjs
           node scripts/console_qa/canvas.mjs      # 只跑单个页面模块
-   Exports: test(name, fn) / runChecks() / runIfMain(metaUrl) / api(...) / page
+   Exports: 67 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
+            page / mockBase / routerBase / screenshot / BASELINE / FIXTURE），
+            完整清单见本文件下方的 export 声明。
    ------------------------------------------------------------------ */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -84,6 +87,13 @@ export async function runChecks() {
       failures.push(`${check.name}: ${error.stack || error}`);
 }
 }
+  /* 跑 0 条绝不能算通过：QA_ONLY 拼错或注册器为空时，过去会打印
+     ALL PASS (0) 并以 0 退出，看起来像绿灯。这里显式计为失败。 */
+  if (ran === 0) {
+    failures.push(filter
+      ? `QA_ONLY=${JSON.stringify(process.env.QA_ONLY)} matched 0 of ${checks.length} registered cases`
+      : `0 cases ran (registry holds ${checks.length})`);
+  }
   try {
     assertRepoDbUnchanged();
 } catch (error) {
@@ -815,6 +825,37 @@ test('mock upstream returns an OpenAI-format completion', async () => {
   assert.equal(body.usage.total_tokens > 0, true);
 });
 
+/* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始图一旦被后面的用例
+   改动，这条用例就该在基座阶段立刻失败，而不是在 100 多条页面用例之后才报。 */
+test('bootstrap registers catalog, periods, decision service and the enabled power graph', async () => {
+  const models = await api('GET', '/admin/models');
+  const modelIds = models.models.map(model => model.id).sort();
+  for (const required of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft']) {
+    assert.ok(modelIds.includes(required), 'missing model ' + required);
+}
+  assert.ok(models.models.every(model => model.provider === 'local'));
+
+  const periods = await api('GET', '/admin/time-periods');
+  assert.deepEqual(periods.periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.deepEqual(periods.periods.map(period => [period.start, period.end]), [
+    ['08:00', '11:00'], ['11:00', '18:00'], ['18:00', '08:00']
+  ]);
+
+  const jev = await api('GET', '/admin/jev');
+  assert.equal(jev.config.base_url, mockBase);
+  assert.equal(jev.config.model, JEV_MODEL);
+
+  const trees = await api('GET', '/admin/trees');
+  const tree = trees.trees.find(item => item.id === TREE_ID);
+  assert.ok(tree, 'power graph tree missing');
+  assert.equal(tree.enabled, true);
+  assert.equal(tree.root.nodes.length, 15);
+  assert.equal(tree.root.edges.length, 15);
+  assert.equal(tree.root.otherwise_target, undefined);
+  assert.equal(tree.root.error_fallback, 'light-target');
+  assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
+});
+
 
 test('admin try routes the sample graph through the live decision mock', async () => {
   const result = await api('POST', '/admin/try', { tree_id: TREE_ID, text: S1_TEXT, now: S1_NOW });
@@ -1376,19 +1417,6 @@ export function assertIncludes(haystack, needle, message) {
 }
 
 
-/* ── Task 14 · 最终验收矩阵（§7.4 补充项 / 极限图 / 响应式 / 中文） ── */
-
-
-/* ── Task 14 · final acceptance hardening ───────────────────────────── */
-
-
-/* loadExample/applyImport 用 change() 换图，不走 loadTree：过去没有 bump loadSeq，
-   在途的 selectTree 回包落地后会把示例/导入的新草稿整份盖回去。 */
-
-
-/* ── 计算日志：分阶段计算视图（Task 5） ─────────────────────────────── */
-
-
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
 let teardownPromise = null;
@@ -1456,6 +1484,15 @@ export async function runRegisteredCases() {
 export async function runIfMain(metaUrl) {
   const invoked = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(metaUrl);
   if (!invoked) return;
+  console.log(`[console-qa] registered cases: ${checks.length}`);
+  /* 独立执行时注册器为空 = 这个模块什么都没跑；此时启动服务再打印
+     ALL PASS (0) 只会伪装成通过，直接报错并以非 0 退出。 */
+  if (!checks.length) {
+    console.error(`[console-qa] no cases registered for ${path.basename(fileURLToPath(metaUrl))};` +
+      ' refusing to report ALL PASS (0) for an empty run');
+    process.exitCode = 1;
+    return;
+  }
   try {
     await runRegisteredCases();
 } catch (error) {
@@ -1472,6 +1509,7 @@ async function main() {
   await import('./console_qa/tryrun.mjs');
   await import('./console_qa/logs.mjs');
   await import('./console_qa/models.mjs');
+  console.log(`[console-qa] registered cases: ${checks.length}`);
   await runRegisteredCases();
 }
 

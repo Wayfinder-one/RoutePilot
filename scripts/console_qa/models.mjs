@@ -1,7 +1,9 @@
-/* RoutePilot 控制台 QA · 模型目录与决策服务用例（bootstrap 目录、catalogue 晚到、JEV 窗口保存错误）
+/* RoutePilot 控制台 QA · 模型目录与决策服务用例（catalogue 晚到、JEV 窗口保存错误）
    ------------------------------------------------------------------
    本文件只注册用例，不启动服务，也不持有页面状态：真实启动、mock、浏览器、
    管理面 API 与 teardown 全部由 ../console_qa.mjs 提供（同一进程内单页顺序执行）。
+   bootstrap 自检（目录 / 时段 / 决策服务 / 初始图）是基座用例，留在
+   ../console_qa.mjs 的基座自检块里，本模块不再持有。
    入口：`npm run check:console`（全量）或 `QA_ONLY=<正则> node scripts/console_qa.mjs`；
    也可单独执行：`node scripts/console_qa/models.mjs`。
    ------------------------------------------------------------------ */
@@ -9,13 +11,9 @@
 import assert from 'node:assert/strict';
 import {
   BASELINE,
-  JEV_MODEL,
-  TREE_ID,
-  api,
   appSnapshot,
   expectHttpStatusError,
   expectedHttpStatusErrors,
-  mockBase,
   page,
   resetExpectedHttpStatusErrors,
   routerBase,
@@ -24,35 +22,6 @@ import {
   waitFor,
   waitInspectorBranch
 } from '../console_qa.mjs';
-
-test('bootstrap registers catalog, periods, decision service and the enabled power graph', async () => {
-  const models = await api('GET', '/admin/models');
-  const modelIds = models.models.map(model => model.id).sort();
-  for (const required of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft']) {
-    assert.ok(modelIds.includes(required), 'missing model ' + required);
-}
-  assert.ok(models.models.every(model => model.provider === 'local'));
-
-  const periods = await api('GET', '/admin/time-periods');
-  assert.deepEqual(periods.periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
-  assert.deepEqual(periods.periods.map(period => [period.start, period.end]), [
-    ['08:00', '11:00'], ['11:00', '18:00'], ['18:00', '08:00']
-  ]);
-
-  const jev = await api('GET', '/admin/jev');
-  assert.equal(jev.config.base_url, mockBase);
-  assert.equal(jev.config.model, JEV_MODEL);
-
-  const trees = await api('GET', '/admin/trees');
-  const tree = trees.trees.find(item => item.id === TREE_ID);
-  assert.ok(tree, 'power graph tree missing');
-  assert.equal(tree.enabled, true);
-  assert.equal(tree.root.nodes.length, 15);
-  assert.equal(tree.root.edges.length, 15);
-  assert.equal(tree.root.otherwise_target, undefined);
-  assert.equal(tree.root.error_fallback, 'light-target');
-  assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
-});
 
 test('Task 11 · boot unlocks the canvas before catalogues and late catalogue data does not wipe inspector edits', async () => {
   let release = () => {};
