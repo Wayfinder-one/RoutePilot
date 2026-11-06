@@ -1,6 +1,8 @@
 import asyncio
+import threading
+import time
 
-from router.api.requestlog import LOG_COLUMNS, RECENT_LIMIT, RequestLogger
+from router.request_logging import LOG_COLUMNS, RECENT_LIMIT, RequestLogger
 from router.config import Settings
 from router.store.db import connect, migrate
 
@@ -10,7 +12,7 @@ def make_log(tmp_path):
     conn = connect(settings.db_path)
     migrate(conn)
     conn.close()
-    return RequestLogger(settings)
+    return RequestLogger(settings.db_path)
 
 
 def record(i, **overrides):
@@ -29,7 +31,7 @@ def record(i, **overrides):
 
 
 def rows(log):
-    conn = connect(log.settings.db_path)
+    conn = connect(log.db_path)
     try:
         return [dict(row) for row in conn.execute("SELECT * FROM request_logs ORDER BY rowid")]
     finally:
@@ -75,8 +77,8 @@ def test_hydrate_recent_restores_persisted_tail_without_live_detail(tmp_path):
         log.enqueue(record(i, total_ms=100.0 + i))
     asyncio.run(log.flush())
 
-    restored = RequestLogger(log.settings)
-    conn = connect(log.settings.db_path)
+    restored = RequestLogger(log.db_path)
+    conn = connect(log.db_path)
     try:
         restored.hydrate_recent(conn)
         restored.hydrate_recent(conn)
@@ -95,7 +97,7 @@ def test_hydrate_recent_restores_persisted_tail_without_live_detail(tmp_path):
 
 
 def test_queue_full_is_counted_and_ring_survives(tmp_path, monkeypatch):
-    monkeypatch.setattr("router.api.requestlog.FLUSH_QUEUE_LIMIT", 1)
+    monkeypatch.setattr("router.request_logging.FLUSH_QUEUE_LIMIT", 1)
     log = make_log(tmp_path)
     log.enqueue(record(1))
     log.enqueue(record(2))
@@ -140,7 +142,7 @@ def test_waves_persists_but_answers_text_and_trace_stay_in_memory(tmp_path):
 
 def test_log_columns_are_the_sqlite_whitelist(tmp_path):
     log = make_log(tmp_path)
-    conn = connect(log.settings.db_path)
+    conn = connect(log.db_path)
     try:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(request_logs)")}
     finally:
@@ -162,3 +164,44 @@ def test_routing_error_uses_existing_ledger_columns(tmp_path):
     assert stored["model"] is None
     assert "trace" not in stored
     assert "node_labels" not in stored
+
+
+def test_flush_does_not_block_event_loop(tmp_path, monkeypatch):
+    """Step 1 (RED before the refactor): the SQLite write must happen off the
+    event loop.  A 50ms write must leave the loop free to run a 5ms ticker."""
+    log = make_log(tmp_path)
+    worker_threads = []
+
+    async def run():
+        real_write = log._write_rows
+
+        def slow_write(rows):
+            worker_threads.append(threading.current_thread())
+            time.sleep(0.05)
+            return real_write(rows)
+
+        monkeypatch.setattr(log, "_write_rows", slow_write)
+        log.enqueue(record(1))
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.005)
+                ticks += 1
+
+        task = asyncio.create_task(tick())
+        try:
+            await log.flush()
+            assert ticks >= 3
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+    # The blocking write ran on a worker thread, not on the event-loop thread.
+    assert worker_threads and worker_threads[0] is not threading.current_thread()
+    assert len(rows(log)) == 1

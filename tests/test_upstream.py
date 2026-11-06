@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import FrozenInstanceError
 
 import pytest
@@ -6,6 +7,8 @@ from router.routing.snapshot import build_snapshot
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.upstream.breaker import CircuitBreaker
+from router.upstream.breaker_store import BreakerStore
+from router.upstream.breaker_worker import BreakerSyncWorker
 from router.upstream.catalog import Backend, load_backends
 
 
@@ -76,24 +79,7 @@ def test_half_open_after_window():
     assert not cb.is_open("m")         # window elapsed -> one probe allowed
 
 
-def test_breaker_state_shared_across_replicas(tmp_path):
-    db = str(tmp_path / "t.db")
-    conn = connect(db)
-    migrate(conn)
-    conn.close()
-    a = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    b = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    for _ in range(3):
-        a.failure("m")
-    assert a.is_open("m")
-    assert b.is_open("m")              # replica b sees the DB quarantine
-    a.success("m")                     # clears local + DB
-    # a replica that latched (b) stays conservative; a fresh one is clear
-    c = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    assert not c.is_open("m")
-
-
-def test_breaker_without_db_is_process_local(tmp_path):
+def test_breaker_without_worker_stays_process_local():
     cb = CircuitBreaker(threshold=3, half_open_after=300.0)
     for _ in range(3):
         cb.failure("m")
@@ -102,100 +88,42 @@ def test_breaker_without_db_is_process_local(tmp_path):
     assert not cb.is_open("m")
 
 
-# --------------------------------------------------------------------------- #
-# F4 (second audit round): the cross-replica latch imports the DB's failure
-# count and its ORIGINAL opened_at; it does not reset opened_at = now.
-# --------------------------------------------------------------------------- #
-def _breaker_db(tmp_path):
-    db = str(tmp_path / "t.db")
-    conn = connect(db)
-    migrate(conn)
-    conn.close()
-    return db
+def test_breaker_state_machine_has_no_storage():
+    """The pure state machine carries no sqlite import and no db_path knob."""
+    import inspect
+
+    import router.upstream.breaker as breaker_module
+
+    assert not hasattr(breaker_module, "sqlite3")
+    assert not hasattr(CircuitBreaker, "_db_read")
+    assert not hasattr(CircuitBreaker, "_db_write")
+    assert "db_path" not in inspect.signature(CircuitBreaker).parameters
+    assert "db_sync_seconds" not in inspect.signature(CircuitBreaker).parameters
 
 
-def _set_db_opened_at(db, model, opened_at):
-    conn = connect(db)
-    try:
-        with conn:
-            conn.execute("UPDATE breaker SET opened_at = ? WHERE model = ?",
-                         (opened_at, model))
-    finally:
-        conn.close()
+def test_is_open_and_failure_never_open_the_database(monkeypatch):
+    """is_open()/failure()/success() must stay pure memory: sqlite is poisoned."""
+    import sqlite3 as sqlite_module
 
+    def boom(*args, **kwargs):
+        raise AssertionError("circuit breaker touched sqlite")
+    monkeypatch.setattr(sqlite_module, "connect", boom)
 
-def _db_opened_at(db, model):
-    conn = connect(db)
-    try:
-        row = conn.execute("SELECT opened_at FROM breaker WHERE model = ?",
-                           (model,)).fetchone()
-    finally:
-        conn.close()
-    return row[0]
-
-
-def test_latch_imports_db_count_and_original_opened_at(tmp_path):
-    """A replica that first sees the DB quarantine latches the DB state as-is:
-    failure count = DB count, opened_at = the DB's original open time (mapped
-    onto the local monotonic clock), not `now`."""
-    import time
-
-    db = _breaker_db(tmp_path)
-    a = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    for _ in range(3):
-        a.failure("m")
-    opened_at_db = _db_opened_at(db, "m")
-    assert opened_at_db is not None
-
-    time.sleep(0.05)
-    b = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    assert b.is_open("m") is True
-
-    # count imported wholesale (not incremented / reset)
-    assert b._failures["m"] == 3
-    # local opened_at represents the same instant as the DB one
-    elapsed_local = time.monotonic() - b._opened_at["m"]
-    elapsed_db = time.time() - opened_at_db
-    assert abs(elapsed_local - elapsed_db) < 2.0
-
-
-def test_stale_db_quarantine_lets_latched_replica_probe_immediately(tmp_path):
-    """F4: the old docstring claimed a latched replica is conservative. It is
-    not once the DB row is older than the half-open window: the probe is
-    allowed immediately (and that is the intended self-healing behaviour)."""
-    import time
-
-    db = _breaker_db(tmp_path)
-    a = CircuitBreaker(threshold=3, half_open_after=60.0, db_path=db)
-    for _ in range(3):
-        a.failure("m")
-    _set_db_opened_at(db, "m", time.time() - 3600.0)      # opened an hour ago
-
-    c = CircuitBreaker(threshold=3, half_open_after=60.0, db_path=db)
-    assert c.is_open("m") is False      # window long elapsed -> probe allowed
-    assert c._failures["m"] == 3        # ... but the count was still imported
-
-
-def test_latched_replica_keeps_window_while_db_row_is_fresh(tmp_path):
-    db = _breaker_db(tmp_path)
-    a = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    for _ in range(3):
-        a.failure("m")
-
-    b = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
-    assert b.is_open("m") is True
-    assert b.is_open("m") is True       # stays open on repeated checks
+    cb = CircuitBreaker(threshold=1, half_open_after=300.0)
+    for _ in range(5):
+        cb.failure("m")
+        assert cb.is_open("m") is True
+    cb.success("m")
+    assert cb.is_open("m") is False
 
 
 # --------------------------------------------------------------------------- #
-# 2026-10-21 audit P0 2.2 / P2 4.3: failure() must re-arm the open clock, and
-# the DB sync is low-rate with writes only on state changes.
+# 2026-10-21 audit P0 2.2 / P2 4.3: failure() must re-arm the open clock.
 # --------------------------------------------------------------------------- #
 def test_failed_probe_rearms_the_circuit():
     """P0 2.2: after the half-open window a failed probe must close the circuit
     again. The old setdefault kept the ORIGINAL opened_at, so one elapsed
-    window permanently disarmed the breaker (in memory AND via a latched DB
-    row)."""
+    window permanently disarmed the breaker."""
     import time
 
     cb = CircuitBreaker(threshold=3, half_open_after=0.05)
@@ -258,57 +186,197 @@ def test_timed_out_probe_allows_a_replacement():
     assert cb.is_open("m") is True
 
 
-def test_stale_db_row_cannot_disarm_later_failures(tmp_path):
-    """P0 2.2 repro: latching an hours-old DB quarantine, then failing again,
-    must re-open the circuit from now (and refresh the DB row)."""
+# --------------------------------------------------------------------------- #
+# Task 4: cross-replica quarantine lives in BreakerStore (SQLite) and is synced
+# explicitly by BreakerSyncWorker. These tests call the sync methods directly;
+# no request-path (is_open) call ever reads the database.
+# --------------------------------------------------------------------------- #
+def _breaker_db(tmp_path):
+    db = str(tmp_path / "t.db")
+    conn = connect(db)
+    migrate(conn)
+    conn.close()
+    return db
+
+
+def _replica(db, *, threshold=3, half_open_after=300.0):
+    breaker = CircuitBreaker(threshold=threshold, half_open_after=half_open_after)
+    return breaker, BreakerSyncWorker(breaker, BreakerStore(db))
+
+
+def _sync(worker):
+    asyncio.run(worker.sync_once())
+
+
+def _stored(db, model):
+    return BreakerStore(db).load_all().get(model)
+
+
+def test_breaker_state_shared_across_replicas(tmp_path):
+    db = _breaker_db(tmp_path)
+    a, worker_a = _replica(db)
+    for _ in range(3):
+        a.failure("m")
+    assert a.is_open("m")
+    assert _stored(db, "m") is None     # nothing written until the worker syncs
+    _sync(worker_a)
+    assert _stored(db, "m")[0] == 3
+
+    b, worker_b = _replica(db)
+    assert not b.is_open("m")           # not loaded before the sync
+    _sync(worker_b)
+    assert b.is_open("m")               # replica b sees the shared quarantine
+
+    a.success("m")
+    _sync(worker_a)                      # clears the shared row
+    c, worker_c = _replica(db)
+    _sync(worker_c)
+    assert not c.is_open("m")           # a fresh replica is clear
+    assert b.is_open("m")               # ... a latched replica stays conservative
+
+
+def test_latch_imports_shared_count_and_original_opened_at(tmp_path):
+    """A replica that first sees the shared quarantine latches it as-is:
+    failure count = shared count, opened_at = the ORIGINAL open time (mapped
+    onto the local monotonic clock), not `now`."""
     import time
 
     db = _breaker_db(tmp_path)
-    conn = connect(db)
-    conn.execute("INSERT INTO breaker (model, failures, opened_at) "
-                 "VALUES ('m', 3, ?)", (time.time() - 1000.0,))
-    conn.commit()
-    conn.close()
+    a, worker_a = _replica(db)
+    for _ in range(3):
+        a.failure("m")
+    _sync(worker_a)
+    opened_at_stored = _stored(db, "m")[1]
+    assert opened_at_stored is not None
 
-    cb = CircuitBreaker(threshold=3, half_open_after=60.0, db_path=db)
+    time.sleep(0.05)
+    b, worker_b = _replica(db)
+    _sync(worker_b)
+    assert b.is_open("m") is True
+
+    # count imported wholesale (not incremented / reset)
+    assert b._failures["m"] == 3
+    # local opened_at represents the same instant as the stored one
+    elapsed_local = time.monotonic() - b._opened_at["m"]
+    elapsed_stored = time.time() - opened_at_stored
+    assert abs(elapsed_local - elapsed_stored) < 2.0
+
+
+def test_stale_shared_quarantine_lets_latched_replica_probe_immediately(tmp_path):
+    """F4: a row older than the half-open window lets the latched replica probe
+    immediately (intended self-healing behaviour)."""
+    import time
+
+    db = _breaker_db(tmp_path)
+    BreakerStore(db).write_failure("m", 3, time.time() - 3600.0)   # an hour old
+
+    cb, worker = _replica(db, half_open_after=60.0)
+    _sync(worker)
+    assert cb.is_open("m") is False      # window long elapsed -> probe allowed
+    assert cb._failures["m"] == 3        # ... but the count was still imported
+
+
+def test_latched_replica_keeps_window_while_shared_row_is_fresh(tmp_path):
+    db = _breaker_db(tmp_path)
+    a, worker_a = _replica(db)
+    for _ in range(3):
+        a.failure("m")
+    _sync(worker_a)
+
+    b, worker_b = _replica(db)
+    _sync(worker_b)
+    assert b.is_open("m") is True
+    assert b.is_open("m") is True        # stays open on repeated checks
+
+
+def test_stale_shared_row_cannot_disarm_later_failures(tmp_path):
+    """P0 2.2 repro: latching an hours-old quarantine, then failing again, must
+    re-open the circuit from now (and refresh the shared row)."""
+    import time
+
+    db = _breaker_db(tmp_path)
+    BreakerStore(db).write_failure("m", 3, time.time() - 1000.0)
+
+    cb, worker = _replica(db, half_open_after=60.0)
+    _sync(worker)
     assert cb.is_open("m") is False              # stale row -> probe allowed
     for _ in range(5):
         cb.failure("m")
         assert cb.is_open("m") is True           # stays re-armed
-    assert abs(_db_opened_at(db, "m") - time.time()) < 5.0
+    _sync(worker)
+    failures, opened_at = _stored(db, "m")
+    assert failures == 8                         # 3 imported + 5 local failures
+    assert abs(opened_at - time.time()) < 5.0
 
 
-def test_db_reads_are_rate_limited_per_model(tmp_path, monkeypatch):
-    """P2 4.3: is_open hits the DB at most once per db_sync_seconds per model."""
+def test_worker_does_not_rewrite_unchanged_state(tmp_path, monkeypatch):
+    """The periodic push only writes state that changed locally, so two
+    replicas with different counts cannot overwrite each other every tick."""
     db = _breaker_db(tmp_path)
-    cb = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db,
-                        db_sync_seconds=30.0)
-    calls = []
-    original = cb._db_read
-
-    def counting(model):
-        calls.append(model)
-        return original(model)
-
-    monkeypatch.setattr(cb, "_db_read", counting)
+    cb, worker = _replica(db)
     for _ in range(3):
-        cb.is_open("m")
-    assert len(calls) == 1                       # first check only
-    cb._db_read_at["m"] = 0.0                    # pretend the window elapsed
-    cb.is_open("m")
-    assert len(calls) == 2
+        cb.failure("m")
+    _sync(worker)
 
-
-def test_healthy_requests_never_write_the_breaker_table(tmp_path, monkeypatch):
-    """P2 4.3: success() without local failure state must not open the DB."""
-    db = _breaker_db(tmp_path)
-    cb = CircuitBreaker(threshold=3, half_open_after=300.0, db_path=db)
     writes = []
-    monkeypatch.setattr(cb, "_db_write",
-                        lambda *a: writes.append(a))
-    cb.is_open("m")                              # reads once, no row
-    cb.success("m")
+    monkeypatch.setattr(worker.store, "write_failure",
+                        lambda *args: writes.append(args))
+    _sync(worker)                                # unchanged -> no write
     assert writes == []
+    cb.failure("m")                              # local change -> one write
+    _sync(worker)
+    assert [args[0] for args in writes] == ["m"]
+    assert writes[0][1] == 4
+
+
+def test_healthy_requests_never_write_the_breaker_table(tmp_path):
+    """A replica that never opened a circuit keeps the store empty."""
+    db = _breaker_db(tmp_path)
+    cb, worker = _replica(db)
+    cb.is_open("m")                              # healthy read only
+    cb.success("m")                              # no local state -> no delete
+    _sync(worker)
+    assert BreakerStore(db).load_all() == {}
+
+
+def test_worker_start_loads_shared_quarantine_before_returning(tmp_path):
+    """start() awaits one sync, so startup ordering guarantees the shared
+    quarantine is in memory before the app serves traffic."""
+    import time
+
+    db = _breaker_db(tmp_path)
+    BreakerStore(db).write_failure("m", 3, time.time())
+    cb, worker = _replica(db)
+
+    async def scenario():
+        await worker.start()
+        try:
+            assert cb.is_open("m") is True
+        finally:
+            await worker.close()
+
+    asyncio.run(scenario())
+
+
+def test_app_lifespan_loads_shared_quarantine_before_traffic(tmp_path):
+    """The app serves traffic only after the shared quarantine is in memory."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from router.api.app import create_app
+    from tests.routing_fixtures import test_settings
+
+    settings = test_settings(tmp_path)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    conn.close()
+    BreakerStore(settings.db_path).write_failure("fast", 3, time.time())
+
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert app.state.breaker.is_open("fast") is True
+        assert client.get("/healthz").json() == {"ok": True}
 
 
 # --------------------------------------------------------------------------- #

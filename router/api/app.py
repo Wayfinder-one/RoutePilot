@@ -9,7 +9,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from router.api.requestlog import RequestLogger
 from router.config import Settings
 from router.control.config import (
     AlreadyExists,
@@ -21,6 +20,8 @@ from router.control.config import (
 from router.control.validation import issues_payload
 from router.jev.client import JevClient
 from router.jev.config import JevConfigRepo, JevSettings
+from router.maintenance import MaintenanceWorker
+from router.request_logging import RequestLogger
 from router.routing.affinity import SessionAffinity
 from router.routing.graph.engine import GraphExecutionEngine
 from router.routing.reloader import GraphReloadWorker
@@ -36,6 +37,8 @@ from router.store.routing_trees import (
     RoutingTreeRepo,
 )
 from router.upstream.breaker import CircuitBreaker
+from router.upstream.breaker_store import BreakerStore
+from router.upstream.breaker_worker import BreakerSyncWorker
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 logger = logging.getLogger(__name__)
@@ -128,7 +131,7 @@ def _seed_jev(conn, state) -> None:
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
-    requestlog = RequestLogger(settings)
+    requestlog = RequestLogger(settings.db_path)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
@@ -141,11 +144,19 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # 共享熔断 quarantine 必须在接收流量之前进入内存：start() 先 await
+        # 一次跨副本同步，然后才启动后台轮询。
+        await app.state.breaker_worker.start()
+        await app.state.maintenance.start()
         await requestlog.start()
         await app.state.graph_reloader.start()
         try:
             yield
         finally:
+            # 先停全部后台 worker（它们可能仍在用数据库/外部资源），最后才
+            # 关闭 HTTP client。
+            await app.state.breaker_worker.close()
+            await app.state.maintenance.close()
             await app.state.graph_reloader.close()
             await requestlog.close()
             await app.state.http.aclose()
@@ -153,7 +164,11 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app = FastAPI(title="RoutePilot", lifespan=lifespan)
     app.state.settings = settings
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
-    app.state.breaker = CircuitBreaker(db_path=settings.db_path)
+    app.state.breaker = CircuitBreaker()
+    app.state.breaker_store = BreakerStore(settings.db_path)
+    app.state.breaker_worker = BreakerSyncWorker(
+        app.state.breaker, app.state.breaker_store)
+    app.state.maintenance = MaintenanceWorker(settings.db_path)
     app.state.balancer = LoadBalancer(app.state.breaker)
     app.state.affinity = SessionAffinity(max_entries=settings.session_max_entries)
     app.state.jev_client = JevClient(app.state.http)
