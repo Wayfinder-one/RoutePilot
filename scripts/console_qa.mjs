@@ -6490,6 +6490,283 @@ test('Task 8 · out-of-order tree switches keep the newest selection', async () 
   }
 });
 
+/* loadExample/applyImport 用 change() 换图，不走 loadTree：过去没有 bump loadSeq，
+   在途的 selectTree 回包落地后会把示例/导入的新草稿整份盖回去。 */
+test('Task 8 · a tree switch that loses to Load example is discarded', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const baseline = await serverTree(TREE_ID);
+  const STALE_ID = 'qa-example-stale';
+  const matcher = url => url.pathname === '/admin/trees/' + STALE_ID;
+  let pending = null;
+  await page.route(matcher, route => {
+    if (route.request().method() !== 'GET') return route.continue();
+    pending = route;
+  });
+  try {
+    await page.evaluate(async id => {
+      const { app } = await import('/console/routing/app.js');
+      window.__exampleRace = app.selectTree(id);
+    }, STALE_ID);
+    const deadline = Date.now() + 5000;
+    while (!pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(pending, 'the tree switch GET was not issued');
+
+    await page.locator('#cvLoadExample').click();
+    await waitConfirmDialog();
+    await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+    await waitFor(async expected => {
+      const { app } = await import('/console/routing/app.js');
+      const node = app.graph && app.graph.nodes.find(item => item.id === 'start');
+      return app.treeId === expected.id && app.kind() === 'clean' && !!node &&
+        node.position.x === expected.start.x && node.position.y === expected.start.y;
+    }, { id: TREE_ID, start: EXAMPLE_START }, { timeout: 8000 });
+
+    /* 示例已落地，旧 switch 的回包现在才到：必须被 loadSeq 丢弃。 */
+    const stale = Object.assign(JSON.parse(JSON.stringify(baseline)), {
+      id: STALE_ID,
+      name: 'stale example response'
+    });
+    await pending.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ tree: stale })
+    });
+    pending = null;
+    const results = await page.evaluate(async () => {
+      const value = await window.__exampleRace;
+      delete window.__exampleRace;
+      return [value];
+    });
+    assert.deepEqual(results, [false],
+      'a switch that lost to an example load did not report itself as discarded');
+    const after = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      const node = app.graph.nodes.find(item => item.id === 'start');
+      return {
+        id: app.treeId,
+        name: app.tree.name,
+        kind: app.kind(),
+        nodes: app.graph.nodes.length,
+        edges: app.graph.edges.length,
+        start: { x: node.position.x, y: node.position.y }
+      };
+    });
+    assert.deepEqual(after, {
+      id: TREE_ID,
+      name: BASELINE.name,
+      kind: 'clean',
+      nodes: EXAMPLE_NODES,
+      edges: EXAMPLE_EDGES,
+      start: EXAMPLE_START
+    }, 'a stale tree switch overwrote the example graph');
+  } finally {
+    if (pending) {
+      try { await pending.abort(); } catch (error) { /* already gone */ }
+    }
+    await page.unroute(matcher);
+    await ensureBaselineTree();
+    await openCanvas();
+  }
+});
+
+test('Task 8 · a tree switch that loses to Import is discarded', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const baseline = await serverTree(TREE_ID);
+  const source = JSON.parse((await exportViaUi()).text);
+  source.name = 'import beats stale switch';
+  const STALE_ID = 'qa-import-stale';
+  const matcher = url => url.pathname === '/admin/trees/' + STALE_ID;
+  let pending = null;
+  await page.route(matcher, route => {
+    if (route.request().method() !== 'GET') return route.continue();
+    pending = route;
+  });
+  try {
+    await page.evaluate(async id => {
+      const { app } = await import('/console/routing/app.js');
+      window.__importRace = app.selectTree(id);
+    }, STALE_ID);
+    const deadline = Date.now() + 5000;
+    while (!pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(pending, 'the tree switch GET was not issued');
+
+    await setImportPayload(source, 'import-race.json');
+    await waitFor(async name => {
+      const { app } = await import('/console/routing/app.js');
+      return app.tree.name === name;
+    }, source.name, { timeout: 8000 });
+
+    const stale = Object.assign(JSON.parse(JSON.stringify(baseline)), {
+      id: STALE_ID,
+      name: 'stale import response'
+    });
+    await pending.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ tree: stale })
+    });
+    pending = null;
+    const results = await page.evaluate(async () => {
+      const value = await window.__importRace;
+      delete window.__importRace;
+      return [value];
+    });
+    assert.deepEqual(results, [false],
+      'a switch that lost to an import did not report itself as discarded');
+    const after = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        id: app.treeId,
+        name: app.tree.name,
+        nodes: app.graph.nodes.length,
+        edges: app.graph.edges.length
+      };
+    });
+    assert.deepEqual(after, {
+      id: TREE_ID,
+      name: source.name,
+      nodes: EXAMPLE_NODES,
+      edges: EXAMPLE_EDGES
+    }, 'a stale tree switch overwrote the imported graph');
+  } finally {
+    if (pending) {
+      try { await pending.abort(); } catch (error) { /* already gone */ }
+    }
+    await page.unroute(matcher);
+    await ensureBaselineTree();
+    await openCanvas();
+  }
+});
+
+test('Task 8 · a stale tree switch failure stays silent', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const source = JSON.parse((await exportViaUi()).text);
+  source.name = 'import wins over stale failure';
+  const STALE_ID = 'qa-stale-fail';
+  const matcher = url => url.pathname === '/admin/trees/' + STALE_ID;
+  let pending = null;
+  await page.route(matcher, route => {
+    if (route.request().method() !== 'GET') return route.continue();
+    pending = route;
+  });
+  const loadFailPrefix = await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return t('cv.toastLoadFail').split('{err}')[0];
+  });
+  expectHttpStatusError({ url: new RegExp('/admin/trees/' + STALE_ID + '$'), status: /500/ });
+  try {
+    await page.evaluate(async id => {
+      const { app } = await import('/console/routing/app.js');
+      window.__staleFail = app.selectTree(id);
+    }, STALE_ID);
+    const deadline = Date.now() + 5000;
+    while (!pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(pending, 'the tree switch GET was not issued');
+
+    await setImportPayload(source, 'import-stale-fail.json');
+    await waitFor(async name => {
+      const { app } = await import('/console/routing/app.js');
+      return app.tree.name === name;
+    }, source.name, { timeout: 8000 });
+
+    await clearToasts();
+    await pending.fulfill({
+      status: 500,
+      contentType: 'application/json',
+      body: JSON.stringify({ detail: 'stale switch must stay silent' })
+    });
+    pending = null;
+    const results = await page.evaluate(async () => {
+      const value = await window.__staleFail;
+      delete window.__staleFail;
+      return [value];
+    });
+    assert.deepEqual(results, [false],
+      'a stale tree switch failure did not report itself as discarded');
+    assert.equal((await toastText()).includes(loadFailPrefix), false,
+      'a stale tree switch failure still showed a load-error toast');
+    assert.equal(await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.tree.name;
+    }), source.name, 'a stale tree switch failure mutated the imported draft');
+  } finally {
+    if (pending) {
+      try { await pending.abort(); } catch (error) { /* already gone */ }
+    }
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+    await ensureBaselineTree();
+    await openCanvas();
+  }
+});
+
+test('Task 8 · cancelling New keeps an in-flight tree switch', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  /* 需要 dirty 草稿，New 才会弹丢弃确认框。 */
+  await dragNodeBy('start', 24, 14);
+  const baseline = await serverTree(TREE_ID);
+  const RACE_ID = 'qa-new-cancel';
+  const matcher = url => url.pathname === '/admin/trees/' + RACE_ID;
+  let pending = null;
+  await page.route(matcher, route => {
+    if (route.request().method() !== 'GET') return route.continue();
+    pending = route;
+  });
+  try {
+    await page.evaluate(async id => {
+      const { app } = await import('/console/routing/app.js');
+      window.__newCancelRace = app.selectTree(id);
+    }, RACE_ID);
+    await waitConfirmDialog();
+    await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+    const deadline = Date.now() + 5000;
+    while (!pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.ok(pending, 'the tree switch GET was not issued');
+
+    /* 取消 New 不能动 loadSeq：在途 switch 仍是用户最后一次有效选择。 */
+    await page.locator('#cvNewTree').click();
+    const dialog = await waitConfirmDialog();
+    assert.ok(dialog.length > 0, 'New did not ask before replacing the dirty draft');
+    await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
+    await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
+
+    const selection = Object.assign(JSON.parse(JSON.stringify(baseline)), {
+      id: RACE_ID,
+      name: 'cancel-safe selection'
+    });
+    await pending.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ tree: selection })
+    });
+    pending = null;
+    const results = await page.evaluate(async () => {
+      const value = await window.__newCancelRace;
+      delete window.__newCancelRace;
+      return [value];
+    });
+    assert.deepEqual(results, [true],
+      'cancelling New invalidated an in-flight tree switch');
+    const after = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return { id: app.treeId, name: app.tree.name };
+    });
+    assert.deepEqual(after, { id: RACE_ID, name: 'cancel-safe selection' },
+      'the in-flight switch did not win after New was cancelled');
+  } finally {
+    if (pending) {
+      try { await pending.abort(); } catch (error) { /* already gone */ }
+    }
+    await page.unroute(matcher);
+    await ensureBaselineTree();
+    await openCanvas();
+  }
+});
+
 test('Task 14 · New, Import and Load example stay inert until the canvas is booted', async () => {
   let release = () => {};
   const gate = new Promise(resolve => { release = resolve; });

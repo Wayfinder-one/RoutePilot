@@ -117,7 +117,8 @@ export class RoutingController {
   }
 
   loadTree(raw, saved) {
-    /* 程序化换树（新建/导入/示例/启动）同样让在途的 selectTree 回包过期。 */
+    /* 真正换树（新建/启动兜底/selectTree 成功）时让在途的 selectTree 回包过期。
+       示例与导入不走这里，它们在应用前各自 bump（见 loadExample / applyImport）。 */
     this.loadSeq += 1;
     const tree = normaliseTree(raw);
     this.treeId = raw && raw.id ? raw.id : newTreeId();
@@ -292,18 +293,19 @@ export class RoutingController {
       this.loadTree(tree, true);
       return true;
     } catch (error) {
+      /* 旧请求失败时已有更新的选择胜出：静默丢弃，不能再弹加载失败提示。 */
+      if (seq !== this.loadSeq) return false;
       this.hooks.toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
       return false;
     }
   }
 
   async newTree() {
-    /* 从点击“新建”起，在途的 selectTree 回包就已是过期选择。 */
-    this.loadSeq += 1;
     if (this.store.dirtyKind !== 'clean') {
       const discard = await this.hooks.askDiscard('new');
       if (!discard) return false;
     }
+    /* 确认通过才换树：取消“新建”不能把在途的 switch 判成过期（loadTree 内部 bump）。 */
     this.loadTree(this.newDraftTree(), false);
     this.hooks.toast(t('cv.toastNewTree'));
     return true;
@@ -322,6 +324,9 @@ export class RoutingController {
           !Array.isArray(example.nodes) || !Array.isArray(example.edges)) {
         throw new Error('invalid example graph');
       }
+      /* 示例是整图替换（不走 loadTree）：应用前让在途的 switch 过期，
+         否则旧回包会在示例落地后把草稿盖回去。 */
+      this.loadSeq += 1;
       /* 一次历史操作替换整张图；envelope 的 id/enabled/name/timezone/sticky 保持不变。 */
       if (this.hooks.change('behavior', tree => { tree.root = RTGraph.clone(example); }) === false) {
         return false;
@@ -390,6 +395,8 @@ export class RoutingController {
       this.hooks.toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
       return false;
     }
+    /* 导入同样整图替换（不走 loadTree）：应用前让在途的 switch 过期。 */
+    this.loadSeq += 1;
     if (this.hooks.change('behavior', tree => {
       tree.name = result.tree.name;
       tree.timezone = result.tree.timezone;
