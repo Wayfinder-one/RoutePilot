@@ -1113,7 +1113,7 @@ def test_stream_disconnect_does_not_count_as_upstream_failure(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=Breaker())
-        generator = proxy._relay(response, model="safe", outcome=outcome, request=None,
+        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
                                  backend=backend, upstream_started=0.0, upstream_ms=1.0,
                                  release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
@@ -1152,7 +1152,7 @@ def test_mid_stream_upstream_error_counts_in_breaker(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=CircuitBreaker(threshold=1))
-        generator = proxy._relay(response, model="safe", outcome=outcome, request=None,
+        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
                                  backend=backend, upstream_started=0.0, upstream_ms=1.0,
                                  release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
@@ -1196,7 +1196,7 @@ def test_stream_generator_closes_response_and_releases_lease_once(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=Breaker())
-        generator = proxy._relay(response, model="safe", outcome=outcome, request=None,
+        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
                                  backend=backend, upstream_started=0.0, upstream_ms=1.0,
                                  release=lambda: released.append(True))
         chunks = [chunk async for chunk in generator]

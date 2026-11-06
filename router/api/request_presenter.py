@@ -12,34 +12,29 @@ that record and nothing else:
 * ``OutcomeRecorder`` finalises a record exactly once (upstream facts, usage,
   outcome event, display fields, ledger enqueue).
 
-Outcome state names live here because they are part of the display/log
-contract (``outcome_state`` is also persisted by ``router.request_logging``).
+Outcome state names are the shared vocabulary in ``router.request_outcome``
+(``outcome_state`` is persisted by ``router.request_logging`` and recorded by
+the upstream transport); this module re-exports them for its display tables.
 """
 from __future__ import annotations
 
 import time
 
+from router.request_outcome import (
+    OUTCOME_CANCELLED,
+    OUTCOME_CLIENT_DISCONNECTED,
+    OUTCOME_COMPLETED,
+    OUTCOME_INCOMPLETE,
+    OUTCOME_ROUTING_ERROR,
+    OUTCOME_STATES,
+    OUTCOME_UPSTREAM_ERROR,
+)
 from router.routing.graph.model import (
     ConditionNode,
     LogicNode,
     QuestionNode,
     StartNode,
     TargetNode,
-)
-
-OUTCOME_COMPLETED = "completed"
-OUTCOME_UPSTREAM_ERROR = "upstream_error"
-OUTCOME_CLIENT_DISCONNECTED = "client_disconnected"
-OUTCOME_CANCELLED = "cancelled"
-OUTCOME_INCOMPLETE = "incomplete"
-OUTCOME_ROUTING_ERROR = "routing_error"
-OUTCOME_STATES = (
-    OUTCOME_COMPLETED,
-    OUTCOME_UPSTREAM_ERROR,
-    OUTCOME_CLIENT_DISCONNECTED,
-    OUTCOME_CANCELLED,
-    OUTCOME_INCOMPLETE,
-    OUTCOME_ROUTING_ERROR,
 )
 
 OUTCOME_DISPLAY = {
@@ -166,7 +161,10 @@ def _usage_fields(usage) -> dict:
 
 
 class OutcomeRecorder:
-    """Finalise one request record exactly once (later ``finish`` calls are no-ops)."""
+    """Finalise one request record exactly once (later ``finish`` calls are no-ops).
+
+    Structurally implements ``router.request_outcome.OutcomeSink``.
+    """
 
     def __init__(self, requestlog, record: dict, started: float):
         self.requestlog = requestlog
