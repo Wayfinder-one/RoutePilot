@@ -116,7 +116,7 @@
           ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
           ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
           esc(conditionText(graph, edge)) + '</button>'
-        : '<span class="rtc-cond is-static" data-start-condition>' +
+        : '<span class="rtc-cond is-static" data-start-condition="' + esc(edge.id) + '" tabindex="-1">' +
           esc(conditionText(graph, edge)) + '</span>';
       return '<div class="rtc-slot' + (kind === 'number' ? ' is-num' : '') + '"' +
         ' data-slot="' + esc(port.id) + '" data-edge="' + esc(edge.id) + '">' +

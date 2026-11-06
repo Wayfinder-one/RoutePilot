@@ -366,13 +366,13 @@ body.is-try-running .rtc-stage.is-locked::after {
   font-family: var(--mono); font-size: 8px; color: var(--text-2);
   cursor: pointer;
 }
-.rtc-cond:hover { border-color: var(--indigo-line); background: var(--indigo-soft); color: var(--indigo); }
+.rtc-cond:not(.is-static):hover { border-color: var(--indigo-line); background: var(--indigo-soft); color: var(--indigo); }
 .rtc-cond.is-num {
   color: var(--teal);
   border-color: color-mix(in srgb, var(--teal) 28%, var(--panel));
   background: color-mix(in srgb, var(--teal) 7%, var(--panel));
 }
-.rtc-cond.is-num:hover { border-color: var(--teal); }
+.rtc-cond.is-num:not(.is-static):hover { border-color: var(--teal); }
 .rtc-cond.is-static { cursor: default; }
 .rtc-slot .rtc-live { margin-left: 2px; }
 
