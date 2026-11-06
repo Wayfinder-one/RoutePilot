@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.api.requestlog import RequestLogger
-from router.api.upstream import CircuitBreaker
 from router.config import Settings
 from router.control.config import (
     AlreadyExists,
@@ -36,6 +35,7 @@ from router.store.routing_trees import (
     GraphStorageError,
     RoutingTreeRepo,
 )
+from router.upstream.breaker import CircuitBreaker
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 logger = logging.getLogger(__name__)

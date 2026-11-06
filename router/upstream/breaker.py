@@ -1,139 +1,14 @@
-"""Upstream resolution (models join providers) and the circuit breaker.
+"""按模型的熔断器（进程内失败计数；db_path 给出时跨副本共享隔离状态）。
 
-Hot-path discipline (design doc section 4.4): routing must NOT touch the
-database. The app builds a `model_id -> Backend` snapshot at startup and
-rebuilds it wholesale whenever admin writes a model or a provider; the /v1
-handler only reads that in-memory snapshot.
-
-The breaker keeps per-model failure counts in process memory: three
-consecutive failures open the circuit; after half_open_after seconds one
-probe request is allowed through. Deliberately process-local for M1 —
-cross-replica sharing is an M4 concern (design doc section 5.2).
+存储职责的拆分属于后续任务；本模块当前只承载从旧 API 模块原样搬过来
+的实现，保证应用仍可启动。
 """
 
 from __future__ import annotations
 
-import json
-import os
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
-
-from router.reasoning import normalize_reasoning
-
-
-@dataclass
-class Backend:
-    url: str
-    headers: dict
-    upstream_name: str
-    #: 归一化后的推理能力（§3.2）；None = 未声明/明确不支持 → 热路径透传。
-    reasoning: dict | None = None
-    provider: str = ""
-
-
-def _headers_for(key_env: str, api_key: str = "") -> dict:
-    # Stored key wins over the environment (contract §5.3); empty both = no auth.
-    key = api_key or (os.environ.get(key_env, "") if key_env else "")
-    return {"Authorization": f"Bearer {key}"} if key else {}
-
-
-def _reasoning_capability(profile_text: str | None,
-                          provider_format: str) -> dict | None:
-    """Parse profile JSON + normalize; unusable/illegal declarations -> None.
-
-    Hot path does zero parsing: this runs at startup and on every admin write
-    that swaps the snapshot. A corrupt/illegal declaration must never prevent
-    the service from starting (old databases), so fall back to "undeclared".
-    """
-    if not profile_text:
-        return None
-    try:
-        profile = json.loads(profile_text)
-    except (TypeError, ValueError):
-        return None
-    normalized = normalize_reasoning(profile, provider_format)
-    if not normalized or not normalized.get("declared") \
-            or not normalized.get("supported"):
-        return None
-    return normalized
-
-
-def load_backends(conn: sqlite3.Connection) -> dict[str, Backend]:
-    """Build the model_id -> Backend snapshot in one join.
-
-    A model whose provider row is missing is simply absent from the snapshot;
-    resolve_backend then raises KeyError and the /v1 handler answers 502.
-    """
-    rows = conn.execute(
-        "SELECT m.id AS id, m.upstream AS upstream, m.provider AS provider, "
-        "       m.profile AS profile, p.base_url AS base_url, "
-        "       p.key_env AS key_env, p.api_key AS api_key, "
-        "       p.reasoning_format AS reasoning_format "
-        "FROM models m JOIN providers p ON m.provider = p.name")
-    return {r["id"]: Backend(
-        url=f"{r['base_url']}/chat/completions",
-        headers=_headers_for(r["key_env"], r["api_key"] or ""),
-        upstream_name=r["upstream"],
-        reasoning=_reasoning_capability(r["profile"], r["reasoning_format"]),
-        provider=r["provider"])
-        for r in rows}
-
-
-def resolve_backend(backends: dict[str, Backend], model_id: str) -> Backend:
-    """Read the in-memory snapshot; unknown model raises KeyError."""
-    if model_id not in backends:
-        raise KeyError(model_id)
-    return backends[model_id]
-
-
-def parse_profile_text(text: str | None) -> dict:
-    """models.profile JSON text -> dict; empty/broken JSON behaves as undeclared."""
-    if not text:
-        return {}
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def reasoning_map_for_rows(conn: sqlite3.Connection,
-                           rows) -> dict[str, dict | None]:
-    """model_id -> normalized reasoning for a model-catalog row set.
-
-    ``rows`` are catalog dicts (``id``/``profile``/``provider``) and may be a
-    **prospective** snapshot that is not stored yet (a pending POST/PUT
-    /admin/models).  The provider ``reasoning_format`` comes from the providers
-    table (missing provider -> ``"openai"``), exactly like
-    :func:`load_backends`/:func:`model_reasoning_from_db`: one rule for boot,
-    hot-path backends and admin-write validation, so a write can never be
-    accepted by the API and rejected by the next startup.
-    """
-    formats = {row["name"]: (row["reasoning_format"] or "openai")
-               for row in conn.execute(
-                   "SELECT name, reasoning_format FROM providers")}
-    return {
-        row["id"]: normalize_reasoning(
-            parse_profile_text(row.get("profile")),
-            formats.get(row.get("provider"), "openai"))
-        for row in rows}
-
-
-def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
-    """model_id -> normalized reasoning capability of the CURRENT catalog.
-
-    Same source for every consumer that must never disagree about a model's
-    declared levels (startup check, ``/admin/trees`` enable validation):
-    rows written straight into the DB (bypassing the API) are judged by the
-    same rule as rows coming through the API.
-    """
-    rows = [{"id": row["id"], "profile": row["profile"],
-             "provider": row["provider"]}
-            for row in conn.execute(
-                "SELECT id, profile, provider FROM models")]
-    return reasoning_map_for_rows(conn, rows)
 
 
 class CircuitBreaker:
@@ -299,4 +174,3 @@ class CircuitBreaker:
             self._probe_at.pop(model, None)
             if self.db_path and had_state:
                 self._db_write(model, 0, None)
-

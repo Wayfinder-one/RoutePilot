@@ -15,10 +15,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.api.upstream import load_backends
 from router.reasoning import FORMAT_IDS, LEVELS
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
+from router.upstream.catalog import load_backends
 from tests.routing_fixtures import test_settings
 
 OPENAI_REASONING = {"reasoning": {

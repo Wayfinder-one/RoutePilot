@@ -1,24 +1,54 @@
+from dataclasses import FrozenInstanceError
+
 import pytest
 
-from router.api.upstream import CircuitBreaker, load_backends, resolve_backend
+from router.routing.snapshot import build_snapshot
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
+from router.upstream.breaker import CircuitBreaker
+from router.upstream.catalog import Backend, load_backends
 
 
-def test_load_backends_and_resolve(tmp_path, monkeypatch):
+def test_load_backends_returns_model_mapping(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCAL_KEY", "secret")
     conn = connect(str(tmp_path / "t.db"))
     migrate(conn)
     seed_default(conn)
     conn.execute("UPDATE providers SET key_env = 'LOCAL_KEY' WHERE name = 'local'")
     backends = load_backends(conn)
-    b = resolve_backend(backends, "qwen3-8b")
+    b = backends["qwen3-8b"]
     assert b.url == "http://127.0.0.1:8000/v1/chat/completions"
     assert b.headers["Authorization"] == "Bearer secret"
     assert b.upstream_name == "qwen3-8b"
-    with pytest.raises(KeyError):
-        resolve_backend(backends, "nope")
+    assert "nope" not in backends        # unknown model is simply absent
     conn.close()
+
+
+def test_backend_is_frozen():
+    backend = Backend(url="http://u", headers={}, upstream_name="m")
+    with pytest.raises(FrozenInstanceError):
+        backend.upstream_name = "other"
+
+
+def test_snapshot_copies_backend_mutable_leaves():
+    headers = {"Authorization": "Bearer k"}
+    reasoning = {"declared": True, "supported": True, "format": "openai",
+                 "efforts": [{"id": "high", "wire": "high"}]}
+    backend = Backend(url="http://u", headers=headers, upstream_name="m",
+                      reasoning=reasoning)
+    snapshot = build_snapshot(tree=None, backends={"m": backend},
+                              time_periods=[], jev=None, capabilities={})
+    published = snapshot.backends["m"]
+    assert published is not backend
+    assert published == backend
+    assert published.headers is not headers
+    assert published.reasoning is not reasoning
+    assert published.reasoning["efforts"] is not reasoning["efforts"]
+    # Later edits to the catalog result cannot leak into the published snapshot.
+    headers["Authorization"] = "Bearer changed"
+    reasoning["efforts"].append({"id": "off", "wire": None})
+    assert published.headers["Authorization"] == "Bearer k"
+    assert len(published.reasoning["efforts"]) == 1
 
 
 def test_load_backends_omits_models_without_provider(tmp_path):

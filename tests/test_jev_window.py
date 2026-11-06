@@ -8,7 +8,6 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.api.routes_jev import router as jev_router
-from router.api.upstream import Backend
 from router.jev.client import ChoiceAnswer
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.jev.window import (
@@ -26,6 +25,7 @@ from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
+from router.upstream.catalog import Backend
 from tests.routing_fixtures import test_settings, tree_dict
 
 

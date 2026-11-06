@@ -10,12 +10,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from router.api.deps import get_conn, get_tree_repo
-from router.api.upstream import parse_profile_text
 from router.control.config import ConfigurationService
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import FORMATS, FORMAT_IDS, LEVELS, ReasoningError, normalize_reasoning, validate_model_profile
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import RoutingTreeRepo
+from router.upstream.catalog import parse_profile_text
 
 router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

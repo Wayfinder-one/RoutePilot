@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import sqlite3
 
-from router.api.upstream import model_reasoning_from_db
 from router.jev.config import JevConfigRepo
 from router.routing.graph.validate import EnableContext, Issue, validate_graph_for_enable
 from router.routing.model import RoutingTree
 from router.store.repositories import ModelRepo, TimePeriodRepo
 from router.store.routing_trees import RoutingTreeRepo
+from router.upstream.catalog import model_reasoning_from_db
 
 
 def build_enable_context(conn: sqlite3.Connection) -> EnableContext:

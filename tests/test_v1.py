@@ -18,7 +18,6 @@ from fastapi import FastAPI
 
 from router.api.requestlog import LOG_COLUMNS, RequestLogger
 from router.api.routes_v1 import router
-from router.api.upstream import Backend, CircuitBreaker
 from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
@@ -28,6 +27,8 @@ from router.routing.model import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import build_snapshot
 from router.store.db import connect, migrate
+from router.upstream.breaker import CircuitBreaker
+from router.upstream.catalog import Backend
 from tests.routing_fixtures import tree_dict
 
 

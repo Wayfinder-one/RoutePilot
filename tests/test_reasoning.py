@@ -6,8 +6,9 @@
 
 import pytest
 
-from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, ReasoningError,
-                              apply_reasoning, level_label, normalize_reasoning,
+from router.reasoning import (FORMATS, FORMAT_IDS, LEVELS, REASONING_WRITERS,
+                              ReasoningError, ReasoningWriter, apply_reasoning,
+                              level_label, normalize_reasoning,
                               validate_model_profile)
 
 
@@ -34,6 +35,15 @@ def test_public_constants_are_the_contract():
         assert spec.zh and spec.en          # console renders these descriptions
     assert level_label("high") == "高"
     assert level_label("unknown") == "unknown"
+
+
+def test_registry_pairs_each_format_with_its_writer():
+    assert tuple(REASONING_WRITERS) == FORMAT_IDS
+    for fmt in FORMAT_IDS:
+        writer = REASONING_WRITERS[fmt]
+        assert isinstance(writer, ReasoningWriter)
+        assert writer.spec is FORMATS[fmt]          # metadata stays single-sourced
+        assert callable(writer.apply)
 
 
 # --------------------------------------------------------------------------- #
