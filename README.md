@@ -324,7 +324,7 @@ npm run check:console
 
 - `pytest` collects only `tests/` (`testpaths` in `pyproject.toml`): unit and FastAPI integration tests. It never starts a browser or the router, and it does not collect `experiments/`.
 - `node --test` runs the pure ES-module suites: graph/canonical behavior, draft state, and the cross-runtime contract fixtures in `tests/fixtures/graph_contracts.json`, which assert the same issue codes and behavior hashes as Python.
-- `npm run check:console` runs the two Node suites plus the Playwright acceptance matrix against a temporary database, mock decision service, and mock upstream. Screenshots are off by default; set `QA_SCREENSHOTS=1` to regenerate evidence. `QA_ONLY=<regex>` selects cases, and a page module can run alone, for example `node scripts/console_qa/canvas.mjs` (also `inspector`, `tryrun`, `logs`, `models`). Set `CHROME=/path/to/chrome` if Chromium is not found in the usual cache.
+- `npm run check:console` runs the three Node suites (graph, draft, graph contract) plus the Playwright acceptance matrix against a temporary database, mock decision service, and mock upstream. Screenshots are off by default; set `QA_SCREENSHOTS=1` to regenerate evidence. `QA_ONLY=<regex>` selects cases, and a page module can run alone, for example `node scripts/console_qa/canvas.mjs` (also `inspector`, `tryrun`, `logs`, `models`). Set `CHROME=/path/to/chrome` if Chromium is not found in the usual cache.
 - `scripts/i18n_dead_keys.py` checks that every dictionary key is still referenced.
 
 `experiments/jev-batch/` is a standalone spike; it is not shipped and not collected by the default run:
