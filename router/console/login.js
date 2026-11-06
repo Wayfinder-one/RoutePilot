@@ -17,6 +17,12 @@ setLang(LANG);
   const $ = s => document.querySelector(s);
   const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 
+  /* login.html 不加载 nav.js，语言按钮必须在这里绑定：setLang 是模块导出，
+     不是页面全局，inline onclick 已经不再可用。 */
+  document.querySelectorAll('.langtog button').forEach(button => {
+    button.addEventListener('click', () => setLang(button.dataset.lang));
+  });
+
   /* 站内绝对路径白名单；任何可疑值一律回首页。 */
   function nextTarget() {
     const raw = String(new URLSearchParams(window.location.search).get('next') || '').trim();

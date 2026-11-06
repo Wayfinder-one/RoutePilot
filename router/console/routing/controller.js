@@ -68,6 +68,8 @@ export class RoutingController {
     this.trees = [];
     this.treeId = '';
     this.snapshotRevision = '';
+    /* 单调递增的装载序号：并发 selectTree 只允许最后一次请求把树写进 store。 */
+    this.loadSeq = 0;
   }
 
   get saved() {
@@ -115,6 +117,8 @@ export class RoutingController {
   }
 
   loadTree(raw, saved) {
+    /* 程序化换树（新建/导入/示例/启动）同样让在途的 selectTree 回包过期。 */
+    this.loadSeq += 1;
     const tree = normaliseTree(raw);
     this.treeId = raw && raw.id ? raw.id : newTreeId();
     tree.id = this.treeId;
@@ -273,8 +277,16 @@ export class RoutingController {
       const discard = await this.hooks.askDiscard('switch');
       if (!discard) return false;
     }
+    const seq = ++this.loadSeq;
     try {
       const result = await api.get('/admin/trees/' + encodeURIComponent(id));
+      /* 晚到的旧响应绝不能覆盖更新的选择；期间若已开始保存，也不换草稿，
+         否则服务端已提交的回包会被保存的 identity 检查丢弃。 */
+      if (seq !== this.loadSeq) return false;
+      if (this.store.saving) {
+        this.hooks.toast(t('cv.toastSavingBlocked'), 'warn');
+        return false;
+      }
       const tree = result && result.tree;
       if (!tree || !tree.root) throw new Error('invalid tree payload');
       this.loadTree(tree, true);
@@ -286,6 +298,8 @@ export class RoutingController {
   }
 
   async newTree() {
+    /* 从点击“新建”起，在途的 selectTree 回包就已是过期选择。 */
+    this.loadSeq += 1;
     if (this.store.dirtyKind !== 'clean') {
       const discard = await this.hooks.askDiscard('new');
       if (!discard) return false;
