@@ -262,6 +262,92 @@ def test_invalid_timezone_rejected_on_create_and_update(client):
     assert client.get("/admin/trees/main").json()["tree"]["timezone"] == "Asia/Shanghai"
 
 
+# ── 显式 null 语义（base 428a35d 回归） ────────────────────────────────
+# DTO 迁移后 `None` 曾同时表示「字段缺失」与「显式 null」，把 base 的 null 行为
+# 退化成「继承」。以下用例锁定 base 对五个字段的原始语义。
+
+def test_update_explicit_id_null_is_tree_id_mismatch(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    response = save_tree(client, {"id": None})
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == "tree id mismatch"
+    assert client.get("/admin/trees/main").json()["tree"]["id"] == "main"
+
+
+def test_update_explicit_name_null_clears_name(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    assert client.get("/admin/trees/main").json()["tree"]["name"] == "测试图"
+
+    response = save_tree(client, {"name": None})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["name"] == ""
+    assert client.get("/admin/trees/main").json()["tree"]["name"] == ""
+
+
+def test_update_explicit_root_null_is_parse_error(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+
+    response = save_tree(client, {"root": None})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and len(detail) == 1
+    issue = detail[0]
+    assert set(issue) == ISSUE_KEYS
+    assert issue["code"] == "graph_parse_error"
+    assert issue["zh"] == (
+        "图解析失败：root 不符合 sr-routing-graph v3 结构（graph must be an object）")
+    assert client.get("/admin/trees/main").json()["tree"] == before
+
+
+def test_update_explicit_timezone_null_is_parse_error(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+
+    response = save_tree(client, {"timezone": None})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and len(detail) == 1
+    issue = detail[0]
+    assert set(issue) == ISSUE_KEYS
+    assert issue["code"] == "graph_parse_error"
+    assert issue["zh"] == (
+        "图解析失败：root 不符合 sr-routing-graph v3 结构（timezone must be a nonempty string）")
+    assert client.get("/admin/trees/main").json()["tree"] == before
+
+
+def test_update_explicit_sticky_null_resets_to_default(client):
+    raw = tree_dict(
+        root=graph_with_model(), sticky={"enabled": True, "ttl_seconds": 900})
+    assert create_tree(client, raw).status_code == 201
+
+    response = save_tree(client, {"sticky": None})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["sticky"] == {"enabled": False, "ttl_seconds": 1800}
+    assert client.get("/admin/trees/main").json()["tree"]["sticky"] == {
+        "enabled": False, "ttl_seconds": 1800}
+
+
+def test_update_absent_fields_inherit_existing_values(client):
+    """缺失字段仍走 patch 继承（控制台按部分字段保存时依赖此语义）。"""
+    raw = tree_dict(
+        root=graph_with_model(), sticky={"enabled": True, "ttl_seconds": 900})
+    raw["timezone"] = "UTC"
+    assert create_tree(client, raw).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+
+    response = save_tree(client, {})
+
+    assert response.status_code == 200, response.text
+    after = client.get("/admin/trees/main").json()["tree"]
+    for field in ("name", "timezone", "sticky", "root"):
+        assert after[field] == before[field]
+
+
 def test_enable_switches_single_active_tree(client, app):
     configure_jev(client)
     for tree_id in ("a", "b"):
