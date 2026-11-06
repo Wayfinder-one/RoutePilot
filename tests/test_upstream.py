@@ -229,10 +229,35 @@ def test_breaker_state_shared_across_replicas(tmp_path):
 
     a.success("m")
     _sync(worker_a)                      # clears the shared row
+    assert not a.is_open("m")           # ... without re-latching itself
     c, worker_c = _replica(db)
     _sync(worker_c)
     assert not c.is_open("m")           # a fresh replica is clear
     assert b.is_open("m")               # ... a latched replica stays conservative
+
+
+def test_recovery_is_not_undone_by_the_same_tick_import(tmp_path):
+    """Regression repro: 3 failures -> sync -> success() -> sync.
+
+    The shared row is cleared in the clear loop, but `shared` was snapshotted
+    BEFORE that loop; importing from it re-latches the model this same tick and
+    silently undoes the recovery. Both the replica and the shared table must be
+    clear afterwards.
+    """
+    db = _breaker_db(tmp_path)
+    a, worker_a = _replica(db)
+    for _ in range(3):
+        a.failure("m")
+    _sync(worker_a)
+    assert a.is_open("m") is True
+    assert _stored(db, "m")[0] == 3
+
+    a.success("m")
+    _sync(worker_a)
+
+    assert not a.is_open("m")
+    assert a._failures.get("m") is None
+    assert "m" not in BreakerStore(db).load_all()
 
 
 def test_latch_imports_shared_count_and_original_opened_at(tmp_path):
