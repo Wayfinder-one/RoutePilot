@@ -6,9 +6,9 @@ DB 只存 hash）。
 本文件只覆盖"门"本身；登录/角色/CRUD 的细节在 ``tests/test_users.py``。
 
 两种模式：
-* ``user_auth=False``（Settings dataclass 默认，旧测试/本地 dev 兼容路径）：
+* ``user_auth=False``（旧测试/本地 dev 兼容路径；fixtures 显式设置，dataclass 默认已是 True）：
   /admin 完全开放，Authorization 头被忽略。
-* ``user_auth=True``（``Settings.from_env()`` 的生产默认）：/admin/login 免鉴权，
+* ``user_auth=True``（生产默认）：/admin/login 免鉴权，
   其余 /admin* 需要未过期会话。
 """
 
@@ -40,7 +40,7 @@ def test_admin_open_when_user_auth_disabled(tmp_path):
     """ROUTER_USER_AUTH=0：旧行为，/admin 完全开放（仅限本地 dev）。"""
     c = _client(tmp_path, user_auth=False)
     assert c.get("/admin/models").status_code == 200
-    assert c.put("/admin/settings", json={"a": "b"}).status_code == 200
+    assert c.put("/admin/time-periods", json={"periods": []}).status_code == 200
     # 开放模式不看 Authorization 头（也不存在静态 token 了）
     assert c.get("/admin/models", headers=OLD_STATIC_TOKEN).status_code == 200
     me = c.get("/admin/me")
@@ -51,9 +51,9 @@ def test_admin_open_when_user_auth_disabled(tmp_path):
 def test_user_auth_enabled_requires_login(tmp_path):
     """生产默认（user_auth=True）：无会话一律 401；默认管理员登录后放行。"""
     c = _client(tmp_path, user_auth=True)
-    for call in (c.get("/admin/models"), c.get("/admin/settings"),
+    for call in (c.get("/admin/models"), c.get("/admin/changes"),
                  c.get("/admin/users"), c.get("/admin/me"),
-                 c.put("/admin/settings", json={"a": "b"})):
+                 c.put("/admin/jev/window", json={})):
         assert call.status_code == 401, call.request.url
         assert call.json() == {"detail": "unauthorized: /admin requires login"}
         assert call.headers["www-authenticate"] == "Bearer"

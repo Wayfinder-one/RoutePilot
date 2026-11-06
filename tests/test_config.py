@@ -37,7 +37,7 @@ def test_env_override(monkeypatch):
 
 
 def test_user_auth_defaults_and_override(monkeypatch):
-    assert Settings().user_auth is False
+    assert Settings().user_auth is True
     for name in ("ROUTER_USER_AUTH", "ROUTER_ADMIN_EMAIL", "ROUTER_ADMIN_PASSWORD", "ROUTER_SESSION_TTL_HOURS"):
         monkeypatch.delenv(name, raising=False)
     assert Settings.from_env().user_auth is True

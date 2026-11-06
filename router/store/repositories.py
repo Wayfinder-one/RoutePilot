@@ -13,11 +13,11 @@ from router.routing.conditions import TimePeriod
 from router.routing.model import RoutingTree, tree_revision_of
 
 
-def _now_iso() -> str:
+def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _uid() -> str:
+def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
@@ -37,7 +37,7 @@ def write_transaction(conn: sqlite3.Connection):
 
 
 @contextmanager
-def _tx(conn: sqlite3.Connection):
+def transaction(conn: sqlite3.Connection):
     if conn.in_transaction:
         yield
         return
@@ -49,7 +49,7 @@ def record_revision(conn: sqlite3.Connection, kind: str, content: str) -> str:
     sha = sha256_text(content)
     conn.execute(
         "INSERT OR IGNORE INTO config_revisions (kind, sha256, content, created_at) VALUES (?, ?, ?, ?)",
-        (kind, sha, content, _now_iso()),
+        (kind, sha, content, now_iso()),
     )
     return sha
 
@@ -69,7 +69,7 @@ def seed_default(conn: sqlite3.Connection) -> None:
     if settings.get("catalog_seeded"):
         return
     local = PRESET_BY_ID["local"]
-    with _tx(conn):
+    with transaction(conn):
         conn.execute(
             "INSERT OR IGNORE INTO providers (name, base_url, key_env, reasoning_format, api_key) VALUES ('local', ?, ?, ?, ?)",
             (local["base_url"], local.get("key_env") or "", local.get("reasoning_format") or "openai", ""),
@@ -87,7 +87,7 @@ class ConfigRevisionRepo:
         self.conn = conn
 
     def record(self, kind: str, content: str) -> str:
-        with _tx(self.conn):
+        with transaction(self.conn):
             return record_revision(self.conn, kind, content)
 
     def get(self, kind: str, sha256: str) -> dict | None:
@@ -117,7 +117,7 @@ class ModelRepo:
         return dict(row) if row else None
 
     def create(self, model_id: str, upstream: str, provider: str, profile: str = "{}") -> bool:
-        with _tx(self.conn):
+        with transaction(self.conn):
             cursor = self.conn.execute(
                 "INSERT OR IGNORE INTO models (id, upstream, provider, profile) VALUES (?, ?, ?, ?)",
                 (model_id, upstream, provider, profile),
@@ -125,7 +125,7 @@ class ModelRepo:
         return cursor.rowcount > 0
 
     def delete(self, model_id: str) -> bool:
-        with _tx(self.conn):
+        with transaction(self.conn):
             cursor = self.conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
         return cursor.rowcount > 0
 
@@ -137,7 +137,7 @@ class ModelRepo:
                 values.append(value)
         if not fields:
             return self.get(model_id) is not None
-        with _tx(self.conn):
+        with transaction(self.conn):
             cursor = self.conn.execute(
                 f"UPDATE models SET {', '.join(fields)} WHERE id = ?",
                 (*values, model_id),
@@ -178,7 +178,7 @@ class ProviderRepo:
 
     def upsert(self, name: str, base_url: str, *, key_env: str | None = None, reasoning_format: str | None = None, api_key: str | None = None) -> None:
         existing = self.get(name) or {}
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute(
                 "INSERT INTO providers (name, base_url, key_env, reasoning_format, api_key) VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(name) DO UPDATE SET base_url = excluded.base_url, key_env = excluded.key_env, "
@@ -193,7 +193,7 @@ class ProviderRepo:
             )
 
     def delete(self, name: str) -> bool:
-        with _tx(self.conn):
+        with transaction(self.conn):
             cursor = self.conn.execute("DELETE FROM providers WHERE name = ?", (name,))
         return cursor.rowcount > 0
 
@@ -238,7 +238,7 @@ class TimePeriodRepo:
             return
         if not self.conn.execute("SELECT COUNT(*) FROM time_periods").fetchone()[0]:
             self.save(self.DEFAULTS)
-        with _tx(self.conn):
+        with transaction(self.conn):
             settings.set("time_periods_seeded", "1")
 
     def save(self, periods: list[dict]) -> None:
@@ -246,7 +246,7 @@ class TimePeriodRepo:
         names = [period["name"] for period in validated]
         if len(names) != len(set(names)):
             raise ValueError("period names must be unique")
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute("DELETE FROM time_periods")
             for period in validated:
                 self.conn.execute(
@@ -260,7 +260,7 @@ class ChangeRepo:
         self.conn = conn
 
     def record(self, ts: str, kind: str, detail: dict) -> None:
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute(
                 "INSERT INTO changes (ts, kind, detail) VALUES (?, ?, ?)",
                 (ts, kind, json.dumps(detail, ensure_ascii=False)),
@@ -313,10 +313,10 @@ class UserRepo:
         if self.get_by_email(email) is not None:
             raise EmailExists(email)
         user_id = uuid.uuid4().hex
-        now = _now_iso()
+        now = now_iso()
         password_hash = auth.hash_password(password)
         try:
-            with _tx(self.conn):
+            with transaction(self.conn):
                 self.conn.execute(
                     "INSERT INTO users (id, email, password_hash, role, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (user_id, email, password_hash, role, "active", now, now),
@@ -339,9 +339,9 @@ class UserRepo:
         if not fields:
             return self.get(user_id)
         fields.append("updated_at = ?")
-        values.extend([_now_iso(), user_id])
+        values.extend([now_iso(), user_id])
         try:
-            with _tx(self.conn):
+            with transaction(self.conn):
                 cursor = self.conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id = ?", values)
         except sqlite3.IntegrityError:
             raise EmailExists(auth.normalize_email(email or "")) from None
@@ -349,21 +349,21 @@ class UserRepo:
 
     def set_password(self, user_id: str, password: str) -> bool:
         password_hash = auth.hash_password(password)
-        with _tx(self.conn):
+        with transaction(self.conn):
             cursor = self.conn.execute(
                 "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
-                (password_hash, _now_iso(), user_id),
+                (password_hash, now_iso(), user_id),
             )
         return cursor.rowcount > 0
 
     def delete(self, user_id: str) -> bool:
-        with _tx(self.conn):
+        with transaction(self.conn):
             cursor = self.conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         return cursor.rowcount > 0
 
     def record_login(self, user_id: str) -> None:
-        with _tx(self.conn):
-            self.conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (_now_iso(), user_id))
+        with transaction(self.conn):
+            self.conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now_iso(), user_id))
 
     def seed_admin(self, email: str, password: str) -> bool:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -380,7 +380,7 @@ class SessionRepo:
         token = auth.new_session_token()
         now = datetime.now().astimezone()
         expires_at = (now + timedelta(hours=ttl_hours)).isoformat(timespec="seconds")
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute(
                 "INSERT INTO user_sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)",
                 (auth.session_token_hash(token), user_id, now.isoformat(timespec="seconds"), expires_at),
@@ -406,11 +406,11 @@ class SessionRepo:
         return {**UserRepo(self.conn).public(user), "expires_at": expires_at}
 
     def delete(self, token: str) -> None:
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute("DELETE FROM user_sessions WHERE token_hash = ?", (auth.session_token_hash(token),))
 
     def delete_for_user(self, user_id: str) -> None:
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
 
     def purge_expired(self) -> None:
@@ -418,5 +418,5 @@ class SessionRepo:
         expired = [row["token_hash"] for row in self.conn.execute("SELECT token_hash, expires_at FROM user_sessions") if _is_expired(row["expires_at"], now)]
         if not expired:
             return
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.executemany("DELETE FROM user_sessions WHERE token_hash = ?", [(token_hash,) for token_hash in expired])

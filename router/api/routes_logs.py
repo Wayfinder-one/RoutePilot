@@ -3,13 +3,12 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Request
 
 from router.api.deps import get_conn
-from router.store.repositories import ChangeRepo, SettingsRepo, _now_iso
+from router.store.repositories import ChangeRepo
 
 router = APIRouter()
-RESERVED_SETTINGS = {"snapshot_revision", "jev_config"}
 
 
 @router.get("/requests/recent")
@@ -20,25 +19,6 @@ def recent_requests(request: Request, limit: int = 20):
 @router.get("/requests/stats")
 def request_stats(request: Request):
     return request.app.state.requestlog.stats()
-
-
-@router.get("/settings")
-def get_settings(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"settings": SettingsRepo(conn).all()}
-
-
-@router.put("/settings")
-def put_settings(body: dict, conn: sqlite3.Connection = Depends(get_conn)):
-    for key, value in body.items():
-        if not isinstance(key, str) or not key or key.startswith("_") or key in RESERVED_SETTINGS:
-            raise HTTPException(422, detail=f"reserved or invalid setting key {key!r}")
-        if not isinstance(value, (str, int, float, bool)):
-            raise HTTPException(422, detail=f"setting {key!r} must be a scalar")
-    with conn:
-        for key, value in body.items():
-            SettingsRepo(conn).set(key, str(value))
-        ChangeRepo(conn).record(_now_iso(), "settings", {"keys": sorted(body)})
-    return {"ok": True, "settings": SettingsRepo(conn).all()}
 
 
 @router.get("/changes")

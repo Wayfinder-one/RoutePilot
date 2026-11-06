@@ -7,23 +7,61 @@ import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo
+from router.routing.model import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.routing_trees import RoutingTreeRepo
+from tests.routing_fixtures import tree_dict, test_settings
+
+
+def direct_graph():
+    """start → 单 target(qwen3-8b)：不触碰决策服务的最小启用树。"""
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "direct", "type": "target", "priority": 1,
+             "models": [{"model": "qwen3-8b", "reasoning": None}]},
+        ],
+        "edges": [{
+            "id": "e-start-direct", "source": "start", "source_port": "out",
+            "target": "direct", "target_port": "in_1", "condition": None,
+        }],
+        "error_fallback": "direct",
+    }
+
+
+def prepare_active_tree(tmp_path, document):
+    """在临时 graph 目录写入并启用一棵树，供真实 create_app() 使用。"""
+    settings = test_settings(tmp_path)
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    repo.create(tree_from_dict(document))
+    repo.enable(document["id"])
+    return settings
 
 
 class Publisher:
+    """SnapshotPublisher 桩：本文件其余用例只关心 locked/prepare/publish 次序。"""
+
     def __init__(self):
-        self.refreshes = 0
+        self.prepared = []
+        self.published = []
 
     @contextmanager
     def locked(self):
         yield self
 
-    def refresh(self, conn):
-        self.refreshes += 1
+    def prepare(self, conn, tree, fingerprint):
+        prepared = (tree, fingerprint)
+        self.prepared.append(prepared)
+        return prepared
+
+    def publish(self, prepared):
+        self.published.append(prepared)
 
 
 def make_client(tmp_path, handler=None, requests=None):
@@ -72,7 +110,7 @@ def test_config_crud_hides_keys_and_preserves_then_clears_secret(tmp_path, monke
     monkeypatch.setenv("ROUTER_JEV_API_KEY", "environment-secret")
     cleared = client.put("/admin/jev", json={**payload(), "api_key": ""})
     assert cleared.json()["config"]["key_source"] == "environment"
-    assert app.state.publisher.refreshes == 3
+    assert len(app.state.publisher.published) == 3
     conn = connect(app.state.settings.db_path)
     assert JevConfigRepo(conn).load().api_key == ""
     conn.close()
@@ -129,3 +167,25 @@ def test_test_endpoint_huge_probability_returns_502_not_500(tmp_path):
         assert "route" in response.json()["detail"]
     finally:
         asyncio.run(app.state.http.aclose())
+
+
+def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
+    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    app = create_app(settings)
+    conn = connect(settings.db_path)
+    conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
+    conn.commit()
+    conn.close()
+    before = app.state.snapshot.snapshot_revision
+    with TestClient(app) as client:
+        response = client.put("/admin/jev", json={
+            "base_url": "http://jev.test", "model": "d1-2B",
+            "instructions": "route", "state_template": "{request}",
+        })
+    assert response.status_code == 422
+    conn = connect(settings.db_path)
+    assert JevConfigRepo(conn).load() is None
+    assert conn.execute("SELECT COUNT(*) FROM changes WHERE kind = 'jev'").fetchone()[0] == 0
+    conn.close()
+    assert app.state.snapshot.snapshot_revision == before
+    assert app.state.snapshot.jev is None

@@ -35,7 +35,7 @@ from router.routing.snapshot import (
     read_jev_window,
 )
 from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
-from router.store.repositories import ChangeRepo, ModelRepo, TimePeriodRepo, _now_iso, _uid
+from router.store.repositories import ChangeRepo, ModelRepo, TimePeriodRepo, new_id, now_iso
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
     GraphConflictError,
@@ -77,7 +77,7 @@ def _parse_issue(exc: Exception) -> Issue:
 
 
 def _clean_id(raw) -> str:
-    value = _uid() if raw is None else raw
+    value = new_id() if raw is None else raw
     if not isinstance(value, str) or not _ID_RE.match(value):
         raise HTTPException(422, detail="invalid tree id")
     return value
@@ -105,19 +105,10 @@ def _tree_or_404(trees: RoutingTreeRepo, tree_id: str) -> RoutingTree:
     return tree
 
 
-def active_tree(trees: RoutingTreeRepo) -> RoutingTree | None:
-    return trees.active()
-
-
-def active_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo):
-    tree = active_tree(trees)
-    return [] if tree is None else _safe_validate(validate_graph_for_enable, tree, build_enable_context(conn))
-
-
 def _record_graph_change(conn: sqlite3.Connection, action: str, detail: dict) -> None:
     try:
         with conn:
-            ChangeRepo(conn).record(_now_iso(), "tree", {"action": action, **detail})
+            ChangeRepo(conn).record(now_iso(), "tree", {"action": action, **detail})
     except sqlite3.Error:
         logger.exception("graph change committed but audit write failed: %s", action)
 

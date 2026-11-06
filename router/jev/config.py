@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from string import Formatter
 from urllib.parse import urlsplit
 
-from router.store.repositories import _now_iso, _tx
+from router.store.repositories import now_iso, transaction
 
 DEFAULT_INSTRUCTIONS = "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。"
 DEFAULT_STATE_TEMPLATE = "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
@@ -92,7 +92,7 @@ class JevConfigRepo:
         )
 
     def save(self, settings: JevSettings) -> None:
-        with _tx(self.conn):
+        with transaction(self.conn):
             self.conn.execute(
                 "INSERT INTO jev_config (id, base_url, model, api_key, timeout_seconds, instructions, state_template, updated_at) "
                 "VALUES (1, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
@@ -106,6 +106,6 @@ class JevConfigRepo:
                     settings.timeout_seconds,
                     settings.instructions,
                     settings.state_template,
-                    _now_iso(),
+                    now_iso(),
                 ),
             )

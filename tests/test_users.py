@@ -378,7 +378,11 @@ def test_viewer_can_read_trees_but_not_write(tmp_path):
             ("post", "/admin/trees/tree-a/enable", None),
             ("post", "/admin/trees/tree-a/disable", None),
             ("post", "/admin/try", {"tree_id": "tree-a", "text": "hello"}),
-            ("put", "/admin/settings", {"a": "b"}),
+            ("put", "/admin/time-periods", {"periods": []}),
+            ("put", "/admin/jev/window", {"context_tokens": 4096}),
+            ("put", "/admin/jev", {"base_url": "http://jev.test",
+                                   "model": "m1", "instructions": "route",
+                                   "state_template": "{request}"}),
             ("post", "/admin/models", {"id": "m1", "upstream": "u",
                                        "provider": "p"})):
         kwargs = {"headers": headers}
@@ -570,7 +574,7 @@ def test_cannot_demote_or_disable_last_admin(tmp_path):
     assert c.put(f"/admin/users/{me['id']}", json={"role": "viewer"},
                  headers=second).status_code == 200
     # seed admin 现在是 viewer：它的旧会话写权限也随之消失（角色每次现查）
-    assert c.put("/admin/settings", json={"a": "b"},
+    assert c.put("/admin/time-periods", json={"periods": []},
                  headers=admin).status_code == 403
     assert c.put(f"/admin/users/{me['id']}", json={"status": "disabled"},
                  headers=second).status_code == 200
@@ -673,7 +677,7 @@ def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
     db = str(tmp_path / "legacy.db")
     c = TestClient(create_app(test_settings(tmp_path, db_path=db, user_auth=False)))
     assert c.get("/admin/models").status_code == 200
-    assert c.put("/admin/settings", json={"a": "b"}).status_code == 200
+    assert c.put("/admin/time-periods", json={"periods": []}).status_code == 200
     assert c.get("/admin/users").json() == {"users": []}
     me = c.get("/admin/me")
     assert me.status_code == 200
