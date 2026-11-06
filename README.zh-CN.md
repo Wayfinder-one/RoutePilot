@@ -61,7 +61,7 @@ flowchart LR
 - **决策组** — 画布编辑、图设置、节点/连线检查器、校验、试算、导入导出。
 - **计算日志** — 最近决策的模型、目标、候选、波次、JEV 概率、推理、上游结果和可回放轨迹。
 - **JEV 模型** — 决策服务地址、模型、指令/State 模板、连接测试、上下文与输入 token 窗口。
-- **模型与设置** — 模型注册表、上游模型 id、提供方、推理声明、能力说明。
+- **模型** — 模型注册表、上游模型 id、提供方、推理声明、能力说明。
 - **用户管理** — 管理员/只读账号、改密、角色与状态管理。
 
 ### 决策画布
@@ -171,7 +171,7 @@ flowchart LR
 
 模型注册表把决策图使用的**模型位**映射到**上游模型 id** 和提供方。一个目标可以配置多个模型位，由 `least_inflight` 选择。
 
-![模型与设置](assets/routepilot/zh/models.png)
+![模型](assets/routepilot/zh/models.png)
 
 提供方配置 OpenAI 兼容 base URL、API key 环境变量和推理方言。模型 profile 可以声明：
 
@@ -197,7 +197,7 @@ flowchart LR
 ## 账号与运维
 
 - 邮箱 + 口令登录，口令使用 scrypt 哈希，会话使用不透明 bearer token。
-- `admin` 可编辑决策图、模型、JEV、用户和设置；`viewer` 只读，不能管理用户。
+- `admin` 可编辑决策图、模型、JEV 和用户；`viewer` 只读，不能管理用户。
 - 最后一个有效管理员不能被降级、禁用或删除。
 - 用户和配置变更写入审计历史。
 - 每个图文件用 SHA-256 内容哈希做保存冲突和重载判断；不保留图历史版本。
@@ -316,6 +316,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 ```bash
 .venv/bin/python -m pytest -q
 node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs
+npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 ```
