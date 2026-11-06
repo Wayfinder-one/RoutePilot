@@ -55,6 +55,36 @@ def test_route_composes_evaluator_then_scheduler_and_collects_shared_trace():
     assert balancer.calls[-1]["preferred"] is None
 
 
+# 五场景矩阵的模型/推理契约：base 428a35d 的 tests/test_graph_scenarios.py 断言
+# s1–s5 的最终模型与推理档位；重构后这些字段来自 RoutingDecision，必须走组合根。
+@pytest.mark.parametrize(
+    ("scenario_id", "model", "reasoning", "selection_reason"),
+    [
+        ("s1", "qwen3.8-flash-sft", "high", "target"),
+        ("s2", "qwen3-8b", "low", "target"),
+        ("s3", "deepseek-v3", "high", "target"),
+        ("s4", "deepseek-v3", "high", "target"),
+        ("s5", "qwen3-8b", "low", "error_fallback"),
+    ],
+)
+def test_scenario_matrix_schedules_expected_model_and_reasoning(
+    scenario_id, model, reasoning, selection_reason,
+):
+    decision, _jev, balancer, _affinity = run_scenario(scenario_id)
+
+    assert decision.model == model
+    assert decision.reasoning == reasoning
+    assert decision.selection_reason == selection_reason
+    assert balancer.calls[-1]["models"] == [model]
+    assert decision.trace[-1] == {
+        "event": "scheduled",
+        "model": model,
+        "reason": selection_reason,
+        "dry_run": False,
+    }
+    decision.release()
+
+
 def test_schedule_trace_uses_actual_selection_and_preserves_event_order():
     decision, _jev, _balancer, _affinity = run_scenario("s1")
     schedule = next(event for event in decision.trace if event["event"] == "schedule")

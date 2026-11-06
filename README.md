@@ -61,7 +61,7 @@ The console is the control plane for the router. It is plain native ES Modules s
 - **Decision groups** — canvas editor, graph settings, node/edge inspector, validation, dry-run, import/export.
 - **Calc Log** — recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, and a replayable trace.
 - **JEV Model** — decision-service endpoint, model, prompt/state template, connection test, context and input-token window.
-- **Models & Settings** — model registry, upstream model ids, providers, reasoning declarations, capability notes.
+- **Models** — model registry, upstream model ids, providers, reasoning declarations, capability notes.
 - **Users** — admin/viewer accounts, password changes, role and status management.
 
 ### Canvas
@@ -171,7 +171,7 @@ Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` value
 
 The model registry maps a **model slot** used by the graph to an **upstream model id** and a provider. A target can hold several model slots; `least_inflight` picks among them.
 
-![Models and settings](assets/routepilot/en/models.png)
+![Models](assets/routepilot/en/models.png)
 
 Providers define the OpenAI-compatible base URL, API-key environment variable, and reasoning dialect. Model profiles can declare:
 
@@ -197,7 +197,7 @@ Environment variables can seed the decision-service config on first start only; 
 ## Access and operations
 
 - Email/password login with scrypt password hashing and opaque bearer sessions.
-- `admin` can edit graphs, models, JEV settings, users, and settings. `viewer` is read-only and cannot manage users.
+- `admin` can edit graphs, models, JEV settings, and users. `viewer` is read-only and cannot manage users.
 - The last active admin cannot be demoted, disabled, or deleted.
 - Every user and configuration change is recorded in the audit log.
 - Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
@@ -317,6 +317,7 @@ Default checks need no running server and make no external requests:
 ```bash
 .venv/bin/python -m pytest -q
 node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs
+npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 ```
