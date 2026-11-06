@@ -1336,11 +1336,21 @@ test('review-chinese-node-names-contract', () => {
   assert.match(read('routing/inspector.js'),
     /import\s*\{[^}]*\bnodeName\b[^}]*\}\s*from\s*['"]\.\/cards\.js['"]/,
     'routing/inspector.js does not import nodeName from cards.js');
-  assert.match(read('routing/tryrun.js'),
-    /import\s*\{[^}]*\bnodeName\s+as\s+nodeNameOf\b[^}]*\}\s*from\s*['"]\.\/cards\.js['"]/,
-    'routing/tryrun.js does not import nodeName from cards.js');
-  /* 必须是调用点，不能靠 import/定义本身蒙混过关。 */
-  assert.match(read('routing/condpop.js'), /\bnodeNameOf\(node, graph\)/,
+  /* tryrun 的本地别名可以任意命名：断言「从 cards.js 导入了 nodeName」+「真的调用了
+     这个本地名」，不钉死 alias 名字或单行格式（纯重命名/换行不应让用例误红）。 */
+  const tryrun = read('routing/tryrun.js');
+  const tryrunCards = tryrun.match(/import\s*\{([^}]*)\}\s*from\s*['"]\.\/cards\.js['"]/);
+  assert.ok(tryrunCards, 'routing/tryrun.js does not import from cards.js');
+  const tryrunAlias = tryrunCards[1].match(/\bnodeName\s+as\s+([A-Za-z_$][\w$]*)/);
+  const tryrunNodeName = tryrunAlias
+    ? tryrunAlias[1]
+    : (/\bnodeName\b/.test(tryrunCards[1]) ? 'nodeName' : null);
+  assert.ok(tryrunNodeName, 'routing/tryrun.js does not import nodeName from cards.js');
+  assert.match(tryrun, new RegExp('(?:^|[^\\w$])' +
+    tryrunNodeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\('),
+  'routing/tryrun.js does not call the node-name helper it imported');
+  /* 必须是调用点，不能靠 import/定义本身蒙混过关（定义是 `const nodeNameOf = (`）。 */
+  assert.match(read('routing/condpop.js'), /\bnodeNameOf\s*\(/,
     'routing/condpop.js does not call the injected node-name helper');
   assert.match(read('routing/app.js'),
     /configureCondPop\(\{[^}]*\bnodeName:\s*nodeName\b[^}]*\}\)/,
