@@ -5,7 +5,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo, JevSettings
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.config import Settings
 from router.routing.document import graph_document_bytes
 from router.routing.graph.compiled import CompiledGraph, edge_order_key, compile_graph
@@ -14,6 +14,7 @@ from router.routing.tree import tree_from_dict
 from router.routing.reloader import GraphReloadWorker
 from router.routing.snapshot import SnapshotPublisher, load_snapshot
 from router.store.db import connect, migrate
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, tree_dict

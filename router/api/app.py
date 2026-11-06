@@ -19,7 +19,7 @@ from router.control.config import (
 )
 from router.control.validation import issues_payload
 from router.jev.client import JevClient
-from router.jev.config import JevConfigRepo, JevSettings
+from router.jev.config import JevSettings
 from router.maintenance import MaintenanceWorker
 from router.request_logging import RequestLogger
 from router.routing.affinity import SessionAffinity
@@ -30,6 +30,7 @@ from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import SessionRepo, UserRepo, seed_default
 from router.store.routing_trees import (
     GraphAlreadyExistsError,

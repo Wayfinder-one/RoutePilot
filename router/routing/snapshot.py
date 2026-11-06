@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from router.control.validation import build_enable_context
-from router.jev.config import JevConfigRepo, JevSettings
+from router.jev.config import JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_INPUT_TOKENS,
@@ -25,6 +25,7 @@ from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
 from router.routing.types import RoutingMiss
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
 from router.upstream.catalog import Backend, load_backends

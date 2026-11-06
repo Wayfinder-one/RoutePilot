@@ -1,5 +1,6 @@
 import pytest
 
+from router.routing.codec import slot_sort_key
 from router.routing.graph.conditions import (
     UNKNOWN,
     ConditionResult,
@@ -19,7 +20,7 @@ from router.routing.graph.model import (
     TargetNode,
     graph_from_dict,
 )
-from router.routing.graph.ports import Port, edge_type, next_slot, output_ports, slot_sort_key
+from router.routing.graph.ports import Port, edge_type, next_slot, output_ports
 from tests.routing_fixtures import graph_dict
 
 
@@ -157,9 +158,12 @@ def test_condition_invalid_reason_helper():
     assert conditionInvalidReason(_numeric_edge(op="gt", threshold=0.5), question) is None
     assert conditionInvalidReason(_boolean_edge(None), _start()) is None
     assert conditionInvalidReason(_boolean_edge(Condition("is", False)), _start()) is None
-    illegal = conditionInvalidReason(_numeric_edge(op=None), question)
-    assert isinstance(illegal, str) and illegal
-    assert isinstance(conditionInvalidReason(Edge("e", "q", "prob.strong", "safe", "in_2", Condition("gt", 1e12)), question), str)
+    missing = conditionInvalidReason(_numeric_edge(op=None), question)
+    assert missing is not None and missing.code == "numeric_condition_missing"
+    assert isinstance(missing.message, str) and missing.message
+    oversized = conditionInvalidReason(Edge("e", "q", "prob.strong", "safe", "in_2", Condition("gt", 1e12)), question)
+    assert oversized is not None and oversized.code == "numeric_threshold_out_of_range"
+    assert oversized.message != missing.message
 
 
 def test_output_ports_follow_node_types():

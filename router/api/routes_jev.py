@@ -13,7 +13,6 @@ from router.jev.client import ChoiceAnswer, DecisionQuestion, JevCandidate, JevC
 from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
-    JevConfigRepo,
     JevSettings,
 )
 from router.jev.window import (
@@ -24,6 +23,7 @@ from router.jev.window import (
     MIN_INPUT_TOKENS,
 )
 from router.routing.snapshot import read_jev_window
+from router.store.jev_config import JevConfigRepo
 from router.store.routing_trees import RoutingTreeRepo
 
 router = APIRouter()

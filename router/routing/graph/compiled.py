@@ -12,8 +12,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from router.routing.codec import slot_sort_key
 from router.routing.graph.model import Edge, GraphNode, GraphRoot
-from router.routing.graph.ports import Port, output_ports, slot_sort_key
+from router.routing.graph.ports import Port, output_ports
 
 
 @dataclass(frozen=True)

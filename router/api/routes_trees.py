@@ -20,7 +20,6 @@ from router.api.deps import get_conn, get_tree_repo
 from router.api.trace_presenter import present_trace
 from router.control.graphs import GraphPatch, GraphService, graph_parse_failed
 from router.control.validation import issues_payload, tree_issues
-from router.jev.config import JevConfigRepo
 from router.jev.serialization import answer_to_dict
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
@@ -33,6 +32,7 @@ from router.routing.snapshot import (
     read_jev_window,
 )
 from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, TimePeriodRepo, new_id
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import load_backends

@@ -15,8 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from router.control.validation import active_tree_issues
-from router.jev.config import JevConfigRepo, JevSettings
+from router.jev.config import JevSettings
 from router.jev.window import MAX_TOKENS, MIN_CONTEXT_TOKENS, MIN_INPUT_TOKENS
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import (
     ChangeRepo,
     ModelRepo,
@@ -28,6 +29,7 @@ from router.store.repositories import (
     now_iso,
     write_transaction,
 )
+from router.store.routing_trees import GraphChangedDuringLoad
 
 
 class ValidationFailed(ValueError):
@@ -89,12 +91,28 @@ class ConfigurationService:
         self.publisher = publisher
 
     # ── 共享骨架：publisher.locked() → 写事务（写入/校验/审计/prepare）→
-    #    提交 → publish（纯内存替换）。任何一步失败：ROLLBACK 且不发布。─────
+    #    提交 → 复核指纹 → publish（纯内存替换）。任何一步失败：ROLLBACK 且不发布。
+    #    指纹复核在锁内、提交之后进行，且不把 publish 挪进数据库事务。─────────
     def _write_and_publish(self, write):
         with self.publisher.locked():
             with write_transaction(self.conn):
                 prepared = write(self.conn)
-            self.publisher.publish(prepared)
+            self.publisher.publish(self._recheck_fingerprint(prepared))
+
+    def _recheck_fingerprint(self, prepared):
+        """发布前复核磁盘指纹（等价旧 SnapshotPublisher.refresh 的复核语义）。
+
+        若图在候选快照构造后变了，用新指纹重建一次；仍不稳定就抛与 GraphService
+        相同的冲突，绝不把过期指纹打给已发布快照。
+        """
+        for _attempt in range(2):
+            fingerprint = self.trees.fingerprint()
+            if fingerprint == prepared.fingerprint:
+                return prepared
+            prepared = self.publisher.prepare(
+                self.conn, self.trees.active(), fingerprint)
+        raise GraphChangedDuringLoad(
+            "graph changed between document write and snapshot publish")
 
     def _require_valid_active_graph(self) -> None:
         issues = active_tree_issues(self.conn, self.trees)

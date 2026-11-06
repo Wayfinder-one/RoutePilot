@@ -6,11 +6,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.jev.config import JevConfigRepo
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
 from router.routing.snapshot import build_snapshot, model_capability, read_jev_window
 from router.store.db import connect
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, TimePeriodRepo
 from router.store.routing_trees import GraphStorageError
 from router.upstream.catalog import load_backends
