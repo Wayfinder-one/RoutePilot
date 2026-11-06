@@ -23,7 +23,7 @@ from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevS
 from router.request_logging import LOG_COLUMNS, RequestLogger
 from router.routing.affinity import SessionAffinity
 from router.routing.graph.engine import GraphExecutionEngine
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import build_snapshot
 from router.store.db import connect, migrate

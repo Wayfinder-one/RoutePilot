@@ -53,7 +53,7 @@ def tree_dict(tree_id="main", *, root=None, enabled=False, sticky=None):
 
 
 def huge_chain_graph(count=1200):
-    """n0 → n1 → … 的 target 链（默认 1200 节点/1199 边），用于极限图 RecursionError 回归。
+    """n0 → n1 → … 的 target 链（默认 1200 节点/1199 边），用于极限图限额回归。
 
     节点与边都超过 spec §2.7 限额，校验必须在任何 DFS 之前返回 limit_exceeded。
     """

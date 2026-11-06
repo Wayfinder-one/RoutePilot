@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from router.routing.document import graph_document_bytes, parse_graph_document
-from router.routing.model import RoutingTree
+from router.routing.tree import RoutingTree
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -153,7 +153,7 @@ class RoutingTreeRepo:
                 updated_at=modified,
                 document_sha256=hashlib.sha256(content).hexdigest(),
             )
-        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        except (OSError, UnicodeError, ValueError) as exc:
             raise GraphStorageError(f"invalid graph document: {tree_id}") from exc
 
     def _require_writer(self) -> None:

@@ -1,70 +1,21 @@
-"""决策组 envelope（Sticky / RoutingTree）与 tree_* 序列化视图；图模型在 router.routing.graph。"""
+"""决策组 envelope（Sticky / RoutingTree）与 tree_* 序列化视图；图模型在 router.routing.graph.model。"""
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
-from router.routing.graph.conditions import (
-    UNKNOWN,
-    ConditionResult,
-    conditionInvalidReason,
-    evaluate_condition,
-)
+from router.routing.codec import optional_text_field, reject_unknown_fields, text_field
 from router.routing.graph.model import (
-    Condition,
-    ConditionNode,
-    Edge,
-    GraphNode,
     GraphRoot,
-    LogicNode,
-    ModelTarget,
-    Position,
-    QuestionNode,
-    QuestionOption,
-    StartNode,
-    TargetNode,
     canonical_json,
     graph_behavior_dict,
     graph_from_dict,
-    graph_revision_of,
     graph_to_dict,
-)
-from router.routing.graph.ports import (
-    Port,
-    edge_type,
-    next_slot,
-    output_ports,
-    slot_sort_key,
 )
 
 __all__ = [
-    "UNKNOWN",
-    "Condition",
-    "ConditionNode",
-    "ConditionResult",
-    "Edge",
-    "GraphNode",
-    "GraphRoot",
-    "LogicNode",
-    "ModelTarget",
-    "Port",
-    "Position",
-    "QuestionNode",
-    "QuestionOption",
     "RoutingTree",
     "Sticky",
-    "StartNode",
-    "TargetNode",
-    "canonical_json",
-    "conditionInvalidReason",
-    "edge_type",
-    "evaluate_condition",
-    "graph_behavior_dict",
-    "graph_from_dict",
-    "graph_revision_of",
-    "graph_to_dict",
-    "next_slot",
-    "output_ports",
-    "slot_sort_key",
     "tree_behavior_dict",
     "tree_from_dict",
     "tree_revision_of",
@@ -92,24 +43,12 @@ class RoutingTree:
     document_sha256: str = ""
 
 
-def _unknown(kind: str, raw: dict, allowed: set[str]) -> None:
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ValueError(f"{kind} has unknown fields: {', '.join(unknown)}")
-
-
-def _text(value, field: str, *, empty: bool = False) -> str:
-    if not isinstance(value, str) or (not empty and not value.strip()):
-        raise ValueError(f"{field} must be a {'string' if empty else 'nonempty string'}")
-    return value
-
-
 def _sticky_from_dict(raw) -> Sticky:
     if raw is None:
         return Sticky()
     if not isinstance(raw, dict):
         raise ValueError("sticky must be an object")
-    _unknown("sticky", raw, {"enabled", "ttl_seconds"})
+    reject_unknown_fields("sticky", raw, {"enabled", "ttl_seconds"})
     enabled = raw.get("enabled", False)
     ttl = raw.get("ttl_seconds", 1800)
     if not isinstance(enabled, bool):
@@ -122,20 +61,25 @@ def _sticky_from_dict(raw) -> Sticky:
 def tree_from_dict(raw) -> RoutingTree:
     if not isinstance(raw, dict):
         raise ValueError("tree must be an object")
-    _unknown("tree", raw, {"id", "name", "enabled", "timezone", "sticky", "root", "tree_revision", "updated_at", "document_sha256"})
+    reject_unknown_fields(
+        "tree",
+        raw,
+        {"id", "name", "enabled", "timezone", "sticky", "root", "tree_revision",
+         "updated_at", "document_sha256"},
+    )
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
     return RoutingTree(
-        id=_text(raw.get("id"), "tree id"),
-        name=_text(raw.get("name", ""), "tree name", empty=True),
+        id=text_field(raw.get("id"), "tree id"),
+        name=optional_text_field(raw.get("name", ""), "tree name"),
         enabled=enabled,
         root=graph_from_dict(raw.get("root")),
         sticky=_sticky_from_dict(raw.get("sticky")),
-        timezone=_text(raw.get("timezone", "Asia/Shanghai"), "timezone"),
-        tree_revision=_text(raw.get("tree_revision", ""), "tree_revision", empty=True),
-        updated_at=_text(raw.get("updated_at", ""), "updated_at", empty=True),
-        document_sha256=_text(raw.get("document_sha256", ""), "document_sha256", empty=True),
+        timezone=text_field(raw.get("timezone", "Asia/Shanghai"), "timezone"),
+        tree_revision=optional_text_field(raw.get("tree_revision", ""), "tree_revision"),
+        updated_at=optional_text_field(raw.get("updated_at", ""), "updated_at"),
+        document_sha256=optional_text_field(raw.get("document_sha256", ""), "document_sha256"),
     )
 
 
@@ -168,4 +112,5 @@ def tree_to_dict(tree: RoutingTree) -> dict:
 
 
 def tree_revision_of(tree: RoutingTree) -> str:
-    return graph_revision_of(tree)
+    payload = canonical_json(tree_behavior_dict(tree)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()

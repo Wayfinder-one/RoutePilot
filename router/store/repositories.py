@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from router import auth
 from router.presets import PRESET_BY_ID
 from router.routing.conditions import TimePeriod
-from router.routing.model import RoutingTree, tree_revision_of
+from router.routing.tree import RoutingTree, tree_revision_of
 
 
 def now_iso() -> str:

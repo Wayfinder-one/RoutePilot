@@ -5,7 +5,8 @@ import sqlite3
 import pytest
 
 from router.jev.config import JevConfigRepo, JevSettings
-from router.routing.model import canonical_json, tree_from_dict, tree_revision_of, tree_storage_dict
+from router.routing.graph.model import canonical_json
+from router.routing.tree import tree_from_dict, tree_revision_of, tree_storage_dict
 from router.store.db import connect, migrate
 from router.store.graph_migration import export_sqlite_graphs
 from router.store.repositories import ModelRepo, seed_default

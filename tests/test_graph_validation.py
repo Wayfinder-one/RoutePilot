@@ -10,7 +10,7 @@ from router.routing.graph.validate import (
     validate_graph_for_enable,
     validate_graph_structure,
 )
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from tests.routing_fixtures import enable_context, graph_dict, huge_chain_graph, tree_dict
 
 EDGE_ISSUE_CODES = {
@@ -544,16 +544,20 @@ def test_huge_chain_returns_limit_exceeded_without_recursion():
     assert all(issue.zh and issue.en and issue.level == "hard" for issue in issues)
 
 
-def test_recursion_error_in_traversal_folds_into_limit_issue(monkeypatch):
-    """防御层：DFS 溢出时追加 limit_exceeded，绝不把 RecursionError 抛给调用方。"""
-    from router.routing.graph import validate as validate_module
+def test_cycle_dfs_is_iterative_beyond_python_recursion_limit():
+    """显式栈 DFS：深度远超 Python 递归上限的链也必须正常返回，不依赖调用方兜底。"""
+    from router.routing.graph.validate import _cycle_back_edges
 
-    def boom(adjacency):
-        raise RecursionError("simulated deep graph")
+    count = 5000  # > sys.getrecursionlimit() (1000)
+    adjacency = {
+        f"n{index}": [(f"n{index + 1}", f"e{index}", "in_1")]
+        for index in range(count - 1)
+    }
+    adjacency[f"n{count - 1}"] = []
+    assert _cycle_back_edges(adjacency) == []
 
-    monkeypatch.setattr(validate_module, "_cycle_back_edges", boom)
-    issues = validate_graph_structure(tree_from_dict(tree_dict()))
-    assert {issue.code for issue in issues} == {"limit_exceeded"}
+    adjacency[f"n{count - 1}"] = [("n0", "e-cycle", "in_1")]
+    assert _cycle_back_edges(adjacency) == [("n0", "e-cycle", "in_1")]
 
 
 # ─────────────────────── determinism / parse ────────────────────────

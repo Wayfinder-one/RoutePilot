@@ -25,7 +25,8 @@ from router.control.config import AlreadyExists, MissingError, ValidationFailed
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue, validate_graph_structure
-from router.routing.model import RoutingTree, graph_to_dict, tree_from_dict
+from router.routing.graph.model import graph_to_dict
+from router.routing.tree import RoutingTree, tree_from_dict
 from router.store.repositories import ChangeRepo, now_iso
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
@@ -186,7 +187,7 @@ class GraphService:
                            if patch.sticky is UNSET else patch.sticky),
                 "timezone": current.timezone if patch.timezone is UNSET else patch.timezone,
             })
-        except (ValueError, RecursionError) as exc:
+        except ValueError as exc:
             raise ValidationFailed(graph_parse_failed(exc)) from exc
 
     def _require_fingerprint(self, fingerprint: tuple[str | None, str]) -> None:

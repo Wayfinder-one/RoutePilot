@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.request_logging import RequestLogger
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import test_settings, tree_dict
