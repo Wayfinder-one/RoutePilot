@@ -1,4 +1,8 @@
 /* Calculation log: render only phases present in trace. */
+import { api, apiErrText, esc, fmtTime } from './api.js';
+import { LANG, onLangChange, t, tf } from './i18n.js';
+import './nav.js';
+
 const $ = selector => document.querySelector(selector);
 let requests = [];
 let filter = 'all';
@@ -210,5 +214,5 @@ async function load() {
     $('#list').innerHTML = '<div class="lg-list-empty">' + esc(apiErrText(error)) + '</div>';
   }
 }
-window.onLangChange = render;
+onLangChange(render);
 load();

@@ -1,13 +1,16 @@
 /* Login page (email + password -> POST /admin/login).
 
    - The session token is stored by api.login() in localStorage (sr_admin_token);
-     ?token=<static token> is still honoured by api.js and bounces straight on.
+     there is no URL-token shortcut anymore, so every visitor signs in here.
    - A signed-in visitor (GET /admin/me 200) never sees the form: it redirects
      to `next` or index.html.
    - `next` accepts only same-origin absolute paths ("/console/users.html"),
      never protocol-relative ("//evil.example") or backslash tricks: this is
      the post-401 bounce target and must not become an open redirect.
    - login.html does not load nav.js: the main nav is meaningless before auth. */
+import { api, apiErrText } from './api.js';
+import { LANG, onLangChange, setLang, t, tf } from './i18n.js';
+
 setLang(LANG);
 
 (function () {
@@ -43,7 +46,7 @@ setLang(LANG);
   function paintTitle() { document.title = t('login.title') + ' · RoutePilot'; }
 
   async function boot() {
-    /* Signed in (session or ?token= static token) -> go back to the target page. */
+    /* Signed in (existing session) -> go back to the target page. */
     try {
       await api.me();
       go();

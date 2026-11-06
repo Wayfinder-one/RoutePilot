@@ -1,16 +1,14 @@
 /* RTGraph 纯函数层契约测试（Task 9，规格 §2.2–§2.8 / §5）。
  *
  * 运行：node --test scripts/console_graph_test.mjs
- * 加载：graph.js 必须同时可用于浏览器（window.RTGraph）与 Node（module.exports）。
+ * 加载：graph.js / trace.js 是原生 ES module，浏览器与 Node 共用同一份源码。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
-const RTGraph = require('../router/console/routing/graph.js');
-const SRTrace = require('../router/console/trace.js');
+import * as RTGraph from '../router/console/routing/graph.js';
+import * as SRTrace from '../router/console/trace.js';
 
 const EXAMPLE_URL = new URL('../router/console/routing/example.json', import.meta.url);
 
@@ -1330,11 +1328,16 @@ test('review-chinese-node-names-contract', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const cards = read('routing/cards.js');
   assert.match(cards, /function nodeName\(node, graph\)/, 'cards.js lost the Chinese node names');
-  assert.match(cards, /nodeName: nodeName/, 'cards.js does not expose nodeName');
+  assert.match(cards, /^\s*nodeName,$/m, 'cards.js does not export nodeName');
   assert.match(cards, /cv\.name\.question\./, 'question cards do not use the Chinese name labels');
-  for (const file of ['routing/inspector.js', 'routing/condpop.js', 'routing/tryrun.js']) {
-    assert.match(read(file), /RTCards\.nodeName\(/, file + ' does not use the Chinese node names');
-  }
+  /* ESM：inspector / tryrun 直接从 cards.js 导入 nodeName；condpop 由
+     configureCondPop({ nodeName }) 注入，避免与 cards.js 形成循环依赖。 */
+  assert.match(read('routing/inspector.js'), /import \{[^}]*\bnodeName\b[^}]*\} from '\.\/cards\.js'/,
+    'routing/inspector.js does not use the Chinese node names');
+  assert.match(read('routing/tryrun.js'), /nodeName as nodeNameOf/,
+    'routing/tryrun.js does not use the Chinese node names');
+  assert.match(read('routing/condpop.js'), /nodeNameOf/,
+    'routing/condpop.js does not use the Chinese node names');
   /* 卡片不再渲染 OR 说明（说明仅保留在检查器里）。 */
   assert.doesNotMatch(cards, /cv\.slot\.orNote/, 'card still renders the OR note');
   const i18n = read('i18n.js');

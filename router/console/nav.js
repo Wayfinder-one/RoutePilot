@@ -4,10 +4,14 @@
    item come from GET /admin/me, fetched once per page. Both start hidden so a
    viewer never sees admin UI flash in; clicking the user control opens a
    dropdown with 用户管理 (admin) and 退出. An older backend without /admin/me
-   simply leaves the bar in its previous form (no user control). The fetch is
-   deferred to DOMContentLoaded because nav.js loads *before* api.js. */
-(function () {
-  const page = document.body.dataset.page;
+   simply leaves the bar in its previous form (no user control).
+
+   ES module: the language buttons are bound here instead of using inline
+   onclick handlers, because setLang is no longer a page global. */
+import { api } from './api.js';
+import { LANG, onLangChange, setLang, t } from './i18n.js';
+
+const page = document.body.dataset.page;
   const pages = ['overview', 'routing', 'logs', 'jev', 'models'];
   const bar = document.createElement('header');
   bar.className = 'top';
@@ -33,10 +37,13 @@
        </div>
      </span>
      <span class="langtog">
-       <button data-lang="zh" onclick="setLang('zh')">中文</button>
-       <button data-lang="en" onclick="setLang('en')">EN</button>
+       <button type="button" data-lang="zh">中文</button>
+       <button type="button" data-lang="en">EN</button>
      </span>`;
   document.body.prepend(bar);
+  bar.querySelectorAll('.langtog button').forEach(button => {
+    button.addEventListener('click', () => setLang(button.dataset.lang));
+  });
   setLang(LANG);
   /* Narrow view scrolls the nav sideways; keep the current page in view
      without moving the document itself (scrollIntoView can move both). */
@@ -100,7 +107,6 @@
     });
   }
 
-  if (typeof onLangChange === 'function') onLangChange(paintUser);
+  onLangChange(paintUser);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initUser);
   else initUser();
-})();

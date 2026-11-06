@@ -445,6 +445,9 @@ const I18N = {
     'cv.toastAlreadyEnabled': '该决策组已启用',
     'cv.toastEnableFail': '启用失败：{err}',
     'cv.toastEnableIssues': '启用失败：{n} 个校验问题，请在校验条中定位修复',
+    'cv.toastDisabled': '已停用该决策组',
+    'cv.toastDisableFail': '停用失败：{err}',
+    'cv.toastDisableIssues': '停用失败：{n} 个校验问题，请在校验条中定位修复',
     'cv.toastExported': '已导出 v3 图 JSON',
     'cv.toastExportFail': '导出失败：{err}',
     'cv.toastImported': '已导入 v3 图（可撤销）',
@@ -909,6 +912,9 @@ const I18N = {
     'cv.toastAlreadyEnabled': 'This decision group is already enabled',
     'cv.toastEnableFail': 'Enable failed: {err}',
     'cv.toastEnableIssues': 'Enable failed: {n} validation issues; locate and fix them in the validation bar',
+    'cv.toastDisabled': 'Decision group disabled',
+    'cv.toastDisableFail': 'Disable failed: {err}',
+    'cv.toastDisableIssues': 'Disable failed: {n} validation issues; locate and fix them in the validation bar',
     'cv.toastExported': 'Exported the v3 graph JSON',
     'cv.toastExportFail': 'Export failed: {err}',
     'cv.toastImported': 'Imported the v3 graph (undoable)',
@@ -929,7 +935,14 @@ const I18N = {
     /* ── trace: shared routing-trace renderer (pipeline + logs) ── */
   },
 };
-let LANG = localStorage.getItem('router_lang') || 'zh';
+/* Node 直测（node --test）没有 localStorage / document：模块顶层只做能力探测，
+   真正写存储与 DOM 的路径都在 setLang 内并带同样的守卫。 */
+const STORAGE = (() => {
+  if (typeof window === 'undefined') return null;
+  try { return window.localStorage; } catch (error) { return null; }
+})();
+let LANG = (STORAGE && STORAGE.getItem('router_lang')) || 'zh';
+export { LANG };
 function t(key) { return (I18N[LANG] && I18N[LANG][key]) || I18N.zh[key] || key; }
 /* Substitute {name} placeholders: tf('logs.jev', {tmp:'1.1'}). */
 function tf(key, vars) {
@@ -938,24 +951,27 @@ function tf(key, vars) {
   return s;
 }
 /* Additive hook for code-owned DOM (nav user chip, users table): pages
-   register here instead of replacing window.onLangChange, so several
-   components can repaint without fighting over the single global slot. */
-const LANG_HOOKS = [];
-function onLangChange(fn) { if (typeof fn === 'function') LANG_HOOKS.push(fn); }
+   register here, so several components can repaint without fighting over a
+   single global slot. The list is module-private by design. */
+const languageListeners = [];
+function onLangChange(fn) { if (typeof fn === 'function') languageListeners.push(fn); }
 function setLang(l) {
-  LANG = l; localStorage.setItem('router_lang', l);
-  document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
-  document.querySelectorAll('[data-i18n]').forEach(el => {
-    el.textContent = t(el.dataset.i18n);
-  });
-  document.querySelectorAll('[data-i18n-aria]').forEach(el => {
-    el.setAttribute('aria-label', t(el.dataset.i18nAria));
-  });
-  document.querySelectorAll('[data-i18n-title]').forEach(el => {
-    el.title = t(el.dataset.i18nTitle);
-  });
-  document.querySelectorAll('.langtog button').forEach(b =>
-    b.classList.toggle('on', b.dataset.lang === l));
-  LANG_HOOKS.forEach(fn => { try { fn(l); } catch (e) { /* one bad hook must not break the toggle */ } });
-  if (typeof window.onLangChange === 'function') window.onLangChange();
+  LANG = l;
+  if (STORAGE) STORAGE.setItem('router_lang', l);
+  if (typeof document !== 'undefined') {
+    document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
+    document.querySelectorAll('[data-i18n]').forEach(el => {
+      el.textContent = t(el.dataset.i18n);
+    });
+    document.querySelectorAll('[data-i18n-aria]').forEach(el => {
+      el.setAttribute('aria-label', t(el.dataset.i18nAria));
+    });
+    document.querySelectorAll('[data-i18n-title]').forEach(el => {
+      el.title = t(el.dataset.i18nTitle);
+    });
+    document.querySelectorAll('.langtog button').forEach(b =>
+      b.classList.toggle('on', b.dataset.lang === l));
+  }
+  languageListeners.forEach(fn => { try { fn(l); } catch (e) { /* one bad listener must not break the toggle */ } });
 }
+export { t, tf, onLangChange, setLang };

@@ -2,12 +2,14 @@
 
    Auth: the console signs in with email + password (POST /admin/login) and
    keeps the opaque session token in this browser's localStorage
-   ("sr_admin_token"). The static ROUTER_ADMIN_TOKEN was removed on 2026-10-26.
-   A ?token=... query parameter is still accepted once — useful to hand an
-   existing session token to a script/demo browser — then stripped from the
-   URL. On a 401 the session is gone: clear the token and bounce to
+   ("sr_admin_token"). The static ROUTER_ADMIN_TOKEN was removed on 2026-10-26
+   and there is no URL token handoff either: scripts and demo browsers sign in
+   normally (or seed localStorage) instead of leaking a session token through
+   the address bar. On a 401 the session is gone: clear the token and bounce to
    login.html?next=<this page>; the login page itself never bounces (login.js
    shows the error instead). */
+import { tf } from './i18n.js';
+
 const api = {
   TOKEN_KEY: 'sr_admin_token',
   TIMEOUT_MS: 15000,
@@ -116,19 +118,6 @@ function apiErrText(e) {
   return m === '[object Object]' ? JSON.stringify(e) : m;
 }
 
-/* Accept ?token=... once (handy for shared demo links), then strip it. */
-(function () {
-  try {
-    const u = new URL(window.location.href);
-    const q = u.searchParams.get('token');
-    if (q) {
-      api.setToken(q);
-      u.searchParams.delete('token');
-      window.history.replaceState({}, '', u.toString());
-    }
-  } catch (e) { /* ignore */ }
-})();
-
 /* Shared helpers used by every page. */
 function esc(s) {
   return String(s == null ? '' : s)
@@ -148,3 +137,5 @@ function toast(msg, ms) {
   d.className = 'toast'; d.textContent = msg;
   document.body.appendChild(d); setTimeout(() => d.remove(), ms || 2200);
 }
+
+export { api, apiErrText, esc, fmt, fmtTime, toast };
