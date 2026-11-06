@@ -40,11 +40,22 @@ flowchart LR
 
 `unknown` 不会激活任何问题或目标；数值比较遇到 unknown 时结果保持 unknown。
 
+## 架构与边界
+
+- **API 层。** `router/api/` 只解析请求 DTO、把领域异常映射为 HTTP 状态/Issue，并转发上游响应；admin 路由不直接写控制面状态。
+- **控制面服务。** `router/control/` 承载写用例。`GraphService` 按顺序完成校验 → 准备候选快照 → 在单写入者锁内写图文件 → 复核文档哈希 → 发布快照 → 写审计；草稿过期时返回 409，不覆盖他人修改。
+- **路由领域。** `router/routing/graph/`（模型、校验、条件、端口、编译拓扑、执行器）是纯领域代码，不依赖 FastAPI 或 SQLite。`router/routing/service.py` 只做单向编排：求值 → 调度。
+- **快照装配。** `router/routing/snapshot.py` 读取启用图、模型目录、时段与 JEV 配置，构建不可变的 `RoutingSnapshot`；未通过启用校验的图不会被编译或发布。
+- **控制台。** `router/console/` 是原生 ES Modules：每个页面只有一个 `<script type="module">` 入口，模块之间通过显式 import 与 store 交换状态，不使用 `window.*` 应用全局，也没有 CommonJS。
+- **编译拓扑。** `compile_graph()` 在每次发布时一次性索引节点、排序边并生成入边/端口映射；请求热路径读取 `snapshot.require_compiled()`，不重建索引，也不访问 SQLite。
+- **请求账本。** 事件循环只把行写入有界内存队列和环形缓冲；每 2 秒一次性投影白名单列并在线程池（`asyncio.to_thread`）写库。写失败只丢弃该批并累加 `ledger_write_failures`，不阻塞请求。
+- **熔断同步。** 后台 worker 启动时先加载共享 quarantine，之后每 30 秒推送本地变化并导入其它副本状态；数据库访问始终在工作线程。跨副本可见性最坏约两个同步周期。
+
 ## 控制台
 
 ![概览](assets/routepilot/zh/overview.png)
 
-控制台是路由器的操作面：
+控制台是路由器的操作面。它由路由器直接提供原生 ES Modules：没有前端构建步骤，每个页面恰好一个模块入口。
 
 - **概览** — 请求量、分流分布、JEV 置信度、粘性命中、当前决策组。
 - **决策组** — 画布编辑、图设置、节点/连线检查器、校验、试算、导入导出。
@@ -154,6 +165,8 @@ flowchart LR
 }
 ```
 
+只接受 `sr-routing-graph` v3。旧版 version 2、非 v3 的 `kind`、未知节点类型、未知的信封/节点/边字段（包括已删除的 `otherwise_target`）都会在替换草稿或已发布快照之前被拒绝；结构性拒绝以 `graph_parse_error` 呈现，控制台在应用导入前执行同一套校验。`tree_revision` 是 `{timezone, sticky, root}` 规范化 JSON 的 SHA-256：节点按 id 排序，边按 (target, slot, source, source_port) 排序，因此 Python 服务端与 ES Modules 控制台计算出相同的行为哈希。展示/布局编辑——标题、目标的 capability 说明、坐标、节点/边数组顺序、边 id——都不会改变它。
+
 ## 模型与推理
 
 模型注册表把决策图使用的**模型位**映射到**上游模型 id** 和提供方。一个目标可以配置多个模型位，由 `least_inflight` 选择。
@@ -188,7 +201,7 @@ flowchart LR
 - 最后一个有效管理员不能被降级、禁用或删除。
 - 用户和配置变更写入审计历史。
 - 每个图文件用 SHA-256 内容哈希做保存冲突和重载判断；不保留图历史版本。
-- 控制面状态（模型、提供方、用户、日志、设置）保存在 SQLite（WAL）；决策图保存在共享 JSON 文件。请求日志异步落库，同时保留 20 条进程内环形缓冲供页面实时读取；进程重启时从 SQLite 回填最近 20 条。
+- 控制面状态（模型、提供方、用户、日志、设置）保存在 SQLite（WAL）；决策图保存在共享 JSON 文件。请求日志由工作线程写库（事件循环只入队），同时保留 20 条进程内环形缓冲供页面实时读取；进程重启时从 SQLite 回填最近 20 条。
 - 会话粘性和在途计数仍在进程内。多个 Router 副本可以共享图文件，但跨副本的会话/在途一致性需要额外的共享状态层。
 
 ## 共享图存储与多副本
@@ -196,7 +209,7 @@ flowchart LR
 决策图不再保存在 SQLite。每个决策组是一个 v3 导出文档，位于
 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`；`ROUTER_GRAPH_DIR/current` 只保存启用组 ID。
 管理 API 只有一个写入者。其余副本使用 `ROUTER_GRAPH_WRITER=false`，只读挂载同一目录，并每 2 秒轮询。
-副本先构建候选快照，成功后才替换内存快照；文件非法时旧快照继续服务，`/readyz` 报告 stale。
+副本先构建候选快照，成功后才替换内存快照；文件非法时旧快照继续服务，`/readyz` 报告 stale。每个已发布快照都是不可变的，并携带编译后的拓扑；重载时先编译候选，文件非法不会替换正在服务的快照。
 
 - Kubernetes 需要 ReadWriteMany PVC；RWX/NFS 上不要共享 SQLite。
 - Docker 需要把同一个 NFS 导出目录挂载到每个容器；写入者的 SQLite 留在本地存储。
@@ -263,7 +276,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | `GET /readyz` | 初始快照就绪检查；该副本没有快照时返回 503 |
 | `POST /admin/login` / `POST /admin/logout` | 控制台会话 |
 | `GET /admin/me` / `POST /admin/me/password` | 当前用户与自助改密 |
-| `GET/POST /admin/trees`、`GET/PUT/DELETE /admin/trees/{id}` | 决策组 CRUD |
+| `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 决策组 CRUD |
 | `POST /admin/trees/{id}/copy`、`/enable`、`/disable` | 决策组生命周期 |
 | `POST /admin/try` | 对草稿图执行试算 |
 | `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 模型注册表 |
@@ -273,7 +286,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | `GET/PUT /admin/jev/window` | JEV 上下文与输入 token 窗口 |
 | `GET/PUT /admin/time-periods` | 命名时段 |
 | `GET /admin/requests/recent`、`GET /admin/requests/stats` | 实时请求环形缓冲与日志统计 |
-| `GET /admin/overview`、`GET /admin/changes`、`GET/PUT /admin/settings` | 概览、审计历史、设置 |
+| `GET /admin/overview`、`GET /admin/changes` | 概览与审计历史 |
 | `GET/POST /admin/users`、`PUT/DELETE /admin/users/{id}`、`POST /admin/users/{id}/password` | 用户管理 |
 
 ### 错误
@@ -294,35 +307,54 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 
 上游 4xx 会原样透传状态码和响应体。
 
+配置写入使用专用接口（`/admin/models`、`/admin/providers`、`/admin/jev`、`/admin/jev/window`、`/admin/time-periods`），不存在通用的 `/admin/settings` 写接口。
+
 ## 测试
 
-```bash
-.venv/bin/python -m pytest tests/ -q
-```
+默认检查不需要已启动的服务，也不会访问外部网络：
 
 ```bash
-npm install
+.venv/bin/python -m pytest -q
+node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs
 npm run check:console
+.venv/bin/python scripts/i18n_dead_keys.py
 ```
 
-`check:console` 会在临时数据库、模拟决策服务和模拟上游上运行图契约测试与 Playwright 验收矩阵，不需要已启动的服务，也不会访问外部网络。如果找不到 Chromium，可设置 `CHROME=/path/to/chrome`。
+- `pytest` 只收集 `tests/`（`pyproject.toml` 的 `testpaths`）：单元测试与 FastAPI 集成测试；不启动浏览器或路由器，也不会收集 `experiments/`。
+- `node --test` 运行纯 ES Module 套件：图/规范化行为、草稿状态，以及 `tests/fixtures/graph_contracts.json` 的跨运行时契约 fixture；后者断言与 Python 相同的 issue code 与行为哈希。
+- `npm run check:console` 运行上述两个 Node 套件，外加在临时数据库、模拟决策服务和模拟上游上的 Playwright 验收矩阵。截图默认关闭；设置 `QA_SCREENSHOTS=1` 才会重新生成证据图。`QA_ONLY=<正则>` 可选择用例，单个页面模块也可独立运行，例如 `node scripts/console_qa/canvas.mjs`（另有 `inspector`、`tryrun`、`logs`、`models`）。如果找不到 Chromium，可设置 `CHROME=/path/to/chrome`。
+- `scripts/i18n_dead_keys.py` 检查每个词典 key 仍被引用。
+
+`experiments/jev-batch/` 是独立实验，不随产品发布，默认测试也不会收集：
+
+```bash
+.venv/bin/python -m pytest -q experiments/jev-batch/test_spike_jev_batch.py
+.venv/bin/python experiments/jev-batch/spike_jev_batch.py \
+  --samples /path/to/samples.jsonl --scenario all --dry-run
+```
 
 ## 项目结构
 
 ```
 router/
-  api/                 FastAPI 应用、admin/v1 路由、上游代理、请求日志
+  api/                 FastAPI 路由、请求 DTO、异常映射、上游代理
+  control/             控制面写服务（图生命周期、配置校验）
   routing/
-    graph/             图模型、校验、执行器、端口
-    affinity.py        会话粘性
+    graph/             纯图领域：模型、校验、条件、编译器、执行器
+    service.py         求值 → 调度编排
+    scheduling.py      粘性选择、租约获取、粘性写入
+    affinity.py        会话粘性 LRU
     scheduler.py       least_inflight 负载均衡与租约
-    snapshot.py        不可变路由快照
+    snapshot.py        不可变快照装配与编译拓扑
+  request_logging.py   请求账本队列/环形缓冲与工作线程写库
   jev/                 决策服务客户端、配置、输入窗口
+  upstream/            上游代理、熔断器与同步 worker、后端目录
   store/               SQLite schema/仓储与共享图文件仓储
-  console/             双语静态控制台
+  console/             双语原生 ES Module 控制台
 configs/               示例决策组与演示用例
-tests/                 pytest 测试
-scripts/               图契约测试与 Playwright QA
+tests/                 pytest 测试与跨运行时契约 fixture
+scripts/               Node 契约测试与 Playwright QA 入口及页面模块
+experiments/jev-batch/ 独立 JEV 批处理实验（不随产品发布）
 assets/routepilot/     README 截图
 ```
 

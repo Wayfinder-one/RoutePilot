@@ -40,11 +40,22 @@ flowchart LR
 
 `unknown` never activates a question or target. Numeric comparisons with an unknown value stay unknown.
 
+## Architecture and boundaries
+
+- **API layer.** `router/api/` parses request DTOs, maps domain exceptions to HTTP status/issues, and proxies the upstream response. Admin routes never write control-plane state directly.
+- **Control-plane services.** `router/control/` owns the write use cases. `GraphService` validates, prepares a candidate snapshot, writes the graph file under the single-writer lock, re-checks the document hash, publishes the snapshot, and records the audit entry in that order; a stale draft returns 409 instead of overwriting.
+- **Routing domain.** `router/routing/graph/` (model, validation, conditions, ports, compiled topology, executor) is pure: it imports neither FastAPI nor SQLite. `router/routing/service.py` runs exactly one direction, evaluate → schedule.
+- **Snapshot assembly.** `router/routing/snapshot.py` reads the enabled graph, model catalog, periods, and JEV settings, then builds an immutable `RoutingSnapshot`; a tree that fails enable validation is never compiled or published.
+- **Console.** `router/console/` is native ES Modules: every page has one `<script type="module">` entry, and modules exchange state through explicit imports and stores, with no `window.*` application globals and no CommonJS.
+- **Compiled topology.** `compile_graph()` indexes nodes, sorts edges, and builds incoming/port maps once per published graph. The request path reads `snapshot.require_compiled()` and never rebuilds an index or opens SQLite.
+- **Request ledger.** The event loop only enqueues rows into a bounded in-memory queue and ring; a 2-second flush projects the whitelisted columns and writes them on a worker thread (`asyncio.to_thread`). A failed write drops that batch and increments `ledger_write_failures` without blocking requests.
+- **Breaker sync.** A background worker loads the shared quarantine at startup, then pushes local changes and imports other replicas' state every 30 seconds; database access stays on a worker thread. Cross-replica visibility is eventually consistent within roughly two intervals.
+
 ## Console
 
 ![Overview](assets/routepilot/en/overview.png)
 
-The console is the control plane for the router:
+The console is the control plane for the router. It is plain native ES Modules served by the router: no front-end build step, and every page has exactly one module entry.
 
 - **Overview** — request volume, route distribution, JEV confidence, sticky hits, active decision group.
 - **Decision groups** — canvas editor, graph settings, node/edge inspector, validation, dry-run, import/export.
@@ -154,6 +165,8 @@ The canvas imports and exports a single JSON envelope:
 }
 ```
 
+Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types, and unknown envelope/node/edge fields (including the retired `otherwise_target`) are rejected before they can replace a draft or a published snapshot; structural rejections surface as `graph_parse_error`, and the console runs the same validation before it applies an import. `tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, with nodes sorted by id and edges by (target, slot, source, source_port), so the Python server and the ES-module console compute the same behavior hash. Display/layout edits — titles, a target's capability note, positions, node/edge array order, edge ids — do not change it.
+
 ## Models and reasoning
 
 The model registry maps a **model slot** used by the graph to an **upstream model id** and a provider. A target can hold several model slots; `least_inflight` picks among them.
@@ -188,7 +201,7 @@ Environment variables can seed the decision-service config on first start only; 
 - The last active admin cannot be demoted, disabled, or deleted.
 - Every user and configuration change is recorded in the audit log.
 - Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
-- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail.
+- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are written on a worker thread — the event loop only enqueues — and are also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail.
 - Session affinity and in-flight counts remain process-local. Multiple router replicas can share graph files, but cross-replica session/in-flight consistency requires an external shared state layer.
 
 ## Shared graph storage and replicas
@@ -197,7 +210,7 @@ Decision graphs are not stored in SQLite. Each group is one v3 export document a
 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains only the enabled group id.
 The admin API has a single writer. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the same
 directory read-only, and poll every 2 seconds. A replica builds a candidate snapshot before replacing its
-in-memory snapshot; if a file is invalid, the previous snapshot keeps serving and `/readyz` reports stale.
+in-memory snapshot; if a file is invalid, the previous snapshot keeps serving and `/readyz` reports stale. Every published snapshot is immutable and carries the compiled topology; reloads compile a candidate before publishing, so an invalid file never replaces the serving snapshot.
 
 - Kubernetes: use a ReadWriteMany PVC; do not share SQLite on NFS/RWX.
 - Docker: mount the same NFS export into every container. Keep SQLite on local storage for the writer.
@@ -264,7 +277,7 @@ The first start against an empty users table seeds the admin account. Change the
 | `GET /readyz` | Initial-snapshot readiness; 503 until this replica has one |
 | `POST /admin/login` / `POST /admin/logout` | Console session |
 | `GET /admin/me` / `POST /admin/me/password` | Current user and self-service password change |
-| `GET/POST /admin/trees`, `GET/PUT/DELETE /admin/trees/{id}` | Decision-group CRUD |
+| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | Decision-group CRUD |
 | `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Decision-group lifecycle |
 | `POST /admin/try` | Dry-run against a draft graph |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry |
@@ -274,7 +287,7 @@ The first start against an empty users table seeds the admin account. Change the
 | `GET/PUT /admin/jev/window` | JEV context and input-token window |
 | `GET/PUT /admin/time-periods` | Named time periods |
 | `GET /admin/requests/recent`, `GET /admin/requests/stats` | Live request ring and logger stats |
-| `GET /admin/overview`, `GET /admin/changes`, `GET/PUT /admin/settings` | Overview, audit history, settings |
+| `GET /admin/overview`, `GET /admin/changes` | Overview and audit history |
 | `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | User management |
 
 ### Errors
@@ -295,35 +308,54 @@ The first start against an empty users table seeds the admin account. Change the
 
 Upstream 4xx responses are passed through with their status and body.
 
+Configuration is written through dedicated endpoints (`/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/jev/window`, `/admin/time-periods`); there is no generic `/admin/settings` write API.
+
 ## Tests
 
-```bash
-.venv/bin/python -m pytest tests/ -q
-```
+Default checks need no running server and make no external requests:
 
 ```bash
-npm install
+.venv/bin/python -m pytest -q
+node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs
 npm run check:console
+.venv/bin/python scripts/i18n_dead_keys.py
 ```
 
-`check:console` runs the graph contract tests and the Playwright acceptance matrix against a temporary database, mock decision service, and mock upstream. It needs no running server and makes no external requests. Set `CHROME=/path/to/chrome` if Chromium is not found in the usual cache.
+- `pytest` collects only `tests/` (`testpaths` in `pyproject.toml`): unit and FastAPI integration tests. It never starts a browser or the router, and it does not collect `experiments/`.
+- `node --test` runs the pure ES-module suites: graph/canonical behavior, draft state, and the cross-runtime contract fixtures in `tests/fixtures/graph_contracts.json`, which assert the same issue codes and behavior hashes as Python.
+- `npm run check:console` runs the two Node suites plus the Playwright acceptance matrix against a temporary database, mock decision service, and mock upstream. Screenshots are off by default; set `QA_SCREENSHOTS=1` to regenerate evidence. `QA_ONLY=<regex>` selects cases, and a page module can run alone, for example `node scripts/console_qa/canvas.mjs` (also `inspector`, `tryrun`, `logs`, `models`). Set `CHROME=/path/to/chrome` if Chromium is not found in the usual cache.
+- `scripts/i18n_dead_keys.py` checks that every dictionary key is still referenced.
+
+`experiments/jev-batch/` is a standalone spike; it is not shipped and not collected by the default run:
+
+```bash
+.venv/bin/python -m pytest -q experiments/jev-batch/test_spike_jev_batch.py
+.venv/bin/python experiments/jev-batch/spike_jev_batch.py \
+  --samples /path/to/samples.jsonl --scenario all --dry-run
+```
 
 ## Project layout
 
 ```
 router/
-  api/                 FastAPI app, admin/v1 routes, upstream proxy, request logger
+  api/                 FastAPI routes, request DTOs, exception mapping, upstream proxy
+  control/             control-plane write services (graph lifecycle, config validation)
   routing/
-    graph/             graph model, validation, executor, ports
-    affinity.py        session affinity
+    graph/             pure graph domain: model, validation, conditions, compiler, executor
+    service.py         evaluate → schedule orchestration
+    scheduling.py      sticky selection, lease acquisition, affinity writes
+    affinity.py        session affinity LRU
     scheduler.py       least_inflight load balancer and leases
-    snapshot.py        immutable routing snapshots
+    snapshot.py        immutable snapshot assembly and compiled topology
+  request_logging.py   request ledger queue/ring and worker-thread writes
   jev/                 decision-service client, config, input window
+  upstream/            proxy, circuit breaker + sync worker, backend catalog
   store/               SQLite schema/repositories and the shared graph-file repository
-  console/             static bilingual console
+  console/             bilingual native ES Module console
 configs/               example decision groups and demo cases
-tests/                 pytest suite
-scripts/               graph contract tests and Playwright QA
+tests/                 pytest suite and cross-runtime contract fixtures
+scripts/               Node contract tests and the Playwright QA entry + page modules
+experiments/jev-batch/ standalone JEV batch spike (not shipped)
 assets/routepilot/     README screenshots
 ```
 
