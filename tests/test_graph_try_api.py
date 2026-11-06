@@ -414,6 +414,9 @@ def test_try_fixed_peak_scenario_matches_engine(client, app):
     assert _machine_event(body["trace"][0]) == {
         "event": "time", "active_periods": ["peak"], "timezone": "Asia/Shanghai",
     }
+    # 真实时段条件参与计算：time 与 condition 事件都归入「时段判断」阶段。
+    assert body["trace"][0]["phase"] == "period"
+    assert body["trace"][0]["label"] == {"zh": "时段判断", "en": "Time period"}
     assert body["trace"][-1]["event"] == "scheduled"
     assert body["trace"][-1]["dry_run"] is True
     # 启用级校验只作为 warnings 返回：未登记模型不阻塞试算
@@ -425,6 +428,26 @@ def test_try_fixed_peak_scenario_matches_engine(client, app):
         candidate.target_id for candidate in reference.candidates
     ]
     assert body["outcome"]["waves"][-1]["questions"] == list(reference.waves[-1].questions)
+
+
+def test_try_without_period_condition_keeps_time_event_initial(client, app):
+    """部署有生效时段，但草稿图从不判断时段：time 事件必须留在「初始计算」。"""
+    periods = client.put("/admin/time-periods", json={"periods": SCENARIO_DATA["periods"]})
+    assert periods.status_code == 200, periods.text
+    install_engine(app)
+
+    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": "你好"})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert _machine_event(body["trace"][0])["event"] == "time"
+    assert body["trace"][0]["phase"] == "initial"
+    assert body["trace"][0]["label"] == {"zh": "初始计算", "en": "Initial evaluation"}
+    # 没有任何 condition/source=periods 事件。
+    assert not [
+        event for event in body["trace"]
+        if event["event"] == "condition" and event["source"] == "periods"
+    ]
 
 
 # ── 422 / 503 ─────────────────────────────────────────────────────────

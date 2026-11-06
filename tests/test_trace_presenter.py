@@ -39,13 +39,26 @@ def test_present_trace_enriches_events_without_losing_machine_fields():
     assert present_trace(presented, has_time_period=True) == presented
 
 
-def test_present_trace_uses_snapshot_time_period_fact():
+def test_present_trace_accepts_explicit_time_period_override():
     event = {"event": "time", "active_periods": [], "timezone": "UTC"}
-    # Explicit snapshot fact: no configured periods -> folded into the initial stage.
+    # Explicit override: the caller already knows whether a period condition ran.
     assert present_trace([event], has_time_period=False)[0]["phase"] == "initial"
     assert present_trace([event], has_time_period=True)[0]["phase"] == "period"
-    # Direct callers keep the condition-derived fallback.
+    # Default: derive from this graph's own events.
     assert present_trace([event])[0]["phase"] == "initial"
+
+
+def test_present_trace_derives_time_phase_from_period_conditions_only():
+    time_event = {"event": "time", "active_periods": [], "timezone": "UTC"}
+    text_condition = {"event": "condition", "node_id": "c", "source": "text",
+                      "value": True, "matched": ["x"]}
+    period_condition = {"event": "condition", "node_id": "p", "source": "periods",
+                        "value": True, "matched": ["peak"], "periods": ["peak"]}
+
+    # Non-period conditions do not promote the time event.
+    assert present_trace([time_event, text_condition])[0]["phase"] == "initial"
+    # A real period condition does.
+    assert present_trace([time_event, period_condition])[0]["phase"] == "period"
 
 
 def test_present_trace_renders_routing_failure_event():

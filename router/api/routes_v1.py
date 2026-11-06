@@ -50,10 +50,6 @@ def _error(message: str, status_code: int) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"message": message}})
 
 
-def _has_time_period(snapshot) -> bool:
-    return bool(getattr(snapshot, "time_periods", ()))
-
-
 def _last_user_text(messages: list) -> str:
     for message in reversed(messages):
         if isinstance(message, dict) and message.get("role") == "user":
@@ -212,7 +208,7 @@ async def chat_completions(request: Request):
             "error_class": error_class,
             "message": message,
         })
-        trace[:] = present_trace(trace, has_time_period=_has_time_period(snapshot))
+        trace[:] = present_trace(trace)
         record = present_record(_routing_failure_record(
             snapshot, text, session_id, trace,
             error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
@@ -247,7 +243,7 @@ async def chat_completions(request: Request):
 
     upstream_body, reasoning_warning = prepare_upstream_request(
         body, backend, decision.reasoning)
-    trace[:] = present_trace(trace, has_time_period=_has_time_period(snapshot))
+    trace[:] = present_trace(trace)
     record = present_record(_decision_record(
         decision, snapshot, text, reasoning_warning, routing_ms, started))
     requestlog.enqueue(record)

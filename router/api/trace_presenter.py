@@ -3,12 +3,13 @@
 Machine fields remain the routing/replay contract.  These optional fields let
 the console render graph events without the evaluator knowing about UI text.
 
-``has_time_period`` describes the *snapshot* (does this run have configured
-time periods at all?), so callers pass ``bool(snapshot.time_periods)``.  When
-it is omitted we fall back to inferring it from period-condition events, which
-keeps direct unit callers working but loses the information for graphs whose
-period conditions never get evaluated (a display-only edge case for
-``/admin/try`` drafts).
+``has_time_period`` decides whether the always-emitted ``time`` event is shown
+as the ``period`` stage.  It is a fact about *this graph*: a run that never
+evaluated a period condition (``condition``/``source == "periods"``) keeps the
+``time`` event in the ``initial`` stage, preserving the pre-refactor display.
+``present_trace`` derives it from the events; accepting a deployment-wide
+``bool(snapshot.time_periods)`` at the call sites would promote every graph,
+including graphs with no period condition at all.
 """
 from __future__ import annotations
 
@@ -182,8 +183,12 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
 def present_trace(events: list[dict], *, has_time_period: bool | None = None) -> list[dict]:
     """Present raw machine events, leaving already-presented events untouched.
 
-    ``has_time_period`` is the snapshot fact (``bool(snapshot.time_periods)``);
-    ``None`` infers it from period-condition events for direct callers.
+    ``has_time_period`` defaults to ``None``, meaning "derive from this graph's
+    events": a ``condition`` event with ``source == "periods"``.  API callers
+    must leave it unset -- a deployment-wide ``bool(snapshot.time_periods)`` is
+    not the same fact and would move the ``time`` event of unrelated graphs to
+    the ``period`` stage.  The parameter remains as an explicit override for
+    callers that already hold the graph-level answer.
     """
     if has_time_period is None:
         has_time_period = any(
