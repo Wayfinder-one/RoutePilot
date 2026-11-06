@@ -1,3 +1,7 @@
+import { api, apiErrText, esc, fmtTime } from './api.js';
+import { onLangChange, t } from './i18n.js';
+import './nav.js';
+
 const $ = selector => document.querySelector(selector);
 
 async function boot() {
@@ -19,5 +23,5 @@ async function boot() {
   $('#confSince').textContent = overview.confidence_since ? ' · ' + fmtTime(overview.confidence_since) : '';
 }
 
-window.onLangChange = () => boot().catch(() => {});
+onLangChange(() => { boot().catch(() => {}); });
 boot().catch(error => { $('#cards').innerHTML = `<div class="empty">${esc(apiErrText(error))}</div>`; });

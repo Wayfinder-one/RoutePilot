@@ -1,3 +1,7 @@
+import { api, apiErrText, esc, toast } from './api.js';
+import { onLangChange, t, tf } from './i18n.js';
+import './nav.js';
+
 const $ = selector => document.querySelector(selector);
 let defaults = {};
 
@@ -13,11 +17,6 @@ function showConfig(body) {
   $('#clearKey').checked = false;
   $('#apiKey').placeholder = config.key_present ? t('jev.keyKeep') : t('jev.keyEmpty');
   $('#jevStatus').textContent = config.model || t('jev.unconfigured');
-}
-
-async function boot() {
-  try { showConfig(await api.get('/admin/jev')); }
-  catch (error) { $('#saveMsg').textContent = apiErrText(error); }
 }
 
 $('#saveJev').addEventListener('click', async () => {
@@ -122,7 +121,7 @@ $('#saveWindow').addEventListener('click', async () => {
   } catch (error) { $('#windowMsg').textContent = apiErrText(error); }
 });
 
-window.onLangChange = () => renderWindow(windowLimits);
+onLangChange(() => renderWindow(windowLimits));
 
 async function boot() {
   const [jevBody, winBody] = await Promise.all([

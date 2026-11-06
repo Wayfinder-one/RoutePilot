@@ -1,4 +1,9 @@
-const FALLBACK_REASON = { declared: false, supported: null, format: null, efforts: [], default: null };
+/* Shared console helpers that are not tied to the admin API.
+
+   The server clock offset is applied by pages that render server timestamps;
+   FALLBACK_REASON lives in models.js because it describes a model profile,
+   not a page-wide constant. */
+
 let SERVER_OFFSET_MS = 0;
 let clockTimer = null;
 
@@ -20,3 +25,5 @@ function startServerClockTick(tick) {
   tick();
   clockTimer = setInterval(tick, 1000);
 }
+
+export { setServerOffset, serverNow, fmtServerTime, startServerClockTick };

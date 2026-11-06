@@ -12,10 +12,16 @@
    Contract: docs/模型目录与推理配置-2026-10-21.md §5/§7. Old backends without
    /admin/model-catalog or without model.reasoning degrade gracefully (catalog
    notice, "未声明" badges) instead of throwing. */
+import { api, esc, toast } from './api.js';
+import { LANG, onLangChange, t, tf } from './i18n.js';
+import './nav.js';
+
 const $ = s => document.querySelector(s);
 const $$ = (s, root = document) => Array.from((root || document).querySelectorAll(s));
 
 /* ── static protocol knowledge ───────────────────────────────────────── */
+/* Shape returned for a model whose reasoning capability is not declared. */
+const FALLBACK_REASON = { declared: false, supported: null, format: null, efforts: [], default: null };
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const LEVELS = ['off', 'on', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 /* The protocol table (formats, needs_wire, supports_sre) comes from the
@@ -1116,7 +1122,7 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && closeTopModal()) e.preventDefault();
 });
 
-window.onLangChange = () => {
+onLangChange(() => {
   // Capture the open modals BEFORE re-rendering: the language switch rebuilds
   // their DOM, so unsaved input would be lost (the capture/restore patches
   // keep the draft, not the DOM).
@@ -1127,5 +1133,5 @@ window.onLangChange = () => {
   renderProviders();
   if (modal) renderModelModal();
   if (provModal) renderProvModal();
-};
+});
 boot();

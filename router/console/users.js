@@ -11,6 +11,10 @@
    The server enforces every guard; this page computes the same guards from the
    loaded list only to disable buttons early (self / last active admin). Every
    user-supplied value is inserted through esc(). */
+import { api, apiErrText, esc, toast } from './api.js';
+import { onLangChange, t, tf } from './i18n.js';
+import './nav.js';
+
 const $ = s => document.querySelector(s);
 const $$ = (s, root = document) => Array.from((root || document).querySelectorAll(s));
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
