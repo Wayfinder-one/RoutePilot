@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import dataclass
 from string import Formatter
 from urllib.parse import urlsplit
-
-from router.store.repositories import now_iso, transaction
 
 DEFAULT_INSTRUCTIONS = "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。"
 DEFAULT_STATE_TEMPLATE = "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
@@ -72,40 +69,3 @@ class JevSettings:
             "instructions": self.instructions,
             "state_template": self.state_template,
         }
-
-
-class JevConfigRepo:
-    def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn
-
-    def load(self) -> JevSettings | None:
-        row = self.conn.execute("SELECT * FROM jev_config WHERE id = 1").fetchone()
-        if row is None:
-            return None
-        return JevSettings(
-            base_url=row["base_url"],
-            model=row["model"],
-            api_key=row["api_key"],
-            timeout_seconds=row["timeout_seconds"],
-            instructions=row["instructions"],
-            state_template=row["state_template"],
-        )
-
-    def save(self, settings: JevSettings) -> None:
-        with transaction(self.conn):
-            self.conn.execute(
-                "INSERT INTO jev_config (id, base_url, model, api_key, timeout_seconds, instructions, state_template, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
-                "base_url = excluded.base_url, model = excluded.model, api_key = excluded.api_key, "
-                "timeout_seconds = excluded.timeout_seconds, instructions = excluded.instructions, "
-                "state_template = excluded.state_template, updated_at = excluded.updated_at",
-                (
-                    settings.base_url,
-                    settings.model,
-                    settings.api_key,
-                    settings.timeout_seconds,
-                    settings.instructions,
-                    settings.state_template,
-                    now_iso(),
-                ),
-            )

@@ -306,6 +306,38 @@ def test_boolean_condition_must_be_null_or_is():
     assert codes(graph_dict()) == set()  # null 条件（= true）合法
 
 
+def test_condition_issue_codes_are_machine_driven():
+    """Issue 码由 conditions 的机器码决定：改文案不改码，三个码都可达。"""
+    from router.routing.graph.conditions import ConditionProblem
+    from router.routing.graph.model import Edge
+    from router.routing.graph.validate import _CONDITION_ISSUE_CODES, _condition_issue
+
+    edge = Edge("e-q-safe", "q", "prob.strong", "safe", "in_1", None)
+    mapping = {
+        "numeric_condition_missing": "numeric_edge_condition_missing",
+        "numeric_operator_invalid": "numeric_edge_condition_invalid",
+        "numeric_threshold_not_finite": "numeric_edge_condition_invalid",
+        "numeric_threshold_out_of_range": "numeric_edge_condition_invalid",
+        "boolean_operator_invalid": "boolean_edge_condition_invalid",
+        "boolean_value_invalid": "boolean_edge_condition_invalid",
+    }
+    for code, issue_code in mapping.items():
+        # 同一个机器码配任意改写过的文案 → 同一个 Issue 码。
+        assert _condition_issue(edge, ConditionProblem(code, "文案已改写")).code == issue_code
+    assert set(_CONDITION_ISSUE_CODES) == set(mapping) | {"source_port_missing"}
+    assert set(_CONDITION_ISSUE_CODES.values()) == {
+        "numeric_edge_condition_missing",
+        "numeric_edge_condition_invalid",
+        "boolean_edge_condition_invalid",
+    }
+    # 三个 Issue 码都能由真实非法图产生。
+    assert codes(numeric_edge_raw(None)) == {"numeric_edge_condition_missing"}
+    assert codes(numeric_edge_raw({"op": "is", "value": True})) == {"numeric_edge_condition_invalid"}
+    raw = graph_dict()
+    raw["edges"][0]["condition"] = {"op": "gt", "value": 0.5}
+    assert codes(raw) == {"boolean_edge_condition_invalid"}
+
+
 # ─────────────────────────── logic gates ────────────────────────────
 
 

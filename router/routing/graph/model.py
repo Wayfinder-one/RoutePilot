@@ -11,6 +11,7 @@ from router.routing.codec import (
     optional_text_field,
     optional_title,
     reject_unknown_fields,
+    slot_sort_key,
     text_field,
 )
 
@@ -439,9 +440,6 @@ def _edge_behavior_dict(edge: Edge) -> dict:
 
 
 def graph_behavior_dict(root: GraphRoot) -> dict:
-    # ports 依赖本模块的节点类型，因此槽位排序键只能在调用时导入（单向、非 revision 耦合）。
-    from router.routing.graph.ports import slot_sort_key
-
     return {
         "type": "graph",
         "error_fallback": root.error_fallback,

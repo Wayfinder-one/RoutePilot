@@ -11,7 +11,8 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
-from router.routing.graph.conditions import conditionInvalidReason
+from router.routing.codec import slot_sort_key
+from router.routing.graph.conditions import ConditionProblem, conditionInvalidReason
 from router.routing.graph.model import (
     ConditionNode,
     GraphNode,
@@ -22,7 +23,7 @@ from router.routing.graph.model import (
     TargetNode,
     graph_from_dict,
 )
-from router.routing.graph.ports import output_ports, slot_sort_key
+from router.routing.graph.ports import output_ports
 from router.routing.tree import RoutingTree, tree_from_dict
 
 _LOGIC_OPERATORS = frozenset({"and", "or", "not"})
@@ -168,8 +169,22 @@ def _question_chain_depth(by_id: dict[str, GraphNode], adjacency: dict[str, list
     return max(questions, default=0)
 
 
-def _condition_issue(edge, reason: str) -> Issue:
-    """把 conditions.conditionInvalidReason 的英文 reason 映射到结构码表。"""
+#: conditions 的机器码 → 对外 Issue 码。键是结构判定，不是英文文案，
+#: 所以改诊断文案不会改变机器码；未知码直接 KeyError（新码必须显式登记）。
+_CONDITION_ISSUE_CODES = {
+    "numeric_condition_missing": "numeric_edge_condition_missing",
+    "numeric_operator_invalid": "numeric_edge_condition_invalid",
+    "numeric_threshold_not_finite": "numeric_edge_condition_invalid",
+    "numeric_threshold_out_of_range": "numeric_edge_condition_invalid",
+    "boolean_operator_invalid": "boolean_edge_condition_invalid",
+    "boolean_value_invalid": "boolean_edge_condition_invalid",
+    # 端口缺失会先命中 edge_port_missing；保留与旧兜底一致的归类。
+    "source_port_missing": "boolean_edge_condition_invalid",
+}
+
+
+def _condition_issue(edge, problem: ConditionProblem) -> Issue:
+    """把 conditions.conditionInvalidReason 的机器码直接映射到结构码表。"""
     context = {
         "node_id": edge.target, "edge_id": edge.id, "port": edge.target_port,
         "params": {
@@ -177,11 +192,7 @@ def _condition_issue(edge, reason: str) -> Issue:
             "target": edge.target, "target_port": edge.target_port,
         },
     }
-    if "requires a comparison condition" in reason:
-        return Issue("numeric_edge_condition_missing", **context)
-    if reason.startswith("numeric") or "threshold" in reason:
-        return Issue("numeric_edge_condition_invalid", **context)
-    return Issue("boolean_edge_condition_invalid", **context)
+    return Issue(_CONDITION_ISSUE_CODES[problem.code], **context)
 
 
 def validate_graph_structure(value) -> list[Issue]:
@@ -403,9 +414,9 @@ def validate_graph_structure(value) -> list[Issue]:
                 port=edge.target_port, params={"kind": "target"},
             ))
         if source_port_ok and slot_ok:
-            reason = conditionInvalidReason(edge, source)
-            if reason is not None:
-                issues.append(_condition_issue(edge, reason))
+            problem = conditionInvalidReason(edge, source)
+            if problem is not None:
+                issues.append(_condition_issue(edge, problem))
 
     groups: dict[tuple[str, str], list] = {}
     for edge in root.edges:

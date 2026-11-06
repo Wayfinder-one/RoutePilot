@@ -11,9 +11,10 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
+from router.store.jev_config import JevConfigRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import tree_dict, test_settings
 
@@ -57,7 +58,7 @@ class Publisher:
         yield self
 
     def prepare(self, conn, tree, fingerprint):
-        prepared = (tree, fingerprint)
+        prepared = SimpleNamespace(tree=tree, fingerprint=fingerprint)
         self.prepared.append(prepared)
         return prepared
 

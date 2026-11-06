@@ -20,6 +20,20 @@ class ConditionResult:
     reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ConditionProblem:
+    """A condition defect: ``code`` is the contract, ``message`` is diagnostics only.
+
+    ``validate`` maps ``code`` to the structural Issue code; the English
+    ``message`` is what evaluation traces report. Because the machine code is
+    chosen structurally (never by parsing ``message``), a copy edit cannot
+    change an Issue code.
+    """
+
+    code: str
+    message: str
+
+
 def _port_kind(source_node: GraphNode, port_name: str) -> str | None:
     for port in output_ports(source_node):
         if port.name == port_name:
@@ -27,28 +41,43 @@ def _port_kind(source_node: GraphNode, port_name: str) -> str | None:
     return None
 
 
-def conditionInvalidReason(edge: Edge, source_node: GraphNode) -> str | None:
+def conditionInvalidReason(edge: Edge, source_node: GraphNode) -> ConditionProblem | None:
+    """Return the machine-coded defect of ``edge``'s condition, or ``None`` if valid."""
     kind = _port_kind(source_node, edge.source_port)
     if kind is None:
-        return f"source port {edge.source_port!r} does not exist on node {source_node.id!r}"
+        return ConditionProblem(
+            "source_port_missing",
+            f"source port {edge.source_port!r} does not exist on node {source_node.id!r}")
     condition = edge.condition
     if kind == "number":
         if condition is None:
-            return "numeric source port requires a comparison condition"
+            return ConditionProblem(
+                "numeric_condition_missing",
+                "numeric source port requires a comparison condition")
         if condition.op not in _NUMERIC_OPS:
-            return f"numeric source port cannot use operator {condition.op!r}"
+            return ConditionProblem(
+                "numeric_operator_invalid",
+                f"numeric source port cannot use operator {condition.op!r}")
         threshold = condition.value
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not math.isfinite(float(threshold)):
-            return "condition threshold must be a finite number"
+            return ConditionProblem(
+                "numeric_threshold_not_finite",
+                "condition threshold must be a finite number")
         if abs(float(threshold)) > _THRESHOLD_LIMIT:
-            return f"condition threshold magnitude must not exceed {_THRESHOLD_LIMIT:g}"
+            return ConditionProblem(
+                "numeric_threshold_out_of_range",
+                f"condition threshold magnitude must not exceed {_THRESHOLD_LIMIT:g}")
         return None
     if condition is None:
         return None
     if condition.op != "is":
-        return f"boolean source port cannot use operator {condition.op!r}"
+        return ConditionProblem(
+            "boolean_operator_invalid",
+            f"boolean source port cannot use operator {condition.op!r}")
     if not isinstance(condition.value, bool):
-        return "boolean condition value must be true or false"
+        return ConditionProblem(
+            "boolean_value_invalid",
+            "boolean condition value must be true or false")
     return None
 
 
@@ -69,9 +98,9 @@ def _compare(op: str, value: float, threshold: float) -> bool:
 
 
 def evaluate_condition(edge: Edge, source_node: GraphNode, raw) -> ConditionResult:
-    reason = conditionInvalidReason(edge, source_node)
-    if reason is not None:
-        return ConditionResult(raw, "invalid", UNKNOWN, reason)
+    problem = conditionInvalidReason(edge, source_node)
+    if problem is not None:
+        return ConditionResult(raw, "invalid", UNKNOWN, problem.message)
     kind = _port_kind(source_node, edge.source_port)
     condition = edge.condition
     if kind == "boolean":

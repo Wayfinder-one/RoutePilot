@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.api.routes_jev import router as jev_router
+from router.control.config import ConfigurationService
 from router.jev.client import ChoiceAnswer
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.jev.window import (
@@ -25,7 +26,7 @@ from router.routing.snapshot import build_snapshot, read_jev_window
 from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
 from router.store.repositories import SettingsRepo
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.routing_trees import GraphChangedDuringLoad, RoutingTreeRepo
 from router.upstream.catalog import Backend
 from tests.routing_fixtures import test_settings, tree_dict
 
@@ -129,7 +130,7 @@ class Publisher:
         yield self
 
     def prepare(self, conn, tree, fingerprint):
-        return (tree, fingerprint)
+        return SimpleNamespace(tree=tree, fingerprint=fingerprint)
 
     def publish(self, prepared):
         self.published.append(prepared)
@@ -189,6 +190,65 @@ def test_put_window_rejects_invalid(tmp_path, payload):
     resp = client.put("/admin/jev/window", json=payload)
     assert resp.status_code == 422, resp.text
     assert app.state.publisher.published == []
+
+
+# ── 发布前指纹复核（Task 10 FIX 4）────────────────────────────────────
+
+class _Trees:
+    """最小树仓库桩：按队列吐指纹，队列耗尽后停在最后一个。"""
+
+    def __init__(self, fingerprints):
+        self._fingerprints = list(fingerprints)
+
+    def fingerprint(self):
+        if len(self._fingerprints) > 1:
+            return self._fingerprints.pop(0)
+        return self._fingerprints[0]
+
+    def active(self):
+        return None
+
+
+def _fresh_conn(tmp_path):
+    conn = connect(str(tmp_path / "v3.db"))
+    migrate(conn)
+    return conn
+
+
+def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
+    """提交后图被改写：用新指纹重建快照，不发布过期指纹。"""
+    conn = _fresh_conn(tmp_path)
+    try:
+        publisher = Publisher()
+        service = ConfigurationService(
+            conn, _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b")]), publisher)
+
+        def write(_conn):
+            prepared = service._prepared_snapshot()  # 指纹 sha-a
+            return prepared
+
+        service._write_and_publish(write)
+        assert len(publisher.published) == 1
+        assert publisher.published[0].fingerprint == ("tree-1", "sha-b")
+    finally:
+        conn.close()
+
+
+def test_publish_refuses_when_fingerprint_keeps_changing(tmp_path):
+    """复核期间指纹持续变化：抛与 GraphService 相同的冲突且不发布。"""
+    conn = _fresh_conn(tmp_path)
+    try:
+        publisher = Publisher()
+        service = ConfigurationService(
+            conn,
+            _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b"), ("tree-1", "sha-c")]),
+            publisher,
+        )
+        with pytest.raises(GraphChangedDuringLoad):
+            service._write_and_publish(lambda _conn: service._prepared_snapshot())
+        assert publisher.published == []
+    finally:
+        conn.close()
 
 
 # ── 真实组合根：写事务回滚契约（与服务层 save_window 同型）──────────────

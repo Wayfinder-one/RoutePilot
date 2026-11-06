@@ -1,7 +1,8 @@
 import pytest
 
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo, JevSettings
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.store.db import connect, migrate
+from router.store.jev_config import JevConfigRepo
 
 
 def settings(api_key="secret"):

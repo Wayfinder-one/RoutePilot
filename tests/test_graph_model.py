@@ -409,7 +409,8 @@ def test_public_surface_lives_in_concrete_modules():
         ConditionResult,
         evaluate_condition,
     )
-    from router.routing.graph.ports import edge_type, next_slot, output_ports, slot_sort_key
+    from router.routing.codec import slot_sort_key
+    from router.routing.graph.ports import edge_type, next_slot, output_ports
 
     assert UNKNOWN == "unknown"
     assert not hasattr(graph_package, "ConditionNode")

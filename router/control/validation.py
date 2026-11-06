@@ -8,9 +8,9 @@ from __future__ import annotations
 import sqlite3
 
 from router.api.issue_presenter import present_issue
-from router.jev.config import JevConfigRepo
 from router.routing.graph.validate import EnableContext, Issue, validate_graph_for_enable
 from router.routing.tree import RoutingTree
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, TimePeriodRepo
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import model_reasoning_from_db
