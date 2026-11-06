@@ -55,8 +55,10 @@ def test_route_composes_evaluator_then_scheduler_and_collects_shared_trace():
     assert balancer.calls[-1]["preferred"] is None
 
 
-# 五场景矩阵的模型/推理契约：base 428a35d 的 tests/test_graph_scenarios.py 断言
-# s1–s5 的最终模型与推理档位；重构后这些字段来自 RoutingDecision，必须走组合根。
+# 五场景矩阵的模型/推理契约：base 428a35d 的 tests/test_graph_scenarios.py 字面断言了
+# s1–s3 的最终模型与推理档位；s4/s5 的模型有字面断言，推理档位则由未变更的
+# tests/fixtures/graph_power.json 固定（deep-target=high / light-target=low）。
+# 重构后这些字段来自 RoutingDecision，必须走组合根。
 @pytest.mark.parametrize(
     ("scenario_id", "model", "reasoning", "selection_reason"),
     [

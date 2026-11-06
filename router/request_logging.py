@@ -23,7 +23,8 @@ import sqlite3
 from collections import deque
 from datetime import datetime
 
-from router.api.request_presenter import OUTCOME_INCOMPLETE, present_record
+from router.api.request_presenter import present_record
+from router.request_outcome import OUTCOME_INCOMPLETE
 from router.store.db import connect
 
 logger = logging.getLogger(__name__)
