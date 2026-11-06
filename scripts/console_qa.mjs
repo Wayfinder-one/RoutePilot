@@ -5901,6 +5901,39 @@ test('calculation-log mobile keeps the main conclusion within the viewport', asy
   }
 });
 
+test('boolean condition guidance is bilingual and has no expected-value syntax', async () => {
+  await openCanvas();
+  await openIssuesPanel();
+
+  async function guidance() {
+    return page.evaluate(() => ({
+      legend: document.querySelector('[data-i18n="cv.legendBool"]').textContent.trim(),
+      issues: document.getElementById('cvIssues').textContent.replace(/\s+/g, ' ').trim(),
+      slotTitle: document.querySelector(
+        '#cvNodes [data-node-id="capability"] [data-port][data-port-dir="in"][data-port-id="in_1"]'
+      ).getAttribute('title')
+    }));
+  }
+
+  const zh = await guidance();
+  assert.equal(zh.legend, '布尔线 · 默认直接通过');
+  assert.match(zh.issues, /直接通过/);
+  assert.match(zh.issues, /取反/);
+  assert.doesNotMatch([zh.legend, zh.issues, zh.slotTitle].join('\n'), /= (?:true|false)/);
+
+  await page.evaluate(() => window.setLang('en'));
+  try {
+    const en = await guidance();
+    assert.equal(en.legend, 'Boolean edge · passes through by default');
+    assert.match(en.issues, /pass(?:es)? through/i);
+    assert.match(en.issues, /negat/i);
+    assert.doesNotMatch([en.legend, en.issues, en.slotTitle].join('\n'), /= (?:true|false)/);
+    await screenshot('boolean-condition-guidance-en-1440.png');
+  } finally {
+    await page.evaluate(() => window.setLang('zh'));
+  }
+});
+
 test('boolean start is read-only and legacy negation needs an explicit clear', async () => {
   await openCanvas();
   const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
