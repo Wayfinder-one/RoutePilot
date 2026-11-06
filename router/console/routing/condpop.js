@@ -289,8 +289,11 @@
     if (!info) return;
     let target = info.element && info.element.isConnected ? info.element : null;
     if (!target && info.condEdge) {
-      target = Array.from(document.querySelectorAll('[data-cond-edge]'))
-        .find(el => el.dataset.condEdge === info.condEdge) || null;
+      target = Array.from(document.querySelectorAll(
+        '[data-cond-edge], [data-start-condition][tabindex="-1"]'
+      )).find(element =>
+        (element.dataset.condEdge || element.dataset.startCondition || '') === info.condEdge
+      ) || null;
     }
     if (target && typeof target.focus === 'function' && target !== document.activeElement) {
       target.focus({ preventScroll: true });

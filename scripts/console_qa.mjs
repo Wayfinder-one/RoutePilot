@@ -1690,6 +1690,7 @@ test('Task 11 · boolean conditions use a negation switch from both entries', as
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
   assert.equal((await edgeOf(edgeId)).condition, null);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: false });
+  assert.equal((await appSnapshot()).kind, 'clean');
 
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
   await waitCondPop(edgeId);
@@ -1697,6 +1698,11 @@ test('Task 11 · boolean conditions use a negation switch from both entries', as
   await page.keyboard.press('Escape');
   assert.equal(await page.locator('#cvCondPop').isHidden(), true);
   assert.equal((await edgeOf(edgeId)).condition, null);
+  assert.equal((await appSnapshot()).kind, 'clean');
+  assert.equal(await page.evaluate(() =>
+    document.activeElement && document.activeElement.dataset
+      ? document.activeElement.dataset.condEdge || '' : ''
+  ), edgeId, 'Esc did not return focus to the condition chip');
 
   await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).click();
   await waitCondPop(edgeId);
@@ -1722,9 +1728,13 @@ test('Task 11 · boolean conditions use a negation switch from both entries', as
   await openCanvas();
   await clickEdge(edgeId);
   await waitInspectorBranch('edge', edgeId);
+  assert.equal(await page.locator(
+    '#cvInspectorBody [data-ins-branch="edge"]'
+  ).getAttribute('data-edge-type'), 'boolean');
   await page.locator('#cvInspectorBody [data-cond-field="negate"]').check();
   await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
   await waitEdgeCondition(edgeId, { op: 'is', value: false });
+  assert.equal((await appSnapshot()).kind, 'behavior');
   await page.locator('#cvUndo').click();
   await waitEdgeCondition(edgeId, null);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
@@ -5965,6 +5975,62 @@ test('boolean start is read-only and legacy negation needs an explicit clear', a
   assert.equal(await slot.locator('[data-cond-edge]').count(), 0);
   assert.equal((await slot.locator('[data-start-condition]').textContent()).trim(),
     await page.evaluate(() => window.t('cv.cond.startAlways')));
+  await page.locator('#cvUndo').click();
+  await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
+});
+
+test('static start condition has no editable hover feedback', async () => {
+  await openCanvas();
+  const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
+  const condition = page.locator(`#cvNodes [data-edge="${startEdge.id}"] [data-start-condition]`);
+  const style = () => condition.evaluate(element => {
+    const value = getComputedStyle(element);
+    return {
+      color: value.color,
+      backgroundColor: value.backgroundColor,
+      borderColor: value.borderColor,
+      cursor: value.cursor
+    };
+  });
+
+  await page.mouse.move(0, 0);
+  const resting = await style();
+  assert.equal(resting.cursor, 'default');
+  await condition.hover();
+  assert.deepEqual(await style(), resting);
+});
+
+test('clearing legacy start negation restores keyboard focus', async () => {
+  await openCanvas();
+  const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
+  await page.evaluate(id => {
+    window.App.change('behavior', tree => {
+      tree.root.edges.find(item => item.id === id).condition = { op: 'is', value: false };
+    });
+  }, startEdge.id);
+
+  const chip = page.locator(`#cvNodes [data-cond-edge="${startEdge.id}"]`);
+  await chip.focus();
+  await page.keyboard.press('Enter');
+  await waitCondPop(startEdge.id);
+  const negate = page.locator('#cvCondPop [data-cond-field="negate"]');
+  assert.equal(await negate.isChecked(), true);
+  await negate.focus();
+  await page.keyboard.press('Space');
+  assert.equal(await negate.isChecked(), false);
+  await page.locator('#cvCondPop [data-act="cond-confirm"]').focus();
+  await page.keyboard.press('Enter');
+  await waitEdgeCondition(startEdge.id, null);
+
+  const focused = await page.evaluate(() => ({
+    tag: document.activeElement && document.activeElement.tagName,
+    startCondition: document.activeElement && document.activeElement.dataset
+      ? document.activeElement.dataset.startCondition || '' : '',
+    tabIndex: document.activeElement ? document.activeElement.tabIndex : null
+  }));
+  assert.deepEqual(focused, { tag: 'SPAN', startCondition: startEdge.id, tabIndex: -1 });
+  assert.equal(await page.locator(`#cvNodes [data-cond-edge="${startEdge.id}"]`).count(), 0);
+
   await page.locator('#cvUndo').click();
   await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
 });
