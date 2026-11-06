@@ -77,8 +77,43 @@ function slotSortKey(port) {
 
 /* ── 0. canonical JSON（键排序、去 undefined，供行为/可编辑比较） ───── */
 
+/* Python json.dumps 用 float repr 序列化行为字段：整数值浮点输出 "1.0"，
+   而 JS 默认输出 "1"。用哨兵包装让 stableStringify 按 Python 语义输出，
+   使 RTGraph.behaviorCanonical 与 router.routing.tree.tree_revision_of 逐字节一致。 */
+const PY_FLOAT = Symbol('routepilot.pyFloat');
+const pyFloat = value => ({ [PY_FLOAT]: true, value });
+
+function pythonFloat(value) {
+  if (!Number.isFinite(value)) return 'null';
+  if (Object.is(value, -0)) return '-0.0';
+  const [mantissa, expText] = value.toExponential().split('e');
+  const exponent = Number(expText);
+  const sign = mantissa.startsWith('-') ? '-' : '';
+  const digits = mantissa.replace('-', '').replace('.', '');
+  const absolute = Math.abs(value);
+  /* Python repr 的指数切换点是 1e-4 / 1e16，且指数至少两位；与 JS 的
+     1e-6 / 1e21 不同，必须显式还原，否则 1e-5、1e20 等会与 Python 不一致。 */
+  if (absolute !== 0 && (absolute < 1e-4 || absolute >= 1e16)) {
+    const head = digits[0];
+    const tail = digits.slice(1);
+    const exponentSign = exponent < 0 ? '-' : '+';
+    const exponentDigits = String(Math.abs(exponent)).padStart(2, '0');
+    return sign + head + (tail ? '.' + tail : '') + 'e' + exponentSign + exponentDigits;
+  }
+  if (exponent >= 0) {
+    if (digits.length <= exponent + 1) {
+      return sign + digits + '0'.repeat(exponent + 1 - digits.length) + '.0';
+    }
+    return sign + digits.slice(0, exponent + 1) + '.' + digits.slice(exponent + 1);
+  }
+  return sign + '0.' + '0'.repeat(-exponent - 1) + digits;
+}
+
 function stableStringify(value) {
   if (value === undefined) return 'null';
+  if (value !== null && typeof value === 'object' && value[PY_FLOAT] === true) {
+    return pythonFloat(value.value);
+  }
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return '[' + value.map(stableStringify).join(',') + ']';
   const keys = Object.keys(value).filter(key => value[key] !== undefined).sort();
@@ -1065,18 +1100,30 @@ function normalizedNode(node, includeDisplay) {
   if (node.type === 'question') {
     output.question_type = node.question_type;
     output.instructions = node.instructions;
-    output.options = (Array.isArray(node.options) ? node.options : []).map(option => ({
-      key: option && option.key,
-      label: option && option.label,
-      capability: option && option.capability
-    }));
-    output.criteria = Array.isArray(node.criteria) ? node.criteria.slice() : null;
+    /* 与 Python graph_behavior_dict 对齐：只投影该问题类型真正携带的字段，
+       noul 不出现 options/criteria，choice 不出现 criteria，score 不出现 options。
+       惰性空字段不进入 behavior，避免语义无变化的编辑 bump revision。 */
+    if (node.question_type === 'choice' && Array.isArray(node.options) && node.options.length) {
+      output.options = node.options.map(option => ({
+        key: option && option.key,
+        label: option && option.label,
+        capability: option && option.capability
+      }));
+    } else if (node.question_type === 'score' && node.criteria != null) {
+      output.criteria = Array.isArray(node.criteria)
+        ? node.criteria.map(level => (typeof level === 'number' ? pyFloat(level) : level))
+        : node.criteria;
+    }
   } else if (node.type === 'logic') {
     output.operator = node.operator;
   } else if (node.type === 'condition') {
     output.source = node.source;
-    output.contains_any = Array.isArray(node.contains_any) ? node.contains_any.slice() : [];
-    output.periods = Array.isArray(node.periods) ? node.periods.slice() : [];
+    if (Array.isArray(node.contains_any) && node.contains_any.length) {
+      output.contains_any = node.contains_any.slice();
+    }
+    if (Array.isArray(node.periods) && node.periods.length) {
+      output.periods = node.periods.slice();
+    }
   } else if (node.type === 'target') {
     output.models = (Array.isArray(node.models) ? node.models : []).map(item => ({
       model: item && item.model,
@@ -1105,7 +1152,8 @@ function normalizedEdge(edge) {
     target_port: edge.target_port,
     condition: condition == null ? null : {
       op: condition.op,
-      value: condition.value
+      /* 数值阈值在 Python 侧是 float（1 → "1.0"），布尔 is 保持 true/false。 */
+      value: typeof condition.value === 'number' ? pyFloat(condition.value) : condition.value
     }
   };
 }
