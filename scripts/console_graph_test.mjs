@@ -1154,7 +1154,7 @@ test('validate allows an 8-wave question chain and flags a 9th wave', () => {
 test('logs fallback filter knows the graph v3 enum', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
-  assert.match(logs, /FALLBACK_REASONS = \['otherwise', 'error_fallback'/,
+  assert.match(logs, /\['error_fallback', 'fallback', 'otherwise'\]/,
     'logs fallback filter does not know the graph v3 enum');
   assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
     'logs still uses the pre-graph fallback enum');
@@ -1169,18 +1169,17 @@ test('logs fallback filter knows the graph v3 enum', () => {
 test('calculation log detail shows the process inline and keeps technical facts folded', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
-  const trace = read('trace.js');
 
-  assert.match(logs, /class="lg-process" data-trace/);
-  assert.match(logs, /SRTrace\.render\(host, record\)/);
+  /* 图 v3：详情按 trace 事件分阶段内联渲染，不再交给 SRTrace 的旧分节渲染器。 */
+  assert.match(logs, /function stages\(record\)/);
+  assert.match(logs, /path\.length \? path\.map\(stageHtml\)\.join/);
+  assert.match(logs, /class="lg-stage /);
   assert.doesNotMatch(logs, /lg-more--trace/);
   assert.doesNotMatch(logs, /logs\.sec\.probs/);
   assert.match(logs, /routing_error/);
-  assert.match(logs, /SRTrace\.hasJev/);
-  assert.match(trace, /function render\(host, record\)/);
-  assert.match(trace, /event\.status === 'invalid'/);
-  assert.match(trace, /op === 'is'/);
-  assert.match(trace, /via_port/);
+  /* 技术事实折叠在 <details> 里，不展开时不占位。 */
+  assert.match(logs, /<details class="lg-raw">/);
+  assert.doesNotMatch(logs, /SRTrace\./);
 });
 
 function attachQuestion(tree, questionType) {
