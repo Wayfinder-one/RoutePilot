@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
@@ -20,9 +20,10 @@ from router.routing.graph.model import (
     QuestionNode,
     StartNode,
     TargetNode,
+    graph_from_dict,
 )
 from router.routing.graph.ports import output_ports, slot_sort_key
-from router.routing.model import RoutingTree, graph_from_dict, tree_from_dict
+from router.routing.tree import RoutingTree, tree_from_dict
 
 _LOGIC_OPERATORS = frozenset({"and", "or", "not"})
 _LIMIT_NODES = 200
@@ -35,7 +36,7 @@ _CRITERIA_MAX = 10
 
 
 def _finite_level(level: object) -> bool:
-    """与 model.py 同型的有限性判定：超量级 int 在 float() 处溢出 → 视为非法。"""
+    """与 codec.finite_number 同型的有限性判定：超量级 int 在 float() 处溢出 → 视为非法。"""
     try:
         return math.isfinite(float(level))
     except OverflowError:
@@ -63,15 +64,6 @@ class EnableContext:
     model_reasoning: Mapping[str, Mapping[str, object] | None] = field(default_factory=dict)
     known_periods: frozenset[str] | set[str] = frozenset()
     jev_available: bool = False
-
-
-def _too_deep_issue() -> Issue:
-    """遍历深度溢出（限额内的图不可达）→ limit_exceeded，绝不向调用方抛 RecursionError。"""
-    return Issue(
-        "limit_exceeded",
-        f"图结构过深，遍历超出安全递归深度（节点/边上限 {_LIMIT_NODES}/{_LIMIT_EDGES}）",
-        f"Graph is too deep to traverse safely (limits: {_LIMIT_NODES} nodes / {_LIMIT_EDGES} edges)",
-    )
 
 
 def _finish(issues: list[Issue]) -> list[Issue]:
@@ -105,23 +97,37 @@ def _is_slot(port: str) -> bool:
 
 
 def _cycle_back_edges(adjacency: dict[str, list[tuple[str, str, str]]]) -> list[tuple[str, str, str]]:
-    """DFS 找回边：返回 (node_id, edge_id, target_port) 列表，即成环处。"""
-    state: dict[str, int] = {}
+    """DFS 找回边（显式栈迭代，深度与 Python 递归上限无关）。
+
+    返回 ``(node_id, edge_id, target_port)`` 列表，即成环处；遍历顺序与递归实现
+    完全一致（节点按 id、同节点出边按 ``(target, edge_id)`` 排序）。
+    """
+    state: dict[str, int] = {}  # 0/缺失 = 白，1 = 灰（在栈上），2 = 黑（已完成）
     back: list[tuple[str, str, str]] = []
-
-    def visit(node_id: str) -> None:
-        state[node_id] = 1
-        for target, edge_id, port in sorted(adjacency.get(node_id, ()), key=lambda item: (item[0], item[1])):
-            current = state.get(target, 0)
-            if current == 1:
-                back.append((target, edge_id, port))
-            elif current == 0:
-                visit(target)
-        state[node_id] = 2
-
-    for node_id in sorted(adjacency):
-        if state.get(node_id, 0) == 0:
-            visit(node_id)
+    for root_id in sorted(adjacency):
+        if state.get(root_id, 0) != 0:
+            continue
+        state[root_id] = 1
+        stack: list[tuple[str, Iterator[tuple[str, str, str]]]] = [(
+            root_id,
+            iter(sorted(adjacency.get(root_id, ()), key=lambda item: (item[0], item[1]))),
+        )]
+        while stack:
+            node_id, children = stack[-1]
+            for target, edge_id, port in children:
+                current = state.get(target, 0)
+                if current == 1:
+                    back.append((target, edge_id, port))
+                elif current == 0:
+                    state[target] = 1
+                    stack.append((
+                        target,
+                        iter(sorted(adjacency.get(target, ()), key=lambda item: (item[0], item[1]))),
+                    ))
+                    break
+            else:
+                state[node_id] = 2
+                stack.pop()
     return back
 
 
@@ -180,14 +186,6 @@ def _condition_issue(edge, reason: str) -> Issue:
 
 def validate_graph_structure(value) -> list[Issue]:
     """结构校验（保存/试算/导入）：时区、start、id、端点、槽位、环、条件、节点配置、兜底与限额。"""
-    try:
-        return _validate_structure(value)
-    except RecursionError:
-        # 防御层：即使限额检查被绕过（例如直接构造的深层图），也返回 Issue 数组而不是 500。
-        return _finish([_too_deep_issue()])
-
-
-def _validate_structure(value) -> list[Issue]:
     root, timezone = _coerce(value)
     if root is None:
         return _finish([Issue(
@@ -196,7 +194,7 @@ def _validate_structure(value) -> list[Issue]:
             "Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)",
         )])
     issues: list[Issue] = []
-    # 限额必须先于任何图遍历：DFS 深度随节点数增长，超限图的遍历可能先触发 RecursionError。
+    # 限额必须先于任何图遍历：超限图直接返回 limit_exceeded，绝不做 O(超限) 的遍历/排序。
     # 节点/边任一超限即提前返回（>400 条边的路径必然 >200 个节点，两者通常同时出现）。
     if len(root.nodes) > _LIMIT_NODES or len(root.edges) > _LIMIT_EDGES:
         if len(root.nodes) > _LIMIT_NODES:
@@ -497,12 +495,7 @@ def _validate_structure(value) -> list[Issue]:
                         node_id=target_id, edge_id=edge.id, port=port,
                     ))
 
-    try:
-        back_edges_found = _cycle_back_edges(back_edges)
-    except RecursionError:
-        # 深度防御：限额检查已保证正常路径不可达；若仍溢出，追加 Issue 继续返回。
-        back_edges_found = []
-        issues.append(_too_deep_issue())
+    back_edges_found = _cycle_back_edges(back_edges)
     for node_id, edge_id, port in back_edges_found:
         issues.append(Issue(
             "edge_cycle",

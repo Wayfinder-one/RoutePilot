@@ -1,3 +1,7 @@
+import copy
+import json
+from pathlib import Path
+
 import pytest
 
 from router.routing.graph.model import (
@@ -10,7 +14,7 @@ from router.routing.graph.model import (
     graph_revision_of,
     graph_to_dict,
 )
-from router.routing.model import (
+from router.routing.tree import (
     RoutingTree,
     Sticky,
     tree_behavior_dict,
@@ -20,6 +24,10 @@ from router.routing.model import (
     tree_to_dict,
 )
 from tests.routing_fixtures import graph_dict, tree_dict
+
+POWER_GRAPH = json.loads(
+    (Path(__file__).with_name("fixtures") / "graph_power.json").read_text(encoding="utf-8")
+)
 
 
 def _node(tree, node_id):
@@ -399,32 +407,55 @@ def test_huge_int_raises_value_error():
         tree_from_dict(tree_dict(root=raw))
 
 
-def test_public_surface_reexports():
-    from router.routing.graph import ConditionNode as package_condition_node
-    from router.routing.graph import Edge as package_edge
-    from router.routing.model import (
+def test_public_surface_lives_in_concrete_modules():
+    """No re-export barrel: graph primitives come from their concrete modules."""
+    import router.routing.graph as graph_package
+
+    from router.routing.graph.conditions import (
         UNKNOWN,
-        Condition,
-        ConditionNode,
         ConditionResult,
-        Edge,
-        edge_type,
         evaluate_condition,
-        graph_from_dict,
-        graph_to_dict,
-        next_slot,
-        output_ports,
-        slot_sort_key,
     )
+    from router.routing.graph.ports import edge_type, next_slot, output_ports, slot_sort_key
 
     assert UNKNOWN == "unknown"
-    assert package_edge is Edge
-    assert package_condition_node is ConditionNode  # __all__ 里的 ConditionNode 必须真的可导入
+    assert not hasattr(graph_package, "ConditionNode")
+    assert not hasattr(graph_package, "graph_revision_of")
     assert canonical_json({"b": 1, "a": [1.0, True, "电网"]}) == '{"a":[1.0,true,"电网"],"b":1}'
     with pytest.raises(ValueError):
         canonical_json(float("nan"))
     tree = tree_from_dict(tree_dict())
-    assert graph_revision_of(tree) == tree_revision_of(tree)
+    root_revision = graph_revision_of(tree.root)
+    assert root_revision == graph_revision_of(graph_from_dict(graph_to_dict(tree.root)))
+    assert root_revision != tree_revision_of(tree)  # envelope adds timezone/sticky
+    with pytest.raises(TypeError):
+        graph_revision_of(tree)  # trees use tree_revision_of; no duck typing
     assert callable(evaluate_condition) and callable(output_ports)
     assert callable(next_slot) and callable(edge_type) and callable(slot_sort_key)
     assert graph_from_dict(graph_to_dict(tree.root)) == tree.root
+
+
+def test_shared_sample_revision_is_order_and_display_invariant():
+    """共享样例：节点/边输入顺序反转、title/position 编辑都不改变 revision。
+
+    同时锁定重构前的 revision 值：行为不变时 revision 必须逐字节一致。
+    """
+    samples = {
+        "fixture": (tree_dict(), "81a318d8a40117baa68247c89d835b8d65e3977853c608929f48332cef1ee1f8"),
+        "power": (tree_dict(root=POWER_GRAPH), "2ce3fa7347f53b88465d9930f781a54a0368f9f228c354ed45c4072a3fb9d6b7"),
+    }
+    for name, (raw, expected) in samples.items():
+        assert tree_revision_of(tree_from_dict(raw)) == expected, name
+
+        permuted = copy.deepcopy(raw)
+        permuted["root"]["nodes"].reverse()
+        permuted["root"]["edges"].reverse()
+        assert tree_revision_of(tree_from_dict(permuted)) == expected, name
+
+        decorated = copy.deepcopy(raw)
+        for node in decorated["root"]["nodes"]:
+            node["title"] = "标题编辑"
+            node["position"] = {"x": 123, "y": 456}
+        for edge in decorated["root"]["edges"]:
+            edge["id"] = "renamed-" + edge["id"]
+        assert tree_revision_of(tree_from_dict(decorated)) == expected, name

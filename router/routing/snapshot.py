@@ -20,13 +20,10 @@ from router.jev.window import (
     MIN_INPUT_TOKENS,
 )
 from router.routing.conditions import TimePeriod
+from router.routing.graph.compiled import CompiledGraph, compile_graph
+from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
-from router.routing.model import (
-    RoutingTree,
-    canonical_json,
-    tree_behavior_dict,
-    tree_revision_of,
-)
+from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
 from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
 from router.upstream.catalog import Backend, load_backends
@@ -44,6 +41,8 @@ class RoutingSnapshot:
     content: str
     jev_input_tokens: int = DEFAULT_INPUT_TOKENS
     jev_context_tokens: int = DEFAULT_CONTEXT_TOKENS
+    # 通过启用校验后才编译的不可变拓扑；未校验的草稿/测试快照为 None。
+    compiled: CompiledGraph | None = None
 
     @property
     def tree_id(self) -> str | None:
@@ -100,6 +99,7 @@ def build_snapshot(
     capabilities: Mapping[str, str],
     jev_input_tokens: int = DEFAULT_INPUT_TOKENS,
     jev_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    compiled: CompiledGraph | None = None,
 ) -> RoutingSnapshot:
     revision = tree_revision_of(tree) if tree is not None else ""
     if tree is not None and tree.tree_revision != revision:
@@ -135,6 +135,7 @@ def build_snapshot(
         content=content,
         jev_input_tokens=jev_input_tokens,
         jev_context_tokens=jev_context_tokens,
+        compiled=compiled,
     )
 
 
@@ -160,14 +161,14 @@ def read_jev_window(conn) -> tuple[int, int]:
 
 
 def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
+    compiled = None
     if tree is not None:
-        try:
-            issues = validate_graph_for_enable(tree, build_enable_context(conn))
-        except RecursionError as exc:
-            raise GraphStorageError("active graph exceeds safe validation depth") from exc
+        issues = validate_graph_for_enable(tree, build_enable_context(conn))
         if issues:
             codes = ",".join(sorted({issue.code for issue in issues}))
             raise GraphStorageError(f"invalid active graph: {codes}")
+        # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
+        compiled = compile_graph(tree.root)
     input_tokens, context_tokens = read_jev_window(conn)
     return build_snapshot(
         tree=tree,
@@ -177,6 +178,7 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
         capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
+        compiled=compiled,
     )
 
 

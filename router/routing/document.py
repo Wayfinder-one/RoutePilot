@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from router.routing.model import RoutingTree, graph_to_dict, tree_from_dict, tree_revision_of
+from router.routing.graph.model import graph_to_dict
+from router.routing.tree import RoutingTree, tree_from_dict, tree_revision_of
 
 KIND = "sr-routing-graph"
 VERSION = 3
@@ -30,7 +31,9 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
                          updated_at: str, document_sha256: str) -> RoutingTree:
     try:
         raw = json.loads(content.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        # JSON 解码是唯一能由任意嵌套输入触发递归的边界；在这里一次性归一为
+        # ValueError，存储/控制/API 层只处理 ValueError，不再各自兜 RecursionError。
         raise ValueError("graph document is not valid UTF-8 JSON") from exc
     if not isinstance(raw, dict):
         raise ValueError("graph document must be an object")

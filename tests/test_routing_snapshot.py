@@ -1,19 +1,22 @@
 import asyncio
+import copy
 import json
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo, JevSettings
 from router.config import Settings
 from router.routing.document import graph_document_bytes
-from router.routing.model import tree_from_dict
+from router.routing.graph.compiled import CompiledGraph, edge_order_key, compile_graph
+from router.routing.graph.model import graph_from_dict
+from router.routing.tree import tree_from_dict
 from router.routing.reloader import GraphReloadWorker
 from router.routing.snapshot import SnapshotPublisher, load_snapshot
 from router.store.db import connect, migrate
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
-from tests.routing_fixtures import tree_dict
+from tests.routing_fixtures import graph_dict, tree_dict
 
 
 def direct_graph(model):
@@ -101,6 +104,7 @@ def test_no_active_tree_is_a_valid_snapshot(tmp_path):
     assert snapshot.tree is None
     assert snapshot.tree_id is None
     assert snapshot.backends == {}
+    assert snapshot.compiled is None  # no active graph → nothing to compile
     conn.close()
 
 
@@ -193,3 +197,51 @@ def test_worker_real_background_loop_loads_change(repo, app):
             await worker.close()
 
     asyncio.run(scenario())
+
+
+def test_compile_graph_sorts_immutable_topology():
+    raw = graph_dict()
+    raw["nodes"].reverse()
+    raw["edges"].reverse()
+    root = graph_from_dict(raw)
+    compiled = compile_graph(root)
+
+    assert isinstance(compiled, CompiledGraph)
+    assert compiled.root is root
+    assert compiled.node_order == ("q", "safe", "start")
+    assert set(compiled.nodes) == set(compiled.node_order)
+    assert compiled.edges == tuple(sorted(root.edges, key=edge_order_key))
+    assert compiled.incoming["q"] == tuple(edge for edge in compiled.edges if edge.target == "q")
+    assert [edge.id for edge in compiled.incoming["q"]] == ["e-start-q"]
+    assert compiled.incoming["start"] == ()
+    assert set(compiled.ports["q"]) == {
+        "selected.easy", "selected.strong", "prob.easy", "prob.strong", "p_top", "margin",
+    }
+    assert compiled.ports["safe"] == {}
+    for value in (compiled.nodes, compiled.incoming, compiled.ports):
+        assert isinstance(value, MappingProxyType)
+    with pytest.raises(TypeError):
+        compiled.nodes["extra"] = None
+
+
+def test_published_snapshot_compiles_after_enable_validation(conn, repo):
+    snapshot = load_snapshot(conn, repo)
+    compiled = snapshot.compiled
+    assert isinstance(compiled, CompiledGraph)
+    assert compiled.root is snapshot.tree.root
+    assert compiled.node_order == ("start", "target")
+    assert compiled.edges == tuple(sorted(snapshot.tree.root.edges, key=edge_order_key))
+    assert compiled.incoming["target"] == compiled.edges
+    assert set(compiled.ports["target"]) == set()
+
+
+def test_invalid_active_graph_is_rejected_before_compilation(conn, repo, app):
+    original = app.state.snapshot
+    raw = tree_dict()
+    raw["root"]["nodes"].append(copy.deepcopy(raw["root"]["nodes"][1]))  # duplicate node id q
+    path = repo.root / "graphs" / "main.json"
+    path.write_bytes(graph_document_bytes(tree_from_dict(raw)))
+
+    with pytest.raises(GraphStorageError, match="duplicate_node_id"):
+        app.state.publisher.refresh(conn)
+    assert app.state.snapshot is original

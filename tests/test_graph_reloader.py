@@ -3,7 +3,7 @@ import json
 from types import SimpleNamespace
 
 from router.config import Settings
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.routing.reloader import GraphReloadWorker
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate

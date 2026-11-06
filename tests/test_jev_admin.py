@@ -12,7 +12,7 @@ from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevConfigRepo
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import tree_dict, test_settings

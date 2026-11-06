@@ -11,7 +11,7 @@ from router.control.validation import build_enable_context
 from router.routing.document import parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo

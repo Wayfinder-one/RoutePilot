@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from router.routing.model import tree_behavior_dict, tree_from_dict, tree_revision_of
+from router.routing.tree import tree_behavior_dict, tree_from_dict, tree_revision_of
 from router.routing.snapshot import build_snapshot
 from router.store.routing_trees import (
     GraphAlreadyExistsError,

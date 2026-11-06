@@ -22,8 +22,10 @@ from router.control.validation import issues_payload, tree_issues
 from router.jev.config import JevConfigRepo
 from router.jev.serialization import answer_to_dict
 from router.routing.conditions import TimePeriod
+from router.routing.graph.compiled import compile_graph
+from router.routing.graph.model import graph_to_dict
 from router.routing.graph.validate import validate_graph_structure
-from router.routing.model import RoutingTree, Sticky, graph_to_dict, tree_from_dict, tree_to_dict
+from router.routing.tree import RoutingTree, Sticky, tree_from_dict, tree_to_dict
 from router.routing.snapshot import (
     build_snapshot,
     model_capability,
@@ -150,7 +152,7 @@ def get_tree(tree_id: str, trees: RoutingTreeRepo = Depends(get_tree_repo)):
 def _parse_tree(raw: dict) -> RoutingTree:
     try:
         return tree_from_dict(raw)
-    except (ValueError, RecursionError) as exc:
+    except ValueError as exc:
         raise HTTPException(422, detail=issues_payload(graph_parse_failed(exc))) from exc
 
 
@@ -234,12 +236,15 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
                 "enabled": sticky_default.enabled, "ttl_seconds": sticky_default.ttl_seconds,
             },
         })
-    except (ValueError, RecursionError) as exc:
+    except ValueError as exc:
         raise HTTPException(422, detail=issues_payload(graph_parse_failed(exc))) from exc
 
 
 def _try_snapshot(conn: sqlite3.Connection, tree: RoutingTree):
-    """草稿快照：与线上 snapshot 使用同一 JEV 窗口配置，但绝不替换 app.state.snapshot。"""
+    """草稿快照：与线上 snapshot 使用同一 JEV 窗口配置，但绝不替换 app.state.snapshot。
+
+    调用前 ``try_tree`` 已通过结构校验；只有通过校验的图才编译静态拓扑。
+    """
     models = ModelRepo(conn).list()
     input_tokens, context_tokens = read_jev_window(conn)
     return build_snapshot(
@@ -250,6 +255,7 @@ def _try_snapshot(conn: sqlite3.Connection, tree: RoutingTree):
         capabilities={row["id"]: model_capability(row) for row in models},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
+        compiled=compile_graph(tree.root),
     )
 
 
@@ -298,8 +304,7 @@ async def try_tree(
             now = datetime.fromisoformat(body.now)
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, detail="now must be an ISO datetime") from exc
-    # validate_graph_structure 自身折叠 RecursionError；启用级问题（含深图折叠为
-    # limit_exceeded）统一走 router.control.validation 的公开入口。
+    # 结构校验是编译静态拓扑的前提；启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
     issues = validate_graph_structure(tree)
     if issues:
         raise HTTPException(422, detail=issues_payload(issues))

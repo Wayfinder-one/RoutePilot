@@ -1,7 +1,7 @@
 import pytest
 
 from router.routing.conditions import TimePeriod
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.repositories import ModelRepo, TimePeriodRepo, model_references, seed_default
 from router.store.routing_trees import RoutingTreeRepo

@@ -6,6 +6,14 @@ import json
 import math
 from dataclasses import dataclass
 
+from router.routing.codec import (
+    finite_number,
+    optional_text_field,
+    optional_title,
+    reject_unknown_fields,
+    text_field,
+)
+
 
 @dataclass(frozen=True)
 class Position:
@@ -14,15 +22,7 @@ class Position:
 
     def __post_init__(self):
         for name in ("x", "y"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"position.{name} must be a finite number")
-            try:
-                value = float(value)
-            except OverflowError:
-                raise ValueError(f"position.{name} must be a finite number") from None
-            if not math.isfinite(value):
-                raise ValueError(f"position.{name} must be a finite number")
+            value = finite_number(getattr(self, name), f"position.{name}")
             object.__setattr__(self, name, value)
 
 
@@ -102,14 +102,12 @@ class Condition:
             if not isinstance(self.value, bool):
                 raise ValueError(f"condition.value must be a boolean for op is, got {self.value!r}")
             return
-        if isinstance(self.value, bool) or not isinstance(self.value, (int, float)):
-            raise ValueError(f"condition.value must be a finite number for op {self.op}, got {self.value!r}")
         try:
-            value = float(self.value)
-        except OverflowError:
-            raise ValueError(f"condition.value must be a finite number for op {self.op}, got {self.value!r}") from None
-        if not math.isfinite(value):
-            raise ValueError(f"condition.value must be a finite number for op {self.op}, got {self.value!r}")
+            value = finite_number(self.value, "condition.value")
+        except ValueError:
+            raise ValueError(
+                f"condition.value must be a finite number for op {self.op}, got {self.value!r}"
+            ) from None
         object.__setattr__(self, "value", value)
 
 
@@ -136,49 +134,21 @@ _LOGIC_OPERATORS = ("and", "or", "not")
 _CONDITION_SOURCES = ("text", "periods")
 
 
-def _unknown(kind: str, raw: dict, allowed: set[str]) -> None:
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ValueError(f"{kind} has unknown fields: {', '.join(unknown)}")
-
-
-def _text(value, field: str, *, empty: bool = False) -> str:
-    if not isinstance(value, str) or (not empty and not value.strip()):
-        raise ValueError(f"{field} must be a {'string' if empty else 'nonempty string'}")
-    return value
-
-
-def _display(raw: dict, kind: str) -> str | None:
-    value = raw.get("title")
-    if value is not None and not isinstance(value, str):
-        raise ValueError(f"{kind}.title must be a string")
-    return value
-
-
-def _number(value, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field} must be a finite number")
-    try:
-        value = float(value)
-    except OverflowError:
-        raise ValueError(f"{field} must be a finite number") from None
-    if not math.isfinite(value):
-        raise ValueError(f"{field} must be a finite number")
-    return value
-
-
 def _position(raw: dict, kind: str) -> Position | None:
     raw_position = raw.get("position")
     if raw_position is None:
         return None
     if not isinstance(raw_position, dict):
         raise ValueError(f"{kind}.position must be an object with x/y")
-    _unknown(f"{kind}.position", raw_position, {"x", "y"})
-    return Position(_number(raw_position.get("x"), f"{kind}.position.x"), _number(raw_position.get("y"), f"{kind}.position.y"))
+    reject_unknown_fields(f"{kind}.position", raw_position, {"x", "y"})
+    return Position(
+        finite_number(raw_position.get("x"), f"{kind}.position.x"),
+        finite_number(raw_position.get("y"), f"{kind}.position.y"),
+    )
 
 
 def _node_id(raw: dict) -> str:
-    return _text(raw.get("id"), "node id")
+    return text_field(raw.get("id"), "node id")
 
 
 def _condition_from_dict(raw) -> Condition | None:
@@ -186,30 +156,30 @@ def _condition_from_dict(raw) -> Condition | None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("edge condition must be an object")
-    _unknown("edge condition", raw, {"op", "value"})
+    reject_unknown_fields("edge condition", raw, {"op", "value"})
     op = raw.get("op")
     if op == "is":
         value = raw.get("value")
         if not isinstance(value, bool):
             raise ValueError("condition.value must be a boolean for op is")
         return Condition(op, value)
-    return Condition(_text(op, "condition.op"), _number(raw.get("value"), "condition.value"))
+    return Condition(text_field(op, "condition.op"), finite_number(raw.get("value"), "condition.value"))
 
 
 def _model_target_from_dict(raw) -> ModelTarget:
     if not isinstance(raw, dict):
         raise ValueError("target model must be an object")
-    _unknown("target model", raw, {"model", "reasoning"})
+    reject_unknown_fields("target model", raw, {"model", "reasoning"})
     reasoning = raw.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, str):
         raise ValueError("target model reasoning must be a string")
-    return ModelTarget(_text(raw.get("model"), "target model name"), reasoning)
+    return ModelTarget(text_field(raw.get("model"), "target model name"), reasoning)
 
 
 def _option_from_dict(raw) -> QuestionOption:
     if not isinstance(raw, dict):
         raise ValueError("question option must be an object")
-    _unknown("question option", raw, {"key", "label", "capability"})
+    reject_unknown_fields("question option", raw, {"key", "label", "capability"})
     for field in ("key", "label", "capability"):
         if not isinstance(raw.get(field), str):
             raise ValueError(f"question option {field} must be a string")
@@ -219,13 +189,13 @@ def _option_from_dict(raw) -> QuestionOption:
 def _criteria_from_dict(raw) -> tuple[float, ...]:
     if not isinstance(raw, list):
         raise ValueError("score criteria must be a list of finite numbers")
-    return tuple(_number(level, "score criteria level") for level in raw)
+    return tuple(finite_number(level, "score criteria level") for level in raw)
 
 
 def _string_list(raw, field: str) -> tuple[str, ...]:
     if not isinstance(raw, list):
         raise ValueError(f"{field} must be a list of strings")
-    return tuple(_text(item, f"{field} item", empty=True) for item in raw)
+    return tuple(optional_text_field(item, f"{field} item") for item in raw)
 
 
 def _node_from_dict(raw) -> GraphNode:
@@ -233,10 +203,15 @@ def _node_from_dict(raw) -> GraphNode:
         raise ValueError("node must be an object")
     node_type = raw.get("type")
     if node_type == "start":
-        _unknown("start node", raw, {"id", "type", "title", "position"})
-        return StartNode(_node_id(raw), _display(raw, "start"), _position(raw, "start"))
+        reject_unknown_fields("start node", raw, {"id", "type", "title", "position"})
+        return StartNode(_node_id(raw), optional_title(raw, "start"), _position(raw, "start"))
     if node_type == "question":
-        _unknown("question node", raw, {"id", "type", "question_type", "instructions", "title", "options", "criteria", "position"})
+        reject_unknown_fields(
+            "question node",
+            raw,
+            {"id", "type", "question_type", "instructions", "title", "options",
+             "criteria", "position"},
+        )
         question_type = raw.get("question_type")
         if question_type not in _QUESTION_TYPES:
             raise ValueError(f"question.question_type must be one of {'/'.join(_QUESTION_TYPES)}, got {question_type!r}")
@@ -253,20 +228,24 @@ def _node_from_dict(raw) -> GraphNode:
         return QuestionNode(
             _node_id(raw),
             question_type,
-            _text(raw.get("instructions"), "question.instructions", empty=True),
+            optional_text_field(raw.get("instructions"), "question.instructions"),
             tuple(_option_from_dict(option) for option in options),
             _criteria_from_dict(criteria) if criteria is not None else None,
-            _display(raw, "question"),
+            optional_title(raw, "question"),
             _position(raw, "question"),
         )
     if node_type == "logic":
-        _unknown("logic node", raw, {"id", "type", "operator", "title", "position"})
+        reject_unknown_fields("logic node", raw, {"id", "type", "operator", "title", "position"})
         operator = raw.get("operator")
         if operator not in _LOGIC_OPERATORS:
             raise ValueError(f"logic.operator must be one of {'/'.join(_LOGIC_OPERATORS)}, got {operator!r}")
-        return LogicNode(_node_id(raw), operator, _display(raw, "logic"), _position(raw, "logic"))
+        return LogicNode(_node_id(raw), operator, optional_title(raw, "logic"), _position(raw, "logic"))
     if node_type == "condition":
-        _unknown("condition node", raw, {"id", "type", "source", "contains_any", "periods", "title", "position"})
+        reject_unknown_fields(
+            "condition node",
+            raw,
+            {"id", "type", "source", "contains_any", "periods", "title", "position"},
+        )
         source = raw.get("source")
         if source not in _CONDITION_SOURCES:
             raise ValueError(f"condition.source must be one of {'/'.join(_CONDITION_SOURCES)}, got {source!r}")
@@ -275,11 +254,15 @@ def _node_from_dict(raw) -> GraphNode:
             source,
             _string_list(raw.get("contains_any", []), "condition.contains_any"),
             _string_list(raw.get("periods", []), "condition.periods"),
-            _display(raw, "condition"),
+            optional_title(raw, "condition"),
             _position(raw, "condition"),
         )
     if node_type == "target":
-        _unknown("target node", raw, {"id", "type", "models", "priority", "strategy", "capability", "title", "position"})
+        reject_unknown_fields(
+            "target node",
+            raw,
+            {"id", "type", "models", "priority", "strategy", "capability", "title", "position"},
+        )
         models = raw.get("models", [])
         if not isinstance(models, list):
             raise ValueError("target.models must be a list")
@@ -302,7 +285,7 @@ def _node_from_dict(raw) -> GraphNode:
             priority,
             strategy,
             capability,
-            _display(raw, "target"),
+            optional_title(raw, "target"),
             _position(raw, "target"),
         )
     raise ValueError(f"unknown node type {node_type!r}")
@@ -311,13 +294,15 @@ def _node_from_dict(raw) -> GraphNode:
 def _edge_from_dict(raw) -> Edge:
     if not isinstance(raw, dict):
         raise ValueError("edge must be an object")
-    _unknown("edge", raw, {"id", "source", "source_port", "target", "target_port", "condition"})
+    reject_unknown_fields(
+        "edge", raw, {"id", "source", "source_port", "target", "target_port", "condition"},
+    )
     return Edge(
-        _text(raw.get("id"), "edge id"),
-        _text(raw.get("source"), "edge source"),
-        _text(raw.get("source_port"), "edge source_port"),
-        _text(raw.get("target"), "edge target"),
-        _text(raw.get("target_port"), "edge target_port"),
+        text_field(raw.get("id"), "edge id"),
+        text_field(raw.get("source"), "edge source"),
+        text_field(raw.get("source_port"), "edge source_port"),
+        text_field(raw.get("target"), "edge target"),
+        text_field(raw.get("target_port"), "edge target_port"),
         _condition_from_dict(raw.get("condition")),
     )
 
@@ -331,13 +316,15 @@ def _fallback_ref(raw: dict) -> str | None:
         value = raw.get("otherwise_target")
     if value is None:
         return None
-    return _text(value, "graph error_fallback")
+    return text_field(value, "graph error_fallback")
 
 
 def graph_from_dict(raw) -> GraphRoot:
     if not isinstance(raw, dict):
         raise ValueError("graph must be an object")
-    _unknown("graph", raw, {"id", "type", "nodes", "edges", "error_fallback", "otherwise_target"})
+    reject_unknown_fields(
+        "graph", raw, {"id", "type", "nodes", "edges", "error_fallback", "otherwise_target"},
+    )
     if raw.get("type") != "graph":
         raise ValueError(f"graph.type must be 'graph', got {raw.get('type')!r}")
     nodes = raw.get("nodes", [])
@@ -347,7 +334,7 @@ def graph_from_dict(raw) -> GraphRoot:
     if not isinstance(edges, list):
         raise ValueError("graph.edges must be a list")
     return GraphRoot(
-        _text(raw.get("id"), "graph id"),
+        text_field(raw.get("id"), "graph id"),
         tuple(_node_from_dict(node) for node in nodes),
         tuple(_edge_from_dict(edge) for edge in edges),
         _fallback_ref(raw),
@@ -457,6 +444,7 @@ def _edge_behavior_dict(edge: Edge) -> dict:
 
 
 def graph_behavior_dict(root: GraphRoot) -> dict:
+    # ports 依赖本模块的节点类型，因此槽位排序键只能在调用时导入（单向、非 revision 耦合）。
     from router.routing.graph.ports import slot_sort_key
 
     return {
@@ -474,15 +462,11 @@ def canonical_json(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def graph_revision_of(value) -> str:
-    if isinstance(value, GraphRoot):
-        payload = graph_behavior_dict(value)
-    elif hasattr(value, "root") and hasattr(value, "timezone") and hasattr(value, "sticky"):
-        # 单一来源：envelope 的 canonical 结构与 tree_behavior_dict 完全一致。
-        # 局部导入避免 router.routing.model ↔ graph.model 的循环依赖。
-        from router.routing.model import tree_behavior_dict
-
-        payload = tree_behavior_dict(value)
-    else:
-        raise TypeError("graph_revision_of expects a RoutingTree or a GraphRoot")
+def graph_revision_of(root: GraphRoot) -> str:
+    """Behavior revision of a graph root; tree envelopes use ``tree_revision_of``."""
+    if not isinstance(root, GraphRoot):
+        raise TypeError(
+            f"graph_revision_of expects a GraphRoot, got {type(root).__name__}"
+        )
+    payload = graph_behavior_dict(root)
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()

@@ -4,7 +4,7 @@ import json
 import pytest
 
 from router.routing.document import graph_document, graph_document_bytes, parse_graph_document
-from router.routing.model import tree_from_dict, tree_revision_of
+from router.routing.tree import tree_from_dict, tree_revision_of
 from tests.routing_fixtures import tree_dict
 
 
@@ -69,3 +69,14 @@ def test_document_rejects_every_missing_outer_field(field):
 
     with pytest.raises(ValueError):
         load(json.dumps(document).encode())
+
+
+def test_deeply_nested_json_maps_to_value_error_not_recursion_error():
+    """JSON 解码边界唯一一次把 RecursionError 归一为 ValueError（任意嵌套输入）。"""
+    nested = b"[" * 200_000 + b"]" * 200_000
+    content = (
+        b'{"kind":"sr-routing-graph","version":3,"name":"x","timezone":"UTC",'
+        b'"sticky":{"enabled":false,"ttl_seconds":1800},"root":' + nested + b"}"
+    )
+    with pytest.raises(ValueError, match="valid UTF-8 JSON"):
+        load(content)

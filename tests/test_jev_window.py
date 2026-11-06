@@ -19,7 +19,7 @@ from router.jev.window import (
     estimate_tokens,
 )
 from router.routing.graph.engine import GraphExecutionEngine
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.routing.snapshot import build_snapshot, read_jev_window
 from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate

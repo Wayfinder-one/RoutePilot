@@ -9,7 +9,7 @@ from pathlib import Path
 
 from router.control.validation import build_enable_context
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
-from router.routing.model import tree_from_dict, tree_revision_of, tree_storage_dict
+from router.routing.tree import tree_from_dict, tree_revision_of, tree_storage_dict
 from router.store.routing_trees import RoutingTreeRepo
 
 

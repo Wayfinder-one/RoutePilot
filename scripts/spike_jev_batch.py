@@ -35,7 +35,7 @@ from router.routing.affinity import SessionAffinity  # noqa: E402
 from router.routing.graph.conditions import evaluate_condition  # noqa: E402
 from router.routing.graph.engine import GraphExecutionEngine  # noqa: E402
 from router.routing.graph.model import Condition, Edge, QuestionNode  # noqa: E402
-from router.routing.model import tree_from_dict  # noqa: E402
+from router.routing.tree import tree_from_dict  # noqa: E402
 from router.routing.scheduler import LoadBalancer  # noqa: E402
 from router.routing.snapshot import build_snapshot  # noqa: E402
 from router.routing.types import RoutingRequest  # noqa: E402

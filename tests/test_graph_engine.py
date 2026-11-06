@@ -24,7 +24,7 @@ from router.routing.affinity import SessionAffinity
 from router.routing.conditions import TimePeriod
 from router.routing.graph.conditions import UNKNOWN
 from router.routing.graph.engine import GraphExecutionEngine, combine_gate
-from router.routing.model import tree_from_dict
+from router.routing.tree import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.snapshot import build_snapshot
 from router.routing.types import (
