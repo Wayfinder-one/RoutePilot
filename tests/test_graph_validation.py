@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from router.api.issue_presenter import present_issue
 from router.routing.graph.model import graph_from_dict, graph_to_dict
 from router.routing.graph.validate import (
     EnableContext,
@@ -27,6 +28,11 @@ EDGE_ISSUE_CODES = {
 # ───────────────────────────── helpers ─────────────────────────────
 
 
+def message(issue):
+    """Issue is machine-only; bilingual copy comes from the presenter."""
+    return present_issue(issue)
+
+
 def structure(raw):
     return validate_graph_structure(tree_from_dict(tree_dict(root=raw)))
 
@@ -44,7 +50,7 @@ def edge_issue(raw, code):
         assert isinstance(issue.edge_id, str) and issue.edge_id, issue
         assert isinstance(issue.port, str) and issue.port, issue
         assert issue.level == "hard"
-        assert issue.zh and issue.en
+        assert message(issue)["zh"] and message(issue)["en"]
     return issues[0]
 
 
@@ -370,7 +376,7 @@ def test_choice_option_rules():
     raw["nodes"][1]["options"][0]["capability"] = ""
     assert codes(raw) == {"question_incomplete"}
     for issue in structure(raw):
-        assert issue.zh and issue.en
+        assert message(issue)["zh"] and message(issue)["en"]
 
 
 def test_choice_options_upper_bound_255():
@@ -415,7 +421,7 @@ def test_question_chain_depth_limit():
     assert codes(question_chain_raw(8)) == set()  # 恰 8 波合法
     assert codes(question_chain_raw(9)) == {"limit_exceeded"}  # 9 波超限
     issue = next(issue for issue in structure(question_chain_raw(9)) if issue.code == "limit_exceeded")
-    assert issue.zh and issue.en
+    assert message(issue)["zh"] and message(issue)["en"]
 
 
 # ─────────────────────────── targets ────────────────────────────────
@@ -486,7 +492,7 @@ def test_blank_condition_keywords_and_periods_are_rejected():
         assert codes(raw) == {"condition_config_invalid"}, contains_any
         issue = next(issue for issue in structure(raw) if issue.code == "condition_config_invalid")
         assert issue.node_id == "c"
-        assert issue.zh and issue.en
+        assert message(issue)["zh"] and message(issue)["en"]
     for periods in ([""], [" "], ["peak", " "]):
         raw = graph_dict()
         raw["nodes"].append({
@@ -541,7 +547,7 @@ def test_huge_chain_returns_limit_exceeded_without_recursion():
     """终审 Critical 回归：1200 节点链必须返回 limit_exceeded，而不是 RecursionError → 500。"""
     issues = validate_graph_structure(huge_chain_graph())  # raw dict：走完整解析 + 校验入口
     assert {issue.code for issue in issues} == {"limit_exceeded"}
-    assert all(issue.zh and issue.en and issue.level == "hard" for issue in issues)
+    assert all(message(issue)["zh"] and message(issue)["en"] and issue.level == "hard" for issue in issues)
 
 
 def test_cycle_dfs_is_iterative_beyond_python_recursion_limit():
@@ -597,7 +603,7 @@ def test_issue_list_is_order_independent():
 def test_graph_parse_error_for_raw_dict():
     issues = validate_graph_structure({"type": "tree"})
     assert {issue.code for issue in issues} == {"graph_parse_error"}
-    assert issues[0].zh and issues[0].en
+    assert message(issues[0])["zh"] and message(issues[0])["en"]
     issues = validate_graph_structure({"id": "root", "type": "graph", "nodes": [{"id": "s", "type": "start"}], "edges": []})
     assert {issue.code for issue in issues} == {"fallback_missing"}  # 两个兜底都未配置
 

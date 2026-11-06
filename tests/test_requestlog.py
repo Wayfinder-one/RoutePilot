@@ -94,6 +94,28 @@ def test_hydrate_recent_restores_persisted_tail_without_live_detail(tmp_path):
     assert "text" not in recent[0]
     assert "trace" not in recent[0]
     assert "jev_probabilities" not in recent[0]
+    # Restored rows use the same presenter as live rows (no client-side adapter).
+    assert recent[0]["route_label"] == {"zh": "目标命中", "en": "Target selected"}
+    assert [pair[0]["en"] for pair in recent[0]["metrics"]] == [
+        "Upstream", "Routing", "Total", "Waves"]
+    assert recent[0]["fields"][0][0] == {"zh": "请求 ID", "en": "Request ID"}
+
+
+def test_hydrate_presents_otherwise_selection_reason(tmp_path):
+    log = make_log(tmp_path)
+    log.enqueue(record(1, selection_reason="otherwise", outcome_state="completed",
+                       total_ms=5.0))
+    asyncio.run(log.flush())
+
+    restored = RequestLogger(log.db_path)
+    conn = connect(log.db_path)
+    try:
+        restored.hydrate_recent(conn)
+    finally:
+        conn.close()
+
+    assert restored.recent_requests(1)[0]["route_label"] == {
+        "zh": "默认目标兜底", "en": "Default target fallback"}
 
 
 def test_queue_full_is_counted_and_ring_survives(tmp_path, monkeypatch):

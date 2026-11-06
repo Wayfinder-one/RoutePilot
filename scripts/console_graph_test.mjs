@@ -1151,19 +1151,26 @@ test('validate allows an 8-wave question chain and flags a 9th wave', () => {
 
 /* ── 10. 计算日志 / 时间路径静态契约（Task 14） ─────────────────────── */
 
-test('logs fallback filter knows the graph v3 enum', () => {
+test('logs render presenter fields and keep no legacy adapters', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
   assert.match(logs, /\['error_fallback', 'fallback', 'otherwise'\]/,
     'logs fallback filter does not know the graph v3 enum');
   assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
     'logs still uses the pre-graph fallback enum');
-  assert.match(logs, /logs\.reason\.fallback/);
+  /* Task 7：展示字段全部由 API presenter 生成，控制台不再适配旧事件。 */
+  assert.match(logs, /record\.route_label/, 'logs does not render the presenter route label');
+  assert.match(logs, /event\.phase/, 'logs does not consume presenter phases');
+  assert.doesNotMatch(logs, /const LEGACY/, 'logs still carries the legacy event table');
+  assert.doesNotMatch(logs, /function legacy\(/, 'logs still carries the legacy adapter');
+  assert.doesNotMatch(logs, /legacyFields|legacyRoute/, 'logs still carries legacy field adapters');
   const i18n = read('i18n.js');
-  for (const key of ['logs.reason.otherwise', 'logs.reason.errorFallback']) {
-    assert.equal(i18n.split("'" + key + "'").length - 1, 2,
-      'i18n key ' + key + ' is not defined in both zh and en');
+  for (const prefix of ['logs.legacy.', 'logs.ev.', 'logs.reason.']) {
+    assert.equal(i18n.split("'" + prefix).length - 1, 0,
+      'removed i18n namespace still present: ' + prefix);
   }
+  assert.equal(i18n.split("'logs.sticky.unavailable'").length - 1, 2,
+    'scheduler sticky unavailable status has no bilingual copy');
 });
 
 test('calculation log detail shows the process inline and keeps technical facts folded', () => {

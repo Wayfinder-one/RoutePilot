@@ -33,65 +33,22 @@ function ms(value) {
 function events(record) {
   return Array.isArray(record.trace) ? record.trace.filter(e => e && typeof e === 'object') : [];
 }
-/* Migration adapter for graph-v3 records emitted before the display contract.
-   Only actual events are projected; no phase is synthesized from configuration. */
-const LEGACY = {
-  time: ['time', 'logs.ev.time'], window: ['window', 'logs.ev.window'],
-  condition: ['condition', 'logs.ev.condition'],
-  fallback: ['fallback', 'logs.ev.fallback'], final: ['final', 'logs.ev.final'],
-  schedule: ['schedule', 'logs.ev.schedule'], sticky_hit: ['sticky', 'logs.ev.sticky'],
-  scheduled: ['scheduled', 'logs.ev.scheduled'], routing_error: ['error', 'logs.out.routing'],
-};
-const LEGACY_FACTS = ['active_periods', 'timezone', 'tokens_before', 'tokens_after',
-  'truncated', 'node_id', 'source', 'matched', 'value', 'wave', 'questions',
-  'selected', 'p_top', 'margin', 'duration_ms', 'failed', 'status', 'via_port',
-  'target_id', 'kind', 'priority', 'strategy', 'configured_models',
-  'available_models', 'model'];
-function legacy(event, hasPeriodCondition) {
-  const kind = String(event.event || 'event');
-  // The old graph emits a time event for every route, even when a configured
-  // period is active but this route never evaluates a period condition.
-  if (kind === 'time' && !hasPeriodCondition) return null;
-  const wave = Number(event.wave);
-  const isWaveStep = ['wave', 'question', 'gate', 'slot', 'activate'].includes(kind);
-  const phase = isWaveStep ? (Number.isInteger(wave) && wave > 0 ? `wave${wave}` : 'wave0')
-    : (LEGACY[kind] || [kind])[0];
-  const key = isWaveStep ? (phase === 'wave0' ? 'logs.ev.wave0' : 'logs.ev.wave')
-    : (LEGACY[kind] || [null, null])[1];
-  // Old error/reason strings can contain raw upstream exceptions.
-  const facts = LEGACY_FACTS.filter(name => event[name] != null && event[name] !== '')
-    .map(name => [t('logs.legacy.' + name), display(event[name])]);
-  const tone = kind === 'routing_error' || (kind === 'wave' && event.failed) ? 'bad'
-    : kind === 'fallback' || (kind === 'final' && event.kind !== 'target') ? 'warn'
-    : kind === 'sticky_hit' || kind === 'scheduled' || (kind === 'activate' && event.node_id) ? 'hit' : '';
-  const marker = event.model ?? event.selected ?? event.target_id ??
-    event.node_id ?? event.status;
-  const safeFailure = kind === 'wave' && event.failed ? t('logs.ev.waveFailed')
-    : kind === 'fallback' ? t('logs.ev.fallbackUsed') : null;
-  const label = key ? (kind === 'wave' || (isWaveStep && phase !== 'wave0')
-    ? tf('logs.ev.wave', {n: Number.isInteger(wave) ? wave : '?'}) : t(key)) : kind;
-  return { phase, label,
-    cell: safeFailure ?? marker ?? (kind === 'time' && !event.active_periods?.length ? t('logs.timeNone') : t(key || kind)),
-    summary: safeFailure ?? marker ?? (kind === 'time' && !event.active_periods?.length ? t('logs.timeNone') : t(key || kind)),
-    facts, tone };
-}
 function stages(record) {
   const groups = new Map();
-  const trace = events(record);
-  const hasPeriodCondition = trace.some(e => e.event === 'condition' && e.source === 'periods');
-  trace.forEach(event => {
-    const item = event.phase ? event : legacy(event, hasPeriodCondition);
-    if (!item) return;
-    const id = String(item.phase);
-    if (!groups.has(id)) groups.set(id, { id, label: item.label ?? id, cell: '—',
+  events(record).forEach(event => {
+    /* The API presenter attaches phase/label/cell/summary/facts to every trace
+       event; a raw machine event here means "no displayed stage". */
+    if (!event.phase) return;
+    const id = String(event.phase);
+    if (!groups.has(id)) groups.set(id, { id, label: event.label ?? id, cell: '—',
       summary: '—', facts: [], tone: '', count: 0 });
     const group = groups.get(id);
     group.count += 1;
-    if (item.label != null) group.label = item.label;
-    if (item.cell != null && item.cell !== '') group.cell = item.cell;
-    if (item.summary != null && item.summary !== '') group.summary = item.summary;
-    if (Array.isArray(item.facts) && item.facts.length) group.facts = item.facts.slice(0, 3);
-    const tone = Object.prototype.hasOwnProperty.call(TONES, item.tone) ? item.tone : '';
+    if (event.label != null) group.label = event.label;
+    if (event.cell != null && event.cell !== '') group.cell = event.cell;
+    if (event.summary != null && event.summary !== '') group.summary = event.summary;
+    if (Array.isArray(event.facts) && event.facts.length) group.facts = event.facts.slice(0, 3);
+    const tone = Object.prototype.hasOwnProperty.call(TONES, event.tone) ? event.tone : '';
     if (TONES[tone] > TONES[group.tone]) group.tone = tone;
   });
   return [...groups.values()];
@@ -176,25 +133,14 @@ function stageHtml(stage, index) {
     '<div class="lg-evidence">' + (pairsHtml(stage.facts, 'lg-evidence-pair') || '—') + '</div>' +
     '<div class="lg-stage-count">' + stage.count + '</div></div>';
 }
-function legacyFields(record) {
-  const keys = [['id', 'logs.f.id'], ['tree_id', 'logs.f.tree'], ['snapshot_revision', 'logs.f.snapshot'],
-    ['policy_path', 'logs.f.policy'], ['session_hash', 'logs.f.session'], ['jev_model', 'logs.f.jevModel'],
-    ['upstream_status', 'logs.f.upstreamStatus'], ['total_tokens', 'logs.f.tokensTotal']];
-  return keys.filter(([key]) => record[key] != null).map(([key, label]) => [t(label), record[key]]);
-}
-function legacyRoute(record, status) {
-  const keys = { target: 'logs.reason.target', sticky: 'logs.reason.sticky',
-    error_fallback: 'logs.reason.errorFallback', fallback: 'logs.reason.fallback',
-    otherwise: 'logs.reason.otherwise' };
-  return t(keys[record.selection_reason] || status[0]);
-}
 function detailHtml(record, path) {
   const status = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
-  const route = record.route_label ?? legacyRoute(record, status);
-  const metrics = Array.isArray(record.metrics) ? record.metrics :
-    [[t('logs.f.routing'), ms(record.routing_ms)], [t('logs.f.total'), ms(record.total_ms ?? record.latency_ms)]];
-  const fields = Array.isArray(record.fields) ? record.fields : legacyFields(record);
-  return '<div class="lg-detail-head"><span class="lg-route">' + safe(route) + '</span>' +
+  /* route_label/metrics/fields are produced by the API presenter for both live
+     and SQLite-restored rows; the console renders them verbatim. */
+  const route = record.route_label != null ? safe(record.route_label) : esc(t(status[0]));
+  const metrics = Array.isArray(record.metrics) ? record.metrics : [];
+  const fields = Array.isArray(record.fields) ? record.fields : [];
+  return '<div class="lg-detail-head"><span class="lg-route">' + route + '</span>' +
     '<span class="lg-status ' + status[1] + '">' + esc(t(status[0])) + '</span>' +
     '<span class="lg-detail-metrics">' + pairsHtml(metrics, 'lg-metric') + '</span></div>' +
     '<div class="lg-rail" role="group" aria-label="' + esc(t('logs.path')) + '">' +
