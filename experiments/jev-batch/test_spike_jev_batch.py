@@ -7,7 +7,7 @@ import pytest
 
 from router.jev.client import NoulAnswer
 from router.routing.graph.validate import EnableContext, validate_graph_for_enable
-from scripts.spike_jev_batch import (
+from spike_jev_batch import (
     BudgetExceeded,
     ResponseRecord,
     Sample,
@@ -390,7 +390,7 @@ def test_dry_run_prints_budget_without_network(tmp_path, capsys):
 
 def test_capacity_observations_use_the_posted_rendered_state():
     """H2 发送的是 render_state(state_text)，校准观测必须用同一份 wire 定义。"""
-    import scripts.spike_jev_batch as spike
+    import spike_jev_batch as spike
 
     class RecordingTransport(ScriptedH1Transport):
         def __init__(self):
@@ -421,7 +421,7 @@ def test_capacity_observations_use_the_posted_rendered_state():
 
 def test_over_context_probe_cannot_inherit_consecutive_5xx(monkeypatch):
     """C1：N=16 的 5xx 不得与 N=32 探测叠成两连击；探测 5xx 也不能给后续阶段留计数。"""
-    import scripts.spike_jev_batch as spike
+    import spike_jev_batch as spike
 
     posted_question_counts = []
 
@@ -474,7 +474,7 @@ def test_over_context_probe_cannot_inherit_consecutive_5xx(monkeypatch):
 
 def test_call_document_redacts_api_key_from_body_and_error(monkeypatch):
     """Important：calls 保留完整 ResponseRecord（含 body），但任何位置的 key 都要变成 ***。"""
-    import scripts.spike_jev_batch as spike
+    import spike_jev_batch as spike
 
     secret = "sk-SECRET-ABC"
     cached = {

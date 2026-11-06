@@ -14,7 +14,7 @@ English | [简体中文](README.zh-CN.md)
 - **Deterministic target selection.** Activated targets compete by priority; the largest number wins. Both a normal empty result and a failed decision wave use the single fallback model, `error_fallback`.
 - **Sticky sessions and load balancing.** Reuse a model per tree revision and target, then pick a backend with `least_inflight`. Failed backends are removed by a circuit breaker.
 - **Dry-run before publishing.** `/admin/try` runs the same graph executor with the same trace format without touching affinity, in-flight counts, or upstream generation models.
-- **Operations built in.** Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, config revisions, audit history, and role-based users.
+- **Operations built in.** Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, audit history, and role-based users.
 - **Bilingual console.** Chinese and English UI, with admin and viewer roles.
 
 ## How a request is routed
@@ -188,7 +188,7 @@ Environment variables can seed the decision-service config on first start only; 
 - The last active admin cannot be demoted, disabled, or deleted.
 - Every user and configuration change is recorded in the audit log.
 - Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
-- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail. Legacy `otherwise_target` in old graph files is read as the unified fallback and is normalized to `error_fallback` on save.
+- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are flushed asynchronously and also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail.
 - Session affinity and in-flight counts remain process-local. Multiple router replicas can share graph files, but cross-replica session/in-flight consistency requires an external shared state layer.
 
 ## Shared graph storage and replicas

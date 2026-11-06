@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA = (
     """
@@ -82,19 +82,6 @@ SCHEMA = (
     """,
     """
     CREATE INDEX idx_request_logs_ts ON request_logs(ts)
-    """,
-    """
-    CREATE TABLE config_revisions (
-        id INTEGER PRIMARY KEY,
-        kind TEXT NOT NULL,
-        sha256 TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        UNIQUE(kind, sha256)
-    )
-    """,
-    """
-    CREATE INDEX idx_config_revisions_kind ON config_revisions(kind, id)
     """,
     """
     CREATE TABLE changes (
@@ -211,6 +198,22 @@ def _upgrade_v2_to_v3(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO schema_migrations VALUES (?)", (3,))
 
 
+def _upgrade_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """Drop the retired config-revision ledger; refuse to lose unexported rows."""
+    if "config_revisions" in _table_names(conn):
+        rows = int(conn.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0])
+        if rows:
+            raise RuntimeError(
+                f"config_revisions still holds {rows} row(s); export them before upgrading "
+                "(for example: sqlite3 router.db \".mode insert config_revisions\" "
+                "\"SELECT * FROM config_revisions;\" > config-revisions.sql), then "
+                "DELETE FROM config_revisions and retry"
+            )
+        conn.execute("DROP INDEX IF EXISTS idx_config_revisions_kind")
+        conn.execute("DROP TABLE config_revisions")
+    conn.execute("INSERT INTO schema_migrations VALUES (?)", (4,))
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
     applied = int(conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
@@ -249,5 +252,11 @@ def migrate(conn: sqlite3.Connection) -> None:
                 + ", ".join(legacy)
             )
         _in_transaction(conn, lambda: _upgrade_v2_to_v3(conn))
+        applied = 3
+        tables = _table_names(conn)
+    if applied == 3:
+        if not {"request_logs", "settings"} <= tables:
+            raise RuntimeError("unsupported database contents; use a new database")
+        _in_transaction(conn, lambda: _upgrade_v3_to_v4(conn))
         return
     raise RuntimeError("unsupported database contents; use a new database")

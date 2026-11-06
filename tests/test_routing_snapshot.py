@@ -79,7 +79,6 @@ def test_snapshot_loads_current_config_and_revision_excludes_secrets(conn, repo)
     assert "upstream-secret" not in snapshot.content
     assert "jev-secret" not in snapshot.content
     assert snapshot.tree_revision == snapshot.tree.tree_revision
-    assert conn.execute("SELECT COUNT(*) FROM config_revisions WHERE kind = 'snapshot'").fetchone()[0] == 0
 
 
 def test_publisher_swaps_whole_snapshot_without_mutating_old_one(conn, repo):

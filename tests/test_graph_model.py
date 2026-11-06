@@ -374,18 +374,11 @@ def test_tree_envelope_strict():
     assert tree.root.error_fallback == "missing-target"
 
 
-def test_legacy_otherwise_target_is_read_as_the_unified_fallback():
+def test_otherwise_target_is_rejected_as_an_unknown_field():
     raw = tree_dict()
-    raw["root"].pop("error_fallback")
     raw["root"]["otherwise_target"] = "safe"
-    tree = tree_from_dict(raw)
-    assert tree.root.error_fallback == "safe"
-    assert "otherwise_target" not in tree_storage_dict(tree)["root"]
-
-    # The canonical error_fallback wins when a legacy file carries both.
-    raw = tree_dict()
-    raw["root"]["otherwise_target"] = "other"
-    assert tree_from_dict(raw).root.error_fallback == "safe"
+    with pytest.raises(ValueError, match="unknown fields: otherwise_target"):
+        tree_from_dict(raw)
 
 
 def test_huge_int_raises_value_error():
