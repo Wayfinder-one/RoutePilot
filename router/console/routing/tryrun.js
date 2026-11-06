@@ -85,10 +85,6 @@
     return String(raw);
   }
 
-  function conditionText(condition) {
-    return root.RTCondPop.conditionLabel(condition, { start: false });
-  }
-
   function statusText(status) {
     if (status === 'unknown') return t('cv.tryUnknown');
     if (status === 'invalid') return t('cv.tryInvalid');
@@ -787,10 +783,15 @@
         /* §6.9 示例是 `in_1 0.84 > 0.65 → true`：节点 id 在中间列，槽位号必须留在行文本里。 */
         return (row.port ? row.port + ' ' : '') + slotLine(row);
       case 'gate': {
-        const inputs = (row.inputs || []).map(input =>
-          input.port + ' ' + rawText(input.raw) + ' ' +
-          (input.condition ? conditionText(input.condition) : root.RTCondPop.conditionLabel(null)) + ' → ' + statusText(input.status))
-          .join(t('cv.trySepClause'));
+        const graph = app() && app().graph;
+        const inputs = (row.inputs || []).map(input => {
+          const edge = graph && (graph.edges || []).find(item => item &&
+            item.target === row.node_id && item.target_port === input.port);
+          const label = edge
+            ? root.RTCondPop.conditionText(edge)
+            : root.RTCondPop.conditionLabel(input.condition, { start: false });
+          return input.port + ' ' + rawText(input.raw) + ' ' + label + ' → ' + statusText(input.status);
+        }).join(t('cv.trySepClause'));
         return tf('cv.tryGateRow', { operator: row.operator, inputs: inputs, value: String(row.value) });
       }
       case 'question': {
