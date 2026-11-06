@@ -22,6 +22,7 @@ from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.request_logging import LOG_COLUMNS, RequestLogger
 from router.routing.affinity import SessionAffinity
+from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
 from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.tree import tree_from_dict
@@ -133,6 +134,28 @@ def direct_graph():
     )
 
 
+def period_condition_graph():
+    """direct_graph 再加一个真实时段条件（condition/source=periods）。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "cond-peak", "type": "condition", "source": "periods",
+             "periods": ["peak"], "position": {"x": 200, "y": 0}},
+            _target("direct", 1, ("safe",)),
+        ],
+        [
+            _edge("e-start-direct", "start", "out", "direct", "in_1"),
+            _edge("e-cond-direct", "cond-peak", "out", "direct", "in_2"),
+        ],
+        error="direct",
+    )
+
+
+def all_day_peak():
+    # start == end 在 matching_periods 里表示全天生效（HH:MM 不允许 24:00）。
+    return [TimePeriod("peak", (0, 1, 2, 3, 4, 5, 6), "00:00", "00:00")]
+
+
 def two_question_graph():
     """同一波两个问题：choice + noul，数值 AND 组合到 power-target。"""
     return _graph(
@@ -224,7 +247,8 @@ def priority_graph():
 # ── harness ────────────────────────────────────────────────────────────
 
 
-def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transport=None):
+def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transport=None,
+             time_periods=None):
     path = str(tmp_path / "v1.db")
     conn = connect(path)
     migrate(conn)
@@ -256,7 +280,8 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
             sticky=sticky or {"enabled": False, "ttl_seconds": 1800},
         ))
     app.state.snapshot = build_snapshot(
-        tree=tree, backends=backends, time_periods=[],
+        tree=tree, backends=backends,
+        time_periods=[] if time_periods is None else time_periods,
         jev=JEV_SETTINGS, capabilities=CAPABILITIES,
         compiled=compile_graph(tree.root) if tree is not None else None,
     )
@@ -749,6 +774,49 @@ def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
     asyncio.run(scenario())
 
 
+# ── trace presentation: time phase follows the graph, not the deployment ─
+
+
+def test_time_event_stays_initial_when_no_period_condition_ran(tmp_path):
+    """部署配置了时段，但本图没有时段条件：time 事件仍属于「初始计算」。"""
+
+    async def scenario():
+        app = make_app(tmp_path, Harness({}), root=direct_graph(),
+                       time_periods=all_day_peak())
+        response = await post(app)
+
+        assert response.status_code == 200
+        trace = recent(app)["trace"]
+        time_event = trace[0]
+        assert time_event["event"] == "time"
+        assert time_event["phase"] == "initial"
+        assert time_event["label"] == {"zh": "初始计算", "en": "Initial evaluation"}
+        assert app.state.balancer.inflight("safe") == 0
+
+    asyncio.run(scenario())
+
+
+def test_time_event_is_period_when_a_real_period_condition_ran(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, Harness({}), root=period_condition_graph(),
+                       time_periods=all_day_peak())
+        response = await post(app)
+
+        assert response.status_code == 200
+        trace = recent(app)["trace"]
+        time_event = trace[0]
+        assert time_event["event"] == "time"
+        assert time_event["phase"] == "period"
+        assert time_event["label"] == {"zh": "时段判断", "en": "Time period"}
+        condition = next(event for event in trace if event["event"] == "condition")
+        assert condition["source"] == "periods"
+        assert condition["value"] is True
+        assert condition["phase"] == "period"
+        assert app.state.balancer.inflight("safe") == 0
+
+    asyncio.run(scenario())
+
+
 # ── upstream / lease / stream paths ────────────────────────────────────
 
 
@@ -797,6 +865,155 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert record["answers"] == {}
         assert record["trace"][-1]["event"] == "request_outcome"
         assert record["fields"][-1][1] == 3
+
+    asyncio.run(scenario())
+
+
+def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path, monkeypatch):
+    """stream=true + 上游 5xx：JSON 502 返回、上游响应关闭一次、租约释放一次。"""
+    from router.routing import scheduler as scheduler_module
+
+    released = []
+    lease_release = scheduler_module.Lease.release
+
+    def counting_release(self):
+        released.append(self.model)
+        lease_release(self)
+
+    monkeypatch.setattr(scheduler_module.Lease, "release", counting_release)
+    closes = []
+
+    class ErrorStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"error":"down"}'
+
+        async def aclose(self):
+            closes.append(True)
+
+    def handler(request):
+        return httpx.Response(
+            503, headers={"content-type": "application/json"}, stream=ErrorStream(),
+        )
+
+    async def scenario():
+        app = make_app(tmp_path, handler, root=direct_graph())
+        response = await post(app, payload(stream=True))
+
+        # 客户端可见的响应仍是现有 handler 的 upstream_error 映射。
+        assert response.status_code == 502
+        assert response.headers["content-type"] == "application/json"
+        assert response.headers["x-sr-model"] == "safe"
+        assert response.headers["x-sr-selection"] == "target"
+        assert response.json() == {"error": {"message": "upstream_error"}}
+        # 上游响应恰好关闭一次，租约恰好释放一次（未移交 _relay，也没有 double release）。
+        assert closes == [True]
+        assert released == ["safe"]
+        assert app.state.balancer.inflight("safe") == 0
+        record = recent(app)
+        assert record["outcome_state"] == "upstream_error"
+        assert record["error_class"] == "upstream_error"
+        assert record["metrics"][0][1] == 503
+
+    asyncio.run(scenario())
+
+
+def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
+    """hand-off 后租约归 _relay 所有：第二个分片未到之前 inflight 必须仍为 1。"""
+    from router.routing import scheduler as scheduler_module
+
+    released = []
+    lease_release = scheduler_module.Lease.release
+
+    def counting_release(self):
+        released.append(self.model)
+        lease_release(self)
+
+    monkeypatch.setattr(scheduler_module.Lease, "release", counting_release)
+    closes = []
+    gate = None
+
+    class GatedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"data: first\n\n"
+            await gate.wait()
+            yield b"data: second\n\n"
+
+        async def aclose(self):
+            closes.append(True)
+
+    async def scenario():
+        nonlocal gate
+        gate = asyncio.Event()
+
+        def handler(request):
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=GatedStream(),
+            )
+
+        app = make_app(tmp_path, handler, root=direct_graph())
+        request_body = json.dumps(payload(stream=True)).encode()
+        request_started = False
+        messages = asyncio.Queue()
+
+        async def receive():
+            nonlocal request_started
+            if not request_started:
+                request_started = True
+                return {"type": "http.request", "body": request_body, "more_body": False}
+            await asyncio.Event().wait()  # 客户端在测试期间保持连接。
+
+        async def send(message):
+            await messages.put(message)
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [
+                (b"host", b"router.test"),
+                (b"content-type", b"application/json"),
+            ],
+            "client": ("127.0.0.1", 1234),
+            "server": ("router.test", 80),
+        }
+        task = asyncio.create_task(app(scope, receive, send))
+        try:
+            while True:
+                message = await asyncio.wait_for(messages.get(), 2)
+                if message["type"] == "http.response.start":
+                    assert message["status"] == 200
+                elif message["type"] == "http.response.body" and message.get("body"):
+                    first = message["body"]
+                    break
+            # 第一个 SSE 分片已发出，第二个仍被上游 gate 挡住：租约必须被持有。
+            assert first == b"data: first\n\n"
+            assert app.state.balancer.inflight("safe") == 1
+            assert released == []
+            gate.set()
+            chunks = [first]
+            while True:
+                message = await asyncio.wait_for(messages.get(), 2)
+                if message["type"] == "http.response.body":
+                    chunks.append(message.get("body", b""))
+                    if not message.get("more_body", False):
+                        break
+            await asyncio.wait_for(task, 2)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+        assert b"".join(chunks) == b"data: first\n\ndata: second\n\n"
+        assert closes == [True]
+        assert released == ["safe"]
+        assert app.state.balancer.inflight("safe") == 0
+        assert recent(app)["outcome_state"] == "completed"
 
     asyncio.run(scenario())
 
