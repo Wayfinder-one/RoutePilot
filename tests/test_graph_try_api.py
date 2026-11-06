@@ -510,6 +510,38 @@ def test_try_invalid_timezone_is_422_without_entering_engine(client, app):
     assert row_counts(app) == before_counts
 
 
+# ── 显式 null 语义（base 428a35d 回归） ────────────────────────────────
+
+def test_try_explicit_timezone_null_is_parse_error_not_inherited(client, app):
+    engine, *_rest = install_engine(app)
+    create_stored_tree(client, timezone="UTC")
+
+    response = client.post("/admin/try", json={
+        "root": three_answer_graph(), "tree_id": "main", "text": "抢修", "timezone": None,
+    })
+
+    assert response.status_code == 422, response.text
+    issue = response.json()["detail"][0]
+    assert issue["code"] == "graph_parse_error"
+    assert issue["zh"] == (
+        "图解析失败：root 不符合 sr-routing-graph v3 结构（timezone must be a nonempty string）")
+    assert engine.calls == 0
+
+
+def test_try_explicit_sticky_null_resets_to_default_not_inherited(client, app):
+    engine, *_rest = install_engine(app)
+    create_stored_tree(client, sticky={"enabled": True, "ttl_seconds": 900})
+
+    response = client.post("/admin/try", json={
+        "root": three_answer_graph(), "tree_id": "main", "text": "抢修", "sticky": None,
+    })
+
+    assert response.status_code == 200, response.text
+    draft = engine.snapshots[0].tree
+    assert draft.sticky.enabled is False
+    assert draft.sticky.ttl_seconds == 1800
+
+
 def test_try_requires_root_or_tree_id(client, app):
     engine, *_rest = install_engine(app)
     response = client.post("/admin/try", json={"text": "你好"})

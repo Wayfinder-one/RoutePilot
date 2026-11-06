@@ -39,6 +39,18 @@ logger = logging.getLogger(__name__)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
+class _Unset:
+    """「字段缺失」哨兵：必须与显式 null（``None``）区分。"""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
 def graph_parse_failed(exc: Exception) -> list[Issue]:
     return [Issue(
         "graph_parse_error",
@@ -49,12 +61,18 @@ def graph_parse_failed(exc: Exception) -> list[Issue]:
 
 @dataclass(frozen=True)
 class GraphPatch:
-    """PUT /admin/trees/{id} 的显式载荷；None = 继承已存值（spec §2.8 合并）。"""
+    """PUT /admin/trees/{id} 的显式载荷。
 
-    name: str | None = None
-    root: dict | None = None
-    sticky: dict | None = None
-    timezone: str | None = None
+    字段缺失（``UNSET``）= 继承已存值（spec §2.8 合并）；显式 null（``None``）
+    原样交给 ``tree_from_dict``，恢复重构前的 dict 载荷语义：root/timezone 解析
+    失败 → 422 Issue，sticky → 默认粘性配置。name 的显式 null 由路由折算成 ""
+    （清空名称），与 base 的 ``_clean_name(None)`` 一致。
+    """
+
+    name: str | None | _Unset = UNSET
+    root: dict | None | _Unset = UNSET
+    sticky: dict | None | _Unset = UNSET
+    timezone: str | None | _Unset = UNSET
 
 
 class GraphService:
@@ -152,17 +170,21 @@ class GraphService:
     # ── 内部 ────────────────────────────────────────────────────────────
     @staticmethod
     def _envelope(current: RoutingTree, patch: GraphPatch) -> RoutingTree:
-        """enabled 是外部状态：持久化 envelope 与 current 一致（启停走专用端点）。"""
+        """enabled 是外部状态：持久化 envelope 与 current 一致（启停走专用端点）。
+
+        patch 缺失（``UNSET``）的字段继承 current；显式 null 原样交给
+        ``tree_from_dict``，恢复 base 对 root/timezone/sticky 的 null 语义。
+        """
         try:
             return tree_from_dict({
                 "id": current.id,
-                "name": current.name if patch.name is None else patch.name,
+                "name": current.name if patch.name is UNSET else patch.name,
                 "enabled": current.enabled,
-                "root": graph_to_dict(current.root) if patch.root is None else patch.root,
+                "root": graph_to_dict(current.root) if patch.root is UNSET else patch.root,
                 "sticky": ({"enabled": current.sticky.enabled,
                             "ttl_seconds": current.sticky.ttl_seconds}
-                           if patch.sticky is None else patch.sticky),
-                "timezone": current.timezone if patch.timezone is None else patch.timezone,
+                           if patch.sticky is UNSET else patch.sticky),
+                "timezone": current.timezone if patch.timezone is UNSET else patch.timezone,
             })
         except (ValueError, RecursionError) as exc:
             raise ValidationFailed(graph_parse_failed(exc)) from exc

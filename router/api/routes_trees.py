@@ -78,7 +78,12 @@ def _trees_payload(request: Request, trees: RoutingTreeRepo) -> dict:
 
 class TreeUpsertIn(BaseModel):
     """POST/PUT /admin/trees 的 DTO：未知字段一律拒绝；id/name/root/sticky/
-    timezone 的类型校验保留原文案（_clean_id/_clean_name/图解析）。"""
+    timezone 的类型校验保留原文案（_clean_id/_clean_name/图解析）。
+
+    PUT 时字段缺失 = 继承已存值；PUT 的显式 null 按重构前的 dict 语义处理（name
+    清空、root/timezone 解析失败 422、sticky 重置为默认、id → 422 tree id
+    mismatch）；POST 的 null 语义同样维持 base（如 id=null 生成新 id）。路由用
+    ``model_fields_set`` 区分字段缺失与显式 null。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -98,6 +103,11 @@ class TreeCopyIn(BaseModel):
 
 
 class TryIn(BaseModel):
+    """POST /admin/try 的 DTO：未知字段一律拒绝。
+
+    timezone/sticky 的显式 null 按 base dict 语义处理（timezone null 交给图解析
+    → 422，sticky null 重置为默认粘性配置）；字段缺失才继承已存值。"""
+
     model_config = ConfigDict(extra="forbid")
 
     tree_id: Any = None
@@ -150,16 +160,18 @@ def update_tree(
     conn: sqlite3.Connection = Depends(get_conn),
     trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
-    if body.id is not None and body.id != tree_id:
+    fields = body.model_fields_set
+    # base 用 `"id" in body` 判断：显式 null 同样触发 mismatch（→ 422）。
+    if "id" in fields and body.id != tree_id:
         raise HTTPException(422, detail="tree id mismatch")
-    patch = GraphPatch(
-        name=_clean_name(body.name) if body.name is not None else None,
-        root=body.root,
-        sticky=body.sticky,
-        timezone=body.timezone,
-    )
+    changes: dict[str, Any] = {}
+    if "name" in fields:
+        changes["name"] = _clean_name(body.name)  # 显式 null → ""（清空名称）
+    for field in ("root", "sticky", "timezone"):
+        if field in fields:
+            changes[field] = getattr(body, field)
     updated = _service(request, conn, trees).update(
-        tree_id, patch, base_document_sha256=body.base_document_sha256)
+        tree_id, GraphPatch(**changes), base_document_sha256=body.base_document_sha256)
     return {
         "tree": tree_to_dict(updated),
         "snapshot_revision": _published_revision(request),
@@ -200,10 +212,15 @@ def disable_tree(
 
 
 def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
-    """按 spec §4.3 合并 envelope：root 优先；显式字段覆盖，缺失字段继承已存值。"""
+    """按 spec §4.3 合并 envelope：root 优先；显式字段覆盖，缺失字段继承已存值。
+
+    显式 null 与缺失不同（base dict 语义）：timezone null 原样交给图解析 → 422，
+    sticky null 重置为默认粘性配置。
+    """
     root = body.root
     if root is None and stored is None:
         raise HTTPException(422, detail="try needs root or tree_id")
+    fields = body.model_fields_set
     sticky_default = stored.sticky if stored else Sticky()
     timezone_default = stored.timezone if stored else "Asia/Shanghai"
     try:
@@ -212,8 +229,8 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
             "name": stored.name if stored else "",
             "enabled": False,
             "root": root if root is not None else graph_to_dict(stored.root),
-            "timezone": body.timezone if body.timezone is not None else timezone_default,
-            "sticky": body.sticky if body.sticky is not None else {
+            "timezone": body.timezone if "timezone" in fields else timezone_default,
+            "sticky": body.sticky if "sticky" in fields else {
                 "enabled": sticky_default.enabled, "ttl_seconds": sticky_default.ttl_seconds,
             },
         })
