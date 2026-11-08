@@ -115,6 +115,20 @@ def test_get_models_reports_illegal_old_declaration_with_error(tmp_path):
     assert reasoning["error"]
 
 
+def test_invalid_old_profile_json_normalizes_to_empty_object(tmp_path):
+    """非 JSON 的旧 profile TEXT 在 API 出参归一为 {}，capability 为空串。"""
+    path = str(tmp_path / "t.db")
+    make_app(tmp_path)
+    conn = connect(path)
+    with conn:
+        conn.execute("UPDATE models SET profile = 'not-json' WHERE id = 'qwen3-8b'")
+    conn.close()
+    model = {m["id"]: m for m in TestClient(make_app(tmp_path)).get(
+        "/admin/models").json()["models"]}["qwen3-8b"]
+    assert model["profile"] == {}
+    assert model["capability"] == ""
+
+
 # --------------------------------------------------------------------------- #
 # POST /admin/models
 # --------------------------------------------------------------------------- #
@@ -125,6 +139,10 @@ def test_create_model_and_swap_backend_snapshot(client, app):
     assert r.status_code == 201, r.text
     model = r.json()["model"]
     assert model["id"] == "my-model" and model["upstream"] == "upstream-v1"
+    assert isinstance(model["profile"], dict)
+    assert model["profile"] == OPENAI_REASONING
+    assert isinstance(model["capability"], str)
+    assert isinstance(model["reasoning"], dict)
     assert model["reasoning"]["declared"] is True
     assert model["reasoning"]["format"] == "openai"
     assert client.get("/admin/models").json()["models"]
@@ -217,6 +235,9 @@ def test_put_model_accepts_json_string_profile_and_unknown_is_404(client):
                       json={"profile": payload}).status_code == 200
     model = {m["id"]: m for m in
              client.get("/admin/models").json()["models"]}["qwen3-8b"]
+    # DB keeps JSON TEXT, but the API always returns the normalized object
+    assert model["profile"] == {"reasoning": {
+        "efforts": {"off": None, "high": "high"}}}
     assert model["reasoning"]["declared"] is True
     assert client.put("/admin/models/nope", json={"upstream": "x"}).status_code == 404
 
@@ -503,7 +524,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# fix-wave 1 / I-1: model writes are judged against the PROSPECTIVE catalog
+# model writes are judged against the PROSPECTIVE catalog
 # --------------------------------------------------------------------------- #
 def _reasoning_tree_root(level="high"):
     return _direct_graph((("qwen3-8b", level),), node_id="reasoning-target",
@@ -532,10 +553,10 @@ def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
 
 
 def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
-    """I-1: the health check must judge the write with the PROSPECTIVE rows.
+    """The health check must judge the write with the PROSPECTIVE rows.
 
     Removing a level the ACTIVE tree references is rejected instead of being
-    accepted (which used to make the next startup refuse to boot).
+    accepted, so the next startup can always boot.
     """
     _declare_high(client)
     _activate_reasoning_tree(client)
@@ -598,10 +619,10 @@ def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Task 2 Step 1：服务层回滚契约 —— 校验失败必须同时保住 DB、审计与快照
+# 服务层回滚契约：校验失败必须同时保住 DB、审计与快照
 # --------------------------------------------------------------------------- #
 def test_model_update_rolls_back_when_active_graph_becomes_invalid(client, app):
-    """brief 逐字场景：非法提供方写入返回 422，快照不得被替换。"""
+    """非法提供方写入返回 422，快照不得被替换。"""
     before = app.state.snapshot.snapshot_revision
     response = client.put("/admin/models/qwen3-8b", json={"provider": "missing-provider"})
     assert response.status_code == 422
@@ -687,10 +708,9 @@ def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     ("put", "/admin/providers/local", {"base_url": "http://x/v1"}),
 ])
 def test_model_and_provider_dtos_reject_unknown_fields(client, method, path, payload):
-    """Task 2 Step 3：请求 DTO 的 ``ConfigDict(extra="forbid")`` 取代手写白名单。
+    """请求 DTO 的 ``ConfigDict(extra="forbid")`` 契约：未知字段不允许通过。
 
-    旧实现把 body 当 dict：未知字段被静默忽略，写入照常发生；现在必须在进入
-    写用例之前 422，且不留下任何数据库副作用。"""
+    未知字段在进入写用例之前 422，且不留下任何数据库副作用。"""
     response = getattr(client, method)(path, json={**payload, "bogus": 1})
 
     assert response.status_code == 422, response.text
@@ -701,7 +721,7 @@ def test_model_and_provider_dtos_reject_unknown_fields(client, method, path, pay
 
 # --------------------------------------------------------------------------- #
 # delete-model: the reference check and the delete share the publish lock
-# (the scan lives in the ConfigurationService write path now — Task 2)
+# (the scan lives in the ConfigurationService write path)
 # --------------------------------------------------------------------------- #
 def _instrument_delete_lock(app, client, monkeypatch):
     """Record whether ``model_references`` is called while the lock is held."""

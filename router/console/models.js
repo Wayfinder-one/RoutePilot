@@ -103,21 +103,15 @@ function normReason(ri) {
   if (!ri || typeof ri !== 'object') return { ...FALLBACK_REASON };
   return ri;
 }
+/* profile 只接受对象契约：GET /admin/models 已把 DB 里的 JSON TEXT 归一为对象。 */
 function profileOf(model) {
   const raw = model && model.profile;
-  if (!raw) return {};
-  if (typeof raw === 'object') return { ...raw };
-  // The server stores models.profile as a JSON *text* column, so it arrives
-  // as a string. TODO(remove after the server returns an object).
-  try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
 }
-/* Natural-language capability description. GET /admin/models also returns the
-   validated text as a top-level ``capability`` field; fall back to the raw
-   profile for older backends so the list never renders empty by accident. */
+/* Natural-language capability description, validated by the server and
+   returned as a top-level string on GET /admin/models. */
 function capabilityOf(model) {
-  if (model && typeof model.capability === 'string') return model.capability;
-  const cap = profileOf(model).capability;
-  return typeof cap === 'string' ? cap : '';
+  return model && typeof model.capability === 'string' ? model.capability : '';
 }
 function modelIds() { return new Set(STATE.models.map(m => m.id)); }
 function providerNames() { return new Set(STATE.providers.map(p => p.name)); }

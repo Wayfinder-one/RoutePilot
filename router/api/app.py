@@ -222,7 +222,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
             "message": str(exc),
         }})
 
-    # 服务层异常 → HTTP 的统一映射（Task 2）：ValidationFailed/引用冲突/缺失
+    # 服务层异常 → HTTP 的统一映射：ValidationFailed/引用冲突/缺失
     # 由服务抛出，这里构成唯一映射点；路由层只做 DTO 解析与最小 try 包装。
     @app.exception_handler(ValidationFailed)
     async def validation_failed_handler(request: Request, exc: ValidationFailed):

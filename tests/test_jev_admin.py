@@ -214,7 +214,7 @@ def _graph_tree_files(settings):
 
 
 def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatch):
-    """Task 2 契约（Task 1 review carry-forward）：真实 SnapshotPublisher 上，
+    """ConfigurationService 写用例契约：真实 SnapshotPublisher 上，
     ConfigurationService 写用例 = 提交恰在 publish 之前、发布恰好一次，且发布
     本身是纯内存替换（不写数据库、不写图文件）。"""
     settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))

@@ -55,15 +55,20 @@ def _undeclared_reasoning(provider_format: str) -> dict:
     return {"declared": False, "supported": None, "format": provider_format if provider_format in FORMATS else "openai", "efforts": [], "default": None}
 
 
-def _capability_of_model(row: dict) -> str:
-    profile = parse_profile_text(row.get("profile"))
-    value = profile.get("capability")
-    return value.strip() if isinstance(value, str) else ""
-
-
 def _public_model(row: dict, provider_format: str) -> dict:
-    normalized = normalize_reasoning(parse_profile_text(row.get("profile")), provider_format)
-    return {**row, "capability": _capability_of_model(row), "reasoning": normalized or _undeclared_reasoning(provider_format)}
+    """API 出参契约：``profile``/``reasoning`` 归一为对象，``capability`` 为纯文本。
+
+    DB 中 ``profile`` 仍是 JSON TEXT（``parse_profile_text`` 容忍非法旧值并归一为
+    ``{}``）；归一只发生在 API 边界。"""
+    profile = parse_profile_text(row.get("profile"))
+    normalized = normalize_reasoning(profile, provider_format)
+    capability = profile.get("capability")
+    return {
+        **row,
+        "profile": profile,
+        "capability": capability.strip() if isinstance(capability, str) else "",
+        "reasoning": normalized or _undeclared_reasoning(provider_format),
+    }
 
 
 def _validated_profile(raw: dict | str | None, provider_format: str) -> str | None:

@@ -1,4 +1,4 @@
-/* RoutingController · 决策组管理面编排（Task 8，规格 Step 4）
+/* RoutingController · 决策组管理面编排
    ------------------------------------------------------------------
    唯一职责：保存 / 启用 / 停用 / 切换 / 导入导出这些管理面 API 的编排。
    · 唯一 saving 状态：controller 写 store.setSaving()，Store 据此拒绝编辑；
