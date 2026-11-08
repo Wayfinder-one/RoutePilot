@@ -10,14 +10,14 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.config import Settings
-from router.control.config import (
+from router.control.config import ConfigurationService
+from router.control.errors import (
     AlreadyExists,
-    ConfigurationService,
     MissingError,
     ReferencedByError,
     ValidationFailed,
 )
-from router.control.validation import issues_payload
+from router.api.issue_presenter import issues_payload
 from router.jev.client import JevClient
 from router.jev.config import JevSettings
 from router.maintenance import MaintenanceWorker

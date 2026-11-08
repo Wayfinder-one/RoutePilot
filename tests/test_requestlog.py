@@ -2,6 +2,7 @@ import asyncio
 import threading
 import time
 
+from router.api.request_presenter import present_record
 from router.request_logging import LOG_COLUMNS, RECENT_LIMIT, RequestLogger
 from router.config import Settings
 from router.store.db import connect, migrate
@@ -95,10 +96,11 @@ def test_hydrate_recent_restores_persisted_tail_without_live_detail(tmp_path):
     assert "trace" not in recent[0]
     assert "jev_probabilities" not in recent[0]
     # Restored rows use the same presenter as live rows (no client-side adapter).
-    assert recent[0]["route_label"] == {"zh": "目标命中", "en": "Target selected"}
-    assert [pair[0]["en"] for pair in recent[0]["metrics"]] == [
+    presented = present_record(recent[0])
+    assert presented["route_label"] == {"zh": "目标命中", "en": "Target selected"}
+    assert [pair[0]["en"] for pair in presented["metrics"]] == [
         "Upstream", "Routing", "Total", "Waves"]
-    assert recent[0]["fields"][0][0] == {"zh": "请求 ID", "en": "Request ID"}
+    assert presented["fields"][0][0] == {"zh": "请求 ID", "en": "Request ID"}
 
 
 def test_hydrate_presents_otherwise_selection_reason(tmp_path):
@@ -114,7 +116,7 @@ def test_hydrate_presents_otherwise_selection_reason(tmp_path):
     finally:
         conn.close()
 
-    assert restored.recent_requests(1)[0]["route_label"] == {
+    assert present_record(restored.recent_requests(1)[0])["route_label"] == {
         "zh": "默认目标兜底", "en": "Default target fallback"}
 
 
