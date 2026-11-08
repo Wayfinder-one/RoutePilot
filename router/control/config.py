@@ -90,20 +90,23 @@ class ConfigurationService:
         self.trees = trees
         self.publisher = publisher
 
-    # ── 共享骨架：publisher.locked() → 写事务（写入/校验/审计/prepare）→
-    #    提交 → 复核指纹 → publish（纯内存替换）。任何一步失败：ROLLBACK 且不发布。
-    #    指纹复核在锁内、提交之后进行，且不把 publish 挪进数据库事务。─────────
+    # ── 共享骨架：publisher.locked() → 写事务（写入/校验/审计/prepare/复核指纹）→
+    #    COMMIT → publish（纯内存替换）。复核在事务内、提交之前进行：指纹仍不稳定
+    #    时在 COMMIT 前抛冲突，DB、审计与候选快照一并回滚，且不发布。publish 不进
+    #    数据库事务。─────────
     def _write_and_publish(self, write):
         with self.publisher.locked():
             with write_transaction(self.conn):
                 prepared = write(self.conn)
-            self.publisher.publish(self._recheck_fingerprint(prepared))
+                prepared = self._recheck_fingerprint(prepared)
+            self.publisher.publish(prepared)
 
     def _recheck_fingerprint(self, prepared):
-        """发布前复核磁盘指纹（等价旧 SnapshotPublisher.refresh 的复核语义）。
+        """COMMIT 前在同一事务连接上复核磁盘指纹（等价旧 SnapshotPublisher.refresh 的复核语义）。
 
-        若图在候选快照构造后变了，用新指纹重建一次；仍不稳定就抛与 GraphService
-        相同的冲突，绝不把过期指纹打给已发布快照。
+        同一连接能看到本事务未提交的写入，重建候选快照读到的是事务内配置。若图在
+        候选快照构造后变了，用新指纹重建一次；仍不稳定就在提交前抛与 GraphService
+        相同的冲突并回滚，绝不把过期指纹打给已发布快照。
         """
         for _attempt in range(2):
             fingerprint = self.trees.fingerprint()
