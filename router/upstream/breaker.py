@@ -9,12 +9,11 @@
 因此本模块不导入 ``sqlite3``，``is_open()`` 在状态锁内只做算术，永不等待磁盘；
 路由热路径（``LoadBalancer.available``）只访问内存状态。
 
-语义（与拆分前逐条一致）：
+语义：
 
 * ``failure()`` 在计数达到阈值后的 **每一次** 失败都重新计时
   （``self._opened_at[model] = time.monotonic()``）：半开探针失败必须重新关上
-  电路。旧实现用 ``setdefault`` 保留原始 opened_at，导致一个窗口过后电路再也
-  不阻断。
+  电路。
 * ``success()`` 清空该模型的失败计数、开启时间与在途探针标记。
 * 半开是**严格单探针**：窗口结束后 ``is_open`` 只放行一个探针
   （记录在 ``_probe_at``），并发请求继续被阻断，直到 ``success()`` /
@@ -23,7 +22,7 @@
 * 跨副本导入（``import_state``）：导入对方记录的失败计数与 **原始**
   ``opened_at``（按本进程单调钟平移），半开窗口从电路真正打开的时刻计算，
   而不是从本副本发现它的时刻；早于 ``half_open_after`` 的陈旧行导入后立即
-  放行探针（自愈，second-round audit F4）。
+  放行探针（自愈）。
 """
 
 from __future__ import annotations
@@ -73,9 +72,8 @@ class CircuitBreaker:
             if count >= self.threshold:
                 # Re-arm from NOW on every failure at/above the threshold: the
                 # first crossing opens the circuit, and a failed half-open
-                # probe closes it again. setdefault() here kept the ORIGINAL
-                # open time, so after one half_open window is_open stayed
-                # False forever and the circuit never blocked again (P0 2.2).
+                # probe closes it again, so the timer must restart for the
+                # next half_open window.
                 self._opened_at[model] = time.monotonic()
                 self._probe_at.pop(model, None)
 

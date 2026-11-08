@@ -3,8 +3,8 @@
    The top-right user control ("头像 + 邮箱 + 角色") and the admin-only 用户管理
    item come from GET /admin/me, fetched once per page. Both start hidden so a
    viewer never sees admin UI flash in; clicking the user control opens a
-   dropdown with 用户管理 (admin) and 退出. An older backend without /admin/me
-   simply leaves the bar in its previous form (no user control).
+   dropdown with 用户管理 (admin) and 退出. Any failure of that request leaves
+   the bar in its previous form (no user control).
 
    ES module: the language buttons are bound here instead of using inline
    onclick handlers, because setLang is no longer a page global. */
@@ -102,8 +102,8 @@ const page = document.body.dataset.page;
       window.location.href = 'login.html';
     });
     api.me().then(data => { me = data; paintUser(); }).catch(() => {
-      /* 401 → api.js already bounced to login.html; 404 → backend older than the
-         user-management release, leave the bar as it was. */
+      /* 401 → api.js already bounced to login.html; any other failure leaves
+         the bar as it was. */
     });
   }
 

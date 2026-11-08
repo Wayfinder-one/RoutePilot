@@ -1,6 +1,6 @@
 """决策组管理面：graph CRUD/enable/copy/disable 与完整 envelope 草稿试算。
 
-写用例全部在 `router/control/graphs.GraphService`（Task 2）：API 只做 DTO 解析
+写用例全部在 `router.control.graphs.GraphService`：API 只做 DTO 解析
 与异常映射（ValidationFailed/GraphConflictError/MissingError 由 app 级处理器
 映射）。所有校验失败统一返回 `Issue` 数组（spec §5）。
 `POST /admin/try` 按 spec §4.3 的 root 优先 envelope 做 dry-run：不落库、不发布

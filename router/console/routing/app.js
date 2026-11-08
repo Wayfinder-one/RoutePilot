@@ -472,10 +472,10 @@ function locateIssue(issue) {
     return true;
   }
   /* 图级定位要聚焦检查器图设置：先关掉可能还开着的输入槽条件浮层，
-     否则浮层会盖住检查器（Task 11 QA 曾需先按 Esc）。 */
+     否则浮层会盖住检查器。 */
   if (isCondPopOpen()) closeCondPop();
   /* 试算/收起会把检查器折叠起来：图级定位必须重新展开，否则焦点落在
-     一个不可见的「图设置」上，用户看不到修复入口（Task 14 QA）。 */
+     一个不可见的「图设置」上，用户看不到修复入口。 */
   app.inspCollapsed = false;
   applyInspectorCollapsed();
   app.kit.clearSelection();

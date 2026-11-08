@@ -59,7 +59,7 @@ def load_backends(conn: sqlite3.Connection) -> dict[str, Backend]:
     """Build the model_id -> Backend snapshot in one join.
 
     A model whose provider row is missing is simply absent from the snapshot;
-    the /v1 handler then answers 502 for that model.
+    the /v1 handler then answers 503 ``no_available_backend`` for that model.
     """
     rows = conn.execute(
         "SELECT m.id AS id, m.upstream AS upstream, m.provider AS provider, "

@@ -1,4 +1,4 @@
-/* DraftStore · 决策组草稿与撤销历史的唯一所有者（Task 8，规格 Step 1/Step 3）
+/* DraftStore · 决策组草稿与撤销历史的唯一所有者
    ------------------------------------------------------------------
    纯内存状态：不读 DOM、不发请求、不碰 localStorage。所有写入都走
    change(kind, mutate)：先克隆 before，再执行 mutate，再克隆 after 入栈；
