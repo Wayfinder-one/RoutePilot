@@ -250,3 +250,27 @@ def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatc
     repo = RoutingTreeRepo(settings.graph_dir)
     assert status["document_sha256"] == repo.fingerprint()[1]
     assert _graph_tree_files(settings) == files_before
+
+
+def test_unstable_graph_during_jev_save_rolls_back_db_audit_and_snapshot(tmp_path):
+    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    app = create_app(settings)
+    repo = app.state.graph_repo
+    initial = repo.fingerprint()
+    unstable = [("main", "1" * 64), ("main", "2" * 64)]
+    # 复核会重建一次快照并再取指纹：固定流程读序为 初始 → prepare 读 → 复核读 →
+    # 复核重建后再读。迭代器耗尽后持续返回最后一个不稳定值，保证复核判定“仍不稳定”。
+    values = iter([initial, *unstable])
+    repo.fingerprint = lambda: next(values, unstable[-1])
+    before = app.state.snapshot.snapshot_revision
+    with TestClient(app) as client:
+        response = client.put("/admin/jev", json=payload())
+    assert response.status_code == 503, response.text
+    conn = connect(settings.db_path)
+    assert JevConfigRepo(conn).load() is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM changes WHERE kind = 'jev'"
+    ).fetchone()[0] == 0
+    conn.close()
+    assert app.state.snapshot.snapshot_revision == before
+    assert app.state.snapshot.jev is None

@@ -43,7 +43,7 @@ flowchart LR
 ## 架构与边界
 
 - **API 层。** `router/api/` 只解析请求 DTO、把领域异常映射为 HTTP 状态/Issue，并转发上游响应；配置类与决策图类 admin 路由不直接写控制面状态，账号与会话路由（`/admin/login`、`/admin/logout`、`/admin/users`、`/admin/me`）直接调用 `UserRepo`/`SessionRepo`/`ChangeRepo`。
-- **控制面服务。** `router/control/` 承载写用例。`GraphService` 按顺序完成校验 → 准备候选快照 → 在单写入者锁内写图文件 → 复核文档哈希 → 发布快照 → 写审计；草稿过期时返回 409，不覆盖他人修改。
+- **控制面服务。** `router/control/` 承载写用例。`GraphService` 按顺序完成校验 → 准备候选快照 → 在单写入者锁内写图文件 → 复核文档哈希 → 发布快照 → 写审计；草稿过期时返回 409，不覆盖他人修改。`ConfigurationService`（JEV 配置、窗口、模型）在同一个写事务内完成写入与审计，并在 COMMIT 之前、事务内复核图指纹；只有提交成功后才替换内存快照。指纹仍不稳定时在提交前抛冲突，数据库、审计与快照全部保持原值。
 - **路由领域。** `router/routing/graph/`（模型、校验、条件、端口、编译拓扑、执行器）是纯领域代码，不依赖 FastAPI 或 SQLite。`router/routing/service.py` 只做单向编排：求值 → 调度。
 - **快照装配。** `router/routing/snapshot.py` 读取启用图、模型目录、时段与 JEV 配置，构建不可变的 `RoutingSnapshot`；未通过启用校验的图不会被编译进已发布快照，`/admin/try` 草稿路径只把启用级问题作为 warning 返回，并编译一份不会替换已发布快照的草稿快照。
 - **控制台。** `router/console/` 是原生 ES Modules：每个页面只有一个 `<script type="module">` 入口，模块之间通过显式 import 与 store 交换状态，不使用 `window.*` 应用全局，也没有 CommonJS。
