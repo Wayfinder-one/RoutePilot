@@ -8,7 +8,7 @@ from router.jev.config import JevSettings
 from router.routing.graph.model import canonical_json
 from router.routing.tree import tree_from_dict, tree_revision_of, tree_storage_dict
 from router.store.db import connect, migrate
-from router.store.graph_migration import export_sqlite_graphs
+from router.control.graph_migration import export_sqlite_graphs
 from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo

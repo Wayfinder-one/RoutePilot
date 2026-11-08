@@ -227,3 +227,24 @@ def present_issue(issue: Issue) -> dict[str, str]:
         )
     # Defensive: an unmapped code must still render deterministically.
     return _text(code, code)
+
+
+def issues_payload(issues) -> list[dict]:
+    """Issue 列表 → spec §5 的 422 载荷（dict of 双语字段 + 机器定位）。
+
+    Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成，
+    控制台收到的键集合与重构前一致。
+    """
+    payload = []
+    for issue in issues:
+        message = present_issue(issue)
+        payload.append({
+            "code": issue.code,
+            "zh": message["zh"],
+            "en": message["en"],
+            "node_id": issue.node_id,
+            "edge_id": issue.edge_id,
+            "port": issue.port,
+            "level": issue.level,
+        })
+    return payload

@@ -14,6 +14,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from router.control.errors import (
+    AlreadyExists,
+    MissingError,
+    ReferencedByError,
+    ValidationFailed,
+)
 from router.control.validation import active_tree_issues
 from router.jev.config import JevSettings
 from router.jev.window import MAX_TOKENS, MIN_CONTEXT_TOKENS, MIN_INPUT_TOKENS
@@ -30,37 +36,6 @@ from router.store.repositories import (
     write_transaction,
 )
 from router.store.routing_trees import GraphChangedDuringLoad
-
-
-class ValidationFailed(ValueError):
-    def __init__(self, issues):
-        super().__init__("configuration validation failed")
-        self.issues = list(issues)
-
-
-class MissingError(Exception):
-    """写用例的目标资源不存在（服务抛出，API 映射 404）。"""
-
-    def __init__(self, message: str):
-        super().__init__(message)
-        self.message = message
-
-
-class AlreadyExists(Exception):
-    """写用例的目标资源已存在（服务抛出，API 映射 409）。"""
-
-    def __init__(self, message: str):
-        super().__init__(message)
-        self.message = message
-
-
-class ReferencedByError(Exception):
-    """写用例的目标仍被引用（服务抛出，API 映射 409，detail 直接透传）。"""
-
-    def __init__(self, detail: dict):
-        super().__init__(detail.get("message", "referenced"))
-        self.detail = detail
-
 
 @dataclass(frozen=True)
 class JevWindow:

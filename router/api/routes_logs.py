@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, Request
 
 from router.api.deps import get_conn
+from router.api.request_presenter import present_record
 from router.store.repositories import ChangeRepo
 
 router = APIRouter()
@@ -13,7 +14,8 @@ router = APIRouter()
 
 @router.get("/requests/recent")
 def recent_requests(request: Request, limit: int = 20):
-    return {"requests": request.app.state.requestlog.recent_requests(limit)}
+    records = request.app.state.requestlog.recent_requests(limit)
+    return {"requests": [present_record(record) for record in records]}
 
 
 @router.get("/requests/stats")

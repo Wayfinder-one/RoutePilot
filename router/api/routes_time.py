@@ -7,7 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from router.api.deps import get_conn, get_tree_repo
-from router.control.config import ConfigurationService, ValidationFailed
+from router.control.config import ConfigurationService
+from router.control.errors import ValidationFailed
 from router.store.repositories import TimePeriodRepo, now_iso
 from router.store.routing_trees import RoutingTreeRepo
 

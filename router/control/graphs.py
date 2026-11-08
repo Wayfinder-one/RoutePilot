@@ -21,7 +21,7 @@ import sqlite3
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
-from router.control.config import AlreadyExists, MissingError, ValidationFailed
+from router.control.errors import AlreadyExists, MissingError, ValidationFailed
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue, validate_graph_structure
