@@ -382,7 +382,3 @@ scripts/               Node 契约测试、Playwright QA、部署脚本
 experiments/jev-batch/ 独立 JEV 批量 spike
 assets/routepilot/     README 截图
 ```
-
----
-
-© 2026 Sandlake. All rights reserved.
