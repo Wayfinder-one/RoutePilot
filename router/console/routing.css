@@ -635,7 +635,9 @@ body.is-try-running .rtc-stage.is-locked::after {
   border-radius: 8px; padding: 6px 7px; margin-bottom: 6px;
 }
 .rtc-opt-edit .btn { margin-top: 4px; }
-.rtc-model-edit { display: flex; align-items: flex-end; gap: 6px; }
+.rtc-model-edit {
+  display: flex; align-items: flex-end; gap: 6px; flex-wrap: wrap;
+}
 .rtc-model-edit .field { flex: 1; min-width: 0; margin-top: 0; }
 .rtc-model-edit .btn { flex: none; }
 
@@ -691,6 +693,12 @@ body.is-try-running .rtc-stage.is-locked::after {
 .rtc-mini-node[data-type="condition"] { fill: var(--amber); }
 .rtc-mini-node[data-type="target"] { fill: var(--teal); }
 .rtc-mini-view { fill: var(--indigo); fill-opacity: .08; stroke: var(--indigo); stroke-width: 1; }
+
+/* 目标模型行：未声明推理档位时的可操作提示（占满整行，不挤压下拉） */
+.rtc-model-hint {
+  flex: 1 0 100%;
+  font-size: 9px; line-height: 1.5; color: var(--text-3);
+}
 
 /* ── 执行区（停靠画布下方：试算输入/结论在上，执行轨迹在下） ───── */
 .rtc-exec {
