@@ -524,6 +524,13 @@ async function bootstrap() {
     provider: 'local',
     profile: MODEL_PROFILE
 });
+  /* 未声明推理档位的模型：用于目标检查器空态提示的回归覆盖。 */
+  await api('POST', '/admin/models', {
+    id: 'tierless-model',
+    upstream: 'tierless-model',
+    provider: 'local',
+    profile: { domains: [], tier: 'small' }
+});
 
   /* 3. peak / normal / offpeak 三个固定时段（与 graph_scenarios.json 一致）。 */
   await api('PUT', '/admin/time-periods', { periods: FIXTURE.periods });

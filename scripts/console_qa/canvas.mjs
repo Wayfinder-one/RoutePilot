@@ -3952,3 +3952,37 @@ test('numeric unset and English boolean condition labels stay explicit', async (
 });
 
 await runIfMain(import.meta.url);
+
+test('inspector · target model row hints when the model declares no reasoning tiers', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await clickNode('power-target');
+  await waitInspectorBranch('node', 'power-target');
+  const reasoningSelect = page.locator('#cvInspectorBody [data-model-row] [data-model-field="reasoning"]').first();
+  const modelSelect = page.locator('#cvInspectorBody [data-model-row] [data-model-field="model"]').first();
+  assert.equal(await page.locator('#cvInspectorBody [data-reasoning-hint]').count(), 0,
+    'a declared model row must not show the undeclared-reasoning hint');
+
+  /* 切换所选模型即时生效：档位只剩「不指定」，并出现可操作提示（无需保存）。 */
+  await modelSelect.selectOption('tierless-model');
+  await page.waitForSelector('#cvInspectorBody [data-reasoning-hint]', { timeout: 4000 });
+  const hint = page.locator('#cvInspectorBody [data-reasoning-hint]').first();
+  assert.equal(await hint.count(), 1, 'an undeclared-reasoning model row shows no hint');
+  const hintText = (await hint.innerText()).trim();
+  assert.ok(hintText.length > 0, 'the undeclared-reasoning hint is empty');
+  const options = await reasoningSelect.locator('option').allInnerTexts();
+  assert.equal(options.length, 1, 'an undeclared model must only offer the unspecified tier');
+
+  /* 切回已声明模型：提示消失、档位可选。 */
+  const declared = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const model = app.models.find(item => item && item.id !== 'tierless-model');
+    return model ? model.id : null;
+});
+  await modelSelect.selectOption(declared);
+  await page.waitForFunction(
+    () => document.getElementById('cvInspectorBody').querySelectorAll('[data-reasoning-hint]').length === 0,
+    null, { timeout: 4000 });
+  const declaredOptions = await reasoningSelect.locator('option').allInnerTexts();
+  assert.ok(declaredOptions.length > 1, 'a declared model must offer reasoning tiers');
+});

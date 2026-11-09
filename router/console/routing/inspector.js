@@ -244,6 +244,15 @@ function reasoningOptionsHTML(model, selected) {
       esc(id) + '</option>').join('');
 }
 
+function reasoningHintHTML(modelId, reasoning) {
+  const model = findModel(modelId);
+  if (!model || (reasoning && reasoning.length)) return '';
+  if (reasoningOf(model).efforts.length) return '';
+  /* 未声明推理档位的模型只能选「不指定」：给出可操作的提示，避免看起来像界面缺陷。 */
+  return '<div class="rtc-model-hint" data-reasoning-hint>' +
+    esc(t('cv.ins.reasoningUndeclared')) + '</div>';
+}
+
 function modelRowHTML(item) {
   const modelId = (item && item.model) || '';
   const known = !!findModel(modelId);
@@ -253,6 +262,7 @@ function modelRowHTML(item) {
   const extra = !known && modelId
     ? '<option value="' + esc(modelId) + '" selected>' + esc(modelId) + '</option>' : '';
   const reasoning = item && item.reasoning ? item.reasoning : '';
+  const reasoningHint = reasoningHintHTML(modelId, reasoning);
   return '<div class="rtc-model-edit" data-model-row>' +
     '<label class="field">' + esc(t('cv.ins.model')) +
     '<select data-model-field="model" aria-label="' + esc(t('cv.ins.model')) + '">' +
@@ -262,6 +272,7 @@ function modelRowHTML(item) {
     reasoningOptionsHTML(findModel(modelId), reasoning) + '</select></label>' +
     '<button type="button" class="btn sm ghost" data-act="model-remove" aria-label="' +
     esc(t('cv.ins.modelRemove')) + '">' + esc(t('cv.ins.modelRemove')) + '</button>' +
+    reasoningHint +
     '</div>';
 }
 
@@ -879,6 +890,11 @@ function onChange(event) {
   const model = findModel(select.value);
   const info = reasoningOf(model);
   reasoning.innerHTML = reasoningOptionsHTML(model, info.default || '');
+  /* 提示随所选模型即时更新：未声明推理档位的模型只能选「不指定」。 */
+  const stale = row.querySelector('[data-reasoning-hint]');
+  if (stale) stale.remove();
+  const hint = reasoningHintHTML(select.value, '');
+  if (hint) row.insertAdjacentHTML('beforeend', hint);
 }
 
 function bind() {
