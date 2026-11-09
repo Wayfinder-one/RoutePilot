@@ -683,41 +683,60 @@ test('trace-drawer-row-locates-slot', async () => {
   assert.equal(await row.getAttribute('role'), 'button', 'drawer slot row is not exposed as a button');
   assert.equal(await row.getAttribute('tabindex'), '0', 'drawer slot row is not keyboard focusable');
   await row.click();
-  await waitFor(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const selection = app.kit.getSelection();
-    return selection.kind === 'edge' && selection.id === 'e-cap-strong-and-power';
-
+  /* 执行区只定位：选中该边并把画布移到它，但不打开条件编辑器（编辑是编辑区的动作）。 */
+  let located = null;
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    located = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.kit ? app.kit.getSelection() : null;
 });
-  assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), false,
-    'clicking a slot row did not open the condition popup');
-  assert.equal(await page.evaluate(async () => {
-    const RTCondPop = await import('/console/routing/condpop.js');
-    return (RTCondPop.currentEdgeId());
-}), 'e-cap-strong-and-power');
-  await page.keyboard.press('Escape');
-  await page.waitForFunction(() => document.getElementById('cvCondPop').hidden === true);
+    if (located && located.kind === 'edge' && located.id === 'e-cap-strong-and-power') break;
+    await page.waitForTimeout(50);
+}
+  assert.deepEqual(located, { kind: 'edge', id: 'e-cap-strong-and-power' },
+    'clicking a trace row did not select the located edge');
+  assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
+    'clicking a trace row opened the condition editor (execution zone must stay view-only)');
+  const centered = await page.evaluate(() => {
+    const stage = document.getElementById('cvStage').getBoundingClientRect();
+    const edge = document.querySelector('#cvEdges [data-edge-id="e-cap-strong-and-power"]');
+    return edge ? { exists: true } : { exists: false, stage: { w: stage.width, h: stage.height } };
+});
+  assert.equal(centered.exists, true, 'the located edge is not rendered on the canvas');
 
-  /* §6.11：同一行必须能用 Enter / Space 触发，不必依赖鼠标。 */
-  await row.focus();
-  await page.keyboard.press('Enter');
-  await waitFor(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (document.getElementById('cvCondPop').hidden === false &&
-    app.kit.getSelection().id === 'e-cap-strong-and-power');
+  /* §6.11：同一行必须能用 Enter / Space 触发定位，不必依赖鼠标；
+     与鼠标一致，键盘触发也只定位、不打开编辑器（编辑器属于编辑区）。 */
+  async function pressRowAndReadSelection(key) {
+    await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      app.kit.clearSelection();
 });
-  await page.keyboard.press('Escape');
-  await page.waitForFunction(() => document.getElementById('cvCondPop').hidden === true);
-  await row.focus();
-  await page.keyboard.press('Space');
-  await waitFor(async () => {
-    const RTCondPop = await import('/console/routing/condpop.js');
-    return (document.getElementById('cvCondPop').hidden === false &&
-    RTCondPop.currentEdgeId() === 'e-cap-strong-and-power');
+    await row.focus();
+    await page.keyboard.press(key);
+    let selection = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      selection = await page.evaluate(async () => {
+        const { app } = await import('/console/routing/app.js');
+        return app.kit ? app.kit.getSelection() : null;
 });
-  await page.keyboard.press('Escape');
-  await page.waitForFunction(() => document.getElementById('cvCondPop').hidden === true);
+      if (selection && selection.kind === 'edge' && selection.id === 'e-cap-strong-and-power') break;
+      await page.waitForTimeout(50);
+}
+    return {
+      selection: selection,
+      condHidden: await page.evaluate(() => document.getElementById('cvCondPop').hidden)
+};
+}
+  const viaEnter = await pressRowAndReadSelection('Enter');
+  assert.deepEqual(viaEnter.selection, { kind: 'edge', id: 'e-cap-strong-and-power' },
+    'Enter on a trace row did not locate the edge');
+  assert.equal(viaEnter.condHidden, true,
+    'Enter on a trace row opened the condition editor (execution zone must stay view-only)');
+  const viaSpace = await pressRowAndReadSelection(' ');
+  assert.deepEqual(viaSpace.selection, { kind: 'edge', id: 'e-cap-strong-and-power' },
+    'Space on a trace row did not locate the edge');
+  assert.equal(viaSpace.condHidden, true,
+    'Space on a trace row opened the condition editor (execution zone must stay view-only)');
 
   await page.locator('#cvTraceDrawer [data-try-act="drawer-close"]').click();
   await page.waitForFunction(() => document.getElementById('cvTraceDrawer').hidden === true);

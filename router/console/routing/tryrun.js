@@ -13,7 +13,7 @@ import * as RTGraph from './graph.js';
 import { api, apiErrText } from '../api.js';
 import { t, tf } from '../i18n.js';
 import { escape as esc, nodeName as nodeNameOf } from './cards.js';
-import { close as closeCondition, conditionLabel, conditionText, isOpen as isCondPopOpen, open as openCondition } from './condpop.js';
+import { close as closeCondition, conditionLabel, conditionText, isOpen as isCondPopOpen } from './condpop.js';
 
 let deps = null;
 export function configureTryRun(next) { deps = next || null; }
@@ -1217,11 +1217,12 @@ function onAction(event) {
   if (name === 'waves') { layoutByWaves(); }
 }
 
+/* 执行区（轨迹）只做定位：把画布平移到该边并高亮选中，不打开条件编辑器。
+   改配置属于编辑区动作，必须回到画布/检查器入口。 */
 function locateTraceEdge(edgeId) {
   const kit = kitNow();
   if (!kit || !edgeId) return;
   kit.focusEdge(edgeId);
-  openCondition(edgeId);
 }
 
 function onDrawerClick(event) {
