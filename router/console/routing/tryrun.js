@@ -625,6 +625,7 @@ function paintEdges(replay, graph) {
 function apply(replay) {
   state = replay;
   if (!replay || !replay.final) {
+    drawerOpen = false;
     renderResult(null);
     renderHud(null);
     renderDrawer(null);
@@ -731,8 +732,9 @@ function renderResult(replay) {
         esc(tf('cv.tryCalls', { n: replay.waves.length })) + ' · ' +
         esc(ms(totalDuration(replay))) + '</span>' +
       '<span class="rtc-try-acts">' +
-        '<button type="button" class="btn sm" id="cvTryDrawerBtn" data-try-act="drawer">' +
-          esc(t('cv.tryDrawerBtn')) + '</button>' +
+        '<button type="button" class="btn sm" id="cvTryDrawerBtn" data-try-act="drawer" aria-expanded="' +
+          (drawerOpen ? 'true' : 'false') + '">' +
+          esc(t(drawerOpen ? 'cv.tryDrawerHide' : 'cv.tryDrawerBtn')) + '</button>' +
         '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
           esc(t('cv.tryWavesLayout')) + '</button>' +
         '<button type="button" class="btn sm" id="cvTryRerun" data-try-act="rerun">' +
@@ -873,9 +875,10 @@ function rowsHTML(replay) {
 }
 
 function closeDrawer() {
-  const wasOpen = drawerOpen || document.body.classList.contains('has-drawer');
+  const wasOpen = drawerOpen;
   drawerOpen = false;
   renderDrawer(state);
+  if (state) renderResult(state);
   return wasOpen;
 }
 
@@ -889,11 +892,9 @@ function renderDrawer(replay) {
   if (!replay || !replay.final || !drawerOpen) {
     host.hidden = true;
     host.innerHTML = '';
-    document.body.classList.remove('has-drawer');
     return;
   }
   host.hidden = false;
-  document.body.classList.add('has-drawer');
   const waveCards = replay.waves.map(wave => {
     const conds = waveSlotRows(replay, wave.wave);
     return '<div class="rtc-dw-wave' + (wave.failed ? ' is-failed' : '') + '" data-wave-card="' + esc(wave.wave) + '">' +
@@ -912,7 +913,7 @@ function renderDrawer(replay) {
       '</div>';
   }).join('');
   host.innerHTML =
-    '<div class="rtc-drawer-h">' +
+    '<div class="rtc-trace-h">' +
       '<span class="rtc-dw-tt">' + esc(t('cv.tryDrawer')) + '</span>' +
       '<span class="rtc-dw-sub">' +
         esc(tf('cv.tryDrawerSub', {
@@ -923,9 +924,9 @@ function renderDrawer(replay) {
       '<button type="button" class="btn sm rtc-dw-close" data-try-act="drawer-close" aria-label="' +
         esc(t('cv.tryDrawerHide')) + '">✕</button>' +
     '</div>' +
-    '<div class="rtc-drawer-body">' +
-      '<div class="rtc-drawer-waves">' + waveCards + '</div>' +
-      '<div class="rtc-drawer-rows">' + rowsHTML(replay) + '</div>' +
+    '<div class="rtc-trace-body">' +
+      '<div class="rtc-trace-waves">' + waveCards + '</div>' +
+      '<div class="rtc-trace-rows">' + rowsHTML(replay) + '</div>' +
     '</div>';
 }
 
@@ -1067,6 +1068,8 @@ async function run(text, options) {
     rebuilt.id = token;
     rebuilt.request = { text: inputText, now: now };
     state = rebuilt;
+    /* 执行轨迹直接展示：一次试算落地即展开执行区，不需要再点「查看轨迹」。 */
+    drawerOpen = true;
     apply(rebuilt);
     return true;
   } catch (error) {
@@ -1200,8 +1203,9 @@ function onAction(event) {
   if (!action) return;
   const name = action.dataset.tryAct;
   if (name === 'drawer') {
-    drawerOpen = true;
+    drawerOpen = !drawerOpen;
     renderDrawer(state);
+    if (state) renderResult(state);
     return;
   }
   if (name === 'drawer-close') {

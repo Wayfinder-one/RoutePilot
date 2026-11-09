@@ -146,6 +146,9 @@
     <!-- 回放 HUD · 当前运行的波次胶囊（波次头带命中槽位条件 tooltip） -->
     <div class="rtc-hud" id="cvReplayHud" hidden></div>
   </div>
+
+  <!-- 执行区 · 执行轨迹直接停靠在画布下方（不遮挡画布）；标题/波次卡/逐行轨迹由 RTTryRun 渲染 -->
+  <div class="rtc-trace" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
 </main>
 
 <!-- 端口拖到空白 · 快速创建兼容节点 -->
@@ -166,9 +169,6 @@
 
 <!-- 导入 v3 图（隐藏文件选择器） -->
 <input type="file" id="cvImportFile" accept=".json,application/json" hidden>
-
-<!-- 轨迹抽屉：标题 / 关闭 / 行文案由 RTTryRun 按 i18n 渲染；Esc 与关闭按钮共用 closeDrawer() -->
-<div class="rtc-drawer" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
 
 <!-- toast -->
 <div class="rtc-toasts" id="cvToast" role="status" aria-live="polite"></div>

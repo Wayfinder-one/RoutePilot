@@ -596,7 +596,6 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
     edgeStatuses: document.querySelectorAll('#cvEdges .rtc-edge[data-status]').length,
     failedNodes: document.querySelectorAll('#cvNodes .rtc-node.is-fail').length,
     fallbackNodes: document.querySelectorAll('#cvNodes .rtc-node.is-fallback').length,
-    hasDrawer: document.body.classList.contains('has-drawer'),
     drawerHidden: document.getElementById('cvTraceDrawer').hidden
 }));
 });
@@ -607,8 +606,7 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
   assert.equal(cleared.edgeStatuses, 0, 'clear left edge data-status attributes behind');
   assert.equal(cleared.failedNodes, 0);
   assert.equal(cleared.fallbackNodes, 0);
-  assert.equal(cleared.hasDrawer, false);
-  assert.equal(cleared.drawerHidden, true);
+  assert.equal(cleared.drawerHidden, true, 'clear left the execution trace panel visible');
 });
 
 test('Task 13 · a failed /admin/try toasts the api error and fabricates no replay', async () => {
@@ -657,9 +655,7 @@ test('Task 13 · a failed /admin/try toasts the api error and fabricates no repl
 test('trace-drawer-row-locates-slot', async () => {
   await prepareTryCanvas();
   await runTrySample(0);
-  assert.equal(await page.evaluate(() => document.getElementById('cvTraceDrawer').hidden), true,
-    'drawer should stay closed until the user opens it');
-  await page.locator('#cvTryDrawerBtn').click();
+  /* 执行轨迹直接展示：试算落地后执行区即展开，不需要再点「查看轨迹」。 */
   await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
   const drawer = await trySnapshot();
   assert.equal(drawer.drawerHidden, false);
@@ -732,70 +728,68 @@ test('trace-drawer-row-locates-slot', async () => {
     'closing the drawer cleared the replay');
 });
 
-test('Task 13 · Esc closes the drawer and a later render does not reopen it', async () => {
+test('Task 13 · execution trace is docked, auto-shown, and Esc hides it without reopening', async () => {
   await prepareTryCanvas();
   await runTrySample(2);
-  const closedBottom = await page.evaluate(() =>
-    parseFloat(getComputedStyle(document.getElementById('cvTryBar')).bottom));
-  await page.locator('#cvTryDrawerBtn').click();
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+  /* 执行区直接展示：试算落地即展开，且占用独立布局空间（画布让位，而非浮层遮挡）。 */
+  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
   const opened = await page.evaluate(async () => {
     const RTTryRun = await import('/console/routing/tryrun.js');
+    const panel = document.getElementById('cvTraceDrawer');
+    const stage = document.getElementById('cvStage');
     return (({
-    bottom: parseFloat(getComputedStyle(document.getElementById('cvTryBar')).bottom),
-    hasDrawer: document.body.classList.contains('has-drawer'),
-    open: RTTryRun.isDrawerOpen()
+    open: RTTryRun.isDrawerOpen(),
+    docked: getComputedStyle(panel).position !== 'fixed',
+    panelTop: panel.getBoundingClientRect().top,
+    stageBottom: stage.getBoundingClientRect().bottom,
+    stageHeight: stage.getBoundingClientRect().height
 }));
 });
-  assert.equal(opened.hasDrawer, true, 'opening the drawer did not set body.has-drawer');
-  assert.equal(opened.open, true, 'opening the drawer did not set the RTTryRun drawer state');
-  assert.ok(opened.bottom > closedBottom + 100,
-    `drawer did not lift the try bar (${opened.bottom} vs ${closedBottom})`);
+  assert.equal(opened.open, true, 'a completed run did not open the execution trace panel');
+  assert.equal(opened.docked, true, 'the trace panel is still a fixed overlay instead of a docked zone');
+  assert.ok(opened.panelTop >= opened.stageBottom - 1,
+    `trace panel overlaps the canvas (panel top ${opened.panelTop} < stage bottom ${opened.stageBottom})`);
 
   await page.keyboard.press('Escape');
-  await page.waitForFunction(() => document.getElementById('cvTraceDrawer').hidden === true &&
-    !document.body.classList.contains('has-drawer'));
+  await page.waitForFunction(() => document.getElementById('cvTraceDrawer').hidden === true);
   const closed = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTTryRun = await import('/console/routing/tryrun.js');
+    const { app } = await import('/console/routing/app.js');
+    const RTTryRun = await import('/console/routing/tryrun.js');
+    const stage = document.getElementById('cvStage');
     return (({
-    bottom: parseFloat(getComputedStyle(document.getElementById('cvTryBar')).bottom),
-    hasDrawer: document.body.classList.contains('has-drawer'),
     open: RTTryRun.isDrawerOpen(),
     replay: !!app.replay,
-    drawerHidden: document.getElementById('cvTraceDrawer').hidden
+    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
+    stageHeight: stage.getBoundingClientRect().height
 }));
 });
   assert.equal(closed.drawerHidden, true);
-  assert.equal(closed.hasDrawer, false, 'Esc hid the drawer but left body.has-drawer');
-  assert.equal(closed.open, false, 'Esc did not clear the RTTryRun drawer state');
-  assert.ok(Math.abs(closed.bottom - closedBottom) < 0.5,
-    `Esc did not restore the try bar offset (${closed.bottom} vs ${closedBottom})`);
-  assert.equal(closed.replay, true, 'closing the drawer cleared the replay result');
+  assert.equal(closed.open, false, 'Esc did not clear the RTTryRun trace panel state');
+  assert.ok(closed.stageHeight > opened.stageHeight + 20,
+    `hiding the trace did not give the canvas its space back (${closed.stageHeight} vs ${opened.stageHeight})`);
+  assert.equal(closed.replay, true, 'closing the trace panel cleared the replay result');
 
-  /* 语言切换会走 renderAll → RTTryRun.apply；已关闭的抽屉不得被重新弹开。 */
+  /* 语言切换会走 renderAll → RTTryRun.apply；已收起的执行区不得被重新弹开。 */
   await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (setLang('en'));
+    const { setLang } = await import('/console/i18n.js');
+    return setLang('en');
 });
   await page.waitForFunction(() => document.documentElement.lang === 'en');
   const rerendered = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTTryRun = await import('/console/routing/tryrun.js');
+    const { app } = await import('/console/routing/app.js');
+    const RTTryRun = await import('/console/routing/tryrun.js');
     return (({
     drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-    hasDrawer: document.body.classList.contains('has-drawer'),
     open: RTTryRun.isDrawerOpen(),
     replay: !!app.replay
 }));
 });
-  assert.equal(rerendered.drawerHidden, true, 'a renderAll reopened the drawer after Esc');
-  assert.equal(rerendered.hasDrawer, false, 'a renderAll restored body.has-drawer after Esc');
+  assert.equal(rerendered.drawerHidden, true, 'a renderAll reopened the trace panel after Esc');
   assert.equal(rerendered.open, false);
-  assert.equal(rerendered.replay, true, 'a renderAll dropped the replay after closing the drawer');
+  assert.equal(rerendered.replay, true, 'a renderAll dropped the replay after closing the trace panel');
   await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (setLang('zh'));
+    const { setLang } = await import('/console/i18n.js');
+    return setLang('zh');
 });
   await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
 });
@@ -1118,8 +1112,8 @@ test('7.4-18-replay-data-from-admin-try', async () => {
 test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async () => {
   await prepareTryCanvas();
   await runTrySample(0);
-  await page.locator('#cvTryDrawerBtn').click();
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+  /* 执行轨迹直接展示，无需点击开合按钮。 */
+  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
   const chinese = await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (({
@@ -1336,8 +1330,8 @@ const RTGraph = await import('/console/routing/graph.js');
 
 });
   await runTrySample(0);
-  await page.locator('#cvTryDrawerBtn').click();
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+  /* 执行轨迹直接展示：等待执行区自动展开（按钮只用于收起/再展开）。 */
+  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
 
   const gate = page.locator('#cvTraceDrawer .rtc-dw-row--gate').filter({ hasText: 'in_3' });
   assert.equal(await gate.count(), 1);
@@ -1351,8 +1345,8 @@ test('gate replay labels direct and negated boolean inputs', async () => {
   await prepareTryCanvas();
 
   async function gateText() {
-    await page.locator('#cvTryDrawerBtn').click();
-    await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+    /* 执行轨迹直接展示：等待执行区自动展开（按钮只用于收起/再展开）。 */
+    await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
     const row = page.locator(
       '#cvTraceDrawer .rtc-dw-row--gate[data-trace-node="or-ctx"]'
     );
@@ -1420,8 +1414,8 @@ test('gate replay falls back to trace conditions for missing edges', async () =>
   try {
     await runTrySample(0);
     assert.ok(gateFound, 'real try response did not contain the or-ctx gate');
-    await page.locator('#cvTryDrawerBtn').click();
-    await page.waitForSelector('#cvTraceDrawer:not([hidden])');
+    /* 执行轨迹直接展示：等待执行区自动展开（按钮只用于收起/再展开）。 */
+    await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
     const row = page.locator(
       '#cvTraceDrawer .rtc-dw-row--gate[data-trace-node="or-ctx"]'
     );
