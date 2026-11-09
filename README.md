@@ -1,28 +1,32 @@
 # RoutePilot
 
-RoutePilot is an OpenAI-compatible routing proxy for LLM traffic. Every request runs through a versioned decision graph made of request conditions, decision-service questions, logic gates, and model targets. The same graph is edited, validated, dry-run, and published in the built-in console.
+**Natural-language-driven intelligent routing for LLM traffic.**
 
 English | [简体中文](README.zh-CN.md)
 
+RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/chat/completions`; a versioned decision graph selects the upstream model. Graphs are edited, validated, dry-run and published in the built-in console.
+
 ![RoutePilot decision canvas](assets/routepilot/en/routing-canvas.png)
 
-## Highlights
+## Features
 
-- **Visual routing policy.** Build branching policies on a canvas instead of writing if/else chains. Nodes, wires, conditions, validation, layout, undo/redo, and graph import/export are all first-class.
-- **OpenAI-compatible entry point.** `POST /v1/chat/completions` supports JSON and SSE streaming, with the selected model returned in response headers.
-- **Decision-service driven.** Choice, yes/no, and score questions are batched per wave and sent to a `systemone`-compatible decision service. Answers activate downstream questions, gates, and targets.
-- **Deterministic target selection.** Activated targets compete by priority; the largest number wins. Both a normal empty result and a failed decision wave use the single fallback model, `error_fallback`.
-- **Sticky sessions and load balancing.** Reuse a model per tree revision and target, then pick a backend with `least_inflight`. Failed backends are removed by a circuit breaker.
-- **Dry-run before publishing.** `/admin/try` runs the same graph executor with the same trace format without touching affinity, in-flight counts, or upstream generation models.
-- **Operations built in.** Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, audit history, and role-based users.
-- **Bilingual console.** Chinese and English UI, with admin and viewer roles.
+| Area | Capability |
+|---|---|
+| Entry point | `POST /v1/chat/completions`, JSON and SSE, `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` response headers |
+| Routing policy | Visual decision graph: conditions, decision-service questions, logic gates, model targets |
+| Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service |
+| Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
+| Backend selection | Session affinity, `least_inflight` load balancing, per-model circuit breaker |
+| Dry run | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models |
+| Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, audit history, role-based users |
+| Console | Bilingual (zh/en) native ES Modules, no build step |
 
-## How a request is routed
+## Request pipeline
 
 ```mermaid
 flowchart LR
   C[Client] --> V["/v1/chat/completions"]
-  V --> G[Graph executor]
+  V --> G[Graph evaluator]
   G <--> J["Decision service /v1/systemone"]
   G --> T["Target selection<br/>priority · fallback"]
   T --> A[Session affinity]
@@ -31,61 +35,83 @@ flowchart LR
   G -. trace .-> R[(Request ledger)]
 ```
 
-1. Load the immutable routing snapshot and evaluate request conditions (time period / text keywords).
-2. Activate the first wave of questions. All questions in one wave are merged into one decision-service call.
-3. Update numeric ports and `selected` ports, then re-evaluate every downstream slot condition and logic gate.
-4. Repeat wave by wave until no new question is activated.
-5. Choose the highest-priority active target. If none activated, or if a decision call failed, use the fallback model `error_fallback`.
-6. Apply session affinity, select a backend with `least_inflight`, and proxy the request upstream. Failures open the circuit breaker for that model.
+1. Load the immutable routing snapshot and evaluate request conditions (time period, text keywords).
+2. Activate the first question wave; all questions in one wave are merged into one decision-service call.
+3. Write numeric and `selected` ports, then re-evaluate downstream slot conditions and logic gates.
+4. Repeat wave by wave until no further question is activated.
+5. Select the highest-priority activated target; otherwise use `error_fallback`.
+6. Apply session affinity, select a backend with `least_inflight`, proxy the request upstream.
 
-`unknown` never activates a question or target. Numeric comparisons with an unknown value stay unknown.
+`unknown` never activates a question or target. A numeric comparison against an unknown value stays unknown.
 
-## Architecture and boundaries
+## Architecture
 
-- **API layer.** `router/api/` parses request DTOs, maps domain exceptions to HTTP status/issues, and proxies the upstream response. Configuration and graph admin routes never write control-plane state directly; the account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
-- **Control-plane services.** `router/control/` owns the write use cases. `GraphService` validates, prepares a candidate snapshot, writes the graph file under the single-writer lock, re-checks the document hash, publishes the snapshot, and records the audit entry in that order; a stale draft returns 409 instead of overwriting. `ConfigurationService` (JEV settings, window, models) writes rows and audit inside one transaction, re-checks the graph fingerprint inside that transaction before COMMIT, and swaps the in-memory snapshot only after COMMIT; an unstable fingerprint raises before commit, so the database, audit, and snapshot stay untouched.
-- **Routing domain.** `router/routing/graph/` (model, validation, conditions, ports, compiled topology, executor) is pure: it imports neither FastAPI nor SQLite. `router/routing/service.py` runs exactly one direction, evaluate → schedule.
-- **Snapshot assembly.** `router/routing/snapshot.py` reads the enabled graph, model catalog, periods, and JEV settings, then builds an immutable `RoutingSnapshot`; a tree that fails enable validation is never compiled into the published snapshot, and the `/admin/try` draft path reports those enable issues as warnings while compiling a draft snapshot that never replaces the published one.
-- **Console.** `router/console/` is native ES Modules: every page has one `<script type="module">` entry, and modules exchange state through explicit imports and stores, with no `window.*` application globals and no CommonJS.
-- **Compiled topology.** `compile_graph()` indexes nodes, sorts edges, and builds incoming/port maps once per published graph. The request path reads `snapshot.require_compiled()` and never rebuilds an index or opens SQLite.
-- **Request ledger.** The event loop only enqueues rows into a bounded in-memory queue and ring; a 2-second flush projects the whitelisted columns and writes them on a worker thread (`asyncio.to_thread`). A failed write drops that batch and increments `ledger_write_failures` without blocking requests.
-- **Breaker sync.** A background worker loads the shared quarantine at startup, then pushes local changes and imports other replicas' state every 30 seconds; database access stays on a worker thread. Cross-replica visibility is eventually consistent within roughly two intervals.
+| Layer | Path | Responsibility |
+|---|---|---|
+| API | `router/api/` | DTO parsing, exception-to-HTTP mapping, upstream proxy, presenters |
+| Control plane | `router/control/` | Write use cases for graphs and configuration, enable validation |
+| Routing domain | `router/routing/` | Graph model, validation, compiled topology, evaluator, scheduler |
+| Decision service | `router/jev/` | `systemone` client, settings, input window |
+| Upstream | `router/upstream/` | Backend catalog, proxy transport, circuit breaker and sync worker |
+| Storage | `router/store/` | SQLite schema/repositories, graph-file repository |
+| Console | `router/console/` | Bilingual native ES Module UI |
+| Runtime | `router/request_logging.py`, `router/maintenance.py` | Ledger queue/worker, session purge |
+
+Boundaries:
+
+- `router/routing/` and `router/upstream/` import neither FastAPI nor SQLite. `router/control/` and `router/store/` do not import `router.api`.
+- The API layer parses DTOs and maps exceptions; it does not write control-plane state. Account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
+- `GraphService` validates, prepares a candidate snapshot, writes the graph file under the single-writer lock, re-checks the document hash, publishes the snapshot, then records the audit entry. A stale draft returns 409.
+- `ConfigurationService` writes rows and the audit entry inside one transaction, re-checks the graph fingerprint inside that transaction, commits, then swaps the in-memory snapshot. An unstable fingerprint raises before COMMIT.
+- `compile_graph()` runs once per published snapshot. The request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
+- The event loop only enqueues ledger rows into a bounded queue and a 20-entry ring; a 2-second flush projects whitelisted columns and writes them through `asyncio.to_thread`.
+- The breaker worker loads shared quarantine state at startup and syncs local changes every 30 seconds on a worker thread.
 
 ## Console
 
 ![Overview](assets/routepilot/en/overview.png)
 
-The console is the control plane for the router. It is plain native ES Modules served by the router: no front-end build step, and every page has exactly one module entry.
+One `<script type="module">` entry per page, no application globals, no CommonJS.
 
-- **Overview** — request volume, route distribution, JEV confidence, sticky hits, active decision group.
-- **Decision groups** — canvas editor, graph settings, node/edge inspector, validation, dry-run, import/export.
-- **Calc Log** — recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, and a replayable trace.
-- **JEV Model** — decision-service endpoint, model, prompt/state template, connection test, context and input-token window.
-- **Models** — model registry, upstream model ids, providers, reasoning declarations, capability notes.
-- **Users** — admin/viewer accounts, password changes, role and status management.
+| Page | Content |
+|---|---|
+| Overview | Request volume, route distribution, JEV confidence, sticky hits, active decision group |
+| Decision groups | Canvas editor, graph settings, inspector, validation, dry run, import/export |
+| Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
+| JEV Model | Endpoint, model, prompt/state template, connection test, context and input-token window |
+| Models | Model registry, upstream model ids, providers, reasoning declarations, capability notes |
+| Users | Admin/viewer accounts, passwords, roles, status |
 
-### Canvas
+### Editor and execution zone
 
-![Decision canvas](assets/routepilot/en/routing-canvas.png)
+The routing page is split into two zones.
+
+**Editor zone** — canvas, node library, inspector, validation:
 
 - Drag nodes from the library, pan/zoom, auto-layout, undo/redo.
-- Draw typed wires; numeric outputs create a default condition when dropped into a boolean slot.
-- Every input slot is an OR input with its own edge condition.
-- Drag an output to empty canvas to quick-create a compatible node.
-- Save and enable are separate; dirty and layout-only states are visible.
-- Target cards show the target display name, model list, fallback roles, and scheduling strategy.
+- Typed wires; a numeric output dropped into a boolean slot creates a default condition.
+- Each input slot is an OR input with its own edge condition.
+- Dragging an output onto empty canvas quick-creates a compatible node.
+- Save and enable are separate; dirty and layout-only states are shown in the toolbar.
+- Target cards show display name, model list, fallback role and scheduling strategy.
 
-### Dry-run replay
+**Execution zone** — docked below the canvas:
+
+- Input field, sample prompts, run button.
+- Result: final target, model, candidates with priorities, selection reason, waves and call count.
+- Execution trace: one card per wave with hit conditions, plus the full request timeline.
+
+Dry runs highlight the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
 
 ![Dry-run replay](assets/routepilot/en/try-run.png)
-
-Dry-run highlights the winning path wave by wave, shows candidates and priorities, and exposes the full trace. It uses the same executor as production routing but does not consume affinity, in-flight capacity, or an upstream model call.
 
 ### Decision log
 
 ![Calculation log](assets/routepilot/en/logs.png)
 
-Each expanded row shows the calculation process directly in stages: input preparation, initial computation, per-round JEV, candidates & final pick, model scheduling, and the execution result; every slot and technical detail expands on demand instead of cluttering the default view. A routing failure (`routing_error`) keeps the partial process up to that point: a schedule-stage failure (e.g. an open breaker) keeps the scheduling snapshot — configured, registered, available, unavailable reasons and pre-selection inflight — with sticky shown as not checked when it was never consulted; a failed JEV wave voids that round's candidates and falls to the error-fallback target. Legacy records without a scheduling snapshot and restored ledger rows after a restart state plainly that the detail is absent rather than fabricating it. SQLite still stores only the ledger fields — no request text, trace, per-round answers, or node labels; the page reads the last 20 live records from an in-process ring, so calculation detail is replica-local: there is no cross-replica log aggregation and no long-term trace persistence.
+Expanded rows show the calculation stages in order: input preparation, initial computation, per-wave JEV, candidates and final pick, model scheduling, execution result. A `routing_error` keeps the partial process up to the failure point: a schedule-stage failure keeps the scheduling snapshot (configured, registered, available, unavailable reasons, pre-selection inflight), and a failed JEV wave voids that round's candidates and falls to `error_fallback`. Records without a scheduling snapshot and restored ledger rows report the missing detail explicitly.
+
+SQLite stores ledger fields only — no request text, trace, per-wave answers or node labels. The page reads the last 20 live records from an in-process ring; calculation detail is replica-local and not persisted.
 
 ## Decision graph
 
@@ -93,15 +119,15 @@ Each expanded row shows the calculation process directly in stages: input prepar
 
 | Type | Purpose | Inputs | Outputs |
 |---|---|---|---|
-| `start` | Request entry; always true | — | boolean |
-| `question` | Decision-service question: `choice`, `noul`, or `score` | Boolean slots `in_1..in_n` (OR) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
-| `logic` | Three-valued logic gate: `and`, `or`, `not` | Boolean slots `in_1..in_n`, one edge + condition per slot | boolean |
+| `start` | Request entry, always true | — | boolean |
+| `question` | Decision-service question: `choice`, `noul`, `score` | Boolean slots `in_1..in_n` (OR) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
+| `logic` | Three-valued gate: `and`, `or`, `not` | Boolean slots `in_1..in_n`, one edge and condition per slot | boolean |
 | `condition` | Request condition: time period or text keywords | — | boolean |
 | `target` | Model target: models, reasoning tiers, priority, strategy | Boolean slots `in_1..in_n` (OR) | — |
 
 ### Conditions
 
-Conditions live on edges, not on nodes:
+Conditions live on edges:
 
 ```json
 {
@@ -116,22 +142,21 @@ Conditions live on edges, not on nodes:
 
 | Upstream output | Condition | Evaluation |
 |---|---|---|
-| number | `gt` / `gte` / `lt` / `lte` / `eq` / `neq` + finite threshold | Compare values; unknown propagates as unknown |
-| boolean | `null` (same as `= true`) or `{ "op": "is", "value": true \| false }` | Boolean expectation |
+| number | `gt` / `gte` / `lt` / `lte` / `eq` / `neq` + finite threshold | Value comparison; unknown propagates as unknown |
+| boolean | `null` (equivalent to `= true`) or `{ "op": "is", "value": true \| false }` | Boolean expectation |
 
-- One output can feed multiple slots; each slot has its own condition.
-- Two slots of an AND gate can express a range such as `> 0.3` and `< 0.8`.
-- Each input slot accepts at most one edge. Slot numbers stay stable; deleted slots can be reused.
-- `not` has exactly one slot. `and` / `or` require at least two. Question and target slots are OR.
+- One output can feed multiple slots; every slot keeps its own condition.
+- Two slots of an AND gate can express a range, e.g. `> 0.3` and `< 0.8`.
+- Each input slot accepts one edge. Slot numbers are stable; released slots are reusable.
+- `not` has exactly one slot; `and` / `or` require at least two. Question and target slots are OR.
 
 ### Execution rules
 
-- Questions are executed in waves; one wave = one decision-service call.
-- A failed wave voids the whole round: no ports are filled and all candidates from that round are discarded.
-- Target priorities must be unique. **Larger number wins.**
-- `error_fallback` is used when execution completes normally with zero active targets.
-- The same `error_fallback` is used when a decision call fails, times out, or returns an invalid answer.
-- The fallback model must point to an existing target.
+- Questions execute in waves; one wave is one decision-service call.
+- A failed wave voids the round: no ports are written and all candidates from that round are discarded.
+- Target priorities are unique; the larger number wins.
+- `error_fallback` handles a normal run with no activated target, and a decision call that fails, times out or returns an invalid answer.
+- The fallback reference must point to an existing target.
 
 ### Limits
 
@@ -140,13 +165,11 @@ Conditions live on edges, not on nodes:
 | Nodes | 200 |
 | Edges | 400 |
 | Question nodes | 32 |
-| Longest question chain | 8 waves |
+| Question chain depth | 8 waves |
 | Options per choice question | 255 |
 | Score criteria | 2–10 finite values |
 
 ### Graph document
-
-The canvas imports and exports a single JSON envelope:
 
 ```json
 {
@@ -165,60 +188,62 @@ The canvas imports and exports a single JSON envelope:
 }
 ```
 
-Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types, and unknown envelope/node/edge fields (including the retired `otherwise_target`) are rejected before they can replace a draft or a published snapshot; structural rejections surface as `graph_parse_error`, and the console runs the same validation before it applies an import. `tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, with nodes sorted by id and edges by (target, slot, source, source_port), so the Python server and the ES-module console produce the same canonical behavior form; the console uses it to classify edits, and `tree_revision` itself comes from the server. Display/layout edits — titles, a target's capability note, positions, node/edge array order, edge ids — do not change it.
+Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot. Structural rejections surface as `graph_parse_error`; the console runs the same validation before applying an import.
+
+`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Title, capability, position, array order and edge-id changes do not affect it.
 
 ## Models and reasoning
 
-The model registry maps a **model slot** used by the graph to an **upstream model id** and a provider. A target can hold several model slots; `least_inflight` picks among them.
-
 ![Models](assets/routepilot/en/models.png)
 
-Providers define the OpenAI-compatible base URL, API-key environment variable, and reasoning dialect. Model profiles can declare:
+A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; `least_inflight` selects among them.
 
-- reasoning support and a default level;
-- a map from RoutePilot levels (`off`, `on`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to provider-specific wire values;
+Providers define the OpenAI-compatible base URL, API-key environment variable and reasoning dialect. Model profiles declare:
+
+- reasoning support and default level;
+- level-to-wire mapping for `off`, `on`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`;
 - capability notes and catalog metadata.
 
-Supported reasoning dialects include OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai, Together, string-thinking, and Ant Ling. If a requested level is not supported, the request is sent without reasoning injection and the response carries `x-sr-reasoning-warning`.
+Reasoning dialects: OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai, Together, string-thinking, Ant Ling. An unsupported requested level is forwarded without reasoning injection and the response carries `x-sr-reasoning-warning`.
+
+`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text.
 
 ## Decision service (JEV)
 
 ![JEV model settings](assets/routepilot/en/jev.png)
 
-The decision service exposes `POST /v1/systemone` and is typically served by NeoHorse / vLLM. Configure it in the console:
+The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. Console settings:
 
-- base URL, model name, API key, timeout;
+- base URL, model, API key, timeout;
 - default instructions and state template (must contain `{request}`);
 - connection test with two fixed candidates;
-- service context budget and input truncation limit. Oversized input is truncated head/tail instead of returning a 4xx/5xx.
+- context budget and input truncation limit; oversized input is truncated head/tail.
 
-Environment variables can seed the decision-service config on first start only; the database remains the source of truth afterward.
+Environment variables seed the decision-service configuration on first start only; the database is authoritative afterwards.
 
 ## Access and operations
 
-- Email/password login with scrypt password hashing and opaque bearer sessions.
-- `admin` can edit graphs, models, JEV settings, and users. `viewer` is read-only and cannot manage users.
-- The last active admin cannot be demoted, disabled, or deleted.
-- Every user and configuration change is recorded in the audit log.
-- Each graph file is content-addressed by SHA-256 for save conflicts and reload checks; graph history is not retained.
-- Control-plane state (models, providers, users, logs, settings) is SQLite (WAL); routing graphs live in shared JSON files. Request logs are written on a worker thread — the event loop only enqueues — and are also kept in a 20-entry in-memory ring for the live UI; startup hydrates the ring from the persisted tail.
-- Session affinity and in-flight counts remain process-local. Multiple router replicas can share graph files, but cross-replica session/in-flight consistency requires an external shared state layer.
+- Email/password login, scrypt hashing, opaque bearer sessions.
+- `admin` can edit graphs, models, JEV settings and users; `viewer` is read-only.
+- The last active admin cannot be demoted, disabled or deleted.
+- User and configuration changes are recorded in the audit log.
+- Graph files are content-addressed by SHA-256 for save conflicts and reload checks; no graph history is retained.
+- Control-plane state is SQLite (WAL); routing graphs are shared JSON files. Ledger writes run on a worker thread.
+- Session affinity and inflight counters are process-local.
 
-## Shared graph storage and replicas
+## Graph storage and replicas
 
-Decision graphs are not stored in SQLite. Each group is one v3 export document at
-`ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains only the enabled group id.
-The admin API has a single writer. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the same
-directory read-only, and poll every 2 seconds. A replica builds a candidate snapshot before replacing its
-in-memory snapshot; if a file is invalid, the previous snapshot keeps serving and `/readyz` reports stale. Every published snapshot is immutable and carries the compiled topology; reloads compile a candidate before publishing, so an invalid file never replaces the serving snapshot.
+Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains the enabled group id.
 
-- Kubernetes: use a ReadWriteMany PVC; do not share SQLite on NFS/RWX.
-- Docker: mount the same NFS export into every container. Keep SQLite on local storage for the writer.
-- Graph files and `current` are created through atomic temporary files with mode `0600`. Every writer/reader container must use the same numeric UID (10001 is an example; deployments may use another shared UID). Matching only the GID or `fsGroup` cannot grant access to mode-`0600` files; replicas with different UIDs are unsupported.
-- Set the same `runAsUser`/`runAsGroup` in both Kubernetes pod `securityContext`s and the same `--user UID:GID` for Docker containers. The shared directory and `graphs` subdirectory must be traversable by that UID; only the writer needs create/replace access, while readers mount the same directory read-only.
-- Writes are atomic. A stale save returns 409 `graph_conflict`; imports only change the draft. There is no graph version history or rollback.
-- `/healthz` is the liveness probe. `/readyz` reports whether this replica has an initial snapshot; 503 means not ready. After a later reload failure, an existing snapshot continues serving with `"stale": true`.
-- Migration: back up first, then run `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`. The output directory must not exist. Normal startup never deletes old SQLite graphs; clean them only after explicit confirmation.
+- Single writer: the admin API. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the directory read-only and reload every 2 seconds.
+- A replica compiles a candidate snapshot before replacing the serving snapshot; an invalid file leaves the previous snapshot active and `/readyz` reports stale.
+- Writes are atomic through temporary files with mode `0600`.
+- Kubernetes: ReadWriteMany PVC for graph files; SQLite on local storage for the writer.
+- Docker: mount the same NFS export into every container.
+- All writer/reader containers must share the same numeric UID; mode `0600` files are not accessible through GID or `fsGroup` alone.
+- A stale save returns 409 `graph_conflict`; imports only change the draft.
+- `/healthz` is liveness. `/readyz` reports initial-snapshot readiness; 503 means not ready, and a later reload failure keeps the existing snapshot with `"stale": true`.
+- Migration: `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`. The output directory must not exist; startup never deletes old SQLite graphs.
 
 ## Quick start
 
@@ -226,18 +251,17 @@ in-memory snapshot; if a file is invalid, the previous snapshot keeps serving an
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# Local development: authentication disabled
+# Local development, authentication disabled
 ROUTER_DB=/tmp/routepilot.db \
 ROUTER_GRAPH_DIR=/tmp/routepilot-graph \
 ROUTER_USER_AUTH=0 \
 .venv/bin/python -m router
 ```
 
-Open `http://127.0.0.1:8400/console/`. The API root redirects there.
-
-For a protected deployment:
+Console: `http://127.0.0.1:8400/console/`.
 
 ```bash
+# Protected deployment
 ROUTER_DB=/var/lib/routepilot/router.db \
 ROUTER_GRAPH_DIR=/var/lib/routepilot/graph \
 ROUTER_HOST=0.0.0.0 \
@@ -247,72 +271,70 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 .venv/bin/python -m router
 ```
 
-The first start against an empty users table seeds the admin account. Change the password after signing in.
+The first start against an empty users table seeds the admin account.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ROUTER_DB` | `router.db` | SQLite control-plane database path |
-| `ROUTER_GRAPH_DIR` | `./routing-graph` | Shared directory for graph files and the enabled pointer |
-| `ROUTER_GRAPH_WRITER` | `true` | Allow this instance to write graph files; run exactly one writer |
+| `ROUTER_DB` | `router.db` | SQLite control-plane database |
+| `ROUTER_GRAPH_DIR` | `./routing-graph` | Graph files and enabled pointer |
+| `ROUTER_GRAPH_WRITER` | `true` | Allow graph writes; run exactly one writer |
 | `ROUTER_HOST` | `127.0.0.1` | Listener host |
 | `ROUTER_PORT` | `8400` | Listener port |
-| `ROUTER_JEV_URL` | empty | Decision-service base URL; seeds the database on first start |
-| `ROUTER_JEV_MODEL` | empty | Decision-service model; must be set with `ROUTER_JEV_URL` |
-| `ROUTER_JEV_API_KEY` | empty | Optional decision-service key |
+| `ROUTER_JEV_URL` | empty | Decision-service base URL |
+| `ROUTER_JEV_MODEL` | empty | Decision-service model; paired with `ROUTER_JEV_URL` |
+| `ROUTER_JEV_API_KEY` | empty | Decision-service key |
 | `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout, seconds |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity |
-| `ROUTER_USER_AUTH` | `true` | Enable console authentication |
+| `ROUTER_USER_AUTH` | `true` | Console authentication |
 | `ROUTER_ADMIN_EMAIL` | `admin@test.com` | First-run admin email |
-| `ROUTER_ADMIN_PASSWORD` | seed value | First-run admin password; set this explicitly before the first start |
+| `ROUTER_ADMIN_PASSWORD` | seed value | First-run admin password |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | Console session lifetime |
 
 ## API
 
 | Method and path | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI-compatible routing entry; JSON or SSE |
+| `POST /v1/chat/completions` | Routing entry; JSON or SSE |
 | `GET /healthz` | Liveness probe |
-| `GET /readyz` | Initial-snapshot readiness; 503 until this replica has one |
+| `GET /readyz` | Snapshot readiness |
 | `POST /admin/login` / `POST /admin/logout` | Console session |
-| `GET /admin/me` / `POST /admin/me/password` | Current user and self-service password change |
-| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | Decision-group CRUD |
-| `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Decision-group lifecycle |
-| `POST /admin/try` | Dry-run against a draft graph |
+| `GET /admin/me` / `POST /admin/me/password` | Current user, password change |
+| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | Decision groups |
+| `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Group lifecycle |
+| `POST /admin/try` | Dry run against a draft graph |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry |
-| `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets and upstream model discovery |
-| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Provider configuration |
+| `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets, upstream model discovery |
+| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Providers |
 | `GET/PUT /admin/jev`, `POST /admin/jev/test` | Decision-service settings |
 | `GET/PUT /admin/jev/window` | JEV context and input-token window |
-| `GET/PUT /admin/time-periods` | Named time periods |
-| `GET /admin/requests/recent`, `GET /admin/requests/stats` | Live request ring and logger stats |
-| `GET /admin/overview`, `GET /admin/changes` | Overview and audit history |
-| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | User management |
+| `GET/PUT /admin/time-periods` | Time periods |
+| `GET /admin/requests/recent`, `GET /admin/requests/stats` | Live request ring, logger stats |
+| `GET /admin/overview`, `GET /admin/changes` | Overview, audit history |
+| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | Users |
 
 ### Errors
 
 | Status | Error | Meaning |
 |---|---|---|
-| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | Malformed request body |
+| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | Malformed body |
 | 413 | `request_too_large` | Body exceeds 10 MiB |
 | 502 | `upstream_error` | Upstream 5xx or network failure |
-| 409 | `graph_conflict` | The graph changed after this draft was loaded; reload and reconcile |
-| 409 | `graph_already_exists` | A graph id is already in use |
-| 503 | `graph_read_only` | This replica is a reader; enable writes on the single writer |
-| 503 | `graph_storage_error` | Shared graph storage could not be read |
-| 503 | `no_valid_snapshot` | This replica has no initial snapshot yet |
+| 409 | `graph_conflict` | Graph changed after the draft was loaded |
+| 409 | `graph_already_exists` | Duplicate graph id |
+| 503 | `graph_read_only` | Reader replica |
+| 503 | `graph_storage_error` | Shared graph storage unreadable |
+| 503 | `no_valid_snapshot` | No initial snapshot |
 | 503 | `no_active_tree` | No enabled decision group |
-| 503 | `no_available_backend` | All backends for the chosen target are unavailable |
+| 503 | `no_available_backend` | All backends of the selected target unavailable |
 | 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure |
 
-Upstream 4xx responses are passed through with their status and body.
+Upstream 4xx responses pass through with their status and body.
 
-Configuration is written through dedicated endpoints (`/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/jev/window`, `/admin/time-periods`); there is no generic `/admin/settings` write API.
+Configuration endpoints: `/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/jev/window`, `/admin/time-periods`. There is no generic `/admin/settings` API.
 
 ## Tests
-
-Default checks need no running server and make no external requests:
 
 ```bash
 .venv/bin/python -m pytest -q
@@ -322,41 +344,42 @@ npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 ```
 
-- `pytest` collects only `tests/` (`testpaths` in `pyproject.toml`): unit and FastAPI integration tests. It never starts a browser or the router, and it does not collect `experiments/`.
-- `node --test` runs the pure ES-module suites: graph/canonical behavior, draft state, and the cross-runtime contract fixtures in `tests/fixtures/graph_contracts.json`, which assert the same issue codes and behavior hashes as Python.
-- `npm run check:console` runs the three Node suites (graph, draft, graph contract) plus the Playwright acceptance matrix against a temporary database, mock decision service, and mock upstream. Screenshots are off by default; set `QA_SCREENSHOTS=1` to regenerate evidence. `QA_ONLY=<regex>` selects cases, and a page module can run alone, for example `node scripts/console_qa/canvas.mjs` (also `inspector`, `tryrun`, `logs`, `models`). Set `CHROME=/path/to/chrome` if Chromium is not found in the usual cache.
-- `scripts/i18n_dead_keys.py` checks that every dictionary key is still referenced.
+- `pytest` collects `tests/` only (`testpaths`), runs unit and FastAPI integration tests, starts no browser and does not collect `experiments/`.
+- `node --test` runs the ES-module suites: graph/canonical behavior, draft state and cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
+- `npm run check:console` runs the three Node suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
+- `scripts/i18n_dead_keys.py` reports unreferenced dictionary keys.
 
-`experiments/jev-batch/` is a standalone spike; it is not shipped and not collected by the default run:
+Experiments are standalone and excluded from the default run:
 
 ```bash
 .venv/bin/python -m pytest -q experiments/jev-batch/test_spike_jev_batch.py
-.venv/bin/python experiments/jev-batch/spike_jev_batch.py \
-  --samples /path/to/samples.jsonl --scenario all --dry-run
+.venv/bin/python experiments/jev-batch/spike_jev_batch.py --samples /path/to/samples.jsonl --scenario all --dry-run
 ```
 
 ## Project layout
 
 ```
 router/
-  api/                 FastAPI routes, request DTOs, exception mapping, upstream proxy
-  control/             control-plane write services (graph lifecycle, config validation)
+  api/                 FastAPI routes, DTOs, exception mapping, proxy wiring, presenters
+  control/             control-plane write services and enable validation
   routing/
-    graph/             pure graph domain: model, validation, conditions, compiler, executor
+    graph/             graph model, validation, conditions, compiler, evaluator
     service.py         evaluate → schedule orchestration
     scheduling.py      sticky selection, lease acquisition, affinity writes
-    affinity.py        session affinity LRU
-    scheduler.py       least_inflight load balancer and leases
+    affinity.py        session-affinity LRU
+    scheduler.py       least_inflight balancer and leases
     snapshot.py        immutable snapshot assembly and compiled topology
-  request_logging.py   request ledger queue/ring and worker-thread writes
-  jev/                 decision-service client, config, input window
-  upstream/            proxy, circuit breaker + sync worker, backend catalog
-  store/               SQLite schema/repositories and the shared graph-file repository
+    tree.py            tree envelope codec and revision
+    codec.py           strict field parsing helpers
+  request_logging.py   ledger queue/ring and worker-thread writes
+  jev/                 decision-service client, settings, input window
+  upstream/            catalog, proxy transport, circuit breaker + sync worker
+  store/               SQLite schema/repositories, graph-file repository
   console/             bilingual native ES Module console
-configs/               example decision groups and demo cases
-tests/                 pytest suite and cross-runtime contract fixtures
-scripts/               Node contract tests and the Playwright QA entry + page modules
-experiments/jev-batch/ standalone JEV batch spike (not shipped)
+configs/               example decision groups
+tests/                 pytest suite and contract fixtures
+scripts/               Node contract tests, Playwright QA, deployment helpers
+experiments/jev-batch/ standalone JEV batch spike
 assets/routepilot/     README screenshots
 ```
 
