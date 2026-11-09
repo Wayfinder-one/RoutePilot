@@ -1,20 +1,208 @@
 <!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>RoutePilot · JEV 模型</title><link rel="icon" href="data:"><link rel="stylesheet" href="shared.css"></head>
-<body data-page="jev"><div class="pagehead"><div><div class="crumb" data-i18n="nav.jev"></div><h1><span data-i18n="nav.jev"></span><span class="sub" data-i18n="jev.sub"></span></h1></div><div class="headmeta"><span class="pill indigo" id="jevStatus"></span></div></div>
-<main class="page"><div class="grid2"><section class="card"><div class="col-h" data-i18n="jev.config"></div>
-<div class="field-row"><label class="field"><span data-i18n="jev.url"></span><input id="baseUrl" placeholder="http://127.0.0.1:30000"></label><label class="field"><span data-i18n="jev.model"></span><input id="model" placeholder="NeoHorse-Jev-4B"></label></div>
-<div class="field-row"><label class="field"><span data-i18n="jev.key"></span><input id="apiKey" type="password" autocomplete="off"></label><label class="field"><span data-i18n="jev.timeout"></span><input id="timeout" type="number" min="0.1" max="120" step="0.1"></label></div>
-<label><input type="checkbox" id="clearKey"> <span data-i18n="jev.clearKey"></span></label>
-<label class="field" style="margin-top:10px"><span data-i18n="jev.instructions"></span><textarea id="instructions" rows="4"></textarea></label>
-<label class="field" style="margin-top:10px"><span data-i18n="jev.template"></span><textarea id="stateTemplate" rows="5"></textarea></label>
-<div style="margin-top:12px"><button class="btn pri" id="saveJev" data-i18n="common.save"></button></div><div id="saveMsg" class="footnote"></div>
-</section><section class="card"><div class="col-h" data-i18n="jev.test"></div><p class="mut" data-i18n="jev.testHint"></p><textarea id="testText" rows="5" style="width:100%"></textarea><button class="btn pri" id="testJev" style="margin-top:10px" data-i18n="jev.testRun"></button><div id="testOut" class="try-out"></div></section></div>
-<div class="card" id="windowCard" style="margin-top:12px">
-<div class="col-h"><span data-i18n="models.window.title"></span><span class="pill indigo" id="windowPill"></span></div>
-<div class="set-row"><span class="mut win-label" data-i18n="models.window.context"></span><input id="winContext" class="s-val" type="number" min="512" max="131072" step="1" style="max-width:120px"><span class="mut">token</span><span class="win-presets" id="winContextPresets"></span></div>
-<div class="set-row"><span class="mut win-label" data-i18n="models.window.input"></span><input id="winInput" class="s-val" type="number" min="256" max="131072" step="1" style="max-width:120px"><span class="mut">token</span><span class="win-presets" id="winInputPresets"></span></div>
-<div class="footnote" data-i18n="models.window.hint"></div>
-<div class="addrow" style="margin-top:8px"><span class="modal-msg" id="windowMsg"></span><button class="btn pri sm push-right" id="saveWindow" data-i18n="models.window.save"></button></div>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RoutePilot · JEV 模型</title>
+<link rel="icon" href="data:">
+<link rel="stylesheet" href="shared.css">
+<style>
+/* ── layout only: two-column workbench, read/edit swap, definition rows ──
+   Everything visual (card, field, btn, pill, footnote, adv, modal-msg…)
+   comes from shared.css and stays exactly as the rest of the console. */
+body[data-page="jev"] .pagehead,
+body[data-page="jev"] main.page{max-width:1160px}
+.jev-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:12px;align-items:stretch}
+.jev-grid > .card{margin-top:0}
+.jev-grid.is-editing,
+.jev-grid.has-result{align-items:start}
+.jev-grid.is-editing #testCard{position:sticky;top:64px;align-self:start}
+@media (max-width:900px){.jev-grid{grid-template-columns:minmax(0,1fr)}}
+#readPane[hidden],#editPane[hidden]{display:none}
+.archive-head{flex-wrap:wrap}
+.archive-head #testBadge{font-size:11px;padding:2px 9px}
+
+/* read-only definition list */
+.file{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px 24px;margin:2px 0 0}
+.file-row{display:flex;flex-direction:column;gap:3px;min-width:0;margin:0}
+.file-row.wide{grid-column:1 / -1}
+.file dt{font-size:11px;font-weight:650;letter-spacing:.02em;color:var(--text-3)}
+.file dd{margin:0;font-size:13px;line-height:1.5;color:var(--text);min-width:0;overflow-wrap:anywhere;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.file dd.mono{font-family:var(--mono);font-size:12.5px}
+.file dd .fnote{font-size:10.5px;color:var(--text-3);font-weight:500}
+.file .pill{font-size:10.5px;padding:1px 8px;gap:5px}
+@media (max-width:1159px){.file{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:640px){.file{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px}}
+
+/* edit form */
+.edit-sec-h{margin:2px 0 8px}
+.edit-sec-h .mut{font-size:10.5px}
+.edit-form .field-row{margin-bottom:10px}
+.edit-form label.field{margin-bottom:10px}
+.edit-form label.field > span{line-height:1.4}
+.edit-form textarea{width:100%}
+.chk{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-2);margin:1px 0 2px}
+.chk input{width:auto}
+.win-row{display:flex;align-items:flex-end;gap:8px;margin-bottom:9px;flex-wrap:wrap}
+.win-row .field{flex:0 1 170px;min-width:130px;margin-bottom:0}
+.win-row .wunit{font-size:11px;color:var(--text-3);padding-bottom:7px}
+.presets{display:flex;flex-wrap:wrap;gap:4px;padding-bottom:1px}
+.edit-actions{display:flex;align-items:center;gap:8px;justify-content:flex-end;
+  flex-wrap:wrap;margin-top:8px}
+.edit-actions .fnote{font-size:10.5px;color:var(--text-3);margin-right:auto;line-height:1.45}
+.card-foot{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-height:16px;
+  margin-top:11px;padding-top:9px;border-top:1px solid var(--line)}
+#archiveCard:not(.is-editing) .card-foot .fnote{display:none}
+#archiveCard:not(.is-editing) .card-foot.is-empty{display:none}
+.card-foot .fnote{font-size:10.5px;color:var(--text-3)}
+.card-foot .modal-msg{margin-right:0;max-width:100%}
+
+/* test card */
+.test-hint{margin:-2px 0 10px;line-height:1.55;font-size:11.5px}
+.test-run{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.test-more{margin-top:2px}
+.test-more:not([open]) > .field{display:none}
+.test-more .field{margin-top:2px;margin-bottom:0}
+.test-more textarea{width:100%;min-height:64px}
+.test-out{margin-top:12px;padding-top:11px;border-top:1px solid var(--line);
+  min-height:64px;font-size:12px;line-height:1.55;color:var(--text-2)}
+.test-out .card{box-shadow:none}
+.test-out pre{max-height:280px;overflow:auto;font-family:var(--mono);font-size:10.5px;
+  line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
+#windowPill:empty::before{content:"—";color:var(--text-3);font-family:var(--sans)}
+#windowMsg:not(:empty){color:var(--red)}
+@media (max-width:560px){.edit-form .field-row{flex-direction:column;gap:8px}}
+</style>
+</head>
+<body data-page="jev">
+<div class="pagehead">
+  <div>
+    <div class="crumb" data-i18n="nav.jev"></div>
+    <h1><span data-i18n="nav.jev"></span><span class="sub" data-i18n="jev.sub"></span></h1>
+  </div>
+  <div class="headmeta"><span class="pill indigo" id="jevStatus"></span></div>
 </div>
-</main><script type="module" src="jev.js"></script>
+
+<main class="page">
+  <div class="jev-grid">
+
+    <!-- ── 服务档案 / 编辑 ──────────────────────────────────────────── -->
+    <section class="card" id="archiveCard">
+      <div class="col-h archive-head">
+        <span data-x="archive.title"></span>
+        <span class="pill" id="testBadge" aria-live="polite"><span class="dot"></span><span id="testBadgeText"></span></span>
+        <button class="btn sm push-right" id="editConfig" type="button"
+                data-x="archive.edit" aria-expanded="false" aria-controls="editPane"></button>
+      </div>
+
+      <!-- read-only profile (default) -->
+      <dl class="file" id="readPane">
+        <div class="file-row wide">
+          <dt data-i18n="jev.url"></dt>
+          <dd class="mono" id="roBaseUrl">—</dd>
+        </div>
+        <div class="file-row">
+          <dt data-i18n="jev.model"></dt>
+          <dd class="mono" id="roModel">—</dd>
+        </div>
+        <div class="file-row">
+          <dt data-i18n="jev.key"></dt>
+          <dd><span class="pill" id="roKey">—</span></dd>
+        </div>
+        <div class="file-row">
+          <dt data-i18n="jev.timeout"></dt>
+          <dd class="mono" id="roTimeout">—</dd>
+        </div>
+        <div class="file-row">
+          <dt data-x="file.window"></dt>
+          <dd class="mono"><span id="windowPill"></span><span class="fnote" data-x="file.windowNote"></span></dd>
+        </div>
+        <div class="file-row">
+          <dt data-x="file.instructions"></dt>
+          <dd class="mono" id="roInstr">—</dd>
+        </div>
+        <div class="file-row">
+          <dt data-x="file.template"></dt>
+          <dd><span class="mono" id="roTpl">—</span><span class="pill" id="roReq"></span></dd>
+        </div>
+      </dl>
+
+      <!-- in-place edit (on demand) -->
+      <div class="edit-form" id="editPane" hidden>
+        <div class="col-h sm edit-sec-h" data-x="edit.conn"></div>
+        <div class="field-row">
+          <label class="field"><span data-i18n="jev.url"></span>
+            <input id="baseUrl" type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:30000"></label>
+          <label class="field"><span data-i18n="jev.model"></span>
+            <input id="model" type="text" spellcheck="false" autocomplete="off" placeholder="NeoHorse-Jev-4B"></label>
+        </div>
+        <div class="field-row">
+          <label class="field"><span data-i18n="jev.key"></span>
+            <input id="apiKey" type="password" autocomplete="off" spellcheck="false"></label>
+          <label class="field"><span data-i18n="jev.timeout"></span>
+            <input id="timeout" type="number" min="0.1" max="120" step="0.1"></label>
+        </div>
+        <label class="chk"><input type="checkbox" id="clearKey"><span data-i18n="jev.clearKey"></span></label>
+
+        <div class="hr"></div>
+        <div class="col-h sm edit-sec-h" data-x="edit.prompt"></div>
+        <label class="field"><span data-i18n="jev.instructions"></span>
+          <textarea id="instructions" rows="4"></textarea></label>
+        <label class="field"><span data-i18n="jev.template"></span>
+          <textarea id="stateTemplate" rows="5"></textarea></label>
+
+        <div class="hr"></div>
+        <div id="windowCard">
+          <div class="col-h sm edit-sec-h" data-x="edit.window"></div>
+          <div class="win-row">
+            <label class="field"><span data-i18n="models.window.context"></span>
+              <input id="winContext" type="number" min="512" max="131072" step="1"></label>
+            <span class="wunit mut">token</span>
+            <div class="presets" id="winContextPresets"></div>
+          </div>
+          <div class="win-row">
+            <label class="field"><span data-i18n="models.window.input"></span>
+              <input id="winInput" type="number" min="256" max="131072" step="1"></label>
+            <span class="wunit mut">token</span>
+            <div class="presets" id="winInputPresets"></div>
+          </div>
+          <p class="footnote" data-i18n="models.window.hint"></p>
+          <div class="addrow">
+            <span class="modal-msg" id="windowMsg" role="status" aria-live="polite"></span>
+          </div>
+        </div>
+
+        <div class="edit-actions">
+          <span class="fnote mut" data-x="edit.saveHint"></span>
+          <button class="btn" id="saveWindow" type="button" data-x="save.window"></button>
+          <button class="btn pri" id="saveJev" type="button" data-x="save.all"></button>
+        </div>
+      </div>
+
+      <!-- always-visible feedback (save result, boot errors) -->
+      <div class="card-foot">
+        <span class="fnote" data-x="archive.hint"></span>
+        <span class="modal-msg" id="saveMsg" role="status" aria-live="polite"></span>
+      </div>
+    </section>
+
+    <!-- ── 连接测试 ────────────────────────────────────────────────── -->
+    <section class="card" id="testCard">
+      <div class="col-h" data-i18n="jev.test"></div>
+      <p class="test-hint mut" data-i18n="jev.testHint"></p>
+      <div class="test-run">
+        <button class="btn pri" id="testJev" type="button" data-i18n="jev.testRun"></button>
+      </div>
+      <details class="adv test-more">
+        <summary data-x="test.custom"></summary>
+        <label class="field"><span class="sr-only" data-x="test.label"></span>
+          <textarea id="testText" rows="3" spellcheck="false"></textarea></label>
+      </details>
+      <div id="testOut" class="test-out" role="status" aria-live="polite">
+        <span class="mut out-empty" data-x="test.empty"></span>
+      </div>
+    </section>
+
+  </div>
+</main>
+
+<script type="module" src="jev.js"></script>
 </body></html>
+

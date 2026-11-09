@@ -100,6 +100,9 @@ test('review-jev-window-save-error-uses-window-message', async () => {
     await page.waitForFunction(() =>
       document.getElementById('winContext').value === '4096' &&
       document.getElementById('winInput').value === '1024');
+    /* JEV 页面是「只读档案 + 按需编辑」：窗口字段只在编辑态可见，先进编辑态。 */
+    await page.locator('#editConfig').click();
+    await page.waitForSelector('#saveWindow', { state: 'visible', timeout: 15000 });
     await page.locator('#saveWindow').click();
     await page.waitForFunction(expected =>
       document.getElementById('windowMsg').textContent.includes(expected), detail);
