@@ -134,3 +134,7 @@ async function boot() {
 }
 
 boot();
+
+/* 视图层（只读档案 / 编辑态 / 会话测试徽章 / 保存全部拦截）在独立模块里维护；
+   动态导入让它在 jev.js 主体之后执行，页面 HTML 因此只保留一个 script 标签。 */
+import('./jev-view.js');
