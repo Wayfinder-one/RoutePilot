@@ -131,8 +131,13 @@
       <svg id="cvMinimapSvg" viewBox="0 0 168 104" aria-hidden="true"></svg>
     </div>
 
-    <!-- 底部居中 · 试算台（输入 + 样例 + 运行 + 结论） -->
-    <section class="rtc-trybar rtc-overlay" id="cvTryBar" data-overlay data-i18n-aria="cv.try">
+    <!-- 回放 HUD · 当前运行的波次胶囊（波次头带命中槽位条件 tooltip） -->
+    <div class="rtc-hud" id="cvReplayHud" hidden></div>
+  </div>
+
+  <!-- 执行区 · 试算输入/结论 + 执行轨迹；停靠在画布下方，与编辑区完全分离 -->
+  <section class="rtc-exec" id="cvExecZone">
+    <section class="rtc-trybar" id="cvTryBar" data-i18n-aria="cv.try">
       <div class="rtc-try-row">
         <span class="rtc-try-ico"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg></span>
         <input type="text" id="cvTryInput" autocomplete="off" spellcheck="false">
@@ -142,13 +147,8 @@
       <!-- 试算结论（成功后展开） -->
       <div class="rtc-try-res" id="cvTryResult" hidden></div>
     </section>
-
-    <!-- 回放 HUD · 当前运行的波次胶囊（波次头带命中槽位条件 tooltip） -->
-    <div class="rtc-hud" id="cvReplayHud" hidden></div>
-  </div>
-
-  <!-- 执行区 · 执行轨迹直接停靠在画布下方（不遮挡画布）；标题/波次卡/逐行轨迹由 RTTryRun 渲染 -->
-  <div class="rtc-trace" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
+    <div class="rtc-trace" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
+  </section>
 </main>
 
 <!-- 端口拖到空白 · 快速创建兼容节点 -->

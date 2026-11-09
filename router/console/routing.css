@@ -692,14 +692,16 @@ body.is-try-running .rtc-stage.is-locked::after {
 .rtc-mini-node[data-type="target"] { fill: var(--teal); }
 .rtc-mini-view { fill: var(--indigo); fill-opacity: .08; stroke: var(--indigo); stroke-width: 1; }
 
-/* ── 试算台 ───────────────────────────────────────────────────── */
+/* ── 执行区（停靠画布下方：试算输入/结论在上，执行轨迹在下） ───── */
+.rtc-exec {
+  flex: none; display: flex; flex-direction: column; min-height: 0;
+  background: var(--panel); border-top: 1px solid var(--line-2);
+  box-shadow: 0 -10px 24px -18px rgba(15, 23, 42, .35);
+}
 .rtc-trybar {
-  position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
-  width: min(560px, calc(100% - 620px));
-  min-width: 320px;
-  background: var(--panel); border: 1px solid var(--line);
-  border-radius: 12px; box-shadow: var(--shadow-lg);
-  padding: 7px 9px 6px; z-index: 23;
+  flex: none; display: flex; flex-direction: column; gap: 5px;
+  padding: 8px 14px 7px;
+  background: transparent; border: 0; border-radius: 0; box-shadow: none;
 }
 .rtc-try-row { display: flex; align-items: center; gap: 6px; }
 .rtc-try-ico {
@@ -887,11 +889,11 @@ body.is-try-running .rtc-stage.is-locked::after {
 }
 @keyframes rtc-spin { to { transform: rotate(360deg); } }
 
-/* ── 试算结论（试算台内展开） ─────────────────────────────────── */
-.rtc-trybar { display: flex; flex-direction: column; max-height: min(46vh, 380px); }
+/* ── 试算结论（执行区输入行内展开） ───────────────────────────── */
 .rtc-try-res {
   margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--line);
-  display: flex; flex-direction: column; gap: 4px; min-height: 0; overflow: auto;
+  display: flex; flex-direction: column; gap: 4px;
+  min-height: 0; max-height: min(26vh, 220px); overflow: auto;
 }
 .rtc-try-res-h { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
 .rtc-try-kind {
@@ -969,7 +971,7 @@ body.is-try-running .rtc-stage.is-locked::after {
 /* ── 轨迹抽屉（左侧波次卡 + 右侧逐行轨迹） ────────────────────── */
 /* 执行区：停靠在画布下方、与画布互不遮挡（编辑在上、执行在下）。 */
 .rtc-trace {
-  flex: none; height: min(40vh, 420px);
+  flex: none; height: min(36vh, 380px);
   display: flex; flex-direction: column;
   background: var(--panel); border-top: 1px solid var(--line-2);
   box-shadow: 0 -10px 24px -18px rgba(15, 23, 42, .35);
@@ -1067,13 +1069,11 @@ body.is-try-running .rtc-stage.is-locked::after {
 /* ── 窄屏降级（基线 1440×960 / 1280×800 不滚动） ──────────────── */
 @media (max-width: 1320px) {
   .rtc-inspector { width: 286px; }
-  .rtc-trybar { width: min(520px, calc(100% - 600px)); }
   .rtc-treeselect { max-width: 260px; }
   .rtc-pagehead { padding-left: 12px; padding-right: 12px; }
   .rtc-actions .btn { padding: 4px 8px; }
 }
 @media (max-width: 1080px) {
   .rtc-inspector { display: none; }
-  .rtc-trybar { width: min(480px, calc(100% - 500px)); }
   .rtc-palette { width: 190px; }
 }
