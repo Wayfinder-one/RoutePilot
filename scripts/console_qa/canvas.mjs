@@ -236,7 +236,8 @@ test('7.4-01-pan-zoom-fit-reset', async () => {
   assert.equal(Math.round(panned.k * 1000), Math.round(panStart.k * 1000));
 
   const box = await page.locator('#cvStage').boundingBox();
-  const point = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  /* 输入坐标取整：浏览器输入管线会量化小数坐标，锚点断言（1e-6）会因此假红。 */
+  const point = { x: Math.round(box.x + box.width / 2), y: Math.round(box.y + box.height / 2) };
   const labelBefore = await page.locator('#cvZoomLabel').textContent();
   const worldBefore = await page.evaluate(async ([x, y]) => {
     const { app, store } = await import('/console/routing/app.js');
