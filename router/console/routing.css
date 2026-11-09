@@ -967,12 +967,14 @@ body.is-try-running .rtc-stage.is-locked::after {
 }
 
 /* ── 轨迹抽屉（左侧波次卡 + 右侧逐行轨迹） ────────────────────── */
-.rtc-drawer {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 140;
-  max-height: 42vh; display: flex; flex-direction: column;
-  background: var(--panel); border-top: 1px solid var(--line); box-shadow: var(--shadow-lg);
+/* 执行区：停靠在画布下方、与画布互不遮挡（编辑在上、执行在下）。 */
+.rtc-trace {
+  flex: none; height: min(40vh, 420px);
+  display: flex; flex-direction: column;
+  background: var(--panel); border-top: 1px solid var(--line-2);
+  box-shadow: 0 -10px 24px -18px rgba(15, 23, 42, .35);
 }
-.rtc-drawer-h {
+.rtc-trace-h {
   flex: none; display: flex; align-items: center; gap: 8px;
   padding: 7px 14px; border-bottom: 1px solid var(--line);
 }
@@ -982,10 +984,10 @@ body.is-try-running .rtc-stage.is-locked::after {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .rtc-dw-close { margin-left: auto; flex: none; }
-.rtc-drawer-body {
+.rtc-trace-body {
   flex: 1; min-height: 0; display: grid; grid-template-columns: 330px minmax(0, 1fr);
 }
-.rtc-drawer-waves {
+.rtc-trace-waves {
   min-height: 0; overflow: auto; padding: 8px 10px;
   background: var(--panel-2); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; gap: 6px;
@@ -1011,7 +1013,7 @@ body.is-try-running .rtc-stage.is-locked::after {
   font-family: var(--mono); font-size: 8px; line-height: 1.5; color: var(--green);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.rtc-drawer-rows { min-height: 0; overflow: auto; padding: 0 0 6px; }
+.rtc-trace-rows { min-height: 0; overflow: auto; padding: 0 0 6px; }
 .rtc-dw-group {
   position: sticky; top: 0; z-index: 1; background: var(--panel);
   padding: 4px 12px; border-bottom: 1px solid var(--line);
@@ -1040,8 +1042,6 @@ body.is-try-running .rtc-stage.is-locked::after {
 .rtc-dw-row--final .rtc-dw-t, .rtc-dw-row--fallback .rtc-dw-t { color: var(--green); font-weight: 700; }
 .rtc-dw-row--fallback .rtc-dw-t { color: var(--amber); }
 
-/* 抽屉打开时把试算台上移，避免互相遮挡。 */
-body.has-drawer .rtc-trybar { bottom: calc(42vh + 12px); max-height: calc(58vh - 40px); }
 
 /* ── toast / drag ghost ───────────────────────────────────────── */
 .rtc-toasts {

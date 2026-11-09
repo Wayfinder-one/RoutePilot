@@ -1093,8 +1093,7 @@ function closeOverlays() {
   if (modal && !modal.hidden) { hideDelete(); return true; }
   const drawer = $('#cvTraceDrawer');
   if (drawer && !drawer.hidden) {
-    /* 关闭必须走 tryrun：只隐藏 DOM 会把 drawerOpen / body.has-drawer 留在打开态，
-       下一次 renderAll 又会把抽屉弹回来。 */
+    /* 收起必须走 tryrun：只隐藏 DOM 会把 drawerOpen 留在展开态，下一次 renderAll 又会展开。 */
     closeTryDrawer();
     return true;
   }
