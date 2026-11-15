@@ -1516,6 +1516,7 @@ async function main() {
   await import('./console_qa/tryrun.mjs');
   await import('./console_qa/logs.mjs');
   await import('./console_qa/models.mjs');
+  await import('./console_qa/testchat.mjs');
   console.log(`[console-qa] registered cases: ${checks.length}`);
   await runRegisteredCases();
 }
