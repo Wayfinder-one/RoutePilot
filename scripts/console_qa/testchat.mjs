@@ -17,6 +17,7 @@ import {
   resetExpectedHttpStatusErrors,
   routerBase,
   runIfMain,
+  screenshot,
   test,
   waitFor,
 } from '../console_qa.mjs';
@@ -497,6 +498,49 @@ test('test chat new chat aborts the stream and starts a new session', async () =
     assert.notEqual(sessionIds[1], sessionIds[0], 'New Chat must rotate the session id');
   } finally {
     page.off('request', captureSession);
+  }
+});
+
+/* ── 计划 Task 8：首页截图（opt-in）────────────────────────────────────
+   README 的 test.png 必须来自真实交互后的页面，而不是空壳：先通过真实 UI 发一条
+   `你好`（默认 Auto，元信息显示 Auto → 路由到的上游模型），等流式「固定回复」完成
+   （完成态才会渲染 Copy/Regenerate 按钮）后再截图。桌面 1440×1000、移动 390×844
+   各截中英两张。screenshot() 自身在 QA_SCREENSHOTS=1 时才写文件；本用例开头再显式
+   早退，保证普通 `npm run check:console` 不多做导航、也不会因没有截图文件而失败。 */
+test('test chat screenshots (opt-in QA_SCREENSHOTS)', async () => {
+  if (process.env.QA_SCREENSHOTS !== '1') return;
+  const viewports = [
+    { name: '1440', width: 1440, height: 1000 },
+    { name: '390', width: 390, height: 844 },
+  ];
+  const languages = [
+    { name: 'zh', htmlLang: 'zh-CN' },
+    { name: 'en', htmlLang: 'en' },
+  ];
+  try {
+    for (const viewport of viewports) {
+      await page.setViewportSize({ width: viewport.width, height: viewport.height });
+      for (const language of languages) {
+        await openTestPage();
+        await page.locator(`.langtog button[data-lang="${language.name}"]`).click();
+        await waitFor(expected => document.documentElement.lang === expected, language.htmlLang);
+        await sendText('你好');
+        await waitForAssistantText('固定回复');
+        await waitFor(() =>
+          document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
+        /* 390×844 下页头换行会让面板比视口高（实测中文 27px、英文 43px），底栏
+           会被裁掉一截；截图前滚到文档底部，让固定底栏完整入镜（页面本身可滚动，
+           不改生产布局）。 */
+        if (viewport.width < 640) {
+          await page.evaluate(() =>
+            window.scrollTo(0, document.documentElement.scrollHeight - window.innerHeight));
+          await page.waitForTimeout(100);
+        }
+        await screenshot(`test-chat-${language.name}-${viewport.name}.png`);
+      }
+    }
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 960 });
   }
 });
 

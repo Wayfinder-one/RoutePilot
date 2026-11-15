@@ -2,12 +2,13 @@
    ------------------------------------------------------------------
    本文件只保留：服务启动（Node mock + `python -m router` 子进程）、浏览器、
    管理面 API、用例注册器/执行器、共享断言助手与 teardown。页面用例分别位于
-   scripts/console_qa/{canvas,inspector,tryrun,logs,models}.mjs，各模块只调用
+   scripts/console_qa/{canvas,inspector,tryrun,logs,models,testchat}.mjs，各模块只调用
    本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
 
    console_qa.mjs 顶部保留的 9 条用例是基座自检（健康检查 / 原生 ESM / 单模块入口 /
    登录页语言开关 / mock wire shape / mock 故障注入 / mock 上游 OpenAI 格式 /
-   bootstrap 目录与初始图 / 真实 /admin/try），不属于任何页面模块。
+   bootstrap 目录与初始图 / 真实 /admin/try），不属于任何页面模块；首页「测试」
+   对话页的对话、渲染与附件用例注册在 testchat.mjs。
 
    Usage: node scripts/console_qa.mjs            # 全量（= npm run check:console）
           QA_ONLY=<regex> node scripts/console_qa.mjs

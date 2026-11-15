@@ -69,18 +69,29 @@ flowchart LR
 
 ## 控制台
 
-![概览](assets/routepilot/zh/overview.png)
+![测试](assets/routepilot/zh/test.png)
 
 每个页面只有一个 `<script type="module">` 入口，无应用全局变量，无 CommonJS。
 
 | 页面 | 内容 |
 |---|---|
-| 概览 | 请求量、路由分布、JEV 置信度、粘性命中、当前启用决策组 |
+| 测试 | 仅管理员可用的模型测试对话：Auto 路由或固定模型、SSE 流式、内存内多轮历史、图片/文本/音频/文件附件、安全多模态渲染 |
 | 决策组 | 画布编辑、图设置、检查器、校验、试算、导入导出 |
 | 计算日志 | 最近决策的模型、目标、候选、波次、JEV 概率、推理档位、上游结果与可回放轨迹 |
 | JEV 模型 | 端点、模型、提示词与状态模板、连通性测试、上下文与输入 token 窗口 |
 | 模型 | 模型注册表、上游模型 id、提供方、推理声明、能力说明 |
 | 用户 | 管理员/只读账号、密码、角色、状态 |
+
+### 模型测试对话
+
+首页（`/console/index.html`）是仅管理员可用的模型测试对话，请求发往 `/admin/test/chat/completions`，并把响应头 `x-sr-model` / `x-sr-selection` 显示为消息元信息。
+
+- **Auto 与固定模型**：Auto 与 `/v1/chat/completions` 一样评估当前路由快照（决策图、JEV 波次、粘性与负载均衡后端选择）；选择已配置的模型 ID 时跳过决策图与 JEV，返回 `x-sr-selection: direct`。
+- **流式回复**：回答通过 SSE 逐块返回；停止会中止流并保留已生成内容，复制 / 重试 / 重新生成作用于该条消息。
+- **多轮历史**：内存中的对话以 wire-format `messages` 重发；新建对话清空对话并轮换会话 id。
+- **附件**：图片、文本、音频与通用文件在浏览器内读成 data URL 后作为 content part 发送；包含历史与 Base64 的完整 JSON 请求体必须保持在 10 MiB 限制内。
+- **多模态输出**：文本按安全 Markdown 渲染；图片、音频、视频与文件使用原生播放器或下载链接；未知 part 折叠为可检查的 JSON。模型提供的 HTML 只作为文本显示，活动 URL scheme 被丢弃，不会执行。
+- **仅内存**：对话与附件只存在于页面中，刷新即清空，服务端不保存聊天历史与上传文件。
 
 ### 编辑区与执行区
 
@@ -304,6 +315,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 决策组 |
 | `POST /admin/trees/{id}/copy`、`/enable`、`/disable` | 组生命周期 |
 | `POST /admin/try` | 针对草稿图的试算 |
+| `POST /admin/test/chat/completions` | 仅管理员的模型测试对话；JSON 或 SSE |
 | `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 模型注册表 |
 | `GET /admin/model-catalog`、`POST /admin/fetch-models` | 提供方预设、上游模型发现 |
 | `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 提供方 |

@@ -69,18 +69,29 @@ Boundaries:
 
 ## Console
 
-![Overview](assets/routepilot/en/overview.png)
+![Test](assets/routepilot/en/test.png)
 
 One `<script type="module">` entry per page, no application globals, no CommonJS.
 
 | Page | Content |
 |---|---|
-| Overview | Request volume, route distribution, JEV confidence, sticky hits, active decision group |
+| Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
 | Decision groups | Canvas editor, graph settings, inspector, validation, dry run, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
 | JEV Model | Endpoint, model, prompt/state template, connection test, context and input-token window |
 | Models | Model registry, upstream model ids, providers, reasoning declarations, capability notes |
 | Users | Admin/viewer accounts, passwords, roles, status |
+
+### Model test chat
+
+The home page (`/console/index.html`) is an admin-only model test chat. It posts to `/admin/test/chat/completions` and shows the `x-sr-model` / `x-sr-selection` response headers as message metadata.
+
+- **Auto or fixed model** — Auto evaluates the current routing snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. Choosing a configured model ID skips the graph and JEV and returns `x-sr-selection: direct`.
+- **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message.
+- **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`; New Chat clears the conversation and rotates the session id.
+- **Attachments** — image, text, audio and generic files are read to data URLs in the browser and sent as content parts. The whole JSON body, including history and Base64, must stay within the 10 MiB request limit.
+- **Multimodal output** — text renders as safe Markdown; images, audio, video and files use native players or download links; unknown parts stay folded as inspectable JSON. Model-provided HTML is shown as text and active URL schemes are dropped, so nothing executes.
+- **Memory only** — conversations and attachments live in the page; a refresh clears them, and the server stores neither chat history nor uploaded files.
 
 ### Editor and execution zone
 
@@ -304,6 +315,7 @@ The first start against an empty users table seeds the admin account.
 | `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | Decision groups |
 | `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Group lifecycle |
 | `POST /admin/try` | Dry run against a draft graph |
+| `POST /admin/test/chat/completions` | Admin-only model test chat; JSON or SSE |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry |
 | `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets, upstream model discovery |
 | `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Providers |

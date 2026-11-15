@@ -1,6 +1,6 @@
 /* RoutePilot console — Routing Workbench design (direction B).
-   Light, dense, tool-like. Shared by overview / pipeline / logs / signals /
-   models pages. No build step: pure CSS + vanilla JS, served by FastAPI. */
+   Light, dense, tool-like. Shared by test / routing / logs / JEV / models /
+   users / login pages. No build step: pure CSS + vanilla JS, served by FastAPI. */
 :root{
   --bg:#f5f6f8; --panel:#ffffff; --panel-2:#fbfbfc; --line:#e6e8ec; --line-2:#d7dbe2;
   --text:#14171d; --text-2:#5b6270; --text-3:#8b93a1;
