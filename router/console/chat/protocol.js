@@ -1,8 +1,9 @@
-/* Chat 附件协议与请求体积守卫 · 纯函数模块
+/* Chat 附件协议、请求体积守卫与增量归并 · 纯函数模块
    ------------------------------------------------------------------
    浏览器与 Node 共用的无副作用工具：不读 DOM、不发请求、不读文件。
    attachmentPart 把内存里的附件描述映射成 OpenAI 兼容 content part；
    normalizeContent 把响应/历史里各种形态的 content 归一成渲染层统一结构；
+   appendDelta 把流式 delta 归并进已归一化的 part 数组（相邻文本合并）；
    requestBytes 用完整 JSON 信封的 UTF-8 字节数做前端体积上限判断。
    ------------------------------------------------------------------ */
 
@@ -66,4 +67,15 @@ export function normalizeContent(content) {
     }
     return { type: 'unknown', value: part };
   });
+}
+
+export function appendDelta(parts, delta) {
+  const next = parts.map(part => ({ ...part }));
+  const incoming = normalizeContent(delta && delta.content);
+  incoming.forEach(part => {
+    const last = next[next.length - 1];
+    if (part.type === 'text' && last && last.type === 'text') last.text += part.text;
+    else next.push(part);
+  });
+  return next;
 }
