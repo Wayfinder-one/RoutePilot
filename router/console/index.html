@@ -3,34 +3,48 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RoutePilot · 概览</title>
+<title>RoutePilot · 测试</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="shared.css">
+<link rel="stylesheet" href="test.css">
 </head>
-<body data-page="overview">
-<div class="pagehead">
+<body data-page="test">
+<div class="pagehead tc-pagehead">
   <div>
-    <div class="crumb" data-i18n="nav.overview"></div>
-    <h1><span data-i18n="nav.overview"></span><span class="sub" data-i18n="ov.sub"></span></h1>
+    <div class="crumb" data-i18n="nav.test"></div>
+    <h1><span data-i18n="nav.test"></span><span class="sub" data-i18n="test.sub"></span></h1>
   </div>
+  <div class="headmeta"><button class="btn sm" id="testNew" data-i18n="test.new"></button></div>
 </div>
-<main class="page">
-  <div class="grid4" id="cards"></div>
-  <div class="grid2">
-    <div class="card">
-      <div class="col-h" data-i18n="ov.routes"></div>
-      <div id="routes"></div>
+<main class="tc-shell">
+  <section class="tc-panel" aria-label="Model test chat">
+    <header class="tc-topline">
+      <select id="testModel" aria-label="Model"></select>
+      <span class="mut" id="testStatus"></span>
+    </header>
+    <div class="tc-messages" id="testMessages" aria-live="polite">
+      <div class="tc-empty" id="testEmpty">
+        <h2 data-i18n="test.emptyTitle"></h2>
+        <p data-i18n="test.emptyBody"></p>
+        <div class="tc-samples">
+          <button class="tc-sample" data-i18n="test.sample1"></button>
+          <button class="tc-sample" data-i18n="test.sample2"></button>
+          <button class="tc-sample" data-i18n="test.sample3"></button>
+        </div>
+      </div>
     </div>
-    <div class="card" id="engineCard"></div>
-  </div>
-  <div class="grid2" style="margin-top:12px">
-    <div class="card">
-      <div class="col-h"><span data-i18n="ov.confidence"></span><span class="mut" id="confSince" style="font-size:10.5px;font-weight:400"></span></div>
-      <div id="conf"></div>
-    </div>
-    <div class="card" id="routingCard"></div>
-  </div>
+    <footer class="tc-composer">
+      <div class="tc-attachments" id="testFiles"></div>
+      <textarea id="testInput" rows="1" data-i18n-placeholder="test.placeholder"></textarea>
+      <div class="tc-composer-row">
+        <input id="testFileInput" type="file" multiple hidden>
+        <button class="btn sm" id="testAttach" data-i18n="test.attach"></button>
+        <span class="mut" data-i18n="test.shortcuts"></span>
+        <button class="btn pri sm" id="testSend" data-i18n="test.send"></button>
+      </div>
+    </footer>
+  </section>
 </main>
-<script type="module" src="overview.js"></script>
+<script type="module" src="test.js"></script>
 </body>
 </html>

@@ -142,4 +142,22 @@ test('test chat renderer renders markdown blocks and enforces safe media urls', 
   });
 });
 
+/* 计划 Task 5：首页从「概览」换成「测试」，导航、数据页标记与模型选择器都要
+   一次性到位。此用例在旧概览页上必然超时（没有 #testModel），所以先红后绿。 */
+test('test home replaces overview and lists Auto plus configured models', async () => {
+  await page.goto(routerBase + '/console/index.html');
+  /* 原生 <optgroup> 在 <select> 里没有布局盒，Playwright 的 visible 判定永远等不到；
+     这里等它 attached（同一断言意图：模型分组已渲染）。 */
+  await page.waitForSelector('#testModel optgroup', { state: 'attached' });
+  assert.equal(await page.locator('body').getAttribute('data-page'), 'test');
+  assert.equal(await page.locator('.top nav a.on').textContent(), '测试');
+  assert.equal(await page.locator('#testModel').inputValue(), 'auto');
+  assert.ok(await page.locator('#testModel option[value="qwen3-32b"]').count());
+  assert.equal(await page.locator('#cards').count(), 0);
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
+  await page.locator('#testModel').selectOption('auto');
+  assert.match(await page.locator('#testStatus').textContent(), /智能路由/);
+});
+
 await runIfMain(import.meta.url);

@@ -655,7 +655,7 @@ test('graph.js is served as a native ES module with a single module entry', asyn
 test('console pages each load through one native module entry', async () => {
   const pages = ['index.html', 'jev.html', 'logs.html', 'models.html', 'users.html', 'login.html'];
   const markers = {
-    'index.html': '#cards .statcard',
+    'index.html': '#testModel',
     'jev.html': '#jevStatus',
     'logs.html': '#countPill',
     'models.html': '#modelTable tr',
@@ -679,11 +679,11 @@ test('console pages each load through one native module entry', async () => {
   }
   /* 语言开关不再依赖 inline onclick：模块绑定的按钮必须真的切换文案。 */
   await page.goto(routerBase + '/console/index.html');
-  await page.waitForSelector('#cards .statcard');
+  await page.waitForSelector('#testModel');
   await page.locator('.langtog button[data-lang="en"]').click();
   await waitFor(() => document.documentElement.lang === 'en');
   const english = await page.evaluate(() => document.querySelector('.top nav a').textContent.trim());
-  assert.equal(english, 'Overview', 'language toggle did not repaint the nav');
+  assert.equal(english, 'Test', 'language toggle did not repaint the nav');
   await page.locator('.langtog button[data-lang="zh"]').click();
   await waitFor(() => document.documentElement.lang === 'zh-CN');
 });

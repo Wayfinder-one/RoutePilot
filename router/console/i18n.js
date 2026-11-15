@@ -3,8 +3,6 @@ const I18N = {
   zh: {
     'app.title': 'RoutePilot',
     'nav.routing': '决策组', 'nav.jev': 'JEV 模型',
-    'ov.sticky': '粘性命中', 'ov.treeCount': '决策组数量', 'ov.go.jev': '配置 JEV →',
-    'ov.go.routing': '编辑决策组 →', 'ov.activeTree': '当前决策组',
     'jev.sub': '独立 NeoHorse / vLLM systemone 决策服务',
     'jev.config': '服务配置', 'jev.url': '服务地址', 'jev.model': '模型名',
     'jev.key': 'API 密钥', 'jev.timeout': '超时（秒）', 'jev.clearKey': '清除已存密钥并改用环境变量',
@@ -12,19 +10,34 @@ const I18N = {
     'jev.test': '连接测试', 'jev.testHint': '使用两个固定候选验证真实 HTTP 调用，不修改分流状态。',
     'jev.testRun': '测试连接', 'jev.keyKeep': '留空则保留现有密钥',
     'jev.keyEmpty': '可选；也可使用 ROUTER_JEV_API_KEY', 'jev.unconfigured': '未配置',
-    'nav.overview': '概览', 'nav.logs': '计算日志',
+    'nav.test': '测试', 'nav.logs': '计算日志',
     'nav.models': '模型',
     'nav.users': '用户管理', 'nav.logout': '退出', 'nav.service': '服务令牌',
     'common.save': '保存',
     'common.loading': '加载中…', 'common.saved': '已保存',
     'api.timeout': '请求超时（{seconds} 秒）：{path}',
     'common.cancel': '取消', 'common.close': '关闭', 'common.none': '无',
-    /* ── overview ── */
-    'ov.sub': '线上流量、JEV 置信度与调度结果一屏掌握',
-    'ov.total': '总请求',
-    'ov.dailyavg': '近 14 天日均', 'ov.routes': '分流分布', 'ov.empty': '暂无请求',
-    'ov.confidence': 'JEV 最高概率分布',
-    'ov.go.logs': '查看计算日志 →',
+    /* ── model test chat (2026-11-15 · index.html) ── */
+    'test.sub': '选 Auto 智能路由或固定模型，验证真实对话效果',
+    'test.new': '新建对话',
+    'test.auto': 'Auto · 智能路由',
+    'test.autoStatus': 'Auto · 智能路由',
+    'test.directStatus': '固定模型 · 跳过 JEV 决策与粘性路由',
+    'test.direct': '固定模型',
+    'test.emptyTitle': '开始测试模型',
+    'test.emptyBody': '选 Auto 走线上智能路由，或固定一个已配置模型。对话与附件只存在内存里，刷新即清空。',
+    'test.sample1': '用三句话解释什么是智能路由。',
+    'test.sample2': '把下面这句话翻译成英文：今天的请求量比昨天高。',
+    'test.sample3': '写一个 Python 函数，判断字符串是不是回文。',
+    'test.placeholder': '输入消息，Enter 发送，Shift+Enter 换行',
+    'test.attach': '附件',
+    'test.send': '发送', 'test.stop': '停止',
+    'test.shortcuts': 'Enter 发送 · Shift+Enter 换行 · 支持图片 / 音频 / 文件',
+    'test.copy': '复制', 'test.retry': '重试', 'test.regenerate': '重新生成',
+    'test.uploadFail': '读取附件失败，请重试',
+    'test.tooLarge': '请求体超过 10 MB 上限，请减少附件或历史消息',
+    'test.adminOnly': '只有管理员可以测试模型',
+    'test.incomplete': '未完成（流被中断）', 'test.stopped': '已停止',
     /* ── logs (calculation log · staged view) ── */
     'logs.sub': '事件驱动的决策路径 · 最近 20 条（仅内存）',
     'logs.refresh': '刷新', 'logs.empty': '还没有请求。去决策组试算，或通过 /v1/chat/completions 发一条请求。',
@@ -471,8 +484,6 @@ const I18N = {
   en: {
     'app.title': 'RoutePilot',
     'nav.routing': 'Decision groups', 'nav.jev': 'JEV Model',
-    'ov.sticky': 'Sticky hits', 'ov.treeCount': 'Decision groups', 'ov.go.jev': 'Configure JEV →',
-    'ov.go.routing': 'Edit decision group →', 'ov.activeTree': 'Active decision group',
     'jev.sub': 'Standalone NeoHorse / vLLM systemone decision service',
     'jev.config': 'Service configuration', 'jev.url': 'Base URL', 'jev.model': 'Model name',
     'jev.key': 'API key', 'jev.timeout': 'Timeout (seconds)', 'jev.clearKey': 'Clear the stored key and use the environment variable',
@@ -480,19 +491,34 @@ const I18N = {
     'jev.test': 'Connection test', 'jev.testHint': 'Uses two fixed candidates for a real HTTP call without changing routing state.',
     'jev.testRun': 'Test connection', 'jev.keyKeep': 'Leave empty to keep the current key',
     'jev.keyEmpty': 'Optional; ROUTER_JEV_API_KEY also works', 'jev.unconfigured': 'Not configured',
-    'nav.overview': 'Overview', 'nav.logs': 'Calc Log',
+    'nav.test': 'Test', 'nav.logs': 'Calc Log',
     'nav.models': 'Models',
     'nav.users': 'Users', 'nav.logout': 'Sign out', 'nav.service': 'service token',
     'common.save': 'Save',
     'common.loading': 'Loading…', 'common.saved': 'Saved',
     'api.timeout': 'Request timed out after {seconds}s: {path}',
     'common.cancel': 'Cancel', 'common.close': 'Close', 'common.none': 'none',
-    /* ── overview ── */
-    'ov.sub': 'Traffic, JEV confidence and scheduling outcomes at a glance',
-    'ov.total': 'Total requests',
-    'ov.dailyavg': '14-day daily avg', 'ov.routes': 'Route distribution', 'ov.empty': 'No requests yet',
-    'ov.confidence': 'JEV top-probability distribution',
-    'ov.go.logs': 'Open calculation log →',
+    /* ── model test chat (2026-11-15 · index.html) ── */
+    'test.sub': 'Use Auto smart routing or a fixed model to test a real conversation',
+    'test.new': 'New chat',
+    'test.auto': 'Auto · Smart routing',
+    'test.autoStatus': 'Auto · Smart routing',
+    'test.directStatus': 'Fixed model · JEV decision and sticky routing skipped',
+    'test.direct': 'fixed model',
+    'test.emptyTitle': 'Start testing a model',
+    'test.emptyBody': 'Use Auto for live smart routing, or pin a configured model. Messages and attachments live in memory only and vanish on refresh.',
+    'test.sample1': 'Explain smart routing in three sentences.',
+    'test.sample2': 'Translate into English: today’s request volume is higher than yesterday’s.',
+    'test.sample3': 'Write a Python function that checks whether a string is a palindrome.',
+    'test.placeholder': 'Type a message — Enter to send, Shift+Enter for a newline',
+    'test.attach': 'Attach',
+    'test.send': 'Send', 'test.stop': 'Stop',
+    'test.shortcuts': 'Enter to send · Shift+Enter for a newline · images / audio / files supported',
+    'test.copy': 'Copy', 'test.retry': 'Retry', 'test.regenerate': 'Regenerate',
+    'test.uploadFail': 'Could not read the attachment; please retry',
+    'test.tooLarge': 'The request body exceeds the 10 MB limit; trim attachments or history',
+    'test.adminOnly': 'Only admins can test models',
+    'test.incomplete': 'Incomplete (the stream was cut off)', 'test.stopped': 'Stopped',
     /* ── logs (calculation log · staged view) ── */
     'logs.sub': 'Event-driven decision path · last 20 (memory only)',
     'logs.refresh': 'Refresh', 'logs.empty': 'No requests yet. Try in the decision group, or send one via /v1/chat/completions.',
@@ -970,6 +996,9 @@ function setLang(l) {
     });
     document.querySelectorAll('[data-i18n-title]').forEach(el => {
       el.title = t(el.dataset.i18nTitle);
+    });
+    document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+      el.setAttribute('placeholder', t(el.dataset.i18nPlaceholder));
     });
     document.querySelectorAll('.langtog button').forEach(b =>
       b.classList.toggle('on', b.dataset.lang === l));

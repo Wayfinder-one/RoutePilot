@@ -12,13 +12,13 @@ import { api } from './api.js';
 import { LANG, onLangChange, setLang, t } from './i18n.js';
 
 const page = document.body.dataset.page;
-  const pages = ['overview', 'routing', 'logs', 'jev', 'models'];
+  const pages = ['test', 'routing', 'logs', 'jev', 'models'];
   const bar = document.createElement('header');
   bar.className = 'top';
   bar.innerHTML =
     `<a class="brand" href="index.html"><span class="mark">SR</span><span data-i18n="app.title"></span></a>
      <nav>${pages.map(p =>
-       `<a href="${p === 'overview' ? 'index' : p}.html"
+       `<a href="${p === 'test' ? 'index' : p}.html"
            class="${p === page ? 'on' : ''}" data-i18n="nav.${p}"></a>`).join('')}
    <a href="users.html" id="navUsers" class="${page === 'users' ? 'on' : ''}"
       data-i18n="nav.users" hidden></a></nav>
