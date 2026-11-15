@@ -349,25 +349,36 @@ test('test chat auto routing streams the fixed reply', async () => {
   assert.equal(await page.evaluate(() => window.__copyFallbacks), 1,
     'Copy must fall back to execCommand when the Clipboard API is unavailable');
 
-  /* F2：390×844 窄屏（中文页头换行）下底栏必须完整可见且整页不需滚动。 */
-  await page.setViewportSize({ width: 390, height: 844 });
+  /* F2/F3：窄屏（手机 390×844）+ 中档（800×900，shared.css 页头换行断点内）
+     + 桌面（1440×1000）三档都必须首屏装下底栏且整页不滚动；桌面尺寸与旧布局一致。 */
+  const fitBands = [
+    { name: '390x844', width: 390, height: 844 },
+    { name: '800x900', width: 800, height: 900 },
+    { name: '1440x1000', width: 1440, height: 1000 },
+  ];
   try {
-    const fit = await page.evaluate(() => {
-      const composer = document.querySelector('.tc-composer');
-      const panel = document.querySelector('.tc-panel');
-      return {
-        innerHeight: window.innerHeight,
-        composerBottom: Math.round(composer.getBoundingClientRect().bottom),
-        panelBottom: Math.round(panel.getBoundingClientRect().bottom),
-        scrollHeight: document.documentElement.scrollHeight,
-      };
-    });
-    assert.ok(fit.composerBottom <= fit.innerHeight,
-      `composer must be above the fold at 390x844 (bottom ${fit.composerBottom} > ${fit.innerHeight})`);
-    assert.ok(fit.panelBottom <= fit.innerHeight,
-      `panel must fit at 390x844 (bottom ${fit.panelBottom} > ${fit.innerHeight})`);
-    assert.ok(fit.scrollHeight <= fit.innerHeight,
-      `mobile page must not scroll at 390x844 (scrollHeight ${fit.scrollHeight})`);
+    for (const band of fitBands) {
+      await page.setViewportSize({ width: band.width, height: band.height });
+      const fit = await page.evaluate(() => {
+        const composer = document.querySelector('.tc-composer');
+        const panel = document.querySelector('.tc-panel');
+        return {
+          innerHeight: window.innerHeight,
+          scrollY: window.scrollY,
+          composerBottom: Math.round(composer.getBoundingClientRect().bottom),
+          panelBottom: Math.round(panel.getBoundingClientRect().bottom),
+          scrollHeight: document.documentElement.scrollHeight,
+        };
+      });
+      const label = band.name;
+      assert.equal(fit.scrollY, 0, `${label} must not be scrolled on load`);
+      assert.ok(fit.composerBottom <= fit.innerHeight + 1,
+        `${label}: composer must be above the fold (bottom ${fit.composerBottom} > ${fit.innerHeight})`);
+      assert.ok(fit.panelBottom <= fit.innerHeight + 1,
+        `${label}: panel must fit (bottom ${fit.panelBottom} > ${fit.innerHeight})`);
+      assert.ok(fit.scrollHeight <= fit.innerHeight + 1,
+        `${label}: page must not scroll (scrollHeight ${fit.scrollHeight} > ${fit.innerHeight})`);
+    }
   } finally {
     await page.setViewportSize({ width: 1440, height: 960 });
   }

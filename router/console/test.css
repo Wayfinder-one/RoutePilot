@@ -73,9 +73,10 @@
 .tc-file{display:inline-flex;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}
 /* 拖拽悬停态：Task 6 在 .tc-panel 上切这个类 */
 .tc-panel.is-dragover{outline:2px dashed var(--indigo-line);outline-offset:-7px}
-@media(max-width:640px){
-  /* 窄屏页头会换行（zh 页头 145px / en 161px），写死 100vh-170px 会把底栏顶出屏幕。
-     改成 body 列 flex + 面板 flex:1：高度由页头实际高度决定，任何语言都不需要滚动。 */
+/* 与 shared.css 的页头换行断点一致：≤900px 时 pagehead 变成两行（.headmeta 独占
+   一行），写死 100vh-137px 会把底栏顶出屏幕，因此从 900px 起就用列 flex 让面板
+   吃掉页头之后的剩余高度；高度由页头实际高度决定，任何语言都不需要滚动。 */
+@media(max-width:900px){
   body[data-page="test"]{display:flex;flex-direction:column;height:100vh;height:100dvh}
   /* 列 flex 的主轴是纵向、交叉轴是横向：子项默认 min-width:auto 会被内容撑宽，
      窄屏下会把面板顶部/底栏横向推出视口，必须显式允许收缩。 */
@@ -86,6 +87,9 @@
   /* margin:0 auto 的自动横向外边距会让 flex 拉伸失效（宽度变成 max-content 而溢出），
      窄屏显式给满宽并取消自动外边距。 */
   body[data-page="test"] .tc-shell{flex:1;min-height:0;height:auto;margin:0;width:100%;max-width:none}
+}
+/* 手机档位：只保留纯手机的文字/间距收敛，不再参与高度计算。 */
+@media(max-width:640px){
   .tc-shell{padding:0 10px 10px}
   .tc-messages{padding:16px}
   .tc-composer-row .mut{display:none}
