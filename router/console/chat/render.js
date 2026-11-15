@@ -50,6 +50,32 @@ function inlineNodes(text) {
   return nodes;
 }
 
+/* 非安全上下文（如普通 http 部署）里 navigator.clipboard 不存在：围栏代码的
+   Copy 按钮与 test.js 的消息级复制同一策略，clipboard API 不可用时退化为临时
+   textarea + execCommand。复制失败只影响剪贴板，绝不让点击变成未捕获页面错误。 */
+function copyText(text) {
+  if (typeof navigator !== 'undefined' && navigator.clipboard &&
+      typeof navigator.clipboard.writeText === 'function') {
+    navigator.clipboard.writeText(text).catch(() => {});
+    return;
+  }
+  const helper = document.createElement('textarea');
+  helper.value = text;
+  helper.setAttribute('readonly', '');
+  helper.style.position = 'fixed';
+  helper.style.top = '-1000px';
+  helper.style.opacity = '0';
+  try {
+    document.body.append(helper);
+    helper.select();
+    document.execCommand('copy');
+  } catch (error) {
+    /* 无权限 / 无 execCommand：静默 */
+  } finally {
+    helper.remove();
+  }
+}
+
 function renderMarkdown(source) {
   const root = document.createElement('div');
   root.className = 'tc-markdown';
@@ -74,7 +100,7 @@ function renderMarkdown(source) {
       const code = document.createElement('code');
       if (fence[1]) code.className = `language-${fence[1]}`;
       code.textContent = body.join('\n');
-      copy.addEventListener('click', () => navigator.clipboard.writeText(code.textContent));
+      copy.addEventListener('click', () => copyText(code.textContent));
       pre.append(code);
       wrap.append(copy, pre);
       root.append(wrap);

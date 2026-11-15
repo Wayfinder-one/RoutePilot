@@ -37,6 +37,8 @@ const I18N = {
     'test.uploadFail': '读取附件失败，请重试',
     'test.tooLarge': '请求体超过 10 MB 上限，请减少附件或历史消息',
     'test.adminOnly': '只有管理员可以测试模型',
+    'test.noModels': '还没有已配置的模型',
+    'test.goModels': '前往模型页 →',
     'test.incomplete': '未完成（流被中断）', 'test.stopped': '已停止',
     /* ── logs (calculation log · staged view) ── */
     'logs.sub': '事件驱动的决策路径 · 最近 20 条（仅内存）',
@@ -518,6 +520,8 @@ const I18N = {
     'test.uploadFail': 'Could not read the attachment; please retry',
     'test.tooLarge': 'The request body exceeds the 10 MB limit; trim attachments or history',
     'test.adminOnly': 'Only admins can test models',
+    'test.noModels': 'No configured models yet',
+    'test.goModels': 'Open Models →',
     'test.incomplete': 'Incomplete (the stream was cut off)', 'test.stopped': 'Stopped',
     /* ── logs (calculation log · staged view) ── */
     'logs.sub': 'Event-driven decision path · last 20 (memory only)',

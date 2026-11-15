@@ -97,7 +97,8 @@ const api = {
       const data = await response.json().catch(() => ({}));
       const error = new Error(response.status);
       error.status = response.status;
-      error.detail = data.detail || data.error;
+      /* 数据面错误是 {error:{message}}，管理面是 {detail}；统一抽出人读文本。 */
+      error.detail = data.detail || (data.error && data.error.message) || data.error;
       throw error;
     }
     return response;

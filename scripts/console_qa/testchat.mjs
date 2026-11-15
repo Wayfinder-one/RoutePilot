@@ -1,11 +1,16 @@
-/* RoutePilot 控制台 QA · 测试对话页安全渲染用例（计划 Task 4）
+/* RoutePilot 控制台 QA · 模型测试对话页（计划 Task 4–8）
    ------------------------------------------------------------------
    本文件只注册用例，不启动服务，也不持有页面状态：真实 router、浏览器、
    mock 上游与 teardown 全部由 ../console_qa.mjs 提供（同一进程内顺序执行）。
-   覆盖：文本 Markdown → DOM（标题/段落/列表/表格/链接/行内代码/围栏代码 +
-   Copy 按钮）、恶意 HTML 与活动 URL 不执行、图片/音频/视频/文件媒体分派、
-   未知 part 折叠 JSON、safeMediaUrl 的 scheme 白名单。
-   入口：`QA_ONLY="test chat renderer" node scripts/console_qa/testchat.mjs`；
+   覆盖：
+   * Task 4 安全渲染：Markdown → DOM、恶意 HTML/活动 URL 不执行、
+     图片/音频/视频/文件分派、未知 part 折叠、safeMediaUrl 白名单；
+   * Task 5 首页壳：Test 导航、模型目录、Auto/固定模型状态；
+   * Task 6 附件：选择/拖拽/粘贴、chip 预览与移除、空文本 + 附件可发送；
+   * Task 7 流式：Auto/固定模型、多轮历史、附件 wire 形状、多模态 part、
+     Stop、内联错误 + Retry、提前 EOF（未完成）、New Chat 中止与会话轮换；
+   * Task 8 首页截图（仅在 QA_SCREENSHOTS=1 时执行）。
+   入口：`QA_ONLY="test chat" node scripts/console_qa/testchat.mjs`；
          全量：`node scripts/console_qa.mjs`（已在该文件 main() 中注册）。
    ------------------------------------------------------------------ */
 
@@ -79,6 +84,27 @@ test('test chat renderer supports markdown and blocks active content', async () 
     downloadHref: 'data:application/pdf;base64,AA==',
     audioSrc: 'data:audio/mpeg;base64,AA==', unknownFolded: true, pwned: 0,
   });
+
+  /* F1：围栏代码的 Copy 按钮在 Clipboard API 不可用时也必须安全（不能抛 pageerror）。
+     render.js 的浏览器端兜底由 renderer 负责人并行修复；这里捕获窗口级 error 作为
+     明确断言，harness 的 pageerror 守卫仍会兜底整轮失败。 */
+  const rendererCopyErrors = await page.evaluate(async () => {
+    const { renderParts } = await import('/console/chat/render.js');
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    const captured = [];
+    const onError = event => captured.push(String(event.message || (event.error && event.error.message) || event));
+    window.addEventListener('error', onError);
+    const host = document.createElement('div');
+    document.body.append(host);
+    renderParts(host, [{ type: 'text', text: '```js\nconst x = 1;\n```' }]);
+    host.querySelector('.tc-code button').click();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    window.removeEventListener('error', onError);
+    host.remove();
+    return captured;
+  });
+  assert.deepEqual(rendererCopyErrors, [],
+    'renderer Copy must not throw when the Clipboard API is unavailable');
 });
 
 test('test chat renderer renders markdown blocks and enforces safe media urls', async () => {
@@ -175,7 +201,6 @@ test('test home replaces overview and lists Auto plus configured models', async 
    先红后绿：Task 5 的壳还没有任何附件处理器。 */
 const QA_PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 const QA_MARKDOWN = '# QA\n\nhello attachment\n';
-const chipCount = () => document.querySelectorAll('#testFiles .tc-chip').length;
 
 test('test chat attachments add, remove, drop and paste', async () => {
   await page.goto(routerBase + '/console/index.html');
@@ -280,8 +305,12 @@ test('test chat auto routing streams the fixed reply', async () => {
   const lastCall = mockState.chatCalls.at(-1);
   assert.equal(lastCall.stream, true);
   assert.equal(lastCall.messages.at(-1).role, 'user');
-  assert.ok(typeof lastCall.model === 'string' && lastCall.model.length > 0,
-    'upstream body must carry the routed upstream model');
+  /* Auto 必须落到具体上游（不是 "auto"），且是 QA bootstrap 注册过的模型之一。 */
+  const routedModels = ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft', 'tierless-model'];
+  assert.notEqual(lastCall.model, 'auto', 'upstream body must carry a concrete model, not "auto"');
+  assert.match(lastCall.model, /^[a-z0-9.-]+$/);
+  assert.ok(routedModels.includes(lastCall.model),
+    `auto routing picked an unexpected upstream ${JSON.stringify(lastCall.model)}`);
   const meta = await page.locator('.tc-message.assistant .tc-message-meta').textContent();
   assert.match(meta, /^Auto → \S+$/);
   assert.ok(meta.includes(lastCall.model),
@@ -290,6 +319,58 @@ test('test chat auto routing streams the fixed reply', async () => {
   assert.deepEqual(actions, ['复制', '重新生成']);
   assert.match(await page.locator('#testStatus').textContent(), /智能路由/);
   assert.equal(await page.locator('#testInput').inputValue(), '');
+
+  /* I1：语言切换按 state.messages 重建消息区，动作按钮与元信息同步换语言。 */
+  await page.locator('.langtog button[data-lang="en"]').click();
+  await page.waitForFunction(() => document.documentElement.lang === 'en');
+  await waitFor(() => {
+    const labels = [...document.querySelectorAll('.tc-message.assistant .tc-message-actions button')]
+      .map(button => button.textContent);
+    return labels.length === 2 && labels[0] === 'Copy' && labels[1] === 'Regenerate';
+  });
+  assert.match(await page.locator('.tc-message.assistant .tc-message-meta').textContent(),
+    /^Auto → \S+$/);
+  await page.locator('.langtog button[data-lang="zh"]').click();
+  await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+  await waitFor(() => {
+    const labels = [...document.querySelectorAll('.tc-message.assistant .tc-message-actions button')]
+      .map(button => button.textContent);
+    return labels.length === 2 && labels[0] === '复制' && labels[1] === '重新生成';
+  });
+
+  /* F1：Copy 点击。Clipboard API 不可用时走 execCommand 兜底，且不得抛 pageerror。 */
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    window.__copyFallbacks = 0;
+    document.execCommand = () => { window.__copyFallbacks += 1; return true; };
+  });
+  await page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '复制' }).click();
+  await page.waitForTimeout(120);
+  assert.equal(await page.evaluate(() => window.__copyFallbacks), 1,
+    'Copy must fall back to execCommand when the Clipboard API is unavailable');
+
+  /* F2：390×844 窄屏（中文页头换行）下底栏必须完整可见且整页不需滚动。 */
+  await page.setViewportSize({ width: 390, height: 844 });
+  try {
+    const fit = await page.evaluate(() => {
+      const composer = document.querySelector('.tc-composer');
+      const panel = document.querySelector('.tc-panel');
+      return {
+        innerHeight: window.innerHeight,
+        composerBottom: Math.round(composer.getBoundingClientRect().bottom),
+        panelBottom: Math.round(panel.getBoundingClientRect().bottom),
+        scrollHeight: document.documentElement.scrollHeight,
+      };
+    });
+    assert.ok(fit.composerBottom <= fit.innerHeight,
+      `composer must be above the fold at 390x844 (bottom ${fit.composerBottom} > ${fit.innerHeight})`);
+    assert.ok(fit.panelBottom <= fit.innerHeight,
+      `panel must fit at 390x844 (bottom ${fit.panelBottom} > ${fit.innerHeight})`);
+    assert.ok(fit.scrollHeight <= fit.innerHeight,
+      `mobile page must not scroll at 390x844 (scrollHeight ${fit.scrollHeight})`);
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 960 });
+  }
 });
 
 test('test chat direct model keeps multi-turn history and skips JEV', async () => {
@@ -318,6 +399,39 @@ test('test chat direct model keeps multi-turn history and skips JEV', async () =
     'fixed model mode must not call the decision service');
   const metas = await page.locator('.tc-message.assistant .tc-message-meta').allTextContents();
   assert.deepEqual(metas, ['qwen3-32b · 固定模型', 'qwen3-32b · 固定模型']);
+  /* M10：旧回答只保留 Copy；Regenerate 只出现在最后一条 assistant 上。 */
+  const actionRows = await page.evaluate(() =>
+    [...document.querySelectorAll('.tc-message.assistant')].map(view =>
+      [...view.querySelectorAll('.tc-message-actions button')].map(button => button.textContent)));
+  assert.deepEqual(actionRows, [['复制'], ['复制', '重新生成']]);
+
+  /* F1：点击重新生成 —— 恰好一次真实上游调用，只替换最后一条 assistant。 */
+  const callsBeforeRegenerate = mockState.chatCalls.length;
+  const firstAnswer = await page.locator('.tc-message.assistant .tc-bubble').first().textContent();
+  await page.locator('.tc-message.assistant').last()
+    .locator('.tc-message-actions button', { hasText: '重新生成' }).click();
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    if (bubbles.length !== 2) return false;
+    const buttons = document.querySelectorAll('.tc-message.assistant .tc-message-actions button');
+    return bubbles[1].textContent.includes('固定回复') && buttons.length === 3;
+  });
+  assert.equal(mockState.chatCalls.length, callsBeforeRegenerate + 1,
+    'Regenerate must issue exactly one real upstream request');
+  const regenerateCall = mockState.chatCalls.at(-1);
+  assert.deepEqual(regenerateCall.messages.map(message => message.role),
+    ['user', 'assistant', 'user'], 'Regenerate must replay the wire-format history');
+  const afterRegenerate = await page.evaluate(() => ({
+    assistants: document.querySelectorAll('.tc-message.assistant').length,
+    firstAnswerText: document.querySelector('.tc-message.assistant .tc-bubble').textContent,
+    firstMeta: document.querySelector('.tc-message.assistant .tc-message-meta').textContent,
+    actionRows: [...document.querySelectorAll('.tc-message.assistant')].map(view =>
+      [...view.querySelectorAll('.tc-message-actions button')].map(button => button.textContent)),
+  }));
+  assert.equal(afterRegenerate.assistants, 2, 'Regenerate replaces only the last assistant');
+  assert.equal(afterRegenerate.firstAnswerText, firstAnswer, 'earlier answers stay untouched');
+  assert.equal(afterRegenerate.firstMeta, 'qwen3-32b · 固定模型');
+  assert.deepEqual(afterRegenerate.actionRows, [['复制'], ['复制', '重新生成']]);
 });
 
 test('test chat stream sends the attachment as image_url', async () => {
@@ -393,6 +507,15 @@ test('test chat stop preserves the partial stream', async () => {
   await waitFor(() => document.getElementById('testSend').textContent === '停止');
   assert.equal(await page.locator('#testInput').isDisabled(), true,
     'composer is locked while generating');
+  /* I1（生成中）：语言切换按已缓存的 parts 重建消息区，输入区不得解锁。 */
+  await page.locator('.langtog button[data-lang="en"]').click();
+  await page.waitForFunction(() => document.documentElement.lang === 'en');
+  assert.equal(await page.locator('#testInput').isDisabled(), true,
+    'language repaint must not unlock the composer mid-stream');
+  assert.match(await page.locator('.tc-message.assistant .tc-bubble').textContent(), /第一段/);
+  await page.locator('.langtog button[data-lang="zh"]').click();
+  await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+  await waitFor(() => document.getElementById('testSend').textContent === '停止');
   await page.locator('#testSend').click();
   await waitFor(() => {
     const stopped = document.querySelector('.tc-message.assistant .tc-message-actions .mut');
@@ -413,23 +536,52 @@ test('test chat stop preserves the partial stream', async () => {
   await page.waitForTimeout(1900);
   assert.doesNotMatch(await page.locator('.tc-message.assistant .tc-bubble').textContent(), /第二段/,
     'an aborted stream must not append later chunks');
+
+  /* M4：上游提前 EOF（没有 [DONE]）→ 未完成态，保留已收到的文本，不给完成动作。 */
+  await sendText('截断流');
+  await waitFor(() => {
+    const assistants = document.querySelectorAll('.tc-message.assistant');
+    const last = assistants[assistants.length - 1];
+    const mark = last && last.querySelector('.tc-message-actions .mut');
+    return Boolean(mark && mark.textContent === '未完成（流被中断）');
+  });
+  const incomplete = await page.evaluate(() => {
+    const assistants = document.querySelectorAll('.tc-message.assistant');
+    const last = assistants[assistants.length - 1];
+    return {
+      assistantCount: assistants.length,
+      text: last.querySelector('.tc-bubble').textContent,
+      mark: last.querySelector('.tc-message-actions .mut').textContent,
+      buttons: last.querySelectorAll('.tc-message-actions button').length,
+      send: document.getElementById('testSend').textContent,
+      inputDisabled: document.getElementById('testInput').disabled,
+    };
+  });
+  assert.equal(incomplete.mark, '未完成（流被中断）');
+  assert.match(incomplete.text, /截断回复/);
+  assert.equal(incomplete.buttons, 0, 'an incomplete stream offers no completed actions');
+  assert.equal(incomplete.send, '发送');
+  assert.equal(incomplete.inputDisabled, false);
+  assert.equal(incomplete.assistantCount, 2);
 });
 
 test('test chat retry after an inline admin error', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
-  /* 预期的 4xx 资源错误：先声明，再让路由只注入一次 422。 */
+  /* 一次性注入队列：先 422（管理面 {detail}），Retry 之后补一次 503（数据面
+     {error:{message}}）。中间与之后的请求都走真实 router -> mock 上游。 */
   expectHttpStatusError({ url: /\/admin\/test\/chat\/completions$/, status: /422/ });
+  expectHttpStatusError({ url: /\/admin\/test\/chat\/completions$/, status: /503/ });
   const routeMatcher = '**/admin/test/chat/completions';
-  let injected = false;
+  const pending = [{ status: 422, body: { detail: 'qa injected validation failure' } }];
   await page.route(routeMatcher, async route => {
-    if (injected) { await route.continue(); return; }
-    injected = true;
+    const injection = pending.shift();
+    if (!injection) { await route.continue(); return; }
     await route.fulfill({
-      status: 422,
+      status: injection.status,
       contentType: 'application/json',
-      body: JSON.stringify({ detail: 'qa injected validation failure' }),
+      body: JSON.stringify(injection.body),
     });
   });
   try {
@@ -438,7 +590,7 @@ test('test chat retry after an inline admin error', async () => {
       const error = document.querySelector('.tc-message.assistant .tc-error');
       return Boolean(error && error.textContent.includes('qa injected validation failure'));
     });
-    const retry = page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '重试' });
+    let retry = page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '重试' });
     assert.equal(await retry.count(), 1);
     assert.equal(await page.locator('.tc-message.assistant .tc-error').count(), 1);
     await retry.click();
@@ -451,6 +603,32 @@ test('test chat retry after an inline admin error', async () => {
     assert.equal(await page.locator('.tc-message.assistant .tc-error').count(), 0);
     assert.equal(await page.locator('.tc-message.assistant').count(), 1,
       'Retry removes only the failed assistant');
+
+    /* M6：数据面 {error:{message}} 形状 -> 内联文本是 message 本身，不是 JSON 串。 */
+    pending.push({ status: 503, body: { error: { message: 'qa upstream unavailable' } } });
+    await sendText('再触发错误');
+    await waitFor(() => {
+      const error = document.querySelector('.tc-message.assistant .tc-error');
+      return Boolean(error && error.textContent.includes('qa upstream unavailable'));
+    });
+    const upstreamError = await page.locator('.tc-message.assistant .tc-error').textContent();
+    assert.equal(upstreamError, 'qa upstream unavailable',
+      'admin error text must not be JSON-stringified');
+    assert.doesNotMatch(upstreamError, /\{.*\}/);
+    retry = page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '重试' });
+    assert.equal(await retry.count(), 1);
+    await retry.click();
+    /* 旧的成功回答保留，只替换失败的那一条。 */
+    await waitFor(() => {
+      const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+      const last = bubbles[bubbles.length - 1];
+      return bubbles.length === 2 && last.textContent.includes('固定回复') &&
+        !document.querySelector('.tc-message.assistant .tc-error');
+    });
+    assert.equal(mockState.chatCalls.length, chatCallsBefore + 2,
+      'both retries must issue real upstream requests');
+    assert.equal(await page.locator('.tc-message.assistant').count(), 2,
+      'Retry keeps earlier completed answers and replaces only the failed one');
   } finally {
     await page.unroute(routeMatcher);
     resetExpectedHttpStatusErrors();
@@ -476,7 +654,16 @@ test('test chat new chat aborts the stream and starts a new session', async () =
     await waitForAssistantText('第一段');
     assert.equal(await page.locator('#testFiles .tc-chip').count(), 0,
       'send clears the composer attachments');
+    /* M8：New Chat 必须真的中止在途请求（浏览器侧 net::ERR_ABORTED）。 */
+    const abortedRequest = page.waitForEvent('requestfailed', {
+      predicate: request => request.url().includes('/admin/test/chat/completions'),
+      timeout: 8000,
+    });
     await page.locator('#testNew').click();
+    const failed = await abortedRequest;
+    const failure = failed.failure();
+    assert.match(String(failure && failure.errorText), /ABORT/i,
+      'New Chat must abort the in-flight request');
     await waitFor(() => document.querySelectorAll('.tc-message').length === 0 &&
       !document.getElementById('testEmpty').hidden);
     await page.waitForTimeout(1900);
@@ -505,8 +692,9 @@ test('test chat new chat aborts the stream and starts a new session', async () =
    README 的 test.png 必须来自真实交互后的页面，而不是空壳：先通过真实 UI 发一条
    `你好`（默认 Auto，元信息显示 Auto → 路由到的上游模型），等流式「固定回复」完成
    （完成态才会渲染 Copy/Regenerate 按钮）后再截图。桌面 1440×1000、移动 390×844
-   各截中英两张。screenshot() 自身在 QA_SCREENSHOTS=1 时才写文件；本用例开头再显式
-   早退，保证普通 `npm run check:console` 不多做导航、也不会因没有截图文件而失败。 */
+   各截中英两张；移动端先断言底栏完整可见且页面无需滚动。screenshot() 自身在
+   QA_SCREENSHOTS=1 时才写文件；本用例开头再显式早退，保证普通
+   `npm run check:console` 不多做导航、也不会因没有截图文件而失败。 */
 test('test chat screenshots (opt-in QA_SCREENSHOTS)', async () => {
   if (process.env.QA_SCREENSHOTS !== '1') return;
   const viewports = [
@@ -528,13 +716,25 @@ test('test chat screenshots (opt-in QA_SCREENSHOTS)', async () => {
         await waitForAssistantText('固定回复');
         await waitFor(() =>
           document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
-        /* 390×844 下页头换行会让面板比视口高（实测中文 27px、英文 43px），底栏
-           会被裁掉一截；截图前滚到文档底部，让固定底栏完整入镜（页面本身可滚动，
-           不改生产布局）。 */
+        /* F2：窄屏布局改为 body 列 flex，页头换行（zh/en 高度不同）不再把底栏顶出
+           视口；截图前断言底栏完整可见且页面无需滚动，保证截图是诚实的首屏证据。 */
         if (viewport.width < 640) {
-          await page.evaluate(() =>
-            window.scrollTo(0, document.documentElement.scrollHeight - window.innerHeight));
-          await page.waitForTimeout(100);
+          const fit = await page.evaluate(() => {
+            const composer = document.querySelector('.tc-composer');
+            const panel = document.querySelector('.tc-panel');
+            return {
+              innerHeight: window.innerHeight,
+              composerBottom: Math.round(composer.getBoundingClientRect().bottom),
+              panelBottom: Math.round(panel.getBoundingClientRect().bottom),
+              scrollHeight: document.documentElement.scrollHeight,
+            };
+          });
+          assert.ok(fit.composerBottom <= fit.innerHeight,
+            `[${language.name}] composer must be above the fold at 390x844`);
+          assert.ok(fit.panelBottom <= fit.innerHeight,
+            `[${language.name}] panel must fit at 390x844`);
+          assert.ok(fit.scrollHeight <= fit.innerHeight,
+            `[${language.name}] mobile page must not scroll at 390x844`);
         }
         await screenshot(`test-chat-${language.name}-${viewport.name}.png`);
       }

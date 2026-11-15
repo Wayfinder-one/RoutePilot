@@ -409,6 +409,12 @@ function startMock() {
               response.on('close', () => clearTimeout(timer));
               return;
 }
+            if (trigger.includes('截断流')) {
+              /* 只写一段文本就 EOF：没有 finish_reason、没有 [DONE]，模拟上游提前断流。 */
+              response.write(chunk({ role: 'assistant', content: '截断回复' }));
+              response.end();
+              return;
+}
             /* 默认行为保持原样：固定回复。 */
             response.write('data: ' + JSON.stringify({
               id: 'chatcmpl-qa', object: 'chat.completion.chunk', created, model,
@@ -723,7 +729,8 @@ test('graph.js is served as a native ES module with a single module entry', asyn
 test('console pages each load through one native module entry', async () => {
   const pages = ['index.html', 'jev.html', 'logs.html', 'models.html', 'users.html', 'login.html'];
   const markers = {
-    'index.html': '#testModel',
+    /* 只有模块 boot 注入选项后 select 才非空：证明 index.html 的模块真的跑过。 */
+    'index.html': '#testModel:not(:empty)',
     'jev.html': '#jevStatus',
     'logs.html': '#countPill',
     'models.html': '#modelTable tr',

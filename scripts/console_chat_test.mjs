@@ -1,4 +1,5 @@
-/* Test chat 附件协议、请求体积与流式增量的纯函数契约测试（计划 Task 2–3）。
+/* Test chat 附件协议、请求体积、wire 序列化与流式增量的纯函数契约测试
+ * （计划 Task 2–3 + Task 7 的 partToWire/partsToWire 与 SSE onDone）。
  *
  * 运行：node --test scripts/console_chat_test.mjs
  * 约束：纯 ES module，不碰 DOM / fetch / 文件系统；同一模块在浏览器里复用。
@@ -11,6 +12,8 @@ import {
   appendDelta,
   attachmentPart,
   normalizeContent,
+  partToWire,
+  partsToWire,
   requestBytes,
 } from '../router/console/chat/protocol.js';
 import { createSseParser } from '../router/console/chat/stream.js';
@@ -121,4 +124,53 @@ test('SSE parser ignores empty payloads, comment lines and DONE markers', () => 
   parser.push('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
   parser.end();
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['ok']);
+});
+
+test('partToWire and partsToWire keep text, media and unknown parts round-trippable', () => {
+  const parts = [
+    { type: 'text', text: 'a' },
+    { type: 'image', url: 'data:image/png;base64,AA==' },
+    { type: 'unknown', value: { x: 1 } },
+  ];
+  assert.deepEqual(partsToWire(parts), [
+    { type: 'text', text: 'a' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+    { x: 1 },
+  ]);
+  assert.deepEqual(partToWire({ type: 'video', url: 'https://example.test/v.mp4' }),
+    { type: 'video_url', video_url: { url: 'https://example.test/v.mp4' } });
+  assert.deepEqual(partToWire({ type: 'audio', url: 'data:audio/wav;base64,AA==' }),
+    { type: 'audio', audio: { url: 'data:audio/wav;base64,AA==' } });
+  assert.deepEqual(
+    partToWire({ type: 'file', name: 'a.bin', url: 'data:application/octet-stream;base64,AA==' }),
+    { type: 'file', file: { filename: 'a.bin', file_data: 'data:application/octet-stream;base64,AA==' } });
+  /* 纯文本数组压成字符串（OpenAI content 的另一种形态）。 */
+  assert.equal(partsToWire([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]), 'ab');
+  /* 线上格式经 normalizeContent 回到渲染层形状：文本/图片/未知片段都等价。 */
+  assert.deepEqual(normalizeContent(partsToWire(parts)), parts);
+});
+
+test('SSE parser reports DONE through the optional onDone callback', () => {
+  const events = [];
+  let doneCount = 0;
+  const parser = createSseParser(value => events.push(value), () => { doneCount += 1; });
+  parser.push('data: {"choices":[{"delta":{"content":"x"}}]}\n\n');
+  parser.push('data: [DONE]\n\n');
+  parser.end();
+  assert.deepEqual(events.map(event => event.choices[0].delta.content), ['x']);
+  assert.equal(doneCount, 1);
+
+  /* 没有 onDone 的旧调用方行为不变：[DONE] 既不产生 payload 也不抛错。 */
+  const legacy = [];
+  const legacyParser = createSseParser(value => legacy.push(value));
+  legacyParser.push('data: [DONE]\n\n');
+  legacyParser.end();
+  assert.deepEqual(legacy, []);
+
+  /* 上游提前 EOF（没有 [DONE]）不触发 onDone，调用方据此判定 incomplete。 */
+  let truncatedDone = 0;
+  const truncated = createSseParser(() => {}, () => { truncatedDone += 1; });
+  truncated.push('data: {"choices":[{"delta":{"content":"y"}}]}\n\n');
+  truncated.end();
+  assert.equal(truncatedDone, 0);
 });

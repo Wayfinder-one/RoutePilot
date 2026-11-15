@@ -35,7 +35,7 @@ function newId() {
 const state = {
   model: 'auto', models: [], messages: [], attachments: [],
   controller: null, sessionId: newId(), role: null,
-  activeTree: '', bootError: '',
+  activeTree: '', bootError: '', uploadEpoch: 0,
 };
 /* 发送 / 停止 / 复制 / 重试 / 重新生成与提示文案键，统一从这里取。 */
 const COPY = Object.freeze({
@@ -64,8 +64,18 @@ function renderModelOptions() {
 /* ── Auto / 固定模型状态：Auto 附上当前启用的决策组名 ── */
 function renderStatus() {
   const status = $('#testStatus');
+  status.replaceChildren();
   if (state.bootError) { status.textContent = state.bootError; return; }
   if (state.role !== null && state.role !== 'admin') { status.textContent = t(COPY.adminOnly); return; }
+  /* 模型目录为空时保留 Auto，并给出到模型页添加模型的入口。 */
+  if (state.models.length === 0) {
+    status.append(document.createTextNode(`${t('test.noModels')} `));
+    const link = document.createElement('a');
+    link.href = 'models.html';
+    link.textContent = t('test.goModels');
+    status.append(link);
+    return;
+  }
   status.textContent = state.model === 'auto'
     ? t('test.autoStatus') + (state.activeTree ? ` · ${state.activeTree}` : '')
     : t('test.directStatus');
@@ -149,12 +159,15 @@ function renderAttachments() {
 }
 
 async function addFiles(files) {
+  /* 读取是异步的：New Chat / 发送清空附件后，旧的读取结果必须整批丢弃。 */
+  const epoch = state.uploadEpoch;
   for (const file of Array.from(files || [])) {
     try {
       const [dataUrl, text] = await Promise.all([
         readDataUrl(file),
         isTextLike(file) ? file.text() : Promise.resolve(''),
       ]);
+      if (epoch !== state.uploadEpoch) return;
       state.attachments.push({
         id: newId(),
         file,
@@ -162,9 +175,11 @@ async function addFiles(files) {
         previewUrl: String(file.type || '').startsWith('image/') ? URL.createObjectURL(file) : '',
       });
     } catch (error) {
+      if (epoch !== state.uploadEpoch) return;
       toast(t(COPY.uploadFail), 3200);
     }
   }
+  if (epoch !== state.uploadEpoch) return;
   renderAttachments();
   updateSendState();
 }
@@ -179,11 +194,18 @@ function removeAttachment(id) {
 }
 
 function clearAttachments() {
+  /* 令所有在途读取失效：它们的结果属于上一轮输入。 */
+  state.uploadEpoch += 1;
   state.attachments.forEach(attachment => {
     if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
   });
   state.attachments = [];
   renderAttachments();
+}
+
+/* 只有管理员、且没有在途请求/启动错误时才接受新的附件输入。 */
+function canAddAttachments() {
+  return state.role === 'admin' && !state.controller && !state.bootError;
 }
 
 /* ── 消息渲染 ── */
@@ -253,20 +275,30 @@ function renderAssistant(message) {
   };
   if (message.state === 'complete') {
     addAction(t(COPY.copy), () => copyMessage(message));
-    addAction(t(COPY.regenerate), regenerateLast);
   }
   if (message.state === 'error') {
     const error = document.createElement('span');
     error.className = 'tc-error';
     error.textContent = message.error;
     actions.append(error);
-    addAction(t(COPY.retry), retryLast);
   }
   if (message.state === 'stopped') {
     const stopped = document.createElement('span');
     stopped.className = 'mut';
     stopped.textContent = t(COPY.stopped);
     actions.append(stopped);
+  }
+  if (message.state === 'incomplete') {
+    const incomplete = document.createElement('span');
+    incomplete.className = 'mut';
+    incomplete.textContent = t(COPY.incomplete);
+    actions.append(incomplete);
+  }
+  /* 重试/重新生成只作用于最后一条 assistant：只给最后一条渲染按钮，避免
+     旧消息上的按钮操作到新消息（或成为无操作）。Copy 对每条完成消息都可用。 */
+  if (state.messages[state.messages.length - 1] === message) {
+    if (message.state === 'complete') addAction(t(COPY.regenerate), regenerateLast);
+    if (message.state === 'error') addAction(t(COPY.retry), retryLast);
   }
   scrollMessages();
 }
@@ -317,6 +349,8 @@ async function requestAssistant() {
   const controller = new AbortController();
   state.controller = controller;
   updateSendState();
+  let reader = null;
+  let sawDone = false;
   try {
     const response = await api.stream(CHAT_ENDPOINT, body, {
       signal: controller.signal,
@@ -326,7 +360,7 @@ async function requestAssistant() {
     assistant.selection = response.headers.get('x-sr-selection') || '';
     const contentType = response.headers.get('content-type') || '';
     if (contentType.includes('text/event-stream') && response.body) {
-      const reader = response.body.getReader();
+      reader = response.body.getReader();
       const decoder = new TextDecoder();
       const parser = createSseParser(payload => {
         const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
@@ -334,7 +368,7 @@ async function requestAssistant() {
         if (!delta) return;
         assistant.parts = appendDelta(assistant.parts, delta);
         renderAssistant(assistant);
-      });
+      }, () => { sawDone = true; });
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -343,16 +377,23 @@ async function requestAssistant() {
       parser.push(decoder.decode());
       parser.end();
       assistant.content = partsToWire(assistant.parts);
+      /* 正常结束必须见过 [DONE]；EOF 而没有 [DONE] 视为上游提前断流。 */
+      assistant.state = sawDone ? 'complete' : 'incomplete';
     } else {
       const data = await response.json();
       const message = data && data.choices && data.choices[0] && data.choices[0].message;
       assistant.content = message && message.content != null ? message.content : '';
       assistant.parts = normalizeContent(assistant.content);
+      assistant.state = 'complete';
     }
-    assistant.state = 'complete';
   } catch (error) {
-    assistant.content = partsToWire(assistant.parts || []);
     const aborted = error && error.name === 'AbortError';
+    /* 非中止的失败（parser 抛错 / 读流中断）要显式取消 reader，及时释放
+       上游连接与租约；中止路径的 reader 已由 abort 关闭，保持原样。 */
+    if (!aborted && reader) {
+      try { await reader.cancel(); } catch (cancelError) { /* 连接已断开 */ }
+    }
+    assistant.content = partsToWire(assistant.parts || []);
     assistant.state = aborted ? 'stopped' : 'error';
     assistant.error = aborted ? '' : apiErrText(error);
   } finally {
@@ -453,6 +494,7 @@ $('#testInput').addEventListener('keydown', event => {
 $('#testInput').addEventListener('paste', event => {
   if (event.clipboardData && event.clipboardData.files.length) {
     event.preventDefault();
+    if (!canAddAttachments()) return;
     addFiles(event.clipboardData.files);
   }
 });
@@ -460,7 +502,9 @@ $('#testSend').addEventListener('click', () => {
   if (state.controller) { state.controller.abort(); return; }
   sendCurrent();
 });
-$('#testAttach').addEventListener('click', () => $('#testFileInput').click());
+$('#testAttach').addEventListener('click', () => {
+  if (canAddAttachments()) $('#testFileInput').click();
+});
 $('#testFileInput').addEventListener('change', async event => {
   const files = Array.from(event.target.files || []);
   try {
@@ -479,7 +523,7 @@ $('#testFiles').addEventListener('click', event => {
 const panel = $('.tc-panel');
 panel.addEventListener('dragover', event => {
   event.preventDefault();
-  panel.classList.add('is-dragover');
+  if (canAddAttachments()) panel.classList.add('is-dragover');
 });
 panel.addEventListener('dragleave', event => {
   if (!panel.contains(event.relatedTarget)) panel.classList.remove('is-dragover');
@@ -487,6 +531,7 @@ panel.addEventListener('dragleave', event => {
 panel.addEventListener('drop', event => {
   event.preventDefault();
   panel.classList.remove('is-dragover');
+  if (!canAddAttachments()) return;
   const files = event.dataTransfer ? Array.from(event.dataTransfer.files) : [];
   if (files.length) addFiles(files);
 });
@@ -509,6 +554,9 @@ async function boot() {
 onLangChange(() => {
   renderModelOptions();
   renderStatus();
+  /* 文案是就地替换的：消息区的 meta/动作按钮也要按新语言重建。
+     生成中同样安全——assistant 视图从已缓存的 parts 重建，后续 delta 继续更新它。 */
+  renderConversation();
   updateSendState();
 });
 /* 首屏先按「空输入 + 未知角色」落一次按钮状态，避免闪出可点发送。 */

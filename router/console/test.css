@@ -47,8 +47,6 @@
 .tc-chip .tc-chip-remove{border:0;background:transparent;color:var(--text-3);font-size:14px;line-height:1;padding:2px 4px;border-radius:5px;flex:none}
 .tc-chip .tc-chip-remove:hover{background:var(--red-soft);color:var(--red)}
 .tc-chip .tc-chip-remove:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px}
-/* 用户气泡里的附件占位（本地回显用；Task 7 换成渲染层后仍适用） */
-.tc-bubble .tc-chip{margin:4px 4px 0 0;vertical-align:middle}
 /* ── 安全 Markdown 与媒体（render.js 生成的结构） ── */
 .tc-markdown{display:flex;flex-direction:column;gap:8px;line-height:1.62}
 .tc-markdown > :first-child{margin-top:0}
@@ -75,4 +73,22 @@
 .tc-file{display:inline-flex;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--panel-2)}
 /* 拖拽悬停态：Task 6 在 .tc-panel 上切这个类 */
 .tc-panel.is-dragover{outline:2px dashed var(--indigo-line);outline-offset:-7px}
-@media(max-width:640px){.tc-shell{padding:0 10px 10px;height:calc(100vh - 170px)}.tc-messages{padding:16px}.tc-composer-row .mut{display:none}.tc-bubble{max-width:94%}.tc-topline select{max-width:200px}}
+@media(max-width:640px){
+  /* 窄屏页头会换行（zh 页头 145px / en 161px），写死 100vh-170px 会把底栏顶出屏幕。
+     改成 body 列 flex + 面板 flex:1：高度由页头实际高度决定，任何语言都不需要滚动。 */
+  body[data-page="test"]{display:flex;flex-direction:column;height:100vh;height:100dvh}
+  /* 列 flex 的主轴是纵向、交叉轴是横向：子项默认 min-width:auto 会被内容撑宽，
+     窄屏下会把面板顶部/底栏横向推出视口，必须显式允许收缩。 */
+  body[data-page="test"] > .top,
+  body[data-page="test"] > .tc-pagehead,
+  body[data-page="test"] > .tc-shell{min-width:0}
+  body[data-page="test"] .tc-pagehead{flex:none}
+  /* margin:0 auto 的自动横向外边距会让 flex 拉伸失效（宽度变成 max-content 而溢出），
+     窄屏显式给满宽并取消自动外边距。 */
+  body[data-page="test"] .tc-shell{flex:1;min-height:0;height:auto;margin:0;width:100%;max-width:none}
+  .tc-shell{padding:0 10px 10px}
+  .tc-messages{padding:16px}
+  .tc-composer-row .mut{display:none}
+  .tc-bubble{max-width:94%}
+  .tc-topline select{max-width:200px}
+}
