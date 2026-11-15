@@ -84,7 +84,7 @@ flowchart LR
 
 ### 模型测试对话
 
-首页（`/console/index.html`）是仅管理员可用的模型测试对话，请求发往 `/admin/test/chat/completions`，并把响应头 `x-sr-model` / `x-sr-selection` 显示为消息元信息。
+首页（`/console/index.html`）是仅管理员可用的模型测试对话，请求发往 `/admin/test/chat/completions`，并根据响应头 `x-sr-model` / `x-sr-selection` 在消息元信息中显示实际命中的模型（Auto 为 `Auto → <模型>`，固定模型为 `<模型> · 固定模型`）。
 
 - **Auto 与固定模型**：Auto 与 `/v1/chat/completions` 一样评估当前路由快照（决策图、JEV 波次、粘性与负载均衡后端选择）；选择已配置的模型 ID 时跳过决策图与 JEV，返回 `x-sr-selection: direct`。
 - **流式回复**：回答通过 SSE 逐块返回；停止会中止流并保留已生成内容，复制 / 重试 / 重新生成作用于该条消息。
