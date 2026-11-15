@@ -58,6 +58,13 @@ def test_user_auth_enabled_requires_login(tmp_path):
         assert call.json() == {"detail": "unauthorized: /admin requires login"}
         assert call.headers["www-authenticate"] == "Bearer"
 
+    # 新的管理面测试聊天端点同样被登录门保护（POST 不因方法不同而放行）
+    unauth_chat = c.post("/admin/test/chat/completions",
+                         json={"model": "auto", "messages": []})
+    assert unauth_chat.status_code == 401
+    assert unauth_chat.json() == {"detail": "unauthorized: /admin requires login"}
+    assert unauth_chat.headers["www-authenticate"] == "Bearer"
+
     # 旧静态 token 已移除：这个 Bearer 不是会话，必须 401
     assert c.get("/admin/models",
                  headers=OLD_STATIC_TOKEN).status_code == 401

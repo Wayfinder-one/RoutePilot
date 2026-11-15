@@ -71,6 +71,8 @@ def route_label(record: dict) -> dict[str, str]:
     """Human label for ``selection_reason``; derived from the record only."""
     if record.get("outcome_state") == OUTCOME_ROUTING_ERROR:
         return _label("路由中止", "Routing stopped")
+    if record.get("selection_reason") == "direct":
+        return _label("固定模型测试", "Direct model test")
     if record.get("selection_reason") == "sticky" or record.get("sticky_hit"):
         return _label("会话粘性直达", "Session affinity")
     final = next((event for event in reversed(record.get("trace") or [])

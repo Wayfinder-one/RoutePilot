@@ -268,6 +268,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     from router.api.routes_jev import router as jev_router
     from router.api.routes_logs import router as logs_router
     from router.api.routes_models import router as models_router
+    from router.api.routes_test import router as test_router
     from router.api.routes_time import router as time_router
     from router.api.routes_trees import router as trees_router
     from router.api.routes_users import router as users_router
@@ -279,5 +280,6 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.include_router(jev_router, prefix="/admin")
     app.include_router(logs_router, prefix="/admin")
     app.include_router(users_router, prefix="/admin")
+    app.include_router(test_router, prefix="/admin")
     app.include_router(v1_router, prefix="/v1")
     return app

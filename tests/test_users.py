@@ -426,6 +426,8 @@ def test_viewer_can_read_trees_but_not_write(tmp_path):
             ("post", "/admin/trees/tree-a/enable", None),
             ("post", "/admin/trees/tree-a/disable", None),
             ("post", "/admin/try", {"tree_id": "tree-a", "text": "hello"}),
+            ("post", "/admin/test/chat/completions",
+             {"model": "auto", "messages": []}),
             ("put", "/admin/time-periods", {"periods": []}),
             ("put", "/admin/jev/window", {"context_tokens": 4096}),
             ("put", "/admin/jev", {"base_url": "http://jev.test",

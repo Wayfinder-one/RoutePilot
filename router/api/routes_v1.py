@@ -20,6 +20,7 @@ import logging
 import time
 import uuid
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -186,6 +187,17 @@ def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
 
 @router.post("/chat/completions")
 async def chat_completions(request: Request):
+    return await run_chat_completion(request)
+
+
+async def run_chat_completion(request: Request, *, use_requested_model: bool = False):
+    """Shared data-plane executor (``/v1`` and the admin Test chat page).
+
+    ``use_requested_model`` is the only difference between the public data plane
+    and the admin test endpoint: when false the request ``model`` stays ignored
+    and routing decides; when true ``"auto"`` still routes, any other model is a
+    fixed direct selection that skips graph/JEV/sticky.
+    """
     started = time.monotonic()
     length = request.headers.get("content-length")
     if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
@@ -207,6 +219,14 @@ async def chat_completions(request: Request):
     session_id = request.headers.get("x-sr-session-id", "").strip()
     if len(session_id) > 256:
         return _error("invalid_session_id", 400)
+
+    fixed_model = None
+    if use_requested_model:
+        requested_model = body.get("model", "auto")
+        if not isinstance(requested_model, str) or not requested_model.strip():
+            return _error("invalid_model", 422)
+        requested_model = requested_model.strip()
+        fixed_model = None if requested_model == "auto" else requested_model
 
     text = _last_user_text(messages)
     requestlog = request.app.state.requestlog
@@ -233,21 +253,35 @@ async def chat_completions(request: Request):
     snapshot = request.app.state.snapshot
     if snapshot is None:
         return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
-    try:
-        decision = await request.app.state.routing_service.route(
-            snapshot,
-            RoutingRequest(text=text, session_id=session_id),
-            trace_sink=trace,
+    if fixed_model is None:
+        try:
+            decision = await request.app.state.routing_service.route(
+                snapshot,
+                RoutingRequest(text=text, session_id=session_id),
+                trace_sink=trace,
+            )
+        except NoActiveTreeError as exc:
+            return fail("no_active_tree", 503, "graph", str(exc))
+        except NoAvailableBackend as exc:
+            return fail("no_available_backend", 503, "schedule", str(exc))
+        except RoutingMiss as exc:
+            return fail("routing_invariant_violation", 503, "graph", str(exc))
+        except Exception:
+            logger.exception("routing failed")
+            return fail("routing_failed", 503, "graph", "routing failed")
+    else:
+        if snapshot.backends.get(fixed_model) is None:
+            return _error("unknown_model", 404)
+        try:
+            lease = request.app.state.balancer.acquire([fixed_model])
+        except NoAvailableBackend:
+            return _error("no_available_backend", 503)
+        decision = SimpleNamespace(
+            model=fixed_model,
+            reasoning=None,
+            selection_reason="direct",
+            release=lease.release,
         )
-    except NoActiveTreeError as exc:
-        return fail("no_active_tree", 503, "graph", str(exc))
-    except NoAvailableBackend as exc:
-        return fail("no_available_backend", 503, "schedule", str(exc))
-    except RoutingMiss as exc:
-        return fail("routing_invariant_violation", 503, "graph", str(exc))
-    except Exception:
-        logger.exception("routing failed")
-        return fail("routing_failed", 503, "graph", "routing failed")
     routing_ms = (time.monotonic() - routing_started) * 1000.0
     backend = snapshot.backends.get(decision.model)
     # 防御性不变式：正常引擎不可达，decision.model 必来自同一快照的 backends；真到达时无请求记录。
@@ -258,8 +292,50 @@ async def chat_completions(request: Request):
     upstream_body, reasoning_warning = prepare_upstream_request(
         body, backend, decision.reasoning)
     trace[:] = present_trace(trace)
-    record = present_record(_decision_record(
-        decision, snapshot, text, reasoning_warning, routing_ms, started))
+    if fixed_model is None:
+        record = present_record(_decision_record(
+            decision, snapshot, text, reasoning_warning, routing_ms, started))
+    else:
+        record = present_record({
+            "id": uuid.uuid4().hex,
+            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "text": text,
+            "decision": "test",
+            "model": fixed_model,
+            "target_id": None,
+            "tree_id": snapshot.tree_id,
+            "tree_revision": snapshot.tree_revision,
+            "snapshot_revision": snapshot.snapshot_revision,
+            "policy_path": None,
+            "selection_reason": "direct",
+            "fallback_reason": None,
+            "sticky_hit": 0,
+            "session_hash": session_digest(session_id),
+            "jev_model": None,
+            "jev_choice": None,
+            "jev_top": None,
+            "jev_margin": None,
+            "jev_ms": None,
+            "jev_probabilities": None,
+            "waves": 0,
+            "answers": {},
+            "reasoning": None,
+            "reasoning_warning": None,
+            "routing_ms": routing_ms,
+            "latency_ms": (time.monotonic() - started) * 1000.0,
+            "trace": [],
+            "node_labels": node_labels(snapshot),
+            "upstream_model": None,
+            "upstream_status": None,
+            "upstream_ms": None,
+            "ttft_ms": None,
+            "total_ms": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "error_class": None,
+            "outcome_state": OUTCOME_INCOMPLETE,
+        })
     requestlog.enqueue(record)
     outcome = OutcomeRecorder(requestlog, record, started)
     headers = {"x-sr-model": decision.model, "x-sr-selection": decision.selection_reason}
