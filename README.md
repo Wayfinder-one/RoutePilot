@@ -84,7 +84,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 ### Model test chat
 
-The home page (`/console/index.html`) is an admin-only model test chat. It posts to `/admin/test/chat/completions` and shows the actual model in the message metadata (`Auto → <model>` for Auto, `<model> · fixed model` for a fixed model), based on the `x-sr-model` / `x-sr-selection` response headers.
+The home page (`/console/index.html`) is an admin-only model test chat. It posts to `/admin/test/chat/completions` and shows the actual model in the message metadata (`Auto → <model>` for Auto, `<model> · fixed model` for a fixed model), using the `x-sr-model` response header.
 
 - **Auto or fixed model** — Auto evaluates the current routing snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. Choosing a configured model ID skips the graph and JEV and returns `x-sr-selection: direct`.
 - **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message.
