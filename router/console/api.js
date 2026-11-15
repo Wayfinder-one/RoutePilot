@@ -80,6 +80,28 @@ const api = {
   get(p, o) { return this.req('GET', p, undefined, o); },
   put(p, b, o) { return this.req('PUT', p, b, o); },
   post(p, b, o) { return this.req('POST', p, b, o); },
+  /* 原始流式 POST：返回未读的 Response 交给页面自己读 SSE。
+     与 req() 同鉴权、同 401 处理，但不设超时、不解析 JSON（流可能持续数分钟）。 */
+  async stream(path, body, options = {}) {
+    const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+    const token = this.token();
+    if (token) headers.Authorization = 'Bearer ' + token;
+    const response = await fetch(path, {
+      method: 'POST', headers, body: JSON.stringify(body), signal: options.signal,
+    });
+    if (response.status === 401) {
+      this.setToken('');
+      this.toLogin();
+    }
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      const error = new Error(response.status);
+      error.status = response.status;
+      error.detail = data.detail || data.error;
+      throw error;
+    }
+    return response;
+  },
   del(p) { return this.req('DELETE', p); },
   /* 邮箱 + 密码换会话 token（成功后落到 localStorage，调用方只管跳页）。 */
   async login(email, password) {

@@ -79,3 +79,24 @@ export function appendDelta(parts, delta) {
   });
   return next;
 }
+
+/* 渲染层 part → OpenAI 线上 content part：历史回放/多轮请求只用线上格式。 */
+export function partToWire(part) {
+  if (part.type === 'text') return { type: 'text', text: part.text };
+  if (part.type === 'image') return { type: 'image_url', image_url: { url: part.url } };
+  if (part.type === 'video') return { type: 'video_url', video_url: { url: part.url } };
+  if (part.type === 'audio') return { type: 'audio', audio: { url: part.url } };
+  if (part.type === 'file') return {
+    type: 'file', file: { filename: part.name, file_data: part.url },
+  };
+  return part.value;
+}
+
+/* 纯文本数组压成字符串（与 OpenAI content 的两种形态对齐），否则保留数组。 */
+export function partsToWire(parts) {
+  const content = parts.map(partToWire);
+  if (content.every(part => part && part.type === 'text')) {
+    return content.map(part => part.text).join('');
+  }
+  return content;
+}

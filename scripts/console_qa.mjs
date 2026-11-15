@@ -295,6 +295,41 @@ function answerFor(nodeId, question, scenario) {
   throw new Error(`mock does not support question type ${type} (${nodeId})`);
 }
 
+/* ── Task 7 · 测试对话（/v1/chat/completions）的确定性 mock 触发词 ──────
+   默认路径仍然是「固定回复」，只有最后一条 user 文本命中触发词时才切换：
+   * 返回多模态 → 先一个文本 delta，再一个内容 part 数组（图片/音频/视频/文件/
+     未知 part），最后 stop + [DONE]；
+   * 延迟流 → 立刻发「第一段」，1500ms 后发「第二段」+ stop + [DONE]；浏览器
+     中止时上游连接会被 router 掐断，所有补写都带 writableEnded/destroyed 守卫
+     并吞掉 EPIPE，绝不因为 QA 的 Stop/New Chat 而崩溃。
+   浏览器 QA 不加载外网媒体：Chromium 会真的为 <video src="https://…"> 发起请求
+   （实测），而 QA 的外部请求守卫是硬失败；视频用 data: URL，与 renderer 用例
+   「只挂 data: 媒体源」的约定一致（http(s) 白名单由 renderer 用例覆盖）。 */
+const QA_PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const QA_MEDIA_PARTS = [
+  { type: 'image_url', image_url: { url: `data:image/png;base64,${QA_PIXEL}` } },
+  { type: 'audio', audio: { data: 'AA==', format: 'wav' } },
+  { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
+  { type: 'file', file: { filename: 'result.bin', file_data: 'data:application/octet-stream;base64,AA==' } },
+  { type: 'custom', value: { source: 'qa' } },
+];
+const QA_DELAYED_STREAM_MS = 1500;
+
+/* 与 router 的 _last_user_text 保持一致：字符串 content 或 part 数组里的 text。 */
+function lastUserText(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message || message.role !== 'user') continue;
+    const content = message.content;
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content.map(part => (part && typeof part.text === 'string' ? part.text : '')).join(' ');
+    }
+  }
+  return '';
+}
+
 function startMock() {
   return new Promise((resolve, reject) => {
     const server = http.createServer(async (request, response) => {
@@ -342,6 +377,38 @@ function startMock() {
               'cache-control': 'no-cache',
               connection: 'keep-alive'
 });
+            /* 客户端中止后 socket 写失败不能冒泡成未捕获异常。 */
+            response.on('error', () => {});
+            const chunk = (delta, finishReason = null) => 'data: ' + JSON.stringify({
+              id: 'chatcmpl-qa', object: 'chat.completion.chunk', created, model,
+              choices: [{ index: 0, delta, finish_reason: finishReason }],
+}) + '\n\n';
+            const trigger = lastUserText(body.messages);
+            if (trigger.includes('返回多模态')) {
+              response.write(chunk({ role: 'assistant', content: '多模态回复：' }));
+              response.write(chunk({ content: QA_MEDIA_PARTS }));
+              response.write(chunk({}, 'stop'));
+              response.write('data: [DONE]\n\n');
+              response.end();
+              return;
+}
+            if (trigger.includes('延迟流')) {
+              response.write(chunk({ role: 'assistant', content: '第一段' }));
+              const timer = setTimeout(() => {
+                if (response.writableEnded || response.destroyed) return;
+                try {
+                  response.write(chunk({ content: '第二段' }));
+                  response.write(chunk({}, 'stop'));
+                  response.write('data: [DONE]\n\n');
+                  response.end();
+} catch (error) {
+                  /* EPIPE / 已中止：浏览器已经停止读取，补写失败无需处理。 */
+}
+}, QA_DELAYED_STREAM_MS);
+              response.on('close', () => clearTimeout(timer));
+              return;
+}
+            /* 默认行为保持原样：固定回复。 */
             response.write('data: ' + JSON.stringify({
               id: 'chatcmpl-qa', object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: { role: 'assistant', content: '固定回复' }, finish_reason: null }]

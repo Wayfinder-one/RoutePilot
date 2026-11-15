@@ -10,7 +10,16 @@
    ------------------------------------------------------------------ */
 
 import assert from 'node:assert/strict';
-import { page, routerBase, runIfMain, test, waitFor } from '../console_qa.mjs';
+import {
+  expectHttpStatusError,
+  mockState,
+  page,
+  resetExpectedHttpStatusErrors,
+  routerBase,
+  runIfMain,
+  test,
+  waitFor,
+} from '../console_qa.mjs';
 
 test('test chat renderer supports markdown and blocks active content', async () => {
   await page.goto(routerBase + '/console/index.html');
@@ -231,6 +240,264 @@ test('test chat attachments add, remove, drop and paste', async () => {
   assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-paste.png' }).count(), 1);
   assert.equal(await page.locator('#testFiles .tc-chip').count(), 3);
   assert.equal(await page.locator('#testFiles .tc-chip img').count(), 3);
+});
+
+/* ── 计划 Task 7：真实流式对话 ────────────────────────────────────────
+   Auto 路由、固定模型多轮且不碰 JEV、附件 wire 形状、多模态 part 渲染、
+   延迟流 Stop、内联 4xx 错误 + Retry、New Chat 中止并轮换会话 id。
+   mock 触发词见 console_qa.mjs 的 mock /v1/chat/completions 分支。 */
+async function openTestPage() {
+  await page.goto(routerBase + '/console/index.html');
+  await page.waitForSelector('#testModel optgroup', { state: 'attached' });
+}
+
+async function sendText(text) {
+  await page.locator('#testInput').fill(text);
+  await page.waitForFunction(() => !document.getElementById('testSend').disabled);
+  await page.locator('#testSend').click();
+}
+
+function waitForAssistantText(text) {
+  return waitFor(value => {
+    const bubbles = Array.from(document.querySelectorAll('.tc-message.assistant .tc-bubble'));
+    return bubbles.some(bubble => bubble.textContent.includes(value));
+  }, text);
+}
+
+test('test chat auto routing streams the fixed reply', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  const jevCallsBefore = mockState.systemoneCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('auto');
+  await sendText('你好，请走智能路由');
+  await waitForAssistantText('固定回复');
+  await waitFor(() =>
+    document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 1, 'one upstream call per send');
+  assert.equal(mockState.systemoneCalls.length > jevCallsBefore, true,
+    'Auto routing must consult the decision service first');
+  const lastCall = mockState.chatCalls.at(-1);
+  assert.equal(lastCall.stream, true);
+  assert.equal(lastCall.messages.at(-1).role, 'user');
+  assert.ok(typeof lastCall.model === 'string' && lastCall.model.length > 0,
+    'upstream body must carry the routed upstream model');
+  const meta = await page.locator('.tc-message.assistant .tc-message-meta').textContent();
+  assert.match(meta, /^Auto → \S+$/);
+  assert.ok(meta.includes(lastCall.model),
+    `answer meta ${JSON.stringify(meta)} must name the upstream model ${lastCall.model}`);
+  const actions = await page.locator('.tc-message.assistant .tc-message-actions button').allTextContents();
+  assert.deepEqual(actions, ['复制', '重新生成']);
+  assert.match(await page.locator('#testStatus').textContent(), /智能路由/);
+  assert.equal(await page.locator('#testInput').inputValue(), '');
+});
+
+test('test chat direct model keeps multi-turn history and skips JEV', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  const jevCallsBefore = mockState.systemoneCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
+  await sendText('第一轮');
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    return bubbles.length === 1 && bubbles[0].textContent.includes('固定回复');
+  });
+  await sendText('第二轮');
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    return bubbles.length === 2 && bubbles[1].textContent.includes('固定回复');
+  });
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 2);
+  const lastCall = mockState.chatCalls.at(-1);
+  assert.deepEqual(lastCall.messages.map(message => message.role), ['user', 'assistant', 'user']);
+  assert.equal(lastCall.messages[1].content, '固定回复', 'assistant history stays wire-format text');
+  assert.equal(lastCall.messages[2].content, '第二轮');
+  assert.equal(lastCall.model, 'qwen3-32b');
+  assert.equal(mockState.systemoneCalls.length, jevCallsBefore,
+    'fixed model mode must not call the decision service');
+  const metas = await page.locator('.tc-message.assistant .tc-message-meta').allTextContents();
+  assert.deepEqual(metas, ['qwen3-32b · 固定模型', 'qwen3-32b · 固定模型']);
+});
+
+test('test chat stream sends the attachment as image_url', async () => {
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await page.locator('#testFileInput').setInputFiles({
+    name: 'qa-wire.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
+  });
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+  await page.waitForFunction(() => !document.getElementById('testSend').disabled);
+  await page.locator('#testSend').click();
+  await waitForAssistantText('固定回复');
+  const lastCall = mockState.chatCalls.at(-1);
+  const content = lastCall.messages.at(-1).content;
+  assert.ok(Array.isArray(content), 'image-only turn must send a content part array');
+  const image = content.find(part => part && part.type === 'image_url');
+  assert.ok(image, 'missing image_url part');
+  assert.match(image.image_url.url, /^data:image\/png;base64,/);
+  assert.equal(await page.locator('#testFiles .tc-chip').count(), 0,
+    'composer chips are cleared after send');
+});
+
+test('test chat multimodal answer renders every part type', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await sendText('返回多模态');
+  await waitFor(() => Boolean(document.querySelector('.tc-message.assistant img.tc-media-image')));
+  await waitFor(() =>
+    document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
+  const rendered = await page.evaluate(() => {
+    const bubble = document.querySelector('.tc-message.assistant .tc-bubble');
+    const image = bubble.querySelector('img.tc-media-image');
+    const audio = bubble.querySelector('audio');
+    const video = bubble.querySelector('video');
+    const file = bubble.querySelector('a.tc-file');
+    const details = bubble.querySelector('details');
+    return {
+      text: bubble.textContent,
+      imageSrc: image && image.getAttribute('src'),
+      audioControls: Boolean(audio && audio.hasAttribute('controls')),
+      audioSrc: audio && audio.getAttribute('src'),
+      videoControls: Boolean(video && video.hasAttribute('controls')),
+      videoSrc: video && video.getAttribute('src'),
+      fileText: file && file.textContent,
+      fileHref: file && file.getAttribute('href'),
+      fileDownload: file && file.getAttribute('download'),
+      unknownFolded: Boolean(details && !details.open),
+      unknownSummary: details && details.querySelector('summary').textContent,
+      scripts: bubble.querySelectorAll('script').length,
+    };
+  });
+  assert.match(rendered.text, /多模态回复/);
+  assert.match(rendered.imageSrc, /^data:image\/png;base64,/);
+  assert.equal(rendered.audioControls, true);
+  assert.match(rendered.audioSrc, /^data:audio\/wav;base64,/);
+  assert.equal(rendered.videoControls, true);
+  assert.match(rendered.videoSrc, /^data:video\/mp4;base64,/);
+  assert.equal(rendered.fileText, 'result.bin');
+  assert.equal(rendered.fileDownload, 'result.bin');
+  assert.match(rendered.fileHref, /^data:application\/octet-stream;base64,/);
+  assert.equal(rendered.unknownFolded, true);
+  assert.equal(rendered.unknownSummary, 'Unsupported content');
+  assert.equal(rendered.scripts, 0);
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 1);
+});
+
+test('test chat stop preserves the partial stream', async () => {
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await sendText('延迟流');
+  await waitForAssistantText('第一段');
+  await waitFor(() => document.getElementById('testSend').textContent === '停止');
+  assert.equal(await page.locator('#testInput').isDisabled(), true,
+    'composer is locked while generating');
+  await page.locator('#testSend').click();
+  await waitFor(() => {
+    const stopped = document.querySelector('.tc-message.assistant .tc-message-actions .mut');
+    return Boolean(stopped && stopped.textContent === '已停止');
+  });
+  const afterStop = await page.evaluate(() => ({
+    text: document.querySelector('.tc-message.assistant .tc-bubble').textContent,
+    send: document.getElementById('testSend').textContent,
+    sendDisabled: document.getElementById('testSend').disabled,
+    stopped: document.querySelector('.tc-message.assistant .tc-message-actions .mut').textContent,
+  }));
+  assert.match(afterStop.text, /第一段/);
+  assert.doesNotMatch(afterStop.text, /第二段/);
+  assert.equal(afterStop.stopped, '已停止');
+  assert.equal(afterStop.send, '发送');
+  assert.equal(afterStop.sendDisabled, true);
+  assert.equal(await page.locator('#testInput').isDisabled(), false);
+  await page.waitForTimeout(1900);
+  assert.doesNotMatch(await page.locator('.tc-message.assistant .tc-bubble').textContent(), /第二段/,
+    'an aborted stream must not append later chunks');
+});
+
+test('test chat retry after an inline admin error', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  /* 预期的 4xx 资源错误：先声明，再让路由只注入一次 422。 */
+  expectHttpStatusError({ url: /\/admin\/test\/chat\/completions$/, status: /422/ });
+  const routeMatcher = '**/admin/test/chat/completions';
+  let injected = false;
+  await page.route(routeMatcher, async route => {
+    if (injected) { await route.continue(); return; }
+    injected = true;
+    await route.fulfill({
+      status: 422,
+      contentType: 'application/json',
+      body: JSON.stringify({ detail: 'qa injected validation failure' }),
+    });
+  });
+  try {
+    await sendText('触发错误');
+    await waitFor(() => {
+      const error = document.querySelector('.tc-message.assistant .tc-error');
+      return Boolean(error && error.textContent.includes('qa injected validation failure'));
+    });
+    const retry = page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '重试' });
+    assert.equal(await retry.count(), 1);
+    assert.equal(await page.locator('.tc-message.assistant .tc-error').count(), 1);
+    await retry.click();
+    await waitFor(() => {
+      const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+      return bubbles.length === 1 && bubbles[0].textContent.includes('固定回复');
+    });
+    assert.equal(mockState.chatCalls.length, chatCallsBefore + 1,
+      'Retry must issue a real upstream request');
+    assert.equal(await page.locator('.tc-message.assistant .tc-error').count(), 0);
+    assert.equal(await page.locator('.tc-message.assistant').count(), 1,
+      'Retry removes only the failed assistant');
+  } finally {
+    await page.unroute(routeMatcher);
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('test chat new chat aborts the stream and starts a new session', async () => {
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  const sessionIds = [];
+  const captureSession = request => {
+    if (request.url().endsWith('/admin/test/chat/completions')) {
+      sessionIds.push(request.headers()['x-sr-session-id'] || '');
+    }
+  };
+  page.on('request', captureSession);
+  try {
+    await page.locator('#testFileInput').setInputFiles({
+      name: 'qa-new-chat.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
+    });
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    await sendText('延迟流');
+    await waitForAssistantText('第一段');
+    assert.equal(await page.locator('#testFiles .tc-chip').count(), 0,
+      'send clears the composer attachments');
+    await page.locator('#testNew').click();
+    await waitFor(() => document.querySelectorAll('.tc-message').length === 0 &&
+      !document.getElementById('testEmpty').hidden);
+    await page.waitForTimeout(1900);
+    assert.equal(await page.locator('.tc-message').count(), 0,
+      'aborted stream must not re-append after New Chat');
+    /* New Chat 也要清掉空闲时新选的附件。 */
+    await page.locator('#testFileInput').setInputFiles({
+      name: 'qa-idle.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
+    });
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    await page.locator('#testNew').click();
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 0);
+    /* 下一条真实请求使用轮换后的会话 id。 */
+    await sendText('你好');
+    await waitForAssistantText('固定回复');
+    assert.equal(sessionIds.length, 2, 'expected two real admin requests');
+    assert.equal(sessionIds[0].length > 0, true);
+    assert.equal(sessionIds[1].length > 0, true);
+    assert.notEqual(sessionIds[1], sessionIds[0], 'New Chat must rotate the session id');
+  } finally {
+    page.off('request', captureSession);
+  }
 });
 
 await runIfMain(import.meta.url);
