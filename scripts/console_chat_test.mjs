@@ -67,3 +67,58 @@ test('SSE parser handles split chunks, CRLF, multiline data and DONE', () => {
   parser.end();
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['你', '好']);
 });
+
+/* ---- Hardening round（评审补强：只补测试，不改实现） ---- */
+
+test('attachmentPart maps wav audio and text-extension fallback', () => {
+  assert.deepEqual(
+    attachmentPart({ name: 'a.wav', type: 'audio/wav', dataUrl: 'data:audio/wav;base64,AA==' }),
+    { type: 'input_audio', input_audio: { data: 'AA==', format: 'wav' } });
+  assert.deepEqual(
+    attachmentPart({ name: 'a.log', type: '', text: 'LOG' }),
+    { type: 'text', text: '\n\n[File: a.log]\nLOG' });
+});
+
+test('appendDelta leaves its input untouched and keeps text after media separate', () => {
+  const input = [
+    { type: 'text', text: 'a' },
+    { type: 'image', url: 'https://example.test/a.png' },
+  ];
+  const snapshot = JSON.parse(JSON.stringify(input));
+  const merged = appendDelta(input, { content: 'b' });
+  assert.deepEqual(input, snapshot, 'appendDelta must not mutate its input array/parts');
+  assert.equal(merged.length, 3);
+  assert.deepEqual(merged[0], { type: 'text', text: 'a' });
+  assert.deepEqual(merged[1], { type: 'image', url: 'https://example.test/a.png' });
+  assert.deepEqual(merged[2], { type: 'text', text: 'b' },
+    'text after a non-text part must be pushed as a new part');
+});
+
+test('SSE parser flushes a trailing unterminated event on end()', () => {
+  const events = [];
+  const parser = createSseParser(value => events.push(value));
+  parser.push('data: {"choices":[{"delta":{"content":"尾"}}]}');
+  parser.end();
+  assert.deepEqual(events.map(event => event.choices[0].delta.content), ['尾']);
+});
+
+test('SSE parser joins multiline data fields with newlines before parsing', () => {
+  const events = [];
+  const parser = createSseParser(value => events.push(value));
+  parser.push('data: {"choices":[{"delta":\ndata: {"content":"联"}}]}\n\n');
+  parser.end();
+  assert.deepEqual(events, [{ choices: [{ delta: { content: '联' } }] }]);
+});
+
+test('SSE parser ignores empty payloads, comment lines and DONE markers', () => {
+  const events = [];
+  const parser = createSseParser(value => events.push(value));
+  parser.push('data: \n\n');
+  parser.push(': keepalive\n\n');
+  parser.push(': data: {"fake":true}\n\n');
+  parser.push('data: [DONE]\n\n');
+  assert.deepEqual(events, []);
+  parser.push('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
+  parser.end();
+  assert.deepEqual(events.map(event => event.choices[0].delta.content), ['ok']);
+});
