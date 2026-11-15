@@ -10,7 +10,7 @@
    ------------------------------------------------------------------ */
 
 import assert from 'node:assert/strict';
-import { page, routerBase, runIfMain, test } from '../console_qa.mjs';
+import { page, routerBase, runIfMain, test, waitFor } from '../console_qa.mjs';
 
 test('test chat renderer supports markdown and blocks active content', async () => {
   await page.goto(routerBase + '/console/index.html');
@@ -158,6 +158,79 @@ test('test home replaces overview and lists Auto plus configured models', async 
   assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
   await page.locator('#testModel').selectOption('auto');
   assert.match(await page.locator('#testStatus').textContent(), /智能路由/);
+});
+
+/* 计划 Task 6：附件全部只留在内存（FileReader → data URL → 协议 part），
+   选择、拖拽、粘贴都落到同一套 chip；移除按附件 id 删并回收预览 URL。
+   先红后绿：Task 5 的壳还没有任何附件处理器。 */
+const QA_PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+const QA_MARKDOWN = '# QA\n\nhello attachment\n';
+const chipCount = () => document.querySelectorAll('#testFiles .tc-chip').length;
+
+test('test chat attachments add, remove, drop and paste', async () => {
+  await page.goto(routerBase + '/console/index.html');
+  await page.waitForSelector('#testModel optgroup', { state: 'attached' });
+
+  /* 空输入区 + 无附件时 Send 必须是禁用态。 */
+  await waitFor(() => document.getElementById('testSend').disabled === true);
+  assert.equal(await page.locator('#testSend').isDisabled(), true, 'Send must start disabled');
+
+  /* 文件选择：一张内存 PNG + 一个 Markdown，两个 chip、一个图片预览、一个体积标签。 */
+  await page.locator('#testFileInput').setInputFiles([
+    { name: 'qa-pixel.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64') },
+    { name: 'qa-notes.md', mimeType: 'text/markdown', buffer: Buffer.from(QA_MARKDOWN, 'utf8') },
+  ]);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 2);
+  assert.equal(await page.locator('#testFiles .tc-chip').count(), 2);
+  assert.equal(await page.locator('#testFiles .tc-chip img').count(), 1, 'exactly one image preview');
+  assert.match(await page.locator('#testFiles .tc-chip img').getAttribute('src'), /^blob:/,
+    'image preview must be an in-memory blob URL');
+  assert.equal(await page.locator('#testFiles .tc-chip img').getAttribute('alt'), 'qa-pixel.png');
+  const mdChip = page.locator('#testFiles .tc-chip', { hasText: 'qa-notes.md' });
+  assert.equal(await mdChip.count(), 1);
+  assert.match(await mdChip.locator('.tc-chip-meta').textContent(), /^\d+ B$/,
+    'chip must show a numeric file size');
+  assert.ok(await mdChip.getAttribute('data-attachment-id'), 'chip carries its attachment id');
+  /* 读完即清空 input.value，同一个文件才能被再次选择。 */
+  await waitFor(() => document.getElementById('testFileInput').value === '');
+  assert.equal(await page.locator('#testFileInput').evaluate(input => input.value), '',
+    'file input must be cleared after reading');
+
+  /* 空文本 + 一个附件也能发送。 */
+  assert.equal(await page.locator('#testInput').inputValue(), '');
+  assert.equal(await page.locator('#testSend').isDisabled(), false,
+    'one attachment without text must enable Send');
+
+  /* 移除 Markdown chip：只按 id 删一个，图片预览仍在。 */
+  await mdChip.locator('.tc-chip-remove').click();
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+  assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-notes.md' }).count(), 0);
+  assert.equal(await page.locator('#testFiles .tc-chip img').count(), 1);
+
+  /* 拖拽：同一个 PNG 通过 DataTransfer 落到 .tc-panel，恰好新增一个附件。 */
+  await page.evaluate(base64 => {
+    const binary = Uint8Array.from(atob(base64), char => char.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([binary], 'qa-drop.png', { type: 'image/png' }));
+    document.querySelector('.tc-panel').dispatchEvent(
+      new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  }, QA_PIXEL);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 2);
+  assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-drop.png' }).count(), 1);
+
+  /* 粘贴：同一个 PNG 通过 ClipboardEvent 落到 #testInput，同样只新增一个附件。 */
+  await page.locator('#testInput').click();
+  await page.evaluate(base64 => {
+    const binary = Uint8Array.from(atob(base64), char => char.charCodeAt(0));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([binary], 'qa-paste.png', { type: 'image/png' }));
+    document.getElementById('testInput').dispatchEvent(new ClipboardEvent('paste', {
+      clipboardData: transfer, bubbles: true, cancelable: true }));
+  }, QA_PIXEL);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 3);
+  assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-paste.png' }).count(), 1);
+  assert.equal(await page.locator('#testFiles .tc-chip').count(), 3);
+  assert.equal(await page.locator('#testFiles .tc-chip img').count(), 3);
 });
 
 await runIfMain(import.meta.url);
