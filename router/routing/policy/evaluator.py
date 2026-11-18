@@ -34,17 +34,17 @@ from router.jev.window import apply_window
 from router.routing.conditions import matching_periods
 from router.routing.policy.conditions import EvaluationContext, evaluate_condition
 from router.routing.policy.model import Policy, Rule, Target
-from router.routing.types import RoutingMiss, RoutingRequest
+from router.routing.types import (
+    NoActivePolicyError,
+    RoutingMiss,
+    RoutingRequest,
+)
 
 __all__ = [
     "NoActivePolicyError",
     "PolicyEvaluator",
     "PolicyOutcome",
 ]
-
-
-class NoActivePolicyError(RuntimeError):
-    """快照没有已启用的路由策略。"""
 
 
 @dataclass(frozen=True)

@@ -1,14 +1,14 @@
-"""One-way routing orchestration: evaluate the graph, then schedule a model."""
+"""One-way routing orchestration: evaluate the policy, then schedule a model."""
 from __future__ import annotations
 
-from router.routing.graph.evaluator import GraphEvaluator
+from router.routing.policy.evaluator import PolicyEvaluator
 from router.routing.scheduling import ModelScheduler
 from router.routing.snapshot import RoutingSnapshot
 from router.routing.types import RoutingDecision, RoutingRequest
 
 
 class RoutingService:
-    def __init__(self, evaluator: GraphEvaluator, scheduler: ModelScheduler):
+    def __init__(self, evaluator: PolicyEvaluator, scheduler: ModelScheduler):
         self.evaluator = evaluator
         self.scheduler = scheduler
 

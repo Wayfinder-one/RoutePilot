@@ -59,6 +59,7 @@ __all__ = [
     "Target",
     "TextCondition",
     "canonical_json",
+    "policy_behavior_dict",
     "policy_from_dict",
     "policy_revision_of",
     "policy_to_dict",
@@ -525,7 +526,14 @@ def canonical_json(value) -> str:
     )
 
 
-def policy_revision_of(policy: Policy) -> str:
+def policy_behavior_dict(policy: Policy) -> dict:
+    """去掉 ``name`` 的 canonical 行为文档：快照 content 与行为版本共用此序列化。"""
     document = policy_to_dict(policy)
     document.pop("name", None)
-    return hashlib.sha256(canonical_json(document).encode("utf-8")).hexdigest()
+    return document
+
+
+def policy_revision_of(policy: Policy) -> str:
+    return hashlib.sha256(
+        canonical_json(policy_behavior_dict(policy)).encode("utf-8")
+    ).hexdigest()

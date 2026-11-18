@@ -8,7 +8,13 @@ from router.store.db import connect
 logger = logging.getLogger(__name__)
 
 
-class GraphReloadWorker:
+class PolicyReloadWorker:
+    """定期复核策略目录指纹：仅指纹变化时重建并替换内存快照。
+
+    指纹只覆盖策略文件与 current 指针（``PolicyRepo.fingerprint``），布局写入
+    不触发快照替换；轮询失败仅记录日志，绝不中断服务或替换旧快照。
+    """
+
     def __init__(self, app, poll_seconds: float = 2.0):
         self.app = app
         self.poll_seconds = poll_seconds
@@ -29,7 +35,7 @@ class GraphReloadWorker:
         try:
             await asyncio.to_thread(refresh)
         except Exception:
-            logger.exception("graph snapshot reload failed")
+            logger.exception("policy snapshot reload failed")
 
     async def _loop(self) -> None:
         while True:
