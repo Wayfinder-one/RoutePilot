@@ -2,7 +2,7 @@
 
 纯函数：不读数据库、不发 HTTP、不打印、不抛业务异常。``policy_from_dict``
 已把形状错误折叠为 ``ValueError``，本层只对解析成功的 Policy 做数量上限、
-引用完整性、答案路径与比较符/取值范围的语义校验，产出机器可读的 ``Issue``
+时区标识、引用完整性、答案路径与比较符/取值范围的语义校验，产出机器可读的 ``Issue``
 列表（空列表 = 无问题）；中英文案统一由 ``router.api.issue_presenter`` 生成。
 
 - 限额常量唯一来源于 ``router.routing.policy.model``（MAX_*）。
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from router.routing.policy.model import (
     MAX_CONDITION_DEPTH,
@@ -177,12 +178,19 @@ def _numeric_issues(
 
 
 def validate_policy(policy: Policy) -> list[Issue]:
-    """结构校验（保存/试算，设计 §7.1）：限额、引用、答案路径与取值范围。"""
+    """结构校验（保存/试算，设计 §7.1）：限额、引用、时区、答案路径与取值范围。"""
     issues: list[Issue] = []
     if len(policy.questions) > MAX_QUESTIONS:
         issues.append(Issue("limit_exceeded", "questions", params={"limit": MAX_QUESTIONS}))
     if len(policy.rules) > MAX_RULES:
         issues.append(Issue("limit_exceeded", "rules", params={"limit": MAX_RULES}))
+    # 时区必须是 ZoneInfo 可解析的标识（v3 的 invalid_timezone 语义回归）：
+    # 否则求值期 ZoneInfo(policy.timezone) 才失败，线上每次 auto 请求 503。
+    try:
+        ZoneInfo(policy.timezone)
+    except (KeyError, ValueError, OSError):
+        issues.append(Issue(
+            "invalid_timezone", "timezone", params={"timezone": policy.timezone}))
     if policy.fallback not in policy.targets:
         issues.append(Issue("unknown_target", "fallback", params={"target": policy.fallback}))
     for tid, target in policy.targets.items():

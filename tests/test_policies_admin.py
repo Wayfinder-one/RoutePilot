@@ -7,6 +7,8 @@ layout 独立存取、viewer 写权限门、以及服务层异常 → HTTP 状�
 MissingError→404、ActivePolicyError→409、PolicyReadOnlyError→503）。
 """
 
+import pytest
+
 from router.store.db import connect
 from tests.policy_harness import make_policy_client
 from tests.routing_fixtures import policy_dict
@@ -149,6 +151,20 @@ def test_create_rejects_v3_body_and_unknown_fields(tmp_path):
     assert client.get("/admin/policies").json()["policies"] == []
 
 
+@pytest.mark.parametrize("bad_id", [12345, True])
+def test_create_rejects_non_string_ids_as_422(tmp_path, bad_id):
+    """body.id 非字符串：API 层折叠为 policy_parse_error 422（修复前直达
+    仓库 _validate_id 的 TypeError → 500）。"""
+    client, app = make_policy_client(tmp_path)
+    body = client.post("/admin/policies", json={"id": bad_id, "policy": policy_dict()})
+    assert body.status_code == 422, body.text
+    issues = body.json()["detail"]
+    assert issues[0]["code"] == "policy_parse_error"
+    assert issues[0]["path"] == "$"
+    assert issues[0]["params"]["detail"] == "id must be a string"
+    assert client.get("/admin/policies").json()["policies"] == []
+
+
 def test_wrong_answer_path_error_carries_machine_code_and_path(tmp_path):
     client, app = make_policy_client(tmp_path)
     broken = policy_dict()
@@ -158,7 +174,37 @@ def test_wrong_answer_path_error_carries_machine_code_and_path(tmp_path):
     issues = body.json()["detail"]
     issue = next(item for item in issues if item["code"] == "unknown_answer_path")
     assert issue["path"] == "rules.0.when.answer"
+    # 422 载荷必须机器可读（设计 §6.1）：params 原样透传校验器插值数据。
+    assert issue["params"] == {"answer": "missing.yes"}
     assert client.get("/admin/policies").json()["policies"] == []
+
+
+def test_invalid_timezone_fails_at_save_and_never_reaches_enable(tmp_path):
+    """时区标识不可解析：保存即 422 invalid_timezone（v3 语义回归），
+    文档不落盘，也就没有可启用的资源；存量资源同样挡在 PUT。"""
+    client, app = make_policy_client(tmp_path)
+    broken = policy_dict()
+    broken["timezone"] = "Not/AZone"
+    created = client.post("/admin/policies", json={"id": "badzone", "policy": broken})
+    assert created.status_code == 422, created.text
+    issues = created.json()["detail"]
+    assert [(item["code"], item["path"]) for item in issues] == [
+        ("invalid_timezone", "timezone")
+    ]
+    assert issues[0]["params"] == {"timezone": "Not/AZone"}
+    assert client.get("/admin/policies").json()["policies"] == []
+    assert client.post("/admin/policies/badzone/enable").status_code == 404
+
+    _create_main(client)
+    etag = client.get("/admin/policies/main").json()["policy_resource"]["document_sha256"]
+    replaced = client.put("/admin/policies/main", json=broken,
+                           headers={"If-Match": etag})
+    assert replaced.status_code == 422, replaced.text
+    assert any(item["code"] == "invalid_timezone"
+               for item in replaced.json()["detail"])
+    kept = client.get("/admin/policies/main").json()["policy_resource"]
+    assert kept["document_sha256"] == etag
+    assert kept["policy"]["timezone"] == "Asia/Shanghai"
 
 
 # --------------------------------------------------------------------------- #

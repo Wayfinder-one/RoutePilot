@@ -160,8 +160,12 @@ def create_policy(
     conn: sqlite3.Connection = Depends(get_conn),
     policies: PolicyRepo = Depends(get_policy_repo),
 ):
+    # id 类型在 API 层先拒绝：非字符串交给仓库会变成 _validate_id 的
+    # TypeError（→ 500）；这里折叠为与其它解析失败同型的 422 Issue。
+    if body.id is not None and not isinstance(body.id, str):
+        raise _parse_issue(ValueError("id must be a string"))
     policy = _parse_policy(body.policy)
-    # id 形状不在 API 层校验：非法 ID 由仓库 _validate_id → PolicyStorageError → 503。
+    # 字符串 id 的形状仍由仓库 _validate_id 把关 → PolicyStorageError → 503。
     created = _service(request, conn, policies).create(body.id, policy)
     return {"policy_resource": resource_payload(created)}
 
@@ -323,8 +327,9 @@ async def try_policy(
             snapshot, RoutingRequest(text=text, session_id=session_id),
             now=now, dry_run=True, trace_sink=trace,
         )
-    except (RoutingMiss, NoAvailableBackend, NoActivePolicyError) as exc:
+    except (RoutingMiss, NoAvailableBackend, NoActivePolicyError, KeyError) as exc:
         # 调度/求值失败不是文档问题：与数据面同型映射 503（含原因文本）。
+        # KeyError 覆盖 ZoneInfoNotFoundError：求值期时区意外绝不冒泡成 500。
         raise HTTPException(503, detail=str(exc)) from exc
     try:
         return {

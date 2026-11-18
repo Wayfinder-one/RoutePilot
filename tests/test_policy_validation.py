@@ -333,6 +333,35 @@ def test_finish_sorts_and_dedups_issues_stably():
 
 
 # ---------------------------------------------------------------------------
+# 时区：ZoneInfo 可解析性（v3 invalid_timezone 语义回归）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        pytest.param("Not/AZone", id="unknown-zone"),
+        pytest.param("Mars/Olympus", id="fictional-zone"),
+    ],
+)
+def test_unresolvable_timezone_yields_exactly_one_invalid_timezone_issue(timezone):
+    issues = _validated(lambda raw: raw.update(timezone=timezone))
+    assert [(i.code, i.path) for i in issues] == [("invalid_timezone", "timezone")]
+    assert issues[0].params == {"timezone": timezone}
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        pytest.param("UTC", id="utc"),
+        pytest.param("Asia/Shanghai", id="asia-shanghai"),
+    ],
+)
+def test_resolvable_timezones_stay_legal(timezone):
+    assert _validated(lambda raw: raw.update(timezone=timezone)) == []
+
+
+# ---------------------------------------------------------------------------
 # 启用校验（设计 §7.2）
 # ---------------------------------------------------------------------------
 
@@ -475,6 +504,9 @@ def test_enable_context_is_mutable_in_place():
             {"model": "fast", "reasoning": "high", "efforts": []}, id="reasoning-unsupported",
         ),
         pytest.param("unknown_period", "rules.3.when.period_in", {"period": "missing"}, id="unknown-period"),
+        pytest.param(
+            "invalid_timezone", "timezone", {"timezone": "Not/AZone"}, id="invalid-timezone",
+        ),
         pytest.param("decision_service_unavailable", "", {}, id="jev-unavailable"),
     ],
 )
@@ -487,7 +519,7 @@ def test_presenter_renders_every_new_code_bilingually(code, path, params):
     assert message["en"]
 
 
-def test_issues_payload_attaches_path_and_keeps_no_graph_locators():
+def test_issues_payload_attaches_path_params_and_keeps_no_graph_locators():
     issues = [
         Issue("unknown_answer_path", "rules.0.when.answer", params={"answer": "missing.yes"}),
         Issue("limit_exceeded", "questions", params={"limit": 32}),
@@ -500,6 +532,8 @@ def test_issues_payload_attaches_path_and_keeps_no_graph_locators():
             "en": "Unknown answer path: missing.yes",
             "path": "rules.0.when.answer",
             "level": "hard",
+            # 设计 §6.1：422 载荷机器可读，params 原样透传校验器插值数据。
+            "params": {"answer": "missing.yes"},
         },
         {
             "code": "limit_exceeded",
@@ -507,6 +541,7 @@ def test_issues_payload_attaches_path_and_keeps_no_graph_locators():
             "en": "Too many questions: limit is 32",
             "path": "questions",
             "level": "hard",
+            "params": {"limit": 32},
         },
     ]
     assert "node_id" not in payload[0] and "edge_id" not in payload[0] and "port" not in payload[0]

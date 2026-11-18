@@ -93,6 +93,10 @@ def present_issue(issue: Issue) -> dict[str, str]:
         period = _param(issue, "period")
         return _text(f"条件引用未定义时段：{period}",
                      f"Condition references an undefined period: {period}")
+    if code == "invalid_timezone":
+        timezone = _param(issue, "timezone")
+        return _text(f"时区标识无法解析：{timezone}",
+                     f"Unrecognized timezone identifier: {timezone}")
     if code == "decision_service_unavailable":
         return _text(
             "策略包含问题与规则，但决策服务（JEV）未配置或不可用",
@@ -104,10 +108,11 @@ def present_issue(issue: Issue) -> dict[str, str]:
 
 
 def issues_payload(issues) -> list[dict]:
-    """Issue 列表 → 422 载荷（双语字段 + 机器定位 ``path``）。
+    """Issue 列表 → 422 载荷（双语字段 + 机器定位 ``path`` + 机器参数 ``params``）。
 
     Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成，
-    ``path`` 直接来自校验器，控制台用它定位文档位置。
+    ``path`` 直接来自校验器，控制台用它定位文档位置；``params`` 原样透传
+    （设计 §6.1：422 载荷必须机器可读，脚本可按 code+params 自行处置）。
     """
     payload = []
     for issue in issues:
@@ -118,5 +123,6 @@ def issues_payload(issues) -> list[dict]:
             "en": message["en"],
             "path": issue.path,
             "level": issue.level,
+            "params": dict(issue.params or {}),
         })
     return payload
