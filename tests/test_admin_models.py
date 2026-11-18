@@ -2,8 +2,8 @@
 fetch-models (MockTransport), v9 migration.  Reasoning-profile validation is
 still covered here through the model CRUD endpoints; the retired
 /admin/pipeline reasoning health tests were removed with that endpoint
-(equivalent coverage: tests/test_unified_tree_validation.py and
-tests/test_routing_trees_admin.py).
+(equivalent coverage: tests/test_policy_validation.py and
+tests/test_policies_admin.py).
 """
 
 import json
