@@ -203,67 +203,109 @@ test('historyMessages maps assistant raw content and other roles verbatim', () =
 
 /* ---- Task 3 · stream.js：SSE 解码与终态 ---- */
 
-test('SSE parser handles split chunks, CRLF, multiline data and DONE', () => {
+test('SSE handles split chunks and DONE', () => {
   const events = [];
-  const parser = createSseParser(value => events.push(value));
+  const parser = createSseParser(event => events.push(event));
+  parser.push('data: {"choices":[{"delta":{"content":"你"}}]}\r');
+  parser.push('\n\r\ndata: {"choices":[{"delta":{"content":"好"}}]}\n\n');
+  parser.push('data: [DONE]\n\n');
+  assert.equal(parser.end(), true);
+  assert.equal(events.map(event => event.choices[0].delta.content).join(''), '你好');
+});
+
+test('finish_reason is terminal even without DONE', () => {
+  const parser = createSseParser(() => {});
+  parser.push('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
+  assert.equal(parser.end(), true);
+});
+
+test('EOF without DONE or finish_reason is incomplete', () => {
+  const parser = createSseParser(() => {});
+  parser.push('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+  assert.equal(parser.end(), false);
+});
+
+test('provider error payload throws', () => {
+  const parser = createSseParser(() => {});
+  assert.throws(
+    () => parser.push('data: {"error":{"message":"upstream failed"}}\n\n'),
+    /upstream failed/,
+  );
+});
+
+test('SSE reassembles events split mid-JSON across chunks', () => {
+  const events = [];
+  const parser = createSseParser(event => events.push(event));
   parser.push('data: {"choices":[{"delta":{"content":"你"}}]}\r');
   parser.push('\n\r\ndata: {"choices":');
   parser.push('[{"delta":{"content":"好"}}]}\n\n');
   parser.push('data: [DONE]\n\n');
-  parser.end();
+  assert.equal(parser.end(), true);
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['你', '好']);
 });
 
-test('SSE parser flushes a trailing unterminated event on end()', () => {
+test('end() flushes a trailing unterminated event and reports it incomplete', () => {
   const events = [];
-  const parser = createSseParser(value => events.push(value));
+  const parser = createSseParser(event => events.push(event));
   parser.push('data: {"choices":[{"delta":{"content":"尾"}}]}');
-  parser.end();
+  assert.equal(parser.end(), false);
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['尾']);
+  /* 冲刷后的二次 end() 不再触发回调，仍报告未完成。 */
+  assert.equal(parser.end(), false);
+  assert.equal(events.length, 1);
 });
 
 test('SSE parser joins multiline data fields with newlines before parsing', () => {
   const events = [];
-  const parser = createSseParser(value => events.push(value));
+  const parser = createSseParser(event => events.push(event));
   parser.push('data: {"choices":[{"delta":\ndata: {"content":"联"}}]}\n\n');
   parser.end();
   assert.deepEqual(events, [{ choices: [{ delta: { content: '联' } }] }]);
 });
 
-test('SSE parser ignores empty payloads, comment lines and DONE markers', () => {
+test('empty payloads, comment lines and DONE markers never reach onPayload', () => {
   const events = [];
-  const parser = createSseParser(value => events.push(value));
+  const parser = createSseParser(event => events.push(event));
   parser.push('data: \n\n');
   parser.push(': keepalive\n\n');
   parser.push(': data: {"fake":true}\n\n');
   parser.push('data: [DONE]\n\n');
   assert.deepEqual(events, []);
+  /* 终态标记之后调用方仍可继续 push（防御性），事件照常解码。 */
   parser.push('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
-  parser.end();
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['ok']);
+  assert.equal(parser.end(), true);
 });
 
-test('SSE parser reports DONE through the optional onDone callback', () => {
+test('terminal markers never fire onPayload and end() stays quiet after flushing', () => {
   const events = [];
-  let doneCount = 0;
-  const parser = createSseParser(value => events.push(value), () => { doneCount += 1; });
+  const parser = createSseParser(event => events.push(event));
   parser.push('data: {"choices":[{"delta":{"content":"x"}}]}\n\n');
-  parser.push('data: [DONE]\n\n');
-  parser.end();
+  parser.push('data: [DONE]');
+  assert.equal(parser.end(), true);
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['x']);
-  assert.equal(doneCount, 1);
+  /* 终态契约：end() 冲刷掉 [DONE] 本身不产生 payload，重复 end() 也不再触发任何回调。 */
+  assert.equal(parser.end(), true);
+  assert.equal(events.length, 1);
+});
 
-  /* 没有 onDone 的旧调用方行为不变：[DONE] 既不产生 payload 也不抛错。 */
-  const legacy = [];
-  const legacyParser = createSseParser(value => legacy.push(value));
-  legacyParser.push('data: [DONE]\n\n');
-  legacyParser.end();
-  assert.deepEqual(legacy, []);
-
-  /* 上游提前 EOF（没有 [DONE]）不触发 onDone，调用方据此判定 incomplete。 */
-  let truncatedDone = 0;
-  const truncated = createSseParser(() => {}, () => { truncatedDone += 1; });
-  truncated.push('data: {"choices":[{"delta":{"content":"y"}}]}\n\n');
-  truncated.end();
-  assert.equal(truncatedDone, 0);
+test('provider errors carry .payload and stringify a missing message', () => {
+  const parser = createSseParser(() => {});
+  assert.throws(
+    () => parser.push('data: {"error":{"message":"upstream failed"}}\n\n'),
+    error => {
+      assert.equal(error.message, 'upstream failed');
+      assert.deepEqual(error.payload, { message: 'upstream failed' });
+      return true;
+    },
+  );
+  const fallback = createSseParser(() => {});
+  assert.throws(
+    () => fallback.push('data: {"error":{"code":503}}\n\n'),
+    error => {
+      assert.equal(error.message, JSON.stringify({ code: 503 }));
+      assert.deepEqual(error.payload, { code: 503 });
+      return true;
+    },
+  );
 });
