@@ -3,7 +3,9 @@
    Task 5（壳）：模型目录选择器、Auto / 固定模型状态、空目录提示
    （#testModelEmpty + 模型页链接）、内联会话错误（#testError）、
    角色门控（renderAccessState）、新建对话、语言重绘。
-   Task 6（附件）：选择 / 拖拽 / 粘贴附件管线（本提交沿用 v1 形状）。
+   Task 6（附件）：选择 / 拖拽 / 粘贴同一管线；预检在读取之前按
+   estimateAttachmentBytes 拒绝预估超限；文本文件只读 file.text()，
+   非文本走 Data URL；单文件失败就地内联「文件名: 错误」。
    Task 7（流式）：本提交按评审决议 3 暂时禁用发送 —— 协议/流模块契约
    （Task 2+3）已改写为 raw 消息模型，完整的 guarded 流式生命周期在
    Task 7 以 RED → GREEN 重建；在此之前不伪造任何发送成功状态。
@@ -15,7 +17,8 @@
 import { api, apiErrText, esc, toast } from './api.js';
 import { onLangChange, t } from './i18n.js';
 import {
-  MAX_REQUEST_BYTES, attachmentPart, historyMessages, normalizeMessage, requestBytes,
+  MAX_REQUEST_BYTES, attachmentPart, estimateAttachmentBytes, historyMessages,
+  isTextFile, normalizeMessage, requestBytes,
 } from './chat/protocol.js';
 import { renderParts } from './chat/render.js';
 import './nav.js';
@@ -48,8 +51,9 @@ const COPY = Object.freeze({
 });
 /* 评审决议 3（绑定）：分支中段允许「发送暂时回归」。Task 2+3 改写了
    protocol/stream 契约，完整的流式生命周期在 Task 7 以 TDD 重建；本提交里
-   发送按钮保持禁用、requestAssistant 为占位，绝不伪造发送成功状态。
-   Task 7 落地后删除本常量与两处守卫。 */
+   sendCurrent 直接返回，绝不伪造发送成功状态。发送按钮状态如实反映输入
+   内容（Task 6 用例断言「空文本 + 附件启用 Send」）。Task 7 落地后删除
+   本常量与 sendCurrent 里的守卫。 */
 const SENDING_READY = false;
 const $ = selector => document.querySelector(selector);
 
@@ -120,16 +124,21 @@ function hasComposerContent() {
 }
 
 /* 发送按钮：生成中变「停止」可点；其余按启动失败/角色/输入内容计算。
-   SENDING_READY 守卫见常量声明处（Task 7 移除）。 */
+   按钮状态如实反映可发送内容（Task 6 的附件用例断言这一点）；发送动作
+   本身仍由 SENDING_READY 守卫在 sendCurrent 里拦下（Task 7 移除）。 */
 function updateSendState() {
   const busy = Boolean(state.controller);
   const send = $('#testSend');
   send.textContent = t(busy ? COPY.stop : COPY.send);
-  send.disabled = !SENDING_READY || Boolean(state.bootError) || state.role !== 'admin' ||
+  send.disabled = Boolean(state.bootError) || state.role !== 'admin' ||
     (!busy && !hasComposerContent());
 }
 
-/* ── 附件：只留在内存。FileReader → data URL，文本类顺带读出正文 ── */
+/* ── 附件：只留在内存；预检先于任何读取 ────────────────────────────
+   体积三段式（计划 Task 6）：历史 JSON 实测 + 已选附件估算 + 本文件估算
+   超过 10MB 就地内联拒绝，绝不碰 FileReader。文本文件只读 file.text()，
+   不再额外转 Data URL（协议分类的唯一判定是 isTextFile）；非文本走
+   readDataUrl。单文件读取失败只内联「文件名: 错误」，其余文件照常处理。 */
 function readDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -139,9 +148,8 @@ function readDataUrl(file) {
   });
 }
 
-function isTextLike(file) {
-  return String(file.type || '').startsWith('text/') ||
-    /\.(?:txt|md|markdown|csv|json|jsonl|py|js|mjs|ts|tsx|html|css|xml|ya?ml|log)$/i.test(file.name);
+function selectedAttachmentEstimate() {
+  return state.attachments.reduce((sum, item) => sum + item.estimatedBytes, 0);
 }
 
 function formatBytes(bytes) {
@@ -168,20 +176,33 @@ async function addFiles(files) {
   /* 读取是异步的：New Chat / 发送清空附件后，旧的读取结果必须整批丢弃。 */
   const epoch = state.uploadEpoch;
   for (const file of Array.from(files || [])) {
+    const estimatedBytes = estimateAttachmentBytes(file);
+    const historyBytes = requestBytes({
+      model: state.model,
+      messages: historyMessages(state.messages),
+      stream: true,
+    });
+    /* 预检先于读取：预估超限就地报错并跳过该文件，不做任何 FileReader 转换。 */
+    if (historyBytes + selectedAttachmentEstimate() + estimatedBytes > MAX_REQUEST_BYTES) {
+      showConversationError(t(COPY.tooLarge));
+      continue;
+    }
     try {
-      const [dataUrl, text] = await Promise.all([
-        readDataUrl(file),
-        isTextLike(file) ? file.text() : Promise.resolve(''),
-      ]);
+      const text = isTextFile(file) ? await file.text() : '';
+      const dataUrl = isTextFile(file) ? '' : await readDataUrl(file);
       if (epoch !== state.uploadEpoch) return;
       state.attachments.push({
         id: newId(),
         file,
         part: attachmentPart({ name: file.name, type: file.type, dataUrl, text }),
         previewUrl: String(file.type || '').startsWith('image/') ? URL.createObjectURL(file) : '',
+        estimatedBytes,
       });
     } catch (error) {
       if (epoch !== state.uploadEpoch) return;
+      /* 单文件失败：内联该文件的名字与错误（计划 Task 6）；toast 保留作
+         短时提示（i18n 基线要求 test.uploadFail 键保持被引用）。 */
+      showConversationError(`${file.name}: ${error.message}`);
       toast(t(COPY.uploadFail), 3200);
     }
   }

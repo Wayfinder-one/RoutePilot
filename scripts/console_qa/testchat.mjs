@@ -8,7 +8,8 @@
      复制链整链失败写进 Copy 按钮标签；
    * Task 5 首页壳：Test 导航、模型目录、Auto/固定模型状态、390/800/1440
      首屏适配、空目录时的 #testModelEmpty 模型页入口、viewer 锁定输入区；
-   * Task 6 附件：选择/拖拽/粘贴、chip 预览与移除、空文本 + 附件可发送；
+   * Task 6 附件：五类文件 chip 与移除、拖拽/粘贴、空文本 + 附件启用 Send、
+     文本文件免 Data URL 转换、预估超限先于读取就地拒绝、单文件失败内联；
    * Task 7 流式：Auto/固定模型、多轮历史、附件 wire 形状、多模态 part、
      Stop、内联错误 + Retry、提前 EOF（未完成）、New Chat 中止与会话轮换；
    * Task 8 首页截图（仅在 QA_SCREENSHOTS=1 时执行）。
@@ -353,51 +354,60 @@ test('test viewer cannot use the composer', async () => {
   }
 });
 
-/* 计划 Task 6：附件全部只留在内存（FileReader → data URL → 协议 part），
-   选择、拖拽、粘贴都落到同一套 chip；移除按附件 id 删并回收预览 URL。
-   先红后绿：Task 5 的壳还没有任何附件处理器。 */
+/* ── 计划 Task 6：附件预检与文本直读 ──────────────────────────────────
+   v1 的单条「add, remove, drop and paste」用例拆成两条并保留全部断言：
+   * 五类文件（PNG/MD/YAML/PDF/MP3）的 chip / 预览 / 体积 / 移除；
+   * 拖拽与粘贴各落一个附件，空文本 + 附件启用 Send。
+   再加三条新行为用例（先红）：文本文件只读 file.text()（无 Data URL 转换）、
+   预估超限先于任何读取就地拒绝（无 FileReader / 无 admin 请求 / 不加 chip）、
+   单文件读取失败只内联该文件错误且其余文件可用。 */
 const QA_PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 const QA_MARKDOWN = '# QA\n\nhello attachment\n';
+const QA_YAML = 'key: value\n';
 
-test('test chat attachments add, remove, drop and paste', async () => {
-  await page.goto(routerBase + '/console/index.html');
-  await page.waitForSelector('#testModel optgroup', { state: 'attached' });
-
+test('test chat attachments add chips for every file type', async () => {
+  await openTestPage();
   /* 空输入区 + 无附件时 Send 必须是禁用态。 */
   await waitFor(() => document.getElementById('testSend').disabled === true);
   assert.equal(await page.locator('#testSend').isDisabled(), true, 'Send must start disabled');
 
-  /* 文件选择：一张内存 PNG + 一个 Markdown，两个 chip、一个图片预览、一个体积标签。 */
+  /* 文件选择：PNG（图片预览）+ MD/YAML（文本）+ PDF/MP3（二进制），五个 chip。 */
   await page.locator('#testFileInput').setInputFiles([
     { name: 'qa-pixel.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64') },
     { name: 'qa-notes.md', mimeType: 'text/markdown', buffer: Buffer.from(QA_MARKDOWN, 'utf8') },
+    { name: 'qa-config.yaml', mimeType: 'text/yaml', buffer: Buffer.from(QA_YAML, 'utf8') },
+    { name: 'qa-manual.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 qa', 'utf8') },
+    { name: 'qa-audio.mp3', mimeType: 'audio/mpeg', buffer: Buffer.from('ID3qa-audio', 'utf8') },
   ]);
-  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 2);
-  assert.equal(await page.locator('#testFiles .tc-chip').count(), 2);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 5);
+  assert.equal(await page.locator('#testFiles .tc-chip').count(), 5);
   assert.equal(await page.locator('#testFiles .tc-chip img').count(), 1, 'exactly one image preview');
   assert.match(await page.locator('#testFiles .tc-chip img').getAttribute('src'), /^blob:/,
     'image preview must be an in-memory blob URL');
   assert.equal(await page.locator('#testFiles .tc-chip img').getAttribute('alt'), 'qa-pixel.png');
-  const mdChip = page.locator('#testFiles .tc-chip', { hasText: 'qa-notes.md' });
-  assert.equal(await mdChip.count(), 1);
-  assert.match(await mdChip.locator('.tc-chip-meta').textContent(), /^\d+ B$/,
-    'chip must show a numeric file size');
-  assert.ok(await mdChip.getAttribute('data-attachment-id'), 'chip carries its attachment id');
+  for (const name of ['qa-notes.md', 'qa-config.yaml', 'qa-manual.pdf', 'qa-audio.mp3']) {
+    const chip = page.locator('#testFiles .tc-chip', { hasText: name });
+    assert.equal(await chip.count(), 1, `${name} chip missing`);
+    assert.match(await chip.locator('.tc-chip-meta').textContent(), /^\d+ B$/,
+      `${name} chip must show a numeric file size`);
+    assert.ok(await chip.getAttribute('data-attachment-id'), `${name} chip carries its attachment id`);
+  }
   /* 读完即清空 input.value，同一个文件才能被再次选择。 */
   await waitFor(() => document.getElementById('testFileInput').value === '');
   assert.equal(await page.locator('#testFileInput').evaluate(input => input.value), '',
     'file input must be cleared after reading');
 
-  /* 空文本 + 一个附件也能发送。 */
-  assert.equal(await page.locator('#testInput').inputValue(), '');
-  assert.equal(await page.locator('#testSend').isDisabled(), false,
-    'one attachment without text must enable Send');
-
-  /* 移除 Markdown chip：只按 id 删一个，图片预览仍在。 */
-  await mdChip.locator('.tc-chip-remove').click();
-  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
-  assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-notes.md' }).count(), 0);
+  /* 移除 YAML chip：只按 id 删一个，PNG 预览与其余 chip 原样保留。 */
+  const yamlChip = page.locator('#testFiles .tc-chip', { hasText: 'qa-config.yaml' });
+  await yamlChip.locator('.tc-chip-remove').click();
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 4);
+  assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-config.yaml' }).count(), 0);
   assert.equal(await page.locator('#testFiles .tc-chip img').count(), 1);
+});
+
+test('test chat attachments drop and paste add one each', async () => {
+  await openTestPage();
+  assert.equal(await page.locator('#testSend').isDisabled(), true, 'Send must start disabled');
 
   /* 拖拽：同一个 PNG 通过 DataTransfer 落到 .tc-panel，恰好新增一个附件。 */
   await page.evaluate(base64 => {
@@ -407,8 +417,15 @@ test('test chat attachments add, remove, drop and paste', async () => {
     document.querySelector('.tc-panel').dispatchEvent(
       new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }));
   }, QA_PIXEL);
-  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 2);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
   assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-drop.png' }).count(), 1);
+
+  /* 空文本 + 一个附件也能启用 Send（发送动作本身在 Task 7 恢复）。 */
+  assert.equal(await page.locator('#testInput').inputValue(), '');
+  await page.waitForFunction(() => !document.getElementById('testSend').disabled, null,
+    { timeout: 15000 });
+  assert.equal(await page.locator('#testSend').isDisabled(), false,
+    'one attachment without text must enable Send');
 
   /* 粘贴：同一个 PNG 通过 ClipboardEvent 落到 #testInput，同样只新增一个附件。 */
   await page.locator('#testInput').click();
@@ -419,10 +436,130 @@ test('test chat attachments add, remove, drop and paste', async () => {
     document.getElementById('testInput').dispatchEvent(new ClipboardEvent('paste', {
       clipboardData: transfer, bubbles: true, cancelable: true }));
   }, QA_PIXEL);
-  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 3);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 2);
   assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-paste.png' }).count(), 1);
-  assert.equal(await page.locator('#testFiles .tc-chip').count(), 3);
-  assert.equal(await page.locator('#testFiles .tc-chip img').count(), 3);
+  assert.equal(await page.locator('#testFiles .tc-chip img').count(), 2);
+});
+
+/* 计划 Task 6：文本文件只读 file.text()，绝不再走 Data URL 转换。
+   在页面里给 FileReader.prototype.readAsDataURL 挂计数器即可证明。
+   上游 wire 正文的断言归 Task 8（`test chat attachment wire`）。 */
+test('test chat attachments read text files without data urls', async () => {
+  await openTestPage();
+  await page.evaluate(() => {
+    window.__dataUrlReads = 0;
+    window.__savedReadAsDataURL = FileReader.prototype.readAsDataURL;
+    FileReader.prototype.readAsDataURL = function (...args) {
+      window.__dataUrlReads += 1;
+      return window.__savedReadAsDataURL.apply(this, args);
+    };
+  });
+  try {
+    await page.locator('#testFileInput').setInputFiles({
+      name: 'qa-config.yaml', mimeType: 'text/yaml', buffer: Buffer.from(QA_YAML, 'utf8'),
+    });
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    const chip = page.locator('#testFiles .tc-chip', { hasText: 'qa-config.yaml' });
+    assert.equal(await chip.count(), 1, 'a text-file chip must exist');
+    assert.ok(await chip.getAttribute('data-attachment-id'), 'the chip carries its attachment id');
+    assert.equal(await page.evaluate(() => window.__dataUrlReads), 0,
+      'a text file must not be converted to a Data URL');
+  } finally {
+    await page.evaluate(() => {
+      FileReader.prototype.readAsDataURL = window.__savedReadAsDataURL;
+    });
+  }
+});
+
+/* 计划 Task 6：预估超限的文件在读取之前就被拒绝 —— 8MB 二进制的 base64 膨胀
+   估算 ≈ 10.7MB，超出 10MB 请求体上限。断言三件事：就地内联提示、零
+   FileReader 转换（挂计数器）、零 admin 测试请求；chip 也不得出现。 */
+test('test oversized attachment is rejected before any read', async () => {
+  await openTestPage();
+  await page.evaluate(() => {
+    window.__dataUrlReads = 0;
+    window.__savedReadAsDataURL = FileReader.prototype.readAsDataURL;
+    FileReader.prototype.readAsDataURL = function (...args) {
+      window.__dataUrlReads += 1;
+      return window.__savedReadAsDataURL.apply(this, args);
+    };
+  });
+  const chatRequests = [];
+  const onRequest = request => {
+    if (request.url().includes('/admin/test/chat/completions')) chatRequests.push(request.url());
+  };
+  page.on('request', onRequest);
+  try {
+    await page.locator('#testFileInput').setInputFiles({
+      name: 'qa-big.bin', mimeType: 'application/octet-stream',
+      buffer: Buffer.alloc(8 * 1024 * 1024, 7),
+    });
+    await waitFor(() => !document.getElementById('testError').hidden, null, { timeout: 8000 });
+    assert.equal(await page.locator('#testError').isHidden(), false,
+      'the oversize rejection must surface inline');
+    assert.equal(await page.locator('#testError').textContent(),
+      '请求体超过 10 MB 上限，请减少附件或历史消息');
+    assert.equal(await page.locator('#testFiles .tc-chip').count(), 0,
+      'an estimated-oversize file must not become a chip');
+    assert.equal(await page.evaluate(() => window.__dataUrlReads), 0,
+      'the oversize file must be rejected before any FileReader conversion');
+    assert.equal(chatRequests.length, 0, 'no admin test request may be issued');
+  } finally {
+    page.off('request', onRequest);
+    await page.evaluate(() => {
+      FileReader.prototype.readAsDataURL = window.__savedReadAsDataURL;
+    });
+  }
+});
+
+/* 计划 Task 6：单文件读取失败只内联「文件名: 错误」，不得炸成未捕获页面
+   错误，同批的好文件照常可用（可移除、可继续添加新附件）。 */
+test('test chat attachments read failure shows a per-file inline error', async () => {
+  await openTestPage();
+  await page.evaluate(() => {
+    window.__capturedPageErrors = [];
+    window.addEventListener('error', event => {
+      window.__capturedPageErrors.push(String(event.message || event));
+    });
+    window.addEventListener('unhandledrejection', event => {
+      window.__capturedPageErrors.push('rejection: ' +
+        String(event.reason && event.reason.message || event.reason));
+    });
+    /* File.prototype.text 原本继承自 Blob.prototype：挂一个自有覆盖，
+       finally 里 delete 即可还原继承链。 */
+    File.prototype.text = function () {
+      if (this.name === 'qa-broken.md') {
+        return Promise.reject(new Error('forced read failure'));
+      }
+      return Object.getPrototypeOf(File.prototype).text.call(this);
+    };
+  });
+  try {
+    await page.locator('#testFileInput').setInputFiles([
+      { name: 'qa-broken.md', mimeType: 'text/markdown', buffer: Buffer.from('# broken\n', 'utf8') },
+      { name: 'qa-good.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64') },
+    ]);
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-good.png' }).count(), 1,
+      'the valid file must stay usable as a chip');
+    assert.equal(await page.locator('#testError').isHidden(), false,
+      'the read failure must surface inline');
+    assert.equal(await page.locator('#testError').textContent(), 'qa-broken.md: forced read failure');
+    assert.deepEqual(await page.evaluate(() => window.__capturedPageErrors), [],
+      'a per-file read failure must not become an unhandled page error');
+    /* 好文件仍然可用：既能移除，也能继续添加新附件。 */
+    await page.locator('#testFiles .tc-chip', { hasText: 'qa-good.png' })
+      .locator('.tc-chip-remove').click();
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 0);
+    await page.locator('#testFileInput').setInputFiles({
+      name: 'qa-after.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
+    });
+    await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    assert.equal(await page.locator('#testFiles .tc-chip', { hasText: 'qa-after.png' }).count(), 1,
+      'the attachment pipeline must keep working after a failed read');
+  } finally {
+    await page.evaluate(() => { delete File.prototype.text; });
+  }
 });
 
 /* ── 计划 Task 7：真实流式对话 ────────────────────────────────────────
@@ -430,6 +567,12 @@ test('test chat attachments add, remove, drop and paste', async () => {
    延迟流 Stop、内联 4xx 错误 + Retry、New Chat 中止并轮换会话 id。
    mock 触发词见 console_qa.mjs 的 mock /v1/chat/completions 分支。 */
 async function openTestPage() {
+  /* 对话用例都以 zh 断言文案：导航前先把 router_lang 种进 localStorage
+     （与壳用例 openShellPage 同一策略；about:blank 先拿一次页面建立 origin）。 */
+  if (!page.url().startsWith(routerBase)) {
+    await page.goto(routerBase + '/console/index.html');
+  }
+  await page.evaluate(() => localStorage.setItem('router_lang', 'zh'));
   await page.goto(routerBase + '/console/index.html');
   await page.waitForSelector('#testModel optgroup', { state: 'attached' });
 }
