@@ -10,8 +10,10 @@
      首屏适配、空目录时的 #testModelEmpty 模型页入口、viewer 锁定输入区；
    * Task 6 附件：五类文件 chip 与移除、拖拽/粘贴、空文本 + 附件启用 Send、
      文本文件免 Data URL 转换、预估超限先于读取就地拒绝、单文件失败内联；
-   * Task 7 流式：Auto/固定模型、多轮历史、附件 wire 形状、多模态 part、
-     Stop、内联错误 + Retry、提前 EOF（未完成）、New Chat 中止与会话轮换；
+   * Task 7 流式（具名）：auto stream / direct stream / multi-turn text /
+     stop / incomplete eof / new generation race（代次守卫回归）/
+     provider stream error；附件 wire、多模态 part、Retry、New Chat 清场
+     仍由 v1 用例覆盖，Task 8 具名收编；
    * Task 8 首页截图（仅在 QA_SCREENSHOTS=1 时执行）。
    入口：`QA_ONLY="test chat" node scripts/console_qa/testchat.mjs`；
          全量：`node scripts/console_qa.mjs`（已在该文件 main() 中注册）。
@@ -562,9 +564,12 @@ test('test chat attachments read failure shows a per-file inline error', async (
   }
 });
 
-/* ── 计划 Task 7：真实流式对话 ────────────────────────────────────────
-   Auto 路由、固定模型多轮且不碰 JEV、附件 wire 形状、多模态 part 渲染、
-   延迟流 Stop、内联 4xx 错误 + Retry、New Chat 中止并轮换会话 id。
+/* ── 计划 Task 7：真实流式对话（修订版 7 条具名用例）──────────────────
+   auto stream / direct stream / multi-turn text / stop / incomplete eof /
+   new generation race（评审发现 1 的回归：旧请求的 finally 不得清掉新
+   controller）/ provider stream error（SSE 错误负载内联且绝不完成）。
+   附件 wire 形状、多模态 part、Retry/Regenerate 流程与 New Chat 清场
+   仍由 v1 用例覆盖，Task 8 按计划具名重排。
    mock 触发词见 console_qa.mjs 的 mock /v1/chat/completions 分支。 */
 async function openTestPage() {
   /* 对话用例都以 zh 断言文案：导航前先把 router_lang 种进 localStorage
@@ -590,7 +595,7 @@ function waitForAssistantText(text) {
   }, text);
 }
 
-test('test chat auto routing streams the fixed reply', async () => {
+test('test chat auto stream', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   const jevCallsBefore = mockState.systemoneCalls.length;
   await openTestPage();
@@ -650,12 +655,37 @@ test('test chat auto routing streams the fixed reply', async () => {
     'Copy must fall back to execCommand when the Clipboard API is unavailable');
 });
 
-test('test chat direct model keeps multi-turn history and skips JEV', async () => {
+/* 计划 Task 7：固定模型直连 —— 跳过 JEV，元信息带「固定模型」直连标记。 */
+test('test chat direct stream', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   const jevCallsBefore = mockState.systemoneCalls.length;
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
   assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
+  await sendText('第一轮');
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    return bubbles.length === 1 && bubbles[0].textContent.includes('固定回复');
+  });
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 1, 'one upstream call per send');
+  const lastCall = mockState.chatCalls.at(-1);
+  assert.equal(lastCall.model, 'qwen3-32b', 'the pinned model must reach the upstream verbatim');
+  assert.equal(mockState.systemoneCalls.length, jevCallsBefore,
+    'fixed model mode must not call the decision service');
+  const metas = await page.locator('.tc-message.assistant .tc-message-meta').allTextContents();
+  assert.deepEqual(metas, ['qwen3-32b · 固定模型']);
+  const actions = await page.locator('.tc-message.assistant .tc-message-actions button').allTextContents();
+  assert.deepEqual(actions, ['复制', '重新生成']);
+});
+
+/* 计划 Task 7：多轮文本 —— 第二次请求体必须是 user / 原始 assistant 内容 /
+   user（无损历史回放，绝不做渲染往返转换）。v1 重新生成段保留在此
+   （重命名不弱化断言），Task 8 的 `test chat regenerate` 具名收编。 */
+test('test chat multi-turn text', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  const jevCallsBefore = mockState.systemoneCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('第一轮');
   await waitFor(() => {
     const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
@@ -669,7 +699,8 @@ test('test chat direct model keeps multi-turn history and skips JEV', async () =
   assert.equal(mockState.chatCalls.length, chatCallsBefore + 2);
   const lastCall = mockState.chatCalls.at(-1);
   assert.deepEqual(lastCall.messages.map(message => message.role), ['user', 'assistant', 'user']);
-  assert.equal(lastCall.messages[1].content, '固定回复', 'assistant history stays wire-format text');
+  assert.equal(lastCall.messages[1].content, '固定回复',
+    'the second body must replay the ORIGINAL assistant content, not render-derived parts');
   assert.equal(lastCall.messages[2].content, '第二轮');
   assert.equal(lastCall.model, 'qwen3-32b');
   assert.equal(mockState.systemoneCalls.length, jevCallsBefore,
@@ -776,7 +807,9 @@ test('test chat multimodal answer renders every part type', async () => {
   assert.equal(mockState.chatCalls.length, chatCallsBefore + 1);
 });
 
-test('test chat stop preserves the partial stream', async () => {
+/* 计划 Task 7：延迟流上 Stop —— 部分文本保留、输入区在生成中锁定
+   （R-T5 评审回补 a）、语言重绘不解锁、中止后上游补写不再落地。 */
+test('test chat stop', async () => {
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('延迟流');
@@ -813,8 +846,13 @@ test('test chat stop preserves the partial stream', async () => {
   await page.waitForTimeout(1900);
   assert.doesNotMatch(await page.locator('.tc-message.assistant .tc-bubble').textContent(), /第二段/,
     'an aborted stream must not append later chunks');
+});
 
-  /* M4：上游提前 EOF（没有 [DONE]）→ 未完成态，保留已收到的文本，不给完成动作。 */
+/* 计划 Task 7：上游提前 EOF（没有 [DONE] / finish_reason）→ 未完成态，
+   保留已收到的文本，绝不落成完成态（没有 Copy/Regenerate）。 */
+test('test chat incomplete eof', async () => {
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('截断流');
   await waitFor(() => {
     const assistants = document.querySelectorAll('.tc-message.assistant');
@@ -839,7 +877,124 @@ test('test chat stop preserves the partial stream', async () => {
   assert.equal(incomplete.buttons, 0, 'an incomplete stream offers no completed actions');
   assert.equal(incomplete.send, '发送');
   assert.equal(incomplete.inputDisabled, false);
-  assert.equal(incomplete.assistantCount, 2);
+  assert.equal(incomplete.assistantCount, 1);
+});
+
+/* 计划 Task 7（评审发现 1 的回归）：代次竞态 —— 启动延迟流 A，点 New Chat
+   立刻发 B；A 落定后 B 仍是活请求（按钮还是「停止」＝ A 的 finally 没清掉
+   B 的 controller），Stop 只作用于 B；消息区只渲染 B 这一轮对话；B 的请求
+   头带 New Chat 轮换后的新 x-sr-session-id；两条被放弃的流都不得补写。 */
+test('test chat new generation race', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  const sessionIds = [];
+  const captureSession = request => {
+    if (request.url().endsWith('/admin/test/chat/completions')) {
+      sessionIds.push(request.headers()['x-sr-session-id'] || '');
+    }
+  };
+  page.on('request', captureSession);
+  try {
+    /* A：延迟流在途，等「第一段」确认。 */
+    await sendText('延迟流');
+    await waitForAssistantText('第一段');
+    /* M8（v1 保留）：New Chat 必须真的中止 A（浏览器侧 net::ERR_ABORTED）。
+       事件 promise 先建好不阻塞，点完 New Chat 立刻发 B。 */
+    const aAbort = page.waitForEvent('requestfailed', {
+      predicate: request => request.url().includes('/admin/test/chat/completions'),
+      timeout: 8000,
+    });
+    await page.locator('#testNew').click();
+    /* B：新一轮对话，同样延迟流，保持 B 在途可停止。 */
+    await sendText('延迟流');
+    await waitFor(() => {
+      const users = document.querySelectorAll('.tc-message.user');
+      const assistants = document.querySelectorAll('.tc-message.assistant');
+      return users.length === 1 && assistants.length === 1 &&
+        assistants[0].textContent.includes('第一段');
+    });
+    /* A 落定：abort 事件 + A 的 finally 必须无痕退场。 */
+    const failed = await aAbort;
+    assert.match(String(failed.failure() && failed.failure().errorText), /ABORT/i,
+      'New Chat must abort the in-flight request A');
+    /* B 仍是活请求：A 的 finally 不得清掉 B 的 controller —— 按钮还得是
+       「停止」，输入区仍锁定；消息区只有 B 这一轮。 */
+    await waitFor(() => document.getElementById('testSend').textContent === '停止');
+    const race = await page.evaluate(() => ({
+      assistants: document.querySelectorAll('.tc-message.assistant').length,
+      users: document.querySelectorAll('.tc-message.user').length,
+      text: document.querySelector('.tc-message.assistant .tc-bubble').textContent,
+      send: document.getElementById('testSend').textContent,
+      inputDisabled: document.getElementById('testInput').disabled,
+    }));
+    assert.equal(race.assistants, 1, 'only conversation B renders; A never re-appends');
+    assert.equal(race.users, 1, 'only B’s user bubble remains after New Chat');
+    assert.match(race.text, /第一段/);
+    assert.equal(race.send, '停止', 'B must still be the live request after A settles');
+    assert.equal(race.inputDisabled, true, 'the composer stays locked while B streams');
+    /* 会话轮换：B 的请求头必须是新 x-sr-session-id。 */
+    assert.equal(sessionIds.length, 2, 'A and B each issued one admin request');
+    assert.equal(sessionIds[0].length > 0, true);
+    assert.equal(sessionIds[1].length > 0, true);
+    assert.notEqual(sessionIds[1], sessionIds[0], 'New Chat must rotate the session id');
+    /* Stop 只作用于当前 controller：B 停在第一段，带「已停止」标记。 */
+    await page.locator('#testSend').click();
+    await waitFor(() => {
+      const stopped = document.querySelector('.tc-message.assistant .tc-message-actions .mut');
+      return Boolean(stopped && stopped.textContent === '已停止');
+    });
+    const after = await page.evaluate(() => ({
+      text: document.querySelector('.tc-message.assistant .tc-bubble').textContent,
+      stopped: document.querySelector('.tc-message.assistant .tc-message-actions .mut').textContent,
+      send: document.getElementById('testSend').textContent,
+      inputDisabled: document.getElementById('testInput').disabled,
+    }));
+    assert.match(after.text, /第一段/);
+    assert.doesNotMatch(after.text, /第二段/);
+    assert.equal(after.stopped, '已停止');
+    assert.equal(after.send, '发送');
+    assert.equal(after.inputDisabled, false);
+    /* A 的中止流与 B 的停止流都不得再补写。 */
+    await page.waitForTimeout(1900);
+    assert.doesNotMatch(await page.locator('.tc-message.assistant .tc-bubble').textContent(), /第二段/,
+      'neither the aborted A nor the stopped B may append later chunks');
+    assert.equal(mockState.chatCalls.length, chatCallsBefore + 2,
+      'exactly one upstream call per conversation');
+  } finally {
+    page.off('request', captureSession);
+  }
+});
+
+/* 计划 Task 7：SSE 错误负载 —— mock 用「流错误」触发词发 {"error":…}，
+   parser 抛错走 catch：内联可见、绝不落成完成态（只有 Retry，没有
+   Copy/Regenerate，也没有未完成标记）。 */
+test('test chat provider stream error', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await sendText('流错误');
+  await waitFor(() => {
+    const error = document.querySelector('.tc-message.assistant .tc-error');
+    return Boolean(error && error.textContent.includes('mock stream failure'));
+  });
+  const failed = await page.evaluate(() => {
+    const assistants = document.querySelectorAll('.tc-message.assistant');
+    const last = assistants[assistants.length - 1];
+    return {
+      error: last.querySelector('.tc-error').textContent,
+      buttons: [...last.querySelectorAll('.tc-message-actions button')].map(node => node.textContent),
+      marks: [...last.querySelectorAll('.tc-message-actions .mut')].map(node => node.textContent),
+      send: document.getElementById('testSend').textContent,
+      inputDisabled: document.getElementById('testInput').disabled,
+    };
+  });
+  assert.equal(failed.error, 'mock stream failure');
+  assert.deepEqual(failed.buttons, ['重试'], 'a provider error is never complete: only Retry');
+  assert.deepEqual(failed.marks, [], 'a provider error is not an incomplete mark');
+  assert.equal(failed.send, '发送');
+  assert.equal(failed.inputDisabled, false);
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 1);
 });
 
 test('test chat retry after an inline admin error', async () => {

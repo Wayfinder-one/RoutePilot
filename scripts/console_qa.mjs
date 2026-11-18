@@ -303,6 +303,9 @@ function answerFor(nodeId, question, scenario) {
    * 延迟流 → 立刻发「第一段」，1500ms 后发「第二段」+ stop + [DONE]；浏览器
      中止时上游连接会被 router 掐断，所有补写都带 writableEnded/destroyed 守卫
      并吞掉 EPIPE，绝不因为 QA 的 Stop/New Chat 而崩溃。
+   * 截断流 → 只发一段文本就 EOF（没有 finish_reason、没有 [DONE]）。
+   * 流错误 → SSE 错误负载 {"error":{"message":…}}：parser 抛错走 catch，
+     页面必须内联展示且绝不落成完成态（修订计划 Task 7）。
    浏览器 QA 不加载外网媒体：Chromium 会真的为 <video src="https://…"> 发起请求
    （实测），而 QA 的外部请求守卫是硬失败；视频用 data: URL，与 renderer 用例
    「只挂 data: 媒体源」的约定一致（http(s) 白名单由 renderer 用例覆盖）。 */
@@ -412,6 +415,13 @@ function startMock() {
             if (trigger.includes('截断流')) {
               /* 只写一段文本就 EOF：没有 finish_reason、没有 [DONE]，模拟上游提前断流。 */
               response.write(chunk({ role: 'assistant', content: '截断回复' }));
+              response.end();
+              return;
+}
+            if (trigger.includes('流错误')) {
+              /* SSE 错误负载：前端 parser 对带 error 的 payload 抛错并把
+                 .payload 挂上；页面必须内联展示且绝不落成完成态。 */
+              response.write('data: ' + JSON.stringify({ error: { message: 'mock stream failure' } }) + '\n\n');
               response.end();
               return;
 }
