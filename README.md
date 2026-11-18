@@ -87,9 +87,9 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 The home page (`/console/index.html`) is an admin-only model test chat. It posts to `/admin/test/chat/completions` and shows the actual model in the message metadata (`Auto → <model>` for Auto, `<model> · fixed model` for a fixed model), using the `x-sr-model` response header.
 
 - **Auto or fixed model** — Auto evaluates the current routing snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. Choosing a configured model ID skips the graph and JEV and returns `x-sr-selection: direct`.
-- **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message.
-- **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`; New Chat clears the conversation and rotates the session id.
-- **Attachments** — image, text, audio and generic files are read to data URLs in the browser and sent as content parts. The whole JSON body, including history and Base64, must stay within the 10 MiB request limit.
+- **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message. A stream counts as complete only when the upstream ends it cleanly — an early EOF is marked incomplete and a provider error is shown inline in the conversation, never silently passed off as a complete answer.
+- **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`, replayed losslessly from the raw assistant message (message-level media renders but never re-enters history); New Chat aborts any in-flight reply, clears the conversation and rotates the session id.
+- **Attachments** — text files are read as text and sent as content parts; images, audio and other files are read to data URLs. A file whose estimated size would break the 10 MiB request limit is rejected inline before it is read, and the exact whole-body size (history + Base64) is checked again before sending.
 - **Multimodal output** — text renders as safe Markdown; images, audio, video and files use native players or download links; unknown parts stay folded as inspectable JSON. Model-provided HTML is shown as text and active URL schemes are dropped, so nothing executes.
 - **Memory only** — conversations and attachments live in the page; a refresh clears them, and the server stores neither chat history nor uploaded files.
 
