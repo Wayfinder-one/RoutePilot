@@ -84,11 +84,21 @@ export class DraftStore {
   _refreshDirty() {
     if (!this.draft) this._dirtyKind = 'clean';
     else if (!this.saved || this.saved.policy == null) this._dirtyKind = 'behavior';
-    else if (behaviorCanonical(this.draft.policy) !== behaviorCanonical(this.saved.policy)) {
-      this._dirtyKind = 'behavior';
-    } else if (layoutChanged(this.draft.layout, this.saved.layout)) this._dirtyKind = 'layout';
+    else if (this._behaviorChanged()) this._dirtyKind = 'behavior';
+    else if (layoutChanged(this.draft.layout, this.saved.layout)) this._dirtyKind = 'layout';
     else this._dirtyKind = 'clean';
     return this._dirtyKind;
+  }
+
+  /* 行为差异 = canonical 差异（键序无关）或 name 差异。name 是文档字段：
+     用户改了它必须能保存（dirty 徽章、beforeunload、启用先保存都要生效），
+     所以计入 behavior dirty；但它不进 behaviorCanonical，行为串不变，
+     policy_revision 语义完全由服务端决定（Task 8 评审裁决）。 */
+  _behaviorChanged() {
+    if (behaviorCanonical(this.draft.policy) !== behaviorCanonical(this.saved.policy)) {
+      return true;
+    }
+    return this.draft.policy.name !== this.saved.policy.name;
   }
 
   notify(event) {

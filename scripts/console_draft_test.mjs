@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { DraftStore, HISTORY_LIMIT } from '../router/console/routing/draft.js';
-import { clone, createPolicy } from '../router/console/routing/policy.js';
+import { behaviorCanonical, clone, createPolicy } from '../router/console/routing/policy.js';
 
 function makeResource(model) {
   return {
@@ -173,7 +173,10 @@ test('undo and redo never roll back server-owned resource metadata', () => {
 test('markSaved replaces the baselines wholesale and by value', () => {
   const store = storeWith();
   store.change('behavior', draft => { draft.policy.name = '本地草稿'; });
-  assert.equal(store.dirtyKind, 'clean', 'name edits are not behaviour by canonical');
+  /* Task 8 评审裁决：name 是可保存的文档字段 → dirty 可见（behavior 类）；
+     但不进 behaviorCanonical，行为串不变（revision 语义不受影响）。 */
+  assert.equal(store.dirtyKind, 'behavior', 'name edits must stay dirty-visible');
+  assert.equal(behaviorCanonical(store.policy), behaviorCanonical(store.saved.policy));
 
   const server = clone(store.draft.resource);
   server.policy_revision = 'abc123';

@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { api } from '../router/console/api.js';
 import { DraftStore } from '../router/console/routing/draft.js';
 import { RoutingController } from '../router/console/routing/controller.js';
-import { clone, createPolicy } from '../router/console/routing/policy.js';
+import { behaviorCanonical, clone, createPolicy } from '../router/console/routing/policy.js';
 
 /* ── DraftStore：brief 逐字用例 ─────────────────────────────────── */
 
@@ -60,6 +60,40 @@ test('markSaved replaces the policy baselines only and keeps layout dirty', () =
   assert.equal(store.dirtyKind, 'clean');
   /* 布局保存也不清策略基线：resource 哈希保持服务端值。 */
   assert.equal(store.saved.resource.document_sha256, 'c'.repeat(64));
+});
+
+/* Task 8 评审裁决：name 改动 dirty 可见、行为不可见——它是可保存的文档
+   字段（徽章/beforeunload/启用先保存都要生效），但不进 behaviorCanonical，
+   行为串与 policy_revision 语义不受影响。 */
+test('a name-only edit is dirty-visible but behaviour-invisible', () => {
+  const store = new DraftStore();
+  store.load(makeResource(), { panels: { left: 20 } }, { saved: true });
+  assert.equal(store.dirtyKind, 'clean');
+  const canonical = behaviorCanonical(store.policy);
+  assert.equal(behaviorCanonical(store.saved.policy), canonical);
+
+  store.change('behavior', draft => { draft.policy.name = '新名字'; });
+  assert.equal(store.dirtyKind, 'behavior',
+    'a name-only edit must count as an unsaved document change');
+  assert.equal(behaviorCanonical(store.policy), canonical,
+    'name is not part of the behaviour string');
+  assert.equal(behaviorCanonical(store.saved.policy), canonical);
+
+  /* 撤销同样回到 clean（历史快照包含 name）。 */
+  assert.equal(store.undo(), true);
+  assert.equal(store.dirtyKind, 'clean');
+
+  store.change('behavior', draft => { draft.policy.name = '新名字'; });
+  assert.equal(store.dirtyKind, 'behavior');
+  /* 服务端回带新名字：基线整体替换后回到 clean，行为串全程相等。 */
+  const saved = makeResource();
+  saved.policy = clone(store.policy);
+  saved.document_sha256 = 'd'.repeat(64);
+  assert.equal(store.markSaved(saved), true);
+  assert.equal(store.dirtyKind, 'clean');
+  assert.equal(store.saved.policy.name, '新名字');
+  assert.equal(behaviorCanonical(store.policy), canonical);
+  assert.equal(behaviorCanonical(store.saved.policy), canonical);
 });
 
 /* ── RoutingController：拦截 api.req 断言管理面 wire ─────────────── */
