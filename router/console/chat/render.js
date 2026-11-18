@@ -3,7 +3,8 @@
    模型内容一律通过 document.createElement + textContent 生成节点，绝不使用
    innerHTML：原始 HTML（含 <script>）只作为文本显示，不执行。
    renderMarkdown 支持安全的标题/段落/列表/表格/链接/行内代码/围栏代码块
-   （围栏代码附 Copy 按钮）；renderParts 在文本之外分派图片/音频/视频/文件，
+   （围栏代码附 Copy 按钮，整条复制链失败时按钮标签显示 Copy failed）；
+   renderParts 在文本之外分派图片/音频/视频/文件，
    未识别 part 折叠为 JSON。媒体 URL 只允许 http(s)/blob，以及类型匹配的
    data:（通用 data: 仅限文件下载），javascript: 等主动 scheme 一律拒绝。
    本模块只依赖浏览器 API，不被 Node 单测导入；页面通过动态 import 加载。
@@ -52,28 +53,39 @@ function inlineNodes(text) {
 
 /* 非安全上下文（如普通 http 部署）里 navigator.clipboard 不存在：围栏代码的
    Copy 按钮与 test.js 的消息级复制同一策略，clipboard API 不可用时退化为临时
-   textarea + execCommand。复制失败只影响剪贴板，绝不让点击变成未捕获页面错误。 */
+   textarea + execCommand。copyText 永远 resolve（true=已复制，false=整条链
+   失败）且绝不 reject，点击因此绝不会变成未捕获页面错误；失败只由调用方写进
+   按钮标签。 */
 function copyText(text) {
   if (typeof navigator !== 'undefined' && navigator.clipboard &&
       typeof navigator.clipboard.writeText === 'function') {
-    navigator.clipboard.writeText(text).catch(() => {});
-    return;
+    try {
+      return navigator.clipboard.writeText(text).then(
+        () => true,
+        () => false,
+      );
+    } catch (error) {
+      return Promise.resolve(false);
+    }
   }
-  const helper = document.createElement('textarea');
-  helper.value = text;
-  helper.setAttribute('readonly', '');
-  helper.style.position = 'fixed';
-  helper.style.top = '-1000px';
-  helper.style.opacity = '0';
-  try {
-    document.body.append(helper);
-    helper.select();
-    document.execCommand('copy');
-  } catch (error) {
-    /* 无权限 / 无 execCommand：静默 */
-  } finally {
-    helper.remove();
-  }
+  return new Promise(resolve => {
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.setAttribute('readonly', '');
+    helper.style.position = 'fixed';
+    helper.style.top = '-1000px';
+    helper.style.opacity = '0';
+    try {
+      document.body.append(helper);
+      helper.select();
+      resolve(Boolean(document.execCommand('copy')));
+    } catch (error) {
+      /* 无权限 / 无 execCommand：整条链失败 */
+      resolve(false);
+    } finally {
+      helper.remove();
+    }
+  });
 }
 
 function renderMarkdown(source) {
@@ -100,7 +112,13 @@ function renderMarkdown(source) {
       const code = document.createElement('code');
       if (fence[1]) code.className = `language-${fence[1]}`;
       code.textContent = body.join('\n');
-      copy.addEventListener('click', () => copyText(code.textContent));
+      /* 评审决议：整条复制链（clipboard → textarea+execCommand）都失败时把失败
+         写进按钮标签；成功则保持/恢复 Copy。 */
+      copy.addEventListener('click', () => {
+        copyText(code.textContent).then(copied => {
+          copy.textContent = copied ? 'Copy' : 'Copy failed';
+        });
+      });
       pre.append(code);
       wrap.append(copy, pre);
       root.append(wrap);

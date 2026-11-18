@@ -4,7 +4,8 @@
    mock 上游与 teardown 全部由 ../console_qa.mjs 提供（同一进程内顺序执行）。
    覆盖：
    * Task 4 安全渲染：Markdown → DOM、恶意 HTML/活动 URL 不执行、
-     图片/音频/视频/文件分派、未知 part 折叠、safeMediaUrl 白名单；
+     图片/音频/视频/文件分派、未知 part 折叠、safeMediaUrl 白名单、
+     复制链整链失败写进 Copy 按钮标签；
    * Task 5 首页壳：Test 导航、模型目录、Auto/固定模型状态；
    * Task 6 附件：选择/拖拽/粘贴、chip 预览与移除、空文本 + 附件可发送；
    * Task 7 流式：Auto/固定模型、多轮历史、附件 wire 形状、多模态 part、
@@ -29,65 +30,126 @@ import {
 
 test('test chat renderer supports markdown and blocks active content', async () => {
   await page.goto(routerBase + '/console/index.html');
+  /* 计划 Task 4 Step 1 的唯一综合用例（合并 v1 的两条 renderer 用例）：一次
+     renderParts 渲染 Markdown 全部块级/行内元素、http + javascript: 两种链接、
+     图片/音频/视频/文件/未知五类 part，并注入字面 <script> 与 javascript:
+     图片。所有主动内容只作为文本显示或被丢弃，绝不执行。 */
   const result = await page.evaluate(async () => {
     const { renderParts } = await import('/console/chat/render.js');
     const host = document.createElement('div');
     renderParts(host, [
-      { type: 'text', text: '# Title\n\n**bold** <script>window.pwned=1</script>\n\n```js\nconst x = 1;\n```' },
+      {
+        type: 'text',
+        text: [
+          '# RoutePilot QA',
+          '',
+          '**bold** statement with literal <script>window.pwned=1</script> kept as text',
+          '',
+          'Paragraph with `inline` code, a [safe](https://example.test/x) link and a [bad](javascript:window.pwned=9) link.',
+          '',
+          '- one',
+          '- two',
+          '',
+          '1. first',
+          '2. second',
+          '',
+          '| a | b |',
+          '| --- | --- |',
+          '| 1 | 2 |',
+          '',
+          '```python',
+          'print(1)',
+          '```',
+        ].join('\n'),
+      },
       { type: 'image', url: 'javascript:window.pwned=2' },
-      { type: 'image', url: 'data:image/png;base64,iVBORw0KGgo=' },
-      { type: 'unknown', value: { answer: 42 } },
-    ]);
-    return {
-      heading: host.querySelector('h1').textContent,
-      code: host.querySelector('pre code').textContent,
-      scripts: host.querySelectorAll('script').length,
-      unsafeImages: host.querySelectorAll('img[src^="javascript:"]').length,
-      safeImages: host.querySelectorAll('img[src^="data:image/"]').length,
-      unknown: host.querySelector('details pre').textContent,
-      pwned: window.pwned || 0,
-    };
-  });
-  assert.deepEqual(result, {
-    heading: 'Title', code: 'const x = 1;', scripts: 0, unsafeImages: 0,
-    safeImages: 1, unknown: '{\n  "answer": 42\n}', pwned: 0,
-  });
-
-  /* 同一渲染入口还要分派音频/视频/文件：原生播放器带 controls，文件是可下载链接。
-     只挂 data: 媒体源，避免 QA 浏览器发出容器外的真实请求（http(s)/blob 由下面的
-     safeMediaUrl 断言覆盖）。 */
-  const media = await page.evaluate(async () => {
-    const { renderParts } = await import('/console/chat/render.js');
-    const host = document.createElement('div');
-    renderParts(host, [
+      { type: 'image', url: 'data:image/png;base64,iVBORw0KGgo=', name: 'pixel.png' },
       { type: 'audio', url: 'data:audio/mpeg;base64,AA==', name: 'a.mp3' },
       { type: 'audio', url: 'javascript:window.pwned=3' },
       { type: 'video', url: 'data:video/mp4;base64,AA==', name: 'v.mp4' },
       { type: 'video', url: 'javascript:window.pwned=4' },
       { type: 'file', url: 'data:application/pdf;base64,AA==', name: 'a.pdf' },
-      { type: 'unknown', value: { folded: true } },
+      { type: 'file', url: 'javascript:window.pwned=5' },
+      { type: 'unknown', value: { answer: 42 } },
     ]);
+    const link = host.querySelector('p a');
     const download = host.querySelector('a[download]');
     return {
+      heading: host.querySelector('h1').textContent,
+      bold: host.querySelector('strong').textContent,
+      paragraphs: host.querySelectorAll('p').length,
+      scriptLiteral: [...host.querySelectorAll('p')].some(node =>
+        node.textContent.includes('<script>window.pwned=1</script>')),
+      inlineCode: host.querySelector('p code').textContent,
+      links: host.querySelectorAll('p a').length,
+      linkHref: link.getAttribute('href'),
+      linkTarget: link.target,
+      linkRel: link.rel,
+      badLinkText: [...host.querySelectorAll('p')].some(node => node.textContent.includes('bad')),
+      unordered: [...host.querySelectorAll('ul li')].map(node => node.textContent),
+      ordered: [...host.querySelectorAll('ol li')].map(node => node.textContent),
+      tableHead: [...host.querySelectorAll('table th')].map(node => node.textContent),
+      tableCells: [...host.querySelectorAll('table td')].map(node => node.textContent),
+      codeLanguage: host.querySelector('.tc-code code').className,
+      codeText: host.querySelector('.tc-code code').textContent,
+      copyButton: host.querySelector('.tc-code button').textContent,
+      scripts: host.querySelectorAll('script').length,
+      activeUrls: host.querySelectorAll('[src^="javascript:"],[href^="javascript:"]').length,
+      images: host.querySelectorAll('img.tc-media-image').length,
+      imageAlt: host.querySelector('img.tc-media-image').alt,
+      imageSrc: host.querySelector('img.tc-media-image').getAttribute('src'),
       audio: host.querySelectorAll('audio[controls]').length,
+      audioSrc: host.querySelector('audio').getAttribute('src'),
       video: host.querySelectorAll('video[controls]').length,
+      videoSrc: host.querySelector('video').getAttribute('src'),
       downloads: host.querySelectorAll('a[download]').length,
       downloadText: download.textContent,
       downloadHref: download.getAttribute('href'),
-      audioSrc: host.querySelector('audio').getAttribute('src'),
+      unknownSummary: host.querySelector('details summary').textContent,
       unknownFolded: !host.querySelector('details').open,
+      unknown: host.querySelector('details pre').textContent,
       pwned: window.pwned || 0,
     };
   });
-  assert.deepEqual(media, {
-    audio: 1, video: 1, downloads: 1, downloadText: 'a.pdf',
+  assert.deepEqual(result, {
+    heading: 'RoutePilot QA',
+    bold: 'bold',
+    paragraphs: 2,
+    scriptLiteral: true,
+    inlineCode: 'inline',
+    links: 1,
+    linkHref: 'https://example.test/x',
+    linkTarget: '_blank',
+    linkRel: 'noopener noreferrer',
+    badLinkText: true,
+    unordered: ['one', 'two'],
+    ordered: ['first', 'second'],
+    tableHead: ['a', 'b'],
+    tableCells: ['1', '2'],
+    codeLanguage: 'language-python',
+    codeText: 'print(1)',
+    copyButton: 'Copy',
+    scripts: 0,
+    activeUrls: 0,
+    images: 1,
+    imageAlt: 'pixel.png',
+    imageSrc: 'data:image/png;base64,iVBORw0KGgo=',
+    audio: 1,
+    audioSrc: 'data:audio/mpeg;base64,AA==',
+    video: 1,
+    videoSrc: 'data:video/mp4;base64,AA==',
+    downloads: 1,
+    downloadText: 'a.pdf',
     downloadHref: 'data:application/pdf;base64,AA==',
-    audioSrc: 'data:audio/mpeg;base64,AA==', unknownFolded: true, pwned: 0,
+    unknownSummary: 'Unsupported content',
+    unknownFolded: true,
+    unknown: '{\n  "answer": 42\n}',
+    pwned: 0,
   });
 
-  /* F1：围栏代码的 Copy 按钮在 Clipboard API 不可用时也必须安全（不能抛 pageerror）。
-     render.js 的浏览器端兜底由 renderer 负责人并行修复；这里捕获窗口级 error 作为
-     明确断言，harness 的 pageerror 守卫仍会兜底整轮失败。 */
+  /* F1：围栏代码的 Copy 按钮在 Clipboard API 不可用时也必须安全（不能抛
+     pageerror）：textarea+execCommand 兜底接管。这里捕获窗口级 error 作为明确
+     断言，harness 的 pageerror 守卫仍会兜底整轮失败。 */
   const rendererCopyErrors = await page.evaluate(async () => {
     const { renderParts } = await import('/console/chat/render.js');
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
@@ -105,77 +167,61 @@ test('test chat renderer supports markdown and blocks active content', async () 
   });
   assert.deepEqual(rendererCopyErrors, [],
     'renderer Copy must not throw when the Clipboard API is unavailable');
+
+  /* 评审决议（绑定）：整条复制链失败时把失败写进按钮标签 —— 剪贴板不可用且
+     execCommand 返回 false → 标签变 Copy failed；随后 execCommand 成功（剪贴板
+     仍不可用）→ 标签恢复 Copy。全程仍不得产生未捕获页面错误。 */
+  const failureLabel = await page.evaluate(async () => {
+    const { renderParts } = await import('/console/chat/render.js');
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    const captured = [];
+    const onError = event => captured.push(String(event.message || (event.error && event.error.message) || event));
+    window.addEventListener('error', onError);
+    const host = document.createElement('div');
+    document.body.append(host);
+    renderParts(host, [{ type: 'text', text: '```js\nconst x = 1;\n```' }]);
+    const button = host.querySelector('.tc-code button');
+    document.execCommand = () => false;
+    button.click();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    const failed = button.textContent;
+    document.execCommand = () => true;
+    button.click();
+    await new Promise(resolve => setTimeout(resolve, 80));
+    const restored = button.textContent;
+    window.removeEventListener('error', onError);
+    host.remove();
+    delete document.execCommand;
+    return { failed, restored, captured };
+  });
+  assert.deepEqual(failureLabel, { failed: 'Copy failed', restored: 'Copy', captured: [] },
+    'Copy must display failure in its label only when the whole chain fails');
 });
 
-test('test chat renderer renders markdown blocks and enforces safe media urls', async () => {
+/* safeMediaUrl 白名单矩阵（v1 额外覆盖，保留）：http(s)/blob 全类型放行，
+   data: 仅类型匹配（file 额外放行任意 data: 下载），javascript: 一律拒绝；
+   http(s)/blob 的分派路径由上面的综合用例以 data: 源 + 断言覆盖。 */
+test('test chat renderer safeMediaUrl whitelist matrix', async () => {
   await page.goto(routerBase + '/console/index.html');
-  const result = await page.evaluate(async () => {
-    const { renderParts, safeMediaUrl } = await import('/console/chat/render.js');
-    const host = document.createElement('div');
-    renderParts(host, [{
-      type: 'text',
-      text: [
-        'A paragraph with `inline` and [safe](https://example.test/x) and [bad](javascript:window.pwned=9).',
-        '',
-        '- one',
-        '- two',
-        '',
-        '1. first',
-        '',
-        '| a | b |',
-        '| --- | --- |',
-        '| 1 | 2 |',
-        '',
-        '```python',
-        'print(1)',
-        '```',
-      ].join('\n'),
-    }]);
-    const link = host.querySelector('p a');
-    return {
-      paragraphs: host.querySelectorAll('p').length,
-      inlineCode: host.querySelector('p code').textContent,
-      links: host.querySelectorAll('p a').length,
-      linkHref: link.href,
-      linkTarget: link.target,
-      linkRel: link.rel,
-      badLinkText: host.querySelector('p').textContent.includes('bad'),
-      badLinks: host.querySelectorAll('a[href^="javascript:"]').length,
-      unordered: host.querySelectorAll('ul li').length,
-      ordered: host.querySelectorAll('ol li').length,
-      tableHead: [...host.querySelectorAll('table th')].map(th => th.textContent),
-      tableCells: [...host.querySelectorAll('table td')].map(td => td.textContent),
-      copyText: host.querySelector('.tc-code button').textContent,
-      codeLanguage: host.querySelector('.tc-code code').className,
-      codeText: host.querySelector('.tc-code code').textContent,
-      pwned: window.pwned || 0,
-      urls: [
-        safeMediaUrl('https://example.test/a.png', 'image'),
-        safeMediaUrl('http://example.test/a.png', 'image'),
-        safeMediaUrl('blob:https://example.test/x', 'video'),
-        safeMediaUrl('javascript:alert(1)', 'image'),
-        safeMediaUrl('data:image/png;base64,AA==', 'image'),
-        safeMediaUrl('data:audio/mpeg;base64,AA==', 'image'),
-        safeMediaUrl('data:application/pdf;base64,AA==', 'file'),
-        safeMediaUrl('data:text/html;base64,AA==', 'image'),
-      ],
-    };
+  const urls = await page.evaluate(async () => {
+    const { safeMediaUrl } = await import('/console/chat/render.js');
+    return [
+      safeMediaUrl('https://example.test/a.png', 'image'),
+      safeMediaUrl('http://example.test/a.png', 'image'),
+      safeMediaUrl('blob:https://example.test/x', 'video'),
+      safeMediaUrl('javascript:alert(1)', 'image'),
+      safeMediaUrl('data:image/png;base64,AA==', 'image'),
+      safeMediaUrl('data:audio/mpeg;base64,AA==', 'image'),
+      safeMediaUrl('data:application/pdf;base64,AA==', 'file'),
+      safeMediaUrl('data:text/html;base64,AA==', 'image'),
+    ];
   });
-  assert.deepEqual(result, {
-    paragraphs: 1, inlineCode: 'inline', links: 1,
-    linkHref: 'https://example.test/x', linkTarget: '_blank', linkRel: 'noopener noreferrer',
-    badLinkText: true, badLinks: 0,
-    unordered: 2, ordered: 1,
-    tableHead: ['a', 'b'], tableCells: ['1', '2'],
-    copyText: 'Copy', codeLanguage: 'language-python', codeText: 'print(1)',
-    pwned: 0,
-    urls: [
-      'https://example.test/a.png', 'http://example.test/a.png',
-      'blob:https://example.test/x', '',
-      'data:image/png;base64,AA==', '',
-      'data:application/pdf;base64,AA==', '',
-    ],
-  });
+  assert.deepEqual(urls, [
+    'https://example.test/a.png', 'http://example.test/a.png',
+    'blob:https://example.test/x', '',
+    'data:image/png;base64,AA==', '',
+    'data:application/pdf;base64,AA==', '',
+  ]);
 });
 
 /* 计划 Task 5：首页从「概览」换成「测试」，导航、数据页标记与模型选择器都要
