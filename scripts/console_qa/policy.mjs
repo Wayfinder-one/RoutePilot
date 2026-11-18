@@ -443,14 +443,15 @@ test('dry run panel shows one JEV, ordered rules and the final target', async ()
   assert.equal(result.reason, null);
   assert.equal(result.trace.filter(event => event.event === 'jev').length, 1);
 
-  /* 面板只读展示：目标/模型/命中规则 + 一次 JEV + 逐条规则判断。 */
+  /* 面板只读展示：目标/模型/命中规则 + 一次 JEV + 逐条规则判断
+     （规则行由 trace.js 渲染，Task 9 起复用 .lg-rule 区块）。 */
   const text = await page.locator('#cvTryResult').innerText();
   assertIncludes(text, 'power');
   assertIncludes(text, 'qwen3.8-flash-sft');
   assertIncludes(text, '电力业务优先');
   assertIncludes(text, '一次 JEV');
   /* 首条命中即停：trace 只含已求值的规则（1 未命中、2 命中），后续不求值。 */
-  const rows = await page.locator('#cvTryResult .pv-try-rule').allInnerTexts();
+  const rows = await page.locator('#cvTryResult .lg-rule').allInnerTexts();
   assert.equal(rows.length, 2, 'the trace must stop at the first matching rule');
   assert.ok(rows[0].indexOf('未命中') >= 0, 'rule 1 was not marked as missed');
   assert.ok(rows[1].indexOf('命中') >= 0 && rows[1].indexOf('未命中') < 0,

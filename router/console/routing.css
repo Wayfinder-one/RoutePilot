@@ -276,21 +276,7 @@
 .pv-try-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .pv-try-models { font-size: 11.5px; color: var(--text-2); }
 .pv-try-rule-name { color: var(--text-2); }
-.pv-try-jev { margin: 0; font-size: 11.5px; color: var(--text-3); }
-.pv-try-block h4 {
-  margin: 0 0 5px; font-size: 11px; letter-spacing: .04em;
-  color: var(--text-3); font-weight: 700;
-}
-.pv-try-answer { display: flex; gap: 10px; padding: 3px 0; align-items: baseline; }
-.pv-try-answer .mono { font-size: 11.5px; color: var(--indigo); min-width: 110px; }
-.pv-try-detail { color: var(--text-2); }
-.pv-try-rule { display: flex; gap: 8px; align-items: center; padding: 3px 0; }
-.pv-try-rule .mono { color: var(--text-3); width: 18px; }
-.pv-try-rule.is-hit { color: var(--text); font-weight: 600; }
-.pv-try-rule.is-miss { color: var(--text-3); }
-.pv-try-flag { margin-left: auto; font-size: 11px; }
-.pv-try-rule.is-hit .pv-try-flag { color: var(--green); }
-.pv-try-rule.is-miss .pv-try-flag { color: var(--text-3); }
+/* JEV / 各问题答案 / 逐条规则区块由 ../trace.js 渲染，样式在 shared.css。 */
 .pv-try-error {
   margin: 0; color: var(--red);
   background: var(--red-soft); border: 1px solid var(--red-line);

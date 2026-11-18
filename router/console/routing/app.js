@@ -4,8 +4,9 @@
      · DraftStore 持有 {resource, policy, layout} 草稿、双基线与撤销历史；
      · RoutingController 持有 /admin/policies 的保存/启停/切换/删除编排；
      · editor.js 渲染问题/目标/规则/设置四个编辑区（只编辑数据，不求解路由）；
-     · 试算直接展示 /admin/try 返回的一次 JEV、各答案与逐条规则判断，
-       前端不重新求值任何规则；布局（折叠状态）经独立 /layout API 保存。
+     · tryrun.js 持有试算面板：一次 /admin/try，只读展示返回的一次 JEV、
+       各答案与逐条规则判断（复用 ../trace.js 视图），前端不重新求值任何
+       规则；布局（折叠状态）经独立 /layout API 保存。
    所有编辑仍走一次 store.change(kind, mutate) = 一个历史项。
    ------------------------------------------------------------------ */
 import '../nav.js';
@@ -13,8 +14,10 @@ import { api, apiErrText, esc } from '../api.js';
 import { onLangChange, t, tf } from '../i18n.js';
 import { DraftStore } from './draft.js';
 import { RoutingController } from './controller.js';
-import { clone } from './policy.js';
 import { editorEditing, renderEditor, revealPath } from './editor.js';
+import {
+  currentTryResult, initTryRun, renderTryResult, resetTryRun,
+} from './tryrun.js';
 
 const $ = (sel, scope) => (scope || document).querySelector(sel);
 
@@ -23,9 +26,6 @@ const store = new DraftStore();
 let toastSeq = 0;
 /* 共享的「丢弃草稿 / 删除策略」确认框；null = 未打开。 */
 let confirmState = null;
-/* 最近一次试算：{text, result}；渲染只读服务端返回，不二次求值。 */
-let tryState = null;
-let trySeq = 0;
 
 /* 装配层暴露给模块与测试观察的只读视图；没有 window 全局。 */
 const app = {
@@ -44,7 +44,7 @@ const app = {
   get policies() { return app.controller ? app.controller.policies : []; },
   get saving() { return store.saving; },
   get tryRunning() { return store.tryRunning; },
-  get tryResult() { return tryState; },
+  get tryResult() { return currentTryResult(); },
   get changeKind() { return store.dirtyKind; },
   kind() { return store.dirtyKind; },
   change: (kind, mutate) => change(kind, mutate),
@@ -81,8 +81,8 @@ function handleStoreEvent(event) {
     return;
   }
   if (event.type === 'load') {
-    tryState = null;
-    renderTryResult();
+    /* 换策略/新建草稿：在途试算响应随之过期，结果区整体清空。 */
+    resetTryRun();
     renderAll();
     refreshDirty();
     return;
@@ -328,108 +328,6 @@ function settleConfirm(ok) {
   if (state) state.resolve(!!ok);
 }
 
-/* ── 试算：一次 /admin/try，只读展示结果（不二次求值） ─────────── */
-
-async function runTry() {
-  const input = $('#cvTryInput');
-  if (!input || !store.policy || store.tryRunning || store.saving) return;
-  const text = String(input.value || '').trim();
-  if (!text) {
-    toast(t('pv.tryEmpty'), 'warn');
-    return;
-  }
-  const targetDraft = store.draft;
-  const seq = ++trySeq;
-  store.setTryRunning(true);
-  updateToolbar();
-  try {
-    const result = await api.post('/admin/try', {
-      policy: clone(store.policy),
-      text: text,
-    }, { timeoutMs: 130000 });
-    if (seq !== trySeq || store.draft !== targetDraft) return;
-    tryState = { text: text, result: result };
-    renderTryResult();
-  } catch (error) {
-    if (seq !== trySeq || store.draft !== targetDraft) return;
-    tryState = { text: text, error: apiErrText(error) };
-    renderTryResult();
-  } finally {
-    store.setTryRunning(false);
-    updateToolbar();
-  }
-}
-
-function pct(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? Math.round(n * 100) + '%' : '—';
-}
-
-function renderTryResult() {
-  const box = $('#cvTryResult');
-  if (!box) return;
-  if (!tryState) {
-    box.hidden = true;
-    box.innerHTML = '';
-    return;
-  }
-  if (tryState.error) {
-    box.hidden = false;
-    box.innerHTML = '<p class="pv-try-error">' + esc(tf('pv.tryFailed', { err: tryState.error })) + '</p>';
-    return;
-  }
-  const result = tryState.result || {};
-  const trace = Array.isArray(result.trace) ? result.trace : [];
-  const jev = trace.filter(event => event.event === 'jev')[0] || null;
-  const ruleRows = trace.filter(event => event.event === 'rule');
-  const answers = result.answers || {};
-
-  const answerHtml = Object.keys(answers).map(qid => {
-    const answer = answers[qid] || {};
-    let detail = '';
-    if (answer.probabilities) {
-      detail = Object.keys(answer.probabilities).map(key =>
-        esc(key) + ' ' + pct(answer.probabilities[key])).join(' · ') +
-        ' · p_top ' + esc(pct(answer.p_top));
-    } else if (answer.yes != null) {
-      detail = 'P(yes) ' + esc(pct(answer.yes)) + ' · P(no) ' + esc(pct(answer.no));
-    } else if (answer.value != null) {
-      detail = 'value ' + esc(answer.value);
-    } else {
-      detail = '—';
-    }
-    return '<div class="pv-try-answer"><span class="mono">' + esc(qid) + '</span>' +
-      '<span class="pv-try-detail">' + detail + '</span></div>';
-  }).join('');
-
-  const rulesHtml = ruleRows.map(row =>
-    '<div class="pv-try-rule ' + (row.matched ? 'is-hit' : 'is-miss') + '">' +
-    '<span class="mono">' + esc(String(row.index + 1)) + '</span>' +
-    '<span>' + esc(row.name == null ? '' : row.name) + '</span>' +
-    '<span class="pv-try-flag">' + esc(t(row.matched ? 'pv.tryHit' : 'pv.tryMiss')) + '</span>' +
-    '</div>').join('');
-
-  box.hidden = false;
-  box.innerHTML =
-    '<div class="pv-try-head">' +
-    '<span class="pill ' + (result.fallback ? 'warn' : 'ok') + '">' +
-    esc(t(result.fallback ? 'pv.tryFallback' : 'pv.tryTarget')) + ' <b class="mono">' +
-    esc(result.target == null ? '—' : result.target) + '</b></span>' +
-    '<span class="pv-try-models mono">' + esc((result.models || []).join(' · ') || '—') + '</span>' +
-    (result.matched_rule != null
-      ? '<span class="pv-try-rule-name">' + esc(t('pv.tryMatched')) + ' ' + esc(result.matched_rule) + '</span>'
-      : '<span class="pv-try-rule-name">' + esc(t('pv.tryReason.' + (result.reason || 'no_rule_matched'))) + '</span>') +
-    '</div>' +
-    (jev
-      ? '<p class="pv-try-jev">' + esc(tf('pv.tryJev', {
-        n: (jev.questions || []).length,
-        ms: jev.duration_ms == null ? '—' : Math.round(jev.duration_ms),
-      })) + '</p>'
-      : '') +
-    (answerHtml ? '<div class="pv-try-block"><h4>' + esc(t('pv.tryAnswers')) + '</h4>' + answerHtml + '</div>' : '') +
-    (rulesHtml ? '<div class="pv-try-block"><h4>' + esc(t('pv.tryRules')) + '</h4>' + rulesHtml + '</div>' : '');
-}
-
 /* ── 事件绑定 ─────────────────────────────────────────────────── */
 
 function bindEvents() {
@@ -464,10 +362,8 @@ function bindEvents() {
     const button = document.getElementById(id);
     if (button) button.addEventListener('click', () => { actions[id](); });
   });
-  $('#cvTryRun').addEventListener('click', runTry);
-  $('#cvTryInput').addEventListener('keydown', event => {
-    if (event.key === 'Enter') runTry();
-  });
+  /* 试算面板（输入 Enter / 运行按钮）由 tryrun.js 自持绑定。 */
+  initTryRun({ store: store, toast: toast, updateToolbar: updateToolbar });
   $('#cvPolicySelect').addEventListener('change', async event => {
     const id = event.target.value;
     if (!id || id === controller.policyId) return;
@@ -508,6 +404,7 @@ function bindEvents() {
     renderPolicySelect();
     renderAll();
     refreshDirty();
+    renderTryResult();
   });
 }
 

@@ -2,8 +2,9 @@
    ------------------------------------------------------------------
    本文件只保留：服务启动（Node mock + `python -m router` 子进程，策略目录走
    ROUTER_POLICY_DIR）、浏览器、管理面 API、用例注册器/执行器、共享断言助手
-   与 teardown。页面用例位于 scripts/console_qa/{testchat,models,policy}.mjs
-   （Task 8 注册表裁决：canvas / inspector 与 tryrun / logs 留盘待 Task 9/10），
+   与 teardown。页面用例位于 scripts/console_qa/{testchat,models,policy,
+   tryrun,logs}.mjs（Task 9 注册表：试算与计算日志已按 Policy v4 重写注册；
+   canvas / inspector 属画布时代，Task 10 随页面一并删除，保持退出注册），
    各模块只调用本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
 
    console_qa.mjs 顶部保留的基座自检（健康检查 / 原生 ESM / 单模块入口 /
@@ -365,11 +366,15 @@ function startMock() {
           mockState.scenarioCalls[scenario.id] = (mockState.scenarioCalls[scenario.id] || 0) + 1;
           mockState.systemoneCalls.push({ scenario: scenario.id, keys: questionKeys });
 
-          /* s5「决策服务超时」：第 1 波整波失败（504）；后续波（例如只问 clarify）
-             不在场景 answers 里，仍可正常应答，便于验证「整波作废」后的兜底路径。 */
-          const firstWave = scenario.fail && questionKeys.length > 0 &&
-            questionKeys.every(key => Object.prototype.hasOwnProperty.call(scenario.answers || {}, key));
-          if (firstWave) {
+          /* s5「决策服务超时」：v4 一次 JEV 覆盖全部问题；场景标记 fail 且每个
+             问题都可应答（场景 answers（按 QUESTION_SOURCES 映射）或固定 noul
+             答案）时整次调用失败（504）。场景外问题（例如 clarify）仍正常应答。 */
+          const answerable = key =>
+            Object.prototype.hasOwnProperty.call(scenario.answers || {}, QUESTION_SOURCES[key] || key) ||
+            Object.prototype.hasOwnProperty.call(FIXED_NOUL_ANSWERS, key);
+          const failCall = scenario.fail && questionKeys.length > 0 &&
+            questionKeys.every(answerable);
+          if (failCall) {
             sendJson(response, 504, {
               detail: 'mock decision timeout',
               scenario: scenario.id,
@@ -1236,11 +1241,13 @@ export async function runIfMain(metaUrl) {
 async function main() {
   /* 静态 import 会先于本文件执行（页面模块又反向 import 本文件的注册器），
      因此页面模块在 main 里动态加载，确保基座初始化完成后再注册用例。
-     Task 8 注册表裁决：canvas / inspector（画布时代）与 tryrun / logs
-     （页面待 Task 9 重写）退出注册，只保留 testchat / models / policy。 */
+     Task 9 注册表：testchat / models / policy / tryrun / logs；canvas /
+     inspector（画布时代）保持退出注册，Task 10 随页面一并删除。 */
   await import('./console_qa/testchat.mjs');
   await import('./console_qa/models.mjs');
   await import('./console_qa/policy.mjs');
+  await import('./console_qa/tryrun.mjs');
+  await import('./console_qa/logs.mjs');
   console.log(`[console-qa] registered cases: ${checks.length}`);
   await runRegisteredCases();
 }
