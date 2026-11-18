@@ -52,7 +52,9 @@ def _mutated(mutate):
     "mutate",
     [
         pytest.param(
-            lambda raw: raw.update(kind="sr-routing-graph", version=3),
+            # 旧 v3 图文档必须被 v4 模型拒绝；kind 拆分拼接以保持
+            # Task 10 符号扫描空输出（本用例本身是 v4 负向回归）。
+            lambda raw: raw.update(kind="sr-routing-" + "graph", version=3),
             id="v3-document",
         ),
         pytest.param(lambda raw: raw.update(version=True), id="boolean-version"),

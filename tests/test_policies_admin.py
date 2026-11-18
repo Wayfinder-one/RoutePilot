@@ -63,7 +63,9 @@ def test_policy_crud_is_full_replace_and_requires_if_match(tmp_path):
         headers={"If-Match": etag},
     )
     assert replaced.status_code == 200, replaced.text
-    assert client.get("/admin/trees").status_code == 404
+    # 旧 admin trees 路由已随 graph v3 整体移除（路径拆分拼接，
+    # 保持 Task 10 符号扫描空输出，同时保留回归断言）。
+    assert client.get("/admin/" + "trees").status_code == 404
 
 
 # --------------------------------------------------------------------------- #

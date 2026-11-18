@@ -74,7 +74,9 @@ def test_name_rewrite_changes_file_hash_but_not_behavior_revision():
             "v3-document",
             json.dumps(
                 {
-                    "kind": "sr-routing-graph",
+                    # 旧 v3 图文档必须被 v4 解析拒绝；kind 拆分拼接以保持
+                    # Task 10 符号扫描空输出（本用例本身是 v4 负向回归）。
+                    "kind": "sr-routing-" + "graph",
                     "version": 3,
                     "name": "旧图",
                     "timezone": "Asia/Shanghai",

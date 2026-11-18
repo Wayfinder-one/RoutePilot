@@ -113,7 +113,7 @@ def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
     """model_id -> normalized reasoning capability of the CURRENT catalog.
 
     Same source for every consumer that must never disagree about a model's
-    declared levels (startup check, ``/admin/trees`` enable validation):
+    declared levels (startup check, ``/admin/policies`` enable validation):
     rows written straight into the DB (bypassing the API) are judged by the
     same rule as rows coming through the API.
     """

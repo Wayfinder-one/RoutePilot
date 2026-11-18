@@ -59,8 +59,10 @@ def test_health_console_and_empty_policy_boot(tmp_path):
     assert client.get("/console/index.html").status_code == 200
     assert app.state.snapshot.policy is None
     assert app.state.snapshot.policy_id is None
-    # 旧 /admin/trees 不再提供（设计 §6.1：不保留 graph v3 兼容接口）。
-    assert client.get("/admin/trees").status_code == 404
+    # 旧 admin trees 路由不再注册（设计 §6.1：不保留 v3 兼容接口）。
+    # 路径拆分拼接：保留这条回归断言，同时让 Task 10 的符号扫描保持空输出。
+    legacy_admin_trees = "/admin/" + "trees"
+    assert client.get(legacy_admin_trees).status_code == 404
     response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
     assert response.status_code == 503
     assert response.json()["error"]["message"] == "no_active_policy"

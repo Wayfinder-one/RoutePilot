@@ -11,8 +11,8 @@ policy_revision 全部由路径 + current 指针派生（设计 §4.7），绝�
 布局是独立的前端文档：后端只负责独立存取与 1 MiB 上限，不解析为行为模型，
 不参与策略校验、启用、行为版本或 If-Match。
 
-原子写复用 RoutingTreeRepo 的 fsync + ``os.replace`` 实现，作为模块私有
-``_atomic_write`` 整体搬入（不留旧类包装）。
+原子写（``fsync`` + ``os.replace``）以模块私有 ``_atomic_write`` 提供，
+不保留任何旧仓储包装。
 """
 from __future__ import annotations
 
