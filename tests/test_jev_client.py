@@ -4,7 +4,9 @@ MockTransport 响应严格按 2026-11-02 M0 冻结的实测 wire 形状构造：
 - noul 答案：{"type": "noul", "noul": <P(yes)>}，客户端派生 no = 1 - yes；
 - score 答案：{"type": "score", "score": <档位索引>, "legend": {"<索引>": <档位值>}}，
   客户端映射 value = legend[str(int(round(score)))]；
-- choice 答案的 probabilities 以 label 为 key，客户端映射回 option key。
+- choice 答案的 probabilities 以 label 为 key，客户端映射回 option key；
+- answers 的 key 集合必须与本次 questions 完全一致：缺失、额外或非对象
+  answers 都在逐题解析前被拒绝（Routing Policy v4 设计 §5.2）。
 """
 
 import asyncio
@@ -187,7 +189,24 @@ def test_non_dict_usage_falls_back_to_empty_dict_on_every_answer():
     assert answers["complexity"].usage == {}
 
 
+@pytest.mark.parametrize("mutation", ["missing", "extra"])
+def test_choose_many_rejects_non_exact_answer_key_set(mutation):
+    body = multi_body()
+    if mutation == "missing":
+        body["answers"].pop("domain")
+    else:
+        body["answers"]["unused"] = {"type": "noul", "noul": 1.0}
+    client = JevClient(httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body))
+    ))
+    with pytest.raises(JevError, match="answers do not match questions"):
+        run(client)
+
+
 # 任一问题的解析失败都必须抛 JevError、消息含该问题 key（node id）、且绝不返回部分 dict。
+# 缺失/额外/非对象 answers 在逐题 parse 前就被 key-set 门拒绝（消息固定、不含
+# question key），因此不再出现在下面的逐题解析失败矩阵中，由上面的
+# test_choose_many_rejects_non_exact_answer_key_set 与紧随其后的非对象用例覆盖。
 def wire_body(body):
     """按真实 wire 字节构造响应：NaN/inf 用例无法走 httpx.Response(json=...) 的默认序列化。"""
     return httpx.Response(
@@ -197,8 +216,21 @@ def wire_body(body):
     )
 
 
+@pytest.mark.parametrize("breakage", ["answers-not-an-object", "body-not-an-object"])
+def test_choose_many_rejects_non_object_answers_at_the_key_set_gate(breakage):
+    body = multi_body()
+    if breakage == "answers-not-an-object":
+        body["answers"] = ["not", "an", "object"]
+    else:
+        body = ["not", "an", "object"]
+    client = JevClient(httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=body)),
+    ))
+    with pytest.raises(JevError, match="answers do not match questions"):
+        run(client)
+
+
 FAILURE_CASES = [
-    ("missing-answer", lambda b: b["answers"].pop("domain"), "domain"),
     ("inexact-probability-keys", lambda b: b["answers"]["capability"].update(probabilities={"轻量": 0.8}), "capability"),
     ("negative-probability", lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": -0.2, "增强": 1.2}), "capability"),
     ("probability-sum-out-of-tolerance", lambda b: b["answers"]["capability"].update(probabilities={"轻量": 0.4, "增强": 0.4}), "capability"),
@@ -218,7 +250,6 @@ FAILURE_CASES = [
     ("score-legend-missing", lambda b: b["answers"]["complexity"].pop("legend"), "complexity"),
     ("score-legend-value-bool", lambda b: b["answers"]["complexity"]["legend"].update({"2": True}), "complexity"),
     ("score-legend-value-nan", lambda b: b["answers"]["complexity"]["legend"].update({"2": float("nan")}), "complexity"),
-    ("answers-not-an-object", lambda b: b.update(answers=[]), "capability"),
     (
         "huge-probability",
         lambda b: b["answers"]["capability"]["probabilities"].update({"轻量": 10 ** 1000, "增强": 1.0}),
