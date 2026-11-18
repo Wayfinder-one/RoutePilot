@@ -1,27 +1,29 @@
-/* RoutePilot · 模型测试对话页（计划 Task 5–7）
+/* RoutePilot · 模型测试对话页（计划 Task 5–7，修订版）
    ------------------------------------------------------------------
-   Task 5（壳）：模型目录选择器、Auto / 固定模型状态、新建对话、语言重绘。
-   Task 6（附件）：选择 / 拖拽 / 粘贴都走同一条 FileReader 管线；chip 显示
-   预览、名字与体积；Enter 发送、Shift+Enter 换行。
-   Task 7（流式）：POST /admin/test/chat/completions，SSE 增量经
-   createSseParser + appendDelta + renderParts 渲染；支持停止、重试、重新
-   生成、复制、多模态答案、实际模型/直连标记，错误就地内联。
-   线上唯一的历史格式是 message.content（OpenAI wire format）；message.parts
-   只是渲染缓存，绝不序列化。
+   Task 5（壳）：模型目录选择器、Auto / 固定模型状态、空目录提示
+   （#testModelEmpty + 模型页链接）、内联会话错误（#testError）、
+   角色门控（renderAccessState）、新建对话、语言重绘。
+   Task 6（附件）：选择 / 拖拽 / 粘贴附件管线（本提交沿用 v1 形状）。
+   Task 7（流式）：本提交按评审决议 3 暂时禁用发送 —— 协议/流模块契约
+   （Task 2+3）已改写为 raw 消息模型，完整的 guarded 流式生命周期在
+   Task 7 以 RED → GREEN 重建；在此之前不伪造任何发送成功状态。
+   消息形状（修订版）：assistant 携带 raw（历史回放的唯一事实源）与
+   parts 渲染缓存，字段名是 status（v1 叫 state）；user 消息的 parts 由
+   normalizeMessage({content}) 一次性派生。parts 绝不序列化。
    页面不写任何全局：state 模块私有，事件监听在模块体内绑定。
    ------------------------------------------------------------------ */
 import { api, apiErrText, esc, toast } from './api.js';
 import { onLangChange, t } from './i18n.js';
 import {
-  MAX_REQUEST_BYTES, appendDelta, attachmentPart, normalizeContent, partsToWire, requestBytes,
+  MAX_REQUEST_BYTES, attachmentPart, historyMessages, normalizeMessage, requestBytes,
 } from './chat/protocol.js';
-import { createSseParser } from './chat/stream.js';
 import { renderParts } from './chat/render.js';
 import './nav.js';
 
 /* crypto.randomUUID / crypto.getRandomValues 只在安全上下文可用；明文 HTTP
    部署（http://<host>:8400/console/）也必须能跑。未知环境退回时间戳 + 随机数，
-   与 router/console/routing/controller.js 的 id 兜底同一策略。 */
+   与 router/console/routing/controller.js 的 id 兜底同一策略（评审决议 2：
+   保留 v1 的守卫版 newId，禁止裸 crypto.randomUUID()）。 */
 function newId() {
   let raw = '';
   try {
@@ -34,7 +36,7 @@ function newId() {
 
 const state = {
   model: 'auto', models: [], messages: [], attachments: [],
-  controller: null, sessionId: newId(), role: null,
+  controller: null, conversationId: 0, sessionId: newId(), role: null,
   activeTree: '', bootError: '', uploadEpoch: 0,
 };
 /* 发送 / 停止 / 复制 / 重试 / 重新生成与提示文案键，统一从这里取。 */
@@ -44,10 +46,16 @@ const COPY = Object.freeze({
   tooLarge: 'test.tooLarge', adminOnly: 'test.adminOnly', incomplete: 'test.incomplete',
   stopped: 'test.stopped',
 });
+/* 评审决议 3（绑定）：分支中段允许「发送暂时回归」。Task 2+3 改写了
+   protocol/stream 契约，完整的流式生命周期在 Task 7 以 TDD 重建；本提交里
+   发送按钮保持禁用、requestAssistant 为占位，绝不伪造发送成功状态。
+   Task 7 落地后删除本常量与两处守卫。 */
+const SENDING_READY = false;
 const $ = selector => document.querySelector(selector);
-const CHAT_ENDPOINT = '/admin/test/chat/completions';
 
-/* ── 模型目录：Auto + 按提供方分组的已配置模型 ── */
+/* ── 模型目录：Auto + 按提供方分组的已配置模型 ──
+   Auto 永远保留；目录为空时把 #testModelEmpty（含 models.html 链接）亮出，
+   不再把链接塞进状态行（计划 Task 5 的 DOM 拆分）。 */
 function renderModelOptions() {
   const groups = new Map();
   state.models.forEach(model => {
@@ -59,6 +67,7 @@ function renderModelOptions() {
     Array.from(groups, ([provider, models]) => `<optgroup label="${esc(provider)}">${models.map(model =>
       `<option value="${esc(model.id)}">${esc(model.id)} · ${esc(model.upstream)}</option>`).join('')}</optgroup>`).join('');
   $('#testModel').value = state.model;
+  $('#testModelEmpty').hidden = state.models.length > 0;
 }
 
 /* ── Auto / 固定模型状态：Auto 附上当前启用的决策组名 ── */
@@ -67,18 +76,27 @@ function renderStatus() {
   status.replaceChildren();
   if (state.bootError) { status.textContent = state.bootError; return; }
   if (state.role !== null && state.role !== 'admin') { status.textContent = t(COPY.adminOnly); return; }
-  /* 模型目录为空时保留 Auto，并给出到模型页添加模型的入口。 */
-  if (state.models.length === 0) {
-    status.append(document.createTextNode(`${t('test.noModels')} `));
-    const link = document.createElement('a');
-    link.href = 'models.html';
-    link.textContent = t('test.goModels');
-    status.append(link);
-    return;
-  }
   status.textContent = state.model === 'auto'
     ? t('test.autoStatus') + (state.activeTree ? ` · ${state.activeTree}` : '')
     : t('test.directStatus');
+}
+
+/* ── 角色门控（计划 Task 5 独立成函数）：非管理员锁死整个输入区 ──
+   * 未知角色按只读处理（fail closed）；
+   * 启动失败同样锁死输入区/附件/选择器；
+   * updateSendState 只负责在途/内容驱动的发送按钮状态。 */
+function renderAccessState() {
+  const admin = state.role === 'admin';
+  const locked = Boolean(state.bootError) || !admin;
+  ['#testInput', '#testAttach', '#testFileInput'].forEach(selector => {
+    const element = $(selector);
+    if (element) element.disabled = locked;
+  });
+  const modelSelect = $('#testModel');
+  if (modelSelect) modelSelect.disabled = Boolean(state.bootError);
+  const input = $('#testInput');
+  if (state.bootError) input.placeholder = t('test.placeholder');
+  else if (state.role !== null && !admin) input.placeholder = t(COPY.adminOnly);
 }
 
 /* ── 输入区：自动增高（≤180px）与发送/停止按钮状态 ── */
@@ -88,7 +106,7 @@ function autoResize() {
   input.style.height = `${Math.min(input.scrollHeight || 0, 180)}px`;
 }
 
-/* Task 7 的请求体会用同一个构造函数：单段文本直接给字符串，否则给 part 数组。 */
+/* 单段文本直接给字符串，否则给 part 数组；Task 7 的请求体复用同一构造。 */
 function buildUserContent(text, attachments) {
   const parts = [];
   if (text.trim()) parts.push({ type: 'text', text: text.trim() });
@@ -101,26 +119,14 @@ function hasComposerContent() {
   return Array.isArray(content) ? content.length > 0 : Boolean(String(content || '').trim());
 }
 
-/* 组件状态（角色/在途请求/启动失败）与 send 按钮标签都由这里统一计算：
-   * 未知角色按只读处理（fail closed）；
-   * 生成中禁用输入区与附件，但按钮变成可点的「停止」；
-   * 语言切换只重算文案，不会把生成中的输入区重新放开。 */
+/* 发送按钮：生成中变「停止」可点；其余按启动失败/角色/输入内容计算。
+   SENDING_READY 守卫见常量声明处（Task 7 移除）。 */
 function updateSendState() {
   const busy = Boolean(state.controller);
-  const admin = state.role === 'admin';
-  const locked = Boolean(state.bootError) || !admin || busy;
-  ['#testInput', '#testAttach', '#testFileInput'].forEach(selector => {
-    const element = $(selector);
-    if (element) element.disabled = locked;
-  });
-  const modelSelect = $('#testModel');
-  if (modelSelect) modelSelect.disabled = Boolean(state.bootError);
-  const input = $('#testInput');
-  if (state.bootError) input.placeholder = t('test.placeholder');
-  else if (state.role !== null && !admin) input.placeholder = t(COPY.adminOnly);
   const send = $('#testSend');
   send.textContent = t(busy ? COPY.stop : COPY.send);
-  send.disabled = Boolean(state.bootError) || !admin || (!busy && !hasComposerContent());
+  send.disabled = !SENDING_READY || Boolean(state.bootError) || state.role !== 'admin' ||
+    (!busy && !hasComposerContent());
 }
 
 /* ── 附件：只留在内存。FileReader → data URL，文本类顺带读出正文 ── */
@@ -214,6 +220,21 @@ function scrollMessages() {
   host.scrollTop = host.scrollHeight;
 }
 
+/* 内联会话错误（#testError）：体积/附件读取/流错误就地展示在消息区，
+   不再只靠 toast（计划 Task 5；Task 6/7 的调用方陆续接入）。 */
+function showConversationError(message) {
+  const host = $('#testError');
+  host.textContent = String(message || '');
+  host.hidden = !host.textContent;
+  scrollMessages();
+}
+
+function hideConversationError() {
+  const host = $('#testError');
+  host.textContent = '';
+  host.hidden = true;
+}
+
 function copyMessage(message) {
   const text = (message.parts || [])
     .filter(part => part.type === 'text')
@@ -241,8 +262,9 @@ function copyFallback(text) {
   helper.remove();
 }
 
-function appendAssistantView(message) {
-  $('#testEmpty').hidden = true;
+/* assistant 气泡骨架：meta / bubble / actions 三段；只构造不挂载，
+   挂载位置由调用方决定（流式插在 #testError 前，重绘进节点数组）。 */
+function buildAssistantView(message) {
   const view = document.createElement('article');
   view.className = 'tc-message assistant';
   view.dataset.messageId = message.id;
@@ -254,7 +276,13 @@ function appendAssistantView(message) {
   actions.className = 'tc-message-actions';
   view.append(meta, body, actions);
   message.view = view;
-  $('#testMessages').append(view);
+  return view;
+}
+
+function appendAssistantView(message) {
+  $('#testEmpty').hidden = true;
+  /* #testError 永远保持消息区最后一个节点：流式新气泡插到它前面。 */
+  $('#testError').before(buildAssistantView(message));
   renderAssistant(message);
 }
 
@@ -273,139 +301,75 @@ function renderAssistant(message) {
     button.addEventListener('click', handler);
     actions.append(button);
   };
-  if (message.state === 'complete') {
+  if (message.status === 'complete') {
     addAction(t(COPY.copy), () => copyMessage(message));
   }
-  if (message.state === 'error') {
+  if (message.status === 'error') {
     const error = document.createElement('span');
     error.className = 'tc-error';
     error.textContent = message.error;
     actions.append(error);
   }
-  if (message.state === 'stopped') {
+  if (message.status === 'stopped') {
     const stopped = document.createElement('span');
     stopped.className = 'mut';
     stopped.textContent = t(COPY.stopped);
     actions.append(stopped);
   }
-  if (message.state === 'incomplete') {
+  if (message.status === 'incomplete') {
     const incomplete = document.createElement('span');
     incomplete.className = 'mut';
     incomplete.textContent = t(COPY.incomplete);
     actions.append(incomplete);
   }
   /* 重试/重新生成只作用于最后一条 assistant：只给最后一条渲染按钮，避免
-     旧消息上的按钮操作到新消息（或成为无操作）。Copy 对每条完成消息都可用。 */
+      旧消息上的按钮操作到新消息（或成为无操作）。Copy 对每条完成消息都可用。 */
   if (state.messages[state.messages.length - 1] === message) {
-    if (message.state === 'complete') addAction(t(COPY.regenerate), regenerateLast);
-    if (message.state === 'error') addAction(t(COPY.retry), retryLast);
+    if (message.status === 'complete') addAction(t(COPY.regenerate), regenerateLast);
+    if (message.status === 'error') addAction(t(COPY.retry), retryLast);
   }
   scrollMessages();
 }
 
 function renderConversation() {
   const empty = $('#testEmpty');
-  $('#testMessages').replaceChildren(empty);
+  const errorElement = $('#testError');
+  const nodes = [empty];
   state.messages.forEach(message => {
-    if (message.role === 'assistant') {
-      appendAssistantView(message);
-      return;
-    }
+    if (message.role === 'assistant') { nodes.push(buildAssistantView(message)); return; }
     const view = document.createElement('article');
     view.className = 'tc-message user';
     const body = document.createElement('div');
     body.className = 'tc-bubble';
-    renderParts(body, normalizeContent(message.content));
+    /* user 消息在入列时就派生好 parts 渲染缓存，重绘/换语言直接复用。 */
+    renderParts(body, message.parts || []);
     view.append(body);
     message.view = view;
-    $('#testMessages').append(view);
+    nodes.push(view);
   });
+  /* #testError 归位到消息区末尾：它必须永远是最后一个节点（流式气泡、
+     会话错误都围绕这个不变量排布）。 */
+  nodes.push(errorElement);
+  $('#testMessages').replaceChildren(...nodes);
   empty.hidden = state.messages.length > 0;
+  state.messages.forEach(message => {
+    if (message.role === 'assistant') renderAssistant(message);
+  });
   scrollMessages();
 }
 
-/* ── 请求编排：wire-format 历史 → /admin/test/chat/completions → SSE ── */
-function requestBody() {
-  return {
-    model: state.model,
-    messages: state.messages.map(message => ({ role: message.role, content: message.content })),
-    stream: true,
-  };
-}
-
+/* ── 请求编排占位（评审决议 3：中段允许发送回归）───────────────────
+   完整流式生命周期（本地 controller + conversationId 代次守卫 +
+   historyMessages 请求体 + SSE 循环 feeding appendMessageDelta +
+   parser.end() 终态布尔）由计划 Task 7 以 RED → GREEN 重建；旧实现
+   引用的 appendDelta/partsToWire 已随协议改写删除，此处绝不伪造完成态。 */
 async function requestAssistant() {
-  const body = requestBody();
-  if (requestBytes(body) > MAX_REQUEST_BYTES) {
-    toast(t(COPY.tooLarge), 4000);
-    return;
-  }
-  const assistant = {
-    id: newId(), role: 'assistant', content: '', parts: [],
-    state: 'streaming', requestedModel: state.model,
-    actualModel: '', selection: '', error: '', view: null,
-  };
-  state.messages.push(assistant);
-  appendAssistantView(assistant);
-  const controller = new AbortController();
-  state.controller = controller;
-  updateSendState();
-  let reader = null;
-  let sawDone = false;
-  try {
-    const response = await api.stream(CHAT_ENDPOINT, body, {
-      signal: controller.signal,
-      headers: { 'x-sr-session-id': state.sessionId },
-    });
-    assistant.actualModel = response.headers.get('x-sr-model') || state.model;
-    assistant.selection = response.headers.get('x-sr-selection') || '';
-    const contentType = response.headers.get('content-type') || '';
-    if (contentType.includes('text/event-stream') && response.body) {
-      reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      const parser = createSseParser(payload => {
-        const choice = payload && Array.isArray(payload.choices) ? payload.choices[0] : null;
-        const delta = choice && choice.delta;
-        if (!delta) return;
-        assistant.parts = appendDelta(assistant.parts, delta);
-        renderAssistant(assistant);
-      }, () => { sawDone = true; });
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        parser.push(decoder.decode(value, { stream: true }));
-      }
-      parser.push(decoder.decode());
-      parser.end();
-      assistant.content = partsToWire(assistant.parts);
-      /* 正常结束必须见过 [DONE]；EOF 而没有 [DONE] 视为上游提前断流。 */
-      assistant.state = sawDone ? 'complete' : 'incomplete';
-    } else {
-      const data = await response.json();
-      const message = data && data.choices && data.choices[0] && data.choices[0].message;
-      assistant.content = message && message.content != null ? message.content : '';
-      assistant.parts = normalizeContent(assistant.content);
-      assistant.state = 'complete';
-    }
-  } catch (error) {
-    const aborted = error && error.name === 'AbortError';
-    /* 非中止的失败（parser 抛错 / 读流中断）要显式取消 reader，及时释放
-       上游连接与租约；中止路径的 reader 已由 abort 关闭，保持原样。 */
-    if (!aborted && reader) {
-      try { await reader.cancel(); } catch (cancelError) { /* 连接已断开 */ }
-    }
-    assistant.content = partsToWire(assistant.parts || []);
-    assistant.state = aborted ? 'stopped' : 'error';
-    assistant.error = aborted ? '' : apiErrText(error);
-  } finally {
-    if (state.controller === controller) state.controller = null;
-    if (state.messages.includes(assistant)) renderAssistant(assistant);
-    updateSendState();
-  }
+  return undefined;
 }
 
 function retryLast() {
   const last = state.messages[state.messages.length - 1];
-  if (state.controller || !last || last.role !== 'assistant' || last.state !== 'error') return;
+  if (state.controller || !last || last.role !== 'assistant' || last.status !== 'error') return;
   state.messages.pop();
   renderConversation();
   requestAssistant();
@@ -413,29 +377,33 @@ function retryLast() {
 
 function regenerateLast() {
   const last = state.messages[state.messages.length - 1];
-  if (state.controller || !last || last.role !== 'assistant' || last.state !== 'complete') return;
+  if (state.controller || !last || last.role !== 'assistant' || last.status !== 'complete') return;
   state.messages.pop();
   renderConversation();
   requestAssistant();
 }
 
 async function sendCurrent() {
-  if (state.controller || state.role !== 'admin') return;
+  /* 中段守卫（评审决议 3）：Task 7 重建 requestAssistant 后恢复发送。 */
+  if (!SENDING_READY || state.controller || state.role !== 'admin') return;
   const input = $('#testInput');
   const text = input.value;
   if (!text.trim() && !state.attachments.length) return;
   const content = buildUserContent(text, state.attachments);
-  const candidate = state.messages.concat({ role: 'user', content });
+  const user = {
+    id: newId(), role: 'user', content, parts: normalizeMessage({ content }), view: null,
+  };
   const candidateBody = {
     model: state.model,
-    messages: candidate.map(message => ({ role: message.role, content: message.content })),
+    messages: historyMessages(state.messages.concat(user)),
     stream: true,
   };
+  /* 体积上限先于任何状态变更检查；超限就地内联，不再只靠 toast。 */
   if (requestBytes(candidateBody) > MAX_REQUEST_BYTES) {
-    toast(t(COPY.tooLarge), 4000);
+    showConversationError(t(COPY.tooLarge));
     return;
   }
-  state.messages.push({ id: newId(), role: 'user', content, view: null });
+  state.messages.push(user);
   clearAttachments();
   input.value = '';
   autoResize();
@@ -443,17 +411,21 @@ async function sendCurrent() {
   await requestAssistant();
 }
 
-/* ── 消息区回到空态：移除已渲染气泡，只保留 #testEmpty 节点 ── */
+/* ── 消息区回到空态：移除已渲染气泡与内联错误，只保留 #testEmpty 节点 ── */
 function clearMessages() {
-  $('#testMessages').replaceChildren($('#testEmpty'));
+  hideConversationError();
+  $('#testMessages').replaceChildren($('#testEmpty'), $('#testError'));
   $('#testEmpty').hidden = false;
   state.messages = [];
 }
 
-/* 新建对话：中止在途请求、清空附件与消息、换一个会话 id、恢复空态。 */
+/* 新建对话：先递增会话代次（Task 7 的 stale-request 守卫用它判定「结果属于
+   哪一轮对话」），摘下再中止在途控制器，清空附件与消息、换会话 id、恢复空态。 */
 function newChat() {
-  if (state.controller) state.controller.abort();
+  state.conversationId += 1;
+  const controller = state.controller;
   state.controller = null;
+  if (controller) controller.abort();
   clearAttachments();
   clearMessages();
   state.sessionId = newId();
@@ -546,6 +518,7 @@ async function boot() {
   const active = (trees.trees || []).find(tree => tree.enabled);
   state.activeTree = active ? (active.name || active.id) : '';
   renderModelOptions();
+  renderAccessState();
   renderStatus();
   updateSendState();
   autoResize();
@@ -554,12 +527,14 @@ async function boot() {
 onLangChange(() => {
   renderModelOptions();
   renderStatus();
-  /* 文案是就地替换的：消息区的 meta/动作按钮也要按新语言重建。
-     生成中同样安全——assistant 视图从已缓存的 parts 重建，后续 delta 继续更新它。 */
+  renderAccessState();
+  renderAttachments();
+  /* 文案是就地替换的：消息区的 meta/动作按钮也要按新语言重建。 */
   renderConversation();
   updateSendState();
 });
-/* 首屏先按「空输入 + 未知角色」落一次按钮状态，避免闪出可点发送。 */
+/* 首屏先按「空输入 + 未知角色」落一次状态，避免闪出可点的输入区。 */
+renderAccessState();
 updateSendState();
 autoResize();
 boot().catch(error => {
@@ -567,5 +542,6 @@ boot().catch(error => {
   state.bootError = apiErrText(error);
   state.role = null;
   renderStatus();
+  renderAccessState();
   updateSendState();
 });

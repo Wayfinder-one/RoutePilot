@@ -11,7 +11,17 @@
 .tc-topline{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line)}
 .tc-topline select{max-width:340px;font-weight:600}
 .tc-topline .mut{font-size:11.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* 空模型提示（#testModelEmpty）：renderModelOptions 在目录为空时亮出，
+   带到模型页的入口链接（计划 Task 5 新 DOM）。 */
+#testModelEmpty{display:inline-flex;align-items:baseline;gap:6px;min-width:0}
+#testModelEmpty[hidden]{display:none}
+#testModelEmpty a{color:var(--indigo);white-space:nowrap}
+#testModelEmpty a:hover{text-decoration:underline}
 .tc-messages{flex:1;min-height:0;overflow-y:auto;padding:24px}
+/* 内联会话错误（#testError）：体积/附件读取/流错误就地展示在消息区，
+   不再只靠 toast（计划 Task 5 新 DOM，Task 6/7 复用）。 */
+#testError{max-width:860px;margin:0 auto 20px;padding:8px 12px;border:1px solid var(--red-line);background:var(--red-soft);color:var(--red);border-radius:9px;font-size:12px;word-break:break-word}
+#testError[hidden]{display:none}
 .tc-empty{min-height:100%;display:grid;place-content:center;text-align:center;color:var(--text-2)}
 /* shared.css 没有 [hidden] 兜底，display:grid 会盖掉 UA 的 [hidden]{display:none} */
 .tc-empty[hidden]{display:none}

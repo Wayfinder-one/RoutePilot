@@ -6,7 +6,8 @@
    * Task 4 安全渲染：Markdown → DOM、恶意 HTML/活动 URL 不执行、
      图片/音频/视频/文件分派、未知 part 折叠、safeMediaUrl 白名单、
      复制链整链失败写进 Copy 按钮标签；
-   * Task 5 首页壳：Test 导航、模型目录、Auto/固定模型状态；
+   * Task 5 首页壳：Test 导航、模型目录、Auto/固定模型状态、390/800/1440
+     首屏适配、空目录时的 #testModelEmpty 模型页入口、viewer 锁定输入区；
    * Task 6 附件：选择/拖拽/粘贴、chip 预览与移除、空文本 + 附件可发送；
    * Task 7 流式：Auto/固定模型、多轮历史、附件 wire 形状、多模态 part、
      Stop、内联错误 + Retry、提前 EOF（未完成）、New Chat 中止与会话轮换；
@@ -162,10 +163,11 @@ test('test chat renderer supports markdown and blocks active content', async () 
     host.querySelector('.tc-code button').click();
     await new Promise(resolve => setTimeout(resolve, 80));
     window.removeEventListener('error', onError);
+    const fenceText = host.querySelector('.tc-code code').textContent;
     host.remove();
-    return captured;
+    return { fenceText, captured };
   });
-  assert.deepEqual(rendererCopyErrors, [],
+  assert.deepEqual(rendererCopyErrors, { fenceText: 'const x = 1;', captured: [] },
     'renderer Copy must not throw when the Clipboard API is unavailable');
 
   /* 评审决议（绑定）：整条复制链失败时把失败写进按钮标签 —— 剪贴板不可用且
@@ -224,22 +226,131 @@ test('test chat renderer safeMediaUrl whitelist matrix', async () => {
   ]);
 });
 
-/* 计划 Task 5：首页从「概览」换成「测试」，导航、数据页标记与模型选择器都要
-   一次性到位。此用例在旧概览页上必然超时（没有 #testModel），所以先红后绿。 */
-test('test home replaces overview and lists Auto plus configured models', async () => {
+/* 计划 Task 5（修订）：首页壳。v1 同名用例的全部断言保留（导航/目录/状态文案），
+   并把 390/800/1440 三档「首屏装下底栏且整页不滚动」断言从流式用例挪到这里——
+   本提交里发送按评审决议 3 暂时禁用，布局回归必须落在不发送就能跑的用例上。 */
+async function openShellPage(waitMarker, waitState) {
+  /* 壳用例都以 zh 断言文案：导航前先把 router_lang 种进 localStorage；
+     about:blank 没有同源 storage，先拿一次页面建立 origin。 */
+  if (!page.url().startsWith(routerBase)) {
+    await page.goto(routerBase + '/console/index.html');
+  }
+  await page.evaluate(() => localStorage.setItem('router_lang', 'zh'));
   await page.goto(routerBase + '/console/index.html');
-  /* 原生 <optgroup> 在 <select> 里没有布局盒，Playwright 的 visible 判定永远等不到；
-     这里等它 attached（同一断言意图：模型分组已渲染）。 */
-  await page.waitForSelector('#testModel optgroup', { state: 'attached' });
+  /* 原生 <optgroup> 在 <select> 里没有布局盒，visible 判定等不到：等 attached
+     （同一断言意图：模型分组已渲染）。#testModelEmpty 是静态节点，必须等
+     visible 才能证明 boot 的 renderModelOptions 真的亮出了空目录提示。 */
+  await page.waitForSelector(waitMarker || '#testModel optgroup', {
+    state: waitState || 'attached', timeout: 15000,
+  });
+}
+
+test('test home replaces overview and lists Auto plus configured models', async () => {
+  await openShellPage();
   assert.equal(await page.locator('body').getAttribute('data-page'), 'test');
   assert.equal(await page.locator('.top nav a.on').textContent(), '测试');
   assert.equal(await page.locator('#testModel').inputValue(), 'auto');
+  /* 提供方分组：bootstrap 注册的模型全部挂在 local 提供方下。 */
+  const groups = await page.evaluate(() =>
+    [...document.querySelectorAll('#testModel optgroup')].map(group => group.label));
+  assert.deepEqual(groups, ['local']);
   assert.ok(await page.locator('#testModel option[value="qwen3-32b"]').count());
   assert.equal(await page.locator('#cards').count(), 0);
+  /* 目录非空：空模型提示必须藏起来（Task 5 新 DOM 的另一侧）。 */
+  assert.equal(await page.locator('#testModelEmpty').isHidden(), true);
   await page.locator('#testModel').selectOption('qwen3-32b');
   assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
   await page.locator('#testModel').selectOption('auto');
   assert.match(await page.locator('#testStatus').textContent(), /智能路由/);
+
+  /* F2/F3：窄屏（手机 390×844）+ 中档（800×900，shared.css 页头换行断点内）
+     + 桌面（1440×1000）三档都必须首屏装下底栏且整页不滚动；桌面尺寸与旧布局一致。 */
+  const fitBands = [
+    { name: '390x844', width: 390, height: 844 },
+    { name: '800x900', width: 800, height: 900 },
+    { name: '1440x1000', width: 1440, height: 1000 },
+  ];
+  try {
+    for (const band of fitBands) {
+      await page.setViewportSize({ width: band.width, height: band.height });
+      const fit = await page.evaluate(() => {
+        const composer = document.querySelector('.tc-composer');
+        const panel = document.querySelector('.tc-panel');
+        return {
+          innerHeight: window.innerHeight,
+          scrollY: window.scrollY,
+          composerBottom: Math.round(composer.getBoundingClientRect().bottom),
+          panelBottom: Math.round(panel.getBoundingClientRect().bottom),
+          scrollHeight: document.documentElement.scrollHeight,
+        };
+      });
+      const label = band.name;
+      assert.equal(fit.scrollY, 0, `${label} must not be scrolled on load`);
+      assert.ok(fit.composerBottom <= fit.innerHeight + 1,
+        `${label}: composer must be above the fold (bottom ${fit.composerBottom} > ${fit.innerHeight})`);
+      assert.ok(fit.panelBottom <= fit.innerHeight + 1,
+        `${label}: panel must fit (bottom ${fit.panelBottom} > ${fit.innerHeight})`);
+      assert.ok(fit.scrollHeight <= fit.innerHeight + 1,
+        `${label}: page must not scroll (scrollHeight ${fit.scrollHeight} > ${fit.innerHeight})`);
+    }
+  } finally {
+    await page.setViewportSize({ width: 1440, height: 960 });
+  }
+});
+
+/* 计划 Task 5：/admin/models 返回空目录时 Auto 选项保留，模型页入口
+   （#testModelEmpty + a[href="models.html"]）就地亮出。先红：v1 把链接塞在
+   #testStatus 里，没有 #testModelEmpty 这个节点。 */
+test('test empty models keeps auto and links to the model page', async () => {
+  const modelsMatcher = '**/admin/models';
+  await page.route(modelsMatcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ models: [] }),
+  }));
+  try {
+    await openShellPage('#testModelEmpty', 'visible');
+    assert.equal(await page.locator('#testModel option').count(), 1,
+      'only the Auto option remains');
+    assert.equal(await page.locator('#testModel option[value="auto"]').textContent(),
+      'Auto · 智能路由');
+    assert.equal(await page.locator('#testModelEmpty').isHidden(), false,
+      'the empty-model notice must be visible');
+    assert.match(await page.locator('#testModelEmpty').textContent(), /还没有已配置的模型/);
+    const link = page.locator('#testModelEmpty a[href="models.html"]');
+    assert.equal(await link.count(), 1);
+    assert.equal(await link.isVisible(), true);
+    assert.equal(await link.textContent(), '前往模型页 →');
+  } finally {
+    await page.unroute(modelsMatcher);
+  }
+});
+
+/* 计划 Task 5：viewer 角色锁死整个输入区（textarea/附件/发送），并亮出
+   test.adminOnly 文案。先红：v1 没有独立的 viewer 用例。 */
+test('test viewer cannot use the composer', async () => {
+  const meMatcher = '**/admin/me';
+  await page.route(meMatcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ id: 'qa-viewer', email: 'viewer@example.test', role: 'viewer' }),
+  }));
+  try {
+    await openShellPage('#testModel option[value="auto"]');
+    assert.equal(await page.locator('#testInput').isDisabled(), true,
+      'the textarea must be locked for a viewer');
+    assert.equal(await page.locator('#testAttach').isDisabled(), true,
+      'the attach button must be locked for a viewer');
+    assert.equal(await page.locator('#testFileInput').isDisabled(), true,
+      'the file input must be locked for a viewer');
+    assert.equal(await page.locator('#testSend').isDisabled(), true,
+      'send must be locked for a viewer');
+    assert.equal(await page.locator('#testStatus').textContent(), '只有管理员可以测试模型');
+    assert.equal(await page.locator('#testInput').getAttribute('placeholder'),
+      '只有管理员可以测试模型');
+  } finally {
+    await page.unroute(meMatcher);
+  }
 });
 
 /* 计划 Task 6：附件全部只留在内存（FileReader → data URL → 协议 part），
@@ -394,40 +505,6 @@ test('test chat auto routing streams the fixed reply', async () => {
   await page.waitForTimeout(120);
   assert.equal(await page.evaluate(() => window.__copyFallbacks), 1,
     'Copy must fall back to execCommand when the Clipboard API is unavailable');
-
-  /* F2/F3：窄屏（手机 390×844）+ 中档（800×900，shared.css 页头换行断点内）
-     + 桌面（1440×1000）三档都必须首屏装下底栏且整页不滚动；桌面尺寸与旧布局一致。 */
-  const fitBands = [
-    { name: '390x844', width: 390, height: 844 },
-    { name: '800x900', width: 800, height: 900 },
-    { name: '1440x1000', width: 1440, height: 1000 },
-  ];
-  try {
-    for (const band of fitBands) {
-      await page.setViewportSize({ width: band.width, height: band.height });
-      const fit = await page.evaluate(() => {
-        const composer = document.querySelector('.tc-composer');
-        const panel = document.querySelector('.tc-panel');
-        return {
-          innerHeight: window.innerHeight,
-          scrollY: window.scrollY,
-          composerBottom: Math.round(composer.getBoundingClientRect().bottom),
-          panelBottom: Math.round(panel.getBoundingClientRect().bottom),
-          scrollHeight: document.documentElement.scrollHeight,
-        };
-      });
-      const label = band.name;
-      assert.equal(fit.scrollY, 0, `${label} must not be scrolled on load`);
-      assert.ok(fit.composerBottom <= fit.innerHeight + 1,
-        `${label}: composer must be above the fold (bottom ${fit.composerBottom} > ${fit.innerHeight})`);
-      assert.ok(fit.panelBottom <= fit.innerHeight + 1,
-        `${label}: panel must fit (bottom ${fit.panelBottom} > ${fit.innerHeight})`);
-      assert.ok(fit.scrollHeight <= fit.innerHeight + 1,
-        `${label}: page must not scroll (scrollHeight ${fit.scrollHeight} > ${fit.innerHeight})`);
-    }
-  } finally {
-    await page.setViewportSize({ width: 1440, height: 960 });
-  }
 });
 
 test('test chat direct model keeps multi-turn history and skips JEV', async () => {

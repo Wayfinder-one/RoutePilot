@@ -21,6 +21,8 @@
     <header class="tc-topline">
       <select id="testModel" aria-label="Model"></select>
       <span class="mut" id="testStatus"></span>
+      <span class="mut" id="testModelEmpty" hidden><span data-i18n="test.noModels"></span>
+        <a href="models.html" data-i18n="test.goModels"></a></span>
     </header>
     <div class="tc-messages" id="testMessages" aria-live="polite">
       <div class="tc-empty" id="testEmpty">
@@ -32,6 +34,7 @@
           <button class="tc-sample" data-i18n="test.sample3"></button>
         </div>
       </div>
+      <div class="tc-conversation-error" id="testError" hidden></div>
     </div>
     <footer class="tc-composer">
       <div class="tc-attachments" id="testFiles"></div>
