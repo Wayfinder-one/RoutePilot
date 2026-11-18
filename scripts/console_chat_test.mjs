@@ -1,22 +1,37 @@
-/* Test chat 附件协议、请求体积、wire 序列化与流式增量的纯函数契约测试
- * （计划 Task 2–3 + Task 7 的 partToWire/partsToWire 与 SSE onDone）。
+/* Test chat 协议与流式解码的纯函数契约测试（计划 Task 2–3，修订轮）。
  *
  * 运行：node --test scripts/console_chat_test.mjs
- * 约束：纯 ES module，不碰 DOM / fetch / 文件系统；同一模块在浏览器里复用。
+ * 约束：纯 ES module，不碰 DOM / fetch / 文件系统；被测模块在浏览器里复用。
+ * 分区：Task 2 = protocol.js（附件分类 / 体积 / 归一化 / raw 增量 / 无损历史）；
+ *       Task 3 = stream.js（SSE 解码与终态跟踪），见下方独立分区。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
   MAX_REQUEST_BYTES,
-  appendDelta,
+  appendMessageDelta,
   attachmentPart,
+  estimateAttachmentBytes,
+  historyMessages,
+  isTextFile,
   normalizeContent,
-  partToWire,
-  partsToWire,
+  normalizeMessage,
   requestBytes,
 } from '../router/console/chat/protocol.js';
 import { createSseParser } from '../router/console/chat/stream.js';
+
+/* ---- Task 2 · protocol.js ---- */
+
+test('text detection and attachment serialization use the same file classification', () => {
+  for (const name of ['a.yaml', 'a.html', 'a.jsonl', 'a.markdown']) {
+    const file = { name, type: '', size: 4 };
+    assert.equal(isTextFile(file), true, name);
+    assert.equal(attachmentPart({ ...file, text: 'body' }).text.endsWith('body'), true);
+  }
+  assert.equal(isTextFile({ name: 'a.png', type: 'image/png' }), false);
+  assert.ok(estimateAttachmentBytes({ name: 'a.png', type: 'image/png', size: 3 }) >= 4);
+});
 
 test('attachmentPart maps images, text, audio, and generic files', () => {
   assert.deepEqual(
@@ -29,12 +44,32 @@ test('attachmentPart maps images, text, audio, and generic files', () => {
     attachmentPart({ name: 'a.mp3', type: 'audio/mpeg', dataUrl: 'data:audio/mpeg;base64,AA==' }),
     { type: 'input_audio', input_audio: { data: 'AA==', format: 'mp3' } });
   assert.deepEqual(
+    attachmentPart({ name: 'a.wav', type: 'audio/wav', dataUrl: 'data:audio/wav;base64,AA==' }),
+    { type: 'input_audio', input_audio: { data: 'AA==', format: 'wav' } });
+  assert.deepEqual(
     attachmentPart({ name: 'a.pdf', type: 'application/pdf', dataUrl: 'data:application/pdf;base64,AA==' }),
     { type: 'file', file: { filename: 'a.pdf', file_data: 'data:application/pdf;base64,AA==' } });
+  /* 空 MIME 时退回扩展名分类：a.log 是文本附件。 */
+  assert.deepEqual(
+    attachmentPart({ name: 'a.log', type: '', text: 'LOG' }),
+    { type: 'text', text: '\n\n[File: a.log]\nLOG' });
 });
 
-test('requestBytes counts UTF-8 and the complete JSON envelope', () => {
-  assert.equal(requestBytes({ text: '你好' }), Buffer.byteLength(JSON.stringify({ text: '你好' })));
+test('estimateAttachmentBytes inflates binary bodies and adds envelope overhead', () => {
+  /* 文本附件按原始字节数计；二进制按 base64 膨胀 4·ceil(size/3)。 */
+  assert.equal(estimateAttachmentBytes({ name: 'a.yaml', type: '', size: 300 }),
+    300 + Buffer.byteLength('a.yaml') + 256);
+  assert.equal(estimateAttachmentBytes({ name: 'a.png', type: 'image/png', size: 300 }),
+    400 + Buffer.byteLength('a.png') + 256);
+  /* 文件名按 UTF-8 计字节；任何附件都预留信封开销，预检宁可保守。 */
+  assert.equal(estimateAttachmentBytes({ name: '附件.bin', type: 'application/octet-stream', size: 3 }),
+    4 + Buffer.byteLength('附件.bin') + 256);
+  assert.ok(estimateAttachmentBytes({ name: 'a', type: '', size: 0 }) >= 256);
+});
+
+test('requestBytes measures the complete UTF-8 envelope', () => {
+  const body = { messages: [{ role: 'user', content: '你好' }] };
+  assert.equal(requestBytes(body), Buffer.byteLength(JSON.stringify(body)));
   assert.equal(MAX_REQUEST_BYTES, 10 * 1024 * 1024);
 });
 
@@ -50,15 +85,123 @@ test('normalizeContent keeps text and known/unknown multimodal parts', () => {
   assert.equal(parts[2].type, 'unknown');
 });
 
-test('appendDelta merges adjacent text and retains media parts', () => {
-  let parts = appendDelta([], { content: 'hel' });
-  parts = appendDelta(parts, { content: 'lo' });
-  parts = appendDelta(parts, { content: [
-    { type: 'image_url', image_url: { url: 'https://example.test/a.png' } },
-  ] });
-  assert.equal(parts[0].text, 'hello');
-  assert.equal(parts[1].type, 'image');
+test('normalizeMessage reads content and message-level images/audio', () => {
+  const parts = normalizeMessage({
+    content: null,
+    images: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
+    audio: { data: 'AA==', format: 'wav' },
+  });
+  assert.equal(parts[0].type, 'image');
+  assert.equal(parts[1].type, 'audio');
+  assert.equal(parts[1].url, 'data:audio/wav;base64,AA==');
 });
+
+test('normalizeMessage appends message-level media after content parts', () => {
+  const parts = normalizeMessage({
+    content: [{ type: 'text', text: 'answer' }],
+    images: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,BB==' } }],
+    audio: { data: 'AA==', format: 'wav' },
+  });
+  assert.deepEqual(parts, [
+    { type: 'text', text: 'answer' },
+    { type: 'image', url: 'data:image/png;base64,BB==' },
+    { type: 'audio', url: 'data:audio/wav;base64,AA==' },
+  ]);
+  /* 非对象输入安全退化成空 parts。 */
+  assert.deepEqual(normalizeMessage(null), []);
+});
+
+test('raw deltas preserve content while normalized parts expose media', () => {
+  let raw = { role: 'assistant', content: '' };
+  raw = appendMessageDelta(raw, { content: 'hel' });
+  raw = appendMessageDelta(raw, { content: 'lo' });
+  raw = appendMessageDelta(raw, { audio: { data: 'AA==', format: 'wav' } });
+  assert.equal(raw.content, 'hello');
+  assert.equal(raw.audio.data, 'AA==');
+  assert.deepEqual(historyMessages([{ role: 'assistant', raw }]), [
+    { role: 'assistant', content: 'hello' },
+  ]);
+  assert.equal(normalizeMessage(raw).at(-1).type, 'audio');
+});
+
+test('appendMessageDelta concatenates message-level audio data and transcripts', () => {
+  let raw = { role: 'assistant', content: '' };
+  raw = appendMessageDelta(raw, { audio: { data: 'AA==', format: 'wav', transcript: '你' } });
+  raw = appendMessageDelta(raw, { audio: { data: 'BB==', transcript: '好' } });
+  assert.equal(raw.audio.data, 'AA==BB==');
+  assert.equal(raw.audio.transcript, '你好');
+  /* 后续 delta 不带 format 时保留先前的元数据。 */
+  assert.equal(raw.audio.format, 'wav');
+});
+
+test('appendMessageDelta concatenates message-level images without dropping earlier ones', () => {
+  const first = { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } };
+  const second = { type: 'image_url', image_url: { url: 'data:image/png;base64,BB==' } };
+  let raw = { role: 'assistant', content: '' };
+  raw = appendMessageDelta(raw, { images: [first] });
+  raw = appendMessageDelta(raw, { images: [second] });
+  assert.deepEqual(raw.images, [first, second]);
+});
+
+test('appendMessageDelta merges indexed content parts and strips the index marker', () => {
+  let raw = { role: 'assistant', content: '' };
+  raw = appendMessageDelta(raw, { content: [{ type: 'text', text: 'a', index: 0 }] });
+  raw = appendMessageDelta(raw, { content: [{ type: 'text', text: 'b', index: 0 }] });
+  raw = appendMessageDelta(raw, { content: [{ type: 'text', text: '!', index: 1 }] });
+  assert.deepEqual(raw.content, [
+    { type: 'text', text: 'ab' },
+    { type: 'text', text: '!' },
+  ]);
+  /* 无 index 的内容段按序追加，不覆盖已有 parts。 */
+  raw = appendMessageDelta(raw, { content: [{ type: 'text', text: '?' }] });
+  assert.equal(raw.content.length, 3);
+  assert.deepEqual(raw.content.at(-1), { type: 'text', text: '?' });
+});
+
+test('appendMessageDelta leaves its raw input and delta untouched', () => {
+  const raw = {
+    role: 'assistant',
+    content: 'a',
+    images: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }],
+    audio: { data: 'AA==', format: 'wav', transcript: '嗨' },
+  };
+  const rawSnapshot = JSON.parse(JSON.stringify(raw));
+  const delta = {
+    content: 'b',
+    images: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,BB==' } }],
+    audio: { data: 'BB==' },
+  };
+  const deltaSnapshot = JSON.parse(JSON.stringify(delta));
+  const next = appendMessageDelta(raw, delta);
+  assert.deepEqual(raw, rawSnapshot, 'appendMessageDelta must not mutate its input raw');
+  assert.deepEqual(delta, deltaSnapshot, 'appendMessageDelta must not mutate its input delta');
+  assert.equal(next.content, 'ab');
+  assert.equal(next.audio.data, 'AA==BB==');
+  assert.equal(next.audio.transcript, '嗨');
+  assert.deepEqual(next.images, [
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,BB==' } },
+  ]);
+  assert.notEqual(next, raw, 'a new raw object is returned for each delta');
+});
+
+test('historyMessages maps assistant raw content and other roles verbatim', () => {
+  const content = [
+    { type: 'text', text: 'answer' },
+    { type: 'weird', x: 1 },
+  ];
+  assert.deepEqual(historyMessages([
+    { role: 'user', content: 'question' },
+    { role: 'assistant', raw: { role: 'assistant', content } },
+  ]), [
+    { role: 'user', content: 'question' },
+    /* assistant 只回放原始 content（含未知 part，不做渲染往返）；
+     * 消息级 images/audio 有意不出现在历史里。 */
+    { role: 'assistant', content },
+  ]);
+});
+
+/* ---- Task 3 · stream.js：SSE 解码与终态 ---- */
 
 test('SSE parser handles split chunks, CRLF, multiline data and DONE', () => {
   const events = [];
@@ -69,32 +212,6 @@ test('SSE parser handles split chunks, CRLF, multiline data and DONE', () => {
   parser.push('data: [DONE]\n\n');
   parser.end();
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['你', '好']);
-});
-
-/* ---- Hardening round（评审补强：只补测试，不改实现） ---- */
-
-test('attachmentPart maps wav audio and text-extension fallback', () => {
-  assert.deepEqual(
-    attachmentPart({ name: 'a.wav', type: 'audio/wav', dataUrl: 'data:audio/wav;base64,AA==' }),
-    { type: 'input_audio', input_audio: { data: 'AA==', format: 'wav' } });
-  assert.deepEqual(
-    attachmentPart({ name: 'a.log', type: '', text: 'LOG' }),
-    { type: 'text', text: '\n\n[File: a.log]\nLOG' });
-});
-
-test('appendDelta leaves its input untouched and keeps text after media separate', () => {
-  const input = [
-    { type: 'text', text: 'a' },
-    { type: 'image', url: 'https://example.test/a.png' },
-  ];
-  const snapshot = JSON.parse(JSON.stringify(input));
-  const merged = appendDelta(input, { content: 'b' });
-  assert.deepEqual(input, snapshot, 'appendDelta must not mutate its input array/parts');
-  assert.equal(merged.length, 3);
-  assert.deepEqual(merged[0], { type: 'text', text: 'a' });
-  assert.deepEqual(merged[1], { type: 'image', url: 'https://example.test/a.png' });
-  assert.deepEqual(merged[2], { type: 'text', text: 'b' },
-    'text after a non-text part must be pushed as a new part');
 });
 
 test('SSE parser flushes a trailing unterminated event on end()', () => {
@@ -124,30 +241,6 @@ test('SSE parser ignores empty payloads, comment lines and DONE markers', () => 
   parser.push('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
   parser.end();
   assert.deepEqual(events.map(event => event.choices[0].delta.content), ['ok']);
-});
-
-test('partToWire and partsToWire keep text, media and unknown parts round-trippable', () => {
-  const parts = [
-    { type: 'text', text: 'a' },
-    { type: 'image', url: 'data:image/png;base64,AA==' },
-    { type: 'unknown', value: { x: 1 } },
-  ];
-  assert.deepEqual(partsToWire(parts), [
-    { type: 'text', text: 'a' },
-    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
-    { x: 1 },
-  ]);
-  assert.deepEqual(partToWire({ type: 'video', url: 'https://example.test/v.mp4' }),
-    { type: 'video_url', video_url: { url: 'https://example.test/v.mp4' } });
-  assert.deepEqual(partToWire({ type: 'audio', url: 'data:audio/wav;base64,AA==' }),
-    { type: 'audio', audio: { url: 'data:audio/wav;base64,AA==' } });
-  assert.deepEqual(
-    partToWire({ type: 'file', name: 'a.bin', url: 'data:application/octet-stream;base64,AA==' }),
-    { type: 'file', file: { filename: 'a.bin', file_data: 'data:application/octet-stream;base64,AA==' } });
-  /* 纯文本数组压成字符串（OpenAI content 的另一种形态）。 */
-  assert.equal(partsToWire([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]), 'ab');
-  /* 线上格式经 normalizeContent 回到渲染层形状：文本/图片/未知片段都等价。 */
-  assert.deepEqual(normalizeContent(partsToWire(parts)), parts);
 });
 
 test('SSE parser reports DONE through the optional onDone callback', () => {

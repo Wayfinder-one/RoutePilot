@@ -1,10 +1,14 @@
-/* Chat 附件协议、请求体积守卫与增量归并 · 纯函数模块
+/* Chat 附件协议、体积守卫与无损消息归一 · 纯函数模块
    ------------------------------------------------------------------
    浏览器与 Node 共用的无副作用工具：不读 DOM、不发请求、不读文件。
-   attachmentPart 把内存里的附件描述映射成 OpenAI 兼容 content part；
-   normalizeContent 把响应/历史里各种形态的 content 归一成渲染层统一结构；
-   appendDelta 把流式 delta 归并进已归一化的 part 数组（相邻文本合并）；
-   requestBytes 用完整 JSON 信封的 UTF-8 字节数做前端体积上限判断。
+   isTextFile 是附件分类的唯一判定（text/* MIME 或文本扩展名），attachmentPart
+   的分类与「读文本还是读 Data URL」共用它；estimateAttachmentBytes 在读取之前
+   按 base64 膨胀估算附件体积，供预检提前拒绝超大文件；normalizeMessage 把 raw
+   消息（content + 消息级 images/audio）归一成渲染 parts；appendMessageDelta 把
+   流式 delta 无损归并进 raw（字符串拼接、消息级 images/audio 累加、index 内容
+   段合并），raw 始终是历史回放的唯一事实源；historyMessages 直接取 raw.content
+   构造请求历史，不做渲染往返转换；requestBytes 用完整 JSON 信封的 UTF-8 字节
+   数做前端体积上限判断。
    ------------------------------------------------------------------ */
 
 export const MAX_REQUEST_BYTES = 10 * 1024 * 1024;
@@ -15,16 +19,23 @@ export function requestBytes(body) {
   return new TextEncoder().encode(JSON.stringify(body)).byteLength;
 }
 
+export function isTextFile(file) {
+  return String(file.type || '').toLowerCase().startsWith('text/') || TEXT_EXTENSION.test(file.name || '');
+}
+
+export function estimateAttachmentBytes(file) {
+  const nameBytes = new TextEncoder().encode(file.name || 'attachment').byteLength;
+  const bodyBytes = isTextFile(file) ? file.size : 4 * Math.ceil(file.size / 3);
+  return bodyBytes + nameBytes + 256;
+}
+
 export function attachmentPart({ name, type = '', dataUrl = '', text = '' }) {
+  const file = { name, type };
   const filename = String(name || 'attachment');
   const mime = String(type || '').toLowerCase();
-  if (mime.startsWith('image/')) {
-    return { type: 'image_url', image_url: { url: dataUrl } };
-  }
-  if (mime.startsWith('text/') || TEXT_EXTENSION.test(filename)) {
-    return { type: 'text', text: `\n\n[File: ${filename}]\n${text}` };
-  }
-  if (mime === 'audio/mpeg' || mime === 'audio/wav' || mime === 'audio/x-wav') {
+  if (mime.startsWith('image/')) return { type: 'image_url', image_url: { url: dataUrl } };
+  if (isTextFile(file)) return { type: 'text', text: `\n\n[File: ${filename}]\n${text}` };
+  if (['audio/mpeg', 'audio/wav', 'audio/x-wav'].includes(mime)) {
     return {
       type: 'input_audio',
       input_audio: {
@@ -59,44 +70,66 @@ export function normalizeContent(content) {
     }
     if (part.type === 'file') {
       const file = part.file || part;
-      return {
-        type: 'file',
-        url: file.file_data || file.url || '',
-        name: file.filename || file.name || 'attachment',
-      };
+      return { type: 'file', url: file.file_data || file.url || '', name: file.filename || file.name || 'attachment' };
     }
     return { type: 'unknown', value: part };
   });
 }
 
-export function appendDelta(parts, delta) {
-  const next = parts.map(part => ({ ...part }));
-  const incoming = normalizeContent(delta && delta.content);
+export function normalizeMessage(message) {
+  const raw = message && typeof message === 'object' ? message : {};
+  const parts = normalizeContent(raw.content);
+  if (Array.isArray(raw.images)) parts.push(...normalizeContent(raw.images));
+  if (raw.audio) parts.push(...normalizeContent([{ type: 'audio', audio: raw.audio }]));
+  return parts;
+}
+
+function appendContent(current, incoming) {
+  if (incoming == null) return current ?? '';
+  if (typeof incoming === 'string') {
+    if (Array.isArray(current)) return current.concat({ type: 'text', text: incoming });
+    return String(current || '') + incoming;
+  }
+  if (!Array.isArray(incoming)) return current ?? '';
+  const next = Array.isArray(current)
+    ? current.map(part => ({ ...part }))
+    : current ? [{ type: 'text', text: String(current) }] : [];
   incoming.forEach(part => {
-    const last = next[next.length - 1];
-    if (part.type === 'text' && last && last.type === 'text') last.text += part.text;
-    else next.push(part);
+    if (!part || typeof part !== 'object') { next.push(part); return; }
+    const clean = { ...part };
+    const index = Number.isInteger(clean.index) ? clean.index : null;
+    delete clean.index;
+    if (index === null) { next.push(clean); return; }
+    const previous = next[index];
+    const textDelta = clean.type === 'text' || (!clean.type && typeof clean.text === 'string');
+    if (previous && previous.type === 'text' && textDelta) {
+      next[index] = { ...previous, ...clean, type: 'text', text: previous.text + clean.text };
+    } else next[index] = clean;
   });
   return next;
 }
 
-/* 渲染层 part → OpenAI 线上 content part：历史回放/多轮请求只用线上格式。 */
-export function partToWire(part) {
-  if (part.type === 'text') return { type: 'text', text: part.text };
-  if (part.type === 'image') return { type: 'image_url', image_url: { url: part.url } };
-  if (part.type === 'video') return { type: 'video_url', video_url: { url: part.url } };
-  if (part.type === 'audio') return { type: 'audio', audio: { url: part.url } };
-  if (part.type === 'file') return {
-    type: 'file', file: { filename: part.name, file_data: part.url },
+export function appendMessageDelta(raw, delta) {
+  const next = {
+    ...raw,
+    role: 'assistant',
+    content: appendContent(raw.content, delta.content),
   };
-  return part.value;
+  if (Array.isArray(delta.images)) next.images = (raw.images || []).concat(delta.images);
+  if (delta.audio) {
+    next.audio = {
+      ...(raw.audio || {}),
+      ...delta.audio,
+      data: String((raw.audio && raw.audio.data) || '') + String(delta.audio.data || ''),
+      transcript: String((raw.audio && raw.audio.transcript) || '') + String(delta.audio.transcript || ''),
+    };
+  }
+  return next;
 }
 
-/* 纯文本数组压成字符串（与 OpenAI content 的两种形态对齐），否则保留数组。 */
-export function partsToWire(parts) {
-  const content = parts.map(partToWire);
-  if (content.every(part => part && part.type === 'text')) {
-    return content.map(part => part.text).join('');
-  }
-  return content;
+export function historyMessages(messages) {
+  return messages.map(message => ({
+    role: message.role,
+    content: message.role === 'assistant' ? message.raw.content : message.content,
+  }));
 }
