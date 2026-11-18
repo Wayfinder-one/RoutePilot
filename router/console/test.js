@@ -484,7 +484,7 @@ async function requestAssistant() {
       assistant.raw = {
         role: 'assistant',
         ...(message || {}),
-        content: (message && message.content) != null ? message.content : '',
+        content: (message && message.content) ?? null,
       };
       assistant.parts = normalizeMessage(assistant.raw);
       assistant.status = 'complete';
