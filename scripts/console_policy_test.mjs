@@ -16,6 +16,13 @@ import { api } from '../router/console/api.js';
 import { DraftStore } from '../router/console/routing/draft.js';
 import { RoutingController } from '../router/console/routing/controller.js';
 import { behaviorCanonical, clone, createPolicy } from '../router/console/routing/policy.js';
+import { initTryRun, resetTryRun } from '../router/console/routing/tryrun.js';
+
+/* tryrun.js 的渲染入口按 id 查 DOM；node 直测没有页面，给一个永远
+   返回 null 的最小 document 桩：渲染路径整体空跑，状态逻辑照常执行。 */
+if (typeof globalThis.document === 'undefined') {
+  globalThis.document = { getElementById: () => null };
+}
 
 /* ── DraftStore：brief 逐字用例 ─────────────────────────────────── */
 
@@ -308,5 +315,28 @@ test('enabling a dirty policy requires a successful save first', async () => {
     assert.equal(store.resource.enabled, true, 'the toolbar state did not adopt enabled');
   } finally {
     api.req = realReq;
+  }
+});
+
+/* ── tryrun：resetTryRun 必须释放在途试算留下的运行锁 ─────────────── */
+
+test('resetTryRun releases a stuck try lock so the draft stays editable', () => {
+  const store = new DraftStore();
+  store.load(makeResource(), {}, { saved: true });
+  /* 复现锁定路径：一次试算把 runSeq 记在案后，装载/新建让序号前进——
+     在途请求的 finally 因 seq !== runSeq 永不释放，锁必须由 reset 交还。 */
+  store.setTryRunning(true);
+  assert.equal(store.change('behavior', draft => { draft.policy.name = 'locked'; }), false);
+
+  let toolbars = 0;
+  initTryRun({ store: store, toast: () => {}, updateToolbar: () => { toolbars += 1; } });
+  try {
+    resetTryRun();
+    assert.equal(store.tryRunning, false, 'resetTryRun left the try lock held forever');
+    assert.equal(store.change('behavior', draft => { draft.policy.name = 'unlocked'; }), true,
+      'the editor stayed locked after the draft was replaced');
+    assert.ok(toolbars >= 1, 'resetTryRun did not refresh the toolbar');
+  } finally {
+    initTryRun(null);
   }
 });

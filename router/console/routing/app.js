@@ -153,7 +153,7 @@ function renderIssues() {
   const rows = counts.hard.concat(counts.hints);
   app.issueRows = rows;
   if (panel.hidden) { panel.innerHTML = ''; return; }
-  /* 服务端 422 Issue：{code, zh, en, path, level}；文本按语言取，定位靠 path。 */
+  /* 服务端 422 Issue：{code, zh, en, path, level, params}；文本按语言取，定位靠 path。 */
   panel.innerHTML = rows.map((issue, index) => {
     const lang = document.documentElement.lang === 'en' ? 'en' : 'zh';
     const title = (lang === 'en' && issue.en) ? issue.en : (issue.zh || issue.en || issue.code || '');
@@ -196,7 +196,9 @@ function updateToolbar() {
       if (!button) return;
       button.disabled = busy ||
         (id === 'cvSaveLayout' && !store.saved) ||
-        (id === 'cvDeletePolicy' && !controller.policyId);
+        /* 未保存草稿也持有本地 UUID 形状的 policyId：只认 store.saved，
+           否则首屏空库时删除按钮可点，DELETE 打到不存在的资源上（404）。 */
+        (id === 'cvDeletePolicy' && (!controller.policyId || !store.saved));
     });
   const save = $('#cvSave');
   if (save) {

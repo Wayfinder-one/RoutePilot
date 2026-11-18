@@ -110,9 +110,16 @@ test('editor creates a new policy, saves it and adopts the server resource', asy
   assert.equal(list.policies.some(item => item.id === snap.policyId), false,
     'the draft leaked to the server before saving');
 
+  /* 删除门控：未保存草稿只持有本地 UUID 形状的 policyId，删除必须禁用
+     （否则 DELETE 打到不存在的资源，页面只剩「删除失败」toast）。 */
+  assert.equal(await page.locator('#cvDeletePolicy').isDisabled(), true,
+    'delete is clickable for a never-saved local draft');
+
   await commitText(page.locator('#policySettings [data-field="s-name"]'), 'QA 新建策略');
   await page.locator('#cvSave').click();
   await waitCleanSaved();
+  assert.equal(await page.locator('#cvDeletePolicy').isDisabled(), false,
+    'delete stayed disabled after the draft was saved');
 
   const created = await serverPolicyResource(snap.policyId);
   assert.equal(created.policy.name, 'QA 新建策略');

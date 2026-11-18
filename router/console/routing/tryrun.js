@@ -114,11 +114,17 @@ function renderTryResult() {
   box.innerHTML = html;
 }
 
-/* 换策略/新草稿：序号 +1 让在途响应过期，结果区整体清空。 */
+/* 换策略/新草稿：序号 +1 让在途响应过期，结果区整体清空。
+   在途请求的 finally 只在 seq === runSeq 时释放锁；序号已前进就意味着
+   那个释放路径永远不会触发——锁必须在这里一并放下，否则 DraftStore
+   永远拒绝编辑/保存/试算（旧版只能靠刷新页面脱困，未保存编辑随之丢失）。 */
 function resetTryRun() {
   runSeq += 1;
   current = null;
   lastError = null;
+  const store = storeNow();
+  if (store) store.setTryRunning(false);
+  updateToolbarNow();
   renderTryResult();
 }
 
