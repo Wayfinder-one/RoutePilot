@@ -118,8 +118,8 @@ def _install_admin_auth(app: FastAPI, settings: Settings) -> None:
 def _seed_jev(conn, state) -> None:
     """boot 种子：环境配置的 JEV 决策服务经真实 ConfigurationService.save_jev 落库。
 
-    与路由层写用例同一次序（校验活动图 → 提交 → 候选发布，发布为纯内存替换），
-    不再"先提交后校验"。活动图在校验失败时保持旧 boot 的降级语义：不中止启动，
+    与路由层写用例同一次序（校验活跃策略 → 提交 → 候选发布，发布为纯内存替换），
+    不再"先提交后校验"。活跃策略在校验失败时保持旧 boot 的降级语义：不中止启动，
     仅跳过本次种子（差别：未通过校验的配置不再残留数据库）。"""
     if JevConfigRepo(conn).load() is not None:
         return

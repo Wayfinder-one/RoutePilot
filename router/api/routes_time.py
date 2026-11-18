@@ -42,7 +42,7 @@ def put_time_periods(
     try:
         service.save_periods(periods)
     except ValidationFailed:
-        raise  # 活动图校验失败：交给 app 级处理器返回 422 + Issue 数组（spec §5）
+        raise  # 活跃策略校验失败：交给 app 级处理器返回 422 + Issue 数组（设计 §7.2）
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     return {"ok": True, "periods": TimePeriodRepo(conn).load()}

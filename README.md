@@ -249,7 +249,7 @@ Policies are not stored in SQLite. Each policy is one v4 document at `ROUTER_POL
 - All writer/reader containers must share the same numeric UID; mode `0600` files are not accessible through GID or `fsGroup` alone.
 - A stale save returns 409 `policy_conflict`; imports only change the draft.
 - `/healthz` is liveness. `/readyz` reports initial-snapshot readiness; 503 means not ready, and a later reload failure keeps the existing snapshot with `"stale": true`.
-- A database that still carries the legacy v3 tree table refuses to start; back it up and point the deployment at a fresh `ROUTER_DB`.
+- Old v3 routing trees are not migrated into v4 policies. A v1/v2 database refuses to start while its `routing_trees` table is missing or holds rows predating the graph format: back it up, then `DELETE FROM routing_trees` and retry. Graph-format rows are ignored — a v3-era database with such rows starts fine and keeps the leftover table unused.
 
 ## Quick start
 

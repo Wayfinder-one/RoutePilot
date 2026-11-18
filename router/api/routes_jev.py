@@ -92,7 +92,7 @@ def put_jev(
         )
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
-    # ValidationFailed（活动图校验失败）由 app 级异常处理器统一映射 422 Issue 数组。
+    # ValidationFailed（活跃策略校验失败）由 app 级异常处理器统一映射 422 Issue 数组。
     ConfigurationService(conn, policies, request.app.state.publisher).save_jev(settings)
     return _public(settings)
 
@@ -185,7 +185,7 @@ def put_jev_window(
         window = JevWindow(input_tokens=input_tokens, context_tokens=context_tokens)
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
-    # ValidationFailed（活动图校验失败）由 app 级异常处理器统一映射；本用例失败时
+    # ValidationFailed（活跃策略校验失败）由 app 级异常处理器统一映射；本用例失败时
     # 窗口 DB 写与审计随事务回滚（brief Step 1 RED 场景）。
     ConfigurationService(conn, policies, request.app.state.publisher).save_window(window)
     return get_jev_window(conn)
