@@ -185,6 +185,31 @@ test('appendMessageDelta leaves its raw input and delta untouched', () => {
   assert.notEqual(next, raw, 'a new raw object is returned for each delta');
 });
 
+test('appendMessageDelta copies array content parts instead of mutating them', () => {
+  /* R-T23 评审加固：数组 content 走 appendContent 的防御性拷贝路径
+   * （current.map(part => ({...part}))），不能原地合并。 */
+  let raw = { role: 'assistant', content: '' };
+  raw = appendMessageDelta(raw, { content: [{ type: 'text', text: 'a', index: 0 }] });
+  raw = appendMessageDelta(raw, {
+    content: [
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+      { type: 'text', text: 'b', index: 0 },
+    ],
+  });
+  const rawSnapshot = JSON.parse(JSON.stringify(raw));
+  const delta = { content: [{ type: 'text', text: 'c', index: 0 }] };
+  const deltaSnapshot = JSON.parse(JSON.stringify(delta));
+  const next = appendMessageDelta(raw, delta);
+  assert.deepEqual(raw, rawSnapshot, 'array content must not be merged in place');
+  assert.deepEqual(delta, deltaSnapshot, 'the incoming indexed parts must not be mutated');
+  assert.notEqual(next, raw, 'a new raw object is returned for each delta');
+  assert.notEqual(next.content, raw.content, 'content parts are copied, not shared');
+  assert.deepEqual(next.content, [
+    { type: 'text', text: 'abc' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+  ]);
+});
+
 test('historyMessages maps assistant raw content and other roles verbatim', () => {
   const content = [
     { type: 'text', text: 'answer' },
@@ -217,6 +242,16 @@ test('finish_reason is terminal even without DONE', () => {
   const parser = createSseParser(() => {});
   parser.push('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n');
   assert.equal(parser.end(), true);
+
+  /* R-T23 评审加固：终态 chunk 必须照常投递。stream.js 在标记 terminal 后仍要
+   * 调用 onPayload；上游常把 finish_reason 与最后一个 delta 同帧发送，回归若在
+   * 设置 terminal 后提前 return，会静默丢掉这一帧的增量内容。 */
+  const events = [];
+  const delivering = createSseParser(event => events.push(event));
+  delivering.push('data: {"choices":[{"delta":{"content":"尾"},"finish_reason":"stop"}]}\n\n');
+  assert.equal(events.length, 1, 'the terminal chunk must still be delivered exactly once');
+  assert.equal(events[0].choices[0].delta.content, '尾');
+  assert.equal(delivering.end(), true);
 });
 
 test('EOF without DONE or finish_reason is incomplete', () => {
