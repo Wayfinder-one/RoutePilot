@@ -1,4 +1,4 @@
-/* RoutePilot · 模型测试对话页（计划 Task 5–7，修订版）
+/* RoutePilot · 模型测试对话页（计划 Task 5–8，修订版）
    ------------------------------------------------------------------
    Task 5（壳）：模型目录选择器、Auto / 固定模型状态、空目录提示
    （#testModelEmpty + 模型页链接）、内联会话错误（#testError）、
@@ -9,6 +9,9 @@
    Task 7（流式）：guarded 流式生命周期 —— 本地 controller + 会话代次
    守卫（New Chat 换代后旧请求无痕退场），raw 无损历史回放，SSE 增量
    appendMessageDelta + parser.end() 终态布尔，停止/未完成/错误三态区分。
+   Task 8（动作）：Copy 只复制归一化 text part，整链失败按 render.js
+   契约写进按钮标签；多模态消息级 images/audio 只渲染不进历史；
+   New Chat 清场并回收预览 blob（已发送内容用 Data URL，互不相干）。
    消息形状（修订版）：assistant 携带 raw（历史回放的唯一事实源）与
    parts 渲染缓存，字段名是 status（v1 叫 state）；user 消息的 parts 由
    normalizeMessage({content}) 一次性派生。parts 绝不序列化。
@@ -262,31 +265,50 @@ function hideConversationError() {
   host.hidden = true;
 }
 
-function copyMessage(message) {
+/* 消息级 Copy（计划 Task 8）：只复制归一化 text part；与 render.js 的
+   copyText 同一契约 —— clipboard 优先、兜底 textarea+execCommand，整链
+   失败时把失败写进按钮标签（Copy failed，与渲染器围栏代码的英文一致），
+   兜底成功后恢复；全程不产生未捕获页面错误。 */
+function copyMessage(message, button) {
   const text = (message.parts || [])
     .filter(part => part.type === 'text')
     .map(part => part.text)
     .join('\n');
   const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : null;
+  const finish = copied => {
+    if (button) button.textContent = copied ? t(COPY.copy) : 'Copy failed';
+  };
   if (clipboard && typeof clipboard.writeText === 'function') {
-    clipboard.writeText(text).catch(() => copyFallback(text));
+    clipboard.writeText(text).then(
+      () => finish(true),
+      () => copyFallback(text).then(finish),
+    );
     return;
   }
-  copyFallback(text);
+  copyFallback(text).then(finish);
 }
 
-/* 非安全上下文 / 无剪贴板权限时的兜底：临时 textarea + execCommand，失败也静默。 */
+/* 非安全上下文 / 无剪贴板权限时的兜底：临时 textarea + execCommand；
+   永远 resolve（true=已复制，false=整链失败），绝不 reject。 */
 function copyFallback(text) {
-  const helper = document.createElement('textarea');
-  helper.value = text;
-  helper.setAttribute('readonly', '');
-  helper.style.position = 'fixed';
-  helper.style.top = '-1000px';
-  helper.style.opacity = '0';
-  document.body.append(helper);
-  helper.select();
-  try { document.execCommand('copy'); } catch (error) { /* 无权限：静默 */ }
-  helper.remove();
+  return new Promise(resolve => {
+    const helper = document.createElement('textarea');
+    helper.value = text;
+    helper.setAttribute('readonly', '');
+    helper.style.position = 'fixed';
+    helper.style.top = '-1000px';
+    helper.style.opacity = '0';
+    document.body.append(helper);
+    helper.select();
+    try {
+      resolve(Boolean(document.execCommand('copy')));
+    } catch (error) {
+      /* 无权限 / 无 execCommand：整链失败 */
+      resolve(false);
+    } finally {
+      helper.remove();
+    }
+  });
 }
 
 /* assistant 气泡骨架：meta / bubble / actions 三段；只构造不挂载，
@@ -329,7 +351,12 @@ function renderAssistant(message) {
     actions.append(button);
   };
   if (message.status === 'complete') {
-    addAction(t(COPY.copy), () => copyMessage(message));
+    const copy = document.createElement('button');
+    copy.className = 'btn ghost sm';
+    copy.textContent = t(COPY.copy);
+    /* 失败标签要写回按钮自身：handler 拿到按钮引用。 */
+    copy.addEventListener('click', () => copyMessage(message, copy));
+    actions.append(copy);
   }
   if (message.status === 'error') {
     const error = document.createElement('span');

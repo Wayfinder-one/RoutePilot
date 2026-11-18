@@ -14,7 +14,9 @@
      stop / incomplete eof / new generation race（代次守卫回归）/
      provider stream error；附件 wire、多模态 part、Retry、New Chat 清场
      仍由 v1 用例覆盖，Task 8 具名收编；
-   * Task 8 首页截图（仅在 QA_SCREENSHOTS=1 时执行）。
+   * Task 8（具名）：message-level media / content media / attachment wire /
+     exact oversize request / retry / regenerate / copy / new chat clears
+     media；另有首页截图（仅在 QA_SCREENSHOTS=1 时执行）。
    入口：`QA_ONLY="test chat" node scripts/console_qa/testchat.mjs`；
          全量：`node scripts/console_qa.mjs`（已在该文件 main() 中注册）。
    ------------------------------------------------------------------ */
@@ -679,8 +681,8 @@ test('test chat direct stream', async () => {
 });
 
 /* 计划 Task 7：多轮文本 —— 第二次请求体必须是 user / 原始 assistant 内容 /
-   user（无损历史回放，绝不做渲染往返转换）。v1 重新生成段保留在此
-   （重命名不弱化断言），Task 8 的 `test chat regenerate` 具名收编。 */
+   user（无损历史回放，绝不做渲染往返转换）。重新生成段已按计划 Task 8
+   平移进独立的 `test chat regenerate` 用例（断言原样，未弱化）。 */
 test('test chat multi-turn text', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   const jevCallsBefore = mockState.systemoneCalls.length;
@@ -712,57 +714,56 @@ test('test chat multi-turn text', async () => {
     [...document.querySelectorAll('.tc-message.assistant')].map(view =>
       [...view.querySelectorAll('.tc-message-actions button')].map(button => button.textContent)));
   assert.deepEqual(actionRows, [['复制'], ['复制', '重新生成']]);
-
-  /* F1：点击重新生成 —— 恰好一次真实上游调用，只替换最后一条 assistant。 */
-  const callsBeforeRegenerate = mockState.chatCalls.length;
-  const firstAnswer = await page.locator('.tc-message.assistant .tc-bubble').first().textContent();
-  await page.locator('.tc-message.assistant').last()
-    .locator('.tc-message-actions button', { hasText: '重新生成' }).click();
-  await waitFor(() => {
-    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
-    if (bubbles.length !== 2) return false;
-    const buttons = document.querySelectorAll('.tc-message.assistant .tc-message-actions button');
-    return bubbles[1].textContent.includes('固定回复') && buttons.length === 3;
-  });
-  assert.equal(mockState.chatCalls.length, callsBeforeRegenerate + 1,
-    'Regenerate must issue exactly one real upstream request');
-  const regenerateCall = mockState.chatCalls.at(-1);
-  assert.deepEqual(regenerateCall.messages.map(message => message.role),
-    ['user', 'assistant', 'user'], 'Regenerate must replay the wire-format history');
-  const afterRegenerate = await page.evaluate(() => ({
-    assistants: document.querySelectorAll('.tc-message.assistant').length,
-    firstAnswerText: document.querySelector('.tc-message.assistant .tc-bubble').textContent,
-    firstMeta: document.querySelector('.tc-message.assistant .tc-message-meta').textContent,
-    actionRows: [...document.querySelectorAll('.tc-message.assistant')].map(view =>
-      [...view.querySelectorAll('.tc-message-actions button')].map(button => button.textContent)),
-  }));
-  assert.equal(afterRegenerate.assistants, 2, 'Regenerate replaces only the last assistant');
-  assert.equal(afterRegenerate.firstAnswerText, firstAnswer, 'earlier answers stay untouched');
-  assert.equal(afterRegenerate.firstMeta, 'qwen3-32b · 固定模型');
-  assert.deepEqual(afterRegenerate.actionRows, [['复制'], ['复制', '重新生成']]);
 });
 
-test('test chat stream sends the attachment as image_url', async () => {
+/* ── 计划 Task 8：附件 wire 与多模态历史 ───────────────────────────── */
+
+/* 计划 Task 8：附件 wire —— PNG→image_url、MP3→input_audio（裸 base64）、
+   PDF→file.file_data、YAML 正文进 text part；发送后 chip 清空（v1 断言保留）。 */
+test('test chat attachment wire', async () => {
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
-  await page.locator('#testFileInput').setInputFiles({
-    name: 'qa-wire.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
-  });
-  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+  const mp3Body = Buffer.from('ID3qa-audio', 'utf8');
+  await page.locator('#testFileInput').setInputFiles([
+    { name: 'qa-wire.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64') },
+    { name: 'qa-wire.mp3', mimeType: 'audio/mpeg', buffer: mp3Body },
+    { name: 'qa-wire.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 qa', 'utf8') },
+    { name: 'qa-wire.yaml', mimeType: 'text/yaml', buffer: Buffer.from(QA_YAML, 'utf8') },
+  ]);
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 4);
+  /* 空文本 + 四个附件直接发送。 */
+  assert.equal(await page.locator('#testInput').inputValue(), '');
   await page.waitForFunction(() => !document.getElementById('testSend').disabled);
   await page.locator('#testSend').click();
   await waitForAssistantText('固定回复');
   const lastCall = mockState.chatCalls.at(-1);
   const content = lastCall.messages.at(-1).content;
-  assert.ok(Array.isArray(content), 'image-only turn must send a content part array');
+  assert.ok(Array.isArray(content), 'the attachment turn must send a content part array');
   const image = content.find(part => part && part.type === 'image_url');
   assert.ok(image, 'missing image_url part');
   assert.match(image.image_url.url, /^data:image\/png;base64,/);
+  const audio = content.find(part => part && part.type === 'input_audio');
+  assert.ok(audio, 'missing input_audio part');
+  assert.equal(audio.input_audio.format, 'mp3');
+  assert.equal(audio.input_audio.data, mp3Body.toString('base64'),
+    'input_audio.data must be the raw base64 payload without the data: prefix');
+  const file = content.find(part => part && part.type === 'file');
+  assert.ok(file, 'missing file part');
+  assert.equal(file.file.filename, 'qa-wire.pdf');
+  assert.match(file.file.file_data, /^data:application\/pdf;base64,/);
+  const text = content.find(part => part && part.type === 'text');
+  assert.ok(text, 'missing text part for the YAML attachment');
+  assert.match(text.text, /\[File: qa-wire\.yaml\]/);
+  assert.ok(text.text.includes('key: value'), 'the YAML body must travel as text');
   assert.equal(await page.locator('#testFiles .tc-chip').count(), 0,
     'composer chips are cleared after send');
 });
 
-test('test chat multimodal answer renders every part type', async () => {
+/* 计划 Task 8：消息级媒体 —— mock 把图片/音频放在 content 之外
+   （delta.images / delta.audio）投递，气泡照常渲染；下一轮请求里的
+   assistant 历史只有 role+content，content 是原始回放，绝不含消息级
+   图片/音频，也没有任何渲染派生字段。 */
+test('test chat message-level media', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
@@ -774,21 +775,11 @@ test('test chat multimodal answer renders every part type', async () => {
     const bubble = document.querySelector('.tc-message.assistant .tc-bubble');
     const image = bubble.querySelector('img.tc-media-image');
     const audio = bubble.querySelector('audio');
-    const video = bubble.querySelector('video');
-    const file = bubble.querySelector('a.tc-file');
-    const details = bubble.querySelector('details');
     return {
       text: bubble.textContent,
       imageSrc: image && image.getAttribute('src'),
       audioControls: Boolean(audio && audio.hasAttribute('controls')),
       audioSrc: audio && audio.getAttribute('src'),
-      videoControls: Boolean(video && video.hasAttribute('controls')),
-      videoSrc: video && video.getAttribute('src'),
-      fileText: file && file.textContent,
-      fileHref: file && file.getAttribute('href'),
-      fileDownload: file && file.getAttribute('download'),
-      unknownFolded: Boolean(details && !details.open),
-      unknownSummary: details && details.querySelector('summary').textContent,
       scripts: bubble.querySelectorAll('script').length,
     };
   });
@@ -796,6 +787,51 @@ test('test chat multimodal answer renders every part type', async () => {
   assert.match(rendered.imageSrc, /^data:image\/png;base64,/);
   assert.equal(rendered.audioControls, true);
   assert.match(rendered.audioSrc, /^data:audio\/wav;base64,/);
+  assert.equal(rendered.scripts, 0);
+  /* 下一轮：assistant 历史不带消息级媒体，也不做渲染往返转换。 */
+  await sendText('你好');
+  await waitForAssistantText('固定回复');
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 2);
+  const history = mockState.chatCalls.at(-1).messages[1];
+  assert.deepEqual(Object.keys(history), ['role', 'content'],
+    'history must carry only role and content — no render-derived images/audio fields');
+  assert.equal(history.role, 'assistant');
+  assert.ok(Array.isArray(history.content), 'the streamed content array replays verbatim');
+  const historyTypes = history.content.map(part => part && part.type);
+  assert.equal(historyTypes[0], 'text');
+  assert.equal(history.content[0].text, '多模态回复：',
+    'the ORIGINAL streamed text must survive into the next request');
+  assert.equal(historyTypes.includes('image_url'), false,
+    'message-level images must not leak into the content history');
+  assert.equal(historyTypes.includes('audio') || historyTypes.includes('input_audio'), false,
+    'message-level audio must not leak into the content history');
+});
+
+/* 计划 Task 8：内容 part —— 视频/文件/未知 part 渲染；下一轮请求原样保留
+   原始 content part（video_url 还是 video_url，绝不做 partToWire 式转换）。 */
+test('test chat content media', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await sendText('返回多模态');
+  await waitFor(() => Boolean(document.querySelector('.tc-message.assistant video')));
+  await waitFor(() =>
+    document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
+  const rendered = await page.evaluate(() => {
+    const bubble = document.querySelector('.tc-message.assistant .tc-bubble');
+    const video = bubble.querySelector('video');
+    const file = bubble.querySelector('a.tc-file');
+    const details = bubble.querySelector('details');
+    return {
+      videoControls: Boolean(video && video.hasAttribute('controls')),
+      videoSrc: video && video.getAttribute('src'),
+      fileText: file && file.textContent,
+      fileHref: file && file.getAttribute('href'),
+      fileDownload: file && file.getAttribute('download'),
+      unknownFolded: Boolean(details && !details.open),
+      unknownSummary: details && details.querySelector('summary').textContent,
+    };
+  });
   assert.equal(rendered.videoControls, true);
   assert.match(rendered.videoSrc, /^data:video\/mp4;base64,/);
   assert.equal(rendered.fileText, 'result.bin');
@@ -803,8 +839,53 @@ test('test chat multimodal answer renders every part type', async () => {
   assert.match(rendered.fileHref, /^data:application\/octet-stream;base64,/);
   assert.equal(rendered.unknownFolded, true);
   assert.equal(rendered.unknownSummary, 'Unsupported content');
-  assert.equal(rendered.scripts, 0);
-  assert.equal(mockState.chatCalls.length, chatCallsBefore + 1);
+  /* 下一轮：content 深度等于原始 part 数组（逐字段，含未知 part）。 */
+  await sendText('你好');
+  await waitForAssistantText('固定回复');
+  assert.equal(mockState.chatCalls.length, chatCallsBefore + 2);
+  assert.deepEqual(mockState.chatCalls.at(-1).messages[1].content, [
+    { type: 'text', text: '多模态回复：' },
+    { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
+    { type: 'file', file: { filename: 'result.bin', file_data: 'data:application/octet-stream;base64,AA==' } },
+    { type: 'custom', value: { source: 'qa' } },
+  ], 'the next request must preserve the ORIGINAL content parts verbatim');
+});
+
+/* 计划 Task 8：精确超限 —— 小附件过预检（估算只看附件），但文本把完整
+   JSON 信封顶过 10MB 精确上限：就地内联报错、零新请求、不推进任何状态。 */
+test('test chat exact oversize request', async () => {
+  const chatCallsBefore = mockState.chatCalls.length;
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  /* 小附件：预检（估算）放行。 */
+  await page.locator('#testFileInput').setInputFiles({
+    name: 'qa-small.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
+  });
+  await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+  /* 大文本：估算看不见文本，精确 JSON 检查必须拦下（11MB > 10MB 上限）。 */
+  await page.evaluate(() => {
+    const input = document.getElementById('testInput');
+    input.value = 'a'.repeat(11 * 1024 * 1024);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await page.waitForFunction(() => !document.getElementById('testSend').disabled, null,
+    { timeout: 15000 });
+  await page.locator('#testSend').click();
+  await waitFor(() => !document.getElementById('testError').hidden, null, { timeout: 8000 });
+  const rejected = await page.evaluate(() => ({
+    error: document.getElementById('testError').textContent,
+    messages: document.querySelectorAll('.tc-message').length,
+    inputLength: document.getElementById('testInput').value.length,
+    chips: document.querySelectorAll('#testFiles .tc-chip').length,
+  }));
+  assert.equal(rejected.error, '请求体超过 10 MB 上限，请减少附件或历史消息');
+  assert.equal(rejected.messages, 0, 'no user message may be pushed on an oversize request');
+  assert.equal(rejected.inputLength, 11 * 1024 * 1024,
+    'the composer state must be untouched by the rejected send');
+  assert.equal(rejected.chips, 1,
+    'the attachment stays in the composer — only the send is rejected');
+  await page.waitForTimeout(300);
+  assert.equal(mockState.chatCalls.length, chatCallsBefore, 'ZERO new upstream call');
 });
 
 /* 计划 Task 7：延迟流上 Stop —— 部分文本保留、输入区在生成中锁定
@@ -997,7 +1078,9 @@ test('test chat provider stream error', async () => {
   assert.equal(mockState.chatCalls.length, chatCallsBefore + 1);
 });
 
-test('test chat retry after an inline admin error', async () => {
+/* 计划 Task 8：重试 —— 一次性 422 内联（{detail}），Retry 只移除失败的
+   assistant 并真实重发；数据面 {error:{message}} 不得 JSON 化（v1 断言全保留）。 */
+test('test chat retry', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
@@ -1067,7 +1150,118 @@ test('test chat retry after an inline admin error', async () => {
   }
 });
 
-test('test chat new chat aborts the stream and starts a new session', async () => {
+/* 计划 Task 8：重新生成 —— 只移除最后一条完成的 assistant，早轮原样保留，
+   恰好一次真实上游请求并回放 wire 历史（自 Task 7 的 multi-turn 用例
+   平移收编，断言原样未弱化）。 */
+test('test chat regenerate', async () => {
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await sendText('第一轮');
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    return bubbles.length === 1 && bubbles[0].textContent.includes('固定回复');
+  });
+  await sendText('第二轮');
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    return bubbles.length === 2 && bubbles[1].textContent.includes('固定回复');
+  });
+  /* F1：点击重新生成 —— 恰好一次真实上游调用，只替换最后一条 assistant。 */
+  const callsBeforeRegenerate = mockState.chatCalls.length;
+  const firstAnswer = await page.locator('.tc-message.assistant .tc-bubble').first().textContent();
+  await page.locator('.tc-message.assistant').last()
+    .locator('.tc-message-actions button', { hasText: '重新生成' }).click();
+  await waitFor(() => {
+    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
+    if (bubbles.length !== 2) return false;
+    const buttons = document.querySelectorAll('.tc-message.assistant .tc-message-actions button');
+    return bubbles[1].textContent.includes('固定回复') && buttons.length === 3;
+  });
+  assert.equal(mockState.chatCalls.length, callsBeforeRegenerate + 1,
+    'Regenerate must issue exactly one real upstream request');
+  const regenerateCall = mockState.chatCalls.at(-1);
+  assert.deepEqual(regenerateCall.messages.map(message => message.role),
+    ['user', 'assistant', 'user'], 'Regenerate must replay the wire-format history');
+  const afterRegenerate = await page.evaluate(() => ({
+    assistants: document.querySelectorAll('.tc-message.assistant').length,
+    firstAnswerText: document.querySelector('.tc-message.assistant .tc-bubble').textContent,
+    firstMeta: document.querySelector('.tc-message.assistant .tc-message-meta').textContent,
+    actionRows: [...document.querySelectorAll('.tc-message.assistant')].map(view =>
+      [...view.querySelectorAll('.tc-message-actions button')].map(button => button.textContent)),
+  }));
+  assert.equal(afterRegenerate.assistants, 2, 'Regenerate replaces only the last assistant');
+  assert.equal(afterRegenerate.firstAnswerText, firstAnswer, 'earlier answers stay untouched');
+  assert.equal(afterRegenerate.firstMeta, 'qwen3-32b · 固定模型');
+  assert.deepEqual(afterRegenerate.actionRows, [['复制'], ['复制', '重新生成']]);
+});
+
+/* 计划 Task 8：消息复制 —— 只复制归一化 text part（不带 JSON/媒体 URL）；
+   整条复制链失败时按 render.js 契约把失败写进按钮标签，不得抛页面错误，
+   兜底链成功后标签恢复。 */
+test('test chat copy', async () => {
+  await openTestPage();
+  await page.locator('#testModel').selectOption('qwen3-32b');
+  await sendText('返回多模态');
+  await waitFor(() =>
+    document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
+  /* 1) 捕获式 clipboard：写入内容必须只有文本 part。 */
+  await page.evaluate(() => {
+    window.__copied = [];
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: text => { window.__copied.push(text); return Promise.resolve(); } },
+    });
+  });
+  await page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '复制' }).click();
+  await waitFor(() => window.__copied.length === 1);
+  assert.deepEqual(await page.evaluate(() => window.__copied), ['多模态回复：'],
+    'Copy must join only the text parts — no JSON, no media URLs');
+  assert.equal(await page.locator('.tc-message.assistant .tc-message-actions button',
+    { hasText: '复制' }).textContent(), '复制',
+    'a successful copy leaves the button label alone');
+  /* 2) 整链失败：clipboard 拒绝 + execCommand false → 按钮标签变 Copy failed。 */
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: () => Promise.reject(new Error('denied')) },
+    });
+    document.execCommand = () => false;
+    window.__capturedCopyErrors = [];
+    window.addEventListener('error', event => {
+      window.__capturedCopyErrors.push(String(event.message || event));
+    });
+    window.addEventListener('unhandledrejection', event => {
+      window.__capturedCopyErrors.push('rejection: ' +
+        String(event.reason && event.reason.message || event.reason));
+    });
+  });
+  await page.locator('.tc-message.assistant .tc-message-actions button', { hasText: '复制' }).click();
+  await page.waitForFunction(() =>
+    [...document.querySelectorAll('.tc-message.assistant .tc-message-actions button')]
+      .some(button => button.textContent === 'Copy failed'));
+  assert.deepEqual(await page.evaluate(() => window.__capturedCopyErrors), [],
+    'a failed copy chain must not become an unhandled page error');
+  /* 3) 兜底链成功（clipboard 不可用 + execCommand true）→ 标签恢复。 */
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    document.execCommand = () => true;
+  });
+  await page.locator('.tc-message.assistant .tc-message-actions button',
+    { hasText: 'Copy failed' }).click();
+  await page.waitForFunction(() =>
+    [...document.querySelectorAll('.tc-message.assistant .tc-message-actions button')]
+      .some(button => button.textContent === '复制'));
+  /* 清理现场：还原原型补丁，后续用例不受影响。 */
+  await page.evaluate(() => {
+    delete navigator.clipboard;
+    delete document.execCommand;
+  });
+});
+
+/* 计划 Task 8：New Chat 清场 —— 中止在途请求（net::ERR_ABORTED，v1 断言
+   保留）、清空消息/附件并回收预览 blob URL、恢复空态、轮换会话 id；
+   已发送内容渲染用的是 Data URL（读取管线产物），与被回收的 blob 无关。 */
+test('test chat new chat clears media', async () => {
   await openTestPage();
   await page.locator('#testModel').selectOption('qwen3-32b');
   const sessionIds = [];
@@ -1077,16 +1271,34 @@ test('test chat new chat aborts the stream and starts a new session', async () =
     }
   };
   page.on('request', captureSession);
+  await page.evaluate(() => {
+    window.__savedRevokeObjectURL = URL.revokeObjectURL;
+    window.__revokedUrls = [];
+    URL.revokeObjectURL = function (url) {
+      window.__revokedUrls.push(String(url));
+      return window.__savedRevokeObjectURL.apply(this, arguments);
+    };
+  });
   try {
     await page.locator('#testFileInput').setInputFiles({
       name: 'qa-new-chat.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
     });
     await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    const sentPreview = await page.locator('#testFiles .tc-chip img').getAttribute('src');
+    assert.match(sentPreview, /^blob:/, 'the chip preview is an in-memory blob URL');
     await sendText('延迟流');
     await waitForAssistantText('第一段');
     assert.equal(await page.locator('#testFiles .tc-chip').count(), 0,
       'send clears the composer attachments');
-    /* M8：New Chat 必须真的中止在途请求（浏览器侧 net::ERR_ABORTED）。 */
+    /* 独立性：已发送的用户气泡渲染自 Data URL（FileReader 产物），
+       不依赖预览 blob —— 回收 blob 不影响已发送内容。 */
+    const userBubbleSrc = await page.locator('.tc-message.user img').first().getAttribute('src');
+    assert.match(userBubbleSrc, /^data:image\/png;base64,/,
+      'sent content renders from its Data URL, never from the preview blob');
+    assert.equal(
+      await page.evaluate(url => window.__revokedUrls.includes(url), sentPreview), true,
+      'the sent attachment’s preview blob must be revoked when the composer clears');
+    /* M8（v1 保留）：New Chat 必须真的中止在途请求（浏览器侧 net::ERR_ABORTED）。 */
     const abortedRequest = page.waitForEvent('requestfailed', {
       predicate: request => request.url().includes('/admin/test/chat/completions'),
       timeout: 8000,
@@ -1096,18 +1308,30 @@ test('test chat new chat aborts the stream and starts a new session', async () =
     const failure = failed.failure();
     assert.match(String(failure && failure.errorText), /ABORT/i,
       'New Chat must abort the in-flight request');
-    await waitFor(() => document.querySelectorAll('.tc-message').length === 0 &&
-      !document.getElementById('testEmpty').hidden);
+    const cleared = await page.evaluate(() => ({
+      messages: document.querySelectorAll('.tc-message').length,
+      empty: !document.getElementById('testEmpty').hidden,
+      chips: document.querySelectorAll('#testFiles .tc-chip').length,
+      inputDisabled: document.getElementById('testInput').disabled,
+    }));
+    assert.equal(cleared.messages, 0);
+    assert.equal(cleared.empty, true, 'the empty state must be restored');
+    assert.equal(cleared.chips, 0);
+    assert.equal(cleared.inputDisabled, false);
     await page.waitForTimeout(1900);
     assert.equal(await page.locator('.tc-message').count(), 0,
       'aborted stream must not re-append after New Chat');
-    /* New Chat 也要清掉空闲时新选的附件。 */
+    /* New Chat 也要清掉空闲时新选的附件，并回收它的预览 blob。 */
     await page.locator('#testFileInput').setInputFiles({
       name: 'qa-idle.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
     });
     await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 1);
+    const idlePreview = await page.locator('#testFiles .tc-chip img').getAttribute('src');
     await page.locator('#testNew').click();
     await waitFor(() => document.querySelectorAll('#testFiles .tc-chip').length === 0);
+    assert.equal(
+      await page.evaluate(url => window.__revokedUrls.includes(url), idlePreview), true,
+      'New Chat must revoke the idle attachment’s preview blob');
     /* 下一条真实请求使用轮换后的会话 id。 */
     await sendText('你好');
     await waitForAssistantText('固定回复');
@@ -1117,6 +1341,9 @@ test('test chat new chat aborts the stream and starts a new session', async () =
     assert.notEqual(sessionIds[1], sessionIds[0], 'New Chat must rotate the session id');
   } finally {
     page.off('request', captureSession);
+    await page.evaluate(() => {
+      URL.revokeObjectURL = window.__savedRevokeObjectURL;
+    });
   }
 });
 

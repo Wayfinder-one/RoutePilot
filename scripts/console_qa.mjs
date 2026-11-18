@@ -298,8 +298,9 @@ function answerFor(nodeId, question, scenario) {
 
 /* ── Task 7 · 测试对话（/v1/chat/completions）的确定性 mock 触发词 ──────
    默认路径仍然是「固定回复」，只有最后一条 user 文本命中触发词时才切换：
-   * 返回多模态 → 先一个文本 delta，再一个内容 part 数组（图片/音频/视频/文件/
-     未知 part），最后 stop + [DONE]；
+   * 返回多模态 → 先一个文本 delta，再一个带内容 part（视频/文件/未知）+
+     消息级 delta.images / delta.audio 的 delta，最后 stop + [DONE]（修订版
+     Task 8：图片/音频移到 content 之外）；
    * 延迟流 → 立刻发「第一段」，1500ms 后发「第二段」+ stop + [DONE]；浏览器
      中止时上游连接会被 router 掐断，所有补写都带 writableEnded/destroyed 守卫
      并吞掉 EPIPE，绝不因为 QA 的 Stop/New Chat 而崩溃。
@@ -310,13 +311,18 @@ function answerFor(nodeId, question, scenario) {
    （实测），而 QA 的外部请求守卫是硬失败；视频用 data: URL，与 renderer 用例
    「只挂 data: 媒体源」的约定一致（http(s) 白名单由 renderer 用例覆盖）。 */
 const QA_PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
-const QA_MEDIA_PARTS = [
-  { type: 'image_url', image_url: { url: `data:image/png;base64,${QA_PIXEL}` } },
-  { type: 'audio', audio: { data: 'AA==', format: 'wav' } },
+/* 修订版（计划 Task 8）：返回多模态 的图片/音频改为消息级 delta.images /
+   delta.audio 投递（content 之外），content 只留视频/文件/未知 part ——
+   浏览器用例据此断言「消息级媒体照常渲染，但绝不进下一轮历史」。 */
+const QA_CONTENT_PARTS = [
   { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
   { type: 'file', file: { filename: 'result.bin', file_data: 'data:application/octet-stream;base64,AA==' } },
   { type: 'custom', value: { source: 'qa' } },
 ];
+const QA_DELTA_IMAGES = [
+  { type: 'image_url', image_url: { url: `data:image/png;base64,${QA_PIXEL}` } },
+];
+const QA_DELTA_AUDIO = { data: 'AA==', format: 'wav' };
 const QA_DELAYED_STREAM_MS = 1500;
 
 /* 与 router 的 _last_user_text 保持一致：字符串 content 或 part 数组里的 text。 */
@@ -389,8 +395,14 @@ function startMock() {
 }) + '\n\n';
             const trigger = lastUserText(body.messages);
             if (trigger.includes('返回多模态')) {
+              /* 文本 delta → 内容 part（视频/文件/未知）+ 消息级 images/audio
+                 → stop + [DONE]；图片与音频在 content 之外。 */
               response.write(chunk({ role: 'assistant', content: '多模态回复：' }));
-              response.write(chunk({ content: QA_MEDIA_PARTS }));
+              response.write(chunk({
+                content: QA_CONTENT_PARTS,
+                images: QA_DELTA_IMAGES,
+                audio: QA_DELTA_AUDIO,
+              }));
               response.write(chunk({}, 'stop'));
               response.write('data: [DONE]\n\n');
               response.end();
