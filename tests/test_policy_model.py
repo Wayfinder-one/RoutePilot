@@ -89,16 +89,28 @@ def _mutated(mutate):
             id="boolean-score-criteria",
         ),
         pytest.param(
+            lambda raw: raw["questions"]["route"].update(instructions=" "),
+            id="blank-choice-instructions",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["risk"].update(instructions=""),
+            id="blank-noul-instructions",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["severity"].update(instructions=" \t"),
+            id="blank-score-instructions",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["route"]["options"][0].update(label="  "),
+            id="blank-option-label",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["route"]["options"][0].update(capability=""),
+            id="blank-option-capability",
+        ),
+        pytest.param(
             lambda raw: raw["questions"]["risk"].update(extra="nope"),
             id="unknown-question-field",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][0].update(target="missing"),
-            id="undefined-rule-target",
-        ),
-        pytest.param(
-            lambda raw: raw.update(fallback="missing"),
-            id="undefined-fallback-target",
         ),
         pytest.param(
             lambda raw: raw["rules"][1].update(
@@ -118,34 +130,14 @@ def _mutated(mutate):
             id="empty-any",
         ),
         pytest.param(
-            lambda raw: raw["rules"][0].update(when={"answer": "route.selected", "gte": "fast"}),
-            id="selected-with-non-eq-op",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][0].update(when={"answer": "route.selected", "eq": "missing"}),
-            id="selected-with-undefined-option",
-        ),
-        pytest.param(
             lambda raw: raw["rules"][0].update(
                 when={"answer": "route.selected", "eq": "fast", "extra": 1},
             ),
             id="answer-condition-with-extra-field",
         ),
         pytest.param(
-            lambda raw: raw["rules"][0].update(when={"answer": "route.prob.missing", "gte": 0.5}),
-            id="prob-with-undefined-option",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][0].update(when={"answer": "route.margin", "gte": 2.0}),
-            id="margin-value-out-of-range",
-        ),
-        pytest.param(
             lambda raw: raw["rules"][0].update(when={"answer": "risk.yes", "gte": True}),
             id="boolean-comparison-value",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][0].update(when={"answer": "missing.yes", "gte": 0.8}),
-            id="undefined-question-path",
         ),
         pytest.param(
             lambda raw: raw["rules"][0].update(when={"text_contains_any": []}),
@@ -166,28 +158,32 @@ def test_invalid_documents_are_rejected(mutate):
         policy_from_dict(_mutated(mutate))
 
 
-def test_condition_tree_limits_reject_deep_and_wide_trees():
+def test_parse_depth_guard_rejects_runaway_condition_nesting():
     def nested(depth):
         node = {"answer": "risk.yes", "gte": 0.8}
         for _ in range(depth):
             node = {"all": [node]}
         return node
 
+    # 语义上的 16 层嵌套限制属于 validate 层（Task 2）；解析期只保留远高于它的
+    # 递归守卫，保证任意嵌套输入得到 ValueError 而不是栈溢出。
+    parseable = policy_from_dict(
+        dict(policy_dict(), rules=[{"when": nested(99), "target": "safe"}])
+    )
+    assert parseable.rules[0].when.op == "all"
     with pytest.raises(ValueError):
         policy_from_dict(
-            dict(policy_dict(), rules=[{"when": nested(16), "target": "safe"}])
+            dict(policy_dict(), rules=[{"when": nested(100), "target": "safe"}])
         )
-    deep_but_legal = policy_from_dict(
-        dict(policy_dict(), rules=[{"when": nested(15), "target": "safe"}])
-    )
-    assert len(deep_but_legal.rules[0].when.children) == 1
 
-    wide = dict(
-        policy_dict(),
-        rules=[{"when": {"any": [{"answer": "risk.yes", "gte": 0.8}] * 400}, "target": "safe"}],
-    )
-    with pytest.raises(ValueError):
-        policy_from_dict(wide)
+
+def test_omitted_defaults_are_written_back_explicitly():
+    raw = policy_dict()
+    del raw["sticky"]
+    del raw["timezone"]
+    document = policy_to_dict(policy_from_dict(raw))
+    assert document["sticky"] == {"enabled": False, "ttl_seconds": 1800}
+    assert document["timezone"] == "Asia/Shanghai"
 
 
 def test_text_period_and_not_conditions_round_trip():

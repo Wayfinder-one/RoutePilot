@@ -1,12 +1,14 @@
-"""Routing Policy v4 的不可变模型、严格解析和 canonical 序列化。
+"""Routing Policy v4 的不可变模型、严格结构解析和 canonical 序列化。
 
 约定（对应设计文档 §4）：
 
 - 所有 dataclass 一律 frozen；``questions``/``targets`` 在构造时用
   ``MappingProxyType(dict(...))`` 包装，其余集合全部使用 tuple。
-- ``policy_from_dict`` 是总解析函数：先验证 kind/version 与顶层字段，再分派
-  question/target/rule/condition；任何输入形状错误抛 ``ValueError``，绝不返回
-  部分 Policy。
+- ``policy_from_dict`` 只做结构与形状解析：kind/version、字段白名单、ID 形状、
+  非空白文本、条件形状和有限数值；任何形状错误抛 ``ValueError``，绝不返回部分
+  Policy。数量上限、问题/选项/目标/规则引用完整性、答案路径与输出/比较符/取值
+  范围等语义校验属于保存时校验（``router.routing.policy.validate``，设计 §7.1），
+  解析层不重复强制，保证校验器能拿到完整 Policy 并产出机器可读的 issue 列表。
 - ``policy_to_dict`` 输出唯一的 canonical 行为文档：默认值显式写回，值为
   ``None`` 的 model reasoning 省略，使省略与显式 ``null`` 得到同一文档。
 - 行为版本（``policy_revision_of``）是去掉 ``name`` 后 canonical JSON 的
@@ -34,6 +36,15 @@ from router.routing.codec import (
 __all__ = [
     "KIND",
     "VERSION",
+    "MAX_CONDITION_DEPTH",
+    "MAX_CONDITION_NODES",
+    "MAX_CRITERIA",
+    "MAX_OPTIONS",
+    "MAX_QUESTIONS",
+    "MAX_RULES",
+    "MAX_STICKY_TTL_SECONDS",
+    "MIN_CRITERIA",
+    "MIN_OPTIONS",
     "AnswerCondition",
     "ChoiceOption",
     "Condition",
@@ -57,6 +68,12 @@ KIND = "sr-routing-policy"
 VERSION = 4
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+# 语义限额（设计 §4.3/§4.5），validate 层的唯一常量来源：除 sticky 区间、
+# options 下限（MIN_OPTIONS）与 criteria 2–10 外，policy_from_dict 不在解析期
+# 强制这些上限/引用/范围语义——数量上限、问题/选项/目标/规则引用完整性、答案
+# 路径与输出/比较符/取值范围的强制属于 router.routing.policy.validate 的
+# 保存时校验（设计 §7.1，Task 2）。
 MAX_STICKY_TTL_SECONDS = 31536000
 MAX_QUESTIONS = 32
 MIN_OPTIONS = 2
@@ -66,6 +83,10 @@ MAX_CRITERIA = 10
 MAX_RULES = 200
 MAX_CONDITION_NODES = 400
 MAX_CONDITION_DEPTH = 16
+
+#: 解析期唯一的递归防护：远高于 validate 的 16 层语义上限、远低于 C 栈极限，
+#: 保证任意嵌套输入只会得到 ValueError，不会打爆 Python 栈。
+_MAX_PARSE_DEPTH = 100
 
 #: 问题ID/目标ID/选项 key 的唯一合法形状（设计 §4.3）：不允许点号，保证答案
 #: 路径可以无歧义地按 ``.`` 切分。
@@ -220,10 +241,8 @@ def _sticky_from_dict(raw: object) -> Sticky:
 def _options_from_dict(qid: str, raw: object) -> tuple[ChoiceOption, ...]:
     if not isinstance(raw, list):
         raise ValueError(f"question {qid!r}.options must be an array")
-    if not MIN_OPTIONS <= len(raw) <= MAX_OPTIONS:
-        raise ValueError(
-            f"question {qid!r}.options must hold {MIN_OPTIONS}-{MAX_OPTIONS} options"
-        )
+    if len(raw) < MIN_OPTIONS:
+        raise ValueError(f"question {qid!r}.options must hold at least {MIN_OPTIONS} options")
     options: list[ChoiceOption] = []
     keys: set[str] = set()
     labels: set[str] = set()
@@ -283,8 +302,6 @@ def _question_from_dict(qid: str, raw: object) -> Question:
 
 def _questions_from_dict(raw: object) -> dict[str, Question]:
     raw = _require_object(raw, "questions")
-    if len(raw) > MAX_QUESTIONS:
-        raise ValueError(f"questions must hold at most {MAX_QUESTIONS} entries")
     questions: dict[str, Question] = {}
     for qid, item in raw.items():
         questions[_validated_id(qid, "question id")] = _question_from_dict(qid, item)
@@ -305,8 +322,8 @@ def _target_from_dict(tid: str, raw: object) -> Target:
     raw = _require_object(raw, f"target {tid!r}")
     reject_unknown_fields(f"target {tid!r}", raw, {"models"})
     models_raw = raw.get("models")
-    if not isinstance(models_raw, list) or not models_raw:
-        raise ValueError(f"target {tid!r}.models must be a nonempty array")
+    if not isinstance(models_raw, list):
+        raise ValueError(f"target {tid!r}.models must be an array")
     models = tuple(_model_target_from_dict(tid, item) for item in models_raw)
     return Target(id=tid, models=models)
 
@@ -319,63 +336,16 @@ def _targets_from_dict(raw: object) -> dict[str, Target]:
     return targets
 
 
-def _numeric_answer_condition(
-    path: str, op: str, value_raw: object, bounds: tuple[float, float] | None
-) -> AnswerCondition:
-    value = finite_number(value_raw, f"comparison value for answer path {path!r}")
-    if bounds is not None and not bounds[0] <= value <= bounds[1]:
-        raise ValueError(
-            f"comparison value for answer path {path!r} must be in [{bounds[0]},{bounds[1]}]"
-        )
-    return AnswerCondition(path=path, op=op, value=value)
-
-
-def _choice_answer_condition(
-    path: str, parts: list[str], op: str, value_raw: object, question: Question
-) -> AnswerCondition:
-    option_keys = {option.key for option in question.options}
-    if len(parts) == 2 and parts[1] == "selected":
-        if op != "eq":
-            raise ValueError(f"answer path {path!r} only accepts eq")
-        if not isinstance(value_raw, str) or value_raw not in option_keys:
-            raise ValueError(
-                f"answer path {path!r} must compare with a defined option key"
-            )
-        return AnswerCondition(path=path, op=op, value=value_raw)
-    if len(parts) == 3 and parts[1] == "prob":
-        if parts[2] not in option_keys:
-            raise ValueError(
-                f"answer path {path!r} references undefined option {parts[2]!r}"
-            )
-        return _numeric_answer_condition(path, op, value_raw, bounds=(0.0, 1.0))
-    if len(parts) == 2 and parts[1] == "p_top":
-        return _numeric_answer_condition(path, op, value_raw, bounds=(0.0, 1.0))
-    if len(parts) == 2 and parts[1] == "margin":
-        return _numeric_answer_condition(path, op, value_raw, bounds=(-1.0, 1.0))
-    raise ValueError(f"answer path {path!r} is not a valid choice question output")
-
-
-def _answer_condition_from_dict(
-    path_raw: object, op: str, value_raw: object, questions: Mapping[str, Question]
-) -> AnswerCondition:
+def _answer_condition_from_dict(path_raw: object, op: str, value_raw: object) -> AnswerCondition:
     path = text_field(path_raw, "answer path")
-    parts = path.split(".")
-    question = questions.get(parts[0])
-    if question is None:
-        raise ValueError(
-            f"answer path {path!r} references undefined question {parts[0]!r}"
-        )
-    if question.question_type == "choice":
-        return _choice_answer_condition(path, parts, op, value_raw, question)
-    if question.question_type == "noul":
-        if len(parts) != 2 or parts[1] not in ("yes", "no"):
-            raise ValueError(
-                f"answer path {path!r} must be '<q>.yes' or '<q>.no' for noul question"
-            )
-        return _numeric_answer_condition(path, op, value_raw, bounds=(0.0, 1.0))
-    if len(parts) != 2 or parts[1] != "value":
-        raise ValueError(f"answer path {path!r} must be '<q>.value' for score question")
-    return _numeric_answer_condition(path, op, value_raw, bounds=None)
+    if isinstance(value_raw, bool):
+        raise ValueError("answer condition value must be a string or finite number")
+    value = (
+        value_raw
+        if isinstance(value_raw, str)
+        else finite_number(value_raw, "answer condition value")
+    )
+    return AnswerCondition(path=path, op=op, value=value)
 
 
 def _string_tuple(raw: object, field: str) -> tuple[str, ...]:
@@ -384,17 +354,10 @@ def _string_tuple(raw: object, field: str) -> tuple[str, ...]:
     return tuple(text_field(value, f"{field} entry") for value in raw)
 
 
-def _condition_from_dict(
-    raw: object, questions: Mapping[str, Question], depth: int, budget: list[int]
-) -> Condition:
-    budget[0] += 1
-    if budget[0] > MAX_CONDITION_NODES:
+def _condition_from_dict(raw: object, depth: int) -> Condition:
+    if depth > _MAX_PARSE_DEPTH:
         raise ValueError(
-            f"condition tree must hold at most {MAX_CONDITION_NODES} nodes"
-        )
-    if depth > MAX_CONDITION_DEPTH:
-        raise ValueError(
-            f"condition tree must nest at most {MAX_CONDITION_DEPTH} levels"
+            f"condition tree must not nest deeper than {_MAX_PARSE_DEPTH} levels during parsing"
         )
     raw = _require_object(raw, "condition")
     keys = set(raw)
@@ -404,12 +367,12 @@ def _condition_from_dict(
         if not isinstance(children_raw, list) or not children_raw:
             raise ValueError(f"{op} must hold a nonempty array of conditions")
         children = tuple(
-            _condition_from_dict(child_raw, questions, depth + 1, budget)
+            _condition_from_dict(child_raw, depth + 1)
             for child_raw in children_raw
         )
         return LogicCondition(op=op, children=children)
     if keys == {"not"}:
-        child = _condition_from_dict(raw["not"], questions, depth + 1, budget)
+        child = _condition_from_dict(raw["not"], depth + 1)
         return LogicCondition(op="not", children=(child,))
     if "answer" in keys:
         ops = keys - {"answer"}
@@ -419,7 +382,7 @@ def _condition_from_dict(
                 + "/".join(_ANSWER_OPS)
             )
         return _answer_condition_from_dict(
-            raw["answer"], next(iter(ops)), raw[next(iter(ops))], questions
+            raw["answer"], next(iter(ops)), raw[next(iter(ops))]
         )
     if keys == {"text_contains_any"}:
         return TextCondition(
@@ -433,13 +396,9 @@ def _condition_from_dict(
     )
 
 
-def _rules_from_dict(
-    raw: object, questions: Mapping[str, Question], targets: Mapping[str, Target]
-) -> tuple[Rule, ...]:
+def _rules_from_dict(raw: object) -> tuple[Rule, ...]:
     if not isinstance(raw, list):
         raise ValueError("rules must be an array")
-    if len(raw) > MAX_RULES:
-        raise ValueError(f"rules must hold at most {MAX_RULES} entries")
     rules: list[Rule] = []
     for item in raw:
         item = _require_object(item, "rule")
@@ -447,10 +406,8 @@ def _rules_from_dict(
         name = optional_text_field(item.get("name", ""), "rule name")
         if "when" not in item:
             raise ValueError("rule requires a 'when' condition")
-        when = _condition_from_dict(item["when"], questions, depth=1, budget=[0])
-        target = item.get("target")
-        if not isinstance(target, str) or target not in targets:
-            raise ValueError("rule target must be a defined target id")
+        when = _condition_from_dict(item["when"], depth=1)
+        target = text_field(item.get("target"), "rule target")
         rules.append(Rule(when=when, target=target, name=name))
     return tuple(rules)
 
@@ -472,9 +429,7 @@ def policy_from_dict(raw: object) -> Policy:
     questions = _questions_from_dict(raw["questions"])
     targets = _targets_from_dict(raw["targets"])
     fallback = text_field(raw["fallback"], "fallback")
-    if fallback not in targets:
-        raise ValueError("fallback must be a defined target id")
-    rules = _rules_from_dict(raw["rules"], questions, targets)
+    rules = _rules_from_dict(raw["rules"])
     return Policy(
         name=name,
         timezone=timezone,
