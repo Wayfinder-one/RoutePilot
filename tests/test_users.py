@@ -408,24 +408,25 @@ def test_static_admin_token_is_gone(tmp_path):
     assert c.get("/admin/users", headers=admin_headers(c)).status_code == 200
 
 
-def test_viewer_can_read_trees_but_not_write(tmp_path):
-    """viewer 门（Task 9 起）：树列表只读放行；树管理/启停等写操作 403。"""
+def test_viewer_can_read_policies_but_not_write(tmp_path):
+    """viewer 门：策略列表只读放行；策略管理/启停/试算等写操作 403。"""
     c = api_client(tmp_path)
     create_user(c, "viewer@test.com", "viewer-pass-1", "viewer")
     headers = bearer(login(c, "viewer@test.com", "viewer-pass-1"))
     # 只读面照常
-    assert c.get("/admin/trees", headers=headers).status_code == 200
+    assert c.get("/admin/policies", headers=headers).status_code == 200
     assert c.get("/admin/models", headers=headers).status_code == 200
-    # 非白名单写操作 → 403（含统一树管理与启停）
-    tree_root = {"id": "r", "type": "route", "model": "qwen3-8b"}
+    # 非白名单写操作 → 403（含统一策略管理与启停）
+    policy = {"kind": "sr-routing-policy", "version": 4, "name": "t",
+              "questions": {}, "targets": {"a": {"models": [{"model": "m"}]}},
+              "rules": [], "fallback": "a"}
     for method, path, payload in (
-            ("post", "/admin/trees", {"name": "t", "root": tree_root}),
-            ("put", "/admin/trees/tree-a", {"name": "t", "root": tree_root}),
-            ("post", "/admin/trees/tree-a/copy",
-             {"id": "tree-b", "name": "b"}),
-            ("post", "/admin/trees/tree-a/enable", None),
-            ("post", "/admin/trees/tree-a/disable", None),
-            ("post", "/admin/try", {"tree_id": "tree-a", "text": "hello"}),
+            ("post", "/admin/policies", {"policy": policy}),
+            ("put", "/admin/policies/main", policy),
+            ("post", "/admin/policies/main/enable", None),
+            ("post", "/admin/policies/main/disable", None),
+            ("put", "/admin/policies/main/layout", {"panels": {}}),
+            ("post", "/admin/try", {"policy": policy, "text": "hello"}),
             ("post", "/admin/test/chat/completions",
              {"model": "auto", "messages": []}),
             ("put", "/admin/time-periods", {"periods": []}),

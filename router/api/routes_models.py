@@ -9,12 +9,12 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from router.api.deps import get_conn, get_tree_repo
+from router.api.deps import get_conn, get_policy_repo
 from router.control.config import ConfigurationService
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import FORMATS, FORMAT_IDS, LEVELS, ReasoningError, normalize_reasoning, validate_model_profile
 from router.store.repositories import ModelRepo, ProviderRepo
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.policies import PolicyRepo
 from router.upstream.catalog import parse_profile_text
 
 router = APIRouter()
@@ -101,9 +101,9 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
     return json.dumps(validated, ensure_ascii=False)
 
 
-def _service(request: Request, conn: sqlite3.Connection, trees: RoutingTreeRepo):
+def _service(request: Request, conn: sqlite3.Connection, policies: PolicyRepo):
     """ConfigurationService 只由 API 在解析 DTO 后构造；写用例本体见 router.control.config。"""
-    return ConfigurationService(conn, trees, request.app.state.publisher)
+    return ConfigurationService(conn, policies, request.app.state.publisher)
 
 
 @router.get("/model-catalog")
@@ -155,7 +155,7 @@ class ModelCreateIn(ModelIn):
 def post_model(
     body: ModelCreateIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
     model_id = body.id.strip()
     if not _ID_RE.match(model_id):
@@ -166,7 +166,7 @@ def post_model(
     provider = _clean_text(body.provider, "provider", max_len=64)
     provider_row = _require_provider(conn, provider)
     profile = _validated_profile(body.profile, provider_row.get("reasoning_format") or "openai")
-    _service(request, conn, trees).create_model(
+    _service(request, conn, policies).create_model(
         model_id=model_id, upstream=upstream, provider=provider,
         profile_text=profile, audit_profile=body.profile,
     )
@@ -177,7 +177,7 @@ def post_model(
 def put_model(
     model_id: str, body: ModelIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
     if ModelRepo(conn).get(model_id) is None:
         raise HTTPException(404, detail=f"unknown model {model_id}")
@@ -188,7 +188,7 @@ def put_model(
     existing = ModelRepo(conn).get(model_id)
     effective_provider = provider or existing["provider"]
     profile = _validated_profile(body.profile, _provider_formats(conn).get(effective_provider, "openai")) if body.profile is not None else None
-    _service(request, conn, trees).update_model(
+    _service(request, conn, policies).update_model(
         model_id=model_id, upstream=upstream, provider=provider, profile_text=profile,
         audit_upstream=body.upstream, audit_provider=body.provider, audit_profile=body.profile,
     )
@@ -200,9 +200,9 @@ def put_model(
 def delete_model(
     model_id: str, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
-    _service(request, conn, trees).delete_model(model_id)
+    _service(request, conn, policies).delete_model(model_id)
     return {"ok": True, "deleted": model_id}
 
 
@@ -230,7 +230,7 @@ class ProviderIn(BaseModel):
 def put_provider(
     name: str, body: ProviderIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
     if not _ID_RE.match(name):
         raise HTTPException(422, detail="invalid provider name")
@@ -241,7 +241,7 @@ def put_provider(
     if body.reasoning_format is not None and body.reasoning_format not in FORMAT_IDS:
         raise HTTPException(422, detail="invalid reasoning_format")
     api_key = body.api_key.strip() if body.api_key is not None else None
-    _service(request, conn, trees).upsert_provider(
+    _service(request, conn, policies).upsert_provider(
         name=name, base_url=base_url, key_env=key_env,
         reasoning_format=body.reasoning_format, api_key=api_key,
     )
@@ -250,8 +250,8 @@ def put_provider(
 
 @router.delete("/providers/{name}")
 def delete_provider(name: str, request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                    trees: RoutingTreeRepo = Depends(get_tree_repo)):
-    _service(request, conn, trees).delete_provider(name)
+                    policies: PolicyRepo = Depends(get_policy_repo)):
+    _service(request, conn, policies).delete_provider(name)
     return {"ok": True, "deleted": name}
 
 

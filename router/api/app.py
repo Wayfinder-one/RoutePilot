@@ -23,22 +23,23 @@ from router.jev.config import JevSettings
 from router.maintenance import MaintenanceWorker
 from router.request_logging import RequestLogger
 from router.routing.affinity import SessionAffinity
-from router.routing.graph.evaluator import GraphEvaluator
-from router.routing.reloader import GraphReloadWorker
+from router.routing.policy.evaluator import PolicyEvaluator
+from router.routing.reloader import PolicyReloadWorker
 from router.routing.scheduler import LoadBalancer
 from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
 from router.store.jev_config import JevConfigRepo
-from router.store.repositories import SessionRepo, UserRepo, seed_default
-from router.store.routing_trees import (
-    GraphAlreadyExistsError,
-    GraphConflictError,
-    GraphReadOnlyError,
-    GraphStorageError,
-    RoutingTreeRepo,
+from router.store.policies import (
+    ActivePolicyError,
+    PolicyChangedDuringLoad,
+    PolicyConflictError,
+    PolicyReadOnlyError,
+    PolicyRepo,
+    PolicyStorageError,
 )
+from router.store.repositories import SessionRepo, UserRepo, seed_default
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.breaker_store import BreakerStore
 from router.upstream.breaker_worker import BreakerSyncWorker
@@ -65,6 +66,13 @@ def _viewer_forbidden(method: str, path: str) -> bool:
         return True
     if method in ("GET", "HEAD"):
         return False
+    # GET /admin/policies*（资源、layout、状态）对 viewer 开放；其全部写路径
+    # （create/replace/enable/disable/delete/layout PUT）以及 POST /admin/try
+    # 需要 admin。其余写路径维持原默认门。
+    if path == "/admin/policies" or path.startswith("/admin/policies/"):
+        return True
+    if path == "/admin/try":
+        return True
     return (method, path) not in _VIEWER_WRITE_WHITELIST
 
 
@@ -126,11 +134,11 @@ def _seed_jev(conn, state) -> None:
         api_key=settings.jev_api_key,
         timeout_seconds=settings.jev_timeout,
     )
-    service = ConfigurationService(conn, state.graph_repo, state.publisher)
+    service = ConfigurationService(conn, state.policy_repo, state.publisher)
     try:
         service.save_jev(seed)
-    except (ValidationFailed, GraphStorageError):
-        logger.exception("boot jev seeding skipped: active graph rejected the context")
+    except (ValidationFailed, PolicyStorageError):
+        logger.exception("boot jev seeding skipped: active policy rejected the context")
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
@@ -152,7 +160,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         await app.state.breaker_worker.start()
         await app.state.maintenance.start()
         await requestlog.start()
-        await app.state.graph_reloader.start()
+        await app.state.policy_reloader.start()
         try:
             yield
         finally:
@@ -160,7 +168,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
             # 关闭 HTTP client。
             await app.state.breaker_worker.close()
             await app.state.maintenance.close()
-            await app.state.graph_reloader.close()
+            await app.state.policy_reloader.close()
             await requestlog.close()
             await app.state.http.aclose()
 
@@ -176,49 +184,58 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.affinity = SessionAffinity(max_entries=settings.session_max_entries)
     app.state.jev_client = JevClient(app.state.http)
     app.state.routing_service = RoutingService(
-        GraphEvaluator(app.state.jev_client),
+        PolicyEvaluator(app.state.jev_client),
         ModelScheduler(app.state.affinity, app.state.balancer),
     )
     app.state.requestlog = requestlog
 
-    app.state.graph_repo = RoutingTreeRepo(settings.graph_dir, writer=settings.graph_writer)
-    if settings.graph_writer:
-        app.state.graph_repo.initialize()
+    app.state.policy_repo = PolicyRepo(settings.policy_dir, writer=settings.policy_writer)
+    if settings.policy_writer:
+        app.state.policy_repo.initialize()
     app.state.snapshot = None
-    app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
+    app.state.publisher = SnapshotPublisher(app, app.state.policy_repo)
     conn = connect(settings.db_path)
     try:
         # boot 种子位于 publisher 构造之后：同类服务同一写路径（校验 → 提交 → 发布）。
         _seed_jev(conn, app.state)
         app.state.publisher.refresh(conn)
-    except GraphStorageError:
-        logger.exception("initial graph snapshot is unavailable")
+    except PolicyStorageError:
+        logger.exception("initial policy snapshot is unavailable")
     finally:
         conn.close()
-    app.state.graph_reloader = GraphReloadWorker(app)
+    app.state.policy_reloader = PolicyReloadWorker(app)
 
-    @app.exception_handler(GraphConflictError)
-    async def graph_conflict_handler(request: Request, exc: GraphConflictError):
+    @app.exception_handler(PolicyConflictError)
+    async def policy_conflict_handler(request: Request, exc: PolicyConflictError):
         return JSONResponse(status_code=409, content={"detail": {
-            "code": "graph_conflict",
-            "actual_document_sha256": exc.actual_document_sha256,
+            "code": "policy_conflict",
+            "document_sha256": exc.actual_document_sha256,
         }})
 
-    @app.exception_handler(GraphAlreadyExistsError)
-    async def graph_exists_handler(request: Request, exc: GraphAlreadyExistsError):
+    @app.exception_handler(ActivePolicyError)
+    async def active_policy_handler(request: Request, exc: ActivePolicyError):
         return JSONResponse(status_code=409, content={"detail": {
-            "code": "graph_already_exists",
-            "tree_id": str(exc),
+            "code": "policy_is_active",
+            "policy_id": exc.policy_id,
         }})
 
-    @app.exception_handler(GraphReadOnlyError)
-    async def graph_read_only_handler(request: Request, exc: GraphReadOnlyError):
-        return JSONResponse(status_code=503, content={"detail": {"code": "graph_read_only"}})
-
-    @app.exception_handler(GraphStorageError)
-    async def graph_storage_handler(request: Request, exc: GraphStorageError):
+    @app.exception_handler(PolicyReadOnlyError)
+    async def policy_read_only_handler(request: Request, exc: PolicyReadOnlyError):
         return JSONResponse(status_code=503, content={"detail": {
-            "code": "graph_storage_error",
+            "code": "policy_read_only",
+        }})
+
+    @app.exception_handler(PolicyChangedDuringLoad)
+    async def policy_changed_handler(request: Request, exc: PolicyChangedDuringLoad):
+        return JSONResponse(status_code=503, content={"detail": {
+            "code": "policy_changed_during_load",
+            "message": str(exc),
+        }})
+
+    @app.exception_handler(PolicyStorageError)
+    async def policy_storage_handler(request: Request, exc: PolicyStorageError):
+        return JSONResponse(status_code=503, content={"detail": {
+            "code": "policy_storage_error",
             "message": str(exc),
         }})
 
@@ -268,15 +285,15 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     from router.api.routes_jev import router as jev_router
     from router.api.routes_logs import router as logs_router
     from router.api.routes_models import router as models_router
+    from router.api.routes_policies import router as policies_router
     from router.api.routes_test import router as test_router
     from router.api.routes_time import router as time_router
-    from router.api.routes_trees import router as trees_router
     from router.api.routes_users import router as users_router
     from router.api.routes_v1 import router as v1_router
 
     app.include_router(models_router, prefix="/admin")
     app.include_router(time_router, prefix="/admin")
-    app.include_router(trees_router, prefix="/admin")
+    app.include_router(policies_router, prefix="/admin")
     app.include_router(jev_router, prefix="/admin")
     app.include_router(logs_router, prefix="/admin")
     app.include_router(users_router, prefix="/admin")

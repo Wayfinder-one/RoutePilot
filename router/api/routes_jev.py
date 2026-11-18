@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from router.api.deps import get_conn, get_tree_repo
+from router.api.deps import get_conn, get_policy_repo
 from router.control.config import ConfigurationService, JevWindow
 from router.jev.client import ChoiceAnswer, DecisionQuestion, JevCandidate, JevClient, JevError
 from router.jev.config import (
@@ -24,7 +24,7 @@ from router.jev.window import (
 )
 from router.routing.snapshot import read_jev_window
 from router.store.jev_config import JevConfigRepo
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.policies import PolicyRepo
 
 router = APIRouter()
 
@@ -75,7 +75,7 @@ def get_jev(conn: sqlite3.Connection = Depends(get_conn)):
 def put_jev(
     body: JevConfigIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
     repo = JevConfigRepo(conn)
     existing = repo.load()
@@ -93,7 +93,7 @@ def put_jev(
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     # ValidationFailed（活动图校验失败）由 app 级异常处理器统一映射 422 Issue 数组。
-    ConfigurationService(conn, trees, request.app.state.publisher).save_jev(settings)
+    ConfigurationService(conn, policies, request.app.state.publisher).save_jev(settings)
     return _public(settings)
 
 
@@ -167,7 +167,7 @@ def get_jev_window(conn: sqlite3.Connection = Depends(get_conn)):
 def put_jev_window(
     body: JevWindowIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
     """保存输入窗口配置（服务层 ConfigurationService.save_window）。
 
@@ -187,5 +187,5 @@ def put_jev_window(
         raise HTTPException(422, detail=str(exc)) from exc
     # ValidationFailed（活动图校验失败）由 app 级异常处理器统一映射；本用例失败时
     # 窗口 DB 写与审计随事务回滚（brief Step 1 RED 场景）。
-    ConfigurationService(conn, trees, request.app.state.publisher).save_window(window)
+    ConfigurationService(conn, policies, request.app.state.publisher).save_window(window)
     return get_jev_window(conn)

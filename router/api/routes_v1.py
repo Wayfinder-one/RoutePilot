@@ -36,7 +36,7 @@ from router.api.trace_presenter import present_trace
 from router.jev.client import ChoiceAnswer
 from router.jev.serialization import answer_to_dict
 from router.routing.types import (
-    NoActiveTreeError,
+    NoActivePolicyError,
     NoAvailableBackend,
     RoutingMiss,
     RoutingRequest,
@@ -260,8 +260,8 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
                 RoutingRequest(text=text, session_id=session_id),
                 trace_sink=trace,
             )
-        except NoActiveTreeError as exc:
-            return fail("no_active_tree", 503, "graph", str(exc))
+        except NoActivePolicyError as exc:
+            return fail("no_active_policy", 503, "policy", str(exc))
         except NoAvailableBackend as exc:
             return fail("no_available_backend", 503, "schedule", str(exc))
         except RoutingMiss as exc:

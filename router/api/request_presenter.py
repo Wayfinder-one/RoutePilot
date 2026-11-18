@@ -139,11 +139,15 @@ def present_result_event(record: dict) -> dict:
 
 
 def node_labels(snapshot) -> dict:
-    """Trace/console display names for the snapshot's graph nodes."""
-    if snapshot is None or snapshot.tree is None:
+    """Trace/console display names for the snapshot's graph nodes.
+
+    Policy v4 snapshots carry no node tree (labels arrive with the policy
+    editor's own documents), so they render without node labels."""
+    tree = getattr(snapshot, "tree", None)
+    if tree is None:
         return {}
     labels = {}
-    for node in snapshot.tree.root.nodes:
+    for node in tree.root.nodes:
         node_type = next(
             (name for node_class, name in _NODE_TYPES if isinstance(node, node_class)),
             "unknown",

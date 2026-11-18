@@ -12,37 +12,30 @@ from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
-from router.routing.tree import tree_from_dict
+from router.routing.policy import policy_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_config import JevConfigRepo
-from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import tree_dict, test_settings
+from router.store.policies import PolicyRepo
+from tests.routing_fixtures import policy_dict, test_settings
 
 
-def direct_graph():
-    """start → 单 target(qwen3-8b)：不触碰决策服务的最小启用树。"""
-    return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "direct", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}]},
-        ],
-        "edges": [{
-            "id": "e-start-direct", "source": "start", "source_port": "out",
-            "target": "direct", "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": "direct",
-    }
+def active_policy():
+    """最小可启用 v4 策略：单目标 qwen3-8b、无规则（不依赖 JEV 配置）。"""
+    document = policy_dict()
+    document["questions"] = {}
+    document["rules"] = []
+    document["targets"] = {"main": {"models": [{"model": "qwen3-8b"}]}}
+    document["fallback"] = "main"
+    return document
 
 
-def prepare_active_tree(tmp_path, document):
-    """在临时 graph 目录写入并启用一棵树，供真实 create_app() 使用。"""
+def prepare_active_policy(tmp_path, document=None):
+    """在临时 policy 目录写入并启用一份策略，供真实 create_app() 使用。"""
     settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
+    repo = PolicyRepo(settings.policy_dir)
     repo.initialize()
-    repo.create(tree_from_dict(document))
-    repo.enable(document["id"])
+    repo.create("main", policy_from_dict(document or active_policy()))
+    repo.enable("main")
     return settings
 
 
@@ -83,8 +76,8 @@ def make_client(tmp_path, handler=None, requests=None):
     transport = httpx.MockTransport(handler or default_handler)
     app = FastAPI()
     app.state.settings = SimpleNamespace(db_path=path)
-    app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
-    app.state.graph_repo.initialize()
+    app.state.policy_repo = PolicyRepo(tmp_path / "routing-policy")
+    app.state.policy_repo.initialize()
     app.state.http = httpx.AsyncClient(transport=transport)
     app.state.jev_client = JevClient(app.state.http)
     app.state.publisher = Publisher()
@@ -173,7 +166,7 @@ def test_test_endpoint_huge_probability_returns_502_not_500(tmp_path):
 
 def test_explicit_null_field_is_validated_not_treated_as_absent(tmp_path):
     """DTO 迁移不得把「显式 null」误当成「缺省继承」：null 仍走值校验 → 422。"""
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    settings = prepare_active_policy(tmp_path)
     app = create_app(settings)
     with TestClient(app) as client:
         assert client.put("/admin/jev", json=payload()).status_code == 200
@@ -185,7 +178,7 @@ def test_explicit_null_field_is_validated_not_treated_as_absent(tmp_path):
 
 
 def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    settings = prepare_active_policy(tmp_path)
     app = create_app(settings)
     conn = connect(settings.db_path)
     conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
@@ -206,9 +199,9 @@ def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
     assert app.state.snapshot.jev is None
 
 
-def _graph_tree_files(settings):
-    """图目录的全部文件字节：用于证明 publish 是纯内存替换（不触碰文件）。"""
-    root = Path(settings.graph_dir)
+def _policy_files(settings):
+    """策略目录的全部文件字节：用于证明 publish 是纯内存替换（不触碰文件）。"""
+    root = Path(settings.policy_dir)
     return {path.relative_to(root).as_posix(): path.read_bytes()
             for path in sorted(root.rglob("*")) if path.is_file()}
 
@@ -217,11 +210,11 @@ def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatc
     """ConfigurationService 写用例契约：真实 SnapshotPublisher 上，
     ConfigurationService 写用例 = 提交恰在 publish 之前、发布恰好一次，且发布
     本身是纯内存替换（不写数据库、不写图文件）。"""
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+    settings = prepare_active_policy(tmp_path)
     app = create_app(settings)
     publisher = app.state.publisher
     before = app.state.snapshot.snapshot_revision
-    files_before = _graph_tree_files(settings)
+    files_before = _policy_files(settings)
     published = []
     real_publish = publisher.publish
 
@@ -244,18 +237,18 @@ def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatc
     assert len(published) == 1
     assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
     assert app.state.snapshot.snapshot_revision != before
-    assert app.state.snapshot.tree_id == "main"          # 内存替换未丢活动树
+    assert app.state.snapshot.policy_id == "main"        # 内存替换未丢活动策略
     status = publisher.status()
     assert status["ready"] and status["stale"] is False
-    repo = RoutingTreeRepo(settings.graph_dir)
+    repo = PolicyRepo(settings.policy_dir)
     assert status["document_sha256"] == repo.fingerprint()[1]
-    assert _graph_tree_files(settings) == files_before
+    assert _policy_files(settings) == files_before
 
 
-def test_unstable_graph_during_jev_save_rolls_back_db_audit_and_snapshot(tmp_path):
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
+def test_unstable_policy_during_jev_save_rolls_back_db_audit_and_snapshot(tmp_path):
+    settings = prepare_active_policy(tmp_path)
     app = create_app(settings)
-    repo = app.state.graph_repo
+    repo = app.state.policy_repo
     initial = repo.fingerprint()
     unstable = [("main", "1" * 64), ("main", "2" * 64)]
     # 复核会重建一次快照并再取指纹：固定流程读序为 初始 → prepare 读 → 复核读 →
