@@ -5,7 +5,7 @@ from router.routing.policy.validate import EnableContext
 def test_settings(tmp_path, **overrides):
     values = {
         "db_path": str(tmp_path / "control.db"),
-        "graph_dir": str(tmp_path / "routing-graph"),
+        "policy_dir": str(tmp_path / "routing-policy"),
         "user_auth": False,
     }
     values.update(overrides)

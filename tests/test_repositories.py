@@ -1,28 +1,11 @@
 import pytest
 
 from router.routing.conditions import TimePeriod
-from router.routing.tree import tree_from_dict
+from router.routing.policy import policy_from_dict
 from router.store.db import connect, migrate
+from router.store.policies import PolicyRepo
 from router.store.repositories import ModelRepo, TimePeriodRepo, model_references, seed_default
-from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import tree_dict
-
-
-def pool_graph(models):
-    return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
-            {"id": "pool", "type": "target", "priority": 1,
-             "position": {"x": 200, "y": 0},
-             "models": [{"model": model, "reasoning": None} for model in models]},
-        ],
-        "edges": [{
-            "id": "e-start-pool", "source": "start", "source_port": "out",
-            "target": "pool", "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": "pool",
-    }
+from tests.routing_fixtures import policy_dict
 
 
 @pytest.fixture
@@ -51,11 +34,17 @@ def test_time_periods_validate_and_roundtrip(conn):
         repo.save([{"name": "坏", "days": [7], "start": "25:00", "end": "09:00"}])
 
 
-def test_model_references_finds_every_target_in_saved_trees(conn, tmp_path):
-    repo = RoutingTreeRepo(tmp_path / "routing-graph")
+def test_model_references_finds_every_target_in_saved_policies(conn, tmp_path):
+    repo = PolicyRepo(tmp_path / "routing-policy")
     repo.initialize()
-    raw = tree_dict(root=pool_graph(("fast", "strong-a")))
-    saved = repo.create(tree_from_dict(raw))
+    raw = policy_dict()
+    raw["targets"]["pool"] = {"models": [{"model": "strong-a"}]}
+    saved = repo.create("main", policy_from_dict(raw))
     refs = model_references(repo.list(), "strong-a")
-    assert refs == [{"tree_id": "main", "tree_revision": saved.tree_revision, "node_id": "pool", "via": "target"}]
+    assert refs == [{
+        "policy_id": "main",
+        "policy_revision": saved.policy_revision,
+        "target_id": "pool",
+        "via": "target",
+    }]
     assert model_references(repo.list(), "missing") == []

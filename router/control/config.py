@@ -20,10 +20,11 @@ from router.control.errors import (
     ReferencedByError,
     ValidationFailed,
 )
-from router.control.validation import active_tree_issues
+from router.control.validation import active_policy_issues
 from router.jev.config import JevSettings
 from router.jev.window import MAX_TOKENS, MIN_CONTEXT_TOKENS, MIN_INPUT_TOKENS
 from router.store.jev_config import JevConfigRepo
+from router.store.policies import PolicyChangedDuringLoad
 from router.store.repositories import (
     ChangeRepo,
     ModelRepo,
@@ -35,7 +36,6 @@ from router.store.repositories import (
     now_iso,
     write_transaction,
 )
-from router.store.routing_trees import GraphChangedDuringLoad
 
 @dataclass(frozen=True)
 class JevWindow:
@@ -60,9 +60,9 @@ class JevWindow:
 
 
 class ConfigurationService:
-    def __init__(self, conn, trees, publisher):
+    def __init__(self, conn, policies, publisher):
         self.conn = conn
-        self.trees = trees
+        self.policies = policies
         self.publisher = publisher
 
     # ── 共享骨架：publisher.locked() → 写事务（写入/校验/审计/prepare/复核指纹）→
@@ -79,37 +79,37 @@ class ConfigurationService:
     def _recheck_fingerprint(self, prepared):
         """COMMIT 前在同一事务连接上复核磁盘指纹（等价旧 SnapshotPublisher.refresh 的复核语义）。
 
-        同一连接能看到本事务未提交的写入，重建候选快照读到的是事务内配置。若图在
-        候选快照构造后变了，用新指纹重建一次；仍不稳定就在提交前抛与 GraphService
+        同一连接能看到本事务未提交的写入，重建候选快照读到的是事务内配置。若策略在
+        候选快照构造后变了，用新指纹重建一次；仍不稳定就在提交前抛与 PolicyService
         相同的冲突并回滚，绝不把过期指纹打给已发布快照。
         """
         for _attempt in range(2):
-            fingerprint = self.trees.fingerprint()
+            fingerprint = self.policies.fingerprint()
             if fingerprint == prepared.fingerprint:
                 return prepared
             prepared = self.publisher.prepare(
-                self.conn, self.trees.active(), fingerprint)
-        raise GraphChangedDuringLoad(
-            "graph changed between document write and snapshot publish")
+                self.conn, self.policies.active(), fingerprint)
+        raise PolicyChangedDuringLoad(
+            "policy changed between document write and snapshot publish")
 
-    def _require_valid_active_graph(self) -> None:
-        issues = active_tree_issues(self.conn, self.trees)
+    def _require_valid_active_policy(self) -> None:
+        issues = active_policy_issues(self.conn, self.policies)
         if issues:
             raise ValidationFailed(issues)
 
     def _prepared_snapshot(self):
-        # 必须先取指纹再读树：两次读取之间图若被改写，_recheck_fingerprint 会看到
-        # 不匹配并重建一次。反过来（先读树、后取指纹）会产出（过期树, 当前指纹），
-        # 复核只看指纹标签，于是把过期树当最新快照发布出去。
-        fingerprint = self.trees.fingerprint()
-        return self.publisher.prepare(self.conn, self.trees.active(), fingerprint)
+        # 必须先取指纹再读策略：两次读取之间策略若被改写，_recheck_fingerprint 会看到
+        # 不匹配并重建一次。反过来（先读策略、后取指纹）会产出（过期策略, 当前指纹），
+        # 复核只看指纹标签，于是把过期策略当最新快照发布出去。
+        fingerprint = self.policies.fingerprint()
+        return self.publisher.prepare(self.conn, self.policies.active(), fingerprint)
 
     def save_jev(self, settings: JevSettings) -> None:
         self._write_and_publish(lambda conn: self._save_jev_in_tx(settings))
 
     def _save_jev_in_tx(self, settings: JevSettings):
         JevConfigRepo(self.conn).save(settings)
-        self._require_valid_active_graph()
+        self._require_valid_active_policy()
         ChangeRepo(self.conn).record(
             now_iso(), "jev", {"action": "save", "model": settings.model}
         )
@@ -122,7 +122,7 @@ class ConfigurationService:
         repo = SettingsRepo(self.conn)
         repo.set("jev_context_tokens", str(window.context_tokens))
         repo.set("jev_input_tokens", str(window.input_tokens))
-        self._require_valid_active_graph()
+        self._require_valid_active_policy()
         ChangeRepo(self.conn).record(now_iso(), "jev_window", {
             "action": "window",
             "context_tokens": window.context_tokens,
@@ -136,7 +136,7 @@ class ConfigurationService:
 
     def _save_periods_in_tx(self, periods: list):
         TimePeriodRepo(self.conn).save(periods)
-        self._require_valid_active_graph()
+        self._require_valid_active_policy()
         ChangeRepo(self.conn).record(
             now_iso(), "time-periods", {"periods": len(periods)}
         )
@@ -150,7 +150,7 @@ class ConfigurationService:
         def write(conn):
             if not ModelRepo(conn).create(model_id, upstream, provider, profile_text or "{}"):
                 raise AlreadyExists(f"model {model_id} 已存在")
-            self._require_valid_active_graph()
+            self._require_valid_active_policy()
             ChangeRepo(conn).record(now_iso(), "model", {
                 "action": "create", "id": model_id,
                 "upstream": upstream, "provider": provider,
@@ -166,7 +166,7 @@ class ConfigurationService:
             if not ModelRepo(conn).update(
                     model_id, upstream=upstream, provider=provider, profile=profile_text):
                 raise MissingError(f"unknown model {model_id}")
-            self._require_valid_active_graph()
+            self._require_valid_active_policy()
             ChangeRepo(conn).record(now_iso(), "model", {
                 "action": "update", "id": model_id,
                 "upstream": audit_upstream, "provider": audit_provider,
@@ -179,10 +179,10 @@ class ConfigurationService:
         def write(conn):
             if ModelRepo(conn).get(model_id) is None:
                 raise MissingError(f"unknown model {model_id}")
-            refs = model_references(self.trees.list(), model_id)
+            refs = model_references(self.policies.list(), model_id)
             if refs:
                 raise ReferencedByError({
-                    "message": f"model {model_id} 被路由树引用", "references": refs})
+                    "message": f"model {model_id} 被策略引用", "references": refs})
             if not ModelRepo(conn).delete(model_id):
                 raise MissingError(f"unknown model {model_id}")
             ChangeRepo(conn).record(
@@ -197,7 +197,7 @@ class ConfigurationService:
             ProviderRepo(conn).upsert(
                 name, base_url, key_env=key_env,
                 reasoning_format=reasoning_format, api_key=api_key)
-            self._require_valid_active_graph()
+            self._require_valid_active_policy()
             ChangeRepo(conn).record(now_iso(), "provider", {
                 "action": "upsert", "name": name, "base_url": base_url,
                 "key_env": key_env if key_env is not None else (existing or {}).get("key_env", ""),

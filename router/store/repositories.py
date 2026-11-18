@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from router import auth
 from router.presets import PRESET_BY_ID
 from router.routing.conditions import TimePeriod
-from router.routing.tree import RoutingTree, tree_revision_of
+from router.routing.policy.model import PolicyResource
 
 
 def now_iso() -> str:
@@ -108,17 +108,19 @@ class ModelRepo:
         return cursor.rowcount > 0
 
 
-def model_references(trees: list[RoutingTree], model_id: str) -> list[dict]:
-    # Graph v3 is the only persisted tree shape: target nodes carry their model
-    # list and every other node type has no `models` attribute, so a plain walk
-    # over each tree's nodes is the model-reference scan.
+def model_references(resources: list[PolicyResource], model_id: str) -> list[dict]:
+    # 目标是策略 v4 里唯一携带模型列表的节点：逐个扫描 resource.policy.targets，
+    # 命中模型的目标产出一条引用行（供 delete_model 的 409 detail 使用）。
     refs = []
-    for tree in trees:
-        revision = tree.tree_revision or tree_revision_of(tree)
-        for node in tree.root.nodes:
-            models = getattr(node, "models", ()) or ()
-            if any(item.model == model_id for item in models):
-                refs.append({"tree_id": tree.id, "tree_revision": revision, "node_id": node.id, "via": "target"})
+    for resource in resources:
+        for target in resource.policy.targets.values():
+            if any(item.model == model_id for item in target.models):
+                refs.append({
+                    "policy_id": resource.id,
+                    "policy_revision": resource.policy_revision,
+                    "target_id": target.id,
+                    "via": "target",
+                })
     return refs
 
 
