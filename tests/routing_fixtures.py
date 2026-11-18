@@ -1,5 +1,5 @@
 from router.config import Settings
-from router.routing.graph.validate import EnableContext
+from router.routing.policy.validate import EnableContext
 
 
 def test_settings(tmp_path, **overrides):
@@ -17,7 +17,7 @@ test_settings.__test__ = False
 
 def enable_context():
     return EnableContext(
-        known_models={"fast"},
+        known_models={"fast", "strong"},
         model_reasoning={"fast": None},
         known_periods={"peak", "normal", "offpeak"},
         jev_available=True,
