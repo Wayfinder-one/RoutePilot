@@ -17,7 +17,9 @@ class _SseBody(httpx.AsyncByteStream):
     """Minimal async SSE body: a buffered ``httpx.Response`` cannot be re-streamed."""
 
     async def __aiter__(self):
-        yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+        yield 'data: {"choices":[{"delta":{"content":"第一段"}}]}\n\n'.encode()
+        yield 'data: {"choices":[{"delta":{"content":"第二段"}}]}\n\n'.encode()
+        yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
         yield b"data: [DONE]\n\n"
 
 
@@ -138,7 +140,8 @@ def test_admin_fixed_model_streams_sse_and_releases_lease(tmp_path):
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["x-sr-selection"] == "direct"
     assert response.headers["x-sr-model"] == "qwen3-32b"
-    assert '"ok"' in response.text
+    assert "第一段" in response.text
+    assert "第二段" in response.text
     assert app.state.balancer.inflight("qwen3-32b") == 0
 
 
