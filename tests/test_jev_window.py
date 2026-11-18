@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.api.routes_jev import router as jev_router
 from router.control.config import ConfigurationService
-from router.jev.client import ChoiceAnswer
+from router.jev.client import ChoiceAnswer, NoulAnswer, ScoreAnswer
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
@@ -19,16 +19,19 @@ from router.jev.window import (
     apply_window,
     estimate_tokens,
 )
-from router.routing.graph.compiled import compile_graph
-from router.routing.graph.evaluator import GraphEvaluator
-from router.routing.tree import tree_from_dict
+from router.routing.policy import (
+    PolicyResource,
+    policy_from_dict,
+    policy_revision_of,
+)
+from router.routing.policy.evaluator import PolicyEvaluator
 from router.routing.snapshot import build_snapshot, read_jev_window
 from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
+from router.store.policies import PolicyChangedDuringLoad, PolicyRepo
 from router.store.repositories import SettingsRepo
-from router.store.routing_trees import GraphChangedDuringLoad, RoutingTreeRepo
 from router.upstream.catalog import Backend
-from tests.routing_fixtures import test_settings, tree_dict
+from tests.routing_fixtures import policy_dict, test_settings
 
 
 
@@ -129,8 +132,8 @@ class Publisher:
     def locked(self):
         yield self
 
-    def prepare(self, conn, tree, fingerprint):
-        return SimpleNamespace(tree=tree, fingerprint=fingerprint)
+    def prepare(self, conn, resource, fingerprint):
+        return SimpleNamespace(snapshot=resource, fingerprint=fingerprint)
 
     def publish(self, prepared):
         self.published.append(prepared)
@@ -143,8 +146,8 @@ def make_client(tmp_path):
     conn.close()
     app = FastAPI()
     app.state.settings = SimpleNamespace(db_path=path)
-    app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
-    app.state.graph_repo.initialize()
+    app.state.policy_repo = PolicyRepo(tmp_path / "routing-policy")
+    app.state.policy_repo.initialize()
     app.state.publisher = Publisher()
     app.include_router(jev_router, prefix="/admin")
     return TestClient(app), app, path
@@ -197,8 +200,8 @@ def test_put_window_rejects_invalid(tmp_path, payload):
 
 # ── 发布前指纹复核（Task 10 FIX 4）────────────────────────────────────
 
-class _Trees:
-    """最小树仓库桩：按队列吐指纹，队列耗尽后停在最后一个。"""
+class _Policies:
+    """最小策略仓库桩：按队列吐指纹，队列耗尽后停在最后一个。"""
 
     def __init__(self, fingerprints):
         self._fingerprints = list(fingerprints)
@@ -219,12 +222,12 @@ def _fresh_conn(tmp_path):
 
 
 def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
-    """提交后图被改写：用新指纹重建快照，不发布过期指纹。"""
+    """提交后策略被改写：用新指纹重建快照，不发布过期指纹。"""
     conn = _fresh_conn(tmp_path)
     try:
         publisher = Publisher()
         service = ConfigurationService(
-            conn, _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b")]), publisher)
+            conn, _Policies([("policy-1", "sha-a"), ("policy-1", "sha-b")]), publisher)
 
         def write(_conn):
             prepared = service._prepared_snapshot()  # 指纹 sha-a
@@ -232,50 +235,50 @@ def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
 
         service._write_and_publish(write)
         assert len(publisher.published) == 1
-        assert publisher.published[0].fingerprint == ("tree-1", "sha-b")
+        assert publisher.published[0].fingerprint == ("policy-1", "sha-b")
     finally:
         conn.close()
 
 
 def test_publish_refuses_when_fingerprint_keeps_changing(tmp_path):
-    """复核期间指纹持续变化：抛与 GraphService 相同的冲突且不发布。"""
+    """复核期间指纹持续变化：抛与 PolicyService 相同的冲突且不发布。"""
     conn = _fresh_conn(tmp_path)
     try:
         publisher = Publisher()
         service = ConfigurationService(
             conn,
-            _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b"), ("tree-1", "sha-c")]),
+            _Policies([("policy-1", "sha-a"), ("policy-1", "sha-b"), ("policy-1", "sha-c")]),
             publisher,
         )
-        with pytest.raises(GraphChangedDuringLoad):
+        with pytest.raises(PolicyChangedDuringLoad):
             service._write_and_publish(lambda _conn: service._prepared_snapshot())
         assert publisher.published == []
     finally:
         conn.close()
 
 
-class _SwappingTrees:
-    """最小树仓库桩：底层文档在两次读取之间被改写，模拟磁盘竞态。
+class _SwappingPolicies:
+    """最小策略仓库桩：底层文档在两次读取之间被改写，模拟磁盘竞态。
 
-    真实 ``RoutingTreeRepo.fingerprint()`` 与 ``active()`` 是两次独立读取；
+    真实 ``PolicyRepo.fingerprint()`` 与 ``active()`` 是两次独立读取；
     这里让文档恰好在这两次读取之间换掉（``swap_after`` 次读取后生效），
-    于是「先读树、后读指纹」会拿到（过期树, 当前指纹）这一自相矛盾的候选。
+    于是「先读策略、后读指纹」会拿到（过期策略, 当前指纹）这一自相矛盾的候选。
     """
 
     def __init__(self, before, after, *, swap_after=1):
-        self._document = before              # ((tree_id, sha256), tree)
+        self._document = before              # ((policy_id, sha256), policy)
         self._after = after
         self._reads = 0
         self._swap_after = swap_after
         self.calls = []
 
     def _read(self, name):
-        fingerprint, tree = self._document
+        fingerprint, policy = self._document
         self.calls.append(name)
         self._reads += 1
         if self._reads >= self._swap_after:
             self._document = self._after
-        return fingerprint, tree
+        return fingerprint, policy
 
     def fingerprint(self):
         return self._read("fingerprint")[0]
@@ -284,25 +287,25 @@ class _SwappingTrees:
         return self._read("active")[1]
 
 
-def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
-    """指纹必须先于树读取：两次读取之间图变了，绝不能把过期树配当前指纹发布。"""
-    doc_a = (("tree-a", "sha-a"), SimpleNamespace(id="doc-a"))
-    doc_b = (("tree-b", "sha-b"), SimpleNamespace(id="doc-b"))
+def test_prepared_snapshot_reads_fingerprint_before_policy(tmp_path):
+    """指纹必须先于策略读取：两次读取之间策略变了，绝不能把过期策略配当前指纹发布。"""
+    doc_a = (("policy-a", "sha-a"), SimpleNamespace(id="doc-a"))
+    doc_b = (("policy-b", "sha-b"), SimpleNamespace(id="doc-b"))
     conn = _fresh_conn(tmp_path)
     try:
         publisher = Publisher()
-        trees = _SwappingTrees(doc_a, doc_b)
-        service = ConfigurationService(conn, trees, publisher)
+        policies = _SwappingPolicies(doc_a, doc_b)
+        service = ConfigurationService(conn, policies, publisher)
 
         service._write_and_publish(lambda _conn: service._prepared_snapshot())
 
         assert len(publisher.published) == 1
         published = publisher.published[0]
-        # 重考发现「树过期、指纹是当前」，用当前文档重建一次；绝不发布
-        # (doc-a 的树, doc-b 的指纹) 这种自相矛盾的快照。
-        assert published.tree is doc_b[1]
+        # 重考发现「策略过期、指纹是当前」，用当前文档重建一次；绝不发布
+        # (doc-a 的策略, doc-b 的指纹) 这种自相矛盾的快照。
+        assert published.snapshot is doc_b[1]
         assert published.fingerprint == doc_b[0]
-        assert trees.calls[:2] == ["fingerprint", "active"]
+        assert policies.calls[:2] == ["fingerprint", "active"]
     finally:
         conn.close()
 
@@ -310,36 +313,32 @@ def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
 # ── 真实组合根：写事务回滚契约（与服务层 save_window 同型）──────────────
 
 
-def direct_graph():
-    """start → target(qwen3-8b)：无问题节点，不需要决策服务即可启用。"""
+def window_policy(model="qwen3-8b"):
+    """无问题策略：文本条件直连 target(model)。"""
     return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "direct", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}]},
-        ],
-        "edges": [{
-            "id": "e-start-direct", "source": "start", "source_port": "out",
-            "target": "direct", "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": "direct",
+        "kind": "sr-routing-policy", "version": 4, "name": "窗口策略",
+        "timezone": "Asia/Shanghai",
+        "sticky": {"enabled": False, "ttl_seconds": 1800},
+        "questions": {},
+        "targets": {"direct": {"models": [{"model": model}]}},
+        "rules": [{"name": "直连", "when": {"text_contains_any": ["请求"]}, "target": "direct"}],
+        "fallback": "direct",
     }
 
 
-def _window_tree_app(tmp_path):
-    """真实 create_app + 已启用图：enable 校验失败时 DB/审计/快照都不得变化。"""
+def _window_policy_app(tmp_path):
+    """真实 create_app + 已启用策略：enable 校验失败时 DB/审计/快照都不得变化。"""
     settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
+    repo = PolicyRepo(settings.policy_dir)
     repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=direct_graph())))
+    repo.create("main", policy_from_dict(window_policy()))
     repo.enable("main")
     app = create_app(settings)
     return app, TestClient(app)
 
 
 def test_failed_window_save_changes_neither_db_audit_nor_snapshot(tmp_path):
-    app, client = _window_tree_app(tmp_path)
+    app, client = _window_policy_app(tmp_path)
     conn = connect(app.state.settings.db_path)
     try:
         conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
@@ -383,8 +382,8 @@ def test_put_window_publishes_candidate_snapshot_with_new_values(tmp_path):
 
 # ── 路由引擎：截断生效 + trace ─────────────────────────────────────────
 
-class GraphJev:
-    """Graph v3 决策服务替身：一次 choose_many 返回本波全部问题答案。"""
+class PolicyJev:
+    """Policy v4 决策服务替身：一次 choose_many 返回全部问题答案。"""
 
     def __init__(self):
         self.calls = []
@@ -392,34 +391,38 @@ class GraphJev:
     async def choose_many(self, settings, text, questions):
         self.calls.append({"text": text, "questions": list(questions)})
         return {
-            node_id: ChoiceAnswer(
-                {"easy": 0.3, "strong": 0.7}, ["strong", "easy"], 0.7, 0.4,
+            "route": ChoiceAnswer(
+                {"fast": 0.3, "strong": 0.7}, ["strong", "fast"], 0.7, 0.4,
                 {"input_tokens": 5}, 8.0,
-            )
-            for node_id in questions
+            ),
+            "risk": NoulAnswer(0.1, 0.9, {"input_tokens": 5}, 8.0),
+            "severity": ScoreAnswer(2.0, {"input_tokens": 5}, 8.0),
         }
 
 
 def _snapshot(*, input_tokens=MIN_INPUT_TOKENS, context_tokens=DEFAULT_CONTEXT_TOKENS):
     jev_settings = JevSettings("http://jev.test", "d1-2B", "", 5, DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE)
-    tree = tree_from_dict(tree_dict(enabled=True))
+    policy = policy_from_dict(policy_dict())
+    resource = PolicyResource(
+        id="main", policy=policy, enabled=True,
+        policy_revision=policy_revision_of(policy),
+    )
     return build_snapshot(
-        tree=tree,
+        resource=resource,
         backends={"fast": Backend(url="http://fast.test", headers={}, upstream_name="fast")},
         time_periods=[],
         jev=jev_settings,
         capabilities={"fast": "简单请求"},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
-        compiled=compile_graph(tree.root),
     )
 
 
-def test_evaluator_truncates_jev_input_and_traces_it():
+def test_evaluator_truncates_jev_input_and_traces_it(tmp_path):
     snap = _snapshot(input_tokens=MIN_INPUT_TOKENS)
-    jev = GraphJev()
+    jev = PolicyJev()
     trace = []
-    asyncio.run(GraphEvaluator(jev).evaluate(
+    asyncio.run(PolicyEvaluator(jev).evaluate(
         snap, RoutingRequest("国网营销数字化改造项目背景。" * 500, session_id="s1"),
         trace_sink=trace,
     ))
@@ -434,10 +437,11 @@ def test_evaluator_truncates_jev_input_and_traces_it():
 
 def test_evaluator_leaves_short_input_alone():
     snap = _snapshot()
-    jev = GraphJev()
+    jev = PolicyJev()
     trace = []
-    asyncio.run(GraphEvaluator(jev).evaluate(
-        snap, RoutingRequest("你好", session_id="s2"), trace_sink=trace,
+    asyncio.run(PolicyEvaluator(jev).evaluate(
+        snap, RoutingRequest("你好", session_id="s2"),
+        trace_sink=trace,
     ))
 
     assert jev.calls[0]["text"] == "你好"

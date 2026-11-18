@@ -34,12 +34,12 @@ CONF_BUCKETS = 5
 FLUSH_QUEUE_LIMIT = 10000
 
 LOG_COLUMNS = (
-    "id", "ts", "decision", "model", "target_id", "tree_id", "tree_revision",
+    "id", "ts", "decision", "model", "target_id", "policy_id", "policy_revision",
     "snapshot_revision", "policy_path", "selection_reason", "sticky_hit",
     "session_hash", "jev_model", "jev_choice", "jev_top", "jev_margin",
     "jev_ms", "reasoning", "routing_ms", "upstream_model", "upstream_status",
     "upstream_ms", "ttft_ms", "total_ms", "prompt_tokens", "completion_tokens",
-    "total_tokens", "outcome_state", "error_class", "waves",
+    "total_tokens", "outcome_state", "error_class", "jev_calls",
 )
 
 _LOG_INSERT = (
@@ -111,9 +111,9 @@ class RequestLogger:
         """Warm the ring with the persisted tail after a process restart.
 
         SQLite intentionally stores only the ledger whitelist. Restored rows
-        therefore have no request text, trace, answers, node_labels or
-        probabilities; the console renders those details as absent until a new
-        live request arrives.  Only raw ledger dicts are kept here; display
+        therefore have no request text, trace, answers or probabilities; the
+        console renders those details as absent until a new live request
+        arrives.  Only raw ledger dicts are kept here; display
         facts (``route_label``/``metrics``/``fields``) are attached at the API
         outlet via ``present_record()``.
         """

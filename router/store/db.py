@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA = (
     """
@@ -53,8 +53,8 @@ SCHEMA = (
         decision TEXT NOT NULL,
         model TEXT,
         target_id TEXT,
-        tree_id TEXT,
-        tree_revision TEXT,
+        policy_id TEXT,
+        policy_revision TEXT,
         snapshot_revision TEXT,
         policy_path TEXT,
         selection_reason TEXT,
@@ -65,7 +65,7 @@ SCHEMA = (
         jev_top REAL,
         jev_margin REAL,
         jev_ms REAL,
-        waves INTEGER,
+        jev_calls INTEGER,
         reasoning TEXT,
         routing_ms REAL,
         upstream_model TEXT,
@@ -214,6 +214,13 @@ def _upgrade_v3_to_v4(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO schema_migrations VALUES (?)", (4,))
 
 
+def _upgrade_v4_to_v5(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE request_logs RENAME COLUMN tree_id TO policy_id")
+    conn.execute("ALTER TABLE request_logs RENAME COLUMN tree_revision TO policy_revision")
+    conn.execute("ALTER TABLE request_logs RENAME COLUMN waves TO jev_calls")
+    conn.execute("INSERT INTO schema_migrations VALUES (5)")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
     applied = int(conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
@@ -258,5 +265,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         if not {"request_logs", "settings"} <= tables:
             raise RuntimeError("unsupported database contents; use a new database")
         _in_transaction(conn, lambda: _upgrade_v3_to_v4(conn))
+        applied = 4
+        tables = _table_names(conn)
+    if applied == 4:
+        if "request_logs" not in tables:
+            raise RuntimeError("unsupported database contents; use a new database")
+        _in_transaction(conn, lambda: _upgrade_v4_to_v5(conn))
         return
     raise RuntimeError("unsupported database contents; use a new database")
