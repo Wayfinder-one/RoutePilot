@@ -34,7 +34,9 @@ const api = {
     window.location.href = 'login.html?next=' + next + '&expired=1';
   },
   async req(method, path, body, opts) {
-    const headers = {};
+    /* Task 8：调用方可带自定义 header（If-Match 等）；Content-Type、
+       Authorization 与 timeout 仍由本客户端统一决定，调用方不能关闭鉴权。 */
+    const headers = Object.assign({}, opts && opts.headers ? opts.headers : {});
     if (body !== undefined && body !== null) headers['Content-Type'] = 'application/json';
     const tok = this.token();
     if (tok) headers['Authorization'] = 'Bearer ' + tok;

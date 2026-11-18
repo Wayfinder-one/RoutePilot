@@ -1,21 +1,18 @@
-/* RoutePilot 控制台 QA 基座（Task 10 拆分后）
+/* RoutePilot 控制台 QA 基座（Task 8 起以 Policy v4 为面）
    ------------------------------------------------------------------
-   本文件只保留：服务启动（Node mock + `python -m router` 子进程）、浏览器、
-   管理面 API、用例注册器/执行器、共享断言助手与 teardown。页面用例分别位于
-   scripts/console_qa/{canvas,inspector,tryrun,logs,models,testchat}.mjs，各模块只调用
-   本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
+   本文件只保留：服务启动（Node mock + `python -m router` 子进程，策略目录走
+   ROUTER_POLICY_DIR）、浏览器、管理面 API、用例注册器/执行器、共享断言助手
+   与 teardown。页面用例位于 scripts/console_qa/{testchat,models,policy}.mjs
+   （Task 8 注册表裁决：canvas / inspector 与 tryrun / logs 留盘待 Task 9/10），
+   各模块只调用本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
 
-   console_qa.mjs 顶部保留的 9 条用例是基座自检（健康检查 / 原生 ESM / 单模块入口 /
+   console_qa.mjs 顶部保留的基座自检（健康检查 / 原生 ESM / 单模块入口 /
    登录页语言开关 / mock wire shape / mock 故障注入 / mock 上游 OpenAI 格式 /
-   bootstrap 目录与初始图 / 真实 /admin/try），不属于任何页面模块；首页「测试」
-   对话页的对话、渲染与附件用例注册在 testchat.mjs。
+   bootstrap 目录与初始策略 / 真实 /admin/try）不属于任何页面模块。
 
    Usage: node scripts/console_qa.mjs            # 全量（= npm run check:console）
           QA_ONLY=<regex> node scripts/console_qa.mjs
-          node scripts/console_qa/canvas.mjs      # 只跑单个页面模块
-   Exports: 67 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
-            page / mockBase / routerBase / screenshot / BASELINE / FIXTURE），
-            完整清单见本文件下方的 export 声明。
+          node scripts/console_qa/policy.mjs     # 只跑单个页面模块
    ------------------------------------------------------------------ */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -31,15 +28,14 @@ import { chromium } from 'playwright-core';
 /* 控制台源码是原生 ES module：Node 侧可直接导入纯模块常量，
    页面内则用动态 import() 读取同一份模块实例（不暴露 window 全局）。 */
 import { HISTORY_LIMIT } from '../router/console/routing/draft.js';
-import { MIN_K } from '../router/console/routing/canvas.js';
 
-export { HISTORY_LIMIT, MIN_K };
+export { HISTORY_LIMIT };
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXAMPLE_PATH = path.join(ROOT, 'router/console/routing/example.json');
 const SCENARIO_PATH = path.join(ROOT, 'tests/fixtures/graph_scenarios.json');
 const SHOT_DIR = path.join(ROOT, 'docs/od-design/routing-canvas-2026-11-02/implementation-qa');
-export const TREE_ID = 'power-priority';
+export const POLICY_ID = 'power-priority';
 export const JEV_MODEL = 'd1-2B';
 export const S1_TEXT = '10kV 线路跳闸，请安排抢修工单并做故障定位。';
 export const S1_NOW = '2026-11-02T12:00:00+08:00';
@@ -48,18 +44,17 @@ const API_TIMEOUT_MS = 15000;
    the committed evidence PNGs. Regenerate with QA_SCREENSHOTS=1. */
 const WRITE_SHOTS = process.env.QA_SCREENSHOTS === '1';
 
-/* 示例图是 15 节点图的唯一来源：节点/边数、start 坐标、兜底目标都从 fixture 派生，
-   避免 QA 里散落 15 / 20,150 / standard-target 这类字面量。 */
+/* 示例策略（= tests/fixtures/policy_v4.json，spec §4.1 完整文档）：问题/规则数、
+   兜底目标都从这份文档派生，避免 QA 里散落字面量。 */
 export const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
-export const EXAMPLE_NODES = EXAMPLE.nodes.length;
-export const EXAMPLE_EDGES = EXAMPLE.edges.length;
-export const EXAMPLE_START = EXAMPLE.nodes.find(node => node.id === 'start').position;
-export const EXAMPLE_TARGETS = { fallback: EXAMPLE.error_fallback };
-/* 示例图只有 root；envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
+export const EXAMPLE_QUESTIONS = Object.keys(EXAMPLE.questions);
+export const EXAMPLE_RULES = EXAMPLE.rules.length;
+export const EXAMPLE_FALLBACK = EXAMPLE.fallback;
+/* envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
 export const BASELINE = {
-  name: '电力优先决策组',
-  timezone: 'Asia/Shanghai',
-  sticky: { enabled: true, ttl_seconds: 1800 }
+  name: EXAMPLE.name,
+  timezone: EXAMPLE.timezone,
+  sticky: EXAMPLE.sticky,
 };
 
 /* ── 用例注册器 ─────────────────────────────────────────────────────── */
@@ -203,15 +198,36 @@ function sendJson(response, status, body) {
 
 /* ── mock：/v1/systemone + /v1/chat/completions ─────────────────────── */
 
+/* v4 策略问题的确定性来源映射：route 的场景概率取自旧 capability 场景
+   （选项键 fast/strong/power ← easy/standard/strong），power_business ← domain；
+   adversarial 不在旧场景里，固定 0.08 让「对抗请求」规则可预测地不触发。 */
+const QUESTION_SOURCES = { route: 'capability', power_business: 'domain' };
+const FIXED_NOUL_ANSWERS = { adversarial: 0.08 };
+const OPTION_SOURCES = { route: { fast: 'easy', strong: 'standard', power: 'strong' } };
+/* 旧 M0 wire-shape 自检仍用 capability 等问题键与标准三档 label：
+   没有专属映射的问题退回这张通用 label → 场景概率键 兜底。 */
+const DEFAULT_LABEL_SOURCES = { 轻量模型: 'easy', 标准模型: 'standard', 增强模型: 'strong' };
+
 function loadScenarioFixture() {
   const fixture = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
   const optionKeys = {};
-  (EXAMPLE.nodes || []).forEach(node => {
-    if (node.type === 'question' && node.question_type === 'choice') {
-      optionKeys[node.id] = (node.options || []).map(option => option.key);
-}
-});
-  return { periods: fixture.periods || [], scenarios: fixture.scenarios || [], optionKeys };
+  const labelSources = {};
+  Object.entries(EXAMPLE.questions || {}).forEach(([qid, question]) => {
+    if (question && question.type === 'choice') {
+      optionKeys[qid] = (question.options || []).map(option => option.key);
+      const sources = OPTION_SOURCES[qid] || {};
+      labelSources[qid] = {};
+      (question.options || []).forEach(option => {
+        labelSources[qid][option.label] = sources[option.key] || option.key;
+      });
+    }
+  });
+  return {
+    periods: fixture.periods || [],
+    scenarios: fixture.scenarios || [],
+    optionKeys: optionKeys,
+    labelSources: labelSources,
+  };
 }
 
 export const FIXTURE = loadScenarioFixture();
@@ -229,11 +245,11 @@ function normalizeProbabilities(values) {
 
 function choiceAnswer(nodeId, question, fixture) {
   const labels = Object.keys(question.criteria || {});
-  const keys = FIXTURE.optionKeys[nodeId];
-  const probsByKey = (fixture && fixture.probs) || {};
-  let values = labels.map((label, index) => {
-    const key = Array.isArray(keys) && keys.length === labels.length ? keys[index] : null;
-    const value = key && typeof probsByKey[key] === 'number' ? probsByKey[key] : null;
+  const sourceLabels = FIXTURE.labelSources[nodeId] || DEFAULT_LABEL_SOURCES;
+  const probsBySource = (fixture && fixture.probs) || {};
+  let values = labels.map(label => {
+    const source = sourceLabels[label] || label;
+    const value = typeof probsBySource[source] === 'number' ? probsBySource[source] : null;
     return value;
 });
   if (values.every(value => value === null)) values = labels.map(() => 1 / Math.max(1, labels.length));
@@ -250,9 +266,12 @@ function choiceAnswer(nodeId, question, fixture) {
 };
 }
 
-function noulAnswer(fixture) {
-  const yes = fixture && typeof fixture.yes === 'number' ? fixture.yes : 0.5;
-  return { type: 'noul', noul: yes };
+function noulAnswer(fixture, nodeId) {
+  if (fixture && typeof fixture.yes === 'number') return { type: 'noul', noul: fixture.yes };
+  if (typeof FIXED_NOUL_ANSWERS[nodeId] === 'number') {
+    return { type: 'noul', noul: FIXED_NOUL_ANSWERS[nodeId] };
+  }
+  return { type: 'noul', noul: 0.5 };
 }
 
 function scoreAnswer(question, fixture) {
@@ -289,9 +308,11 @@ function scoreAnswer(question, fixture) {
 
 function answerFor(nodeId, question, scenario) {
   const type = question && question.type;
-  const fixture = (scenario.answers || {})[nodeId] || null;
+  /* v4 策略问题 → 旧场景键映射（见 loadScenarioFixture 上方注释）。 */
+  const sourceId = QUESTION_SOURCES[nodeId] || nodeId;
+  const fixture = (scenario.answers || {})[sourceId] || null;
   if (type === 'choice') return choiceAnswer(nodeId, question, fixture);
-  if (type === 'noul') return noulAnswer(fixture);
+  if (type === 'noul') return noulAnswer(fixture, nodeId);
   if (type === 'score') return scoreAnswer(question, fixture);
   throw new Error(`mock does not support question type ${type} (${nodeId})`);
 }
@@ -478,7 +499,7 @@ async function startRouter(port) {
     env: {
       ...process.env,
       ROUTER_DB: path.join(tempDir, 'router.db'),
-      ROUTER_GRAPH_DIR: path.join(tempDir, 'routing-graph'),
+      ROUTER_POLICY_DIR: path.join(tempDir, 'routing-policy'),
       ROUTER_HOST: '127.0.0.1',
       ROUTER_PORT: String(port),
       ROUTER_USER_AUTH: '0',
@@ -536,9 +557,9 @@ async function stopRouter() {
 
 /* ── 管理面 API + bootstrap ─────────────────────────────────────────── */
 
-export async function api(method, apiPath, body) {
+export async function api(method, apiPath, body, headers) {
   if (!routerBase) throw new Error('router is not ready');
-  const init = { method, headers: {} };
+  const init = { method, headers: Object.assign({}, headers || {}) };
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json';
     init.body = JSON.stringify(body);
@@ -616,15 +637,12 @@ async function bootstrap() {
     timeout_seconds: 5
 });
 
-  /* 5. 建图并启用（root 原样使用 Task 3 的 graph_power 示例）。 */
-  await api('POST', '/admin/trees', {
-    id: TREE_ID,
-    name: BASELINE.name,
-    timezone: BASELINE.timezone,
-    sticky: BASELINE.sticky,
-    root: EXAMPLE
+  /* 5. 建策略并启用（policy 原样使用 example.json = spec §4.1 完整文档）。 */
+  await api('POST', '/admin/policies', {
+    id: POLICY_ID,
+    policy: EXAMPLE
 });
-  await api('POST', '/admin/trees/' + TREE_ID + '/enable');
+  await api('POST', '/admin/policies/' + POLICY_ID + '/enable');
 }
 
 /* ── 浏览器 ─────────────────────────────────────────────────────────── */
@@ -709,13 +727,12 @@ test('router service is ready on an isolated database', async () => {
   assertRepoDbUnchanged();
 });
 
-test('graph.js is served as a native ES module with a single module entry', async () => {
-  const response = await fetch(routerBase + '/console/routing/graph.js');
+test('policy.js is served as a native ES module with a single module entry', async () => {
+  const response = await fetch(routerBase + '/console/routing/policy.js');
   assert.equal(response.status, 200);
   const text = await response.text();
-  assert.match(text, /export \{/, 'graph.js is not an ES module');
-  assert.doesNotMatch(text, /module\.exports/, 'graph.js still carries the CommonJS export');
-  assert.doesNotMatch(text, /root\.RTGraph/, 'graph.js still writes a window/global bridge');
+  assert.match(text, /export function/, 'policy.js is not an ES module');
+  assert.doesNotMatch(text, /module\.exports/, 'policy.js still carries the CommonJS export');
   const pageResponse = await fetch(routerBase + '/console/routing.html');
   assert.equal(pageResponse.status, 200);
   const html = await pageResponse.text();
@@ -909,7 +926,7 @@ test('mock upstream returns an OpenAI-format completion', async () => {
 
 /* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始图一旦被后面的用例
    改动，这条用例就该在基座阶段立刻失败，而不是在 100 多条页面用例之后才报。 */
-test('bootstrap registers catalog, periods, decision service and the enabled power graph', async () => {
+test('bootstrap registers catalog, periods, decision service and the enabled policy', async () => {
   const models = await api('GET', '/admin/models');
   const modelIds = models.models.map(model => model.id).sort();
   for (const required of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft']) {
@@ -927,85 +944,74 @@ test('bootstrap registers catalog, periods, decision service and the enabled pow
   assert.equal(jev.config.base_url, mockBase);
   assert.equal(jev.config.model, JEV_MODEL);
 
-  const trees = await api('GET', '/admin/trees');
-  const tree = trees.trees.find(item => item.id === TREE_ID);
-  assert.ok(tree, 'power graph tree missing');
-  assert.equal(tree.enabled, true);
-  assert.equal(tree.root.nodes.length, 15);
-  assert.equal(tree.root.edges.length, 15);
-  assert.equal(tree.root.otherwise_target, undefined);
-  assert.equal(tree.root.error_fallback, 'light-target');
-  assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
+  const policies = await api('GET', '/admin/policies');
+  const resource = policies.policies.find(item => item.id === POLICY_ID);
+  assert.ok(resource, 'example policy resource missing');
+  assert.equal(resource.enabled, true);
+  assert.equal(resource.policy.name, EXAMPLE.name);
+  assert.deepEqual(Object.keys(resource.policy.questions).sort(), EXAMPLE_QUESTIONS.slice().sort());
+  assert.equal(resource.policy.rules.length, EXAMPLE_RULES);
+  assert.equal(resource.policy.fallback, EXAMPLE_FALLBACK);
+  assert.match(resource.policy_revision, /^[0-9a-f]{64}$/);
+  assert.match(resource.document_sha256, /^[0-9a-f]{64}$/);
 });
 
 
-test('admin try routes the sample graph through the live decision mock', async () => {
-  const result = await api('POST', '/admin/try', { tree_id: TREE_ID, text: S1_TEXT, now: S1_NOW });
-  assert.equal(result.outcome.type, 'hit');
-  assert.equal(result.outcome.target_id, 'power-target');
-  assert.equal(result.outcome.model, 'qwen3.8-flash-sft');
-  assert.equal(result.outcome.waves.length, 1);
-  assert.deepEqual(result.outcome.waves[0].questions.sort(), ['capability', 'domain']);
-  assert.deepEqual(result.outcome.candidates.map(candidate => candidate.target_id).sort(), ['power-target', 'strong-target']);
-  assert.ok(Math.abs(result.answers.capability.probabilities.strong - 0.84) < 1e-9);
-  assert.ok(Math.abs(result.answers.domain.yes - 0.92) < 1e-9);
-  assert.deepEqual(result.warnings, []);
+test('admin try routes the sample policy through the live decision mock', async () => {
+  const result = await api('POST', '/admin/try', {
+    policy_id: POLICY_ID, text: S1_TEXT, now: S1_NOW,
+  });
+  assert.equal(result.target, 'power');
+  assert.deepEqual(result.models, ['qwen3.8-flash-sft']);
+  assert.equal(result.matched_rule, '电力业务优先');
+  assert.equal(result.fallback, false);
+  assert.equal(result.reason, null);
+  /* 一次 JEV 调用；answer 只展示后端返回，前端不重新求值。 */
+  const jevEvents = result.trace.filter(event => event.event === 'jev');
+  assert.equal(jevEvents.length, 1);
+  assert.deepEqual(jevEvents[0].questions.slice().sort(), ['adversarial', 'power_business', 'route']);
+  assert.equal(jevEvents[0].failed, false);
+  const ruleEvents = result.trace.filter(event => event.event === 'rule');
+  assert.deepEqual(ruleEvents.map(row => row.matched), [false, true]);
+  assert.equal(result.trace.filter(event => event.event === 'final').length, 1);
+  assert.ok(Math.abs(result.answers.route.probabilities.power - 0.84) < 1e-9);
+  assert.ok(Math.abs(result.answers.route.p_top - 0.84) < 1e-9);
+  assert.ok(Math.abs(result.answers.power_business.yes - 0.92) < 1e-9);
+  assert.ok(Math.abs(result.answers.adversarial.yes - 0.08) < 1e-9);
 
   const calls = mockState.systemoneCalls.filter(call => call.scenario === 's1');
   assert.equal(calls.length >= 1, true);
-  assert.deepEqual(calls[calls.length - 1].keys.sort(), ['capability', 'domain']);
+  assert.deepEqual(calls[calls.length - 1].keys.slice().sort(), ['adversarial', 'power_business', 'route']);
 });
 
-/* ── Task 10 · 画布骨架 / 视口 / 连线 / 快速创建 / 历史栈 ───────────── */
+/* ── Task 8 · 策略编辑器页面助手（替换画布时代 helper） ────────────── */
 
-export const MOD = process.platform === 'darwin' ? 'Meta' : 'Control';
-
-export async function openCanvas() {
+export async function openEditor() {
   await page.goto(routerBase + '/console/routing.html');
-  await page.waitForSelector('#cvStage [data-node-id]', { timeout: 20000 });
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app && app.booted && app.kit);
+    return (app && app.booted && app.policy);
 });
-  await page.waitForTimeout(180);
+  await page.waitForSelector('#policyQuestions .pv-card', { timeout: 20000 });
+  await page.waitForTimeout(150);
 }
 
 export async function appSnapshot() {
   return page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (({
-    viewport: app.kit.getViewport(),
+    return ({
+    booted: app.booted,
+    policyId: app.policyId,
     kind: app.kind(),
-    nodes: app.graph.nodes.map(node => ({
-      id: node.id, type: node.type, question_type: node.question_type || null,
-      operator: node.operator || null, source: node.source || null,
-      position: { x: node.position.x, y: node.position.y }
+    name: app.policy ? app.policy.name : null,
+    questions: Object.keys(app.policy ? app.policy.questions : {}),
+    targets: Object.keys(app.policy ? app.policy.targets : {}),
+    rules: (app.policy ? app.policy.rules : []).map(rule => ({
+      name: rule.name, target: rule.target
 })),
-    edges: app.graph.edges.map(edge => ({
-      id: edge.id, source: edge.source, source_port: edge.source_port,
-      target: edge.target, target_port: edge.target_port,
-      condition: edge.condition ? { op: edge.condition.op, value: edge.condition.value } : edge.condition
-})),
-    selection: app.kit.getSelection(),
+    layout: app.layout,
     history: { undo: store.canUndo, redo: store.canRedo }
-}));
 });
-}
-
-export async function blankPoint() {
-  return page.evaluate(() => {
-    const stage = document.getElementById('cvStage');
-    const rect = stage.getBoundingClientRect();
-    for (let y = rect.top + 14; y < rect.bottom - 130; y += 22) {
-      for (let x = rect.left + 14; x < rect.right - 14; x += 22) {
-        const el = document.elementFromPoint(x, y);
-        if (!el) continue;
-        if (el.closest('[data-node-id]') || el.closest('.rtc-overlay') || el.closest('.rtc-edge-hit')) continue;
-        if (el !== stage && !stage.contains(el)) continue;
-        return { x: x, y: y };
-}
-}
-    return null;
 });
 }
 
@@ -1015,57 +1021,6 @@ export async function clearToasts() {
 
 export async function toastText() {
   return page.evaluate(() => document.getElementById('cvToast').textContent.replace(/\s+/g, ' ').trim());
-}
-
-export async function portPoint(nodeId, portId, dir) {
-  const locator = page.locator(`[data-node-id="${nodeId}"] [data-port-id="${portId}"][data-port-dir="${dir}"]`).first();
-  const box = await locator.boundingBox();
-  assert.ok(box, `port not visible: ${nodeId}.${portId} (${dir})`);
-  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
-}
-
-export async function dragPort(sourceNode, sourcePort, target, options) {
-  const from = await portPoint(sourceNode, sourcePort, 'out');
-  const opts = options || {};
-  await page.mouse.move(from.x, from.y);
-  await page.mouse.down();
-  /* 空槽位只在拖线期间显示：目标坐标必须在 mousedown 之后再取。 */
-  await page.mouse.move(from.x + 26, from.y + 18, { steps: 4 });
-  const point = target && typeof target.node === 'string' && typeof target.port === 'string'
-    ? await portPoint(target.node, target.port, 'in')
-    : target;
-  await page.mouse.move(point.x, point.y, { steps: 10 });
-  if (opts.beforeUp) await opts.beforeUp();
-  await page.mouse.up();
-}
-
-export async function clickNode(nodeId) {
-  const box = await page.locator(`[data-node-id="${nodeId}"]`).first().boundingBox();
-  assert.ok(box, `node not visible: ${nodeId}`);
-  await page.mouse.move(box.x + 24, box.y + 12);
-  await page.mouse.down();
-  await page.mouse.up();
-}
-
-export async function clickEdge(edgeId) {
-  const point = await page.evaluate(id => {
-    const hit = Array.from(document.querySelectorAll('.rtc-edge-hit'))
-      .find(path => path.dataset.edgeId === id);
-    if (!hit) return null;
-    const length = hit.getTotalLength();
-    const matrix = hit.getScreenCTM();
-    for (const ratio of [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9]) {
-      const local = hit.getPointAtLength(length * ratio);
-      const screen = new DOMPoint(local.x, local.y).matrixTransform(matrix);
-      if (document.elementFromPoint(screen.x, screen.y) === hit) return { x: screen.x, y: screen.y };
-}
-    return null;
-}, edgeId);
-  if (point) await page.mouse.click(point.x, point.y);
-  else await page.evaluate(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app.kit.select('edge', id));
-}, edgeId);
 }
 
 /* 负向断言：给异步副作用一个有限的窗口；窗口内出现坏状态即失败。 */
@@ -1104,72 +1059,6 @@ export async function waitFor(predicate, arg, options) {
   throw error;
 }
 
-export async function dragLibraryItem(kind, target) {
-  const item = page.locator(`[data-lib-kind="${kind}"]`);
-  const box = await item.boundingBox();
-  assert.ok(box, `node library item not visible: ${kind}`);
-  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  await page.mouse.down();
-  await page.mouse.move(target.x, target.y, { steps: 12 });
-  await page.mouse.up();
-}
-
-
-/* ── Task 11 · 检查器 / 条件双入口 / 级联删除 ─────────────────────── */
-
-export async function waitCondPop(edgeId) {
-  await page.waitForFunction(id => {
-    const pop = document.getElementById('cvCondPop');
-    return pop && !pop.hidden && pop.dataset.edgeId === id;
-}, edgeId, { timeout: 4000 });
-}
-
-export async function waitInspectorBranch(branch, id) {
-  await page.waitForFunction(([kind, value]) => {
-    const root = document.querySelector('#cvInspectorBody [data-ins-branch]');
-    return root && root.dataset.insBranch === kind && (!value || root.dataset.insId === value);
-}, [branch, id], { timeout: 4000 });
-}
-
-export async function waitEdgeCondition(edgeId, check) {
-  await waitFor(async ([id, expected]) => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const edge = app.graph.edges.find(item => item.id === id);
-    if (!edge) return false;
-    if (expected === null) return edge.condition === null;
-    return edge.condition && Object.keys(expected).every(key => edge.condition[key] === expected[key]);
-
-}, [edgeId, check], { timeout: 4000 });
-}
-
-export async function edgeOf(edgeId) {
-  return page.evaluate(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const edge = app.graph.edges.find(item => item.id === id);
-    return edge ? JSON.parse(JSON.stringify(edge)) : null;
-
-}, edgeId);
-}
-
-export async function danglingEdgeIds() {
-  return page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTGraph = await import('/console/routing/graph.js');
-
-    const graph = app.graph;
-    return graph.edges.filter(edge => {
-      const source = RTGraph.findNode(graph, edge.source);
-      const target = RTGraph.findNode(graph, edge.target);
-      return !source || !target ||
-        !RTGraph.portOf(source, edge.source_port, graph) ||
-        !RTGraph.portOf(target, edge.target_port, graph);
-}).map(edge => edge.id);
-
-});
-}
-
 export async function issueCodes() {
   return page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -1182,33 +1071,32 @@ export async function openIssuesPanel() {
   await page.waitForFunction(() => !document.getElementById('cvIssues').hidden);
 }
 
-
-/* ── Task 12 · 保存 / 启用 / dirty / 导入导出 / 校验定位 ────────────── */
-
-/* 每个 Task 12 用例都从同一份服务端基线开始：power-priority 恢复为示例图并启用。
-   管理面没有 DELETE /admin/trees/{id}，用例新建的组留在临时库里但保持未启用。 */
-export async function putTree(id, payload) {
-  const current = await serverTree(id);
-  return api('PUT', '/admin/trees/' + encodeURIComponent(id), {
-    ...payload,
-    base_document_sha256: current.document_sha256,
-});
+/* 兼容导出：models.mjs 的 import 语句仍列出该名称（画布时代用例已删除，
+   注册在案的健康用例不再调用）。 */
+export async function waitInspectorBranch() {
+  return false;
 }
 
-export async function ensureBaselineTree() {
-  const restored = await putTree(TREE_ID, {
-    id: TREE_ID,
-    name: BASELINE.name,
-    timezone: BASELINE.timezone,
-    sticky: BASELINE.sticky,
-    root: EXAMPLE
-});
-  if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
-  return (await api('GET', '/admin/trees/' + TREE_ID)).tree;
+/* ── Task 8 · 策略资源基线 / dirty / 保存 / 布局 ───────────────────── */
+
+export async function serverPolicyResource(id) {
+  return (await api('GET', '/admin/policies/' + encodeURIComponent(id || POLICY_ID))).policy_resource;
 }
 
-export async function serverTree(id) {
-  return (await api('GET', '/admin/trees/' + encodeURIComponent(id))).tree;
+export async function putPolicy(id, policy) {
+  const current = await serverPolicyResource(id);
+  return api('PUT', '/admin/policies/' + encodeURIComponent(id), policy, {
+    'if-match': current.document_sha256,
+  }).then(result => result.policy_resource);
+}
+
+/* 每个策略用例都从同一份服务端基线开始：power-priority 恢复为示例文档并启用。 */
+export async function ensureBaselinePolicy() {
+  const restored = await putPolicy(POLICY_ID, EXAMPLE);
+  if (!restored.enabled) {
+    await api('POST', '/admin/policies/' + POLICY_ID + '/enable');
+  }
+  return serverPolicyResource(POLICY_ID);
 }
 
 export async function dirtyBadge() {
@@ -1225,37 +1113,6 @@ export async function dirtyBadge() {
 };
 
 });
-}
-
-export async function dragNodeBy(nodeId, dx, dy) {
-  const before = await page.evaluate(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === id);
-    return { x: node.position.x, y: node.position.y };
-
-}, nodeId);
-  const box = await page.locator(`[data-node-id="${nodeId}"]`).first().boundingBox();
-  assert.ok(box, `node not visible: ${nodeId}`);
-  const start = { x: box.x + box.width / 2, y: box.y + 11 };
-  await page.mouse.move(start.x, start.y);
-  await page.mouse.down();
-  await page.mouse.move(start.x + dx, start.y + dy, { steps: 8 });
-  await page.mouse.up();
-  await waitFor(async ([id, previous]) => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === id);
-    return node && (node.position.x !== previous.x || node.position.y !== previous.y);
-
-}, [nodeId, before], { timeout: 4000 });
-  return page.evaluate(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === id);
-    return { x: node.position.x, y: node.position.y };
-
-}, nodeId);
 }
 
 export async function saveNow() {
@@ -1275,23 +1132,6 @@ export async function beforeUnloadBlocked() {
 });
 }
 
-export async function exportViaUi() {
-  const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
-  await page.locator('#cvExport').click();
-  const download = await downloadPromise;
-  const file = await download.path();
-  assert.ok(file, 'browser download has no local path');
-  return { name: download.suggestedFilename(), text: fs.readFileSync(file, 'utf8') };
-}
-
-export async function setImportPayload(payload, name) {
-  await page.locator('#cvImportFile').setInputFiles({
-    name: name || 'graph.sr-routing-graph-v3.json',
-    mimeType: 'application/json',
-    buffer: Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload))
-});
-}
-
 export async function waitConfirmDialog() {
   await page.waitForSelector('#cvConfirmModal:not([hidden])', { timeout: 4000 });
   return page.locator('#cvConfirmBody').innerText();
@@ -1304,200 +1144,10 @@ export async function waitToastIncludes(fragment, timeout) {
 }, fragment, { timeout: timeout || 6000 });
 }
 
-
-/* ── Task 13 · 真实试算 / trace-only 回放 / 轨迹抽屉 / 波次布局 ─────── */
-
-/* 样例输入是「文本 + 固定 now」的请求预设：断言用 fixture 的文本/时间，
-   但答案永远从实时 /admin/try 读，QA 不把 fixture answers 传给页面。 */
-export const TRY_SAMPLES = FIXTURE.scenarios.map(scenario => ({
-  id: scenario.id,
-  name: scenario.name,
-  text: scenario.text,
-  now: scenario.now
-}));
-
-export async function prepareTryCanvas() {
-  await ensureBaselineTree();
-  await openCanvas();
-  const treeId = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app.treeId);
-});
-  if (treeId !== TREE_ID) {
-    await page.evaluate(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app.selectTree(id));
-}, TREE_ID);
-    await waitFor(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app.treeId === id && app.booted);
-},
-      TREE_ID, { timeout: 10000 });
-}
-  await waitFor(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app && !app.tryRunning);
-});
-}
-
-export async function waitTryResult(expected) {
-  await waitFor(async want => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const replay = app.replay;
-    if (!replay || app.tryRunning) return false;
-    if (!want) return true;
-    if (want.text != null && replay.text !== want.text) return false;
-    if (want.now !== undefined && (replay.now || null) !== want.now) return false;
-    return true;
-
-}, expected || null, { timeout: 15000 });
-}
-
-export async function runTrySample(index) {
-  const sample = TRY_SAMPLES[index];
-  assert.ok(sample, `missing scenario fixture at index ${index}`);
-  await page.locator(`[data-try-sample="${index}"]`).click();
-  await waitTryResult({ text: sample.text, now: sample.now });
-  return sample;
-}
-
-export async function runTryManual(text) {
-  await page.locator('#cvTryInput').fill(text);
-  await page.locator('#cvTryRun').click();
-  await waitTryResult({ text: text });
-}
-
-/* 一次性读取回放数据 + 卡片/边/结论/抽屉的 DOM 状态；所有断言都基于
-   页面公开状态（App.replay / data-* / class），不猜内部实现。 */
-export async function trySnapshot() {
-  return page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const replay = app.replay;
-    if (!replay) return null;
-    const nodeEl = id => document.querySelector(`#cvNodes [data-node-id="${id}"]`);
-    const textOf = (el, sel) => {
-      if (!el) return '';
-      const target = el.querySelector(sel);
-      return target ? target.textContent.replace(/\s+/g, ' ').trim() : '';
-};
-    const nodeInfo = id => {
-      const el = nodeEl(id);
-      if (!el) return null;
-      const live = {};
-      Array.prototype.forEach.call(el.querySelectorAll('[data-live]'), item => {
-        live[item.dataset.live] = item.textContent.trim();
-});
-      return {
-        replay: el.dataset.replay || '',
-        replayKind: el.dataset.replayKind || '',
-        classes: el.className,
-        state: textOf(el, '.rtc-card-h [data-live="state"]'),
-        foot: textOf(el, '.rtc-tfoot [data-live="state"]'),
-        gate: textOf(el, '.rtc-gate'),
-        selectedOptions: Array.prototype.map.call(el.querySelectorAll('.rtc-opt.is-sel'),
-          row => row.dataset.optkey),
-        keywordClasses: Array.prototype.map.call(el.querySelectorAll('.rtc-kw'),
-          chip => chip.className),
-        live: live
-};
-};
-    const slotInfo = (nodeId, port) => {
-      const row = document.querySelector(
-        `#cvNodes [data-node-id="${nodeId}"] .rtc-slot[data-slot="${port}"]`);
-      if (!row) return null;
-      const live = row.querySelector('.rtc-live');
-      return {
-        classes: row.className,
-        status: row.dataset.status || '',
-        edge: row.dataset.edge || '',
-        live: live ? live.textContent.trim() : ''
-};
-};
-    const edges = {};
-    Array.prototype.forEach.call(document.querySelectorAll('#cvEdges path.rtc-edge'), path => {
-      edges[path.dataset.edgeId] = path.className.baseVal;
-});
-    return {
-      id: replay.id,
-      text: replay.text,
-      now: replay.now,
-      final: replay.final ? {
-        target_id: replay.final.target_id,
-        kind: replay.final.kind,
-        selection_reason: replay.final.selection_reason,
-        model: replay.final.model,
-        priority: replay.final.priority,
-        candidates: replay.final.candidates
-} : null,
-      waves: replay.waves.map(wave => ({
-        wave: wave.wave,
-        questions: wave.questions,
-        duration_ms: wave.duration_ms,
-        failed: wave.failed,
-        error: wave.error
-})),
-      nodeStates: replay.nodeStates,
-      edgeStates: replay.edgeStates,
-      candidates: replay.candidates,
-      nodes: {
-        start: nodeInfo('start'),
-        capability: nodeInfo('capability'),
-        domain: nodeInfo('domain'),
-        clarify: nodeInfo('clarify'),
-        'and-power': nodeInfo('and-power'),
-        'or-ctx': nodeInfo('or-ctx'),
-        'not-cap': nodeInfo('not-cap'),
-        'and-follow': nodeInfo('and-follow'),
-        'cond-text': nodeInfo('cond-text'),
-        'cond-peak': nodeInfo('cond-peak'),
-        'power-target': nodeInfo('power-target'),
-        'strong-target': nodeInfo('strong-target'),
-        'deep-target': nodeInfo('deep-target'),
-        'standard-target': nodeInfo('standard-target'),
-        'light-target': nodeInfo('light-target')
-},
-      slots: {
-        andPowerIn1: slotInfo('and-power', 'in_1'),
-        andPowerIn2: slotInfo('and-power', 'in_2'),
-        deepIn1: slotInfo('deep-target', 'in_1'),
-        clarifyIn1: slotInfo('clarify', 'in_1'),
-        powerIn1: slotInfo('power-target', 'in_1'),
-        lightIn1: slotInfo('light-target', 'in_1')
-},
-      edges: edges,
-      svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
-      resultHidden: document.getElementById('cvTryResult').hidden,
-      resultText: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
-      resultFinal: document.getElementById('cvTryResult').dataset.final || '',
-      resultKind: document.getElementById('cvTryResult').dataset.kind || '',
-      hudHidden: document.getElementById('cvReplayHud').hidden,
-      hudText: document.getElementById('cvReplayHud').textContent.replace(/\s+/g, ' ').trim(),
-      hudTitles: Array.prototype.map.call(
-        document.querySelectorAll('#cvReplayHud [data-hud-wave]'),
-        el => el.getAttribute('title') || ''),
-      drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-      drawerWaveCount: document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave').length,
-      drawerWaveTexts: Array.prototype.map.call(
-        document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave'),
-        el => el.textContent.replace(/\s+/g, ' ').trim()),
-      drawerText: document.getElementById('cvTraceDrawer').textContent.replace(/\s+/g, ' ').trim(),
-      running: app.tryRunning,
-      runDisabled: document.getElementById('cvTryRun').disabled,
-      topRunDisabled: document.getElementById('cvTryBtn').disabled,
-      palCollapsed: document.getElementById('cvPalette').classList.contains('is-collapsed'),
-      inspCollapsed: document.getElementById('cvInspector').classList.contains('is-collapsed')
-};
-
-});
-}
-
 export function assertIncludes(haystack, needle, message) {
   assert.ok(String(haystack).indexOf(needle) >= 0,
     `${message || 'missing text'} (wanted ${JSON.stringify(needle)} in ${JSON.stringify(String(haystack).slice(0, 400))})`);
 }
-
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
@@ -1585,13 +1235,12 @@ export async function runIfMain(metaUrl) {
 
 async function main() {
   /* 静态 import 会先于本文件执行（页面模块又反向 import 本文件的注册器），
-     因此页面模块在 main 里动态加载，确保基座初始化完成后再注册用例。 */
-  await import('./console_qa/canvas.mjs');
-  await import('./console_qa/inspector.mjs');
-  await import('./console_qa/tryrun.mjs');
-  await import('./console_qa/logs.mjs');
-  await import('./console_qa/models.mjs');
+     因此页面模块在 main 里动态加载，确保基座初始化完成后再注册用例。
+     Task 8 注册表裁决：canvas / inspector（画布时代）与 tryrun / logs
+     （页面待 Task 9 重写）退出注册，只保留 testchat / models / policy。 */
   await import('./console_qa/testchat.mjs');
+  await import('./console_qa/models.mjs');
+  await import('./console_qa/policy.mjs');
   console.log(`[console-qa] registered cases: ${checks.length}`);
   await runRegisteredCases();
 }

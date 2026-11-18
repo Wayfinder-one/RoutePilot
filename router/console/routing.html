@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>RoutePilot · 决策组</title>
+<title>RoutePilot · 路由策略</title>
 <link rel="icon" href="data:"><link rel="stylesheet" href="shared.css"><link rel="stylesheet" href="routing.css">
 </head>
 <body data-page="routing">
@@ -12,53 +12,45 @@
   <symbol id="ri-undo" viewBox="0 0 16 16"><path d="M6.2 4.4 3.2 8l3 3.6"/><path d="M3.4 8h6.1a3.3 3.3 0 0 1 0 6.6H6.6"/></symbol>
   <symbol id="ri-redo" viewBox="0 0 16 16"><path d="M9.8 4.4 12.8 8l-3 3.6"/><path d="M12.6 8H6.5a3.3 3.3 0 0 0 0 6.6h2.9"/></symbol>
   <symbol id="ri-layout" viewBox="0 0 16 16"><rect x="2.4" y="2.4" width="4.2" height="4.2" rx="1"/><rect x="9.4" y="2.4" width="4.2" height="4.2" rx="1"/><rect x="5.9" y="9.4" width="4.2" height="4.2" rx="1"/><path d="M6.6 4.5h2.8M4.5 6.6v2.4M11.5 6.6v2.4"/></symbol>
-  <symbol id="ri-import" viewBox="0 0 16 16"><path d="M8 2.6v7.6"/><path d="M5 7.2l3 3 3-3"/><path d="M3 13.4h10"/></symbol>
-  <symbol id="ri-export" viewBox="0 0 16 16"><path d="M8 13V5.4"/><path d="M5 8.4l3-3 3 3"/><path d="M3 2.6h10"/></symbol>
+  <symbol id="ri-newtree" viewBox="0 0 16 16"><path d="M3.4 2.8h6.2l3 2.8"/><path d="M3.4 2.8v10.4h4.4"/><path d="M11.6 9.4v3.8M9.7 11.3h3.8"/></symbol>
+  <symbol id="ri-sample" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="6.6" height="6.6" rx="1"/><path d="M6.4 5.8h6.8v7.4H6.4z"/></symbol>
   <symbol id="ri-play" viewBox="0 0 16 16"><path d="M5.8 3.6v8.8L13 8z" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-save" viewBox="0 0 16 16"><path d="M3.4 2.8h6.4L12.8 5.8V13.2H3.4z"/><path d="M5.6 2.8v3.1h4.6V2.8"/><path d="M5.4 13.2V9.5h5.2v3.7"/></symbol>
   <symbol id="ri-alert" viewBox="0 0 16 16"><path d="M8 2.6l5.6 10.2H2.4z"/><path d="M8 6.4v3.1"/><circle cx="8" cy="11.2" r=".72" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-check" viewBox="0 0 16 16"><path d="M3.2 8.6 6.2 11.6 12.8 4.9"/></symbol>
   <symbol id="ri-chev" viewBox="0 0 16 16"><path d="M6 3.6 10.4 8 6 12.4"/></symbol>
-  <symbol id="ri-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="3.7"/><path d="M9.8 9.8 13 13"/></symbol>
   <symbol id="ri-plus" viewBox="0 0 16 16"><path d="M8 3.4v9.2M3.4 8h9.2"/></symbol>
-  <symbol id="ri-fit" viewBox="0 0 16 16"><path d="M2.6 6V2.6H6M10 2.6h3.4V6M13.4 10v3.4H10M6 13.4H2.6V10"/></symbol>
   <symbol id="ri-close" viewBox="0 0 16 16"><path d="M4.2 4.2l7.6 7.6M11.8 4.2l-7.6 7.6"/></symbol>
-  <symbol id="ri-start" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6"/><path d="M6.6 5.4v5.2L10.8 8z" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ri-question" viewBox="0 0 16 16"><path d="M3 3.2h10v6.2H7.6L4.6 12v-2.6H3z"/><path d="M6.1 5.9h3.8M6.1 7.6h2.4"/></symbol>
   <symbol id="ri-logic" viewBox="0 0 16 16"><path d="M4.6 3.2v9.6h3.2a4.8 4.8 0 0 0 0-9.6z"/><path d="M2.4 8h2.2M11.2 5.4h1.9M11.2 10.6h1.9"/></symbol>
   <symbol id="ri-condition" viewBox="0 0 16 16"><path d="M2.4 3.4h11.2L9.4 8.6v4.2l-2.8 1V8.6z"/></symbol>
   <symbol id="ri-target" viewBox="0 0 16 16"><rect x="2.8" y="2.8" width="10.4" height="4" rx="1"/><rect x="2.8" y="9.2" width="10.4" height="4" rx="1"/><circle cx="5.1" cy="4.8" r=".7" fill="currentColor" stroke="none"/><circle cx="5.1" cy="11.2" r=".7" fill="currentColor" stroke="none"/></symbol>
-  <symbol id="ri-help" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M6.3 6.1a1.8 1.8 0 1 1 2.3 1.7c-.4.2-.6.5-.6.9v.3"/><circle cx="8" cy="11.4" r=".7" fill="currentColor" stroke="none"/></symbol>
-  <symbol id="ri-link" viewBox="0 0 16 16"><path d="M6.2 9.8 9.8 6.2"/><path d="M7 4.4 8.4 3a2.8 2.8 0 0 1 4 4L11 8.4M9 11.6 7.6 13a2.8 2.8 0 0 1-4-4L5 7.6"/></symbol>
-  <symbol id="ri-newtree" viewBox="0 0 16 16"><path d="M3.4 2.8h6.2l3 2.8"/><path d="M3.4 2.8v10.4h4.4"/><path d="M11.6 9.4v3.8M9.7 11.3h3.8"/></symbol>
-  <symbol id="ri-sample" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="6.6" height="6.6" rx="1"/><path d="M6.4 5.8h6.8v7.4H6.4z"/></symbol>
 </svg>
 
 <main class="rtc-main">
   <!-- ── 顶栏 ───────────────────────────────────────────────────── -->
   <header class="rtc-pagehead">
     <div class="rtc-headl">
-      <div class="rtc-crumb"><span data-i18n="cv.crumb"></span></div>
+      <div class="rtc-crumb"><span data-i18n="pv.crumb"></span></div>
       <div class="rtc-h1">
-        <select id="cvTreeSelect" class="rtc-treeselect" data-i18n-aria="cv.group" aria-label="决策组"></select>
+        <select id="cvPolicySelect" class="rtc-treeselect" data-i18n-aria="pv.policy" aria-label="路由策略"></select>
+        <button type="button" class="btn sm rtc-iconbtn" id="cvDeletePolicy" data-i18n-aria="pv.deletePolicy" title="删除策略"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-close"/></svg></button>
         <span class="pill rtc-rev" id="cvRevision">—</span>
-        <span class="pill ok" id="cvEnabled" hidden><span class="dot"></span><span id="cvEnabledLabel" data-i18n="cv.enabled"></span></span>
-        <span class="pill ok" id="cvClean"><span class="dot"></span><span data-i18n="cv.saved"></span></span>
+        <span class="pill ok" id="cvEnabled" hidden><span class="dot"></span><span id="cvEnabledLabel" data-i18n="pv.enabled"></span></span>
+        <span class="pill ok" id="cvClean"><span class="dot"></span><span data-i18n="pv.saved"></span></span>
         <span class="pill warn" id="cvDirty" data-kind="clean" hidden></span>
       </div>
     </div>
     <div class="rtc-headr">
       <div class="rtc-actions">
-        <button type="button" class="btn sm rtc-iconbtn" id="cvUndo" data-i18n-aria="cv.undo" title="撤销（⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-undo"/></svg></button>
-        <button type="button" class="btn sm rtc-iconbtn" id="cvRedo" data-i18n-aria="cv.redo" title="重做（⇧⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-redo"/></svg></button>
-        <button type="button" class="btn sm" id="cvAutoLayout"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-layout"/></svg><span data-i18n="cv.autoLayout"></span></button>
-        <button type="button" class="btn sm" id="cvNewTree"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-newtree"/></svg><span data-i18n="cv.newTree"></span></button>
-        <button type="button" class="btn sm" id="cvLoadExample"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-sample"/></svg><span data-i18n="cv.loadExample"></span></button>
-        <button type="button" class="btn sm" id="cvImport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-import"/></svg><span data-i18n="cv.import"></span></button>
-        <button type="button" class="btn sm" id="cvExport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-export"/></svg><span data-i18n="cv.export"></span></button>
-        <button type="button" class="btn sm" id="cvTryBtn"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg><span data-i18n="cv.try"></span></button>
-        <button type="button" class="btn sm pri" id="cvSave"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-save"/></svg><span data-i18n="cv.save"></span></button>
-        <button type="button" class="btn sm rtc-enable" id="cvEnable"><span class="rtc-swt"></span><span id="cvEnableLabel">未启用</span></button>
+        <button type="button" class="btn sm rtc-iconbtn" id="cvUndo" data-i18n-aria="pv.undo" title="撤销"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-undo"/></svg></button>
+        <button type="button" class="btn sm rtc-iconbtn" id="cvRedo" data-i18n-aria="pv.redo" title="重做"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-redo"/></svg></button>
+        <button type="button" class="btn sm" id="cvNewPolicy"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-newtree"/></svg><span data-i18n="pv.newPolicy"></span></button>
+        <button type="button" class="btn sm" id="cvLoadExample"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-sample"/></svg><span data-i18n="pv.loadExample"></span></button>
+        <button type="button" class="btn sm" id="cvTryBtn"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg><span data-i18n="pv.try"></span></button>
+        <button type="button" class="btn sm" id="cvSaveLayout"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-layout"/></svg><span data-i18n="pv.saveLayout"></span></button>
+        <button type="button" class="btn sm pri" id="cvSave"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-save"/></svg><span data-i18n="pv.save"></span></button>
+        <button type="button" class="btn sm rtc-enable" id="cvEnable"><span class="rtc-swt"></span><span id="cvEnableLabel" data-i18n="pv.disabled"></span></button>
         <button type="button" class="pill rtc-issues-btn" id="cvIssuesBtn" aria-expanded="false">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-alert"/></svg>
           <span id="cvIssueText">0 错误 · 0 提示</span>
@@ -67,108 +59,71 @@
     </div>
   </header>
 
-  <!-- ── 校验条（点击展开） ─────────────────────────────────────── -->
-  <div class="rtc-issues" id="cvIssues" hidden role="region" data-i18n-aria="cv.issues"></div>
+  <!-- ── 校验条（422 issue 点击定位到编辑器） ─────────────────── -->
+  <div class="rtc-issues" id="cvIssues" hidden role="region" data-i18n-aria="pv.issues"></div>
 
-  <!-- ── 画布工作区 ─────────────────────────────────────────────── -->
-  <div class="rtc-workspace">
-    <div class="rtc-stage" id="cvStage">
-      <div class="rtc-world" id="cvWorld">
-        <svg class="rtc-edges" id="cvEdges" aria-hidden="true"></svg>
-        <div class="rtc-nodes" id="cvNodes"></div>
-      </div>
-    </div>
-
-    <!-- 左上 · 节点库 -->
-    <aside class="rtc-palette rtc-overlay" id="cvPalette" data-overlay data-i18n-aria="cv.palette">
-      <div class="rtc-pal-h">
-        <span class="rtc-pal-t"><span data-i18n="cv.palette"></span><small data-i18n="cv.paletteHint"></small></span>
-        <button type="button" class="rtc-pal-toggle" id="cvPalToggle" data-i18n-aria="cv.paletteToggle" data-i18n-title="cv.paletteToggle">
-          <svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg>
-        </button>
-      </div>
-      <label class="rtc-pal-search">
-        <svg class="rtc-ic" aria-hidden="true"><use href="#ri-search"/></svg>
-        <input type="text" id="cvPalSearch" autocomplete="off" spellcheck="false">
-      </label>
-      <div class="rtc-pal-body" id="cvPalBody" data-scrollable></div>
-      <div class="rtc-pal-mini" id="cvPalMini"></div>
-      <div class="rtc-pal-foot" data-i18n="cv.paletteFoot"></div>
-    </aside>
-
-    <!-- 右上 · 检查器（选中节点/边/图设置的分支表单） -->
-    <aside class="rtc-inspector rtc-overlay" id="cvInspector" data-overlay data-i18n-aria="cv.inspector">
-      <div class="rtc-insp-h">
-        <span class="rtc-insp-tt" data-i18n="cv.inspector"></span>
-        <span class="rtc-insp-sub" id="cvInspectorSub">root</span>
-        <button type="button" class="rtc-insp-toggle" id="cvInspToggle"
-          data-i18n-aria="cv.inspectorToggle" data-i18n-title="cv.inspectorToggle" aria-expanded="true">
-          <svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg>
-        </button>
-      </div>
-      <div class="rtc-insp-body" id="cvInspectorBody" data-scrollable></div>
-    </aside>
-
-    <!-- 左下 · 缩放 + 图例 -->
-    <div class="rtc-zoom rtc-overlay" id="cvZoom" data-overlay>
-      <div class="rtc-zoom-row">
-        <button type="button" class="rtc-zbtn" data-act="zoom-out" data-i18n-aria="cv.zoomOut" title="缩小">−</button>
-        <button type="button" class="rtc-zpct" id="cvZoomLabel" data-act="zoom-reset" data-i18n-aria="cv.zoomReset" title="恢复到 100%">100%</button>
-        <button type="button" class="rtc-zbtn" data-act="zoom-in" data-i18n-aria="cv.zoomIn" title="放大">＋</button>
-        <span class="rtc-zsep"></span>
-        <button type="button" class="rtc-zfit" data-act="zoom-fit">
-          <svg class="rtc-ic" aria-hidden="true"><use href="#ri-fit"/></svg><span data-i18n="cv.zoomFit"></span>
-        </button>
-      </div>
-      <div class="rtc-legend">
-        <span><i class="rtc-ln rtc-ln--num"></i><span data-i18n="cv.legendNum"></span></span>
-        <span><i class="rtc-ln rtc-ln--bool"></i><span data-i18n="cv.legendBool"></span></span>
-      </div>
-    </div>
-
-    <!-- 右下 · 小地图 -->
-    <div class="rtc-minimap rtc-overlay" id="cvMinimap" data-overlay title="小地图">
-      <svg id="cvMinimapSvg" viewBox="0 0 168 104" aria-hidden="true"></svg>
-    </div>
-
-    <!-- 回放 HUD · 当前运行的波次胶囊（波次头带命中槽位条件 tooltip） -->
-    <div class="rtc-hud" id="cvReplayHud" hidden></div>
-  </div>
-
-  <!-- 执行区 · 试算输入/结论 + 执行轨迹；停靠在画布下方，与编辑区完全分离 -->
-  <section class="rtc-exec" id="cvExecZone">
-    <section class="rtc-trybar" id="cvTryBar" data-i18n-aria="cv.try">
-      <div class="rtc-try-row">
-        <span class="rtc-try-ico"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg></span>
-        <input type="text" id="cvTryInput" autocomplete="off" spellcheck="false">
-        <button type="button" class="btn sm pri" id="cvTryRun" data-i18n="cv.tryRun">运行试算</button>
-      </div>
-      <div class="rtc-try-chips" id="cvTryChips"></div>
-      <!-- 试算结论（成功后展开） -->
-      <div class="rtc-try-res" id="cvTryResult" hidden></div>
+  <!-- ── 策略编辑器：五个明确区域（brief Step 5） ─────────────── -->
+  <div class="rtc-editor">
+    <section id="policyQuestions" class="pv-sec" aria-label="问题">
+      <header class="pv-sec-h">
+        <button type="button" class="pv-sec-toggle" data-act="sec-toggle" data-sec="policyQuestions" aria-expanded="true" data-i18n-aria="pv.secToggle"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg></button>
+        <h2><svg class="rtc-ic" aria-hidden="true"><use href="#ri-question"/></svg><span data-i18n="pv.sec.questions"></span></h2>
+        <span class="flex-spacer"></span>
+        <button type="button" class="btn sm dashed" data-act="q-add"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-plus"/></svg><span data-i18n="pv.q.add"></span></button>
+      </header>
+      <div class="pv-sec-body" data-sec-body></div>
     </section>
-    <div class="rtc-trace" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
-  </section>
+
+    <section id="policyTargets" class="pv-sec" aria-label="目标">
+      <header class="pv-sec-h">
+        <button type="button" class="pv-sec-toggle" data-act="sec-toggle" data-sec="policyTargets" aria-expanded="true" data-i18n-aria="pv.secToggle"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg></button>
+        <h2><svg class="rtc-ic" aria-hidden="true"><use href="#ri-target"/></svg><span data-i18n="pv.sec.targets"></span></h2>
+        <span class="flex-spacer"></span>
+        <button type="button" class="btn sm dashed" data-act="t-add"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-plus"/></svg><span data-i18n="pv.t.add"></span></button>
+      </header>
+      <div class="pv-sec-body" data-sec-body></div>
+    </section>
+
+    <section id="policyRules" class="pv-sec" aria-label="规则">
+      <header class="pv-sec-h">
+        <button type="button" class="pv-sec-toggle" data-act="sec-toggle" data-sec="policyRules" aria-expanded="true" data-i18n-aria="pv.secToggle"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg></button>
+        <h2><svg class="rtc-ic" aria-hidden="true"><use href="#ri-logic"/></svg><span data-i18n="pv.sec.rules"></span></h2>
+        <span class="pill warn pv-first-hit"><span class="dot"></span><span data-i18n="pv.firstHit"></span></span>
+        <span class="flex-spacer"></span>
+        <button type="button" class="btn sm dashed" data-act="r-add"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-plus"/></svg><span data-i18n="pv.r.add"></span></button>
+      </header>
+      <div class="pv-sec-body" data-sec-body></div>
+    </section>
+
+    <section id="policySettings" class="pv-sec" aria-label="策略设置">
+      <header class="pv-sec-h">
+        <button type="button" class="pv-sec-toggle" data-act="sec-toggle" data-sec="policySettings" aria-expanded="true" data-i18n-aria="pv.secToggle"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg></button>
+        <h2><svg class="rtc-ic" aria-hidden="true"><use href="#ri-condition"/></svg><span data-i18n="pv.sec.settings"></span></h2>
+      </header>
+      <div class="pv-sec-body" data-sec-body></div>
+    </section>
+
+    <section id="policyTry" class="pv-sec" aria-label="试算">
+      <header class="pv-sec-h">
+        <button type="button" class="pv-sec-toggle" data-act="sec-toggle" data-sec="policyTry" aria-expanded="true" data-i18n-aria="pv.secToggle"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-chev"/></svg></button>
+        <h2><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg><span data-i18n="pv.sec.try"></span></h2>
+        <span class="pv-mut" data-i18n="pv.tryHint"></span>
+      </header>
+      <div class="pv-sec-body">
+        <div class="pv-try-row">
+          <input type="text" id="cvTryInput" autocomplete="off" spellcheck="false" data-i18n-placeholder="pv.tryPlaceholder">
+          <button type="button" class="btn sm pri" id="cvTryRun" data-i18n="pv.tryRun">运行试算</button>
+        </div>
+        <div class="pv-try-res" id="cvTryResult" hidden></div>
+      </div>
+    </section>
+  </div>
 </main>
 
-<!-- 端口拖到空白 · 快速创建兼容节点 -->
-<div class="rtc-quick" id="cvQuick" hidden role="dialog" data-i18n-aria="cv.quickTitle"></div>
-
-<!-- 输入槽位条件编辑浮层（condpop.js 渲染表单） -->
-<div class="rtc-condpop" id="cvCondPop" hidden role="dialog" data-i18n-aria="cv.condTitle"></div>
-
-<!-- 删除确认 -->
-<div class="rtc-modal" id="cvDeleteModal" hidden>
-  <div class="rtc-dialog" id="cvDeleteBody" role="dialog" aria-modal="true"></div>
-</div>
-
-<!-- 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） -->
+<!-- 丢弃草稿 / 删除策略确认 -->
 <div class="rtc-modal" id="cvConfirmModal" hidden>
   <div class="rtc-dialog" id="cvConfirmBody" role="dialog" aria-modal="true"></div>
 </div>
-
-<!-- 导入 v3 图（隐藏文件选择器） -->
-<input type="file" id="cvImportFile" accept=".json,application/json" hidden>
 
 <!-- toast -->
 <div class="rtc-toasts" id="cvToast" role="status" aria-live="polite"></div>

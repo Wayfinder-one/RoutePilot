@@ -537,14 +537,14 @@ panel.addEventListener('drop', event => {
 });
 
 async function boot() {
-  const [models, me, trees] = await Promise.all([
-    api.get('/admin/models'), api.me(), api.get('/admin/trees'),
+  const [models, me, policies] = await Promise.all([
+    api.get('/admin/models'), api.me(), api.get('/admin/policies'),
   ]);
   state.models = models.models || [];
   /* 未知角色 fail closed：只有明确的 admin 才能发测试请求。 */
   state.role = me.role || 'viewer';
-  const active = (trees.trees || []).find(tree => tree.enabled);
-  state.activeTree = active ? (active.name || active.id) : '';
+  const active = (policies.policies || []).find(item => item.enabled);
+  state.activeTree = active ? ((active.policy && active.policy.name) || active.id) : '';
   renderModelOptions();
   renderStatus();
   updateSendState();
