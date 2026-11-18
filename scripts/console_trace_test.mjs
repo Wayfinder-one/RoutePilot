@@ -57,6 +57,27 @@ test('build renders one JEV and ordered rule results without waves', () => {
   assert.equal(JSON.stringify(model).includes('wave'), false);
 });
 
+test('JEV block renders the duration with a single unit', () => {
+  /* 模板不带单位，单位由 msText 统一给出：45 → 45ms，绝不出现 45msms。 */
+  const withDuration = jevHtml(build([
+    { event: 'jev', questions: ['route', 'risk'], duration_ms: 45, failed: false, error: null },
+  ]));
+  assert.ok(withDuration.includes('45ms'), 'the JEV duration is missing its unit');
+  assert.equal(withDuration.includes('45msms'), false,
+    'the JEV duration rendered a doubled unit');
+  /* 长耗时沿用 msText 的秒级格式。 */
+  const slow = jevHtml(build([
+    { event: 'jev', questions: ['route'], duration_ms: 1200, failed: false, error: null },
+  ]));
+  assert.ok(slow.includes('1.20s'), 'long JEV durations must keep the msText seconds format');
+  /* 缺失耗时干净地显示 —，不渲染 —ms。 */
+  const missing = jevHtml(build([
+    { event: 'jev', questions: ['route'], duration_ms: null, failed: false, error: null },
+  ]));
+  assert.ok(missing.includes('—'), 'a missing JEV duration must render the dash');
+  assert.equal(missing.includes('—ms'), false, 'a missing JEV duration rendered a dangling unit');
+});
+
 test('build ignores slot/gate/activate/wave events entirely', () => {
   const model = build([
     { event: 'wave', wave: 1, questions: ['route'], duration_ms: 9, failed: false },
