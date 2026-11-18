@@ -72,7 +72,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 | Page | Content |
 |---|---|
 | Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
-| Routing policy | Five-section editor (settings, questions, targets, rules), ordered rules, validation, dry run, import/export, independent layout |
+| Routing policy | Five-section editor (questions, targets, rules, settings, try), ordered rules, validation, dry run, import/export, independent layout |
 | Calc Log | Recent decisions with model, target, matched rule, JEV answers, upstream outcome, replayable trace |
 | JEV Model | Endpoint, model, prompt/state template, connection test, context and input-token window |
 | Models | Model registry, upstream model ids, providers, reasoning declarations, capability notes |
@@ -104,7 +104,7 @@ The routing page edits the policy document itself — no second behavior model.
 
 - Input field, run button.
 - Result: matched rule, final target and models, fallback flag with its reason, JEV answers.
-- Trace: one JEV block plus one verdict card per rule in backend order, then the final target.
+- Trace: one JEV block plus a verdict card for each evaluated rule in backend order, then the final target.
 
 Dry runs never write disk, snapshot, sticky or inflight state and never call upstream models. The console only renders the backend's answers and rule verdicts — it implements no routing logic of its own.
 
@@ -114,7 +114,7 @@ Save and enable are separate; dirty and layout-only states are shown in the tool
 
 Expanded rows show the decision in order: input preparation, the single JEV call, per-rule verdicts, final target, model scheduling, execution result. Fallback rows name the reason: `jev_error` (the decision call failed, timed out or returned invalid answers) or `no_rule_matched` (answers were fine but no rule hit). A `routing_error` keeps the partial process up to the failure point: a schedule-stage failure keeps the scheduling snapshot (configured, registered, available, unavailable reasons, pre-selection inflight), and a failed decision call falls to the policy fallback. Direct model records show zero JEV calls. Records without a scheduling snapshot and restored ledger rows report the missing detail explicitly.
 
-SQLite stores ledger fields only — no request text, trace, answers or node labels. The page reads the last 20 live records from an in-process ring; calculation detail is replica-local and not persisted.
+SQLite stores ledger fields only — no request text, trace, answers or rule names. The page reads the last 20 live records from an in-process ring; calculation detail is replica-local and not persisted.
 
 ## Routing policy
 
