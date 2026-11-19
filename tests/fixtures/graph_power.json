@@ -1,0 +1,341 @@
+{
+  "id": "root",
+  "type": "graph",
+  "nodes": [
+    {
+      "id": "start",
+      "type": "start",
+      "position": {
+        "x": 20,
+        "y": 150
+      }
+    },
+    {
+      "id": "cond-text",
+      "type": "condition",
+      "source": "text",
+      "contains_any": [
+        "抢修",
+        "停电",
+        "故障"
+      ],
+      "position": {
+        "x": 170,
+        "y": 10
+      }
+    },
+    {
+      "id": "cond-peak",
+      "type": "condition",
+      "source": "periods",
+      "periods": [
+        "peak"
+      ],
+      "position": {
+        "x": 170,
+        "y": 100
+      }
+    },
+    {
+      "id": "capability",
+      "type": "question",
+      "question_type": "choice",
+      "title": "capability",
+      "instructions": "这条请求需要哪个模型能力档位？请结合问题复杂度、领域和输出长度判断。",
+      "options": [
+        {
+          "key": "easy",
+          "label": "轻量模型",
+          "capability": "简单问答、格式转换和短翻译。"
+        },
+        {
+          "key": "standard",
+          "label": "标准模型",
+          "capability": "中等复杂度写作、总结与纠错。"
+        },
+        {
+          "key": "strong",
+          "label": "增强模型",
+          "capability": "复杂分析、方案设计和深度推理。"
+        }
+      ],
+      "position": {
+        "x": 170,
+        "y": 195
+      }
+    },
+    {
+      "id": "domain",
+      "type": "question",
+      "question_type": "noul",
+      "title": "domain",
+      "instructions": "这条请求是否需要电力行业的业务知识与规程？",
+      "position": {
+        "x": 170,
+        "y": 440
+      }
+    },
+    {
+      "id": "or-ctx",
+      "type": "logic",
+      "operator": "or",
+      "position": {
+        "x": 420,
+        "y": 20
+      }
+    },
+    {
+      "id": "not-cap",
+      "type": "logic",
+      "operator": "not",
+      "position": {
+        "x": 420,
+        "y": 190
+      }
+    },
+    {
+      "id": "and-follow",
+      "type": "logic",
+      "operator": "and",
+      "position": {
+        "x": 640,
+        "y": 80
+      }
+    },
+    {
+      "id": "and-power",
+      "type": "logic",
+      "operator": "and",
+      "position": {
+        "x": 640,
+        "y": 340
+      }
+    },
+    {
+      "id": "clarify",
+      "type": "question",
+      "question_type": "noul",
+      "title": "clarify",
+      "instructions": "是否需要按抢修优先级进一步处理？",
+      "position": {
+        "x": 860,
+        "y": 20
+      }
+    },
+    {
+      "id": "deep-target",
+      "type": "target",
+      "priority": 4,
+      "capability": "最深推理：复杂方案与长链分析",
+      "position": {
+        "x": 1080,
+        "y": 20
+      },
+      "models": [
+        {
+          "model": "deepseek-v3",
+          "reasoning": "high"
+        }
+      ]
+    },
+    {
+      "id": "power-target",
+      "type": "target",
+      "priority": 5,
+      "capability": "国网电力专用：设备故障、抢修工单、电力规程",
+      "position": {
+        "x": 1080,
+        "y": 150
+      },
+      "models": [
+        {
+          "model": "qwen3.8-flash-sft",
+          "reasoning": "high"
+        }
+      ]
+    },
+    {
+      "id": "strong-target",
+      "type": "target",
+      "priority": 3,
+      "capability": "强推理通用模型：复杂分析、方案设计",
+      "position": {
+        "x": 1080,
+        "y": 280
+      },
+      "models": [
+        {
+          "model": "qwen3-32b",
+          "reasoning": "medium"
+        }
+      ]
+    },
+    {
+      "id": "standard-target",
+      "type": "target",
+      "priority": 2,
+      "capability": "标准档通用模型：写作、总结与纠错",
+      "position": {
+        "x": 1080,
+        "y": 410
+      },
+      "models": [
+        {
+          "model": "deepseek-v3",
+          "reasoning": "medium"
+        }
+      ]
+    },
+    {
+      "id": "light-target",
+      "type": "target",
+      "priority": 1,
+      "capability": "轻量快速模型：简单问答与短输出",
+      "position": {
+        "x": 1080,
+        "y": 540
+      },
+      "models": [
+        {
+          "model": "qwen3-8b",
+          "reasoning": "low"
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-start-capability",
+      "source": "start",
+      "source_port": "out",
+      "target": "capability",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-start-domain",
+      "source": "start",
+      "source_port": "out",
+      "target": "domain",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-cap-strong-and-power",
+      "source": "capability",
+      "source_port": "prob.strong",
+      "target": "and-power",
+      "target_port": "in_1",
+      "condition": {
+        "op": "gt",
+        "value": 0.65
+      }
+    },
+    {
+      "id": "e-domain-and-power",
+      "source": "domain",
+      "source_port": "yes",
+      "target": "and-power",
+      "target_port": "in_2",
+      "condition": {
+        "op": "gt",
+        "value": 0.7
+      }
+    },
+    {
+      "id": "e-and-power-target",
+      "source": "and-power",
+      "source_port": "out",
+      "target": "power-target",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-cap-strong-not",
+      "source": "capability",
+      "source_port": "prob.strong",
+      "target": "not-cap",
+      "target_port": "in_1",
+      "condition": {
+        "op": "gt",
+        "value": 0.65
+      }
+    },
+    {
+      "id": "e-not-and-follow",
+      "source": "not-cap",
+      "source_port": "out",
+      "target": "and-follow",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-cond-text-or",
+      "source": "cond-text",
+      "source_port": "out",
+      "target": "or-ctx",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-cond-peak-or",
+      "source": "cond-peak",
+      "source_port": "out",
+      "target": "or-ctx",
+      "target_port": "in_2",
+      "condition": null
+    },
+    {
+      "id": "e-or-and-follow",
+      "source": "or-ctx",
+      "source_port": "out",
+      "target": "and-follow",
+      "target_port": "in_2",
+      "condition": null
+    },
+    {
+      "id": "e-and-follow-clarify",
+      "source": "and-follow",
+      "source_port": "out",
+      "target": "clarify",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-clarify-deep",
+      "source": "clarify",
+      "source_port": "yes",
+      "target": "deep-target",
+      "target_port": "in_1",
+      "condition": {
+        "op": "gt",
+        "value": 0.6
+      }
+    },
+    {
+      "id": "e-selected-easy-light",
+      "source": "capability",
+      "source_port": "selected.easy",
+      "target": "light-target",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-selected-standard-standard",
+      "source": "capability",
+      "source_port": "selected.standard",
+      "target": "standard-target",
+      "target_port": "in_1",
+      "condition": null
+    },
+    {
+      "id": "e-selected-strong-strong",
+      "source": "capability",
+      "source_port": "selected.strong",
+      "target": "strong-target",
+      "target_port": "in_1",
+      "condition": null
+    }
+  ],
+  "error_fallback": "light-target"
+}

@@ -1,16 +1,14 @@
 """Model scheduling: sticky selection, lease acquisition and affinity writes.
 
 ``ModelScheduler`` is the only place that reads session affinity or touches the
-``LoadBalancer``.  It consumes the policy decision produced by
-``PolicyEvaluator`` and turns it into a ``RoutingDecision``.  Ordering is fixed:
-final policy decision (already emitted by the evaluator) → sticky lookup →
-acquire → affinity put → scheduled event.  The evaluator always runs first, so a
-sticky hit never skips JEV; dry-run touches neither affinity nor in-flight
-counters.
+``LoadBalancer``.  It consumes the graph decision produced by
+``GraphEvaluator`` and turns it into a ``RoutingDecision``.  Ordering is fixed:
+final graph decision (already emitted by the evaluator) → sticky lookup →
+acquire → affinity put → scheduled event.
 """
 from __future__ import annotations
 
-from router.routing.policy.evaluator import PolicyOutcome
+from router.routing.graph.evaluator import GraphOutcome
 from router.routing.snapshot import RoutingSnapshot
 from router.routing.types import (
     NoAvailableBackend,
@@ -30,14 +28,12 @@ class ModelScheduler:
         *,
         snapshot: RoutingSnapshot,
         request: RoutingRequest,
-        outcome: PolicyOutcome,
+        outcome: GraphOutcome,
         dry_run: bool,
         trace_sink: list[dict] | None,
     ) -> RoutingDecision:
         events: list[dict] = [] if trace_sink is None else trace_sink
-        # 求值器先于调度运行：NoActivePolicyError 在此之前已抛出，sticky 只读
-        # 已启用策略的会话粘性配置。
-        policy = snapshot.policy
+        tree = snapshot.tree
         target = outcome.target
         configured_models = [item.model for item in target.models]
         models = [item.model for item in target.models if item.model in snapshot.backends]
@@ -47,7 +43,7 @@ class ModelScheduler:
         policy_path = target.id
         preferred: str | None = None
         sticky_hit = False
-        if not policy.sticky.enabled:
+        if not tree.sticky.enabled:
             sticky_status = "disabled"
         elif not request.session_id:
             sticky_status = "no_session"
@@ -73,12 +69,12 @@ class ModelScheduler:
             append_schedule(initial_selection)
             raise NoAvailableBackend(f"target {target.id!r} has no available backend")
 
-        selection_reason = "target" if outcome.fallback_reason is None else "fallback"
-        if policy.sticky.enabled and request.session_id:
+        selection_reason = outcome.selection_reason
+        if tree.sticky.enabled and request.session_id:
             sticky_status = "miss"
             hit = self.affinity.get(
                 request.session_id,
-                policy_revision=snapshot.policy_revision,
+                tree_revision=snapshot.tree_revision,
                 policy_path=policy_path,
                 allowed_models=available,
                 touch=not dry_run,
@@ -102,7 +98,7 @@ class ModelScheduler:
             preferred = None
             sticky_hit = False
             sticky_status = "unavailable"
-            selection_reason = "target" if outcome.fallback_reason is None else "fallback"
+            selection_reason = outcome.selection_reason
             try:
                 lease = self.balancer.acquire(models, dry_run=dry_run)
             except NoAvailableBackend as retry_exc:
@@ -116,14 +112,14 @@ class ModelScheduler:
         )
         if sticky_hit:
             events.append({"event": "sticky_hit", "model": model})
-        if policy.sticky.enabled and request.session_id and not dry_run:
+        if tree.sticky.enabled and request.session_id and not dry_run:
             self.affinity.put(
                 request.session_id,
                 model,
                 target_id=target.id,
-                policy_revision=snapshot.policy_revision,
+                tree_revision=snapshot.tree_revision,
                 policy_path=policy_path,
-                ttl_seconds=policy.sticky.ttl_seconds,
+                ttl_seconds=tree.sticky.ttl_seconds,
             )
         events.append({
             "event": "scheduled",
@@ -132,13 +128,17 @@ class ModelScheduler:
             "dry_run": dry_run,
         })
         return RoutingDecision(
-            model=model, target=target, reasoning=reasoning,
-            policy_path=policy_path, trace=events, sticky_hit=sticky_hit,
-            selection_reason=selection_reason, session_hash=session_digest(request.session_id),
-            lease=lease, answers=dict(outcome.answers),
+            model=model,
+            target=target,
+            reasoning=reasoning,
+            policy_path=policy_path,
+            trace=events,
+            sticky_hit=sticky_hit,
+            selection_reason=selection_reason,
+            session_hash=session_digest(request.session_id),
+            lease=lease,
+            candidates=outcome.candidates,
+            waves=outcome.waves,
+            answers=dict(outcome.answers),
             fallback_reason=outcome.fallback_reason,
-            matched_rule=outcome.matched_rule.name if outcome.matched_rule is not None else None,
-            matched_rule_index=outcome.matched_rule_index,
-            jev_duration_ms=outcome.jev_duration_ms,
-            jev_questions=outcome.jev_questions,
         )

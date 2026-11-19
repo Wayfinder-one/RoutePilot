@@ -1,5 +1,5 @@
 import asyncio
-import json
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,109 +8,93 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.control.validation import build_enable_context
-from router.routing.policy import policy_from_dict
-from router.routing.policy.validate import validate_policy_for_enable
+from router.routing.document import parse_graph_document
+from router.routing.graph.model import TargetNode
+from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
+from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.policies import PolicyRepo
 from router.store.repositories import seed_default
-from tests.routing_fixtures import test_settings
+from router.store.routing_trees import RoutingTreeRepo
+from tests.routing_fixtures import graph_dict, test_settings, tree_dict
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JEV_ENV = {"jev_url": "http://jev.test", "jev_model": "NeoHorse-Jev-4B"}
-SPEC_EXAMPLE = REPO_ROOT / "tests" / "fixtures" / "policy_v4.json"
 
 
-def catalog_policy(model="qwen3-8b"):
-    """无问题策略：文本条件直连 target(model)，启用校验只需要模型存在。"""
+def direct_graph(models=("qwen3-8b",)):
+    """start → target 的直连图（无问题节点，不需要决策服务）。"""
     return {
-        "kind": "sr-routing-policy", "version": 4, "name": "直连策略",
-        "timezone": "Asia/Shanghai",
-        "sticky": {"enabled": False, "ttl_seconds": 1800},
-        "questions": {},
-        "targets": {"direct": {"models": [{"model": model}]}},
-        "rules": [{"name": "直连", "when": {"text_contains_any": ["请求"]}, "target": "direct"}],
-        "fallback": "direct",
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "direct", "type": "target", "priority": 1,
+             "position": {"x": 200, "y": 0},
+             "models": [{"model": model, "reasoning": None} for model in models]},
+        ],
+        "edges": [{
+            "id": "e-start-direct", "source": "start", "source_port": "out",
+            "target": "direct", "target_port": "in_1", "condition": None,
+        }],
+        "error_fallback": "direct",
     }
 
 
-def question_policy(model="qwen3-8b"):
-    """带问题的策略：rules+questions 同时存在，启用校验要求 JEV 配置。"""
-    return {
-        "kind": "sr-routing-policy", "version": 4, "name": "问题策略",
-        "timezone": "Asia/Shanghai",
-        "sticky": {"enabled": False, "ttl_seconds": 1800},
-        "questions": {
-            "route": {"type": "choice", "instructions": "选择模型", "options": [
-                {"key": "fast", "label": "轻量", "capability": "简单请求"},
-                {"key": "strong", "label": "增强", "capability": "复杂请求"},
-            ]},
-        },
-        "targets": {"direct": {"models": [{"model": model}]}},
-        "rules": [{"name": "轻量", "when": {"answer": "route.selected", "eq": "fast"},
-                   "target": "direct"}],
-        "fallback": "direct",
-    }
-
-
-def test_health_console_and_empty_policy_boot(tmp_path):
+def test_health_console_and_empty_tree_boot(tmp_path):
     app = create_app(test_settings(tmp_path))
     client = TestClient(app)
     assert client.get("/healthz").json() == {"ok": True}
     assert client.get("/console/index.html").status_code == 200
-    assert app.state.snapshot.policy is None
-    assert app.state.snapshot.policy_id is None
-    # 旧 admin trees 路由不再注册（设计 §6.1：不保留 v3 兼容接口）。
-    # 路径拆分拼接：保留这条回归断言，同时让 Task 10 的符号扫描保持空输出。
-    legacy_admin_trees = "/admin/" + "trees"
-    assert client.get(legacy_admin_trees).status_code == 404
+    assert app.state.snapshot.tree is None
+    assert client.get("/admin/trees").json()["trees"] == []
     response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
     assert response.status_code == 503
-    assert response.json()["error"]["message"] == "no_active_policy"
+    assert response.json()["error"]["message"] == "no_active_tree"
     assert not hasattr(app.state, "tagger")
 
 
-def prepare_active_policy(tmp_path, raw):
+def prepare_active_tree(tmp_path, raw):
     settings = test_settings(tmp_path)
     conn = connect(settings.db_path)
     migrate(conn)
     seed_default(conn)
     conn.close()
-    repo = PolicyRepo(settings.policy_dir)
+    repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create("main", policy_from_dict(raw))
+    repo.create(tree_from_dict(raw))
     repo.enable("main")
     return settings
 
 
-def test_missing_snapshot_is_not_ready_and_recovered_pointer_is_ready(tmp_path):
+def test_missing_snapshot_is_not_ready_and_disabled_snapshot_is_ready(tmp_path):
     settings = test_settings(tmp_path)
-    repo = PolicyRepo(settings.policy_dir)
+    repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    (repo.current).write_text("missing\n", encoding="utf-8")
+    (repo.root / "current").write_text("missing\n", encoding="utf-8")
     app = create_app(settings)
     with TestClient(app) as client:
         assert client.get("/readyz").status_code == 503
         assert client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hello"}],
         }).status_code == 503
-        (repo.current).write_bytes(b"")
-        asyncio.run(app.state.policy_reloader.poll_once())
+        (repo.root / "current").write_bytes(b"")
+        asyncio.run(app.state.graph_reloader.poll_once())
         assert client.get("/readyz").status_code == 200
 
 
-def test_startup_accepts_valid_direct_policy(tmp_path):
-    settings = prepare_active_policy(tmp_path, catalog_policy())
+def test_startup_accepts_valid_direct_target(tmp_path):
+    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
     app = create_app(settings)
-    assert app.state.snapshot.policy_id == "main"
-    direct = app.state.snapshot.policy.targets["direct"]
-    assert [(item.model, item.reasoning) for item in direct.models] == [
-        ("qwen3-8b", None),
+    assert app.state.snapshot.tree_id == "main"
+    targets = [node for node in app.state.snapshot.tree.root.nodes if isinstance(node, TargetNode)]
+    assert [(node.id, [item.model for item in node.models]) for node in targets] == [
+        ("direct", ["qwen3-8b"]),
     ]
 
 
-def test_startup_with_invalid_active_policy_is_not_ready(tmp_path):
-    # 目录外模型：启用校验失败，快照保持缺失而不是带病发布。
-    settings = prepare_active_policy(tmp_path, catalog_policy(model="ghost-model"))
+def test_startup_with_invalid_active_tree_is_not_ready(tmp_path):
+    raw = tree_dict(root=direct_graph())
+    del raw["root"]["error_fallback"]
+    settings = prepare_active_tree(tmp_path, raw)
     app = create_app(settings)
     with TestClient(app) as client:
         assert client.get("/readyz").status_code == 503
@@ -119,8 +103,10 @@ def test_startup_with_invalid_active_policy_is_not_ready(tmp_path):
         assert response.json()["error"]["message"] == "no_valid_snapshot"
 
 
-def test_policy_with_questions_without_jev_config_is_not_ready(tmp_path):
-    settings = prepare_active_policy(tmp_path, question_policy())
+def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path):
+    raw = tree_dict(root=graph_dict())
+    raw["root"]["nodes"][2]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
+    settings = prepare_active_tree(tmp_path, raw)
     app = create_app(settings)
     with TestClient(app) as client:
         ready = client.get("/readyz")
@@ -135,38 +121,37 @@ def test_environment_jev_config_is_seeded_once(tmp_path):
     assert app.state.snapshot.jev.api_key == "secret"
 
 
-def test_spec_example_policy_document_parses_cleanly():
-    """示例 v4 文档（设计 §4.1）必须始终可解析为行为模型。"""
-    policy = policy_from_dict(json.loads(SPEC_EXAMPLE.read_text(encoding="utf-8")))
-    assert set(policy.questions) == {"route", "power_business", "adversarial"}
-    assert [rule.name for rule in policy.rules] == [
-        "对抗请求优先走安全目标", "电力业务优先", "主问题选择轻量模型", "主问题选择增强模型",
-    ]
-    assert policy.fallback == "safe"
+def shipped_graph(name):
+    content = (REPO_ROOT / "configs" / name).read_bytes()
+    return parse_graph_document(
+        content,
+        tree_id="default-jev",
+        enabled=False,
+        updated_at="",
+        document_sha256=hashlib.sha256(content).hexdigest(),
+    )
 
 
-def test_spec_example_enable_issues_pin_seeded_catalog(tmp_path):
-    """钉住示例策略引用的 seed 目录模型 id：目录里改名/删除会在这里失败。"""
+def test_shipped_configs_are_v3_export_documents():
+    for name in ("default_routing_tree.json", "production_routing_tree.json"):
+        assert validate_graph_structure(shipped_graph(name)) == [], name
+
+
+def test_shipped_graph_configs_pass_enable_validation_with_seeded_catalog(tmp_path):
+    """钉住发布配置引用的模型 id：seed 目录里改名/删除模型会在这里失败，而不只是结构通过。"""
     conn = connect(str(tmp_path / "shipped.db"))
     migrate(conn)
     seed_default(conn)
     try:
-        context = replace(build_enable_context(conn), jev_available=True)  # JEV 打桩：只校验目录存在性
+        context = replace(build_enable_context(conn), jev_available=True)  # JEV 打桩：只校验配置存在性
     finally:
         conn.close()
-    policy = policy_from_dict(json.loads(SPEC_EXAMPLE.read_text(encoding="utf-8")))
-    issues = validate_policy_for_enable(policy, context)
-    # qwen3-8b 在 seed 目录里直接通过；示例文档钉住两个目录事实：
-    # qwen3-32b 的 reasoning 档位与电力专用模型 qwen3.8-flash-sft 都未登记。
-    assert [(issue.code, issue.params) for issue in issues] == [
-        ("reasoning_unsupported",
-         {"model": "qwen3-32b", "reasoning": "high", "efforts": []}),
-        ("unknown_model", {"model": "qwen3.8-flash-sft"}),
-    ]
+    for name in ("default_routing_tree.json", "production_routing_tree.json"):
+        assert validate_graph_for_enable(shipped_graph(name), context) == [], name
 
 
 class TryHandler:
-    """MockTransport 分流：jev.test 回答策略问题，其余请求落到假 OpenAI 上游。"""
+    """MockTransport 分流：jev.test 回答图问题，其余请求落到假 OpenAI 上游。"""
 
     def __init__(self):
         self.jev_paths = []
@@ -175,33 +160,41 @@ class TryHandler:
         if request.url.host == "jev.test":
             self.jev_paths.append(request.url.path)
             return httpx.Response(200, json={
-                "answers": {"route": {"type": "choice", "probabilities": {"轻量": 0.85, "增强": 0.15}}},
+                "answers": {"q": {"type": "choice", "probabilities": {"轻量": 0.85, "增强": 0.15}}},
                 "usage": {"input_tokens": 10},
             })
         return httpx.Response(200, json={"choices": [], "usage": {}})
 
 
+def question_graph(model="qwen3-8b"):
+    """start → choice(轻量/增强) → safe target；target 引用已登记的默认模型。"""
+    raw = graph_dict()
+    for node in raw["nodes"]:
+        if node["type"] == "target":
+            node["models"] = [{"model": model, "reasoning": None}]
+    return raw
+
+
 def composed_try_app(tmp_path, handler):
-    """真实组合根：evaluator/jev_client/breaker 全部由 create_app 构造，测试不注入 evaluator。"""
-    settings = prepare_active_policy(tmp_path, question_policy())
+    """真实组合根：engine/jev_client/breaker 全部由 create_app 构造，测试不注入 engine。"""
+    settings = prepare_active_tree(tmp_path, tree_dict(root=question_graph()))
     return create_app(replace(settings, **JEV_ENV), transport=httpx.MockTransport(handler))
 
 
-def test_try_through_app_composition_routes_policy(tmp_path):
+def test_try_through_app_composition_routes_graph(tmp_path):
     handler = TryHandler()
     app = composed_try_app(tmp_path, handler)
     with TestClient(app) as client:
-        response = client.post("/admin/try", json={"policy_id": "main", "text": "你好"})
+        response = client.post("/admin/try", json={"tree_id": "main", "text": "你好"})
     assert response.status_code == 200, response.text
     body = response.json()
+    assert body["draft"] is False
     assert handler.jev_paths == ["/v1/systemone"]
-    assert body["target"] == "direct"
-    assert body["models"] == ["qwen3-8b"]
-    assert body["matched_rule"] == "轻量"
-    assert body["fallback"] is False
-    assert body["reason"] is None
-    assert body["answers"]["route"]["ranking"] == ["fast", "strong"]
-    assert [event["event"] for event in body["trace"]].count("jev") == 1
+    assert [(item["target_id"], item["priority"], item["wave"]) for item in body["outcome"]["candidates"]] == [
+        ("safe", 1, 1),
+    ]
+    assert body["outcome"]["waves"][0]["questions"] == ["q"]
+    assert body["answers"]["q"]["ranking"] == ["easy", "strong"]
 
 
 def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
@@ -210,7 +203,7 @@ def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
     for _ in range(app.state.breaker.threshold):
         app.state.breaker.failure("qwen3-8b")
     with TestClient(app) as client:
-        response = client.post("/admin/try", json={"policy_id": "main", "text": "你好"})
+        response = client.post("/admin/try", json={"tree_id": "main", "text": "你好"})
     assert response.status_code == 503, response.text
-    assert response.json()["detail"] == "target 'direct' has no available backend"
+    assert response.json()["detail"] == "target 'safe' has no available backend"
     assert handler.jev_paths == ["/v1/systemone"]

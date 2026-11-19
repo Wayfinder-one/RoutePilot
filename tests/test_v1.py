@@ -1,50 +1,47 @@
-"""`/v1/chat/completions` 真链路：MockTransport 分流 JEV `/v1/systemone` 与假 OpenAI 上游。
+"""`/v1/chat/completions` 真链路：MockTransport 分流 `/v1/systemone` 与假 OpenAI 上游。
 
-覆盖 Policy v4 数据面契约（设计 §3/§5）：一次决策至多一次 JEV 调用、首条命中
-规则与兜底目标（jev_error/no_rule_matched）、`x-sr-*` 响应头取值集合、粘性二次
-请求仍然执行全部问题再做 preferred 调度、命中目标熔断返回 503 且不改选其他
-目标、流式/非流式/取消的租约释放，以及 SQLite 账本只持久化白名单元数据
-（policy_id/policy_revision/jev_calls），answers/trace 原样留在内存 ring。
+覆盖 M1 验收矩阵（spec §7.2）：selected 直连、数值 AND、两波追问、统一兜底模型、
+决策失败（缺答案 key / 非法概率 / timeout）、同波合并一次调用、粘性二次请求
+仍然执行被激活的问题再 preferred 调度、移动节点不改变 revision、首选 target 熔断
+返回 503 且不调用次优上游、流式/非流式/取消的 lease 释放、SQLite waves 与内存
+answers 的边界，以及 `x-sr-selection` 取值集合。
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
-import time
-from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi import FastAPI
 
-from router.api import routes_test
-from router.api.routes_v1 import _decision_record, router
+from router.api.routes_v1 import router
 from router.config import Settings
-from router.jev.client import ChoiceAnswer, JevClient
-from router.jev.config import JevSettings
-from router.request_logging import LOG_COLUMNS, RequestLogger, log_values
-from router.request_outcome import OUTCOME_INCOMPLETE
+from router.jev.client import JevClient
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
+from router.request_logging import LOG_COLUMNS, RequestLogger
 from router.routing.affinity import SessionAffinity
 from router.routing.conditions import TimePeriod
-from router.routing.policy import (
-    PolicyResource,
-    policy_from_dict,
-    policy_revision_of,
-)
-from router.routing.policy.evaluator import PolicyEvaluator
+from router.routing.graph.compiled import compile_graph
+from router.routing.graph.evaluator import GraphEvaluator
+from router.routing.tree import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import build_snapshot
-from router.routing.types import RoutingMiss
 from router.store.db import connect, migrate
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.catalog import Backend
+from tests.routing_fixtures import tree_dict
 
 
-JEV_SETTINGS = JevSettings("http://jev.test", "d1-2B")
-SELECTION_VALUES = {"target", "fallback", "sticky", "direct"}
-MODELS = ("fast", "strong-a", "strong-b", "power", "safe")
+JEV_SETTINGS = JevSettings(
+    "http://jev.test", "NeoHorse-Jev-4B", "secret", 5,
+    DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE,
+)
+SELECTION_VALUES = {"target", "sticky", "otherwise", "error_fallback"}
+MODELS = ("fast", "strong", "power", "strong-a", "strong-b", "safe")
 CAPABILITIES = {model: f"{model} 能力" for model in MODELS}
 
 
@@ -72,66 +69,86 @@ class BlockingTransport(httpx.AsyncBaseTransport):
         raise AssertionError("unreachable")
 
 
-# ── policy fixtures ─────────────────────────────────────────────────────
+# ── graph fixtures ──────────────────────────────────────────────────────
 
 
-def route_policy(*, sticky=None, rules=None, fallback="safe", targets=None):
-    """标准测试策略：route(choice)/risk(noul)/severity(score) 三问题 + 有序规则。"""
-    return {
-        "kind": "sr-routing-policy", "version": 4, "name": "测试策略",
-        "timezone": "Asia/Shanghai",
-        "sticky": sticky or {"enabled": False, "ttl_seconds": 1800},
-        "questions": {
-            "route": {
-                "type": "choice", "instructions": "选择模型",
-                "options": [
-                    {"key": "fast", "label": "轻量", "capability": "简单请求"},
-                    {"key": "strong", "label": "增强", "capability": "复杂请求"},
-                ],
-            },
-            "risk": {"type": "noul", "instructions": "是否高风险"},
-            "severity": {"type": "score", "instructions": "评分", "criteria": [1, 5, 10]},
-        },
-        "targets": targets or {
-            "fast": {"models": [{"model": "fast"}]},
-            "strong": {"models": [{"model": "strong-a"}, {"model": "strong-b"}]},
-            "power": {"models": [{"model": "power"}]},
-            "safe": {"models": [{"model": "safe"}]},
-        },
-        "rules": rules if rules is not None else [
-            {"name": "高风险", "when": {"answer": "risk.yes", "gte": 0.8}, "target": "safe"},
-            {
-                "name": "复杂请求",
-                "when": {"all": [
-                    {"answer": "route.selected", "eq": "strong"},
-                    {"answer": "severity.value", "gte": 5},
-                ]},
-                "target": "strong",
-            },
-            {"name": "轻量请求", "when": {"answer": "route.selected", "eq": "fast"}, "target": "fast"},
+def _start():
+    return {"id": "start", "type": "start", "position": {"x": 0, "y": 0}}
+
+
+def _target(node_id, priority, models):
+    return {"id": node_id, "type": "target", "priority": priority,
+            "position": {"x": 400, "y": priority * 100},
+            "models": [{"model": model, "reasoning": None} for model in models]}
+
+
+def _edge(edge_id, source, source_port, target, target_port, condition=None):
+    return {"id": edge_id, "source": source, "source_port": source_port,
+            "target": target, "target_port": target_port, "condition": condition}
+
+
+def _graph(nodes, edges, *, error="safe"):
+    return {"id": "root", "type": "graph", "nodes": nodes, "edges": edges,
+            "error_fallback": error}
+
+
+def switch_graph():
+    """start → choice(fast/strong) → 两个 target；safe 兜底。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 200, "y": 0},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            _target("fast-target", 1, ("fast",)),
+            _target("strong-target", 2, ("strong-a", "strong-b")),
+            _target("safe", 3, ("safe",)),
         ],
-        "fallback": fallback,
-    }
+        [
+            _edge("e-start-q", "start", "out", "q", "in_1"),
+            _edge("e-q-fast", "q", "selected.fast", "fast-target", "in_1"),
+            _edge("e-q-strong", "q", "selected.strong", "strong-target", "in_1"),
+        ],
+    )
 
 
-def direct_policy(model="safe"):
-    """无问题策略：文本条件直连目标，一次决策不触发 JEV。"""
-    return {
-        "kind": "sr-routing-policy", "version": 4, "name": "直连策略",
-        "timezone": "Asia/Shanghai",
-        "sticky": {"enabled": False, "ttl_seconds": 1800},
-        "questions": {},
-        "targets": {"direct": {"models": [{"model": model}]}},
-        "rules": [{"name": "直连", "when": {"text_contains_any": ["请求"]}, "target": "direct"}],
-        "fallback": "direct",
-    }
+def no_target_graph():
+    """只有 selected.fast 连到 target；选 strong 时没有任何 target 激活。"""
+    graph = switch_graph()
+    graph["edges"] = [
+        _edge("e-start-q", "start", "out", "q", "in_1"),
+        _edge("e-q-fast", "q", "selected.fast", "fast-target", "in_1"),
+    ]
+    return graph
 
 
-def period_policy():
-    """时段规则：peak 时段命中 power 目标。"""
-    raw = route_policy()
-    raw["rules"] = [{"name": "高峰", "when": {"period_in": ["peak"]}, "target": "power"}]
-    return raw
+def direct_graph():
+    """start → target，无问题节点（不触碰决策服务）。"""
+    return _graph(
+        [_start(), _target("direct", 1, ("safe",))],
+        [_edge("e-start-direct", "start", "out", "direct", "in_1")],
+        error="direct",
+    )
+
+
+def period_condition_graph():
+    """direct_graph 再加一个真实时段条件（condition/source=periods）。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "cond-peak", "type": "condition", "source": "periods",
+             "periods": ["peak"], "position": {"x": 200, "y": 0}},
+            _target("direct", 1, ("safe",)),
+        ],
+        [
+            _edge("e-start-direct", "start", "out", "direct", "in_1"),
+            _edge("e-cond-direct", "cond-peak", "out", "direct", "in_2"),
+        ],
+        error="direct",
+    )
 
 
 def all_day_peak():
@@ -139,10 +156,98 @@ def all_day_peak():
     return [TimePeriod("peak", (0, 1, 2, 3, 4, 5, 6), "00:00", "00:00")]
 
 
+def two_question_graph():
+    """同一波两个问题：choice + noul，数值 AND 组合到 power-target。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q-cap", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 180, "y": -100},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            {"id": "q-domain", "type": "question", "question_type": "noul",
+             "instructions": "是否需要电力业务知识？", "position": {"x": 180, "y": 40}},
+            {"id": "and-power", "type": "logic", "operator": "and",
+             "position": {"x": 400, "y": -40}},
+            _target("power-target", 4, ("power",)),
+            _target("strong-target", 2, ("strong-a", "strong-b")),
+            _target("fast-target", 2, ("fast",)),
+            _target("safe", 1, ("safe",)),
+        ],
+        [
+            _edge("e-start-cap", "start", "out", "q-cap", "in_1"),
+            _edge("e-start-domain", "start", "out", "q-domain", "in_1"),
+            _edge("e-cap-and", "q-cap", "prob.strong", "and-power", "in_1",
+                  {"op": "gt", "value": 0.65}),
+            _edge("e-domain-and", "q-domain", "yes", "and-power", "in_2",
+                  {"op": "gt", "value": 0.7}),
+            _edge("e-and-power", "and-power", "out", "power-target", "in_1"),
+            _edge("e-cap-strong", "q-cap", "selected.strong", "strong-target", "in_1"),
+            _edge("e-cap-fast", "q-cap", "selected.fast", "fast-target", "in_1"),
+        ],
+    )
+
+
+def two_wave_graph():
+    """第一波 choice；高置信 strong 再激活第二波 noul 追问。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q-cap", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 180, "y": 0},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            {"id": "q-clarify", "type": "question", "question_type": "noul",
+             "instructions": "是否需要更深入处理？", "position": {"x": 400, "y": 80}},
+            _target("strong-target", 1, ("strong-a", "strong-b")),
+            _target("fast-target", 2, ("fast",)),
+            _target("safe", 3, ("safe",)),
+        ],
+        [
+            _edge("e-start-cap", "start", "out", "q-cap", "in_1"),
+            _edge("e-cap-strong", "q-cap", "selected.strong", "strong-target", "in_1"),
+            _edge("e-cap-fast", "q-cap", "selected.fast", "fast-target", "in_1"),
+            _edge("e-cap-clarify", "q-cap", "prob.strong", "q-clarify", "in_1",
+                  {"op": "gte", "value": 0.5}),
+            _edge("e-clarify-strong", "q-clarify", "yes", "strong-target", "in_2",
+                  {"op": "gt", "value": 0.5}),
+        ],
+    )
+
+
+def priority_graph():
+    """selected.strong 同时激活 p4 power-target 与 p3 strong-target（数字越大越优先）。"""
+    return _graph(
+        [
+            _start(),
+            {"id": "q", "type": "question", "question_type": "choice",
+             "instructions": "选择能力档位", "position": {"x": 200, "y": 0},
+             "options": [
+                 {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
+                 {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
+             ]},
+            _target("power-target", 4, ("power",)),
+            _target("strong-target", 3, ("strong-a",)),
+            _target("fast-target", 2, ("fast",)),
+            _target("safe", 1, ("safe",)),
+        ],
+        [
+            _edge("e-start-q", "start", "out", "q", "in_1"),
+            _edge("e-q-power", "q", "selected.strong", "power-target", "in_1"),
+            _edge("e-q-strong", "q", "selected.strong", "strong-target", "in_1"),
+            _edge("e-q-fast", "q", "selected.fast", "fast-target", "in_1"),
+        ],
+    )
+
+
 # ── harness ────────────────────────────────────────────────────────────
 
 
-def make_app(tmp_path, handler, *, raw=None, active=True, transport=None,
+def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transport=None,
              time_periods=None):
     path = str(tmp_path / "v1.db")
     conn = connect(path)
@@ -156,7 +261,7 @@ def make_app(tmp_path, handler, *, raw=None, active=True, transport=None,
     app.state.affinity = SessionAffinity()
     app.state.jev_client = JevClient(app.state.http)
     app.state.routing_service = RoutingService(
-        PolicyEvaluator(app.state.jev_client),
+        GraphEvaluator(app.state.jev_client),
         ModelScheduler(app.state.affinity, app.state.balancer),
     )
     app.state.requestlog = RequestLogger(app.state.settings.db_path)
@@ -167,20 +272,20 @@ def make_app(tmp_path, handler, *, raw=None, active=True, transport=None,
         )
         for model in MODELS
     }
-    resource = None
+    tree = None
     if active:
-        policy = policy_from_dict(raw or route_policy())
-        resource = PolicyResource(
-            id="main", policy=policy, enabled=True,
-            policy_revision=policy_revision_of(policy),
-        )
+        tree = tree_from_dict(tree_dict(
+            "main",
+            root=root or switch_graph(),
+            sticky=sticky or {"enabled": False, "ttl_seconds": 1800},
+        ))
     app.state.snapshot = build_snapshot(
-        resource=resource, backends=backends,
+        tree=tree, backends=backends,
         time_periods=[] if time_periods is None else time_periods,
         jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+        compiled=compile_graph(tree.root) if tree is not None else None,
     )
     app.include_router(router, prefix="/v1")
-    app.include_router(routes_test.router, prefix="/admin")
     return app
 
 
@@ -189,25 +294,11 @@ def payload(text="请求", *, stream=False):
 
 
 def choice(*, fast=0.2, strong=0.8):
-    return {"type": "choice", "probabilities": {"轻量": fast, "增强": strong}}
+    return {"type": "choice", "probabilities": {"轻量模型": fast, "增强模型": strong}}
 
 
 def noul(yes):
     return {"type": "noul", "noul": yes}
-
-
-def score(value):
-    # wire 协议按档位索引选择，legend 回填实际值（criteria [1, 5, 10]）。
-    index = {1: 0, 5: 1, 10: 2}[value]
-    return {"type": "score", "score": index, "legend": {str(index): value}}
-
-
-def standard_answers(*, fast=0.2, strong=0.8, risk=0.1, severity=1):
-    return {
-        "route": choice(fast=fast, strong=strong),
-        "risk": noul(risk),
-        "severity": score(severity),
-    }
 
 
 def upstream_ok(request):
@@ -253,96 +344,37 @@ async def flush(app):
     await app.state.requestlog.flush()
 
 
-# ── brief Step 1: 新账本列与单次 JEV 调用的记录工厂 ───────────────────
-
-
-def make_decision_record():
-    answer = ChoiceAnswer(
-        probabilities={"fast": 0.8, "strong": 0.2},
-        ranking=["fast", "strong"], p_top=0.8, margin=0.6,
-        usage={}, duration_ms=12.0,
-    )
-    decision = SimpleNamespace(
-        model="fast", target_id="safe", policy_path="safe",
-        selection_reason="target", fallback_reason=None,
-        sticky_hit=False, session_hash=None, reasoning=None,
-        matched_rule="高风险", jev_duration_ms=12.0,
-        jev_questions=("route", "risk"), answers={"route": answer},
-        trace=[
-            {"event": "jev", "questions": ["route", "risk"], "duration_ms": 12.0},
-            {"event": "rule", "index": 0, "name": "高风险", "matched": True},
-            {"event": "final", "kind": "target", "target_id": "safe", "reason": None},
-        ],
-    )
-    snapshot = SimpleNamespace(
-        policy_id="main", policy_revision="p" * 64,
-        snapshot_revision="s" * 64,
-        jev=JevSettings("http://jev.test", "d1-2B"),
-    )
-    return _decision_record(
-        decision, snapshot, "测试", None, 1.0, time.monotonic(),
-    )
-
-
-def test_log_values_use_policy_and_jev_call_columns():
-    record = {
-        "id": "r1", "policy_id": "main", "policy_revision": "p" * 64,
-        "jev_calls": 1, "outcome_state": OUTCOME_INCOMPLETE,
-    }
-    values = log_values(record)
-    assert values[LOG_COLUMNS.index("policy_id")] == "main"
-    assert values[LOG_COLUMNS.index("policy_revision")] == "p" * 64
-    assert values[LOG_COLUMNS.index("jev_calls")] == 1
-    assert "tree_id" not in LOG_COLUMNS
-    assert "waves" not in LOG_COLUMNS
-
-
-def test_v1_decision_record_has_one_jev_call_and_raw_rule_trace():
-    record = make_decision_record()
-    assert record["jev_calls"] == 1
-    assert record["matched_rule"] == "高风险"
-    assert "waves" not in record
-    assert "node_labels" not in record
-    assert [e["event"] for e in record["trace"]].count("jev") == 1
-
-
-# ── rule hit / single JEV call / fallback ───────────────────────────────
+# ── selected direct / numeric AND / waves ──────────────────────────────
 
 
 def test_selected_target_uses_real_systemone_chain(tmp_path):
     async def scenario():
-        har = Harness(standard_answers(fast=0.9, strong=0.1))
-        app = make_app(tmp_path, har)
+        har = Harness({"q": choice(fast=0.9, strong=0.1)})
+        app = make_app(tmp_path, har, root=switch_graph())
         response = await post(app)
         assert response.status_code == 200
         assert response.headers["x-sr-selection"] == "target"
         assert response.headers["x-sr-model"] == "fast"
         assert response.headers["x-sr-selection"] in SELECTION_VALUES
-        # 一次决策一次 JEV 调用：全部问题一次构造、一个 choose_many。
         assert len(har.jev_requests) == 1
-        assert list(har.jev_requests[0]["questions"]) == ["route", "risk", "severity"]
+        assert list(har.jev_requests[0]["questions"]) == ["q"]
         assert har.upstream_models == ["fast"]
         record = recent(app)
         assert record["selection_reason"] == "target"
-        assert record["matched_rule"] == "轻量请求"
-        assert record["policy_id"] == "main"
-        assert record["policy_revision"] == app.state.snapshot.policy_revision
-        assert record["jev_model"] == "d1-2B"
-        assert record["jev_calls"] == 1
+        assert record["jev_model"] == "NeoHorse-Jev-4B"
         assert record["jev_choice"] == "fast"
         assert record["jev_top"] == pytest.approx(0.9)
         assert record["jev_margin"] == pytest.approx(0.8)
         assert record["jev_probabilities"] == {
             "fast": pytest.approx(0.9), "strong": pytest.approx(0.1),
         }
-        assert record["answers"]["route"]["probabilities"]["fast"] == pytest.approx(0.9)
+        assert record["waves"] == 1
+        assert record["answers"]["q"]["probabilities"]["fast"] == pytest.approx(0.9)
         assert record["route_label"] == {"zh": "目标命中", "en": "Target selected"}
-        assert [pair[0]["en"] for pair in record["metrics"]] == [
-            "Upstream", "Routing", "Total", "JEV calls"]
+        assert [pair[0]["en"] for pair in record["metrics"]] == ["Upstream", "Routing", "Total", "Waves"]
         assert record["metrics"][0][1] == 200
         assert record["metrics"][3][1] == 1
         assert record["fields"][0] == [{"zh": "请求 ID", "en": "Request ID"}, record["id"]]
-        assert [pair[0]["en"] for pair in record["fields"][1:3]] == ["Policy", "Policy revision"]
         assert [event["event"] for event in record["trace"]].count("request_outcome") == 1
         assert record["trace"][-1]["phase"] == "outcome"
         assert record["trace"][-1]["tone"] == "hit"
@@ -352,168 +384,154 @@ def test_selected_target_uses_real_systemone_chain(tmp_path):
     asyncio.run(scenario())
 
 
-def test_numeric_rule_combines_answers_in_one_systemone_call(tmp_path):
+def test_numeric_and_merges_two_questions_into_one_systemone_call(tmp_path):
     async def scenario():
-        har = Harness(standard_answers(fast=0.1, strong=0.9, severity=5))
-        app = make_app(tmp_path, har)
+        har = Harness({"q-cap": choice(fast=0.1, strong=0.9), "q-domain": noul(0.95)})
+        app = make_app(tmp_path, har, root=two_question_graph())
         response = await post(app)
         assert response.status_code == 200
         assert response.headers["x-sr-selection"] == "target"
-        assert response.headers["x-sr-model"] == "strong-a"
-        # 三个问题只收到一次 systemone 请求，问题按文档一次构造。
+        assert response.headers["x-sr-model"] == "power"
+        # 同波两个问题只收到一次 systemone 请求，问题按 node_id 排序合并。
         assert len(har.jev_requests) == 1
-        assert list(har.jev_requests[0]["questions"]) == ["route", "risk", "severity"]
-        assert har.upstream_models == ["strong-a"]
+        assert list(har.jev_requests[0]["questions"]) == ["q-cap", "q-domain"]
+        assert har.upstream_models == ["power"]
         record = recent(app)
-        assert record["matched_rule"] == "复杂请求"
-        assert record["jev_calls"] == 1
-        assert set(record["answers"]) == {"route", "risk", "severity"}
-        rule_events = [event for event in record["trace"] if event["event"] == "rule"]
-        # 首条命中即停止：高风险未命中、复杂请求命中；轻量请求不再求值，
-        # 以 matched=None + conditions=[] 留痕（§5.5）。
-        assert [(event["index"], event["name"], event["matched"]) for event in rule_events] == [
-            (0, "高风险", False), (1, "复杂请求", True), (2, "轻量请求", None),
-        ]
-        assert rule_events[2]["conditions"] == []
-        # 摘要列取 answers 按问题 ID 排序后的首个 ChoiceAnswer。
+        assert record["waves"] == 1
+        assert set(record["answers"]) == {"q-cap", "q-domain"}
+        question_events = [event for event in record["trace"] if event["event"] == "question"]
+        assert [event["node_id"] for event in question_events] == ["q-cap", "q-domain"]
+        # 兼容列取第一波按 node_id 排序后的首个 ChoiceAnswer。
         assert record["jev_choice"] == "strong"
         assert record["jev_top"] == pytest.approx(0.9)
+        assert record["jev_ms"] == pytest.approx(record["answers"]["q-cap"]["duration_ms"])
         await flush(app)
         conn = connect(app.state.settings.db_path)
         row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
         conn.close()
-        assert row["jev_calls"] == 1
-        assert row["policy_id"] == "main"
+        assert row["waves"] == 1
         assert row["jev_choice"] == "strong"
-        assert set(LOG_COLUMNS) & {
-            "answers", "trace", "text", "route_label", "metrics", "fields", "matched_rule",
-        } == set()
+        assert set(LOG_COLUMNS) & {"answers", "trace", "text", "route_label", "metrics", "fields"} == set()
         assert "answers" in recent(app) and "trace" in recent(app)
-        assert app.state.balancer.inflight("strong-a") == 0
+        assert app.state.balancer.inflight("power") == 0
 
     asyncio.run(scenario())
 
 
-def test_one_decision_never_makes_a_second_jev_call(tmp_path):
-    """v4 去除 wave：无论问题多少，一次决策只有一个 jev 轨迹事件。"""
+def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_path):
     async def scenario():
-        har = Harness(standard_answers(fast=0.1, strong=0.9, severity=5))
-        app = make_app(tmp_path, har)
+        har = Harness({"q-cap": choice(fast=0.1, strong=0.9), "q-clarify": noul(0.9)})
+        app = make_app(tmp_path, har, root=two_wave_graph())
         response = await post(app)
         assert response.status_code == 200
+        assert response.headers["x-sr-selection"] == "target"
         assert response.headers["x-sr-model"] == "strong-a"
-        assert len(har.jev_requests) == 1
+        assert [list(request["questions"]) for request in har.jev_requests] == [
+            ["q-cap"], ["q-clarify"],
+        ]
+        assert har.upstream_models == ["strong-a"]
         record = recent(app)
-        assert record["jev_calls"] == 1
-        kinds = [event["event"] for event in record["trace"]]
-        assert kinds.count("jev") == 1
-        assert "wave" not in kinds
-        jev_event = next(event for event in record["trace"] if event["event"] == "jev")
-        assert jev_event["failed"] is False
+        assert record["waves"] == 2
+        assert record["jev_choice"] == "strong"
+        assert record["jev_ms"] == pytest.approx(record["answers"]["q-cap"]["duration_ms"])
+        wave_events = [event for event in record["trace"] if event["event"] == "wave"]
+        assert [event["wave"] for event in wave_events] == [1, 2]
+        assert set(record["answers"]) == {"q-cap", "q-clarify"}
         await flush(app)
         conn = connect(app.state.settings.db_path)
-        row = dict(conn.execute("SELECT jev_calls FROM request_logs").fetchone())
+        row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
         columns = {item[1] for item in conn.execute("PRAGMA table_info(request_logs)")}
         conn.close()
-        assert row["jev_calls"] == 1
-        assert "waves" not in columns
+        assert row["waves"] == 2
         assert "answers" not in columns and "trace" not in columns
         assert app.state.balancer.inflight("strong-a") == 0
 
     asyncio.run(scenario())
 
 
-def test_no_rule_matched_uses_fallback_target(tmp_path):
+def test_fallback_model_when_no_target_activates(tmp_path):
     async def scenario():
-        har = Harness(standard_answers(fast=0.9, strong=0.1))
-        raw = route_policy(rules=[
-            {"name": "高风险", "when": {"answer": "risk.yes", "gte": 0.8}, "target": "safe"},
-        ])
-        app = make_app(tmp_path, har, raw=raw)
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(tmp_path, har, root=no_target_graph())
         response = await post(app)
         assert response.status_code == 200
-        assert response.headers["x-sr-selection"] == "fallback"
+        assert response.headers["x-sr-selection"] == "error_fallback"
         assert response.headers["x-sr-model"] == "safe"
         assert har.upstream_models == ["safe"]
         record = recent(app)
-        assert record["selection_reason"] == "fallback"
-        assert record["fallback_reason"] == "no_rule_matched"
-        assert record["matched_rule"] is None
+        assert record["selection_reason"] == "error_fallback"
+        assert record["fallback_reason"] == "error_fallback"
         assert record["route_label"] == {"zh": "默认目标兜底", "en": "Default target fallback"}
-        assert record["jev_choice"] == "fast"
+        assert record["jev_choice"] == "strong"
         await flush(app)
         conn = connect(app.state.settings.db_path)
-        assert conn.execute("SELECT jev_calls FROM request_logs").fetchone()[0] == 1
+        assert conn.execute("SELECT waves FROM request_logs").fetchone()[0] == 1
         conn.close()
 
     asyncio.run(scenario())
 
 
-# ── jev_error 兜底 ─────────────────────────────────────────────────────
+# ── error_fallback 三态 ────────────────────────────────────────────────
 
 
-def test_missing_answer_key_uses_jev_error_fallback(tmp_path):
+def test_missing_answer_key_uses_error_fallback(tmp_path):
     async def scenario():
         har = Harness({})
-        app = make_app(tmp_path, har)
+        app = make_app(tmp_path, har, root=switch_graph())
         response = await post(app)
         assert response.status_code == 200
-        assert response.headers["x-sr-selection"] == "fallback"
+        assert response.headers["x-sr-selection"] == "error_fallback"
         assert response.headers["x-sr-model"] == "safe"
         assert har.upstream_models == ["safe"]
         record = recent(app)
-        assert record["selection_reason"] == "fallback"
-        assert record["fallback_reason"] == "jev_error"
-        assert record["matched_rule"] is None
+        assert record["selection_reason"] == "error_fallback"
+        assert record["fallback_reason"] == "error_fallback"
         assert record["jev_choice"] is None
         assert record["jev_top"] is None and record["jev_margin"] is None
-        assert record["jev_calls"] == 1
-        failed = next(event for event in record["trace"] if event["event"] == "jev")
-        assert failed["failed"] is True and failed["error"]
+        assert record["waves"] == 1
+        failed = [event for event in record["trace"] if event["event"] == "wave"]
+        assert failed[0]["failed"] is True and failed[0]["error"]
         assert app.state.balancer.inflight("safe") == 0
 
     asyncio.run(scenario())
 
 
-def test_invalid_probabilities_use_jev_error_fallback(tmp_path):
+def test_invalid_probabilities_use_error_fallback(tmp_path):
     async def scenario():
-        har = Harness({
-            "route": {"type": "choice", "probabilities": {"轻量": 0.9, "增强": 0.9}},
-            "risk": noul(0.1), "severity": score(1),
-        })
-        app = make_app(tmp_path, har)
+        har = Harness({"q": {"type": "choice", "probabilities": {"轻量模型": 0.9, "增强模型": 0.9}}})
+        app = make_app(tmp_path, har, root=switch_graph())
         response = await post(app)
         assert response.status_code == 200
-        assert response.headers["x-sr-selection"] == "fallback"
+        assert response.headers["x-sr-selection"] == "error_fallback"
         assert response.headers["x-sr-model"] == "safe"
         assert har.upstream_models == ["safe"]
 
     asyncio.run(scenario())
 
 
-def test_timeout_uses_jev_error_fallback(tmp_path):
+def test_timeout_uses_error_fallback(tmp_path):
     async def scenario():
-        har = Harness(standard_answers(), jev_failure=httpx.ReadTimeout("timed out"))
-        app = make_app(tmp_path, har)
+        har = Harness({}, jev_failure=httpx.ReadTimeout("timed out"))
+        app = make_app(tmp_path, har, root=switch_graph())
         response = await post(app)
         assert response.status_code == 200
-        assert response.headers["x-sr-selection"] == "fallback"
+        assert response.headers["x-sr-selection"] == "error_fallback"
         assert response.headers["x-sr-model"] == "safe"
         assert har.upstream_models == ["safe"]
-        assert recent(app)["fallback_reason"] == "jev_error"
+        assert recent(app)["fallback_reason"] == "error_fallback"
 
     asyncio.run(scenario())
 
 
-# ── sticky / circuit breaker ────────────────────────────────────────────
+# ── sticky / revision / circuit breaker ────────────────────────────────
 
 
-def test_sticky_second_request_reruns_questions_then_prefers_model(tmp_path):
+def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
     async def scenario():
-        har = Harness(standard_answers(fast=0.1, strong=0.9, severity=5))
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(
-            tmp_path, har,
-            raw=route_policy(sticky={"enabled": True, "ttl_seconds": 1800}),
+            tmp_path, har, root=switch_graph(),
+            sticky={"enabled": True, "ttl_seconds": 1800},
         )
         headers = {"x-sr-session-id": "session-1"}
         first = await post(app, headers=headers)
@@ -522,42 +540,58 @@ def test_sticky_second_request_reruns_questions_then_prefers_model(tmp_path):
         assert first.headers["x-sr-selection"] == "target"
         assert app.state.balancer.calls[-1]["preferred"] is None
         assert app.state.balancer.inflight("strong-a") == 0
+        first_revision = app.state.snapshot.tree_revision
+
+        # 仅移动节点（position 属于纯布局字段）：behavior revision 不变。
+        moved = copy.deepcopy(switch_graph())
+        for node in moved["nodes"]:
+            node["position"] = {
+                "x": node["position"]["x"] + 40,
+                "y": node["position"]["y"] + 40,
+            }
+        moved_tree = tree_from_dict(tree_dict(
+            "main", root=moved,
+            sticky={"enabled": True, "ttl_seconds": 1800},
+        ))
+        moved_snapshot = build_snapshot(
+            tree=moved_tree,
+            backends=app.state.snapshot.backends, time_periods=[],
+            jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+            compiled=compile_graph(moved_tree.root),
+        )
+        assert moved_snapshot.tree_revision == first_revision
+        app.state.snapshot = moved_snapshot
 
         second = await post(app, headers=headers)
         assert second.status_code == 200
         assert second.headers["x-sr-model"] == "strong-a"
         assert second.headers["x-sr-selection"] == "sticky"
-        # 第二次请求仍先执行全部问题，再做 preferred 调度。
-        assert [list(request["questions"]) for request in har.jev_requests] == [
-            ["route", "risk", "severity"], ["route", "risk", "severity"],
-        ]
+        # 第二次请求仍先执行被激活的问题，再做 preferred 调度。
+        assert [list(request["questions"]) for request in har.jev_requests] == [["q"], ["q"]]
         assert app.state.balancer.calls[-1]["preferred"] == "strong-a"
         assert har.upstream_models == ["strong-a", "strong-a"]
         record = recent(app)
         assert record["sticky_hit"] == 1
         assert record["selection_reason"] == "sticky"
-        assert record["answers"]["route"]["ranking"][0] == "strong"
+        assert record["answers"]["q"]["ranking"][0] == "strong"
 
     asyncio.run(scenario())
 
 
-def test_matched_target_circuit_open_returns_503_without_fallback_target(tmp_path):
+def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream(tmp_path):
     async def scenario():
-        # 规则只指向 power 目标；power 熔断后直接 503，不改选其他目标。
-        har = Harness(standard_answers(fast=0.1, strong=0.9, severity=5))
-        raw = route_policy(rules=[
-            {"name": "复杂请求", "when": {"answer": "route.selected", "eq": "strong"},
-             "target": "power"},
-        ])
-        app = make_app(tmp_path, har, raw=raw)
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(tmp_path, har, root=priority_graph())
         for _ in range(app.state.breaker.threshold):
             app.state.breaker.failure("power")
         assert app.state.breaker.is_open("power") is True
         response = await post(app)
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_available_backend"
+        # p1 power-target 熔断后直接 503，不静默改选 p2 strong-target 上游。
         assert har.upstream_models == []
         assert app.state.balancer.inflight("power") == 0
+        assert app.state.balancer.inflight("strong-a") == 0
         record = recent(app)
         assert record["outcome_state"] == "routing_error"
         assert record["error_class"] == "no_available_backend"
@@ -566,100 +600,68 @@ def test_matched_target_circuit_open_returns_503_without_fallback_target(tmp_pat
         assert record["trace"][-1]["stage"] == "schedule"
         assert record["routing_ms"] > 0
         assert record["total_ms"] >= record["routing_ms"]
-        assert record["target_id"] == "power"
+        assert record["target_id"] == "power-target"
         assert record["selection_reason"] == "target"
-        assert record["policy_path"] == "power"
+        assert record["policy_path"] == "power-target"
         assert record["fallback_reason"] is None
-        # 失败记录保持稀疏元数据：命中规则的证据在原始 rule 轨迹事件里。
-        rule_events = [event for event in record["trace"] if event["event"] == "rule"]
-        assert [(event["index"], event["name"], event["matched"]) for event in rule_events] == [
-            (0, "复杂请求", True),
-        ]
-        # 调度失败前 JEV 已成功：账本仍记录这一次调用。
-        assert record["jev_calls"] == 1
 
     asyncio.run(scenario())
 
 
-def test_schedule_failure_on_fallback_target_keeps_fallback_reason(tmp_path):
-    async def scenario():
-        har = Harness(standard_answers(fast=0.9, strong=0.1))
-        raw = route_policy(rules=[
-            {"name": "高风险", "when": {"answer": "risk.yes", "gte": 0.8}, "target": "safe"},
-        ])
-        app = make_app(tmp_path, har, raw=raw)
-        for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure("safe")
+# ── node labels / routing failure logs ────────────────────────────────
 
+
+def test_live_log_uses_node_titles_from_the_serving_snapshot(tmp_path):
+    async def scenario():
+        root = switch_graph()
+        next(item for item in root["nodes"] if item["id"] == "q")["title"] = "能力选择"
+        app = make_app(tmp_path, Harness({"q": choice()}), root=root)
         response = await post(app)
 
-        assert response.status_code == 503
-        assert response.json()["error"]["message"] == "no_available_backend"
-        assert har.upstream_models == []
+        assert response.status_code == 200
         record = recent(app)
-        final = next(event for event in record["trace"] if event["event"] == "final")
-        assert final["kind"] == "fallback"
-        assert final["reason"] == "no_rule_matched"
-        assert record["outcome_state"] == "routing_error"
-        assert record["target_id"] == "safe"
-        assert record["selection_reason"] == "fallback"
-        assert record["policy_path"] == "safe"
-        assert record["fallback_reason"] == "no_rule_matched"
-
-        await flush(app)
-        conn = connect(app.state.settings.db_path)
-        try:
-            row = dict(conn.execute(
-                "SELECT target_id, selection_reason, policy_path, outcome_state FROM request_logs"
-            ).fetchone())
-        finally:
-            conn.close()
-        assert row == {
-            "target_id": "safe",
-            "selection_reason": "fallback",
-            "policy_path": "safe",
-            "outcome_state": "routing_error",
-        }
+        assert record["node_labels"]["q"] == {"title": "能力选择", "type": "question"}
+        assert record["node_labels"]["fast-target"]["type"] == "target"
+        assert any(event["event"] == "schedule" for event in record["trace"])
 
     asyncio.run(scenario())
 
 
-# ── routing failure logs ───────────────────────────────────────────────
-
-
-def test_no_active_policy_creates_a_routing_error_log(tmp_path):
+def test_no_active_tree_creates_a_routing_error_log(tmp_path):
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), active=False)
         response = await post(app)
 
         assert response.status_code == 503
-        assert response.json()["error"]["message"] == "no_active_policy"
+        assert response.json()["error"]["message"] == "no_active_tree"
         record = recent(app)
         assert record["outcome_state"] == "routing_error"
-        assert record["error_class"] == "no_active_policy"
+        assert record["error_class"] == "no_active_tree"
         failure = record["trace"][-1]
         assert {key: failure[key] for key in ("event", "stage", "error_class", "message")} == {
-            "event": "routing_error", "stage": "policy",
-            "error_class": "no_active_policy", "message": "no routing policy is enabled",
+            "event": "routing_error", "stage": "graph",
+            "error_class": "no_active_tree", "message": "no routing tree is enabled",
         }
-        # 轨迹保持机器字段：phase/label/facts/tone 等展示文案不再进入数据面。
-        assert "phase" not in failure and "label" not in failure
+        assert failure["phase"] == "routing_error"
+        assert failure["label"] == {"zh": "路由中止", "en": "Routing stopped"}
+        assert failure["facts"] == [[{"zh": "原因", "en": "Reason"}, "no_active_tree"]]
+        assert failure["tone"] == "bad"
         assert record["route_label"] == {"zh": "路由中止", "en": "Routing stopped"}
         assert not any(event["event"] == "request_outcome" for event in record["trace"])
         assert len(app.state.requestlog.recent_requests()) == 1
+        assert record["node_labels"] == {}
         assert record["model"] is None
         assert record["target_id"] is None
         assert record["selection_reason"] is None
         assert record["policy_path"] is None
         assert record["fallback_reason"] is None
-        assert record["jev_calls"] == 0
 
     asyncio.run(scenario())
 
 
 def test_invalid_json_does_not_create_a_calculation_log(tmp_path):
     async def scenario():
-        app = make_app(tmp_path, lambda request: httpx.Response(500), raw=direct_policy())
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://router.test",
         ) as client:
@@ -673,21 +675,10 @@ def test_invalid_json_does_not_create_a_calculation_log(tmp_path):
     asyncio.run(scenario())
 
 
-def test_invariant_failure_keeps_partial_policy_trace(tmp_path):
-    class BrokenEngine:
-        async def route(self, snapshot, request, *, trace_sink=None):
-            trace_sink.append({
-                "event": "time", "active_periods": [], "timezone": "Asia/Shanghai",
-            })
-            trace_sink.append({
-                "event": "window", "tokens_before": 1, "tokens_after": 1,
-                "truncated": False,
-            })
-            raise RoutingMiss("rule target 'ghost' is not defined in the policy")
-
+def test_invariant_failure_keeps_partial_graph_trace(tmp_path):
     async def scenario():
-        app = make_app(tmp_path, lambda request: httpx.Response(500))
-        app.state.routing_service = BrokenEngine()
+        root = _graph([_start()], [], error="ghost")
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=root)
         response = await post(app)
 
         assert response.status_code == 503
@@ -696,11 +687,50 @@ def test_invariant_failure_keeps_partial_policy_trace(tmp_path):
         assert record["outcome_state"] == "routing_error"
         assert [event["event"] for event in record["trace"][:2]] == ["time", "window"]
         assert record["trace"][-1]["error_class"] == "routing_invariant_violation"
-        assert record["trace"][-1]["stage"] == "policy"
+        assert record["trace"][-1]["stage"] == "graph"
         assert record["target_id"] is None
         assert record["selection_reason"] is None
         assert record["policy_path"] is None
         assert record["fallback_reason"] is None
+
+    asyncio.run(scenario())
+
+
+def test_no_candidate_schedule_failure_preserves_fallback_target(tmp_path):
+    async def scenario():
+        har = Harness({"q": choice(fast=0.1, strong=0.9)})
+        app = make_app(tmp_path, har, root=no_target_graph())
+        for _ in range(app.state.breaker.threshold):
+            app.state.breaker.failure("safe")
+
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json()["error"]["message"] == "no_available_backend"
+        assert har.upstream_models == []
+        record = recent(app)
+        final = next(event for event in record["trace"] if event["event"] == "final")
+        assert final["kind"] == "otherwise"
+        assert record["outcome_state"] == "routing_error"
+        assert record["target_id"] == "safe"
+        assert record["selection_reason"] == "error_fallback"
+        assert record["policy_path"] == "safe"
+        assert record["fallback_reason"] == "error_fallback"
+
+        await flush(app)
+        conn = connect(app.state.settings.db_path)
+        try:
+            row = dict(conn.execute(
+                "SELECT target_id, selection_reason, policy_path, outcome_state FROM request_logs"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row == {
+            "target_id": "safe",
+            "selection_reason": "error_fallback",
+            "policy_path": "safe",
+            "outcome_state": "routing_error",
+        }
 
     asyncio.run(scenario())
 
@@ -714,7 +744,7 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
             raise ValueError("sensitive internal detail")
 
     async def scenario():
-        app = make_app(tmp_path, lambda request: httpx.Response(500))
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
         app.state.routing_service = BrokenEngine()
         response = await post(app)
 
@@ -730,93 +760,59 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
 
 def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
     async def scenario():
-        app = make_app(tmp_path, lambda request: httpx.Response(500))
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
         app.state.snapshot = None
         response = await post(app)
 
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_valid_snapshot"
         record = recent(app)
+        assert record["node_labels"] == {}
         assert record["trace"][-1]["stage"] == "snapshot"
         assert record["trace"][-1]["error_class"] == "no_valid_snapshot"
-        assert record["policy_id"] is None
-        assert record["policy_revision"] is None
-        assert record["jev_calls"] == 0
 
     asyncio.run(scenario())
 
 
-# ── 时段规则走原始轨迹 ─────────────────────────────────────────────────
+# ── trace presentation: time phase follows the graph, not the deployment ─
 
 
-def test_period_condition_uses_active_time_periods(tmp_path):
+def test_time_event_stays_initial_when_no_period_condition_ran(tmp_path):
+    """部署配置了时段，但本图没有时段条件：time 事件仍属于「初始计算」。"""
+
     async def scenario():
-        app = make_app(
-            tmp_path, Harness(standard_answers()),
-            raw=period_policy(), time_periods=all_day_peak(),
-        )
+        app = make_app(tmp_path, Harness({}), root=direct_graph(),
+                       time_periods=all_day_peak())
         response = await post(app)
 
         assert response.status_code == 200
-        assert response.headers["x-sr-model"] == "power"
-        record = recent(app)
-        time_event = record["trace"][0]
+        trace = recent(app)["trace"]
+        time_event = trace[0]
         assert time_event["event"] == "time"
-        assert time_event["active_periods"] == ["peak"]
-        assert time_event["timezone"] == "Asia/Shanghai"
-        assert record["matched_rule"] == "高峰"
-        assert app.state.balancer.inflight("power") == 0
+        assert time_event["phase"] == "initial"
+        assert time_event["label"] == {"zh": "初始计算", "en": "Initial evaluation"}
+        assert app.state.balancer.inflight("safe") == 0
 
     asyncio.run(scenario())
 
 
-# ── admin test chat: direct model selection ────────────────────────────
-
-
-def test_admin_fixed_model_skips_policy_and_jev(tmp_path):
+def test_time_event_is_period_when_a_real_period_condition_ran(tmp_path):
     async def scenario():
-        jev_calls = []
+        app = make_app(tmp_path, Harness({}), root=period_condition_graph(),
+                       time_periods=all_day_peak())
+        response = await post(app)
 
-        def handler(request):
-            if request.url.host == "jev.test":
-                jev_calls.append(request)
-                raise AssertionError("direct model test must skip JEV")
-            return upstream_ok(request)
-
-        app = make_app(tmp_path, handler)
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://router.test",
-        ) as client:
-            response = await client.post("/admin/test/chat/completions", json={
-                "model": "power",
-                "messages": [{"role": "user", "content": "请求"}],
-            })
         assert response.status_code == 200
-        assert response.headers["x-sr-model"] == "power"
-        assert response.headers["x-sr-selection"] == "direct"
-        assert jev_calls == []
-        record = recent(app)
-        assert record["decision"] == "test"
-        assert record["selection_reason"] == "direct"
-        assert record["route_label"] == {"zh": "固定模型测试", "en": "Direct model test"}
-        assert record["jev_calls"] == 0
-        assert record["answers"] == {}
-
-    asyncio.run(scenario())
-
-
-def test_admin_fixed_model_unknown_is_404(tmp_path):
-    async def scenario():
-        app = make_app(tmp_path, lambda request: httpx.Response(500))
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://router.test",
-        ) as client:
-            response = await client.post("/admin/test/chat/completions", json={
-                "model": "ghost",
-                "messages": [{"role": "user", "content": "请求"}],
-            })
-        assert response.status_code == 404
-        assert response.json()["error"]["message"] == "unknown_model"
+        trace = recent(app)["trace"]
+        time_event = trace[0]
+        assert time_event["event"] == "time"
+        assert time_event["phase"] == "period"
+        assert time_event["label"] == {"zh": "时段判断", "en": "Time period"}
+        condition = next(event for event in trace if event["event"] == "condition")
+        assert condition["source"] == "periods"
+        assert condition["value"] is True
+        assert condition["phase"] == "period"
+        assert app.state.balancer.inflight("safe") == 0
 
     asyncio.run(scenario())
 
@@ -824,7 +820,7 @@ def test_admin_fixed_model_unknown_is_404(tmp_path):
 # ── upstream / lease / stream paths ────────────────────────────────────
 
 
-def test_no_active_policy_fails_before_any_http_call(tmp_path):
+def test_no_active_tree_fails_before_any_http_call(tmp_path):
     async def scenario():
         calls = []
 
@@ -835,7 +831,7 @@ def test_no_active_policy_fails_before_any_http_call(tmp_path):
         app = make_app(tmp_path, handler, active=False)
         response = await post(app)
         assert response.status_code == 503
-        assert response.json()["error"]["message"] == "no_active_policy"
+        assert response.json()["error"]["message"] == "no_active_tree"
         assert calls == []
 
     asyncio.run(scenario())
@@ -848,7 +844,7 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         def handler(request):
             if request.url.host == "jev.test":
                 jev_calls.append(request)
-                raise AssertionError("question-free policy must skip JEV")
+                raise AssertionError("direct target must skip JEV")
             body = b'data: {"choices":[]}\n\ndata: {"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}\n\ndata: [DONE]\n\n'
 
             class Chunks(httpx.AsyncByteStream):
@@ -857,7 +853,7 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
 
             return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Chunks())
 
-        app = make_app(tmp_path, handler, raw=direct_policy())
+        app = make_app(tmp_path, handler, root=direct_graph())
         response = await post(app, payload(stream=True))
         assert response.status_code == 200
         assert b"[DONE]" in response.content
@@ -867,7 +863,6 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert record["outcome_state"] == "completed"
         assert record["total_tokens"] == 3
         assert record["answers"] == {}
-        assert record["jev_calls"] == 0
         assert record["trace"][-1]["event"] == "request_outcome"
         assert record["fields"][-1][1] == 3
 
@@ -901,7 +896,7 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
         )
 
     async def scenario():
-        app = make_app(tmp_path, handler, raw=direct_policy())
+        app = make_app(tmp_path, handler, root=direct_graph())
         response = await post(app, payload(stream=True))
 
         # 客户端可见的响应仍是现有 handler 的 upstream_error 映射。
@@ -955,7 +950,7 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
                 200, headers={"content-type": "text/event-stream"}, stream=GatedStream(),
             )
 
-        app = make_app(tmp_path, handler, raw=direct_policy())
+        app = make_app(tmp_path, handler, root=direct_graph())
         request_body = json.dumps(payload(stream=True)).encode()
         request_started = False
         messages = asyncio.Queue()
@@ -1035,7 +1030,7 @@ def test_terminal_result_is_appended_only_once():
             self.results.append(record)
 
     logger = Logger()
-    record = {"trace": [], "model": "safe", "routing_ms": 2.0, "jev_calls": 0}
+    record = {"trace": [], "model": "safe", "routing_ms": 2.0, "waves": 0}
     outcome = OutcomeRecorder(logger, record, time.monotonic())
     assert outcome.finish(outcome_state="completed", upstream_status=200) is True
     assert outcome.finish(outcome_state="upstream_error", upstream_status=503) is False
@@ -1049,7 +1044,7 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
         def handler(request):
             return httpx.Response(503, json={"error": "down"})
 
-        app = make_app(tmp_path, handler, raw=direct_policy())
+        app = make_app(tmp_path, handler, root=direct_graph())
         response = await post(app)
         assert response.status_code == 502
         assert app.state.balancer.inflight("safe") == 0
@@ -1064,7 +1059,7 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
 def test_cancellation_during_upstream_records_terminal_state_and_releases(tmp_path):
     async def scenario():
         transport = BlockingTransport()
-        app = make_app(tmp_path, None, raw=direct_policy(), transport=transport)
+        app = make_app(tmp_path, None, root=direct_graph(), transport=transport)
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://router.test",
         ) as client:
@@ -1215,7 +1210,7 @@ def test_stream_generator_closes_response_and_releases_lease_once(tmp_path):
 
 def test_invalid_json_is_a_client_error(tmp_path):
     async def scenario():
-        app = make_app(tmp_path, lambda request: httpx.Response(500), raw=direct_policy())
+        app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://router.test",
         ) as client:

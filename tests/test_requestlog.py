@@ -20,12 +20,11 @@ def record(i, **overrides):
     value = {
         "id": f"r{i}", "ts": "2026-10-29T10:00:00+08:00", "text": "秘密请求文本",
         "decision": "route", "model": "strong-a", "target_id": "strong-target",
-        "policy_id": "main", "policy_revision": "p" * 64, "snapshot_revision": "s" * 64,
-        "policy_path": "strong", "selection_reason": "target", "sticky_hit": 0,
-        "session_hash": "h" * 64, "jev_model": "d1-2B", "jev_choice": "strong",
-        "jev_top": 0.8, "jev_margin": 0.6, "jev_ms": 12.0, "jev_calls": 1,
-        "routing_ms": 15.0,
-        "trace": [{"event": "jev", "questions": ["q"], "duration_ms": 12.0}],
+        "tree_id": "main", "tree_revision": "t" * 64, "snapshot_revision": "s" * 64,
+        "policy_path": "root/choose", "selection_reason": "jev", "sticky_hit": 0,
+        "session_hash": "h" * 64, "jev_model": "NeoHorse-Jev-4B", "jev_choice": "strong",
+        "jev_top": 0.8, "jev_margin": 0.6, "jev_ms": 12.0, "routing_ms": 15.0,
+        "trace": [{"event": "jev_choice", "probabilities": {"fast": 0.2, "strong": 0.8}}],
         "outcome_state": "incomplete",
     }
     value.update(overrides)
@@ -100,13 +99,13 @@ def test_hydrate_recent_restores_persisted_tail_without_live_detail(tmp_path):
     presented = present_record(recent[0])
     assert presented["route_label"] == {"zh": "目标命中", "en": "Target selected"}
     assert [pair[0]["en"] for pair in presented["metrics"]] == [
-        "Upstream", "Routing", "Total", "JEV calls"]
+        "Upstream", "Routing", "Total", "Waves"]
     assert presented["fields"][0][0] == {"zh": "请求 ID", "en": "Request ID"}
 
 
-def test_hydrate_presents_fallback_selection_reason(tmp_path):
+def test_hydrate_presents_otherwise_selection_reason(tmp_path):
     log = make_log(tmp_path)
-    log.enqueue(record(1, selection_reason="fallback", outcome_state="completed",
+    log.enqueue(record(1, selection_reason="otherwise", outcome_state="completed",
                        total_ms=5.0))
     asyncio.run(log.flush())
 
@@ -117,10 +116,8 @@ def test_hydrate_presents_fallback_selection_reason(tmp_path):
     finally:
         conn.close()
 
-    # Hydrated ledger rows keep selection_reason but not the trace events, so the
-    # fallback label stays generic (the live reason detail is not persisted).
     assert present_record(restored.recent_requests(1)[0])["route_label"] == {
-        "zh": "兜底目标", "en": "Fallback target"}
+        "zh": "默认目标兜底", "en": "Default target fallback"}
 
 
 def test_queue_full_is_counted_and_ring_survives(tmp_path, monkeypatch):
@@ -144,24 +141,23 @@ def test_stats_exposes_queue_and_drop_health(tmp_path):
     assert stats["ring_limit"] == RECENT_LIMIT
 
 
-def test_jev_calls_persists_but_answers_text_and_trace_stay_in_memory(tmp_path):
+def test_waves_persists_but_answers_text_and_trace_stay_in_memory(tmp_path):
     log = make_log(tmp_path)
     answers = {
-        "route": {
+        "capability": {
             "type": "choice",
+            "choice": "strong",
             "probabilities": {"fast": 0.2, "strong": 0.8},
-            "ranking": ["strong", "fast"], "p_top": 0.8, "margin": 0.6,
         },
     }
-    item = record(1, jev_calls=1, answers=answers, fallback_reason="jev_error")
+    item = record(1, waves=2, answers=answers, fallback_reason="error_fallback")
     log.enqueue(item)
     asyncio.run(log.flush())
     stored = rows(log)[0]
-    assert stored["jev_calls"] == 1
+    assert stored["waves"] == 2
     for forbidden in (
         "text", "trace", "answers", "jev_probabilities", "fallback_reason",
         "session_id", "latency_ms", "reasoning_warning", "node_labels",
-        "matched_rule",
     ):
         assert forbidden not in stored
     assert log.recent_requests(1)[0]["answers"] == answers
@@ -176,8 +172,7 @@ def test_log_columns_are_the_sqlite_whitelist(tmp_path):
     finally:
         conn.close()
     assert set(LOG_COLUMNS) == columns
-    assert {"policy_id", "policy_revision", "jev_calls"} <= set(LOG_COLUMNS)
-    assert not {"tree_id", "tree_revision", "waves"} & set(LOG_COLUMNS)
+    assert "waves" in LOG_COLUMNS
     assert not {"answers", "text", "trace", "session_id", "jev_probabilities"} & set(LOG_COLUMNS)
 
 

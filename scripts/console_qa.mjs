@@ -1,19 +1,21 @@
-/* RoutePilot 控制台 QA 基座（Task 8 起以 Policy v4 为面）
+/* RoutePilot 控制台 QA 基座（Task 10 拆分后）
    ------------------------------------------------------------------
-   本文件只保留：服务启动（Node mock + `python -m router` 子进程，策略目录走
-   ROUTER_POLICY_DIR）、浏览器、管理面 API、用例注册器/执行器、共享断言助手
-   与 teardown。页面用例位于 scripts/console_qa/{testchat,models,policy,
-   tryrun,logs}.mjs（Task 9 注册表：试算与计算日志已按 Policy v4 重写注册；
-   canvas / inspector 属画布时代，Task 10 随页面一并删除，保持退出注册），
-   各模块只调用本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
+   本文件只保留：服务启动（Node mock + `python -m router` 子进程）、浏览器、
+   管理面 API、用例注册器/执行器、共享断言助手与 teardown。页面用例分别位于
+   scripts/console_qa/{canvas,inspector,tryrun,logs,models,testchat}.mjs，各模块只调用
+   本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
 
-   console_qa.mjs 顶部保留的基座自检（健康检查 / 原生 ESM / 单模块入口 /
+   console_qa.mjs 顶部保留的 9 条用例是基座自检（健康检查 / 原生 ESM / 单模块入口 /
    登录页语言开关 / mock wire shape / mock 故障注入 / mock 上游 OpenAI 格式 /
-   bootstrap 目录与初始策略 / 真实 /admin/try）不属于任何页面模块。
+   bootstrap 目录与初始图 / 真实 /admin/try），不属于任何页面模块；首页「测试」
+   对话页的对话、渲染与附件用例注册在 testchat.mjs。
 
    Usage: node scripts/console_qa.mjs            # 全量（= npm run check:console）
           QA_ONLY=<regex> node scripts/console_qa.mjs
-          node scripts/console_qa/policy.mjs     # 只跑单个页面模块
+          node scripts/console_qa/canvas.mjs      # 只跑单个页面模块
+   Exports: 67 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
+            page / mockBase / routerBase / screenshot / BASELINE / FIXTURE），
+            完整清单见本文件下方的 export 声明。
    ------------------------------------------------------------------ */
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -29,36 +31,35 @@ import { chromium } from 'playwright-core';
 /* 控制台源码是原生 ES module：Node 侧可直接导入纯模块常量，
    页面内则用动态 import() 读取同一份模块实例（不暴露 window 全局）。 */
 import { HISTORY_LIMIT } from '../router/console/routing/draft.js';
+import { MIN_K } from '../router/console/routing/canvas.js';
 
-export { HISTORY_LIMIT };
+export { HISTORY_LIMIT, MIN_K };
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXAMPLE_PATH = path.join(ROOT, 'router/console/routing/example.json');
-const SCENARIO_PATH = path.join(ROOT, 'tests/fixtures/policy_scenarios.json');
+const SCENARIO_PATH = path.join(ROOT, 'tests/fixtures/graph_scenarios.json');
 const SHOT_DIR = path.join(ROOT, 'docs/od-design/routing-canvas-2026-11-02/implementation-qa');
+export const TREE_ID = 'power-priority';
+export const JEV_MODEL = 'd1-2B';
+export const S1_TEXT = '10kV 线路跳闸，请安排抢修工单并做故障定位。';
+export const S1_NOW = '2026-11-02T12:00:00+08:00';
+const API_TIMEOUT_MS = 15000;
 /* Screenshot writes are opt-in: a plain `npm run check:console` must not dirty
    the committed evidence PNGs. Regenerate with QA_SCREENSHOTS=1. */
 const WRITE_SHOTS = process.env.QA_SCREENSHOTS === '1';
 
-/* 示例策略（= tests/fixtures/policy_v4.json，spec §4.1 完整文档）：问题/规则数、
-   兜底目标都从这份文档派生，避免 QA 里散落字面量。 */
+/* 示例图是 15 节点图的唯一来源：节点/边数、start 坐标、兜底目标都从 fixture 派生，
+   避免 QA 里散落 15 / 20,150 / standard-target 这类字面量。 */
 export const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
-export const EXAMPLE_QUESTIONS = Object.keys(EXAMPLE.questions);
-export const EXAMPLE_RULES = EXAMPLE.rules.length;
-export const EXAMPLE_FALLBACK = EXAMPLE.fallback;
-/* v4 场景 fixture（Task 8 Step 6）：fast/power/adversarial/jev_error 四例，
-   mock 直接按 scenario.answers（问题ID → 概率/yes）出 wire 答案。 */
-export const FIXTURE = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
-export const POLICY_ID = 'power-policy';
-export const JEV_MODEL = 'd1-2B';
-export const S1_TEXT = FIXTURE.scenarios.find(item => item.id === 'power').text;
-export const S1_NOW = FIXTURE.scenarios.find(item => item.id === 'power').now;
-const API_TIMEOUT_MS = 15000;
-/* envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
+export const EXAMPLE_NODES = EXAMPLE.nodes.length;
+export const EXAMPLE_EDGES = EXAMPLE.edges.length;
+export const EXAMPLE_START = EXAMPLE.nodes.find(node => node.id === 'start').position;
+export const EXAMPLE_TARGETS = { fallback: EXAMPLE.error_fallback };
+/* 示例图只有 root；envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
 export const BASELINE = {
-  name: EXAMPLE.name,
-  timezone: EXAMPLE.timezone,
-  sticky: EXAMPLE.sticky,
+  name: '电力优先决策组',
+  timezone: 'Asia/Shanghai',
+  sticky: { enabled: true, ttl_seconds: 1800 }
 };
 
 /* ── 用例注册器 ─────────────────────────────────────────────────────── */
@@ -202,6 +203,19 @@ function sendJson(response, status, body) {
 
 /* ── mock：/v1/systemone + /v1/chat/completions ─────────────────────── */
 
+function loadScenarioFixture() {
+  const fixture = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
+  const optionKeys = {};
+  (EXAMPLE.nodes || []).forEach(node => {
+    if (node.type === 'question' && node.question_type === 'choice') {
+      optionKeys[node.id] = (node.options || []).map(option => option.key);
+}
+});
+  return { periods: fixture.periods || [], scenarios: fixture.scenarios || [], optionKeys };
+}
+
+export const FIXTURE = loadScenarioFixture();
+
 function pickScenario(state) {
   const matched = FIXTURE.scenarios.find(scenario => state.indexOf(scenario.text) >= 0);
   return matched || { id: 'manual', text: '', answers: {}, fail: null };
@@ -213,20 +227,15 @@ function normalizeProbabilities(values) {
   return values.map(value => value / total);
 }
 
-/* v4 场景答案按「问题ID → 选项 key 概率」描述；JEV wire 的 choice criteria
-   键是 label。option key ↔ label 的映射直接取自示例策略文档本身，
-   不再经过任何旧场景键（capability/domain/easy/standard/strong）垫片。 */
-function choiceAnswer(questionId, question, scenario) {
-  const options = ((EXAMPLE.questions || {})[questionId] || {}).options || [];
-  const keyOfLabel = {};
-  options.forEach(option => { keyOfLabel[option.label] = option.key; });
-  const probsByKey = (((scenario || {}).answers || {})[questionId] || {}).probs || {};
+function choiceAnswer(nodeId, question, fixture) {
   const labels = Object.keys(question.criteria || {});
-  let values = labels.map(label => {
-    const key = keyOfLabel[label];
-    const value = key ? probsByKey[key] : null;
-    return typeof value === 'number' ? value : null;
-  });
+  const keys = FIXTURE.optionKeys[nodeId];
+  const probsByKey = (fixture && fixture.probs) || {};
+  let values = labels.map((label, index) => {
+    const key = Array.isArray(keys) && keys.length === labels.length ? keys[index] : null;
+    const value = key && typeof probsByKey[key] === 'number' ? probsByKey[key] : null;
+    return value;
+});
   if (values.every(value => value === null)) values = labels.map(() => 1 / Math.max(1, labels.length));
   values = normalizeProbabilities(values.map(value => (value === null ? 0 : Math.max(0, value))));
   let best = 0;
@@ -241,10 +250,9 @@ function choiceAnswer(questionId, question, scenario) {
 };
 }
 
-function noulAnswer(questionId, scenario) {
-  const answer = ((scenario || {}).answers || {})[questionId];
-  if (answer && typeof answer.yes === 'number') return { type: 'noul', noul: answer.yes };
-  return { type: 'noul', noul: 0.5 };
+function noulAnswer(fixture) {
+  const yes = fixture && typeof fixture.yes === 'number' ? fixture.yes : 0.5;
+  return { type: 'noul', noul: yes };
 }
 
 function scoreAnswer(question, fixture) {
@@ -279,13 +287,13 @@ function scoreAnswer(question, fixture) {
 };
 }
 
-function answerFor(questionId, question, scenario) {
+function answerFor(nodeId, question, scenario) {
   const type = question && question.type;
-  const fixture = ((scenario || {}).answers || {})[questionId] || null;
-  if (type === 'choice') return choiceAnswer(questionId, question, scenario);
-  if (type === 'noul') return noulAnswer(questionId, scenario);
+  const fixture = (scenario.answers || {})[nodeId] || null;
+  if (type === 'choice') return choiceAnswer(nodeId, question, fixture);
+  if (type === 'noul') return noulAnswer(fixture);
   if (type === 'score') return scoreAnswer(question, fixture);
-  throw new Error(`mock does not support question type ${type} (${questionId})`);
+  throw new Error(`mock does not support question type ${type} (${nodeId})`);
 }
 
 /* ── Task 7 · 测试对话（/v1/chat/completions）的确定性 mock 触发词 ──────
@@ -345,19 +353,21 @@ function startMock() {
           mockState.scenarioCalls[scenario.id] = (mockState.scenarioCalls[scenario.id] || 0) + 1;
           mockState.systemoneCalls.push({ scenario: scenario.id, keys: questionKeys });
 
-          /* jev_error 场景：v4 一次 JEV 覆盖全部问题，场景标记 fail 时整次调用
-             直接按其配置的 HTTP status 失败——没有「第几波」要判断。 */
-          if (scenario.fail) {
-            sendJson(response, scenario.fail.status || 504, {
-              detail: scenario.fail.message || 'mock decision failure',
+          /* s5「决策服务超时」：第 1 波整波失败（504）；后续波（例如只问 clarify）
+             不在场景 answers 里，仍可正常应答，便于验证「整波作废」后的兜底路径。 */
+          const firstWave = scenario.fail && questionKeys.length > 0 &&
+            questionKeys.every(key => Object.prototype.hasOwnProperty.call(scenario.answers || {}, key));
+          if (firstWave) {
+            sendJson(response, 504, {
+              detail: 'mock decision timeout',
               scenario: scenario.id,
               message: scenario.fail.message || ''
 });
             return;
 }
           const answers = {};
-          questionKeys.forEach(questionId => {
-            answers[questionId] = answerFor(questionId, body.questions[questionId], scenario);
+          questionKeys.forEach(nodeId => {
+            answers[nodeId] = answerFor(nodeId, body.questions[nodeId], scenario);
 });
           sendJson(response, 200, {
             model: body.model || JEV_MODEL,
@@ -490,7 +500,7 @@ async function startRouter(port) {
     env: {
       ...process.env,
       ROUTER_DB: path.join(tempDir, 'router.db'),
-      ROUTER_POLICY_DIR: path.join(tempDir, 'routing-policy'),
+      ROUTER_GRAPH_DIR: path.join(tempDir, 'routing-graph'),
       ROUTER_HOST: '127.0.0.1',
       ROUTER_PORT: String(port),
       ROUTER_USER_AUTH: '0',
@@ -548,9 +558,9 @@ async function stopRouter() {
 
 /* ── 管理面 API + bootstrap ─────────────────────────────────────────── */
 
-export async function api(method, apiPath, body, headers) {
+export async function api(method, apiPath, body) {
   if (!routerBase) throw new Error('router is not ready');
-  const init = { method, headers: Object.assign({}, headers || {}) };
+  const init = { method, headers: {} };
   if (body !== undefined) {
     init.headers['content-type'] = 'application/json';
     init.body = JSON.stringify(body);
@@ -596,7 +606,7 @@ async function bootstrap() {
     reasoning_format: 'openai'
 });
 
-  /* 2. 示例策略与用例引用的模型，均声明 low/medium/high 推理档位。 */
+  /* 2. 示例图引用的四个模型，均声明 low/medium/high 推理档位。 */
   for (const modelId of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b']) {
     await api('PUT', '/admin/models/' + encodeURIComponent(modelId), {
       upstream: modelId,
@@ -618,7 +628,7 @@ async function bootstrap() {
     profile: { domains: [], tier: 'small' }
 });
 
-  /* 3. peak / normal / offpeak 三个固定时段（与 policy_scenarios.json 一致）。 */
+  /* 3. peak / normal / offpeak 三个固定时段（与 graph_scenarios.json 一致）。 */
   await api('PUT', '/admin/time-periods', { periods: FIXTURE.periods });
 
   /* 4. 决策服务指向 mock。 */
@@ -628,12 +638,15 @@ async function bootstrap() {
     timeout_seconds: 5
 });
 
-  /* 5. 建策略并启用（policy 原样使用 example.json = spec §4.1 完整文档）。 */
-  await api('POST', '/admin/policies', {
-    id: POLICY_ID,
-    policy: EXAMPLE
+  /* 5. 建图并启用（root 原样使用 Task 3 的 graph_power 示例）。 */
+  await api('POST', '/admin/trees', {
+    id: TREE_ID,
+    name: BASELINE.name,
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: EXAMPLE
 });
-  await api('POST', '/admin/policies/' + POLICY_ID + '/enable');
+  await api('POST', '/admin/trees/' + TREE_ID + '/enable');
 }
 
 /* ── 浏览器 ─────────────────────────────────────────────────────────── */
@@ -718,12 +731,13 @@ test('router service is ready on an isolated database', async () => {
   assertRepoDbUnchanged();
 });
 
-test('policy.js is served as a native ES module with a single module entry', async () => {
-  const response = await fetch(routerBase + '/console/routing/policy.js');
+test('graph.js is served as a native ES module with a single module entry', async () => {
+  const response = await fetch(routerBase + '/console/routing/graph.js');
   assert.equal(response.status, 200);
   const text = await response.text();
-  assert.match(text, /export function/, 'policy.js is not an ES module');
-  assert.doesNotMatch(text, /module\.exports/, 'policy.js still carries the CommonJS export');
+  assert.match(text, /export \{/, 'graph.js is not an ES module');
+  assert.doesNotMatch(text, /module\.exports/, 'graph.js still carries the CommonJS export');
+  assert.doesNotMatch(text, /root\.RTGraph/, 'graph.js still writes a window/global bridge');
   const pageResponse = await fetch(routerBase + '/console/routing.html');
   assert.equal(pageResponse.status, 200);
   const html = await pageResponse.text();
@@ -817,11 +831,6 @@ test('login language toggle is module-bound and really switches', async () => {
 });
 
 test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
-  /* v4 问题集直接来自示例策略：route（choice，criteria 键是 option label）、
-     power_business（noul）；complexity 是合成 score 问题，覆盖第三种 wire。 */
-  const route = EXAMPLE.questions.route;
-  const routeCriteria = {};
-  route.options.forEach(option => { routeCriteria[option.label] = option.capability; });
   const state = '【待判断的用户请求】\n' + S1_TEXT + '\n\n【任务】请选择最合适处理这条请求的模型。';
   const response = await fetch(mockBase + '/v1/systemone', {
     method: 'POST',
@@ -830,36 +839,33 @@ test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
       model: JEV_MODEL,
       state,
       questions: {
-        route: { type: 'choice', instructions: route.instructions, criteria: routeCriteria },
-        power_business: {
-          type: 'noul', instructions: EXAMPLE.questions.power_business.instructions
-        },
+        capability: {
+          type: 'choice',
+          instructions: '这条请求需要哪个能力档位？',
+          criteria: { 轻量模型: '简单问答', 标准模型: '标准写作', 增强模型: '复杂分析' }
+},
+        domain: { type: 'noul', instructions: '是否需要电力行业知识？' },
         complexity: { type: 'score', instructions: '复杂度评分。', criteria: [1, 5, 7.5, 10] }
 }
 })
 });
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.deepEqual(Object.keys(body.answers).sort(), ['complexity', 'power_business', 'route']);
+  assert.deepEqual(Object.keys(body.answers).sort(), ['capability', 'complexity', 'domain']);
 
-  const choice = body.answers.route;
+  const choice = body.answers.capability;
   assert.equal(choice.type, 'choice');
   assert.equal(typeof choice.choice, 'string');
-  assert.deepEqual(
-    Object.keys(choice.probabilities).sort(),
-    route.options.map(option => option.label).sort()
-  );
+  assert.deepEqual(Object.keys(choice.probabilities).sort(), ['增强模型', '标准模型', '轻量模型'].sort());
   const total = Object.values(choice.probabilities).reduce((sum, value) => sum + value, 0);
   assert.ok(Math.abs(total - 1) < 1e-9);
-  /* S1_TEXT 命中 power 场景：电力专用模型 0.8。 */
-  assert.ok(Math.abs(choice.probabilities['电力专用模型'] - 0.8) < 1e-9);
-  assert.ok(Math.abs(choice.confidence - 0.8) < 1e-9);
+  assert.ok(Math.abs(choice.probabilities['增强模型'] - 0.84) < 1e-9);
 
-  const noul = body.answers.power_business;
+  const noul = body.answers.domain;
   assert.equal(noul.type, 'noul');
   assert.equal(typeof noul.noul, 'number');
   assert.ok(noul.noul >= 0 && noul.noul <= 1);
-  assert.ok(Math.abs(noul.noul - 0.9) < 1e-9);
+  assert.ok(Math.abs(noul.noul - 0.92) < 1e-9);
   assert.equal('yes' in noul, false);
 
   const score = body.answers.complexity;
@@ -870,37 +876,42 @@ test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
   assert.ok(typeof score.probabilities[String(score.score)] === 'number');
 });
 
-test('mock fails the jev_error scenario with its configured status', async () => {
-  const failing = FIXTURE.scenarios.find(scenario => scenario.id === 'jev_error');
-  assert.ok(failing, 'jev_error scenario fixture missing');
-  assert.ok(failing.fail && failing.fail.status,
-    'the jev_error scenario must carry a configured fail status');
-  const route = EXAMPLE.questions.route;
-  const routeCriteria = {};
-  route.options.forEach(option => { routeCriteria[option.label] = option.capability; });
-  const state = '【待判断的用户请求】\n' + failing.text + '\n\n【任务】请选择最合适处理这条请求的模型。';
-  const response = await fetch(mockBase + '/v1/systemone', {
+test('mock fails the s5 first wave with 504 and answers later waves', async () => {
+  const s5 = FIXTURE.scenarios.find(scenario => scenario.id === 's5');
+  assert.ok(s5, 's5 scenario fixture missing');
+  const state = '【待判断的用户请求】\n' + s5.text + '\n\n【任务】请选择最合适处理这条请求的模型。';
+  const first = await fetch(mockBase + '/v1/systemone', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: JEV_MODEL,
       state,
       questions: {
-        route: { type: 'choice', instructions: route.instructions, criteria: routeCriteria },
-        power_business: {
-          type: 'noul', instructions: EXAMPLE.questions.power_business.instructions
-        },
-        adversarial: {
-          type: 'noul', instructions: EXAMPLE.questions.adversarial.instructions
-        }
+        capability: {
+          type: 'choice',
+          instructions: '这条请求需要哪个能力档位？',
+          criteria: { 轻量模型: '简单问答', 标准模型: '标准写作', 增强模型: '复杂分析' }
+},
+        domain: { type: 'noul', instructions: '是否需要电力行业知识？' }
 }
 })
 });
-  /* v4 一次 JEV 覆盖全部问题：场景 fail 直接以其 HTTP status 失败整次调用。 */
-  assert.equal(response.status, failing.fail.status);
-  const responseBody = await response.json();
-  assert.equal(responseBody.scenario, 'jev_error');
-  assert.equal(responseBody.message, failing.fail.message);
+  assert.equal(first.status, 504);
+  const firstBody = await first.json();
+  assert.equal(firstBody.scenario, 's5');
+
+  const later = await fetch(mockBase + '/v1/systemone', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: JEV_MODEL,
+      state,
+      questions: { clarify: { type: 'noul', instructions: '是否需要进一步处理？' } }
+})
+});
+  assert.equal(later.status, 200);
+  const laterBody = await later.json();
+  assert.equal(typeof laterBody.answers.clarify.noul, 'number');
 });
 
 test('mock upstream returns an OpenAI-format completion', async () => {
@@ -918,9 +929,9 @@ test('mock upstream returns an OpenAI-format completion', async () => {
   assert.equal(body.usage.total_tokens > 0, true);
 });
 
-/* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始策略一旦被后面的用例
+/* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始图一旦被后面的用例
    改动，这条用例就该在基座阶段立刻失败，而不是在 100 多条页面用例之后才报。 */
-test('bootstrap registers catalog, periods, decision service and the enabled policy', async () => {
+test('bootstrap registers catalog, periods, decision service and the enabled power graph', async () => {
   const models = await api('GET', '/admin/models');
   const modelIds = models.models.map(model => model.id).sort();
   for (const required of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft']) {
@@ -938,80 +949,85 @@ test('bootstrap registers catalog, periods, decision service and the enabled pol
   assert.equal(jev.config.base_url, mockBase);
   assert.equal(jev.config.model, JEV_MODEL);
 
-  const policies = await api('GET', '/admin/policies');
-  const resource = policies.policies.find(item => item.id === POLICY_ID);
-  assert.ok(resource, 'example policy resource missing');
-  assert.equal(resource.enabled, true);
-  assert.equal(resource.policy.name, EXAMPLE.name);
-  assert.deepEqual(Object.keys(resource.policy.questions).sort(), EXAMPLE_QUESTIONS.slice().sort());
-  assert.equal(resource.policy.rules.length, EXAMPLE_RULES);
-  assert.equal(resource.policy.fallback, EXAMPLE_FALLBACK);
-  assert.match(resource.policy_revision, /^[0-9a-f]{64}$/);
-  assert.match(resource.document_sha256, /^[0-9a-f]{64}$/);
+  const trees = await api('GET', '/admin/trees');
+  const tree = trees.trees.find(item => item.id === TREE_ID);
+  assert.ok(tree, 'power graph tree missing');
+  assert.equal(tree.enabled, true);
+  assert.equal(tree.root.nodes.length, 15);
+  assert.equal(tree.root.edges.length, 15);
+  assert.equal(tree.root.otherwise_target, undefined);
+  assert.equal(tree.root.error_fallback, 'light-target');
+  assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
 });
 
 
-test('admin try routes the sample policy through the live decision mock', async () => {
-  const result = await api('POST', '/admin/try', {
-    policy_id: POLICY_ID, text: S1_TEXT, now: S1_NOW,
-  });
-  assert.equal(result.target, 'power');
-  assert.deepEqual(result.models, ['qwen3.8-flash-sft']);
-  assert.equal(result.matched_rule, '电力业务优先');
-  assert.equal(result.matched_rule_index, 1);
-  assert.equal(result.fallback, false);
-  assert.equal(result.reason, null);
-  /* 一次 JEV 调用；answer 只展示后端返回，前端不重新求值。 */
-  const jevEvents = result.trace.filter(event => event.event === 'jev');
-  assert.equal(jevEvents.length, 1);
-  assert.deepEqual(jevEvents[0].questions.slice().sort(), ['adversarial', 'power_business', 'route']);
-  assert.equal(jevEvents[0].failed, false);
-  /* 规则轨迹：已求值规则带逐条件结果，命中后剩余规则 matched=null 未求值。 */
-  const ruleEvents = result.trace.filter(event => event.event === 'rule');
-  assert.deepEqual(ruleEvents.map(row => row.matched), [false, true, null, null]);
-  assert.equal(ruleEvents[0].conditions[0].path, 'when');
-  assert.deepEqual(ruleEvents[1].conditions.map(row => row.path),
-    ['when.any.0', 'when.any.1', 'when.any']);
-  assert.ok(ruleEvents.every(row => Array.isArray(row.conditions)));
-  assert.equal(result.trace.filter(event => event.event === 'final').length, 1);
-  assert.ok(Math.abs(result.answers.route.probabilities.power - 0.8) < 1e-9);
-  assert.ok(Math.abs(result.answers.route.p_top - 0.8) < 1e-9);
-  assert.ok(Math.abs(result.answers.power_business.yes - 0.9) < 1e-9);
-  assert.ok(Math.abs(result.answers.adversarial.yes - 0.1) < 1e-9);
+test('admin try routes the sample graph through the live decision mock', async () => {
+  const result = await api('POST', '/admin/try', { tree_id: TREE_ID, text: S1_TEXT, now: S1_NOW });
+  assert.equal(result.outcome.type, 'hit');
+  assert.equal(result.outcome.target_id, 'power-target');
+  assert.equal(result.outcome.model, 'qwen3.8-flash-sft');
+  assert.equal(result.outcome.waves.length, 1);
+  assert.deepEqual(result.outcome.waves[0].questions.sort(), ['capability', 'domain']);
+  assert.deepEqual(result.outcome.candidates.map(candidate => candidate.target_id).sort(), ['power-target', 'strong-target']);
+  assert.ok(Math.abs(result.answers.capability.probabilities.strong - 0.84) < 1e-9);
+  assert.ok(Math.abs(result.answers.domain.yes - 0.92) < 1e-9);
+  assert.deepEqual(result.warnings, []);
 
-  const calls = mockState.systemoneCalls.filter(call => call.scenario === 'power');
+  const calls = mockState.systemoneCalls.filter(call => call.scenario === 's1');
   assert.equal(calls.length >= 1, true);
-  assert.deepEqual(calls[calls.length - 1].keys.slice().sort(), ['adversarial', 'power_business', 'route']);
+  assert.deepEqual(calls[calls.length - 1].keys.sort(), ['capability', 'domain']);
 });
 
-/* ── Task 8 · 策略编辑器页面助手（替换画布时代 helper） ────────────── */
+/* ── Task 10 · 画布骨架 / 视口 / 连线 / 快速创建 / 历史栈 ───────────── */
 
-export async function openEditor() {
+export const MOD = process.platform === 'darwin' ? 'Meta' : 'Control';
+
+export async function openCanvas() {
   await page.goto(routerBase + '/console/routing.html');
+  await page.waitForSelector('#cvStage [data-node-id]', { timeout: 20000 });
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app && app.booted && app.policy);
+    return (app && app.booted && app.kit);
 });
-  await page.waitForSelector('#policyQuestions .pv-card', { timeout: 20000 });
-  await page.waitForTimeout(150);
+  await page.waitForTimeout(180);
 }
 
 export async function appSnapshot() {
   return page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return ({
-    booted: app.booted,
-    policyId: app.policyId,
+    return (({
+    viewport: app.kit.getViewport(),
     kind: app.kind(),
-    name: app.policy ? app.policy.name : null,
-    questions: Object.keys(app.policy ? app.policy.questions : {}),
-    targets: Object.keys(app.policy ? app.policy.targets : {}),
-    rules: (app.policy ? app.policy.rules : []).map(rule => ({
-      name: rule.name, target: rule.target
+    nodes: app.graph.nodes.map(node => ({
+      id: node.id, type: node.type, question_type: node.question_type || null,
+      operator: node.operator || null, source: node.source || null,
+      position: { x: node.position.x, y: node.position.y }
 })),
-    layout: app.layout,
+    edges: app.graph.edges.map(edge => ({
+      id: edge.id, source: edge.source, source_port: edge.source_port,
+      target: edge.target, target_port: edge.target_port,
+      condition: edge.condition ? { op: edge.condition.op, value: edge.condition.value } : edge.condition
+})),
+    selection: app.kit.getSelection(),
     history: { undo: store.canUndo, redo: store.canRedo }
+}));
 });
+}
+
+export async function blankPoint() {
+  return page.evaluate(() => {
+    const stage = document.getElementById('cvStage');
+    const rect = stage.getBoundingClientRect();
+    for (let y = rect.top + 14; y < rect.bottom - 130; y += 22) {
+      for (let x = rect.left + 14; x < rect.right - 14; x += 22) {
+        const el = document.elementFromPoint(x, y);
+        if (!el) continue;
+        if (el.closest('[data-node-id]') || el.closest('.rtc-overlay') || el.closest('.rtc-edge-hit')) continue;
+        if (el !== stage && !stage.contains(el)) continue;
+        return { x: x, y: y };
+}
+}
+    return null;
 });
 }
 
@@ -1021,6 +1037,57 @@ export async function clearToasts() {
 
 export async function toastText() {
   return page.evaluate(() => document.getElementById('cvToast').textContent.replace(/\s+/g, ' ').trim());
+}
+
+export async function portPoint(nodeId, portId, dir) {
+  const locator = page.locator(`[data-node-id="${nodeId}"] [data-port-id="${portId}"][data-port-dir="${dir}"]`).first();
+  const box = await locator.boundingBox();
+  assert.ok(box, `port not visible: ${nodeId}.${portId} (${dir})`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
+export async function dragPort(sourceNode, sourcePort, target, options) {
+  const from = await portPoint(sourceNode, sourcePort, 'out');
+  const opts = options || {};
+  await page.mouse.move(from.x, from.y);
+  await page.mouse.down();
+  /* 空槽位只在拖线期间显示：目标坐标必须在 mousedown 之后再取。 */
+  await page.mouse.move(from.x + 26, from.y + 18, { steps: 4 });
+  const point = target && typeof target.node === 'string' && typeof target.port === 'string'
+    ? await portPoint(target.node, target.port, 'in')
+    : target;
+  await page.mouse.move(point.x, point.y, { steps: 10 });
+  if (opts.beforeUp) await opts.beforeUp();
+  await page.mouse.up();
+}
+
+export async function clickNode(nodeId) {
+  const box = await page.locator(`[data-node-id="${nodeId}"]`).first().boundingBox();
+  assert.ok(box, `node not visible: ${nodeId}`);
+  await page.mouse.move(box.x + 24, box.y + 12);
+  await page.mouse.down();
+  await page.mouse.up();
+}
+
+export async function clickEdge(edgeId) {
+  const point = await page.evaluate(id => {
+    const hit = Array.from(document.querySelectorAll('.rtc-edge-hit'))
+      .find(path => path.dataset.edgeId === id);
+    if (!hit) return null;
+    const length = hit.getTotalLength();
+    const matrix = hit.getScreenCTM();
+    for (const ratio of [0.5, 0.4, 0.6, 0.3, 0.7, 0.2, 0.8, 0.1, 0.9]) {
+      const local = hit.getPointAtLength(length * ratio);
+      const screen = new DOMPoint(local.x, local.y).matrixTransform(matrix);
+      if (document.elementFromPoint(screen.x, screen.y) === hit) return { x: screen.x, y: screen.y };
+}
+    return null;
+}, edgeId);
+  if (point) await page.mouse.click(point.x, point.y);
+  else await page.evaluate(async id => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (app.kit.select('edge', id));
+}, edgeId);
 }
 
 /* 负向断言：给异步副作用一个有限的窗口；窗口内出现坏状态即失败。 */
@@ -1059,6 +1126,72 @@ export async function waitFor(predicate, arg, options) {
   throw error;
 }
 
+export async function dragLibraryItem(kind, target) {
+  const item = page.locator(`[data-lib-kind="${kind}"]`);
+  const box = await item.boundingBox();
+  assert.ok(box, `node library item not visible: ${kind}`);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x, target.y, { steps: 12 });
+  await page.mouse.up();
+}
+
+
+/* ── Task 11 · 检查器 / 条件双入口 / 级联删除 ─────────────────────── */
+
+export async function waitCondPop(edgeId) {
+  await page.waitForFunction(id => {
+    const pop = document.getElementById('cvCondPop');
+    return pop && !pop.hidden && pop.dataset.edgeId === id;
+}, edgeId, { timeout: 4000 });
+}
+
+export async function waitInspectorBranch(branch, id) {
+  await page.waitForFunction(([kind, value]) => {
+    const root = document.querySelector('#cvInspectorBody [data-ins-branch]');
+    return root && root.dataset.insBranch === kind && (!value || root.dataset.insId === value);
+}, [branch, id], { timeout: 4000 });
+}
+
+export async function waitEdgeCondition(edgeId, check) {
+  await waitFor(async ([id, expected]) => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const edge = app.graph.edges.find(item => item.id === id);
+    if (!edge) return false;
+    if (expected === null) return edge.condition === null;
+    return edge.condition && Object.keys(expected).every(key => edge.condition[key] === expected[key]);
+
+}, [edgeId, check], { timeout: 4000 });
+}
+
+export async function edgeOf(edgeId) {
+  return page.evaluate(async id => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const edge = app.graph.edges.find(item => item.id === id);
+    return edge ? JSON.parse(JSON.stringify(edge)) : null;
+
+}, edgeId);
+}
+
+export async function danglingEdgeIds() {
+  return page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+const RTGraph = await import('/console/routing/graph.js');
+
+    const graph = app.graph;
+    return graph.edges.filter(edge => {
+      const source = RTGraph.findNode(graph, edge.source);
+      const target = RTGraph.findNode(graph, edge.target);
+      return !source || !target ||
+        !RTGraph.portOf(source, edge.source_port, graph) ||
+        !RTGraph.portOf(target, edge.target_port, graph);
+}).map(edge => edge.id);
+
+});
+}
+
 export async function issueCodes() {
   return page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -1071,32 +1204,33 @@ export async function openIssuesPanel() {
   await page.waitForFunction(() => !document.getElementById('cvIssues').hidden);
 }
 
-/* 兼容导出：models.mjs 的 import 语句仍列出该名称（画布时代用例已删除，
-   注册在案的健康用例不再调用）。 */
-export async function waitInspectorBranch() {
-  return false;
+
+/* ── Task 12 · 保存 / 启用 / dirty / 导入导出 / 校验定位 ────────────── */
+
+/* 每个 Task 12 用例都从同一份服务端基线开始：power-priority 恢复为示例图并启用。
+   管理面没有 DELETE /admin/trees/{id}，用例新建的组留在临时库里但保持未启用。 */
+export async function putTree(id, payload) {
+  const current = await serverTree(id);
+  return api('PUT', '/admin/trees/' + encodeURIComponent(id), {
+    ...payload,
+    base_document_sha256: current.document_sha256,
+});
 }
 
-/* ── Task 8 · 策略资源基线 / dirty / 保存 / 布局 ───────────────────── */
-
-export async function serverPolicyResource(id) {
-  return (await api('GET', '/admin/policies/' + encodeURIComponent(id || POLICY_ID))).policy_resource;
+export async function ensureBaselineTree() {
+  const restored = await putTree(TREE_ID, {
+    id: TREE_ID,
+    name: BASELINE.name,
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: EXAMPLE
+});
+  if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
+  return (await api('GET', '/admin/trees/' + TREE_ID)).tree;
 }
 
-export async function putPolicy(id, policy) {
-  const current = await serverPolicyResource(id);
-  return api('PUT', '/admin/policies/' + encodeURIComponent(id), policy, {
-    'if-match': current.document_sha256,
-  }).then(result => result.policy_resource);
-}
-
-/* 每个策略用例都从同一份服务端基线开始：power-policy 恢复为示例文档并启用。 */
-export async function ensureBaselinePolicy() {
-  const restored = await putPolicy(POLICY_ID, EXAMPLE);
-  if (!restored.enabled) {
-    await api('POST', '/admin/policies/' + POLICY_ID + '/enable');
-  }
-  return serverPolicyResource(POLICY_ID);
+export async function serverTree(id) {
+  return (await api('GET', '/admin/trees/' + encodeURIComponent(id))).tree;
 }
 
 export async function dirtyBadge() {
@@ -1113,6 +1247,37 @@ export async function dirtyBadge() {
 };
 
 });
+}
+
+export async function dragNodeBy(nodeId, dx, dy) {
+  const before = await page.evaluate(async id => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const node = app.graph.nodes.find(item => item.id === id);
+    return { x: node.position.x, y: node.position.y };
+
+}, nodeId);
+  const box = await page.locator(`[data-node-id="${nodeId}"]`).first().boundingBox();
+  assert.ok(box, `node not visible: ${nodeId}`);
+  const start = { x: box.x + box.width / 2, y: box.y + 11 };
+  await page.mouse.move(start.x, start.y);
+  await page.mouse.down();
+  await page.mouse.move(start.x + dx, start.y + dy, { steps: 8 });
+  await page.mouse.up();
+  await waitFor(async ([id, previous]) => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const node = app.graph.nodes.find(item => item.id === id);
+    return node && (node.position.x !== previous.x || node.position.y !== previous.y);
+
+}, [nodeId, before], { timeout: 4000 });
+  return page.evaluate(async id => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const node = app.graph.nodes.find(item => item.id === id);
+    return { x: node.position.x, y: node.position.y };
+
+}, nodeId);
 }
 
 export async function saveNow() {
@@ -1132,6 +1297,23 @@ export async function beforeUnloadBlocked() {
 });
 }
 
+export async function exportViaUi() {
+  const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
+  await page.locator('#cvExport').click();
+  const download = await downloadPromise;
+  const file = await download.path();
+  assert.ok(file, 'browser download has no local path');
+  return { name: download.suggestedFilename(), text: fs.readFileSync(file, 'utf8') };
+}
+
+export async function setImportPayload(payload, name) {
+  await page.locator('#cvImportFile').setInputFiles({
+    name: name || 'graph.sr-routing-graph-v3.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload))
+});
+}
+
 export async function waitConfirmDialog() {
   await page.waitForSelector('#cvConfirmModal:not([hidden])', { timeout: 4000 });
   return page.locator('#cvConfirmBody').innerText();
@@ -1144,10 +1326,200 @@ export async function waitToastIncludes(fragment, timeout) {
 }, fragment, { timeout: timeout || 6000 });
 }
 
+
+/* ── Task 13 · 真实试算 / trace-only 回放 / 轨迹抽屉 / 波次布局 ─────── */
+
+/* 样例输入是「文本 + 固定 now」的请求预设：断言用 fixture 的文本/时间，
+   但答案永远从实时 /admin/try 读，QA 不把 fixture answers 传给页面。 */
+export const TRY_SAMPLES = FIXTURE.scenarios.map(scenario => ({
+  id: scenario.id,
+  name: scenario.name,
+  text: scenario.text,
+  now: scenario.now
+}));
+
+export async function prepareTryCanvas() {
+  await ensureBaselineTree();
+  await openCanvas();
+  const treeId = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (app.treeId);
+});
+  if (treeId !== TREE_ID) {
+    await page.evaluate(async id => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (app.selectTree(id));
+}, TREE_ID);
+    await waitFor(async id => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (app.treeId === id && app.booted);
+},
+      TREE_ID, { timeout: 10000 });
+}
+  await waitFor(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (app && !app.tryRunning);
+});
+}
+
+export async function waitTryResult(expected) {
+  await waitFor(async want => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const replay = app.replay;
+    if (!replay || app.tryRunning) return false;
+    if (!want) return true;
+    if (want.text != null && replay.text !== want.text) return false;
+    if (want.now !== undefined && (replay.now || null) !== want.now) return false;
+    return true;
+
+}, expected || null, { timeout: 15000 });
+}
+
+export async function runTrySample(index) {
+  const sample = TRY_SAMPLES[index];
+  assert.ok(sample, `missing scenario fixture at index ${index}`);
+  await page.locator(`[data-try-sample="${index}"]`).click();
+  await waitTryResult({ text: sample.text, now: sample.now });
+  return sample;
+}
+
+export async function runTryManual(text) {
+  await page.locator('#cvTryInput').fill(text);
+  await page.locator('#cvTryRun').click();
+  await waitTryResult({ text: text });
+}
+
+/* 一次性读取回放数据 + 卡片/边/结论/抽屉的 DOM 状态；所有断言都基于
+   页面公开状态（App.replay / data-* / class），不猜内部实现。 */
+export async function trySnapshot() {
+  return page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+
+    const replay = app.replay;
+    if (!replay) return null;
+    const nodeEl = id => document.querySelector(`#cvNodes [data-node-id="${id}"]`);
+    const textOf = (el, sel) => {
+      if (!el) return '';
+      const target = el.querySelector(sel);
+      return target ? target.textContent.replace(/\s+/g, ' ').trim() : '';
+};
+    const nodeInfo = id => {
+      const el = nodeEl(id);
+      if (!el) return null;
+      const live = {};
+      Array.prototype.forEach.call(el.querySelectorAll('[data-live]'), item => {
+        live[item.dataset.live] = item.textContent.trim();
+});
+      return {
+        replay: el.dataset.replay || '',
+        replayKind: el.dataset.replayKind || '',
+        classes: el.className,
+        state: textOf(el, '.rtc-card-h [data-live="state"]'),
+        foot: textOf(el, '.rtc-tfoot [data-live="state"]'),
+        gate: textOf(el, '.rtc-gate'),
+        selectedOptions: Array.prototype.map.call(el.querySelectorAll('.rtc-opt.is-sel'),
+          row => row.dataset.optkey),
+        keywordClasses: Array.prototype.map.call(el.querySelectorAll('.rtc-kw'),
+          chip => chip.className),
+        live: live
+};
+};
+    const slotInfo = (nodeId, port) => {
+      const row = document.querySelector(
+        `#cvNodes [data-node-id="${nodeId}"] .rtc-slot[data-slot="${port}"]`);
+      if (!row) return null;
+      const live = row.querySelector('.rtc-live');
+      return {
+        classes: row.className,
+        status: row.dataset.status || '',
+        edge: row.dataset.edge || '',
+        live: live ? live.textContent.trim() : ''
+};
+};
+    const edges = {};
+    Array.prototype.forEach.call(document.querySelectorAll('#cvEdges path.rtc-edge'), path => {
+      edges[path.dataset.edgeId] = path.className.baseVal;
+});
+    return {
+      id: replay.id,
+      text: replay.text,
+      now: replay.now,
+      final: replay.final ? {
+        target_id: replay.final.target_id,
+        kind: replay.final.kind,
+        selection_reason: replay.final.selection_reason,
+        model: replay.final.model,
+        priority: replay.final.priority,
+        candidates: replay.final.candidates
+} : null,
+      waves: replay.waves.map(wave => ({
+        wave: wave.wave,
+        questions: wave.questions,
+        duration_ms: wave.duration_ms,
+        failed: wave.failed,
+        error: wave.error
+})),
+      nodeStates: replay.nodeStates,
+      edgeStates: replay.edgeStates,
+      candidates: replay.candidates,
+      nodes: {
+        start: nodeInfo('start'),
+        capability: nodeInfo('capability'),
+        domain: nodeInfo('domain'),
+        clarify: nodeInfo('clarify'),
+        'and-power': nodeInfo('and-power'),
+        'or-ctx': nodeInfo('or-ctx'),
+        'not-cap': nodeInfo('not-cap'),
+        'and-follow': nodeInfo('and-follow'),
+        'cond-text': nodeInfo('cond-text'),
+        'cond-peak': nodeInfo('cond-peak'),
+        'power-target': nodeInfo('power-target'),
+        'strong-target': nodeInfo('strong-target'),
+        'deep-target': nodeInfo('deep-target'),
+        'standard-target': nodeInfo('standard-target'),
+        'light-target': nodeInfo('light-target')
+},
+      slots: {
+        andPowerIn1: slotInfo('and-power', 'in_1'),
+        andPowerIn2: slotInfo('and-power', 'in_2'),
+        deepIn1: slotInfo('deep-target', 'in_1'),
+        clarifyIn1: slotInfo('clarify', 'in_1'),
+        powerIn1: slotInfo('power-target', 'in_1'),
+        lightIn1: slotInfo('light-target', 'in_1')
+},
+      edges: edges,
+      svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
+      resultHidden: document.getElementById('cvTryResult').hidden,
+      resultText: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
+      resultFinal: document.getElementById('cvTryResult').dataset.final || '',
+      resultKind: document.getElementById('cvTryResult').dataset.kind || '',
+      hudHidden: document.getElementById('cvReplayHud').hidden,
+      hudText: document.getElementById('cvReplayHud').textContent.replace(/\s+/g, ' ').trim(),
+      hudTitles: Array.prototype.map.call(
+        document.querySelectorAll('#cvReplayHud [data-hud-wave]'),
+        el => el.getAttribute('title') || ''),
+      drawerHidden: document.getElementById('cvTraceDrawer').hidden,
+      drawerWaveCount: document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave').length,
+      drawerWaveTexts: Array.prototype.map.call(
+        document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave'),
+        el => el.textContent.replace(/\s+/g, ' ').trim()),
+      drawerText: document.getElementById('cvTraceDrawer').textContent.replace(/\s+/g, ' ').trim(),
+      running: app.tryRunning,
+      runDisabled: document.getElementById('cvTryRun').disabled,
+      topRunDisabled: document.getElementById('cvTryBtn').disabled,
+      palCollapsed: document.getElementById('cvPalette').classList.contains('is-collapsed'),
+      inspCollapsed: document.getElementById('cvInspector').classList.contains('is-collapsed')
+};
+
+});
+}
+
 export function assertIncludes(haystack, needle, message) {
   assert.ok(String(haystack).indexOf(needle) >= 0,
     `${message || 'missing text'} (wanted ${JSON.stringify(needle)} in ${JSON.stringify(String(haystack).slice(0, 400))})`);
 }
+
 
 /* ── 启动 / 清理 ────────────────────────────────────────────────────── */
 
@@ -1235,14 +1607,13 @@ export async function runIfMain(metaUrl) {
 
 async function main() {
   /* 静态 import 会先于本文件执行（页面模块又反向 import 本文件的注册器），
-     因此页面模块在 main 里动态加载，确保基座初始化完成后再注册用例。
-     Task 9 注册表：testchat / models / policy / tryrun / logs；canvas /
-     inspector（画布时代）保持退出注册，Task 10 随页面一并删除。 */
-  await import('./console_qa/testchat.mjs');
-  await import('./console_qa/models.mjs');
-  await import('./console_qa/policy.mjs');
+     因此页面模块在 main 里动态加载，确保基座初始化完成后再注册用例。 */
+  await import('./console_qa/canvas.mjs');
+  await import('./console_qa/inspector.mjs');
   await import('./console_qa/tryrun.mjs');
   await import('./console_qa/logs.mjs');
+  await import('./console_qa/models.mjs');
+  await import('./console_qa/testchat.mjs');
   console.log(`[console-qa] registered cases: ${checks.length}`);
   await runRegisteredCases();
 }

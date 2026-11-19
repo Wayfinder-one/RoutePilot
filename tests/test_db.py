@@ -5,28 +5,15 @@ import pytest
 
 from router.store.db import SCHEMA, SCHEMA_VERSION, connect, migrate
 
-_POLICY_ID_LINE = "        policy_id TEXT,\n"
-_POLICY_REVISION_LINE = "        policy_revision TEXT,\n"
-_JEV_CALLS_LINE = "        jev_calls INTEGER,\n"
-_TREE_ID_LINE = "        tree_id TEXT,\n"
-_TREE_REVISION_LINE = "        tree_revision TEXT,\n"
-_WAVES_LINE = "        waves INTEGER,\n"
-
-
-def _legacy_log_statement(statement: str) -> str:
-    """历史（v4 及更早）request_logs 形状：tree 列名、无 waves/jev_calls。"""
-    return (statement
-            .replace(_POLICY_ID_LINE, _TREE_ID_LINE)
-            .replace(_POLICY_REVISION_LINE, _TREE_REVISION_LINE)
-            .replace(_JEV_CALLS_LINE, ""))
+WAVES_LINE = "        waves INTEGER,\n"
 
 
 def build_v1_database(path):
-    """Create a v1 database: tree-era log columns without the v2 waves column."""
+    """Create a v1 database: current schema without the v2 request_logs.waves column."""
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
     for statement in SCHEMA:
-        conn.execute(_legacy_log_statement(statement))
+        conn.execute(statement.replace(WAVES_LINE, ""))
     conn.execute(
         "CREATE TABLE routing_trees (id TEXT PRIMARY KEY, name TEXT, enabled INTEGER, "
         "root TEXT, tree_revision TEXT, updated_at TEXT)"
@@ -58,25 +45,14 @@ CONFIG_REVISIONS_DDL = (
 
 
 def build_v3_database(path):
-    """Create a v3 database: tree-era log columns plus the retired config_revisions ledger."""
-    conn = build_v2_database(path)
-    for statement in CONFIG_REVISIONS_DDL:
-        conn.execute(statement)
-    conn.execute("UPDATE schema_migrations SET version = 3")
-    conn.commit()
-    return conn
-
-
-def build_v4_database(path):
-    """Create a v4 database: tree-era log columns (waves present, no jev_calls)."""
+    """Create a v3 database: current schema plus the retired config_revisions ledger."""
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
     for statement in SCHEMA:
-        conn.execute(statement
-                     .replace(_POLICY_ID_LINE, _TREE_ID_LINE)
-                     .replace(_POLICY_REVISION_LINE, _TREE_REVISION_LINE)
-                     .replace(_JEV_CALLS_LINE, _WAVES_LINE))
-    conn.execute("INSERT INTO schema_migrations VALUES (4)")
+        conn.execute(statement)
+    for statement in CONFIG_REVISIONS_DDL:
+        conn.execute(statement)
+    conn.execute("INSERT INTO schema_migrations VALUES (3)")
     conn.commit()
     return conn
 
@@ -89,7 +65,7 @@ def schema_version(conn):
     return conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
 
 
-def test_current_schema_is_idempotent_and_wal(tmp_path):
+def test_v4_schema_is_current_only_idempotent_and_wal(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
     migrate(conn)
@@ -103,65 +79,16 @@ def test_current_schema_is_idempotent_and_wal(tmp_path):
     assert not {"keyword_groups", "sessions", "stations", "nodes", "requests", "request_ledger", "evals"} & tables
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 4
     conn.close()
 
 
-def test_empty_database_is_created_directly_at_v5_with_policy_columns(tmp_path):
+def test_empty_database_is_created_directly_at_v4_with_waves(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
-    assert schema_version(conn) == 5
-    columns = column_names(conn, "request_logs")
-    assert {"policy_id", "policy_revision", "jev_calls"} <= columns
-    assert not {"tree_id", "tree_revision", "waves"} & columns
-    assert "routing_trees" not in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    conn.close()
-
-
-def test_v4_upgrade_renames_log_columns_and_keeps_rows(tmp_path):
-    path = str(tmp_path / "v4.db")
-    old = build_v4_database(path)
-    old.execute(
-        "INSERT INTO request_logs (id, ts, decision, model, target_id, tree_id, "
-        "tree_revision, waves, outcome_state) "
-        "VALUES ('row-1', '2026-11-01T10:00:00+08:00', 'route', 'fast', 'safe', "
-        "'main', ?, 2, 'completed')",
-        ("t" * 64,),
-    )
-    old.commit()
-    old.close()
-
-    conn = connect(path)
-    migrate(conn)
-    assert schema_version(conn) == 5
-    columns = column_names(conn, "request_logs")
-    assert {"policy_id", "policy_revision", "jev_calls"} <= columns
-    assert not {"tree_id", "tree_revision", "waves"} & columns
-    row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
-    assert row["policy_id"] == "main"
-    assert row["policy_revision"] == "t" * 64
-    assert row["jev_calls"] == 2
-    assert row["model"] == "fast"
-    assert row["outcome_state"] == "completed"
-    # 迁移只重命名日志列；重复调用幂等。
-    migrate(conn)
-    assert schema_version(conn) == 5
-    conn.close()
-
-
-def test_v4_upgrade_is_refused_without_request_logs(tmp_path):
-    path = str(tmp_path / "broken.db")
-    conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
-    conn.execute("INSERT INTO schema_migrations VALUES (4)")
-    conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
-    conn.commit()
-    conn.close()
-
-    conn = connect(path)
-    with pytest.raises(RuntimeError, match="new database"):
-        migrate(conn)
     assert schema_version(conn) == 4
+    assert "waves" in column_names(conn, "request_logs")
+    assert "routing_trees" not in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
 
 
@@ -178,16 +105,15 @@ def test_v1_upgrade_adds_waves_and_keeps_old_log_rows(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
-    columns = column_names(conn, "request_logs")
-    assert not {"tree_id", "tree_revision", "waves"} & columns
+    assert schema_version(conn) == 4
+    assert "waves" in column_names(conn, "request_logs")
     row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
     assert row["id"] == "old-row"
     assert row["model"] == "qwen3-8b"
     assert row["outcome_state"] == "completed"
-    assert row["jev_calls"] is None
+    assert row["waves"] is None
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 4
     conn.close()
 
 
@@ -212,13 +138,13 @@ def test_v1_upgrade_keeps_existing_graph_trees(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
-    assert "jev_calls" in column_names(conn, "request_logs")
+    assert schema_version(conn) == 4
+    assert "waves" in column_names(conn, "request_logs")
     assert conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
     conn.close()
 
 
-def test_v2_upgrade_to_v5_keeps_graph_rows_logs_and_waves(tmp_path):
+def test_v2_upgrade_to_v4_keeps_graph_rows_logs_and_waves(tmp_path):
     path = str(tmp_path / "v2.db")
     old = build_v2_database(path)
     old.execute(
@@ -243,8 +169,8 @@ def test_v2_upgrade_to_v5_keeps_graph_rows_logs_and_waves(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
-    assert conn.execute("SELECT jev_calls FROM request_logs WHERE id = 'v2-row'").fetchone()[0] == 2
+    assert schema_version(conn) == 4
+    assert conn.execute("SELECT waves FROM request_logs WHERE id = 'v2-row'").fetchone()[0] == 2
     assert conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
     conn.close()
 
@@ -301,8 +227,8 @@ def test_request_logs_contains_no_request_text_or_raw_session(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
     columns = column_names(conn, "request_logs")
-    assert {"policy_id", "policy_revision", "snapshot_revision", "policy_path", "sticky_hit", "session_hash", "jev_choice", "jev_top", "jev_margin", "selection_reason", "outcome_state", "jev_calls"} <= columns
-    assert not {"waves", "tree_id", "tree_revision"} & columns
+    assert {"id", "tree_revision", "snapshot_revision", "policy_path", "sticky_hit", "session_hash", "jev_choice", "jev_top", "jev_margin", "selection_reason", "outcome_state"} <= columns
+    assert "waves" in columns
     assert not {"answers", "text", "signals", "trace", "session_id", "api_key", "jev_probabilities", "fallback_reason"} & columns
     conn.close()
 
@@ -333,7 +259,7 @@ def test_unversioned_nonempty_database_is_rejected(tmp_path):
     conn.close()
 
 
-def test_v3_upgrade_drops_empty_config_revisions_and_records_v5(tmp_path):
+def test_v3_upgrade_drops_empty_config_revisions_and_records_v4(tmp_path):
     path = str(tmp_path / "v3.db")
     old = build_v3_database(path)
     assert old.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 0
@@ -341,14 +267,13 @@ def test_v3_upgrade_drops_empty_config_revisions_and_records_v5(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 4
     objects = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
     assert "config_revisions" not in objects
     assert "idx_config_revisions_kind" not in objects
     assert {"models", "providers", "request_logs", "changes", "users"} <= objects
-    assert {"policy_id", "policy_revision", "jev_calls"} <= column_names(conn, "request_logs")
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 4
     conn.close()
 
 

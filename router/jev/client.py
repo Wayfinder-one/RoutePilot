@@ -264,13 +264,7 @@ class JevClient:
             raise JevError(f"JEV returned HTTP {response.status_code}")
         try:
             body = response.json()
-            raw_answers = body.get("answers") if isinstance(body, dict) else None
-            if not isinstance(raw_answers, dict) or set(raw_answers) != set(questions):
-                raise JevError("JEV answers do not match questions exactly")
-            answers = {
-                key: parse_answer(key, questions[key], body, duration_ms)
-                for key in questions
-            }
+            answers = {key: parse_answer(key, questions[key], body, duration_ms) for key in questions}
         except (ValueError, KeyError, TypeError) as exc:
             raise JevError("JEV returned an invalid response: " + str(exc)) from exc
         return answers

@@ -8,11 +8,10 @@ This module keeps only the HTTP-facing request work:
 4. one ``UpstreamProxy`` call for the upstream exchange, and the framework
    response around the proxy's neutral result.
 
-Presentation lives in ``request_presenter``; transport and lease ownership
-live in ``router.upstream.proxy``.  The proxy never builds a framework
-response: it returns ``ProxyResult``/``ProxyStream`` and this module renders
-them.  The record keeps machine fields only: answers and the trace stay raw
-(design §5.5), and one decision accounts for at most one JEV call.
+Presentation lives in ``request_presenter``/``trace_presenter``; transport and
+lease ownership live in ``router.upstream.proxy``.  The proxy never builds a
+framework response: it returns ``ProxyResult``/``ProxyStream`` and this module
+renders them.
 """
 from __future__ import annotations
 
@@ -26,12 +25,18 @@ from types import SimpleNamespace
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from router.api.request_presenter import OutcomeRecorder, present_record
+from router.api.request_presenter import (
+    OUTCOME_INCOMPLETE,
+    OUTCOME_ROUTING_ERROR,
+    OutcomeRecorder,
+    node_labels,
+    present_record,
+)
+from router.api.trace_presenter import present_trace
 from router.jev.client import ChoiceAnswer
 from router.jev.serialization import answer_to_dict
-from router.request_outcome import OUTCOME_INCOMPLETE, OUTCOME_ROUTING_ERROR
 from router.routing.types import (
-    NoActivePolicyError,
+    NoActiveTreeError,
     NoAvailableBackend,
     RoutingMiss,
     RoutingRequest,
@@ -71,9 +76,13 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
-def _primary_choice(decision):
-    for question_id in sorted(decision.answers):
-        answer = decision.answers[question_id]
+def _first_wave_choice(decision):
+    """第一波按 node_id 排序后的首个 ChoiceAnswer（日志兼容列，spec §3.8）。"""
+    first_wave = decision.waves[0] if decision.waves else None
+    if first_wave is None:
+        return None
+    for node_id in sorted(first_wave.questions):
+        answer = decision.answers.get(node_id)
         if isinstance(answer, ChoiceAnswer):
             return answer
     return None
@@ -82,7 +91,8 @@ def _primary_choice(decision):
 def _decision_record(decision, snapshot, text: str, reasoning_warning,
                      routing_ms: float, started: float) -> dict:
     """Initial record for a completed routing decision (machine fields only)."""
-    answer = _primary_choice(decision)
+    first_wave = decision.waves[0] if decision.waves else None
+    answer = _first_wave_choice(decision)
     return {
         "id": uuid.uuid4().hex,
         "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -90,29 +100,28 @@ def _decision_record(decision, snapshot, text: str, reasoning_warning,
         "decision": "route",
         "model": decision.model,
         "target_id": decision.target_id,
-        "policy_id": snapshot.policy_id,
-        "policy_revision": snapshot.policy_revision,
+        "tree_id": snapshot.tree_id,
+        "tree_revision": snapshot.tree_revision,
         "snapshot_revision": snapshot.snapshot_revision,
         "policy_path": decision.policy_path,
         "selection_reason": decision.selection_reason,
         "fallback_reason": decision.fallback_reason,
-        "matched_rule": decision.matched_rule,
         "sticky_hit": 1 if decision.sticky_hit else 0,
         "session_hash": decision.session_hash,
-        "jev_model": snapshot.jev.model if decision.jev_questions and snapshot.jev else None,
+        "jev_model": snapshot.jev.model if first_wave is not None and snapshot.jev else None,
         "jev_choice": answer.selected_key if answer else None,
         "jev_top": answer.p_top if answer else None,
         "jev_margin": answer.margin if answer else None,
-        "jev_ms": decision.jev_duration_ms,
-        "jev_calls": 1 if decision.jev_duration_ms is not None else 0,
+        "jev_ms": first_wave.duration_ms if first_wave is not None else None,
         "jev_probabilities": dict(answer.probabilities) if answer else None,
-        "answers": {question_id: answer_to_dict(value)
-                    for question_id, value in decision.answers.items()},
+        "waves": len(decision.waves),
+        "answers": {node_id: answer_to_dict(value) for node_id, value in decision.answers.items()},
         "reasoning": decision.reasoning,
         "reasoning_warning": reasoning_warning,
         "routing_ms": routing_ms,
         "latency_ms": (time.monotonic() - started) * 1000.0,
         "trace": list(decision.trace),
+        "node_labels": node_labels(snapshot),
         "upstream_model": None,
         "upstream_status": None,
         "upstream_ms": None,
@@ -128,8 +137,8 @@ def _decision_record(decision, snapshot, text: str, reasoning_warning,
 
 def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
                             routing_ms, total_ms):
-    # 调度失败 ≠ 策略没有决策：恢复 trace 中最后一个 final 的目标元数据；
-    # 无 final（策略求值前失败）时保持 None，不从 sticky/schedule 推断成功结论。
+    # 调度失败 ≠ 图没有决策：恢复 trace 中最后一个 final 的目标元数据；
+    # 无 final（图前失败）时保持 None，不从 sticky/schedule 推断成功结论。
     final = next(
         (
             event for event in reversed(trace)
@@ -138,13 +147,13 @@ def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
         None,
     )
     target_id = final.get("target_id") if final is not None else None
-    final_reason = final.get("reason") if final is not None else None
-    if final is not None and final.get("kind") == "target":
+    final_kind = final.get("kind") if final is not None else None
+    if final_kind == "target":
         selection_reason = "target"
         fallback_reason = None
-    elif final_reason in {"jev_error", "no_rule_matched"}:
-        selection_reason = "fallback"
-        fallback_reason = final_reason
+    elif final_kind in {"otherwise", "error_fallback"}:
+        selection_reason = "error_fallback"
+        fallback_reason = "error_fallback"
     else:
         selection_reason = None
         fallback_reason = None
@@ -155,22 +164,22 @@ def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
         "decision": "route",
         "model": None,
         "target_id": target_id,
-        "policy_id": snapshot.policy_id if snapshot is not None else None,
-        "policy_revision": snapshot.policy_revision if snapshot is not None else None,
-        "snapshot_revision": snapshot.snapshot_revision if snapshot is not None else None,
+        "tree_id": getattr(snapshot, "tree_id", None),
+        "tree_revision": getattr(snapshot, "tree_revision", None),
+        "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
         "policy_path": target_id,
         "selection_reason": selection_reason,
         "fallback_reason": fallback_reason,
-        "matched_rule": None,
         "sticky_hit": 0,
         "session_hash": session_digest(session_id),
         "jev_model": snapshot.jev.model if snapshot is not None and snapshot.jev else None,
-        "jev_calls": sum(event.get("event") == "jev" for event in trace),
+        "waves": sum(event.get("event") == "wave" for event in trace),
         "answers": {},
         "routing_ms": routing_ms,
         "latency_ms": total_ms,
         "total_ms": total_ms,
         "trace": trace,
+        "node_labels": node_labels(snapshot),
         "outcome_state": OUTCOME_ROUTING_ERROR,
         "error_class": error_class,
     }
@@ -187,7 +196,7 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
     ``use_requested_model`` is the only difference between the public data plane
     and the admin test endpoint: when false the request ``model`` stays ignored
     and routing decides; when true ``"auto"`` still routes, any other model is a
-    fixed direct selection that skips policy/JEV/sticky.
+    fixed direct selection that skips graph/JEV/sticky.
     """
     started = time.monotonic()
     length = request.headers.get("content-length")
@@ -233,6 +242,7 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             "error_class": error_class,
             "message": message,
         })
+        trace[:] = present_trace(trace)
         record = present_record(_routing_failure_record(
             snapshot, text, session_id, trace,
             error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
@@ -250,15 +260,15 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
                 RoutingRequest(text=text, session_id=session_id),
                 trace_sink=trace,
             )
-        except NoActivePolicyError as exc:
-            return fail("no_active_policy", 503, "policy", str(exc))
+        except NoActiveTreeError as exc:
+            return fail("no_active_tree", 503, "graph", str(exc))
         except NoAvailableBackend as exc:
             return fail("no_available_backend", 503, "schedule", str(exc))
         except RoutingMiss as exc:
-            return fail("routing_invariant_violation", 503, "policy", str(exc))
+            return fail("routing_invariant_violation", 503, "graph", str(exc))
         except Exception:
             logger.exception("routing failed")
-            return fail("routing_failed", 503, "policy", "routing failed")
+            return fail("routing_failed", 503, "graph", "routing failed")
     else:
         if snapshot.backends.get(fixed_model) is None:
             return _error("unknown_model", 404)
@@ -281,6 +291,7 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
 
     upstream_body, reasoning_warning = prepare_upstream_request(
         body, backend, decision.reasoning)
+    trace[:] = present_trace(trace)
     if fixed_model is None:
         record = present_record(_decision_record(
             decision, snapshot, text, reasoning_warning, routing_ms, started))
@@ -292,13 +303,12 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             "decision": "test",
             "model": fixed_model,
             "target_id": None,
-            "policy_id": snapshot.policy_id,
-            "policy_revision": snapshot.policy_revision,
+            "tree_id": snapshot.tree_id,
+            "tree_revision": snapshot.tree_revision,
             "snapshot_revision": snapshot.snapshot_revision,
             "policy_path": None,
             "selection_reason": "direct",
             "fallback_reason": None,
-            "matched_rule": None,
             "sticky_hit": 0,
             "session_hash": session_digest(session_id),
             "jev_model": None,
@@ -306,14 +316,15 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             "jev_top": None,
             "jev_margin": None,
             "jev_ms": None,
-            "jev_calls": 0,
             "jev_probabilities": None,
+            "waves": 0,
             "answers": {},
             "reasoning": None,
             "reasoning_warning": None,
             "routing_ms": routing_ms,
             "latency_ms": (time.monotonic() - started) * 1000.0,
             "trace": [],
+            "node_labels": node_labels(snapshot),
             "upstream_model": None,
             "upstream_status": None,
             "upstream_ms": None,
