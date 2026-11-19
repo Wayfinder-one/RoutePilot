@@ -1025,3 +1025,27 @@ Expected: `x-sr-model`/`x-sr-selection` 头存在；`revision unchanged by layou
 - [ ] **Step 7: 记录部署结果**
 
 在工作记录中写明：部署时间、DB 恢复来源、routing-graph 备份路径、11 个图文件重写结果、健康与路由验证输出。
+
+---
+
+## 执行记录（实施偏差，2026-11-19）
+
+实施中发现并修正了三处计划缺陷，最终实现以本节为准：
+
+1. **canvas 存在于两个序列化视图的顶层**：文件文档（`document.py`）与 API envelope
+   （`tree.py` 的 `tree_storage_dict`/`tree_to_dict`）。节点对象在两者中都不带 `position`；
+   domain `GraphNode.position` 仅作内部工作状态。前端因此新增 `dispatchCanvas`/`collectCanvas`
+   两个导出，`parseImport`/`serialize` 与 `controller.js` 的 API load/save 边界共用。
+2. **前端范围扩大**：除 `graph.js` 外还改了 `controller.js`（`normaliseTree`/`applySavedResponse`/
+   `save`）与 `tryrun.js`（dry-run payload）；后端范围扩大为 `routes_trees.py` 与
+   `control/graphs.py` 的 canvas 透传。
+3. **`example.json` 改为完整文档**（root-only 无法承载顶层 canvas），并同步三个消费点：
+   `controller.loadExample` 走 `parseImport`、`console_graph_test.mjs` 的 `readExample`、
+   `console_qa.mjs`/`canvas.mjs` 的 `EXAMPLE_ROOT`/`server.canvas` 断言。
+
+执行中还修复一个隐性缺陷：`collectCanvas` 曾对 API payload 也 `Math.round`，导致保存回包坐标
+是整数而草稿保留浮点 → 草稿永远 `layout` dirty、保存后永不 `clean`。最终语义：仅文件导出取整
+（`collectCanvas(tree, {round: true})`），API 保存保留原始数值（与 v3 原行为一致）。
+
+Q&A 迁移范围扩大：`tests/routing_fixtures.py`、`tests/fixtures/graph_power.json`、
+`tests/fixtures/graph_contracts.json` 与 11 个测试文件中的图字面量一并迁移（Task 2 实施时完成）。
