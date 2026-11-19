@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from router.routing.codec import optional_text_field, reject_unknown_fields, text_field
 from router.routing.graph.model import (
     GraphRoot,
+    canvas_to_dict,
     canonical_json,
     graph_behavior_dict,
     graph_from_dict,
@@ -64,7 +65,7 @@ def tree_from_dict(raw) -> RoutingTree:
     reject_unknown_fields(
         "tree",
         raw,
-        {"id", "name", "enabled", "timezone", "sticky", "root", "tree_revision",
+        {"id", "name", "enabled", "timezone", "sticky", "root", "canvas", "tree_revision",
          "updated_at", "document_sha256"},
     )
     enabled = raw.get("enabled", False)
@@ -74,7 +75,7 @@ def tree_from_dict(raw) -> RoutingTree:
         id=text_field(raw.get("id"), "tree id"),
         name=optional_text_field(raw.get("name", ""), "tree name"),
         enabled=enabled,
-        root=graph_from_dict(raw.get("root")),
+        root=graph_from_dict(raw.get("root"), raw.get("canvas")),
         sticky=_sticky_from_dict(raw.get("sticky")),
         timezone=text_field(raw.get("timezone", "Asia/Shanghai"), "timezone"),
         tree_revision=optional_text_field(raw.get("tree_revision", ""), "tree_revision"),
@@ -84,7 +85,7 @@ def tree_from_dict(raw) -> RoutingTree:
 
 
 def tree_storage_dict(tree: RoutingTree) -> dict:
-    return {
+    document = {
         "id": tree.id,
         "name": tree.name,
         "enabled": tree.enabled,
@@ -92,6 +93,10 @@ def tree_storage_dict(tree: RoutingTree) -> dict:
         "sticky": {"enabled": tree.sticky.enabled, "ttl_seconds": tree.sticky.ttl_seconds},
         "root": graph_to_dict(tree.root),
     }
+    canvas = canvas_to_dict(tree.root)
+    if canvas:
+        document["canvas"] = canvas
+    return document
 
 
 def tree_behavior_dict(tree: RoutingTree) -> dict:

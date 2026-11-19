@@ -104,7 +104,7 @@ def test_atomic_replace_never_exposes_partial_json(repo):
 def test_layout_and_display_fields_survive_repository_roundtrip(repo):
     raw = tree_dict()
     raw["root"]["nodes"][0]["title"] = "请求入口"
-    raw["root"]["nodes"][0]["position"] = {"x": 321, "y": 654}
+    raw["canvas"]["start"] = {"x": 321, "y": 654}
     raw["root"]["nodes"][-1]["capability"] = "展示说明"
     created = repo.create(tree_from_dict(raw))
     loaded = repo.get("main")
@@ -118,7 +118,7 @@ def test_layout_only_update_keeps_revision_but_changes_file_hash(repo):
     raw = tree_dict()
     created = repo.create(tree_from_dict(raw))
     before = (repo.root / "graphs" / "main.json").read_bytes()
-    raw["root"]["nodes"][0]["position"] = {"x": 40, "y": 80}
+    raw["canvas"]["start"] = {"x": 40, "y": 80}
     raw["root"]["nodes"][0]["title"] = "入口改名"
     moved = repo.update(tree_from_dict(raw), base_document_sha256=created.document_sha256)
 
@@ -154,7 +154,7 @@ def test_question_option_order_changes_revision(repo):
 def test_copy_preserves_layout_display_and_capability(repo):
     raw = tree_dict("source")
     raw["root"]["nodes"][0]["title"] = "请求入口"
-    raw["root"]["nodes"][0]["position"] = {"x": 40, "y": 60}
+    raw["canvas"]["start"] = {"x": 40, "y": 60}
     raw["root"]["nodes"][-1]["capability"] = "展示说明"
     source = repo.create(tree_from_dict(raw))
 

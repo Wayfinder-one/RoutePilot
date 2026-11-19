@@ -25,7 +25,7 @@ from router.control.errors import AlreadyExists, MissingError, ValidationFailed
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue, validate_graph_structure
-from router.routing.graph.model import graph_to_dict
+from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict
 from router.store.repositories import ChangeRepo, now_iso
 from router.store.routing_trees import (
@@ -68,6 +68,7 @@ class GraphPatch:
 
     name: str | None | _Unset = UNSET
     root: dict | None | _Unset = UNSET
+    canvas: dict | None | _Unset = UNSET
     sticky: dict | None | _Unset = UNSET
     timezone: str | None | _Unset = UNSET
 
@@ -172,12 +173,17 @@ class GraphService:
         patch 缺失（``UNSET``）的字段继承 current；显式 null 原样交给
         ``tree_from_dict``，恢复 base 对 root/timezone/sticky 的 null 语义。
         """
+        if patch.canvas is UNSET:
+            canvas = None if patch.root is not UNSET else canvas_to_dict(current.root)
+        else:
+            canvas = patch.canvas
         try:
             return tree_from_dict({
                 "id": current.id,
                 "name": current.name if patch.name is UNSET else patch.name,
                 "enabled": current.enabled,
                 "root": graph_to_dict(current.root) if patch.root is UNSET else patch.root,
+                "canvas": canvas,
                 "sticky": ({"enabled": current.sticky.enabled,
                             "ttl_seconds": current.sticky.ttl_seconds}
                            if patch.sticky is UNSET else patch.sticky),

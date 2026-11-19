@@ -24,16 +24,24 @@ def enable_context():
     )
 
 
+#: 默认 fixture 的布局坐标；画布坐标属于 envelope 顶层 ``canvas``，不属于节点。
+GRAPH_CANVAS = {
+    "start": {"x": 0, "y": 0},
+    "q": {"x": 200, "y": 0},
+    "safe": {"x": 400, "y": 0},
+}
+
+
 def graph_dict():
     return {
         "id": "root", "type": "graph",
         "nodes": [
-            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
-            {"id": "q", "type": "question", "question_type": "choice", "instructions": "选择", "position": {"x": 200, "y": 0}, "options": [
+            {"id": "start", "type": "start"},
+            {"id": "q", "type": "question", "question_type": "choice", "instructions": "选择", "options": [
                 {"key": "easy", "label": "轻量", "capability": "简单请求"},
                 {"key": "strong", "label": "增强", "capability": "复杂请求"},
             ]},
-            {"id": "safe", "type": "target", "priority": 1, "position": {"x": 400, "y": 0}, "models": [{"model": "fast", "reasoning": None}]},
+            {"id": "safe", "type": "target", "priority": 1, "models": [{"model": "fast", "reasoning": None}]},
         ],
         "edges": [
             {"id": "e-start-q", "source": "start", "source_port": "out", "target": "q", "target_port": "in_1", "condition": None},
@@ -43,13 +51,18 @@ def graph_dict():
     }
 
 
-def tree_dict(tree_id="main", *, root=None, enabled=False, sticky=None):
-    return {
+def tree_dict(tree_id="main", *, root=None, enabled=False, sticky=None, canvas=None):
+    raw = {
         "id": tree_id, "name": "测试图", "enabled": enabled,
         "timezone": "Asia/Shanghai",
         "sticky": sticky or {"enabled": False, "ttl_seconds": 1800},
         "root": root or graph_dict(),
     }
+    if canvas is None and root is None:
+        canvas = {node_id: dict(coords) for node_id, coords in GRAPH_CANVAS.items()}
+    if canvas:
+        raw["canvas"] = canvas
+    return raw
 
 
 def huge_chain_graph(count=1200):

@@ -191,8 +191,8 @@ def test_next_slot_uses_smallest_unoccupied_positive_number():
     assert next_slot(root, "q") == "in_2"
     assert next_slot(root, "safe") == "in_2"
     raw = graph_dict()
-    raw["nodes"].append({"id": "wide", "type": "target", "priority": 2, "position": {"x": 800, "y": 0}, "models": [{"model": "slow", "reasoning": None}]})
-    raw["nodes"].append({"id": "fresh", "type": "target", "priority": 3, "position": {"x": 800, "y": 100}, "models": [{"model": "slow", "reasoning": None}]})
+    raw["nodes"].append({"id": "wide", "type": "target", "priority": 2, "models": [{"model": "slow", "reasoning": None}]})
+    raw["nodes"].append({"id": "fresh", "type": "target", "priority": 3, "models": [{"model": "slow", "reasoning": None}]})
     raw["edges"] += [
         {"id": "e-1", "source": "start", "source_port": "out", "target": "wide", "target_port": "in_1", "condition": None},
         {"id": "e-3", "source": "q", "source_port": "selected.easy", "target": "wide", "target_port": "in_3", "condition": None},

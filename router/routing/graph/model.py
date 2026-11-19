@@ -135,16 +135,16 @@ _LOGIC_OPERATORS = ("and", "or", "not")
 _CONDITION_SOURCES = ("text", "periods")
 
 
-def _position(raw: dict, kind: str) -> Position | None:
-    raw_position = raw.get("position")
+def _position(canvas: dict, node_id: str, kind: str) -> Position | None:
+    raw_position = canvas.get(node_id)
     if raw_position is None:
         return None
     if not isinstance(raw_position, dict):
-        raise ValueError(f"{kind}.position must be an object with x/y")
-    reject_unknown_fields(f"{kind}.position", raw_position, {"x", "y"})
+        raise ValueError(f"canvas.{node_id} must be an object with x/y")
+    reject_unknown_fields(f"canvas.{node_id}", raw_position, {"x", "y"})
     return Position(
-        finite_number(raw_position.get("x"), f"{kind}.position.x"),
-        finite_number(raw_position.get("y"), f"{kind}.position.y"),
+        finite_number(raw_position.get("x"), f"canvas.{node_id}.x"),
+        finite_number(raw_position.get("y"), f"canvas.{node_id}.y"),
     )
 
 
@@ -199,20 +199,22 @@ def _string_list(raw, field: str) -> tuple[str, ...]:
     return tuple(optional_text_field(item, f"{field} item") for item in raw)
 
 
-def _node_from_dict(raw) -> GraphNode:
+def _node_from_dict(raw, canvas: dict) -> GraphNode:
     if not isinstance(raw, dict):
         raise ValueError("node must be an object")
     node_type = raw.get("type")
     if node_type == "start":
-        reject_unknown_fields("start node", raw, {"id", "type", "title", "position"})
-        return StartNode(_node_id(raw), optional_title(raw, "start"), _position(raw, "start"))
+        reject_unknown_fields("start node", raw, {"id", "type", "title"})
+        node_id = _node_id(raw)
+        return StartNode(node_id, optional_title(raw, "start"), _position(canvas, node_id, "start"))
     if node_type == "question":
         reject_unknown_fields(
             "question node",
             raw,
             {"id", "type", "question_type", "instructions", "title", "options",
-             "criteria", "position"},
+             "criteria"},
         )
+        node_id = _node_id(raw)
         question_type = raw.get("question_type")
         if question_type not in _QUESTION_TYPES:
             raise ValueError(f"question.question_type must be one of {'/'.join(_QUESTION_TYPES)}, got {question_type!r}")
@@ -227,43 +229,46 @@ def _node_from_dict(raw) -> GraphNode:
         if question_type != "score" and criteria is not None:
             raise ValueError(f"{question_type} question must not declare criteria")
         return QuestionNode(
-            _node_id(raw),
+            node_id,
             question_type,
             optional_text_field(raw.get("instructions"), "question.instructions"),
             tuple(_option_from_dict(option) for option in options),
             _criteria_from_dict(criteria) if criteria is not None else None,
             optional_title(raw, "question"),
-            _position(raw, "question"),
+            _position(canvas, node_id, "question"),
         )
     if node_type == "logic":
-        reject_unknown_fields("logic node", raw, {"id", "type", "operator", "title", "position"})
+        reject_unknown_fields("logic node", raw, {"id", "type", "operator", "title"})
+        node_id = _node_id(raw)
         operator = raw.get("operator")
         if operator not in _LOGIC_OPERATORS:
             raise ValueError(f"logic.operator must be one of {'/'.join(_LOGIC_OPERATORS)}, got {operator!r}")
-        return LogicNode(_node_id(raw), operator, optional_title(raw, "logic"), _position(raw, "logic"))
+        return LogicNode(node_id, operator, optional_title(raw, "logic"), _position(canvas, node_id, "logic"))
     if node_type == "condition":
         reject_unknown_fields(
             "condition node",
             raw,
-            {"id", "type", "source", "contains_any", "periods", "title", "position"},
+            {"id", "type", "source", "contains_any", "periods", "title"},
         )
+        node_id = _node_id(raw)
         source = raw.get("source")
         if source not in _CONDITION_SOURCES:
             raise ValueError(f"condition.source must be one of {'/'.join(_CONDITION_SOURCES)}, got {source!r}")
         return ConditionNode(
-            _node_id(raw),
+            node_id,
             source,
             _string_list(raw.get("contains_any", []), "condition.contains_any"),
             _string_list(raw.get("periods", []), "condition.periods"),
             optional_title(raw, "condition"),
-            _position(raw, "condition"),
+            _position(canvas, node_id, "condition"),
         )
     if node_type == "target":
         reject_unknown_fields(
             "target node",
             raw,
-            {"id", "type", "models", "priority", "strategy", "capability", "title", "position"},
+            {"id", "type", "models", "priority", "strategy", "capability", "title"},
         )
+        node_id = _node_id(raw)
         models = raw.get("models", [])
         if not isinstance(models, list):
             raise ValueError("target.models must be a list")
@@ -281,13 +286,13 @@ def _node_from_dict(raw) -> GraphNode:
         if capability is not None and not isinstance(capability, str):
             raise ValueError("target.capability must be a string")
         return TargetNode(
-            _node_id(raw),
+            node_id,
             tuple(_model_target_from_dict(model) for model in models),
             priority,
             strategy,
             capability,
             optional_title(raw, "target"),
-            _position(raw, "target"),
+            _position(canvas, node_id, "target"),
         )
     raise ValueError(f"unknown node type {node_type!r}")
 
@@ -315,9 +320,13 @@ def _fallback_ref(raw: dict) -> str | None:
     return text_field(value, "graph error_fallback")
 
 
-def graph_from_dict(raw) -> GraphRoot:
+def graph_from_dict(raw, canvas: dict | None = None) -> GraphRoot:
     if not isinstance(raw, dict):
         raise ValueError("graph must be an object")
+    if canvas is None:
+        canvas = {}
+    if not isinstance(canvas, dict):
+        raise ValueError("canvas must be an object")
     reject_unknown_fields(
         "graph", raw, {"id", "type", "nodes", "edges", "error_fallback"},
     )
@@ -329,12 +338,16 @@ def graph_from_dict(raw) -> GraphRoot:
         raise ValueError("graph.nodes must be a list")
     if not isinstance(edges, list):
         raise ValueError("graph.edges must be a list")
-    return GraphRoot(
+    root = GraphRoot(
         text_field(raw.get("id"), "graph id"),
-        tuple(_node_from_dict(node) for node in nodes),
+        tuple(_node_from_dict(node, canvas) for node in nodes),
         tuple(_edge_from_dict(edge) for edge in edges),
         _fallback_ref(raw),
     )
+    unknown_canvas = sorted(set(canvas) - {node.id for node in root.nodes})
+    if unknown_canvas:
+        raise ValueError(f"canvas references unknown nodes: {', '.join(unknown_canvas)}")
+    return root
 
 
 def _node_to_dict(node: GraphNode) -> dict:
@@ -369,8 +382,6 @@ def _node_to_dict(node: GraphNode) -> dict:
         raise TypeError(f"unsupported node {node!r}")
     if node.title is not None:
         result["title"] = node.title
-    if node.position is not None:
-        result["position"] = {"x": node.position.x, "y": node.position.y}
     return result
 
 
@@ -393,6 +404,14 @@ def graph_to_dict(root: GraphRoot) -> dict:
         "nodes": [_node_to_dict(node) for node in root.nodes],
         "edges": [_edge_to_dict(edge) for edge in root.edges],
         "error_fallback": root.error_fallback,
+    }
+
+
+def canvas_to_dict(root: GraphRoot) -> dict:
+    return {
+        node.id: {"x": node.position.x, "y": node.position.y}
+        for node in root.nodes
+        if node.position is not None
     }
 
 

@@ -50,9 +50,8 @@ def direct_graph(reasoning=None):
     return {
         "id": "root", "type": "graph",
         "nodes": [
-            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "start", "type": "start"},
             {"id": "direct", "type": "target", "priority": 1,
-             "position": {"x": 200, "y": 0},
              "models": [{"model": "qwen3-8b", "reasoning": reasoning}]},
         ],
         "edges": [{

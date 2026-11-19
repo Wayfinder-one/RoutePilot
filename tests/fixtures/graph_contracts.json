@@ -11,14 +11,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}}
+          {"id": "start", "type": "start", "title": "开始"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件"},
+          {"id": "gate-and", "type": "logic", "operator": "and"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量"},
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理"}
         ],
         "edges": [
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
@@ -33,7 +33,8 @@
           {"id": "e-score-value-b", "source": "q-score", "source_port": "value", "target": "target-b", "target_port": "in_3", "condition": {"op": "lte", "value": 8.5}}
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "canvas": {"start": {"x": 78, "y": 360}, "cond-text": {"x": 260, "y": 360}, "gate-and": {"x": 440, "y": 360}, "q-choice": {"x": 640, "y": 360}, "q-noul": {"x": 840, "y": 360}, "q-score": {"x": 1040, "y": 360}, "target-a": {"x": 1240, "y": 300}, "target-b": {"x": 1240, "y": 460}}
     },
     "issue_codes": [],
     "behavior_sha256": "37f7afb853e826e6487cd0504f65c97a35e1db684ddb1538dfef1303109644d2"
@@ -50,14 +51,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
-          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}}
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理"},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "gate-and", "type": "logic", "operator": "and"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件"},
+          {"id": "start", "type": "start", "title": "开始"}
         ],
         "edges": [
           {"id": "e-score-value-b", "source": "q-score", "source_port": "value", "target": "target-b", "target_port": "in_3", "condition": {"op": "lte", "value": 8.5}},
@@ -72,7 +73,8 @@
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null}
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "canvas": {"target-b": {"x": 1240, "y": 460}, "target-a": {"x": 1240, "y": 300}, "q-score": {"x": 1040, "y": 360}, "q-noul": {"x": 840, "y": 360}, "q-choice": {"x": 640, "y": 360}, "gate-and": {"x": 440, "y": 360}, "cond-text": {"x": 260, "y": 360}, "start": {"x": 78, "y": 360}}
     },
     "issue_codes": [],
     "behavior_sha256": "37f7afb853e826e6487cd0504f65c97a35e1db684ddb1538dfef1303109644d2"
@@ -89,14 +91,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 10, "y": 20}, "title": "展示标题 target-b"},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "展示说明", "position": {"x": 21, "y": 33}, "title": "展示标题 target-a"},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 32, "y": 46}, "title": "展示标题 q-score"},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 43, "y": 59}, "title": "展示标题 q-noul"},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "展示标题 q-choice", "position": {"x": 54, "y": 72}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 65, "y": 85}, "title": "展示标题 gate-and"},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "展示标题 cond-text", "position": {"x": 76, "y": 98}},
-          {"id": "start", "type": "start", "title": "展示标题 start", "position": {"x": 87, "y": 111}}
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "title": "展示标题 target-b"},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "展示说明", "title": "展示标题 target-a"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "title": "展示标题 q-score"},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "title": "展示标题 q-noul"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "展示标题 q-choice", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "gate-and", "type": "logic", "operator": "and", "title": "展示标题 gate-and"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "展示标题 cond-text"},
+          {"id": "start", "type": "start", "title": "展示标题 start"}
         ],
         "edges": [
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
@@ -111,7 +113,8 @@
           {"id": "e-score-value-b", "source": "q-score", "source_port": "value", "target": "target-b", "target_port": "in_3", "condition": {"op": "lte", "value": 8.5}}
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "canvas": {"target-b": {"x": 10, "y": 20}, "target-a": {"x": 21, "y": 33}, "q-score": {"x": 32, "y": 46}, "q-noul": {"x": 43, "y": 59}, "q-choice": {"x": 54, "y": 72}, "gate-and": {"x": 65, "y": 85}, "cond-text": {"x": 76, "y": 98}, "start": {"x": 87, "y": 111}}
     },
     "issue_codes": [],
     "behavior_sha256": "37f7afb853e826e6487cd0504f65c97a35e1db684ddb1538dfef1303109644d2"
@@ -181,14 +184,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}}
+          {"id": "start", "type": "start", "title": "开始"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件"},
+          {"id": "gate-and", "type": "logic", "operator": "and"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量"},
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理"}
         ],
         "edges": [
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
@@ -204,7 +207,8 @@
         ],
         "error_fallback": "target-b",
         "otherwise_target": "target-a"
-      }
+      },
+      "canvas": {"start": {"x": 78, "y": 360}, "cond-text": {"x": 260, "y": 360}, "gate-and": {"x": 440, "y": 360}, "q-choice": {"x": 640, "y": 360}, "q-noul": {"x": 840, "y": 360}, "q-score": {"x": 1040, "y": 360}, "target-a": {"x": 1240, "y": 300}, "target-b": {"x": 1240, "y": 460}}
     },
     "issue_codes": ["graph_parse_error"],
     "behavior_sha256": null
@@ -221,14 +225,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}]},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}}
+          {"id": "start", "type": "start", "title": "开始"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件"},
+          {"id": "gate-and", "type": "logic", "operator": "and"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量"},
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理"}
         ],
         "edges": [
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
@@ -242,7 +246,8 @@
           {"id": "e-choice-fast-noul", "source": "q-choice", "source_port": "selected.fast", "target": "q-noul", "target_port": "in_1", "condition": null}
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "canvas": {"start": {"x": 78, "y": 360}, "cond-text": {"x": 260, "y": 360}, "gate-and": {"x": 440, "y": 360}, "q-choice": {"x": 640, "y": 360}, "q-noul": {"x": 840, "y": 360}, "q-score": {"x": 1040, "y": 360}, "target-a": {"x": 1240, "y": 300}, "target-b": {"x": 1240, "y": 460}}
     },
     "issue_codes": ["question_incomplete"],
     "behavior_sha256": null
@@ -259,14 +264,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}}
+          {"id": "start", "type": "start", "title": "开始"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件"},
+          {"id": "gate-and", "type": "logic", "operator": "and"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量"},
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理"}
         ],
         "edges": [
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
@@ -281,7 +286,8 @@
           {"id": "e-score-value-b", "source": "q-score", "source_port": "value", "target": "target-b", "target_port": "in_3", "condition": null}
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "canvas": {"start": {"x": 78, "y": 360}, "cond-text": {"x": 260, "y": 360}, "gate-and": {"x": 440, "y": 360}, "q-choice": {"x": 640, "y": 360}, "q-noul": {"x": 840, "y": 360}, "q-score": {"x": 1040, "y": 360}, "target-a": {"x": 1240, "y": 300}, "target-b": {"x": 1240, "y": 460}}
     },
     "issue_codes": ["numeric_edge_condition_missing"],
     "behavior_sha256": null
@@ -374,14 +380,14 @@
         "id": "root",
         "type": "graph",
         "nodes": [
-          {"id": "start", "type": "start", "title": "开始", "position": {"x": 78, "y": 360}},
-          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件", "position": {"x": 260, "y": 360}},
-          {"id": "gate-and", "type": "logic", "operator": "and", "position": {"x": 440, "y": 360}},
-          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "position": {"x": 640, "y": 360}, "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
-          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？", "position": {"x": 840, "y": 360}},
-          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5], "position": {"x": 1040, "y": 360}},
-          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量", "position": {"x": 1240, "y": 300}},
-          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理", "position": {"x": 1240, "y": 460}}
+          {"id": "start", "type": "start", "title": "开始"},
+          {"id": "cond-text", "type": "condition", "source": "text", "contains_any": ["故障", "抢修"], "title": "文本条件"},
+          {"id": "gate-and", "type": "logic", "operator": "and"},
+          {"id": "q-choice", "type": "question", "question_type": "choice", "instructions": "选择处理档位。", "title": "能力分档", "options": [{"key": "fast", "label": "快速", "capability": "简单问答"}, {"key": "strong", "label": "增强", "capability": "复杂分析"}]},
+          {"id": "q-noul", "type": "question", "question_type": "noul", "instructions": "是否需要电力行业知识？"},
+          {"id": "q-score", "type": "question", "question_type": "score", "instructions": "给请求的复杂度打分。", "criteria": [2.5, 5, 8.5]},
+          {"id": "target-a", "type": "target", "models": [{"model": "qwen3-8b", "reasoning": "low"}], "priority": 1, "strategy": "least_inflight", "capability": "轻量"},
+          {"id": "target-b", "type": "target", "models": [{"model": "qwen3-32b", "reasoning": "high"}], "priority": 2, "strategy": "least_inflight", "capability": "强推理"}
         ],
         "edges": [
           {"id": "e-start-gate", "source": "start", "source_port": "out", "target": "gate-and", "target_port": "in_1", "condition": null},
@@ -396,7 +402,8 @@
           {"id": "e-score-value-b", "source": "q-score", "source_port": "value", "target": "target-b", "target_port": "in_3", "condition": {"op": "lte", "value": 8.5}}
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "canvas": {"start": {"x": 78, "y": 360}, "cond-text": {"x": 260, "y": 360}, "gate-and": {"x": 440, "y": 360}, "q-choice": {"x": 640, "y": 360}, "q-noul": {"x": 840, "y": 360}, "q-score": {"x": 1040, "y": 360}, "target-a": {"x": 1240, "y": 300}, "target-b": {"x": 1240, "y": 460}}
     },
     "issue_codes": [],
     "behavior_sha256": "37f7afb853e826e6487cd0504f65c97a35e1db684ddb1538dfef1303109644d2"

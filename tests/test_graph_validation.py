@@ -59,8 +59,7 @@ def with_targets(raw, *extra):
     base = len([node for node in raw["nodes"] if node["type"] == "target"])
     for index, node_id in enumerate(extra, start=1):
         raw["nodes"].append({
-            "id": node_id, "type": "target", "priority": base + index,
-            "position": None, "models": [{"model": "fast", "reasoning": None}],
+            "id": node_id, "type": "target", "priority": base + index, "models": [{"model": "fast", "reasoning": None}],
         })
     return raw
 
@@ -83,10 +82,10 @@ def question_chain_raw(length):
     for index in range(1, length + 1):
         raw["nodes"].append({
             "id": f"q{index}", "type": "question", "question_type": "noul",
-            "instructions": "是否复杂", "position": None,
+            "instructions": "是否复杂",
         })
     raw["nodes"].append({
-        "id": "sink", "type": "target", "priority": 1, "position": None,
+        "id": "sink", "type": "target", "priority": 1,
         "models": [{"model": "fast", "reasoning": None}],
     })
     previous = "start"
@@ -106,7 +105,7 @@ def score_raw(criteria):
     raw = graph_dict()
     raw["nodes"].append({
         "id": "sc", "type": "question", "question_type": "score",
-        "instructions": "评分", "position": None, "criteria": criteria,
+        "instructions": "评分", "criteria": criteria,
     })
     raw["edges"].append({
         "id": "e-start-sc", "source": "start", "source_port": "out",
@@ -121,7 +120,7 @@ def score_raw(criteria):
 def test_condition_can_activate_question_without_start_edge():
     raw = tree_dict()
     root = raw["root"]
-    root["nodes"].insert(1, {"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"], "position": None})
+    root["nodes"].insert(1, {"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"]})
     root["edges"][0].update({"source": "c", "source_port": "out", "id": "e-c-q"})
     assert validate_graph_structure(tree_from_dict(raw)) == []
 
@@ -146,8 +145,7 @@ def test_empty_target_models_saved_but_not_enabled():
 def test_duplicate_node_id():
     raw = graph_dict()
     raw["nodes"].append({
-        "id": "q", "type": "question", "question_type": "choice", "instructions": "选择",
-        "position": None, "options": [
+        "id": "q", "type": "question", "question_type": "choice", "instructions": "选择", "options": [
             {"key": "easy", "label": "轻量", "capability": "简单请求"},
             {"key": "strong", "label": "增强", "capability": "复杂请求"},
         ],
@@ -214,7 +212,7 @@ def test_unknown_input_slot():
 
 def test_edge_into_start_or_condition_has_no_input_slot():
     raw = graph_dict()
-    raw["nodes"].append({"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"], "position": None})
+    raw["nodes"].append({"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"]})
     raw["edges"].append({
         "id": "e-c-start", "source": "c", "source_port": "out",
         "target": "start", "target_port": "in_1", "condition": None,
@@ -238,7 +236,7 @@ def test_slot_conflict():
 
 def test_cycle_between_question_and_gate():
     raw = with_targets(graph_dict(), "t2")
-    raw["nodes"].append({"id": "gate", "type": "logic", "operator": "and", "position": None})
+    raw["nodes"].append({"id": "gate", "type": "logic", "operator": "and"})
     raw["edges"] = [
         {"id": "e-start-q", "source": "start", "source_port": "out", "target": "q", "target_port": "in_1", "condition": None},
         {"id": "e-q-safe", "source": "q", "source_port": "selected.easy", "target": "safe", "target_port": "in_1", "condition": None},
@@ -347,7 +345,7 @@ def test_gate_slot_counts():
         ("not", 0), ("not", 2),
     ):
         raw = graph_dict()
-        raw["nodes"].append({"id": "gate", "type": "logic", "operator": operator, "position": None})
+        raw["nodes"].append({"id": "gate", "type": "logic", "operator": operator})
         for index in range(edges):
             raw["edges"].append({
                 "id": f"e-start-gate-{index}", "source": "start", "source_port": "out",
@@ -357,7 +355,7 @@ def test_gate_slot_counts():
         issue = next(issue for issue in structure(raw) if issue.code == "logic_slot_count")
         assert issue.node_id == "gate"
     raw = graph_dict()
-    raw["nodes"].append({"id": "gate", "type": "logic", "operator": "and", "position": None})
+    raw["nodes"].append({"id": "gate", "type": "logic", "operator": "and"})
     for index in range(2):  # AND 两个入边 → 合法
         raw["edges"].append({
             "id": f"e-start-gate-{index}", "source": "start", "source_port": "out",
@@ -502,14 +500,14 @@ def test_fallback_missing_or_not_target():
 
 def test_condition_node_config():
     raw = graph_dict()
-    raw["nodes"].append({"id": "c", "type": "condition", "source": "text", "position": None})  # contains_any 空
+    raw["nodes"].append({"id": "c", "type": "condition", "source": "text"})  # contains_any 空
     assert codes(raw) == {"condition_config_invalid"}
     assert next(issue for issue in structure(raw) if issue.code == "condition_config_invalid").node_id == "c"
     raw = graph_dict()
-    raw["nodes"].append({"id": "c", "type": "condition", "source": "periods", "periods": [], "position": None})
+    raw["nodes"].append({"id": "c", "type": "condition", "source": "periods", "periods": []})
     assert codes(raw) == {"condition_config_invalid"}
     raw = graph_dict()
-    raw["nodes"].append({"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"], "position": None})
+    raw["nodes"].append({"id": "c", "type": "condition", "source": "text", "contains_any": ["抢修"]})
     assert codes(raw) == set()  # 非空 contains_any 合法
 
 
@@ -519,7 +517,7 @@ def test_blank_condition_keywords_and_periods_are_rejected():
         raw = graph_dict()
         raw["nodes"].append({
             "id": "c", "type": "condition", "source": "text",
-            "contains_any": contains_any, "position": None,
+            "contains_any": contains_any,
         })
         assert codes(raw) == {"condition_config_invalid"}, contains_any
         issue = next(issue for issue in structure(raw) if issue.code == "condition_config_invalid")
@@ -529,7 +527,7 @@ def test_blank_condition_keywords_and_periods_are_rejected():
         raw = graph_dict()
         raw["nodes"].append({
             "id": "c", "type": "condition", "source": "periods",
-            "periods": periods, "position": None,
+            "periods": periods,
         })
         assert codes(raw) == {"condition_config_invalid"}, periods
         assert next(issue for issue in structure(raw) if issue.code == "condition_config_invalid").node_id == "c"
@@ -540,12 +538,11 @@ def test_blank_condition_keywords_and_periods_are_rejected():
 
 def test_node_limit_exceeded():
     raw = {"id": "root", "type": "graph", "nodes": [
-        {"id": "start", "type": "start", "position": None},
+        {"id": "start", "type": "start"},
     ], "edges": [], "error_fallback": "t0"}
     for index in range(200):  # 共 201 个节点 > 200
         raw["nodes"].append({
-            "id": f"t{index}", "type": "target", "priority": index + 1,
-            "position": None, "models": [{"model": "fast", "reasoning": None}],
+            "id": f"t{index}", "type": "target", "priority": index + 1, "models": [{"model": "fast", "reasoning": None}],
         })
     assert codes(raw) == {"limit_exceeded"}
     raw["nodes"].pop()  # 恰 200 个节点合法
@@ -554,16 +551,16 @@ def test_node_limit_exceeded():
 
 def test_question_limit_exceeded():
     raw = {"id": "root", "type": "graph", "nodes": [
-        {"id": "start", "type": "start", "position": None},
+        {"id": "start", "type": "start"},
     ], "edges": [], "error_fallback": "sink"}
     raw["nodes"].append({
-        "id": "sink", "type": "target", "priority": 1, "position": None,
+        "id": "sink", "type": "target", "priority": 1,
         "models": [{"model": "fast", "reasoning": None}],
     })
     for index in range(33):  # 33 个问题 > 32
         raw["nodes"].append({
             "id": f"q{index}", "type": "question", "question_type": "noul",
-            "instructions": "是否复杂", "position": None,
+            "instructions": "是否复杂",
         })
         raw["edges"].append({
             "id": f"e-start-q{index}", "source": "start", "source_port": "out",
@@ -605,8 +602,7 @@ def test_issue_list_is_order_independent():
     def build(reverse):
         raw = graph_dict()
         raw["nodes"].append({
-            "id": "q", "type": "question", "question_type": "choice", "instructions": "选择",
-            "position": None, "options": [
+            "id": "q", "type": "question", "question_type": "choice", "instructions": "选择", "options": [
                 {"key": "easy", "label": "轻量", "capability": "简单请求"},
                 {"key": "strong", "label": "增强", "capability": "复杂请求"},
             ],
@@ -667,7 +663,7 @@ def test_unknown_model_and_reasoning_unsupported():
 
 def test_unknown_period_is_enable_level():
     raw = graph_dict()
-    raw["nodes"].append({"id": "c", "type": "condition", "source": "periods", "periods": ["holiday"], "position": None})
+    raw["nodes"].append({"id": "c", "type": "condition", "source": "periods", "periods": ["holiday"]})
     assert codes(raw) == set()  # 结构级只要求 periods 非空
     issues = validate_graph_for_enable(tree_from_dict(tree_dict(root=raw)), enable_context())
     assert {i.code for i in issues} == {"unknown_period"}

@@ -12,9 +12,8 @@ def pool_graph(models):
     return {
         "id": "root", "type": "graph",
         "nodes": [
-            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "start", "type": "start"},
             {"id": "pool", "type": "target", "priority": 1,
-             "position": {"x": 200, "y": 0},
              "models": [{"model": model, "reasoning": None} for model in models]},
         ],
         "edges": [{

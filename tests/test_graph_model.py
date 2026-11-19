@@ -10,6 +10,7 @@ from router.routing.graph.model import (
     Position,
     QuestionNode,
     canonical_json,
+    canvas_to_dict,
     graph_from_dict,
     graph_revision_of,
     graph_to_dict,
@@ -44,7 +45,7 @@ def _with_score_criteria(levels):
     raw = graph_dict()
     raw["nodes"].append({
         "id": "sc", "type": "question", "question_type": "score",
-        "instructions": "评分", "position": {"x": 300, "y": 100},
+        "instructions": "评分",
         "criteria": list(levels),
     })
     return raw
@@ -54,12 +55,12 @@ def test_full_storage_and_behavior_revision_are_independent():
     raw = tree_dict()
     tree = tree_from_dict(raw)
     moved = tree_dict()
-    moved["root"]["nodes"][0]["position"] = {"x": 999, "y": 888}
+    moved["canvas"]["start"] = {"x": 999, "y": 888}
     moved["root"]["nodes"][0]["title"] = "入口"
     moved["root"]["edges"].reverse()
     moved_tree = tree_from_dict(moved)
     assert tree_revision_of(tree) == tree_revision_of(moved_tree)
-    assert tree_storage_dict(moved_tree)["root"]["nodes"][0]["position"] == {"x": 999, "y": 888}
+    assert tree_storage_dict(moved_tree)["canvas"]["start"] == {"x": 999, "y": 888}
     assert tree_storage_dict(moved_tree)["root"]["nodes"][0]["title"] == "入口"
     moved["root"]["edges"][0]["condition"] = {"op": "is", "value": False}
     assert tree_revision_of(tree) != tree_revision_of(tree_from_dict(moved))
@@ -81,11 +82,11 @@ def test_timezone_sticky_and_option_order_change_revision():
 def test_graph_roundtrip_preserves_config():
     raw = graph_dict()
     raw["nodes"] += [
-        {"id": "gate", "type": "logic", "operator": "and", "title": "与门", "position": {"x": 600, "y": 0}},
-        {"id": "cond", "type": "condition", "source": "text", "contains_any": ["抢修", "停电"], "position": {"x": 600, "y": 100}},
-        {"id": "period", "type": "condition", "source": "periods", "periods": ["peak"], "position": {"x": 600, "y": 200}},
-        {"id": "ask", "type": "question", "question_type": "noul", "instructions": "是否复杂", "position": {"x": 600, "y": 300}},
-        {"id": "grade", "type": "question", "question_type": "score", "instructions": "评分", "criteria": [1, 5, 10], "position": {"x": 600, "y": 400}},
+        {"id": "gate", "type": "logic", "operator": "and", "title": "与门"},
+        {"id": "cond", "type": "condition", "source": "text", "contains_any": ["抢修", "停电"]},
+        {"id": "period", "type": "condition", "source": "periods", "periods": ["peak"]},
+        {"id": "ask", "type": "question", "question_type": "noul", "instructions": "是否复杂"},
+        {"id": "grade", "type": "question", "question_type": "score", "instructions": "评分", "criteria": [1, 5, 10]},
     ]
     raw["edges"].append({"id": "e-g-safe", "source": "gate", "source_port": "out", "target": "safe", "target_port": "in_2", "condition": None})
     root = graph_from_dict(raw)
@@ -151,35 +152,36 @@ def test_unknown_field_rejected():
 
 
 def test_position_may_be_absent():
-    raw = graph_dict()
-    for node in raw["nodes"]:
-        node.pop("position")
-    tree = tree_from_dict(tree_dict(root=raw))
+    """位置是 envelope 顶层 canvas；节点缺条目合法，非空条目必须严格校验。"""
+    raw = tree_dict()
+    raw.pop("canvas")
+    tree = tree_from_dict(raw)
     assert all(node.position is None for node in tree.root.nodes)
     assert tree_revision_of(tree) == tree_revision_of(tree_from_dict(tree_dict()))
     assert all("position" not in node for node in tree_storage_dict(tree)["root"]["nodes"])
-    raw = graph_dict()
-    raw["nodes"][0]["position"] = None
-    assert tree_from_dict(tree_dict(root=raw)).root.nodes[0].position is None
+    assert "canvas" not in tree_storage_dict(tree)
     node = tree_from_dict(tree_dict()).root.nodes[0]
     assert isinstance(node.position, Position)
     assert node.position == Position(0.0, 0.0)
     assert node.position.x == 0.0 and isinstance(node.position.x, float)
-    bad = tree_dict(root=graph_dict())
-    bad["root"]["nodes"][0]["position"] = "left"
-    with pytest.raises(ValueError, match="position"):
+    bad = tree_dict()
+    bad["canvas"] = "left"
+    with pytest.raises(ValueError, match="canvas must be an object"):
         tree_from_dict(bad)
-    bad["root"]["nodes"][0]["position"] = {"x": 1}
-    with pytest.raises(ValueError, match="position"):
+    bad["canvas"] = {"start": {"x": 1}}
+    with pytest.raises(ValueError, match="canvas.start"):
         tree_from_dict(bad)
-    bad["root"]["nodes"][0]["position"] = {"x": float("nan"), "y": 0}
+    bad["canvas"] = {"start": {"x": float("nan"), "y": 0}}
     with pytest.raises(ValueError, match="finite"):
         tree_from_dict(bad)
-    bad["root"]["nodes"][0]["position"] = {"x": float("inf"), "y": 0}
+    bad["canvas"] = {"start": {"x": float("inf"), "y": 0}}
     with pytest.raises(ValueError, match="finite"):
         tree_from_dict(bad)
-    bad["root"]["nodes"][0]["position"] = {"x": 0, "y": 0, "z": 9}
+    bad["canvas"] = {"start": {"x": 0, "y": 0, "z": 9}}
     with pytest.raises(ValueError, match="unknown"):
+        tree_from_dict(bad)
+    bad["canvas"] = {"ghost": {"x": 0, "y": 0}}
+    with pytest.raises(ValueError, match="canvas references unknown nodes"):
         tree_from_dict(bad)
 
 
@@ -340,10 +342,10 @@ def test_numeric_normalization_is_revision_stable():
     first = tree_revision_of(tree_from_dict(tree_dict(root=_with_condition(1))))
     second = tree_revision_of(tree_from_dict(tree_dict(root=_with_condition(1.0))))
     assert first == second
-    raw = tree_dict(root=graph_dict())
-    raw["root"]["nodes"][0]["position"] = {"x": 1, "y": 2}
-    moved = tree_dict(root=graph_dict())
-    moved["root"]["nodes"][0]["position"] = {"x": 1.0, "y": 2.0}
+    raw = tree_dict()
+    raw["canvas"]["start"] = {"x": 1, "y": 2}
+    moved = tree_dict()
+    moved["canvas"]["start"] = {"x": 1.0, "y": 2.0}
     assert tree_revision_of(tree_from_dict(raw)) == tree_revision_of(tree_from_dict(moved))
     node = tree_from_dict(raw).root.nodes[0]
     assert node.position == Position(1.0, 2.0)
@@ -383,10 +385,10 @@ def test_otherwise_target_is_rejected_as_an_unknown_field():
 
 def test_huge_int_raises_value_error():
     """溢出量级的整数必须报 ValueError（契约），而不是 OverflowError（Task 2 复审发现）。"""
-    raw = graph_dict()
-    raw["nodes"][0]["position"] = {"x": 10 ** 400, "y": 0}
+    raw = tree_dict()
+    raw["canvas"]["start"] = {"x": 10 ** 400, "y": 0}
     with pytest.raises(ValueError, match="finite"):
-        tree_from_dict(tree_dict(root=raw))
+        tree_from_dict(raw)
     raw = graph_dict()
     raw["edges"][0]["condition"] = {"op": "gt", "value": 10 ** 400}
     with pytest.raises(ValueError, match="finite"):
@@ -394,7 +396,7 @@ def test_huge_int_raises_value_error():
     raw = graph_dict()
     raw["nodes"].append({
         "id": "sc", "type": "question", "question_type": "score",
-        "instructions": "评分", "position": None, "criteria": [1, 10 ** 400],
+        "instructions": "评分", "criteria": [1, 10 ** 400],
     })
     with pytest.raises(ValueError, match="finite"):
         tree_from_dict(tree_dict(root=raw))
@@ -426,7 +428,7 @@ def test_public_surface_lives_in_concrete_modules():
         graph_revision_of(tree)  # trees use tree_revision_of; no duck typing
     assert callable(evaluate_condition) and callable(output_ports)
     assert callable(next_slot) and callable(edge_type) and callable(slot_sort_key)
-    assert graph_from_dict(graph_to_dict(tree.root)) == tree.root
+    assert graph_from_dict(graph_to_dict(tree.root), canvas_to_dict(tree.root)) == tree.root
 
 
 def test_shared_sample_revision_is_order_and_display_invariant():
@@ -449,7 +451,50 @@ def test_shared_sample_revision_is_order_and_display_invariant():
         decorated = copy.deepcopy(raw)
         for node in decorated["root"]["nodes"]:
             node["title"] = "标题编辑"
-            node["position"] = {"x": 123, "y": 456}
+        decorated["canvas"] = {
+            node["id"]: {"x": 123, "y": 456} for node in decorated["root"]["nodes"]
+        }
         for edge in decorated["root"]["edges"]:
             edge["id"] = "renamed-" + edge["id"]
         assert tree_revision_of(tree_from_dict(decorated)) == expected, name
+
+
+# ── canvas key ────────────────────────────────────────────────────────
+
+
+def _migrated(tree):
+    """把旧式节点级 position 收进顶层 canvas（新格式 fixture 保持原样）。"""
+    canvas = {}
+    for node in tree["root"]["nodes"]:
+        position = node.pop("position", None)
+        if isinstance(position, dict):
+            canvas[node["id"]] = position
+    if canvas:
+        tree["canvas"] = canvas
+    return tree
+
+
+def test_graph_from_dict_injects_positions_from_canvas():
+    raw = {
+        "id": "root", "type": "graph", "error_fallback": None,
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "t1", "type": "target", "models": [{"model": "fast"}], "priority": 1},
+        ],
+        "edges": [],
+    }
+    root = graph_from_dict(raw, {"start": {"x": 5, "y": 6}})
+    assert root.nodes[0].position.x == 5
+    assert root.nodes[1].position is None
+
+
+def test_canvas_to_dict_skips_unpositioned_nodes():
+    raw = _migrated(tree_dict())
+    assert raw["canvas"]
+    tree = tree_from_dict(raw)
+    assert set(canvas_to_dict(tree.root)) == set(raw["canvas"])
+    for node in tree.root.nodes:
+        if node.position is None:
+            assert node.id not in canvas_to_dict(tree.root)
+    partial = tree_from_dict({**tree_dict(), "canvas": {"start": {"x": 7, "y": 8}}})
+    assert canvas_to_dict(partial.root) == {"start": {"x": 7.0, "y": 8.0}}

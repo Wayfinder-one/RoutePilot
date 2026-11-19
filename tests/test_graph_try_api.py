@@ -68,25 +68,25 @@ def three_answer_graph() -> dict:
     return {
         "id": "root", "type": "graph",
         "nodes": [
-            {"id": "start", "type": "start", "position": {"x": 0, "y": 0}},
+            {"id": "start", "type": "start"},
             {"id": "q-choice", "type": "question", "question_type": "choice",
-             "instructions": "选择能力", "position": {"x": 180, "y": -80},
+             "instructions": "选择能力",
              "options": [
                  {"key": "easy", "label": "轻量模型", "capability": "简单请求"},
                  {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
              ]},
             {"id": "q-noul", "type": "question", "question_type": "noul",
-             "instructions": "是否需要电力知识？", "position": {"x": 180, "y": 40}},
+             "instructions": "是否需要电力知识？"},
             {"id": "q-score", "type": "question", "question_type": "score",
-             "instructions": "难度评分", "criteria": [1, 10], "position": {"x": 180, "y": 160}},
+             "instructions": "难度评分", "criteria": [1, 10]},
             {"id": "t-choice", "type": "target", "priority": 4, "title": "轻量目标",
-             "models": [{"model": "qwen3-8b", "reasoning": None}], "position": {"x": 420, "y": -80}},
+             "models": [{"model": "qwen3-8b", "reasoning": None}]},
             {"id": "t-noul", "type": "target", "priority": 3,
-             "models": [{"model": "qwen3-32b", "reasoning": None}], "position": {"x": 420, "y": 40}},
+             "models": [{"model": "qwen3-32b", "reasoning": None}]},
             {"id": "t-score", "type": "target", "priority": 2,
-             "models": [{"model": "deepseek-v3", "reasoning": None}], "position": {"x": 420, "y": 160}},
+             "models": [{"model": "deepseek-v3", "reasoning": None}]},
             {"id": "safe", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}], "position": {"x": 420, "y": 280}},
+             "models": [{"model": "qwen3-8b", "reasoning": None}]},
         ],
         "edges": [
             {"id": "e-start-choice", "source": "start", "source_port": "out",
@@ -476,7 +476,7 @@ def test_try_parse_error_is_issue_array_and_skips_engine(client, app):
 def test_try_structure_errors_are_issue_arrays_with_locators(client, app):
     engine, *_rest = install_engine(app)
     root = three_answer_graph()
-    root["nodes"].append({"id": "start-2", "type": "start", "position": {"x": 0, "y": 0}})
+    root["nodes"].append({"id": "start-2", "type": "start"})
     response = client.post("/admin/try", json={"root": root, "text": "你好"})
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]

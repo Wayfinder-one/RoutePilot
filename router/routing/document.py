@@ -3,16 +3,16 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from router.routing.graph.model import graph_to_dict
+from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict, tree_revision_of
 
 KIND = "sr-routing-graph"
 VERSION = 3
-FIELDS = {"kind", "version", "name", "timezone", "sticky", "root"}
+FIELDS = {"kind", "version", "name", "timezone", "sticky", "root", "canvas"}
 
 
 def graph_document(tree: RoutingTree) -> dict:
-    return {
+    document = {
         "kind": KIND,
         "version": VERSION,
         "name": tree.name,
@@ -20,6 +20,10 @@ def graph_document(tree: RoutingTree) -> dict:
         "sticky": {"enabled": tree.sticky.enabled, "ttl_seconds": tree.sticky.ttl_seconds},
         "root": graph_to_dict(tree.root),
     }
+    canvas = canvas_to_dict(tree.root)
+    if canvas:
+        document["canvas"] = canvas
+    return document
 
 
 def graph_document_bytes(tree: RoutingTree) -> bytes:
@@ -39,7 +43,7 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
         raise ValueError("graph document must be an object")
     if raw.get("kind") != KIND or isinstance(raw.get("version"), bool) or raw.get("version") != VERSION:
         raise ValueError("only sr-routing-graph v3 is accepted")
-    missing = sorted(FIELDS - set(raw))
+    missing = sorted(FIELDS - set(raw) - {"canvas"})
     if missing:
         raise ValueError(f"missing graph document fields: {', '.join(missing)}")
     unknown = sorted(set(raw) - FIELDS)
@@ -52,6 +56,7 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
         "timezone": raw["timezone"],
         "sticky": raw["sticky"],
         "root": raw["root"],
+        "canvas": raw.get("canvas", {}),
         "updated_at": updated_at,
     })
     return replace(

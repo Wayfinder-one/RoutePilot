@@ -4,11 +4,7 @@
   "nodes": [
     {
       "id": "start",
-      "type": "start",
-      "position": {
-        "x": 20,
-        "y": 150
-      }
+      "type": "start"
     },
     {
       "id": "cond-text",
@@ -18,11 +14,7 @@
         "抢修",
         "停电",
         "故障"
-      ],
-      "position": {
-        "x": 170,
-        "y": 10
-      }
+      ]
     },
     {
       "id": "cond-peak",
@@ -30,11 +22,7 @@
       "source": "periods",
       "periods": [
         "peak"
-      ],
-      "position": {
-        "x": 170,
-        "y": 100
-      }
+      ]
     },
     {
       "id": "capability",
@@ -58,79 +46,47 @@
           "label": "增强模型",
           "capability": "复杂分析、方案设计和深度推理。"
         }
-      ],
-      "position": {
-        "x": 170,
-        "y": 195
-      }
+      ]
     },
     {
       "id": "domain",
       "type": "question",
       "question_type": "noul",
       "title": "domain",
-      "instructions": "这条请求是否需要电力行业的业务知识与规程？",
-      "position": {
-        "x": 170,
-        "y": 440
-      }
+      "instructions": "这条请求是否需要电力行业的业务知识与规程？"
     },
     {
       "id": "or-ctx",
       "type": "logic",
-      "operator": "or",
-      "position": {
-        "x": 420,
-        "y": 20
-      }
+      "operator": "or"
     },
     {
       "id": "not-cap",
       "type": "logic",
-      "operator": "not",
-      "position": {
-        "x": 420,
-        "y": 190
-      }
+      "operator": "not"
     },
     {
       "id": "and-follow",
       "type": "logic",
-      "operator": "and",
-      "position": {
-        "x": 640,
-        "y": 80
-      }
+      "operator": "and"
     },
     {
       "id": "and-power",
       "type": "logic",
-      "operator": "and",
-      "position": {
-        "x": 640,
-        "y": 340
-      }
+      "operator": "and"
     },
     {
       "id": "clarify",
       "type": "question",
       "question_type": "noul",
       "title": "clarify",
-      "instructions": "是否需要按抢修优先级进一步处理？",
-      "position": {
-        "x": 860,
-        "y": 20
-      }
+      "instructions": "是否需要按抢修优先级进一步处理？"
     },
     {
       "id": "deep-target",
       "type": "target",
       "priority": 4,
       "capability": "最深推理：复杂方案与长链分析",
-      "position": {
-        "x": 1080,
-        "y": 20
-      },
       "models": [
         {
           "model": "deepseek-v3",
@@ -143,10 +99,6 @@
       "type": "target",
       "priority": 5,
       "capability": "国网电力专用：设备故障、抢修工单、电力规程",
-      "position": {
-        "x": 1080,
-        "y": 150
-      },
       "models": [
         {
           "model": "qwen3.8-flash-sft",
@@ -159,10 +111,6 @@
       "type": "target",
       "priority": 3,
       "capability": "强推理通用模型：复杂分析、方案设计",
-      "position": {
-        "x": 1080,
-        "y": 280
-      },
       "models": [
         {
           "model": "qwen3-32b",
@@ -175,10 +123,6 @@
       "type": "target",
       "priority": 2,
       "capability": "标准档通用模型：写作、总结与纠错",
-      "position": {
-        "x": 1080,
-        "y": 410
-      },
       "models": [
         {
           "model": "deepseek-v3",
@@ -191,10 +135,6 @@
       "type": "target",
       "priority": 1,
       "capability": "轻量快速模型：简单问答与短输出",
-      "position": {
-        "x": 1080,
-        "y": 540
-      },
       "models": [
         {
           "model": "qwen3-8b",

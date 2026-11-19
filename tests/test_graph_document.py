@@ -18,19 +18,32 @@ def load(content, **overrides):
     return parse_graph_document(content, **values)
 
 
+def _migrated(tree):
+    """把旧式节点级 position 收进顶层 canvas（新格式 fixture 保持原样）。"""
+    canvas = {}
+    for node in tree["root"]["nodes"]:
+        position = node.pop("position", None)
+        if isinstance(position, dict):
+            canvas[node["id"]] = position
+    if canvas:
+        tree["canvas"] = canvas
+    return tree
+
+
 def test_v3_document_roundtrip_preserves_display_and_external_metadata():
     raw = tree_dict()
+    raw["canvas"]["start"] = {"x": 321, "y": 654}
     raw["root"]["nodes"][0]["title"] = "入口"
-    raw["root"]["nodes"][0]["position"] = {"x": 321, "y": 654}
     raw["root"]["nodes"][-1]["capability"] = "展示说明"
     source = tree_from_dict(raw)
 
     content = graph_document_bytes(source)
     document = json.loads(content)
-    assert set(document) == {"kind", "version", "name", "timezone", "sticky", "root"}
+    assert set(document) == {"kind", "version", "name", "timezone", "sticky", "root", "canvas"}
     assert document["kind"] == "sr-routing-graph"
     assert document["version"] == 3
     assert "id" not in document and "enabled" not in document
+    assert document["canvas"]["start"] == {"x": 321, "y": 654}
 
     loaded = load(content)
     assert loaded.id == "file-main" and loaded.enabled is True
@@ -41,10 +54,10 @@ def test_v3_document_roundtrip_preserves_display_and_external_metadata():
 
 
 def test_layout_only_change_changes_file_hash_not_behavior_revision():
-    raw = tree_dict()
-    first = tree_from_dict(raw)
-    raw["root"]["nodes"][0]["position"] = {"x": 40, "y": 80}
-    second = tree_from_dict(raw)
+    first = tree_from_dict(tree_dict())
+    moved = tree_dict()
+    moved["canvas"]["start"] = {"x": 40, "y": 80}
+    second = tree_from_dict(moved)
     first_bytes = graph_document_bytes(first)
     second_bytes = graph_document_bytes(second)
     assert hashlib.sha256(first_bytes).digest() != hashlib.sha256(second_bytes).digest()
@@ -80,3 +93,72 @@ def test_deeply_nested_json_maps_to_value_error_not_recursion_error():
     )
     with pytest.raises(ValueError, match="valid UTF-8 JSON"):
         load(content)
+
+
+# ── canvas key（节点级 position 严格拒绝） ─────────────────────────────
+
+
+def test_document_moves_positions_to_top_level_canvas():
+    raw = _migrated(tree_dict())
+    assert raw["canvas"]
+    expected = raw["canvas"][raw["root"]["nodes"][0]["id"]]
+    source = tree_from_dict(raw)
+
+    document = json.loads(graph_document_bytes(source))
+    assert document["canvas"] == raw["canvas"]
+    for node in document["root"]["nodes"]:
+        assert "position" not in node, node
+
+    loaded = load(graph_document_bytes(source))
+    assert loaded.root.nodes[0].position.x == expected["x"]
+    assert loaded.tree_revision == tree_revision_of(source)
+
+
+def test_document_omits_canvas_when_no_node_has_a_position():
+    raw = tree_dict()
+    raw.pop("canvas", None)
+    for node in raw["root"]["nodes"]:
+        node.pop("position", None)
+    document = json.loads(graph_document_bytes(tree_from_dict(raw)))
+    assert "canvas" not in document
+
+
+def test_document_rejects_legacy_node_position():
+    raw = _migrated(tree_dict())
+    raw["root"]["nodes"][0]["position"] = {"x": 1, "y": 2}
+    content = json.dumps({
+        "kind": "sr-routing-graph", "version": 3, "name": raw.get("name", ""),
+        "timezone": raw["timezone"], "sticky": raw["sticky"], "root": raw["root"],
+        "canvas": raw["canvas"],
+    }, ensure_ascii=False).encode("utf-8")
+    with pytest.raises(ValueError, match="unknown"):
+        load(content)
+
+
+@pytest.mark.parametrize("canvas, message", [
+    ([], "canvas must be an object"),
+    ({"start": {"x": 1}}, "canvas.start"),
+    ({"ghost": {"x": 1, "y": 2}}, "canvas references unknown nodes"),
+    ({"start": {"x": "1", "y": 2}}, "canvas.start.x"),
+    ({"start": {"x": 1, "y": 2, "z": 3}}, "canvas.start"),
+    ({"start": {"x": float("nan"), "y": 2}}, "canvas.start.x"),
+])
+def test_document_rejects_invalid_canvas(canvas, message):
+    raw = tree_dict()
+    raw.pop("canvas", None)
+    content = json.dumps({
+        "kind": "sr-routing-graph", "version": 3, "name": raw.get("name", ""),
+        "timezone": raw["timezone"], "sticky": raw["sticky"], "root": raw["root"],
+        "canvas": canvas,
+    }, ensure_ascii=False).encode("utf-8")
+    with pytest.raises(ValueError, match=message):
+        load(content)
+
+
+def test_canvas_edits_do_not_change_the_behavior_revision():
+    raw = _migrated(tree_dict())
+    base = tree_from_dict(raw)
+    moved = json.loads(graph_document_bytes(base))
+    moved["canvas"] = {node["id"]: {"x": 10, "y": 20} for node in moved["root"]["nodes"]}
+    shifted = load(json.dumps(moved, ensure_ascii=False).encode("utf-8"))
+    assert shifted.tree_revision == tree_revision_of(base)

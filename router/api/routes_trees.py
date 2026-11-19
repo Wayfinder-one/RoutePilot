@@ -24,7 +24,7 @@ from router.control.validation import tree_issues
 from router.jev.serialization import answer_to_dict
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
-from router.routing.graph.model import graph_to_dict
+from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.graph.validate import validate_graph_structure
 from router.routing.tree import RoutingTree, Sticky, tree_from_dict, tree_to_dict
 from router.routing.snapshot import (
@@ -94,6 +94,7 @@ class TreeUpsertIn(BaseModel):
     id: Any = None
     name: Any = None
     root: Any = None
+    canvas: Any = None
     sticky: Any = None
     timezone: Any = None
     base_document_sha256: Any = None
@@ -116,6 +117,7 @@ class TryIn(BaseModel):
 
     tree_id: Any = None
     root: Any = None
+    canvas: Any = None
     timezone: Any = None
     sticky: Any = None
     text: Any = None
@@ -137,7 +139,7 @@ def create_tree(
     payload = {
         "id": _clean_id(body.id), "name": _clean_name(body.name),
         "enabled": False,
-        "root": body.root, "sticky": body.sticky,
+        "root": body.root, "canvas": body.canvas, "sticky": body.sticky,
     }
     if "timezone" in body.model_fields_set:
         payload["timezone"] = body.timezone
@@ -171,7 +173,7 @@ def update_tree(
     changes: dict[str, Any] = {}
     if "name" in fields:
         changes["name"] = _clean_name(body.name)  # 显式 null → ""（清空名称）
-    for field in ("root", "sticky", "timezone"):
+    for field in ("root", "canvas", "sticky", "timezone"):
         if field in fields:
             changes[field] = getattr(body, field)
     updated = _service(request, conn, trees).update(
@@ -227,12 +229,19 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
     fields = body.model_fields_set
     sticky_default = stored.sticky if stored else Sticky()
     timezone_default = stored.timezone if stored else "Asia/Shanghai"
+    if "canvas" in fields:
+        canvas = body.canvas
+    elif root is None:
+        canvas = canvas_to_dict(stored.root)
+    else:
+        canvas = None
     try:
         return tree_from_dict({
             "id": stored.id if stored else "draft",
             "name": stored.name if stored else "",
             "enabled": False,
             "root": root if root is not None else graph_to_dict(stored.root),
+            "canvas": canvas,
             "timezone": body.timezone if "timezone" in fields else timezone_default,
             "sticky": body.sticky if "sticky" in fields else {
                 "enabled": sticky_default.enabled, "ttl_seconds": sticky_default.ttl_seconds,

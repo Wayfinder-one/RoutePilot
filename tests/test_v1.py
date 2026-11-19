@@ -73,12 +73,11 @@ class BlockingTransport(httpx.AsyncBaseTransport):
 
 
 def _start():
-    return {"id": "start", "type": "start", "position": {"x": 0, "y": 0}}
+    return {"id": "start", "type": "start"}
 
 
 def _target(node_id, priority, models):
     return {"id": node_id, "type": "target", "priority": priority,
-            "position": {"x": 400, "y": priority * 100},
             "models": [{"model": model, "reasoning": None} for model in models]}
 
 
@@ -98,7 +97,7 @@ def switch_graph():
         [
             _start(),
             {"id": "q", "type": "question", "question_type": "choice",
-             "instructions": "选择能力档位", "position": {"x": 200, "y": 0},
+             "instructions": "选择能力档位",
              "options": [
                  {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
                  {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
@@ -140,7 +139,7 @@ def period_condition_graph():
         [
             _start(),
             {"id": "cond-peak", "type": "condition", "source": "periods",
-             "periods": ["peak"], "position": {"x": 200, "y": 0}},
+             "periods": ["peak"]},
             _target("direct", 1, ("safe",)),
         ],
         [
@@ -162,15 +161,14 @@ def two_question_graph():
         [
             _start(),
             {"id": "q-cap", "type": "question", "question_type": "choice",
-             "instructions": "选择能力档位", "position": {"x": 180, "y": -100},
+             "instructions": "选择能力档位",
              "options": [
                  {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
                  {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
              ]},
             {"id": "q-domain", "type": "question", "question_type": "noul",
-             "instructions": "是否需要电力业务知识？", "position": {"x": 180, "y": 40}},
-            {"id": "and-power", "type": "logic", "operator": "and",
-             "position": {"x": 400, "y": -40}},
+             "instructions": "是否需要电力业务知识？"},
+            {"id": "and-power", "type": "logic", "operator": "and"},
             _target("power-target", 4, ("power",)),
             _target("strong-target", 2, ("strong-a", "strong-b")),
             _target("fast-target", 2, ("fast",)),
@@ -196,13 +194,13 @@ def two_wave_graph():
         [
             _start(),
             {"id": "q-cap", "type": "question", "question_type": "choice",
-             "instructions": "选择能力档位", "position": {"x": 180, "y": 0},
+             "instructions": "选择能力档位",
              "options": [
                  {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
                  {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
              ]},
             {"id": "q-clarify", "type": "question", "question_type": "noul",
-             "instructions": "是否需要更深入处理？", "position": {"x": 400, "y": 80}},
+             "instructions": "是否需要更深入处理？"},
             _target("strong-target", 1, ("strong-a", "strong-b")),
             _target("fast-target", 2, ("fast",)),
             _target("safe", 3, ("safe",)),
@@ -225,7 +223,7 @@ def priority_graph():
         [
             _start(),
             {"id": "q", "type": "question", "question_type": "choice",
-             "instructions": "选择能力档位", "position": {"x": 200, "y": 0},
+             "instructions": "选择能力档位",
              "options": [
                  {"key": "fast", "label": "轻量模型", "capability": "简单请求"},
                  {"key": "strong", "label": "增强模型", "capability": "复杂请求"},
@@ -542,15 +540,14 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         assert app.state.balancer.inflight("strong-a") == 0
         first_revision = app.state.snapshot.tree_revision
 
-        # 仅移动节点（position 属于纯布局字段）：behavior revision 不变。
+        # 仅移动节点（canvas 属于纯布局字段）：behavior revision 不变。
         moved = copy.deepcopy(switch_graph())
-        for node in moved["nodes"]:
-            node["position"] = {
-                "x": node["position"]["x"] + 40,
-                "y": node["position"]["y"] + 40,
-            }
+        moved_canvas = {
+            node["id"]: {"x": 40 + index * 100, "y": 60 + index * 80}
+            for index, node in enumerate(moved["nodes"])
+        }
         moved_tree = tree_from_dict(tree_dict(
-            "main", root=moved,
+            "main", root=moved, canvas=moved_canvas,
             sticky={"enabled": True, "ttl_seconds": 1800},
         ))
         moved_snapshot = build_snapshot(

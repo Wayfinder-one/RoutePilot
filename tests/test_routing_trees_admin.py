@@ -79,7 +79,7 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     raw = tree_dict(sticky={"enabled": True, "ttl_seconds": 1800})
     raw["root"] = graph_with_model()
     raw["root"]["nodes"][0]["title"] = "请求入口"
-    raw["root"]["nodes"][0]["position"] = {"x": 40, "y": 60}
+    raw["canvas"]["start"] = {"x": 40, "y": 60}
     target = next(node for node in raw["root"]["nodes"] if node["type"] == "target")
     target["capability"] = "展示说明"
 
@@ -91,21 +91,22 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     assert create_tree(client, raw).status_code == 409
 
     saved = client.get("/admin/trees/main").json()["tree"]
-    assert saved["root"]["nodes"][0]["position"] == {"x": 40, "y": 60}
+    assert saved["canvas"]["start"] == {"x": 40, "y": 60}
     assert saved["root"]["nodes"][0]["title"] == "请求入口"
     saved_target = next(node for node in saved["root"]["nodes"] if node["type"] == "target")
     assert saved_target["capability"] == "展示说明"
-    assert saved["root"]["nodes"][1]["position"] == {"x": 200, "y": 0}
+    assert saved["canvas"]["q"] == {"x": 200, "y": 0}
 
     updated_root = copy.deepcopy(saved["root"])
     updated_root["nodes"][1]["instructions"] = "重新选择能力"
-    updated_root["nodes"][-1]["position"] = {"x": 400, "y": 200}
-    response = save_tree(client, {"name": "改名", "root": updated_root})
+    updated_canvas = copy.deepcopy(saved["canvas"])
+    updated_canvas["safe"] = {"x": 400, "y": 200}
+    response = save_tree(client, {"name": "改名", "root": updated_root, "canvas": updated_canvas})
     assert response.status_code == 200, response.text
     saved = client.get("/admin/trees/main").json()["tree"]
     assert saved["name"] == "改名"
     assert saved["root"]["nodes"][1]["instructions"] == "重新选择能力"
-    assert saved["root"]["nodes"][-1]["position"] == {"x": 400, "y": 200}
+    assert saved["canvas"]["safe"] == {"x": 400, "y": 200}
     assert client.put("/admin/trees/main", json={"enabled": True}).status_code == 422
 
     copied = client.post("/admin/trees/main/copy", json={"id": "copy", "name": "副本"})
@@ -207,7 +208,7 @@ def test_parse_failures_are_issue_arrays(client):
 
 def test_structure_failures_are_issue_arrays_with_locators(client):
     root = graph_with_model()
-    root["nodes"].append({"id": "start-2", "type": "start", "position": {"x": 0, "y": 0}})
+    root["nodes"].append({"id": "start-2", "type": "start"})
     response = create_tree(client, tree_dict(root=root))
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
