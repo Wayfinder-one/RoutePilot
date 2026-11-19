@@ -120,21 +120,21 @@ test('filters read jev_calls and trace events; restored rows keep the empty stat
     /* SQLite 恢复行：只有账本白名单字段——没有请求文本、trace、answers。 */
     {
       id: 'restored-routed', ts: '2026-11-19T10:00:00+08:00', decision: 'route',
-      model: 'qwen3.8-flash-sft', target_id: 'power', policy_id: 'power-priority',
+      model: 'qwen3.8-flash-sft', target_id: 'power', policy_id: POLICY_ID,
       policy_revision: revision, selection_reason: 'target', sticky_hit: 0,
       outcome_state: 'completed', jev_calls: 1, total_ms: 800, latency_ms: 800,
       route_label: { zh: '目标命中', en: 'Target selected' },
     },
     {
       id: 'restored-direct', ts: '2026-11-19T10:00:01+08:00', decision: 'test',
-      model: 'qwen3-8b', target_id: null, policy_id: 'power-priority',
+      model: 'qwen3-8b', target_id: null, policy_id: POLICY_ID,
       policy_revision: revision, selection_reason: 'direct', sticky_hit: 0,
       outcome_state: 'completed', jev_calls: 0, total_ms: 120, latency_ms: 120,
       route_label: { zh: '固定模型测试', en: 'Direct model test' },
     },
     {
       id: 'failed', ts: '2026-11-19T10:00:02+08:00', text: '调度失败请求',
-      model: null, target_id: 'power', policy_id: 'power-priority',
+      model: null, target_id: 'power', policy_id: POLICY_ID,
       policy_revision: revision, selection_reason: 'target', sticky_hit: 0,
       outcome_state: 'routing_error', error_class: 'no_available_backend',
       jev_calls: 1, routing_ms: 4, total_ms: 4,
@@ -197,7 +197,7 @@ test('filters read jev_calls and trace events; restored rows keep the empty stat
     assertIncludes(await restored.innerText(), '（无文本）');
     assertIncludes(await restored.innerText(), '这条请求没有路径记录');
     const facts = await restored.locator('.lg-policyfacts').innerText();
-    assertIncludes(facts, 'power-priority');
+    assertIncludes(facts, POLICY_ID);
     assertIncludes(facts, '—');
     assert.equal(await restored.locator('[data-sec="jev"]').count(), 0);
     assert.equal(await restored.locator('.lg-rule').count(), 0);

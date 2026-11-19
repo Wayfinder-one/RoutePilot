@@ -5,7 +5,7 @@
    ../console_qa.mjs 提供。用例走真实 /admin/try 与真实页面，覆盖：
    * 试算只出现一个 JEV 区块，规则按后端 trace 顺序展示并停在首条命中，
      最终目标/模型/命中规则来自响应字段；
-   * jev_error（s5 场景整次调用 504）与 no_rule_matched 渲染不同文案；
+   * jev_error（场景整次调用 504）与 no_rule_matched 渲染不同文案；
    * 空规则草稿不触发 JEV，直接走兜底且不渲染 JEV/答案/规则区块；
    * 试算失败（503）保留草稿、保留输入框文本、保留上一次成功轨迹。
    前端不重算任何规则——所有断言读 app.tryResult.result 与页面 DOM。
@@ -72,7 +72,7 @@ async function runTryAndWait(text) {
 
 test('dry run shows one JEV block with rules in backend order and the final target', async () => {
   await openBaselineEditor();
-  const before = mockState.systemoneCalls.filter(call => call.scenario === 's1').length;
+  const before = mockState.systemoneCalls.filter(call => call.scenario === 'power').length;
 
   const result = await runTryAndWait(S1_TEXT);
   assert.equal(result.target, 'power');
@@ -96,8 +96,8 @@ test('dry run shows one JEV block with rules in backend order and the final targ
   assertIncludes(text, 'route');
   assertIncludes(text, 'power_business');
   assertIncludes(text, '选中项');
-  assertIncludes(text, '84%');
-  assertIncludes(text, '92%');
+  assertIncludes(text, '80%');
+  assertIncludes(text, '90%');
 
   /* 逐条规则按后端 trace 顺序渲染，命中后跳过的规则明确标「未求值」，
      已求值规则内嵌逐条件结果行（路径 + ✓/✗）。 */
@@ -122,7 +122,7 @@ test('dry run shows one JEV block with rules in backend order and the final targ
   assertIncludes(text, '首条命中后停止');
 
   /* 恰好一次新的 JEV 调用（对当前草稿，不落盘不发布）。 */
-  const after = mockState.systemoneCalls.filter(call => call.scenario === 's1').length;
+  const after = mockState.systemoneCalls.filter(call => call.scenario === 'power').length;
   assert.equal(after, before + 1);
   assert.equal((await appSnapshot()).kind, 'clean', 'a dry run must not dirty the draft');
 });
@@ -130,8 +130,8 @@ test('dry run shows one JEV block with rules in backend order and the final targ
 test('dry run renders the distinct jev_error and no_rule_matched copy', async () => {
   await openBaselineEditor();
 
-  /* jev_error：s5 场景整次 JEV 调用 504，无答案无规则判断，走兜底。 */
-  const jevError = await runTryAndWait(scenarioText('s5'));
+  /* jev_error：场景标记 fail，整次 JEV 调用 504，无答案无规则判断，走兜底。 */
+  const jevError = await runTryAndWait(scenarioText('jev_error'));
   assert.equal(jevError.fallback, true);
   assert.equal(jevError.reason, 'jev_error');
   assert.equal(jevError.matched_rule, null);
@@ -145,7 +145,7 @@ test('dry run renders the distinct jev_error and no_rule_matched copy', async ()
   assert.equal(await page.locator('#cvTryResult [data-sec="questions"]').count(), 0,
     'a failed JEV call must not show answers');
 
-  /* no_rule_matched：把草稿规则全部改成永不可能命中（mock 的 adversarial 固定 0.08）。 */
+  /* no_rule_matched：把草稿规则全部改成永不可能命中（fast 场景的 adversarial 固定 0.1）。 */
   const accepted = await page.evaluate(async () => {
     const { app } = await import('/console/routing/app.js');
     return app.change('behavior', draft => {
@@ -155,7 +155,7 @@ test('dry run renders the distinct jev_error and no_rule_matched copy', async ()
     });
   });
   assert.equal(accepted, true, 'the draft edit was rejected');
-  const noRule = await runTryAndWait(scenarioText('s2'));
+  const noRule = await runTryAndWait(scenarioText('fast'));
   assert.equal(noRule.fallback, true);
   assert.equal(noRule.reason, 'no_rule_matched');
   assert.equal(noRule.matched_rule, null);
@@ -189,7 +189,7 @@ test('an empty-rules draft skips the JEV call and renders no JEV block', async (
   });
   assert.equal(accepted, true);
 
-  const result = await runTryAndWait(scenarioText('s2'));
+  const result = await runTryAndWait(scenarioText('fast'));
   assert.equal(result.fallback, true);
   assert.equal(result.reason, 'no_rule_matched');
   assert.equal(result.matched_rule, null);

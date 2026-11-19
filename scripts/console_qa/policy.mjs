@@ -39,8 +39,8 @@ import {
   waitToastIncludes,
 } from '../console_qa.mjs';
 
-/* 打开基线策略：ensureBaselinePolicy 恢复 power-priority 为示例文档并启用；
-   页面 boot 会挑「已启用或第一个」策略，若不是 power-priority 就显式切换。 */
+/* 打开基线策略：ensureBaselinePolicy 恢复 power-policy 为示例文档并启用；
+   页面 boot 会挑「已启用或第一个」策略，若不是 power-policy 就显式切换。 */
 async function openBaselineEditor() {
   await ensureBaselinePolicy();
   await openEditor();
@@ -189,7 +189,7 @@ test('If-Match conflict keeps the local draft and never overwrites it', async ()
 
   /* 故意制造的 409 会被 Chromium 记成 console error：按基座惯例精确声明。 */
   await clearToasts();
-  expectHttpStatusError({ url: /\/admin\/policies\/power-priority$/, status: /409/ });
+  expectHttpStatusError({ url: /\/admin\/policies\/power-policy$/, status: /409/ });
   try {
     await page.locator('#cvSave').click();
     await waitToastIncludes('策略已被其他修改更新');
@@ -224,7 +224,7 @@ test('If-Match conflict keeps the local draft and never overwrites it', async ()
 
 test('enabling a dirty policy saves it first', async () => {
   await openBaselineEditor();
-  /* 先停用：重开后显式切回 power-priority（列表按 updated_at 排序，
+  /* 先停用：重开后显式切回 power-policy（列表按 updated_at 排序，
      boot 的「第一个」不保证是它）。 */
   await api('POST', '/admin/policies/' + POLICY_ID + '/disable');
   await openEditor();
@@ -429,8 +429,8 @@ test('late catalogues do not lock the editor or wipe unsaved edits', async () =>
 
 test('dry run panel shows one JEV, ordered rules and the final target', async () => {
   await openBaselineEditor();
-  const s1CallsBefore = mockState.systemoneCalls
-    .filter(call => call.scenario === 's1').length;
+  const powerCallsBefore = mockState.systemoneCalls
+    .filter(call => call.scenario === 'power').length;
 
   await page.locator('#cvTryInput').fill(S1_TEXT);
   await page.locator('#cvTryRun').click();
@@ -469,9 +469,9 @@ test('dry run panel shows one JEV, ordered rules and the final target', async ()
     'rule 4 must render as skipped, not missed');
 
   /* 恰好一次新的 JEV 调用（对当前草稿，不落盘不发布）。 */
-  const s1CallsAfter = mockState.systemoneCalls
-    .filter(call => call.scenario === 's1').length;
-  assert.equal(s1CallsAfter, s1CallsBefore + 1);
+  const powerCallsAfter = mockState.systemoneCalls
+    .filter(call => call.scenario === 'power').length;
+  assert.equal(powerCallsAfter, powerCallsBefore + 1);
   assert.equal((await appSnapshot()).kind, 'clean', 'a dry run must not dirty the draft');
 });
 

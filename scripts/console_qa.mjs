@@ -34,13 +34,8 @@ export { HISTORY_LIMIT };
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const EXAMPLE_PATH = path.join(ROOT, 'router/console/routing/example.json');
-const SCENARIO_PATH = path.join(ROOT, 'tests/fixtures/graph_scenarios.json');
+const SCENARIO_PATH = path.join(ROOT, 'tests/fixtures/policy_scenarios.json');
 const SHOT_DIR = path.join(ROOT, 'docs/od-design/routing-canvas-2026-11-02/implementation-qa');
-export const POLICY_ID = 'power-priority';
-export const JEV_MODEL = 'd1-2B';
-export const S1_TEXT = '10kV 线路跳闸，请安排抢修工单并做故障定位。';
-export const S1_NOW = '2026-11-02T12:00:00+08:00';
-const API_TIMEOUT_MS = 15000;
 /* Screenshot writes are opt-in: a plain `npm run check:console` must not dirty
    the committed evidence PNGs. Regenerate with QA_SCREENSHOTS=1. */
 const WRITE_SHOTS = process.env.QA_SCREENSHOTS === '1';
@@ -51,6 +46,14 @@ export const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
 export const EXAMPLE_QUESTIONS = Object.keys(EXAMPLE.questions);
 export const EXAMPLE_RULES = EXAMPLE.rules.length;
 export const EXAMPLE_FALLBACK = EXAMPLE.fallback;
+/* v4 场景 fixture（Task 8 Step 6）：fast/power/adversarial/jev_error 四例，
+   mock 直接按 scenario.answers（问题ID → 概率/yes）出 wire 答案。 */
+export const FIXTURE = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
+export const POLICY_ID = 'power-policy';
+export const JEV_MODEL = 'd1-2B';
+export const S1_TEXT = FIXTURE.scenarios.find(item => item.id === 'power').text;
+export const S1_NOW = FIXTURE.scenarios.find(item => item.id === 'power').now;
+const API_TIMEOUT_MS = 15000;
 /* envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
 export const BASELINE = {
   name: EXAMPLE.name,
@@ -199,40 +202,6 @@ function sendJson(response, status, body) {
 
 /* ── mock：/v1/systemone + /v1/chat/completions ─────────────────────── */
 
-/* v4 策略问题的确定性来源映射：route 的场景概率取自旧 capability 场景
-   （选项键 fast/strong/power ← easy/standard/strong），power_business ← domain；
-   adversarial 不在旧场景里，固定 0.08 让「对抗请求」规则可预测地不触发。 */
-const QUESTION_SOURCES = { route: 'capability', power_business: 'domain' };
-const FIXED_NOUL_ANSWERS = { adversarial: 0.08 };
-const OPTION_SOURCES = { route: { fast: 'easy', strong: 'standard', power: 'strong' } };
-/* 旧 M0 wire-shape 自检仍用 capability 等问题键与标准三档 label：
-   没有专属映射的问题退回这张通用 label → 场景概率键 兜底。 */
-const DEFAULT_LABEL_SOURCES = { 轻量模型: 'easy', 标准模型: 'standard', 增强模型: 'strong' };
-
-function loadScenarioFixture() {
-  const fixture = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
-  const optionKeys = {};
-  const labelSources = {};
-  Object.entries(EXAMPLE.questions || {}).forEach(([qid, question]) => {
-    if (question && question.type === 'choice') {
-      optionKeys[qid] = (question.options || []).map(option => option.key);
-      const sources = OPTION_SOURCES[qid] || {};
-      labelSources[qid] = {};
-      (question.options || []).forEach(option => {
-        labelSources[qid][option.label] = sources[option.key] || option.key;
-      });
-    }
-  });
-  return {
-    periods: fixture.periods || [],
-    scenarios: fixture.scenarios || [],
-    optionKeys: optionKeys,
-    labelSources: labelSources,
-  };
-}
-
-export const FIXTURE = loadScenarioFixture();
-
 function pickScenario(state) {
   const matched = FIXTURE.scenarios.find(scenario => state.indexOf(scenario.text) >= 0);
   return matched || { id: 'manual', text: '', answers: {}, fail: null };
@@ -244,15 +213,20 @@ function normalizeProbabilities(values) {
   return values.map(value => value / total);
 }
 
-function choiceAnswer(nodeId, question, fixture) {
+/* v4 场景答案按「问题ID → 选项 key 概率」描述；JEV wire 的 choice criteria
+   键是 label。option key ↔ label 的映射直接取自示例策略文档本身，
+   不再经过任何旧场景键（capability/domain/easy/standard/strong）垫片。 */
+function choiceAnswer(questionId, question, scenario) {
+  const options = ((EXAMPLE.questions || {})[questionId] || {}).options || [];
+  const keyOfLabel = {};
+  options.forEach(option => { keyOfLabel[option.label] = option.key; });
+  const probsByKey = (((scenario || {}).answers || {})[questionId] || {}).probs || {};
   const labels = Object.keys(question.criteria || {});
-  const sourceLabels = FIXTURE.labelSources[nodeId] || DEFAULT_LABEL_SOURCES;
-  const probsBySource = (fixture && fixture.probs) || {};
   let values = labels.map(label => {
-    const source = sourceLabels[label] || label;
-    const value = typeof probsBySource[source] === 'number' ? probsBySource[source] : null;
-    return value;
-});
+    const key = keyOfLabel[label];
+    const value = key ? probsByKey[key] : null;
+    return typeof value === 'number' ? value : null;
+  });
   if (values.every(value => value === null)) values = labels.map(() => 1 / Math.max(1, labels.length));
   values = normalizeProbabilities(values.map(value => (value === null ? 0 : Math.max(0, value))));
   let best = 0;
@@ -267,11 +241,9 @@ function choiceAnswer(nodeId, question, fixture) {
 };
 }
 
-function noulAnswer(fixture, nodeId) {
-  if (fixture && typeof fixture.yes === 'number') return { type: 'noul', noul: fixture.yes };
-  if (typeof FIXED_NOUL_ANSWERS[nodeId] === 'number') {
-    return { type: 'noul', noul: FIXED_NOUL_ANSWERS[nodeId] };
-  }
+function noulAnswer(questionId, scenario) {
+  const answer = ((scenario || {}).answers || {})[questionId];
+  if (answer && typeof answer.yes === 'number') return { type: 'noul', noul: answer.yes };
   return { type: 'noul', noul: 0.5 };
 }
 
@@ -307,15 +279,13 @@ function scoreAnswer(question, fixture) {
 };
 }
 
-function answerFor(nodeId, question, scenario) {
+function answerFor(questionId, question, scenario) {
   const type = question && question.type;
-  /* v4 策略问题 → 旧场景键映射（见 loadScenarioFixture 上方注释）。 */
-  const sourceId = QUESTION_SOURCES[nodeId] || nodeId;
-  const fixture = (scenario.answers || {})[sourceId] || null;
-  if (type === 'choice') return choiceAnswer(nodeId, question, fixture);
-  if (type === 'noul') return noulAnswer(fixture, nodeId);
+  const fixture = ((scenario || {}).answers || {})[questionId] || null;
+  if (type === 'choice') return choiceAnswer(questionId, question, scenario);
+  if (type === 'noul') return noulAnswer(questionId, scenario);
   if (type === 'score') return scoreAnswer(question, fixture);
-  throw new Error(`mock does not support question type ${type} (${nodeId})`);
+  throw new Error(`mock does not support question type ${type} (${questionId})`);
 }
 
 /* ── Task 7 · 测试对话（/v1/chat/completions）的确定性 mock 触发词 ──────
@@ -366,25 +336,19 @@ function startMock() {
           mockState.scenarioCalls[scenario.id] = (mockState.scenarioCalls[scenario.id] || 0) + 1;
           mockState.systemoneCalls.push({ scenario: scenario.id, keys: questionKeys });
 
-          /* s5「决策服务超时」：v4 一次 JEV 覆盖全部问题；场景标记 fail 且每个
-             问题都可应答（场景 answers（按 QUESTION_SOURCES 映射）或固定 noul
-             答案）时整次调用失败（504）。场景外问题（例如 clarify）仍正常应答。 */
-          const answerable = key =>
-            Object.prototype.hasOwnProperty.call(scenario.answers || {}, QUESTION_SOURCES[key] || key) ||
-            Object.prototype.hasOwnProperty.call(FIXED_NOUL_ANSWERS, key);
-          const failCall = scenario.fail && questionKeys.length > 0 &&
-            questionKeys.every(answerable);
-          if (failCall) {
-            sendJson(response, 504, {
-              detail: 'mock decision timeout',
+          /* jev_error 场景：v4 一次 JEV 覆盖全部问题，场景标记 fail 时整次调用
+             直接按其配置的 HTTP status 失败——没有「第几波」要判断。 */
+          if (scenario.fail) {
+            sendJson(response, scenario.fail.status || 504, {
+              detail: scenario.fail.message || 'mock decision failure',
               scenario: scenario.id,
               message: scenario.fail.message || ''
 });
             return;
 }
           const answers = {};
-          questionKeys.forEach(nodeId => {
-            answers[nodeId] = answerFor(nodeId, body.questions[nodeId], scenario);
+          questionKeys.forEach(questionId => {
+            answers[questionId] = answerFor(questionId, body.questions[questionId], scenario);
 });
           sendJson(response, 200, {
             model: body.model || JEV_MODEL,
@@ -610,7 +574,7 @@ async function bootstrap() {
     reasoning_format: 'openai'
 });
 
-  /* 2. 示例图引用的四个模型，均声明 low/medium/high 推理档位。 */
+  /* 2. 示例策略与用例引用的模型，均声明 low/medium/high 推理档位。 */
   for (const modelId of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b']) {
     await api('PUT', '/admin/models/' + encodeURIComponent(modelId), {
       upstream: modelId,
@@ -632,7 +596,7 @@ async function bootstrap() {
     profile: { domains: [], tier: 'small' }
 });
 
-  /* 3. peak / normal / offpeak 三个固定时段（与 graph_scenarios.json 一致）。 */
+  /* 3. peak / normal / offpeak 三个固定时段（与 policy_scenarios.json 一致）。 */
   await api('PUT', '/admin/time-periods', { periods: FIXTURE.periods });
 
   /* 4. 决策服务指向 mock。 */
@@ -831,6 +795,11 @@ test('login language toggle is module-bound and really switches', async () => {
 });
 
 test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
+  /* v4 问题集直接来自示例策略：route（choice，criteria 键是 option label）、
+     power_business（noul）；complexity 是合成 score 问题，覆盖第三种 wire。 */
+  const route = EXAMPLE.questions.route;
+  const routeCriteria = {};
+  route.options.forEach(option => { routeCriteria[option.label] = option.capability; });
   const state = '【待判断的用户请求】\n' + S1_TEXT + '\n\n【任务】请选择最合适处理这条请求的模型。';
   const response = await fetch(mockBase + '/v1/systemone', {
     method: 'POST',
@@ -839,33 +808,36 @@ test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
       model: JEV_MODEL,
       state,
       questions: {
-        capability: {
-          type: 'choice',
-          instructions: '这条请求需要哪个能力档位？',
-          criteria: { 轻量模型: '简单问答', 标准模型: '标准写作', 增强模型: '复杂分析' }
-},
-        domain: { type: 'noul', instructions: '是否需要电力行业知识？' },
+        route: { type: 'choice', instructions: route.instructions, criteria: routeCriteria },
+        power_business: {
+          type: 'noul', instructions: EXAMPLE.questions.power_business.instructions
+        },
         complexity: { type: 'score', instructions: '复杂度评分。', criteria: [1, 5, 7.5, 10] }
 }
 })
 });
   assert.equal(response.status, 200);
   const body = await response.json();
-  assert.deepEqual(Object.keys(body.answers).sort(), ['capability', 'complexity', 'domain']);
+  assert.deepEqual(Object.keys(body.answers).sort(), ['complexity', 'power_business', 'route']);
 
-  const choice = body.answers.capability;
+  const choice = body.answers.route;
   assert.equal(choice.type, 'choice');
   assert.equal(typeof choice.choice, 'string');
-  assert.deepEqual(Object.keys(choice.probabilities).sort(), ['增强模型', '标准模型', '轻量模型'].sort());
+  assert.deepEqual(
+    Object.keys(choice.probabilities).sort(),
+    route.options.map(option => option.label).sort()
+  );
   const total = Object.values(choice.probabilities).reduce((sum, value) => sum + value, 0);
   assert.ok(Math.abs(total - 1) < 1e-9);
-  assert.ok(Math.abs(choice.probabilities['增强模型'] - 0.84) < 1e-9);
+  /* S1_TEXT 命中 power 场景：电力专用模型 0.8。 */
+  assert.ok(Math.abs(choice.probabilities['电力专用模型'] - 0.8) < 1e-9);
+  assert.ok(Math.abs(choice.confidence - 0.8) < 1e-9);
 
-  const noul = body.answers.domain;
+  const noul = body.answers.power_business;
   assert.equal(noul.type, 'noul');
   assert.equal(typeof noul.noul, 'number');
   assert.ok(noul.noul >= 0 && noul.noul <= 1);
-  assert.ok(Math.abs(noul.noul - 0.92) < 1e-9);
+  assert.ok(Math.abs(noul.noul - 0.9) < 1e-9);
   assert.equal('yes' in noul, false);
 
   const score = body.answers.complexity;
@@ -876,42 +848,37 @@ test('mock /v1/systemone answers use the frozen M0 wire shapes', async () => {
   assert.ok(typeof score.probabilities[String(score.score)] === 'number');
 });
 
-test('mock fails the s5 first wave with 504 and answers later waves', async () => {
-  const s5 = FIXTURE.scenarios.find(scenario => scenario.id === 's5');
-  assert.ok(s5, 's5 scenario fixture missing');
-  const state = '【待判断的用户请求】\n' + s5.text + '\n\n【任务】请选择最合适处理这条请求的模型。';
-  const first = await fetch(mockBase + '/v1/systemone', {
+test('mock fails the jev_error scenario with its configured status', async () => {
+  const failing = FIXTURE.scenarios.find(scenario => scenario.id === 'jev_error');
+  assert.ok(failing, 'jev_error scenario fixture missing');
+  assert.ok(failing.fail && failing.fail.status,
+    'the jev_error scenario must carry a configured fail status');
+  const route = EXAMPLE.questions.route;
+  const routeCriteria = {};
+  route.options.forEach(option => { routeCriteria[option.label] = option.capability; });
+  const state = '【待判断的用户请求】\n' + failing.text + '\n\n【任务】请选择最合适处理这条请求的模型。';
+  const response = await fetch(mockBase + '/v1/systemone', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: JEV_MODEL,
       state,
       questions: {
-        capability: {
-          type: 'choice',
-          instructions: '这条请求需要哪个能力档位？',
-          criteria: { 轻量模型: '简单问答', 标准模型: '标准写作', 增强模型: '复杂分析' }
-},
-        domain: { type: 'noul', instructions: '是否需要电力行业知识？' }
+        route: { type: 'choice', instructions: route.instructions, criteria: routeCriteria },
+        power_business: {
+          type: 'noul', instructions: EXAMPLE.questions.power_business.instructions
+        },
+        adversarial: {
+          type: 'noul', instructions: EXAMPLE.questions.adversarial.instructions
+        }
 }
 })
 });
-  assert.equal(first.status, 504);
-  const firstBody = await first.json();
-  assert.equal(firstBody.scenario, 's5');
-
-  const later = await fetch(mockBase + '/v1/systemone', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: JEV_MODEL,
-      state,
-      questions: { clarify: { type: 'noul', instructions: '是否需要进一步处理？' } }
-})
-});
-  assert.equal(later.status, 200);
-  const laterBody = await later.json();
-  assert.equal(typeof laterBody.answers.clarify.noul, 'number');
+  /* v4 一次 JEV 覆盖全部问题：场景 fail 直接以其 HTTP status 失败整次调用。 */
+  assert.equal(response.status, failing.fail.status);
+  const responseBody = await response.json();
+  assert.equal(responseBody.scenario, 'jev_error');
+  assert.equal(responseBody.message, failing.fail.message);
 });
 
 test('mock upstream returns an OpenAI-format completion', async () => {
@@ -929,7 +896,7 @@ test('mock upstream returns an OpenAI-format completion', async () => {
   assert.equal(body.usage.total_tokens > 0, true);
 });
 
-/* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始图一旦被后面的用例
+/* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始策略一旦被后面的用例
    改动，这条用例就该在基座阶段立刻失败，而不是在 100 多条页面用例之后才报。 */
 test('bootstrap registers catalog, periods, decision service and the enabled policy', async () => {
   const models = await api('GET', '/admin/models');
@@ -985,12 +952,12 @@ test('admin try routes the sample policy through the live decision mock', async 
     ['when.any.0', 'when.any.1', 'when.any']);
   assert.ok(ruleEvents.every(row => Array.isArray(row.conditions)));
   assert.equal(result.trace.filter(event => event.event === 'final').length, 1);
-  assert.ok(Math.abs(result.answers.route.probabilities.power - 0.84) < 1e-9);
-  assert.ok(Math.abs(result.answers.route.p_top - 0.84) < 1e-9);
-  assert.ok(Math.abs(result.answers.power_business.yes - 0.92) < 1e-9);
-  assert.ok(Math.abs(result.answers.adversarial.yes - 0.08) < 1e-9);
+  assert.ok(Math.abs(result.answers.route.probabilities.power - 0.8) < 1e-9);
+  assert.ok(Math.abs(result.answers.route.p_top - 0.8) < 1e-9);
+  assert.ok(Math.abs(result.answers.power_business.yes - 0.9) < 1e-9);
+  assert.ok(Math.abs(result.answers.adversarial.yes - 0.1) < 1e-9);
 
-  const calls = mockState.systemoneCalls.filter(call => call.scenario === 's1');
+  const calls = mockState.systemoneCalls.filter(call => call.scenario === 'power');
   assert.equal(calls.length >= 1, true);
   assert.deepEqual(calls[calls.length - 1].keys.slice().sort(), ['adversarial', 'power_business', 'route']);
 });
@@ -1101,7 +1068,7 @@ export async function putPolicy(id, policy) {
   }).then(result => result.policy_resource);
 }
 
-/* 每个策略用例都从同一份服务端基线开始：power-priority 恢复为示例文档并启用。 */
+/* 每个策略用例都从同一份服务端基线开始：power-policy 恢复为示例文档并启用。 */
 export async function ensureBaselinePolicy() {
   const restored = await putPolicy(POLICY_ID, EXAMPLE);
   if (!restored.enabled) {
