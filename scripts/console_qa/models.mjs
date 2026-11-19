@@ -2,7 +2,7 @@
    ------------------------------------------------------------------
    本文件只注册用例，不启动服务，也不持有页面状态：真实启动、mock、浏览器、
    管理面 API 与 teardown 全部由 ../console_qa.mjs 提供（同一进程内单页顺序执行）。
-   bootstrap 自检（目录 / 时段 / 决策服务 / 初始图）是基座用例，留在
+   bootstrap 自检（目录 / 时段 / 决策服务 / 初始策略）是基座用例，留在
    ../console_qa.mjs 的基座自检块里，本模块不再持有。
    入口：`npm run check:console`（全量）或 `QA_ONLY=<正则> node scripts/console_qa.mjs`；
    也可单独执行：`node scripts/console_qa/models.mjs`。
