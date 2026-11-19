@@ -78,11 +78,12 @@ test('dry run shows one JEV block with rules in backend order and the final targ
   assert.equal(result.target, 'power');
   assert.deepEqual(result.models, ['qwen3.8-flash-sft']);
   assert.equal(result.matched_rule, '电力业务优先');
+  assert.equal(result.matched_rule_index, 1);
   assert.equal(result.fallback, false);
   assert.equal(result.reason, null);
-  /* 后端 trace：1 未命中 + 2 命中即停，恰一次 JEV。 */
+  /* 后端 trace：1 未命中 + 2 命中即停，3/4 未求值，恰一次 JEV。 */
   const ruleEvents = result.trace.filter(event => event.event === 'rule');
-  assert.deepEqual(ruleEvents.map(row => row.matched), [false, true]);
+  assert.deepEqual(ruleEvents.map(row => row.matched), [false, true, null, null]);
   assert.equal(result.trace.filter(event => event.event === 'jev').length, 1);
 
   /* 结果区：恰一个 JEV 区块；答案区展示后端返回的各问题答案。 */
@@ -98,14 +99,26 @@ test('dry run shows one JEV block with rules in backend order and the final targ
   assertIncludes(text, '84%');
   assertIncludes(text, '92%');
 
-  /* 逐条规则按后端 trace 顺序渲染，且停在首条命中。 */
+  /* 逐条规则按后端 trace 顺序渲染，命中后跳过的规则明确标「未求值」，
+     已求值规则内嵌逐条件结果行（路径 + ✓/✗）。 */
   const rows = await page.locator('#cvTryResult .lg-rule').allInnerTexts();
-  assert.equal(rows.length, 2, 'the trace must stop at the first matching rule');
+  assert.equal(rows.length, 4, 'the trace must keep every rule (evaluated + skipped)');
   const names = await page.locator('#cvTryResult .lg-rule .lg-rule-name').allInnerTexts();
   assert.deepEqual(names, ruleEvents.map(row => row.name), 'rules are not in backend order');
   assert.ok(rows[0].indexOf('未命中') >= 0, 'rule 1 was not marked as missed');
   assert.ok(rows[1].indexOf('命中') >= 0 && rows[1].indexOf('未命中') < 0,
     'rule 2 was not marked as the first hit');
+  assert.ok(rows[2].indexOf('未求值') >= 0 && rows[2].indexOf('未命中') < 0,
+    'rule 3 must render as skipped (未求值), not missed');
+  assert.ok(rows[3].indexOf('未求值') >= 0 && rows[3].indexOf('未命中') < 0,
+    'rule 4 must render as skipped (未求值), not missed');
+  const condRows = await page.locator('#cvTryResult .lg-rule .lg-cond').allInnerTexts();
+  assert.ok(condRows.length >= 3, 'the evaluated rules must render condition rows');
+  assert.ok(condRows.some(row => row.indexOf('when.any.0') >= 0),
+    'the any-gate child condition path is missing');
+  assert.ok(condRows.some(row => row.indexOf('✓') >= 0) &&
+    condRows.some(row => row.indexOf('✗') >= 0),
+    'condition rows must show pass and fail marks');
   assertIncludes(text, '首条命中后停止');
 
   /* 恰好一次新的 JEV 调用（对当前草稿，不落盘不发布）。 */

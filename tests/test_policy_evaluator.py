@@ -51,10 +51,12 @@ def test_bad_answer_falls_back_without_partial_answers():
 
 def test_trace_event_sequence_matches_design_contract():
     outcome, _ = run_policy(policy_dict(), answers=dict(FULL_ANSWERS))
+    # 命中规则 0 后：规则 1/2 不求值，但仍以 matched=None + conditions=[] 追加。
     assert [e["event"] for e in outcome.trace] == [
         "time", "window", "jev",
         "question", "question", "question",
-        "rule", "final",
+        "rule", "rule", "rule",
+        "final",
     ]
     assert outcome.trace[0] == {
         "event": "time", "active_periods": [], "timezone": "Asia/Shanghai",
@@ -77,12 +79,44 @@ def test_trace_event_sequence_matches_design_contract():
     }
     assert outcome.trace[4]["answer"] == pytest.approx({"type": "noul", "yes": 0.9, "no": 0.1})
     assert outcome.trace[5]["answer"] == {"type": "score", "value": 10.0}
-    assert outcome.trace[6] == {"event": "rule", "index": 0, "name": "高风险", "matched": True}
+    assert outcome.trace[6] == {
+        "event": "rule", "index": 0, "name": "高风险", "matched": True,
+        "conditions": [{
+            "path": "when", "kind": "answer", "answer": "risk.yes",
+            "op": "gte", "expected": 0.8, "actual": 0.9, "result": True,
+        }],
+    }
     assert outcome.trace[7] == {
+        "event": "rule", "index": 1, "name": "复杂请求",
+        "matched": None, "conditions": [],
+    }
+    assert outcome.trace[8] == {
+        "event": "rule", "index": 2, "name": "轻量请求",
+        "matched": None, "conditions": [],
+    }
+    assert outcome.trace[9] == {
         "event": "final", "kind": "target", "target_id": "safe", "reason": None,
     }
     assert outcome.jev_duration_ms == 12.0
     assert outcome.jev_questions == ("route", "risk", "severity")
+
+
+def test_rule_trace_has_each_logic_child_and_marks_later_rules_skipped():
+    raw = policy_dict()
+    raw["rules"].append({
+        "name": "不应执行", "when": {"answer": "risk.yes", "gte": 0.1}, "target": "safe",
+    })
+    outcome, _jev = run_policy(raw, answers={
+        "route": choice("fast", 0.9), "risk": noul(0.1), "severity": score(1.0),
+    })
+    rules = [e for e in outcome.trace if e["event"] == "rule"]
+    assert [e["matched"] for e in rules] == [False, False, True, None]
+    assert [c["path"] for c in rules[1]["conditions"]] == [
+        "when.all.0", "when.all.1", "when.all",
+    ]
+    assert rules[1]["conditions"][0]["actual"] == "fast"
+    assert all(e["matched"] is None and e["conditions"] == []
+               for e in rules[3:])
 
 
 def test_trace_sink_receives_the_same_events():

@@ -92,6 +92,14 @@ def test_try_with_inline_policy_does_not_publish_or_touch_state(tmp_path):
                      "reason": None}
     rule_events = [e for e in body["trace"] if e["event"] == "rule"]
     assert [e["matched"] for e in rule_events] == [False, False, True]
+    # 实际求值的规则携带逐条件轨迹：叶子在前、门在后，actual 来自后端。
+    assert [c["path"] for c in rule_events[1]["conditions"]] == [
+        "when.all.0", "when.all.1", "when.all",
+    ]
+    assert rule_events[1]["conditions"][0]["actual"] == "fast"
+    assert rule_events[1]["conditions"][0]["result"] is False
+    assert rule_events[1]["conditions"][1]["result"] is True
+    assert rule_events[1]["conditions"][2]["kind"] == "all"
     jev_event = next(e for e in body["trace"] if e["event"] == "jev")
     assert jev_event["questions"] == ["route", "risk", "severity"]
     assert jev_event["failed"] is False and jev_event["error"] is None
@@ -112,7 +120,11 @@ def test_try_with_inline_policy_does_not_publish_or_touch_state(tmp_path):
 
 def test_try_with_policy_id_uses_stored_resource(tmp_path):
     client, app = make_policy_client(tmp_path)
-    _create_main(client)
+    stored = policy_dict()
+    stored["rules"].append({
+        "name": "追加规则", "when": {"answer": "risk.yes", "gte": 0.8}, "target": "safe",
+    })
+    _create_main(client, policy=stored)
     response = client.post("/admin/try", json={
         "policy_id": "main", "text": "复杂电力抢修",
         "now": "2026-11-18T10:00:00+08:00"})
@@ -120,6 +132,10 @@ def test_try_with_policy_id_uses_stored_resource(tmp_path):
     assert response.json()["target"] == "fast"
     assert response.json()["matched_rule"] == "轻量请求"
     assert response.json()["matched_rule_index"] == 2
+    # 命中后剩余规则不求值：以 matched=None + conditions=[] 追加（§5.5）。
+    rule_events = [e for e in response.json()["trace"] if e["event"] == "rule"]
+    assert [e["matched"] for e in rule_events] == [False, False, True, None]
+    assert rule_events[3]["conditions"] == []
     # 存量资源试算同样不落任何新文件
     assert [item["id"] for item in client.get("/admin/policies").json()["policies"]] == ["main"]
 

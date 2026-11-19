@@ -457,12 +457,16 @@ test('dry run panel shows one JEV, ordered rules and the final target', async ()
   assertIncludes(text, 'qwen3.8-flash-sft');
   assertIncludes(text, '电力业务优先');
   assertIncludes(text, '一次 JEV');
-  /* 首条命中即停：trace 只含已求值的规则（1 未命中、2 命中），后续不求值。 */
+  /* 首条命中即停：已求值规则（1 未命中、2 命中）+ 未求值规则（3/4）。 */
   const rows = await page.locator('#cvTryResult .lg-rule').allInnerTexts();
-  assert.equal(rows.length, 2, 'the trace must stop at the first matching rule');
+  assert.equal(rows.length, 4, 'the trace must keep evaluated and skipped rules');
   assert.ok(rows[0].indexOf('未命中') >= 0, 'rule 1 was not marked as missed');
   assert.ok(rows[1].indexOf('命中') >= 0 && rows[1].indexOf('未命中') < 0,
     'rule 2 was not marked as the first hit');
+  assert.ok(rows[2].indexOf('未求值') >= 0 && rows[2].indexOf('未命中') < 0,
+    'rule 3 must render as skipped, not missed');
+  assert.ok(rows[3].indexOf('未求值') >= 0 && rows[3].indexOf('未命中') < 0,
+    'rule 4 must render as skipped, not missed');
 
   /* 恰好一次新的 JEV 调用（对当前草稿，不落盘不发布）。 */
   const s1CallsAfter = mockState.systemoneCalls

@@ -969,6 +969,7 @@ test('admin try routes the sample policy through the live decision mock', async 
   assert.equal(result.target, 'power');
   assert.deepEqual(result.models, ['qwen3.8-flash-sft']);
   assert.equal(result.matched_rule, '电力业务优先');
+  assert.equal(result.matched_rule_index, 1);
   assert.equal(result.fallback, false);
   assert.equal(result.reason, null);
   /* 一次 JEV 调用；answer 只展示后端返回，前端不重新求值。 */
@@ -976,8 +977,13 @@ test('admin try routes the sample policy through the live decision mock', async 
   assert.equal(jevEvents.length, 1);
   assert.deepEqual(jevEvents[0].questions.slice().sort(), ['adversarial', 'power_business', 'route']);
   assert.equal(jevEvents[0].failed, false);
+  /* 规则轨迹：已求值规则带逐条件结果，命中后剩余规则 matched=null 未求值。 */
   const ruleEvents = result.trace.filter(event => event.event === 'rule');
-  assert.deepEqual(ruleEvents.map(row => row.matched), [false, true]);
+  assert.deepEqual(ruleEvents.map(row => row.matched), [false, true, null, null]);
+  assert.equal(ruleEvents[0].conditions[0].path, 'when');
+  assert.deepEqual(ruleEvents[1].conditions.map(row => row.path),
+    ['when.any.0', 'when.any.1', 'when.any']);
+  assert.ok(ruleEvents.every(row => Array.isArray(row.conditions)));
   assert.equal(result.trace.filter(event => event.event === 'final').length, 1);
   assert.ok(Math.abs(result.answers.route.probabilities.power - 0.84) < 1e-9);
   assert.ok(Math.abs(result.answers.route.p_top - 0.84) < 1e-9);

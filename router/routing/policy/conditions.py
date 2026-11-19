@@ -6,6 +6,12 @@ score: ``value``），不用 getattr/eval。路径或类型错误属于编程/�
 （保存时校验已拦截的文档不会走到这些分支），``KeyError``/``TypeError``/
 ``ValueError`` 必须原样抛出，绝不转换为 false。
 
+同一个 ``evaluate_condition`` 同时负责布尔结果和条件轨迹（Task 3）：
+``trace_sink`` 非空时按 ``path`` 追加扁平机器事件，布尔结果与事件里的
+``result`` 来自同一次计算，不另写第二套比较逻辑。``all/any`` 先求全部
+child 再调用组合（最多 400 个本地节点，不做 JEV 短路），保证逻辑门下的
+每个条件都有结果；``trace_sink`` 为 None 时不构造任何事件，热路径零开销。
+
 文本条件匹配经过输入窗口处理后的请求文本（设计 §4.4），时段条件匹配
 本次请求计算出的活跃时段名集合。
 """
@@ -80,23 +86,77 @@ def _compare(op: str, left, right) -> bool:
     raise ValueError(f"unknown answer comparison operator {op!r}")
 
 
-def evaluate_condition(condition: Condition, context: EvaluationContext) -> bool:
+def _child_path(path: str, op: str, child_index: int) -> str:
+    """子条件定位：与 validate.py 的定位语法完全一致（``when.all.0`` 这类）。"""
+    return f"{path}.{op}.{child_index}"
+
+
+def evaluate_condition(
+    condition: Condition,
+    context: EvaluationContext,
+    *,
+    path: str = "when",
+    trace_sink: list[dict] | None = None,
+) -> bool:
+    """求值一个条件子树；``trace_sink`` 非空时逐节点追加扁平机器事件。"""
     if isinstance(condition, AnswerCondition):
-        return _compare(condition.op, answer_value(condition.path, context), condition.value)
+        actual = answer_value(condition.path, context)
+        result = _compare(condition.op, actual, condition.value)
+        if trace_sink is not None:
+            trace_sink.append({
+                "path": path, "kind": "answer", "answer": condition.path,
+                "op": condition.op, "expected": condition.value,
+                "actual": actual, "result": result,
+            })
+        return result
     if isinstance(condition, LogicCondition):
-        if condition.op == "all":
-            return all(evaluate_condition(child, context) for child in condition.children)
-        if condition.op == "any":
-            return any(evaluate_condition(child, context) for child in condition.children)
-        if condition.op == "not":
+        if condition.op in ("all", "any"):
+            # 先求全部 child 再调用 all/any：让逻辑门下的每个条件都有结果，
+            # 不做布尔短路（≤400 个本地节点，省下的是可读 trace，不是 JEV 调用）。
+            child_results = [
+                evaluate_condition(
+                    child, context,
+                    path=_child_path(path, condition.op, child_index),
+                    trace_sink=trace_sink,
+                )
+                for child_index, child in enumerate(condition.children)
+            ]
+            result = all(child_results) if condition.op == "all" else any(child_results)
+        elif condition.op == "not":
             if len(condition.children) != 1:
                 raise ValueError(
                     f"'not' must hold exactly one child, got {len(condition.children)}"
                 )
-            return not evaluate_condition(condition.children[0], context)
-        raise ValueError(f"unknown logic operator {condition.op!r}")
+            child_results = [evaluate_condition(
+                condition.children[0], context,
+                path=_child_path(path, "not", 0),
+                trace_sink=trace_sink,
+            )]
+            result = not child_results[0]
+        else:
+            raise ValueError(f"unknown logic operator {condition.op!r}")
+        if trace_sink is not None:
+            # 组合节点事件使用「本层集合」的完整路径：根 all 在 when 时为
+            # "when.all"，其 child 是 "when.all.0"（计划 Task 3 的固定语法）。
+            trace_sink.append({
+                "path": f"{path}.{condition.op}",
+                "kind": condition.op, "result": result,
+            })
+        return result
     if isinstance(condition, TextCondition):
-        return any(needle in context.text for needle in condition.contains_any)
+        result = any(needle in context.text for needle in condition.contains_any)
+        if trace_sink is not None:
+            trace_sink.append({
+                "path": path, "kind": "text_contains_any",
+                "contains_any": list(condition.contains_any), "result": result,
+            })
+        return result
     if isinstance(condition, PeriodCondition):
-        return any(name in context.active_periods for name in condition.names)
+        result = any(name in context.active_periods for name in condition.names)
+        if trace_sink is not None:
+            trace_sink.append({
+                "path": path, "kind": "period_in",
+                "names": list(condition.names), "result": result,
+            })
+        return result
     raise ValueError(f"unknown condition type {type(condition).__name__}")

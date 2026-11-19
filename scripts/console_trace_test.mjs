@@ -42,19 +42,27 @@ const SCORE_EVENT = {
   answer: { type: 'score', value: 5 },
 };
 
-test('build renders one JEV and ordered rule results without waves', () => {
+test('build renders one JEV and ordered condition results without waves', () => {
   const model = build([
     { event: 'window', tokens_before: 10, tokens_after: 10, truncated: false },
     { event: 'jev', questions: ['route', 'risk'], duration_ms: 12, failed: false, error: null },
-    { event: 'question', node_id: 'risk', ports: { yes: 0.9, no: 0.1 } },
-    { event: 'rule', index: 0, name: '高风险', matched: true },
+    { event: 'question', question_id: 'risk', answer: { yes: 0.9, no: 0.1 } },
+    { event: 'rule', index: 0, name: '高风险', matched: true, conditions: [
+      { path: 'when', kind: 'answer', answer: 'risk.yes', op: 'gte',
+        expected: 0.8, actual: 0.9, result: true }
+    ] },
+    { event: 'rule', index: 1, name: '不执行', matched: null, conditions: [] },
     { event: 'final', kind: 'target', target_id: 'safe', reason: null },
     { event: 'scheduled', model: 'fast', reason: 'target', dry_run: true }
   ]);
   assert.equal(model.jev.duration_ms, 12);
-  assert.deepEqual(model.rules.map(rule => rule.name), ['高风险']);
+  assert.deepEqual(model.rules.map(rule => rule.name), ['高风险', '不执行']);
+  assert.equal(model.rules[0].conditions[0].actual, 0.9);
+  assert.equal(model.rules[1].matched, null);
   assert.equal(model.final.target_id, 'safe');
-  assert.equal(JSON.stringify(model).includes('wave'), false);
+  const serialized = JSON.stringify(model);
+  assert.equal(serialized.includes('wave'), false);
+  assert.equal(serialized.includes('ports'), false);
 });
 
 test('JEV block renders the duration with a single unit', () => {
@@ -200,6 +208,66 @@ test('rules view marks misses, keeps trace order and notes the first-match stop'
   assert.equal(allMiss.includes('首条命中后停止'), false,
     'a no-match trace must not claim the run stopped at a match');
   assert.equal((allMiss.match(/lg-rule /g) || []).length, 2);
+});
+
+test('rule cards render condition paths with pass/fail marks', () => {
+  const model = build([
+    { event: 'rule', index: 1, name: '复杂请求', matched: false, conditions: [
+      { path: 'when.all.0', kind: 'answer', answer: 'route.selected', op: 'eq',
+        expected: 'strong', actual: 'fast', result: false },
+      { path: 'when.all.1', kind: 'answer', answer: 'severity.value', op: 'gte',
+        expected: 5, actual: 10, result: true },
+      { path: 'when.all', kind: 'all', result: false },
+    ] },
+  ]);
+  const html = rulesHtml(model);
+  /* 紧凑嵌套列表：每个已求值条件一行，路径 + ✓/✗。 */
+  const rows = [...html.matchAll(/<li class="lg-cond[^"]*">\s*<span class="mono">([^<]*)<\/span>/g)]
+    .map(match => match[1]);
+  assert.deepEqual(rows, ['when.all.0', 'when.all.1', 'when.all'],
+    'condition rows must keep the backend evaluation order (leaves first, gate last)');
+  assert.ok(/✓/.test(html), 'the passing condition is not marked with ✓');
+  assert.ok(/✗/.test(html), 'the failing condition is not marked with ✗');
+
+  /* 未求值的规则（matched=null + conditions=[]）不渲染条件列表。 */
+  const skipped = rulesHtml(build([
+    { event: 'rule', index: 2, name: '主问题选择轻量模型', matched: null, conditions: [] },
+  ]));
+  assert.equal((skipped.match(/lg-cond\b/g) || []).length, 0,
+    'a skipped rule must not render condition rows');
+});
+
+test('a skipped rule renders 未求值 and never 未命中', () => {
+  /* 单条被跳过的规则（matched=null，首条命中后未求值）。 */
+  const skipped = rulesHtml(build([
+    { event: 'rule', index: 1, name: '复杂请求', matched: null, conditions: [] },
+  ]));
+  assert.ok(skipped.includes('未求值'), 'a skipped rule must show 未求值');
+  assert.equal(skipped.includes('未命中'), false,
+    'a skipped rule rendered the 未命中 copy');
+
+  /* 单条未命中的规则：文案仍是未命中，不串到未求值。 */
+  const missed = rulesHtml(build([
+    { event: 'rule', index: 0, name: '高风险', matched: false, conditions: [
+      { path: 'when', kind: 'answer', answer: 'risk.yes', op: 'gte',
+        expected: 0.8, actual: 0.1, result: false },
+    ] },
+  ]));
+  assert.ok(missed.includes('未命中'), 'a missed rule must show 未命中');
+  assert.equal(missed.includes('未求值'), false,
+    'a missed rule rendered the skipped copy');
+
+  /* 命中 + 后续跳过：停止备注仍然出现（首条命中后停止）。 */
+  const stopped = rulesHtml(build([
+    { event: 'rule', index: 0, name: '高风险', matched: true, conditions: [
+      { path: 'when', kind: 'answer', answer: 'risk.yes', op: 'gte',
+        expected: 0.8, actual: 0.9, result: true },
+    ] },
+    { event: 'rule', index: 1, name: '复杂请求', matched: null, conditions: [] },
+  ]));
+  assert.ok(stopped.includes('首条命中后停止'),
+    'the stop note is missing when later rules were skipped');
+  assert.ok(stopped.includes('未求值'), 'the skipped tail must show 未求值');
 });
 
 test('a scheduling failure keeps the preceding trace in the view model', () => {

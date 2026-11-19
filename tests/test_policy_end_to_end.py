@@ -117,7 +117,10 @@ def test_try_any_gate_and_score_condition_with_first_match(policy_app):
     assert body["target"] == "strong"
     assert body["fallback"] is False
     rule_events = [event for event in body["trace"] if event["event"] == "rule"]
-    assert [event["matched"] for event in rule_events] == [True]
+    # 首条命中后：第二条规则不求值，以 matched=None/conditions=[] 追加。
+    assert [event["matched"] for event in rule_events] == [True, None]
+    assert rule_events[0]["conditions"][0]["path"] == "when.any.0"
+    assert rule_events[1]["conditions"] == []
 
     normal = client.post("/admin/try", json={
         "policy": draft, "text": PLAIN, "now": NOW})

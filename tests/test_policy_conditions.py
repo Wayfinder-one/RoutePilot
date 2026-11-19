@@ -177,6 +177,106 @@ def test_unknown_condition_type_raises():
         evaluate_condition(object(), context())
 
 
+# --------------------------------------------------------------------------- #
+# 条件轨迹（Task 3 · 设计 §5.5）：trace_sink 收集扁平机器事件，路径精确到节点
+# --------------------------------------------------------------------------- #
+
+def test_trace_sink_collects_answer_events_with_exact_child_paths():
+    """计划 Task 3/6 逐字场景：``when.all.0`` 这类完整路径按求值顺序追加。"""
+    sink: list[dict] = []
+    condition = LogicCondition("all", (
+        AnswerCondition("route.selected", "eq", "fast"),
+        AnswerCondition("risk.yes", "lt", 0.2),
+    ))
+    result = evaluate_condition(condition, context(), path="when", trace_sink=sink)
+    assert result is False
+    # all 先求全部 child（不做布尔短路），再发组合节点事件：叶子在前、门在后。
+    assert [event["path"] for event in sink] == ["when.all.0", "when.all.1", "when.all"]
+    assert sink[0] == {
+        "path": "when.all.0", "kind": "answer", "answer": "route.selected",
+        "op": "eq", "expected": "fast", "actual": "fast", "result": True,
+    }
+    assert sink[1] == {
+        "path": "when.all.1", "kind": "answer", "answer": "risk.yes",
+        "op": "lt", "expected": 0.2, "actual": 0.9, "result": False,
+    }
+    assert sink[2] == {"path": "when.all", "kind": "all", "result": False}
+
+
+def test_trace_sink_default_path_is_when_and_single_answer_leaf():
+    sink: list[dict] = []
+    result = evaluate_condition(
+        AnswerCondition("risk.yes", "gte", 0.8), context(), trace_sink=sink)
+    assert result is True
+    assert sink == [{
+        "path": "when", "kind": "answer", "answer": "risk.yes",
+        "op": "gte", "expected": 0.8, "actual": 0.9, "result": True,
+    }]
+
+
+def test_trace_sink_emits_logic_not_and_nested_child_paths():
+    sink: list[dict] = []
+    inner = LogicCondition("any", (
+        AnswerCondition("route.prob.fast", "gt", 0.5),
+        AnswerCondition("severity.value", "gte", 5),
+    ))
+    nested = LogicCondition("not", (LogicCondition("all", (inner,)),))
+    result = evaluate_condition(nested, context(), path="when", trace_sink=sink)
+    assert result is False
+    # 每个节点一个事件：叶子在前，组合节点按求值返回顺序在后；
+    # 组合节点事件使用「本层集合」路径（…/any、…/all、when/not）。
+    assert [event["path"] for event in sink] == [
+        "when.not.0.all.0.any.0",
+        "when.not.0.all.0.any.1",
+        "when.not.0.all.0.any",
+        "when.not.0.all",
+        "when.not",
+    ]
+    assert [event["kind"] for event in sink] == [
+        "answer", "answer", "any", "all", "not",
+    ]
+    assert [event["result"] for event in sink] == [True, True, True, True, False]
+
+
+def test_trace_sink_emits_text_and_period_events_with_configured_order():
+    sink: list[dict] = []
+    condition = LogicCondition("any", (
+        TextCondition(contains_any=("95598", "客服")),
+        PeriodCondition(names=("peak", "night")),
+    ))
+    result = evaluate_condition(condition, context(), path="when", trace_sink=sink)
+    assert result is True
+    assert sink[0] == {
+        "path": "when.any.0", "kind": "text_contains_any",
+        "contains_any": ["95598", "客服"], "result": True,
+    }
+    assert sink[1] == {
+        "path": "when.any.1", "kind": "period_in",
+        "names": ["peak", "night"], "result": True,
+    }
+    assert sink[2] == {"path": "when.any", "kind": "any", "result": True}
+
+
+def test_trace_sink_none_keeps_hot_path_free_of_event_construction():
+    # 不传 trace_sink：布尔结果与传 sink 时完全一致，且不构造任何事件。
+    condition = LogicCondition("all", (
+        AnswerCondition("route.selected", "eq", "fast"),
+        AnswerCondition("risk.yes", "gte", 0.8),
+    ))
+    assert evaluate_condition(condition, context()) is True
+    with_sink: list[dict] = []
+    assert evaluate_condition(condition, context(), trace_sink=with_sink) is True
+    assert len(with_sink) == 3
+
+
+def test_condition_events_share_one_computation_with_the_boolean_result():
+    # actual 只读一次答案：布尔结果与事件里的 result 必须来自同一次计算。
+    sink: list[dict] = []
+    assert evaluate_condition(
+        AnswerCondition("severity.value", "gte", 10.0), context(), trace_sink=sink) is True
+    assert sink[0]["actual"] == 10.0 and sink[0]["result"] is True
+
+
 def test_answer_path_errors_inside_conditions_never_become_false():
     with pytest.raises(KeyError):
         evaluate_condition(AnswerCondition("missing.yes", "gte", 0.5), context())

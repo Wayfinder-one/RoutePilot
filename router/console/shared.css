@@ -333,13 +333,24 @@ button.del:focus-visible{outline:2px solid var(--indigo-line);outline-offset:1px
   color:var(--text-3);font-variant-numeric:tabular-nums}
 .lg-jev.hit{color:var(--indigo);font-weight:650}
 /* Policy v4 逐条规则行：顺序与命中状态来自后端 trace。 */
-.lg-rule{display:flex;gap:8px;align-items:baseline;padding:3px 0;font-size:11.5px}
+.lg-rule{display:flex;flex-direction:column;gap:2px;padding:3px 0;font-size:11.5px}
+.lg-rule-line{display:flex;gap:8px;align-items:baseline;min-width:0}
 .lg-rule .mono{color:var(--text-3);width:18px;flex:none}
 .lg-rule.is-hit{color:var(--text);font-weight:600}
 .lg-rule.is-miss{color:var(--text-3)}
+.lg-rule.is-skip{color:var(--text-3)}
 .lg-rule-flag{margin-left:auto;font-size:11px;flex:none}
 .lg-rule.is-hit .lg-rule-flag{color:var(--green)}
 .lg-rule.is-miss .lg-rule-flag{color:var(--text-3)}
+.lg-rule.is-skip .lg-rule-flag{color:var(--text-3)}
+/* 已求值规则的逐条件结果：路径 + ✓/✗（跳过的规则没有条件行）。
+   ✗ 是条件判定，不是路由失败——保持琥珀色，红色只留给 .lg-fail。 */
+.lg-rule-conds{list-style:none;margin:0 0 0 26px;padding:0;display:flex;flex-direction:column;gap:1px}
+.lg-cond{display:flex;gap:8px;align-items:baseline;font-size:11px;color:var(--text-3)}
+.lg-cond .mono{width:auto;color:var(--text-3)}
+.lg-cond-flag{margin-left:auto;flex:none;font-size:10.5px}
+.lg-cond.ok .lg-cond-flag{color:var(--green);font-weight:700}
+.lg-cond.no .lg-cond-flag{color:var(--amber);font-weight:700}
 .lg-judgment-row{display:flex;flex-direction:column;gap:3px;min-width:0}
 .lg-question{display:flex;flex-direction:column;gap:4px;min-width:0}
 .lg-probs{display:flex;flex-direction:column;gap:6px;max-width:460px}

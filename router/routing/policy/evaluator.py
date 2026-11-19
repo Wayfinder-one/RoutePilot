@@ -8,9 +8,11 @@
 ``jev_input_tokens`` 四个字段。
 
 轨迹只含机器字段（time/window/jev/question/rule/final，§5.5），不含
-wave/Candidate/端口写回事件；展示文案由前端生成。成功 final 为
-``kind=target``，两类兜底 final 为 ``kind=fallback`` + ``jev_error``/
-``no_rule_matched``。
+wave/Candidate/端口写回事件；展示文案由前端生成。rule 事件携带
+``conditions``（``evaluate_condition`` 逐节点收集的扁平事件，路径如
+``when.all.0``）；首条命中后的剩余规则不求值，以 ``matched=None`` +
+空 ``conditions`` 追加。成功 final 为 ``kind=target``，两类兜底 final
+为 ``kind=fallback`` + ``jev_error``/``no_rule_matched``。
 """
 from __future__ import annotations
 
@@ -170,12 +172,24 @@ class PolicyEvaluator:
                 active_periods=active_periods,
             )
             for index, rule in enumerate(policy.rules):
-                matched = evaluate_condition(rule.when, context)
-                emit({"event": "rule", "index": index, "name": rule.name, "matched": matched})
+                if matched_rule is not None:
+                    # 首条命中后的剩余规则：不求值，只以 matched=None 留痕
+                    # （§5.5「matched 为 None 表示未求值」，不是 UNKNOWN）。
+                    emit({
+                        "event": "rule", "index": index, "name": rule.name,
+                        "matched": None, "conditions": [],
+                    })
+                    continue
+                conditions: list[dict] = []
+                matched = evaluate_condition(
+                    rule.when, context, path="when", trace_sink=conditions)
+                emit({
+                    "event": "rule", "index": index, "name": rule.name,
+                    "matched": matched, "conditions": conditions,
+                })
                 if matched:
                     matched_rule = rule
                     matched_rule_index = index
-                    break
 
         # 4. 目标确定：命中规则 → 规则目标；失败/未命中 → fallback 目标。
         if matched_rule is not None:

@@ -59,8 +59,11 @@ def test_rule_matching_later_answers_needs_no_second_request():
     assert outcome.matched_rule_index == 1
     assert outcome.matched_rule.name == "复杂请求"
     assert [e["event"] for e in outcome.trace].count("jev") == 1
-    # 第一条命中即停止：规则 2 不再求值。
-    assert [e["index"] for e in outcome.trace if e["event"] == "rule"] == [0, 1]
+    # 第一条命中即停止：规则 2 不求值，但以 matched=None/conditions=[] 留痕。
+    rule_events = [e for e in outcome.trace if e["event"] == "rule"]
+    assert [e["index"] for e in rule_events] == [0, 1, 2]
+    assert [e["matched"] for e in rule_events] == [False, True, None]
+    assert rule_events[2]["conditions"] == []
 
 
 def test_all_any_not_rule_forms_route_end_to_end():

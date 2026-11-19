@@ -73,12 +73,15 @@ test('calculation log shows policy facts, JEV calls and ordered rules', async ()
   assertIncludes(await open.locator('[data-sec="final"]').innerText(), 'power');
   assertIncludes(await open.locator('[data-sec="schedule"]').innerText(), 'qwen3.8-flash-sft');
   assertIncludes(await open.locator('[data-sec="outcome"]').innerText(), '已完成');
-  /* 规则按后端 trace 顺序渲染，停在首条命中。 */
+  /* 规则按后端 trace 顺序渲染，停在首条命中（后续规则未求值）。 */
   const rows = await open.locator('.lg-rule').allInnerTexts();
-  assert.equal(rows.length, 2, 'the trace must stop at the first matching rule');
+  assert.equal(rows.length, 4, 'the trace must keep evaluated and skipped rules');
   assert.ok(rows[0].indexOf('对抗请求优先走安全目标') >= 0 && rows[0].indexOf('未命中') >= 0);
   assert.ok(rows[1].indexOf('电力业务优先') >= 0);
   assert.ok(rows[1].indexOf('命中') >= 0 && rows[1].indexOf('未命中') < 0);
+  assert.ok(rows[2].indexOf('未求值') >= 0 && rows[2].indexOf('未命中') < 0,
+    'a skipped rule must render 未求值, not 未命中');
+  assert.ok(rows[3].indexOf('未求值') >= 0 && rows[3].indexOf('未命中') < 0);
   assertIncludes(detail, '首条命中后停止');
 });
 

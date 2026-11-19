@@ -8,8 +8,10 @@
 
    一次决策至多一个 jev 事件（§5.1）：JEV 区块只取该事件；questions 保留
    答案详情（choice 概率/选中、noul yes/no、score value）；rules 按 trace
-   顺序排列并直接显示后端 matched；final 只按 kind + reason 取文案，绝不
-   读 priority/candidates。
+   顺序排列，直接显示后端 matched 三态（true 命中 / false 未命中 /
+   null 未求值，null 绝不当 false 渲染），已求值规则内嵌逐条件结果列表
+   （路径 + ✓/✗，全部来自后端 conditions 事件）；final 只按 kind + reason
+   取文案，绝不读 priority/candidates。
 
    区块视图（jevHtml/questionsHtml/rulesHtml/finalHtml/…）被两处复用：
    路由页试算面板（routing/tryrun.js）与计算日志详情（logs.js）；文案与
@@ -176,22 +178,49 @@ function probBars(answer) {
   return `<div class="lg-probs">${bars}</div>`;
 }
 
-/* ── 逐条规则：trace 顺序 + 后端 matched；首条命中即停（后续不求值） ── */
+/* ── 逐条规则：trace 顺序 + 后端 matched；首条命中即停（后续未求值） ── */
 function rulesHtml(model) {
   if (!model.rules.length) return '';
   const rows = model.rules.map(ruleHtml).join('');
-  /* 求值器命中即 break：最后一条规则命中 = 后续规则被跳过，明确提示。 */
-  const stopped = model.rules[model.rules.length - 1].matched === true
+  /* 求值器命中即 break：末条规则命中，或存在被跳过的规则（matched=null），
+     都说明求值没有跑完全部规则，明确提示首条命中后停止。 */
+  const stopped = (model.rules[model.rules.length - 1].matched === true
+    || model.rules.some(rule => rule.matched == null))
     ? `<div class="lg-note">${esc(t('pv.tryRulesStopped'))}</div>` : '';
   return section('rules', t('pv.tryRules'), rows + stopped);
 }
 
+/* matched 三态：true 命中 / false 未命中 / null 未求值（首条命中后跳过）。
+   null 绝不能当作 false 渲染，也不得自行补算。 */
+function ruleFlagKey(rule) {
+  if (rule.matched === true) return 'pv.tryHit';
+  if (rule.matched === false) return 'pv.tryMiss';
+  return 'pv.trySkipped';
+}
+
+/* 已求值规则的逐条件紧凑列表：路径 + ✓/✗，全部来自后端 conditions 事件。 */
+function conditionRows(rule) {
+  const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
+  if (!conditions.length) return '';
+  const rows = conditions.map(condition => {
+    const pass = condition.result === true;
+    return `<li class="lg-cond${pass ? ' ok' : ' no'}">` +
+      `<span class="mono">${esc(text(condition.path))}</span>` +
+      `<span class="lg-cond-flag">${pass ? '✓' : '✗'}</span></li>`;
+  }).join('');
+  return `<ul class="lg-rule-conds">${rows}</ul>`;
+}
+
 function ruleHtml(rule) {
   const hit = rule.matched === true;
-  return `<div class="lg-rule ${hit ? 'is-hit' : 'is-miss'}" data-rule-index="${esc(text(rule.index))}">
-    <span class="mono">${esc(text(Number(rule.index) + 1))}</span>
-    <span class="lg-rule-name">${esc(text(rule.name))}</span>
-    <span class="lg-rule-flag">${esc(t(hit ? 'pv.tryHit' : 'pv.tryMiss'))}</span>
+  const skipped = rule.matched == null;
+  return `<div class="lg-rule ${hit ? 'is-hit' : skipped ? 'is-skip' : 'is-miss'}" data-rule-index="${esc(text(rule.index))}">
+    <div class="lg-rule-line">
+      <span class="mono">${esc(text(Number(rule.index) + 1))}</span>
+      <span class="lg-rule-name">${esc(text(rule.name))}</span>
+      <span class="lg-rule-flag">${esc(t(ruleFlagKey(rule)))}</span>
+    </div>
+    ${conditionRows(rule)}
   </div>`;
 }
 

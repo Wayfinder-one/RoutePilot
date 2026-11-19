@@ -369,10 +369,12 @@ def test_numeric_rule_combines_answers_in_one_systemone_call(tmp_path):
         assert record["jev_calls"] == 1
         assert set(record["answers"]) == {"route", "risk", "severity"}
         rule_events = [event for event in record["trace"] if event["event"] == "rule"]
-        # 首条命中即停止：高风险未命中、复杂请求命中，轻量请求不再求值。
+        # 首条命中即停止：高风险未命中、复杂请求命中；轻量请求不再求值，
+        # 以 matched=None + conditions=[] 留痕（§5.5）。
         assert [(event["index"], event["name"], event["matched"]) for event in rule_events] == [
-            (0, "高风险", False), (1, "复杂请求", True),
+            (0, "高风险", False), (1, "复杂请求", True), (2, "轻量请求", None),
         ]
+        assert rule_events[2]["conditions"] == []
         # 摘要列取 answers 按问题 ID 排序后的首个 ChoiceAnswer。
         assert record["jev_choice"] == "strong"
         assert record["jev_top"] == pytest.approx(0.9)
