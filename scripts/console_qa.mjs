@@ -51,10 +51,11 @@ const WRITE_SHOTS = process.env.QA_SCREENSHOTS === '1';
 /* 示例图是 15 节点图的唯一来源：节点/边数、start 坐标、兜底目标都从 fixture 派生，
    避免 QA 里散落 15 / 20,150 / standard-target 这类字面量。 */
 export const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
-export const EXAMPLE_NODES = EXAMPLE.nodes.length;
-export const EXAMPLE_EDGES = EXAMPLE.edges.length;
-export const EXAMPLE_START = EXAMPLE.nodes.find(node => node.id === 'start').position;
-export const EXAMPLE_TARGETS = { fallback: EXAMPLE.error_fallback };
+export const EXAMPLE_ROOT = EXAMPLE.root;
+export const EXAMPLE_NODES = EXAMPLE_ROOT.nodes.length;
+export const EXAMPLE_EDGES = EXAMPLE_ROOT.edges.length;
+export const EXAMPLE_START = EXAMPLE.canvas.start;
+export const EXAMPLE_TARGETS = { fallback: EXAMPLE_ROOT.error_fallback };
 /* 示例图只有 root；envelope 元数据是 QA 基座约定，集中一处供 bootstrap / 基线 / 断言复用。 */
 export const BASELINE = {
   name: '电力优先决策组',
@@ -206,7 +207,7 @@ function sendJson(response, status, body) {
 function loadScenarioFixture() {
   const fixture = JSON.parse(fs.readFileSync(SCENARIO_PATH, 'utf8'));
   const optionKeys = {};
-  (EXAMPLE.nodes || []).forEach(node => {
+  (EXAMPLE_ROOT.nodes || []).forEach(node => {
     if (node.type === 'question' && node.question_type === 'choice') {
       optionKeys[node.id] = (node.options || []).map(option => option.key);
 }
@@ -644,7 +645,8 @@ async function bootstrap() {
     name: BASELINE.name,
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
-    root: EXAMPLE
+    root: EXAMPLE_ROOT,
+    canvas: EXAMPLE.canvas
 });
   await api('POST', '/admin/trees/' + TREE_ID + '/enable');
 }
@@ -1223,7 +1225,8 @@ export async function ensureBaselineTree() {
     name: BASELINE.name,
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
-    root: EXAMPLE
+    root: EXAMPLE_ROOT,
+    canvas: EXAMPLE.canvas
 });
   if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
   return (await api('GET', '/admin/trees/' + TREE_ID)).tree;

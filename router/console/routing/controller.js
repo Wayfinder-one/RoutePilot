@@ -324,16 +324,15 @@ export class RoutingController {
     try {
       const response = await fetch('routing/example.json', { cache: 'no-store' });
       if (!response.ok) throw new Error('HTTP ' + response.status);
-      const example = await response.json();
-      if (!example || example.type !== 'graph' ||
-          !Array.isArray(example.nodes) || !Array.isArray(example.edges)) {
-        throw new Error('invalid example graph');
-      }
+      /* 示例文件是完整 v3 文档（画布坐标在顶层 canvas）：用 parseImport 校验并
+         把坐标分发回内部 node.position，再整图替换。 */
+      const parsed = RTGraph.parseImport(await response.text());
+      if (!parsed.ok) throw new Error(parsed.error);
       /* 示例是整图替换（不走 loadTree）：应用前让在途的 switch 过期，
          否则旧回包会在示例落地后把草稿盖回去。 */
       this.loadSeq += 1;
       /* 一次历史操作替换整张图；envelope 的 id/enabled/name/timezone/sticky 保持不变。 */
-      if (this.hooks.change('behavior', tree => { tree.root = RTGraph.clone(example); }) === false) {
+      if (this.hooks.change('behavior', tree => { tree.root = RTGraph.clone(parsed.tree.root); }) === false) {
         return false;
       }
       this.hooks.fitAfterReplace();

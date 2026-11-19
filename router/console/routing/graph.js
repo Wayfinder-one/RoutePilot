@@ -1335,7 +1335,11 @@ function dispatchCanvas(tree) {
 }
 
 /* 内部 node.position → 顶层 canvas（导出前调用；就地修改并返回 tree）。 */
-function collectCanvas(tree) {
+/* 顶层 canvas 收集器。`round` 只用于文件导出（旧 serialize 的整洁格式）；
+   API 保存必须保留原始数值——服务端原样存回，取整会让回包坐标与草稿不一致，
+   草稿永远判成 layout dirty。 */
+function collectCanvas(tree, options) {
+  const round = !!(options && options.round);
   const root = isRecord(tree) && isRecord(tree.root) ? tree.root : null;
   /* 节点 id 来自用户数据：用无原型对象，避免 __proto__ 之类的 id 丢失坐标。 */
   const canvas = Object.create(null);
@@ -1345,7 +1349,9 @@ function collectCanvas(tree) {
       const position = node.position;
       if (isNonEmptyString(node.id) && isRecord(position) &&
           isFiniteNumber(position.x) && isFiniteNumber(position.y)) {
-        canvas[node.id] = { x: Math.round(position.x), y: Math.round(position.y) };
+        canvas[node.id] = round
+          ? { x: Math.round(position.x), y: Math.round(position.y) }
+          : { x: position.x, y: position.y };
       }
       delete node.position;
     });
@@ -1364,7 +1370,7 @@ function serialize(tree) {
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: clone(parts.root)
-  }), null, 2);
+  }, { round: true }), null, 2);
 }
 
 function parseImport(text) {

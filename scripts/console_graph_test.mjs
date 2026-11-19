@@ -13,7 +13,12 @@ import * as SRTrace from '../router/console/trace.js';
 const EXAMPLE_URL = new URL('../router/console/routing/example.json', import.meta.url);
 
 function readExample() {
-  return JSON.parse(fs.readFileSync(EXAMPLE_URL, 'utf8'));
+  /* 示例文件是完整 v3 文档：parseImport 校验并把顶层 canvas 分发回内部 node.position，
+     返回带坐标的 root（沿用旧 helper「返回 root」的契约）。 */
+  const parsed = RTGraph.parseImport(fs.readFileSync(EXAMPLE_URL, 'utf8'));
+  assert.equal(parsed.ok, true,
+    'example.json must import cleanly: ' + JSON.stringify(parsed.issues));
+  return parsed.tree.root;
 }
 
 function exampleGraph() {
@@ -1273,11 +1278,8 @@ test('review-import-rejects-invalid-envelope-timezone', () => {
 });
 
 test('review-import-keeps-valid-v3-example-accepted', () => {
-  const result = RTGraph.parseImport(JSON.stringify({
-    kind: 'sr-routing-graph', version: 3, name: '合法示例',
-    timezone: 'Asia/Shanghai', sticky: { enabled: false, ttl_seconds: 1800 },
-    root: readExample(),
-  }));
+  /* 示例文件本身就是完整 v3 文档（画布坐标在顶层 canvas），直接导入验证契约。 */
+  const result = RTGraph.parseImport(fs.readFileSync(EXAMPLE_URL, 'utf8'));
   assert.equal(result.ok, true, JSON.stringify(result.issues));
   assert.equal(hardIssues(result.issues).length, 0);
 });

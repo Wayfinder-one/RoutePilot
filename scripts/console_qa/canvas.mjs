@@ -11,6 +11,7 @@ import path from 'node:path';
 import {
   BASELINE,
   EXAMPLE,
+  EXAMPLE_ROOT,
   EXAMPLE_EDGES,
   EXAMPLE_NODES,
   EXAMPLE_START,
@@ -1187,9 +1188,11 @@ test('Task 12 · moving a node saves layout-only: revision unchanged, coordinate
   const server = await serverTree(TREE_ID);
   assert.equal(server.tree_revision, baseline.tree_revision,
     'a position-only save changed the server tree_revision');
-  const start = server.root.nodes.find(node => node.id === 'start');
-  assert.ok(Math.abs(start.position.x - moved.x) < 0.01, 'saved X coordinate differs from the draft');
-  assert.ok(Math.abs(start.position.y - moved.y) < 0.01, 'saved Y coordinate differs from the draft');
+  /* 画布坐标在文档顶层 canvas（节点对象不再带 position）。 */
+  const start = server.canvas.start;
+  assert.ok(start, 'the saved document is missing canvas.start');
+  assert.ok(Math.abs(start.x - moved.x) < 0.01, 'saved X coordinate differs from the draft');
+  assert.ok(Math.abs(start.y - moved.y) < 0.01, 'saved Y coordinate differs from the draft');
 });
 
 test('Task 12 · save clears dirty while the undo history stays usable', async () => {
@@ -1930,7 +1933,7 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
 test('Task 12 · a valid v3 import without positions lays every node out with finite coordinates', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  const stripped = JSON.parse(JSON.stringify(EXAMPLE));
+  const stripped = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
   stripped.nodes.forEach(node => { delete node.position; });
   await setImportPayload({
     kind: 'sr-routing-graph',
@@ -2003,8 +2006,10 @@ const RTGraph = await import('/console/routing/graph.js');
   server.root.nodes.forEach(node => {
     const position = laidOut.positions[node.id];
     assert.ok(position, `${node.id} missing from the client layout`);
-    assert.ok(Math.abs(node.position.x - position.x) < 0.01, `${node.id} saved X differs from the DAG layout`);
-    assert.ok(Math.abs(node.position.y - position.y) < 0.01, `${node.id} saved Y differs from the DAG layout`);
+    const saved = server.canvas[node.id];
+    assert.ok(saved, `${node.id} missing from the saved canvas`);
+    assert.ok(Math.abs(saved.x - position.x) < 0.01, `${node.id} saved X differs from the DAG layout`);
+    assert.ok(Math.abs(saved.y - position.y) < 0.01, `${node.id} saved Y differs from the DAG layout`);
 });
 });
 
@@ -2671,7 +2676,7 @@ test('Task 14 · a malformed v3 import with non-array fields is rejected before 
   await clearToasts();
 
   /* models: 5 曾在 cards.js 里直接 .map 崩溃：parseImport 必须在应用前拒绝。 */
-  const malformed = JSON.parse(JSON.stringify(EXAMPLE));
+  const malformed = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
   malformed.nodes.find(node => node.type === 'target').models = 5;
   const probe = await page.evaluate(async payload => {
     const RTGraph = await import('/console/routing/graph.js');
@@ -3550,7 +3555,7 @@ test('review-slot-limit-import-preserves-draft', async () => {
     slots: document.querySelectorAll('#cvNodes .rtc-slot').length,
 }));
 });
-  const root = JSON.parse(JSON.stringify(EXAMPLE));
+  const root = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
   root.edges[0].target_port = 'in_9999';
   await clearToasts();
   await setImportPayload({
