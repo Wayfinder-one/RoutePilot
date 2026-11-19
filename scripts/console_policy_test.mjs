@@ -16,7 +16,7 @@ import { api } from '../router/console/api.js';
 import { DraftStore } from '../router/console/routing/draft.js';
 import { RoutingController } from '../router/console/routing/controller.js';
 import { behaviorCanonical, clone, createPolicy } from '../router/console/routing/policy.js';
-import { initTryRun, resetTryRun } from '../router/console/routing/tryrun.js';
+import { initTryRun, renderTryResult, resetTryRun, resultHtml } from '../router/console/routing/tryrun.js';
 
 /* tryrun.js 的渲染入口按 id 查 DOM；node 直测没有页面，给一个永远
    返回 null 的最小 document 桩：渲染路径整体空跑，状态逻辑照常执行。 */
@@ -339,4 +339,28 @@ test('resetTryRun releases a stuck try lock so the draft stays editable', () => 
   } finally {
     initTryRun(null);
   }
+});
+
+/* ── tryrun：结果区头部展示命中规则与其 1 起规则序号（Task 9 结果区） ── */
+
+test('try head shows the matched rule with its 1-based rule index', () => {
+  const hit = resultHtml({
+    target: 'power', models: ['qwen3.8-flash-sft'],
+    matched_rule: '电力业务优先', matched_rule_index: 1,
+    fallback: false, reason: null, trace: [],
+  });
+  assert.ok(hit.indexOf('电力业务优先') >= 0, 'the head dropped the matched rule name');
+  assert.ok(hit.indexOf('规则序号') >= 0, 'the head is missing the rule-index label');
+  assert.ok(hit.indexOf('规则序号 2') >= 0,
+    'the head must render the 1-based index (backend index 1 → 规则序号 2)');
+
+  /* 兜底响应：matched_rule_index 为 null，头部不渲染规则序号。 */
+  const fallback = resultHtml({
+    target: 'safe', models: ['qwen3-8b'],
+    matched_rule: null, matched_rule_index: null,
+    fallback: true, reason: 'jev_error', trace: [],
+  });
+  assert.equal(fallback.indexOf('规则序号'), -1,
+    'a fallback response must not render a rule index');
+  assert.ok(fallback.indexOf('兜底目标') >= 0, 'the fallback head lost its target pill');
 });

@@ -88,14 +88,25 @@ function reasonText(result) {
   return result.reason == null ? '' : String(result.reason);
 }
 
+/* 命中规则的序号展示为 1 起规则序号（后端 matched_rule_index 是 0 起）；
+   兜底响应序号为 null：不渲染，不把 null 当成 0。 */
+function ruleIndexText(result) {
+  if (result.matched_rule_index == null) return '';
+  const index = Number(result.matched_rule_index);
+  if (!Number.isInteger(index) || index < 0) return '';
+  return tf('pv.tryRuleIndex', { n: index + 1 });
+}
+
 function resultHtml(result) {
   const model = build(Array.isArray(result.trace) ? result.trace : []);
+  const ruleIndex = ruleIndexText(result);
   return '<div class="pv-try-head">' +
     '<span class="pill ' + (result.fallback ? 'warn' : 'ok') + '">' +
     esc(t(result.fallback ? 'pv.tryFallback' : 'pv.tryTarget')) + ' <b class="mono">' +
     esc(result.target == null ? '—' : result.target) + '</b></span>' +
     '<span class="pv-try-models mono">' + esc((result.models || []).join(' · ') || '—') + '</span>' +
     '<span class="pv-try-rule-name">' + esc(reasonText(result)) + '</span>' +
+    (ruleIndex ? '<span class="pv-try-rule-index mono">' + esc(ruleIndex) + '</span>' : '') +
     '</div>' +
     jevHtml(model) + questionsHtml(model) + rulesHtml(model);
 }
@@ -149,4 +160,4 @@ function initTryRun(next) {
   if (button) button.addEventListener('click', runFromInput);
 }
 
-export { initTryRun, runTry, runFromInput, renderTryResult, resetTryRun, currentTryResult };
+export { initTryRun, runTry, runFromInput, renderTryResult, resetTryRun, currentTryResult, resultHtml };

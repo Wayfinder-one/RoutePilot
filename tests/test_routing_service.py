@@ -176,6 +176,7 @@ def test_scheduler_keeps_rule_and_fallback_cause():
     decision, _jev = route_policy(session_id="s", fallback="no_rule_matched")
     assert decision.fallback_reason == "no_rule_matched"
     assert decision.matched_rule is None
+    assert decision.matched_rule_index is None
     assert not hasattr(decision, "waves")
     assert decision.target.id == "safe"
 
@@ -185,6 +186,7 @@ def test_rule_hit_keeps_matched_rule_and_jev_evidence():
     assert decision.target.id == "fast"
     assert decision.model == "fast"
     assert decision.matched_rule == "轻量请求"
+    assert decision.matched_rule_index == 2
     assert decision.fallback_reason is None
     assert decision.selection_reason == "target"
     assert decision.jev_questions == ("route", "risk", "severity")

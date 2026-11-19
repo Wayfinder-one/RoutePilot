@@ -38,6 +38,7 @@ def test_try_requires_exactly_one_policy_source_and_does_not_save(tmp_path):
     })
     assert response.status_code == 200, response.text
     assert response.json()["fallback"] is False
+    assert response.json()["matched_rule_index"] == 2
     assert len([e for e in response.json()["trace"] if e["event"] == "jev"]) == 1
     assert client.get("/admin/policies").json()["policies"] == []
 
@@ -72,6 +73,7 @@ def test_try_with_inline_policy_does_not_publish_or_touch_state(tmp_path):
     assert body["target"] == "fast"
     assert body["models"] == ["fast"]
     assert body["matched_rule"] == "轻量请求"
+    assert body["matched_rule_index"] == 2
     assert body["fallback"] is False and body["reason"] is None
     assert set(body["answers"]) == {"route", "risk", "severity"}
     assert body["answers"]["route"]["probabilities"] == {"fast": 0.8, "strong": 0.2}
@@ -117,6 +119,7 @@ def test_try_with_policy_id_uses_stored_resource(tmp_path):
     assert response.status_code == 200, response.text
     assert response.json()["target"] == "fast"
     assert response.json()["matched_rule"] == "轻量请求"
+    assert response.json()["matched_rule_index"] == 2
     # 存量资源试算同样不落任何新文件
     assert [item["id"] for item in client.get("/admin/policies").json()["policies"]] == ["main"]
 
@@ -155,6 +158,7 @@ def test_try_jev_failure_falls_back_with_reason(tmp_path):
     assert body["fallback"] is True
     assert body["reason"] == "jev_error"
     assert body["matched_rule"] is None
+    assert body["matched_rule_index"] is None
     assert body["target"] == "safe" and body["models"] == ["fast"]
     assert body["answers"] == {}
     kinds = _event_kinds(body["trace"])
@@ -175,6 +179,7 @@ def test_try_no_rule_matched_falls_back(tmp_path):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["fallback"] is True and body["reason"] == "no_rule_matched"
+    assert body["matched_rule_index"] is None
     assert body["target"] == "safe"
     assert body["answers"] == {}
     assert _event_kinds(body["trace"]).count("jev") == 0

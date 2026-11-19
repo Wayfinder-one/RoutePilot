@@ -138,6 +138,7 @@ class ModelScheduler:
             lease=lease, answers=dict(outcome.answers),
             fallback_reason=outcome.fallback_reason,
             matched_rule=outcome.matched_rule.name if outcome.matched_rule is not None else None,
+            matched_rule_index=outcome.matched_rule_index,
             jev_duration_ms=outcome.jev_duration_ms,
             jev_questions=outcome.jev_questions,
         )

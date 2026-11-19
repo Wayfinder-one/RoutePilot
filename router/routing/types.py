@@ -33,9 +33,10 @@ class RoutingRequest:
 class RoutingDecision:
     """一次路由的完整结果：命中规则（或兜底原因）+ 调度产物。
 
-    ``matched_rule`` 是命中规则的名称（兜底时为 None，具体原因在
-    ``fallback_reason``：``jev_error``/``no_rule_matched``）；``jev_duration_ms``
-    与 ``jev_questions`` 是本次决策唯一一次 JEV 调用的证据。
+    ``matched_rule`` 是命中规则的名称，``matched_rule_index`` 是它在
+    ``rules`` 数组里的 0 起序号（兜底时两者均为 None，具体原因在
+    ``fallback_reason``：``jev_error``/``no_rule_matched``）；
+    ``jev_duration_ms`` 与 ``jev_questions`` 是本次决策唯一一次 JEV 调用的证据。
     """
 
     model: str
@@ -50,8 +51,9 @@ class RoutingDecision:
     answers: Mapping[str, JevAnswer]
     fallback_reason: str | None
     matched_rule: str | None
-    jev_duration_ms: float | None
-    jev_questions: tuple[str, ...]
+    matched_rule_index: int | None = None
+    jev_duration_ms: float | None = None
+    jev_questions: tuple[str, ...] = ()
 
     @property
     def target_id(self) -> str:

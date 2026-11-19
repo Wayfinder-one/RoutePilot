@@ -336,6 +336,7 @@ async def try_policy(
             "target": decision.target_id,
             "models": [item.model for item in decision.target.models],
             "matched_rule": decision.matched_rule,
+            "matched_rule_index": decision.matched_rule_index,
             "answers": {
                 key: answer_to_dict(value) for key, value in decision.answers.items()
             },
