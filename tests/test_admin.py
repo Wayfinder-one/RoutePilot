@@ -5,10 +5,10 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.request_logging import RequestLogger
-from router.routing.tree import tree_from_dict
+from router.routing.policy import policy_from_dict
 from router.store.db import connect, migrate
-from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import test_settings, tree_dict
+from router.store.policies import PolicyRepo
+from tests.routing_fixtures import test_settings
 
 
 @pytest.fixture
@@ -16,29 +16,25 @@ def client(tmp_path):
     return TestClient(create_app(test_settings(tmp_path)))
 
 
-def _direct_root(model="qwen3-8b"):
-    """start → target(model) 的最小启用树：活动图校验只需要模型存在。"""
+def _catalog_policy(model="qwen3-8b"):
+    """引用 seed 目录模型的无问题策略：活动策略校验只需要模型存在。"""
     return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "direct", "type": "target", "priority": 1,
-             "models": [{"model": model, "reasoning": None}]},
-        ],
-        "edges": [{
-            "id": "e-start-direct", "source": "start", "source_port": "out",
-            "target": "direct", "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": "direct",
+        "kind": "sr-routing-policy", "version": 4, "name": "目录策略",
+        "timezone": "Asia/Shanghai",
+        "sticky": {"enabled": False, "ttl_seconds": 1800},
+        "questions": {},
+        "targets": {"direct": {"models": [{"model": model}]}},
+        "rules": [{"name": "直连", "when": {"text_contains_any": ["请求"]}, "target": "direct"}],
+        "fallback": "direct",
     }
 
 
-def _app_with_active_tree(tmp_path):
-    """真实 create_app + 已启用图（graph 目录预置），用于写用例失败路径断言。"""
+def _app_with_active_policy(tmp_path):
+    """真实 create_app + 已启用策略（策略目录预置），用于写用例失败路径断言。"""
     settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
+    repo = PolicyRepo(settings.policy_dir)
     repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=_direct_root())))
+    repo.create("main", policy_from_dict(_catalog_policy()))
     repo.enable("main")
     return create_app(settings)
 
@@ -71,13 +67,13 @@ def test_time_periods_roundtrip_and_snapshot_refresh(client):
 
 
 def test_time_period_write_failure_returns_issue_array_and_rolls_back(tmp_path):
-    """Task 2：时段写用例的活动图校验失败必须是 422 + Issue 数组。
+    """Task 2：时段写用例的活动策略校验失败必须是 422 + Issue 数组。
 
     ``ValidationFailed`` 继承 ``ValueError``，而 ``TimePeriodRepo.save`` 的结构错误
     也走 ``ValueError``；路由若用无差别的 ``except ValueError`` 收敛，就会把 Issue
     数组降级成字符串 detail（破坏 spec §5 契约），所以这里同时断言回滚与载荷。
     """
-    app = _app_with_active_tree(tmp_path)
+    app = _app_with_active_policy(tmp_path)
     conn = connect(app.state.settings.db_path)
     try:
         conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")

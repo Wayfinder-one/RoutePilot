@@ -1,38 +1,38 @@
-/* Staged calculation renderer for the calculation-log detail panel.
- One record renders top-down as input → initial computation → JEV waves
- → candidates → schedule → execution failure, so a reviewer reads the
- calculation in execution order. build()/label()/hasJev() stay pure
- view-models; rendering is read-only — the log page owns selection,
- layout and lazy painting.
+/* Policy v4 trace 视图模型与共享区块视图（Task 9 · 设计 §5.5/§8）。
+   ------------------------------------------------------------------
+   build() 只消费后端原始事件列表（router/routing/policy/evaluator.py +
+   scheduling.py 是唯一生产者）：不合成事件、不改名、不做第二次求值。
+   事件集合固定为 time/window/jev/question/rule/final/schedule/sticky_hit/
+   scheduled/routing_error/request_outcome；wave/slot/gate/activate 一律
+   不识别（Policy v4 已删除这些概念）。
 
- ES module: the log page owns its own renderer now, but the pure view-model
- layer stays importable from node --test. */
+   一次决策至多一个 jev 事件（§5.1）：JEV 区块只取该事件；questions 保留
+   答案详情（choice 概率/选中、noul yes/no、score value）；rules 按 trace
+   顺序排列，直接显示后端 matched 三态（true 命中 / false 未命中 /
+   null 未求值，null 绝不当 false 渲染），已求值规则内嵌逐条件结果列表
+   （路径 + ✓/✗，全部来自后端 conditions 事件）；final 只按 kind + reason
+   取文案，绝不读 priority/candidates。
+
+   区块视图（jevHtml/questionsHtml/rulesHtml/finalHtml/…）被两处复用：
+   路由页试算面板（routing/tryrun.js）与计算日志详情（logs.js）；文案与
+   数据全部来自后端，前端只做展示。渲染统一 esc 名称与答案，概率条宽度
+   限制在 0–100，耗时沿用 msText。
+   ------------------------------------------------------------------ */
 import { t, tf } from './i18n.js';
 import { esc } from './api.js';
-function stringify(value) {
-  let text;
-  if (typeof value === 'object' && value !== null) {
-    try { text = JSON.stringify(value); } catch (error) { text = String(value); }
-  } else {
-    text = String(value);
-  }
-  return text.length > 120 ? text.slice(0, 117) + '…' : text;
-}
 
-/* 单一非关键字段缺失统一显示 —，不丢弃问题或整轮。 */
+/* 单一非关键字段缺失统一显示 —，不丢问题、不丢规则行。 */
 const DASH = '—';
 const text = value => (value == null || value === '' ? DASH : String(value));
 
-/* 日志页不加载 routing/graph.js（没有 RTGraph），条件符号必须自带映射。 */
-const OP_SYMBOL = { gt: '>', gte: '≥', lt: '<', lte: '≤', eq: '=', neq: '≠' };
-
-function conditionText(condition) {
-  if (!condition || typeof condition !== 'object') return stringify(condition);
-  /* 布尔线条件是 op === 'is'（= true / = false）。 */
-  if (condition.op === 'is') return '= ' + stringify(condition.value);
-  const symbol = Object.prototype.hasOwnProperty.call(OP_SYMBOL, condition.op)
-    ? OP_SYMBOL[condition.op] : condition.op;
-  return symbol + ' ' + stringify(condition.value);
+function stringify(value) {
+  let out;
+  if (typeof value === 'object' && value !== null) {
+    try { out = JSON.stringify(value); } catch (error) { out = String(value); }
+  } else {
+    out = String(value);
+  }
+  return out.length > 120 ? out.slice(0, 117) + '…' : out;
 }
 
 function pctText(value) {
@@ -47,40 +47,6 @@ function msText(value) {
   return number >= 1000 ? (number / 1000).toFixed(2) + 's' : Math.round(number) + 'ms';
 }
 
-/* 槽位四态：命中 / 未命中 / 未定 / 非法（invalid 是独立状态，不能折叠成未定）。 */
-function statusText(status) {
-  if (status === 'true' || status === true) return t('logs.slot.hit');
-  if (status === 'false' || status === false) return t('logs.slot.miss');
-  if (status === 'invalid') return t('logs.slot.invalid');
-  return t('logs.slot.unknown');
-}
-
-function slotStatus(status) {
-  if (status === 'true' || status === true) return 'true';
-  if (status === 'false' || status === false) return 'false';
-  if (status === 'invalid') return 'invalid';
-  return 'unknown';
-}
-
-/* sticky 按状态原值映射；not_checked 是「未检查」，不能与 miss 混淆。 */
-function stickyText(status) {
-  const name = String(status == null || status === '' ? 'not_checked' : status);
-  const label = t('logs.sticky.' + name);
-  return label.indexOf('logs.sticky.') === 0 ? name : label;
-}
-
-function label(nodeLabels, id) {
-  const key = id == null ? '' : String(id);
-  const item = nodeLabels && nodeLabels[key];
-  return item && item.title ? String(item.title) : key || DASH;
-}
-
-/* 目标等节点同时给出显示名与原始 id，便于和 trace/图对照。 */
-function nodeRef(labels, id) {
-  const shown = label(labels, id);
-  return shown === text(id) ? esc(shown) : esc(shown) + ' <small>' + esc(text(id)) + '</small>';
-}
-
 function judgment(name, body) {
   return `<div class="lg-judgment"><b>${esc(name)}</b><span>${body}</span></div>`;
 }
@@ -89,232 +55,198 @@ function listText(value) {
   return Array.isArray(value) && value.length ? value.map(item => text(item)).join(', ') : DASH;
 }
 
-/* 不可用原因按原值映射（unregistered / breaker_open）；未知值回退原样显示。 */
-function unavailableText(reason) {
-  const label = t('logs.unavailable.' + reason);
-  return label.indexOf('logs.unavailable.') === 0 ? reason : label;
+/* 区块外壳：data-sec 供页面/QA 定位（jev/questions/rules/final/…）。 */
+function section(key, title, body) {
+  return `<section class="lg-block" data-sec="${esc(key)}">` +
+    `<div class="lg-sec-h">${esc(title)}</div>${body}</section>`;
 }
 
-/* ── 输入准备 ──────────────────────────────────────────────────── */
+/* ── 纯视图模型：只读归组，不改事件对象、不碰 DOM ────────────────── */
+function build(trace) {
+  const model = {
+    input: { time: null, window: null },
+    jev: null,
+    questions: [],
+    rules: [],
+    schedule: null,
+    outcome: { stickyHit: null, scheduled: null, error: null, requestOutcome: null },
+    final: null,
+  };
+  (Array.isArray(trace) ? trace : []).forEach(event => {
+    if (!event || typeof event !== 'object') return;
+    switch (event.event) {
+      case 'time': model.input.time = event; break;
+      case 'window': model.input.window = event; break;
+      case 'jev': model.jev = event; break;
+      case 'question': model.questions.push(event); break;
+      case 'rule': model.rules.push(event); break;
+      case 'final': model.final = event; break;
+      case 'schedule': model.schedule = event; break;
+      case 'sticky_hit': model.outcome.stickyHit = event; break;
+      case 'scheduled': model.outcome.scheduled = event; break;
+      case 'routing_error': model.outcome.error = event; break;
+      case 'request_outcome': model.outcome.requestOutcome = event; break;
+      default: break; /* 未知（含 wave 时代）事件原样跳过，不合成 */
+    }
+  });
+  return model;
+}
+
+/* hasJev 只看 jev_calls 与 jev 事件，绝不查 wave（Task 9 裁决）。 */
+function hasJev(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const model = build(Array.isArray(source.trace) ? source.trace : []);
+  return Number(source.jev_calls) > 0 || model.jev != null;
+}
+
+/* ── 输入准备：time/window + 请求文本（文本只来自实时 ring/试算响应） ── */
 function inputHtml(record, model) {
   const time = model.input.time || {};
   const win = model.input.window || {};
+  const hasWindow = win.tokens_before != null || win.tokens_after != null;
+  const prompt = String((record && record.text) || '');
+  if (!model.input.time && !hasWindow && !prompt) return '';
   const periods = Array.isArray(time.active_periods) ? listText(time.active_periods) : DASH;
-  const tokens = (win.tokens_before == null && win.tokens_after == null)
-    ? DASH
-    : `${esc(text(win.tokens_before))} → ${esc(text(win.tokens_after))}` +
-      (win.truncated ? ` · ${esc(t('logs.f.truncated'))}` : '');
-  const prompt = String(record.text || '');
-  return `<section class="lg-input"><div class="lg-sec-h">${esc(t('logs.input'))}</div>
-    <div class="lg-judgments">
+  const tokens = hasWindow
+    ? `${esc(text(win.tokens_before))} → ${esc(text(win.tokens_after))}` +
+      (win.truncated ? ` · ${esc(t('logs.f.truncated'))}` : '')
+    : DASH;
+  return section('input', t('logs.input'), `<div class="lg-judgments">
       ${judgment(t('logs.f.periods'), esc(periods))}
       ${judgment(t('logs.f.timezone'), esc(text(time.timezone)))}
       ${judgment(t('logs.f.window'), tokens)}
-      ${judgment(t('logs.requestText'), `<span class="lg-prompt-clamp">${esc(prompt)}</span>`)}
-    </div>
-    ${prompt ? `<details class="lg-sub"><summary>${esc(t('logs.fullText'))}</summary>
-      <div class="lg-fulltext">${esc(prompt)}</div></details>` : ''}
-  </section>`;
+      ${prompt ? judgment(t('logs.requestText'), `<span class="lg-prompt-clamp">${esc(prompt)}</span>`) : ''}
+    </div>` +
+    (prompt ? `<details class="lg-sub"><summary>${esc(t('logs.fullText'))}</summary>
+      <div class="lg-fulltext">${esc(prompt)}</div></details>` : ''));
 }
 
-/* ── 单条判断行 ────────────────────────────────────────────────── */
-function conditionHtml(event, labels) {
-  const source = event.source === 'periods'
-    ? t('logs.f.periods') : t('logs.f.text');
-  const matched = Array.isArray(event.matched) ? listText(event.matched) : DASH;
-  return judgment(label(labels, event.node_id),
-    `<small>${esc(t('logs.field.source'))} ${esc(source)} · ${esc(t('logs.field.matched'))} ${esc(matched)}</small> ` +
-    esc(event.value === true ? 'true' : event.value === false ? 'false' : text(event.value)));
+/* ── 一次 JEV：成功一行摘要；失败给出错误文本（兜底由 final 呈现） ── */
+function jevHtml(model) {
+  const jev = model.jev;
+  if (!jev) return '';
+  const count = Array.isArray(jev.questions) ? jev.questions.length : 0;
+  const head = jev.failed
+    ? tf('pv.tryJevFailed', { err: text(jev.error) })
+    : tf('pv.tryJev', { n: count, ms: msText(jev.duration_ms) });
+  return section('jev', head, '');
 }
 
-function gateHtml(event, labels) {
-  const value = event.value === true || event.value === false
-    ? String(event.value) : statusText(event.value);
-  let body = judgment(label(labels, event.node_id),
-    `<small>${esc(text(event.operator))}</small> → ${esc(value)}`);
-  if (Array.isArray(event.inputs) && event.inputs.length) {
-    const rows = event.inputs.map(input => '<div>' +
-      esc(text(input && input.port)) + ' · ' + esc(text(input && input.raw)) +
-      (input && input.condition ? ' ' + esc(conditionText(input.condition)) : '') +
-      ' → ' + esc(statusText(input && input.status)) + '</div>').join('');
-    body += `<details class="lg-sub"><summary>${esc(t('logs.field.inputs'))}</summary>
-      <div class="lg-inputs">${rows}</div></details>`;
+/* ── 各问题答案：choice 概率条 + 选中/p_top/margin；noul yes/no；score value ── */
+function questionsHtml(model) {
+  if (!model.questions.length) return '';
+  return section('questions', t('pv.tryAnswers'),
+    `<div class="lg-judgments">${model.questions.map(questionHtml).join('')}</div>`);
+}
+
+function questionHtml(event) {
+  const answer = event && event.answer && typeof event.answer === 'object' ? event.answer : null;
+  const type = answer ? String(answer.type || '') : '';
+  let line = DASH;
+  if (type === 'choice') {
+    line = `${esc(t('pv.out.selected'))} ${esc(text(answer.selected))} · ` +
+      `${esc(t('pv.out.p_top'))} ${esc(pctText(answer.p_top))} · ` +
+      `${esc(t('pv.out.margin'))} ${esc(pctText(answer.margin))}`;
+  } else if (type === 'noul') {
+    line = `${esc(t('pv.out.yes'))} ${esc(pctText(answer.yes))} · ` +
+      `${esc(t('pv.out.no'))} ${esc(pctText(answer.no))}`;
+  } else if (type === 'score') {
+    line = `${esc(t('pv.out.value'))} ${esc(text(answer.value))}`;
   }
-  return `<div class="lg-judgment-row">${body}</div>`;
+  return `<div class="lg-question">${judgment(text(event.question_id), line)}${probBars(answer)}</div>`;
 }
 
-function questionHtml(event, labels) {
-  const ports = event.ports && typeof event.ports === 'object' ? event.ports : {};
-  const probs = Object.entries(ports)
-    .filter(([key]) => String(key).indexOf('prob.') === 0)
-    .map(([key, value]) => [String(key).slice(5), value])
-    .sort((a, b) => Number(b[1]) - Number(a[1]));
-  let line = '';
-  if (event.selected != null) {
-    /* Choice：概率条 + 事件自带的 selected/p_top/margin。 */
-    line = `${esc(t('logs.field.selected'))} ${esc(text(event.selected))} · ` +
-      `${esc(t('logs.field.pTop'))} ${esc(pctText(event.p_top))} · ` +
-      `${esc(t('logs.field.margin'))} ${esc(pctText(event.margin))}`;
-  } else if (ports.yes != null || ports.no != null) {
-    line = `P(yes) ${esc(pctText(ports.yes))} · P(no) ${esc(pctText(ports.no))}`;
-  } else if (ports.value != null) {
-    line = `${esc(t('logs.field.value'))} ${esc(text(ports.value))}`;
-  } else {
-    line = DASH;
-  }
-  const bars = probs.length ? `<div class="lg-probs">${probs.map(([key, value], index) => {
-    const width = Math.max(2, Math.round(Number(value) * 100) || 0);
-    return `<div class="lg-prob${index === 0 ? ' sel' : ''}">
+/* 概率条：顺序沿用后端 ranking（缺失时按事件原键序），宽度限制 0–100。
+   这里只排展示顺序，绝不依据答案重算任何命中结论。 */
+function probBars(answer) {
+  const probs = answer && answer.probabilities && typeof answer.probabilities === 'object'
+    ? answer.probabilities : {};
+  const keys = Object.keys(probs);
+  if (!keys.length) return '';
+  const order = Array.isArray(answer.ranking) && answer.ranking.length === keys.length
+    ? answer.ranking.map(String) : keys;
+  const selected = answer.selected != null ? String(answer.selected)
+    : (Array.isArray(answer.ranking) && answer.ranking.length ? String(answer.ranking[0]) : '');
+  const bars = order.map(key => {
+    const width = Math.min(100, Math.max(0, Math.round(Number(probs[key]) * 100) || 0));
+    return `<div class="lg-prob${key === selected ? ' sel' : ''}">
       <span class="k" title="${esc(key)}">${esc(key)}</span>
       <span class="track"><i style="width:${width}%"></i></span>
-      <span class="v">${esc(pctText(value))}</span>
+      <span class="v">${esc(pctText(probs[key]))}</span>
     </div>`;
-  }).join('')}</div>` : '';
-  const facts = [];
-  if (event.duration_ms != null) {
-    facts.push(judgment(t('logs.field.duration'), esc(msText(event.duration_ms))));
-  }
-  if (event.usage != null) {
-    facts.push(judgment(t('logs.field.usage'), esc(stringify(event.usage))));
-  }
-  return `<div class="lg-question">
-    ${judgment(label(labels, event.node_id), line)}
-    ${bars}
-    ${facts.length ? `<details class="lg-sub"><summary>${esc(t('logs.field.runDetail'))}</summary>
-      <div class="lg-judgments">${facts.join('')}</div></details>` : ''}
-  </div>`;
+  }).join('');
+  return `<div class="lg-probs">${bars}</div>`;
 }
 
-function activateHtml(event, labels) {
-  return `<div class="lg-activation">${judgment(label(labels, event.node_id),
-    `<small>${esc(t('logs.field.activated'))} · via ${esc(text(event.via_port))}</small>`)}</div>`;
+/* ── 逐条规则：trace 顺序 + 后端 matched；首条命中即停（后续未求值） ── */
+function rulesHtml(model) {
+  if (!model.rules.length) return '';
+  const rows = model.rules.map(ruleHtml).join('');
+  /* 求值器命中即 break：末条规则命中，或存在被跳过的规则（matched=null），
+     都说明求值没有跑完全部规则，明确提示首条命中后停止。 */
+  const stopped = (model.rules[model.rules.length - 1].matched === true
+    || model.rules.some(rule => rule.matched == null))
+    ? `<div class="lg-note">${esc(t('pv.tryRulesStopped'))}</div>` : '';
+  return section('rules', t('pv.tryRules'), rows + stopped);
 }
 
-/* 激活引用键：wave:nodeId:port —— activate 通过 node_id + via_port 引用槽位。 */
-function slotKey(wave, nodeId, port) {
-  return String(wave) + ':' + String(nodeId) + ':' + String(port);
+/* matched 三态：true 命中 / false 未命中 / null 未求值（首条命中后跳过）。
+   null 绝不能当作 false 渲染，也不得自行补算。 */
+function ruleFlagKey(rule) {
+  if (rule.matched === true) return 'pv.tryHit';
+  if (rule.matched === false) return 'pv.tryMiss';
+  return 'pv.trySkipped';
 }
 
-function slotHtml(slot, labels) {
-  const condition = slot.condition == null ? '' : ' ' + conditionText(slot.condition);
-  return `<li class="lg-slot-row" data-status="${esc(slotStatus(slot.status))}">
-    <b>${esc(label(labels, slot.source))}.${esc(text(slot.source_port))}</b>
-    <span>${esc(text(slot.raw))}${esc(condition)} → ${esc(statusText(slot.status))}</span>
-    <small>${esc(label(labels, slot.node_id))}.${esc(text(slot.port))} · ${esc(slot.edge_id || '')}</small>
-  </li>`;
+/* 已求值规则的逐条件紧凑列表：路径 + ✓/✗，全部来自后端 conditions 事件。 */
+function conditionRows(rule) {
+  const conditions = Array.isArray(rule.conditions) ? rule.conditions : [];
+  if (!conditions.length) return '';
+  const rows = conditions.map(condition => {
+    const pass = condition.result === true;
+    return `<li class="lg-cond${pass ? ' ok' : ' no'}">` +
+      `<span class="mono">${esc(text(condition.path))}</span>` +
+      `<span class="lg-cond-flag">${pass ? '✓' : '✗'}</span></li>`;
+  }).join('');
+  return `<ul class="lg-rule-conds">${rows}</ul>`;
 }
 
-/* 默认槽位集合 = invalid 或被同 wave activate 引用；完整列表折叠在 details 里。 */
-function slotGroupHtml(phase, labels) {
-  const slots = phase.slots;
-  if (!slots.length) return '';
-  const counts = { true: 0, false: 0, unknown: 0, invalid: 0 };
-  slots.forEach(event => { counts[slotStatus(event.status)] += 1; });
-  const referenced = new Set();
-  phase.activations.forEach(event => {
-    if (event && event.via_port != null) {
-      referenced.add(slotKey(phase.wave, event.node_id, event.via_port));
-    }
-  });
-  const defaults = slots.filter(event =>
-    event.status === 'invalid' || referenced.has(slotKey(phase.wave, event.node_id, event.port)));
-  const countLine = [
-    `${esc(t('logs.slot.hit'))} ${counts.true}`,
-    `${esc(t('logs.slot.miss'))} ${counts.false}`,
-    `${esc(t('logs.slot.unknown'))} ${counts.unknown}`,
-    `${esc(t('logs.slot.invalid'))} ${counts.invalid}`,
-  ].join(' · ');
-  return `<div class="lg-slots">
-    ${judgment(t('logs.field.slot'), countLine)}
-    ${defaults.length ? `<ul class="lg-slot-defaults">${defaults.map(slot =>
-      slotHtml(slot, labels)).join('')}</ul>` : ''}
-    <details class="lg-slot-all"><summary>${esc(t('logs.slot.all'))}</summary>
-      <ul>${slots.map(slot => slotHtml(slot, labels)).join('')}</ul>
-    </details>
-  </div>`;
-}
-
-/* ── 阶段（wave 0 = 初始计算，其余为第 n 轮） ──────────────────── */
-function phaseHtml(phase, labels) {
-  const title = phase.wave === 0 ? esc(t('logs.initial')) : esc(tf('logs.wave', { n: phase.wave }));
-  const failed = !!(phase.waveEvent && phase.waveEvent.failed);
-  const error = failed && phase.waveEvent.error ? esc(stringify(phase.waveEvent.error)) : '';
-  /* 引擎真实顺序：初始为条件→门→槽位→激活，JEV 轮次为问题→门→槽位→激活。 */
-  const items = (phase.wave === 0 ? [
-    phase.conditions.map(event => conditionHtml(event, labels)).join(''),
-    phase.gates.map(event => gateHtml(event, labels)).join(''),
-    slotGroupHtml(phase, labels),
-    phase.activations.map(event => activateHtml(event, labels)).join(''),
-  ] : [
-    phase.questions.map(event => questionHtml(event, labels)).join(''),
-    phase.gates.map(event => gateHtml(event, labels)).join(''),
-    slotGroupHtml(phase, labels),
-    phase.activations.map(event => activateHtml(event, labels)).join(''),
-  ]).filter(Boolean).join('');
-  return `<section class="lg-phase${failed ? ' bad' : ''}" data-wave="${esc(phase.wave)}">
-    <div class="lg-phase-h"><b>${title}</b>
-      ${failed ? `<span class="lg-wave-fail">${esc(t('logs.failedWave'))}${error ? ' · ' + error : ''}</span>` : ''}
+function ruleHtml(rule) {
+  const hit = rule.matched === true;
+  const skipped = rule.matched == null;
+  return `<div class="lg-rule ${hit ? 'is-hit' : skipped ? 'is-skip' : 'is-miss'}" data-rule-index="${esc(text(rule.index))}">
+    <div class="lg-rule-line">
+      <span class="mono">${esc(text(Number(rule.index) + 1))}</span>
+      <span class="lg-rule-name">${esc(text(rule.name))}</span>
+      <span class="lg-rule-flag">${esc(t(ruleFlagKey(rule)))}</span>
     </div>
-    <div class="lg-judgments">${items}</div>
-  </section>`;
+    ${conditionRows(rule)}
+  </div>`;
 }
 
-/* ── 候选与最终选择：按 candidates 原顺序渲染 ──────────────────── */
+/* ── 最终目标：只按 kind + reason；命中规则名不在此区（由记录字段展示） ── */
 function finalHtml(model) {
   const final = model.final;
   if (!final) return '';
-  const candidates = Array.isArray(final.candidates) ? final.candidates : [];
-  const rows = candidates.map(candidate =>
-    `<tr class="lg-candidate-row${candidate.target_id === final.target_id ? ' win' : ''}">
-      <td>${nodeRef(model.labels, candidate.target_id)}</td>
-      <td>p${esc(text(candidate.priority))}</td>
-      <td>${esc(label(model.labels, candidate.via_node))}</td>
-      <td>${esc(text(candidate.via_port))}</td>
-      <td>${esc(tf('logs.wave', { n: text(candidate.wave) }))}</td>
-      <td>${candidate.target_id === final.target_id ? esc(t('logs.finalSelected')) : ''}</td>
-    </tr>`).join('');
-  const note = candidates.length ? '' : final.kind === 'error_fallback'
-    ? `<div class="lg-note">${esc(t('logs.errorFallback'))}</div>`
-    : final.kind === 'otherwise' ? `<div class="lg-note">${esc(t('logs.noCandidates'))}</div>` : '';
-  const fallback = final.kind === 'error_fallback' && model.fallback
-    ? judgment(t('logs.field.failed'), esc(text(model.fallback.reason))) : '';
-  return `<section class="lg-final"><div class="lg-sec-h">${esc(t('logs.candidates'))}</div>
-    <div class="lg-judgments">
-      ${judgment(t('logs.field.target'), nodeRef(model.labels, final.target_id))}
-      ${fallback}
-    </div>
-    ${candidates.length ? `<table class="lg-candidate-table">
-      <thead><tr>
-        <th>${esc(t('logs.field.target'))}</th><th>${esc(t('logs.field.priority'))}</th>
-        <th>${esc(t('logs.field.via'))}</th><th>${esc(t('logs.field.slot'))}</th>
-        <th>${esc(t('logs.field.rounds'))}</th><th>${esc(t('logs.finalSelected'))}</th>
-      </tr></thead>
-      <tbody>${rows}</tbody>
-    </table>` : note}
-  </section>`;
+  const fallback = final.kind === 'fallback';
+  const pill = `<span class="pill ${fallback ? 'warn' : 'ok'}">${esc(t(fallback ? 'pv.tryFallback' : 'pv.tryTarget'))}</span>`;
+  const reasonKey = final.reason === 'jev_error' || final.reason === 'no_rule_matched'
+    ? 'pv.tryReason.' + final.reason : '';
+  const reason = reasonKey ? judgment(t('pv.finalReason'), esc(t(reasonKey))) : '';
+  return section('final', t('pv.tryFinal'), `<div class="lg-judgments">
+      ${judgment(t('logs.field.target'), pill + ' <b class="mono">' + esc(text(final.target_id)) + '</b>')}
+      ${reason}
+    </div>`);
 }
 
-/* ── 模型调度：完整快照，或旧记录的 Sticky/模型降级 ────────────── */
+/* ── 模型调度快照：目标/策略/模型可用性/粘性（全部来自 schedule 事件） ── */
 function scheduleHtml(model) {
   const schedule = model.schedule;
-  if (!schedule) {
-    /* routing_error 时调度从未发生；只有旧记录降级才显示 noSchedule。 */
-    if (model.error) return '';
-    const sticky = model.stickyHit;
-    const scheduled = model.scheduled;
-    if (!sticky && !scheduled) return '';
-    const rows = [
-      scheduled ? judgment(t('logs.field.model'), esc(text(scheduled.model))) : '',
-      sticky ? judgment(t('logs.f.sticky'), esc(text(sticky.model))) : '',
-    ].filter(Boolean).join('');
-    return `<section class="lg-schedule"><div class="lg-sec-h">${esc(t('logs.schedule'))}</div>
-      <div class="lg-judgments">${rows}</div>
-      <div class="lg-note">${esc(t('logs.noSchedule'))}</div>
-    </section>`;
-  }
+  if (!schedule) return '';
   const unavailable = schedule.unavailable && typeof schedule.unavailable === 'object'
     ? Object.entries(schedule.unavailable).map(([name, reason]) =>
-      judgment(t('logs.f.unavailable'), esc(text(name)) + ' · ' + esc(unavailableText(String(reason))))
+      judgment(t('logs.f.unavailable'),
+        esc(text(name)) + ' · ' + esc(unavailableText(reason)))
     ).join('') : '';
   const inflight = schedule.inflight && typeof schedule.inflight === 'object'
     ? Object.entries(schedule.inflight).map(([name, count]) => text(name) + ': ' + text(count)).join(' · ')
@@ -322,9 +254,8 @@ function scheduleHtml(model) {
   const sticky = schedule.sticky || {};
   const stickyLine = stickyText(sticky.status) +
     (sticky.preferred_model ? ' → ' + text(sticky.preferred_model) : '');
-  return `<section class="lg-schedule"><div class="lg-sec-h">${esc(t('logs.schedule'))}</div>
-    <div class="lg-judgments">
-      ${judgment(t('logs.field.target'), nodeRef(model.labels, schedule.target_id))}
+  return section('schedule', t('logs.schedule'), `<div class="lg-judgments">
+      ${judgment(t('logs.field.target'), esc(text(schedule.target_id)))}
       ${judgment(t('logs.f.strategy'), esc(text(schedule.strategy)))}
       ${judgment(t('logs.f.configured'), esc(listText(schedule.configured_models)))}
       ${judgment(t('logs.f.registered'), esc(listText(schedule.registered_models)))}
@@ -332,94 +263,65 @@ function scheduleHtml(model) {
       ${unavailable}
       ${judgment(t('logs.f.inflight'), esc(inflight))}
       ${judgment(t('logs.f.sticky'), esc(stickyLine))}
-      ${judgment(t('logs.field.model'),
-        '→ ' + esc(text(model.scheduled && model.scheduled.model)))}
-    </div>
-  </section>`;
+    </div>`);
 }
 
-/* ── 路由失败：唯一的红色失败块；正常 unknown 不用红 ──────────── */
-function errorHtml(model) {
-  const error = model.error;
-  if (!error) return '';
-  return `<section class="lg-fail"><div class="lg-sec-h">${esc(t('logs.out.routing'))}</div>
-    <div class="lg-judgments">
-      ${judgment(t('logs.f.errorStage'), esc(text(error.stage)))}
-      ${judgment(t('logs.f.errorClass'), esc(text(error.error_class)))}
-      ${judgment(t('logs.f.errorMessage'), esc(text(error.message)))}
-    </div>
-  </section>`;
+/* sticky 状态按原值映射（disabled/no_session/not_checked/miss/hit/unavailable）；
+   not_checked 是「未检查」，不能与 miss 混淆；未知值回退原样显示。 */
+function stickyText(status) {
+  const name = String(status == null || status === '' ? 'not_checked' : status);
+  const label = t('logs.sticky.' + name);
+  return label.indexOf('logs.sticky.') === 0 ? name : label;
 }
 
-/* ── 纯视图模型：只读归组，不改事件对象、不碰 DOM（渲染交给调用方）。 */
-function build(trace, nodeLabels) {
-  const model = {
-    labels: nodeLabels && typeof nodeLabels === 'object' ? nodeLabels : {},
-    input: { time: null, window: null },
-    phases: [],
-    fallback: null,
-    final: null,
-    schedule: null,
-    stickyHit: null,
-    scheduled: null,
-    error: null,
-  };
-  let current = null;
+/* 不可用原因按原值映射（unregistered / breaker_open）；未知值回退原样。 */
+function unavailableText(reason) {
+  const label = t('logs.unavailable.' + reason);
+  return label.indexOf('logs.unavailable.') === 0 ? String(reason) : label;
+}
 
-  /* 按 wave 建唯一阶段；wave 0 收纳窗口期内的关键点。 */
-  function ensurePhase(wave) {
-    const number = Number.isFinite(Number(wave)) ? Number(wave) : 0;
-    let phase = model.phases.find(item => item.wave === number);
-    if (!phase) {
-      phase = {
-        wave: number,
-        waveEvent: null,
-        conditions: [],
-        gates: [],
-        questions: [],
-        slots: [],
-        activations: [],
-      };
-      model.phases.push(phase);
-    }
-    return phase;
+/* ── 执行结果：粘性命中/调度模型/路由失败/最终 outcome ─────────────── */
+function outcomeHtml(model) {
+  const outcome = model.outcome;
+  const rows = [];
+  if (outcome.scheduled) {
+    rows.push(judgment(t('logs.field.model'),
+      '→ ' + esc(text(outcome.scheduled.model)) +
+      (outcome.scheduled.dry_run === true ? ' · ' + esc(t('logs.dryRun')) : '')));
   }
-
-  (Array.isArray(trace) ? trace : []).forEach(event => {
-    if (!event || typeof event !== 'object') return;
-    switch (event.event) {
-      case 'time': model.input.time = event; break;
-      case 'window': model.input.window = event; break;
-      case 'condition': current = ensurePhase(0); current.conditions.push(event); break;
-      case 'gate': current = ensurePhase(event.wave); current.gates.push(event); break;
-      case 'slot': current = ensurePhase(event.wave); current.slots.push(event); break;
-      case 'activate': current = ensurePhase(event.wave); current.activations.push(event); break;
-      case 'wave': current = ensurePhase(event.wave); current.waveEvent = event; break;
-      case 'question': current = ensurePhase(event.wave); current.questions.push(event); break;
-      case 'fallback': model.fallback = event; current = null; break;
-      case 'final': model.final = event; current = null; break;
-      case 'schedule': model.schedule = event; current = null; break;
-      case 'sticky_hit': model.stickyHit = event; current = null; break;
-      case 'scheduled': model.scheduled = event; current = null; break;
-      case 'routing_error': model.error = event; current = null; break;
-      default: break;
-    }
-  });
-  return model;
+  if (outcome.stickyHit) {
+    rows.push(judgment(t('logs.f.sticky'), esc(text(outcome.stickyHit.model))));
+  }
+  if (outcome.requestOutcome) {
+    rows.push(judgment(t('logs.outcome'), esc(outcomeText(outcome.requestOutcome.outcome_state))));
+  }
+  const head = rows.length ? `<div class="lg-judgments">${rows.join('')}</div>` : '';
+  const error = outcome.error ? `<div class="lg-fail"><div class="lg-sec-h">${esc(t('logs.out.routing'))}</div>
+      <div class="lg-judgments">
+        ${judgment(t('logs.f.errorStage'), esc(text(outcome.error.stage)))}
+        ${judgment(t('logs.f.errorClass'), esc(text(outcome.error.error_class)))}
+        ${judgment(t('logs.f.errorMessage'), esc(stringify(outcome.error.message)))}
+      </div></div>` : '';
+  if (!head && !error) return '';
+  return section('outcome', t('logs.outcome'), head + error);
 }
 
-function hasJev(record) {
-  const trace = Array.isArray(record.trace) ? record.trace : [];
-  return trace.some(event => event && (event.event === 'wave' || event.event === 'question')) ||
-    record.jev_top != null || !!record.jev_model || Number(record.waves) > 0;
+function outcomeText(state) {
+  const label = t('logs.out.' + state);
+  return label.indexOf('logs.out.') === 0 ? text(state) : label;
 }
 
-/* 分阶段渲染：输入 → 各轮 → 候选 → 调度 → 失败。 */
-function render(host, record) {
-  const model = build(record.trace, record.node_labels || {});
-  host.innerHTML = inputHtml(record, model) +
-    model.phases.map(phase => phaseHtml(phase, model.labels)).join('') +
-    finalHtml(model) + scheduleHtml(model) + errorHtml(model);
+/* ── 组合视图：计算日志详情（输入 → JEV → 答案 → 规则 → 最终 → 调度 → 结果） ── */
+function detailHtml(record) {
+  const source = record && typeof record === 'object' ? record : {};
+  const model = build(Array.isArray(source.trace) ? source.trace : []);
+  const body = inputHtml(source, model) + jevHtml(model) + questionsHtml(model) +
+    rulesHtml(model) + finalHtml(model) + scheduleHtml(model) + outcomeHtml(model);
+  /* SQLite 恢复行没有 trace：统一显示空态，绝不编造过程。 */
+  return body || `<div class="lg-none">${esc(t('logs.traceEmpty'))}</div>`;
 }
 
-export { render, build, label, hasJev };
+export {
+  build, hasJev, detailHtml,
+  inputHtml, jevHtml, questionsHtml, rulesHtml, finalHtml, scheduleHtml, outcomeHtml,
+};

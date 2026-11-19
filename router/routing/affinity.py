@@ -12,7 +12,7 @@ from router.routing.types import session_digest
 class _Entry:
     model: str
     target_id: str
-    tree_revision: str
+    policy_revision: str
     policy_path: str
     ttl_seconds: int
     expires_at: float
@@ -31,7 +31,8 @@ class SessionAffinity:
         with self._lock:
             return len(self._entries)
 
-    def get(self, session_id: str, *, tree_revision: str, policy_path: str, allowed_models: list[str], touch: bool = True) -> tuple[str, str] | None:
+    def get(self, session_id: str, *, policy_revision: str, policy_path: str,
+            allowed_models: list[str], touch: bool = True) -> tuple[str, str] | None:
         if not session_id:
             return None
         key = session_digest(session_id)
@@ -44,7 +45,9 @@ class SessionAffinity:
                 if touch:
                     self._entries.pop(key, None)
                 return None
-            if entry.tree_revision != tree_revision or entry.policy_path != policy_path or entry.model not in allowed_models:
+            if (entry.policy_revision != policy_revision
+                    or entry.policy_path != policy_path
+                    or entry.model not in allowed_models):
                 if touch:
                     self._entries.pop(key, None)
                 return None
@@ -53,7 +56,8 @@ class SessionAffinity:
                 self._entries.move_to_end(key)
             return entry.model, entry.target_id
 
-    def put(self, session_id: str, model: str, *, target_id: str, tree_revision: str, policy_path: str, ttl_seconds: int) -> None:
+    def put(self, session_id: str, model: str, *, target_id: str, policy_revision: str,
+            policy_path: str, ttl_seconds: int) -> None:
         if not session_id:
             return
         if ttl_seconds < 1:
@@ -63,7 +67,7 @@ class SessionAffinity:
             self._entries[key] = _Entry(
                 model=model,
                 target_id=target_id,
-                tree_revision=tree_revision,
+                policy_revision=policy_revision,
                 policy_path=policy_path,
                 ttl_seconds=ttl_seconds,
                 expires_at=self.clock() + ttl_seconds,

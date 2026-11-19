@@ -4,6 +4,12 @@ Experiment-only code that informed the unified JEV decision path. It lives
 outside the product tree on purpose: nothing here ships with RoutePilot, and the
 default test run (`testpaths = ["tests"]` in `pyproject.toml`) never collects it.
 
+> Historical status (2026-11-18): the executable spikes below were removed when
+> the routing stack was replaced by Routing Policy v4 (they depended on the
+> deleted GraphEvaluator). This README and the docs/JEV-多问题批量-spike* reports
+> remain as v3-era historical evidence; the commands in this document no longer
+> run against the current codebase.
+
 ## Files
 
 | File | Purpose |

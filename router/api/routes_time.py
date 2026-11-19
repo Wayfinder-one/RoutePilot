@@ -6,11 +6,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from router.api.deps import get_conn, get_tree_repo
+from router.api.deps import get_conn, get_policy_repo
 from router.control.config import ConfigurationService
 from router.control.errors import ValidationFailed
 from router.store.repositories import TimePeriodRepo, now_iso
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.policies import PolicyRepo
 
 router = APIRouter()
 
@@ -33,16 +33,16 @@ def get_time_periods(conn: sqlite3.Connection = Depends(get_conn)):
 def put_time_periods(
     body: TimePeriodsIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
+    policies: PolicyRepo = Depends(get_policy_repo),
 ):
     periods = body.periods
     if not isinstance(periods, list):
         raise HTTPException(422, detail="periods must be a list")
-    service = ConfigurationService(conn, trees, request.app.state.publisher)
+    service = ConfigurationService(conn, policies, request.app.state.publisher)
     try:
         service.save_periods(periods)
     except ValidationFailed:
-        raise  # 活动图校验失败：交给 app 级处理器返回 422 + Issue 数组（spec §5）
+        raise  # 活跃策略校验失败：交给 app 级处理器返回 422 + Issue 数组（设计 §7.2）
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     return {"ok": True, "periods": TimePeriodRepo(conn).load()}

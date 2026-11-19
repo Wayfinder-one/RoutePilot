@@ -29,13 +29,6 @@ from router.request_outcome import (
     OUTCOME_STATES,
     OUTCOME_UPSTREAM_ERROR,
 )
-from router.routing.graph.model import (
-    ConditionNode,
-    LogicNode,
-    QuestionNode,
-    StartNode,
-    TargetNode,
-)
 
 OUTCOME_DISPLAY = {
     OUTCOME_COMPLETED: {"zh": "已完成", "en": "Completed"},
@@ -45,14 +38,6 @@ OUTCOME_DISPLAY = {
     OUTCOME_INCOMPLETE: {"zh": "进行中", "en": "In progress"},
     OUTCOME_ROUTING_ERROR: {"zh": "路由失败", "en": "Routing failed"},
 }
-
-_NODE_TYPES = (
-    (StartNode, "start"),
-    (QuestionNode, "question"),
-    (ConditionNode, "condition"),
-    (LogicNode, "logic"),
-    (TargetNode, "target"),
-)
 
 
 def _label(zh: str, en: str) -> dict[str, str]:
@@ -77,14 +62,15 @@ def route_label(record: dict) -> dict[str, str]:
         return _label("会话粘性直达", "Session affinity")
     final = next((event for event in reversed(record.get("trace") or [])
                   if isinstance(event, dict) and event.get("event") == "final"), None)
-    kind = final.get("kind") if final else None
-    if kind == "otherwise":
-        return _label("默认目标兜底", "Default target fallback")
-    if kind == "error_fallback" or record.get("selection_reason") == "error_fallback":
+    reason = final.get("reason") if final is not None else None
+    if reason == "jev_error":
         return _label("错误兜底目标", "Error fallback target")
-    if record.get("selection_reason") == "otherwise":
-        # Hydrated ledger rows keep selection_reason but not the trace events.
+    if reason == "no_rule_matched":
         return _label("默认目标兜底", "Default target fallback")
+    if record.get("selection_reason") == "fallback":
+        # Hydrated ledger rows keep selection_reason but not the trace events,
+        # so the label stays generic instead of guessing the fallback reason.
+        return _label("兜底目标", "Fallback target")
     return _label("目标命中", "Target selected")
 
 
@@ -99,12 +85,12 @@ def present_record(record: dict) -> dict:
         [_label("上游", "Upstream"), _shown(record.get("upstream_status"))],
         [_label("路由", "Routing"), _milliseconds(record.get("routing_ms"))],
         [_label("总耗时", "Total"), _milliseconds(record.get("total_ms"))],
-        [_label("轮次", "Waves"), _shown(record.get("waves"))],
+        [_label("JEV 调用", "JEV calls"), _shown(record.get("jev_calls"))],
     ]
     record["fields"] = [
         [_label("请求 ID", "Request ID"), _shown(record.get("id"))],
-        [_label("决策组", "Decision group"), _shown(record.get("tree_id"))],
-        [_label("决策组版本", "Tree revision"), _shown(record.get("tree_revision"))],
+        [_label("策略", "Policy"), _shown(record.get("policy_id"))],
+        [_label("策略版本", "Policy revision"), _shown(record.get("policy_revision"))],
         [_label("快照", "Snapshot"), _shown(record.get("snapshot_revision"))],
         [_label("策略路径", "Policy path"), _shown(record.get("policy_path"))],
         [_label("会话哈希", "Session hash"), _shown(record.get("session_hash"))],
@@ -136,20 +122,6 @@ def present_result_event(record: dict) -> dict:
         ],
         "tone": tone, "outcome_state": state,
     }
-
-
-def node_labels(snapshot) -> dict:
-    """Trace/console display names for the snapshot's graph nodes."""
-    if snapshot is None or snapshot.tree is None:
-        return {}
-    labels = {}
-    for node in snapshot.tree.root.nodes:
-        node_type = next(
-            (name for node_class, name in _NODE_TYPES if isinstance(node, node_class)),
-            "unknown",
-        )
-        labels[node.id] = {"title": node.title, "type": node_type}
-    return labels
 
 
 def _usage_fields(usage) -> dict:

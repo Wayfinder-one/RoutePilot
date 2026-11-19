@@ -1,13 +1,21 @@
-/* Calculation log: render only phases present in trace. */
+/* Calculation log (Policy v4): one JEV per decision, ordered rules, no waves.
+ *
+ * The list keeps time · request · JEV calls (0/1) · model · latency; the detail
+ * renders the console-owned policy facts (policy_id / policy_revision /
+ * jev_calls / matched_rule) followed by the shared trace sections from
+ * trace.js (input → one JEV → answers → ordered rules → final → schedule →
+ * outcome). Request text, answers and trace come only from the live ring
+ * (hydrated SQLite rows render the empty state instead of inventing one).
+ */
 import { api, apiErrText, esc, fmtTime } from './api.js';
 import { LANG, onLangChange, t, tf } from './i18n.js';
+import { detailHtml, hasJev } from './trace.js';
 import './nav.js';
 
 const $ = selector => document.querySelector(selector);
 let requests = [];
 let filter = 'all';
 const openIds = new Set();
-const TONES = { '': 0, hit: 1, warn: 2, bad: 3 };
 const OUTCOME = {
   completed: ['logs.out.completed', 'hit'],
   routing_error: ['logs.out.routing', 'bad'],
@@ -37,31 +45,18 @@ function ms(value) {
 function events(record) {
   return Array.isArray(record.trace) ? record.trace.filter(e => e && typeof e === 'object') : [];
 }
-function stages(record) {
-  const groups = new Map();
-  events(record).forEach(event => {
-    /* The API presenter attaches phase/label/cell/summary/facts to every trace
-       event; a raw machine event here means "no displayed stage". */
-    if (!event.phase) return;
-    const id = String(event.phase);
-    if (!groups.has(id)) groups.set(id, { id, label: event.label ?? id, cell: '—',
-      summary: '—', facts: [], tone: '', count: 0 });
-    const group = groups.get(id);
-    group.count += 1;
-    if (event.label != null) group.label = event.label;
-    if (event.cell != null && event.cell !== '') group.cell = event.cell;
-    if (event.summary != null && event.summary !== '') group.summary = event.summary;
-    if (Array.isArray(event.facts) && event.facts.length) group.facts = event.facts.slice(0, 3);
-    const tone = Object.prototype.hasOwnProperty.call(TONES, event.tone) ? event.tone : '';
-    if (TONES[tone] > TONES[group.tone]) group.tone = tone;
-  });
-  return [...groups.values()];
+/* JEV 调用列：数据面保证一次决策至多一次调用，这里只显示字段原值。 */
+function jevCallsText(record) {
+  return record.jev_calls == null ? '—' : String(record.jev_calls);
 }
+/* 筛选只读记录字段与 v4 trace 事件；wave 时代键一律不再参与。 */
 const FILTERS = {
   all: () => true,
-  jev: record => events(record).some(e => e.event === 'question' || (e.event === 'wave' && Number(e.wave) > 0) || /^(?:wave[1-9]|jev-wave-[1-9])/.test(String(e.phase || ''))),
-  sticky: record => events(record).some(e => e.event === 'sticky_hit' || e.phase === 'sticky'),
-  fallback: record => events(record).some(e => e.event === 'fallback' || e.phase === 'fallback' || (e.event === 'final' && e.kind !== 'target')) || ['error_fallback', 'fallback', 'otherwise'].includes(record.selection_reason),
+  jev: record => hasJev(record),
+  sticky: record => Number(record.sticky_hit) > 0 ||
+    events(record).some(e => e.event === 'sticky_hit'),
+  fallback: record => record.fallback_reason != null || record.selection_reason === 'fallback' ||
+    events(record).some(e => e.event === 'final' && e.kind === 'fallback'),
   error: record => record.outcome_state === 'routing_error' || record.outcome_state === 'upstream_error',
 };
 function renderKpis() {
@@ -84,31 +79,7 @@ function renderTabs() {
     button.innerHTML = esc(t('logs.filter.' + key)) + '<span class="c">' + requests.filter(FILTERS[key]).length + '</span>';
   });
 }
-function renderSpread() {
-  const counts = new Map();
-  requests.forEach(record => {
-    const path = stages(record);
-    const tone = path.some(s => s.tone === 'bad') ? 'bad' : path.some(s => s.tone === 'warn') ? 'warn' : '';
-    const key = path.length + '|' + tone;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  });
-  $('#spread').innerHTML = '<strong>' + esc(t('logs.spread')) + '</strong>' +
-    [...counts].sort((a, b) => Number(a[0].split('|')[0]) - Number(b[0].split('|')[0]))
-      .map(([key, count]) => {
-        const [number, tone] = key.split('|');
-        return '<span class="lg-shape ' + tone + '">' + esc(tf('logs.stages', {count: number})) +
-          '<b>' + count + '</b></span>';
-      }).join('');
-}
-function chainHtml(path) {
-  if (!path.length) return '<span class="lg-path-empty">' + esc(t('logs.traceEmpty')) + '</span>';
-  const description = path.map(s => display(s.label) + ': ' + display(s.summary)).join(' → ');
-  return '<span class="lg-chain" role="img" aria-label="' + esc(description) + '">' +
-    path.map((stage, index) => (index ? '<span class="lg-sep" aria-hidden="true">›</span>' : '') +
-      '<span class="lg-node ' + stage.tone + '" title="' + safe(stage.label) + ' · ' + safe(stage.summary) + '">' +
-      '<em>' + safe(stage.label) + '</em><b>' + safe(stage.cell) + '</b></span>').join('') + '</span>';
-}
-function rowHtml(record, path, open) {
+function rowHtml(record, open) {
   const [status, tone] = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
   const text = String(record.text || '').replace(/\s+/g, ' ').trim();
   const timestamp = fmtTime(record.ts);
@@ -118,7 +89,9 @@ function rowHtml(record, path, open) {
     '<span class="lg-time" title="' + esc(timestamp) + '" aria-label="' + esc(timestamp) + '"><span class="lg-dot ' + tone + '" aria-hidden="true"></span>' +
     esc(clock) + '</span>' +
     '<span class="lg-text">' + (text ? esc(text) : esc(t('logs.noText'))) + '</span>' +
-    chainHtml(path) + '<span class="lg-model">→ ' + safe(record.model) + '</span>' +
+    '<span class="lg-jev' + (Number(record.jev_calls) > 0 ? ' hit' : '') + '">' +
+    esc(jevCallsText(record)) + '</span>' +
+    '<span class="lg-model">→ ' + safe(record.model) + '</span>' +
     '<span class="lg-lat">' + esc(ms(record.total_ms ?? record.latency_ms)) + '</span>' +
     '<span class="lg-chev" aria-hidden="true">›</span><span class="sr-only">' +
     esc(t(status)) + '</span></button>';
@@ -127,17 +100,19 @@ function pairsHtml(items, className) {
   return (Array.isArray(items) ? items : []).filter(pair => Array.isArray(pair) && pair.length >= 2)
     .map(([key, value]) => '<span class="' + className + '"><b>' + safe(key) + '</b>' + safe(value) + '</span>').join('');
 }
-function stageHtml(stage, index) {
-  const branch = stage.tone === 'warn' || stage.tone === 'bad' ? ' branch' : '';
-  return '<div class="lg-stage ' + stage.tone + branch + '">' +
-    '<div class="lg-rail-cell"><span class="lg-pin">' + (index + 1) + '</span></div>' +
-    '<div class="lg-stage-name"><b>' + safe(stage.label) + '</b><small>' + safe(stage.id) +
-    ' · ' + esc(tf('logs.eventCount', {count: stage.count})) + '</small></div>' +
-    '<div class="lg-judge" title="' + safe(stage.summary) + '">' + safe(stage.summary) + '</div>' +
-    '<div class="lg-evidence">' + (pairsHtml(stage.facts, 'lg-evidence-pair') || '—') + '</div>' +
-    '<div class="lg-stage-count">' + stage.count + '</div></div>';
+/* 控制台自有的策略事实行：策略 / 版本 / JEV 调用 / 命中规则（读记录字段）。 */
+function policyFactsHtml(record) {
+  const revision = record.policy_revision == null || record.policy_revision === ''
+    ? '—' : String(record.policy_revision).slice(0, 10);
+  const facts = [
+    [t('logs.f.policy'), display(record.policy_id)],
+    [t('logs.f.policyRevision'), revision],
+    [t('logs.f.jevCalls'), jevCallsText(record)],
+    [t('logs.f.matchedRule'), display(record.matched_rule)],
+  ];
+  return '<div class="lg-policyfacts">' + pairsHtml(facts, 'lg-metric') + '</div>';
 }
-function detailHtml(record, path) {
+function detailContent(record) {
   const status = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
   /* route_label/metrics/fields are produced by the API presenter for both live
      and SQLite-restored rows; the console renders them verbatim. */
@@ -147,28 +122,25 @@ function detailHtml(record, path) {
   return '<div class="lg-detail-head"><span class="lg-route">' + route + '</span>' +
     '<span class="lg-status ' + status[1] + '">' + esc(t(status[0])) + '</span>' +
     '<span class="lg-detail-metrics">' + pairsHtml(metrics, 'lg-metric') + '</span></div>' +
-    '<div class="lg-rail" role="group" aria-label="' + esc(t('logs.path')) + '">' +
-    '<div class="lg-rail-head" aria-hidden="true"><span></span><span>' + esc(t('logs.stage')) +
-    '</span><span>' + esc(t('logs.summary')) + '</span><span>' + esc(t('logs.evidence')) +
-    '</span><span>' + esc(t('logs.events')) + '</span></div>' +
-    (path.length ? path.map(stageHtml).join('') : '<div class="lg-none">' + esc(t('logs.traceEmpty')) + '</div>') +
-    '</div><details class="lg-raw"><summary>' + esc(t('logs.raw')) + '</summary>' +
+    policyFactsHtml(record) +
+    detailHtml(record) +
+    '<details class="lg-raw"><summary>' + esc(t('logs.raw')) + '</summary>' +
     '<div class="lg-raw-grid">' + (pairsHtml(fields, 'lg-raw-pair') || '—') + '</div></details>';
 }
 function paintDetail(item, record) {
   const panel = item.querySelector('.lg-expand');
   if (!panel || panel.dataset.ready === '1') return;
-  panel.innerHTML = detailHtml(record, stages(record));
+  panel.innerHTML = detailContent(record);
   panel.dataset.ready = '1';
 }
 function render() {
   const rows = requests.filter(FILTERS[filter] || FILTERS.all);
   $('#countPill').textContent = rows.length + ' / ' + requests.length;
-  renderKpis(); renderTabs(); renderSpread();
+  renderKpis(); renderTabs();
   $('#list').innerHTML = rows.map(record => {
     const open = openIds.has(record.id);
     return '<article class="lg-item' + (open ? ' open' : '') + '" data-id="' + safe(record.id) + '">' +
-      rowHtml(record, stages(record), open) + '<div class="lg-expand" id="detail-' +
+      rowHtml(record, open) + '<div class="lg-expand" id="detail-' +
       safe(record.id) + '"' + (open ? '' : ' hidden') + '></div></article>';
   }).join('') || '<div class="lg-list-empty">' +
     esc(t(requests.length ? 'logs.emptyFilter' : 'logs.empty')) + '</div>';

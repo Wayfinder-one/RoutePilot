@@ -2,8 +2,8 @@
 fetch-models (MockTransport), v9 migration.  Reasoning-profile validation is
 still covered here through the model CRUD endpoints; the retired
 /admin/pipeline reasoning health tests were removed with that endpoint
-(equivalent coverage: tests/test_unified_tree_validation.py and
-tests/test_routing_trees_admin.py).
+(equivalent coverage: tests/test_policy_validation.py and
+tests/test_policies_admin.py).
 """
 
 import json
@@ -259,70 +259,45 @@ def test_put_model_rejects_unknown_provider(client, app):
         conn.close()
 
 
-def _direct_graph(models, *, node_id="direct", fallback="direct"):
-    """start → target 的 graph v3 根；用于模型引用/推理档位回归。"""
+def _direct_policy(models, *, target_id="direct"):
+    """start → target 语义的最小 v4 策略；用于模型引用/推理档位回归。
+
+    无问题无规则：不依赖 JEV 配置即可启用，模型目录是唯一外部约束。"""
     return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": node_id, "type": "target", "priority": 1,
-             "models": [{"model": model, "reasoning": reasoning}
-                        for model, reasoning in models]},
-        ],
-        "edges": [{
-            "id": f"e-start-{node_id}", "source": "start", "source_port": "out",
-            "target": node_id, "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": fallback,
+        "kind": "sr-routing-policy", "version": 4, "name": "直连策略",
+        "timezone": "Asia/Shanghai",
+        "sticky": {"enabled": False, "ttl_seconds": 1800},
+        "questions": {},
+        "targets": {target_id: {"models": [
+            {"model": model, "reasoning": reasoning}
+            for model, reasoning in models]}},
+        "rules": [],
+        "fallback": target_id,
     }
 
 
-def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
-    """Reference check walks the SAVED routing trees: a direct graph target and
-    a choice option target both block the delete, and every finding names its
-    tree/node (``via``)."""
-    route_root = _direct_graph((("qwen3-8b", None),))
-    created = client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref", "root": route_root})
+def test_delete_model_referenced_by_a_policy_is_409_then_free_model_ok(client):
+    """Reference check walks the SAVED policies: every target that lists the
+    model blocks the delete, and every finding names its policy/target
+    (``via``)."""
+    created = client.post("/admin/policies", json={
+        "id": "ref-policy", "policy": _direct_policy((("qwen3-8b", None),))})
     assert created.status_code == 201, created.text
-    nl_root = {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "q", "type": "question", "question_type": "choice",
-             "instructions": "选择能力档位",
-             "options": [
-                 {"key": "fast", "label": "轻量", "capability": "简单任务"},
-                 {"key": "deep", "label": "增强", "capability": "复杂任务"},
-             ]},
-            {"id": "fast-target", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}]},
-            {"id": "deep-target", "type": "target", "priority": 2,
-             "models": [{"model": "qwen3-32b", "reasoning": None}]},
-        ],
-        "edges": [
-            {"id": "e-start-q", "source": "start", "source_port": "out",
-             "target": "q", "target_port": "in_1", "condition": None},
-            {"id": "e-q-fast", "source": "q", "source_port": "selected.fast",
-             "target": "fast-target", "target_port": "in_1", "condition": None},
-            {"id": "e-q-deep", "source": "q", "source_port": "selected.deep",
-             "target": "deep-target", "target_port": "in_1", "condition": None},
-        ],
-        "error_fallback": "deep-target",
-    }
-    created = client.post("/admin/trees", json={
-        "id": "nl-ref", "name": "NL Ref", "root": nl_root})
+    created = client.post("/admin/policies", json={
+        "id": "nl-ref",
+        "policy": _direct_policy(
+            (("qwen3-8b", None), ("qwen3-32b", None)), target_id="mixed")})
     assert created.status_code == 201, created.text
 
     r = client.delete("/admin/models/qwen3-8b")
     assert r.status_code == 409
     detail = r.json()["detail"]
-    assert "路由树引用" in detail["message"]
+    assert "被策略引用" in detail["message"]
     refs = detail["references"]
-    assert {ref["tree_id"] for ref in refs} == {"ref-tree", "nl-ref"}
+    assert {ref["policy_id"] for ref in refs} == {"ref-policy", "nl-ref"}
     for ref in refs:
-        assert ref["tree_id"] and ref["node_id"] and ref["via"]
-        assert "tree_revision" in ref
+        assert ref["policy_id"] and ref["target_id"] and ref["via"] == "target"
+        assert "policy_revision" in ref
     assert "qwen3-8b" in {m["id"] for m in
                           client.get("/admin/models").json()["models"]}
 
@@ -527,9 +502,8 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 # --------------------------------------------------------------------------- #
 # model writes are judged against the PROSPECTIVE catalog
 # --------------------------------------------------------------------------- #
-def _reasoning_tree_root(level="high"):
-    return _direct_graph((("qwen3-8b", level),), node_id="reasoning-target",
-                         fallback="reasoning-target")
+def _reasoning_policy(level="high"):
+    return _direct_policy((("qwen3-8b", level),), target_id="reasoning-target")
 
 
 def _declare_high(client):
@@ -544,23 +518,23 @@ def _declare_low_only(client):
                       "default": "low"}}})
 
 
-def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
-    created = client.post("/admin/trees", json={
-        "id": tree_id, "name": "Reasoning", "root": _reasoning_tree_root()})
+def _activate_reasoning_policy(client, policy_id="reasoning-policy"):
+    created = client.post("/admin/policies", json={
+        "id": policy_id, "policy": _reasoning_policy()})
     assert created.status_code == 201, created.text
-    enabled = client.post(f"/admin/trees/{tree_id}/enable")
+    enabled = client.post(f"/admin/policies/{policy_id}/enable")
     assert enabled.status_code == 200, enabled.text
-    return created.json()["tree"]
+    return created.json()["policy_resource"]
 
 
 def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
     """The health check must judge the write with the PROSPECTIVE rows.
 
-    Removing a level the ACTIVE tree references is rejected instead of being
+    Removing a level the ACTIVE policy references is rejected instead of being
     accepted, so the next startup can always boot.
     """
     _declare_high(client)
-    _activate_reasoning_tree(client)
+    _activate_reasoning_policy(client)
     before = {m["id"]: m["profile"] for m in
               client.get("/admin/models").json()["models"]}
 
@@ -568,33 +542,33 @@ def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
     assert r.status_code == 422, r.text
     issues = r.json()["detail"]
     assert any(issue["code"] == "reasoning_unsupported"
-               and issue["node_id"] == "reasoning-target" for issue in issues), issues
+               and issue["path"] == "targets.reasoning-target.models.0"
+               for issue in issues), issues
     after = {m["id"]: m["profile"] for m in
              client.get("/admin/models").json()["models"]}
     assert after["qwen3-8b"] == before["qwen3-8b"]   # rejected write, DB intact
 
 
-def test_model_write_ignores_reasoning_of_a_closed_tree(client):
-    """Only the ACTIVE tree gates model writes: a closed draft does not, and
-    disabling the active tree lifts the constraint again."""
+def test_model_write_ignores_reasoning_of_a_closed_policy(client):
+    """Only the ACTIVE policy gates model writes: a closed draft does not, and
+    disabling the active policy lifts the constraint again."""
     _declare_high(client)
-    created = client.post("/admin/trees", json={
-        "id": "draft-tree", "name": "Draft",
-        "root": _reasoning_tree_root()})
+    created = client.post("/admin/policies", json={
+        "id": "draft-policy", "policy": _reasoning_policy()})
     assert created.status_code == 201, created.text
-    # No ACTIVE tree: the write cannot break the hot path or the next boot.
+    # No ACTIVE policy: the write cannot break the hot path or the next boot.
     assert _declare_low_only(client).status_code == 200
 
-    # Same write against a formerly-active but now DISABLED tree is accepted.
+    # Same write against a formerly-active but now DISABLED policy is accepted.
     _declare_high(client)
-    _activate_reasoning_tree(client, tree_id="disabled-tree")
-    assert client.post("/admin/trees/disabled-tree/disable").status_code == 200
+    _activate_reasoning_policy(client, policy_id="disabled-policy")
+    assert client.post("/admin/policies/disabled-policy/disable").status_code == 200
     assert _declare_low_only(client).status_code == 200
 
 
 def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
     _declare_high(client)
-    _activate_reasoning_tree(client)
+    _activate_reasoning_policy(client)
     r = client.put("/admin/models/qwen3-8b", json={"profile": {
         "reasoning": {"efforts": {"off": None, "high": "high"},
                       "default": "high"}}})
@@ -608,15 +582,16 @@ def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
 
 def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
     """The old bug: the write was accepted but the next boot refused.  After
-    the 422 the SAME database must still boot with its active reasoning tree."""
+    the 422 the SAME database must still boot with its active reasoning
+    policy."""
     app = make_app(tmp_path)
     client = TestClient(app)
     _declare_high(client)
-    _activate_reasoning_tree(client)
+    _activate_reasoning_policy(client)
     assert _declare_low_only(client).status_code == 422
 
     restarted = make_app(tmp_path)           # create_app on the same DB file
-    assert restarted.state.snapshot.tree_id == "reasoning-tree"
+    assert restarted.state.snapshot.policy_id == "reasoning-policy"
 
 
 # --------------------------------------------------------------------------- #
@@ -635,7 +610,7 @@ def test_rejected_reasoning_write_keeps_snapshot_revision_and_audit_clean(app, c
 
     与 tests/test_jev_admin 的失败保存契约一致，这里覆盖模型写用例。"""
     _declare_high(client)
-    _activate_reasoning_tree(client)
+    _activate_reasoning_policy(client)
     changes = {row["detail"]["action"] for row in
                client.get("/admin/changes").json()["changes"]}
     before_revision = app.state.snapshot.snapshot_revision
@@ -651,10 +626,10 @@ def test_rejected_reasoning_write_keeps_snapshot_revision_and_audit_clean(app, c
 def test_failed_provider_upsert_changes_neither_row_nor_snapshot(app, client):
     """提供方写用例的同一契约：启用校验失败 → 数据库行/审计/快照都不得变化。
 
-    与 tests/test_jev_window 的失败窗口契约同型：浏览活动图引用的模型后，
+    与 tests/test_jev_window 的失败窗口契约同型：浏览活动策略引用的模型后，
     任何提供方写都必须 422 且不落库。"""
     _declare_high(client)
-    _activate_reasoning_tree(client)
+    _activate_reasoning_policy(client)
     conn = connect(app.state.settings.db_path)
     try:
         conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
@@ -684,15 +659,15 @@ def test_failed_provider_upsert_changes_neither_row_nor_snapshot(app, client):
 
 def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     """删除被引用模型 → 409，且该用例不产生审计行、不改变快照 revision。"""
-    assert client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref",
-        "root": _direct_graph((("qwen3-8b", None),))}).status_code == 201
+    assert client.post("/admin/policies", json={
+        "id": "ref-policy",
+        "policy": _direct_policy((("qwen3-8b", None),))}).status_code == 201
     before_revision = app.state.snapshot.snapshot_revision
 
     response = client.delete("/admin/models/qwen3-8b")
 
     assert response.status_code == 409
-    assert response.json()["detail"]["message"] == "model qwen3-8b 被路由树引用"
+    assert response.json()["detail"]["message"] == "model qwen3-8b 被策略引用"
     conn = connect(app.state.settings.db_path)
     try:
         audit = conn.execute(
@@ -759,9 +734,9 @@ def _instrument_delete_lock(app, client, monkeypatch):
 
 def test_delete_model_checks_references_inside_the_publish_lock(
         app, client, monkeypatch):
-    created = client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref",
-        "root": _direct_graph((("qwen3-8b", None),))})
+    created = client.post("/admin/policies", json={
+        "id": "ref-policy",
+        "policy": _direct_policy((("qwen3-8b", None),))})
     assert created.status_code == 201, created.text
     trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
 

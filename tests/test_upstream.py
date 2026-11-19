@@ -39,7 +39,7 @@ def test_snapshot_copies_backend_mutable_leaves():
                  "efforts": [{"id": "high", "wire": "high"}]}
     backend = Backend(url="http://u", headers=headers, upstream_name="m",
                       reasoning=reasoning)
-    snapshot = build_snapshot(tree=None, backends={"m": backend},
+    snapshot = build_snapshot(resource=None, backends={"m": backend},
                               time_periods=[], jev=None, capabilities={})
     published = snapshot.backends["m"]
     assert published is not backend
