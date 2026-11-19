@@ -1017,8 +1017,11 @@ function clear() {
 function payloadFor(text, now) {
   const graph = graphNow();
   const tree = treeNow();
+  /* 画布坐标是内部工作状态：试算 payload 顶层只带 canvas，节点对象不带 position。 */
+  const boundary = RTGraph.collectCanvas({ root: clone(graph) });
   const payload = {
-    root: clone(graph),
+    root: boundary.root,
+    canvas: boundary.canvas,
     timezone: tree && tree.timezone ? tree.timezone : 'Asia/Shanghai',
     sticky: clone((tree && tree.sticky) || { enabled: false, ttl_seconds: 1800 }),
     text: text,

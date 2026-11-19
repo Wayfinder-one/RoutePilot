@@ -37,14 +37,29 @@ function hardIssues(issues) {
 }
 
 function importText(tree) {
-  return JSON.stringify({
+  /* 新格式：节点对象不带 position，坐标只出现在顶层 canvas。
+     helper 把内部 node.position 收集进 canvas，既有用例仍能表达「带坐标的完整 envelope」。 */
+  const root = RTGraph.clone(tree.root);
+  const canvas = {};
+  (Array.isArray(root.nodes) ? root.nodes : []).forEach(node => {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+    const position = node.position;
+    if (position && typeof position === 'object' && !Array.isArray(position) &&
+        Number.isFinite(position.x) && Number.isFinite(position.y)) {
+      canvas[node.id] = { x: position.x, y: position.y };
+    }
+    delete node.position;
+  });
+  const document = {
     kind: 'sr-routing-graph',
     version: 3,
     name: tree.name == null ? '' : tree.name,
     timezone: tree.timezone == null ? 'Asia/Shanghai' : tree.timezone,
     sticky: tree.sticky == null ? { enabled: false, ttl_seconds: 1800 } : tree.sticky,
-    root: tree.root,
-  });
+    root: root,
+  };
+  if (Object.keys(canvas).length) document.canvas = canvas;
+  return JSON.stringify(document);
 }
 
 function scoreEdge(condition) {
@@ -881,24 +896,28 @@ test('parseImport output is behavior-stable across coordinate-only round trips',
 
 /* ── 9. 健壮性回归（Task 9 fix round） ──────────────────────────────── */
 
-test('parseImport rejects null-position coordinates and lays them out', () => {
-  const tree = minimalTree();
-  tree.root.nodes.forEach(node => { node.position = { x: null, y: null }; });
-  const result = RTGraph.parseImport(importText(tree));
-  assert.equal(result.ok, true);
+test('parseImport validates canvas coordinates instead of coercing null', () => {
+  /* 旧格式把坐标写在 node.position；新格式只在顶层 canvas，非法坐标必须拒绝而不是补 0。 */
+  const document = JSON.parse(importText(minimalTree()));
+  document.root.nodes.forEach(node => { delete node.position; });
+
+  document.canvas = { start: { x: null, y: null } };
+  const rejected = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(rejected.ok, false, 'null canvas coordinates were accepted');
+  assert.ok(rejected.issues.some(issue => issue.code === 'graph_parse_error'));
+
+  /* 0 是合法坐标：不能被当成缺失而改写成自动布局。 */
+  document.canvas = { start: { x: 0, y: 0 } };
+  const result = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  const start = result.tree.root.nodes.find(node => node.id === 'start');
+  assert.deepEqual(start.position, { x: 0, y: 0 });
   for (const node of result.tree.root.nodes) {
-    const position = node.position;
-    assert.equal(Number.isFinite(position.x), true, node.id + '.x');
-    assert.equal(Number.isFinite(position.y), true, node.id + '.y');
-    assert.notEqual(position.x, 0, node.id + '.x must not be null-coerced');
-    assert.notEqual(position.y, 0, node.id + '.y must not be null-coerced');
+    assert.equal(Number.isFinite(node.position.x), true, node.id + '.x');
+    assert.equal(Number.isFinite(node.position.y), true, node.id + '.y');
   }
   const laidOut = RTGraph.layoutPositions('dag', result.tree.root);
   assert.deepEqual(Object.keys(laidOut).sort(), result.tree.root.nodes.map(node => node.id).sort());
-  for (const position of Object.values(laidOut)) {
-    assert.equal(Number.isFinite(position.x), true);
-    assert.equal(Number.isFinite(position.y), true);
-  }
 });
 
 test('parseImport rejects non-object node and edge entries before applying', () => {
@@ -1209,7 +1228,6 @@ test('review-import-rejects-unknown-fields-at-every-contract-layer', () => {
     tree => { tree.root.nodes[0].legacy = true; },
     tree => { tree.root.edges[0].legacy = true; },
     tree => { targetOf(tree.root).models[0].upstream = 'legacy-upstream'; },
-    tree => { tree.root.nodes[0].position.z = 1; },
     tree => { tree.sticky.legacy = true; },
   ];
   for (const mutate of cases) {
@@ -1219,6 +1237,12 @@ test('review-import-rejects-unknown-fields-at-every-contract-layer', () => {
     assert.equal(result.ok, false);
     assert.ok(result.issues.some(issue => issue.code === 'graph_parse_error'));
   }
+  /* 顶层 canvas 同样是契约层：未知坐标键必须拒绝。 */
+  const withCanvas = JSON.parse(importText(minimalTree()));
+  withCanvas.canvas.start.z = 3;
+  const canvasResult = RTGraph.parseImport(JSON.stringify(withCanvas));
+  assert.equal(canvasResult.ok, false);
+  assert.ok(canvasResult.issues.some(issue => issue.code === 'graph_parse_error'));
   const text = importText(minimalTree());
   const envelope = JSON.parse(text);
   envelope.legacy = true;
@@ -1428,4 +1452,72 @@ test('calculation log model distinguishes failed waves from normal no-candidate 
   assert.equal(failed.final.kind, 'error_fallback');
   assert.equal(otherwise.fallback, null);
   assert.equal(otherwise.final.kind, 'otherwise');
+});
+
+/* ── 12. 画布坐标边界：顶层 canvas ⇄ 内部 node.position（Task 3） ──── */
+
+test('import dispatches top-level canvas into node positions', () => {
+  const document = {
+    kind: 'sr-routing-graph', version: 3, name: '导入', timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: {
+      id: 'root', type: 'graph', error_fallback: 't1',
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 't1', type: 'target', models: [{ model: 'fast' }], priority: 1 }
+      ],
+      edges: []
+    },
+    canvas: { start: { x: 11, y: 22 } }
+  };
+  const result = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  const start = result.tree.root.nodes.find(node => node.id === 'start');
+  assert.deepEqual(start.position, { x: 11, y: 22 });
+});
+
+test('export collects node positions into a top-level canvas', () => {
+  const tree = {
+    name: '导出', timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: {
+      id: 'root', type: 'graph', error_fallback: null,
+      nodes: [
+        { id: 'start', type: 'start', position: { x: 3, y: 4 } },
+        { id: 't1', type: 'target', models: [{ model: 'fast' }], priority: 1 }
+      ],
+      edges: []
+    }
+  };
+  const document = JSON.parse(RTGraph.serialize(tree));
+  assert.deepEqual(document.canvas, { start: { x: 3, y: 4 } });
+  for (const node of document.root.nodes) assert.equal('position' in node, false);
+});
+
+test('import rejects a node-level position field', () => {
+  const document = {
+    kind: 'sr-routing-graph', version: 3, name: '', timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: {
+      id: 'root', type: 'graph', error_fallback: null,
+      nodes: [{ id: 'start', type: 'start', position: { x: 1, y: 2 } }],
+      edges: []
+    }
+  };
+  const result = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some(item => item.code === 'graph_parse_error'));
+});
+
+test('invalid canvas shapes are rejected on import', () => {
+  const base = {
+    kind: 'sr-routing-graph', version: 3, name: '', timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: { id: 'root', type: 'graph', error_fallback: null,
+      nodes: [{ id: 'start', type: 'start' }], edges: [] }
+  };
+  for (const canvas of [[], { ghost: { x: 1, y: 2 } }, { start: { x: 1 } }]) {
+    const result = RTGraph.parseImport(JSON.stringify(Object.assign({}, base, { canvas })));
+    assert.equal(result.ok, false, JSON.stringify(canvas));
+  }
 });

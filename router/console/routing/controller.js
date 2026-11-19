@@ -32,7 +32,9 @@ function newTreeId() {
 
 /* 服务端树 / 本地新草稿统一补齐 envelope 字段与缺失坐标。 */
 function normaliseTree(raw) {
-  const tree = RTGraph.clone(raw || {});
+  /* API envelope 的坐标在顶层 canvas：先分发回内部 node.position 再做布局补位。 */
+  const tree = RTGraph.dispatchCanvas(RTGraph.clone(raw || {}));
+  delete tree.canvas;
   tree.root = tree.root || { id: 'root', type: 'graph', nodes: [], edges: [] };
   if (!tree.name) tree.name = t('cv.default.name');
   if (!tree.timezone) tree.timezone = 'Asia/Shanghai';
@@ -141,7 +143,9 @@ export class RoutingController {
     tree.updated_at = savedTree.updated_at || '';
     tree.document_sha256 = savedTree.document_sha256 || '';
     this.treeId = tree.id;
-    this.store.markSaved(savedTree);
+    /* 回包是保存基线：坐标同样在顶层 canvas，先分发回内部 position 再入基线，
+       否则 clean 草稿会被判成 layout dirty。 */
+    this.store.markSaved(RTGraph.dispatchCanvas(RTGraph.clone(savedTree)));
     this.snapshotRevision = result.snapshot_revision != null
       ? result.snapshot_revision
       : this.snapshotRevision;
@@ -161,13 +165,14 @@ export class RoutingController {
     const targetTree = store.tree;
     const targetId = this.treeId;
     const isNew = !store.saved;
-    const payload = {
+    /* 线上 payload 与文件文档同一格式：坐标在顶层 canvas，节点对象不带 position。 */
+    const payload = RTGraph.collectCanvas(RTGraph.clone({
       id: this.treeId,
       name: String(store.tree.name == null ? '' : store.tree.name).trim(),
       timezone: store.tree.timezone || 'Asia/Shanghai',
       sticky: RTGraph.clone(store.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
-      root: RTGraph.clone(store.tree.root),
-    };
+      root: store.tree.root,
+    }));
     if (!isNew) payload.base_document_sha256 = store.saved.document_sha256 || '';
     try {
       const result = isNew

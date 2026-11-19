@@ -549,15 +549,17 @@ function hintIssues() {
 }
 
 /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
-const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root'];
+/* canvas 是可选顶层字段：画布坐标只出现在文档顶层，节点对象不再携带 position。 */
+const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root', 'canvas'];
 const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision', 'updated_at'];
 const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'error_fallback'];
+/* 导入文档的节点契约：只有逻辑字段。内部草稿节点仍保留 position 工作状态。 */
 const NODE_FIELDS = {
-  start: ['id', 'type', 'title', 'position'],
-  question: ['id', 'type', 'question_type', 'instructions', 'title', 'options', 'criteria', 'position'],
-  logic: ['id', 'type', 'operator', 'title', 'position'],
-  condition: ['id', 'type', 'source', 'contains_any', 'periods', 'title', 'position'],
-  target: ['id', 'type', 'models', 'priority', 'strategy', 'capability', 'title', 'position'],
+  start: ['id', 'type', 'title'],
+  question: ['id', 'type', 'question_type', 'instructions', 'title', 'options', 'criteria'],
+  logic: ['id', 'type', 'operator', 'title'],
+  condition: ['id', 'type', 'source', 'contains_any', 'periods', 'title'],
+  target: ['id', 'type', 'models', 'priority', 'strategy', 'capability', 'title'],
 };
 const EDGE_FIELDS = ['id', 'source', 'source_port', 'target', 'target_port', 'condition'];
 const QUESTION_TYPES = ['choice', 'noul', 'score'];
@@ -584,13 +586,46 @@ function addUnknownFields(value, allowed, label, issues, nodeId) {
   ));
 }
 
+/* 画布坐标集中在文档顶层 canvas：{node_id: {x, y}}，引用不存在的节点一律拒绝。 */
+function validateCanvas(value, graph, issues) {
+  if (value === undefined) return;
+  if (!isRecord(value)) {
+    issues.push(issue('graph_parse_error', 'canvas 必须是对象', 'canvas must be an object'));
+    return;
+  }
+  const nodeIds = new Set((Array.isArray(graph.nodes) ? graph.nodes : [])
+    .filter(isRecord)
+    .map(node => (isNonEmptyString(node.id) ? node.id : ''))
+    .filter(Boolean));
+  Object.keys(value).forEach(nodeId => {
+    if (!nodeIds.has(nodeId)) {
+      issues.push(issue('graph_parse_error', 'canvas 引用了不存在的节点：' + nodeId,
+        'canvas references an unknown node: ' + nodeId, { node_id: nodeId }));
+      return;
+    }
+    const coords = value[nodeId];
+    if (!isRecord(coords)) {
+      issues.push(issue('graph_parse_error', 'canvas.' + nodeId + ' 必须是 {x,y} 对象',
+        'canvas.' + nodeId + ' must be an {x,y} object', { node_id: nodeId }));
+      return;
+    }
+    addUnknownFields(coords, ['x', 'y'], 'canvas.' + nodeId, issues, nodeId);
+    if (!isFiniteNumber(coords.x) || !isFiniteNumber(coords.y)) {
+      issues.push(issue('graph_parse_error', 'canvas.' + nodeId + ' 的 x/y 必须是有限数值',
+        'canvas.' + nodeId + '.x/y must be finite numbers', { node_id: nodeId }));
+    }
+  });
+}
+
 function validateContract(value, graph, issues) {
   addUnknownFields(graph, ROOT_FIELDS, 'graph', issues, '');
+  validateCanvas(value.canvas, graph, issues);
   graph.nodes.filter(isRecord).forEach(node => {
     const allowed = Object.prototype.hasOwnProperty.call(NODE_FIELDS, node.type) ? NODE_FIELDS[node.type] : null;
-    if (allowed) addUnknownFields(node, allowed, node.type + ' node', issues, String(node.id || ''));
-    if (isRecord(node.position)) {
-      addUnknownFields(node.position, ['x', 'y'], 'position', issues, String(node.id || ''));
+    /* NODE_FIELDS 是文档契约（节点不含 position）；内部草稿保留 node.position
+       工作状态，因此内部校验放行它，文档级严格性由 parseImport 在分发前检查。 */
+    if (allowed) {
+      addUnknownFields(node, allowed.concat('position'), node.type + ' node', issues, String(node.id || ''));
     }
     if (node.type === 'question' && QUESTION_TYPES.indexOf(node.question_type) < 0) {
       issues.push(issue('graph_parse_error', '未知问题类型：' + String(node.question_type),
@@ -1283,27 +1318,53 @@ function layoutPositions(mode, graphValue) {
 
 /* ── 8. 导入 / 导出 ────────────────────────────────────────────────── */
 
-function serialize(tree) {
-  const parts = envelopeParts(tree);
-  const rootValue = clone(parts.root);
-  (Array.isArray(rootValue.nodes) ? rootValue.nodes : []).forEach(node => {
+/* 顶层 canvas → 内部 node.position（文件文档与 API envelope 共用同一边界）。 */
+function dispatchCanvas(tree) {
+  const canvas = isRecord(tree) && isRecord(tree.canvas) ? tree.canvas : {};
+  const root = isRecord(tree) && isRecord(tree.root) ? tree.root : { nodes: [] };
+  (Array.isArray(root.nodes) ? root.nodes : []).forEach(node => {
     if (!isRecord(node)) return;
-    const position = node.position;
-    if (isRecord(position) && isFiniteNumber(position.x) && isFiniteNumber(position.y)) {
-      node.position = { x: Math.round(position.x), y: Math.round(position.y) };
-    } else {
-      /* 非法坐标不当作已定位：导出时丢弃，导入会按 DAG 重新布局。 */
-      delete node.position;
+    /* 节点 id 来自用户数据：用 hasOwnProperty 避免 constructor / __proto__ 命中原型链。 */
+    const coords = isNonEmptyString(node.id) &&
+      Object.prototype.hasOwnProperty.call(canvas, node.id) ? canvas[node.id] : null;
+    if (isRecord(coords) && isFiniteNumber(coords.x) && isFiniteNumber(coords.y)) {
+      node.position = { x: coords.x, y: coords.y };
     }
   });
-  return JSON.stringify({
+  return tree;
+}
+
+/* 内部 node.position → 顶层 canvas（导出前调用；就地修改并返回 tree）。 */
+function collectCanvas(tree) {
+  const root = isRecord(tree) && isRecord(tree.root) ? tree.root : null;
+  /* 节点 id 来自用户数据：用无原型对象，避免 __proto__ 之类的 id 丢失坐标。 */
+  const canvas = Object.create(null);
+  if (root && Array.isArray(root.nodes)) {
+    root.nodes.forEach(node => {
+      if (!isRecord(node)) return;
+      const position = node.position;
+      if (isNonEmptyString(node.id) && isRecord(position) &&
+          isFiniteNumber(position.x) && isFiniteNumber(position.y)) {
+        canvas[node.id] = { x: Math.round(position.x), y: Math.round(position.y) };
+      }
+      delete node.position;
+    });
+  }
+  if (Object.keys(canvas).length) tree.canvas = canvas; else delete tree.canvas;
+  return tree;
+}
+
+function serialize(tree) {
+  const parts = envelopeParts(tree);
+  /* 导出：节点位置收集进顶层 canvas，节点对象只留逻辑字段；没有坐标时不输出 canvas。 */
+  return JSON.stringify(collectCanvas({
     kind: KIND,
     version: VERSION,
     name: parts.name,
     timezone: parts.timezone,
     sticky: parts.sticky,
-    root: rootValue
-  }, null, 2);
+    root: clone(parts.root)
+  }), null, 2);
 }
 
 function parseImport(text) {
@@ -1329,6 +1390,7 @@ function parseImport(text) {
     };
   }
   const missingImportFields = IMPORT_FIELDS
+    .filter(field => field !== 'canvas')
     .filter(field => !Object.prototype.hasOwnProperty.call(data, field)).sort();
   if (missingImportFields.length) {
     const fields = missingImportFields.join(', ');
@@ -1358,6 +1420,27 @@ function parseImport(text) {
   /* 非对象条目不做静默丢弃：保留在 tree 中交给 validate 报 graph_parse_error。 */
   if (!graph.error_fallback && graph.error_fallback !== null) graph.error_fallback = null;
 
+  /* 严格单格式：节点对象不再接受 position，画布坐标只能来自顶层 canvas。 */
+  const legacyPositions = graph.nodes.filter(node =>
+    isRecord(node) && Object.prototype.hasOwnProperty.call(node, 'position'));
+  if (legacyPositions.length) {
+    const ids = legacyPositions.map(node => String(node.id || '')).sort().join(', ');
+    return {
+      ok: false,
+      error: PARSE_ERROR_ZH,
+      issues: [issue(
+        'graph_parse_error',
+        '图解析失败：节点对象不再接受 position 字段（画布坐标请改用顶层 canvas）：' + ids,
+        'Graph parse failed: node objects no longer accept a position field (use the top-level canvas): ' + ids
+      )]
+    };
+  }
+
+  /* canvas 形状/引用校验在分发前完成；坐标集中顶层 canvas，导入时分发回内部 node.position。 */
+  const canvasIssues = [];
+  validateCanvas(data.canvas, graph, canvasIssues);
+  dispatchCanvas({ root: graph, canvas: data.canvas });
+
   const positions = layoutPositions('dag', graph);
   graph.nodes.forEach(node => {
     if (!isRecord(node)) return;
@@ -1376,7 +1459,7 @@ function parseImport(text) {
     sticky: rawSticky,
     root: graph
   };
-  const issues = validate(tree);
+  const issues = finishIssues(canvasIssues.concat(validate(tree)));
   /* 结构错误在应用前拒绝：非对象节点/边或非数组字段会让 renderAll 半途崩溃，
      必须让 applyImport 拿到 ok:false 而不是一个「带 Issue 的成功」。 */
   /* 拒绝文案：存在 graph_parse_error 时沿用固定解析失败文案（既有测试与
@@ -1468,6 +1551,8 @@ export {
   behaviorCanonical,
   changeKind,
   layoutPositions,
+  dispatchCanvas,
+  collectCanvas,
   serialize,
   parseImport,
   createMinimalTree,
