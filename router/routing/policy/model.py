@@ -70,11 +70,11 @@ VERSION = 4
 
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 
-# 语义限额（设计 §4.3/§4.5），validate 层的唯一常量来源：除 sticky 区间、
-# options 下限（MIN_OPTIONS）与 criteria 2–10 外，policy_from_dict 不在解析期
-# 强制这些上限/引用/范围语义——数量上限、问题/选项/目标/规则引用完整性、答案
-# 路径与输出/比较符/取值范围的强制属于 router.routing.policy.validate 的
-# 保存时校验（设计 §7.1，Task 2）。
+# 语义限额（设计 §4.3/§4.5），validate 层的唯一常量来源：除 sticky 区间外，
+# policy_from_dict 不在解析期强制数量/唯一性/引用/范围语义——options 2–255、
+# key/label 唯一、criteria 2–10、逻辑子节点数量等都属于
+# router.routing.policy.validate 的保存时校验（设计 §7.1，Task 2）；解析层只做
+# 形状把关（数组、字段白名单、ID 正则、非空白文本、有限数值）。
 MAX_STICKY_TTL_SECONDS = 31536000
 MAX_QUESTIONS = 32
 MIN_OPTIONS = 2
@@ -242,23 +242,15 @@ def _sticky_from_dict(raw: object) -> Sticky:
 def _options_from_dict(qid: str, raw: object) -> tuple[ChoiceOption, ...]:
     if not isinstance(raw, list):
         raise ValueError(f"question {qid!r}.options must be an array")
-    if len(raw) < MIN_OPTIONS:
-        raise ValueError(f"question {qid!r}.options must hold at least {MIN_OPTIONS} options")
+    # 数量下限（2）与 key/label 唯一性由 validate_policy 以精确路径报告；
+    # 解析层只保证每一项的形状（字段白名单/ID 正则/非空白文本）。
     options: list[ChoiceOption] = []
-    keys: set[str] = set()
-    labels: set[str] = set()
     for item in raw:
         item = _require_object(item, f"question {qid!r} option")
         reject_unknown_fields(f"question {qid!r} option", item, {"key", "label", "capability"})
         key = _validated_id(item.get("key"), f"question {qid!r} option key")
         label = text_field(item.get("label"), f"question {qid!r} option label")
         capability = text_field(item.get("capability"), f"question {qid!r} option capability")
-        if key in keys:
-            raise ValueError(f"question {qid!r} has duplicate option key {key!r}")
-        if label in labels:
-            raise ValueError(f"question {qid!r} has duplicate option label {label!r}")
-        keys.add(key)
-        labels.add(label)
         options.append(ChoiceOption(key=key, label=label, capability=capability))
     return tuple(options)
 
@@ -266,10 +258,7 @@ def _options_from_dict(qid: str, raw: object) -> tuple[ChoiceOption, ...]:
 def _criteria_from_dict(qid: str, raw: object) -> tuple[float, ...]:
     if not isinstance(raw, list):
         raise ValueError(f"question {qid!r}.criteria must be an array")
-    if not MIN_CRITERIA <= len(raw) <= MAX_CRITERIA:
-        raise ValueError(
-            f"question {qid!r}.criteria must hold {MIN_CRITERIA}-{MAX_CRITERIA} finite numbers"
-        )
+    # 2–10 档由 validate_policy 报告；解析层只保证每个元素是有限数值。
     return tuple(
         finite_number(value, f"question {qid!r}.criteria entry") for value in raw
     )
@@ -365,16 +354,27 @@ def _condition_from_dict(raw: object, depth: int) -> Condition:
     if keys in ({"all"}, {"any"}):
         op = "all" if keys == {"all"} else "any"
         children_raw = raw[op]
-        if not isinstance(children_raw, list) or not children_raw:
-            raise ValueError(f"{op} must hold a nonempty array of conditions")
+        # 空数组也解析为空 children：由 validate_policy 的 empty_logic_condition
+        # 以精确路径报告（Task 2），解析层不再提前拒绝。
+        if not isinstance(children_raw, list):
+            raise ValueError(f"{op} must hold an array of conditions")
         children = tuple(
             _condition_from_dict(child_raw, depth + 1)
             for child_raw in children_raw
         )
         return LogicCondition(op=op, children=children)
     if keys == {"not"}:
-        child = _condition_from_dict(raw["not"], depth + 1)
-        return LogicCondition(op="not", children=(child,))
+        # 常规形状是单个条件对象；列表形式（任意长度，含空）也放行，
+        # 子节点数量 ≠1 由 validate_policy 的 not_condition_arity 报告。
+        value = raw["not"]
+        if isinstance(value, list):
+            children = tuple(
+                _condition_from_dict(child_raw, depth + 1)
+                for child_raw in value
+            )
+        else:
+            children = (_condition_from_dict(value, depth + 1),)
+        return LogicCondition(op="not", children=children)
     if "answer" in keys:
         ops = keys - {"answer"}
         if len(keys) != 2 or len(ops) != 1 or next(iter(ops)) not in _ANSWER_OPS:
@@ -481,7 +481,13 @@ def _condition_to_dict(condition: Condition) -> dict:
         return {"answer": condition.path, condition.op: condition.value}
     if isinstance(condition, LogicCondition):
         if condition.op == "not":
-            return {"not": _condition_to_dict(condition.children[0])}
+            # 恰一个 child 保持单条件形状；数量 ≠1（校验层已标记）用列表形状，
+            # 序列化绝不能因子节点数量崩掉。
+            if len(condition.children) == 1:
+                return {"not": _condition_to_dict(condition.children[0])}
+            return {
+                "not": [_condition_to_dict(child) for child in condition.children]
+            }
         return {
             condition.op: [_condition_to_dict(child) for child in condition.children]
         }

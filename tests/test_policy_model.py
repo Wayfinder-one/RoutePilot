@@ -71,14 +71,6 @@ def _mutated(mutate):
             id="dotted-target-id",
         ),
         pytest.param(
-            lambda raw: raw["questions"]["route"]["options"].pop(),
-            id="single-option-choice",
-        ),
-        pytest.param(
-            lambda raw: raw["questions"]["route"]["options"][1].update(label="轻量"),
-            id="duplicate-option-label",
-        ),
-        pytest.param(
             lambda raw: raw["questions"]["severity"].update(criteria=[1, float("nan")]),
             id="nan-score-criteria",
         ),
@@ -113,23 +105,6 @@ def _mutated(mutate):
         pytest.param(
             lambda raw: raw["questions"]["risk"].update(extra="nope"),
             id="unknown-question-field",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][1].update(
-                when={"not": [
-                    {"answer": "risk.yes", "gte": 0.8},
-                    {"answer": "risk.yes", "gte": 0.8},
-                ]},
-            ),
-            id="not-with-two-children",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][1].update(when={"all": []}),
-            id="empty-all",
-        ),
-        pytest.param(
-            lambda raw: raw["rules"][1].update(when={"any": []}),
-            id="empty-any",
         ),
         pytest.param(
             lambda raw: raw["rules"][0].update(
@@ -224,3 +199,35 @@ def test_empty_questions_and_empty_rules_are_legal():
     document = policy_to_dict(policy)
     assert document["questions"] == {}
     assert document["rules"] == []
+
+
+def test_relaxed_structural_shapes_parse_and_round_trip():
+    """单选项/重复 label/空 all·any/not 列表/超范围 criteria 只由校验层把关：
+    解析层必须放行这五种形状（Task 2 的 validate 测试才能构造 Policy），
+    且序列化往返不崩、形状保持。"""
+    raw = policy_dict()
+    raw["questions"]["route"]["options"].pop()          # 单选项 choice
+    raw["questions"]["route"]["options"][0].update(label="重复")  # 单选项下无重复可言
+    raw["questions"]["severity"]["criteria"] = [1]      # 1 档 score（<2）
+    raw["rules"][0]["when"] = {                          # not 的列表形式（2 child）
+        "not": [
+            {"answer": "risk.yes", "gte": 0.8},
+            {"answer": "risk.yes", "lt": 0.2},
+        ],
+    }
+    raw["rules"][1]["when"] = {"all": []}               # 空 all 数组
+    policy = policy_from_dict(raw)
+    assert len(policy.questions["route"].options) == 1
+    assert policy.questions["severity"].criteria == (1.0,)
+    assert policy.rules[0].when.op == "not" and len(policy.rules[0].when.children) == 2
+    assert policy.rules[1].when.children == ()
+
+    document = policy_to_dict(policy)
+    assert document["questions"]["route"]["options"] == [
+        {"key": "fast", "label": "重复", "capability": "简单请求"},
+    ]
+    assert document["questions"]["severity"]["criteria"] == [1.0]
+    # not 恰一个 child 时保持单条件形状；非 1 个时用列表形状往返。
+    assert document["rules"][0]["when"] == raw["rules"][0]["when"]
+    assert document["rules"][1]["when"] == {"all": []}
+    assert policy_to_dict(policy_from_dict(document)) == document

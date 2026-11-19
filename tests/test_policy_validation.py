@@ -36,6 +36,134 @@ def test_enable_checks_models_periods_and_jev_exactly_when_called():
 
 
 # ---------------------------------------------------------------------------
+# 结构形状（Task 2）：解析层放行、校验层以精确路径报告的五种形状
+# ---------------------------------------------------------------------------
+
+
+def _solo_choice_question(options):
+    return {"solo": {
+        "type": "choice", "instructions": "单选示例", "options": options,
+    }}
+
+
+@pytest.mark.parametrize(
+    ("mutate", "issue"),
+    [
+        pytest.param(
+            lambda raw: raw["questions"].update(_solo_choice_question(
+                [{"key": "only", "label": "唯一", "capability": "描述"}])),
+            ("option_count_invalid", "questions.solo.options"),
+            id="single-option-choice",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"].update(_solo_choice_question([])),
+            ("option_count_invalid", "questions.solo.options"),
+            id="empty-options-choice",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"].update(_solo_choice_question([
+                {"key": "a", "label": "甲", "capability": "x"},
+                {"key": "a", "label": "乙", "capability": "y"},
+            ])),
+            ("duplicate_option_key", "questions.solo.options.1.key"),
+            id="duplicate-option-key",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"].update(_solo_choice_question([
+                {"key": "a", "label": "甲", "capability": "x"},
+                {"key": "b", "label": "甲", "capability": "y"},
+            ])),
+            ("duplicate_option_label", "questions.solo.options.1.label"),
+            id="duplicate-option-label",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["severity"].update(criteria=[1]),
+            ("criteria_count_invalid", "questions.severity.criteria"),
+            id="single-criterion-score",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["severity"].update(criteria=[]),
+            ("criteria_count_invalid", "questions.severity.criteria"),
+            id="empty-criteria-score",
+        ),
+        pytest.param(
+            lambda raw: raw["questions"]["severity"].update(criteria=[1] * 11),
+            ("criteria_count_invalid", "questions.severity.criteria"),
+            id="eleven-criteria-score",
+        ),
+        pytest.param(
+            lambda raw: raw["rules"][1].update(when={"all": []}),
+            ("empty_logic_condition", "rules.1.when"),
+            id="empty-all",
+        ),
+        pytest.param(
+            lambda raw: raw["rules"][1].update(when={"any": []}),
+            ("empty_logic_condition", "rules.1.when"),
+            id="empty-any",
+        ),
+        pytest.param(
+            lambda raw: raw["rules"][1].update(when={"all": [{"any": []}]}),
+            ("empty_logic_condition", "rules.1.when.all.0"),
+            id="nested-empty-any",
+        ),
+        pytest.param(
+            lambda raw: raw["rules"][1].update(when={"not": []}),
+            ("not_condition_arity", "rules.1.when"),
+            id="not-with-zero-children",
+        ),
+        pytest.param(
+            lambda raw: raw["rules"][1].update(when={"not": [
+                {"answer": "risk.yes", "gte": 0.8},
+                {"answer": "risk.yes", "lt": 0.2},
+            ]}),
+            ("not_condition_arity", "rules.1.when"),
+            id="not-with-two-children",
+        ),
+        pytest.param(
+            lambda raw: raw["rules"][1].update(when={"all": [{"not": [
+                {"answer": "risk.yes", "gte": 0.8},
+                {"answer": "risk.yes", "lt": 0.2},
+            ]}]}),
+            ("not_condition_arity", "rules.1.when.all.0"),
+            id="nested-not-with-two-children",
+        ),
+    ],
+)
+def test_relaxed_shapes_parse_and_get_precise_issues(mutate, issue):
+    """解析层只管形状（Task 1 约定）：这五种数量/唯一性形状必须先能构造
+    Policy，再由 validate_policy 以精确路径报告唯一一条对应 Issue。"""
+    raw = policy_dict()
+    mutate(raw)
+    policy = policy_from_dict(raw)
+    issues = validate_policy(policy)
+    assert [(i.code, i.path) for i in issues] == [issue]
+
+
+def test_structural_shape_issues_carry_machine_params():
+    options = _validated(lambda raw: raw["questions"].update(
+        _solo_choice_question([{"key": "only", "label": "唯一", "capability": "x"}])))
+    assert options[0].params == {"limit": 2, "count": 1}
+
+    criteria = _validated(lambda raw: raw["questions"]["severity"].update(criteria=[1]))
+    assert criteria[0].params == {"min": 2, "max": 10, "count": 1}
+
+    empty_all = _validated(lambda raw: raw["rules"][1].update(when={"all": []}))
+    assert empty_all[0].params == {"op": "all"}
+
+    not_two = _validated(lambda raw: raw["rules"][1].update(when={"not": [
+        {"answer": "risk.yes", "gte": 0.8},
+        {"answer": "risk.yes", "lt": 0.2},
+    ]}))
+    assert not_two[0].params == {"count": 2}
+
+    duplicate = _validated(lambda raw: raw["questions"].update(_solo_choice_question([
+        {"key": "a", "label": "甲", "capability": "x"},
+        {"key": "a", "label": "乙", "capability": "y"},
+    ])))
+    assert duplicate[0].params == {"question": "solo", "key": "a"}
+
+
+# ---------------------------------------------------------------------------
 # 结构限额：参数化 mutation（设计 §4.3/§4.5）
 # ---------------------------------------------------------------------------
 
@@ -470,6 +598,28 @@ def test_enable_context_is_mutable_in_place():
         pytest.param(
             "limit_exceeded", "questions.route.options",
             {"kind": "options", "limit": 255, "count": 256}, id="limit-options",
+        ),
+        pytest.param(
+            "option_count_invalid", "questions.solo.options",
+            {"limit": 2, "count": 1}, id="option-count-invalid",
+        ),
+        pytest.param(
+            "duplicate_option_key", "questions.solo.options.1.key",
+            {"question": "solo", "key": "a"}, id="duplicate-option-key",
+        ),
+        pytest.param(
+            "duplicate_option_label", "questions.solo.options.1.label",
+            {"question": "solo", "label": "甲"}, id="duplicate-option-label",
+        ),
+        pytest.param(
+            "criteria_count_invalid", "questions.severity.criteria",
+            {"min": 2, "max": 10, "count": 1}, id="criteria-count-invalid",
+        ),
+        pytest.param(
+            "empty_logic_condition", "rules.1.when", {"op": "all"}, id="empty-logic",
+        ),
+        pytest.param(
+            "not_condition_arity", "rules.1.when", {"count": 2}, id="not-arity",
         ),
         pytest.param(
             "limit_exceeded", "rules",

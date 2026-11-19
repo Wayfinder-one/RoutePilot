@@ -26,9 +26,12 @@ from zoneinfo import ZoneInfo
 from router.routing.policy.model import (
     MAX_CONDITION_DEPTH,
     MAX_CONDITION_NODES,
+    MAX_CRITERIA,
     MAX_OPTIONS,
     MAX_QUESTIONS,
     MAX_RULES,
+    MIN_CRITERIA,
+    MIN_OPTIONS,
     AnswerCondition,
     LogicCondition,
     PeriodCondition,
@@ -197,11 +200,7 @@ def validate_policy(policy: Policy) -> list[Issue]:
         if not target.models:
             issues.append(Issue("empty_models", f"targets.{tid}.models", params={"target": tid}))
     for qid, question in policy.questions.items():
-        if question.question_type == "choice" and len(question.options) > MAX_OPTIONS:
-            issues.append(Issue(
-                "limit_exceeded", f"questions.{qid}.options",
-                params={"kind": "options", "limit": MAX_OPTIONS, "count": len(question.options)},
-            ))
+        _question_issues(qid, question, issues)
     condition_count = 0
     for index, rule in enumerate(policy.rules):
         base = f"rules.{index}"
@@ -223,6 +222,7 @@ def validate_policy(policy: Policy) -> list[Issue]:
                 ))
                 continue
             if isinstance(condition, LogicCondition):
+                _logic_issues(condition, path, issues)
                 stack.extend(
                     (child, f"{path}.{condition.op}.{child_index}", depth + 1)
                     for child_index, child in enumerate(condition.children)
@@ -230,6 +230,67 @@ def validate_policy(policy: Policy) -> list[Issue]:
             elif isinstance(condition, AnswerCondition):
                 issues.extend(_validate_answer_condition(policy, condition, path))
     return _finish(issues)
+
+
+def _question_issues(qid: str, question, issues: list[Issue]) -> None:
+    """问题级结构检查（Task 2）：choice 选项 2–255 且 key/label 唯一；score 2–10 档。
+
+    解析层（model.py）对这些形状只做元素级把关，数量与唯一性在这里以
+    精确路径报告。重复项指向后出现的那个下标（``options.<idx>.key/.label``）。
+    """
+    if question.question_type == "choice":
+        options = question.options
+        if len(options) < MIN_OPTIONS:
+            issues.append(Issue(
+                "option_count_invalid", f"questions.{qid}.options",
+                params={"limit": MIN_OPTIONS, "count": len(options)},
+            ))
+        elif len(options) > MAX_OPTIONS:
+            issues.append(Issue(
+                "limit_exceeded", f"questions.{qid}.options",
+                params={"kind": "options", "limit": MAX_OPTIONS, "count": len(options)},
+            ))
+        seen_keys: set[str] = set()
+        seen_labels: set[str] = set()
+        for option_index, option in enumerate(options):
+            if option.key in seen_keys:
+                issues.append(Issue(
+                    "duplicate_option_key",
+                    f"questions.{qid}.options.{option_index}.key",
+                    params={"question": qid, "key": option.key},
+                ))
+            else:
+                seen_keys.add(option.key)
+            if option.label in seen_labels:
+                issues.append(Issue(
+                    "duplicate_option_label",
+                    f"questions.{qid}.options.{option_index}.label",
+                    params={"question": qid, "label": option.label},
+                ))
+            else:
+                seen_labels.add(option.label)
+    elif question.question_type == "score":
+        criteria_count = len(question.criteria or ())
+        if not MIN_CRITERIA <= criteria_count <= MAX_CRITERIA:
+            issues.append(Issue(
+                "criteria_count_invalid", f"questions.{qid}.criteria",
+                params={
+                    "min": MIN_CRITERIA, "max": MAX_CRITERIA,
+                    "count": criteria_count,
+                },
+            ))
+
+
+def _logic_issues(condition: LogicCondition, path: str, issues: list[Issue]) -> None:
+    """逻辑节点结构检查（Task 2）：all/any 至少一个 child；not 恰好一个 child。"""
+    if condition.op in ("all", "any") and not condition.children:
+        issues.append(Issue(
+            "empty_logic_condition", path, params={"op": condition.op},
+        ))
+    elif condition.op == "not" and len(condition.children) != 1:
+        issues.append(Issue(
+            "not_condition_arity", path, params={"count": len(condition.children)},
+        ))
 
 
 def _condition_locations(policy: Policy):

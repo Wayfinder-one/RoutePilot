@@ -37,6 +37,35 @@ def present_issue(issue: Issue) -> dict[str, str]:
                          f"Too many questions: limit is {limit}")
         return _text(f"规则数量超过上限 {limit}",
                      f"Too many rules: limit is {limit}")
+    if code == "option_count_invalid":
+        limit = _param(issue, "limit")
+        count = _param(issue, "count")
+        return _text(f"choice 至少需要 {limit} 个选项（当前 {count} 个）",
+                     f"A choice needs at least {limit} options (found {count})")
+    if code == "duplicate_option_key":
+        key = _param(issue, "key")
+        question = _param(issue, "question")
+        return _text(f"选项 key 重复：{key}（问题 {question}）",
+                     f"Duplicate option key: {key} (question {question})")
+    if code == "duplicate_option_label":
+        label = _param(issue, "label")
+        question = _param(issue, "question")
+        return _text(f"选项 label 重复：{label}（问题 {question}）",
+                     f"Duplicate option label: {label} (question {question})")
+    if code == "criteria_count_invalid":
+        lower = _param(issue, "min")
+        upper = _param(issue, "max")
+        count = _param(issue, "count")
+        return _text(f"评分档数量必须在 {lower}–{upper}（当前 {count} 档）",
+                     f"Score criteria must hold {lower}-{upper} levels (found {count})")
+    if code == "empty_logic_condition":
+        operator = _param(issue, "op")
+        return _text(f"{operator} 条件数组不能为空",
+                     f"The {operator} condition array must not be empty")
+    if code == "not_condition_arity":
+        count = _param(issue, "count")
+        return _text(f"not 条件必须恰好包含 1 个子条件（当前 {count} 个）",
+                     f"A not condition must hold exactly 1 child (found {count})")
     if code == "unknown_target":
         target = _param(issue, "target")
         return _text(f"引用了未定义的目标：{target}",
