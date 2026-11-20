@@ -14,6 +14,7 @@ including graphs with no period condition at all.
 from __future__ import annotations
 
 import math
+from decimal import ROUND_HALF_UP, Decimal
 
 
 def _text(zh: str, en: str) -> dict[str, str]:
@@ -48,7 +49,8 @@ def _percent(value) -> str:
         return _DASH
     if not math.isfinite(float(value)):
         return _DASH
-    return f"{int(math.floor(value * 100 + 0.5))}%"
+    rounded = (Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return f"{int(rounded)}%"
 
 
 def _ms(value) -> str:

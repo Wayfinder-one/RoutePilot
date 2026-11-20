@@ -217,3 +217,16 @@ def test_present_trace_formats_wave_duration_and_activation():
         [{"zh": "节点", "en": "Node"}, "power-target"],
         [{"zh": "入口", "en": "Input"}, "in_1"],
     ]
+
+
+def test_present_trace_formats_probability_boundaries_with_half_up_rounding():
+    presented = present_trace([{
+        "event": "question", "wave": 1, "node_id": "capability",
+        "p_top": 0.145, "margin": 0.285, "duration_ms": 5.0,
+        "ports": {"prob.a": 0.145, "prob.b": 0.855,
+                  "selected.a": True, "selected.b": False,
+                  "p_top": 0.145, "margin": 0.285},
+    }], has_time_period=False)[0]
+    assert presented["summary"]["zh"] == "问题 capability：a（p_top 15%，margin 29%）"
+    assert presented["facts"][0] == [
+        {"zh": "概率", "en": "Probabilities"}, "b 86% · a 15%"]
