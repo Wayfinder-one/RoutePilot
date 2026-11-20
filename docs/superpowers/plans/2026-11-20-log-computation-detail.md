@@ -1105,3 +1105,22 @@ Expected: 只有本次涉及的已跟踪文件（`router/api/*`、`router/consol
 
 **已知取舍：** 折叠行的阶段链仍使用 `stage.cell/summary/tone` 的“最后一条”聚合，
 不在本计划范围内改变；事件行默认全部渲染，不提供折叠开关。
+
+## 执行记录（实施偏差，2026-11-20）
+
+1. **Task 1/2 各有一处计划外的跨文件同步（控制器批准）**：`tests/test_graph_try_api.py`
+   的 `_DISPLAY_FIELDS` 镜像补 `kind_label`；`tests/test_v1.py` 的 routing_error facts
+   断言改为 `阶段/原因/消息` 三行。两处都是新展示字段的直接后果，只提交对应 hunk，
+   未带入工作区其它 WIP。
+2. **`_percent` 实现修正**：计划给的 `floor(v*100+0.5)` 对 `0.145/0.285` 这类二进制略低于
+   半值的概率会少 1 个百分点；改用 `Decimal(str(v)) + ROUND_HALF_UP`，并加边界测试。
+3. **终审修复 1（类型词重复）**：事件行已有 `kind_label` 徽标，`summary` 不再重复类型词
+   （time/condition/question/gate/activate/final）；spec 的 summary 表已按线框图同步。
+4. **终审修复 2（NOT 门不可见）**：一元 NOT 门摘要显式带运算符
+   （`not-cap：NOT true → false`）；AND/OR 拼接保持不变。
+5. **终审 Minors 全部裁定为可上线（不阻塞）**：`_ms` 999.6 边界、部分分支覆盖、
+   `test_v1` 消息断言只查真值、非 dict 候选 label、`str(None)` 防御、英文单复数、
+   死 CSS 规则、QA 未断言 `is-muted`/表头、`invalid` 不灰显、`logs.summary` 孤儿键、
+   `stages()` 的 `group.facts` 聚合已无消费者等，后续可顺手清理。
+6. **验证**：`pytest` 879 passed / 1 既有 warning；`npm run check:console` ALL PASS (155)、
+   退出码 0；新增“无需点击即可看到数值与比较”用例通过。

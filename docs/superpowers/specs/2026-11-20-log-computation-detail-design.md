@@ -72,18 +72,18 @@
 
 | 事件 | kind_label (zh/en) | summary (zh) | facts |
 |---|---|---|---|
-| `time` | 时段 / Time | `时段：Asia/Shanghai，生效 peak、normal`；无生效时段 `时段：Asia/Shanghai，未命中` | `[时区, TZ]`、`[生效时段, "peak, normal" 或 —]` |
+| `time` | 时段 / Time | `Asia/Shanghai，生效 peak、normal`；无生效时段 `Asia/Shanghai，未命中` | `[时区, TZ]`、`[生效时段, "peak, normal" 或 —]` |
 | `window` | 窗口 / Window | `输入窗口：18 → 18 tok`；截断时加 `（已截断）` | `[Token, "18 → 18"]`、`[截断, 是/否]` |
-| `condition` | 条件 / Condition | `条件 cond-text：命中，匹配 10kV、跳闸`；未命中不带“匹配” | `[节点, cond-text]`、`[匹配, "10kV, 跳闸" 或 —]`、`[结果, true/false]` |
+| `condition` | 条件 / Condition | `cond-text：命中，匹配 10kV、跳闸`；未命中不带“匹配” | `[节点, cond-text]`、`[匹配, "10kV, 跳闸" 或 —]`、`[结果, true/false]` |
 | `wave` | 轮次 / Wave | `第 1 轮 JEV：2 个问题，耗时 9 ms`；失败 `第 1 轮 JEV 失败：<error>` | `[轮次, 1]`、`[问题数, 2]`、`[耗时, 9 ms]` |
-| `question`（choice） | 问题 / Question | `问题 capability：strong（p_top 84%，margin 72%）` | `[概率, "strong 84% · easy 16%"]`、`[耗时, 9 ms]` |
-| `question`（noul） | 问题 / Question | `问题 domain：P(yes) 92%，P(no) 8%` | `[概率, "yes 92% · no 8%"]`、`[耗时, …]` |
-| `question`（score） | 问题 / Question | `问题 q-score：value 0.7` | `[值, 0.7]`、`[耗时, …]` |
-| `gate` | 门 / Gate | `门 and-power：true AND true → true`（运算符大写） | 每个输入一条：`[in_1, "0.84 > 0.65 → true"]`；无输入时 `[运算, AND]` |
+| `question`（choice） | 问题 / Question | `capability：strong（p_top 84%，margin 72%）` | `[概率, "strong 84% · easy 16%"]`、`[耗时, 9 ms]` |
+| `question`（noul） | 问题 / Question | `domain：P(yes) 92%，P(no) 8%` | `[概率, "yes 92% · no 8%"]`、`[耗时, …]` |
+| `question`（score） | 问题 / Question | `q-score：value 0.7` | `[值, 0.7]`、`[耗时, …]` |
+| `gate` | 门 / Gate | `and-power：true AND true → true`；一元 NOT 门 `not-x：NOT true → false`（运算符大写） | 每个输入一条：`[in_1, "0.84 > 0.65 → true"]`；无输入时 `[运算, AND]` |
 | `slot` | 槽位 / Slot | `capability.selected.strong 0.84 > 0.65 → true` | `[目标, power-target.in_1]` |
-| `activate` | 激活 / Activation | `激活 power-target（via in_1）` | `[节点, power-target]`、`[入口, in_1]` |
+| `activate` | 激活 / Activation | `power-target（via in_1）` | `[节点, power-target]`、`[入口, in_1]` |
 | `fallback` | 兜底 / Fallback | `JEV 失败，启用错误兜底 safe-target（timeout）` | `[目标, …]`、`[原因, …]` |
-| `final` | 候选 / Candidates | 有候选：`候选：power-target p5、strong-target p3 → power-target 胜出`；无候选：`无候选，使用兜底目标 safe-target` | 每个候选一条：`[power-target, "p5 · via and-power.in_1 · 第 1 轮 ✓"]`；无候选时 `[目标, …]`、`[优先级, …]` |
+| `final` | 候选 / Candidates | 有候选：`power-target p5、strong-target p3 → power-target 胜出`；无候选：`无候选，使用兜底目标 safe-target` | 每个候选一条：`[power-target, "p5 · via and-power.in_1 · 第 1 轮 ✓"]`；无候选时 `[目标, …]`、`[优先级, …]` |
 | `schedule` | 调度 / Schedule | `目标 power-target：2 个可用模型，策略 least_inflight` | `[可用模型, "qwen3-8b, qwen3-32b"]`、`[配置模型, …]`、`[在途, "qwen3-8b: 1"]`（仅非空）、`[会话粘性, "miss → qwen3-8b"]`（仅检查过时） |
 | `sticky_hit` | 粘性 / Affinity | `命中会话粘性：复用 qwen3-8b` | `[模型, qwen3-8b]` |
 | `scheduled` | 调度 / Schedule | `最终调度 qwen3-8b（target）` | `[模型, …]`、`[原因, …]` |
@@ -91,13 +91,15 @@
 
 补充规则：
 
+- 事件行已有 `kind_label` 徽标，`summary` 不再重复类型词（与 §2 线框图一致）。
+
 - 选择类问题的 `p_top/margin` 优先取事件顶层字段，缺失时回退 `ports.p_top` / `ports.margin`；
   `selected` 缺失时从 `ports` 中为 true 的 `selected.<key>` 推导；`ports` 整体缺失时对应值显示 `—`。
 - 逻辑门运算符统一大写（`and` → `AND`、`or` → `OR`、`not` → `NOT`）。
 - 门的每个输入格式为 `<port> <raw><条件> → <status>`：数值线 `<raw> <符号> <阈值>`；
   布尔线无条件显示 `<raw> → <status>`，有 `is false` 显示 `<raw> = false → <status>`。
 - 槽位条件符号映射：`gt >`、`gte ≥`、`lt <`、`lte ≤`、`eq =`、`neq ≠`、`is =`；
-  数值线没有条件时摘要显示 `<raw> （未配置阈值）→ invalid`。
+  数值线没有条件时摘要显示 `<raw> （未配置阈值） → invalid`（英文 `<raw> (no threshold) → invalid`）。
 - `status` 原样使用 `true/false/invalid/unknown`，`invalid` 不折叠成 false。
 - 最终候选顺序沿用引擎的 `(-priority, target_id)` 排序；摘要把排序后的第一个标为胜者，
   同优先级时由 `target_id` 升序决定，不在摘要里额外解释。
