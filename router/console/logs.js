@@ -45,9 +45,10 @@ function stages(record) {
     if (!event.phase) return;
     const id = String(event.phase);
     if (!groups.has(id)) groups.set(id, { id, label: event.label ?? id, cell: '—',
-      summary: '—', facts: [], tone: '', count: 0 });
+      summary: '—', facts: [], tone: '', count: 0, events: [] });
     const group = groups.get(id);
     group.count += 1;
+    group.events.push(event);
     if (event.label != null) group.label = event.label;
     if (event.cell != null && event.cell !== '') group.cell = event.cell;
     if (event.summary != null && event.summary !== '') group.summary = event.summary;
@@ -127,15 +128,32 @@ function pairsHtml(items, className) {
   return (Array.isArray(items) ? items : []).filter(pair => Array.isArray(pair) && pair.length >= 2)
     .map(([key, value]) => '<span class="' + className + '"><b>' + safe(key) + '</b>' + safe(value) + '</span>').join('');
 }
+function eventHtml(event) {
+  const tone = Object.prototype.hasOwnProperty.call(TONES, event.tone) ? event.tone : '';
+  const status = String(event.status ?? '');
+  const muted = event.event === 'slot' && (status === 'false' || status === 'unknown');
+  const kind = event.kind_label != null ? safe(event.kind_label) : '';
+  const facts = Array.isArray(event.facts) ? event.facts : [];
+  return '<div class="lg-event ' + tone + (muted ? ' is-muted' : '') + '">' +
+    '<div class="lg-rail-cell"></div><div class="lg-event-spacer"></div>' +
+    '<div class="lg-event-main">' +
+      (kind ? '<span class="lg-event-kind">' + kind + '</span>' : '') +
+      safe(event.summary) + '</div>' +
+    '<div class="lg-evidence">' + (pairsHtml(facts, 'lg-evidence-pair') || '—') + '</div>' +
+    '<div class="lg-event-spacer"></div></div>';
+}
+
 function stageHtml(stage, index) {
   const branch = stage.tone === 'warn' || stage.tone === 'bad' ? ' branch' : '';
+  const rows = (stage.events || []).map(eventHtml).join('');
   return '<div class="lg-stage ' + stage.tone + branch + '">' +
-    '<div class="lg-rail-cell"><span class="lg-pin">' + (index + 1) + '</span></div>' +
-    '<div class="lg-stage-name"><b>' + safe(stage.label) + '</b><small>' + safe(stage.id) +
-    ' · ' + esc(tf('logs.eventCount', {count: stage.count})) + '</small></div>' +
-    '<div class="lg-judge" title="' + safe(stage.summary) + '">' + safe(stage.summary) + '</div>' +
-    '<div class="lg-evidence">' + (pairsHtml(stage.facts, 'lg-evidence-pair') || '—') + '</div>' +
-    '<div class="lg-stage-count">' + stage.count + '</div></div>';
+    '<div class="lg-stage-h">' +
+      '<div class="lg-rail-cell"><span class="lg-pin">' + (index + 1) + '</span></div>' +
+      '<div class="lg-stage-name"><b>' + safe(stage.label) + '</b><small>' + safe(stage.id) +
+      ' · ' + esc(tf('logs.eventCount', {count: stage.count})) + '</small></div>' +
+      '<div class="lg-stage-spacer"></div><div class="lg-stage-spacer"></div>' +
+      '<div class="lg-stage-count">' + stage.count + '</div>' +
+    '</div>' + rows + '</div>';
 }
 function detailHtml(record, path) {
   const status = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
@@ -149,7 +167,7 @@ function detailHtml(record, path) {
     '<span class="lg-detail-metrics">' + pairsHtml(metrics, 'lg-metric') + '</span></div>' +
     '<div class="lg-rail" role="group" aria-label="' + esc(t('logs.path')) + '">' +
     '<div class="lg-rail-head" aria-hidden="true"><span></span><span>' + esc(t('logs.stage')) +
-    '</span><span>' + esc(t('logs.summary')) + '</span><span>' + esc(t('logs.evidence')) +
+    '</span><span>' + esc(t('logs.computation')) + '</span><span>' + esc(t('logs.evidence')) +
     '</span><span>' + esc(t('logs.events')) + '</span></div>' +
     (path.length ? path.map(stageHtml).join('') : '<div class="lg-none">' + esc(t('logs.traceEmpty')) + '</div>') +
     '</div><details class="lg-raw"><summary>' + esc(t('logs.raw')) + '</summary>' +
