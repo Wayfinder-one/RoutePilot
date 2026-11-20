@@ -1,7 +1,7 @@
 """Presentation-boundary tests: machine events/records -> console fields."""
 from __future__ import annotations
 
-from router.api.request_presenter import present_record
+from router.api.request_presenter import present_record, present_result_event
 from router.api.trace_presenter import present_trace
 
 _DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone", "kind_label"}
@@ -17,7 +17,9 @@ def test_present_trace_enriches_events_without_losing_machine_fields():
         {"event": "condition", "node_id": "c", "source": "periods", "value": True,
          "matched": ["peak"], "periods": ["peak"]},
         {"event": "final", "target_id": "safe", "kind": "target",
-         "priority": 1, "candidates": ["safe"]},
+         "priority": 1,
+         "candidates": [{"target_id": "safe", "priority": 1,
+                         "via_node": "start", "via_port": "in_1", "wave": 0}]},
         {"event": "scheduled", "model": "fast", "reason": "target", "dry_run": False},
     ]
     originals = [machine(event) for event in events]
@@ -70,7 +72,12 @@ def test_present_trace_renders_routing_failure_event():
     assert presented["label"] == {"zh": "路由中止", "en": "Routing stopped"}
     assert presented["cell"] == {"zh": "路由失败", "en": "Routing failed"}
     assert presented["tone"] == "bad"
-    assert presented["facts"] == [[{"zh": "原因", "en": "Reason"}, "no_available_backend"]]
+    assert presented["facts"] == [
+        [{"zh": "阶段", "en": "Stage"}, "schedule"],
+        [{"zh": "原因", "en": "Reason"}, "no_available_backend"],
+        [{"zh": "消息", "en": "Message"}, "none"],
+    ]
+    assert presented["kind_label"] == {"zh": "错误", "en": "Error"}
 
 
 def test_present_record_labels_hydrated_and_live_rows():
@@ -230,3 +237,81 @@ def test_present_trace_formats_probability_boundaries_with_half_up_rounding():
     assert presented["summary"]["zh"] == "问题 capability：a（p_top 15%，margin 29%）"
     assert presented["facts"][0] == [
         {"zh": "概率", "en": "Probabilities"}, "b 86% · a 15%"]
+
+
+def test_present_trace_formats_final_priority_decision():
+    event = {
+        "event": "final", "target_id": "power-target", "kind": "target", "priority": 5,
+        "candidates": [
+            {"target_id": "power-target", "priority": 5, "via_node": "and-power",
+             "via_port": "in_1", "wave": 1},
+            {"target_id": "strong-target", "priority": 3, "via_node": "capability",
+             "via_port": "in_1", "wave": 1},
+        ],
+    }
+    presented = present_trace([event], has_time_period=False)[0]
+    assert presented["kind_label"] == {"zh": "候选", "en": "Candidates"}
+    assert presented["summary"]["zh"] == (
+        "候选：power-target p5、strong-target p3 → power-target 胜出")
+    assert presented["facts"] == [
+        [{"zh": "power-target", "en": "power-target"},
+         {"zh": "p5 · via and-power.in_1 · 第 1 轮 ✓",
+          "en": "p5 · via and-power.in_1 · wave 1 ✓"}],
+        [{"zh": "strong-target", "en": "strong-target"},
+         {"zh": "p3 · via capability.in_1 · 第 1 轮",
+          "en": "p3 · via capability.in_1 · wave 1"}],
+    ]
+
+
+def test_present_trace_formats_fallback_and_no_candidate_final():
+    fallback = present_trace([{
+        "event": "fallback", "target_id": "safe-target", "reason": "timeout",
+    }], has_time_period=False)[0]
+    assert fallback["summary"]["zh"] == "JEV 失败，启用错误兜底 safe-target（timeout）"
+    assert fallback["facts"] == [
+        [{"zh": "目标", "en": "Target"}, "safe-target"],
+        [{"zh": "原因", "en": "Reason"}, "timeout"],
+    ]
+
+    final = present_trace([{
+        "event": "final", "target_id": "safe-target", "kind": "otherwise",
+        "priority": 1, "candidates": [],
+    }], has_time_period=False)[0]
+    assert final["summary"]["zh"] == "无候选，使用兜底目标 safe-target"
+    assert final["facts"][0] == [{"zh": "目标", "en": "Target"}, "safe-target"]
+
+
+def test_present_trace_formats_schedule_and_scheduled_values():
+    schedule = present_trace([{
+        "event": "schedule", "target_id": "power-target", "strategy": "least_inflight",
+        "configured_models": ["qwen3-8b", "qwen3-32b"],
+        "registered_models": ["qwen3-8b", "qwen3-32b"],
+        "available_models": ["qwen3-8b"],
+        "unavailable": {"qwen3-32b": "breaker_open"},
+        "inflight": {"qwen3-8b": 1},
+        "sticky": {"status": "miss", "preferred_model": "qwen3-8b"},
+    }], has_time_period=False)[0]
+    assert schedule["kind_label"] == {"zh": "调度", "en": "Schedule"}
+    assert schedule["summary"]["zh"] == "目标 power-target：1 个可用模型，策略 least_inflight"
+    assert schedule["facts"][0] == [
+        {"zh": "可用模型", "en": "Available models"}, "qwen3-8b"]
+    assert schedule["facts"][2] == [{"zh": "在途", "en": "In flight"}, "qwen3-8b: 1"]
+    assert schedule["facts"][3] == [
+        {"zh": "会话粘性", "en": "Session affinity"}, "miss → qwen3-8b"]
+
+    scheduled = present_trace([{
+        "event": "scheduled", "model": "qwen3-8b", "reason": "target", "dry_run": False,
+    }], has_time_period=False)[0]
+    assert scheduled["summary"]["zh"] == "最终调度 qwen3-8b（target）"
+    assert scheduled["facts"] == [
+        [{"zh": "模型", "en": "Model"}, "qwen3-8b"],
+        [{"zh": "原因", "en": "Reason"}, "target"],
+    ]
+
+
+def test_present_result_event_has_outcome_kind_label():
+    outcome = present_result_event({
+        "outcome_state": "completed", "model": "qwen3-8b",
+        "upstream_status": 200, "total_ms": 12.0,
+    })
+    assert outcome["kind_label"] == {"zh": "结果", "en": "Outcome"}

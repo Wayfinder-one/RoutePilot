@@ -129,6 +129,7 @@ def present_result_event(record: dict) -> dict:
         "event": "request_outcome", "phase": "outcome",
         "label": _label("执行结果", "Execution result"),
         "cell": status, "summary": status,
+        "kind_label": _label("结果", "Outcome"),
         "facts": [
             [_label("模型", "Model"), _shown(record.get("model"))],
             [_label("上游状态", "Upstream status"), _shown(record.get("upstream_status"))],

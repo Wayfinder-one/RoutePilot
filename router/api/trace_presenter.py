@@ -311,58 +311,102 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             cell = _text("已激活", "Activated")
             tone = "hit"
     elif kind == "fallback":
+        event_kind = _text("兜底", "Fallback")
         phase, label = "fallback", _text("兜底路径", "Fallback")
+        target = str(event.get("target_id"))
+        reason = event.get("reason")
         cell = _text("已启用", "Used")
-        summary = _text("JEV 失败后启用错误兜底目标。", "The error fallback target was used after a JEV failure.")
-        facts = [_fact("目标", "Target", event["target_id"])]
+        summary = _text(f"JEV 失败，启用错误兜底 {target}（{reason or _DASH}）",
+                        f"JEV failed; using error fallback {target} ({reason or _DASH})")
+        facts = [
+            _fact("目标", "Target", target),
+            _fact("原因", "Reason", reason or _DASH),
+        ]
         tone = "warn"
     elif kind == "final":
+        event_kind = _text("候选", "Candidates")
         phase, label = "final", _text("目标判定", "Target selected")
-        fallback = event["kind"] != "target"
-        cell = _text("兜底目标" if fallback else "目标命中", "Fallback target" if fallback else "Target matched")
-        summary = _text(
-            f"最终选择目标 {event['target_id']}。",
-            f"Selected target {event['target_id']}.",
-        )
-        facts = [
-            _fact("目标", "Target", event["target_id"]),
-            _fact("优先级", "Priority", str(event["priority"])),
-            _fact("候选数", "Candidates", str(len(event["candidates"]))),
-        ]
+        target = str(event.get("target_id"))
+        candidates = event.get("candidates") if isinstance(event.get("candidates"), list) else []
+        fallback = event.get("kind") != "target"
+        cell = _text("兜底目标" if fallback else "目标命中",
+                     "Fallback target" if fallback else "Target matched")
+        if candidates:
+            parts = "、".join(_candidate_label(candidate) for candidate in candidates)
+            summary = _text(f"候选：{parts} → {target} 胜出",
+                            f"Candidates: {', '.join(_candidate_label(c) for c in candidates)}"
+                            f" → {target} wins")
+            facts = [_candidate_fact(candidate, target) for candidate in candidates]
+        else:
+            summary = _text(f"无候选，使用兜底目标 {target}",
+                            f"No candidates; using fallback target {target}")
+            facts = [
+                _fact("目标", "Target", target),
+                _fact("优先级", "Priority", _number(event.get("priority"))),
+                _fact("候选数", "Candidates", "0"),
+            ]
         tone = "warn" if fallback else "hit"
     elif kind == "schedule":
+        event_kind = _text("调度", "Schedule")
         phase, label = "schedule", _text("模型调度", "Model scheduling")
-        count = len(event["available_models"])
-        cell = _text("有可用模型" if count else "无可用模型", "Available" if count else "Unavailable")
+        target = str(event.get("target_id"))
+        available = [str(model) for model in event.get("available_models") or []]
+        configured = [str(model) for model in event.get("configured_models") or []]
+        strategy = str(event.get("strategy") or _DASH)
+        cell = _text("有可用模型" if available else "无可用模型",
+                     "Available" if available else "Unavailable")
         summary = _text(
-            f"目标 {event['target_id']} {'有' if count else '没有'}可用模型。",
-            f"Target {event['target_id']} has {'available' if count else 'no available'} models.",
+            f"目标 {target}：{len(available)} 个可用模型，策略 {strategy}",
+            f"Target {target}: {len(available)} available models, strategy {strategy}",
         )
-        facts = [
-            _fact("目标", "Target", event["target_id"]),
-            _fact("策略", "Strategy", event["strategy"]),
-            _fact("可用模型数", "Available models", str(count)),
-        ]
-        tone = "" if count else "bad"
+        facts = [_fact("可用模型", "Available models", ", ".join(available) or _DASH)]
+        if configured:
+            facts.append(_fact("配置模型", "Configured models", ", ".join(configured)))
+        inflight = event.get("inflight") if isinstance(event.get("inflight"), dict) else {}
+        if inflight:
+            facts.append(_fact("在途", "In flight",
+                               ", ".join(f"{model}: {count}"
+                                         for model, count in inflight.items())))
+        sticky = event.get("sticky") if isinstance(event.get("sticky"), dict) else {}
+        status = sticky.get("status")
+        if status not in (None, "disabled", "no_session", "not_checked"):
+            preferred = sticky.get("preferred_model")
+            facts.append(_fact("会话粘性", "Session affinity",
+                               f"{status} → {preferred}" if preferred else str(status)))
+        tone = "" if available else "bad"
     elif kind == "sticky_hit":
+        event_kind = _text("粘性", "Affinity")
         phase, label = "sticky", _text("会话粘性", "Session affinity")
+        model = str(event.get("model"))
         cell = _text("命中", "Hit")
-        summary = _text(f"复用会话模型 {event['model']}。", f"Reused session model {event['model']}.")
-        facts = [_fact("模型", "Model", event["model"])]
+        summary = _text(f"命中会话粘性：复用 {model}",
+                        f"Session affinity hit: reusing {model}")
+        facts = [_fact("模型", "Model", model)]
         tone = "hit"
     elif kind == "scheduled":
+        event_kind = _text("调度", "Schedule")
         phase, label = "schedule", _text("模型调度", "Model scheduling")
-        cell = event["model"]
-        summary = _text(f"最终调度模型 {event['model']}。", f"Scheduled model {event['model']}.")
-        facts = [
-            _fact("模型", "Model", event["model"]),
-            _fact("原因", "Reason", event["reason"]),
-        ]
+        model = str(event.get("model"))
+        reason = event.get("reason")
+        cell = model
+        summary = _text(f"最终调度 {model}（{reason or _DASH}）",
+                        f"Scheduled {model} ({reason or _DASH})")
+        facts = [_fact("模型", "Model", model), _fact("原因", "Reason", reason or _DASH)]
         tone = "hit"
     elif kind == "routing_error":
+        event_kind = _text("错误", "Error")
         phase, label = "routing_error", _text("路由中止", "Routing stopped")
-        cell = summary = _text("路由失败", "Routing failed")
-        facts = [_fact("原因", "Reason", event["error_class"])]
+        stage = str(event.get("stage") or _DASH)
+        error_class = str(event.get("error_class") or _DASH)
+        message = str(event.get("message") or _DASH)
+        cell = _text("路由失败", "Routing failed")
+        summary = _text(f"路由失败（{stage}）：{error_class}",
+                        f"Routing failed ({stage}): {error_class}")
+        facts = [
+            _fact("阶段", "Stage", stage),
+            _fact("原因", "Reason", error_class),
+            _fact("消息", "Message", message),
+        ]
         tone = "bad"
 
     return {

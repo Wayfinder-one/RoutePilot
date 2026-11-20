@@ -641,7 +641,11 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         }
         assert failure["phase"] == "routing_error"
         assert failure["label"] == {"zh": "路由中止", "en": "Routing stopped"}
-        assert failure["facts"] == [[{"zh": "原因", "en": "Reason"}, "no_active_tree"]]
+        facts = failure["facts"]
+        assert facts[0] == [{"zh": "阶段", "en": "Stage"}, "graph"]
+        assert facts[1] == [{"zh": "原因", "en": "Reason"}, "no_active_tree"]
+        assert facts[2][0] == {"zh": "消息", "en": "Message"}
+        assert facts[2][1]
         assert failure["tone"] == "bad"
         assert record["route_label"] == {"zh": "路由中止", "en": "Routing stopped"}
         assert not any(event["event"] == "request_outcome" for event in record["trace"])
