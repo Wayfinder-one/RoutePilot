@@ -25,7 +25,7 @@ from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings
 
 
-_DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone"}
+_DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone", "kind_label"}
 
 
 def _machine_event(event):
