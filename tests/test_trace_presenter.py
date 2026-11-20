@@ -114,14 +114,14 @@ def test_present_trace_formats_time_window_and_condition_values():
     ]
     time_event, window_event, condition_event = present_trace(events)
     assert time_event["kind_label"] == {"zh": "时段", "en": "Time"}
-    assert time_event["summary"]["zh"] == "时段：Asia/Shanghai，生效 peak、normal"
+    assert time_event["summary"]["zh"] == "Asia/Shanghai，生效 peak、normal"
     assert time_event["facts"][1] == [
         {"zh": "生效时段", "en": "Active periods"}, {"zh": "peak、normal", "en": "peak, normal"}]
     assert window_event["kind_label"] == {"zh": "窗口", "en": "Window"}
     assert window_event["summary"]["zh"] == "输入窗口：18 → 18 tok"
     assert window_event["facts"][0] == [{"zh": "Token", "en": "Tokens"}, "18 → 18"]
     assert condition_event["kind_label"] == {"zh": "条件", "en": "Condition"}
-    assert condition_event["summary"]["zh"] == "条件 cond-text：命中，匹配 10kV、跳闸"
+    assert condition_event["summary"]["zh"] == "cond-text：命中，匹配 10kV、跳闸"
     assert condition_event["facts"][1] == [
         {"zh": "匹配", "en": "Matched"}, {"zh": "10kV、跳闸", "en": "10kV, 跳闸"}]
 
@@ -138,8 +138,8 @@ def test_present_trace_formats_question_values_with_percentages():
     }
     presented = present_trace([event], has_time_period=False)[0]
     assert presented["kind_label"] == {"zh": "问题", "en": "Question"}
-    assert presented["summary"]["zh"] == "问题 capability：strong（p_top 84%，margin 72%）"
-    assert presented["summary"]["en"] == "Question capability: strong (p_top 84%, margin 72%)"
+    assert presented["summary"]["zh"] == "capability：strong（p_top 84%，margin 72%）"
+    assert presented["summary"]["en"] == "capability: strong (p_top 84%, margin 72%)"
     assert presented["facts"][0] == [
         {"zh": "概率", "en": "Probabilities"}, "strong 84% · easy 16%"]
     assert presented["facts"][1] == [{"zh": "耗时", "en": "Duration"}, "9 ms"]
@@ -150,14 +150,14 @@ def test_present_trace_formats_noul_and_score_questions():
         "event": "question", "wave": 1, "node_id": "domain", "duration_ms": 7.0,
         "ports": {"yes": 0.92, "no": 0.08},
     }], has_time_period=False)[0]
-    assert noul["summary"]["zh"] == "问题 domain：P(yes) 92%，P(no) 8%"
+    assert noul["summary"]["zh"] == "domain：P(yes) 92%，P(no) 8%"
     assert noul["facts"][0][1] == "yes 92% · no 8%"
 
     score = present_trace([{
         "event": "question", "wave": 1, "node_id": "complexity", "duration_ms": 4.0,
         "ports": {"value": 0.7},
     }], has_time_period=False)[0]
-    assert score["summary"]["zh"] == "问题 complexity：value 0.7"
+    assert score["summary"]["zh"] == "complexity：value 0.7"
     assert score["facts"][0] == [{"zh": "值", "en": "Value"}, "0.7"]
 
 
@@ -200,11 +200,20 @@ def test_present_trace_formats_gate_operator_and_inputs():
     }
     presented = present_trace([event], has_time_period=False)[0]
     assert presented["kind_label"] == {"zh": "门", "en": "Gate"}
-    assert presented["summary"]["zh"] == "门 and-power：true AND true → true"
+    assert presented["summary"]["zh"] == "and-power：true AND true → true"
     assert presented["facts"] == [
         [{"zh": "in_1", "en": "in_1"}, "0.84 > 0.65 → true"],
         [{"zh": "in_2", "en": "in_2"}, "0.92 > 0.7 → true"],
     ]
+
+
+def test_present_trace_formats_not_gate_with_operator():
+    event = {"event": "gate", "wave": 1, "node_id": "not-cap", "operator": "not",
+             "value": False,
+             "inputs": [{"port": "in_1", "raw": True, "condition": None, "status": "true"}]}
+    presented = present_trace([event], has_time_period=False)[0]
+    assert presented["summary"]["zh"] == "not-cap：NOT true → false"
+    assert presented["summary"]["en"] == "not-cap: NOT true → false"
 
 
 def test_present_trace_formats_wave_duration_and_activation():
@@ -219,7 +228,7 @@ def test_present_trace_formats_wave_duration_and_activation():
         "event": "activate", "wave": 1, "node_id": "power-target", "via_port": "in_1",
     }], has_time_period=False)[0]
     assert activate["kind_label"] == {"zh": "激活", "en": "Activation"}
-    assert activate["summary"]["zh"] == "激活 power-target（via in_1）"
+    assert activate["summary"]["zh"] == "power-target（via in_1）"
     assert activate["facts"] == [
         [{"zh": "节点", "en": "Node"}, "power-target"],
         [{"zh": "入口", "en": "Input"}, "in_1"],
@@ -234,7 +243,7 @@ def test_present_trace_formats_probability_boundaries_with_half_up_rounding():
                   "selected.a": True, "selected.b": False,
                   "p_top": 0.145, "margin": 0.285},
     }], has_time_period=False)[0]
-    assert presented["summary"]["zh"] == "问题 capability：a（p_top 15%，margin 29%）"
+    assert presented["summary"]["zh"] == "capability：a（p_top 15%，margin 29%）"
     assert presented["facts"][0] == [
         {"zh": "概率", "en": "Probabilities"}, "b 86% · a 15%"]
 
@@ -252,7 +261,7 @@ def test_present_trace_formats_final_priority_decision():
     presented = present_trace([event], has_time_period=False)[0]
     assert presented["kind_label"] == {"zh": "候选", "en": "Candidates"}
     assert presented["summary"]["zh"] == (
-        "候选：power-target p5、strong-target p3 → power-target 胜出")
+        "power-target p5、strong-target p3 → power-target 胜出")
     assert presented["facts"] == [
         [{"zh": "power-target", "en": "power-target"},
          {"zh": "p5 · via and-power.in_1 · 第 1 轮 ✓",

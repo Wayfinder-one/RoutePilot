@@ -156,12 +156,12 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
         joined = "、".join(names)
         cell = _text(joined or "未命中", ", ".join(names) or "No match")
         if names:
-            summary = _text(f"时段：{timezone}，生效 {joined}",
-                            f"Time: {timezone}, active {', '.join(names)}")
+            summary = _text(f"{timezone}，生效 {joined}",
+                            f"{timezone}, active {', '.join(names)}")
             tone = "hit"
         else:
-            summary = _text(f"时段：{timezone}，未命中",
-                            f"Time: {timezone}, no active period")
+            summary = _text(f"{timezone}，未命中",
+                            f"{timezone}, no active period")
         facts = [
             _fact("时区", "Timezone", timezone),
             _fact("生效时段", "Active periods",
@@ -195,12 +195,12 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
         hit = bool(event.get("value"))
         cell = _text("命中" if hit else "未命中", "Matched" if hit else "No match")
         if hit and matched:
-            summary = _text(f"条件 {node}：命中，匹配 {'、'.join(matched)}",
-                            f"Condition {node}: matched {', '.join(matched)}")
+            summary = _text(f"{node}：命中，匹配 {'、'.join(matched)}",
+                            f"{node}: matched {', '.join(matched)}")
         elif hit:
-            summary = _text(f"条件 {node}：命中", f"Condition {node}: matched")
+            summary = _text(f"{node}：命中", f"{node}: matched")
         else:
-            summary = _text(f"条件 {node}：未命中", f"Condition {node}: no match")
+            summary = _text(f"{node}：未命中", f"{node}: no match")
         facts = [
             _fact("节点", "Node", node),
             _fact("匹配", "Matched",
@@ -246,16 +246,16 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             duration = _ms(event.get("duration_ms"))
             if selected is not None:
                 summary = _text(
-                    f"问题 {node}：{selected}（p_top {_percent(p_top)}，margin {_percent(margin)}）",
-                    f"Question {node}: {selected} (p_top {_percent(p_top)}, "
+                    f"{node}：{selected}（p_top {_percent(p_top)}，margin {_percent(margin)}）",
+                    f"{node}: {selected} (p_top {_percent(p_top)}, "
                     f"margin {_percent(margin)})",
                 )
                 facts = [_fact("概率", "Probabilities", _probabilities(ports))]
             elif "yes" in ports or "no" in ports:
                 summary = _text(
-                    f"问题 {node}：P(yes) {_percent(ports.get('yes'))}，"
+                    f"{node}：P(yes) {_percent(ports.get('yes'))}，"
                     f"P(no) {_percent(ports.get('no'))}",
-                    f"Question {node}: P(yes) {_percent(ports.get('yes'))}, "
+                    f"{node}: P(yes) {_percent(ports.get('yes'))}, "
                     f"P(no) {_percent(ports.get('no'))}",
                 )
                 facts = [_fact("概率", "Probabilities",
@@ -263,8 +263,8 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
                                f"no {_percent(ports.get('no'))}")]
             else:
                 value = _number(ports.get("value"))
-                summary = _text(f"问题 {node}：value {value}",
-                                f"Question {node}: value {value}")
+                summary = _text(f"{node}：value {value}",
+                                f"{node}: value {value}")
                 facts = [_fact("值", "Value", value)]
             facts += [_fact("耗时", "Duration", duration)]
             cell = _text("已回答", "Answered")
@@ -277,11 +277,12 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             statuses = [_status_text(input.get("status")) for input in inputs]
             value = "true" if event.get("value") else "false"
             joined = f" {operator} ".join(statuses)
+            body = (f"{operator} {joined}"
+                    if joined and (operator == "NOT" or len(inputs) == 1)
+                    else joined or operator)
             summary = _text(
-                f"门 {node}：{joined} → {value}" if joined
-                else f"门 {node}：{operator} → {value}",
-                f"Gate {node}: {joined} → {value}" if joined
-                else f"Gate {node}: {operator} → {value}",
+                f"{node}：{body} → {value}",
+                f"{node}: {body} → {value}",
             )
             facts = [_input_fact(input) for input in inputs] or [
                 _fact("运算", "Operator", operator)]
@@ -306,7 +307,7 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             event_kind = _text("激活", "Activation")
             node = str(event.get("node_id"))
             port = str(event.get("via_port"))
-            summary = _text(f"激活 {node}（via {port}）", f"Activated {node} (via {port})")
+            summary = _text(f"{node}（via {port}）", f"{node} (via {port})")
             facts = [_fact("节点", "Node", node), _fact("入口", "Input", port)]
             cell = _text("已激活", "Activated")
             tone = "hit"
@@ -333,8 +334,8 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
                      "Fallback target" if fallback else "Target matched")
         if candidates:
             parts = "、".join(_candidate_label(candidate) for candidate in candidates)
-            summary = _text(f"候选：{parts} → {target} 胜出",
-                            f"Candidates: {', '.join(_candidate_label(c) for c in candidates)}"
+            summary = _text(f"{parts} → {target} 胜出",
+                            f"{', '.join(_candidate_label(c) for c in candidates)}"
                             f" → {target} wins")
             facts = [_candidate_fact(candidate, target) for candidate in candidates]
         else:
