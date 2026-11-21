@@ -14,7 +14,6 @@ including graphs with no period condition at all.
 from __future__ import annotations
 
 import math
-from decimal import ROUND_HALF_UP, Decimal
 
 
 def _text(zh: str, en: str) -> dict[str, str]:
@@ -41,16 +40,6 @@ def _number(value) -> str:
             return str(int(rounded))
         return f"{rounded:.3f}".rstrip("0").rstrip(".")
     return str(value)
-
-
-def _percent(value) -> str:
-    """0.84 -> '84%'; rounds halves up, never shows 'true'/'false'."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return _DASH
-    if not math.isfinite(float(value)):
-        return _DASH
-    rounded = (Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    return f"{int(rounded)}%"
 
 
 def _ms(value) -> str:
@@ -113,7 +102,7 @@ def _probabilities(ports: dict) -> str:
         and not isinstance(value, bool)
     ]
     entries.sort(key=lambda item: (-float(item[1]), item[0]))
-    return " · ".join(f"{name} {_percent(value)}" for name, value in entries) or _DASH
+    return " · ".join(f"{name} {_number(value)}" for name, value in entries) or _DASH
 
 
 def _candidate_label(candidate) -> str:
@@ -253,21 +242,21 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             duration = _ms(event.get("duration_ms"))
             if selected is not None:
                 summary = _text(
-                    f"{node}：{selected}（p_top {_percent(p_top)}，margin {_percent(margin)}）",
-                    f"{node}: {selected} (p_top {_percent(p_top)}, "
-                    f"margin {_percent(margin)})",
+                    f"{node}：{selected}（p_top {_number(p_top)}，margin {_number(margin)}）",
+                    f"{node}: {selected} (p_top {_number(p_top)}, "
+                    f"margin {_number(margin)})",
                 )
                 facts = [_fact("概率", "Probabilities", _probabilities(ports))]
             elif "yes" in ports or "no" in ports:
                 summary = _text(
-                    f"{node}：P(yes) {_percent(ports.get('yes'))}，"
-                    f"P(no) {_percent(ports.get('no'))}",
-                    f"{node}: P(yes) {_percent(ports.get('yes'))}, "
-                    f"P(no) {_percent(ports.get('no'))}",
+                    f"{node}：P(yes) {_number(ports.get('yes'))}，"
+                    f"P(no) {_number(ports.get('no'))}",
+                    f"{node}: P(yes) {_number(ports.get('yes'))}, "
+                    f"P(no) {_number(ports.get('no'))}",
                 )
                 facts = [_fact("概率", "Probabilities",
-                               f"yes {_percent(ports.get('yes'))} · "
-                               f"no {_percent(ports.get('no'))}")]
+                               f"yes {_number(ports.get('yes'))} · "
+                               f"no {_number(ports.get('no'))}")]
             else:
                 value = _number(ports.get("value"))
                 summary = _text(f"{node}：value {value}",

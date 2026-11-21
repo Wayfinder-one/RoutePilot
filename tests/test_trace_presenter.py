@@ -126,7 +126,7 @@ def test_present_trace_formats_time_window_and_condition_values():
         {"zh": "匹配", "en": "Matched"}, {"zh": "10kV、跳闸", "en": "10kV, 跳闸"}]
 
 
-def test_present_trace_formats_question_values_with_percentages():
+def test_present_trace_formats_question_values_as_raw_probabilities():
     event = {
         "event": "question", "wave": 1, "node_id": "capability",
         "selected": "strong", "p_top": 0.84, "margin": 0.72, "duration_ms": 9.0,
@@ -138,10 +138,10 @@ def test_present_trace_formats_question_values_with_percentages():
     }
     presented = present_trace([event], has_time_period=False)[0]
     assert presented["kind_label"] == {"zh": "问题", "en": "Question"}
-    assert presented["summary"]["zh"] == "capability：strong（p_top 84%，margin 72%）"
-    assert presented["summary"]["en"] == "capability: strong (p_top 84%, margin 72%)"
+    assert presented["summary"]["zh"] == "capability：strong（p_top 0.84，margin 0.72）"
+    assert presented["summary"]["en"] == "capability: strong (p_top 0.84, margin 0.72)"
     assert presented["facts"][0] == [
-        {"zh": "概率", "en": "Probabilities"}, "strong 84% · easy 16%"]
+        {"zh": "概率", "en": "Probabilities"}, "strong 0.84 · easy 0.16"]
     assert presented["facts"][1] == [{"zh": "耗时", "en": "Duration"}, "9 ms"]
 
 
@@ -150,8 +150,8 @@ def test_present_trace_formats_noul_and_score_questions():
         "event": "question", "wave": 1, "node_id": "domain", "duration_ms": 7.0,
         "ports": {"yes": 0.92, "no": 0.08},
     }], has_time_period=False)[0]
-    assert noul["summary"]["zh"] == "domain：P(yes) 92%，P(no) 8%"
-    assert noul["facts"][0][1] == "yes 92% · no 8%"
+    assert noul["summary"]["zh"] == "domain：P(yes) 0.92，P(no) 0.08"
+    assert noul["facts"][0][1] == "yes 0.92 · no 0.08"
 
     score = present_trace([{
         "event": "question", "wave": 1, "node_id": "complexity", "duration_ms": 4.0,
@@ -246,7 +246,7 @@ def test_present_trace_formats_wave_duration_and_activation():
     ]
 
 
-def test_present_trace_formats_probability_boundaries_with_half_up_rounding():
+def test_present_trace_keeps_raw_probability_precision():
     presented = present_trace([{
         "event": "question", "wave": 1, "node_id": "capability",
         "p_top": 0.145, "margin": 0.285, "duration_ms": 5.0,
@@ -254,9 +254,9 @@ def test_present_trace_formats_probability_boundaries_with_half_up_rounding():
                   "selected.a": True, "selected.b": False,
                   "p_top": 0.145, "margin": 0.285},
     }], has_time_period=False)[0]
-    assert presented["summary"]["zh"] == "capability：a（p_top 15%，margin 29%）"
+    assert presented["summary"]["zh"] == "capability：a（p_top 0.145，margin 0.285）"
     assert presented["facts"][0] == [
-        {"zh": "概率", "en": "Probabilities"}, "b 86% · a 15%"]
+        {"zh": "概率", "en": "Probabilities"}, "b 0.855 · a 0.145"]
 
 
 def test_present_trace_formats_final_priority_decision():

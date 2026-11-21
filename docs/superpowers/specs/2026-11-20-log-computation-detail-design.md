@@ -37,7 +37,7 @@
 
 | 类型 | 格式 | 示例 |
 |---|---|---|
-| 概率 / `p_top` / `margin` | 整数百分比，四舍五入（≥ .5 进位） | `84%`、`72%` |
+| 概率 / `p_top` / `margin` | 原值（0–1），最多 3 位小数去尾零 | `0.84`、`0.72` |
 | 槽位原值与阈值 | 四舍五入到 3 位小数，去掉尾随 0 | `0.84 > 0.65` |
 | 布尔 | 小写 `true` / `false` | `true` |
 | 缺失值 | `—` | `—` |
@@ -76,8 +76,8 @@
 | `window` | 窗口 / Window | `输入窗口：18 → 18 tok`；截断时加 `（已截断）` | `[Token, "18 → 18"]`、`[截断, 是/否]` |
 | `condition` | 条件 / Condition | `cond-text：命中，匹配 10kV、跳闸`；未命中不带“匹配” | `[节点, cond-text]`、`[匹配, "10kV, 跳闸" 或 —]`、`[结果, true/false]` |
 | `wave` | 轮次 / Wave | `第 1 轮 JEV：2 个问题，耗时 9 ms`；失败 `第 1 轮 JEV 失败：<error>` | `[轮次, 1]`、`[问题数, 2]`、`[耗时, 9 ms]` |
-| `question`（choice） | 问题 / Question | `capability：strong（p_top 84%，margin 72%）` | `[概率, "strong 84% · easy 16%"]`、`[耗时, 9 ms]` |
-| `question`（noul） | 问题 / Question | `domain：P(yes) 92%，P(no) 8%` | `[概率, "yes 92% · no 8%"]`、`[耗时, …]` |
+| `question`（choice） | 问题 / Question | `capability：strong（p_top 0.84，margin 0.72）` | `[概率, "strong 0.84 · easy 0.16"]`、`[耗时, 9 ms]` |
+| `question`（noul） | 问题 / Question | `domain：P(yes) 0.92，P(no) 0.08` | `[概率, "yes 0.92 · no 0.08"]`、`[耗时, …]` |
 | `question`（score） | 问题 / Question | `q-score：value 0.7` | `[值, 0.7]`、`[耗时, …]` |
 | `gate` | 门 / Gate | `and-power：true AND true → true`；一元 NOT 门 `not-x：NOT true → false`（运算符大写） | 每个输入一条：`[in_1, "0.84 > 0.65 → true"]`；无输入时 `[运算, AND]` |
 | `slot` | 槽位 / Slot | `capability.selected.strong 0.84 > 0.65 → true` | `[目标, power-target.in_1]` |
@@ -120,8 +120,8 @@
 
 ```
 [pin] ② JEV 第 1 轮 · 15 事件                              15
-      问题   capability：strong（p_top 84%，margin 72%）    概率 strong 84% · easy 16% · 耗时 9 ms
-      问题   domain：P(yes) 92%，P(no) 8%                   概率 yes 92% · no 8% · 耗时 7 ms
+      问题   capability：strong（p_top 0.84，margin 0.72）    概率 strong 0.84 · easy 0.16 · 耗时 9 ms
+      问题   domain：P(yes) 0.92，P(no) 0.08               概率 yes 0.92 · no 0.08 · 耗时 7 ms
       门     and-power：true AND true → true                in_1 0.84 > 0.65 → true · in_2 0.92 > 0.70 → true
       槽位   capability.selected.strong 0.84 > 0.65 → true  目标 power-target.in_1
       激活   power-target（via in_1）                       节点 power-target · 入口 in_1
@@ -158,7 +158,7 @@ CSS：
 
 - 现有阶段顺序、7 个 `.lg-stage`、旧记录空状态、移动端无横滚用例保持不变；
 - 新增/扩展真实请求用例：展开首行后**不点击任何阶段**即可看到
-  `0.84 > 0.65 → true`、`p_top`、`84%`、`AND`、`power-target p5`、`strong-target p3`
+  `0.84 > 0.65 → true`、`p_top 0.84`、`AND`、`power-target p5`、`strong-target p3`
   与胜者 `power-target`；
 - 断言事件行数量大于阶段数，且 `false` 槽位也在文本中。
 
@@ -175,7 +175,7 @@ npm run check:console
 - 打开一条日志即可看到每个阶段的逐事件计算过程，无需二次展开；
 - 任一 JEV 轮次都完整呈现“JEV 返回值 → 槽位比较 → 门运算 → 激活”链路；
 - 目标判定行能看到全部候选的优先级、来源、轮次与胜者；
-- 概率用百分比、阈值比较用原值，数值与结果能逐行对上；
+- 概率与阈值都用原值，数值与比较能逐行对上；
 - 旧记录（无 trace）行为不变；图回放与快照功能不受影响；
 - `pytest` 与 `npm run check:console` 全绿。
 
@@ -185,6 +185,7 @@ npm run check:console
   移动端只要求不横向溢出。若后续嫌长，再引入阶段折叠，不属于本次范围。
 - **展示文案在后端**：延续现有契约（事件自描述、前端纯投影），代价是文案改动需要后端发布；
   但数值格式化、i18n 与事件语义集中在一处，避免前端重新认识 `raw/inputs/ports`。
-- **概率百分比 vs 原值**：概率用百分比便于阅读，阈值比较用原值保证与图回放/配置一致；
-  同一行内不混用两种尺度。
+- **概率用原值（2026-11-21 修订）**：早先版本把概率显示为整数百分比，实测与同一行的
+  `0.172 ≥ 0.7` 阈值比较混用两种尺度；用户反馈后统一为 JEV 返回的原值（3 位小数去尾零），
+  这样“值 → 比较 → 结果”可在同一尺度上直接对照。
 - **无快照标题**：日志页不加载图快照，只显示节点/连接 ID，与现有依据列一致。

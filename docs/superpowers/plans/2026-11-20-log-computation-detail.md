@@ -1124,3 +1124,13 @@ Expected: 只有本次涉及的已跟踪文件（`router/api/*`、`router/consol
    `stages()` 的 `group.facts` 聚合已无消费者等，后续可顺手清理。
 6. **验证**：`pytest` 879 passed / 1 既有 warning；`npm run check:console` ALL PASS (155)、
    退出码 0；新增“无需点击即可看到数值与比较”用例通过。
+
+## 后续修订（2026-11-21）：概率改为原值
+
+- 用户反馈：JEV 概率被显示成整数百分比（`38%`），与同一波次的槽位阈值比较（`0.172 ≥ 0.7`）
+  尺度不一致，难以逐行对照。
+- 实现：`question` 的 `p_top`/`margin`/概率列表/`P(yes)`/`P(no)` 全部改用 `_number` 原值
+  （0–1，最多 3 位小数去尾零）；删除 `_percent` 与 `Decimal` 依赖；单测、浏览器 QA、spec 同步。
+- 效果：`capability：strong（p_top 0.38，margin 0.10）`、`strong 0.38 · standard 0.29 ·
+  电力专用 0.172 · fast 0.156`，与 `0.172 ≥ 0.7 → false` 同尺度。
+- 验证：`pytest` 880 passed；`npm run check:console` ALL PASS (155)；76 重启后实测。
