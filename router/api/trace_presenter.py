@@ -79,7 +79,14 @@ def _status_text(status) -> str:
 
 
 def _slot_expression(raw, condition, status, missing: str) -> str:
-    """'0.84 > 0.65 -> true'; booleans pass through; numbers need a threshold."""
+    """'0.84 > 0.65 -> true'; booleans pass through; numbers need a threshold.
+
+    A missing raw value (round-0 slots before any answer exists) has no
+    comparison to show; appending the numeric "no threshold" note there would
+    mislabel boolean question ports.
+    """
+    if raw is None:
+        return f"{_DASH} → {_status_text(status)}"
     left = _number(raw)
     if isinstance(raw, bool):
         body = left if not condition else f"{left} {_condition(condition)}"

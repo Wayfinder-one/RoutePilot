@@ -187,6 +187,17 @@ def test_present_trace_formats_slot_comparison_and_boolean_passthrough():
     assert invalid["summary"]["en"] == "q.value 0.5 (no threshold) → invalid"
 
 
+def test_present_trace_renders_unknown_slots_without_a_threshold_note():
+    event = {
+        "event": "slot", "wave": 0, "edge_id": "e4", "node_id": "capability",
+        "port": "in_1", "source": "capability", "source_port": "selected.standard",
+        "raw": None, "condition": None, "status": "unknown",
+    }
+    presented = present_trace([event], has_time_period=False)[0]
+    assert presented["summary"]["zh"] == "capability.selected.standard — → unknown"
+    assert presented["summary"]["en"] == "capability.selected.standard — → unknown"
+
+
 def test_present_trace_formats_gate_operator_and_inputs():
     event = {
         "event": "gate", "wave": 1, "node_id": "and-power", "operator": "and",
