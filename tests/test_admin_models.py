@@ -9,6 +9,7 @@ tests/test_routing_trees_admin.py).
 import json
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
 import httpx
 import pytest
@@ -16,10 +17,12 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.reasoning import FORMAT_IDS, LEVELS
+from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.repositories import seed_default
+from router.store.repositories import ProviderRepo, seed_default
+from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import load_backends
-from tests.routing_fixtures import test_settings
+from tests.routing_fixtures import portable_tree_dict, test_settings, tree_dict
 
 OPENAI_REASONING = {"reasoning": {
     "efforts": {"off": None, "low": "low", "high": "high"},
@@ -648,13 +651,22 @@ def test_rejected_reasoning_write_keeps_snapshot_revision_and_audit_clean(app, c
     assert app.state.snapshot.snapshot_revision == before_revision
 
 
-def test_failed_provider_upsert_changes_neither_row_nor_snapshot(app, client):
+def test_failed_provider_upsert_changes_neither_row_nor_snapshot(tmp_path):
     """提供方写用例的同一契约：启用校验失败 → 数据库行/审计/快照都不得变化。
 
-    与 tests/test_jev_window 的失败窗口契约同型：浏览活动图引用的模型后，
-    任何提供方写都必须 422 且不落库。"""
-    _declare_high(client)
-    _activate_reasoning_tree(client)
+    自包含 JSON 生效后「只删数据库 model 行」不再制造无效前提（配置写前会从活动
+    JSON 恢复目录）。这里改用真正的旧图数据库回退：活动图没有内嵌运行配置，外部
+    删除它引用的模型后，提供方写必须 422，且 DB/审计/快照不变、图文件不被写坏。
+    """
+    settings = test_settings(tmp_path, db_path=str(tmp_path / "t.db"))
+    client = TestClient(make_app(tmp_path))
+    _declare_high(client)                       # 先在数据库里声明 high
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.create(tree_from_dict(tree_dict("reasoning-tree", root=_reasoning_tree_root())))
+    repo.enable("reasoning-tree")               # 旧图：文件里没有运行配置
+
+    app = make_app(tmp_path)                    # 重启：活动图走数据库回退
+    client = TestClient(app)
     conn = connect(app.state.settings.db_path)
     try:
         conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
@@ -781,3 +793,124 @@ def test_delete_free_model_also_checks_inside_the_publish_lock(
     assert trace[0] == "lock-enter"
     assert "check" in trace
     assert trace[-1] == "lock-exit"
+
+
+def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
+    """端点变更且请求省略 api_key：旧密钥不得跟随到新地址（spec §5）。"""
+    settings = test_settings(tmp_path, db_path=str(tmp_path / "t.db"))
+    make_app(tmp_path)                       # 先建库/建表
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    document = portable_tree_dict("portable")
+    repo.create(tree_from_dict(document))
+    repo.enable(document["id"])
+    conn = connect(settings.db_path)
+    try:
+        ProviderRepo(conn).upsert(
+            "local", "http://json-only.test/v1", api_key="sk-json-secret")
+    finally:
+        conn.close()
+
+    app = make_app(tmp_path)
+    assert app.state.snapshot.backends["fast"].headers["Authorization"] == \
+        "Bearer sk-json-secret"
+    client = TestClient(app)
+    response = client.put("/admin/providers/local",
+                          json={"base_url": "http://new-upstream.test/v1"})
+
+    assert response.status_code == 200, response.text
+    backend = app.state.snapshot.backends["fast"]
+    assert backend.url == "http://new-upstream.test/v1/chat/completions"
+    assert "Authorization" not in backend.headers
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert ProviderRepo(conn).get("local")["api_key"] == ""
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 密钥通道：profile 是自由 JSON 元数据，但任何层级的密钥/派生状态都不得写入
+# --------------------------------------------------------------------------- #
+SECRET_KEY_SPELLINGS = ["api_key", "API-KEY", "authorization", "key_present", "key_source"]
+
+
+@pytest.mark.parametrize("key", SECRET_KEY_SPELLINGS)
+def test_model_writes_reject_nested_profile_secrets(client, app, key):
+    """模型 POST/PUT 收到嵌套密钥 → 422，且数据库/审计/快照/图文件都不变。"""
+    profile = {"metadata": {"labels": [{"tier": "x", key: "review-secret"}]}}
+    before_revision = app.state.snapshot.snapshot_revision
+    conn = connect(app.state.settings.db_path)
+    try:
+        before_profile = conn.execute(
+            "SELECT profile FROM models WHERE id = 'qwen3-8b'").fetchone()[0]
+        before_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+        before_models = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+    finally:
+        conn.close()
+    graph_dir = Path(app.state.settings.graph_dir, "graphs")
+    before_files = {path.name: path.read_bytes() for path in graph_dir.glob("*.json")}
+
+    updated = client.put("/admin/models/qwen3-8b", json={"profile": profile})
+    assert updated.status_code == 422, updated.text
+    created = client.post("/admin/models", json={
+        "id": "secret-model", "upstream": "u", "provider": "local", "profile": profile})
+    assert created.status_code == 422, created.text
+    assert "review-secret" not in updated.text + created.text
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        after_profile = conn.execute(
+            "SELECT profile FROM models WHERE id = 'qwen3-8b'").fetchone()[0]
+        after_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+        after_models = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+    finally:
+        conn.close()
+    assert after_profile == before_profile
+    assert after_audit == before_audit
+    assert after_models == before_models
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert {path.name: path.read_bytes() for path in graph_dir.glob("*.json")} == before_files
+
+
+@pytest.mark.parametrize("key", SECRET_KEY_SPELLINGS)
+def test_model_reads_sanitize_legacy_profile_secrets_without_mutating_db(app, client, key):
+    """旧库 profile 的 GET 是只读脱敏投影：密钥剔除、合法元数据保留、数据库不改写。"""
+    stored_profile = {
+        "metadata": {
+            "labels": [{"tier": "keep", key: "review-secret"}],
+            "domains": ["json"],
+            "monkey": "keep",
+        }
+    }
+    conn = connect(app.state.settings.db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                (json.dumps(stored_profile),),
+            )
+    finally:
+        conn.close()
+
+    response = client.get("/admin/models")
+
+    assert response.status_code == 200, response.text
+    model = next(item for item in response.json()["models"] if item["id"] == "qwen3-8b")
+    assert model["profile"] == {
+        "metadata": {
+            "labels": [{"tier": "keep"}],
+            "domains": ["json"],
+            "monkey": "keep",
+        }
+    }
+    assert "review-secret" not in response.text
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        stored = conn.execute(
+            "SELECT profile FROM models WHERE id = 'qwen3-8b'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert json.loads(stored) == stored_profile, "GET 只能脱敏投影，不能改写旧库"

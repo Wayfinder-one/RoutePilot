@@ -13,6 +13,10 @@ from router.api.deps import get_conn, get_tree_repo
 from router.control.config import ConfigurationService
 from router.presets import PROVIDER_PRESETS
 from router.reasoning import FORMATS, FORMAT_IDS, LEVELS, ReasoningError, normalize_reasoning, validate_model_profile
+from router.routing.runtime import (
+    reject_runtime_secret_fields,
+    without_runtime_secret_fields,
+)
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import parse_profile_text
@@ -40,15 +44,40 @@ def _clean_base_url(value) -> str:
     return _clean_text(value, "base_url", max_len=500).rstrip("/")
 
 
-def _provider_formats(conn: sqlite3.Connection) -> dict[str, str]:
-    return {row["name"]: row.get("reasoning_format") or "openai" for row in ProviderRepo(conn).list()}
+def _current_runtime(request: Request, conn: sqlite3.Connection):
+    """活动图的内嵌运行配置；旧图/无活动图返回 ``None``（走数据库回退）。
+
+    旧库可能带有非法历史声明或缺失 provider，严格的文件解析器不能作为所有
+    读取路径的依赖，因此这里只返回真正内嵌的 runtime。
+    """
+    tree = request.app.state.graph_repo.active()
+    if tree is not None and tree.runtime is not None:
+        return tree.runtime
+    return None
 
 
-def _require_provider(conn: sqlite3.Connection, name: str) -> dict:
-    row = ProviderRepo(conn).get(name)
+def _provider_formats(conn: sqlite3.Connection, runtime=None) -> dict[str, str]:
+    rows = runtime.backends.providers if runtime is not None else ProviderRepo(conn).list()
+    return {row["name"]: row.get("reasoning_format") or "openai" for row in rows}
+
+
+def _require_provider(conn: sqlite3.Connection, name: str, runtime=None,
+                      *, missing_status: int = 422) -> dict:
+    if runtime is None:
+        row = ProviderRepo(conn).get(name)
+    else:
+        row = next((item for item in runtime.backends.providers if item["name"] == name), None)
     if row is None:
-        raise HTTPException(422, detail=f"unknown provider {name}")
+        raise HTTPException(missing_status, detail=f"unknown provider {name}")
     return row
+
+
+def _provider_with_key_state(conn: sqlite3.Connection, row: dict) -> dict:
+    stored = ProviderRepo(conn).get(row["name"])
+    api_key = ""
+    if stored is not None and stored["base_url"].rstrip("/") == row["base_url"].rstrip("/"):
+        api_key = stored.get("api_key") or ""
+    return {**row, "api_key": api_key}
 
 
 def _undeclared_reasoning(provider_format: str) -> dict:
@@ -56,11 +85,19 @@ def _undeclared_reasoning(provider_format: str) -> dict:
 
 
 def _public_model(row: dict, provider_format: str) -> dict:
-    """API 出参契约：``profile``/``reasoning`` 归一为对象，``capability`` 为纯文本。
+    """归一模型出参；旧库可宽松读取，但密钥只剔除、不回写。
 
-    DB 中 ``profile`` 仍是 JSON TEXT（``parse_profile_text`` 容忍非法旧值并归一为
-    ``{}``）；归一只发生在 API 边界。"""
-    profile = parse_profile_text(row.get("profile"))
+    两种来源都先过同一份脱敏投影：数据库 JSON TEXT（``parse_profile_text`` 容忍
+    非法旧值并归一为 ``{}``）与图内 runtime 的 dict。合法元数据原样保留，旧库
+    非法 reasoning 的 ``reasoning.error`` 展示不变。"""
+    raw = row.get("profile")
+    if isinstance(raw, dict):
+        profile = raw
+    elif isinstance(raw, str):
+        profile = parse_profile_text(raw)
+    else:
+        profile = {}
+    profile = without_runtime_secret_fields(profile)
     normalized = normalize_reasoning(profile, provider_format)
     capability = profile.get("capability")
     return {
@@ -83,6 +120,10 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
         parsed = raw
     if not isinstance(parsed, dict):
         raise HTTPException(422, detail="profile 必须是 JSON 对象")
+    try:
+        reject_runtime_secret_fields(parsed, "profile")
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
     try:
         validated = validate_model_profile(parsed, provider_format)
     except ReasoningError as exc:
@@ -134,9 +175,19 @@ def get_model_catalog():
 
 
 @router.get("/models")
-def get_models(conn: sqlite3.Connection = Depends(get_conn)):
-    formats = _provider_formats(conn)
-    return {"models": [_public_model(row, formats.get(row["provider"], "openai")) for row in ModelRepo(conn).list()]}
+def get_models(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    runtime = _current_runtime(request, conn)
+    if runtime is not None:
+        formats = _provider_formats(conn, runtime)
+        rows = runtime.backends.models
+    else:
+        # 旧图/无活动图：直接读数据库原始行，以保留非法旧声明的 reasoning.error。
+        formats = _provider_formats(conn)
+        rows = ModelRepo(conn).list()
+    return {"models": [
+        _public_model(row, formats.get(row["provider"], "openai"))
+        for row in rows
+    ]}
 
 
 class ModelIn(BaseModel):
@@ -164,7 +215,7 @@ def post_model(
     if body.provider is None:
         raise HTTPException(422, detail="provider 不能为空")
     provider = _clean_text(body.provider, "provider", max_len=64)
-    provider_row = _require_provider(conn, provider)
+    provider_row = _require_provider(conn, provider, _current_runtime(request, conn))
     profile = _validated_profile(body.profile, provider_row.get("reasoning_format") or "openai")
     _service(request, conn, trees).create_model(
         model_id=model_id, upstream=upstream, provider=provider,
@@ -179,15 +230,20 @@ def put_model(
     conn: sqlite3.Connection = Depends(get_conn),
     trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
-    if ModelRepo(conn).get(model_id) is None:
+    runtime = _current_runtime(request, conn)
+    if runtime is not None:
+        existing = next((row for row in runtime.backends.models if row["id"] == model_id), None)
+    else:
+        existing = ModelRepo(conn).get(model_id)
+    if existing is None:
         raise HTTPException(404, detail=f"unknown model {model_id}")
     upstream = _clean_text(body.upstream, "upstream", max_len=200) if body.upstream is not None else None
     provider = _clean_text(body.provider, "provider", max_len=64) if body.provider is not None else None
     if provider is not None:
-        _require_provider(conn, provider)
-    existing = ModelRepo(conn).get(model_id)
+        _require_provider(conn, provider, runtime)
     effective_provider = provider or existing["provider"]
-    profile = _validated_profile(body.profile, _provider_formats(conn).get(effective_provider, "openai")) if body.profile is not None else None
+    formats = _provider_formats(conn, runtime)
+    profile = _validated_profile(body.profile, formats.get(effective_provider, "openai")) if body.profile is not None else None
     _service(request, conn, trees).update_model(
         model_id=model_id, upstream=upstream, provider=provider, profile_text=profile,
         audit_upstream=body.upstream, audit_provider=body.provider, audit_profile=body.profile,
@@ -213,8 +269,13 @@ def _public_provider(row: dict) -> dict:
 
 
 @router.get("/providers")
-def get_providers(conn: sqlite3.Connection = Depends(get_conn)):
-    return {"providers": [_public_provider(row) for row in ProviderRepo(conn).list()]}
+def get_providers(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    runtime = _current_runtime(request, conn)
+    rows = runtime.backends.providers if runtime is not None else ProviderRepo(conn).list()
+    return {"providers": [
+        _public_provider(_provider_with_key_state(conn, row))
+        for row in rows
+    ]}
 
 
 class ProviderIn(BaseModel):
@@ -240,7 +301,17 @@ def put_provider(
         raise HTTPException(422, detail="invalid key_env")
     if body.reasoning_format is not None and body.reasoning_format not in FORMAT_IDS:
         raise HTTPException(422, detail="invalid reasoning_format")
+    runtime = _current_runtime(request, conn)
+    if runtime is not None:
+        current = next(
+            (row for row in runtime.backends.providers if row["name"] == name), None)
+    else:
+        current = ProviderRepo(conn).get(name)
     api_key = body.api_key.strip() if body.api_key is not None else None
+    if api_key is None and current is not None \
+            and current["base_url"].rstrip("/") != base_url:
+        # 端点变了而请求未显式提供密钥：旧密钥不得静默跟随到新地址（spec §5）。
+        api_key = ""
     _service(request, conn, trees).upsert_provider(
         name=name, base_url=base_url, key_env=key_env,
         reasoning_format=body.reasoning_format, api_key=api_key,
@@ -269,11 +340,12 @@ async def fetch_models(body: FetchModelsIn, request: Request, conn: sqlite3.Conn
     stored_key = ""
     key_env = ""
     if body.provider:
-        provider = ProviderRepo(conn).get(body.provider)
-        if provider is None:
-            raise HTTPException(404, detail=f"unknown provider {body.provider}")
+        # fetch-models 沿用原端点的 404 契约：未知 provider 是「路径/资源不存在」，
+        # 与模型写路径的 422 引用错误区分。
+        provider = _require_provider(
+            conn, body.provider, _current_runtime(request, conn), missing_status=404)
         base_url = provider["base_url"].rstrip("/")
-        stored_key = provider.get("api_key") or ""
+        stored_key = _provider_with_key_state(conn, provider)["api_key"]
         key_env = body.key_env if body.key_env is not None else provider.get("key_env") or ""
     elif body.base_url:
         base_url = _clean_base_url(body.base_url)

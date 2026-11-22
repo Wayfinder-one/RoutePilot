@@ -11,12 +11,18 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_config import JevConfigRepo
+from router.store.repositories import SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import tree_dict, test_settings
+from tests.routing_fixtures import (
+    portable_tree_dict,
+    runtime_dict,
+    tree_dict,
+    test_settings,
+)
 
 
 def direct_graph():
@@ -207,7 +213,7 @@ def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
 
 
 def _graph_tree_files(settings):
-    """图目录的全部文件字节：用于证明 publish 是纯内存替换（不触碰文件）。"""
+    """图目录的全部文件字节：用于证明配置写回图 JSON、publish 本身不触碰文件。"""
     root = Path(settings.graph_dir)
     return {path.relative_to(root).as_posix(): path.read_bytes()
             for path in sorted(root.rglob("*")) if path.is_file()}
@@ -215,14 +221,17 @@ def _graph_tree_files(settings):
 
 def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatch):
     """ConfigurationService 写用例契约：真实 SnapshotPublisher 上，
-    ConfigurationService 写用例 = 提交恰在 publish 之前、发布恰好一次，且发布
-    本身是纯内存替换（不写数据库、不写图文件）。"""
+    ConfigurationService 写用例 = 提交恰在 publish 之前、发布恰好一次；配置写回
+    活动图 JSON（本功能需求），而 publish 本身仍是纯内存替换（不写数据库、不写
+    图文件）。"""
     settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
     app = create_app(settings)
     publisher = app.state.publisher
     before = app.state.snapshot.snapshot_revision
     files_before = _graph_tree_files(settings)
     published = []
+    files_at_publish = []
+    files_after_publish = []
     real_publish = publisher.publish
 
     def counting_publish(prepared):
@@ -232,8 +241,11 @@ def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatc
             assert JevConfigRepo(probe).load().model == "NeoHorse-Jev-4B"
         finally:
             probe.close()
+        files_at_publish.append(_graph_tree_files(settings))
         published.append(prepared)
-        return real_publish(prepared)
+        result = real_publish(prepared)
+        files_after_publish.append(_graph_tree_files(settings))
+        return result
 
     monkeypatch.setattr(publisher, "publish", counting_publish)
 
@@ -249,7 +261,21 @@ def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatc
     assert status["ready"] and status["stale"] is False
     repo = RoutingTreeRepo(settings.graph_dir)
     assert status["document_sha256"] == repo.fingerprint()[1]
-    assert _graph_tree_files(settings) == files_before
+
+    # 1) 配置写路径确实把 JEV 写进了活动图 JSON（新需求）。
+    assert files_at_publish[0] != files_before
+    document = json.loads(files_at_publish[0]["graphs/main.json"])
+    assert document["jev"]["model"] == "NeoHorse-Jev-4B"
+    assert document["jev"]["base_url"] == "http://jev.test"
+    assert "backends" in document and "jev_window" in document and "time_periods" in document
+    # 2) 文件不携带任何真实密钥/派生密钥状态。
+    for content in files_at_publish[0].values():
+        text = content.decode("utf-8")
+        assert "api_key" not in text
+        assert "key_source" not in text
+        assert "key_present" not in text
+    # 3) publish 本身是纯内存替换：发布前后图文件逐字节一致。
+    assert files_at_publish[0] == files_after_publish[0]
 
 
 def test_unstable_graph_during_jev_save_rolls_back_db_audit_and_snapshot(tmp_path):
@@ -274,3 +300,140 @@ def test_unstable_graph_during_jev_save_rolls_back_db_audit_and_snapshot(tmp_pat
     conn.close()
     assert app.state.snapshot.snapshot_revision == before
     assert app.state.snapshot.jev is None
+
+
+# ── 自包含 JSON：JEV 有效配置来自活动图 runtime（Task B1）───────────────
+def prepare_portable_tree(tmp_path, handler=None):
+    """写入并启用一棵自包含图（JSON 已含 JEV/窗口/时段），再启动真实 app。"""
+    settings = test_settings(tmp_path)
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    document = portable_tree_dict("portable")
+    repo.create(tree_from_dict(document))
+    repo.enable(document["id"])
+    transport = httpx.MockTransport(handler) if handler is not None else None
+    app = create_app(settings, transport=transport)
+    return app, TestClient(app), settings
+
+
+def _jev_answer_handler(requests):
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "answers": {"route": {"type": "choice",
+                                  "probabilities": {"候选 A": 0.4, "候选 B": 0.6}}},
+            "usage": {"input_tokens": 3, "output_tokens": 0},
+        })
+    return handler
+
+
+def test_get_jev_and_window_prefer_active_json_over_database(tmp_path):
+    """活动 JSON 与数据库故意冲突：GET 必须展示 JSON 的运行配置。"""
+    app, client, settings = prepare_portable_tree(tmp_path)
+    conn = connect(settings.db_path)
+    try:
+        JevConfigRepo(conn).save(JevSettings(
+            "http://db-jev.test", "db-jev", "", 30,
+            DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE))
+        repo = SettingsRepo(conn)
+        repo.set("jev_context_tokens", "8192")
+        repo.set("jev_input_tokens", "2048")
+        conn.commit()
+        TimePeriodRepo(conn).save([
+            {"name": "DB 时段", "days": [0], "start": "01:00", "end": "02:00"},
+        ])
+    finally:
+        conn.close()
+
+    jev = client.get("/admin/jev").json()["config"]
+    assert jev["base_url"] == "http://jev-json.test"
+    assert jev["model"] == "json-jev"
+    window = client.get("/admin/jev/window").json()
+    assert (window["input_tokens"], window["context_tokens"]) == (1024, 4096)
+    periods = client.get("/admin/time-periods").json()["periods"]
+    assert [period["name"] for period in periods] == ["peak", "normal", "offpeak"]
+    # 数据库仍是旧值：GET 不改写管理表
+    conn = connect(settings.db_path)
+    try:
+        assert JevConfigRepo(conn).load().model == "db-jev"
+    finally:
+        conn.close()
+
+
+def test_put_jev_without_database_row_edits_active_json(tmp_path):
+    """数据库无 jev_config 行时，仍可编辑活动 JSON 的 JEV；写入后图 JSON 同步。"""
+    app, client, settings = prepare_portable_tree(tmp_path)
+    conn = connect(settings.db_path)
+    assert JevConfigRepo(conn).load() is None
+    conn.close()
+
+    response = client.put("/admin/jev", json={"timeout_seconds": 7})
+
+    assert response.status_code == 200, response.text
+    body = response.json()["config"]
+    assert body["base_url"] == "http://jev-json.test"
+    assert body["model"] == "json-jev"
+    assert body["timeout_seconds"] == 7
+    tree = app.state.graph_repo.get("portable")
+    assert tree.runtime.jev.timeout_seconds == 7
+    document = json.loads(
+        (Path(settings.graph_dir) / "graphs" / "portable.json").read_text())
+    assert document["jev"]["timeout_seconds"] == 7
+    assert app.state.snapshot.jev.model == "json-jev"
+
+
+def test_jev_test_endpoint_uses_published_snapshot_after_row_removal(tmp_path):
+    """/admin/jev/test 优先使用已发布快照的 JEV，不再强制要求数据库配置行。"""
+    requests = []
+    app, client, settings = prepare_portable_tree(
+        tmp_path, handler=_jev_answer_handler(requests))
+    assert client.put("/admin/jev", json={"timeout_seconds": 7}).status_code == 200
+
+    conn = connect(settings.db_path)
+    conn.execute("DELETE FROM jev_config")
+    conn.commit()
+    conn.close()
+
+    response = client.post("/admin/jev/test", json={"text": "测试连接"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["selected_key"] == "b"
+    assert len(requests) == 1
+    assert str(requests[0].url) == "http://jev-json.test/v1/systemone"
+    assert json.loads(requests[0].content)["model"] == "json-jev"
+
+
+def test_put_jev_reuses_stored_key_only_for_the_same_endpoint(tmp_path, monkeypatch):
+    """省略 api_key 只复用 base_url+model 匹配的数据库 key；环境变量不得写成 stored。"""
+    monkeypatch.setenv("ROUTER_JEV_API_KEY", "environment-secret")
+    app, client, settings = prepare_portable_tree(tmp_path)
+    conn = connect(settings.db_path)
+    JevConfigRepo(conn).save(JevSettings(
+        "http://jev-json.test", "json-jev", "stored-secret", 5,
+        DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE))
+    conn.close()
+
+    initial = client.get("/admin/jev")
+    assert initial.json()["config"]["key_source"] == "stored"
+    assert "stored-secret" not in initial.text
+
+    # 同端点、省略 api_key → 复用 stored key。
+    response = client.put("/admin/jev", json={"timeout_seconds": 9})
+    assert response.status_code == 200, response.text
+    assert response.json()["config"]["key_source"] == "stored"
+    assert "stored-secret" not in response.text
+    assert app.state.snapshot.jev.api_key == "stored-secret"
+    for path in Path(settings.graph_dir).rglob("*.json"):
+        assert "stored-secret" not in path.read_text()
+        assert "environment-secret" not in path.read_text()
+
+    # 改端点、省略 api_key → 旧 key 不得跟随到新地址，环境 key 不落库。
+    response = client.put("/admin/jev", json={"base_url": "http://new-jev.test"})
+    assert response.status_code == 200, response.text
+    assert response.json()["config"]["key_source"] == "environment"
+    conn = connect(settings.db_path)
+    stored = JevConfigRepo(conn).load()
+    conn.close()
+    assert stored.base_url == "http://new-jev.test"
+    assert stored.api_key == ""
+    assert app.state.snapshot.jev.api_key == "environment-secret"

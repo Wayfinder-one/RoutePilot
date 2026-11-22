@@ -3,7 +3,31 @@ from __future__ import annotations
 import json
 import sqlite3
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+# v5：请求图快照。图按内容 SHA-256 去重，trace 单独按请求 ID 保存；
+# ``request_logs`` 仍然只有轻量账本列。
+GRAPH_SNAPSHOTS_DDL = """
+    CREATE TABLE graph_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        tree_id TEXT,
+        snapshot_revision TEXT,
+        graph TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """
+REQUEST_SNAPSHOTS_DDL = """
+    CREATE TABLE request_snapshots (
+        request_id TEXT PRIMARY KEY,
+        graph_snapshot_id TEXT NOT NULL,
+        trace TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """
+REQUEST_SNAPSHOTS_INDEX_DDL = """
+    CREATE INDEX idx_request_snapshots_graph ON request_snapshots(graph_snapshot_id)
+    """
+SNAPSHOT_SCHEMA = (GRAPH_SNAPSHOTS_DDL, REQUEST_SNAPSHOTS_DDL, REQUEST_SNAPSHOTS_INDEX_DDL)
 
 SCHEMA = (
     """
@@ -127,6 +151,7 @@ SCHEMA = (
         opened_at REAL
     )
     """,
+    *SNAPSHOT_SCHEMA,
 )
 
 
@@ -214,6 +239,20 @@ def _upgrade_v3_to_v4(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO schema_migrations VALUES (?)", (4,))
 
 
+def _upgrade_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """Add the request/graph snapshot tables; existing ledger rows stay intact."""
+    existing = _table_names(conn)
+    if "graph_snapshots" not in existing:
+        conn.execute(GRAPH_SNAPSHOTS_DDL)
+    if "request_snapshots" not in existing:
+        conn.execute(REQUEST_SNAPSHOTS_DDL)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_request_snapshots_graph "
+        "ON request_snapshots(graph_snapshot_id)"
+    )
+    conn.execute("INSERT INTO schema_migrations VALUES (?)", (5,))
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)")
     applied = int(conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_migrations").fetchone()[0])
@@ -258,5 +297,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         if not {"request_logs", "settings"} <= tables:
             raise RuntimeError("unsupported database contents; use a new database")
         _in_transaction(conn, lambda: _upgrade_v3_to_v4(conn))
+        applied = 4
+        tables = _table_names(conn)
+    if applied == 4:
+        if "request_logs" not in tables:
+            raise RuntimeError("unsupported database contents; use a new database")
+        _in_transaction(conn, lambda: _upgrade_v4_to_v5(conn))
         return
     raise RuntimeError("unsupported database contents; use a new database")

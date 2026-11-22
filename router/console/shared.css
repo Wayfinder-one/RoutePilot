@@ -776,6 +776,10 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
 .lg-evidence-pair{display:inline-block;max-width:32%;margin-right:8px;overflow:hidden;text-overflow:ellipsis;vertical-align:bottom}
 .lg-evidence-pair b{font-weight:650;margin-right:4px}
 .lg-stage-count{text-align:right;font:10px var(--mono);color:var(--text-3)}
+.lg-snapshot{margin:0 0 8px 6px}
+.lg-snapshot-link{text-decoration:none}
+.lg-snapshot-link::before{content:"";width:11px;height:11px;border:1.5px solid currentColor;border-radius:3px;
+  display:inline-block}
 .lg-raw{margin:7px 0 0 6px;border-top:1px solid var(--line);padding-top:5px}
 .lg-raw summary{cursor:pointer;font:10px var(--mono);color:var(--text-3);padding:5px 0}
 .lg-raw summary:focus-visible{outline:2px solid var(--indigo)}

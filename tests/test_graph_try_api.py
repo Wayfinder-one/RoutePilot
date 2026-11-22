@@ -8,6 +8,7 @@ affinity/inflight、不读已存 root）。
 from __future__ import annotations
 
 import copy
+import json
 
 import httpx
 import pytest
@@ -22,7 +23,7 @@ from router.routing.service import RoutingService
 from router.store.db import connect
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings
+from tests.routing_fixtures import graph_dict, huge_chain_graph, runtime_dict, test_settings
 
 
 _DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone", "kind_label"}
@@ -165,6 +166,115 @@ def create_stored_tree(client, *, root=None, tree_id="main", timezone="Asia/Shan
     })
     assert response.status_code == 201, response.text
     return response.json()["tree"]
+
+
+def portable_graph(model="fast"):
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "target", "type": "target", "priority": 1,
+             "models": [{"model": model, "reasoning": None}]},
+        ],
+        "edges": [{
+            "id": "e-start-target", "source": "start", "source_port": "out",
+            "target": "target", "target_port": "in_1", "condition": None,
+        }],
+        "error_fallback": "target",
+    }
+
+
+def portable_envelope(tree_id="portable"):
+    return {
+        "id": tree_id,
+        "name": "便携配置",
+        "root": portable_graph(),
+        "timezone": "Asia/Shanghai",
+        "sticky": {"enabled": False, "ttl_seconds": 1800},
+        **runtime_dict(),
+    }
+
+
+def test_create_tree_roundtrips_embedded_runtime_without_keys(client, app):
+    response = client.post("/admin/trees", json=portable_envelope())
+
+    assert response.status_code == 201, response.text
+    tree = response.json()["tree"]
+    assert tree["backends"]["models"][0]["upstream"] == "json-upstream"
+    assert tree["jev"]["model"] == "json-jev"
+    assert "api_key" not in json.dumps(tree)
+    stored = app.state.graph_repo.get("portable")
+    assert stored.runtime is not None
+    assert stored.runtime.backends.models[0]["upstream"] == "json-upstream"
+
+
+def test_legacy_create_materializes_current_database_runtime(client):
+    payload = portable_envelope("legacy")
+    for field in runtime_dict():
+        payload.pop(field)
+    payload["root"] = portable_graph("qwen3-8b")
+
+    response = client.post("/admin/trees", json=payload)
+
+    assert response.status_code == 201, response.text
+    tree = response.json()["tree"]
+    assert all(field in tree for field in runtime_dict())
+    assert "qwen3-8b" in {model["id"] for model in tree["backends"]["models"]}
+    assert tree["jev"]["model"] == "d1-2B"
+
+
+def test_partial_runtime_create_returns_graph_parse_error(client):
+    payload = portable_envelope("partial")
+    for field in ("jev", "jev_window", "time_periods"):
+        payload.pop(field)
+
+    response = client.post("/admin/trees", json=payload)
+
+    assert response.status_code == 422
+    assert "graph_parse_error" in response.text
+
+
+def test_try_uses_embedded_runtime_for_unsaved_draft(client, app):
+    engine, _jev, _balancer, _affinity = install_engine(app)
+    payload = portable_envelope()
+    payload.pop("id")
+    payload.pop("name")
+
+    response = client.post("/admin/try", json={
+        **payload, "text": "你好", "session_id": "",
+    })
+
+    assert response.status_code == 200, response.text
+    snapshot = engine.snapshots[-1]
+    assert snapshot.backends["fast"].url == "http://json-only.test/v1/chat/completions"
+    assert snapshot.capabilities == {"fast": "来自 JSON 的能力"}
+    assert snapshot.jev.model == "json-jev"
+
+
+def test_try_without_runtime_inherits_stored_tree(client, app):
+    created = client.post("/admin/trees", json=portable_envelope())
+    assert created.status_code == 201, created.text
+    engine, _jev, _balancer, _affinity = install_engine(app)
+
+    response = client.post("/admin/try", json={"tree_id": "portable", "text": "你好"})
+
+    assert response.status_code == 200, response.text
+    assert engine.snapshots[-1].jev.model == "json-jev"
+    assert engine.snapshots[-1].backends["fast"].upstream_name == "json-upstream"
+
+
+def test_root_only_try_inherits_active_embedded_runtime(client, app):
+    created = client.post("/admin/trees", json=portable_envelope())
+    assert created.status_code == 201, created.text
+    enabled = client.post("/admin/trees/portable/enable")
+    assert enabled.status_code == 200, enabled.text
+    engine, _jev, _balancer, _affinity = install_engine(app)
+
+    response = client.post("/admin/try", json={"root": portable_graph(), "text": "你好"})
+
+    assert response.status_code == 200, response.text
+    assert engine.snapshots[-1].jev.model == "json-jev"
+    assert engine.snapshots[-1].capabilities == {"fast": "来自 JSON 的能力"}
 
 
 # ── 副作用不变量 ───────────────────────────────────────────────────────
@@ -616,3 +726,16 @@ def test_try_trace_events_carry_presentation_fields(client, app):
         assert event["phase"]
     assert body["trace"][-1]["event"] == "scheduled"
     assert body["trace"][-1]["phase"] == "schedule"
+
+
+def test_try_rejects_runtime_control_field(client):
+    """`runtime: null` 只是树写 DTO 的控制字段：/admin/try 契约不变，必须 422。"""
+    payload = portable_envelope()
+    payload.pop("id")
+    payload.pop("name")
+
+    response = client.post("/admin/try", json={
+        **payload, "runtime": None, "text": "你好"})
+
+    assert response.status_code == 422, response.text
+    assert any(item["type"] == "extra_forbidden" for item in response.json()["detail"])

@@ -1,13 +1,14 @@
-/* RTTryRun · 真实草稿试算 / 画布回放 / 轨迹抽屉 / 按波次整理（规格 §6.8 / §6.9）
+/* RTTryRun · 真实草稿试算 / 画布回放 / 按波次整理（规格 §6.8 / §6.9）
    ------------------------------------------------------------------
    回放唯一数据源：POST /admin/try 返回的 trace（§3.9）。rebuild() 只消费事件，
    绝不调用 RTGraph.evaluateCondition、也不读取 graph_scenarios 的 answers。
    卡片回写走 cards.js 已有的 data-live / data-slot / data-edge 契约；边回写走
-   canvas.js 的 edgeEl() + class。
+   canvas.js 的 edgeEl() + class。试算只展示画布回放与结论，不再有执行轨迹抽屉；
+   日志快照复用同一套 rebuild()/apply()，通过 ``readOnly`` 关闭重跑/清除/整理。
 
    ES module：app.js 装配时调用 configureTryRun({ store, getKit, getBooted,
-   change, toast, render, collapsePanels, updateToolbar })；运行锁写回 Store，
-   回放结果由 current() 暴露给装配层重绘。
+   change, toast, render, collapsePanels, updateToolbar, readOnly })；运行锁写回
+   Store，回放结果由 current() 暴露给装配层重绘。
    ------------------------------------------------------------------ */
 import * as RTGraph from './graph.js';
 import { api, apiErrText } from '../api.js';
@@ -25,6 +26,8 @@ const isBootedNow = () => !!(deps && typeof deps.getBooted === 'function' && dep
 const renderNow = () => { if (deps && typeof deps.render === 'function') deps.render(); };
 const toastNow = (message, tone) => { if (deps && typeof deps.toast === 'function') deps.toast(message, tone); };
 const updateToolbarNow = () => { if (deps && typeof deps.updateToolbar === 'function') deps.updateToolbar(); };
+/* 日志快照：只回放，不提供重跑/清除/整理等写入口。 */
+const isReadOnly = () => !!(deps && deps.readOnly);
 const byId = id => document.getElementById(id);
 /* 画布上节点用中文显示名；抽屉里同样显示名称，原始 id 留在 tooltip。 */
 const nodeName = id => {
@@ -49,29 +52,22 @@ const NODE_STATE_CLASSES = ['is-replay', 'is-dim', 'is-final', 'is-cand', 'is-fa
 const SLOT_STATE_CLASSES = ['is-true', 'is-false', 'is-unknown', 'is-invalid', 'is-error-path'];
 const EDGE_STATE_CLASSES = ['is-true', 'is-false', 'is-unknown', 'is-invalid', 'is-error-path'];
 
-const ROW_KINDS = {
-  condition: true, slot: true, gate: true, question: true, activate: true,
-  fallback: true, final: true, sticky_hit: true, scheduled: true
-};
-const ROW_LABEL_KEYS = {
-  condition: 'cv.tryRow.condition', slot: 'cv.tryRow.slot', gate: 'cv.tryRow.gate',
-  question: 'cv.tryRow.question', activate: 'cv.tryRow.activate',
-  fallback: 'cv.tryRow.fallback', final: 'cv.tryRow.final',
-  sticky_hit: 'cv.tryRow.sticky', scheduled: 'cv.tryRow.scheduled'
-};
+/* 只有这些事件把 trace 变成「图上的执行状态」。time/window/request_outcome 与
+   未知事件只描述广延元数据；sticky_hit/scheduled 只在 final 已存在时补字段，
+   都不能单独把静态图涂成回放。 */
+const GRAPH_EVENTS = new Set([
+  'condition', 'slot', 'gate', 'activate', 'wave', 'question',
+  'fallback', 'final', 'routing_error'
+]);
+
 const KIND_KEYS = {
   target: 'cv.tryKind.target', otherwise: 'cv.tryKind.fallback',
   error_fallback: 'cv.tryKind.fallback', sticky: 'cv.tryKind.sticky'
-};
-const SELECTION_KEYS = {
-  target: 'cv.trySelection.target', sticky: 'cv.trySelection.sticky',
-  otherwise: 'cv.trySelection.fallback', error_fallback: 'cv.trySelection.fallback'
 };
 
 let state = null;        /* 最近一次回放（与 App.replay 同一对象） */
 let lastRun = null;      /* {text, now} 供「重跑」复用固定 now */
 let runSeq = 0;
-let drawerOpen = false;
 let bound = false;
 let waveLayout = null;   /* 最近一次按波次整理的列信息（未触发列头用） */
 let waveHeader = null;
@@ -124,11 +120,11 @@ function rebuild(trace, graph) {
   const nodeStates = Object.create(null);
   const edgeStates = Object.create(null);
   const waves = [];
-  const timeline = [];
   const meta = { timezone: '', active_periods: [], tokens_before: null, tokens_after: null, truncated: false };
   let candidates = [];
   let final = null;
   let fallback = null;
+  let error = null;
 
   function ensureNode(id, type) {
     if (!nodeStates[id]) {
@@ -222,16 +218,10 @@ function rebuild(trace, graph) {
         nodeState.value = event.value;
         nodeState.matched = (event.matched || []).slice();
         nodeState.source = event.source;
-        timeline.push({ kind: 'condition', wave: 0, node_id: event.node_id, value: event.value, matched: nodeState.matched });
         break;
       }
       case 'slot':
         applySlot(event);
-        timeline.push({
-          kind: 'slot', wave: event.wave, node_id: event.node_id, edge_id: event.edge_id,
-          port: event.port, source: event.source, source_port: event.source_port,
-          raw: event.raw, condition: event.condition, status: event.status
-        });
         break;
       case 'gate': {
         const nodeState = ensureNode(event.node_id, 'logic');
@@ -241,10 +231,6 @@ function rebuild(trace, graph) {
         nodeState.ports = Object.assign({}, nodeState.ports || {}, { out: event.value });
         nodeState.inputs = clone(event.inputs || []);
         nodeState.operator = event.operator;
-        timeline.push({
-          kind: 'gate', wave: event.wave, node_id: event.node_id, operator: event.operator,
-          inputs: nodeState.inputs, value: event.value
-        });
         break;
       }
       case 'activate': {
@@ -253,7 +239,6 @@ function rebuild(trace, graph) {
         nodeState.wave = event.wave;
         nodeState.via_port = event.via_port;
         if (nodeState.type === 'target') nodeState.status = 'activated';
-        timeline.push({ kind: 'activate', wave: event.wave, node_id: event.node_id, via_port: event.via_port });
         break;
       }
       case 'wave': {
@@ -275,10 +260,6 @@ function rebuild(trace, graph) {
           candidates = [];
           Object.keys(nodeStates).forEach(id => { nodeStates[id].candidate = false; });
         }
-        timeline.push({
-          kind: 'wave', wave: wave.wave, questions: wave.questions,
-          duration_ms: wave.duration_ms, failed: wave.failed, error: wave.error
-        });
         break;
       }
       case 'question': {
@@ -291,11 +272,6 @@ function rebuild(trace, graph) {
         if (event.selected !== undefined) nodeState.selected = event.selected;
         if (event.p_top !== undefined) nodeState.p_top = event.p_top;
         if (event.margin !== undefined) nodeState.margin = event.margin;
-        timeline.push({
-          kind: 'question', wave: event.wave, node_id: event.node_id, ports: nodeState.ports,
-          selected: event.selected, p_top: event.p_top, margin: event.margin,
-          duration_ms: event.duration_ms, usage: nodeState.usage
-        });
         break;
       }
       case 'fallback': {
@@ -306,7 +282,6 @@ function rebuild(trace, graph) {
         };
         candidates = [];
         Object.keys(nodeStates).forEach(id => { nodeStates[id].candidate = false; });
-        timeline.push({ kind: 'fallback', wave: lastWave(), target_id: event.target_id, reason: fallback.reason });
         break;
       }
       case 'final': {
@@ -350,18 +325,22 @@ function rebuild(trace, graph) {
           if (!fallback) fallback = { target_id: event.target_id, reason: null, edge_ids: [] };
           fallback.target_id = event.target_id;
         }
-        timeline.push({
-          kind: 'final', wave: targetState.wave, target_id: event.target_id, final_kind: final.kind,
-          candidates: final.candidates, priority: final.priority
-        });
         break;
       }
+      case 'routing_error':
+        /* error 与 final 独立：命中目标后的调度/上游失败不得清除 final，
+           也绝不把失败合成一个「最终目标」。 */
+        error = {
+          stage: event.stage || '',
+          error_class: event.error_class || '',
+          message: event.message || ''
+        };
+        break;
       case 'sticky_hit': {
         if (final) {
           final.sticky_hit = true;
           final.model = event.model;
         }
-        timeline.push({ kind: 'sticky_hit', wave: lastWave(), model: event.model });
         break;
       }
       case 'scheduled': {
@@ -369,10 +348,6 @@ function rebuild(trace, graph) {
           final.model = event.model;
           if (event.reason) final.selection_reason = event.reason;
         }
-        timeline.push({
-          kind: 'scheduled', wave: lastWave(), model: event.model,
-          reason: event.reason, dry_run: event.dry_run
-        });
         break;
       }
       default:
@@ -399,8 +374,10 @@ function rebuild(trace, graph) {
     candidates: candidates,
     final: final,
     fallback: fallback,
-    timeline: timeline,
-    meta: meta
+    error: error,
+    meta: meta,
+    hasGraphEvents: events.some(event =>
+      !!event && typeof event === 'object' && GRAPH_EVENTS.has(event.event))
   };
 }
 
@@ -453,6 +430,7 @@ function removeReplayClasses() {
       NODE_STATE_CLASSES.forEach(name => el.classList.remove(name));
       delete el.dataset.replay;
       delete el.dataset.replayKind;
+      delete el.dataset.wave;
       const slots = el.querySelectorAll('.rtc-slot[data-slot]');
       for (let slotIndex = 0; slotIndex < slots.length; slotIndex += 1) {
         SLOT_STATE_CLASSES.forEach(name => slots[slotIndex].classList.remove(name));
@@ -477,7 +455,10 @@ function removeReplayClasses() {
     const paths = svg.querySelectorAll('path.rtc-edge');
     for (let index = 0; index < paths.length; index += 1) {
       EDGE_STATE_CLASSES.forEach(name => paths[index].classList.remove(name));
+      /* final 边的绿色是独立 class：不清它会从一次 final 回放漏进无图事件快照。 */
+      paths[index].classList.remove('is-final-edge');
       delete paths[index].dataset.status;
+      delete paths[index].dataset.step;
     }
   }
 }
@@ -490,6 +471,8 @@ function paintQuestion(el, node, nodeState) {
   setLive(el, 'state', done
     ? tf('cv.tryReturned', { n: nodeState.wave })
     : (nodeState.status === 'failed' ? t('cv.tryFailedShort') : t('cv.tryNotTriggered')));
+  if (done && nodeState.wave !== null && nodeState.wave !== undefined) el.dataset.wave = String(nodeState.wave);
+  else delete el.dataset.wave;
   if (node.question_type === 'choice') {
     const options = el.querySelectorAll('.rtc-opt');
     for (let index = 0; index < options.length; index += 1) {
@@ -500,13 +483,6 @@ function paintQuestion(el, node, nodeState) {
       const probability = done && nodeState.ports ? nodeState.ports['prob.' + key] : undefined;
       setLive(option, 'prob.' + key, probability === undefined ? '—' : num(probability));
     }
-    /* §3.9 question 事件顶层已有 p_top/margin；旧 trace 的 ports 副本只作回退。 */
-    const pTop = nodeState.p_top !== undefined && nodeState.p_top !== null
-      ? nodeState.p_top : (nodeState.ports ? nodeState.ports.p_top : undefined);
-    const margin = nodeState.margin !== undefined && nodeState.margin !== null
-      ? nodeState.margin : (nodeState.ports ? nodeState.ports.margin : undefined);
-    setLive(el, 'p_top', done ? numOrDash(pTop) : '—');
-    setLive(el, 'margin', done ? numOrDash(margin) : '—');
   } else if (node.question_type === 'noul') {
     setLive(el, 'yes', done && nodeState.ports ? numOrDash(nodeState.ports.yes) : '—');
     setLive(el, 'no', done && nodeState.ports ? numOrDash(nodeState.ports.no) : '—');
@@ -580,6 +556,43 @@ function errorPathEdges(replay) {
     : [];
 }
 
+/* 最终命中链路：只有胜出候选到最终目标的那条入边涂绿色；
+   兜底/异常路径不涂绿，仍由 errorPathEdges 的琥珀整链表达。 */
+function finalEdgeIds(replay, graph) {
+  const ids = Object.create(null);
+  if (!replay || !replay.final || replay.final.kind === 'error_fallback') return ids;
+  const final = replay.final;
+  (final.candidates || []).forEach(candidate => {
+    if (!candidate || candidate.target_id !== final.target_id) return;
+    const edge = (graph.edges || []).find(item => item && item.source === candidate.via_node &&
+      item.target === candidate.target_id && item.target_port === candidate.via_port);
+    if (edge) ids[edge.id] = true;
+  });
+  return ids;
+}
+
+/* 边第一次通过的波次：后端每轮都会重评所有槽位，只看最后一次会把整条链路
+   压到最深的一波；history 里第一条 status=true 才是它真正被选中的时刻。 */
+function edgeWaveOf(edgeState) {
+  if (!edgeState) return null;
+  const history = edgeState.history || [];
+  for (let index = 0; index < history.length; index += 1) {
+    const record = history[index];
+    if (record && record.status === 'true') return record.wave;
+  }
+  return edgeState.wave;
+}
+
+/* 波次 → 色阶：开始/条件（第 0 轮）最浅，之后每波加深一档，最多三档。
+   整条被走通的链路都要着色，否则前缀是灰的、只红末端，一眼看不出完整路径。 */
+function waveStepOf(replay, wave) {
+  if (wave === 0 || wave === null || wave === undefined) return 1;
+  const waves = (replay.waves || []).map(item => item.wave);
+  const index = waves.indexOf(wave);
+  if (index < 0) return 1;
+  return Math.min(index + 2, 3);
+}
+
 function paintSlots(replay, graph) {
   const errorEdges = errorPathEdges(replay);
   (graph.edges || []).forEach(edge => {
@@ -609,47 +622,59 @@ function paintEdges(replay, graph) {
   if (svg) svg.classList.add('is-replay');
   const kit = kitNow();
   const errorEdges = errorPathEdges(replay);
+  const finalEdges = finalEdgeIds(replay, graph);
   (graph.edges || []).forEach(edge => {
     const path = kit && kit.edgeEl ? kit.edgeEl(edge.id) : null;
     if (!path) return;
     const edgeState = replay.edgeStates[edge.id];
     const status = edgeState ? edgeState.status : 'unknown';
     EDGE_STATE_CLASSES.forEach(name => path.classList.remove(name));
+    path.classList.remove('is-final-edge');
+    delete path.dataset.step;
     path.classList.add('is-' + (status === 'true' ? 'true' : status === 'false' ? 'false'
       : status === 'invalid' ? 'invalid' : 'unknown'));
     path.dataset.status = status;
+    if (status === 'true') path.dataset.step = String(waveStepOf(replay, edgeWaveOf(edgeState)));
+    if (finalEdges[edge.id]) path.classList.add('is-final-edge');
     if (errorEdges.indexOf(edge.id) >= 0) path.classList.add('is-error-path');
   });
 }
 
 function apply(replay) {
   state = replay;
-  if (!replay || !replay.final) {
-    drawerOpen = false;
+  if (!replay) {
     renderResult(null);
-    renderHud(null);
-    renderDrawer(null);
     return;
   }
   const graph = graphNow();
-  if (!graph) return;
-  removeReplayClasses();
-  (graph.nodes || []).forEach(node => {
-    const el = findNodeEl(node.id);
-    if (!el) return;
-    const nodeState = replay.nodeStates[node.id] || { status: 'not-triggered', ports: null };
-    el.classList.add('is-replay');
-    if (node.type === 'start') paintStart(el);
-    else if (node.type === 'question') paintQuestion(el, node, nodeState);
-    else if (node.type === 'logic') paintLogic(el, nodeState);
-    else if (node.type === 'condition') paintCondition(el, nodeState);
-    else if (node.type === 'target') paintTarget(el, nodeState);
-  });
-  paintSlots(replay, graph);
-  paintEdges(replay, graph);
+  if (graph) {
+    /* 先清旧回放样式：无图事件时只保留静态图，绝不能继承上一次回放的涂色。 */
+    removeReplayClasses();
+    if (replay.hasGraphEvents) {
+      (graph.nodes || []).forEach(node => {
+        const el = findNodeEl(node.id);
+        if (!el) return;
+        const nodeState = replay.nodeStates[node.id] || { status: 'not-triggered', ports: null };
+        el.classList.add('is-replay');
+        /* 波次也写在卡片上：类型色条在回放时让位给链路色阶（目标卡保持类型色，
+           最终命中由 is-final 单独着色）。 */
+        if (node.type !== 'target' && nodeState.status !== 'not-triggered' &&
+          nodeState.wave !== null && nodeState.wave !== undefined) {
+          el.dataset.wave = String(nodeState.wave);
+        } else if (node.type !== 'question') {
+          delete el.dataset.wave;
+        }
+        if (node.type === 'start') paintStart(el);
+        else if (node.type === 'question') paintQuestion(el, node, nodeState);
+        else if (node.type === 'logic') paintLogic(el, nodeState);
+        else if (node.type === 'condition') paintCondition(el, nodeState);
+        else if (node.type === 'target') paintTarget(el, nodeState);
+      });
+      paintSlots(replay, graph);
+      paintEdges(replay, graph);
+    }
+  }
   renderResult(replay);
-  renderHud(replay);
-  renderDrawer(replay);
 }
 
 /* ── 结论 / HUD / 抽屉 DOM ────────────────────────────────────── */
@@ -662,13 +687,8 @@ function finalKindLabel(replay) {
   return t(KIND_KEYS[kind] || KIND_KEYS.target);
 }
 
-function selectionReason(replay) {
-  const reason = replay.final.sticky_hit ? 'sticky' : (replay.final.selection_reason || replay.final.kind);
-  const key = SELECTION_KEYS[reason] || SELECTION_KEYS.target;
-  return t(key);
-}
-
-function finalReason(replay) {
+/* 候选比较脚注：把「谁赢、为什么」写成一句人话；优先级数字大者优先，所以用 > 不用 <。 */
+function candidateNote(replay) {
   const final = replay.final;
   if (final.kind === 'error_fallback') {
     const failed = replay.waves.find(wave => wave.failed);
@@ -677,13 +697,21 @@ function finalReason(replay) {
   if (final.kind === 'otherwise') return t('cv.tryFallbackReason');
   if (final.candidates.length > 1) {
     const winner = final.candidates.find(candidate => candidate.target_id === final.target_id) || final.candidates[0];
-    const rival = final.candidates.find(candidate => candidate.target_id !== final.target_id);
+    const rival = final.candidates.find(candidate => candidate.target_id !== final.target_id) || final.candidates[1];
+    if (!rival) return tf('cv.tryUniqueTarget', { target: nodeName(final.target_id), priority: final.priority });
+    if (winner.priority === rival.priority) {
+      return tf('cv.tryPriorityTie', { priority: winner.priority, winner: nodeName(winner.target_id) });
+    }
     return tf('cv.tryPriorityWin', {
       winner: winner.target_id, priority: winner.priority,
       rival: rival.target_id, rivalPriority: rival.priority
     });
   }
-  return tf('cv.tryUniqueTarget', { target: final.target_id, priority: final.priority });
+  return tf('cv.tryUniqueTarget', { target: nodeName(final.target_id), priority: final.priority });
+}
+
+function factHTML(labelKey, value) {
+  return '<span class="rtc-try-fact"><i>' + esc(t(labelKey)) + '</i><b>' + esc(value) + '</b></span>';
 }
 
 function candidateChips(replay) {
@@ -693,24 +721,62 @@ function candidateChips(replay) {
       '<span class="rtc-try-op">→</span>' +
       '<span class="rtc-try-pick">' + esc(t('cv.tryFallback')) + ' ' + esc(nodeName(final.target_id)) + '</span>';
   }
-  return final.candidates.map((candidate, index) =>
-    (index ? '<span class="rtc-try-op">&lt;</span>' : '') +
-    '<span class="rtc-try-cand' + (candidate.target_id === final.target_id ? ' is-win' : '') + '"' +
-    ' data-candidate="' + esc(candidate.target_id) + '" data-priority="' + esc(candidate.priority) + '">' +
-    esc(nodeName(candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i></span>').join('') +
-    '<span class="rtc-try-op">→</span><span class="rtc-try-pick">' +
-    esc(tf('cv.tryPick', { target: final.target_id })) + '</span>';
+  return final.candidates.map((candidate, index) => {
+    const win = candidate.target_id === final.target_id;
+    return (index ? '<span class="rtc-try-op">›</span>' : '') +
+      '<span class="rtc-try-cand' + (win ? ' is-win' : '') + '"' +
+      ' data-candidate="' + esc(candidate.target_id) + '" data-priority="' + esc(candidate.priority) + '"' +
+      ' title="' + esc(candidate.target_id) + '">' +
+      esc(nodeName(candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i>' +
+      (win ? '<em>' + esc(t('cv.tryWin')) + '</em>' : '') +
+      '</span>';
+  }).join('');
 }
 
 function renderResult(replay) {
   const host = byId('cvTryResult');
   if (!host) return;
-  if (!replay || !replay.final) {
+  if (!replay || (!replay.final && !replay.error)) {
     host.hidden = true;
     host.innerHTML = '';
     delete host.dataset.final;
     delete host.dataset.kind;
     delete host.dataset.selection;
+    delete host.dataset.error;
+    return;
+  }
+  /* error 与 final 独立维护：后续调度/上游失败既不清除 final，也不被 final 掩盖。 */
+  if (replay.error) host.dataset.error = 'routing_error';
+  else delete host.dataset.error;
+  if (!replay.final) {
+    /* 无 final 的失败回放：只读失败结论，不显示候选/优先级/波次等成功语义。 */
+    const error = replay.error;
+    host.hidden = false;
+    delete host.dataset.final;
+    host.dataset.kind = 'routing_error';
+    host.dataset.selection = 'routing_error';
+    host.innerHTML =
+      '<div class="rtc-try-res-h">' +
+        '<span class="rtc-try-kind is-fb">' + esc(t('cv.tryRoutingFailed')) + '</span>' +
+        '<span class="rtc-try-lbl">' + esc(t('cv.tryFinal')) + '</span>' +
+        '<b class="rtc-try-final">' + esc(error.error_class || t('cv.tryUnknown')) + '</b>' +
+        (error.stage ? '<span class="rtc-try-id">' + esc(error.stage) + '</span>' : '') +
+        '<span class="rtc-try-acts">' +
+          (isReadOnly() ? '' :
+            '<button type="button" class="btn sm" id="cvTryRerun" data-try-act="rerun">' +
+              esc(t('cv.tryRerun')) + '</button>' +
+            '<button type="button" class="btn sm" id="cvTryClear" data-try-act="clear">' +
+              esc(t('cv.tryClear')) + '</button>') +
+        '</span>' +
+      '</div>' +
+      '<div class="rtc-try-facts">' +
+        factHTML('cv.tryFactStage', error.stage || '—') +
+        factHTML('cv.tryFactError', error.error_class || '—') +
+      '</div>' +
+      (error.message
+        ? '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
+            esc(error.message) + '</span></div>'
+        : '');
     return;
   }
   const final = replay.final;
@@ -720,214 +786,54 @@ function renderResult(replay) {
   host.dataset.selection = final.sticky_hit ? 'sticky' : (final.selection_reason || final.kind);
   const kindClass = final.kind === 'target' && !final.sticky_hit ? 'ok'
     : final.kind === 'otherwise' ? 'cand' : 'fb';
+  const priorityText = final.priority === null || final.priority === undefined
+    ? '—' : 'p' + final.priority;
+  const waveText = tf('cv.tryWaves', { n: replay.waves.length }) + ' · ' +
+    tf('cv.tryCalls', { n: replay.waves.length });
+  /* 命中目标之后的失败是附加事实：复用失败分支的样式与文案，不重写 final。 */
+  const errorBadge = replay.error
+    ? '<span class="rtc-try-kind is-fb" data-routing-error>' +
+      esc(t('cv.tryRoutingFailed')) + '</span>'
+    : '';
+  const errorFacts = replay.error
+    ? factHTML('cv.tryFactStage', replay.error.stage || '—') +
+      factHTML('cv.tryFactError', replay.error.error_class || '—')
+    : '';
+  const errorMessage = replay.error && replay.error.message
+    ? '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
+      esc(replay.error.message) + '</span></div>'
+    : '';
   host.innerHTML =
     '<div class="rtc-try-res-h">' +
       '<span class="rtc-try-kind is-' + kindClass + '">' + esc(finalKindLabel(replay)) + '</span>' +
+      errorBadge +
       '<span class="rtc-try-lbl">' + esc(t('cv.tryFinal')) + '</span>' +
       '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' + esc(nodeName(final.target_id)) + '</b>' +
-      '<span class="rtc-try-sub">' + (final.model ? esc(final.model) + ' · ' : '') +
-        esc(tf('cv.tryPriorityMeta', { priority: final.priority })) + ' · ' + esc(selectionReason(replay)) + '</span>' +
-      '<span class="rtc-try-meta">' +
-        esc(tf('cv.tryWaves', { n: replay.waves.length })) + ' · ' +
-        esc(tf('cv.tryCalls', { n: replay.waves.length })) + ' · ' +
-        esc(ms(totalDuration(replay))) + '</span>' +
+      '<span class="rtc-try-id">' + esc(final.target_id) + '</span>' +
+      (final.model ? '<span class="rtc-try-model">' + esc(final.model) + '</span>' : '') +
       '<span class="rtc-try-acts">' +
-        '<button type="button" class="btn sm" id="cvTryDrawerBtn" data-try-act="drawer" aria-expanded="' +
-          (drawerOpen ? 'true' : 'false') + '">' +
-          esc(t(drawerOpen ? 'cv.tryDrawerHide' : 'cv.tryDrawerBtn')) + '</button>' +
-        '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
-          esc(t('cv.tryWavesLayout')) + '</button>' +
-        '<button type="button" class="btn sm" id="cvTryRerun" data-try-act="rerun">' +
-          esc(t('cv.tryRerun')) + '</button>' +
-        '<button type="button" class="btn sm" id="cvTryClear" data-try-act="clear">' +
-          esc(t('cv.tryClear')) + '</button>' +
+        (isReadOnly() ? '' :
+          '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
+            esc(t('cv.tryWavesLayout')) + '</button>' +
+          '<button type="button" class="btn sm" id="cvTryRerun" data-try-act="rerun">' +
+            esc(t('cv.tryRerun')) + '</button>' +
+          '<button type="button" class="btn sm" id="cvTryClear" data-try-act="clear">' +
+            esc(t('cv.tryClear')) + '</button>') +
       '</span>' +
     '</div>' +
-    '<div class="rtc-try-cmp"><span class="rtc-try-cmp-l">' + esc(t('cv.tryCandidates')) + '</span>' +
-      candidateChips(replay) + '</div>' +
-    '<div class="rtc-try-reason">' + esc(finalReason(replay)) + '</div>';
-}
-
-function waveSlotRows(replay, wave) {
-  return (replay.timeline || []).filter(row =>
-    row.kind === 'slot' && row.wave === wave && row.status === 'true');
-}
-
-function waveConditionTitle(replay, wave) {
-  const rows = waveSlotRows(replay, wave);
-  if (!rows.length) return t('cv.tryNoHitSlot');
-  return rows.map(row => nodeName(row.node_id) + '.' + row.port + ' ' + slotLine(row))
-    .join(t('cv.trySepClause'));
-}
-
-function renderHud(replay) {
-  const host = byId('cvReplayHud');
-  if (!host) return;
-  if (!replay || !replay.final) {
-    host.hidden = true;
-    host.innerHTML = '';
-    return;
-  }
-  host.hidden = false;
-  const waves = replay.waves.map(wave =>
-    '<span class="rtc-hud-wave' + (wave.failed ? ' is-failed' : '') + '" data-hud-wave="' + esc(wave.wave) +
-    '" title="' + esc(waveConditionTitle(replay, wave.wave)) + '">' +
-    esc(tf('cv.tryWave', { n: wave.wave })) + ' · ' +
-    esc(tf('cv.tryWaveQuestions', { n: wave.questions.length })) + ' · ' +
-    esc(wave.failed ? t('cv.tryWaveFailed') : ms(wave.duration_ms)) + '</span>').join('');
-  host.innerHTML = '<span class="rtc-hud-tt">' + esc(t('cv.tryHud')) + '</span>' + waves +
-    '<span class="rtc-hud-final' + (replay.final.kind === 'error_fallback' ? ' is-failed' : '') + '">→ ' +
-    esc(nodeName(replay.final.target_id)) + '</span>';
-}
-
-function rowLabel(kind) {
-  return t(ROW_LABEL_KEYS[kind] || 'cv.tryRow.slot');
-}
-
-function rowText(row) {
-  switch (row.kind) {
-    case 'condition': {
-      const matched = (row.matched || []).join(t('cv.trySepList'));
-      return matched
-        ? tf('cv.tryConditionRow', { matched: matched, value: String(row.value) })
-        : t('cv.tryConditionNone') + ' → ' + String(row.value);
-    }
-    case 'slot':
-      /* §6.9 示例是 `in_1 0.84 > 0.65 → true`：节点 id 在中间列，槽位号必须留在行文本里。 */
-      return (row.port ? row.port + ' ' : '') + slotLine(row);
-    case 'gate': {
-      const graph = graphNow();
-      const inputs = (row.inputs || []).map(input => {
-        const edge = graph && (graph.edges || []).find(item => item &&
-          item.target === row.node_id && item.target_port === input.port);
-        const label = edge
-          ? conditionText(edge, graph)
-          : conditionLabel(input.condition, { start: false });
-        return input.port + ' ' + rawText(input.raw) + ' ' + label + ' → ' + statusText(input.status);
-      }).join(t('cv.trySepClause'));
-      return tf('cv.tryGateRow', { operator: row.operator, inputs: inputs, value: String(row.value) });
-    }
-    case 'question': {
-      const pTop = row.p_top !== undefined && row.p_top !== null
-        ? row.p_top : (row.ports ? row.ports.p_top : undefined);
-      const margin = row.margin !== undefined && row.margin !== null
-        ? row.margin : (row.ports ? row.ports.margin : undefined);
-      if (row.selected !== undefined) {
-        return tf('cv.tryQuestionRow', {
-          selected: row.selected,
-          pTop: numOrDash(pTop), margin: numOrDash(margin)
-        });
-      }
-      if (row.ports && Object.prototype.hasOwnProperty.call(row.ports, 'yes')) {
-        return tf('cv.tryNoulRow', { yes: numOrDash(row.ports.yes), no: numOrDash(row.ports.no) });
-      }
-      return tf('cv.tryScoreRow', { value: numOrDash(row.ports ? row.ports.value : undefined) });
-    }
-    case 'activate':
-      return tf('cv.tryActivateRow', { port: row.via_port });
-    case 'fallback':
-      return tf('cv.tryFallbackRow', { target: row.target_id, reason: row.reason || '' });
-    case 'final':
-      return tf('cv.tryFinalRow', {
-        kind: t(KIND_KEYS[row.final_kind] || KIND_KEYS.target),
-        target: row.target_id, priority: row.priority
-      });
-    case 'sticky_hit':
-      return tf('cv.tryStickyModel', { model: row.model });
-    case 'scheduled':
-      return tf('cv.tryScheduledRow', { model: row.model, reason: row.reason || '' });
-    default:
-      return '';
-  }
-}
-
-function drawerGroupLabel(group) {
-  if (group === 'request') return t('cv.tryRequest');
-  if (group === 'final') return t('cv.trySelectTarget');
-  return tf('cv.tryWave', { n: group });
-}
-
-function rowsHTML(replay) {
-  let html = '';
-  let group = null;
-  (replay.timeline || []).forEach(row => {
-    if (!ROW_KINDS[row.kind]) return;
-    const rowGroup = (row.kind === 'fallback' || row.kind === 'final' ||
-      row.kind === 'scheduled' || row.kind === 'sticky_hit')
-      ? 'final' : (row.wave === 0 ? 'request' : row.wave);
-    if (rowGroup !== group) {
-      group = rowGroup;
-      html += '<div class="rtc-dw-group">' + esc(drawerGroupLabel(group)) + '</div>';
-    }
-    const edgeId = row.kind === 'slot' ? row.edge_id : '';
-    const nodeId = row.node_id || row.target_id || '';
-    /* 槽位行等价于一个按钮：鼠标、Enter、Space 都触发同一个定位动作（§6.11）。 */
-    const keyboard = edgeId ? ' tabindex="0" role="button"' : '';
-    html += '<div class="rtc-dw-row rtc-dw-row--' + esc(row.kind) + (edgeId ? ' is-clickable' : '') + '"' +
-      (edgeId ? ' data-trace-edge="' + esc(edgeId) + '"' : '') +
-      (nodeId ? ' data-trace-node="' + esc(nodeId) + '"' : '') + keyboard + '>' +
-      '<span class="rtc-dw-k">' + esc(rowLabel(row.kind)) + '</span>' +
-      '<span class="rtc-dw-n" title="' + esc(nodeId) + '">' + esc(nodeName(nodeId)) + '</span>' +
-      '<span class="rtc-dw-t">' + esc(rowText(row)) + '</span>' +
-      '</div>';
-  });
-  return html;
-}
-
-function closeDrawer() {
-  const wasOpen = drawerOpen;
-  drawerOpen = false;
-  renderDrawer(state);
-  if (state) renderResult(state);
-  return wasOpen;
-}
-
-function isDrawerOpen() {
-  return drawerOpen;
-}
-
-function renderDrawer(replay) {
-  const host = byId('cvTraceDrawer');
-  if (!host) return;
-  if (!replay || !replay.final || !drawerOpen) {
-    host.hidden = true;
-    host.innerHTML = '';
-    return;
-  }
-  host.hidden = false;
-  const waveCards = replay.waves.map(wave => {
-    const conds = waveSlotRows(replay, wave.wave);
-    return '<div class="rtc-dw-wave' + (wave.failed ? ' is-failed' : '') + '" data-wave-card="' + esc(wave.wave) + '">' +
-      '<div class="rtc-dw-wave-h"><b>' + esc(tf('cv.tryWave', { n: wave.wave })) + '</b>' +
-        '<span class="rtc-dw-badge' + (wave.failed ? ' is-failed' : '') + '">' +
-        esc(wave.failed ? t('cv.tryWaveFailed') : tf('cv.tryWaveQuestions', { n: wave.questions.length })) +
-        '</span></div>' +
-      '<div class="rtc-dw-wave-m">' + esc(tf('cv.tryWaveQuestions', { n: wave.questions.length })) +
-        ' · ' + esc(ms(wave.duration_ms)) + '</div>' +
-      (wave.failed && wave.error ? '<div class="rtc-dw-wave-e">' + esc(wave.error) + '</div>' : '') +
-      (conds.length
-        ? '<div class="rtc-dw-cond-h">' + esc(t('cv.tryWaveConditions')) + '</div>' +
-          conds.slice(0, 8).map(row => '<div class="rtc-dw-cond">' +
-            esc(nodeName(row.node_id) + '.' + row.port + ' ' + slotLine(row)) + '</div>').join('')
-        : '') +
-      '</div>';
-  }).join('');
-  host.innerHTML =
-    '<div class="rtc-trace-h">' +
-      '<span class="rtc-dw-tt">' + esc(t('cv.tryDrawer')) + '</span>' +
-      '<span class="rtc-dw-sub">' +
-        esc(tf('cv.tryDrawerSub', {
-          target: replay.final.target_id,
-          waves: replay.waves.length,
-          calls: replay.waves.length
-        })) + '</span>' +
-      '<button type="button" class="btn sm rtc-dw-close" data-try-act="drawer-close" aria-label="' +
-        esc(t('cv.tryDrawerHide')) + '">✕</button>' +
+    '<div class="rtc-try-facts">' +
+      factHTML('cv.tryFactPriority', priorityText) +
+      factHTML('cv.tryFactWaves', waveText) +
+      factHTML('cv.tryFactCost', ms(totalDuration(replay))) +
+      errorFacts +
     '</div>' +
-    '<div class="rtc-trace-body">' +
-      '<div class="rtc-trace-waves">' + waveCards + '</div>' +
-      '<div class="rtc-trace-rows">' + rowsHTML(replay) + '</div>' +
-    '</div>';
+    '<div class="rtc-try-cmp">' +
+      '<span class="rtc-try-cmp-l">' + esc(t('cv.tryCandidates')) + '</span>' +
+      candidateChips(replay) +
+      '<span class="rtc-try-note' + (final.kind === 'error_fallback' ? ' is-warn' : '') + '">' +
+        esc(candidateNote(replay)) + '</span>' +
+    '</div>' +
+    errorMessage;
 }
 
 /* ── run 生命周期 ─────────────────────────────────────────────── */
@@ -968,9 +874,6 @@ function collapsePanels() {
 
 function hideResultPanels() {
   renderResult(null);
-  renderHud(null);
-  drawerOpen = false;
-  renderDrawer(null);
 }
 
 /* 按波次整理后，未触发列没有节点 id 可读；补一个 world 坐标里的列头标签。 */
@@ -1027,6 +930,11 @@ function payloadFor(text, now) {
     text: text,
     session_id: ''
   };
+  /* 草稿的运行配置属于试算输入：有 runtime 时整组平铺进 payload，服务端不再按
+     活动树/数据库继承，试算结果必须与当前草稿看到的目录一致。 */
+  const runtime = typeof RTGraph.runtimeDocumentView === 'function'
+    ? RTGraph.runtimeDocumentView(tree) : null;
+  if (runtime) Object.assign(payload, runtime);
   if (now) payload.now = now;
   return payload;
 }
@@ -1071,8 +979,6 @@ async function run(text, options) {
     rebuilt.id = token;
     rebuilt.request = { text: inputText, now: now };
     state = rebuilt;
-    /* 执行轨迹直接展示：一次试算落地即展开执行区，不需要再点「查看轨迹」。 */
-    drawerOpen = true;
     apply(rebuilt);
     return true;
   } catch (error) {
@@ -1205,52 +1111,9 @@ function onAction(event) {
   const action = event.target.closest('[data-try-act]');
   if (!action) return;
   const name = action.dataset.tryAct;
-  if (name === 'drawer') {
-    drawerOpen = !drawerOpen;
-    renderDrawer(state);
-    if (state) renderResult(state);
-    return;
-  }
-  if (name === 'drawer-close') {
-    closeDrawer();
-    return;
-  }
   if (name === 'rerun') { rerun(); return; }
   if (name === 'clear') { clear(); return; }
   if (name === 'waves') { layoutByWaves(); }
-}
-
-/* 执行区（轨迹）只做定位：把画布平移到该边并高亮选中，不打开条件编辑器。
-   改配置属于编辑区动作，必须回到画布/检查器入口。 */
-function locateTraceEdge(edgeId) {
-  const kit = kitNow();
-  if (!kit || !edgeId) return;
-  kit.focusEdge(edgeId);
-}
-
-function onDrawerClick(event) {
-  const close = event.target.closest('[data-try-act="drawer-close"]');
-  if (close) {
-    closeDrawer();
-    return;
-  }
-  const kit = kitNow();
-  if (!kit) return;
-  const row = event.target.closest('[data-trace-edge]');
-  if (row) {
-    locateTraceEdge(row.dataset.traceEdge);
-    return;
-  }
-  const nodeRow = event.target.closest('[data-trace-node]');
-  if (nodeRow) kit.focusNode(nodeRow.dataset.traceNode);
-}
-
-function onDrawerKeydown(event) {
-  if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') return;
-  const row = event.target.closest('[data-trace-edge]');
-  if (!row) return;
-  event.preventDefault();
-  locateTraceEdge(row.dataset.traceEdge);
 }
 
 function init() {
@@ -1296,22 +1159,13 @@ function init() {
   }
   const result = byId('cvTryResult');
   if (result) result.addEventListener('click', onAction);
-  const drawer = byId('cvTraceDrawer');
-  if (drawer) {
-    drawer.addEventListener('click', onDrawerClick);
-    drawer.addEventListener('keydown', onDrawerKeydown);
-  }
 }
 
 function refresh() {
   renderChips();
   renderWaveHeader();
   if (state) apply(state);
-  else {
-    renderResult(null);
-    renderHud(null);
-    if (!drawerOpen) renderDrawer(null);
-  }
+  else renderResult(null);
 }
 
 function samples() {
@@ -1335,7 +1189,5 @@ export {
   refresh,
   samples,
   layoutByWaves,
-  closeDrawer,
-  isDrawerOpen,
   current
 };

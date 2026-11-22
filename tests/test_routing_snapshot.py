@@ -7,17 +7,18 @@ import pytest
 
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.config import Settings
+from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.compiled import CompiledGraph, edge_order_key, compile_graph
 from router.routing.graph.model import graph_from_dict
 from router.routing.tree import tree_from_dict
 from router.routing.reloader import GraphReloadWorker
-from router.routing.snapshot import SnapshotPublisher, load_snapshot
+from router.routing.snapshot import SnapshotPublisher, build_snapshot_for_tree, load_snapshot
 from router.store.db import connect, migrate
 from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, tree_dict
+from tests.routing_fixtures import graph_dict, runtime_dict, tree_dict
 
 
 def direct_graph(model):
@@ -79,6 +80,73 @@ def test_snapshot_loads_current_config_and_revision_excludes_secrets(conn, repo)
     assert "upstream-secret" not in snapshot.content
     assert "jev-secret" not in snapshot.content
     assert snapshot.tree_revision == snapshot.tree.tree_revision
+
+
+def portable_tree(values=None):
+    raw = tree_dict(root=direct_graph("fast"))
+    raw.update(runtime_dict() if values is None else values)
+    return tree_from_dict(raw)
+
+
+def test_embedded_runtime_drives_snapshot_instead_of_database(conn):
+    snapshot = build_snapshot_for_tree(conn, portable_tree())
+
+    assert set(snapshot.backends) == {"fast"}
+    assert snapshot.backends["fast"].url == "http://json-only.test/v1/chat/completions"
+    assert snapshot.backends["fast"].upstream_name == "json-upstream"
+    assert snapshot.backends["fast"].headers == {}
+    assert snapshot.capabilities == {"fast": "来自 JSON 的能力"}
+    assert snapshot.jev.base_url == "http://jev-json.test"
+    assert snapshot.jev.model == "json-jev"
+    assert snapshot.jev.api_key == ""
+    assert snapshot.jev_input_tokens == 1024
+    assert snapshot.jev_context_tokens == 4096
+    assert {period.name for period in snapshot.time_periods} == {"peak", "normal", "offpeak"}
+
+
+def test_matching_embedded_endpoints_reuse_stored_keys_without_serializing_them(conn):
+    values = runtime_dict()
+    values["backends"]["providers"][0]["base_url"] = "http://upstream.test/v1/"
+    values["jev"]["base_url"] = "http://jev.test/"
+    values["jev"]["model"] = "NeoHorse-Jev-4B"
+
+    snapshot = build_snapshot_for_tree(conn, portable_tree(values))
+
+    assert snapshot.backends["fast"].headers["Authorization"] == "Bearer upstream-secret"
+    assert snapshot.jev.api_key == "jev-secret"
+    assert "upstream-secret" not in snapshot.content
+    assert "jev-secret" not in snapshot.content
+
+
+def test_mismatched_embedded_endpoints_use_environment_keys_only(conn, monkeypatch):
+    monkeypatch.setenv("JSON_PROVIDER_API_KEY", "json-provider-env-secret")
+    monkeypatch.setenv("ROUTER_JEV_API_KEY", "json-jev-env-secret")
+
+    snapshot = build_snapshot_for_tree(conn, portable_tree())
+
+    assert snapshot.backends["fast"].headers["Authorization"] == "Bearer json-provider-env-secret"
+    assert snapshot.jev.api_key == "json-jev-env-secret"
+    assert "upstream-secret" not in snapshot.content
+    assert "jev-secret" not in snapshot.content
+
+
+def test_embedded_empty_catalog_rejects_model_even_when_database_has_it(conn):
+    values = runtime_dict()
+    values["backends"]["models"] = []
+
+    issues = tree_issues(conn, portable_tree(values))
+
+    assert "unknown_model" in {issue.code for issue in issues}
+
+
+def test_embedded_null_jev_rejects_questions_even_when_database_has_jev(conn):
+    raw = tree_dict()
+    raw.update(runtime_dict(jev=None))
+    tree = tree_from_dict(raw)
+
+    issues = tree_issues(conn, tree)
+
+    assert "decision_service_unavailable" in {issue.code for issue in issues}
 
 
 def test_publisher_swaps_whole_snapshot_without_mutating_old_one(conn, repo):

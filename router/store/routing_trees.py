@@ -4,7 +4,7 @@ import hashlib
 import os
 import re
 import tempfile
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,6 +34,72 @@ class GraphConflictError(GraphStorageError):
     def __init__(self, actual_document_sha256: str | None):
         super().__init__("graph_conflict")
         self.actual_document_sha256 = actual_document_sha256
+
+
+@dataclass(frozen=True)
+class _StagedGraph:
+    """一份待替换的图：原字节、目标字节与同目录暂存文件。"""
+
+    path: Path
+    original_bytes: bytes
+    target_bytes: bytes
+    staged_path: Path
+
+
+class GraphBatch:
+    """多图写入批次：预检/暂存全部完成后才逐份替换，失败可整体回滚。
+
+    提交只替换文件，不在内部自行回滚：调用方负责在数据库事务失败时调用
+    ``rollback()``，并在回滚失败时刷新快照（见 ConfigurationService）。
+    """
+
+    def __init__(self, repo: "RoutingTreeRepo", entries: list[_StagedGraph]):
+        self.repo = repo
+        self.entries = entries
+        self.committed_paths: set[Path] = set()
+        self._active = True
+
+    def commit(self) -> None:
+        if not self._active:
+            raise GraphStorageError("graph batch is closed")
+        try:
+            for entry in self.entries:
+                self.repo._replace_staged(entry.staged_path, entry.path)
+                self.committed_paths.add(entry.path)
+        except OSError as exc:
+            raise GraphStorageError("graph batch write failed") from exc
+
+    def rollback(self) -> None:
+        """恢复本批次已替换的文件；只覆盖仍等于本批次目标字节的文件。"""
+        if not self._active:
+            return
+        failures: list[tuple[Path, BaseException]] = []
+        for entry in reversed(self.entries):
+            if entry.path not in self.committed_paths:
+                continue
+            try:
+                current = entry.path.read_bytes()
+                if current != entry.target_bytes:
+                    raise GraphStorageError(
+                        f"graph changed during rollback: {entry.path.stem}")
+                self.repo._atomic_write(entry.path, entry.original_bytes)
+                self.committed_paths.remove(entry.path)
+            except (OSError, GraphStorageError) as exc:
+                failures.append((entry.path, exc))
+        self.discard()
+        if failures:
+            raise GraphStorageError(
+                "graph rollback failed; snapshot refresh required") from failures[0][1]
+
+    def discard(self) -> None:
+        if not self._active:
+            return
+        self._active = False
+        for entry in self.entries:
+            try:
+                entry.staged_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 class RoutingTreeRepo:
@@ -120,6 +186,36 @@ class RoutingTreeRepo:
         self._atomic_write(path, graph_document_bytes(replace(tree, enabled=active_id == tree.id)))
         return self._read_tree(path, tree.id, active_id)
 
+    def stage_updates(self, updates) -> GraphBatch:
+        """预检所有基线哈希并暂存目标文档，返回可提交/回滚的批次。
+
+        顺序固定为非活动图在前、活动图最后：中途失败或崩溃时，当前生效的
+        运行配置仍是旧活动图，不会出现半份新配置对外生效。
+        """
+        self._require_writer()
+        active_id = self.active_id()
+        entries: list[_StagedGraph] = []
+        batch = GraphBatch(self, entries)
+        try:
+            ordered = sorted(updates, key=lambda item: item[0].id == active_id)
+            for tree, expected_sha256 in ordered:
+                self._validate_id(tree.id)
+                path = self.graphs / f"{tree.id}.json"
+                try:
+                    original = path.read_bytes()
+                except FileNotFoundError:
+                    original = None
+                actual = hashlib.sha256(original).hexdigest() if original is not None else None
+                if not expected_sha256 or actual != expected_sha256:
+                    raise GraphConflictError(actual)
+                target = graph_document_bytes(replace(tree, enabled=active_id == tree.id))
+                staged_path = self._stage_file(path, target)
+                entries.append(_StagedGraph(path, original, target, staged_path))
+            return batch
+        except BaseException:
+            batch.discard()
+            raise
+
     def copy(self, source_id: str, new_id: str, new_name: str) -> RoutingTree:
         source = self.get(source_id)
         if source is None:
@@ -166,17 +262,35 @@ class RoutingTreeRepo:
             raise GraphStorageError(f"invalid tree id: {tree_id!r}")
 
     @staticmethod
-    def _atomic_write(path: Path, content: bytes) -> None:
+    def _stage_file(path: Path, content: bytes) -> Path:
+        """同目录暂存完整内容并 fsync；失败时清理临时文件。"""
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
+            return Path(temporary)
         except BaseException:
             try:
                 os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @staticmethod
+    def _replace_staged(staged_path: Path, path: Path) -> None:
+        os.replace(staged_path, path)
+
+    @classmethod
+    def _atomic_write(cls, path: Path, content: bytes) -> None:
+        # 类级调用：批次故障注入（实例属性）不得影响回滚路径。
+        staged = cls._stage_file(path, content)
+        try:
+            cls._replace_staged(staged, path)
+        except BaseException:
+            try:
+                staged.unlink()
             except FileNotFoundError:
                 pass
             raise

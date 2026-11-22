@@ -45,6 +45,7 @@
         <span class="pill ok" id="cvEnabled" hidden><span class="dot"></span><span id="cvEnabledLabel" data-i18n="cv.enabled"></span></span>
         <span class="pill ok" id="cvClean"><span class="dot"></span><span data-i18n="cv.saved"></span></span>
         <span class="pill warn" id="cvDirty" data-kind="clean" hidden></span>
+        <span class="pill" id="cvSnapshotBadge" data-i18n="cv.snapshotBadge" hidden></span>
       </div>
     </div>
     <div class="rtc-headr">
@@ -130,12 +131,9 @@
     <div class="rtc-minimap rtc-overlay" id="cvMinimap" data-overlay title="小地图">
       <svg id="cvMinimapSvg" viewBox="0 0 168 104" aria-hidden="true"></svg>
     </div>
-
-    <!-- 回放 HUD · 当前运行的波次胶囊（波次头带命中槽位条件 tooltip） -->
-    <div class="rtc-hud" id="cvReplayHud" hidden></div>
   </div>
 
-  <!-- 执行区 · 试算输入/结论 + 执行轨迹；停靠在画布下方，与编辑区完全分离 -->
+  <!-- 执行区 · 试算输入/结论；停靠在画布下方，与编辑区完全分离 -->
   <section class="rtc-exec" id="cvExecZone">
     <section class="rtc-trybar" id="cvTryBar" data-i18n-aria="cv.try">
       <div class="rtc-try-row">
@@ -147,7 +145,6 @@
       <!-- 试算结论（成功后展开） -->
       <div class="rtc-try-res" id="cvTryResult" hidden></div>
     </section>
-    <div class="rtc-trace" id="cvTraceDrawer" role="region" data-i18n-aria="cv.tryDrawer" hidden></div>
   </section>
 </main>
 

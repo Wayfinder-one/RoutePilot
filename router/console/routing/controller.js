@@ -32,9 +32,15 @@ function newTreeId() {
 
 /* 服务端树 / 本地新草稿统一补齐 envelope 字段与缺失坐标。 */
 function normaliseTree(raw) {
+  const source = raw || {};
   /* API envelope 的坐标在顶层 canvas：先分发回内部 node.position 再做布局补位。 */
-  const tree = RTGraph.dispatchCanvas(RTGraph.clone(raw || {}));
+  const tree = RTGraph.dispatchCanvas(RTGraph.clone(source));
   delete tree.canvas;
+  /* 运行配置在内部树里统一成嵌套 runtime：Python tree_to_dict 的四字段是扁平的，
+     先投影成契约形状再剔除顶层键；旧文档（无 runtime）显式置 null。 */
+  const runtime = RTGraph.runtimeDocumentView(source);
+  RTGraph.RUNTIME_FIELDS.forEach(field => { delete tree[field]; });
+  tree.runtime = runtime;
   tree.root = tree.root || { id: 'root', type: 'graph', nodes: [], edges: [] };
   if (!tree.name) tree.name = t('cv.default.name');
   if (!tree.timezone) tree.timezone = 'Asia/Shanghai';
@@ -142,6 +148,9 @@ export class RoutingController {
     tree.tree_revision = savedTree.tree_revision || '';
     tree.updated_at = savedTree.updated_at || '';
     tree.document_sha256 = savedTree.document_sha256 || '';
+    /* 服务端保存时物化的运行配置就是新基线：不同步回当前草稿的话，
+       刚保存的旧草稿（无 runtime）会立刻被判成 behavior dirty。 */
+    tree.runtime = RTGraph.runtimeDocumentView(savedTree);
     this.treeId = tree.id;
     /* 回包是保存基线：坐标同样在顶层 canvas，先分发回内部 position 再入基线，
        否则 clean 草稿会被判成 layout dirty。 */
@@ -165,7 +174,9 @@ export class RoutingController {
     const targetTree = store.tree;
     const targetId = this.treeId;
     const isNew = !store.saved;
-    /* 线上 payload 与文件文档同一格式：坐标在顶层 canvas，节点对象不带 position。 */
+    /* 线上 payload 与文件文档同一格式：坐标在顶层 canvas，节点对象不带 position；
+       自包含运行配置按四字段平铺（旧草稿没有 runtime 时发送 runtime:null，由服务端
+       清除当前图继承后按活动图/数据库物化）。 */
     const payload = RTGraph.collectCanvas(RTGraph.clone({
       id: this.treeId,
       name: String(store.tree.name == null ? '' : store.tree.name).trim(),
@@ -173,6 +184,11 @@ export class RoutingController {
       sticky: RTGraph.clone(store.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
       root: store.tree.root,
     }));
+    /* 旧草稿没有 runtime：显式发送 null，让服务端丢弃“当前图继承”再按活动图/
+       数据库物化；省略该键会继承该图自己的旧配置。 */
+    const runtime = RTGraph.runtimeDocumentView(store.tree);
+    if (runtime) Object.assign(payload, runtime);
+    else payload.runtime = null;
     if (!isNew) payload.base_document_sha256 = store.saved.document_sha256 || '';
     try {
       const result = isNew
@@ -331,8 +347,12 @@ export class RoutingController {
       /* 示例是整图替换（不走 loadTree）：应用前让在途的 switch 过期，
          否则旧回包会在示例落地后把草稿盖回去。 */
       this.loadSeq += 1;
-      /* 一次历史操作替换整张图；envelope 的 id/enabled/name/timezone/sticky 保持不变。 */
-      if (this.hooks.change('behavior', tree => { tree.root = RTGraph.clone(parsed.tree.root); }) === false) {
+      /* 示例是完整自包含文档：整图替换时连运行配置一起换（旧示例文件没有 runtime
+         时就是 null，不能残留载入前的配置）。 */
+      if (this.hooks.change('behavior', tree => {
+        tree.root = RTGraph.clone(parsed.tree.root);
+        tree.runtime = RTGraph.clone(parsed.tree.runtime);
+      }) === false) {
         return false;
       }
       this.hooks.fitAfterReplace();
@@ -399,13 +419,16 @@ export class RoutingController {
       this.hooks.toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
       return false;
     }
-    /* 导入同样整图替换（不走 loadTree）：应用前让在途的 switch 过期。 */
+    /* 导入同样整图替换（不走 loadTree）：应用前让在途的 switch 过期。
+       运行配置也在这一次历史里整体替换 —— 导入旧文档（无 runtime）必须清空
+       载入前的 runtime，撤销能恢复。 */
     this.loadSeq += 1;
     if (this.hooks.change('behavior', tree => {
       tree.name = result.tree.name;
       tree.timezone = result.tree.timezone;
       tree.sticky = RTGraph.clone(result.tree.sticky);
       tree.root = RTGraph.clone(result.tree.root);
+      tree.runtime = RTGraph.clone(result.tree.runtime);
     }) === false) return false;
     this.hooks.fitAfterReplace();
     this.hooks.toast(t('cv.toastImported'));

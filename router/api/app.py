@@ -110,9 +110,16 @@ def _install_admin_auth(app: FastAPI, settings: Settings) -> None:
 def _seed_jev(conn, state) -> None:
     """boot 种子：环境配置的 JEV 决策服务经真实 ConfigurationService.save_jev 落库。
 
+    - 活动图内嵌运行配置（``tree.runtime is not None``）时完全跳过：自包含 JSON
+      是事实源，环境种子不得覆盖图内 JEV（``jev: null`` 也视为图内配置已定）。
+    - 旧图/无活动图沿用原种子逻辑（已有配置行则不动；环境未配置则跳过）。
+
     与路由层写用例同一次序（校验活动图 → 提交 → 候选发布，发布为纯内存替换），
     不再"先提交后校验"。活动图在校验失败时保持旧 boot 的降级语义：不中止启动，
     仅跳过本次种子（差别：未通过校验的配置不再残留数据库）。"""
+    active = state.graph_repo.active()
+    if active is not None and active.runtime is not None:
+        return
     if JevConfigRepo(conn).load() is not None:
         return
     settings = state.settings

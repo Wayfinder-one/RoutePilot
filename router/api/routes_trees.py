@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -20,23 +21,18 @@ from router.api.deps import get_conn, get_tree_repo
 from router.api.trace_presenter import present_trace
 from router.control.graphs import GraphPatch, GraphService, graph_parse_failed
 from router.api.issue_presenter import issues_payload
+from router.control.runtime import effective_runtime, runtime_for_tree, snapshot_parts
 from router.control.validation import tree_issues
 from router.jev.serialization import answer_to_dict
-from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.graph.validate import validate_graph_structure
+from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, Sticky, tree_from_dict, tree_to_dict
-from router.routing.snapshot import (
-    build_snapshot,
-    model_capability,
-    read_jev_window,
-)
+from router.routing.snapshot import build_snapshot
 from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
-from router.store.jev_config import JevConfigRepo
-from router.store.repositories import ModelRepo, TimePeriodRepo, new_id
+from router.store.repositories import new_id
 from router.store.routing_trees import RoutingTreeRepo
-from router.upstream.catalog import load_backends
 
 router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -87,7 +83,11 @@ class TreeUpsertIn(BaseModel):
     PUT 时字段缺失 = 继承已存值；PUT 的显式 null 按重构前的 dict 语义处理（name
     清空、root/timezone 解析失败 422、sticky 重置为默认、id → 422 tree id
     mismatch）；POST 的 null 语义同样维持 base（如 id=null 生成新 id）。路由用
-    ``model_fields_set`` 区分字段缺失与显式 null。"""
+    ``model_fields_set`` 区分字段缺失与显式 null。
+
+    ``runtime`` 不是文件字段，而是写用例的控制字段：只允许显式 null，表示
+    「丢弃当前图内嵌配置，再由服务端按活动图/数据库物化」。非 null 值或与四个
+    扁平 runtime 字段同时出现都拒绝，避免出现两套来源互相覆盖。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -97,6 +97,11 @@ class TreeUpsertIn(BaseModel):
     canvas: Any = None
     sticky: Any = None
     timezone: Any = None
+    backends: Any = None
+    jev: Any = None
+    jev_window: Any = None
+    time_periods: Any = None
+    runtime: Any = None
     base_document_sha256: Any = None
 
 
@@ -120,6 +125,10 @@ class TryIn(BaseModel):
     canvas: Any = None
     timezone: Any = None
     sticky: Any = None
+    backends: Any = None
+    jev: Any = None
+    jev_window: Any = None
+    time_periods: Any = None
     text: Any = None
     session_id: Any = None
     now: Any = None
@@ -128,6 +137,16 @@ class TryIn(BaseModel):
 @router.get("/trees")
 def get_trees(request: Request, trees: RoutingTreeRepo = Depends(get_tree_repo)):
     return _trees_payload(request, trees)
+
+
+def _validate_runtime_control(body: TreeUpsertIn) -> None:
+    """`runtime` 只能是显式 null，且不能与四个扁平 runtime 字段同时出现。"""
+    if "runtime" not in body.model_fields_set:
+        return
+    if body.runtime is not None:
+        raise HTTPException(422, detail="runtime must be null; use the four runtime fields")
+    if body.model_fields_set & RUNTIME_FIELDS:
+        raise HTTPException(422, detail="runtime cannot accompany runtime fields")
 
 
 @router.post("/trees", status_code=201)
@@ -143,6 +162,13 @@ def create_tree(
     }
     if "timezone" in body.model_fields_set:
         payload["timezone"] = body.timezone
+    runtime_fields = body.model_fields_set & RUNTIME_FIELDS
+    _validate_runtime_control(body)
+    if runtime_fields:
+        payload.update({
+            field: getattr(body, field)
+            for field in runtime_fields
+        })
     tree = _parse_tree(payload)
     created = _service(request, conn, trees).create(tree)
     return {"tree": tree_to_dict(created), "snapshot_revision": _published_revision(request)}
@@ -176,6 +202,15 @@ def update_tree(
     for field in ("root", "canvas", "sticky", "timezone"):
         if field in fields:
             changes[field] = getattr(body, field)
+    runtime_fields = fields & RUNTIME_FIELDS
+    _validate_runtime_control(body)
+    if "runtime" in fields:
+        changes["runtime"] = None
+    elif runtime_fields:
+        changes["runtime"] = {
+            field: getattr(body, field)
+            for field in runtime_fields
+        }
     updated = _service(request, conn, trees).update(
         tree_id, GraphPatch(**changes), base_document_sha256=body.base_document_sha256)
     return {
@@ -235,37 +270,34 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
         canvas = canvas_to_dict(stored.root)
     else:
         canvas = None
+    payload = {
+        "id": stored.id if stored else "draft",
+        "name": stored.name if stored else "",
+        "enabled": False,
+        "root": root if root is not None else graph_to_dict(stored.root),
+        "canvas": canvas,
+        "timezone": body.timezone if "timezone" in fields else timezone_default,
+        "sticky": body.sticky if "sticky" in fields else {
+            "enabled": sticky_default.enabled, "ttl_seconds": sticky_default.ttl_seconds,
+        },
+    }
+    runtime_fields = fields & RUNTIME_FIELDS
+    if runtime_fields:
+        payload.update({field: getattr(body, field) for field in runtime_fields})
+    elif stored is not None and stored.runtime is not None:
+        payload.update(runtime_to_dict(stored.runtime))
     try:
-        return tree_from_dict({
-            "id": stored.id if stored else "draft",
-            "name": stored.name if stored else "",
-            "enabled": False,
-            "root": root if root is not None else graph_to_dict(stored.root),
-            "canvas": canvas,
-            "timezone": body.timezone if "timezone" in fields else timezone_default,
-            "sticky": body.sticky if "sticky" in fields else {
-                "enabled": sticky_default.enabled, "ttl_seconds": sticky_default.ttl_seconds,
-            },
-        })
+        return tree_from_dict(payload)
     except ValueError as exc:
         raise HTTPException(422, detail=issues_payload(graph_parse_failed(exc))) from exc
 
 
 def _try_snapshot(conn: sqlite3.Connection, tree: RoutingTree):
-    """草稿快照：与线上 snapshot 使用同一 JEV 窗口配置，但绝不替换 app.state.snapshot。
-
-    调用前 ``try_tree`` 已通过结构校验；只有通过校验的图才编译静态拓扑。
-    """
-    models = ModelRepo(conn).list()
-    input_tokens, context_tokens = read_jev_window(conn)
+    """草稿快照：与线上 snapshot 使用同一运行配置，但不替换 app.state.snapshot。"""
+    runtime = runtime_for_tree(conn, tree)
     return build_snapshot(
         tree=tree,
-        backends=load_backends(conn),
-        time_periods=[TimePeriod.from_dict(period) for period in TimePeriodRepo(conn).load()],
-        jev=JevConfigRepo(conn).load(),
-        capabilities={row["id"]: model_capability(row) for row in models},
-        jev_input_tokens=input_tokens,
-        jev_context_tokens=context_tokens,
+        **snapshot_parts(conn, runtime),
         compiled=compile_graph(tree.root),
     )
 
@@ -303,6 +335,8 @@ async def try_tree(
             raise HTTPException(422, detail="try tree_id must be a nonempty string")
         stored = _tree_or_404(trees, tree_id)
     tree = draft_tree(body, stored)
+    if tree.runtime is None:
+        tree = replace(tree, runtime=effective_runtime(conn, trees))
     text = body.text
     if not isinstance(text, str):
         raise HTTPException(422, detail="try text must be a string")

@@ -196,6 +196,49 @@ test('load resets both history stacks and the saved baseline', () => {
   assert.equal(store.dirtyKind, 'behavior');
 });
 
+test('runtime travels with the draft and undo/redo keep deep copies', () => {
+  const store = new DraftStore();
+  const tree = createMinimalTree('qwen3-8b');
+  /* 新草稿不带 runtime（旧草稿路径：保存时由服务端物化）。 */
+  assert.equal('runtime' in tree, false, 'a brand-new draft must not carry a runtime');
+  tree.runtime = {
+    backends: { providers: [], models: [] },
+    jev: null,
+    jev_window: { input_tokens: 1024, context_tokens: 4096 },
+    time_periods: [{ name: 'peak', days: [0, 1, 2, 3, 4, 5, 6], start: '08:00', end: '11:00' }]
+  };
+  store.load(tree, { saved: true });
+  assert.equal(store.dirtyKind, 'clean');
+
+  assert.equal(store.change('behavior', draft => {
+    draft.runtime.time_periods = [{ name: 'normal', days: [0], start: '11:00', end: '18:00' }];
+  }), true);
+  assert.equal(store.dirtyKind, 'behavior');
+
+  /* 历史快照是深拷贝：撤销后改当前树不能回写到 before 快照。 */
+  const before = store.undoStack[0].before;
+  assert.equal(store.undo(), true);
+  assert.equal(store.tree.runtime.time_periods[0].name, 'peak');
+  store.tree.runtime.time_periods[0].name = 'mutated-after-undo';
+  assert.equal(before.runtime.time_periods[0].name, 'peak', 'undo history kept a live runtime reference');
+
+  assert.equal(store.redo(), true);
+  assert.equal(store.tree.runtime.time_periods[0].name, 'normal');
+  assert.equal(store.dirtyKind, 'behavior');
+
+  /* 窗口数值随 runtime 一起参与 dirty 判定。 */
+  assert.equal(store.change('behavior', draft => { draft.runtime.jev_window.input_tokens = 256; }), true);
+  assert.equal(store.undo(), true);
+  assert.equal(store.tree.runtime.jev_window.input_tokens, 1024);
+
+  /* 清空 runtime（导入旧文档的等价动作）是可撤销的 behavior 变更。 */
+  assert.equal(store.change('behavior', draft => { draft.runtime = null; }), true);
+  assert.equal(store.tree.runtime, null);
+  assert.equal(store.undo(), true);
+  assert.deepEqual(store.tree.runtime.time_periods.map(period => period.name), ['normal']);
+  assert.equal(store.tree.runtime.jev_window.input_tokens, 1024);
+});
+
 test('subscribers observe load/change/undo/redo/saved events', () => {
   const store = new DraftStore();
   const seen = [];

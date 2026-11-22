@@ -13,9 +13,15 @@ from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
+from router.store.jev_config import JevConfigRepo
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, test_settings, tree_dict
+from tests.routing_fixtures import (
+    graph_dict,
+    portable_tree_dict,
+    test_settings,
+    tree_dict,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JEV_ENV = {"jev_url": "http://jev.test", "jev_model": "NeoHorse-Jev-4B"}
@@ -118,6 +124,28 @@ def test_environment_jev_config_is_seeded_once(tmp_path):
     app = create_app(settings)
     assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
     assert app.state.snapshot.jev.api_key == "secret"
+
+
+def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
+    """活动图已有内嵌 JEV 时，环境种子不得覆盖 JSON，也不写管理表。"""
+    settings = test_settings(tmp_path, **JEV_ENV)
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    document = portable_tree_dict("main")
+    repo.create(tree_from_dict(document))
+    repo.enable("main")
+
+    app = create_app(settings)
+
+    assert app.state.snapshot.jev.base_url == "http://jev-json.test"
+    assert app.state.snapshot.jev.model == "json-jev"
+    conn = connect(settings.db_path)
+    try:
+        assert JevConfigRepo(conn).load() is None
+    finally:
+        conn.close()
+    stored = app.state.graph_repo.get("main")
+    assert stored.runtime.jev.model == "json-jev"
 
 
 def shipped_graph(name):

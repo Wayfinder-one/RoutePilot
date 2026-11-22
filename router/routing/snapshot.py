@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
+from router.control.runtime import enable_context_for_runtime, snapshot_parts
 from router.control.validation import build_enable_context
 from router.jev.config import JevSettings
 from router.jev.window import (
@@ -177,13 +178,32 @@ def read_jev_window(conn) -> tuple[int, int]:
 
 
 def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
+    """活动树快照：内嵌运行配置优先，旧图/无活动图回退数据库装配。
+
+    两条路径的校验上下文严格分开：只有 ``tree.runtime is not None`` 才使用
+    图内配置；旧图继续使用宽松的数据库上下文，避免旧库非法历史声明阻断启动。
+    """
     compiled = None
+    if tree is not None and tree.runtime is not None:
+        issues = validate_graph_for_enable(
+            tree, enable_context_for_runtime(tree.runtime))
+        if issues:
+            codes = ",".join(sorted({issue.code for issue in issues}))
+            raise GraphStorageError(f"invalid active graph: {codes}")
+        # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
+        compiled = compile_graph(tree.root)
+        return build_snapshot(
+            tree=tree,
+            **snapshot_parts(conn, tree.runtime),
+            compiled=compiled,
+        )
+
+    # ── 旧图（无内嵌运行配置）与无活动图：沿用原数据库装配路径 ──────────
     if tree is not None:
         issues = validate_graph_for_enable(tree, build_enable_context(conn))
         if issues:
             codes = ",".join(sorted({issue.code for issue in issues}))
             raise GraphStorageError(f"invalid active graph: {codes}")
-        # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
         compiled = compile_graph(tree.root)
     input_tokens, context_tokens = read_jev_window(conn)
     return build_snapshot(

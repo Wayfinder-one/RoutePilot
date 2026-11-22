@@ -22,7 +22,7 @@ import pytest
 
 from router.routing.document import parse_graph_document
 from router.routing.graph.validate import validate_graph_structure
-from router.routing.tree import tree_revision_of
+from router.routing.tree import tree_behavior_dict, tree_revision_of
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "graph_contracts.json"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -40,6 +40,9 @@ REQUIRED_FIXTURES = {
     "valid-small-float-threshold",
     "valid-envelope-variation",
     "valid-old-field-control",
+    "valid-self-contained-runtime",
+    "invalid-runtime-api-key",
+    "invalid-runtime-nested-secret",
 }
 
 FIXTURES = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -169,3 +172,38 @@ def test_python_matches_the_shared_contract(fixture: dict) -> None:
             f"Python behavior hash for {fixture['name']} does not match the fixture; "
             "the Node test asserts the same value"
         )
+
+
+def test_self_contained_runtime_fixture_pins_the_behavior_normalization() -> None:
+    """自包含 fixture 的 canonical 规则：四字段、整数值浮点归一、密钥字段拒绝。"""
+
+    def load(document: dict):
+        return parse_graph_document(
+            json.dumps(document, ensure_ascii=False).encode("utf-8"),
+            tree_id="contract",
+            enabled=False,
+            updated_at="",
+            document_sha256="",
+        )
+
+    document = BY_NAME["valid-self-contained-runtime"]["document"]
+    assert {"backends", "jev", "jev_window", "time_periods"} <= set(document)
+    assert document["jev"]["timeout_seconds"] == 10.0
+    assert document["backends"]["models"][0]["profile"]["context_window"] == 131072
+    assert "api_key" not in document["backends"]["providers"][0]
+
+    tree = load(document)
+    assert tree.runtime is not None
+    behavior = tree_behavior_dict(tree)
+    assert behavior["jev"]["timeout_seconds"] == 10
+    assert isinstance(behavior["jev"]["timeout_seconds"], int), (
+        "integral floats must normalize to int so Node (no float/int distinction) matches"
+    )
+    assert behavior["backends"]["models"][0]["profile"]["context_window"] == 131072
+    assert behavior["backends"]["providers"][1]["key_env"] == ""
+    assert behavior["backends"]["providers"][1]["reasoning_format"] == "openai"
+    assert behavior["backends"]["providers"][0]["base_url"] == "http://json-only.test/v1"
+    assert behavior["backends"]["models"][0]["profile"]["capability"] == "来自 JSON 的能力"
+
+    with pytest.raises(ValueError, match="api_key"):
+        load(BY_NAME["invalid-runtime-api-key"]["document"])

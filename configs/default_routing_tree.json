@@ -121,5 +121,101 @@
       "x": 520.0,
       "y": 320.0
     }
-  }
+  },
+  "backends": {
+    "providers": [
+      {
+        "name": "local",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "qwen3-8b",
+        "upstream": "qwen3-8b",
+        "provider": "local",
+        "profile": {
+          "domains": [],
+          "tier": "small",
+          "reasoning": {
+            "efforts": {
+              "off": null,
+              "on": null
+            },
+            "format": "qwen-chat-template",
+            "default": "on"
+          },
+          "capability": "速度最快、成本最低的本地轻量模型：适合简单短小的请求，例如闲聊、简单事实问答、格式转换、短翻译、信息提取。"
+        }
+      },
+      {
+        "id": "qwen3-32b",
+        "upstream": "qwen3-32b",
+        "provider": "local",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "reasoning": {
+            "efforts": {
+              "off": null,
+              "on": null
+            },
+            "format": "qwen-chat-template",
+            "default": "on"
+          },
+          "capability": "能力更强但较慢的本地大模型：适合复杂请求，例如长文档分析、多约束方案设计、复杂代码与故障排查。"
+        }
+      }
+    ]
+  },
+  "jev": {
+    "base_url": "http://127.0.0.1:8100",
+    "model": "d1-2b",
+    "timeout_seconds": 10.0,
+    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+    "state_template": "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+  },
+  "jev_window": {
+    "input_tokens": 1024,
+    "context_tokens": 4096
+  },
+  "time_periods": [
+    {
+      "name": "白天",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "start": "09:00",
+      "end": "18:00"
+    },
+    {
+      "name": "夜间",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "18:00",
+      "end": "09:00"
+    },
+    {
+      "name": "周末",
+      "days": [
+        5,
+        6
+      ],
+      "start": "00:00",
+      "end": "00:00"
+    }
+  ]
 }

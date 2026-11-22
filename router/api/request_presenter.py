@@ -19,6 +19,7 @@ the upstream transport); this module re-exports them for its display tables.
 from __future__ import annotations
 
 import time
+from urllib.parse import quote
 
 from router.request_outcome import (
     OUTCOME_CANCELLED,
@@ -95,6 +96,12 @@ def present_record(record: dict) -> dict:
     this is idempotent so the outcome refresh can call it again.
     """
     record["route_label"] = route_label(record)
+    # 快照链接只指向绘制画板；整图不随列表下发，打开链接时才读取。
+    if record.get("graph_snapshot_id"):
+        record["snapshot_url"] = "/console/routing.html?request=" + quote(
+            str(record.get("id") or ""), safe="")
+    else:
+        record.pop("snapshot_url", None)
     record["metrics"] = [
         [_label("上游", "Upstream"), _shown(record.get("upstream_status"))],
         [_label("路由", "Routing"), _milliseconds(record.get("routing_ms"))],

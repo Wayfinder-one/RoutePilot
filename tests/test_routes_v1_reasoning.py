@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -147,6 +148,12 @@ def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
     conn = connect(h.app.state.settings.db_path)
     with conn:
         conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'", (json.dumps({"reasoning": {"efforts": {"off": None, "low": "low"}}}),))
+    # 自包含 JSON 生效后，活动图内嵌运行配置优先；外部改库要产生「陈旧快照」必须
+    # 让活动图回到旧图形态（无内嵌运行配置），运行配置才以数据库为事实源。
+    repo = h.app.state.graph_repo
+    active = repo.active()
+    repo.update(replace(active, runtime=None),
+                base_document_sha256=active.document_sha256)
     stale_tree = h.app.state.snapshot.tree
     with pytest.raises(GraphStorageError):
         h.app.state.publisher.refresh(conn)

@@ -2,11 +2,19 @@
 
 所有管理路由与控制面服务统一使用本公开入口。校验器不做递归遍历，因此这里
 只透传 Issue 列表（空列表 = 无问题）；由调用方决定如何呈现（API 422 / 服务层回滚）。
+
+两条上下文来源严格分开：
+
+- 内嵌运行配置的图（``tree.runtime is not None``）：用图内配置构造上下文，
+  与快照/试算采用同一事实源。
+- 旧图（无内嵌运行配置）：沿用原数据库装配逻辑。旧库可能存在非法历史声明、
+  缺失 provider 等宽松数据，不能套用新文件解析器的严格性。
 """
 from __future__ import annotations
 
 import sqlite3
 
+from router.control.runtime import enable_context_for_runtime
 from router.routing.graph.validate import EnableContext, Issue, validate_graph_for_enable
 from router.routing.tree import RoutingTree
 from router.store.jev_config import JevConfigRepo
@@ -16,6 +24,7 @@ from router.upstream.catalog import model_reasoning_from_db
 
 
 def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
+    """旧图/无运行配置时的数据库回退上下文（与历史行为一致，宽松读取）。"""
     models = ModelRepo(conn).list()
     return EnableContext(
         known_models={row["id"] for row in models},
@@ -27,7 +36,11 @@ def build_enable_context(conn: sqlite3.Connection) -> EnableContext:
 
 def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:
     """启用级校验任意树（active/草稿/已存关闭树共此入口）。"""
-    return validate_graph_for_enable(tree, build_enable_context(conn))
+    if tree.runtime is not None:
+        context = enable_context_for_runtime(tree.runtime)
+    else:
+        context = build_enable_context(conn)
+    return validate_graph_for_enable(tree, context)
 
 
 def active_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> list[Issue]:

@@ -162,9 +162,15 @@ function detailHtml(record, path) {
   const route = record.route_label != null ? safe(record.route_label) : esc(t(status[0]));
   const metrics = Array.isArray(record.metrics) ? record.metrics : [];
   const fields = Array.isArray(record.fields) ? record.fields : [];
+  /* 只有保存了不可变图快照的请求才有链接；旧日志保持纯文字阶段视图。 */
+  const snapshot = typeof record.snapshot_url === 'string' && record.snapshot_url
+    ? '<div class="lg-snapshot"><a class="btn sm lg-snapshot-link" href="' +
+      esc(record.snapshot_url) + '">' + esc(t('logs.snapshot')) + '</a></div>'
+    : '';
   return '<div class="lg-detail-head"><span class="lg-route">' + route + '</span>' +
     '<span class="lg-status ' + status[1] + '">' + esc(t(status[0])) + '</span>' +
     '<span class="lg-detail-metrics">' + pairsHtml(metrics, 'lg-metric') + '</span></div>' +
+    snapshot +
     '<div class="lg-rail" role="group" aria-label="' + esc(t('logs.path')) + '">' +
     '<div class="lg-rail-head" aria-hidden="true"><span></span><span>' + esc(t('logs.stage')) +
     '</span><span>' + esc(t('logs.computation')) + '</span><span>' + esc(t('logs.evidence')) +

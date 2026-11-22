@@ -21,6 +21,27 @@ MIN_INPUT_TOKENS = 256
 MIN_CONTEXT_TOKENS = 512
 MAX_TOKENS = 131072
 
+
+@dataclass(frozen=True)
+class JevWindow:
+    input_tokens: int
+    context_tokens: int
+
+    def __post_init__(self):
+        if isinstance(self.context_tokens, bool) or not isinstance(self.context_tokens, int):
+            raise ValueError("context_tokens 必须是整数")
+        if isinstance(self.input_tokens, bool) or not isinstance(self.input_tokens, int):
+            raise ValueError("input_tokens 必须是整数")
+        if not MIN_CONTEXT_TOKENS <= self.context_tokens <= MAX_TOKENS:
+            raise ValueError(
+                f"context_tokens 必须在 {MIN_CONTEXT_TOKENS}..{MAX_TOKENS} 之间")
+        if not MIN_INPUT_TOKENS <= self.input_tokens <= MAX_TOKENS:
+            raise ValueError(
+                f"input_tokens 必须在 {MIN_INPUT_TOKENS}..{MAX_TOKENS} 之间")
+        if self.input_tokens > self.context_tokens:
+            raise ValueError("input_tokens cannot exceed context_tokens: input_tokens 不能大于 context_tokens")
+
+
 # 截断时首尾各保留多少（比例）；开头通常是背景，结尾通常是诉求
 HEAD_RATIO = 0.7
 

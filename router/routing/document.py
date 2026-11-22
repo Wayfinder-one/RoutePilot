@@ -4,11 +4,12 @@ import json
 from dataclasses import replace
 
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
+from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict, tree_revision_of
 
 KIND = "sr-routing-graph"
 VERSION = 3
-FIELDS = {"kind", "version", "name", "timezone", "sticky", "root", "canvas"}
+FIELDS = {"kind", "version", "name", "timezone", "sticky", "root", "canvas", *RUNTIME_FIELDS}
 
 
 def graph_document(tree: RoutingTree) -> dict:
@@ -23,6 +24,8 @@ def graph_document(tree: RoutingTree) -> dict:
     canvas = canvas_to_dict(tree.root)
     if canvas:
         document["canvas"] = canvas
+    if tree.runtime is not None:
+        document.update(runtime_to_dict(tree.runtime))
     return document
 
 
@@ -43,13 +46,13 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
         raise ValueError("graph document must be an object")
     if raw.get("kind") != KIND or isinstance(raw.get("version"), bool) or raw.get("version") != VERSION:
         raise ValueError("only sr-routing-graph v3 is accepted")
-    missing = sorted(FIELDS - set(raw) - {"canvas"})
+    missing = sorted(FIELDS - set(raw) - {"canvas", *RUNTIME_FIELDS})
     if missing:
         raise ValueError(f"missing graph document fields: {', '.join(missing)}")
     unknown = sorted(set(raw) - FIELDS)
     if unknown:
         raise ValueError(f"unknown graph document fields: {', '.join(unknown)}")
-    tree = tree_from_dict({
+    payload = {
         "id": tree_id,
         "name": raw["name"],
         "enabled": enabled,
@@ -58,7 +61,11 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
         "root": raw["root"],
         "canvas": raw.get("canvas", {}),
         "updated_at": updated_at,
-    })
+    }
+    runtime_fields = set(raw) & RUNTIME_FIELDS
+    if runtime_fields:
+        payload.update({field: raw[field] for field in RUNTIME_FIELDS if field in raw})
+    tree = tree_from_dict(payload)
     return replace(
         tree,
         tree_revision=tree_revision_of(tree),

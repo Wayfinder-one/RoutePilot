@@ -1223,3 +1223,30 @@ def test_invalid_json_is_a_client_error(tmp_path):
         assert response.json()["error"]["message"] == "invalid_json"
 
     asyncio.run(scenario())
+
+
+def test_real_request_logs_a_graph_snapshot_index(tmp_path):
+    async def scenario():
+        har = Harness({"q": choice(fast=0.9, strong=0.1)})
+        app = make_app(tmp_path, har, root=direct_graph())
+        response = await post(app)
+        assert response.status_code == 200
+        record = recent(app)
+        assert record["graph_snapshot_id"]
+        assert record["_graph_snapshot"]["snapshot_id"] == record["graph_snapshot_id"]
+        assert record["snapshot_url"].startswith("/console/routing.html?request=")
+        snapshot = app.state.requestlog.snapshot_for(record["id"])
+        assert snapshot["tree"]["root"]["type"] == "graph"
+        assert snapshot["trace"] == record["trace"]
+        await flush(app)
+        conn = connect(app.state.settings.db_path)
+        try:
+            stored = conn.execute(
+                "SELECT graph_snapshot_id FROM request_snapshots WHERE request_id = ?",
+                (record["id"],),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert stored is not None and stored[0] == record["graph_snapshot_id"]
+
+    asyncio.run(scenario())

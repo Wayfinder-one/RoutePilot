@@ -247,7 +247,7 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             snapshot, text, session_id, trace,
             error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
         ))
-        requestlog.enqueue(record)
+        requestlog.enqueue(record, snapshot=snapshot)
         return _error(error_class, status_code)
 
     snapshot = request.app.state.snapshot
@@ -336,7 +336,7 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             "error_class": None,
             "outcome_state": OUTCOME_INCOMPLETE,
         })
-    requestlog.enqueue(record)
+    requestlog.enqueue(record, snapshot=snapshot)
     outcome = OutcomeRecorder(requestlog, record, started)
     headers = {"x-sr-model": decision.model, "x-sr-selection": decision.selection_reason}
     if reasoning_warning:

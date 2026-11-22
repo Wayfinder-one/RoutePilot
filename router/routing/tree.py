@@ -13,6 +13,13 @@ from router.routing.graph.model import (
     graph_from_dict,
     graph_to_dict,
 )
+from router.routing.runtime import (
+    RUNTIME_FIELDS,
+    GraphRuntime,
+    runtime_behavior_dict,
+    runtime_from_dict,
+    runtime_to_dict,
+)
 
 __all__ = [
     "RoutingTree",
@@ -39,6 +46,7 @@ class RoutingTree:
     root: GraphRoot
     sticky: Sticky = Sticky()
     timezone: str = "Asia/Shanghai"
+    runtime: GraphRuntime | None = None
     tree_revision: str = ""
     updated_at: str = ""
     document_sha256: str = ""
@@ -66,8 +74,11 @@ def tree_from_dict(raw) -> RoutingTree:
         "tree",
         raw,
         {"id", "name", "enabled", "timezone", "sticky", "root", "canvas", "tree_revision",
-         "updated_at", "document_sha256"},
+         "updated_at", "document_sha256", *RUNTIME_FIELDS},
     )
+    runtime_fields = set(raw) & RUNTIME_FIELDS
+    if runtime_fields and runtime_fields != RUNTIME_FIELDS:
+        raise ValueError("runtime fields must appear together")
     enabled = raw.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("enabled must be a boolean")
@@ -78,6 +89,7 @@ def tree_from_dict(raw) -> RoutingTree:
         root=graph_from_dict(raw.get("root"), raw.get("canvas")),
         sticky=_sticky_from_dict(raw.get("sticky")),
         timezone=text_field(raw.get("timezone", "Asia/Shanghai"), "timezone"),
+        runtime=runtime_from_dict(raw) if runtime_fields else None,
         tree_revision=optional_text_field(raw.get("tree_revision", ""), "tree_revision"),
         updated_at=optional_text_field(raw.get("updated_at", ""), "updated_at"),
         document_sha256=optional_text_field(raw.get("document_sha256", ""), "document_sha256"),
@@ -96,15 +108,20 @@ def tree_storage_dict(tree: RoutingTree) -> dict:
     canvas = canvas_to_dict(tree.root)
     if canvas:
         document["canvas"] = canvas
+    if tree.runtime is not None:
+        document.update(runtime_to_dict(tree.runtime))
     return document
 
 
 def tree_behavior_dict(tree: RoutingTree) -> dict:
-    return {
+    document = {
         "timezone": tree.timezone,
         "sticky": {"enabled": tree.sticky.enabled, "ttl_seconds": tree.sticky.ttl_seconds},
         "root": graph_behavior_dict(tree.root),
     }
+    if tree.runtime is not None:
+        document.update(runtime_behavior_dict(tree.runtime))
+    return document
 
 
 def tree_to_dict(tree: RoutingTree) -> dict:

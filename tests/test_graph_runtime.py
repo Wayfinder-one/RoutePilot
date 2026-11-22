@@ -1,0 +1,142 @@
+import copy
+import hashlib
+import json
+
+import pytest
+
+from router.routing.document import graph_document_bytes, parse_graph_document
+from router.routing.tree import tree_from_dict, tree_revision_of
+from tests.routing_fixtures import runtime_dict, tree_dict
+
+RUNTIME_FIELDS = ("backends", "jev", "jev_window", "time_periods")
+
+
+def load(content):
+    return parse_graph_document(
+        content,
+        tree_id="portable",
+        enabled=False,
+        updated_at="",
+        document_sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+
+def portable_tree_dict():
+    raw = tree_dict()
+    raw.update(runtime_dict())
+    return raw
+
+
+def test_self_contained_document_roundtrip_preserves_runtime_without_keys():
+    source = tree_from_dict(portable_tree_dict())
+
+    content = graph_document_bytes(source)
+    document = json.loads(content)
+    assert document["backends"]["models"][0]["upstream"] == "json-upstream"
+    assert document["backends"]["models"][0]["profile"]["capability"] == "来自 JSON 的能力"
+    assert document["jev"]["model"] == "json-jev"
+    assert document["jev_window"] == {"input_tokens": 1024, "context_tokens": 4096}
+    assert document["time_periods"][0]["name"] == "peak"
+    assert "api_key" not in document["backends"]["providers"][0]
+    assert "api_key" not in document["jev"]
+
+    loaded = load(content)
+    assert loaded.runtime == source.runtime
+    assert loaded.tree_revision == tree_revision_of(source)
+
+
+def test_legacy_tree_has_no_runtime_and_self_contained_runtime_changes_revision():
+    legacy = tree_from_dict(tree_dict())
+    portable = tree_from_dict(portable_tree_dict())
+
+    assert legacy.runtime is None
+    assert portable.runtime is not None
+    assert tree_revision_of(portable) != tree_revision_of(legacy)
+
+
+@pytest.mark.parametrize("field", RUNTIME_FIELDS)
+def test_partial_runtime_fields_are_rejected(field):
+    raw = tree_dict()
+    raw[field] = runtime_dict()[field]
+
+    with pytest.raises(ValueError, match="runtime fields must appear together"):
+        tree_from_dict(raw)
+
+
+@pytest.mark.parametrize(("path", "message"), [
+    (("backends", "providers", 0, "api_key"), "secret field is not allowed"),
+    (("jev", "api_key"), "secret field is not allowed"),
+])
+def test_runtime_rejects_secret_fields(path, message):
+    raw = portable_tree_dict()
+    target = raw
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = "must-not-be-persisted"
+
+    with pytest.raises(ValueError, match=message):
+        tree_from_dict(raw)
+
+
+#: 大小写/连字符/下划线变体都必须命中同一条密钥规则（Julia/K8s 风格键名也拒绝）。
+SECRET_KEY_SPELLINGS = ["api_key", "API-KEY", "authorization", "key_present", "key_source"]
+
+
+@pytest.mark.parametrize("key", SECRET_KEY_SPELLINGS)
+@pytest.mark.parametrize("place", ["provider", "jev", "profile", "profile_array", "period"])
+def test_runtime_rejects_secret_keys_recursively(key, place):
+    """profile 是合法 JSON 元数据容器，但任何层级的密钥字段都不得进入 runtime。"""
+    raw = portable_tree_dict()
+    if place == "provider":
+        raw["backends"]["providers"][0][key] = "review-secret"
+    elif place == "jev":
+        raw["jev"][key] = "review-secret"
+    elif place == "profile":
+        raw["backends"]["models"][0]["profile"][key] = "review-secret"
+    elif place == "profile_array":
+        raw["backends"]["models"][0]["profile"]["metadata"] = [{key: "review-secret"}]
+    else:
+        raw["time_periods"][0][key] = "review-secret"
+
+    with pytest.raises(ValueError, match="secret field is not allowed"):
+        tree_from_dict(raw)
+
+
+@pytest.mark.parametrize("key", ["monkey", "key", "keys", "keychain", "hot_key"])
+def test_runtime_keeps_legitimate_metadata_that_merely_mentions_key(key):
+    """只有固定密钥集合被拒绝；包含 key 的正常元数据必须原样保留。"""
+    raw = portable_tree_dict()
+    raw["backends"]["models"][0]["profile"]["metadata"] = [{key: "keep-me"}]
+
+    tree = tree_from_dict(raw)
+
+    assert tree.runtime.backends.models[0]["profile"]["metadata"] == [{key: "keep-me"}]
+
+
+@pytest.mark.parametrize(("kind", "message"), [
+    ("duplicate_provider", "duplicate provider"),
+    ("duplicate_model", "duplicate model"),
+    ("missing_provider", "unknown provider"),
+    ("profile", "profile must be an object"),
+    ("window", "input_tokens cannot exceed context_tokens"),
+    ("period", "period needs exactly"),
+])
+def test_runtime_rejects_invalid_catalog_window_and_periods(kind, message):
+    raw = portable_tree_dict()
+    if kind == "duplicate_provider":
+        provider = raw["backends"]["providers"][0]
+        raw["backends"]["providers"].append(copy.deepcopy(provider))
+    elif kind == "duplicate_model":
+        model = raw["backends"]["models"][0]
+        raw["backends"]["models"].append(copy.deepcopy(model))
+    elif kind == "missing_provider":
+        raw["backends"]["models"][0]["provider"] = "missing"
+    elif kind == "profile":
+        raw["backends"]["models"][0]["profile"] = []
+    elif kind == "window":
+        raw["jev_window"] = {"input_tokens": 8192, "context_tokens": 4096}
+    elif kind == "period":
+        del raw["time_periods"][0]["end"]
+
+    with pytest.raises(ValueError, match=message):
+        tree_from_dict(raw)

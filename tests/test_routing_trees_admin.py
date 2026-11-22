@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -9,8 +11,11 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
+from router.routing.tree import tree_from_dict
+from router.store.db import connect
+from router.store.repositories import ProviderRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, huge_chain_graph, test_settings, tree_dict
+from tests.routing_fixtures import graph_dict, huge_chain_graph, runtime_dict, test_settings, tree_dict
 
 
 @pytest.fixture
@@ -56,6 +61,71 @@ def configure_jev(client):
         "state_template": DEFAULT_STATE_TEMPLATE,
     })
     assert response.status_code == 200, response.text
+
+
+def create_portable_tree(client, tree_id):
+    raw = tree_dict(tree_id, root=graph_with_model("fast"))
+    raw.update(runtime_dict())
+    response = create_tree(client, raw)
+    assert response.status_code == 201, response.text
+
+
+def test_configuration_writes_update_every_graph_and_gets_prefer_active_json(client, app):
+    create_portable_tree(client, "main")
+    create_portable_tree(client, "second")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+
+    conn = connect(app.state.settings.db_path)
+    try:
+        ProviderRepo(conn).upsert("local", "http://database-only.test/v1")
+    finally:
+        conn.close()
+    providers = client.get("/admin/providers")
+    assert providers.status_code == 200, providers.text
+    assert providers.json()["providers"][0]["base_url"] == "http://json-only.test/v1"
+
+    response = client.put("/admin/providers/local", json={
+        "base_url": "http://changed.test/v1",
+        "key_env": "CHANGED_API_KEY",
+        "reasoning_format": "openai",
+    })
+    assert response.status_code == 200, response.text
+    for tree_id in ("main", "second"):
+        tree = app.state.graph_repo.get(tree_id)
+        assert tree.runtime.backends.providers[0]["base_url"] == "http://changed.test/v1"
+    assert app.state.snapshot.backends["fast"].url == "http://changed.test/v1/chat/completions"
+
+    response = client.put("/admin/jev/window", json={
+        "input_tokens": 2048, "context_tokens": 8192,
+    })
+    assert response.status_code == 200, response.text
+    response = client.put("/admin/time-periods", json={"periods": [
+        {"name": "JSON 新时段", "days": [0], "start": "08:00", "end": "17:00"},
+    ]})
+    assert response.status_code == 200, response.text
+    for tree_id in ("main", "second"):
+        runtime = app.state.graph_repo.get(tree_id).runtime
+        assert runtime.jev_input_tokens == 2048
+        assert runtime.jev_context_tokens == 8192
+        assert [period.name for period in runtime.time_periods] == ["JSON 新时段"]
+
+
+def test_model_edit_uses_active_json_when_database_catalog_is_empty(client, app):
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    conn = connect(app.state.settings.db_path)
+    try:
+        conn.execute("DELETE FROM models")
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.put("/admin/models/fast", json={"upstream": "edited-upstream"})
+
+    assert response.status_code == 200, response.text
+    tree = app.state.graph_repo.get("main")
+    assert tree.runtime.backends.models[0]["upstream"] == "edited-upstream"
+    assert app.state.snapshot.backends["fast"].upstream_name == "edited-upstream"
 
 
 def test_stale_browser_save_returns_409_and_keeps_file(client):
@@ -414,3 +484,209 @@ def test_tree_dtos_reject_unknown_fields(client):
         assert any(item["type"] == "extra_forbidden"
                    for item in response.json()["detail"]), path
     assert client.get("/admin/trees/extra-tree").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# 密钥通道：树写 API 与旧库物化都不得让 profile 元数据里的密钥进入 JSON
+# --------------------------------------------------------------------------- #
+SECRET_KEY_SPELLINGS = ["api_key", "API-KEY", "authorization", "key_present", "key_source"]
+
+
+def _graph_bytes(app):
+    graph_dir = Path(app.state.settings.graph_dir, "graphs")
+    return {path.name: path.read_bytes() for path in graph_dir.glob("*.json")}
+
+
+@pytest.mark.parametrize("key", SECRET_KEY_SPELLINGS)
+def test_tree_writes_reject_nested_profile_secrets(client, app, key):
+    """POST/PUT 带嵌套密钥 → 422 graph_parse_error，原图响应与文件字节不变。"""
+    create_portable_tree(client, "main")
+    before_tree = client.get("/admin/trees/main").json()["tree"]
+    before_files = _graph_bytes(app)
+
+    payload = tree_dict("nested", root=graph_with_model("fast"))
+    payload.update(runtime_dict())
+    payload.pop("enabled")
+    payload["backends"]["models"][0]["profile"]["metadata"] = [
+        {"tier": "x", key: "review-secret"}]
+    created = client.post("/admin/trees", json=payload)
+    assert created.status_code == 422, created.text
+    assert created.json()["detail"][0]["code"] == "graph_parse_error"
+    assert "review-secret" not in created.text
+
+    runtime = runtime_dict()
+    runtime["backends"]["models"][0]["profile"]["metadata"] = [{key: "review-secret"}]
+    updated = save_tree(client, runtime)
+    assert updated.status_code == 422, updated.text
+    assert updated.json()["detail"][0]["code"] == "graph_parse_error"
+    assert "review-secret" not in updated.text
+
+    assert client.get("/admin/trees/main").json()["tree"] == before_tree
+    assert _graph_bytes(app) == before_files
+    assert not (Path(app.state.settings.graph_dir) / "graphs" / "nested.json").exists()
+
+
+def test_legacy_database_secret_profile_blocks_materialization(tmp_path):
+    """旧库 profile 带密钥：旧图仍能启动，但保存/启用物化必须拒绝且不写文件。"""
+    direct = {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "direct", "type": "target", "priority": 1,
+             "models": [{"model": "qwen3-8b", "reasoning": None}]},
+        ],
+        "edges": [{"id": "e-start-direct", "source": "start", "source_port": "out",
+                   "target": "direct", "target_port": "in_1", "condition": None}],
+        "error_fallback": "direct",
+    }
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"answers": {}}))
+    app = create_app(test_settings(tmp_path), transport=transport)
+    repo = RoutingTreeRepo(app.state.settings.graph_dir)
+    repo.create(tree_from_dict(tree_dict("legacy", root=direct)))
+    repo.enable("legacy")
+    conn = connect(app.state.settings.db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
+                (json.dumps({"metadata": {"api_key": "review-secret"}}),))
+    finally:
+        conn.close()
+
+    restarted = create_app(test_settings(tmp_path), transport=transport)
+    client = TestClient(restarted)
+    # 旧图（文件无内嵌运行配置）继续走宽松数据库回退：应用可启动。
+    assert restarted.state.snapshot.tree_id == "legacy"
+    before_files = _graph_bytes(restarted)
+
+    created = client.post("/admin/trees", json={
+        "id": "materialized", "name": "物化", "root": direct})
+    assert created.status_code == 422, created.text
+    assert created.json()["detail"][0]["code"] == "graph_parse_error"
+    enabled = client.post("/admin/trees/legacy/enable")
+    assert enabled.status_code == 422, enabled.text
+
+    assert _graph_bytes(restarted) == before_files
+    assert not (Path(restarted.state.settings.graph_dir) /
+                "graphs" / "materialized.json").exists()
+    assert "review-secret" not in b"".join(before_files.values()).decode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Task C：`runtime: null` 只解除「当前图继承」，随后仍按活动图/数据库物化
+# --------------------------------------------------------------------------- #
+def _direct_graph(model_id):
+    return {
+        "id": "root", "type": "graph",
+        "nodes": [
+            {"id": "start", "type": "start"},
+            {"id": "direct", "type": "target", "priority": 1,
+             "models": [{"model": model_id, "reasoning": None}]},
+        ],
+        "edges": [{"id": "e-start-direct", "source": "start", "source_port": "out",
+                   "target": "direct", "target_port": "in_1", "condition": None}],
+        "error_fallback": "direct",
+    }
+
+
+def _runtime_with_model(model_id, *, upstream="json-upstream"):
+    runtime = runtime_dict()
+    runtime["backends"]["models"] = [{
+        "id": model_id, "upstream": upstream, "provider": "local",
+        "profile": {"capability": f"{model_id} 的能力"},
+    }]
+    return runtime
+
+
+def _portable_payload(tree_id, model_id):
+    raw = tree_dict(tree_id, root=_direct_graph(model_id))
+    raw.update(_runtime_with_model(model_id))
+    raw.pop("enabled")
+    return raw
+
+
+def _active_and_inactive(client):
+    """活动图 a（active-model）+ 非活动图 b（old-model），两者内嵌配置不同。"""
+    assert create_tree(client, _portable_payload("a", "active-model")).status_code == 201
+    assert client.post("/admin/trees/a/enable").status_code == 200
+    assert create_tree(client, _portable_payload("b", "old-model")).status_code == 201
+    active = client.get("/admin/trees/a").json()["tree"]
+    inactive = client.get("/admin/trees/b").json()["tree"]
+    return active, inactive
+
+
+def _model_ids(tree):
+    return [model["id"] for model in tree["backends"]["models"]]
+
+
+def test_update_explicit_null_runtime_clears_and_materializes_from_active(client, app):
+    active, inactive = _active_and_inactive(client)
+    assert _model_ids(inactive) == ["old-model"]
+
+    response = save_tree(
+        client, {"root": inactive["root"], "runtime": None}, tree_id="b")
+
+    assert response.status_code == 200, response.text
+    saved = response.json()["tree"]
+    # 清除的是 B 自己的旧配置；随后物化活动图 A 的完整 runtime（不是跳过物化）。
+    assert _model_ids(saved) == ["active-model"]
+    assert saved["jev"] == active["jev"]
+    assert saved["backends"]["providers"] == active["backends"]["providers"]
+    assert (app.state.graph_repo.get("b").runtime.backends.models[0]["id"]
+            == "active-model")
+    # 活动图不受影响。
+    assert _model_ids(client.get("/admin/trees/a").json()["tree"]) == ["active-model"]
+
+
+def test_update_without_runtime_still_inherits_existing_graph_runtime(client):
+    _active, inactive = _active_and_inactive(client)
+
+    response = save_tree(client, {"root": inactive["root"]}, tree_id="b")
+
+    assert response.status_code == 200, response.text
+    # 未提供控制字段 = 普通缺省继承：保留 B 自己的 old-model。
+    assert _model_ids(response.json()["tree"]) == ["old-model"]
+
+
+def test_create_explicit_null_runtime_materializes_from_active(client):
+    assert create_tree(client, _portable_payload("a", "active-model")).status_code == 201
+    assert client.post("/admin/trees/a/enable").status_code == 200
+
+    response = client.post("/admin/trees", json={
+        "id": "c", "name": "新组", "root": _direct_graph("old-model"), "runtime": None,
+    })
+
+    assert response.status_code == 201, response.text
+    assert _model_ids(response.json()["tree"]) == ["active-model"]
+
+
+@pytest.mark.parametrize("value", ["text", [], {}, {"backends": {}}])
+def test_tree_dtos_reject_non_null_runtime(client, app, value):
+    _active, inactive = _active_and_inactive(client)
+    updated = save_tree(client, {"root": inactive["root"], "runtime": value}, tree_id="b")
+    assert updated.status_code == 422, updated.text
+    assert "runtime must be null" in updated.text
+    created = client.post("/admin/trees", json={
+        "id": "d", "name": "D", "root": _direct_graph("old-model"), "runtime": value,
+    })
+    assert created.status_code == 422, created.text
+    assert "runtime must be null" in created.text
+    # 拒绝后不落文件。
+    assert not (Path(app.state.settings.graph_dir) / "graphs" / "d.json").exists()
+
+
+def test_tree_dtos_reject_runtime_null_accompanied_by_runtime_fields(client):
+    _active, inactive = _active_and_inactive(client)
+    runtime = _runtime_with_model("old-model")
+    updated = save_tree(
+        client, {"root": inactive["root"], "runtime": None, "jev": runtime["jev"]},
+        tree_id="b")
+    assert updated.status_code == 422, updated.text
+    assert "runtime cannot accompany runtime fields" in updated.text
+    created = client.post("/admin/trees", json={
+        "id": "e", "name": "E", "root": _direct_graph("old-model"),
+        "runtime": None, "backends": runtime["backends"],
+    })
+    assert created.status_code == 422, created.text
+    assert "runtime cannot accompany runtime fields" in created.text

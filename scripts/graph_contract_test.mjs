@@ -18,6 +18,7 @@ const FIXTURES = JSON.parse(
 );
 const HEX64 = /^[0-9a-f]{64}$/;
 const NUMERIC_OPS = new Set(['gt', 'gte', 'lt', 'lte', 'eq', 'neq']);
+const RUNTIME_FIELDS = ['backends', 'jev', 'jev_window', 'time_periods'];
 const REQUIRED_FIXTURES = [
   'valid-choice-noul-score',
   'valid-node-edge-shuffle',
@@ -30,7 +31,10 @@ const REQUIRED_FIXTURES = [
   'valid-condition-periods',
   'valid-small-float-threshold',
   'valid-envelope-variation',
-  'valid-old-field-control'
+  'valid-old-field-control',
+  'valid-self-contained-runtime',
+  'invalid-runtime-api-key',
+  'invalid-runtime-nested-secret'
 ];
 const BY_NAME = new Map(FIXTURES.map(fixture => [fixture.name, fixture]));
 
@@ -146,6 +150,45 @@ test('graph contract fixtures cover choice/noul/score, boolean/numeric edges and
   delete expectedControl.root.otherwise_target;
   assert.deepEqual(controlDocument, expectedControl,
     'the positive control must be the rejected document without otherwise_target');
+
+  /* 自包含运行配置：四字段成组、整数值浮点归一、密钥字段拒绝。 */
+  const runtimeDocument = BY_NAME.get('valid-self-contained-runtime').document;
+  for (const field of RUNTIME_FIELDS) {
+    assert.ok(Object.prototype.hasOwnProperty.call(runtimeDocument, field),
+      'self-contained fixture is missing runtime field ' + field);
+  }
+  assert.equal(runtimeDocument.jev.timeout_seconds, 10,
+    'the fixture must pin an integral float (10.0) for jev.timeout_seconds');
+  assert.equal(runtimeDocument.backends.models[0].profile.context_window, 131072,
+    'the fixture must pin an integral profile number');
+  assert.equal(Object.prototype.hasOwnProperty.call(runtimeDocument.backends.providers[0], 'api_key'),
+    false, 'the valid fixture must not carry keys');
+  const keyDocument = BY_NAME.get('invalid-runtime-api-key').document;
+  assert.ok(Object.prototype.hasOwnProperty.call(keyDocument.backends.providers[0], 'api_key'),
+    'the invalid fixture must exercise a persisted api_key');
+});
+
+test('self-contained runtime fixture imports with normalized defaults', () => {
+  const fixture = BY_NAME.get('valid-self-contained-runtime');
+  const result = RTGraph.parseImport(JSON.stringify(fixture.document));
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  const runtime = result.tree.runtime;
+  assert.deepEqual(Object.keys(runtime).sort(), ['backends', 'jev', 'jev_window', 'time_periods']);
+  /* 缺省键补默认值：key_env="" / reasoning_format="openai"，jev 用默认文案。 */
+  assert.equal(runtime.backends.providers[1].key_env, '');
+  assert.equal(runtime.backends.providers[1].reasoning_format, 'openai');
+  assert.equal(runtime.jev.timeout_seconds, 10);
+  assert.ok(runtime.jev.instructions.length > 0);
+  assert.ok(runtime.jev.state_template.includes('{request}'));
+  assert.equal(runtime.backends.providers[0].base_url, 'http://json-only.test/v1');
+  assert.deepEqual(runtime.backends.models[0].profile,
+    { capability: '来自 JSON 的能力', context_window: 131072, rate: 1e-05, reasoning: { efforts: { off: null, high: 'high' }, default: 'off' } });
+
+  /* 密钥 fixture：解析阶段即拒绝，不允许部分接受。 */
+  const rejected = RTGraph.parseImport(JSON.stringify(BY_NAME.get('invalid-runtime-api-key').document));
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.tree, undefined);
+  assert.ok(rejected.issues.some(issue => issue.code === 'graph_parse_error'));
 });
 
 for (const fixture of FIXTURES) {

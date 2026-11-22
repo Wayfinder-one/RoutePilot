@@ -407,5 +407,120 @@
     },
     "issue_codes": [],
     "behavior_sha256": "37f7afb853e826e6487cd0504f65c97a35e1db684ddb1538dfef1303109644d2"
+  },
+  {
+    "name": "valid-self-contained-runtime",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "自包含契约",
+      "timezone": "Asia/Shanghai",
+      "sticky": {"enabled": false, "ttl_seconds": 1800},
+      "backends": {
+        "providers": [
+          {"name": " local ", "base_url": " http://json-only.test/v1/ ", "key_env": "JSON_PROVIDER_API_KEY", "reasoning_format": "openai"},
+          {"name": "backup", "base_url": "https://backup.test/v1"}
+        ],
+        "models": [
+          {"id": "fast", "upstream": "json-upstream", "provider": "local", "profile": {"capability": "  来自 JSON 的能力  ", "context_window": 131072, "rate": 1e-05, "reasoning": {"efforts": {"off": null, "high": "high"}, "default": "off"}}},
+          {"id": "backup-model", "upstream": "backup-upstream", "provider": "backup", "profile": {}}
+        ]
+      },
+      "jev": {"base_url": "http://jev-json.test", "model": "json-jev", "timeout_seconds": 10.0},
+      "jev_window": {"input_tokens": 1024, "context_tokens": 4096},
+      "time_periods": [
+        {"name": "peak", "days": [0, 1, 2, 3, 4], "start": "09:00", "end": "18:00"},
+        {"name": "night", "days": [5, 6], "start": "22:00", "end": "06:00"}
+      ],
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start"},
+          {"id": "fast-target", "type": "target", "models": [{"model": "fast", "reasoning": "high"}], "priority": 1, "strategy": "least_inflight"},
+          {"id": "backup-target", "type": "target", "models": [{"model": "backup-model", "reasoning": null}], "priority": 2, "strategy": "least_inflight"}
+        ],
+        "edges": [
+          {"id": "e-start-fast", "source": "start", "source_port": "out", "target": "fast-target", "target_port": "in_1", "condition": null},
+          {"id": "e-start-backup", "source": "start", "source_port": "out", "target": "backup-target", "target_port": "in_1", "condition": null}
+        ],
+        "error_fallback": "fast-target"
+      },
+      "canvas": {"start": {"x": 40, "y": 180}, "fast-target": {"x": 320, "y": 120}, "backup-target": {"x": 320, "y": 260}}
+    },
+    "issue_codes": [],
+    "behavior_sha256": "617a79b7a6b9149b4e5de211b0f61756c2a31b89fb0d3f5c98424fa08f4b24d8"
+  },
+  {
+    "name": "invalid-runtime-api-key",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "自包含契约",
+      "timezone": "Asia/Shanghai",
+      "sticky": {"enabled": false, "ttl_seconds": 1800},
+      "backends": {
+        "providers": [
+          {"name": "local", "base_url": "http://json-only.test/v1", "key_env": "JSON_PROVIDER_API_KEY", "api_key": "sk-must-not-persist"}
+        ],
+        "models": [
+          {"id": "fast", "upstream": "json-upstream", "provider": "local", "profile": {}}
+        ]
+      },
+      "jev": null,
+      "jev_window": {"input_tokens": 1024, "context_tokens": 4096},
+      "time_periods": [],
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start"},
+          {"id": "fast-target", "type": "target", "models": [{"model": "fast", "reasoning": null}], "priority": 1, "strategy": "least_inflight"}
+        ],
+        "edges": [
+          {"id": "e-start-fast", "source": "start", "source_port": "out", "target": "fast-target", "target_port": "in_1", "condition": null}
+        ],
+        "error_fallback": "fast-target"
+      }
+    },
+    "issue_codes": ["graph_parse_error"],
+    "behavior_sha256": null
+  },
+  {
+    "name": "invalid-runtime-nested-secret",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 3,
+      "name": "自包含契约",
+      "timezone": "Asia/Shanghai",
+      "sticky": {"enabled": false, "ttl_seconds": 1800},
+      "backends": {
+        "providers": [
+          {"name": "local", "base_url": "http://json-only.test/v1", "key_env": "JSON_PROVIDER_API_KEY", "reasoning_format": "openai"}
+        ],
+        "models": [
+          {"id": "fast", "upstream": "json-upstream", "provider": "local",
+           "profile": {"capability": "保留的合法元数据",
+                       "metadata": {"labels": [{"API-KEY": "sk-must-not-persist"}]}}}
+        ]
+      },
+      "jev": null,
+      "jev_window": {"input_tokens": 1024, "context_tokens": 4096},
+      "time_periods": [],
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {"id": "start", "type": "start"},
+          {"id": "fast-target", "type": "target", "models": [{"model": "fast", "reasoning": null}], "priority": 1, "strategy": "least_inflight"}
+        ],
+        "edges": [
+          {"id": "e-start-fast", "source": "start", "source_port": "out", "target": "fast-target", "target_port": "in_1", "condition": null}
+        ],
+        "error_fallback": "fast-target"
+      }
+    },
+    "issue_codes": ["graph_parse_error"],
+    "behavior_sha256": null
   }
 ]
