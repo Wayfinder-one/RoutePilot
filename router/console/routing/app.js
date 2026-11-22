@@ -747,7 +747,8 @@ function updateToolbar() {
       const button = document.getElementById(id);
       if (button) button.disabled = busy;
     });
-  /* 保存/启用请求在途：顶栏必须可见地进入忙碌态，双击不会再发第二个请求。 */
+  /* 保存/启用请求在途：菜单里的 #cvSave 仍要显示忙碌文案，
+     主按钮的 aria-busy 由 paintLifecycle() 统一暴露。 */
   const save = $('#cvSave');
   if (save) {
     save.setAttribute('aria-busy', String(!!store.saving));
@@ -755,40 +756,50 @@ function updateToolbar() {
     const label = save.querySelector('span[data-i18n]');
     if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.saveDraft');
   }
-  const enableLabel = $('#cvEnableLabel');
-  const enabled = !!(store.tree && store.tree.enabled);
-  if (enableLabel) enableLabel.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
   const disable = $('#cvDisable');
-  if (disable) disable.hidden = !enabled;
-  const enable = $('#cvEnable');
-  if (enable) enable.classList.toggle('is-on', enabled);
-  const enabledPill = $('#cvEnabled');
-  const enabledText = $('#cvEnabledLabel');
-  if (enabledPill) {
-    enabledPill.hidden = false;
-    enabledPill.classList.toggle('ok', enabled);
-    enabledPill.classList.toggle('warn', !enabled);
+  if (disable) disable.hidden = !(store.tree && store.tree.enabled);
+  paintLifecycle();
+}
+
+/* 顶栏状态只由 store 的持久化视图投影：启用与否 + 草稿是否干净 + 是否落过盘。
+   dirtyKind 仍保留 behavior/layout/display 分类，供保存语义与 beforeunload 使用；
+   这里只把它折叠成用户需要看的四种生命周期，不再另设第五种“仅布局”状态。 */
+function lifecycleState() {
+  const enabled = !!(store.tree && store.tree.enabled);
+  const clean = store.dirtyKind === 'clean';
+  if (enabled) return clean ? 'running' : 'unpublished';
+  if (store.saved && clean) return 'disabled';
+  return 'draft';
+}
+
+function paintLifecycle() {
+  const state = lifecycleState();
+  const badge = $('#cvLifecycle');
+  const label = $('#cvLifecycleLabel');
+  if (label) label.textContent = t('cv.status.' + state);
+  if (badge) {
+    badge.dataset.state = state;
+    badge.classList.toggle('ok', state === 'running');
+    badge.classList.toggle('warn', state === 'unpublished' || state === 'draft');
+    const revision = store.tree && store.tree.tree_revision;
+    badge.title = revision ? tf('cv.revision', { rev: String(revision).slice(0, 10) }) : t('cv.unpublished');
   }
-  if (enabledText) enabledText.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
-  const revision = $('#cvRevision');
-  if (revision) {
-    revision.textContent = store.tree && store.tree.tree_revision
-      ? tf('cv.revision', { rev: String(store.tree.tree_revision).slice(0, 10) })
-      : t('cv.unpublished');
+  const enabled = !!(store.tree && store.tree.enabled);
+  const dirty = store.dirtyKind !== 'clean' || !store.saved;
+  const primaryKey = store.saving ? 'cv.saving'
+    : enabled ? (dirty ? 'cv.publishUpdate' : 'cv.published')
+    : (dirty ? 'cv.publish' : 'cv.enable');
+  const primary = $('#cvEnable');
+  const primaryLabel = $('#cvEnableLabel');
+  if (primaryLabel) primaryLabel.textContent = t(primaryKey);
+  if (primary) {
+    primary.setAttribute('aria-busy', String(!!store.saving));
+    primary.disabled = !!store.tryRunning || !!store.saving || (enabled && !dirty);
   }
 }
 
 function refreshDirty() {
   if (!store.tree) return;
-  const kind = store.dirtyKind;
-  const badge = $('#cvDirty');
-  if (badge) {
-    badge.hidden = kind === 'clean';
-    badge.dataset.kind = kind;
-    badge.textContent = kind === 'layout' ? t('cv.dirtyLayout') : t('cv.dirty');
-  }
-  const clean = $('#cvClean');
-  if (clean) clean.hidden = kind !== 'clean';
   updateToolbar();
 }
 

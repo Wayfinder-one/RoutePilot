@@ -1285,19 +1285,18 @@ export async function serverTree(id) {
   return (await api('GET', '/admin/trees/' + encodeURIComponent(id))).tree;
 }
 
-export async function dirtyBadge() {
+export async function draftStatus() {
   return page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const badge = document.getElementById('cvDirty');
+    const { app } = await import('/console/routing/app.js');
+    const badge = document.getElementById('cvLifecycle');
     return {
-      hidden: badge.hidden,
-      kind: badge.dataset.kind,
-      text: badge.textContent.trim(),
+      kind: app.kind(),
       appKind: app.kind(),
-      cleanHidden: document.getElementById('cvClean').hidden
+      state: badge.dataset.state,
+      text: badge.textContent.trim(),
+      revision: badge.title,
+      visible: !!(badge.offsetWidth || badge.offsetHeight || badge.getClientRects().length)
 };
-
 });
 }
 

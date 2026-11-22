@@ -538,6 +538,7 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
       palette: css('#cvPalette'),
       inspector: css('#cvInspector'),
       actions: css('.rtc-actions'),
+      lifecycle: css('#cvLifecycle'),
       tryRow: css('.rtc-try-row'),
       chips: css('#cvTryChips'),
       runButton: css('#cvTryRun'),
@@ -558,7 +559,7 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
   assert.equal(opened.locked, true, 'the snapshot canvas is not locked');
   assert.equal(opened.snapshotMode, true);
   assert.equal(opened.badgeHidden, false, 'the read-only badge is missing');
-  for (const key of ['palette', 'inspector', 'actions', 'chips']) {
+  for (const key of ['palette', 'inspector', 'actions', 'lifecycle', 'chips']) {
     assert.equal(opened[key], 'none', `snapshot mode still shows ${key}`);
   }
   /* 快照问题放回画布原有的试算问题输入位：只读、无运行按钮/图标/样例。 */
@@ -640,7 +641,9 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
   assert.equal(await page.evaluate(
     () => getComputedStyle(document.getElementById('cvInspector')).display), 'none',
   'snapshot mode rendered the inspector after selection');
-  assert.equal(await page.locator('#cvSave:visible').count(), 0, 'the snapshot still offers save');
+  assert.equal(await page.evaluate(
+    () => getComputedStyle(document.querySelector('.rtc-actions')).display), 'none',
+  'the snapshot still offers toolbar actions');
 
   /* 刷新同一 URL 仍能回放：图来自不可变快照，不依赖当前编辑中的 tree。 */
   await page.reload();
@@ -668,7 +671,9 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
     assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
       'a log snapshot opened the condition editor');
   }
-  assert.equal(await page.locator('#cvSave:visible').count(), 0, 'the snapshot still offers save');
+  assert.equal(await page.evaluate(
+    () => getComputedStyle(document.querySelector('.rtc-actions')).display), 'none',
+  'the snapshot still offers toolbar actions');
 });
 
 test('calculation-log snapshot replays from SQLite after a real router restart', async () => {

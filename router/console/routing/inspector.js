@@ -361,7 +361,7 @@ function formTail(saveAction, extraActions, showSave = true) {
     '<div class="rtc-dialog-acts">' + (extraActions || '') +
     (showSave
       ? '<button type="submit" class="btn sm pri" data-act="' + saveAction + '">' +
-        esc(t('cv.ins.save')) + '</button>'
+        esc(t('cv.ins.apply')) + '</button>'
       : '') +
     '</div>';
 }

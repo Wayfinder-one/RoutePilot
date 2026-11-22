@@ -20,7 +20,7 @@ import {
   clickEdge,
   clickNode,
   danglingEdgeIds,
-  dirtyBadge,
+  draftStatus,
   dragPort,
   edgeOf,
   ensureBaselineTree,
@@ -846,11 +846,12 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.timezone === 'UTC');
 });
-  let badge = await dirtyBadge();
+  let badge = await draftStatus();
   assert.equal(badge.kind, 'behavior', 'timezone change was not classified as behavior');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirty'));
+    return (t('cv.status.unpublished'));
 }));
   await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
@@ -866,7 +867,9 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.find(node => node.id === 'capability').title === '能力分档（展示标题）');
 });
-  assert.equal((await dirtyBadge()).kind, 'display', 'question title was not classified as display');
+  badge = await draftStatus();
+  assert.equal(badge.kind, 'display', 'question title was not classified as display');
+  assert.equal(badge.state, 'unpublished');
 
   await clickNode('strong-target');
   await waitInspectorBranch('node', 'strong-target');
@@ -876,7 +879,9 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.find(node => node.id === 'strong-target').capability === '强推理（展示说明）');
 });
-  assert.equal((await dirtyBadge()).kind, 'display', 'target capability was not classified as display');
+  badge = await draftStatus();
+  assert.equal(badge.kind, 'display', 'target capability was not classified as display');
+  assert.equal(badge.state, 'unpublished');
 
   await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -889,11 +894,12 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === '展示字段决策组');
 });
-  badge = await dirtyBadge();
+  badge = await draftStatus();
   assert.equal(badge.kind, 'display', 'tree name was not classified as display');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirty'));
+    return (t('cv.status.unpublished'));
 }));
 
   await saveNow();
@@ -903,6 +909,30 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
   assert.equal(server.name, '展示字段决策组');
   assert.equal(server.root.nodes.find(node => node.id === 'capability').title, '能力分档（展示标题）');
   assert.equal(server.root.nodes.find(node => node.id === 'strong-target').capability, '强推理（展示说明）');
+});
+
+test('P0 inspector applies to draft and lifecycle explains publish state', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  const apply = page.locator('#cvInspectorBody [data-act="ins-save-node"]');
+  assert.equal((await apply.textContent()).trim(), await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return t('cv.ins.apply');
+  }));
+  await page.locator('#cvInspectorBody [data-field="instructions"]').fill('P0 只应用到草稿');
+  await apply.click();
+  await waitFor(async () => {
+    const badge = document.getElementById('cvLifecycle');
+    return badge && badge.dataset.state === 'unpublished';
+  });
+  assert.equal(await page.locator('#cvRevision').count(), 0);
+  assert.equal(await page.locator('#cvClean').count(), 0);
+  assert.equal(await page.locator('#cvDirty').count(), 0);
+  assert.equal(await page.locator('#cvEnabled').count(), 0);
+  await saveNow();
+  assert.equal(await page.locator('#cvLifecycle').getAttribute('data-state'), 'running');
 });
 
 test('review-inspector-adds-input-connection', async () => {
@@ -934,9 +964,10 @@ test('review-inspector-adds-input-connection', async () => {
     'canvas slot row did not become occupied');
   assert.match(await page.locator('#cvNodes [data-node-id="and-power"] .rtc-slot[data-slot="in_3"]').innerText(), /开始/,
     'canvas slot row does not show the new source');
-  const badge = await dirtyBadge();
-  assert.equal(badge.hidden, false, 'inspector connection did not mark the draft dirty');
+  const badge = await draftStatus();
+  assert.equal(badge.visible, true, 'inspector connection did not mark the draft dirty');
   assert.equal(badge.appKind, 'behavior');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (store.canUndo);

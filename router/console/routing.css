@@ -74,32 +74,14 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 .rtc-treeselect:hover { background: var(--panel-2); border-color: var(--line); }
 .rtc-treeselect:focus { outline: none; border-color: var(--indigo-line); box-shadow: 0 0 0 3px var(--indigo-soft); }
-.rtc-rev { font-family: var(--mono); font-size: 10px; color: var(--text-2); padding: 3px 8px; }
-#cvDirty { font-weight: 600; }
-#cvDirty[data-kind="layout"] { background: var(--indigo-soft); border-color: var(--indigo-line); color: var(--indigo); }
-#cvClean .dot { background: var(--green); }
-#cvEnabled { padding: 3px 8px; }
+#cvLifecycle { font-weight: 600; padding: 3px 8px; }
+#cvLifecycle[data-state="disabled"] { color: var(--text-3); }
 
 .rtc-headr { flex: none; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 6px; }
 .rtc-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 5px; }
 .rtc-actions .btn { font-size: 12px; }
 .rtc-actions .btn .rtc-ic { width: 13px; height: 13px; }
 .rtc-iconbtn { padding: 4px 7px; }
-.rtc-enable { gap: 6px; }
-.rtc-swt {
-  width: 22px; height: 12px; border-radius: 99px;
-  background: var(--line-2); position: relative; flex: none;
-  transition: background .15s;
-}
-.rtc-swt::after {
-  content: ''; position: absolute; left: 2px; top: 2px;
-  width: 8px; height: 8px; border-radius: 99px; background: var(--panel);
-  box-shadow: var(--shadow);
-  transition: transform .15s;
-}
-.rtc-enable.is-on { color: var(--green); border-color: var(--green-line); background: var(--green-soft); }
-.rtc-enable.is-on .rtc-swt { background: var(--green); }
-.rtc-enable.is-on .rtc-swt::after { transform: translateX(10px); }
 .rtc-issues-btn {
   cursor: pointer; color: var(--text-2); height: 27px;
   border: 1px solid var(--line); background: var(--panel);
@@ -1056,9 +1038,7 @@ body.is-log-snapshot .rtc-palette,
 body.is-log-snapshot .rtc-inspector,
 body.is-log-snapshot .rtc-actions,
 body.is-log-snapshot .rtc-issues-btn,
-body.is-log-snapshot .rtc-rev,
-body.is-log-snapshot #cvClean,
-body.is-log-snapshot #cvDirty { display: none; }
+body.is-log-snapshot #cvLifecycle { display: none; }
 /* 快照只读：默认不显示试算输入与样例；请求正文存在时把问题放回输入位（只读）。 */
 body.is-log-snapshot .rtc-try-row,
 body.is-log-snapshot .rtc-try-chips { display: none; }

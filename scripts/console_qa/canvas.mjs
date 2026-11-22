@@ -31,7 +31,7 @@ import {
   clickEdge,
   clickNode,
   danglingEdgeIds,
-  dirtyBadge,
+  draftStatus,
   dragLibraryItem,
   dragNodeBy,
   dragPort,
@@ -160,9 +160,19 @@ test('P0 toolbar keeps only primary actions visible and overflow remains operabl
   }
   for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
                     'cvLoadExample', 'cvImport', 'cvExport']) {
+    assert.equal(await page.locator('#' + id).count(), 1, id + ' must still exist in the toolbar');
+    assert.equal(await page.locator('#cvMore #' + id).count(), 1,
+      id + ' must be a descendant of the overflow menu');
     assert.equal(await page.locator('#' + id).isVisible(), false,
       id + ' must start inside the closed overflow menu');
   }
+  assert.equal(await page.locator('#cvDisable').count(), 1);
+  assert.equal(await page.locator('#cvMore #cvDisable').count(), 1,
+    'disable must live inside the overflow menu');
+  assert.equal(await page.locator('#cvLifecycle').count(), 1, 'the lifecycle badge is missing');
+  assert.equal(await page.locator('#cvLifecycle').isVisible(), true, 'the lifecycle badge must be visible');
+  assert.equal(await page.locator('#cvRevision, #cvEnabled, #cvClean, #cvDirty').count(), 0,
+    'legacy status badges must be gone');
   await page.locator('#cvMoreBtn').click();
   assert.equal(await page.locator('#cvMore').evaluate(element => element.open), true);
   await page.keyboard.press('Escape');
@@ -353,17 +363,11 @@ test('7.4-02-node-drag-live-layout-only', async () => {
 
 });
   assert.notDeepEqual(movedPosition, originalPosition);
-  const dirty = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (({
-    kind: document.getElementById('cvDirty').dataset.kind,
-    hidden: document.getElementById('cvDirty').hidden,
-    appKind: app.kind()
-}));
-});
-  assert.equal(dirty.hidden, false);
+  const dirty = await draftStatus();
+  assert.equal(dirty.visible, true);
   assert.equal(dirty.kind, 'layout');
   assert.equal(dirty.appKind, 'layout');
+  assert.equal(dirty.state, 'unpublished');
   let snapshot = await appSnapshot();
   assert.deepEqual(snapshot.history, { undo: true, redo: false });
 
@@ -724,7 +728,12 @@ const RTGraph = await import('/console/routing/graph.js');
     positions: Object.fromEntries(app.graph.nodes.map(node => [node.id, { x: node.position.x, y: node.position.y }])),
     edges: app.graph.edges.map(edge => ({ source: edge.source, target: edge.target })),
     kind: app.kind(),
-    badge: { kind: document.getElementById('cvDirty').dataset.kind, hidden: document.getElementById('cvDirty').hidden },
+    lifecycle: {
+      state: document.getElementById('cvLifecycle').dataset.state,
+      visible: !!(document.getElementById('cvLifecycle').offsetWidth ||
+        document.getElementById('cvLifecycle').offsetHeight ||
+        document.getElementById('cvLifecycle').getClientRects().length)
+    },
     history: { undo: store.canUndo, redo: store.canRedo }
 }));
 });
@@ -732,7 +741,7 @@ const RTGraph = await import('/console/routing/graph.js');
     .filter(id => laidOut.positions[id].x !== before[id].x || laidOut.positions[id].y !== before[id].y);
   assert.equal(moved.length, Object.keys(before).length, 'auto layout did not move every node');
   assert.equal(laidOut.kind, 'layout', 'auto layout must not dirty behavior');
-  assert.deepEqual(laidOut.badge, { kind: 'layout', hidden: false });
+  assert.deepEqual(laidOut.lifecycle, { state: 'unpublished', visible: true });
   assert.deepEqual(laidOut.history, { undo: true, redo: false });
   laidOut.edges.forEach(edge => {
     assert.ok(laidOut.positions[edge.target].x > laidOut.positions[edge.source].x,
@@ -754,12 +763,12 @@ const RTGraph = await import('/console/routing/graph.js');
     const { app, store } = await import('/console/routing/app.js');
     return (({
     kind: app.kind(),
-    badgeHidden: document.getElementById('cvDirty').hidden,
+    state: document.getElementById('cvLifecycle').dataset.state,
     history: { undo: store.canUndo, redo: store.canRedo }
 }));
 });
   assert.equal(undone.kind, 'clean', 'undo after a no-op layout did not restore the saved positions');
-  assert.equal(undone.badgeHidden, true);
+  assert.equal(undone.state, 'running');
   assert.deepEqual(undone.history, { undo: false, redo: true });
 });
 
@@ -1182,17 +1191,18 @@ test('option-delete-cascades-edges', async () => {
   assert.equal(restored.kind, 'clean');
 });
 
-test('Task 12 · moving a node saves layout-only: revision unchanged, coordinates persist, badge 仅布局', async () => {
+test('Task 12 · moving a node saves layout-only: revision unchanged, coordinates persist, lifecycle unpublished', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
   const moved = await dragNodeBy('start', 66, 38);
-  const badge = await dirtyBadge();
-  assert.equal(badge.hidden, false);
+  const badge = await draftStatus();
+  assert.equal(badge.visible, true);
   assert.equal(badge.kind, 'layout');
   assert.equal(badge.appKind, 'layout');
+  assert.equal(badge.state, 'unpublished', 'a layout edit is still an unpublished change');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirtyLayout'));
+    return (t('cv.status.unpublished'));
 }));
 
   await saveNow();
@@ -1202,13 +1212,13 @@ test('Task 12 · moving a node saves layout-only: revision unchanged, coordinate
     kind: app.kind(),
     revision: app.tree.tree_revision,
     savedRevision: app.saved.tree_revision,
-    badgeHidden: document.getElementById('cvDirty').hidden
+    state: document.getElementById('cvLifecycle').dataset.state
 }));
 });
   assert.equal(saved.kind, 'clean');
   assert.equal(saved.revision, baseline.tree_revision, 'layout-only save changed the local revision');
   assert.equal(saved.savedRevision, baseline.tree_revision);
-  assert.equal(saved.badgeHidden, true);
+  assert.equal(saved.state, 'running');
 
   const server = await serverTree(TREE_ID);
   assert.equal(server.tree_revision, baseline.tree_revision,
@@ -1234,11 +1244,12 @@ test('Task 12 · save clears dirty while the undo history stays usable', async (
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === '保存后仍可撤销' && app.kind() === 'display');
 });
-  const beforeSave = await dirtyBadge();
-  assert.equal(beforeSave.hidden, false);
+  const beforeSave = await draftStatus();
+  assert.equal(beforeSave.visible, true);
+  assert.equal(beforeSave.state, 'unpublished');
   assert.equal(beforeSave.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirty'));
+    return (t('cv.status.unpublished'));
 }));
 
   await saveNow();
@@ -1250,13 +1261,13 @@ test('Task 12 · save clears dirty while the undo history stays usable', async (
     canRedo: store.canRedo,
     revision: app.tree.tree_revision,
     savedRevision: app.saved.tree_revision,
-    badgeHidden: document.getElementById('cvDirty').hidden
+    state: document.getElementById('cvLifecycle').dataset.state
 }));
 });
   assert.equal(after.kind, 'clean');
   assert.equal(after.canUndo, true, 'save cleared the undo history');
   assert.equal(after.canRedo, false);
-  assert.equal(after.badgeHidden, true);
+  assert.equal(after.state, 'running');
   assert.equal(after.revision, after.savedRevision);
   assert.equal((await serverTree(TREE_ID)).name, '保存后仍可撤销');
 
@@ -1265,7 +1276,9 @@ test('Task 12 · save clears dirty while the undo history stays usable', async (
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === expected);
 }, BASELINE.name);
-  assert.equal((await dirtyBadge()).kind, 'display', 'undoing a save did not mark the draft dirty again');
+  const undone = await draftStatus();
+  assert.equal(undone.kind, 'display', 'undoing a save did not mark the draft dirty again');
+  assert.equal(undone.state, 'unpublished', 'undoing a save did not repaint the lifecycle badge');
 });
 
 test('shared graph · stale save keeps the local draft and reports a conflict', async () => {
@@ -1348,7 +1361,9 @@ test('Task 12 · unsaved switch-group asks one shared confirmation and beforeunl
     return (app.treeId);
 }), TREE_ID);
   assert.equal(await select.inputValue(), TREE_ID);
-  assert.equal((await dirtyBadge()).kind, 'layout');
+  const switchedDirty = await draftStatus();
+  assert.equal(switchedDirty.kind, 'layout');
+  assert.equal(switchedDirty.state, 'unpublished');
 
   await select.selectOption(otherId);
   await waitConfirmDialog();
@@ -1398,6 +1413,24 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(draft.fallback, draft.target, 'fallback model does not point at the target');
   assert.equal(draft.finite, true, 'new tree nodes have no finite coordinates');
 
+  const primaryUi = () => page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    const badge = document.getElementById('cvLifecycle');
+    return {
+      label: document.getElementById('cvEnableLabel').textContent.trim(),
+      publish: t('cv.publish'),
+      published: t('cv.published'),
+      enable: t('cv.enable'),
+      state: badge && badge.dataset.state,
+      disabled: document.getElementById('cvEnable').disabled,
+      disableHidden: document.getElementById('cvDisable').hidden
+    };
+});
+  let ui = await primaryUi();
+  assert.equal(ui.label, ui.publish, 'a new draft must offer to publish');
+  assert.equal(ui.state, 'draft', 'an unsaved draft must be projected as draft');
+  assert.equal(ui.disableHidden, true, 'a disabled draft must not offer disable');
+
   await saveNow();
   const saved = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -1417,38 +1450,63 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(server.root.nodes.length, 2);
   assert.equal(server.root.edges.length, 1);
 
+  ui = await primaryUi();
+  assert.equal(ui.label, ui.enable, 'a saved clean disabled draft must offer enable');
+  assert.equal(ui.state, 'disabled', 'a saved clean disabled draft must be projected as disabled');
+  assert.equal(ui.disableHidden, true, 'a disabled draft must not offer disable');
+
   await clickCanvasAction('cvEnable');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app.tree.enabled === true);
+    return (app.tree.enabled === true && app.changeKind === 'clean');
 }, null, { timeout: 8000 });
-  assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
-    await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.enabled'));
-}));
+  ui = await primaryUi();
+  assert.equal(ui.label, ui.published, 'a clean enabled group must read as published');
+  assert.equal(ui.state, 'running', 'an enabled clean group must be projected as running');
+  assert.equal(ui.disabled, true, 'published is a state, not a repeatable action');
   const enabled = await serverTree(draft.id);
   assert.equal(enabled.enabled, true);
   const list = await api('GET', '/admin/trees');
   assert.equal(list.trees.find(tree => tree.id === draft.id).enabled, true);
   assert.equal(list.trees.find(tree => tree.id === TREE_ID).enabled, false);
+
+  await page.locator('#cvMoreBtn').click();
+  assert.equal(await page.locator('#cvDisable').isVisible(), true,
+    'an enabled group must expose disable inside the overflow menu');
+  await clickCanvasAction('cvDisable');
+  await waitFor(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (app.tree.enabled === false && app.changeKind === 'clean');
+}, null, { timeout: 8000 });
+  ui = await primaryUi();
+  assert.equal(ui.label, ui.enable, 'a clean disabled group must offer enable again');
+  assert.equal(ui.state, 'disabled', 'disabling a clean saved group must project disabled');
+  assert.equal(ui.disableHidden, true, 'a disabled group must hide the disable action');
+  assert.equal((await serverTree(draft.id)).enabled, false, 'disable did not reach the server');
   await ensureBaselineTree();
 });
 
 test('7.4-13-save-enable-unsaved-badge', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  /* 未保存提示：布局改动显示「仅布局」徽标；保存后徽标消失。 */
+  /* 未保存提示：布局改动仍是未发布修改；保存后生命周期回到运行中。 */
   await dragNodeBy('start', 26, 16);
-  let badge = await dirtyBadge();
-  assert.equal(badge.hidden, false, 'a dirty draft did not show the unsaved badge');
+  let badge = await draftStatus();
+  assert.equal(badge.visible, true, 'a dirty draft did not show the lifecycle badge');
   assert.equal(badge.kind, 'layout');
+  assert.equal(badge.state, 'unpublished');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.dirtyLayout'));
+    return (t('cv.status.unpublished'));
+}));
+  assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
+    await page.evaluate(async () => {
+    const { setLang, t, tf } = await import('/console/i18n.js');
+    return (t('cv.publishUpdate'));
 }));
   await saveNow();
-  assert.equal((await dirtyBadge()).hidden, true, 'save left the unsaved badge visible');
+  badge = await draftStatus();
+  assert.equal(badge.state, 'running', 'save left the draft unpublished');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.kind());
@@ -1473,7 +1531,7 @@ test('7.4-13-save-enable-unsaved-badge', async () => {
 },
       null, { timeout: 10000 });
     assert.deepEqual(requests, ['create', 'enable'], 'enable did not auto-save the dirty new tree first');
-    assert.equal((await dirtyBadge()).hidden, true);
+    assert.equal((await draftStatus()).state, 'running');
     const server = await serverTree(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.treeId);
@@ -1509,7 +1567,7 @@ test('Task 12 · enabling an already-enabled dirty draft saves it first and neve
     await page.waitForTimeout(250);
     assert.deepEqual(requests, ['save'],
       'enable short-circuited on an enabled tree before saving its dirty draft');
-    assert.equal((await dirtyBadge()).hidden, true);
+    assert.equal((await draftStatus()).state, 'running');
     assert.equal((await serverTree(TREE_ID)).enabled, true);
 } finally {
     page.off('request', onRequest);
@@ -1661,7 +1719,9 @@ test('Task 12 · loading the example from a clean saved draft still confirms bef
   /* clean 但内容已和示例不同（拖动后保存），让“载入示例”成为一次可见的整图替换。 */
   const moved = await dragNodeBy('start', 52, 36);
   await saveNow();
-  assert.equal((await dirtyBadge()).kind, 'clean');
+  const clean = await draftStatus();
+  assert.equal(clean.kind, 'clean');
+  assert.equal(clean.state, 'running');
 
   await clickCanvasAction('cvLoadExample');
   const dialog = await waitConfirmDialog();
@@ -1763,7 +1823,9 @@ test('Task 12 · export downloads the complete v3 envelope including timezone an
     'exported document leaked a server-side api_key field');
   assert.equal(JSON.stringify(parsed).includes('"key_present"'), false,
     'exported document leaked a server-side key_present field');
-  assert.equal((await dirtyBadge()).kind, 'clean', 'export mutated the draft');
+  const exported = await draftStatus();
+  assert.equal(exported.kind, 'clean', 'export mutated the draft');
+  assert.equal(exported.state, 'running', 'export left the lifecycle badge dirty');
 });
 
 test('envelope-roundtrip-preserves-revision', async () => {
@@ -2149,7 +2211,9 @@ test('7.4-14-import-export-v3-only', async () => {
     'import did not reuse the shared dirty dialog');
   await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
   await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
-  assert.equal((await dirtyBadge()).kind, 'layout');
+  const keptDirty = await draftStatus();
+  assert.equal(keptDirty.kind, 'layout');
+  assert.equal(keptDirty.state, 'unpublished');
 
   const rejection = await page.evaluate(async () => {
     const RTGraph = await import('/console/routing/graph.js');
@@ -2340,13 +2404,13 @@ const RTGraph = await import('/console/routing/graph.js');
     const { app, store } = await import('/console/routing/app.js');
     return (({
     kind: app.kind(),
-    badge: document.getElementById('cvDirty').dataset.kind,
+    state: document.getElementById('cvLifecycle').dataset.state,
     positions: Object.fromEntries(app.graph.nodes.map(node =>
       [node.id, { x: node.position.x, y: node.position.y }]))
 }));
 });
   assert.equal(laidOut.kind, 'layout');
-  assert.equal(laidOut.badge, 'layout');
+  assert.equal(laidOut.state, 'unpublished');
 
   await saveNow();
   const server = await serverTree(TREE_ID);
@@ -2590,18 +2654,19 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
     enabled: app.tree.enabled,
     nodes: app.graph.nodes.length,
     edges: app.graph.edges.length,
-    kind: app.kind(),
-    revisionLabel: document.getElementById('cvRevision').textContent
+    kind: app.kind()
 }));
 });
+  const status = await draftStatus();
   assert.equal(after.treeId, newId, 'refresh booted a different tree than the enabled one');
   assert.equal(after.revision, revision, 'refreshed tree revision differs from the GET revision');
   assert.equal(after.enabled, true);
   assert.equal(after.nodes, EXAMPLE_NODES);
   assert.equal(after.edges, EXAMPLE_EDGES);
   assert.equal(after.kind, 'clean');
-  assert.ok(after.revisionLabel.includes(revision.slice(0, 10)),
-    'toolbar revision label does not show the refreshed revision');
+  assert.equal(status.state, 'running');
+  assert.ok(status.revision.includes(revision.slice(0, 10)),
+    'lifecycle badge title does not show the refreshed revision');
   assert.equal((await serverTree(newId)).tree_revision, revision);
   await ensureBaselineTree();
 });
@@ -3009,14 +3074,14 @@ test('layout-persists-across-save-and-reload', async () => {
     return (({
     revision: app.tree.tree_revision,
     kind: app.kind(),
-    badgeHidden: document.getElementById('cvDirty').hidden,
+    state: document.getElementById('cvLifecycle').dataset.state,
     positions: Object.fromEntries(app.graph.nodes.map(node =>
       [node.id, { x: node.position.x, y: node.position.y }]))
 }));
 });
   assert.equal(after.revision, saved.revision, 'reload changed the tree revision');
   assert.equal(after.kind, 'clean');
-  assert.equal(after.badgeHidden, true);
+  assert.equal(after.state, 'running');
   Object.keys(saved.positions).forEach(id => {
     assert.ok(after.positions[id], `${id} disappeared after reload`);
     assert.ok(Math.abs(after.positions[id].x - saved.positions[id].x) < 0.01, `${id} X moved after reload`);
@@ -3148,7 +3213,11 @@ const { setLang, t, tf } = await import('/console/i18n.js');
       label: document.querySelector('#cvSave span[data-i18n]').textContent,
       expectedLabel: t('cv.saving'),
       newDisabled: document.getElementById('cvNewTree').disabled,
-      importDisabled: document.getElementById('cvImport').disabled
+      importDisabled: document.getElementById('cvImport').disabled,
+      primaryBusy: document.getElementById('cvEnable').getAttribute('aria-busy'),
+      primaryDisabled: document.getElementById('cvEnable').disabled,
+      primaryLabel: document.getElementById('cvEnableLabel').textContent,
+      expectedSaving: t('cv.saving')
 }));
 });
     assert.equal(busy.saving, true);
@@ -3157,6 +3226,9 @@ const { setLang, t, tf } = await import('/console/i18n.js');
     assert.equal(busy.label, busy.expectedLabel, 'the save button did not show the busy label');
     assert.equal(busy.newDisabled, true, 'New stayed enabled while saving');
     assert.equal(busy.importDisabled, true, 'Import stayed enabled while saving');
+    assert.equal(busy.primaryBusy, 'true', 'the primary action did not expose aria-busy while saving');
+    assert.equal(busy.primaryDisabled, true, 'the primary action stayed enabled while saving');
+    assert.equal(busy.primaryLabel, busy.expectedSaving, 'the primary action did not show the busy label');
 
     /* 保存回包落地前切换草稿必须被拒绝。 */
     const switched = await page.evaluate(async () => {

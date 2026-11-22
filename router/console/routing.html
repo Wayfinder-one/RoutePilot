@@ -41,10 +41,9 @@
       <div class="rtc-crumb"><span data-i18n="cv.crumb"></span></div>
       <div class="rtc-h1">
         <select id="cvTreeSelect" class="rtc-treeselect" data-i18n-aria="cv.group" aria-label="决策组"></select>
-        <span class="pill rtc-rev" id="cvRevision">—</span>
-        <span class="pill ok" id="cvEnabled" hidden><span class="dot"></span><span id="cvEnabledLabel" data-i18n="cv.enabled"></span></span>
-        <span class="pill ok" id="cvClean"><span class="dot"></span><span data-i18n="cv.saved"></span></span>
-        <span class="pill warn" id="cvDirty" data-kind="clean" hidden></span>
+        <span class="pill" id="cvLifecycle" data-state="draft">
+          <span class="dot"></span><span id="cvLifecycleLabel"></span>
+        </span>
         <span class="pill" id="cvSnapshotBadge" data-i18n="cv.snapshotBadge" hidden></span>
       </div>
     </div>
