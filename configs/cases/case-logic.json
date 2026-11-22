@@ -1,0 +1,369 @@
+{
+  "id": "case-logic",
+  "name": "案例四 · 请求条件与逻辑门",
+  "timezone": "Asia/Shanghai",
+  "sticky": {
+    "enabled": false,
+    "ttl_seconds": 1800
+  },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "nodes": [
+      {
+        "id": "start",
+        "type": "start",
+        "title": "开始"
+      },
+      {
+        "id": "c-keyword",
+        "type": "condition",
+        "source": "text",
+        "title": "关键词 · 告警/抢修/故障/紧急",
+        "contains_any": [
+          "告警",
+          "抢修",
+          "故障",
+          "紧急"
+        ]
+      },
+      {
+        "id": "c-fault",
+        "type": "condition",
+        "source": "text",
+        "title": "关键词 · 故障/抢修",
+        "contains_any": [
+          "故障",
+          "抢修"
+        ]
+      },
+      {
+        "id": "c-day",
+        "type": "condition",
+        "source": "periods",
+        "title": "时段 · 白天",
+        "periods": [
+          "白天"
+        ]
+      },
+      {
+        "id": "c-night",
+        "type": "condition",
+        "source": "periods",
+        "title": "时段 · 夜间",
+        "periods": [
+          "夜间"
+        ]
+      },
+      {
+        "id": "q-urgent",
+        "type": "question",
+        "question_type": "noul",
+        "title": "是否紧急",
+        "instructions": "这条用户请求描述的告警或故障是否紧急，是否需要立即处置？"
+      },
+      {
+        "id": "q-severity",
+        "type": "question",
+        "question_type": "score",
+        "title": "严重度",
+        "instructions": "请评估这条用户请求所描述问题的严重程度：1 分表示轻微咨询，10 分表示重大事故。",
+        "criteria": [
+          1,
+          3,
+          6,
+          8,
+          10
+        ]
+      },
+      {
+        "id": "g-and-urgent",
+        "type": "logic",
+        "operator": "and",
+        "title": "与门 · 关键词且紧急"
+      },
+      {
+        "id": "g-or-dayfault",
+        "type": "logic",
+        "operator": "or",
+        "title": "或门 · 白天或故障"
+      },
+      {
+        "id": "g-and-night",
+        "type": "logic",
+        "operator": "and",
+        "title": "与门 · 夜间且高严重度"
+      },
+      {
+        "id": "g-and-severity",
+        "type": "logic",
+        "operator": "and",
+        "title": "与门 · 严重度中段（4–8）"
+      },
+      {
+        "id": "t-emergency",
+        "type": "target",
+        "title": "紧急处置（industry-energy）",
+        "priority": 5,
+        "models": [
+          {
+            "model": "industry-energy",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "t-oncall",
+        "type": "target",
+        "title": "值班响应（ha-general）",
+        "priority": 4,
+        "models": [
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "t-review",
+        "type": "target",
+        "title": "排期复审（ha-general）",
+        "priority": 3,
+        "models": [
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "t-normal",
+        "type": "target",
+        "title": "常规处理（ha-general）",
+        "priority": 2,
+        "models": [
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "t-fallback",
+        "type": "target",
+        "title": "异常兜底（ha-general）",
+        "priority": 1,
+        "models": [
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-start-urgent",
+        "source": "start",
+        "source_port": "out",
+        "target": "q-urgent",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-start-severity",
+        "source": "start",
+        "source_port": "out",
+        "target": "q-severity",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-kw-and",
+        "source": "c-keyword",
+        "source_port": "out",
+        "target": "g-and-urgent",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-urgent-and",
+        "source": "q-urgent",
+        "source_port": "yes",
+        "target": "g-and-urgent",
+        "target_port": "in_2",
+        "condition": {
+          "op": "gte",
+          "value": 0.5
+        }
+      },
+      {
+        "id": "e-and-emergency",
+        "source": "g-and-urgent",
+        "source_port": "out",
+        "target": "t-emergency",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-day-or",
+        "source": "c-day",
+        "source_port": "out",
+        "target": "g-or-dayfault",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-fault-or",
+        "source": "c-fault",
+        "source_port": "out",
+        "target": "g-or-dayfault",
+        "target_port": "in_2",
+        "condition": null
+      },
+      {
+        "id": "e-or-oncall",
+        "source": "g-or-dayfault",
+        "source_port": "out",
+        "target": "t-oncall",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-nonurgent-normal",
+        "source": "q-urgent",
+        "source_port": "yes",
+        "target": "t-normal",
+        "target_port": "in_1",
+        "condition": {
+          "op": "lt",
+          "value": 0.5
+        }
+      },
+      {
+        "id": "e-night-and",
+        "source": "c-night",
+        "source_port": "out",
+        "target": "g-and-night",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-sev-night",
+        "source": "q-severity",
+        "source_port": "value",
+        "target": "g-and-night",
+        "target_port": "in_2",
+        "condition": {
+          "op": "gte",
+          "value": 8
+        }
+      },
+      {
+        "id": "e-andnight-emergency",
+        "source": "g-and-night",
+        "source_port": "out",
+        "target": "t-emergency",
+        "target_port": "in_2",
+        "condition": null
+      },
+      {
+        "id": "e-sev-andgt",
+        "source": "q-severity",
+        "source_port": "value",
+        "target": "g-and-severity",
+        "target_port": "in_1",
+        "condition": {
+          "op": "gt",
+          "value": 4
+        }
+      },
+      {
+        "id": "e-sev-andlt",
+        "source": "q-severity",
+        "source_port": "value",
+        "target": "g-and-severity",
+        "target_port": "in_2",
+        "condition": {
+          "op": "lt",
+          "value": 8
+        }
+      },
+      {
+        "id": "e-andsev-review",
+        "source": "g-and-severity",
+        "source_port": "out",
+        "target": "t-review",
+        "target_port": "in_1",
+        "condition": null
+      }
+    ],
+    "error_fallback": "t-fallback"
+  },
+  "canvas": {
+    "start": {
+      "x": 40.0,
+      "y": 380.0
+    },
+    "c-keyword": {
+      "x": 330.0,
+      "y": -40.0
+    },
+    "c-fault": {
+      "x": 330.0,
+      "y": 100.0
+    },
+    "c-day": {
+      "x": 330.0,
+      "y": 240.0
+    },
+    "c-night": {
+      "x": 330.0,
+      "y": 380.0
+    },
+    "q-urgent": {
+      "x": 330.0,
+      "y": 540.0
+    },
+    "q-severity": {
+      "x": 330.0,
+      "y": 700.0
+    },
+    "g-and-urgent": {
+      "x": 640.0,
+      "y": 40.0
+    },
+    "g-or-dayfault": {
+      "x": 640.0,
+      "y": 180.0
+    },
+    "g-and-night": {
+      "x": 640.0,
+      "y": 460.0
+    },
+    "g-and-severity": {
+      "x": 640.0,
+      "y": 620.0
+    },
+    "t-emergency": {
+      "x": 970.0,
+      "y": 80.0
+    },
+    "t-oncall": {
+      "x": 970.0,
+      "y": 240.0
+    },
+    "t-review": {
+      "x": 970.0,
+      "y": 400.0
+    },
+    "t-normal": {
+      "x": 970.0,
+      "y": 560.0
+    },
+    "t-fallback": {
+      "x": 970.0,
+      "y": 720.0
+    }
+  }
+}

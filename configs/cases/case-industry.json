@@ -1,0 +1,224 @@
+{
+  "id": "case-industry",
+  "name": "案例一 · 行业模型分流",
+  "timezone": "Asia/Shanghai",
+  "sticky": {
+    "enabled": false,
+    "ttl_seconds": 1800
+  },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "nodes": [
+      {
+        "id": "start",
+        "type": "start",
+        "title": "开始"
+      },
+      {
+        "id": "industry",
+        "type": "question",
+        "question_type": "choice",
+        "title": "行业领域",
+        "instructions": "你是一个行业模型路由器。下面是一条用户请求，请阅读每个候选模型的能力说明，选择最适合处理这条请求的行业模型。",
+        "options": [
+          {
+            "key": "medical",
+            "label": "医疗健康模型",
+            "capability": "面向医疗健康领域：适合疾病症状与用药咨询、检查检验报告解读、病历与诊断文书、健康管理、医学术语与临床指南问答。"
+          },
+          {
+            "key": "legal",
+            "label": "法律合规模型",
+            "capability": "面向法律合规领域：适合合同审查与条款解释、劳动争议与赔偿、诉讼流程与管辖、侵权责任、知识产权、公司合规与法务风险问答。"
+          },
+          {
+            "key": "finance",
+            "label": "金融财务模型",
+            "capability": "面向金融财务领域：适合投资理财与资产配置、股票基金行情分析、信贷风控、财务报表与税务、保险产品解读、宏观经济数据问答。"
+          },
+          {
+            "key": "energy",
+            "label": "电力能源模型",
+            "capability": "面向电力能源行业：适合电网调度、运维抢修与设备缺陷、安规与两票、输变电与继电保护、电价电费与计量采集、新能源并网、电力营销服务问答。"
+          },
+          {
+            "key": "code",
+            "label": "编程代码模型",
+            "capability": "面向软件开发：适合代码编写与补全、调试排错、代码审查与重构、算法与数据结构、框架选型、数据库与 SQL、脚本与自动化问答。"
+          },
+          {
+            "key": "general",
+            "label": "通用对话模型",
+            "capability": "通用对话：适合日常闲聊、常识问答、写作润色、翻译、摘要、生活建议等没有明确行业归属的通用请求。"
+          }
+        ]
+      },
+      {
+        "id": "industry-medical-target",
+        "type": "target",
+        "title": "医疗健康模型",
+        "priority": 6,
+        "models": [
+          {
+            "model": "industry-medical",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "industry-legal-target",
+        "type": "target",
+        "title": "法律合规模型",
+        "priority": 5,
+        "models": [
+          {
+            "model": "industry-legal",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "industry-finance-target",
+        "type": "target",
+        "title": "金融财务模型",
+        "priority": 4,
+        "models": [
+          {
+            "model": "industry-finance",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "industry-energy-target",
+        "type": "target",
+        "title": "电力能源模型",
+        "priority": 3,
+        "models": [
+          {
+            "model": "industry-energy",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "industry-code-target",
+        "type": "target",
+        "title": "编程代码模型",
+        "priority": 2,
+        "models": [
+          {
+            "model": "industry-code",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "industry-general-target",
+        "type": "target",
+        "title": "通用兜底模型",
+        "priority": 1,
+        "models": [
+          {
+            "model": "industry-general",
+            "reasoning": null
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-start-industry",
+        "source": "start",
+        "source_port": "out",
+        "target": "industry",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-medical",
+        "source": "industry",
+        "source_port": "selected.medical",
+        "target": "industry-medical-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-legal",
+        "source": "industry",
+        "source_port": "selected.legal",
+        "target": "industry-legal-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-finance",
+        "source": "industry",
+        "source_port": "selected.finance",
+        "target": "industry-finance-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-energy",
+        "source": "industry",
+        "source_port": "selected.energy",
+        "target": "industry-energy-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-code",
+        "source": "industry",
+        "source_port": "selected.code",
+        "target": "industry-code-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-general",
+        "source": "industry",
+        "source_port": "selected.general",
+        "target": "industry-general-target",
+        "target_port": "in_1",
+        "condition": null
+      }
+    ],
+    "error_fallback": "industry-general-target"
+  },
+  "canvas": {
+    "start": {
+      "x": 40.0,
+      "y": 360.0
+    },
+    "industry": {
+      "x": 320.0,
+      "y": 360.0
+    },
+    "industry-medical-target": {
+      "x": 660.0,
+      "y": -60.0
+    },
+    "industry-legal-target": {
+      "x": 660.0,
+      "y": 100.0
+    },
+    "industry-finance-target": {
+      "x": 660.0,
+      "y": 260.0
+    },
+    "industry-energy-target": {
+      "x": 660.0,
+      "y": 420.0
+    },
+    "industry-code-target": {
+      "x": 660.0,
+      "y": 580.0
+    },
+    "industry-general-target": {
+      "x": 660.0,
+      "y": 740.0
+    }
+  }
+}

@@ -1,0 +1,185 @@
+{
+  "id": "case-ha",
+  "name": "案例五 · 调度与容错",
+  "timezone": "Asia/Shanghai",
+  "sticky": {
+    "enabled": true,
+    "ttl_seconds": 1800
+  },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "nodes": [
+      {
+        "id": "start",
+        "type": "start",
+        "title": "开始"
+      },
+      {
+        "id": "scene",
+        "type": "question",
+        "question_type": "choice",
+        "title": "调度场景",
+        "instructions": "你是一个调度演示路由器。下面是一条用户请求，请根据每个演示场景的能力说明，选择最符合这条请求意图的调度场景。",
+        "options": [
+          {
+            "key": "balanced",
+            "label": "均衡调度",
+            "capability": "均衡调度演示：两个同构慢速后端组成资源池，按最少在途请求分摊并发流量，同一会话保持粘滞。"
+          },
+          {
+            "key": "complex",
+            "label": "复杂推理熔断",
+            "capability": "复杂推理演示：主后端与通用备用后端组合，主后端连续失败触发熔断后，由通用备用后端接管。"
+          },
+          {
+            "key": "drill",
+            "label": "故障演练",
+            "capability": "故障演练：只指向故障后端，连续失败触发熔断，用于观察无可用后端时的 503 兜底行为。"
+          }
+        ]
+      },
+      {
+        "id": "ha-balanced",
+        "type": "target",
+        "title": "均衡调度（ha-slow-a / ha-slow-b · least_inflight）",
+        "priority": 5,
+        "models": [
+          {
+            "model": "ha-slow-a",
+            "reasoning": null
+          },
+          {
+            "model": "ha-slow-b",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "ha-balanced-backup",
+        "type": "target",
+        "title": "均衡调度 · 低优先备份（ha-general）",
+        "priority": 4,
+        "models": [
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "ha-complex",
+        "type": "target",
+        "title": "复杂推理（ha-fail → ha-general 熔断转移）",
+        "priority": 3,
+        "models": [
+          {
+            "model": "ha-fail",
+            "reasoning": null
+          },
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "ha-drill",
+        "type": "target",
+        "title": "故障演练（ha-fail 单点熔断）",
+        "priority": 2,
+        "models": [
+          {
+            "model": "ha-fail",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "ha-general-target",
+        "type": "target",
+        "title": "通用兜底（ha-general）",
+        "priority": 1,
+        "models": [
+          {
+            "model": "ha-general",
+            "reasoning": null
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-start-scene",
+        "source": "start",
+        "source_port": "out",
+        "target": "scene",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-balanced",
+        "source": "scene",
+        "source_port": "selected.balanced",
+        "target": "ha-balanced",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-balanced-backup",
+        "source": "scene",
+        "source_port": "selected.balanced",
+        "target": "ha-balanced-backup",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-complex",
+        "source": "scene",
+        "source_port": "selected.complex",
+        "target": "ha-complex",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-drill",
+        "source": "scene",
+        "source_port": "selected.drill",
+        "target": "ha-drill",
+        "target_port": "in_1",
+        "condition": null
+      }
+    ],
+    "error_fallback": "ha-general-target"
+  },
+  "canvas": {
+    "start": {
+      "x": 40.0,
+      "y": 320.0
+    },
+    "scene": {
+      "x": 330.0,
+      "y": 320.0
+    },
+    "ha-balanced": {
+      "x": 720.0,
+      "y": 20.0
+    },
+    "ha-balanced-backup": {
+      "x": 720.0,
+      "y": 200.0
+    },
+    "ha-complex": {
+      "x": 720.0,
+      "y": 380.0
+    },
+    "ha-drill": {
+      "x": 720.0,
+      "y": 560.0
+    },
+    "ha-general-target": {
+      "x": 720.0,
+      "y": 740.0
+    }
+  }
+}

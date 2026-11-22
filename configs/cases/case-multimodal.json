@@ -1,0 +1,108 @@
+{
+  "id": "case-multimodal",
+  "name": "案例二 · 多模态分流",
+  "timezone": "Asia/Shanghai",
+  "sticky": {
+    "enabled": false,
+    "ttl_seconds": 1800
+  },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "nodes": [
+      {
+        "id": "start",
+        "type": "start",
+        "title": "开始"
+      },
+      {
+        "id": "modality",
+        "type": "question",
+        "question_type": "choice",
+        "title": "输入模态",
+        "instructions": "你是一个多模态路由器。下面是一条用户请求，请判断这条请求需要处理文本还是需要理解图像，并选择对应模态的模型。",
+        "options": [
+          {
+            "key": "text",
+            "label": "文本对话模型",
+            "capability": "纯文本模型：接收文字输入，擅长写作、总结、翻译、代码、常识问答与信息提取，输入内容只有文字。"
+          },
+          {
+            "key": "image",
+            "label": "视觉多模态模型",
+            "capability": "视觉多模态模型：接收文字与图片输入，擅长识别截图、照片、图表、表格与页面内容，并结合文字提问作答，请求中带有图片或要求看图。"
+          }
+        ]
+      },
+      {
+        "id": "text-target",
+        "type": "target",
+        "title": "文本模型（text-general）",
+        "priority": 1,
+        "models": [
+          {
+            "model": "text-general",
+            "reasoning": null
+          }
+        ]
+      },
+      {
+        "id": "image-target",
+        "type": "target",
+        "title": "视觉模型（vl-qwen35-4b）",
+        "priority": 2,
+        "models": [
+          {
+            "model": "vl-qwen35-4b",
+            "reasoning": null
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": "e-start-modality",
+        "source": "start",
+        "source_port": "out",
+        "target": "modality",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-text",
+        "source": "modality",
+        "source_port": "selected.text",
+        "target": "text-target",
+        "target_port": "in_1",
+        "condition": null
+      },
+      {
+        "id": "e-selected-image",
+        "source": "modality",
+        "source_port": "selected.image",
+        "target": "image-target",
+        "target_port": "in_1",
+        "condition": null
+      }
+    ],
+    "error_fallback": "text-target"
+  },
+  "canvas": {
+    "start": {
+      "x": 40.0,
+      "y": 220.0
+    },
+    "modality": {
+      "x": 330.0,
+      "y": 220.0
+    },
+    "text-target": {
+      "x": 680.0,
+      "y": 110.0
+    },
+    "image-target": {
+      "x": 680.0,
+      "y": 330.0
+    }
+  }
+}

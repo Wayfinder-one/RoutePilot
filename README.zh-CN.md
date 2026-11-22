@@ -132,7 +132,7 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 |---|---|---|---|
 | `start` | 请求入口，恒为真 | — | 布尔 |
 | `question` | 决策服务问题：`choice`、`noul`、`score` | 布尔槽位 `in_1..in_n`（OR） | choice：`prob.*`、`selected.*`、`p_top`、`margin`；noul：`yes`、`no`；score：`value` |
-| `logic` | 三值逻辑门：`and`、`or`、`not` | 布尔槽位 `in_1..in_n`，每槽一条边条件 | 布尔 |
+| `logic` | 三值逻辑门：`and`、`or` | 布尔槽位 `in_1..in_n`，每槽一条边条件 | 布尔 |
 | `condition` | 输入条件：时段或文本关键词 | — | 布尔 |
 | `target` | 模型目标：模型、推理档位、优先级、策略 | 布尔槽位 `in_1..in_n`（OR） | — |
 
@@ -159,7 +159,8 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 - 一个输出可接入多个槽位，每个槽位保留各自条件。
 - AND 门的两个槽位可表达区间，例如 `> 0.3` 与 `< 0.8`。
 - 每个输入槽位只接一条边；槽位编号稳定，释放后可复用。
-- `not` 恰好一个槽位；`and` / `or` 至少两个。问题与目标的槽位为 OR。
+- `and` / `or` 至少两个槽位。问题与目标的槽位为 OR。
+- 反向判断使用布尔槽位取反，或使用数值比较的反向算子；不提供独立 NOT 节点。
 
 ### 执行规则
 
@@ -201,7 +202,11 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 
 只接受 `sr-routing-graph` v3。v2 文档、非 v3 的 `kind`、未知节点类型，以及未知的 envelope/节点/边字段，都会在覆盖草稿或已发布快照之前被拒绝。结构性拒绝以 `graph_parse_error` 返回；控制台在导入时执行同一套校验。
 
-`tree_revision` 是 `{timezone, sticky, root}` canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。标题、能力说明、坐标、数组顺序与边 id 变化不影响该值。
+实验版本不提供旧 NOT 图兼容：任何 `logic/operator=not` 都直接拒绝，不自动迁移，也不保证历史 NOT 快照可展示。需要反向判断时，手工改用布尔槽位取反或数值补比较，例如 `> 0.65 → NOT` 改为 `<= 0.65`，`>= 0.5 → NOT` 改为 `< 0.5`。
+
+v3 文档还可以用四个可选顶层字段自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），见[自包含画布 JSON](#自包含画布-json)。
+
+`tree_revision` 是 `{timezone, sticky, root}`（文档携带内嵌运行配置时再加上四个运行字段）canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。标题、能力说明、坐标、数组顺序与边 id 变化不影响该值；仅缺少内嵌运行配置、且不包含已移除能力的文档保持原有行为哈希；含 NOT 的旧图直接拒绝，不发生 revision 迁移。
 
 ## 模型与推理
 
@@ -217,7 +222,11 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 
 推理方言：OpenAI、DeepSeek、Qwen、Qwen chat template、OpenRouter、Z.ai、Together、string-thinking、Ant Ling。请求了不支持的档位时不注入推理，响应头携带 `x-sr-reasoning-warning`。
 
-`GET /admin/models` 返回的 `profile` 为 JSON 对象；数据库以 JSON 文本存储。
+`GET /admin/models` 返回的 `profile` 为 JSON 对象；数据库以 JSON 文本存储。活动决策组携带内嵌 `backends` 目录时，`GET /admin/models` 与 `GET /admin/providers` 投影图内目录，否则回退数据库；配置写操作会先同步管理表，两种视图最终一致。
+
+旧数据库 profile 仍按兼容规则宽松读取，但响应是脱敏投影：`api_key`、`authorization`、`key_present`、`key_source` 及其大小写/分隔符变体会从 `profile` 中递归剔除。这只是只读投影——合法元数据（`tier`、`domains`、`capability` 等）保留，数据库原行不被改写；图文件与管理写入仍严格拒绝这些字段，而不是清洗后保存。
+
+提供方 API Key 从不出现在响应中：投影只暴露 `key_present` 与 `key_source`（`stored` / `env` / `none`）。
 
 ## 决策服务（JEV）
 
@@ -230,7 +239,7 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 - 使用两个固定候选的连通性测试；
 - 上下文预算与输入截断上限；超长输入按头尾截断。
 
-环境变量只在首次启动时写入决策服务配置，之后以数据库为准。
+活动决策组携带内嵌 `jev` / `jev_window` 时以图内配置为准，环境变量不会覆盖它（图内 `jev: null` 也视为已经确定）。旧文档与无活动组实例仍按原逻辑：`ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` 只在首次启动时写入数据库，之后以数据库为准。JSON 从不携带 `api_key`：仅当端点匹配时复用已存密钥，否则在构建快照时读取环境变量 `ROUTER_JEV_API_KEY`。
 
 ## 账号与运维
 
@@ -244,7 +253,7 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 
 ## 图存储与多副本
 
-图不存于 SQLite。每个决策组是 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json` 下的一份 v3 文档；`ROUTER_GRAPH_DIR/current` 保存已启用组的 id。
+图不存于 SQLite。每个决策组是 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json` 下的一份 v3 文档；`ROUTER_GRAPH_DIR/current` 保存已启用组的 id。文档可自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），因此不依赖控制面数据库也能恢复；没有这四个字段的文档继续使用数据库目录。
 
 - 单写者：管理面 API。其他副本设置 `ROUTER_GRAPH_WRITER=false`，只读挂载目录并每 2 秒重载。
 - 副本在替换服务快照前编译候选快照；文件非法时保留旧快照，`/readyz` 报告 stale。
@@ -255,6 +264,104 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 - 过期保存返回 409 `graph_conflict`；导入只改草稿。
 - `/healthz` 为存活探针；`/readyz` 报告初始快照就绪状态，503 表示未就绪，后续重载失败会保留现有快照并标记 `"stale": true`。
 - 迁移：`python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`。输出目录必须不存在；启动过程不会删除旧 SQLite 图。
+
+## 自包含画布 JSON
+
+v3 文档可以自带运行配置，因此单份文件就能在空数据库实例上恢复一个决策组。信封新增四个可选顶层字段：
+
+| 字段 | 内容 |
+|---|---|
+| `backends` | `providers`（名称、base URL、密钥环境变量名、推理方言）与 `models`（模型 id、上游 id、提供方、profile） |
+| `jev` | 决策服务端点、模型、超时、提示词与状态模板，或 `null` |
+| `jev_window` | 决策服务输入预算 `input_tokens` / `context_tokens` |
+| `time_periods` | `periods` 条件引用的时段定义 |
+
+```json
+{
+  "kind": "sr-routing-graph",
+  "version": 3,
+  "name": "默认路由",
+  "timezone": "Asia/Shanghai",
+  "sticky": { "enabled": true, "ttl_seconds": 1800 },
+  "root": { "id": "root", "type": "graph", "nodes": [], "edges": [], "error_fallback": null },
+  "backends": {
+    "providers": [
+      {
+        "name": "local",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "LOCAL_API_KEY",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "qwen3-8b",
+        "upstream": "qwen3-8b",
+        "provider": "local",
+        "profile": {
+          "capability": "适合简单请求的本地轻量模型。",
+          "reasoning": { "efforts": { "off": null, "on": null }, "default": "on" }
+        }
+      }
+    ]
+  },
+  "jev": {
+    "base_url": "http://127.0.0.1:8100",
+    "model": "d1-2b",
+    "timeout_seconds": 10.0,
+    "instructions": "你是一个模型路由器。",
+    "state_template": "【待判断的用户请求】\n{request}"
+  },
+  "jev_window": { "input_tokens": 1024, "context_tokens": 4096 },
+  "time_periods": [
+    { "name": "白天", "days": [0, 1, 2, 3, 4], "start": "09:00", "end": "18:00" }
+  ]
+}
+```
+
+四个字段遵循同一组规则：
+
+- **要么四个都有，要么四个都没有。** 只出现部分字段的文档会在覆盖草稿或已发布快照之前以 `graph_parse_error` 拒绝；四个都缺失表示旧文档。
+- **不含密钥，且任意层级都拒绝。** 提供方只写 `key_env`（环境变量名），不写 Key；`jev` 不含 `api_key`。密钥与派生的密钥字段（`api_key`、`authorization`、`key_present`、`key_source`）出现在四个字段内部任意位置——包括 `backends.models[*].profile` 下的嵌套对象和数组——都会被拒绝。键名比较忽略大小写与 `-`/`_`（`API-KEY` 等同 `api_key`），但只覆盖这个固定集合，`monkey`、`keychain` 之类正常元数据照旧保留。除此之外 `profile` 仍是自由 JSON 元数据对象：`capability`、`domains`、`tier` 以及后续元数据原样保存。无需鉴权的本地服务可以把 `key_env` 留空。
+- **在文件边界校验。** 提供方与模型 id、提供方引用、profile、推理档位声明、JEV 配置、窗口与时段都在解析时校验。
+- **参与行为版本。** 四个字段存在时进入 `tree_revision`（以及控制台 dirty/undo 基线）；画布坐标仍不影响行为。仅缺少内嵌运行配置、且不包含已移除能力的文档保持原有行为哈希；含 NOT 的旧图直接拒绝，不发生 revision 迁移。
+
+### 旧文档
+
+没有四个字段的 v3 文档是旧文档：运行配置仍按原有逻辑从 SQLite 装配，升级后读取旧文件不受影响。旧文档在第一次通过 API 写入时物化：
+
+- 保存（`POST` / `PUT /admin/trees`）与启用（`POST /admin/trees/{id}/enable`）会把当前有效运行配置（活动组的内嵌配置，否则数据库）写进保存后的文件；
+- 复制决策组保留源组的运行配置；
+- `POST /admin/try` 未携带运行字段时，依次继承所引用组的配置、活动组的配置，最后回退数据库。
+
+没有 runtime 的草稿还可以显式要求物化：`POST`/`PUT /admin/trees` 接受控制字段 `"runtime": null`，含义是**先丢弃该组自己的内嵌配置**，再按既有规则从活动组/数据库取值。它不是文件字段，也不表示“保存为旧图”，并且不能与四个扁平字段同时出现；任何非 `null` 值返回 422。省略 `runtime` 时仍是普通的“继承已存图”语义；控制台保存没有 runtime 的草稿时总会显式发送 `null`。
+
+### 密钥
+
+JSON 从不保存密钥，环境在构建快照时提供。
+
+| 密钥 | 解析顺序 |
+|---|---|
+| 提供方 API Key | 仅当数据库提供方的 `name` 与规范化 `base_url` **都匹配**时复用其已存密钥，否则为空；再取 `os.environ[key_env]` |
+| 决策服务 Key | 仅当数据库 JEV 配置的 `base_url` 与 `model` **都匹配**时复用其已存密钥，否则为空；再取 `ROUTER_JEV_API_KEY` |
+
+因此端点变化不会把旧密钥静默发往新地址；环境变量密钥不会被写进 SQLite 或 JSON；派生鉴权头只存在于内存快照；任何 JSON 文件、API 响应信封或图响应都不包含真实密钥。
+
+### 配置写入是全局的
+
+配置页保持既有全局语义。模型、提供方、JEV、JEV 窗口或时段的成功写入会先用活动组的内嵌配置回填管理表（只保留端点匹配的密钥），再执行本次编辑、用结果校验活动图、记录审计，最后把结果运行配置写回**所有**决策组 JSON。所以一次保存会影响所有组，即使只有一个组处于启用状态；其它写入路径不会重写别的组，失败写入不改动任何文件。
+
+跨图更新是一个批次而不是逐份独立写入：先对所有基线 SHA-256 做预检、把目标文档写进各自的同目录暂存文件，之后才开始第一次正式替换；替换顺序为非活动组在前、活动组最后。配置写回调只做校验、审计与暂存，提交图文件、构造并复核候选快照由外层事务骨架统一执行。请求处理期间的任何可捕获异常（暂存替换、候选快照构造、指纹复核、数据库事务）都先让数据库事务退出（ROLLBACK），随后才恢复本用例替换过的文件原字节；内存快照只在提交成功后才发布，只有文件恢复失败时才按已经回滚的数据库和实际活动图刷新快照。不得把该刷新移回数据库事务内部。暂存/回滚保证的是请求内失败不留下半份配置；它**不是** SQLite 与 JSON 文件之间的分布式事务，进程在替换之间崩溃不会被回滚（活动组最后写，使当前生效配置在最后一步之前仍指向旧图）。
+
+### 用一份 JSON 恢复
+
+1. 启动一个空数据库、空图目录的实例。
+2. 把 JSON 导入决策组（控制台「决策组」页，或 `POST /admin/trees`），保存并启用。
+3. 执行试算（`POST /admin/try`），验证图、内嵌模型目录、决策服务、窗口与时段。
+4. 调用 `POST /v1/chat/completions` 走 Auto 路由，或用模型测试对话选择固定模型。
+5. 只需为密钥配置环境变量：各提供方的 `key_env`，以及决策服务端点需要鉴权时的 `ROUTER_JEV_API_KEY`。
+
+`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、本地决策服务端点与三个种子时段。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
 
 ## 快速开始
 

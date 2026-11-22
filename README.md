@@ -132,7 +132,7 @@ SQLite stores ledger fields only — no request text, trace, per-wave answers or
 |---|---|---|---|
 | `start` | Request entry, always true | — | boolean |
 | `question` | Decision-service question: `choice`, `noul`, `score` | Boolean slots `in_1..in_n` (OR) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
-| `logic` | Three-valued gate: `and`, `or`, `not` | Boolean slots `in_1..in_n`, one edge and condition per slot | boolean |
+| `logic` | Three-valued gate: `and`, `or` | Boolean slots `in_1..in_n`, one edge and condition per slot | boolean |
 | `condition` | Request condition: time period or text keywords | — | boolean |
 | `target` | Model target: models, reasoning tiers, priority, strategy | Boolean slots `in_1..in_n` (OR) | — |
 
@@ -159,7 +159,8 @@ Conditions live on edges:
 - One output can feed multiple slots; every slot keeps its own condition.
 - Two slots of an AND gate can express a range, e.g. `> 0.3` and `< 0.8`.
 - Each input slot accepts one edge. Slot numbers are stable; released slots are reusable.
-- `not` has exactly one slot; `and` / `or` require at least two. Question and target slots are OR.
+- `and` / `or` require at least two slots. Question and target slots are OR.
+- Use boolean-slot negation or the complementary numeric comparison for the opposite test; there is no standalone NOT node.
 
 ### Execution rules
 
@@ -201,7 +202,11 @@ Conditions live on edges:
 
 Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot. Structural rejections surface as `graph_parse_error`; the console runs the same validation before applying an import.
 
-`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Title, capability, position, array order and edge-id changes do not affect it.
+This experimental version does not accept legacy NOT graphs. Any `logic/operator=not` is rejected without migration, and historical NOT snapshots are not supported. Rewrite the condition manually: `> 0.65 → NOT` becomes `<= 0.65`, and `>= 0.5 → NOT` becomes `< 0.5`.
+
+A v3 document may also carry its run configuration in four optional top-level fields (`backends`, `jev`, `jev_window`, `time_periods`); see [Self-contained canvas JSON](#self-contained-canvas-json).
+
+`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, plus the four embedded run fields when the document carries them, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Title, capability, position, array order and edge-id changes do not affect it. Only documents that lack embedded run configuration and contain no removed capabilities keep their original behaviour hash. Legacy graphs containing NOT are rejected, so no revision migration occurs.
 
 ## Models and reasoning
 
@@ -217,7 +222,11 @@ Providers define the OpenAI-compatible base URL, API-key environment variable an
 
 Reasoning dialects: OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai, Together, string-thinking, Ant Ling. An unsupported requested level is forwarded without reasoning injection and the response carries `x-sr-reasoning-warning`.
 
-`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text.
+`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text. When the active decision group carries an embedded `backends` catalog, `GET /admin/models` and `GET /admin/providers` project that catalog; otherwise they fall back to the database. A configuration write synchronizes the management tables first, so both views converge.
+
+Legacy database profiles are still read leniently, but the response is a sanitized projection: `api_key`, `authorization`, `key_present`, `key_source` and their case/separator variants are removed recursively from `profile`. This is read-only — legal metadata (`tier`, `domains`, `capability`, …) is preserved and the database row is never rewritten. Graph files and management writes still reject those fields rather than cleaning them.
+
+A provider API key never appears in a response: the projection exposes `key_present` and `key_source` (`stored` / `env` / `none`) only.
 
 ## Decision service (JEV)
 
@@ -230,7 +239,7 @@ The decision service exposes `POST /v1/systemone`; typical deployments use NeoHo
 - connection test with two fixed candidates;
 - context budget and input truncation limit; oversized input is truncated head/tail.
 
-Environment variables seed the decision-service configuration on first start only; the database is authoritative afterwards.
+When the active decision group carries embedded `jev` / `jev_window` fields, that configuration is authoritative and the environment never overwrites it (an embedded `jev: null` also counts as decided). For legacy documents and instances without an active group, `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` seed the database on first start only and the database is authoritative afterwards. JSON never carries `api_key`: an endpoint-matching stored key is reused, otherwise `ROUTER_JEV_API_KEY` is read from the environment when the snapshot is built.
 
 ## Access and operations
 
@@ -244,7 +253,7 @@ Environment variables seed the decision-service configuration on first start onl
 
 ## Graph storage and replicas
 
-Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains the enabled group id.
+Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains the enabled group id. A document may embed its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`) so it restores without the control-plane database; documents without those fields keep using the database catalog.
 
 - Single writer: the admin API. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the directory read-only and reload every 2 seconds.
 - A replica compiles a candidate snapshot before replacing the serving snapshot; an invalid file leaves the previous snapshot active and `/readyz` reports stale.
@@ -255,6 +264,104 @@ Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUT
 - A stale save returns 409 `graph_conflict`; imports only change the draft.
 - `/healthz` is liveness. `/readyz` reports initial-snapshot readiness; 503 means not ready, and a later reload failure keeps the existing snapshot with `"stale": true`.
 - Migration: `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`. The output directory must not exist; startup never deletes old SQLite graphs.
+
+## Self-contained canvas JSON
+
+A v3 document can carry its own run configuration, so one file restores a decision group on an empty database instance. Four optional top-level fields are added to the envelope:
+
+| Field | Content |
+|---|---|
+| `backends` | `providers` (name, base URL, API-key environment variable, reasoning dialect) and `models` (id, upstream id, provider, profile) |
+| `jev` | Decision-service endpoint, model, timeout, instructions and state template, or `null` |
+| `jev_window` | `input_tokens` / `context_tokens` for the decision-service input budget |
+| `time_periods` | Time period definitions referenced by `periods` conditions |
+
+```json
+{
+  "kind": "sr-routing-graph",
+  "version": 3,
+  "name": "Default routing",
+  "timezone": "Asia/Shanghai",
+  "sticky": { "enabled": true, "ttl_seconds": 1800 },
+  "root": { "id": "root", "type": "graph", "nodes": [], "edges": [], "error_fallback": null },
+  "backends": {
+    "providers": [
+      {
+        "name": "local",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "LOCAL_API_KEY",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "qwen3-8b",
+        "upstream": "qwen3-8b",
+        "provider": "local",
+        "profile": {
+          "capability": "Fast small model for simple requests.",
+          "reasoning": { "efforts": { "off": null, "on": null }, "default": "on" }
+        }
+      }
+    ]
+  },
+  "jev": {
+    "base_url": "http://127.0.0.1:8100",
+    "model": "d1-2b",
+    "timeout_seconds": 10.0,
+    "instructions": "You are a model router.",
+    "state_template": "【待判断的用户请求】\n{request}"
+  },
+  "jev_window": { "input_tokens": 1024, "context_tokens": 4096 },
+  "time_periods": [
+    { "name": "day", "days": [0, 1, 2, 3, 4], "start": "09:00", "end": "18:00" }
+  ]
+}
+```
+
+Four rules govern the fields:
+
+- **All four or none.** A document carrying only some of the four fields is rejected with `graph_parse_error` before it can replace a draft or a published snapshot; all four absent means a legacy document.
+- **No secrets, at any depth.** A provider carries `key_env` (an environment variable name) instead of a key, and `jev` never carries `api_key`. Secret and derived-key fields (`api_key`, `authorization`, `key_present`, `key_source`) are rejected wherever they appear inside the four fields, including nested objects and arrays below `backends.models[*].profile`. The match ignores case, `-` and `_` (`API-KEY` is the same as `api_key`) but only covers that fixed set, so ordinary metadata such as `monkey` or `keychain` is preserved. `profile` stays a free-form JSON metadata object otherwise: `capability`, `domains`, `tier` and later metadata are stored unchanged. A local server that needs no authentication may leave `key_env` empty.
+- **Validated at the file boundary.** Provider and model ids, provider references, profiles, reasoning declarations, JEV settings, the window and the periods are all validated while parsing.
+- **Part of the behaviour version.** When present, the fields join `tree_revision` (and the console dirty/undo baseline); canvas coordinates still do not affect behaviour. Only documents that lack embedded run configuration and contain no removed capabilities keep their original behaviour hash. Legacy graphs containing NOT are rejected, so no revision migration occurs.
+
+### Legacy documents
+
+A v3 document without the four fields is a legacy document: the runtime configuration is assembled from SQLite exactly as before, so reading an old file keeps working after an upgrade. An old document is materialized the first time it is written through the API:
+
+- save (`POST` / `PUT /admin/trees`) and enable (`POST /admin/trees/{id}/enable`) write the current effective run configuration — the active group's embedded configuration when present, otherwise the database — into the saved file;
+- copying a group keeps the source group's run configuration;
+- `POST /admin/try` without run fields inherits the referenced group's configuration, then the active group's, then the database.
+
+A draft that carries no runtime can also ask for explicit materialization: `POST`/`PUT /admin/trees` accept the control field `"runtime": null`, which discards the group's own embedded configuration *before* the normal materialization rule runs (active group first, database otherwise). It is not a file field, it never means "save as a legacy graph", and it cannot be combined with the four flat fields; any non-null value returns 422. Omitted `runtime` keeps the ordinary inheritance of the stored graph, and the console sends the explicit `null` whenever it saves a draft without a runtime.
+
+### Keys
+
+JSON never stores keys; the environment supplies them when a snapshot is built.
+
+| Secret | Resolution order |
+|---|---|
+| Provider API key | The database provider's stored key **only when `name` and the normalized `base_url` both match**, otherwise none; then `os.environ[key_env]` |
+| Decision-service key | The database JEV configuration's stored key **only when `base_url` and `model` both match**, otherwise none; then `ROUTER_JEV_API_KEY` |
+
+An endpoint change therefore never forwards an old key to the new address, environment keys are never written to SQLite or the JSON, derived authorization headers exist only in the in-memory snapshot, and no JSON file, API envelope or graph response contains a real key.
+
+### Configuration writes are global
+
+The configuration pages keep their global semantics. A successful write to models, providers, JEV, the JEV window or time periods seeds the management tables from the active group's embedded configuration (keeping only endpoint-matched keys), applies the edit, validates the active graph against the result, records the audit entry, and finally writes the resulting run configuration back to **every** decision group JSON. That is why one save affects all groups even when only one group is enabled; no other write path rewrites other groups, and a failed write changes no file.
+
+The cross-graph update is a batch, not a loop of independent writes. Every baseline SHA-256 is preflighted and every target document is staged in its own directory before the first real replacement; replacements then run non-active groups first and the active group last. A configuration write callback only validates, audits and stages the batch; the outer transaction skeleton commits the graph files and builds/re-checks the candidate snapshot. Any catchable failure — staged replacement, candidate snapshot, fingerprint re-check or the database transaction — first lets the database transaction exit (ROLLBACK) and only then restores the original bytes of every file this write replaced; the in-memory snapshot is published only after COMMIT, and refreshed after a failed restore using the already-rolled-back database and the actual active graph. That refresh must never move back inside the database transaction. Staging/rollback makes request-scoped failures whole; it is not a distributed transaction across SQLite and the JSON files, so a process crash between replacements is not rolled back (writing the active group last keeps the live configuration on the old graph until the very last step).
+
+### Restoring from one file
+
+1. Start an instance with an empty database and an empty graph directory.
+2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`), then save and enable it.
+3. Run a dry run (`POST /admin/try`) to verify the graph, embedded model catalog, decision service, window and time periods.
+4. Call `POST /v1/chat/completions` for Auto routing, or use the model test chat with a fixed model.
+5. Provide keys through environment variables only: each provider's `key_env`, and `ROUTER_JEV_API_KEY` when the decision-service endpoint requires authentication.
+
+`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, a local decision-service endpoint and the three seeded time periods. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
 
 ## Quick start
 
