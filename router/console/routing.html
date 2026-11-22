@@ -50,16 +50,28 @@
     </div>
     <div class="rtc-headr">
       <div class="rtc-actions">
-        <button type="button" class="btn sm rtc-iconbtn" id="cvUndo" data-i18n-aria="cv.undo" title="撤销（⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-undo"/></svg></button>
-        <button type="button" class="btn sm rtc-iconbtn" id="cvRedo" data-i18n-aria="cv.redo" title="重做（⇧⌘Z）"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-redo"/></svg></button>
-        <button type="button" class="btn sm" id="cvAutoLayout"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-layout"/></svg><span data-i18n="cv.autoLayout"></span></button>
-        <button type="button" class="btn sm" id="cvNewTree"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-newtree"/></svg><span data-i18n="cv.newTree"></span></button>
-        <button type="button" class="btn sm" id="cvLoadExample"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-sample"/></svg><span data-i18n="cv.loadExample"></span></button>
-        <button type="button" class="btn sm" id="cvImport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-import"/></svg><span data-i18n="cv.import"></span></button>
-        <button type="button" class="btn sm" id="cvExport"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-export"/></svg><span data-i18n="cv.export"></span></button>
-        <button type="button" class="btn sm" id="cvTryBtn"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg><span data-i18n="cv.try"></span></button>
-        <button type="button" class="btn sm pri" id="cvSave"><svg class="rtc-ic" aria-hidden="true"><use href="#ri-save"/></svg><span data-i18n="cv.save"></span></button>
-        <button type="button" class="btn sm rtc-enable" id="cvEnable"><span class="rtc-swt"></span><span id="cvEnableLabel">未启用</span></button>
+        <button type="button" class="btn sm" id="cvTryBtn">
+          <svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg>
+          <span data-i18n="cv.try"></span>
+        </button>
+        <details class="rtc-more" id="cvMore">
+          <summary class="btn sm" id="cvMoreBtn" data-i18n="cv.more"></summary>
+          <div class="rtc-more-menu" role="group" data-i18n-aria="cv.more">
+            <button type="button" class="btn sm" id="cvUndo" data-i18n="cv.undo"></button>
+            <button type="button" class="btn sm" id="cvRedo" data-i18n="cv.redo"></button>
+            <button type="button" class="btn sm" id="cvAutoLayout" data-i18n="cv.autoLayout"></button>
+            <!-- 保存按钮保留内层 span：updateToolbar 在请求在途时改写这里的忙碌文案。 -->
+            <button type="button" class="btn sm" id="cvSave"><span data-i18n="cv.saveDraft"></span></button>
+            <button type="button" class="btn sm" id="cvNewTree" data-i18n="cv.newTree"></button>
+            <button type="button" class="btn sm" id="cvLoadExample" data-i18n="cv.loadExample"></button>
+            <button type="button" class="btn sm" id="cvImport" data-i18n="cv.import"></button>
+            <button type="button" class="btn sm" id="cvExport" data-i18n="cv.export"></button>
+            <button type="button" class="btn sm danger" id="cvDisable" data-i18n="cv.disable" hidden></button>
+          </div>
+        </details>
+        <button type="button" class="btn sm pri" id="cvEnable">
+          <span id="cvEnableLabel" data-i18n="cv.publish"></span>
+        </button>
         <button type="button" class="pill rtc-issues-btn" id="cvIssuesBtn" aria-expanded="false">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-alert"/></svg>
           <span id="cvIssueText">0 错误 · 0 提示</span>

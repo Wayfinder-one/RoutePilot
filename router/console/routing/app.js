@@ -742,7 +742,7 @@ function updateToolbar() {
     redo.disabled = busy || !store.canRedo;
     redo.title = t('cv.redoTitle');
   }
-  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvLoadExample', 'cvImport', 'cvExport', 'cvTryBtn']
+  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvLoadExample', 'cvImport', 'cvExport', 'cvTryBtn', 'cvDisable']
     .forEach(id => {
       const button = document.getElementById(id);
       if (button) button.disabled = busy;
@@ -753,11 +753,13 @@ function updateToolbar() {
     save.setAttribute('aria-busy', String(!!store.saving));
     save.classList.toggle('is-saving', !!store.saving);
     const label = save.querySelector('span[data-i18n]');
-    if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.save');
+    if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.saveDraft');
   }
   const enableLabel = $('#cvEnableLabel');
   const enabled = !!(store.tree && store.tree.enabled);
   if (enableLabel) enableLabel.textContent = enabled ? t('cv.enabled') : t('cv.disabled');
+  const disable = $('#cvDisable');
+  if (disable) disable.hidden = !enabled;
   const enable = $('#cvEnable');
   if (enable) enable.classList.toggle('is-on', enabled);
   const enabledPill = $('#cvEnabled');
@@ -843,7 +845,7 @@ function restoreDeleteFocus() {
     trigger.focus();
     return;
   }
-  const fallback = $('#cvSave');
+  const fallback = $('#cvEnable');
   if (fallback) fallback.focus();
 }
 
@@ -989,8 +991,8 @@ function confirmDelete() {
   if (cleared.length) toast(t('cv.toastFallbackCleared'), 'warn');
   else toast(t('cv.toastDeleted'));
   /* 确认删除后触发按钮可能随卡片重绘消失：回到顶栏的稳定焦点位。 */
-  const save = $('#cvSave');
-  if (save && document.contains(save)) save.focus();
+  const enable = $('#cvEnable');
+  if (enable && document.contains(enable)) enable.focus();
 }
 
 /* ── 快速创建（输出端口拖到空白） ─────────────────────────────── */
@@ -1309,7 +1311,27 @@ function autoLayout() {
 }
 
 /* ── 顶栏动作 ─────────────────────────────────────────────────── */
+/* 「更多」菜单是原生 <details>：点菜单项、点菜单外、按 Esc 都要收起，
+   Esc 之后把焦点还给 summary，键盘用户不会掉到文档开头。 */
+function bindMoreMenu() {
+  const menu = $('#cvMore');
+  if (!menu) return;
+  menu.addEventListener('click', event => {
+    if (event.target.closest('button')) menu.open = false;
+  });
+  document.addEventListener('pointerdown', event => {
+    if (menu.open && !menu.contains(event.target)) menu.open = false;
+  }, true);
+  menu.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    event.preventDefault();
+    menu.open = false;
+    $('#cvMoreBtn').focus();
+  });
+}
+
 function bindToolbar() {
+  bindMoreMenu();
   $('#cvUndo').addEventListener('click', () => {
     if (!store.undo()) toast(t('cv.toastNothingUndo'), 'warn');
   });
@@ -1332,7 +1354,8 @@ function bindToolbar() {
     cvImport: requireBooted(() => controller.openImport()),
     cvExport: () => controller.exportTree(),
     cvSave: () => controller.save(),
-    cvEnable: () => controller.enable()
+    cvEnable: () => controller.enable(),
+    cvDisable: () => controller.disable()
   };
   Object.keys(actions).forEach(id => {
     const button = document.getElementById(id);

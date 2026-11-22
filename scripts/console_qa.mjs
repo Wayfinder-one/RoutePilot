@@ -13,7 +13,7 @@
    Usage: node scripts/console_qa.mjs            # 全量（= npm run check:console）
           QA_ONLY=<regex> node scripts/console_qa.mjs
           node scripts/console_qa/canvas.mjs      # 只跑单个页面模块
-   Exports: 71 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
+   Exports: 72 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
             page / mockBase / routerBase / screenshot / BASELINE / FIXTURE），
             完整清单见本文件下方的 export 声明。
    ------------------------------------------------------------------ */
@@ -1332,8 +1332,23 @@ export async function dragNodeBy(nodeId, dx, dy) {
 }, nodeId);
 }
 
+/* 顶栏动作可分为「常驻可见」与「收进 #cvMore 菜单」两类：调用方按 id 点击，
+   由这个助手在需要时展开菜单，避免每个用例都自己关心菜单位置。 */
+export async function clickCanvasAction(id) {
+  const button = page.locator('#' + id);
+  if (await button.isVisible()) {
+    await button.click();
+    return;
+  }
+  const menu = page.locator('#cvMore');
+  if (!(await menu.evaluate(element => element.open))) {
+    await page.locator('#cvMoreBtn').click();
+  }
+  await button.click();
+}
+
 export async function saveNow() {
-  await page.locator('#cvSave').click();
+  await clickCanvasAction('cvSave');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.changeKind === 'clean' && !!app.saved);
@@ -1351,7 +1366,7 @@ export async function beforeUnloadBlocked() {
 
 export async function exportViaUi() {
   const downloadPromise = page.waitForEvent('download', { timeout: 10000 });
-  await page.locator('#cvExport').click();
+  await clickCanvasAction('cvExport');
   const download = await downloadPromise;
   const file = await download.path();
   assert.ok(file, 'browser download has no local path');

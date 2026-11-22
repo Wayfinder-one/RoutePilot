@@ -27,6 +27,7 @@ import {
   beforeUnloadBlocked,
   blankPoint,
   clearToasts,
+  clickCanvasAction,
   clickEdge,
   clickNode,
   danglingEdgeIds,
@@ -149,6 +150,27 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
     /scale\(1\)/.test(document.getElementById('cvWorld').style.transform));
   await screenshot('task10-canvas-100.png');
   await page.setViewportSize({ width: 1440, height: 960 });
+});
+
+test('P0 toolbar keeps only primary actions visible and overflow remains operable', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  for (const id of ['cvTryBtn', 'cvEnable', 'cvMoreBtn']) {
+    assert.equal(await page.locator('#' + id).isVisible(), true, id + ' must be visible');
+  }
+  for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
+                    'cvLoadExample', 'cvImport', 'cvExport']) {
+    assert.equal(await page.locator('#' + id).isVisible(), false,
+      id + ' must start inside the closed overflow menu');
+  }
+  await page.locator('#cvMoreBtn').click();
+  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), true);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), false);
+
+  await clickCanvasAction('cvAutoLayout');
+  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), false,
+    'an overflow action must close the menu');
 });
 
 test('Task 10 · blank drag, space+drag and middle-button drag all pan the viewport', async () => {
@@ -355,13 +377,13 @@ test('7.4-02-node-drag-live-layout-only', async () => {
 }, expected);
 };
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await expectPosition(originalPosition);
   snapshot = await appSnapshot();
   assert.equal(snapshot.kind, 'clean');
   assert.deepEqual(snapshot.history, { undo: false, redo: true });
 
-  await page.locator('#cvRedo').click();
+  await clickCanvasAction('cvRedo');
   await expectPosition(movedPosition);
 
   await page.keyboard.press(`${MOD}+z`);
@@ -432,10 +454,10 @@ test('7.4-05-numeric-default-and-boolean-true', async () => {
   assert.equal(pop.hidden, false, 'condition editor did not open for a numeric edge');
   assert.equal(pop.edgeId, edge.id);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   let undone = await appSnapshot();
   assert.equal(undone.edges.length, before.edges.length, 'one undo did not remove the numeric edge');
-  await page.locator('#cvRedo').click();
+  await clickCanvasAction('cvRedo');
   const redone = await appSnapshot();
   assert.equal(redone.edges.length, before.edges.length + 1, 'redo did not restore the numeric edge');
 
@@ -686,7 +708,7 @@ const RTGraph = await import('/console/routing/graph.js');
 });
   assert.equal(Object.keys(expected).length, Object.keys(before).length);
 
-  await page.locator('#cvAutoLayout').click();
+  await clickCanvasAction('cvAutoLayout');
   await waitFor(async positions => {
     const { app, store } = await import('/console/routing/app.js');
 
@@ -718,8 +740,8 @@ const RTGraph = await import('/console/routing/graph.js');
 });
 
   /* 第二次自动整理是 no-op：不得再入栈。若入了空历史，下面一次 undo 会退到同样的布局。 */
-  await page.locator('#cvAutoLayout').click();
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvAutoLayout');
+  await clickCanvasAction('cvUndo');
   await waitFor(async positions => {
     const { app, store } = await import('/console/routing/app.js');
 
@@ -770,7 +792,7 @@ test('Task 10 · edge delete confirm lists the edge, removes it and undo restore
   assert.equal(removed.edges.length, before.edges.length - 1);
   assert.equal(removed.edges.some(edge => edge.id === edgeId), false);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async id => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.edges.some(edge => edge.id === id));
@@ -852,7 +874,7 @@ test('7.4-06-condition-edit-dual-entry-dirty-undo', async () => {
   let snapshot = await appSnapshot();
   assert.equal(snapshot.kind, 'behavior', 'condition confirm did not mark the draft behavior-dirty');
   assert.deepEqual(snapshot.history, { undo: true, redo: false });
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitEdgeCondition(edgeId, { op: 'gt', value: 0.65 });
   snapshot = await appSnapshot();
   assert.equal(snapshot.kind, 'clean');
@@ -910,7 +932,7 @@ test('7.4-06-condition-edit-dual-entry-dirty-undo', async () => {
   assert.equal((await page.locator(`#cvNodes [data-cond-edge="${edgeId}"]`).textContent()).trim(), '≠ 0.7');
   snapshot = await appSnapshot();
   assert.equal(snapshot.kind, 'behavior');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitEdgeCondition(edgeId, { op: 'gt', value: 0.65 });
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
 });
@@ -988,7 +1010,7 @@ const RTCondPop = await import('/console/routing/condpop.js');
   await page.locator('#cvInspectorBody [data-act="ins-save-edge"]').click();
   await waitEdgeCondition(edgeId, { op: 'is', value: false });
   assert.equal((await appSnapshot()).kind, 'behavior');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitEdgeCondition(edgeId, null);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
 
@@ -1083,7 +1105,7 @@ test('Task 11 · validate-bar edge and graph issues locate and open the same con
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.error_fallback);
 }), 'standard-target');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.error_fallback === null);
@@ -1144,7 +1166,7 @@ test('option-delete-cascades-edges', async () => {
     edge.source === 'capability' && (edge.source_port === 'selected.strong' || edge.source_port === 'prob.strong')));
 }), false);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.find(node => node.id === 'capability')
@@ -1238,7 +1260,7 @@ test('Task 12 · save clears dirty while the undo history stays usable', async (
   assert.equal(after.revision, after.savedRevision);
   assert.equal((await serverTree(TREE_ID)).name, '保存后仍可撤销');
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === expected);
@@ -1271,7 +1293,7 @@ test('shared graph · stale save keeps the local draft and reports a conflict', 
     const { app, store } = await import('/console/routing/app.js');
     return (app.change('display', tree => { tree.name = '保留这份本地草稿'; }));
 });
-    await page.locator('#cvSave').click();
+    await clickCanvasAction('cvSave');
     await page.waitForFunction(() => document.getElementById('cvToast').textContent.includes('其他修改'));
     assert.match(await toastText(), /其他修改/);
     assert.equal(sentBase, baseline.document_sha256);
@@ -1348,7 +1370,7 @@ test('Task 12 · unsaved switch-group asks one shared confirmation and beforeunl
 test('minimal-new-group-template', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  await page.locator('#cvNewTree').click();
+  await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null && app.kind() !== 'clean');
@@ -1395,7 +1417,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(server.root.nodes.length, 2);
   assert.equal(server.root.edges.length, 1);
 
-  await page.locator('#cvEnable').click();
+  await clickCanvasAction('cvEnable');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.enabled === true);
@@ -1439,12 +1461,12 @@ test('7.4-13-save-enable-unsaved-badge', async () => {
 };
   page.on('request', onRequest);
   try {
-    await page.locator('#cvNewTree').click();
+    await clickCanvasAction('cvNewTree');
     await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null);
 });
-    await page.locator('#cvEnable').click();
+    await clickCanvasAction('cvEnable');
     await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.enabled === true && app.changeKind === 'clean');
@@ -1475,7 +1497,7 @@ test('Task 12 · enabling an already-enabled dirty draft saves it first and neve
 };
   page.on('request', onRequest);
   try {
-    await page.locator('#cvEnable').click();
+    await clickCanvasAction('cvEnable');
     await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.changeKind === 'clean');
@@ -1527,7 +1549,7 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
 
     const posted = page.waitForRequest(request =>
       request.method() === 'POST' && new URL(request.url()).pathname === '/admin/trees');
-    await page.locator('#cvSave').click();
+    await clickCanvasAction('cvSave');
     const request = await posted;
     const payload = request.postDataJSON();
     assert.match(payload.id, /^[0-9a-f]{12}$/, 'POST /admin/trees did not use the UUID-slice id');
@@ -1563,7 +1585,7 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
   await openCanvas();
   const moved = await dragNodeBy('start', 48, 34);
 
-  await page.locator('#cvLoadExample').click();
+  await clickCanvasAction('cvLoadExample');
   const dialog = await waitConfirmDialog();
   assert.ok(dialog.includes(await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
@@ -1582,7 +1604,7 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
   assert.deepEqual({ x: kept.x, y: kept.y }, { x: moved.x, y: moved.y });
   assert.equal(kept.kind, 'layout');
 
-  await page.locator('#cvLoadExample').click();
+  await clickCanvasAction('cvLoadExample');
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
   /* 示例是异步 fetch 的：等待它真正替换草稿（示例 start 坐标），不能只看节点数（本来就是 15）。 */
@@ -1617,7 +1639,7 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
   assert.notDeepEqual(loaded.start, { x: moved.x, y: moved.y });
 
   /* 一次撤销必须回到载入前的完整草稿（拖拽后的坐标），而不是半张示例图。 */
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === expected && app.kind() === 'layout');
@@ -1641,7 +1663,7 @@ test('Task 12 · loading the example from a clean saved draft still confirms bef
   await saveNow();
   assert.equal((await dirtyBadge()).kind, 'clean');
 
-  await page.locator('#cvLoadExample').click();
+  await clickCanvasAction('cvLoadExample');
   const dialog = await waitConfirmDialog();
   assert.ok(dialog.includes(await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
@@ -1676,7 +1698,7 @@ test('Task 12 · loading the example from a clean saved draft still confirms bef
   assert.equal(kept.kind, 'clean');
   assert.equal(kept.nodes, EXAMPLE_NODES);
 
-  await page.locator('#cvLoadExample').click();
+  await clickCanvasAction('cvLoadExample');
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
   await waitFor(async expected => {
@@ -1702,7 +1724,7 @@ test('Task 12 · loading the example from a clean saved draft still confirms bef
     'replacing the saved draft with the self-contained example was not classified as a behavior change');
 
   /* 一次撤销回到保存后的拖拽坐标，证明示例载入只产生一个历史项。 */
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
 
@@ -1760,7 +1782,7 @@ test('envelope-roundtrip-preserves-revision', async () => {
   assert.ok(sourceCanonical, 'the exported document no longer parses as a self-contained v3 document');
   const parsedSource = JSON.parse(source.text);
 
-  await page.locator('#cvNewTree').click();
+  await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null && app.graph.nodes.length === 2);
@@ -1814,7 +1836,7 @@ const RTGraph = await import('/console/routing/graph.js');
     parsedSource.backends.providers.map(provider => [provider.name, provider.base_url]));
   assert.equal(Object.prototype.hasOwnProperty.call(roundTripped, 'jev'), true);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === 2);
@@ -1943,7 +1965,7 @@ test('Task C2 · import replaces the runtime and an old document materializes on
 },
       TREE_ID, { timeout: 8000 });
 }
-  await page.locator('#cvEnable').click();
+  await clickCanvasAction('cvEnable');
   await waitFor(async () => {
     const { app } = await import('/console/routing/app.js');
     return (app.tree.enabled === true);
@@ -2092,7 +2114,7 @@ test('Task C2 · inspector models and periods follow the current tree runtime', 
     ['peak'], 'inspector periods did not come from the tree runtime');
 
   /* 新草稿没有 runtime：检查器回退 /admin/models 的全局目录。 */
-  await page.locator('#cvNewTree').click();
+  await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app } = await import('/console/routing/app.js');
     return (app.saved === null && app.graph.nodes.length === 2);
@@ -2118,7 +2140,7 @@ test('7.4-14-import-export-v3-only', async () => {
   await dragNodeBy('start', 36, 24);
 
   /* 未保存时先弹共享确认框；取消后不选文件、草稿保持。 */
-  await page.locator('#cvImport').click();
+  await clickCanvasAction('cvImport');
   const dialog = await waitConfirmDialog();
   assert.ok(dialog.includes(await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
@@ -2306,7 +2328,7 @@ test('7.4-12-auto-layout-layout-only', async () => {
 const RTGraph = await import('/console/routing/graph.js');
     return (RTGraph.layoutPositions('dag', app.graph));
 });
-  await page.locator('#cvAutoLayout').click();
+  await clickCanvasAction('cvAutoLayout');
   await waitFor(async positions => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.every(node => {
@@ -2344,7 +2366,7 @@ test('7.4-15-validation-bar-and-locate', async () => {
   await ensureBaselineTree();
   await openCanvas();
   /* 用禁用中的新组（enable 才会先保存）；载入示例，让 422 Issue 有可定位的节点/边。 */
-  await page.locator('#cvNewTree').click();
+  await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null && app.graph.nodes.length === 2);
@@ -2353,7 +2375,7 @@ test('7.4-15-validation-bar-and-locate', async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.treeId);
 });
-  await page.locator('#cvLoadExample').click();
+  await clickCanvasAction('cvLoadExample');
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
   await waitFor(async expected => {
@@ -2399,7 +2421,7 @@ test('7.4-15-validation-bar-and-locate', async () => {
   try {
     /* 只允许这一条故意 422：URL 精确到本用例的新组，状态必须是 422。 */
     expectHttpStatusError({ url: new RegExp('/admin/trees/' + targetId + '$'), status: /422/ });
-    await page.locator('#cvEnable').click();
+    await clickCanvasAction('cvEnable');
     await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.issues.length === 8 &&
@@ -2522,7 +2544,7 @@ const RTGraph = await import('/console/routing/graph.js');
 test('Task 12 · example graph saves, enables and survives a page refresh with a consistent revision', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  await page.locator('#cvNewTree').click();
+  await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null && app.graph.nodes.length === 2);
@@ -2531,7 +2553,7 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
     const { app, store } = await import('/console/routing/app.js');
     return (app.treeId);
 });
-  await page.locator('#cvLoadExample').click();
+  await clickCanvasAction('cvLoadExample');
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
   /* 新建草稿是 2 个节点：必须等示例 root 真正替换后再保存。 */
@@ -2550,7 +2572,7 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
   assert.equal(savedServer.root.edges.length, EXAMPLE_EDGES);
   const revision = savedServer.tree_revision;
 
-  await page.locator('#cvEnable').click();
+  await clickCanvasAction('cvEnable');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.enabled === true);
@@ -2608,9 +2630,9 @@ test('7.4-11-undo-redo-buttons-and-keyboard', async () => {
 
 }, position, { timeout: 4000 });
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await expectStart(original);
-  await page.locator('#cvRedo').click();
+  await clickCanvasAction('cvRedo');
   await expectStart(moved);
   await page.keyboard.press(`${MOD}+z`);
   await expectStart(original);
@@ -2906,7 +2928,7 @@ test('condition-only-question-is-valid', async () => {
 }
 };
   /* 新建未启用的组再导入：保存走 POST /admin/trees，不会覆盖已启用的基线组。 */
-  await page.locator('#cvNewTree').click();
+  await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null && app.graph.nodes.length === 2);
@@ -3111,7 +3133,7 @@ test('Task 14 · an in-flight save is busy, blocks switching and discards a stal
   const matcher = url => url.pathname === '/admin/trees/' + TREE_ID;
   await page.route(matcher, async route => { await gate; await route.continue(); });
   try {
-    await page.locator('#cvSave').click();
+    await clickCanvasAction('cvSave');
     await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saving === true);
@@ -3281,7 +3303,7 @@ test('Task 8 · a tree switch that loses to Load example is discarded', async ()
     while (!pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
     assert.ok(pending, 'the tree switch GET was not issued');
 
-    await page.locator('#cvLoadExample').click();
+    await clickCanvasAction('cvLoadExample');
     await waitConfirmDialog();
     await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
     await waitFor(async expected => {
@@ -3498,7 +3520,7 @@ test('Task 8 · cancelling New keeps an in-flight tree switch', async () => {
     assert.ok(pending, 'the tree switch GET was not issued');
 
     /* 取消 New 不能动 loadSeq：在途 switch 仍是用户最后一次有效选择。 */
-    await page.locator('#cvNewTree').click();
+    await clickCanvasAction('cvNewTree');
     const dialog = await waitConfirmDialog();
     assert.ok(dialog.length > 0, 'New did not ask before replacing the dirty draft');
     await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
@@ -3558,7 +3580,7 @@ test('Task 14 · New, Import and Load example stay inert until the canvas is boo
 });
     for (const id of ['cvNewTree', 'cvImport', 'cvLoadExample']) {
       await clearToasts();
-      await page.locator('#' + id).click();
+      await clickCanvasAction(id);
       await waitToastIncludes(notReady);
       assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -4115,7 +4137,7 @@ test('boolean start is read-only and legacy negation needs an explicit clear', a
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (t('cv.cond.startAlways'));
 }));
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
 });
 
@@ -4174,7 +4196,7 @@ test('clearing legacy start negation restores keyboard focus', async () => {
   assert.deepEqual(focused, { tag: 'SPAN', startCondition: startEdge.id, tabIndex: -1 });
   assert.equal(await page.locator(`#cvNodes [data-cond-edge="${startEdge.id}"]`).count(), 0);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
 });
 

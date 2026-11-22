@@ -15,6 +15,7 @@ import {
   TRY_SAMPLES,
   api,
   assertIncludes,
+  clickCanvasAction,
   dragNodeBy,
   ensureBaselineTree,
   expectHttpStatusError,
@@ -823,7 +824,7 @@ const { setLang, t, tf } = await import('/console/i18n.js');
   assert.equal(again.result, true, 'a no-op wave layout should still succeed');
   assert.equal(again.replay, true, 'a no-op wave layout cleared the replay');
   assert.equal(again.toast, again.same, 'a no-op wave layout toasted the moved copy');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async previous => {
     const { app, store } = await import('/console/routing/app.js');
 

@@ -46,6 +46,8 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 }
 
 /* ── 页头 ─────────────────────────────────────────────────────── */
+/* z-index 必须高于画布浮层（节点库/检查器 22、缩放/小地图 23）：
+   「更多」菜单是页头的子元素，页头自身成层，低于浮层就会被检查器挡住点击。 */
 .rtc-pagehead {
   flex: none;
   display: flex; align-items: flex-end; gap: 12px;
@@ -53,7 +55,7 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
   padding: 8px 16px 7px;
   background: var(--panel);
   border-bottom: 1px solid var(--line);
-  position: relative; z-index: 20;
+  position: relative; z-index: 24;
 }
 .rtc-headl { flex: 1 1 320px; min-width: 0; }
 .rtc-crumb { font-size: 10px; color: var(--text-3); letter-spacing: .02em; line-height: 1.4; }
@@ -106,6 +108,22 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-issues-btn .rtc-ic { width: 12px; height: 12px; }
 .rtc-issues-btn.warn { background: var(--amber-soft); border-color: var(--amber-line); color: var(--amber); }
 .rtc-issues-btn.bad { background: var(--red-soft); border-color: var(--red-line); color: var(--red); }
+
+/* 低频动作收进原生 <details> 菜单：summary 就是「更多」按钮，菜单绝对定位于其下方。 */
+.rtc-more { position: relative; }
+.rtc-more > summary { list-style: none; cursor: pointer; user-select: none; }
+.rtc-more > summary::-webkit-details-marker { display: none; }
+.rtc-more-menu {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 80;
+  display: grid; grid-template-columns: repeat(2, minmax(128px, 1fr)); gap: 5px;
+  width: 300px; padding: 8px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-lg);
+}
+.rtc-more-menu .btn { justify-content: flex-start; width: 100%; box-shadow: none; }
+.rtc-more-menu [hidden] { display: none; }
+@media (max-width: 640px) {
+  .rtc-more-menu { position: fixed; left: 8px; right: 8px; top: 56px; width: auto; }
+}
 
 /* ── 校验条 ───────────────────────────────────────────────────── */
 .rtc-issues {

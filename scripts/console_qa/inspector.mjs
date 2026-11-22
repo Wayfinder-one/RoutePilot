@@ -16,6 +16,7 @@ import {
   api,
   appSnapshot,
   blankPoint,
+  clickCanvasAction,
   clickEdge,
   clickNode,
   danglingEdgeIds,
@@ -81,7 +82,7 @@ test('7.4-07-selected-edge-inspector', async () => {
   assert.deepEqual(await danglingEdgeIds(), []);
   assert.equal((await issueCodes()).includes('edge_port_missing'), false);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async id => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.edges.some(edge => edge.id === id));
@@ -277,7 +278,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(ports.includes('selected.easy'), false);
   assert.equal(await page.locator('#cvNodes [data-node-id="capability"] [data-optkey="light"]').count(), 1);
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.edges.some(edge => edge.source_port === 'selected.easy'));
@@ -351,7 +352,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.deepEqual((await appSnapshot()).history, { undo: true, redo: false },
     'two-key swap must be exactly one history entry');
 
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -405,7 +406,7 @@ const RTGraph = await import('/console/routing/graph.js');
     RTGraph.findNode(app.graph, 'cond-text'))));
 }), condTextBefore,
   'inspector save wrote to the silently moved kit selection');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -493,7 +494,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(saved.options.find(option => option.key === 'easy').label, '轻量档');
   assert.deepEqual(saved.options.find(option => option.key === 'medium'),
     { key: 'medium', label: '中档模型', capability: '中等复杂度写作与总结。' });
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -528,7 +529,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }),
     ['抢修', '停电', '电梯', '故障']);
   assert.equal(await page.locator('#cvNodes [data-node-id="cond-text"] [data-kw="电梯"]').count(), 1);
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -554,7 +555,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }),
     ['peak', 'normal']);
   assert.equal(await page.locator('#cvNodes [data-node-id="cond-peak"] [data-period="normal"]').count(), 1);
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -599,7 +600,7 @@ const RTGraph = await import('/console/routing/graph.js');
     return (RTGraph.findNode(app.graph, 'and-power').operator === 'or');
 });
   assert.equal(await page.locator('#cvNodes [data-node-id="and-power"]').getAttribute('data-operator'), 'or');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -655,7 +656,7 @@ const RTGraph = await import('/console/routing/graph.js');
 });
   assert.equal(target.strategy, 'least_inflight');
   assert.equal(target.capability, '强推理通用模型：复杂分析。');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
@@ -736,7 +737,7 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.error_fallback);
 }), 'power-target');
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.name === expected.name &&
@@ -851,7 +852,7 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (t('cv.dirty'));
 }));
-  await page.locator('#cvUndo').click();
+  await clickCanvasAction('cvUndo');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.tree.timezone === expected && app.kind() === 'clean');
