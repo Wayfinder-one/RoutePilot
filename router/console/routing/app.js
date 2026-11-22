@@ -26,15 +26,18 @@ import {
 import { configureInspector, render as renderInspectorBranch } from './inspector.js';
 import {
   apply as applyTryRun,
-  closeDrawer as closeTryDrawer,
   configureTryRun,
   current as currentReplay,
   init as initTryRun,
   refresh as refreshTryRun,
+  rebuild as rebuildTryRun,
   reset as resetTryRun,
 } from './tryrun.js';
 
 const $ = (sel, scope) => (scope || document).querySelector(sel);
+/* 日志快照：URL 带 ?request=<id> 时进入只读回放，不装配任何编辑入口。 */
+const SNAPSHOT_REQUEST = new URLSearchParams(window.location.search).get('request') || '';
+const isLogSnapshot = () => SNAPSHOT_REQUEST !== '';
 const clone = value => JSON.parse(JSON.stringify(value));
 const icon = (name, cls) =>
   '<svg class="rtc-ic' + (cls ? ' ' + cls : '') + '" aria-hidden="true"><use href="#ri-' + name + '"/></svg>';
@@ -53,8 +56,7 @@ const CATALOG = [
     id: 'logic', tone: 'logic', labelKey: 'cv.group.logic',
     items: [
       { kind: 'logic-and', icon: 'logic', labelKey: 'cv.node.logic-and', descKey: 'cv.desc.logic-and' },
-      { kind: 'logic-or', icon: 'logic', labelKey: 'cv.node.logic-or', descKey: 'cv.desc.logic-or' },
-      { kind: 'logic-not', icon: 'logic', labelKey: 'cv.node.logic-not', descKey: 'cv.desc.logic-not' }
+      { kind: 'logic-or', icon: 'logic', labelKey: 'cv.node.logic-or', descKey: 'cv.desc.logic-or' }
     ]
   },
   {
@@ -88,13 +90,88 @@ function kindLabel(kind) {
   return item ? t(item.labelKey) : kind;
 }
 
+/* ── 检查器目录：当前树的内嵌运行配置优先，旧草稿沿用全局目录 ─────
+   树有 runtime 时，模型/时段以文档自带的 backends/time_periods 为准（与运行快照
+   消费同一事实源）；新草稿/旧图没有 runtime 才回退 /admin/models 与
+   /admin/time-periods 的全局目录。 */
+function currentRuntime() {
+  /* 旧 graph.js（未带自包含 runtime）也能跑：缺少视图函数时退回全局目录。 */
+  if (!store.tree || typeof RTGraph.runtimeBehaviorView !== 'function') return null;
+  return RTGraph.runtimeBehaviorView(store.tree);
+}
+
+function providerFormatOf(runtime, providerName) {
+  const providers = (runtime && runtime.backends && runtime.backends.providers) || [];
+  const provider = providers.find(item => item && item.name === providerName);
+  const format = provider && provider.reasoning_format;
+  return typeof format === 'string' && format ? format : 'openai';
+}
+
+/* runtime 的 provider.reasoning_format 决定未显式声明 format 的模型协议；
+   profile.reasoning.efforts 是「档位 → 协议拼写」map，检查器消费的是
+   /admin/models 归一化后的数组形状（efforts: [{id, wire}]）。 */
+function runtimeModelOption(model, providerFormat) {
+  const source = model && typeof model === 'object' ? model : {};
+  const profile = source.profile && typeof source.profile === 'object' ? source.profile : {};
+  const format = typeof providerFormat === 'string' && providerFormat ? providerFormat : 'openai';
+  const declared = profile.reasoning;
+  let reasoning;
+  if (declared === false) {
+    reasoning = { declared: true, supported: false, format: format, efforts: [], default: null };
+  } else if (declared && typeof declared === 'object' && !Array.isArray(declared)) {
+    const efforts = declared.efforts && typeof declared.efforts === 'object' &&
+      !Array.isArray(declared.efforts) ? declared.efforts : {};
+    reasoning = {
+      declared: true,
+      supported: true,
+      format: typeof declared.format === 'string' && declared.format ? declared.format : format,
+      efforts: Object.keys(efforts).map(level => ({ id: level, wire: efforts[level] })),
+      default: typeof declared.default === 'string' ? declared.default : null
+    };
+  } else {
+    reasoning = { declared: false, supported: null, format: format, efforts: [], default: null };
+  }
+  return {
+    id: source.id,
+    upstream: source.upstream,
+    provider: source.provider,
+    profile: profile,
+    capability: typeof profile.capability === 'string' ? profile.capability.trim() : '',
+    reasoning: reasoning
+  };
+}
+
+function runtimeModels() {
+  const runtime = currentRuntime();
+  if (!runtime) return null;
+  const models = (runtime.backends && Array.isArray(runtime.backends.models))
+    ? runtime.backends.models : [];
+  return models.map(model =>
+    runtimeModelOption(model, providerFormatOf(runtime, model && model.provider)));
+}
+
+/* 检查器消费者只需要 id / reasoning / profile：runtime 投影与 /admin/models 同形。 */
+function effectiveModels() {
+  const models = runtimeModels();
+  return models || app.models || [];
+}
+
+function effectivePeriods() {
+  const runtime = currentRuntime();
+  if (!runtime) return app.periods || [];
+  return (Array.isArray(runtime.time_periods) ? runtime.time_periods : [])
+    .map(period => (period && period.name) || '')
+    .filter(Boolean);
+}
+
 function defaultModelId() {
-  if (app.models && app.models.length) return app.models[0].id;
+  const models = effectiveModels();
+  if (models.length) return models[0].id;
   return 'qwen3-8b';
 }
 
 function reasoningFor(modelId) {
-  const model = (app.models || []).find(item => item.id === modelId);
+  const model = effectiveModels().find(item => item && item.id === modelId);
   if (!model) return null;
   const reasoning = model.reasoning ||
     (model.profile && typeof model.profile === 'object' ? model.profile.reasoning : null);
@@ -151,7 +228,7 @@ function makeNode(kind, position, graph, forcedId) {
       criteria: [1, 5, 7.5, 10],
       position: point
     };
-  } else if (kind.indexOf('logic-') === 0) {
+  } else if (kind === 'logic-and' || kind === 'logic-or') {
     node = {
       id: uniqueNodeId(kind, graph, forcedId),
       type: 'logic', operator: kind.slice('logic-'.length),
@@ -165,10 +242,13 @@ function makeNode(kind, position, graph, forcedId) {
       position: point
     };
   } else if (kind === 'condition-periods') {
+    /* 新时段的默认值来自当前目录（runtime 的 time_periods 或全局目录），
+       避免新节点引用当前树根本不存在的时段。 */
+    const firstPeriod = effectivePeriods()[0] || 'peak';
     node = {
       id: uniqueNodeId('condition-periods', graph, forcedId),
       type: 'condition', source: 'periods',
-      periods: ['peak'],
+      periods: [firstPeriod],
       position: point
     };
   } else if (kind === 'target') {
@@ -202,6 +282,8 @@ let ghost = null;
 let toastSeq = 0;
 /* 检查器里有未提交输入：焦点仍在表单控件内，或本次渲染后发生过 input/change。 */
 let inspectorDirty = false;
+/* 保存/启用被 422 驳回后，画布上的红色标注要闪一次再常驻。 */
+let issueFlashPending = false;
 /* 共享的「丢弃草稿」确认框；null = 未打开。 */
 let confirmState = null;
 
@@ -360,6 +442,13 @@ function renderPalette() {
 
 /* ── 渲染：检查器（三分支由 inspector.js 生成） ──────────────── */
 function renderInspector() {
+  /* 快照只读：检查器不生成表单，避免出现任何可提交的编辑控件。 */
+  if (isLogSnapshot()) {
+    const body = document.getElementById('cvInspectorBody');
+    if (body) body.innerHTML = '';
+    inspectorDirty = false;
+    return;
+  }
   const selection = app.kit ? app.kit.getSelection() : app.selection;
   renderInspectorBranch(selection);
   /* 新 DOM 里没有未提交输入；只有下一次 input/change 才会重新置脏。 */
@@ -391,6 +480,9 @@ function renderIssues() {
   const rows = counts.hard.concat(counts.hints);
   /* 校验条点击按行号取回原始 Issue（服务端 422 与本地 validate 共用同一份定位规则）。 */
   app.issueRows = rows;
+  /* 画布上的红色标注和校验条同一份数据：面板收起时标记仍然保留。 */
+  paintIssueTargets(rows, { flash: issueFlashPending });
+  issueFlashPending = false;
   if (panel.hidden) { panel.innerHTML = ''; return; }
   const lang = (typeof LANG === 'string' && LANG === 'en') ? 'en' : 'zh';
   panel.innerHTML = rows.map((issue, index) => {
@@ -487,9 +579,58 @@ function revealIssues() {
   const panel = $('#cvIssues');
   if (!panel) return;
   panel.hidden = false;
+  issueFlashPending = true;
   renderIssues();
   const button = $('#cvIssuesBtn');
   if (button) button.setAttribute('aria-expanded', 'true');
+}
+
+/* ── 校验命中：把 issue 目标涂成红色（节点 / 边 / 槽位） ───────── */
+function cssEscape(value) {
+  if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(value));
+  return String(value).replace(/["\\]/g, '\\$&');
+}
+
+function clearIssueTargets() {
+  const marked = document.querySelectorAll('.is-issue-target');
+  for (let index = 0; index < marked.length; index += 1) {
+    marked[index].classList.remove('is-issue-target', 'is-issue-flash');
+  }
+}
+
+function issueTargetElements(target) {
+  const elements = [];
+  if (!target) return elements;
+  if (target.kind === 'node') {
+    const node = document.querySelector('#cvNodes [data-node-id="' + cssEscape(target.id) + '"]');
+    if (node) elements.push(node);
+    return elements;
+  }
+  if (target.kind !== 'edge') return elements;
+  const path = app.kit && app.kit.edgeEl ? app.kit.edgeEl(target.id) : null;
+  if (path) elements.push(path);
+  const edge = ((store.graph && store.graph.edges) || []).find(item => item && item.id === target.id);
+  if (!edge) return elements;
+  const node = document.querySelector('#cvNodes [data-node-id="' + cssEscape(edge.target) + '"]');
+  const slot = node && node.querySelector('.rtc-slot[data-slot="' + cssEscape(edge.target_port) + '"]');
+  if (slot) elements.push(slot);
+  return elements;
+}
+
+function paintIssueTargets(rows, options) {
+  if (!app.kit) return;
+  clearIssueTargets();
+  const flash = !!(options && options.flash);
+  (rows || []).forEach(issue => {
+    const target = issueTarget(issue);
+    if (!target) return;
+    issueTargetElements(target).forEach(el => {
+      el.classList.add('is-issue-target');
+      if (!flash) return;
+      el.classList.add('is-issue-flash');
+      setTimeout(() => el.classList.remove('is-issue-flash'), 2200);
+    });
+  });
 }
 
 /* ── 渲染：小地图（只读 graph positions/viewport，不写 dirty） ── */
@@ -1091,12 +1232,6 @@ function closeOverlays() {
   if (pop && !pop.hidden) { closeCondPop(); return true; }
   const modal = $('#cvDeleteModal');
   if (modal && !modal.hidden) { hideDelete(); return true; }
-  const drawer = $('#cvTraceDrawer');
-  if (drawer && !drawer.hidden) {
-    /* 收起必须走 tryrun：只隐藏 DOM 会把 drawerOpen 留在展开态，下一次 renderAll 又会展开。 */
-    closeTryDrawer();
-    return true;
-  }
   const issues = $('#cvIssues');
   if (issues && !issues.hidden) { issues.hidden = true; renderIssues(); return true; }
   return false;
@@ -1252,7 +1387,7 @@ function bindStageCards() {
   nodesLayer.addEventListener('click', event => {
     const chip = event.target.closest('[data-cond-edge]');
     if (!chip) return;
-    if (store.tryRunning) return;
+    if (store.tryRunning || isLogSnapshot()) return;
     openCondPop(chip.dataset.condEdge);
   });
 }
@@ -1297,7 +1432,7 @@ function bindOverlays() {
   if (importFile) importFile.addEventListener('change', event => controller.onImportFile(event));
 }
 
-/* 试算台、样例 chips、回放与轨迹抽屉全部由 tryrun.js 实现。 */
+/* 试算台、样例 chips 与画布回放全部由 tryrun.js 实现。 */
 function bindTryBar() {
   initTryRun();
 }
@@ -1378,8 +1513,9 @@ function createKit() {
     store: store,
     getGraph: () => store.graph,
     getTree: () => store.tree,
-    getModels: () => app.models,
-    getPeriods: () => app.periods,
+    /* 当前树的 runtime 优先；旧草稿回退全局目录（见顶部 effectiveModels）。 */
+    getModels: () => effectiveModels(),
+    getPeriods: () => effectivePeriods(),
     getSelection: () => (app.kit ? app.kit.getSelection() : app.selection),
     requestDelete: selection => requestDelete(selection),
     addEdge: draft => app.kit.addEdge(draft),
@@ -1393,11 +1529,72 @@ function createKit() {
     render: () => app.render(),
     collapsePanels: () => app.collapsePanels(),
     updateToolbar: () => updateToolbar(),
+    readOnly: isLogSnapshot(),
   });
+}
+
+/* ── 日志快照 (只读回放) ────────────────────────────────────────── */
+function showSnapshotHeader(result) {
+  const badge = $('#cvSnapshotBadge');
+  if (badge) badge.hidden = false;
+  const select = $('#cvTreeSelect');
+  if (select) {
+    select.disabled = true;
+    select.title = t('cv.snapshotBadge');
+  }
+}
+
+/* 快照问题放回画布原有的「试算问题」输入位：只读展示本次请求正文。 */
+function showSnapshotRequest(result) {
+  const text = result && result.request ? String(result.request.text || '') : '';
+  if (!text) return '';
+  const input = $('#cvTryInput');
+  if (input) {
+    input.value = text;
+    input.readOnly = true;
+    input.title = text;
+  }
+  document.body.classList.add('has-snapshot-request');
+  return text;
+}
+
+async function bootLogSnapshot() {
+  document.body.classList.add('is-log-snapshot');
+  bindViewport();
+  onLangChange(() => {
+    if (!app.booted) return;
+    refreshTryRun();
+  });
+  try {
+    const result = await api.get(
+      '/admin/requests/' + encodeURIComponent(SNAPSHOT_REQUEST) + '/snapshot');
+    const tree = result && result.tree;
+    if (!tree || !tree.root) throw new Error('request snapshot has no graph');
+    controller.loadTree(tree, true);
+    showSnapshotHeader(result);
+    const snapshotText = showSnapshotRequest(result);
+    const replay = rebuildTryRun(result.trace || [], store.graph);
+    replay.trace = Array.isArray(result.trace) ? result.trace : [];
+    /* 回放对象带上请求正文：复制/导出等观察入口与普通试算保持同一字段。 */
+    replay.text = snapshotText;
+    if (snapshotText) replay.request = { text: snapshotText };
+    applyTryRun(replay);
+    app.kit.setLocked(true);
+    app.booted = true;
+    requestAnimationFrame(() => {
+      if (!app.kit) return;
+      app.kit.fit({ padding: 24 });
+      renderMinimap();
+    });
+  } catch (error) {
+    app.booted = true;
+    toast(tf('cv.snapshotLoadFail', { err: apiErrText(error) }), 'error');
+  }
 }
 
 async function boot() {
   createKit();
+  if (isLogSnapshot()) return bootLogSnapshot();
   bindEvents();
   renderPalette();
   /* 模型目录与决策组解耦：/admin/models 抖动不能回退或清空已加载的草稿。 */

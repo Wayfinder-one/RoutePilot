@@ -173,40 +173,11 @@ test('7.4-08-logic-slot-rows', async () => {
 }, andId);
   assert.equal(centered, true, 'node issue locate did not center the node');
 
-  await page.locator('[data-lib-kind="logic-not"]').click();
-  const notId = await page.evaluate(async known => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item =>
-      item.type === 'logic' && item.operator === 'not' && known.indexOf(item.id) < 0);
-    return node && node.id;
-
-}, before.nodes.map(node => node.id));
-  assert.ok(notId, 'NOT node was not created');
-  assert.equal(await page.locator(`#cvNodes [data-node-id="${notId}"] .rtc-slot`).count(), 1,
-    'NOT must render exactly one input row');
-
-  await page.evaluate(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTGraph = await import('/console/routing/graph.js');
-
-    app.change('behavior', tree => {
-      RTGraph.addEdge(tree.root, {
-        source: 'cond-text', source_port: 'out', target: id, target_port: 'in_1', condition: null
-});
-      RTGraph.addEdge(tree.root, {
-        source: 'cond-peak', source_port: 'out', target: id, target_port: 'in_2', condition: null
-});
-});
-
-}, notId);
-  await waitFor(async id => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app.issues.some(issue =>
-    issue.node_id === id && issue.code === 'logic_slot_count' && /当前 2 个/.test(issue.zh)));
-}, notId);
-  assert.equal(await page.locator(`#cvNodes [data-node-id="${notId}"] .rtc-slot`).count(), 1,
-    'NOT with two incoming edges still renders a single slot row');
+  await clickNode('and-power');
+  await waitInspectorBranch('node', 'and-power');
+  assert.deepEqual(await page.locator(
+    '#cvInspectorBody [data-field="operator"] option').evaluateAll(
+      options => options.map(option => option.value)), ['and', 'or']);
 });
 
 test('7.4-09-question-target-rows', async () => {
@@ -353,7 +324,7 @@ const RTGraph = await import('/console/routing/graph.js');
     'renamed strong row did not follow to prob.light');
   assert.equal(edgeById['e-cap-strong-and-power'].condition.value, 0.65,
     'swap changed an unrelated condition');
-  assert.equal(edgeById['e-cap-strong-not'].source_port, 'prob.light');
+  assert.equal(edgeById['e-cap-below-strong-follow'].source_port, 'prob.light');
   assert.equal(edgeById['e-selected-strong-strong'].source_port, 'selected.light');
   assert.equal(edgeById['e-selected-standard-standard'].source_port, 'selected.standard');
 
@@ -724,7 +695,7 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
 });
   assert.deepEqual(limitRows.counts, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, questions: 3 });
   assert.equal(limitRows.nodes, EXAMPLE_NODES + ' / 200');
-  assert.equal(limitRows.edges, '15 / 400');
+  assert.equal(limitRows.edges, EXAMPLE_EDGES + ' / 400');
   assert.equal(limitRows.questions, '3 / 32');
   assert.equal(limitRows.waves, '≤ 8');
 

@@ -134,7 +134,7 @@
       "title": "低置信度追问",
       "text": "停电了，但我不确定该找谁处理。",
       "period": "normal",
-      "hint": "NOT + OR 触发第 2 波；target 槽位条件直接命中",
+      "hint": "数值反向条件 + OR 触发第 2 波；target 槽位条件直接命中",
       "answers": {
         "capability": {
           "probs": {

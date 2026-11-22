@@ -127,12 +127,7 @@ function slotRow(graph, node, port) {
 }
 
 function visibleSlots(graph, node) {
-  const slots = RTGraph.portsOf(node, graph).filter(port => port.slot);
-  if (node.type === 'logic' && node.operator === 'not') {
-    const occupied = slots.filter(port => port.occupied);
-    return occupied.length ? occupied.slice(0, 1) : slots.slice(0, 1);
-  }
-  return slots;
+  return RTGraph.portsOf(node, graph).filter(port => port.slot);
 }
 
 function slotsHTML(graph, node) {
@@ -192,19 +187,11 @@ function choiceCard(graph, node) {
       '<span class="rtc-oport">' + portHTML(node, prob, { side: 'right' }) + '<i>' + esc(t('cv.card.prob')) + '</i></span>' +
       '</div></div>';
   }).join('');
-  const topPort = byId('p_top');
-  const marginPort = byId('margin');
   return nodeWrap(node, 'choice',
     header(node, { icon: 'question', badge: t('cv.card.choice'), title: nodeName(node, graph) }) +
     '<div class="rtc-instr" title="' + esc(node.instructions || '') + '"><span class="rtc-instr-t">' + esc(snippet(node.instructions, 66)) + '</span></div>' +
     slotsHTML(graph, node) +
-    '<div class="rtc-opts">' + rows + '</div>' +
-    '<div class="rtc-qfoot">' +
-    '<span class="rtc-sump">' + portHTML(node, topPort, { side: 'right' }) + '<i>p_top</i>' +
-    '<b data-live="p_top">—</b></span>' +
-    '<span class="rtc-sump">' + portHTML(node, marginPort, { side: 'right' }) + '<i>margin</i>' +
-    '<b data-live="margin">—</b></span>' +
-    '</div>');
+    '<div class="rtc-opts">' + rows + '</div>');
 }
 
 function noulCard(graph, node) {

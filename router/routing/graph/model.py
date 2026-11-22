@@ -131,7 +131,7 @@ class GraphRoot:
 
 
 _QUESTION_TYPES = ("choice", "noul", "score")
-_LOGIC_OPERATORS = ("and", "or", "not")
+_LOGIC_OPERATORS = ("and", "or")
 _CONDITION_SOURCES = ("text", "periods")
 
 

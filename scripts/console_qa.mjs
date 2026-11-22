@@ -13,7 +13,7 @@
    Usage: node scripts/console_qa.mjs            # 全量（= npm run check:console）
           QA_ONLY=<regex> node scripts/console_qa.mjs
           node scripts/console_qa/canvas.mjs      # 只跑单个页面模块
-   Exports: 67 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
+   Exports: 71 个具名导出，这里只列常用入口（test / runChecks / runIfMain / api /
             page / mockBase / routerBase / screenshot / BASELINE / FIXTURE），
             完整清单见本文件下方的 export 声明。
    ------------------------------------------------------------------ */
@@ -48,8 +48,8 @@ const API_TIMEOUT_MS = 15000;
    the committed evidence PNGs. Regenerate with QA_SCREENSHOTS=1. */
 const WRITE_SHOTS = process.env.QA_SCREENSHOTS === '1';
 
-/* 示例图是 15 节点图的唯一来源：节点/边数、start 坐标、兜底目标都从 fixture 派生，
-   避免 QA 里散落 15 / 20,150 / standard-target 这类字面量。 */
+/* 共享示例图是节点/边数、start 坐标、兜底目标的唯一来源，
+   避免 QA 里散落 20 / 20,150 / standard-target 这类字面量。 */
 export const EXAMPLE = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8'));
 export const EXAMPLE_ROOT = EXAMPLE.root;
 export const EXAMPLE_NODES = EXAMPLE_ROOT.nodes.length;
@@ -120,6 +120,7 @@ export let routerBase = '';
 let browser = null;
 let routerChild = null;
 let mockServer = null;
+let routerPort = 0;
 export let tempDir = '';
 let routerLog = '';
 let repoDbFingerprint = null;
@@ -557,6 +558,15 @@ async function stopRouter() {
 });
 }
 
+/* 真实进程重启：沿用同一临时目录、端口、mock 与浏览器会话。
+   用例据此验证 SQLite 回退，而不是页面 reload 或内存命中。 */
+export async function restartRouter() {
+  if (!routerPort || !routerBase) throw new Error('router is not ready');
+  await stopRouter();
+  await startRouter(routerPort);
+  return routerBase;
+}
+
 /* ── 管理面 API + bootstrap ─────────────────────────────────────────── */
 
 export async function api(method, apiPath, body) {
@@ -599,6 +609,23 @@ const MODEL_PROFILE = {
 }
 };
 
+/* Python tree_to_dict 的四运行字段：保存/导入现在会自带 runtime，
+   QA 基座必须把它们当一等状态显式恢复（不能让上一个用例残留的 runtime 继承下来）。 */
+const RUNTIME_FIELDS = ['backends', 'jev', 'jev_window', 'time_periods'];
+
+export function treeRuntimeFields(tree) {
+  if (!tree) return null;
+  if (!RUNTIME_FIELDS.every(field => Object.prototype.hasOwnProperty.call(tree, field))) return null;
+  const runtime = {};
+  /* 保存一份脱离响应对象的副本：用例可能就地改响应再发回。 */
+  RUNTIME_FIELDS.forEach(field => { runtime[field] = JSON.parse(JSON.stringify(tree[field])); });
+  return runtime;
+}
+
+/* bootstrap 时服务端按数据库目录物化出来的全局运行配置（provider → mock、JEV → mock）。
+   ensureBaselineTree 每次显式带这四字段，恢复的是「示例被保存进基线组之前」的配置。 */
+export let BASELINE_RUNTIME = null;
+
 async function bootstrap() {
   /* 1. local provider → mock（/v1/chat/completions 由 mock 承接）。 */
   await api('PUT', '/admin/providers/local', {
@@ -640,7 +667,7 @@ async function bootstrap() {
 });
 
   /* 5. 建图并启用（root 原样使用 Task 3 的 graph_power 示例）。 */
-  await api('POST', '/admin/trees', {
+  const created = await api('POST', '/admin/trees', {
     id: TREE_ID,
     name: BASELINE.name,
     timezone: BASELINE.timezone,
@@ -648,6 +675,10 @@ async function bootstrap() {
     root: EXAMPLE_ROOT,
     canvas: EXAMPLE.canvas
 });
+  /* 服务端保存时物化的运行配置是基线组的「全局目录」快照：控制台载入示例/导入会把
+     文档自带的 runtime 写进草稿，用例保存后这条组会带上示例的 local runtime；
+     ensureBaselineTree 用这份快照显式恢复，后续 tryrun/auto 仍打 mock。 */
+  BASELINE_RUNTIME = treeRuntimeFields(created.tree);
   await api('POST', '/admin/trees/' + TREE_ID + '/enable');
 }
 
@@ -955,11 +986,23 @@ test('bootstrap registers catalog, periods, decision service and the enabled pow
   const tree = trees.trees.find(item => item.id === TREE_ID);
   assert.ok(tree, 'power graph tree missing');
   assert.equal(tree.enabled, true);
-  assert.equal(tree.root.nodes.length, 15);
-  assert.equal(tree.root.edges.length, 15);
+  assert.equal(tree.root.nodes.length, EXAMPLE_NODES);
+  assert.equal(tree.root.edges.length, EXAMPLE_EDGES);
   assert.equal(tree.root.otherwise_target, undefined);
   assert.equal(tree.root.error_fallback, 'light-target');
   assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
+
+  /* 自包含 runtime：bootstrap 建组时服务端按数据库目录物化四字段并落到文档里。 */
+  assert.ok(BASELINE_RUNTIME, 'bootstrap did not capture the materialized runtime');
+  assert.deepEqual(Object.keys(BASELINE_RUNTIME).sort(), RUNTIME_FIELDS.slice().sort());
+  assert.deepEqual(BASELINE_RUNTIME.backends.providers.map(provider => [provider.name, provider.base_url]),
+    [['local', mockBase + '/v1']]);
+  const runtimeModelIds = BASELINE_RUNTIME.backends.models.map(model => model.id);
+  ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft', 'tierless-model'].forEach(id => {
+    assert.ok(runtimeModelIds.includes(id), 'materialized runtime is missing model ' + id);
+});
+  assert.deepEqual(BASELINE_RUNTIME.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.equal(BASELINE_RUNTIME.jev.base_url, mockBase);
 });
 
 
@@ -1220,14 +1263,20 @@ export async function putTree(id, payload) {
 }
 
 export async function ensureBaselineTree() {
-  const restored = await putTree(TREE_ID, {
+  const payload = {
     id: TREE_ID,
     name: BASELINE.name,
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
     root: EXAMPLE_ROOT,
     canvas: EXAMPLE.canvas
-});
+};
+  /* 显式带上 bootstrap 物化的运行配置：PUT 缺省会继承该组当前 runtime，
+     而「载入示例 → 保存」的用例会把 local runtime 留在基线组里，
+     不恢复就会让后续 tryrun/auto 打到 127.0.0.1:8000 而不是 QA mock。 */
+  const runtime = BASELINE_RUNTIME || treeRuntimeFields(await serverTree(TREE_ID));
+  if (runtime) Object.assign(payload, treeRuntimeFields(runtime));
+  const restored = await putTree(TREE_ID, payload);
   if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
   return (await api('GET', '/admin/trees/' + TREE_ID)).tree;
 }
@@ -1473,7 +1522,6 @@ export async function trySnapshot() {
         clarify: nodeInfo('clarify'),
         'and-power': nodeInfo('and-power'),
         'or-ctx': nodeInfo('or-ctx'),
-        'not-cap': nodeInfo('not-cap'),
         'and-follow': nodeInfo('and-follow'),
         'cond-text': nodeInfo('cond-text'),
         'cond-peak': nodeInfo('cond-peak'),
@@ -1497,17 +1545,6 @@ export async function trySnapshot() {
       resultText: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
       resultFinal: document.getElementById('cvTryResult').dataset.final || '',
       resultKind: document.getElementById('cvTryResult').dataset.kind || '',
-      hudHidden: document.getElementById('cvReplayHud').hidden,
-      hudText: document.getElementById('cvReplayHud').textContent.replace(/\s+/g, ' ').trim(),
-      hudTitles: Array.prototype.map.call(
-        document.querySelectorAll('#cvReplayHud [data-hud-wave]'),
-        el => el.getAttribute('title') || ''),
-      drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-      drawerWaveCount: document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave').length,
-      drawerWaveTexts: Array.prototype.map.call(
-        document.querySelectorAll('#cvTraceDrawer .rtc-dw-wave'),
-        el => el.textContent.replace(/\s+/g, ' ').trim()),
-      drawerText: document.getElementById('cvTraceDrawer').textContent.replace(/\s+/g, ' ').trim(),
       running: app.tryRunning,
       runDisabled: document.getElementById('cvTryRun').disabled,
       topRunDisabled: document.getElementById('cvTryBtn').disabled,
@@ -1577,9 +1614,9 @@ export async function runRegisteredCases() {
     repoDbFingerprint = repoDbSignature();
     mockServer = await startMock();
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rt-console-qa-'));
-    const port = await freePort();
-    routerBase = `http://127.0.0.1:${port}`;
-    await startRouter(port);
+    routerPort = await freePort();
+    routerBase = `http://127.0.0.1:${routerPort}`;
+    await startRouter(routerPort);
     await bootstrap();
     await startBrowser();
     await runChecks();

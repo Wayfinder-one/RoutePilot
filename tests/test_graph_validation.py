@@ -340,10 +340,7 @@ def test_condition_issue_codes_are_machine_driven():
 
 
 def test_gate_slot_counts():
-    for operator, edges in (
-        ("and", 0), ("and", 1), ("or", 1),
-        ("not", 0), ("not", 2),
-    ):
+    for operator, edges in (("and", 0), ("and", 1), ("or", 0), ("or", 1)):
         raw = graph_dict()
         raw["nodes"].append({"id": "gate", "type": "logic", "operator": operator})
         for index in range(edges):
@@ -364,11 +361,12 @@ def test_gate_slot_counts():
     assert codes(raw) == set()
 
 
-def test_logic_operator_invalid_defensive():
+@pytest.mark.parametrize("operator", ["xor", "not"])
+def test_logic_operator_invalid_defensive(operator):
     from router.routing.graph.model import LogicNode
 
     root = graph_from_dict(graph_dict())
-    gate = LogicNode("gate", "xor")  # 绕过解析层直接构造：校验器需兜住非法算子
+    gate = LogicNode("gate", operator)  # 绕过解析层直接构造：校验器需兜住非法算子
     object.__setattr__(root, "nodes", root.nodes + (gate,))
     issues = validate_graph_structure(root)
     assert {issue.code for issue in issues} == {"logic_operator_invalid"}

@@ -70,11 +70,6 @@
         "operator": "or"
       },
       {
-        "id": "not-cap",
-        "type": "logic",
-        "operator": "not"
-      },
-      {
         "id": "and-follow",
         "type": "logic",
         "operator": "and"
@@ -200,23 +195,15 @@
         "condition": null
       },
       {
-        "id": "e-cap-strong-not",
+        "id": "e-cap-below-strong-follow",
         "source": "capability",
         "source_port": "prob.strong",
-        "target": "not-cap",
-        "target_port": "in_1",
-        "condition": {
-          "op": "gt",
-          "value": 0.65
-        }
-      },
-      {
-        "id": "e-not-and-follow",
-        "source": "not-cap",
-        "source_port": "out",
         "target": "and-follow",
         "target_port": "in_1",
-        "condition": null
+        "condition": {
+          "op": "lte",
+          "value": 0.65
+        }
       },
       {
         "id": "e-cond-text-or",
@@ -313,10 +300,6 @@
       "x": 420.0,
       "y": 20.0
     },
-    "not-cap": {
-      "x": 420.0,
-      "y": 190.0
-    },
     "and-follow": {
       "x": 640.0,
       "y": 80.0
@@ -349,5 +332,148 @@
       "x": 1080.0,
       "y": 540.0
     }
-  }
+  },
+  "backends": {
+    "providers": [
+      {
+        "name": "local",
+        "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "qwen3-8b",
+        "upstream": "qwen3-8b",
+        "provider": "local",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "速度最快、成本最低的本地轻量模型：适合闲聊、简单问答、格式转换与信息提取。",
+          "reasoning": {
+            "efforts": {
+              "low": "low",
+              "medium": "medium",
+              "high": "high"
+            },
+            "format": "openai",
+            "default": "medium"
+          }
+        }
+      },
+      {
+        "id": "qwen3-32b",
+        "upstream": "qwen3-32b",
+        "provider": "local",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "本地增强模型：适合长文档分析、多约束方案设计与复杂代码排查。",
+          "reasoning": {
+            "efforts": {
+              "low": "low",
+              "medium": "medium",
+              "high": "high"
+            },
+            "format": "openai",
+            "default": "medium"
+          }
+        }
+      },
+      {
+        "id": "deepseek-v3",
+        "upstream": "deepseek-v3",
+        "provider": "local",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "通用大模型：适合复杂推理、写作与跨领域分析。",
+          "reasoning": {
+            "efforts": {
+              "low": "low",
+              "medium": "medium",
+              "high": "high"
+            },
+            "format": "openai",
+            "default": "medium"
+          }
+        }
+      },
+      {
+        "id": "qwen3.8-flash-sft",
+        "upstream": "qwen3.8-flash-sft",
+        "provider": "local",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "低延迟高并发模型：适合高频短请求与在线服务。",
+          "reasoning": {
+            "efforts": {
+              "low": "low",
+              "medium": "medium",
+              "high": "high"
+            },
+            "format": "openai",
+            "default": "medium"
+          }
+        }
+      }
+    ]
+  },
+  "jev": {
+    "base_url": "http://127.0.0.1:8100",
+    "model": "d1-2b",
+    "timeout_seconds": 10.0,
+    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+    "state_template": "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+  },
+  "jev_window": {
+    "input_tokens": 1024,
+    "context_tokens": 4096
+  },
+  "time_periods": [
+    {
+      "name": "peak",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "08:00",
+      "end": "11:00"
+    },
+    {
+      "name": "normal",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "11:00",
+      "end": "18:00"
+    },
+    {
+      "name": "offpeak",
+      "days": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "start": "18:00",
+      "end": "08:00"
+    }
+  ]
 }

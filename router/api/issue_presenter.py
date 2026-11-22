@@ -190,9 +190,6 @@ def present_issue(issue: Issue) -> dict[str, str]:
         return _text(f"图中有环：{node_id}", f"The graph contains a cycle at {node_id}")
     if code == "logic_slot_count":
         count = _param(issue, "count")
-        if kind == "not":
-            return _text(f"NOT 必须恰好有 1 个输入（当前 {count} 个）：{node_id}",
-                         f"NOT needs exactly 1 input (found {count}): {node_id}")
         if kind == "and_or":
             return _text(f"AND / OR 至少需要 2 个输入（当前 {count} 个）：{node_id}",
                          f"AND / OR need at least 2 inputs (found {count}): {node_id}")

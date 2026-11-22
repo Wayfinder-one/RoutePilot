@@ -44,7 +44,7 @@ test('Task 11 · boot unlocks the canvas before catalogues and late catalogue da
 
     /* Palette creation must work while models/periods are still pending. */
     const before = await appSnapshot();
-    await page.locator('[data-lib-kind="logic-not"]').click();
+    await page.locator('[data-lib-kind="logic-or"]').click();
     await waitFor(async count => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === count + 1);

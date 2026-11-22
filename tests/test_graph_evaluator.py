@@ -314,10 +314,6 @@ def choice_options(*keys):
 
 
 def test_combine_gate_three_valued_truth_tables():
-    assert combine_gate("not", [True]) is False
-    assert combine_gate("not", [False]) is True
-    assert combine_gate("not", [UNKNOWN]) == UNKNOWN
-    assert combine_gate("not", [True, False]) == UNKNOWN
     assert combine_gate("and", [True, True]) is True
     assert combine_gate("and", [False, UNKNOWN]) is False
     assert combine_gate("and", [True, UNKNOWN]) == UNKNOWN
@@ -326,9 +322,13 @@ def test_combine_gate_three_valued_truth_tables():
     assert combine_gate("or", [True, UNKNOWN]) is True
     assert combine_gate("or", [False, UNKNOWN]) == UNKNOWN
     assert combine_gate("or", [False]) == UNKNOWN
-    # 防御层：未知算子必须显式失败，绝不静默按 OR 处理（校验层已拦截合法图）。
+
+
+@pytest.mark.parametrize("operator", ["not", "xor"])
+def test_combine_gate_rejects_removed_and_unknown_operators(operator):
+    # 防御层：未知算子（含已移除的 NOT）必须显式失败，绝不静默按 OR 处理（校验层已拦截合法图）。
     with pytest.raises(ValueError, match="unknown logic operator"):
-        combine_gate("xor", [True, False])
+        combine_gate(operator, [True])
 
 
 # ---------------------------------------------------------------------------

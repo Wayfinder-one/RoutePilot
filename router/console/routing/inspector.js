@@ -310,7 +310,7 @@ function fieldsForNode(node) {
     html += '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.logic')) + '</div>' +
       '<label class="field">' + esc(t('cv.ins.operator')) +
       '<select data-field="operator" aria-label="' + esc(t('cv.ins.operator')) + '">' +
-      ['and', 'or', 'not'].map(operator =>
+      ['and', 'or'].map(operator =>
         '<option value="' + esc(operator) + '"' + (node.operator === operator ? ' selected' : '') + '>' +
         esc(t('cv.op.' + operator)) + '</option>').join('') +
       '</select></label></div>';
@@ -609,7 +609,7 @@ function applyNodeValues(treeRoot, nodeId, values) {
       node.criteria = levels;
     }
   } else if (node.type === 'logic') {
-    if (['and', 'or', 'not'].indexOf(values.operator) < 0) return error(t('cv.ins.errOperator'));
+    if (['and', 'or'].indexOf(values.operator) < 0) return error(t('cv.ins.errOperator'));
     node.operator = values.operator;
   } else if (node.type === 'condition') {
     if (node.source === 'text') {

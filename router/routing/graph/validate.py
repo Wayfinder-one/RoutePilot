@@ -26,7 +26,7 @@ from router.routing.graph.model import (
 from router.routing.graph.ports import output_ports
 from router.routing.tree import RoutingTree, tree_from_dict
 
-_LOGIC_OPERATORS = frozenset({"and", "or", "not"})
+_LOGIC_OPERATORS = frozenset({"and", "or"})
 _LIMIT_NODES = 200
 _LIMIT_EDGES = 400
 _LIMIT_QUESTIONS = 32
@@ -440,11 +440,6 @@ def validate_graph_structure(value) -> list[Issue]:
     for node in sorted(by_id.values(), key=lambda item: item.id):
         incoming_count = len(incoming[node.id])
         if isinstance(node, LogicNode):
-            if node.operator == "not" and incoming_count != 1:
-                issues.append(Issue(
-                    "logic_slot_count", node_id=node.id,
-                    params={"kind": "not", "count": incoming_count},
-                ))
             if node.operator in {"and", "or"} and incoming_count < 2:
                 issues.append(Issue(
                     "logic_slot_count", node_id=node.id,

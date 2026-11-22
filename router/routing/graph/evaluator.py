@@ -87,8 +87,6 @@ class GraphOutcome:
 
 def combine_gate(operator, values):
     """Three-valued logic gate combination (spec §3.4, brief verbatim)."""
-    if operator == "not":
-        return UNKNOWN if len(values) != 1 or values[0] == UNKNOWN else not values[0]
     if operator == "and":
         if any(value is False for value in values):
             return False

@@ -56,6 +56,7 @@ import {
   setImportPayload,
   test,
   toastText,
+  treeRuntimeFields,
   waitCondPop,
   waitConfirmDialog,
   waitEdgeCondition,
@@ -81,12 +82,12 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
     scrollH: document.documentElement.scrollHeight,
     innerH: window.innerHeight
 }));
-  assert.equal(metrics.nodes, 15);
-  assert.equal(metrics.edges, 15);
+  assert.equal(metrics.nodes, EXAMPLE_NODES);
+  assert.equal(metrics.edges, EXAMPLE_EDGES);
   assert.equal(metrics.groups, 4);
   assert.ok(metrics.inspector && metrics.minimap && metrics.trybar);
   assert.match(metrics.zoom, /^\d+%$/);
-  assert.equal(metrics.miniNodes, 15);
+  assert.equal(metrics.miniNodes, EXAMPLE_NODES);
   assert.equal(metrics.miniView, 1);
   assert.equal(HISTORY_LIMIT, 100, 'draft history limit changed');
   assert.ok(metrics.scrollW <= metrics.clientW + 1, `horizontal overflow: ${metrics.scrollW} > ${metrics.clientW}`);
@@ -371,11 +372,13 @@ test('7.4-02-node-drag-live-layout-only', async () => {
 
 test('7.4-03-node-library-four-groups', async () => {
   await openCanvas();
+  assert.equal(await page.locator('[data-lib-kind="logic-not"]').count(), 0,
+    'the node library still exposes a NOT entry');
   const actions = [
     { kind: 'question-choice', how: 'click', match: node => node.type === 'question' && node.question_type === 'choice' },
     { kind: 'question-noul', how: 'drag', match: node => node.type === 'question' && node.question_type === 'noul' },
     { kind: 'logic-and', how: 'click', match: node => node.type === 'logic' && node.operator === 'and' },
-    { kind: 'logic-not', how: 'drag', match: node => node.type === 'logic' && node.operator === 'not' },
+    { kind: 'logic-or', how: 'drag', match: node => node.type === 'logic' && node.operator === 'or' },
     { kind: 'condition-text', how: 'click', match: node => node.type === 'condition' && node.source === 'text' },
     { kind: 'condition-periods', how: 'drag', match: node => node.type === 'condition' && node.source === 'periods' },
     { kind: 'target', how: 'click', match: node => node.type === 'target' },
@@ -1529,6 +1532,11 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
     const payload = request.postDataJSON();
     assert.match(payload.id, /^[0-9a-f]{12}$/, 'POST /admin/trees did not use the UUID-slice id');
     assert.equal(payload.id, draft.treeId);
+    /* 旧草稿（无 runtime）保存时不带四运行字段：服务端负责物化。 */
+    ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+      assert.equal(Object.prototype.hasOwnProperty.call(payload, field), false,
+        'a runtime-less draft save must not send the ' + field + ' runtime field');
+});
     await waitFor(async id => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.changeKind === 'clean' && app.treeId === id);
@@ -1537,6 +1545,13 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
     const listed = (await api('GET', '/admin/trees')).trees.find(tree => tree.id === draft.treeId);
     assert.ok(listed, 'boot fallback save did not create a tree with the draft id');
     assert.equal(listed.enabled, false);
+    /* 保存回包物化的 runtime 同步进草稿与基线：旧草稿保存后也必须 clean。 */
+    const materialized = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (({ kind: app.kind(), runtime: app.tree.runtime }));
+});
+    assert.equal(materialized.kind, 'clean', 'the materialized runtime was not synced into the saved draft');
+    assert.ok(materialized.runtime, 'the saved response runtime was not written back to the draft');
 } finally {
     await page.unroute(treeListRoute, emptyTreeList);
     await ensureBaselineTree();
@@ -1578,7 +1593,7 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
     return app.graph.nodes.length === expected.nodes &&
       app.graph.edges.length === expected.edges &&
       node && node.position.x === expected.start.x && node.position.y === expected.start.y &&
-      app.kind() === 'clean';
+      app.kind() === 'behavior';
 
 }, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, start: EXAMPLE_START }, { timeout: 8000 });
   const loaded = await page.evaluate(async () => {
@@ -1586,13 +1601,18 @@ test('Task 12 · loading the example asks for confirmation and replaces the grap
     return (({
     kind: app.kind(),
     canUndo: store.canUndo,
+    runtime: app.tree.runtime,
     start: (() => {
       const node = app.graph.nodes.find(item => item.id === 'start');
       return { x: node.position.x, y: node.position.y };
 })()
 }));
 });
-  assert.equal(loaded.kind, 'clean');
+  /* 示例文件现在自包含 local runtime：行为配置相对已保存的 mock 基线变了，
+     所以整图替换后的分类是 behavior（不是之前只比坐标时的 clean）。 */
+  assert.equal(loaded.kind, 'behavior');
+  assert.ok(loaded.runtime, 'loading the example did not import its self-contained runtime');
+  assert.deepEqual(loaded.runtime.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
   assert.equal(loaded.canUndo, true);
   assert.notDeepEqual(loaded.start, { x: moved.x, y: moved.y });
 
@@ -1676,9 +1696,10 @@ test('Task 12 · loading the example from a clean saved draft still confirms bef
 }));
 });
   assert.equal(loaded.canUndo, true, 'confirming the example load did not add a history entry');
-  /* 保存后的草稿与示例只差节点坐标，所以内容分类是 layout（整图替换仍算一个历史项）。 */
-  assert.equal(loaded.kind, 'layout',
-    'replacing the saved layout with the example was not classified as a layout change');
+  /* 示例文件自带 local runtime，与已保存基线（mock 运行配置）不同：整图替换
+     是一次 behavior 变更（layout 差异同时存在，但 behavior 优先级更高）。 */
+  assert.equal(loaded.kind, 'behavior',
+    'replacing the saved draft with the self-contained example was not classified as a behavior change');
 
   /* 一次撤销回到保存后的拖拽坐标，证明示例载入只产生一个历史项。 */
   await page.locator('#cvUndo').click();
@@ -1708,6 +1729,18 @@ test('Task 12 · export downloads the complete v3 envelope including timezone an
   assert.equal(parsed.root.edges.length, EXAMPLE_EDGES);
   assert.equal(parsed.root.otherwise_target, undefined);
   assert.equal(parsed.root.error_fallback, EXAMPLE_TARGETS.fallback);
+  /* 自包含文档：导出的 v3 文件必须带四运行字段（与保存 payload 同一形状），
+     且服务端密钥/密钥状态不得出现在文件里。 */
+  ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+    assert.ok(Object.prototype.hasOwnProperty.call(parsed, field),
+      'exported document is missing the ' + field + ' runtime field');
+});
+  assert.equal(parsed.backends.providers.length >= 1, true, 'exported runtime has no providers');
+  assert.equal(parsed.time_periods.map(period => period.name).join(','), 'peak,normal,offpeak');
+  assert.equal(JSON.stringify(parsed).includes('"api_key"'), false,
+    'exported document leaked a server-side api_key field');
+  assert.equal(JSON.stringify(parsed).includes('"key_present"'), false,
+    'exported document leaked a server-side key_present field');
   assert.equal((await dirtyBadge()).kind, 'clean', 'export mutated the draft');
 });
 
@@ -1715,15 +1748,17 @@ test('envelope-roundtrip-preserves-revision', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
   const source = await exportViaUi();
+  /* 源文档的 canonical 必须走 parseImport 的整树投影：手工拼 {name,...,root}
+     会丢掉四运行字段，导入后的整树 canonical 就永远不相等。 */
   const sourceCanonical = await page.evaluate(async text => {
     const RTGraph = await import('/console/routing/graph.js');
 
-    const parsed = JSON.parse(text);
-    return RTGraph.behaviorCanonical({
-      name: parsed.name, timezone: parsed.timezone, sticky: parsed.sticky, root: parsed.root
-});
+    const parsed = RTGraph.parseImport(text);
+    return parsed.ok ? RTGraph.behaviorCanonical(parsed.tree) : null;
 
 }, source.text);
+  assert.ok(sourceCanonical, 'the exported document no longer parses as a self-contained v3 document');
+  const parsedSource = JSON.parse(source.text);
 
   await page.locator('#cvNewTree').click();
   await waitFor(async () => {
@@ -1749,6 +1784,7 @@ const RTGraph = await import('/console/routing/graph.js');
     name: app.tree.name,
     timezone: app.tree.timezone,
     sticky: app.tree.sticky,
+    runtime: app.tree.runtime,
     kind: app.kind(),
     canonical: RTGraph.behaviorCanonical(app.tree),
     canUndo: store.canUndo
@@ -1759,6 +1795,8 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(imported.name, JSON.parse(source.text).name);
   assert.equal(imported.timezone, BASELINE.timezone);
   assert.deepEqual(imported.sticky, BASELINE.sticky);
+  assert.ok(imported.runtime, 'import did not restore the self-contained runtime');
+  assert.deepEqual(imported.runtime.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
   assert.equal(imported.canonical, sourceCanonical, 'import round-trip changed the behavior canonical');
   assert.equal(imported.kind, 'behavior');
   assert.equal(imported.canUndo, true);
@@ -1770,17 +1808,302 @@ const RTGraph = await import('/console/routing/graph.js');
     'export → import → save changed the behavior revision');
   assert.equal(roundTripped.root.nodes.length, EXAMPLE_NODES);
   assert.equal(roundTripped.root.edges.length, EXAMPLE_EDGES);
+  /* 导入文档自带的 runtime 必须原样进保存 payload/服务端文档，不能退回活动树的配置。 */
+  assert.deepEqual(roundTripped.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.deepEqual(roundTripped.backends.providers.map(provider => [provider.name, provider.base_url]),
+    parsedSource.backends.providers.map(provider => [provider.name, provider.base_url]));
+  assert.equal(Object.prototype.hasOwnProperty.call(roundTripped, 'jev'), true);
 
   await page.locator('#cvUndo').click();
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === 2);
 });
-  assert.equal(await page.evaluate(async () => {
+  const undone = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app.graph.edges.length);
-}), 1,
-    'one undo did not restore the pre-import draft');
+    return { edges: app.graph.edges.length, runtime: app.tree.runtime };
+});
+  assert.equal(undone.edges, 1, 'one undo did not restore the pre-import draft');
+  assert.equal(undone.runtime, null,
+    'undo did not restore the pre-import old draft without a runtime');
+});
+
+test('Task C2 · save carries the runtime and the saved response becomes the draft baseline', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  const draftRuntime = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime;
+  });
+  assert.ok(draftRuntime, 'the server tree loaded into the draft has no runtime');
+
+  /* 制造一次 display 改动再保存：PUT payload 必须同时带四运行字段与文档指纹。 */
+  await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.change('display', tree => { tree.name = '保存携带运行配置'; }));
+});
+  const captured = page.waitForRequest(request =>
+    request.method() === 'PUT' && new URL(request.url()).pathname === '/admin/trees/' + TREE_ID);
+  await saveNow();
+  const payload = (await captured).postDataJSON();
+  ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+    assert.ok(Object.prototype.hasOwnProperty.call(payload, field),
+      'save payload dropped the ' + field + ' runtime field');
+});
+  assert.deepEqual(payload.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.deepEqual(payload.backends.models.map(model => model.id).sort(),
+    draftRuntime.backends.models.map(model => model.id).sort(),
+    'save payload sent a different runtime model catalog than the draft');
+  assert.equal(payload.base_document_sha256, baseline.document_sha256);
+
+  /* 回包里服务端物化的 runtime 必须写回草稿与基线：刚保存就必须 clean。 */
+  const afterSave = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (({
+    kind: app.kind(),
+    runtime: app.tree.runtime,
+    savedBackends: app.saved.backends,
+    savedJev: app.saved.jev,
+    savedWindow: app.saved.jev_window,
+    savedPeriods: app.saved.time_periods
+}));
+});
+  assert.equal(afterSave.kind, 'clean', 'a save with runtime left the draft dirty');
+  assert.ok(afterSave.runtime, 'the saved response runtime was not synced into the draft');
+  assert.deepEqual(afterSave.runtime.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.deepEqual(afterSave.savedBackends.models.map(model => model.id).sort(),
+    afterSave.runtime.backends.models.map(model => model.id).sort());
+  assert.deepEqual(afterSave.savedPeriods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.ok(afterSave.savedJev && typeof afterSave.savedJev.base_url === 'string');
+  assert.ok(afterSave.savedWindow && Number.isInteger(afterSave.savedWindow.input_tokens));
+
+  const savedServer = await serverTree(TREE_ID);
+  assert.deepEqual(savedServer.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.equal(savedServer.backends.providers[0].base_url,
+    draftRuntime.backends.providers[0].base_url,
+    'saving changed the runtime provider endpoint');
+  await ensureBaselineTree();
+});
+
+test('Task C2 · import replaces the runtime and an old document materializes on save', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  const source = JSON.parse((await exportViaUi()).text);
+  assert.ok(source.jev, 'the exported document has no jev runtime section');
+
+  /* 自包含文档：导入必须整组替换 runtime（jev.model 是可观测差异）。 */
+  const patched = JSON.parse(JSON.stringify(source));
+  patched.name = '导入带自定义运行配置';
+  patched.jev.model = 'qa-imported-runtime';
+  await setImportPayload(patched, 'self-contained-runtime.json');
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return !!(app.tree.runtime && app.tree.runtime.jev &&
+      app.tree.runtime.jev.model === 'qa-imported-runtime');
+}, null, { timeout: 8000 });
+  const imported = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return (({
+    kind: app.kind(),
+    canUndo: store.canUndo,
+    runtime: app.tree.runtime
+}));
+});
+  assert.equal(imported.kind, 'behavior', 'importing a document with a different runtime is not a behavior change');
+  assert.equal(imported.canUndo, true, 'import did not become a single history entry');
+  assert.deepEqual(imported.runtime.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.deepEqual(imported.runtime.backends.models.map(model => model.id).sort(),
+    source.backends.models.map(model => model.id).sort(),
+    'import dropped or reshaped the document runtime models');
+
+  /* 保存：导入的 runtime 必须原样进 payload 与服务端文档。 */
+  const captured = page.waitForRequest(request =>
+    request.method() === 'PUT' && new URL(request.url()).pathname === '/admin/trees/' + TREE_ID);
+  await saveNow();
+  const payload = (await captured).postDataJSON();
+  assert.equal(payload.jev.model, 'qa-imported-runtime', 'the imported runtime did not reach the save payload');
+  assert.equal(Array.isArray(payload.backends.models), true);
+  const savedServer = await serverTree(TREE_ID);
+  assert.equal(savedServer.jev.model, 'qa-imported-runtime');
+  assert.equal(await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.kind());
+}), 'clean');
+
+  /* 启用：停用后重新启用，服务端用刚保存的 runtime 走完整启用校验，再导出。
+     停用后 boot 会回退到别的组（或列表首个组），必须显式切回 TREE_ID 再启用。 */
+  await api('POST', '/admin/trees/' + TREE_ID + '/disable');
+  await openCanvas();
+  const enableSelect = page.locator('#cvTreeSelect');
+  if ((await enableSelect.inputValue()) !== TREE_ID) {
+    await enableSelect.selectOption(TREE_ID);
+    await waitFor(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.treeId === id && app.changeKind === 'clean');
+},
+      TREE_ID, { timeout: 8000 });
+}
+  await page.locator('#cvEnable').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.tree.enabled === true);
+}, null, { timeout: 8000 });
+  const enabledServer = await serverTree(TREE_ID);
+  assert.equal(enabledServer.enabled, true);
+  assert.equal(enabledServer.jev.model, 'qa-imported-runtime');
+  const selfContainedExport = JSON.parse((await exportViaUi()).text);
+  ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+    assert.ok(Object.prototype.hasOwnProperty.call(selfContainedExport, field),
+      'the enabled tree export dropped the ' + field + ' runtime field');
+  });
+  assert.equal(selfContainedExport.jev.model, 'qa-imported-runtime');
+
+  /* 旧文档（无四运行字段）：必须清空上一份 runtime，不能带着它保存。 */
+  const legacy = JSON.parse(JSON.stringify(source));
+  ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => { delete legacy[field]; });
+  legacy.name = '导入旧文档';
+  await setImportPayload(legacy, 'legacy-document.json');
+  await waitFor(async name => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.tree.name === name);
+}, legacy.name, { timeout: 8000 });
+  const legacyState = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (({ runtime: app.tree.runtime, kind: app.kind() }));
+});
+  assert.equal(legacyState.runtime, null, 'an old document import kept the previous draft runtime');
+  assert.equal(legacyState.kind, 'behavior');
+
+  /* 保存旧文档：payload 必须显式 runtime:null，且不带任何扁平四字段。
+     省略该键会让服务端继承该组自己的旧配置，而不是清除后物化。 */
+  const legacySave = page.waitForRequest(request =>
+    request.method() === 'PUT' && new URL(request.url()).pathname === '/admin/trees/' + TREE_ID);
+  await saveNow();
+  const legacyPayload = (await legacySave).postDataJSON();
+  assert.equal(legacyPayload.runtime, null,
+    'saving an old document did not send runtime:null');
+  ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+    assert.equal(Object.prototype.hasOwnProperty.call(legacyPayload, field), false,
+      'saving an old document also sent the flat runtime field ' + field);
+  });
+
+  /* 回包物化：草稿与服务器 GET 使用同一份活动图/数据库运行配置。 */
+  const materialized = treeRuntimeFields(await serverTree(TREE_ID));
+  assert.ok(materialized, 'the server did not materialize a runtime for the old document');
+  const afterLegacySave = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (({ kind: app.kind(), runtime: app.tree.runtime }));
+});
+  assert.equal(afterLegacySave.kind, 'clean', 'saving an old document left the draft dirty');
+  assert.deepEqual(afterLegacySave.runtime, materialized,
+    'the saved draft runtime does not match the server materialized runtime');
+
+  /* 刷新页面：仍是 clean、runtime 与 GET 一致、导出文件仍有完整四字段。 */
+  await openCanvas();
+  const reloaded = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (({ kind: app.kind(), runtime: app.tree.runtime }));
+});
+  assert.equal(reloaded.kind, 'clean', 'reloading after the old-document save is not clean');
+  assert.deepEqual(reloaded.runtime, materialized,
+    'the reloaded draft runtime drifted from the server runtime');
+  const exported = JSON.parse((await exportViaUi()).text);
+  ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+    assert.ok(Object.prototype.hasOwnProperty.call(exported, field),
+      'the exported file dropped the materialized runtime field ' + field);
+  });
+  await ensureBaselineTree();
+});
+
+test('Task C2 · inspector models and periods follow the current tree runtime', async () => {
+  await ensureBaselineTree();
+  const baseline = await serverTree(TREE_ID);
+  const runtime = {
+    backends: {
+      providers: JSON.parse(JSON.stringify(baseline.backends.providers)),
+      models: JSON.parse(JSON.stringify(baseline.backends.models))
+        .filter(model => model.id !== 'tierless-model')
+        .concat([{
+          id: 'runtime-only-model',
+          upstream: 'runtime-only-model',
+          provider: 'local',
+          profile: {
+            domains: [],
+            tier: 'small',
+            capability: '只存在于这份文档 runtime 里的模型',
+            reasoning: { efforts: { low: 'low', medium: 'medium', high: 'high' }, default: 'low' }
+}
+}])
+},
+    jev: JSON.parse(JSON.stringify(baseline.jev)),
+    jev_window: JSON.parse(JSON.stringify(baseline.jev_window)),
+    time_periods: JSON.parse(JSON.stringify(baseline.time_periods)).filter(period => period.name === 'peak')
+};
+  const RUNTIME_TREE_ID = 'qa-runtime-catalog';
+  await api('POST', '/admin/trees', {
+    id: RUNTIME_TREE_ID,
+    name: '自带运行配置的决策组',
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: EXAMPLE_ROOT,
+    canvas: EXAMPLE.canvas,
+    ...runtime
+});
+  await openCanvas();
+  const switched = await page.evaluate(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.selectTree(id));
+}, RUNTIME_TREE_ID);
+  assert.equal(switched, true, 'switching to the self-contained tree was rejected');
+  await waitFor(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.treeId === id && app.booted && app.kind() === 'clean');
+}, RUNTIME_TREE_ID, { timeout: 8000 });
+
+  /* 目标节点：模型下拉来自文档 runtime，看不到全局目录独有的 tierless-model。 */
+  await clickNode('power-target');
+  await waitInspectorBranch('node', 'power-target');
+  const modelOptions = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-model-field="model"] option')).map(option => option.value));
+  assert.ok(modelOptions.includes('runtime-only-model'),
+    'inspector models did not come from the tree runtime: ' + modelOptions.join(','));
+  assert.equal(modelOptions.includes('tierless-model'), false,
+    'inspector models still included a global-catalog-only model');
+  const reasoningOptions = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-model-field="reasoning"] option')).map(option => option.value));
+  ['low', 'medium', 'high'].forEach(level => {
+    assert.ok(reasoningOptions.includes(level),
+      'profile.reasoning.efforts map was not projected into the inspector array: ' + reasoningOptions.join(','));
+});
+  assert.deepEqual(await page.evaluate(() => {
+    const select = document.querySelector('#cvInspectorBody [data-model-field="model"]');
+    const reasoning = document.querySelector('#cvInspectorBody [data-model-field="reasoning"]');
+    select.value = 'runtime-only-model';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    return Array.from(reasoning.querySelectorAll('option')).map(option => option.value);
+}), ['', 'low', 'medium', 'high'],
+  'the runtime model reasoning options are not its declared tiers');
+
+  /* 时段节点：复选框只列文档 runtime 的时段（全局目录还有 normal/offpeak）。 */
+  await clickNode('cond-peak');
+  await waitInspectorBranch('node', 'cond-peak');
+  assert.deepEqual(await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-field="periods"] input')).map(input => input.value)),
+    ['peak'], 'inspector periods did not come from the tree runtime');
+
+  /* 新草稿没有 runtime：检查器回退 /admin/models 的全局目录。 */
+  await page.locator('#cvNewTree').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.saved === null && app.graph.nodes.length === 2);
+});
+  await clickNode('target-1');
+  await waitInspectorBranch('node', 'target-1');
+  const fallbackModels = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-model-field="model"] option')).map(option => option.value));
+  assert.ok(fallbackModels.includes('tierless-model'),
+    'a new draft without a runtime did not fall back to the global /admin/models catalog');
+  await ensureBaselineTree();
 });
 
 test('7.4-14-import-export-v3-only', async () => {
@@ -1954,6 +2277,7 @@ test('Task 12 · a valid v3 import without positions lays every node out with fi
 const RTGraph = await import('/console/routing/graph.js');
     return (({
     kind: app.kind(),
+    runtime: app.tree.runtime,
     issues: app.issues.filter(issue => issue.level !== 'hint').map(issue => issue.code),
     nodes: app.graph.nodes.map(node => ({ id: node.id, x: node.position.x, y: node.position.y })),
     expected: RTGraph.layoutPositions('dag', {
@@ -1967,7 +2291,10 @@ const RTGraph = await import('/console/routing/graph.js');
     assert.deepEqual({ x: node.x, y: node.y }, result.expected[node.id],
       `${node.id} was not placed by the shared DAG layout`);
 });
-  assert.equal(result.kind, 'layout', 'filling missing positions must stay layout-only');
+  /* 旧文档（无四运行字段）导入必须清空上一份 runtime，所以相对已保存基线是 behavior 变更；
+     缺坐标的自动补位本身仍是 layout 级别的。 */
+  assert.equal(result.runtime, null, 'an old document import kept the previous draft runtime');
+  assert.equal(result.kind, 'behavior', 'importing an old document must clear the previous runtime');
 });
 
 test('7.4-12-auto-layout-layout-only', async () => {
@@ -2109,6 +2436,22 @@ const RTGraph = await import('/console/routing/graph.js');
     return (app.issues.every(issue =>
       issue.level === 'hint' || issue.level === 'hard'));
 }), true);
+
+    /* 保存被 422 驳回时，画布上的问题节点 / 边 / 槽位同步标红（不等用户点「定位」）。 */
+    assert.equal(await page.locator('#cvNodes [data-node-id="capability"].is-issue-target').count(), 1,
+      'the 422 node issue was not painted red on the canvas');
+    assert.equal(await page.locator(
+      '#cvNodes [data-node-id="deep-target"] .rtc-slot[data-slot="in_1"].is-issue-target').count(), 1,
+      'the slot behind the invalid edge issue was not painted red');
+    assert.equal(await page.evaluate(() => {
+      const path = document.querySelector('#cvEdges path.rtc-edge[data-edge-id="e-clarify-deep"]');
+      return !!path && path.classList.contains('is-issue-target') &&
+        getComputedStyle(path).stroke === 'rgb(185, 28, 28)';
+}), true, 'the invalid edge was not stroked red');
+    assert.equal(await page.evaluate(() => {
+      const node = document.querySelector('#cvNodes [data-node-id="capability"]');
+      return getComputedStyle(node).borderColor;
+}), 'rgb(185, 28, 28)', 'the invalid node border is not red');
 
     /* 节点定位：选中并居中 */
     await page.locator('#cvIssues [data-issue-node="capability"]').click();
@@ -2296,7 +2639,7 @@ test('quick-create-compatible-node', async () => {
   /* 快速创建只列出「有输入槽位、且当前输出类型可连」的节点；条件/起点不在列。 */
   assert.deepEqual(menu.kinds, [
     'question-choice', 'question-noul', 'question-score',
-    'logic-and', 'logic-or', 'logic-not', 'target'
+    'logic-and', 'logic-or', 'target'
   ]);
   assert.deepEqual(menu.quick, { source: 'capability', port: 'prob.easy' });
   assertIncludes(menu.head, 'capability');
@@ -2336,7 +2679,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.deepEqual(await page.evaluate(() =>
     Array.from(document.querySelectorAll('#cvQuick [data-qkind]')).map(el => el.dataset.qkind)), [
     'question-choice', 'question-noul', 'question-score',
-    'logic-and', 'logic-or', 'logic-not', 'target'
+    'logic-and', 'logic-or', 'target'
   ]);
   await page.locator('#cvQuick [data-qkind="question-noul"]').click();
   const boolAfter = await appSnapshot();
@@ -2944,7 +3287,8 @@ test('Task 8 · a tree switch that loses to Load example is discarded', async ()
     await waitFor(async expected => {
       const { app } = await import('/console/routing/app.js');
       const node = app.graph && app.graph.nodes.find(item => item.id === 'start');
-      return app.treeId === expected.id && app.kind() === 'clean' && !!node &&
+      /* 示例自带 local runtime：相对已保存的 mock 基线是 behavior dirty。 */
+      return app.treeId === expected.id && app.kind() === 'behavior' && !!node &&
         node.position.x === expected.start.x && node.position.y === expected.start.y;
     }, { id: TREE_ID, start: EXAMPLE_START }, { timeout: 8000 });
 
@@ -2981,7 +3325,7 @@ test('Task 8 · a tree switch that loses to Load example is discarded', async ()
     assert.deepEqual(after, {
       id: TREE_ID,
       name: BASELINE.name,
-      kind: 'clean',
+      kind: 'behavior',
       nodes: EXAMPLE_NODES,
       edges: EXAMPLE_EDGES,
       start: EXAMPLE_START
@@ -3955,6 +4299,8 @@ test('numeric unset and English boolean condition labels stay explicit', async (
     await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
 }
 });
+
+
 
 await runIfMain(import.meta.url);
 

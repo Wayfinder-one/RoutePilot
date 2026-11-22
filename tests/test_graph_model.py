@@ -438,7 +438,7 @@ def test_shared_sample_revision_is_order_and_display_invariant():
     """
     samples = {
         "fixture": (tree_dict(), "81a318d8a40117baa68247c89d835b8d65e3977853c608929f48332cef1ee1f8"),
-        "power": (tree_dict(root=POWER_GRAPH), "2ce3fa7347f53b88465d9930f781a54a0368f9f228c354ed45c4072a3fb9d6b7"),
+        "power": (tree_dict(root=POWER_GRAPH), "971bef4ca5669dfe0bb7874ae9fe582aa8a772051e5315ef3cf78466b6c2b4f1"),
     }
     for name, (raw, expected) in samples.items():
         assert tree_revision_of(tree_from_dict(raw)) == expected, name
@@ -498,3 +498,58 @@ def test_canvas_to_dict_skips_unpositioned_nodes():
             assert node.id not in canvas_to_dict(tree.root)
     partial = tree_from_dict({**tree_dict(), "canvas": {"start": {"x": 7, "y": 8}}})
     assert canvas_to_dict(partial.root) == {"start": {"x": 7.0, "y": 8.0}}
+
+
+# ── NOT removal: every legacy NOT graph is rejected ──────────────────
+
+
+def _graph_with_legacy_not():
+    raw = graph_dict()
+    raw["nodes"].append({"id": "legacy-not", "type": "logic", "operator": "not"})
+    raw["edges"] = [edge for edge in raw["edges"] if edge["id"] != "e-q-safe"]
+    raw["edges"] += [
+        {"id": "e-q-not", "source": "q", "source_port": "selected.strong",
+         "target": "legacy-not", "target_port": "in_1", "condition": None},
+        {"id": "e-not-safe", "source": "legacy-not", "source_port": "out",
+         "target": "safe", "target_port": "in_1", "condition": None},
+    ]
+    return raw
+
+
+def test_legacy_not_gate_is_rejected_without_migration():
+    with pytest.raises(ValueError, match="and/or"):
+        graph_from_dict(_graph_with_legacy_not())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("unexpected", True),
+    ("title", 42),
+    ("id", []),
+])
+def test_invalid_legacy_not_node_fields_are_rejected(field, value):
+    raw = _graph_with_legacy_not()
+    raw["nodes"][-1][field] = value
+    with pytest.raises(ValueError):
+        graph_from_dict(raw)
+
+
+@pytest.mark.parametrize("condition", [
+    {"op": "is", "value": True, "unexpected": True},
+    {"op": [], "value": True},
+])
+def test_invalid_legacy_not_condition_is_rejected(condition):
+    raw = _graph_with_legacy_not()
+    raw["edges"][-2]["condition"] = condition
+    with pytest.raises(ValueError):
+        graph_from_dict(raw)
+
+
+def test_legacy_not_cannot_reduce_the_node_limit_before_rejection():
+    raw = _graph_with_legacy_not()
+    for index in range(197):
+        raw["nodes"].append({
+            "id": f"extra-{index}", "type": "target", "priority": index + 2,
+            "models": [{"model": "fast", "reasoning": None}],
+        })
+    with pytest.raises(ValueError, match="and/or"):
+        graph_from_dict(raw)

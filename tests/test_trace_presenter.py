@@ -218,13 +218,13 @@ def test_present_trace_formats_gate_operator_and_inputs():
     ]
 
 
-def test_present_trace_formats_not_gate_with_operator():
-    event = {"event": "gate", "wave": 1, "node_id": "not-cap", "operator": "not",
+def test_present_trace_formats_unary_gate_with_operator():
+    event = {"event": "gate", "wave": 1, "node_id": "unary-cap", "operator": "custom",
              "value": False,
              "inputs": [{"port": "in_1", "raw": True, "condition": None, "status": "true"}]}
     presented = present_trace([event], has_time_period=False)[0]
-    assert presented["summary"]["zh"] == "not-cap：NOT true → false"
-    assert presented["summary"]["en"] == "not-cap: NOT true → false"
+    assert presented["summary"]["zh"] == "unary-cap：CUSTOM true → false"
+    assert presented["summary"]["en"] == "unary-cap: CUSTOM true → false"
 
 
 def test_present_trace_formats_wave_duration_and_activation():

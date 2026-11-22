@@ -93,7 +93,7 @@ def test_s3_second_wave_only_asks_clarify_then_deep_target_wins():
     assert trace[-1]["event"] == "final"
 
 
-def test_s4_not_or_follow_up_then_deep_target_wins():
+def test_s4_negated_condition_or_follow_up_then_deep_target_wins():
     outcome, jev, trace = run_evaluate("s4")
 
     assert [call["keys"] for call in jev.calls] == [["capability", "domain"], ["clarify"]]

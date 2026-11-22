@@ -33,6 +33,26 @@ function targetOf(graph) {
   return graph.nodes.find(node => node.type === 'target');
 }
 
+function legacyNotTree() {
+  const tree = minimalTree();
+  const graph = tree.root;
+  graph.nodes.push(
+    { id: 'q', type: 'question', question_type: 'choice', instructions: '能力？', options: [
+      { key: 'easy', label: '轻量', capability: '简单。' },
+      { key: 'strong', label: '增强', capability: '复杂。' },
+    ], position: { x: 200, y: 200 } },
+    { id: 'legacy-not', type: 'logic', operator: 'not', position: { x: 400, y: 200 } },
+  );
+  graph.edges.push(
+    { id: 'e-start-q', source: 'start', source_port: 'out', target: 'q', target_port: 'in_1', condition: null },
+    { id: 'e-q-not', source: 'q', source_port: 'prob.strong', target: 'legacy-not', target_port: 'in_1',
+      condition: { op: 'gt', value: 0.65 } },
+    { id: 'e-not-target', source: 'legacy-not', source_port: 'out', target: targetOf(graph).id,
+      target_port: 'in_2', condition: null },
+  );
+  return tree;
+}
+
 function codesOf(issues) {
   return issues.filter(issue => issue.level !== 'hint').map(issue => issue.code);
 }
@@ -466,7 +486,7 @@ test('validate reports structural problems with locatable codes', () => {
   assert.ok(issues.every(issue => typeof issue.en === 'string' && issue.en.length > 0));
 });
 
-test('validate enforces NOT one slot and AND/OR at least two slots', () => {
+test('validate rejects NOT and enforces AND/OR at least two slots', () => {
   const graph = minimalTree().root;
   graph.nodes.push(
     { id: 'and', type: 'logic', operator: 'and', position: { x: 0, y: 0 } },
@@ -475,15 +495,30 @@ test('validate enforces NOT one slot and AND/OR at least two slots', () => {
   assert.equal(RTGraph.addEdge(graph, {
     source: 'start', source_port: 'out', target: 'and', target_port: 'in_1',
   }).ok, true);
-  assert.equal(RTGraph.addEdge(graph, {
-    source: 'start', source_port: 'out', target: 'not', target_port: 'in_1',
-  }).ok, true);
-  assert.equal(RTGraph.addEdge(graph, {
-    source: 'start', source_port: 'out', target: 'not', target_port: 'in_2',
-  }).ok, true);
+  const issues = RTGraph.validate(graph);
+  assert.ok(issues.some(issue => issue.code === 'logic_operator_invalid' && issue.node_id === 'not'));
+  assert.ok(issues.some(issue => issue.code === 'logic_slot_count' && issue.node_id === 'and'));
+});
 
-  const issues = RTGraph.validate(graph).filter(issue => issue.code === 'logic_slot_count');
-  assert.deepEqual(issues.map(issue => issue.node_id).sort(), ['and', 'not']);
+test('legacy NOT import is rejected without migration or draft mutation', () => {
+  const original = legacyNotTree();
+  const before = JSON.stringify(original);
+  const parsed = RTGraph.parseImport(importText(original));
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.tree, undefined);
+  assert.ok(parsed.issues.some(issue =>
+    issue.code === 'logic_operator_invalid' && issue.node_id === 'legacy-not'));
+  assert.equal(JSON.stringify(original), before);
+});
+
+
+test('unknown fields on a rejected NOT node cannot disappear during import', () => {
+  const original = legacyNotTree();
+  original.root.nodes.find(node => node.id === 'legacy-not').unexpected = true;
+  const parsed = RTGraph.parseImport(importText(original));
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.tree, undefined);
+  assert.ok(parsed.issues.some(issue => issue.code === 'graph_parse_error'));
 });
 
 test('validate reports dangling ports, invalid conditions and question config', () => {
@@ -573,8 +608,8 @@ test('serialize and parseImport round-trip the complete envelope', () => {
   assert.equal(exported.name, tree.name);
   assert.equal(exported.timezone, tree.timezone);
   assert.deepEqual(exported.sticky, tree.sticky);
-  assert.equal(exported.root.nodes.length, 15);
-  assert.equal(exported.root.edges.length, 15);
+  assert.equal(exported.root.nodes.length, 14);
+  assert.equal(exported.root.edges.length, 14);
 
   const result = RTGraph.parseImport(text);
   assert.equal(result.ok, true);
@@ -1382,7 +1417,7 @@ test('review-chinese-node-names-contract', () => {
   assert.doesNotMatch(cards, /cv\.slot\.orNote/, 'card still renders the OR note');
   const i18n = read('i18n.js');
   for (const key of ['cv.name.start', 'cv.name.question.choice', 'cv.name.question.noul',
-    'cv.name.question.score', 'cv.name.logic.and', 'cv.name.logic.or', 'cv.name.logic.not',
+    'cv.name.question.score', 'cv.name.logic.and', 'cv.name.logic.or',
     'cv.name.condition.text', 'cv.name.condition.periods', 'cv.name.target']) {
     assert.equal(i18n.split("'" + key + "'").length - 1, 2,
       'i18n key ' + key + ' is not defined in both zh and en');
@@ -1522,4 +1557,505 @@ test('invalid canvas shapes are rejected on import', () => {
     const result = RTGraph.parseImport(JSON.stringify(Object.assign({}, base, { canvas })));
     assert.equal(result.ok, false, JSON.stringify(canvas));
   }
+});
+
+/* ── 10. 自包含运行配置（backends / jev / jev_window / time_periods） ───
+   四字段是画布 JSON 的运行配置事实源：Python 端 runtime.py 已完成，
+   这里钉住控制台数据层的导入/导出/严格校验/行为 canonical 语义。 */
+
+function selfContainedGraph() {
+  return {
+    id: 'root', type: 'graph', error_fallback: 'fast-target',
+    nodes: [
+      { id: 'start', type: 'start' },
+      { id: 'fast-target', type: 'target', models: [{ model: 'fast', reasoning: 'high' }], priority: 1, strategy: 'least_inflight' },
+      { id: 'strong-target', type: 'target', models: [{ model: 'strong', reasoning: null }], priority: 2, strategy: 'least_inflight' }
+    ],
+    edges: [
+      { id: 'e-start-fast', source: 'start', source_port: 'out', target: 'fast-target', target_port: 'in_1', condition: null },
+      { id: 'e-start-strong', source: 'start', source_port: 'out', target: 'strong-target', target_port: 'in_1', condition: null }
+    ]
+  };
+}
+
+/* 故意混入需要归一化的写法：provider 名/base_url 带空白与尾部斜杠、
+   缺 key_env / reasoning_format、jev 缺 timeout/instructions/state_template、
+   capability 带空白、profile 里放整数值数字（131072）与指数浮点（1e-5）。 */
+function selfContainedDocument() {
+  return {
+    kind: 'sr-routing-graph', version: 3, name: '自包含决策组', timezone: 'Asia/Shanghai',
+    sticky: { enabled: true, ttl_seconds: 600 },
+    backends: {
+      providers: [
+        { name: ' local ', base_url: ' http://runtime.test/v1/ ', key_env: 'RUNTIME_API_KEY', reasoning_format: 'openai' },
+        { name: 'backup', base_url: 'https://backup.test/v1' }
+      ],
+      models: [
+        {
+          id: 'fast', upstream: 'fast-upstream', provider: 'local',
+          profile: { capability: '  轻量  ', context_window: 131072, rate: 1e-5 }
+        },
+        {
+          id: 'strong', upstream: 'strong-upstream', provider: 'backup',
+          profile: { reasoning: { efforts: { off: null, high: 'high' }, default: 'off' } }
+        }
+      ]
+    },
+    jev: { base_url: 'http://jev.test/v1', model: 'jev-model' },
+    jev_window: { input_tokens: 1024, context_tokens: 4096 },
+    time_periods: [
+      { name: 'peak', days: [0, 1, 2, 3, 4], start: '09:00', end: '18:00' },
+      { name: 'night', days: [5, 6], start: '22:00', end: '06:00' }
+    ],
+    root: selfContainedGraph(),
+    canvas: {
+      start: { x: 40, y: 180 },
+      'fast-target': { x: 320, y: 120 },
+      'strong-target': { x: 320, y: 260 }
+    }
+  };
+}
+
+function expectedRuntime() {
+  const defaults = RTGraph.RUNTIME_DEFAULTS;
+  return {
+    backends: {
+      providers: [
+        { name: 'local', base_url: 'http://runtime.test/v1', key_env: 'RUNTIME_API_KEY', reasoning_format: 'openai' },
+        { name: 'backup', base_url: 'https://backup.test/v1', key_env: '', reasoning_format: 'openai' }
+      ],
+      models: [
+        {
+          id: 'fast', upstream: 'fast-upstream', provider: 'local',
+          profile: { capability: '轻量', context_window: 131072, rate: 1e-5 }
+        },
+        {
+          id: 'strong', upstream: 'strong-upstream', provider: 'backup',
+          profile: { reasoning: { efforts: { off: null, high: 'high' }, default: 'off' } }
+        }
+      ]
+    },
+    jev: {
+      base_url: 'http://jev.test/v1', model: 'jev-model', timeout_seconds: 10,
+      instructions: defaults.instructions, state_template: defaults.state_template
+    },
+    jev_window: { input_tokens: 1024, context_tokens: 4096 },
+    time_periods: [
+      { name: 'peak', days: [0, 1, 2, 3, 4], start: '09:00', end: '18:00' },
+      { name: 'night', days: [5, 6], start: '22:00', end: '06:00' }
+    ]
+  };
+}
+
+function importSelfContained() {
+  const result = RTGraph.parseImport(JSON.stringify(selfContainedDocument()));
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  return result;
+}
+
+function assertRuntimeRejected(mutate, label) {
+  const document = selfContainedDocument();
+  mutate(document);
+  const result = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(result.ok, false, label + ' was accepted');
+  assert.equal(result.tree, undefined, label + ' returned a partial tree');
+  assert.ok(result.issues.some(item => item.code === 'graph_parse_error'),
+    label + ' did not report graph_parse_error: ' + JSON.stringify(result.issues));
+}
+
+test('self-contained documents import, normalize defaults and round-trip the runtime', () => {
+  const result = importSelfContained();
+  assert.deepEqual(result.tree.runtime, expectedRuntime());
+  assert.equal(result.tree.name, '自包含决策组');
+  assert.equal(hardIssues(result.issues).length, 0);
+  assert.equal(RTGraph.hasRuntime(result.tree), true);
+  assert.equal(RTGraph.hasRuntime(minimalTree()), false);
+
+  const text = RTGraph.serialize(result.tree);
+  const document = JSON.parse(text);
+  assert.equal(document.kind, 'sr-routing-graph');
+  assert.deepEqual(document.backends, expectedRuntime().backends);
+  assert.deepEqual(document.jev, expectedRuntime().jev);
+  assert.deepEqual(document.jev_window, expectedRuntime().jev_window);
+  assert.deepEqual(document.time_periods, expectedRuntime().time_periods);
+  /* 导出文档不含任何密钥/派生字段的键名。 */
+  for (const secret of ['api_key', 'key_present', 'key_source']) {
+    assert.equal(text.includes(secret), false, 'serialize leaked ' + secret);
+  }
+
+  const rewritten = RTGraph.parseImport(text);
+  assert.equal(rewritten.ok, true, JSON.stringify(rewritten.issues));
+  assert.deepEqual(rewritten.tree.runtime, expectedRuntime());
+  assert.equal(RTGraph.behaviorCanonical(rewritten.tree), RTGraph.behaviorCanonical(result.tree));
+
+  /* 导出/保存 payload 用的投影：tree 与 runtime 对象两种入参等价。 */
+  assert.deepEqual(RTGraph.runtimeDocumentView(result.tree), expectedRuntime());
+  assert.deepEqual(RTGraph.runtimeDocumentView(result.tree.runtime), expectedRuntime());
+  assert.equal(RTGraph.runtimeDocumentView(minimalTree()), null);
+});
+
+test('serialize drops secret and derived runtime fields even from a tampered tree', () => {
+  const imported = importSelfContained();
+  const tampered = RTGraph.clone(imported.tree);
+  tampered.runtime.backends.providers[0].api_key = 'sk-should-not-be-exported';
+  tampered.runtime.backends.providers[0].key_source = 'stored';
+  tampered.runtime.jev.api_key = 'sk-should-not-be-exported';
+  tampered.runtime.jev.key_present = true;
+  /* profile 是自由 JSON 元数据：嵌套对象/数组里的密钥同样不得随导出泄漏。 */
+  tampered.runtime.backends.models[0].profile.metadata = {
+    labels: [{ 'API-KEY': 'sk-should-not-be-exported', tier: 'keep-me' }],
+    authorization: 'sk-should-not-be-exported'
+  };
+  const text = RTGraph.serialize(tampered);
+  assert.equal(text.includes('sk-should-not-be-exported'), false);
+  for (const secret of ['api_key', 'key_present', 'key_source', 'authorization', 'API-KEY']) {
+    assert.equal(text.includes(secret), false, 'serialize leaked ' + secret);
+  }
+  const runtime = JSON.parse(text);
+  assert.deepEqual(runtime.backends.models[0].profile.metadata, {
+    labels: [{ tier: 'keep-me' }]
+  });
+  assert.deepEqual(runtime.backends.providers, expectedRuntime().backends.providers);
+  assert.deepEqual(runtime.backends.models[0].id, expectedRuntime().backends.models[0].id);
+  assert.deepEqual(runtime.jev, expectedRuntime().jev);
+});
+
+test('self-contained documents accept a null jev block', () => {
+  const document = selfContainedDocument();
+  document.jev = null;
+  const result = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  assert.equal(result.tree.runtime.jev, null);
+  const exported = JSON.parse(RTGraph.serialize(result.tree));
+  assert.equal(Object.prototype.hasOwnProperty.call(exported, 'jev'), true);
+  assert.equal(exported.jev, null);
+  const rewritten = RTGraph.parseImport(RTGraph.serialize(result.tree));
+  assert.deepEqual(rewritten.tree.runtime, result.tree.runtime);
+});
+
+test('legacy documents keep an explicit null runtime and unchanged canonical', () => {
+  /* 仓库自带 example.json 现在携带运行配置；旧文档用去掉四字段的同一份图验证。 */
+  const legacyDocument = JSON.parse(fs.readFileSync(EXAMPLE_URL, 'utf8'));
+  for (const field of RTGraph.RUNTIME_FIELDS) delete legacyDocument[field];
+  const parsed = RTGraph.parseImport(JSON.stringify(legacyDocument));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed.issues));
+  assert.equal(parsed.tree.runtime, null);
+  assert.equal(RTGraph.hasRuntime(parsed.tree), false);
+
+  const document = JSON.parse(RTGraph.serialize(parsed.tree));
+  for (const field of RTGraph.RUNTIME_FIELDS) {
+    assert.equal(Object.prototype.hasOwnProperty.call(document, field), false, field);
+  }
+  /* 显式 runtime:null 与完全缺失必须是同一份 canonical（旧文档逐字节不变）。 */
+  const explicitNull = Object.assign({}, parsed.tree, { runtime: null });
+  assert.equal(RTGraph.behaviorCanonical(explicitNull), RTGraph.behaviorCanonical(parsed.tree));
+
+  const minimal = RTGraph.parseImport(RTGraph.serialize(minimalTree()));
+  assert.equal(minimal.ok, true, JSON.stringify(minimal.issues));
+  assert.equal(minimal.tree.runtime, null);
+});
+
+test('runtime fields must appear together and accept no sibling runtime key', () => {
+  for (const field of RTGraph.RUNTIME_FIELDS) {
+    const document = selfContainedDocument();
+    for (const other of RTGraph.RUNTIME_FIELDS) {
+      if (other !== field) delete document[other];
+    }
+    const result = RTGraph.parseImport(JSON.stringify(document));
+    assert.equal(result.ok, false, 'only ' + field + ' was accepted');
+    const hard = hardIssues(result.issues);
+    assert.equal(hard.length > 0, true, field);
+    for (const item of hard) {
+      assert.equal(item.code, 'graph_parse_error', field);
+      assert.equal(item.level, 'hard', field);
+      assert.equal(typeof item.zh, 'string', field);
+      assert.equal(typeof item.en, 'string', field);
+    }
+  }
+
+  const missingOne = selfContainedDocument();
+  delete missingOne.time_periods;
+  assert.equal(RTGraph.parseImport(JSON.stringify(missingOne)).ok, false);
+
+  /* envelope 顶层只认这四个字段名：嵌套 runtime 或拼错的兄弟字段一律拒绝。 */
+  const nested = selfContainedDocument();
+  nested.runtime = {};
+  assert.equal(RTGraph.parseImport(JSON.stringify(nested)).ok, false);
+  const extraSibling = selfContainedDocument();
+  extraSibling.jev_window_extra = { input_tokens: 1, context_tokens: 2 };
+  assert.equal(RTGraph.parseImport(JSON.stringify(extraSibling)).ok, false);
+});
+
+test('documents containing any secret or derived key field are rejected', () => {
+  const cases = [
+    ['provider api_key', document => { document.backends.providers[0].api_key = 'sk-must-not-persist'; }],
+    ['provider key_present', document => { document.backends.providers[0].key_present = true; }],
+    ['provider key_source', document => { document.backends.providers[0].key_source = 'stored'; }],
+    ['jev api_key', document => { document.jev.api_key = 'sk-must-not-persist'; }],
+    ['jev key_present', document => { document.jev.key_present = false; }],
+    ['jev key_source', document => { document.jev.key_source = 'environment'; }],
+    ['profile api_key', document => { document.backends.models[0].profile.api_key = 'sk-must-not-persist'; }],
+    ['profile API-KEY', document => { document.backends.models[0].profile['API-KEY'] = 'sk-must-not-persist'; }],
+    ['profile Authorization', document => { document.backends.models[0].profile.Authorization = 'Bearer sk-must-not-persist'; }],
+    ['profile nested object', document => {
+      document.backends.models[0].profile.metadata = { auth: { authorization: 'sk-must-not-persist' } };
+    }],
+    ['profile nested array', document => {
+      document.backends.models[0].profile.metadata = [{ key_source: 'stored' }];
+    }],
+    ['model key_source', document => { document.backends.models[1].key_source = 'environment'; }],
+    ['period api_key', document => { document.time_periods[0].api_key = 'sk-must-not-persist'; }]
+  ];
+  for (const [label, mutate] of cases) assertRuntimeRejected(mutate, label);
+});
+
+test('secret detection normalizes case and separators without over-matching', () => {
+  /* 与 Python runtime._secret_key 同一规则：大小写/连字符/下划线无关。 */
+  for (const key of ['api_key', 'API-KEY', 'ApiKey', 'authorization', 'AUTHORIZATION',
+    'key_present', 'Key-Source']) {
+    assert.equal(RTGraph.isSecretField(key), true, key + ' must be treated as secret');
+  }
+  /* 只包含 "key" 的正常元数据必须保留，不能被模糊匹配误伤。 */
+  for (const key of ['monkey', 'key', 'keys', 'keychain', 'hot_key', 'keyed']) {
+    assert.equal(RTGraph.isSecretField(key), false, key + ' must stay a normal field');
+  }
+  assert.deepEqual(RTGraph.withoutSecretFields({
+    api_key: 'x', nested: [{ authorization: 'y', tier: 'keep' }], monkey: 1
+  }), { nested: [{ tier: 'keep' }], monkey: 1 });
+});
+
+test('invalid backend catalogs are rejected', () => {
+  const cases = [
+    ['duplicate provider', document => { document.backends.providers.push(RTGraph.clone(document.backends.providers[1])); }],
+    ['duplicate model', document => { document.backends.models.push(RTGraph.clone(document.backends.models[1])); }],
+    ['dangling provider', document => { document.backends.models[1].provider = 'missing'; }],
+    ['invalid reasoning_format', document => { document.backends.providers[0].reasoning_format = 'chatml'; }],
+    ['non-string reasoning_format', document => { document.backends.providers[0].reasoning_format = 7; }],
+    ['invalid key_env', document => { document.backends.providers[0].key_env = '9BAD-ENV'; }],
+    ['invalid provider name', document => { document.backends.providers[1].name = 'bad name'; }],
+    ['invalid model id', document => { document.backends.models[1].id = '.hidden'; }],
+    ['profile not an object', document => { document.backends.models[1].profile = []; }],
+    ['capability not a string', document => { document.backends.models[1].profile = { capability: 7 }; }],
+    ['upstream empty', document => { document.backends.models[1].upstream = '   '; }],
+    ['provider base_url empty', document => { document.backends.providers[1].base_url = ' '; }],
+    ['providers not a list', document => { document.backends.providers = {}; }],
+    ['backends unknown field', document => { document.backends.extra = true; }],
+    ['provider unknown field', document => { document.backends.providers[1].note = 'x'; }],
+    ['model unknown field', document => { document.backends.models[1].upstream_key = 'x'; }],
+    ['reasoning not an object', document => { document.backends.models[1].profile = { reasoning: 'high' }; }],
+    ['reasoning efforts not an object', document => { document.backends.models[1].profile = { reasoning: { efforts: [] } }; }],
+    ['reasoning unknown key', document => { document.backends.models[1].profile = { reasoning: { efforts: { off: null, high: 'high' }, temperature: 1 } }; }]
+  ];
+  for (const [label, mutate] of cases) assertRuntimeRejected(mutate, label);
+});
+
+test('invalid jev, window and time period values are rejected', () => {
+  const cases = [
+    ['jev not an object', document => { document.jev = 'http://jev.test'; }],
+    ['jev unknown field', document => { document.jev.extra = true; }],
+    ['jev base_url not http', document => { document.jev.base_url = 'ftp://jev.test/v1'; }],
+    ['jev base_url with query', document => { document.jev.base_url = 'http://jev.test/v1?x=1'; }],
+    ['jev model empty', document => { document.jev.model = '  '; }],
+    ['jev timeout zero', document => { document.jev.timeout_seconds = 0; }],
+    ['jev timeout too large', document => { document.jev.timeout_seconds = 121; }],
+    ['jev timeout string', document => { document.jev.timeout_seconds = '10'; }],
+    ['jev instructions empty', document => { document.jev.instructions = '   '; }],
+    ['jev state_template without request', document => { document.jev.state_template = 'no placeholder'; }],
+    ['jev state_template with extra field', document => { document.jev.state_template = '{request}{other}'; }],
+    ['window input below minimum', document => { document.jev_window.input_tokens = 255; }],
+    ['window context below minimum', document => { document.jev_window.context_tokens = 511; }],
+    ['window input above maximum', document => { document.jev_window.input_tokens = 131073; }],
+    ['window input above context', document => { document.jev_window.input_tokens = 8192; }],
+    ['window tokens not integers', document => { document.jev_window.input_tokens = 1024.5; }],
+    ['window unknown field', document => { document.jev_window.budget = 1; }],
+    ['time_periods not a list', document => { document.time_periods = {}; }],
+    ['period unknown field', document => { document.time_periods[0].extra = true; }],
+    ['period missing end', document => { delete document.time_periods[0].end; }],
+    ['duplicate period name', document => { document.time_periods[1].name = 'peak'; }],
+    ['period empty days', document => { document.time_periods[0].days = []; }],
+    ['period day out of range', document => { document.time_periods[0].days = [0, 7]; }],
+    ['period duplicate day', document => { document.time_periods[0].days = [1, 1]; }],
+    ['period day not an integer', document => { document.time_periods[0].days = [0, 1.5]; }],
+    ['period start out of range', document => { document.time_periods[0].start = '24:00'; }],
+    ['period end out of range', document => { document.time_periods[0].end = '09:60'; }],
+    ['period start format', document => { document.time_periods[0].start = '9am'; }],
+    ['period name empty', document => { document.time_periods[0].name = ' '; }]
+  ];
+  for (const [label, mutate] of cases) assertRuntimeRejected(mutate, label);
+});
+
+test('runtime canonical keeps declared order and normalizes integral numbers', () => {
+  const imported = importSelfContained();
+  const canonical = RTGraph.behaviorCanonical(imported.tree);
+  assert.ok(canonical.includes('"timeout_seconds":10'), canonical);
+  assert.ok(canonical.includes('"context_window":131072'), canonical);
+  /* 非整数浮点必须走 Python repr（1e-05），否则与 tree_revision_of 不一致。 */
+  assert.ok(canonical.includes('"rate":1e-05'), canonical);
+  assert.equal(canonical.includes('10.0'), false);
+
+  const integerDocument = selfContainedDocument();
+  integerDocument.jev.timeout_seconds = 10;
+  integerDocument.backends.models[0].profile.context_window = 131072;
+  const integerText = JSON.stringify(integerDocument);
+  const floatText = integerText
+    .replace('"timeout_seconds":10', '"timeout_seconds":10.0')
+    .replace('"context_window":131072', '"context_window":131072.0');
+  assert.notEqual(integerText, floatText);
+  const integerImport = RTGraph.parseImport(integerText);
+  const floatImport = RTGraph.parseImport(floatText);
+  assert.equal(integerImport.ok, true, JSON.stringify(integerImport.issues));
+  assert.equal(floatImport.ok, true, JSON.stringify(floatImport.issues));
+  assert.equal(RTGraph.behaviorCanonical(integerImport.tree), RTGraph.behaviorCanonical(floatImport.tree));
+
+  /* providers / models / time_periods 保持输入顺序，不排序。 */
+  const reversedProviders = selfContainedDocument();
+  reversedProviders.backends.providers.reverse();
+  const reversedImport = RTGraph.parseImport(JSON.stringify(reversedProviders));
+  assert.equal(reversedImport.ok, true, JSON.stringify(reversedImport.issues));
+  assert.notEqual(RTGraph.behaviorCanonical(reversedImport.tree), canonical);
+
+  const reversedPeriods = selfContainedDocument();
+  reversedPeriods.time_periods.reverse();
+  const reversedPeriodsImport = RTGraph.parseImport(JSON.stringify(reversedPeriods));
+  assert.equal(reversedPeriodsImport.ok, true);
+  assert.notEqual(RTGraph.behaviorCanonical(reversedPeriodsImport.tree), canonical);
+
+  const reversedModels = selfContainedDocument();
+  reversedModels.backends.models.reverse();
+  const reversedModelsImport = RTGraph.parseImport(JSON.stringify(reversedModels));
+  assert.equal(reversedModelsImport.ok, true);
+  assert.notEqual(RTGraph.behaviorCanonical(reversedModelsImport.tree), canonical);
+});
+
+test('runtimeBehaviorView projects only the Python behavior shape', () => {
+  const imported = importSelfContained();
+  const view = RTGraph.runtimeBehaviorView(imported.tree);
+  assert.deepEqual(Object.keys(view).sort(), ['backends', 'jev', 'jev_window', 'time_periods']);
+  assert.deepEqual(Object.keys(view.backends).sort(), ['models', 'providers']);
+  assert.deepEqual(view.backends.providers[1],
+    { name: 'backup', base_url: 'https://backup.test/v1', key_env: '', reasoning_format: 'openai' });
+  assert.deepEqual(view.backends.models[0].profile, { capability: '轻量', context_window: 131072, rate: 1e-5 });
+  assert.deepEqual(view.jev_window, { input_tokens: 1024, context_tokens: 4096 });
+  assert.deepEqual(view.time_periods[0], { name: 'peak', days: [0, 1, 2, 3, 4], start: '09:00', end: '18:00' });
+
+  /* tree / runtime 对象 / flat envelope 三种入参都要能读取。 */
+  assert.deepEqual(RTGraph.runtimeBehaviorView(imported.tree.runtime), view);
+  const flat = Object.assign({}, imported.tree.runtime, { name: 'envelope' });
+  assert.deepEqual(RTGraph.runtimeBehaviorView(flat), view);
+  assert.equal(RTGraph.runtimeBehaviorView(minimalTree()), null);
+  assert.equal(RTGraph.runtimeBehaviorView({ runtime: null }), null);
+
+  /* 派生/未知字段不进 canonical：即使调用方污染了 runtime。 */
+  const tampered = RTGraph.clone(imported.tree);
+  tampered.runtime.backends.providers[0].api_key = 'sk-should-not-be-hashed';
+  tampered.runtime.backends.providers[0].key_source = 'stored';
+  tampered.runtime.jev.key_present = true;
+  const tamperedView = RTGraph.runtimeBehaviorView(tampered);
+  const serialized = JSON.stringify(tamperedView);
+  assert.equal(serialized.includes('sk-should-not-be-hashed'), false);
+  assert.equal(serialized.includes('key_source'), false);
+  assert.equal(serialized.includes('key_present'), false);
+});
+
+test('runtime edits classify as behavior changes, not display or layout', () => {
+  const imported = importSelfContained();
+  const tree = imported.tree;
+  assert.equal(RTGraph.changeKind(tree, RTGraph.clone(tree)), 'clean');
+
+  const jevChanged = RTGraph.clone(tree);
+  jevChanged.runtime.jev.model = 'jev-model-2';
+  assert.equal(RTGraph.changeKind(tree, jevChanged), 'behavior');
+
+  const timeoutChanged = RTGraph.clone(tree);
+  timeoutChanged.runtime.jev.timeout_seconds = 12.5;
+  assert.equal(RTGraph.changeKind(tree, timeoutChanged), 'behavior');
+
+  const providerChanged = RTGraph.clone(tree);
+  providerChanged.runtime.backends.providers[1].base_url = 'https://backup.test/v2';
+  assert.equal(RTGraph.changeKind(tree, providerChanged), 'behavior');
+
+  const modelChanged = RTGraph.clone(tree);
+  modelChanged.runtime.backends.models[1].profile = {};
+  assert.equal(RTGraph.changeKind(tree, modelChanged), 'behavior');
+
+  const periodsChanged = RTGraph.clone(tree);
+  periodsChanged.runtime.time_periods[0].start = '08:00';
+  assert.equal(RTGraph.changeKind(tree, periodsChanged), 'behavior');
+
+  const runtimeRemoved = RTGraph.clone(tree);
+  runtimeRemoved.runtime = null;
+  assert.equal(RTGraph.changeKind(tree, runtimeRemoved), 'behavior');
+
+  const renamed = RTGraph.clone(tree);
+  renamed.name = '改名';
+  assert.equal(RTGraph.changeKind(tree, renamed), 'display');
+
+  const moved = RTGraph.clone(tree);
+  moved.root.nodes[0].position = { x: 1, y: 2 };
+  assert.equal(RTGraph.changeKind(tree, moved), 'layout');
+
+  /* 旧文档补上 runtime 也是行为变更。 */
+  const legacy = minimalTree();
+  const withRuntime = RTGraph.clone(legacy);
+  withRuntime.runtime = RTGraph.clone(tree.runtime);
+  assert.equal(RTGraph.changeKind(legacy, withRuntime), 'behavior');
+});
+
+test('validateRuntime accepts normalized runtimes and reports graph_parse_error otherwise', () => {
+  const imported = importSelfContained();
+  assert.deepEqual(RTGraph.validateRuntime(imported.tree), []);
+  assert.deepEqual(RTGraph.validateRuntime(imported.tree.runtime), []);
+  assert.deepEqual(RTGraph.validateRuntime(null), []);
+  assert.deepEqual(RTGraph.validateRuntime({ runtime: null }), []);
+  /* 旧草稿/裸图没有 runtime 也是合法输入。 */
+  assert.deepEqual(RTGraph.validateRuntime(minimalTree()), []);
+
+  const broken = RTGraph.clone(imported.tree.runtime);
+  broken.jev_window.input_tokens = 4096;
+  broken.jev_window.context_tokens = 1024;
+  broken.time_periods[0].days = [9];
+  const issues = RTGraph.validateRuntime(broken);
+  assert.ok(issues.length >= 2, JSON.stringify(issues));
+  for (const item of issues) {
+    assert.equal(item.code, 'graph_parse_error');
+    assert.equal(item.level, 'hard');
+    assert.equal(typeof item.zh, 'string');
+    assert.equal(typeof item.en, 'string');
+    assert.equal(item.node_id, '');
+    assert.equal(item.edge_id, '');
+    assert.equal(item.port, '');
+  }
+
+  /* 嵌套 runtime 缺字段属于「成组出现」错误。 */
+  const partial = RTGraph.clone(imported.tree);
+  delete partial.runtime.jev_window;
+  const partialIssues = RTGraph.validateRuntime(partial);
+  assert.ok(partialIssues.some(item => item.code === 'graph_parse_error'));
+
+  const flatPartial = RTGraph.clone(imported.tree.runtime);
+  delete flatPartial.time_periods;
+  assert.ok(RTGraph.validateRuntime(flatPartial).some(item => item.code === 'graph_parse_error'));
+});
+
+test('parseImport keeps runtime on the tree and validate covers envelope runtime fields', () => {
+  const imported = importSelfContained();
+  assert.deepEqual(hardIssues(RTGraph.validate(imported.tree)), []);
+
+  /* API envelope 形态（flat 四字段）也必须被 validate 识别。 */
+  const envelope = {
+    id: 'tree-1',
+    enabled: true,
+    name: imported.tree.name,
+    timezone: imported.tree.timezone,
+    sticky: imported.tree.sticky,
+    root: RTGraph.clone(imported.tree.root)
+  };
+  Object.assign(envelope, RTGraph.clone(imported.tree.runtime));
+  assert.deepEqual(hardIssues(RTGraph.validate(envelope)), []);
+
+  const badEnvelope = RTGraph.clone(envelope);
+  badEnvelope.backends.providers[0].api_key = 'sk-must-not-persist';
+  const badEnvelopeIssues = hardIssues(RTGraph.validate(badEnvelope));
+  assert.ok(badEnvelopeIssues.some(item => item.code === 'graph_parse_error'),
+    JSON.stringify(badEnvelopeIssues));
 });

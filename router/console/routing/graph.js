@@ -24,8 +24,7 @@ const NUM_OPS = ['gt', 'gte', 'lt', 'lte', 'eq', 'neq'];
 const OP = { gt: '>', gte: '≥', lt: '<', lte: '≤', eq: '=', neq: '≠' };
 const LOGIC = {
   and: { symbol: '∧', name: '与 AND' },
-  or: { symbol: '∨', name: '或 OR' },
-  not: { symbol: '¬', name: '非 NOT' }
+  or: { symbol: '∨', name: '或 OR' }
 };
 const NODE_TYPES = ['start', 'question', 'logic', 'condition', 'target'];
 const NODE_ORDER = { start: 0, condition: 1, question: 2, logic: 3, target: 4 };
@@ -35,13 +34,13 @@ const PARSE_ERROR_EN = 'Graph parse failed: root does not conform to the sr-rout
 const HINTS = [
   '比较条件写在输入槽位上：数值线拖进任何布尔槽位后，点条件即可改成 > 0.75 这类阈值，不需要再放比较门。',
   '同一数值端口可以连到同一个判断门的两个槽位，分别写 > 0.3 与 < 0.8，就是区间条件。',
-  '布尔槽位不写条件即为直接通过；要反向判断可以开启取反，或显式加 NOT 门。',
+  '布尔槽位不写条件即为直接通过；要反向判断可以开启取反。',
   '条件阈值 0.65 / 0.70 / 0.60 是示例值：上线前请按实际问题独立校准。'
 ];
 const HINT_EN = [
   'Comparison conditions live on input slots: drop a numeric edge into any boolean slot and edit the threshold (for example > 0.75); no separate comparison node is needed.',
   'Fan the same numeric output into two slots of one AND gate with > 0.3 and < 0.8 to express a range condition.',
-  'A boolean slot without a condition passes through directly; enable negation (or add an explicit NOT gate) for the opposite test.',
+  'A boolean slot without a condition passes through directly; enable negation for the opposite test.',
   'Thresholds 0.65 / 0.70 / 0.60 are examples: calibrate them for the real questions before enabling the graph.'
 ];
 
@@ -145,7 +144,7 @@ function slotPorts(node, graphValue) {
     .filter(edge => edge.target === node.id)
     .map(edge => edge.target_port);
   let minSlots = 1;
-  if (node.type === 'logic' && node.operator !== 'not') minSlots = 2;
+  if (node.type === 'logic') minSlots = 2;
   let maxUsed = 0;
   used.forEach(port => {
     const index = slotIndex(port);
@@ -548,10 +547,71 @@ function hintIssues() {
   }));
 }
 
+/* ── 运行配置（自包含画布 JSON 的四个顶层字段） ─────────────────────
+   Python 事实源：router/routing/runtime.py、router/jev/config.py、
+   router/jev/window.py、router/routing/conditions.py、router/reasoning.py。
+   四字段必须成组出现；全缺失 = 旧文档（运行时走数据库/全局配置回退）。 */
+const RUNTIME_FIELDS = ['backends', 'jev', 'jev_window', 'time_periods'];
+/* 密钥与派生的密钥状态只存在于服务端：文档任意层级出现即拒绝。
+   RUNTIME_SECRET_FIELDS 是对外展示的字段名；匹配用规范化集合（与 Python
+   runtime._secret_key 一致：大小写无关，去掉 -/_ 后比对固定集合）。 */
+const RUNTIME_SECRET_FIELDS = ['api_key', 'key_present', 'key_source', 'authorization'];
+const SECRET_KEY_NAMES = ['apikey', 'authorization', 'keypresent', 'keysource'];
+
+function isSecretField(key) {
+  const normalized = key.toLowerCase().replace(/[-_]/g, '');
+  return SECRET_KEY_NAMES.indexOf(normalized) >= 0;
+}
+
+/* 递归剔除密钥字段的导出投影：即使内部状态被污染，serialize 也不导出密钥。 */
+function withoutSecretFields(value) {
+  if (Array.isArray(value)) return value.map(withoutSecretFields);
+  if (!isRecord(value)) return value;
+  const result = {};
+  Object.keys(value).forEach(key => {
+    if (!isSecretField(key)) result[key] = withoutSecretFields(value[key]);
+  });
+  return result;
+}
+const BACKENDS_FIELDS = ['providers', 'models'];
+const PROVIDER_FIELDS = ['name', 'base_url', 'key_env', 'reasoning_format'];
+const MODEL_FIELDS = ['id', 'upstream', 'provider', 'profile'];
+const JEV_FIELDS = ['base_url', 'model', 'timeout_seconds', 'instructions', 'state_template'];
+const JEV_WINDOW_FIELDS = ['input_tokens', 'context_tokens'];
+const TIME_PERIOD_FIELDS = ['name', 'days', 'start', 'end'];
+const REASONING_PROFILE_FIELDS = ['format', 'efforts', 'default', 'supports_reasoning_effort'];
+/* router/reasoning.py 的 FORMAT_IDS（provider.reasoning_format 的合法值）。 */
+const REASONING_FORMATS = [
+  'openai', 'deepseek', 'qwen', 'qwen-chat-template', 'openrouter', 'zai',
+  'together', 'string-thinking', 'ant-ling'
+];
+const RUNTIME_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const RUNTIME_ENV_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const RUNTIME_LIMITS = {
+  inputTokensMin: 256,
+  contextTokensMin: 512,
+  maxTokens: 131072,
+  providerBaseUrlMax: 500,
+  upstreamMax: 200,
+  capabilityMax: 2000,
+  timeoutMin: 0.1,
+  timeoutMax: 120
+};
+/* 与 router/jev/config.py 的默认值逐字符一致：缺省键在导入时补齐。 */
+const RUNTIME_DEFAULTS = {
+  timeout_seconds: 10,
+  key_env: '',
+  reasoning_format: 'openai',
+  instructions: '你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。',
+  state_template: '【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。'
+};
+
 /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
 /* canvas 是可选顶层字段：画布坐标只出现在文档顶层，节点对象不再携带 position。 */
-const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root', 'canvas'];
-const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision', 'updated_at'];
+const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root', 'canvas'].concat(RUNTIME_FIELDS);
+/* API envelope 是内部树形态：runtime 以嵌套对象携带；扁平四字段也接受（Python tree_to_dict）。 */
+const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision',
+  'updated_at', 'runtime'].concat(RUNTIME_FIELDS);
 const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'error_fallback'];
 /* 导入文档的节点契约：只有逻辑字段。内部草稿节点仍保留 position 工作状态。 */
 const NODE_FIELDS = {
@@ -679,6 +739,7 @@ function validateContract(value, graph, issues) {
           'sticky.ttl_seconds must be an integer in [1,31536000]'));
       }
     }
+    addRuntimeEnvelopeIssues(value, issues);
   }
 }
 
@@ -1035,14 +1096,6 @@ function validate(value) {
   nodes.forEach(node => {
     if (node.type !== 'logic') return;
     const count = incomingCount[node.id] || 0;
-    if (node.operator === 'not' && count !== 1) {
-      issues.push(issue(
-        'logic_slot_count',
-        'NOT 必须恰好有 1 个输入（当前 ' + count + ' 个）：' + node.id,
-        'NOT needs exactly 1 input (found ' + count + '): ' + node.id,
-        { node_id: node.id }
-      ));
-    }
     if ((node.operator === 'and' || node.operator === 'or') && count < 2) {
       issues.push(issue(
         'logic_slot_count',
@@ -1126,6 +1179,616 @@ function questionChainDepth(nodes, adjacency) {
   return Object.keys(byId)
     .filter(id => byId[id].type === 'question')
     .reduce((max, id) => Math.max(max, depth[id] || 0), 0);
+}
+
+/* ── 5b. 运行配置（backends / jev / jev_window / time_periods） ──────
+   Python 事实源：runtime_from_dict / runtime_to_dict / runtime_behavior_dict。
+   导入侧做与 Python 等价的严格解析与默认值补齐；canonical 侧输出与
+   tree_behavior_dict 逐字节一致的投影（整数值数字归一、非整数走 Python repr）。 */
+
+function hasOwnField(value, key) {
+  return value !== null && typeof value === 'object' &&
+    Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function runtimeIssue(issues, zh, en) {
+  issues.push(issue('graph_parse_error', zh, en));
+}
+
+/* Python runtime._text：strip 后非空、长度上限、无控制字符。 */
+function runtimeText(value, label, maxLen, issues) {
+  if (typeof value !== 'string') {
+    runtimeIssue(issues, label + ' 必须是字符串', label + ' must be a string');
+    return null;
+  }
+  const text = value.trim();
+  if (!text || text.length > maxLen || /[\u0000-\u001f\u007f]/.test(text)) {
+    runtimeIssue(issues, label + ' 为空、过长或含控制字符',
+      label + ' is empty, too long, or contains control characters');
+    return null;
+  }
+  return text;
+}
+
+/* Python runtime._id：_text 后再匹配 ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$。 */
+function runtimeId(value, label, issues) {
+  const text = runtimeText(value, label, 64, issues);
+  if (text !== null && !RUNTIME_ID_RE.test(text)) {
+    runtimeIssue(issues, label + ' 非法：' + text, 'Invalid ' + label + ': ' + text);
+    return null;
+  }
+  return text;
+}
+
+/* Python reject_unknown_fields：严格键集合（api_key 等派生字段也会在这里被拒绝）。 */
+function runtimeKeys(value, allowed, label, issues) {
+  const unknown = Object.keys(value).filter(key => allowed.indexOf(key) < 0).sort();
+  if (!unknown.length) return true;
+  runtimeIssue(issues, label + ' 含未知字段：' + unknown.join(', '),
+    label + ' has unknown fields: ' + unknown.join(', '));
+  return false;
+}
+
+/* 文档任意层级出现密钥/派生字段即拒绝：密钥永不进入画布 JSON。
+   显式栈遍历：导入内容不可信，深度嵌套不能把 parseImport 变成栈溢出。 */
+function findSecretField(value) {
+  const stack = [value];
+  while (stack.length) {
+    const current = stack.pop();
+    if (Array.isArray(current)) {
+      current.forEach(item => stack.push(item));
+      continue;
+    }
+    if (!isRecord(current)) continue;
+    const keys = Object.keys(current);
+    for (let index = 0; index < keys.length; index += 1) {
+      if (isSecretField(keys[index])) return keys[index];
+      stack.push(current[keys[index]]);
+    }
+  }
+  return null;
+}
+
+/* Python _json_copy：profile 只允许 JSON 值（有限数字、字符串、布尔、null、数组、对象）。 */
+function isJsonValue(value) {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (isRecord(value)) return Object.keys(value).every(key => isJsonValue(value[key]));
+  return false;
+}
+
+/* Python JevSettings 的 base_url：http/https、无 query/fragment。 */
+function isHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (!url.hostname || url.search || url.hash) return false;
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+/* Python JevSettings 的 state_template：恰好一个 {request} 占位（{{ / }} 为转义）。 */
+function templateFieldIssues(value, label, issues) {
+  const fields = [];
+  let index = 0;
+  while (index < value.length) {
+    const char = value[index];
+    if (char === '{') {
+      if (value[index + 1] === '{') { index += 2; continue; }
+      const close = value.indexOf('}', index + 1);
+      if (close < 0) {
+        runtimeIssue(issues, label + ' 含未闭合的格式字段', label + ' has an unclosed format field');
+        return;
+      }
+      fields.push(value.slice(index + 1, close).split(':')[0].split('!')[0]);
+      index = close + 1;
+      continue;
+    }
+    if (char === '}') {
+      if (value[index + 1] === '}') { index += 2; continue; }
+      runtimeIssue(issues, label + ' 含未配对的 }', label + ' has an unmatched }');
+      return;
+    }
+    index += 1;
+  }
+  if (fields.length !== 1 || fields[0] !== 'request') {
+    runtimeIssue(issues, label + ' 必须且只能包含一个 {request} 占位',
+      label + ' must contain exactly one {request} placeholder');
+  }
+}
+
+function normalizeRuntimeProviders(raw, issues) {
+  if (!Array.isArray(raw)) {
+    runtimeIssue(issues, 'backends.providers 必须是数组', 'backends.providers must be a list');
+    return [];
+  }
+  const providers = [];
+  const seen = Object.create(null);
+  raw.forEach((item, index) => {
+    const label = 'backends.providers[' + index + ']';
+    if (!isRecord(item)) {
+      runtimeIssue(issues, label + ' 必须是对象', label + ' must be an object');
+      return;
+    }
+    runtimeKeys(item, PROVIDER_FIELDS, label, issues);
+    const name = runtimeId(item.name, label + '.name', issues);
+    if (name !== null) {
+      if (seen[name]) runtimeIssue(issues, 'provider 名称重复：' + name, 'Duplicate provider: ' + name);
+      seen[name] = true;
+    }
+    const keyEnv = hasOwnField(item, 'key_env') ? item.key_env : RUNTIME_DEFAULTS.key_env;
+    const keyEnvOk = typeof keyEnv === 'string' && (!keyEnv || RUNTIME_ENV_RE.test(keyEnv));
+    if (!keyEnvOk) {
+      runtimeIssue(issues, label + '.key_env 必须是空串或合法环境变量名',
+        label + '.key_env must be empty or a valid environment variable name');
+    }
+    const reasoningFormat = hasOwnField(item, 'reasoning_format')
+      ? item.reasoning_format : RUNTIME_DEFAULTS.reasoning_format;
+    const formatOk = typeof reasoningFormat === 'string' &&
+      REASONING_FORMATS.indexOf(reasoningFormat) >= 0;
+    if (!formatOk) {
+      runtimeIssue(issues, label + '.reasoning_format 非法：' + String(reasoningFormat),
+        label + '.reasoning_format is invalid: ' + String(reasoningFormat));
+    }
+    const baseUrl = runtimeText(item.base_url, label + '.base_url',
+      RUNTIME_LIMITS.providerBaseUrlMax, issues);
+    if (name === null || baseUrl === null) return;
+    providers.push({
+      name: name,
+      base_url: baseUrl.replace(/\/+$/, ''),
+      key_env: keyEnv,
+      reasoning_format: reasoningFormat
+    });
+  });
+  return providers;
+}
+
+/* Python reasoning.validate_model_profile 的「形状级」移植：只做对象/键集合/
+   默认档位与 capability 归一；完整 reasoning 规则仍以服务端为准。 */
+function normalizeModelProfile(raw, label, issues) {
+  if (!isRecord(raw)) {
+    runtimeIssue(issues, label + ' 必须是对象', label + ' must be an object');
+    return null;
+  }
+  if (!isJsonValue(raw)) {
+    runtimeIssue(issues, label + ' 只允许 JSON 值', label + ' must contain only JSON values');
+    return null;
+  }
+  const profile = clone(raw);
+  if (hasOwnField(profile, 'reasoning')) {
+    const reasoning = profile.reasoning;
+    if (reasoning === null) {
+      delete profile.reasoning;
+    } else if (reasoning === false) {
+      /* 显式 false = 明确不支持思考，原样保留。 */
+    } else if (!isRecord(reasoning)) {
+      runtimeIssue(issues, label + '.reasoning 必须是对象或 false',
+        label + '.reasoning must be an object or false');
+    } else {
+      runtimeKeys(reasoning, REASONING_PROFILE_FIELDS, label + '.reasoning', issues);
+      const efforts = reasoning.efforts;
+      const effortsOk = isRecord(efforts) && Object.keys(efforts).length > 0;
+      if (!effortsOk) {
+        runtimeIssue(issues, label + '.reasoning.efforts 必须是非空对象',
+          label + '.reasoning.efforts must be a non-empty object');
+      }
+      const normalized = { efforts: effortsOk ? clone(efforts) : {} };
+      if (hasOwnField(reasoning, 'format')) {
+        if (typeof reasoning.format !== 'string' ||
+            REASONING_FORMATS.indexOf(reasoning.format) < 0) {
+          runtimeIssue(issues, label + '.reasoning.format 非法：' + String(reasoning.format),
+            label + '.reasoning.format is invalid: ' + String(reasoning.format));
+        } else {
+          normalized.format = reasoning.format;
+        }
+      }
+      if (hasOwnField(reasoning, 'default') && reasoning.default !== null) {
+        const level = reasoning.default;
+        if (typeof level !== 'string' || !effortsOk || !hasOwnField(efforts, level)) {
+          runtimeIssue(issues, label + '.reasoning.default 必须是 efforts 中的档位',
+            label + '.reasoning.default must be one of the efforts levels');
+        } else {
+          normalized.default = level;
+        }
+      }
+      if (hasOwnField(reasoning, 'supports_reasoning_effort')) {
+        if (typeof reasoning.supports_reasoning_effort !== 'boolean') {
+          runtimeIssue(issues, label + '.reasoning.supports_reasoning_effort 必须是布尔值',
+            label + '.reasoning.supports_reasoning_effort must be a boolean');
+        } else {
+          normalized.supports_reasoning_effort = reasoning.supports_reasoning_effort;
+        }
+      }
+      profile.reasoning = normalized;
+    }
+  }
+  /* capability：字符串或 null，trim 后空串删除、长度 ≤ 2000（Python 同规则）。 */
+  if (hasOwnField(profile, 'capability')) {
+    const capability = profile.capability;
+    if (capability === null) {
+      delete profile.capability;
+    } else if (typeof capability !== 'string') {
+      runtimeIssue(issues, label + '.capability 必须是字符串或 null',
+        label + '.capability must be a string or null');
+    } else {
+      const text = capability.trim();
+      if (text.length > RUNTIME_LIMITS.capabilityMax) {
+        runtimeIssue(issues, label + '.capability 不能超过 ' + RUNTIME_LIMITS.capabilityMax + ' 个字符',
+          label + '.capability must not exceed ' + RUNTIME_LIMITS.capabilityMax + ' characters');
+      } else if (text) {
+        profile.capability = text;
+      } else {
+        delete profile.capability;
+      }
+    }
+  }
+  return profile;
+}
+
+function normalizeRuntimeModels(raw, providers, issues) {
+  if (!Array.isArray(raw)) {
+    runtimeIssue(issues, 'backends.models 必须是数组', 'backends.models must be a list');
+    return [];
+  }
+  const formats = Object.create(null);
+  providers.forEach(provider => { formats[provider.name] = provider.reasoning_format; });
+  const models = [];
+  const seen = Object.create(null);
+  raw.forEach((item, index) => {
+    const label = 'backends.models[' + index + ']';
+    if (!isRecord(item)) {
+      runtimeIssue(issues, label + ' 必须是对象', label + ' must be an object');
+      return;
+    }
+    runtimeKeys(item, MODEL_FIELDS, label, issues);
+    const id = runtimeId(item.id, label + '.id', issues);
+    if (id !== null) {
+      if (seen[id]) runtimeIssue(issues, 'model id 重复：' + id, 'Duplicate model: ' + id);
+      seen[id] = true;
+    }
+    const provider = runtimeId(item.provider, label + '.provider', issues);
+    if (provider !== null && formats[provider] === undefined) {
+      runtimeIssue(issues, 'model 引用了未知 provider：' + provider, 'Unknown provider: ' + provider);
+    }
+    const upstream = runtimeText(item.upstream, label + '.upstream', RUNTIME_LIMITS.upstreamMax, issues);
+    const profile = normalizeModelProfile(item.profile, label + '.profile', issues);
+    if (id === null || provider === null || upstream === null || profile === null) return;
+    models.push({ id: id, upstream: upstream, provider: provider, profile: profile });
+  });
+  return models;
+}
+
+function normalizeRuntimeJev(raw, issues) {
+  if (raw === null) return null;
+  if (!isRecord(raw)) {
+    runtimeIssue(issues, 'jev 必须是对象或 null', 'jev must be an object or null');
+    return null;
+  }
+  runtimeKeys(raw, JEV_FIELDS, 'jev', issues);
+  let baseUrl = null;
+  if (typeof raw.base_url !== 'string') {
+    runtimeIssue(issues, 'jev.base_url 必须是 http/https URL', 'jev.base_url must be an http/https URL');
+  } else {
+    const text = raw.base_url.trim().replace(/\/+$/, '');
+    if (!isHttpUrl(text)) {
+      runtimeIssue(issues, 'jev.base_url 必须是 http/https URL 且不含 query/fragment',
+        'jev.base_url must be an http/https URL without query or fragment');
+    } else {
+      baseUrl = text;
+    }
+  }
+  const model = raw.model;
+  if (typeof model !== 'string' || !model.trim()) {
+    runtimeIssue(issues, 'jev.model 不能为空', 'jev.model must be nonempty');
+  }
+  const timeout = hasOwnField(raw, 'timeout_seconds')
+    ? raw.timeout_seconds : RUNTIME_DEFAULTS.timeout_seconds;
+  if (typeof timeout !== 'number' || !Number.isFinite(timeout) ||
+      timeout < RUNTIME_LIMITS.timeoutMin || timeout > RUNTIME_LIMITS.timeoutMax) {
+    runtimeIssue(issues, 'jev.timeout_seconds 必须是 [' + RUNTIME_LIMITS.timeoutMin + ', ' +
+      RUNTIME_LIMITS.timeoutMax + '] 内的有限数值',
+    'jev.timeout_seconds must be a finite number in [' + RUNTIME_LIMITS.timeoutMin + ', ' +
+      RUNTIME_LIMITS.timeoutMax + ']');
+  }
+  const instructions = hasOwnField(raw, 'instructions')
+    ? raw.instructions : RUNTIME_DEFAULTS.instructions;
+  if (typeof instructions !== 'string' || !instructions.trim()) {
+    runtimeIssue(issues, 'jev.instructions 不能为空', 'jev.instructions must be nonempty');
+  }
+  const stateTemplate = hasOwnField(raw, 'state_template')
+    ? raw.state_template : RUNTIME_DEFAULTS.state_template;
+  if (typeof stateTemplate !== 'string') {
+    runtimeIssue(issues, 'jev.state_template 必须是字符串', 'jev.state_template must be a string');
+  } else {
+    templateFieldIssues(stateTemplate, 'jev.state_template', issues);
+  }
+  if (baseUrl === null) return null;
+  return {
+    base_url: baseUrl,
+    model: model,
+    timeout_seconds: timeout,
+    instructions: instructions,
+    state_template: stateTemplate
+  };
+}
+
+function normalizeRuntimeWindow(raw, issues) {
+  if (!isRecord(raw)) {
+    runtimeIssue(issues, 'jev_window 必须是对象', 'jev_window must be an object');
+    return null;
+  }
+  runtimeKeys(raw, JEV_WINDOW_FIELDS, 'jev_window', issues);
+  const input = raw.input_tokens;
+  const context = raw.context_tokens;
+  const inputOk = typeof input === 'number' && Number.isInteger(input);
+  const contextOk = typeof context === 'number' && Number.isInteger(context);
+  if (!inputOk) {
+    runtimeIssue(issues, 'jev_window.input_tokens 必须是整数', 'jev_window.input_tokens must be an integer');
+  } else if (input < RUNTIME_LIMITS.inputTokensMin || input > RUNTIME_LIMITS.maxTokens) {
+    runtimeIssue(issues, 'jev_window.input_tokens 必须在 ' + RUNTIME_LIMITS.inputTokensMin +
+      '..' + RUNTIME_LIMITS.maxTokens + ' 之间',
+    'jev_window.input_tokens must be in ' + RUNTIME_LIMITS.inputTokensMin +
+      '..' + RUNTIME_LIMITS.maxTokens);
+  }
+  if (!contextOk) {
+    runtimeIssue(issues, 'jev_window.context_tokens 必须是整数', 'jev_window.context_tokens must be an integer');
+  } else if (context < RUNTIME_LIMITS.contextTokensMin || context > RUNTIME_LIMITS.maxTokens) {
+    runtimeIssue(issues, 'jev_window.context_tokens 必须在 ' + RUNTIME_LIMITS.contextTokensMin +
+      '..' + RUNTIME_LIMITS.maxTokens + ' 之间',
+    'jev_window.context_tokens must be in ' + RUNTIME_LIMITS.contextTokensMin +
+      '..' + RUNTIME_LIMITS.maxTokens);
+  }
+  if (inputOk && contextOk && input > context) {
+    runtimeIssue(issues, 'jev_window.input_tokens 不能大于 context_tokens',
+      'jev_window.input_tokens cannot exceed context_tokens');
+  }
+  return { input_tokens: input, context_tokens: context };
+}
+
+/* Python TimePeriod.from_dict / __post_init__ 的字段与校验。 */
+function normalizeRuntimePeriods(raw, issues) {
+  if (!Array.isArray(raw)) {
+    runtimeIssue(issues, 'time_periods 必须是数组', 'time_periods must be a list');
+    return [];
+  }
+  const periods = [];
+  const seen = Object.create(null);
+  const expectedKeys = TIME_PERIOD_FIELDS.slice().sort().join(',');
+  raw.forEach((item, index) => {
+    const label = 'time_periods[' + index + ']';
+    if (!isRecord(item)) {
+      runtimeIssue(issues, label + ' 必须是对象', label + ' must be an object');
+      return;
+    }
+    if (Object.keys(item).sort().join(',') !== expectedKeys) {
+      runtimeIssue(issues, label + ' 必须且只能包含 name/days/start/end',
+        label + ' needs exactly name/days/start/end');
+      return;
+    }
+    const name = item.name;
+    if (typeof name !== 'string' || !name.trim()) {
+      runtimeIssue(issues, label + '.name 不能为空', label + '.name must be nonempty');
+    } else if (seen[name]) {
+      runtimeIssue(issues, '时段名称重复：' + name, 'Duplicate period name: ' + name);
+    } else {
+      seen[name] = true;
+    }
+    const days = item.days;
+    const daySeen = Object.create(null);
+    if (!Array.isArray(days) || !days.length) {
+      runtimeIssue(issues, label + '.days 必须是非空数组', label + '.days must be a non-empty list');
+    } else {
+      days.forEach(day => {
+        if (typeof day !== 'number' || !Number.isInteger(day) || day < 0 || day > 6) {
+          runtimeIssue(issues, label + '.days 只能是 0..6 的整数', label + '.days must contain weekdays in [0,6]');
+          return;
+        }
+        if (daySeen[day]) {
+          runtimeIssue(issues, label + '.days 不能重复', label + '.days must be unique');
+        }
+        daySeen[day] = true;
+      });
+    }
+    const times = ['start', 'end'];
+    times.forEach(field => {
+      const value = item[field];
+      const match = typeof value === 'string' ? /^(\d{1,2}):(\d{1,2})$/.exec(value) : null;
+      const hour = match ? Number(match[1]) : -1;
+      const minute = match ? Number(match[2]) : -1;
+      if (!match || hour > 23 || minute > 59) {
+        runtimeIssue(issues, label + '.' + field + ' 必须使用 HH:MM',
+          label + '.' + field + ' must use HH:MM');
+      }
+    });
+    periods.push({ name: name, days: days, start: item.start, end: item.end });
+  });
+  return periods;
+}
+
+/* 严格解析四字段 → 规范化 runtime（默认值补齐）；任何 graph_parse_error 时返回 null。 */
+function normalizeRuntime(raw, issues) {
+  if (!isRecord(raw)) {
+    runtimeIssue(issues, '运行配置必须是对象', 'Runner config must be an object');
+    return null;
+  }
+  const before = issues.length;
+  runtimeKeys(raw, RUNTIME_FIELDS, 'runtime', issues);
+  const missing = RUNTIME_FIELDS.filter(field => !hasOwnField(raw, field));
+  if (missing.length) {
+    runtimeIssue(issues, '运行配置字段必须成组出现，缺少：' + missing.join(', '),
+      'Runtime fields must appear together; missing: ' + missing.join(', '));
+    return null;
+  }
+  let providers = [];
+  let models = [];
+  if (!isRecord(raw.backends)) {
+    runtimeIssue(issues, 'backends 必须是对象', 'backends must be an object');
+  } else {
+    runtimeKeys(raw.backends, BACKENDS_FIELDS, 'backends', issues);
+    providers = normalizeRuntimeProviders(raw.backends.providers, issues);
+    models = normalizeRuntimeModels(raw.backends.models, providers, issues);
+  }
+  const jev = normalizeRuntimeJev(raw.jev, issues);
+  const window = normalizeRuntimeWindow(raw.jev_window, issues);
+  const periods = normalizeRuntimePeriods(raw.time_periods, issues);
+  if (issues.length !== before) return null;
+  return {
+    backends: { providers: providers, models: models },
+    jev: jev,
+    jev_window: window,
+    time_periods: periods
+  };
+}
+
+function pickRuntimeFields(value) {
+  const out = {};
+  RUNTIME_FIELDS.forEach(field => { out[field] = value[field]; });
+  return out;
+}
+
+/* 内部树（嵌套 runtime）或 API envelope（扁平四字段）里取 runtime；无 runtime 返回 null。
+   嵌套优先；显式 runtime:null 且没有扁平字段时视为旧文档（无 runtime）。 */
+function runtimeOf(value) {
+  if (!isRecord(value)) return null;
+  if (isRecord(value.runtime)) return value.runtime;
+  if (RUNTIME_FIELDS.some(field => hasOwnField(value, field))) return value;
+  return null;
+}
+
+function hasRuntime(value) {
+  return isRecord(runtimeOf(value));
+}
+
+/* 对「四字段容器」做成组校验 + 严格解析；flat 时先剔除 envelope 的其它键。 */
+function addRuntimeGroupIssues(raw, issues, flat) {
+  const local = [];
+  const missing = RUNTIME_FIELDS.filter(field => !hasOwnField(raw, field));
+  if (missing.length) {
+    runtimeIssue(local, '运行配置字段必须成组出现，缺少：' + missing.join(', '),
+      'Runtime fields must appear together; missing: ' + missing.join(', '));
+  } else {
+    normalizeRuntime(flat ? pickRuntimeFields(raw) : raw, local);
+  }
+  local.forEach(item => issues.push(item));
+}
+
+/* validate / validateRuntime 共用：嵌套 runtime 与扁平四字段都接受。 */
+function addRuntimeEnvelopeIssues(value, issues) {
+  const hasNested = hasOwnField(value, 'runtime');
+  const flatPresent = RUNTIME_FIELDS.filter(field => hasOwnField(value, field));
+  if (hasNested && isRecord(value.runtime)) {
+    addRuntimeGroupIssues(value.runtime, issues, false);
+    return;
+  }
+  if (flatPresent.length) {
+    addRuntimeGroupIssues(value, issues, true);
+    return;
+  }
+  if (hasNested && value.runtime !== null) {
+    runtimeIssue(issues, 'runtime 必须是对象或 null', 'runtime must be an object or null');
+  }
+}
+
+/* 公开 API：合法返回 []；支持 runtime 对象、内部树（嵌套）与 API envelope（扁平）。 */
+function validateRuntime(value) {
+  const issues = [];
+  if (value === null || value === undefined) return issues;
+  if (!isRecord(value)) {
+    runtimeIssue(issues, '运行配置必须是对象或 null', 'Runner config must be an object or null');
+    return finishIssues(issues);
+  }
+  const hasNested = hasOwnField(value, 'runtime');
+  const flatPresent = RUNTIME_FIELDS.some(field => hasOwnField(value, field));
+  if (!hasNested && !flatPresent) {
+    /* 没有 runtime（旧草稿/旧文档/裸图）是合法的。 */
+    if (graphOf(value) || hasOwnField(value, 'root')) return issues;
+    runtimeIssue(issues, '运行配置必须是对象或 null', 'Runner config must be an object or null');
+    return finishIssues(issues);
+  }
+  addRuntimeEnvelopeIssues(value, issues);
+  return finishIssues(issues);
+}
+
+/* Python _behavior_numbers 的 JS 等价：整数值数字输出整数；非整数用 pyFloat
+   包装成 Python repr（JSON.parse 无法区分 10 与 10.0，统一按整数归一）。 */
+function runtimeBehaviorNumbers(value) {
+  if (typeof value === 'number') return Number.isInteger(value) ? value : pyFloat(value);
+  if (Array.isArray(value)) return value.map(runtimeBehaviorNumbers);
+  if (isRecord(value)) {
+    const out = {};
+    Object.keys(value).forEach(key => { out[key] = runtimeBehaviorNumbers(value[key]); });
+    return out;
+  }
+  return value;
+}
+
+/* runtime → 只含契约字段的深拷贝投影（剔除未知/派生字段），保持数组输入顺序。 */
+function runtimeView(runtime) {
+  const backends = isRecord(runtime) && isRecord(runtime.backends) ? runtime.backends : {};
+  const providers = (Array.isArray(backends.providers) ? backends.providers : [])
+    .filter(isRecord)
+    .map(provider => ({
+      name: provider.name,
+      base_url: provider.base_url,
+      key_env: provider.key_env,
+      reasoning_format: provider.reasoning_format
+    }));
+  const models = (Array.isArray(backends.models) ? backends.models : [])
+    .filter(isRecord)
+    .map(model => ({
+      id: model.id,
+      upstream: model.upstream,
+      provider: model.provider,
+      profile: isRecord(model.profile) ? withoutSecretFields(model.profile) : {}
+    }));
+  const jevRaw = isRecord(runtime) && isRecord(runtime.jev) ? runtime.jev : null;
+  const jev = jevRaw === null ? null : {
+    base_url: jevRaw.base_url,
+    model: jevRaw.model,
+    timeout_seconds: hasOwnField(jevRaw, 'timeout_seconds')
+      ? jevRaw.timeout_seconds : RUNTIME_DEFAULTS.timeout_seconds,
+    instructions: hasOwnField(jevRaw, 'instructions')
+      ? jevRaw.instructions : RUNTIME_DEFAULTS.instructions,
+    state_template: hasOwnField(jevRaw, 'state_template')
+      ? jevRaw.state_template : RUNTIME_DEFAULTS.state_template
+  };
+  const windowRaw = isRecord(runtime) && isRecord(runtime.jev_window) ? runtime.jev_window : {};
+  const periods = (isRecord(runtime) && Array.isArray(runtime.time_periods)
+    ? runtime.time_periods : [])
+    .filter(isRecord)
+    .map(period => ({
+      name: period.name,
+      days: Array.isArray(period.days) ? period.days.slice() : [],
+      start: period.start,
+      end: period.end
+    }));
+  return {
+    backends: { providers: providers, models: models },
+    jev: jev,
+    jev_window: {
+      input_tokens: windowRaw.input_tokens,
+      context_tokens: windowRaw.context_tokens
+    },
+    time_periods: periods
+  };
+}
+
+/* 契约投影：tree / runtime 对象 / 扁平 envelope 均可，无 runtime 返回 null。
+   canonical 用它做字段/顺序归一，数字是原生 JS number（Python repr 由
+   behaviorCanonical 里的 runtimeBehaviorNumbers 处理）。 */
+function runtimeBehaviorView(value) {
+  const runtime = runtimeOf(value);
+  return runtime ? runtimeView(runtime) : null;
+}
+
+/* 导出用投影（serialize / 保存 payload）：与 runtimeBehaviorView 同一份字段集合、
+   同样接受 tree / runtime 对象 / 扁平 envelope；无 runtime 返回 null。 */
+function runtimeDocumentView(value) {
+  const runtime = runtimeOf(value);
+  return runtime ? runtimeView(runtime) : null;
 }
 
 /* ── 6. 行为 canonical / changeKind（§2.8） ─────────────────────────── */
@@ -1240,11 +1903,16 @@ function envelopeParts(tree) {
 
 function behaviorCanonical(tree) {
   const parts = envelopeParts(tree);
-  return stableStringify({
+  const view = {
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: rootView(parts.root, false)
-  });
+  };
+  /* 自包含运行配置属于行为：旧文档（无 runtime）输出逐字节不变。
+     整数值数字归一为 int、非整数走 Python repr，保证与 tree_revision_of 一致。 */
+  const runtime = runtimeBehaviorView(tree);
+  if (runtime) Object.assign(view, runtimeBehaviorNumbers(runtime));
+  return stableStringify(view);
 }
 
 function editableCanonical(tree, stripPosition) {
@@ -1253,12 +1921,16 @@ function editableCanonical(tree, stripPosition) {
   if (stripPosition) {
     view.nodes.forEach(node => { delete node.position; });
   }
-  return stableStringify({
+  const canonical = {
     name: parts.name,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: view
-  });
+  };
+  /* runtime 变更属于 behavior（不是 display/layout），但必须参与 clean 判定。 */
+  const runtime = runtimeBehaviorView(tree);
+  if (runtime) canonical.runtime = runtime;
+  return stableStringify(canonical);
 }
 
 function changeKind(before, after) {
@@ -1362,15 +2034,19 @@ function collectCanvas(tree, options) {
 
 function serialize(tree) {
   const parts = envelopeParts(tree);
-  /* 导出：节点位置收集进顶层 canvas，节点对象只留逻辑字段；没有坐标时不输出 canvas。 */
-  return JSON.stringify(collectCanvas({
+  const document = {
     kind: KIND,
     version: VERSION,
     name: parts.name,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: clone(parts.root)
-  }, { round: true }), null, 2);
+  };
+  /* 自包含文档：runtime 非空时平铺四字段（jev 可为 null）；旧文档不输出 runtime 键。 */
+  const runtime = runtimeDocumentView(tree);
+  if (runtime) Object.assign(document, runtime);
+  /* 导出：节点位置收集进顶层 canvas，节点对象只留逻辑字段；没有坐标时不输出 canvas。 */
+  return JSON.stringify(collectCanvas(document, { round: true }), null, 2);
 }
 
 function parseImport(text) {
@@ -1395,8 +2071,9 @@ function parseImport(text) {
       issues: [issue('graph_parse_error', text, 'Import envelope has unknown fields: ' + unknownImportFields.join(', '))],
     };
   }
+  /* canvas 与四字段 runtime 都是可选顶层字段：缺失不报，成组规则单独校验。 */
   const missingImportFields = IMPORT_FIELDS
-    .filter(field => field !== 'canvas')
+    .filter(field => field !== 'canvas' && RUNTIME_FIELDS.indexOf(field) < 0)
     .filter(field => !Object.prototype.hasOwnProperty.call(data, field)).sort();
   if (missingImportFields.length) {
     const fields = missingImportFields.join(', ');
@@ -1407,6 +2084,20 @@ function parseImport(text) {
         'graph_parse_error',
         '图解析失败：导入 envelope 缺少必需字段：' + fields,
         'Graph parse failed: import envelope is missing required fields: ' + fields
+      )]
+    };
+  }
+  /* 密钥与派生的密钥状态只存在于服务端：文档任意层级出现即整体拒绝。 */
+  const secretField = findSecretField(data);
+  if (secretField) {
+    const textZh = '导入文档不允许出现密钥字段：' + secretField;
+    return {
+      ok: false,
+      error: textZh,
+      issues: [issue(
+        'graph_parse_error',
+        textZh,
+        'Import document must not contain secret fields: ' + secretField
       )]
     };
   }
@@ -1442,6 +2133,32 @@ function parseImport(text) {
     };
   }
 
+  /* 四字段成组出现：部分接受会让运行配置半生效，一律整体拒绝。 */
+  const runtimePresent = RUNTIME_FIELDS.filter(field => hasOwnField(data, field));
+  let runtime = null;
+  if (runtimePresent.length && runtimePresent.length !== RUNTIME_FIELDS.length) {
+    const missingRuntime = RUNTIME_FIELDS.filter(field => !hasOwnField(data, field)).sort();
+    const textZh = '运行配置字段必须成组出现，缺少：' + missingRuntime.join(', ');
+    return {
+      ok: false,
+      error: textZh,
+      issues: [issue(
+        'graph_parse_error',
+        textZh,
+        'Runtime fields must appear together; missing: ' + missingRuntime.join(', ')
+      )]
+    };
+  }
+  if (runtimePresent.length === RUNTIME_FIELDS.length) {
+    const runtimeIssues = [];
+    runtime = normalizeRuntime(pickRuntimeFields(data), runtimeIssues);
+    /* 运行时默认值（jev 缺省键、key_env、reasoning_format）在导入时补齐，
+       使 serialize(parseImport(x)) 稳定且行为 canonical 与 Python 一致。 */
+    if (runtime === null) {
+      return { ok: false, error: PARSE_ERROR_ZH, issues: finishIssues(runtimeIssues) };
+    }
+  }
+
   /* canvas 形状/引用校验在分发前完成；坐标集中顶层 canvas，导入时分发回内部 node.position。 */
   const canvasIssues = [];
   validateCanvas(data.canvas, graph, canvasIssues);
@@ -1463,7 +2180,10 @@ function parseImport(text) {
     name: data.name,
     timezone: data.timezone,
     sticky: rawSticky,
-    root: graph
+    root: graph,
+    /* 旧文档也显式给 runtime:null：调用方可用统一方式读取（undefined 会让
+       JSON 序列化丢键，且 behaviorCanonical 需要区分「无 runtime」）。 */
+    runtime: runtime
   };
   const issues = finishIssues(canvasIssues.concat(validate(tree)));
   /* 结构错误在应用前拒绝：非对象节点/边或非数组字段会让 renderAll 半途崩溃，
@@ -1531,6 +2251,13 @@ export {
   HINTS,
   THRESHOLD_LIMIT,
   REJECT_MESSAGE,
+  RUNTIME_FIELDS,
+  RUNTIME_SECRET_FIELDS,
+  isSecretField,
+  withoutSecretFields,
+  RUNTIME_DEFAULTS,
+  RUNTIME_LIMITS,
+  REASONING_FORMATS,
   clone,
   stableStringify,
   graphOf,
@@ -1556,6 +2283,11 @@ export {
   validate,
   behaviorCanonical,
   changeKind,
+  runtimeOf,
+  hasRuntime,
+  validateRuntime,
+  runtimeBehaviorView,
+  runtimeDocumentView,
   layoutPositions,
   dispatchCanvas,
   collectCanvas,

@@ -8,13 +8,19 @@
 
 import assert from 'node:assert/strict';
 import {
+  EXAMPLE,
+  EXAMPLE_ROOT,
+  MOD,
   S1_TEXT,
+  TREE_ID,
   api,
   assertIncludes,
   page,
+  restartRouter,
   routerBase,
   runIfMain,
-  test
+  test,
+  waitFor
 } from '../console_qa.mjs';
 
 test('calculation-log renders staged process from a real request', async () => {
@@ -104,6 +110,9 @@ test('calculation-log restored row states that detail is absent', async () => {
     return (t('logs.traceEmpty'));
 });
     assertIncludes(await page.locator('.lg-item.open').innerText(), expected);
+    /* 旧日志没有图快照：不能显示快照链接，原文字阶段视图继续可用。 */
+    assert.equal(await page.locator('.lg-item.open .lg-snapshot-link').count(), 0,
+      'a log row without a snapshot still offered a snapshot link');
     assertIncludes(await page.locator('.lg-item.open .lg-lat').innerText(), '1.20s');
 } finally {
     await page.unroute(matcher);
@@ -221,6 +230,38 @@ test('calculation-log renders the server route label verbatim', async () => {
 }
 });
 
+test('calculation-log shows JEV values and comparisons without clicking a stage', async () => {
+  await api('POST', '/v1/chat/completions', {
+    model: 'ignored',
+    messages: [{ role: 'user', content: S1_TEXT }],
+    stream: false,
+  });
+  await page.goto(routerBase + '/console/logs.html');
+  await page.locator('.lg-row').first().click();
+  await page.waitForSelector('.lg-item.open .lg-rail');
+
+  const open = page.locator('.lg-item.open');
+  const rail = open.locator('.lg-rail');
+  const text = (await rail.innerText()).replace(/\s+/g, ' ');
+  /* 不点任何阶段：事件行必须已经在 DOM 里。 */
+  assert.ok(await open.locator('.lg-event').count() > 7,
+    'the detail still collapses events into one row per phase');
+  assertIncludes(text, '0.84 > 0.65 → true');
+  assertIncludes(text, '0.92 > 0.7 → true');
+  assertIncludes(text, 'p_top 0.84');
+  assertIncludes(text, 'strong 0.84');
+  assertIncludes(text, 'AND');
+  assertIncludes(text, 'power-target p5');
+  assertIncludes(text, 'strong-target p3');
+  assertIncludes(text, 'power-target 胜出');
+  assertIncludes(text, '→ false');
+
+  const kinds = await open.locator('.lg-event-kind').allInnerTexts();
+  assert.ok(kinds.includes('槽位'), 'event rows have no type label');
+  assert.ok(kinds.includes('问题'), 'question rows are missing');
+  assert.ok(kinds.includes('门'), 'gate rows are missing');
+});
+
 test('calculation-log mobile keeps the main conclusion within the viewport', async () => {
   await page.setViewportSize({ width: 390, height: 844 });
   try {
@@ -230,6 +271,518 @@ test('calculation-log mobile keeps the main conclusion within the viewport', asy
 } finally {
     await page.setViewportSize({ width: 1280, height: 800 });
 }
+});
+
+
+/* 快照被 page.route() 截获后的固定 tree envelope：直接复用示例图，
+   保证节点/边 id 与事件顺序一一对应。 */
+function snapshotTree() {
+  return {
+    id: 'partial-tree',
+    name: EXAMPLE.name,
+    timezone: EXAMPLE.timezone,
+    sticky: EXAMPLE.sticky,
+    root: EXAMPLE_ROOT,
+    canvas: EXAMPLE.canvas
+  };
+}
+
+function fulfillSnapshot(requestId, trace, request) {
+  return {
+    request_id: requestId,
+    graph_snapshot_id: requestId + '-graph',
+    tree: snapshotTree(),
+    trace,
+    request
+  };
+}
+
+
+test('routing snapshot replays a partial trace without a final event', async () => {
+  const matcher = '**/admin/requests/partial/snapshot';
+  const trace = [
+    { event: 'condition', node_id: 'cond-text', value: true,
+      matched: ['跳闸'], source: 'text' },
+    { event: 'slot', node_id: 'or-ctx', port: 'in_1', edge_id: 'e-cond-text-or',
+      source: 'cond-text', source_port: 'out', raw: true, condition: null,
+      status: 'true', wave: 0 },
+    { event: 'wave', wave: 1, questions: ['capability', 'domain'],
+      duration_ms: 12.0, failed: false, error: null },
+    { event: 'routing_error', stage: 'schedule',
+      error_class: 'no_available_backend', message: 'none' }
+  ];
+  await page.route(matcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(fulfillSnapshot('partial', trace, {
+      id: 'partial', ts: '2026-11-20T10:00:00+08:00', text: '部分回放',
+      decision: 'route', model: null, outcome_state: 'routing_error',
+      selection_reason: null
+    }))
+  }));
+  try {
+    await page.goto(routerBase + '/console/routing.html?request=partial');
+    await page.waitForSelector('#cvNodes .rtc-node', { timeout: 15000 });
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return !!(app.booted && app.replay);
+    });
+
+    /* 状态绘制与最终结论解耦：没有 final 也要画出已命中的条件和边。 */
+    assert.ok(await page.locator('#cvNodes .rtc-node.is-replay').count() > 0,
+      'a partial replay painted no node state');
+    assert.equal(await page.locator('#cvNodes .rtc-node.is-final').count(), 0,
+      'a partial replay invented a final target');
+    assert.equal(await page.locator('#cvNodes .rtc-node.is-fallback').count(), 0,
+      'a partial replay invented a fallback target');
+    assert.match(await page.locator('#cvTryResult').innerText(), /路由失败|Routing failed/);
+
+    const opened = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      const condition = document.querySelector('#cvNodes [data-node-id="cond-text"]');
+      const edge = document.querySelector('#cvEdges path.rtc-edge[data-edge-id="e-cond-text-or"]');
+      return {
+        locked: app.kit.isLocked(),
+        snapshotMode: document.body.classList.contains('is-log-snapshot'),
+        final: app.replay ? app.replay.final : 'missing',
+        error: app.replay ? app.replay.error : null,
+        conditionReplay: condition.classList.contains('is-replay'),
+        edgeExists: !!edge,
+        edgeClass: edge ? edge.className.baseVal : ''
+      };
+    });
+    assert.equal(opened.final, null, 'a partial replay produced a final outcome');
+    assert.equal(opened.error.error_class, 'no_available_backend');
+    assert.equal(opened.error.stage, 'schedule');
+    assert.equal(opened.conditionReplay, true, 'the hit condition was not painted');
+    assert.equal(opened.edgeExists, true, 'the snapshot canvas lost its edges');
+    assert.match(opened.edgeClass, /is-true/, 'the hit edge was not painted');
+    assert.equal(opened.locked, true);
+    assert.equal(opened.snapshotMode, true);
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
+test('routing snapshot with an empty trace keeps the static graph and invents nothing', async () => {
+  const matcher = '**/admin/requests/direct-only/snapshot';
+  await page.route(matcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(fulfillSnapshot('direct-only', [], {
+      id: 'direct-only', ts: '2026-11-20T10:00:00+08:00', text: '固定模型',
+      decision: 'test', model: 'qwen3.8-flash-sft', outcome_state: 'completed',
+      selection_reason: 'direct'
+    }))
+  }));
+  try {
+    await page.goto(routerBase + '/console/routing.html?request=direct-only');
+    await page.waitForSelector('#cvNodes .rtc-node', { timeout: 15000 });
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return !!(app.booted && app.replay);
+    });
+
+    /* 空 trace 只能显示静态图：不得伪造 final、失败结论或执行轨迹。 */
+    assert.ok(await page.locator('#cvNodes .rtc-node').count() > 0);
+    assert.equal(await page.locator('#cvNodes .rtc-node.is-replay').count(), 0,
+      'an empty trace painted replay node state');
+    assert.equal(await page.locator('#cvEdges .rtc-edge.is-unknown').count(), 0,
+      'an empty trace painted unknown edge state');
+    assert.equal(await page.locator('#cvNodes .rtc-node.is-final').count(), 0);
+    assert.equal(await page.locator('#cvNodes .rtc-node.is-fallback').count(), 0);
+    assert.equal(await page.locator('#cvTryResult').isHidden(), true,
+      'an empty trace rendered a conclusion');
+    const empty = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        final: app.replay ? app.replay.final : 'missing',
+        error: app.replay ? app.replay.error : 'missing',
+        locked: app.kit.isLocked()
+      };
+    });
+    assert.equal(empty.final, null);
+    assert.equal(empty.error, null);
+    assert.equal(empty.locked, true);
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
+test('routing snapshot without graph events keeps static graph for empty and outcome-only traces', async () => {
+  for (const [requestId, trace] of [
+    ['direct-empty', []],
+    ['direct-outcome', [{ event: 'request_outcome', outcome_state: 'completed' }]],
+  ]) {
+    const matcher = `**/admin/requests/${requestId}/snapshot`;
+    await page.route(matcher, route => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(fulfillSnapshot(requestId, trace, {
+        id: requestId, decision: 'test', model: 'qwen3.8-flash-sft',
+        outcome_state: 'completed', selection_reason: 'direct'
+      }))
+    }));
+    try {
+      await page.goto(routerBase + '/console/routing.html?request=' + requestId);
+      await page.waitForSelector('#cvNodes .rtc-node');
+      await waitFor(async () => {
+        const { app } = await import('/console/routing/app.js');
+        return !!(app.booted && app.replay);
+      });
+      /* direct 请求没有图事件：不得把全部节点涂成回放、把全部边标为 unknown。 */
+      assert.equal(await page.locator('#cvNodes .rtc-node.is-replay').count(), 0,
+        requestId + ' painted replay nodes without a graph event');
+      assert.equal(await page.locator('#cvEdges .rtc-edge.is-unknown').count(), 0,
+        requestId + ' painted unknown edges without a graph event');
+      assert.equal(await page.locator('#cvNodes .rtc-node.is-final').count(), 0);
+      assert.equal(await page.locator('#cvTryResult').isHidden(), true);
+      const replay = await page.evaluate(async () => {
+        const { app } = await import('/console/routing/app.js');
+        return {
+          hasGraphEvents: app.replay.hasGraphEvents,
+          final: app.replay.final,
+          error: app.replay.error,
+          locked: app.kit.isLocked()
+        };
+      });
+      assert.deepEqual(replay, {
+        hasGraphEvents: false, final: null, error: null, locked: true
+      });
+    } finally {
+      await page.unroute(matcher);
+    }
+  }
+});
+
+test('routing snapshot shows final and later routing error', async () => {
+  const requestId = 'final-then-error';
+  const matcher = `**/admin/requests/${requestId}/snapshot`;
+  const trace = [
+    { event: 'final', target_id: 'power-target', kind: 'target', priority: 5,
+      candidates: [] },
+    { event: 'scheduled', model: 'qwen3.8-flash-sft', reason: 'target' },
+    { event: 'routing_error', stage: 'upstream', error_class: 'upstream_error',
+      message: 'upstream timed out' }
+  ];
+  await page.route(matcher, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify(fulfillSnapshot(requestId, trace, {
+      id: requestId, decision: 'route', model: 'qwen3.8-flash-sft',
+      outcome_state: 'upstream_error', selection_reason: 'target'
+    }))
+  }));
+  try {
+    await page.goto(routerBase + '/console/routing.html?request=' + requestId);
+    await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return !!(app.booted && app.replay && app.replay.error);
+    });
+    /* final 已命中后上游失败：目标路径保留，失败事实独立可见。 */
+    assert.equal(await page.locator('#cvTryResult [data-routing-error]').count(), 1);
+    const text = await page.locator('#cvTryResult').innerText();
+    assert.match(text, /路由失败|Routing failed/);
+    assert.match(text, /upstream/);
+    assert.match(text, /upstream_error/);
+    assert.match(text, /upstream timed out/);
+    const result = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        final: app.replay.final.target_id,
+        error: app.replay.error,
+        datasetFinal: document.getElementById('cvTryResult').dataset.final,
+        datasetError: document.getElementById('cvTryResult').dataset.error,
+        locked: app.kit.isLocked()
+      };
+    });
+    assert.equal(result.final, 'power-target');
+    assert.equal(result.error.stage, 'upstream');
+    assert.equal(result.error.error_class, 'upstream_error');
+    assert.equal(result.datasetFinal, 'power-target');
+    assert.equal(result.datasetError, 'routing_error');
+    assert.equal(result.locked, true);
+  } finally {
+    await page.unroute(matcher);
+  }
+});
+
+test('calculation-log snapshot link opens a read-only graph replay', async () => {
+  await api('POST', '/v1/chat/completions', {
+    model: 'ignored',
+    messages: [{ role: 'user', content: S1_TEXT }],
+    stream: false,
+  });
+  await page.goto(routerBase + '/console/logs.html');
+  await page.locator('.lg-row').first().click();
+  const link = page.locator('.lg-item.open .lg-snapshot-link');
+  await link.waitFor({ state: 'visible' });
+  const href = await link.getAttribute('href');
+  assert.match(href, /^\/console\/routing\.html\?request=.+/);
+  await Promise.all([page.waitForURL(/routing\.html\?request=/), link.click()]);
+  await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final', { timeout: 15000 });
+
+  const opened = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const css = selector => {
+      const el = document.querySelector(selector);
+      return el ? getComputedStyle(el).display : 'missing';
+    };
+    const start = app.graph.nodes.find(node => node.id === 'start').position;
+    return {
+      final: app.replay ? app.replay.final.target_id : null,
+      locked: app.kit.isLocked(),
+      snapshotMode: document.body.classList.contains('is-log-snapshot'),
+      badgeHidden: document.getElementById('cvSnapshotBadge').hidden,
+      palette: css('#cvPalette'),
+      inspector: css('#cvInspector'),
+      actions: css('.rtc-actions'),
+      tryRow: css('.rtc-try-row'),
+      chips: css('#cvTryChips'),
+      runButton: css('#cvTryRun'),
+      playIcon: css('.rtc-try-ico'),
+      rerun: !!document.getElementById('cvTryRerun'),
+      clear: !!document.getElementById('cvTryClear'),
+      selectDisabled: document.getElementById('cvTreeSelect').disabled,
+      requestInput: document.getElementById('cvTryInput'),
+      inputValue: document.getElementById('cvTryInput').value,
+      inputReadOnly: document.getElementById('cvTryInput').readOnly,
+      replayText: app.replay ? app.replay.text : null,
+      inspectorBody: document.getElementById('cvInspectorBody').innerHTML,
+      zoomVisible: getComputedStyle(document.getElementById('cvZoom')).display,
+      position: { x: start.x, y: start.y },
+    };
+  });
+  assert.equal(opened.final, 'power-target');
+  assert.equal(opened.locked, true, 'the snapshot canvas is not locked');
+  assert.equal(opened.snapshotMode, true);
+  assert.equal(opened.badgeHidden, false, 'the read-only badge is missing');
+  for (const key of ['palette', 'inspector', 'actions', 'chips']) {
+    assert.equal(opened[key], 'none', `snapshot mode still shows ${key}`);
+  }
+  /* 快照问题放回画布原有的试算问题输入位：只读、无运行按钮/图标/样例。 */
+  assert.notEqual(opened.tryRow, 'none', 'snapshot mode hid the logged request question');
+  assert.equal(opened.runButton, 'none', 'snapshot mode shows the try-run button');
+  assert.equal(opened.playIcon, 'none', 'snapshot mode shows the try-run icon');
+  assert.equal(opened.rerun, false, 'snapshot mode offers rerun');
+  assert.equal(opened.clear, false, 'snapshot mode offers clear');
+  assert.equal(opened.selectDisabled, true, 'the snapshot group selector is still enabled');
+  assert.equal(opened.inputValue, S1_TEXT, 'the snapshot question is not in the try input');
+  assert.equal(opened.inputReadOnly, true, 'the snapshot try input is editable');
+  assert.equal(opened.replayText, S1_TEXT, 'the replay does not carry the logged request text');
+  assert.equal(opened.inspectorBody, '', 'snapshot mode rendered inspector forms');
+  assert.notEqual(opened.zoomVisible, 'none', 'snapshot mode lost the zoom controls');
+
+  /* 拖动 start 节点：只读画布只能选中，不能改坐标。 */
+  const box = await page.locator('#cvNodes [data-node-id="start"]').boundingBox();
+  const centerX = box.x + box.width / 2;
+  const centerY = box.y + box.height / 2;
+  await page.mouse.move(centerX, centerY);
+  await page.mouse.down();
+  await page.mouse.move(centerX + 90, centerY + 50, { steps: 6 });
+  await page.mouse.up();
+  const dragged = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const start = app.graph.nodes.find(node => node.id === 'start').position;
+    return { x: start.x, y: start.y };
+  });
+  assert.deepEqual(dragged, opened.position, 'a log snapshot allowed dragging a node');
+
+  /* 完整只读：拖线、Delete/Backspace、撤销、条件 chip 和保存都不能改图或发写请求。 */
+  const graphBefore = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return JSON.stringify(app.tree);
+  });
+  const writes = [];
+  const onWrite = request => {
+    if (request.method() === 'GET') return;
+    if (!request.url().startsWith(routerBase)) return;
+    writes.push(request.method() + ' ' + request.url());
+  };
+  page.on('request', onWrite);
+  try {
+    /* 输出端口拖到输入端口：只读画布不能新增连线。 */
+    const from = await page.locator(
+      '#cvNodes [data-node-id="start"] [data-port][data-port-dir="out"]').first().boundingBox();
+    const to = await page.locator(
+      '#cvNodes [data-node-id="capability"] [data-port][data-port-dir="in"]').first().boundingBox();
+    assert.ok(from && to, 'snapshot canvas lost its connection ports');
+    await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(to.x + to.width / 2, to.y + to.height / 2, { steps: 10 });
+    await page.mouse.up();
+
+    /* 选中节点后 Delete/Backspace 与撤销都不能改图。 */
+    const target = await page.locator('#cvNodes [data-node-id="power-target"]').boundingBox();
+    await page.mouse.click(target.x + 24, target.y + 12);
+    await page.keyboard.press('Delete');
+    await page.keyboard.press('Backspace');
+    await page.keyboard.press(MOD + '+z');
+    await page.waitForTimeout(60);
+
+    /* 条件 chip 不得打开编辑器。 */
+    const chip = page.locator('#cvNodes [data-cond-edge]').first();
+    if (await chip.count()) {
+      await chip.click();
+      assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
+        'a log snapshot opened the condition editor');
+    }
+  } finally {
+    page.off('request', onWrite);
+  }
+  const graphAfter = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return JSON.stringify(app.tree);
+  });
+  assert.equal(graphAfter, graphBefore, 'a read-only interaction changed the graph JSON');
+  assert.deepEqual(writes, [], 'a read-only interaction issued a write request');
+  assert.equal(await page.evaluate(
+    () => getComputedStyle(document.getElementById('cvInspector')).display), 'none',
+  'snapshot mode rendered the inspector after selection');
+  assert.equal(await page.locator('#cvSave:visible').count(), 0, 'the snapshot still offers save');
+
+  /* 刷新同一 URL 仍能回放：图来自不可变快照，不依赖当前编辑中的 tree。 */
+  await page.reload();
+  await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final', { timeout: 15000 });
+  const reloaded = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return {
+      final: app.replay ? app.replay.final.target_id : null,
+      locked: app.kit.isLocked(),
+      snapshotMode: document.body.classList.contains('is-log-snapshot'),
+      inputValue: document.getElementById('cvTryInput').value,
+      inputReadOnly: document.getElementById('cvTryInput').readOnly,
+    };
+  });
+  assert.equal(reloaded.final, 'power-target');
+  assert.equal(reloaded.locked, true);
+  assert.equal(reloaded.snapshotMode, true);
+  assert.equal(reloaded.inputValue, S1_TEXT, 'a reload lost the snapshot question');
+  assert.equal(reloaded.inputReadOnly, true);
+
+  /* 条件编辑入口也必须在只读模式失效：点击边上的条件 chip 不得弹出编辑器。 */
+  const chip = page.locator('#cvNodes [data-cond-edge]').first();
+  if (await chip.count()) {
+    await chip.click();
+    assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
+      'a log snapshot opened the condition editor');
+  }
+  assert.equal(await page.locator('#cvSave:visible').count(), 0, 'the snapshot still offers save');
+});
+
+test('calculation-log snapshot replays from SQLite after a real router restart', async () => {
+  await api('POST', '/v1/chat/completions', {
+    model: 'ignored',
+    messages: [{ role: 'user', content: S1_TEXT }],
+    stream: false,
+  });
+  await page.goto(routerBase + '/console/logs.html');
+  await page.locator('.lg-row').first().click();
+  const link = page.locator('.lg-item.open .lg-snapshot-link');
+  await link.waitFor({ state: 'visible' });
+  await Promise.all([page.waitForURL(/routing\.html\?request=/), link.click()]);
+  await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final', { timeout: 15000 });
+
+  const before = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const stable = value => JSON.stringify(value, (key, item) =>
+      item && typeof item === 'object' && !Array.isArray(item)
+        ? Object.keys(item).sort().reduce((sorted, name) => {
+            sorted[name] = item[name];
+            return sorted;
+          }, {})
+        : item);
+    const start = app.graph.nodes.find(node => node.id === 'start').position;
+    return {
+      final: app.replay.final.target_id,
+      trace: app.replay.trace,
+      tree: stable(app.tree),
+      position: { x: start.x, y: start.y },
+      requestText: document.getElementById('cvTryInput').value,
+    };
+  });
+  assert.equal(before.requestText, S1_TEXT, 'the live snapshot lost the request text');
+
+  /* 真实进程重启：同一临时目录/端口，内存 ring 与 pending 索引全部清空。 */
+  await restartRouter();
+  const hydrated = await api('GET', '/admin/requests/recent');
+  assert.ok(hydrated.requests.length > 0, 'the restarted router lost the ledger rows');
+  assert.equal('text' in hydrated.requests[0], false,
+    'the restarted router still served live request text from the database');
+  const stats = await api('GET', '/admin/requests/stats');
+  assert.equal(stats.pending_snapshots, 0, 'the restarted router resumed a stale pending index');
+
+  await page.reload();
+  await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final', { timeout: 15000 });
+  const after = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const stable = value => JSON.stringify(value, (key, item) =>
+      item && typeof item === 'object' && !Array.isArray(item)
+        ? Object.keys(item).sort().reduce((sorted, name) => {
+            sorted[name] = item[name];
+            return sorted;
+          }, {})
+        : item);
+    const start = app.graph.nodes.find(node => node.id === 'start').position;
+    return {
+      final: app.replay.final.target_id,
+      trace: app.replay.trace,
+      tree: stable(app.tree),
+      position: { x: start.x, y: start.y },
+      requestText: document.getElementById('cvTryInput').value,
+    };
+  });
+  /* 图和 trace 与重启前一致；正文按既有契约不持久化。 */
+  assert.deepEqual(after, { ...before, requestText: '' },
+    'the restart did not replay the same immutable snapshot');
+
+  /* 修改当前 tree 后，旧快照仍显示请求发生时的布局。 */
+  const current = (await api('GET', '/admin/trees/' + TREE_ID)).tree;
+  const movedCanvas = JSON.parse(JSON.stringify(current.canvas));
+  movedCanvas.start = {
+    x: movedCanvas.start.x + 70,
+    y: movedCanvas.start.y + 40,
+  };
+  try {
+    const moved = await api('PUT', '/admin/trees/' + TREE_ID, {
+      root: current.root,
+      canvas: movedCanvas,
+      base_document_sha256: current.document_sha256,
+    });
+    assert.notDeepEqual(moved.tree.canvas.start, before.position,
+      'the tree edit did not move the edited graph');
+    await page.reload();
+    await page.waitForSelector('#cvNodes [data-node-id="power-target"].is-final', { timeout: 15000 });
+    const replayed = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      const stable = value => JSON.stringify(value, (key, item) =>
+        item && typeof item === 'object' && !Array.isArray(item)
+          ? Object.keys(item).sort().reduce((sorted, name) => {
+              sorted[name] = item[name];
+              return sorted;
+            }, {})
+          : item);
+      const start = app.graph.nodes.find(node => node.id === 'start').position;
+      return {
+        final: app.replay.final.target_id,
+        position: { x: start.x, y: start.y },
+        tree: stable(app.tree),
+      };
+    });
+    assert.deepEqual(replayed.position, before.position,
+      'the snapshot picked up a later tree edit');
+    assert.equal(replayed.tree, before.tree, 'the snapshot tree changed after a later edit');
+    assert.equal(replayed.final, before.final);
+  } finally {
+    /* 恢复基线图，后续用例继续使用同一 QA 进程。 */
+    const latest = (await api('GET', '/admin/trees/' + TREE_ID)).tree;
+    await api('PUT', '/admin/trees/' + TREE_ID, {
+      root: latest.root,
+      canvas: current.canvas,
+      base_document_sha256: latest.document_sha256,
+    });
+  }
 });
 
 await runIfMain(import.meta.url);

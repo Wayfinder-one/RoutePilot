@@ -61,11 +61,6 @@
       "operator": "or"
     },
     {
-      "id": "not-cap",
-      "type": "logic",
-      "operator": "not"
-    },
-    {
       "id": "and-follow",
       "type": "logic",
       "operator": "and"
@@ -191,23 +186,15 @@
       "condition": null
     },
     {
-      "id": "e-cap-strong-not",
+      "id": "e-cap-below-strong-follow",
       "source": "capability",
       "source_port": "prob.strong",
-      "target": "not-cap",
-      "target_port": "in_1",
-      "condition": {
-        "op": "gt",
-        "value": 0.65
-      }
-    },
-    {
-      "id": "e-not-and-follow",
-      "source": "not-cap",
-      "source_port": "out",
       "target": "and-follow",
       "target_port": "in_1",
-      "condition": null
+      "condition": {
+        "op": "lte",
+        "value": 0.65
+      }
     },
     {
       "id": "e-cond-text-or",

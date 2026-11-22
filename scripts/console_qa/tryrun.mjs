@@ -330,12 +330,14 @@ test('7.4-17-replay-slots-gates-targets-priority', async () => {
   /* 门三值、问题概率/selected、P(yes)、条件节点。 */
   assert.equal(snap.nodes['and-power'].gate, 'true');
   assert.equal(snap.nodes['or-ctx'].gate, 'true');
-  assert.equal(snap.nodes['not-cap'].gate, 'false');
+  assert.equal(snap.edgeStates['e-cap-below-strong-follow'].condition.op, 'lte');
+  assert.equal(snap.edgeStates['e-cap-below-strong-follow'].status, 'false');
   assert.equal(snap.nodes['and-follow'].gate, 'false');
   assert.deepEqual(snap.nodes.capability.selectedOptions, ['strong']);
   assert.equal(snap.nodes.capability.live['prob.strong'], '0.84');
-  assert.equal(snap.nodes.capability.live.p_top, '0.84');
-  assert.equal(snap.nodes.capability.live.margin, '0.72');
+  /* p_top / margin 只留在 trace 与抽屉里，不再上卡片（2026-11-20 变更）。 */
+  assert.equal(snap.nodes.capability.live.p_top, undefined, 'choice card still renders a p_top chip');
+  assert.equal(snap.nodes.capability.live.margin, undefined, 'choice card still renders a margin chip');
   assert.equal(snap.nodes.domain.live.yes, '0.92');
   assert.equal(snap.nodes.domain.live.no, '0.08');
   assert.equal(snap.nodes['cond-text'].replay, 'hit');
@@ -355,92 +357,10 @@ test('7.4-17-replay-slots-gates-targets-priority', async () => {
   assertIncludes(snap.edges['e-cap-strong-and-power'], 'is-true');
   assertIncludes(snap.edges['e-selected-strong-strong'], 'is-true');
   assertIncludes(snap.edges['e-selected-easy-light'], 'is-false');
-  assert.equal(snap.hudHidden, false, 'replay HUD is hidden');
-  assert.equal(snap.hudTitles.length, 1);
-  assertIncludes(snap.hudTitles[0], '0.84');
-  assertIncludes(snap.hudTitles[0], '> 0.65');
-  assertIncludes(snap.hudTitles[0], '> 0.7');
+  /* HUD 与执行轨迹都已撤掉：命中条件只保留在回放数据（边状态）里。 */
+  assert.equal(snap.edgeStates['e-cap-strong-and-power'].condition.value, 0.65);
+  assert.equal(snap.edgeStates['e-domain-and-power'].condition.value, 0.7);
   await screenshot('s1-replay-1440.png');
-});
-
-test('Task 13 · the HUD keeps eight wave capsules and the final chip reachable', async () => {
-  await prepareTryCanvas();
-  await runTrySample(2);
-  const normal = await page.evaluate(() => {
-    const hud = document.getElementById('cvReplayHud');
-    return {
-      waves: hud.querySelectorAll('[data-hud-wave]').length,
-      scrollWidth: hud.scrollWidth,
-      clientWidth: hud.clientWidth
-};
-});
-  assert.equal(normal.waves, 2);
-  assert.ok(normal.scrollWidth <= normal.clientWidth + 1,
-    'normal wave counts must not introduce HUD scrolling');
-
-  await page.setViewportSize({ width: 1280, height: 800 });
-  try {
-    const eight = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTTryRun = await import('/console/routing/tryrun.js');
-
-      const trace = [];
-      for (let wave = 1; wave <= 8; wave += 1) {
-        trace.push({
-          event: 'wave', wave: wave, questions: ['capability'],
-          duration_ms: 4, failed: false, error: null
-});
-}
-      trace.push({
-        event: 'final', target_id: 'power-target', kind: 'target', priority: 1,
-        candidates: [{
-          target_id: 'power-target', priority: 1, via_node: 'and-power', via_port: 'in_1', wave: 8
-}]
-});
-      RTTryRun.apply(RTTryRun.rebuild(trace, app.graph));
-      const hud = document.getElementById('cvReplayHud');
-      const final = hud.querySelector('.rtc-hud-final');
-      const waves = hud.querySelectorAll('[data-hud-wave]');
-      const style = getComputedStyle(hud);
-      const hudRect = hud.getBoundingClientRect();
-      hud.scrollLeft = hud.scrollWidth;
-      const finalRect = final.getBoundingClientRect();
-      hud.scrollLeft = 0;
-      const firstRect = waves[0].getBoundingClientRect();
-      return {
-        waves: waves.length,
-        finalCount: hud.querySelectorAll('.rtc-hud-final').length,
-        overflowX: style.overflowX,
-        flexWrap: style.flexWrap,
-        scrollWidth: hud.scrollWidth,
-        clientWidth: hud.clientWidth,
-        finalRight: finalRect.right,
-        finalLeft: finalRect.left,
-        firstLeft: firstRect.left,
-        hudLeft: hudRect.left,
-        hudRight: hudRect.right
-};
-
-});
-    assert.equal(eight.waves, 8, 'the HUD dropped wave capsules at the 8-wave limit');
-    assert.equal(eight.finalCount, 1, 'the HUD dropped the final target chip');
-    assert.equal(eight.overflowX, 'auto', 'the HUD still clips instead of scrolling');
-    assert.equal(eight.flexWrap, 'nowrap', 'normal single-row HUD layout changed');
-    assert.ok(eight.scrollWidth > eight.clientWidth + 1,
-      'an 8-wave HUD does not become horizontally scrollable');
-    assert.ok(eight.finalRight <= eight.hudRight + 1,
-      'the final chip is not reachable at max HUD scroll');
-    assert.ok(eight.finalLeft >= eight.hudLeft - 1,
-      'the final chip scrolled past the HUD viewport');
-    assert.ok(eight.firstLeft >= eight.hudLeft - 1,
-      'the first wave capsule is not reachable at scrollLeft=0');
-} finally {
-    await page.evaluate(async () => {
-    const RTTryRun = await import('/console/routing/tryrun.js');
-    return (RTTryRun.clear());
-});
-    await page.setViewportSize({ width: 1440, height: 960 });
-}
 });
 
 test('Task 13 · s2 leaves the untriggered clarify question at 未触发 instead of zero', async () => {
@@ -467,55 +387,6 @@ test('Task 13 · s2 leaves the untriggered clarify question at 未触发 instead
   assert.equal(snap.nodes['light-target'].replay, 'final');
 });
 
-test('Task 13 · §3.9 top-level p_top/margin win over the ports copy and never render undefined', async () => {
-  await prepareTryCanvas();
-  const proof = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTTryRun = await import('/console/routing/tryrun.js');
-
-    const read = () => {
-      const node = document.querySelector('#cvNodes [data-node-id="capability"]');
-      const live = {};
-      node.querySelectorAll('[data-live]').forEach(el => { live[el.dataset.live] = el.textContent.trim(); });
-      return {
-        pTop: live.p_top,
-        margin: live.margin,
-        text: node.textContent.replace(/\s+/g, ' ').trim()
-};
-};
-    const base = { event: 'question', wave: 1, node_id: 'capability', duration_ms: 3, selected: 'strong' };
-    const finalEvent = {
-      event: 'final', target_id: 'power-target', kind: 'target', priority: 1,
-      candidates: [{ target_id: 'power-target', priority: 1, via_node: 'capability', via_port: 'in_1', wave: 1 }]
-};
-    /* 顶层字段是 §3.9 的权威值；ports 里的旧副本即使不同也不能覆盖。 */
-    RTTryRun.apply(RTTryRun.rebuild([
-      Object.assign({}, base, { ports: { p_top: 0.11, margin: 0.01 }, p_top: 0.84, margin: 0.72 }),
-      finalEvent
-    ], app.graph));
-    const preferred = read();
-    /* 没有顶层字段的旧 trace 才回退到 ports。 */
-    RTTryRun.apply(RTTryRun.rebuild([
-      Object.assign({}, base, { ports: { p_top: 0.66, margin: 0.5 } }),
-      finalEvent
-    ], app.graph));
-    const fallback = read();
-    return { preferred: preferred, fallback: fallback };
-
-});
-  assert.equal(proof.preferred.pTop, '0.84', 'p_top did not prefer the question event top-level field');
-  assert.equal(proof.preferred.margin, '0.72', 'margin did not prefer the question event top-level field');
-  assert.equal(proof.fallback.pTop, '0.66', 'p_top did not fall back to the ports copy');
-  assert.equal(proof.fallback.margin, '0.5', 'margin did not fall back to the ports copy');
-  [proof.preferred.text, proof.fallback.text].forEach(text => {
-    assert.equal(text.indexOf('undefined'), -1, 'question card rendered undefined for p_top/margin');
-});
-  await page.evaluate(async () => {
-    const RTTryRun = await import('/console/routing/tryrun.js');
-    return (RTTryRun.clear());
-});
-});
-
 test('Task 13 · s3/s4 replay two waves and the clarify slot condition hits', async () => {
   await prepareTryCanvas();
   await runTrySample(2);
@@ -533,9 +404,7 @@ test('Task 13 · s3/s4 replay two waves and the clarify slot condition hits', as
   assertIncludes(snap.slots.deepIn1.live, '0.74');
   assertIncludes(snap.edges['e-clarify-deep'], 'is-true');
   assert.equal(snap.nodes['deep-target'].replay, 'final');
-  assert.equal(snap.hudTitles.length, 2);
-  assertIncludes(snap.hudTitles[1], '0.74');
-  assertIncludes(snap.hudTitles[1], '> 0.6');
+  assert.equal(snap.edgeStates['e-clarify-deep'].condition.value, 0.6);
 
   await runTrySample(3);
   snap = await trySnapshot();
@@ -543,6 +412,81 @@ test('Task 13 · s3/s4 replay two waves and the clarify slot condition hits', as
   assert.equal(snap.final.target_id, 'deep-target');
   assertIncludes(snap.slots.deepIn1.live, '0.83');
   assert.equal(snap.nodes['deep-target'].replay, 'final');
+});
+
+test('Task 15 · the conclusion panel wraps without clipping at 1024', async () => {
+  await prepareTryCanvas();
+  await runTrySample(0);
+  await page.setViewportSize({ width: 1024, height: 900 });
+  await page.waitForTimeout(250);
+  const info = await page.evaluate(() => {
+    const host = document.getElementById('cvTryResult');
+    const note = host.querySelector('.rtc-try-note');
+    const facts = host.querySelector('.rtc-try-facts');
+    const chip = host.querySelector('.rtc-try-cand.is-win');
+    return {
+      overflow: host.scrollWidth - host.clientWidth,
+      noteOverflow: note ? note.scrollWidth - note.clientWidth : -1,
+      noteWhiteSpace: note ? getComputedStyle(note).whiteSpace : '',
+      noteHeight: note ? Math.round(note.getBoundingClientRect().height) : 0,
+      factsHeight: facts ? Math.round(facts.getBoundingClientRect().height) : 0,
+      chipText: chip ? chip.textContent.trim() : '',
+      hasLessThan: host.textContent.indexOf('<') >= 0,
+      hasRule: (note ? note.textContent : '').indexOf('>') >= 0
+    };
+  });
+  assert.ok(info.overflow <= 1, `conclusion panel overflows horizontally by ${info.overflow}px`);
+  assert.ok(info.noteOverflow <= 1, `rule note is clipped by ${info.noteOverflow}px instead of wrapping`);
+  assert.equal(info.noteWhiteSpace, 'normal', 'rule note still refuses to wrap');
+  assert.ok(info.noteHeight > 0);
+  assert.ok(info.factsHeight > 0);
+  assertIncludes(info.chipText, 'p5');
+  assert.equal(info.hasLessThan, false, 'candidate comparison still uses a less-than sign');
+  assert.equal(info.hasRule, true, 'candidate note lost the explicit priority rule');
+  await screenshot('task15-conclusion-1024.png');
+  await page.setViewportSize({ width: 1440, height: 960 });
+});
+
+test('Task 15 · replay paths ramp by wave and the winning edge is the strongest', async () => {
+  await prepareTryCanvas();
+  await runTrySample(2);
+  const ramp = await page.evaluate(() => {
+    const styleOf = id => {
+      const path = document.querySelector('#cvEdges path.rtc-edge[data-edge-id="' + id + '"]');
+      if (!path) return null;
+      const style = getComputedStyle(path);
+      return {
+        step: path.dataset.step || '',
+        final: path.classList.contains('is-final-edge'),
+        stroke: style.stroke,
+        width: parseFloat(style.strokeWidth)
+      };
+    };
+    const steps = {};
+    Array.prototype.forEach.call(document.querySelectorAll('#cvEdges path.rtc-edge'), path => {
+      if (!path.dataset.step) return;
+      steps[path.dataset.step] = (steps[path.dataset.step] || 0) + 1;
+    });
+    const firstPath = document.querySelector('#cvEdges path.rtc-edge[data-step="1"]');
+    return {
+      first: firstPath ? styleOf(firstPath.dataset.edgeId) : null,
+      winning: styleOf('e-clarify-deep'),
+      steps: steps
+    };
+});
+  /* 第一波浅红、第二波玫红：色阶必须真的分出层次，而不是所有选中边一个颜色。 */
+  assert.ok(ramp.steps['1'] > 0, 'no wave-1 edge carried the first ramp step');
+  assert.ok(ramp.steps['2'] > 0, 'no wave-2 edge carried the second ramp step');
+  assert.ok(ramp.first, 'no wave-1 edge carried the first ramp step');
+  assert.equal(ramp.first.step, '1');
+  assert.equal(ramp.first.stroke, 'rgb(251, 113, 133)', 'the first ramp step is not the lightest red');
+  assert.equal(ramp.first.final, false);
+  /* 最终命中链路单独走最深的酒红、更粗，是色阶的终点。 */
+  assert.equal(ramp.winning.final, true, 'the winning edge is not marked as the final path');
+  assert.equal(ramp.winning.stroke, 'rgb(136, 19, 55)', 'the winning edge is not the deepest red');
+  assert.ok(ramp.winning.width > ramp.first.width,
+    'the winning edge is not thicker than the wave-1 edges');
+  await screenshot('task15-replay-ramp-1440.png');
 });
 
 test('Task 13 · s5 voids the failed wave, clears candidates and paints the amber error path', async () => {
@@ -595,8 +539,7 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
     slotStatuses: document.querySelectorAll('#cvNodes .rtc-slot[data-status]').length,
     edgeStatuses: document.querySelectorAll('#cvEdges .rtc-edge[data-status]').length,
     failedNodes: document.querySelectorAll('#cvNodes .rtc-node.is-fail').length,
-    fallbackNodes: document.querySelectorAll('#cvNodes .rtc-node.is-fallback').length,
-    drawerHidden: document.getElementById('cvTraceDrawer').hidden
+    fallbackNodes: document.querySelectorAll('#cvNodes .rtc-node.is-fallback').length
 }));
 });
   assert.equal(cleared.replay, null);
@@ -606,7 +549,6 @@ test('Task 13 · s5 voids the failed wave, clears candidates and paints the ambe
   assert.equal(cleared.edgeStatuses, 0, 'clear left edge data-status attributes behind');
   assert.equal(cleared.failedNodes, 0);
   assert.equal(cleared.fallbackNodes, 0);
-  assert.equal(cleared.drawerHidden, true, 'clear left the execution trace panel visible');
 });
 
 test('Task 13 · a failed /admin/try toasts the api error and fabricates no replay', async () => {
@@ -632,7 +574,6 @@ test('Task 13 · a failed /admin/try toasts the api error and fabricates no repl
       running: app.tryRunning,
       runDisabled: document.getElementById('cvTryRun').disabled,
       resultHidden: document.getElementById('cvTryResult').hidden,
-      hudHidden: document.getElementById('cvReplayHud').hidden,
       svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
       finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
       lastToast: app.lastToast
@@ -642,7 +583,6 @@ test('Task 13 · a failed /admin/try toasts the api error and fabricates no repl
     assert.equal(after.running, false);
     assert.equal(after.runDisabled, false, 'the run button stayed disabled after a failed request');
     assert.equal(after.resultHidden, true);
-    assert.equal(after.hudHidden, true);
     assert.equal(after.svgReplay, false);
     assert.equal(after.finalNodes, 0);
     assertIncludes(after.lastToast, 'routing backend unavailable');
@@ -650,167 +590,6 @@ test('Task 13 · a failed /admin/try toasts the api error and fabricates no repl
     resetExpectedHttpStatusErrors();
     await page.unroute(matcher);
 }
-});
-
-test('trace-drawer-row-locates-slot', async () => {
-  await prepareTryCanvas();
-  await runTrySample(0);
-  /* 执行轨迹直接展示：试算落地后执行区即展开，不需要再点「查看轨迹」。 */
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
-  const drawer = await trySnapshot();
-  assert.equal(drawer.drawerHidden, false);
-  assert.equal(drawer.drawerWaveCount, 1, 'drawer must show one wave card per executed wave');
-  const waveText = drawer.drawerWaveTexts[0];
-  assertIncludes(waveText, await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.tryWave', { n: 1 }));
-}));
-  assertIncludes(waveText, await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.tryWaveQuestions', { n: 2 }));
-}));
-  assertIncludes(waveText, 'ms');
-  assertIncludes(waveText, '0.84');
-  assertIncludes(waveText, '> 0.65');
-  const row = page.locator('#cvTraceDrawer [data-trace-edge="e-cap-strong-and-power"]')
-    .filter({ hasText: '0.84' }).first();
-  assert.equal(await row.count(), 1, 'drawer has no slot row for the and-power in_1 edge');
-  const rowText = await row.innerText();
-  assertIncludes(rowText, 'in_1', 'drawer slot row lost the slot port (in_1)');
-  assertIncludes(rowText, '0.84');
-  assertIncludes(rowText, '> 0.65');
-  assertIncludes(rowText, 'true');
-  assert.equal(await row.getAttribute('role'), 'button', 'drawer slot row is not exposed as a button');
-  assert.equal(await row.getAttribute('tabindex'), '0', 'drawer slot row is not keyboard focusable');
-  await row.click();
-  /* 执行区只定位：选中该边并把画布移到它，但不打开条件编辑器（编辑是编辑区的动作）。 */
-  let located = null;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    located = await page.evaluate(async () => {
-      const { app } = await import('/console/routing/app.js');
-      return app.kit ? app.kit.getSelection() : null;
-});
-    if (located && located.kind === 'edge' && located.id === 'e-cap-strong-and-power') break;
-    await page.waitForTimeout(50);
-}
-  assert.deepEqual(located, { kind: 'edge', id: 'e-cap-strong-and-power' },
-    'clicking a trace row did not select the located edge');
-  assert.equal(await page.evaluate(() => document.getElementById('cvCondPop').hidden), true,
-    'clicking a trace row opened the condition editor (execution zone must stay view-only)');
-  const centered = await page.evaluate(() => {
-    const stage = document.getElementById('cvStage').getBoundingClientRect();
-    const edge = document.querySelector('#cvEdges [data-edge-id="e-cap-strong-and-power"]');
-    return edge ? { exists: true } : { exists: false, stage: { w: stage.width, h: stage.height } };
-});
-  assert.equal(centered.exists, true, 'the located edge is not rendered on the canvas');
-
-  /* §6.11：同一行必须能用 Enter / Space 触发定位，不必依赖鼠标；
-     与鼠标一致，键盘触发也只定位、不打开编辑器（编辑器属于编辑区）。 */
-  async function pressRowAndReadSelection(key) {
-    await page.evaluate(async () => {
-      const { app } = await import('/console/routing/app.js');
-      app.kit.clearSelection();
-});
-    await row.focus();
-    await page.keyboard.press(key);
-    let selection = null;
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      selection = await page.evaluate(async () => {
-        const { app } = await import('/console/routing/app.js');
-        return app.kit ? app.kit.getSelection() : null;
-});
-      if (selection && selection.kind === 'edge' && selection.id === 'e-cap-strong-and-power') break;
-      await page.waitForTimeout(50);
-}
-    return {
-      selection: selection,
-      condHidden: await page.evaluate(() => document.getElementById('cvCondPop').hidden)
-};
-}
-  const viaEnter = await pressRowAndReadSelection('Enter');
-  assert.deepEqual(viaEnter.selection, { kind: 'edge', id: 'e-cap-strong-and-power' },
-    'Enter on a trace row did not locate the edge');
-  assert.equal(viaEnter.condHidden, true,
-    'Enter on a trace row opened the condition editor (execution zone must stay view-only)');
-  const viaSpace = await pressRowAndReadSelection(' ');
-  assert.deepEqual(viaSpace.selection, { kind: 'edge', id: 'e-cap-strong-and-power' },
-    'Space on a trace row did not locate the edge');
-  assert.equal(viaSpace.condHidden, true,
-    'Space on a trace row opened the condition editor (execution zone must stay view-only)');
-
-  await page.locator('#cvTraceDrawer [data-try-act="drawer-close"]').click();
-  await page.waitForFunction(() => document.getElementById('cvTraceDrawer').hidden === true);
-  assert.equal(await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (!!app.replay);
-}), true,
-    'closing the drawer cleared the replay');
-});
-
-test('Task 13 · execution trace is docked, auto-shown, and Esc hides it without reopening', async () => {
-  await prepareTryCanvas();
-  await runTrySample(2);
-  /* 执行区直接展示：试算落地即展开，且占用独立布局空间（画布让位，而非浮层遮挡）。 */
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
-  const opened = await page.evaluate(async () => {
-    const RTTryRun = await import('/console/routing/tryrun.js');
-    const panel = document.getElementById('cvTraceDrawer');
-    const stage = document.getElementById('cvStage');
-    return (({
-    open: RTTryRun.isDrawerOpen(),
-    docked: getComputedStyle(panel).position !== 'fixed',
-    panelTop: panel.getBoundingClientRect().top,
-    stageBottom: stage.getBoundingClientRect().bottom,
-    stageHeight: stage.getBoundingClientRect().height
-}));
-});
-  assert.equal(opened.open, true, 'a completed run did not open the execution trace panel');
-  assert.equal(opened.docked, true, 'the trace panel is still a fixed overlay instead of a docked zone');
-  assert.ok(opened.panelTop >= opened.stageBottom - 1,
-    `trace panel overlaps the canvas (panel top ${opened.panelTop} < stage bottom ${opened.stageBottom})`);
-
-  await page.keyboard.press('Escape');
-  await page.waitForFunction(() => document.getElementById('cvTraceDrawer').hidden === true);
-  const closed = await page.evaluate(async () => {
-    const { app } = await import('/console/routing/app.js');
-    const RTTryRun = await import('/console/routing/tryrun.js');
-    const stage = document.getElementById('cvStage');
-    return (({
-    open: RTTryRun.isDrawerOpen(),
-    replay: !!app.replay,
-    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-    stageHeight: stage.getBoundingClientRect().height
-}));
-});
-  assert.equal(closed.drawerHidden, true);
-  assert.equal(closed.open, false, 'Esc did not clear the RTTryRun trace panel state');
-  assert.ok(closed.stageHeight > opened.stageHeight + 20,
-    `hiding the trace did not give the canvas its space back (${closed.stageHeight} vs ${opened.stageHeight})`);
-  assert.equal(closed.replay, true, 'closing the trace panel cleared the replay result');
-
-  /* 语言切换会走 renderAll → RTTryRun.apply；已收起的执行区不得被重新弹开。 */
-  await page.evaluate(async () => {
-    const { setLang } = await import('/console/i18n.js');
-    return setLang('en');
-});
-  await page.waitForFunction(() => document.documentElement.lang === 'en');
-  const rerendered = await page.evaluate(async () => {
-    const { app } = await import('/console/routing/app.js');
-    const RTTryRun = await import('/console/routing/tryrun.js');
-    return (({
-    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-    open: RTTryRun.isDrawerOpen(),
-    replay: !!app.replay
-}));
-});
-  assert.equal(rerendered.drawerHidden, true, 'a renderAll reopened the trace panel after Esc');
-  assert.equal(rerendered.open, false);
-  assert.equal(rerendered.replay, true, 'a renderAll dropped the replay after closing the trace panel');
-  await page.evaluate(async () => {
-    const { setLang } = await import('/console/i18n.js');
-    return setLang('zh');
-});
-  await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
 });
 
 test('7.4-19-rerun-and-clear', async () => {
@@ -853,8 +632,6 @@ test('7.4-19-rerun-and-clear', async () => {
     return (({
     replay: app.replay,
     resultHidden: document.getElementById('cvTryResult').hidden,
-    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-    hudHidden: document.getElementById('cvReplayHud').hidden,
     svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
     finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
     trueEdges: document.querySelectorAll('#cvEdges .rtc-edge.is-true').length,
@@ -863,8 +640,6 @@ test('7.4-19-rerun-and-clear', async () => {
 });
   assert.equal(cleared.replay, null);
   assert.equal(cleared.resultHidden, true);
-  assert.equal(cleared.drawerHidden, true);
-  assert.equal(cleared.hudHidden, true);
   assert.equal(cleared.svgReplay, false, 'clearing replay left the SVG replay class');
   assert.equal(cleared.finalNodes, 0, 'clearing replay left final node classes');
   assert.equal(cleared.trueEdges, 0, 'clearing replay left highlighted edges');
@@ -892,8 +667,6 @@ test('Task 13 · any edit after a result clears the replay immediately', async (
     return (({
     replay: app.replay,
     resultHidden: document.getElementById('cvTryResult').hidden,
-    drawerHidden: document.getElementById('cvTraceDrawer').hidden,
-    hudHidden: document.getElementById('cvReplayHud').hidden,
     svgReplay: document.getElementById('cvEdges').classList.contains('is-replay'),
     finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
     kind: app.kind()
@@ -901,8 +674,6 @@ test('Task 13 · any edit after a result clears the replay immediately', async (
 });
   assert.equal(after.replay, null, 'dragging a node did not clear the replay state');
   assert.equal(after.resultHidden, true);
-  assert.equal(after.drawerHidden, true);
-  assert.equal(after.hudHidden, true);
   assert.equal(after.svgReplay, false);
   assert.equal(after.finalNodes, 0);
   assert.equal(after.kind, 'layout');
@@ -978,7 +749,6 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(x('cond-text'), x('cond-peak'));
   assert.equal(x('capability'), x('domain'));
   assert.equal(x('capability'), x('and-power'));
-  assert.equal(x('and-power'), x('not-cap'));
   assert.equal(x('and-power'), x('and-follow'));
   assert.equal(x('and-follow'), x('standard-target'));
   assert.equal(x('clarify'), x('deep-target'));
@@ -991,7 +761,7 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.ok(x('light-target') > x('clarify'), 'untriggered column is not after every wave column');
   const untriggeredOrder = untriggered.slice().sort((a, b) => y(a) - y(b));
   assert.deepEqual(untriggeredOrder, untriggered, 'untriggered column is not sorted by node id');
-  const column = ['capability', 'domain', 'and-power', 'not-cap', 'and-follow', 'standard-target']
+  const column = ['capability', 'domain', 'and-power', 'and-follow', 'standard-target']
     .sort((a, b) => y(a) - y(b));
   assert.deepEqual(column, column.slice().sort(),
     'a wave column is not sorted by node id (same column must be id-ascending)');
@@ -1131,16 +901,17 @@ test('7.4-18-replay-data-from-admin-try', async () => {
 test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async () => {
   await prepareTryCanvas();
   await runTrySample(0);
-  /* 执行轨迹直接展示，无需点击开合按钮。 */
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
   const chinese = await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (({
     result: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
-    priorityMeta: tf('cv.tryPriorityMeta', { priority: 5 })
+    priorityLabel: t('cv.tryFactPriority')
 }));
 });
-  assertIncludes(chinese.result, chinese.priorityMeta, 'result meta still hardcodes priority');
+  assertIncludes(chinese.result, chinese.priorityLabel, 'result facts lost the localized priority label');
+  assertIncludes(chinese.result, 'p5', 'result facts lost the winner priority value');
+  assert.equal(chinese.result.indexOf('<'), -1,
+    'candidate comparison still renders a less-than sign even though larger priority wins');
   const english = await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
 
@@ -1148,24 +919,15 @@ test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async ()
     return {
       lang: document.documentElement.lang,
       result: document.getElementById('cvTryResult').textContent.replace(/\s+/g, ' ').trim(),
-      drawer: document.getElementById('cvTraceDrawer').textContent.replace(/\s+/g, ' ').trim(),
-      hud: document.getElementById('cvReplayHud').textContent.replace(/\s+/g, ' ').trim(),
       clear: document.getElementById('cvTryClear').textContent.trim(),
       finalLabel: t('cv.tryFinal'),
-      drawerLabel: t('cv.tryDrawer'),
-      waveLabel: tf('cv.tryWave', { n: 1 }),
-      priorityMeta: tf('cv.tryPriorityMeta', { priority: 5 }),
-      drawerAria: document.getElementById('cvTraceDrawer').getAttribute('aria-label'),
+      priorityLabel: t('cv.tryFactPriority'),
       inspectorTitle: document.getElementById('cvInspToggle').title,
       paletteTitle: document.getElementById('cvPalToggle').title,
       inspectorToggle: t('cv.inspectorToggle'),
       paletteToggle: t('cv.paletteToggle'),
-      cjkPunctuation: /[；、]/.test(document.getElementById('cvTryResult').textContent +
-        document.getElementById('cvTraceDrawer').textContent +
-        document.getElementById('cvReplayHud').textContent),
-      rawKey: /cv\.[a-zA-Z]/.test(document.getElementById('cvTryResult').textContent +
-        document.getElementById('cvTraceDrawer').textContent +
-        document.getElementById('cvReplayHud').textContent)
+      cjkPunctuation: /[；、]/.test(document.getElementById('cvTryResult').textContent),
+      rawKey: /cv\.[a-zA-Z]/.test(document.getElementById('cvTryResult').textContent)
 };
 
 });
@@ -1175,10 +937,7 @@ test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async ()
     return (t('cv.tryClear'));
 }));
   assertIncludes(english.result, english.finalLabel);
-  assertIncludes(english.result, english.priorityMeta);
-  assertIncludes(english.drawer, english.drawerLabel);
-  assertIncludes(english.drawer, english.waveLabel);
-  assert.equal(english.drawerAria, english.drawerLabel, 'drawer aria-label is not localized');
+  assertIncludes(english.result, english.priorityLabel);
   assert.equal(english.inspectorTitle, english.inspectorToggle, 'inspector toggle tooltip is not localized');
   assert.equal(english.paletteTitle, english.paletteToggle, 'palette toggle tooltip is not localized');
   assert.equal(english.cjkPunctuation, false, 'English replay UI leaked CJK separators');
@@ -1194,7 +953,7 @@ test('Task 13 · replay copy is bilingual and leaves no raw i18n keys', async ()
     return (!!app.replay);
 }), true,
     'language switch dropped the replay');
-  await screenshot('task13-replay-s3-drawer.png');
+  await screenshot('task13-replay-s3.png');
 });
 
 test('try-uses-draft-timezone-and-sticky', async () => {
@@ -1215,6 +974,15 @@ test('try-uses-draft-timezone-and-sticky', async () => {
       app.tree.sticky.enabled === false && app.tree.sticky.ttl_seconds === 600);
 });
 
+    const expectedRuntime = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      const runtime = app.tree.runtime;
+      return {
+        jevBase: runtime.jev.base_url,
+        providerUrl: runtime.backends.providers[0].base_url,
+        periods: runtime.time_periods.map(period => period.name)
+};
+});
     const captured = page.waitForRequest(request =>
       request.method() === 'POST' && new URL(request.url()).pathname === '/admin/try');
     await page.locator('[data-try-sample="0"]').click();
@@ -1222,6 +990,17 @@ test('try-uses-draft-timezone-and-sticky', async () => {
     assert.equal(payload.timezone, 'UTC', 'try did not send the draft timezone');
     assert.deepEqual(payload.sticky, { enabled: false, ttl_seconds: 600 },
       'try did not send the draft sticky settings');
+    /* §C2：草稿自包含 runtime 时试算 payload 必须整组携带，服务端不能再按活动树继承。 */
+    ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
+      assert.ok(Object.prototype.hasOwnProperty.call(payload, field),
+        'try payload dropped the ' + field + ' runtime field');
+});
+    assert.deepEqual(payload.time_periods.map(period => period.name), expectedRuntime.periods,
+      'try payload sent a different runtime catalog than the draft');
+    assert.equal(payload.jev.base_url, expectedRuntime.jevBase,
+      'try payload did not carry the draft runtime JEV endpoint');
+    assert.equal(payload.backends.providers[0].base_url, expectedRuntime.providerUrl,
+      'try payload did not carry the draft runtime provider endpoint');
     assert.ok(payload.root && payload.root.nodes.length === EXAMPLE_NODES,
       'try did not send the draft graph');
     assert.equal(payload.now, TRY_SAMPLES[0].now);
@@ -1334,119 +1113,27 @@ const RTCondPop = await import('/console/routing/condpop.js');
   await page.unroute(matcher);
 });
 
-test('gate replay labels a start input as always passing', async () => {
+test('try result keeps the graph and verdict without an execution trace drawer', async () => {
   await prepareTryCanvas();
-  await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-const RTGraph = await import('/console/routing/graph.js');
-
-    app.change('behavior', tree => {
-      const result = RTGraph.addEdge(tree.root, {
-        source: 'start', source_port: 'out', target: 'or-ctx', target_port: 'in_3'
-});
-      if (!result.ok) throw new Error(result.reason || 'failed to add start gate input');
-});
-
-});
   await runTrySample(0);
-  /* 执行轨迹直接展示：等待执行区自动展开（按钮只用于收起/再展开）。 */
-  await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
-
-  const gate = page.locator('#cvTraceDrawer .rtc-dw-row--gate').filter({ hasText: 'in_3' });
-  assert.equal(await gate.count(), 1);
-  const text = await gate.innerText();
-  assert.match(text, /in_3[^；]*总是通过/);
-  assert.doesNotMatch(text, /in_3[^；]*直接通过/);
-  assert.doesNotMatch(text, /= (?:true|false)/);
-});
-
-test('gate replay labels direct and negated boolean inputs', async () => {
-  await prepareTryCanvas();
-
-  async function gateText() {
-    /* 执行轨迹直接展示：等待执行区自动展开（按钮只用于收起/再展开）。 */
-    await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
-    const row = page.locator(
-      '#cvTraceDrawer .rtc-dw-row--gate[data-trace-node="or-ctx"]'
-    );
-    assert.equal(await row.count(), 1);
-    return row.innerText();
-}
-
-  await runTrySample(0);
-  const direct = await gateText();
-  assert.match(direct, /in_1[^；]*直接通过/);
-  assert.doesNotMatch(direct, /= (?:true|false)/);
-
-  await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    app.change('behavior', tree => {
-      tree.root.edges.find(item => item.id === 'e-cond-text-or').condition = {
-        op: 'is', value: false
-};
-});
-
-});
-  try {
-    await runTrySample(0);
-    const negated = await gateText();
-    assert.match(negated, /in_1[^；]*取反/);
-    assert.doesNotMatch(negated, /in_1[^；]*直接通过/);
-    assert.doesNotMatch(negated, /= (?:true|false)/);
-} finally {
-    await page.locator('#cvUndo').click();
-    await waitEdgeCondition('e-cond-text-or', null);
-}
-});
-
-test('gate replay falls back to trace conditions for missing edges', async () => {
-  await prepareTryCanvas();
-  const matcher = url => url.pathname === '/admin/try';
-  /* 拦截回调里只记录，断言放到 runTrySample 之后：否则缺失 gate 会以
-     “请求中止 + 超时”呈现，而不是可读的 assertion message。 */
-  let gateFound = false;
-  await page.route(matcher, async route => {
-    const response = await route.fetch();
-    const body = await response.json();
-    /* wire trace 用 `event` 字段标事件类型（engine.py trace.append），不是 `kind`。 */
-    const gate = body.trace.find(item =>
-      item.event === 'gate' && item.node_id === 'or-ctx');
-    gateFound = !!gate;
-    if (gate) {
-      gate.inputs = [
-        { port: 'in_trace_direct', raw: true, condition: null, status: 'true' },
-        {
-          port: 'in_trace_negated', raw: true,
-          condition: { op: 'is', value: false }, status: 'false'
-}
-      ];
-      gate.value = true;
-}
-    await route.fulfill({
-      response,
-      contentType: 'application/json',
-      body: JSON.stringify(body)
-});
-});
-
-  try {
-    await runTrySample(0);
-    assert.ok(gateFound, 'real try response did not contain the or-ctx gate');
-    /* 执行轨迹直接展示：等待执行区自动展开（按钮只用于收起/再展开）。 */
-    await page.waitForSelector('#cvTraceDrawer:not([hidden])', { timeout: 4000 });
-    const row = page.locator(
-      '#cvTraceDrawer .rtc-dw-row--gate[data-trace-node="or-ctx"]'
-    );
-    assert.equal(await row.count(), 1);
-    const text = await row.innerText();
-    assert.match(text, /in_trace_direct true 直接通过 → true/);
-    assert.match(text, /in_trace_negated true 取反 → false/);
-    assert.doesNotMatch(text, /in_trace_(?:direct|negated)[^；]*总是通过/);
-    assert.doesNotMatch(text, /= (?:true|false)/);
-} finally {
-    await page.unroute(matcher);
-}
+  const state = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const RTTryRun = await import('/console/routing/tryrun.js');
+    return {
+      final: app.replay && app.replay.final.target_id,
+      resultHidden: document.getElementById('cvTryResult').hidden,
+      traceDrawer: document.querySelectorAll('.rtc-trace, .rtc-dw-row, [data-try-act="drawer"]').length,
+      finalNodes: document.querySelectorAll('#cvNodes .rtc-node.is-final').length,
+      drawerApi: Object.keys(RTTryRun).filter(key => /drawer/i.test(key)),
+      execHeight: document.getElementById('cvExecZone').classList.contains('has-height'),
+    };
+  });
+  assert.equal(state.final, 'power-target');
+  assert.equal(state.resultHidden, false, 'the verdict panel did not stay visible');
+  assert.equal(state.traceDrawer, 0, 'the removed execution trace drawer still renders DOM');
+  assert.ok(state.finalNodes > 0, 'the replay lost its final node highlight');
+  assert.deepEqual(state.drawerApi, [], 'the trial trace drawer API still exists');
+  assert.equal(state.execHeight, false, 'the removed execution resize left a pinned height');
 });
 
 await runIfMain(import.meta.url);

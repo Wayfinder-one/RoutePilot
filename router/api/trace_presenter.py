@@ -274,7 +274,7 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
             value = "true" if event.get("value") else "false"
             joined = f" {operator} ".join(statuses)
             body = (f"{operator} {joined}"
-                    if joined and (operator == "NOT" or len(inputs) == 1)
+                    if joined and len(inputs) == 1
                     else joined or operator)
             summary = _text(
                 f"{node}：{body} → {value}",
