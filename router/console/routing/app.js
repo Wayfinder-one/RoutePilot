@@ -742,7 +742,7 @@ function updateToolbar() {
     redo.disabled = busy || !store.canRedo;
     redo.title = t('cv.redoTitle');
   }
-  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvLoadExample', 'cvImport', 'cvExport', 'cvTryBtn', 'cvDisable']
+  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvImport', 'cvExport', 'cvTryBtn', 'cvDisable']
     .forEach(id => {
       const button = document.getElementById(id);
       if (button) button.disabled = busy;
@@ -1259,7 +1259,6 @@ function closeOverlays() {
 /* ── 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） ───────────── */
 const CONFIRM_TITLES = {
   switch: 'cv.confirmSwitchTitle',
-  example: 'cv.confirmExampleTitle',
   import: 'cv.confirmImportTitle',
   new: 'cv.confirmNewTitle'
 };
@@ -1358,7 +1357,7 @@ function bindToolbar() {
   });
   $('#cvAutoLayout').addEventListener('click', autoLayout);
   /* boot 完成（store.tree 已装配）前，替换整张图的入口一律拒绝：
-     newTree/loadExample/import 都会写草稿，此时 change() 没有可操作对象。 */
+     newTree/import 都会写草稿，此时 change() 没有可操作对象。 */
   const requireBooted = action => function () {
     if (!app.booted) {
       toast(t('cv.toastNotReady'), 'warn');
@@ -1368,7 +1367,6 @@ function bindToolbar() {
   };
   const actions = {
     cvNewTree: requireBooted(() => controller.newTree()),
-    cvLoadExample: requireBooted(() => controller.loadExample()),
     cvImport: requireBooted(() => controller.openImport()),
     cvExport: () => controller.exportTree(),
     cvSave: () => controller.save(),

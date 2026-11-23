@@ -175,7 +175,7 @@ test('P0 toolbar keeps only primary actions visible and overflow remains operabl
   assert.deepEqual(visiblePrimary, ['cvTryBtn', 'cvMoreBtn', 'cvEnable', 'cvIssuesBtn'],
     'the first screen must expose only the primary actions plus the validation entry');
   for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
-                    'cvLoadExample', 'cvImport', 'cvExport']) {
+                    'cvImport', 'cvExport']) {
     assert.equal(await page.locator('#' + id).count(), 1, id + ' must still exist in the toolbar');
     assert.equal(await page.locator('#cvMore #' + id).count(), 1,
       id + ' must be a descendant of the overflow menu');
@@ -1861,164 +1861,6 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
 }
 });
 
-test('Task 12 · loading the example asks for confirmation and replaces the graph as one undo step', async () => {
-  await ensureBaselineTree();
-  await openCanvas();
-  const moved = await dragNodeBy('start', 48, 34);
-
-  await clickCanvasAction('cvLoadExample');
-  const dialog = await waitConfirmDialog();
-  assert.ok(dialog.includes(await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.confirmExampleTitle'));
-})),
-    'example load did not reuse the shared dirty dialog');
-  await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
-  await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
-  const kept = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === 'start');
-    return { x: node.position.x, y: node.position.y, kind: app.kind() };
-
-});
-  assert.deepEqual({ x: kept.x, y: kept.y }, { x: moved.x, y: moved.y });
-  assert.equal(kept.kind, 'layout');
-
-  await clickCanvasAction('cvLoadExample');
-  await waitConfirmDialog();
-  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
-  /* 示例是异步 fetch 的：等待它真正替换草稿（示例 start 坐标），不能只看节点数（本来就是 15）。 */
-  await waitFor(async expected => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === 'start');
-    return app.graph.nodes.length === expected.nodes &&
-      app.graph.edges.length === expected.edges &&
-      node && node.position.x === expected.start.x && node.position.y === expected.start.y &&
-      app.kind() === 'behavior';
-
-}, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, start: EXAMPLE_START }, { timeout: 8000 });
-  const loaded = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (({
-    kind: app.kind(),
-    canUndo: store.canUndo,
-    runtime: app.tree.runtime,
-    start: (() => {
-      const node = app.graph.nodes.find(item => item.id === 'start');
-      return { x: node.position.x, y: node.position.y };
-})()
-}));
-});
-  /* 示例文件现在自包含 local runtime：行为配置相对已保存的 mock 基线变了，
-     所以整图替换后的分类是 behavior（不是之前只比坐标时的 clean）。 */
-  assert.equal(loaded.kind, 'behavior');
-  assert.ok(loaded.runtime, 'loading the example did not import its self-contained runtime');
-  assert.deepEqual(loaded.runtime.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
-  assert.equal(loaded.canUndo, true);
-  assert.notDeepEqual(loaded.start, { x: moved.x, y: moved.y });
-
-  /* 一次撤销必须回到载入前的完整草稿（拖拽后的坐标），而不是半张示例图。 */
-  await clickCanvasAction('cvUndo');
-  await waitFor(async expected => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (app.graph.nodes.length === expected && app.kind() === 'layout');
-}, EXAMPLE_NODES);
-  const undone = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === 'start');
-    return { x: node.position.x, y: node.position.y };
-
-});
-  assert.deepEqual(undone, { x: moved.x, y: moved.y },
-    'loading the example was not a single replace-entire-graph history operation');
-});
-
-test('Task 12 · loading the example from a clean saved draft still confirms before replacing it', async () => {
-  await ensureBaselineTree();
-  await openCanvas();
-  /* clean 但内容已和示例不同（拖动后保存），让“载入示例”成为一次可见的整图替换。 */
-  const moved = await dragNodeBy('start', 52, 36);
-  await saveNow();
-  const clean = await draftStatus();
-  assert.equal(clean.kind, 'clean');
-  assert.equal(clean.state, 'running');
-
-  await clickCanvasAction('cvLoadExample');
-  const dialog = await waitConfirmDialog();
-  assert.ok(dialog.includes(await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.confirmLoadExample'));
-})),
-    'clean example load did not use the clean confirmation title');
-  assert.ok(dialog.includes(await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.confirmLoadExampleClean'));
-})),
-    'clean example load did not explain that the whole graph is replaced');
-  assert.equal(dialog.includes(await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.confirmDirtyBody'));
-})), false,
-    'clean example load reused the discard-draft copy');
-
-  await page.locator('#cvConfirmBody [data-act="confirm-cancel"]').click();
-  await page.waitForFunction(() => document.getElementById('cvConfirmModal').hidden);
-  const kept = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === 'start');
-    return {
-      start: { x: node.position.x, y: node.position.y },
-      kind: app.kind(),
-      nodes: app.graph.nodes.length
-};
-
-});
-  assert.deepEqual(kept.start, moved, 'cancelling the clean example load changed the draft');
-  assert.equal(kept.kind, 'clean');
-  assert.equal(kept.nodes, EXAMPLE_NODES);
-
-  await clickCanvasAction('cvLoadExample');
-  await waitConfirmDialog();
-  await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
-  await waitFor(async expected => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === 'start');
-    return app.graph.nodes.length === expected.nodes &&
-      app.graph.edges.length === expected.edges &&
-      node && node.position.x === expected.start.x && node.position.y === expected.start.y;
-
-}, { nodes: EXAMPLE_NODES, edges: EXAMPLE_EDGES, start: EXAMPLE_START }, { timeout: 8000 });
-  const loaded = await page.evaluate(async () => {
-    const { app, store } = await import('/console/routing/app.js');
-    return (({
-    canUndo: store.canUndo,
-    kind: app.kind()
-}));
-});
-  assert.equal(loaded.canUndo, true, 'confirming the example load did not add a history entry');
-  /* 示例文件自带 local runtime，与已保存基线（mock 运行配置）不同：整图替换
-     是一次 behavior 变更（layout 差异同时存在，但 behavior 优先级更高）。 */
-  assert.equal(loaded.kind, 'behavior',
-    'replacing the saved draft with the self-contained example was not classified as a behavior change');
-
-  /* 一次撤销回到保存后的拖拽坐标，证明示例载入只产生一个历史项。 */
-  await clickCanvasAction('cvUndo');
-  await waitFor(async expected => {
-    const { app, store } = await import('/console/routing/app.js');
-
-    const node = app.graph.nodes.find(item => item.id === 'start');
-    return node && node.position.x === expected.x && node.position.y === expected.y &&
-      app.kind() === 'clean';
-
-}, moved, { timeout: 4000 });
-  await ensureBaselineTree();
-});
-
 test('Task 12 · export downloads the complete v3 envelope including timezone and sticky', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
@@ -2652,7 +2494,7 @@ const RTGraph = await import('/console/routing/graph.js');
 test('7.4-15-validation-bar-and-locate', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  /* 用禁用中的新组（enable 才会先保存）；载入示例，让 422 Issue 有可定位的节点/边。 */
+  /* 用禁用中的新组（enable 才会先保存）；导入示例文档，让 422 Issue 有可定位的节点/边。 */
   await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -2662,9 +2504,11 @@ test('7.4-15-validation-bar-and-locate', async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.treeId);
 });
-  await clickCanvasAction('cvLoadExample');
+  /* 新建草稿未保存（behavior dirty）：导入先弹共享丢弃确认，确认后再选文件。 */
+  await clickCanvasAction('cvImport');
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+  await setImportPayload(EXAMPLE, 'example-graph.json');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === expected.nodes &&
@@ -2828,7 +2672,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }
 });
 
-test('Task 12 · example graph saves, enables and survives a page refresh with a consistent revision', async () => {
+test('Task 12 · an imported graph saves, enables and survives a page refresh with a consistent revision', async () => {
   await ensureBaselineTree();
   await openCanvas();
   await clickCanvasAction('cvNewTree');
@@ -2840,10 +2684,13 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
     const { app, store } = await import('/console/routing/app.js');
     return (app.treeId);
 });
-  await clickCanvasAction('cvLoadExample');
+  /* 新建草稿未保存（behavior dirty）：导入先弹共享丢弃确认，确认后再选文件。
+     导入的文档就是示例 fixture（含顶层 canvas），整图替换后的图与旧的「载入示例」一致。 */
+  await clickCanvasAction('cvImport');
   await waitConfirmDialog();
   await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
-  /* 新建草稿是 2 个节点：必须等示例 root 真正替换后再保存。 */
+  await setImportPayload(EXAMPLE, 'example-graph.json');
+  /* 新建草稿是 2 个节点：必须等导入文档真正替换后再保存。 */
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === expected.nodes &&
@@ -2866,7 +2713,7 @@ test('Task 12 · example graph saves, enables and survives a page refresh with a
 }, null, { timeout: 8000 });
   const enabledServer = await serverTree(newId);
   assert.equal(enabledServer.enabled, true);
-  assert.equal(enabledServer.tree_revision, revision, 'enabling the example graph changed its revision');
+  assert.equal(enabledServer.tree_revision, revision, 'enabling the imported graph changed its revision');
 
   await openCanvas();
   const after = await page.evaluate(async () => {
@@ -3578,11 +3425,11 @@ test('Task 8 · out-of-order tree switches keep the newest selection', async () 
   }
 });
 
-test('Task 8 · a tree switch that loses to Load example is discarded', async () => {
+test('Task 8 · a tree switch that loses to an import of the example document is discarded', async () => {
   await ensureBaselineTree();
   await openCanvas();
   const baseline = await serverTree(TREE_ID);
-  const STALE_ID = 'qa-example-stale';
+  const STALE_ID = 'qa-example-import-stale';
   const matcher = url => url.pathname === '/admin/trees/' + STALE_ID;
   let pending = null;
   await page.route(matcher, route => {
@@ -3592,24 +3439,31 @@ test('Task 8 · a tree switch that loses to Load example is discarded', async ()
   try {
     await page.evaluate(async id => {
       const { app } = await import('/console/routing/app.js');
-      window.__exampleRace = app.selectTree(id);
+      window.__exampleImportRace = app.selectTree(id);
     }, STALE_ID);
     const deadline = Date.now() + 5000;
     while (!pending && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
     assert.ok(pending, 'the tree switch GET was not issued');
 
-    await clickCanvasAction('cvLoadExample');
-    await waitConfirmDialog();
-    await page.locator('#cvConfirmBody [data-act="confirm-discard"]').click();
+    /* 基线草稿是 clean 的：导入不弹丢弃确认，直接在文件选择器里放示例文档。
+       导入同样整图替换并在应用前 bump loadSeq（applyImport）。 */
+    const chooser = page.waitForEvent('filechooser');
+    await clickCanvasAction('cvImport');
+    await (await chooser).setFiles({
+      name: 'example-graph.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(EXAMPLE))
+    });
     await waitFor(async expected => {
       const { app } = await import('/console/routing/app.js');
       const node = app.graph && app.graph.nodes.find(item => item.id === 'start');
-      /* 示例自带 local runtime：相对已保存的 mock 基线是 behavior dirty。 */
-      return app.treeId === expected.id && app.kind() === 'behavior' && !!node &&
+      /* 示例文档自带 local runtime：相对已保存的 mock 基线是 behavior dirty。 */
+      return app.treeId === expected.id && app.tree.name === expected.name &&
+        app.kind() === 'behavior' && !!node &&
         node.position.x === expected.start.x && node.position.y === expected.start.y;
-    }, { id: TREE_ID, start: EXAMPLE_START }, { timeout: 8000 });
+    }, { id: TREE_ID, name: EXAMPLE.name, start: EXAMPLE_START }, { timeout: 8000 });
 
-    /* 示例已落地，旧 switch 的回包现在才到：必须被 loadSeq 丢弃。 */
+    /* 导入已落地，旧 switch 的回包现在才到：必须被 loadSeq 丢弃。 */
     const stale = Object.assign(JSON.parse(JSON.stringify(baseline)), {
       id: STALE_ID,
       name: 'stale example response'
@@ -3621,12 +3475,12 @@ test('Task 8 · a tree switch that loses to Load example is discarded', async ()
     });
     pending = null;
     const results = await page.evaluate(async () => {
-      const value = await window.__exampleRace;
-      delete window.__exampleRace;
+      const value = await window.__exampleImportRace;
+      delete window.__exampleImportRace;
       return [value];
     });
     assert.deepEqual(results, [false],
-      'a switch that lost to an example load did not report itself as discarded');
+      'a switch that lost to an example document import did not report itself as discarded');
     const after = await page.evaluate(async () => {
       const { app } = await import('/console/routing/app.js');
       const node = app.graph.nodes.find(item => item.id === 'start');
@@ -3641,12 +3495,12 @@ test('Task 8 · a tree switch that loses to Load example is discarded', async ()
     });
     assert.deepEqual(after, {
       id: TREE_ID,
-      name: BASELINE.name,
+      name: EXAMPLE.name,
       kind: 'behavior',
       nodes: EXAMPLE_NODES,
       edges: EXAMPLE_EDGES,
       start: EXAMPLE_START
-    }, 'a stale tree switch overwrote the example graph');
+    }, 'a stale tree switch overwrote the imported example graph');
   } finally {
     if (pending) {
       try { await pending.abort(); } catch (error) { /* already gone */ }
@@ -3854,7 +3708,7 @@ test('Task 8 · cancelling New keeps an in-flight tree switch', async () => {
   }
 });
 
-test('Task 14 · New, Import and Load example stay inert until the canvas is booted', async () => {
+test('Task 14 · New and Import stay inert until the canvas is booted', async () => {
   let release = () => {};
   const gate = new Promise(resolve => { release = resolve; });
   const hold = async route => {
@@ -3873,7 +3727,7 @@ test('Task 14 · New, Import and Load example stay inert until the canvas is boo
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (t('cv.toastNotReady'));
 });
-    for (const id of ['cvNewTree', 'cvImport', 'cvLoadExample']) {
+    for (const id of ['cvNewTree', 'cvImport']) {
       await clearToasts();
       await clickCanvasAction(id);
       await waitToastIncludes(notReady);

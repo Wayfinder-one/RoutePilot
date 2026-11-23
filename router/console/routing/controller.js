@@ -126,7 +126,7 @@ export class RoutingController {
 
   loadTree(raw, saved) {
     /* 真正换树（新建/启动兜底/selectTree 成功）时让在途的 selectTree 回包过期。
-       示例与导入不走这里，它们在应用前各自 bump（见 loadExample / applyImport）。 */
+       示例已移除；导入不走这里，它在应用前自己 bump loadSeq（见 applyImport）。 */
     this.loadSeq += 1;
     const tree = normaliseTree(raw);
     this.treeId = raw && raw.id ? raw.id : newTreeId();
@@ -332,40 +332,6 @@ export class RoutingController {
     return true;
   }
 
-  async loadExample() {
-    /* 载入示例总是确认：clean 草稿用“替换整张图”文案，dirty 才提示丢弃改动。 */
-    const confirmed = await this.hooks.askDiscard('example',
-      this.store.dirtyKind === 'clean' ? CONFIRM_LOAD_EXAMPLE : null);
-    if (!confirmed) return false;
-    try {
-      const response = await fetch('routing/example.json', { cache: 'no-store' });
-      if (!response.ok) throw new Error('HTTP ' + response.status);
-      /* 示例文件是完整 v3 文档（画布坐标在顶层 canvas）：用 parseImport 校验并
-         把坐标分发回内部 node.position，再整图替换。 */
-      const parsed = RTGraph.parseImport(await response.text());
-      if (!parsed.ok) throw new Error(parsed.error);
-      /* 示例是整图替换（不走 loadTree）：应用前让在途的 switch 过期，
-         否则旧回包会在示例落地后把草稿盖回去。 */
-      this.loadSeq += 1;
-      /* 示例是完整自包含文档：整图替换时连运行配置一起换（旧示例文件没有 runtime
-         时就是 null，不能残留载入前的配置）。 */
-      if (this.hooks.change('behavior', tree => {
-        tree.root = RTGraph.clone(parsed.tree.root);
-        tree.runtime = RTGraph.clone(parsed.tree.runtime);
-      }) === false) {
-        return false;
-      }
-      this.hooks.fitAfterReplace();
-      this.hooks.toast(t('cv.toastExampleLoaded'));
-      return true;
-    } catch (error) {
-      this.hooks.toast(tf('cv.toastLoadFail', {
-        err: String(error && error.message != null ? error.message : error),
-      }), 'error');
-      return false;
-    }
-  }
-
   exportTree() {
     const tree = this.store.tree;
     if (!tree) return false;
@@ -463,10 +429,3 @@ export class RoutingController {
     this.applyImport(text);
   }
 }
-
-/* 载入示例总是确认；clean 草稿没有“丢弃”语义，用只描述替换整张图的文案。 */
-const CONFIRM_LOAD_EXAMPLE = {
-  title: 'cv.confirmLoadExample',
-  body: 'cv.confirmLoadExampleClean',
-  action: 'cv.confirmLoad',
-};
