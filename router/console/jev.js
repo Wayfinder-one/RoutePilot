@@ -82,7 +82,9 @@ function renderWindow(windowConfig) {
   paintWindowMsg();
 }
 
-/* 窗口字段的输入监听只挂一次；renderWindow 会在 boot / 保存 / 切语言时重绘预设。 */
+/* 窗口字段的输入监听只挂一次；renderWindow 只在 boot 与窗口保存成功后回填数值；
+   语言切换仅重算校验消息。预设按钮里只有数字、没有需要翻译的文本，静态窗口
+   说明由全局 data-i18n 处理，所以切语言不需要重建预设按钮，更不能回填数值。 */
 ['#winContext', '#winInput'].forEach(sel => {
   const el = $(sel);
   if (el) el.addEventListener('input', paintWindowMsg);
@@ -130,7 +132,12 @@ export async function testConnection(text) {
   return api.post('/admin/jev/test', { text }, { timeoutMs: 130000 });
 }
 
-onLangChange(() => renderWindow(windowLimits));
+/* 切语言只重算校验消息：renderWindow() 会用服务端值覆盖输入，把用户还没保存
+   的窗口草稿扔掉（甚至伪造成“已保存基线”）。paintWindowMsg() 从当前 DOM 重新
+   计算，既保留输入，也让已有的校验错误跟着换语言。 */
+onLangChange(() => {
+  paintWindowMsg();
+});
 
 async function boot() {
   const [jevBody, winBody] = await Promise.all([

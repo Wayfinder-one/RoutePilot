@@ -513,6 +513,56 @@ test('P0 decision service cancel after test failure preserves both saved stages'
   }
 });
 
+test('P0 decision service language switch preserves unsaved window draft', async () => {
+  const beforeWindow = await api('GET', '/admin/jev/window');
+  const draftContext = beforeWindow.context_tokens === 8192 ? 16384 : 8192;
+  const draftInput = draftContext / 4;
+  const invalidInput = draftContext * 2;
+  const writes = [];
+  const onRequest = request => {
+    const path = new URL(request.url()).pathname;
+    if ((path === '/admin/jev' || path === '/admin/jev/window') && request.method() === 'PUT') {
+      writes.push(path);
+    }
+  };
+  page.on('request', onRequest);
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(expected =>
+      document.getElementById('winContext').value === String(expected), beforeWindow.context_tokens);
+    await page.locator('#editConfig').click();
+    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
+    await page.locator('#winContext').fill(String(draftContext));
+    await page.locator('#winInput').fill(String(draftInput));
+
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('en');
+    });
+    assert.equal(await page.locator('#winContext').inputValue(), String(draftContext));
+    assert.equal(await page.locator('#winInput').inputValue(), String(draftInput));
+    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), true);
+
+    await page.locator('#winInput').fill(String(invalidInput));
+    assert.match(await page.locator('#windowMsg').innerText(),
+      /Input limit cannot exceed the service context budget/);
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    });
+    assert.equal(await page.locator('#winContext').inputValue(), String(draftContext));
+    assert.equal(await page.locator('#winInput').inputValue(), String(invalidInput));
+    assert.match(await page.locator('#windowMsg').innerText(), /输入截断上限不能大于服务上下文预算/);
+    assert.deepEqual(writes, [], 'language switches must not save the draft');
+  } finally {
+    page.off('request', onRequest);
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    }).catch(() => {});
+  }
+});
+
 test('P0 preset connection hides model ids by default and uses one save action', async () => {
   await page.goto(routerBase + '/console/models.html');
   await page.waitForSelector('#modelTable tr[data-mrow]');
