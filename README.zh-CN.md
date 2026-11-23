@@ -89,8 +89,8 @@ flowchart LR
 - 决策组顶栏只保留“检查路由”、主按钮与“更多”。新草稿的主按钮显示“保存并启用”；已启用的组显示“已启用”，有未发布修改时显示“保存并更新”。撤销/重做、自动整理、新建、导入、导出、保存草稿与停用都在“更多”里。检查器中的“应用”只更新本地草稿，不写服务端。
 - 图设置（检查器）从数据库 JEV 目录选择服务，并在同一个历史项里应用 **JEV 与其窗口**；“从数据库刷新运行配置”按目录重建草稿的 `backends`/`jev`/`jev_window`/`time_periods`。两者都只改本地草稿，不写服务端。
 - 模型页的“接入模型”是默认入口，可从预置目录一次完成提供方与模型接入；模型 ID 自动生成。预置弹窗的高级选项只放连接信息与模型位 ID，手工 ID、推理声明、档位、领域和提供方协议配置在自定义表单的高级选项里。
-- “决策服务”页是目录：左侧列出服务，右侧编辑选中的服务（地址、模型、`key_env`、密钥、超时、指令、State 模板、输入/上下文窗口）并测试连接。窗口属于服务本身，因此画布总是成组替换 JEV 与窗口。空目录首次启动可由 `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY` 播种一个 `default` 服务。
-- 编辑或删除仍被画布引用的模型、提供方或 JEV 服务会进入两步确认：第一次写入返回 409，列出每幅受影响画布（名称、id、启用状态、当前 `document_sha256`、使用位置）；确认后原样带回这些哈希，服务端只同步受影响的画布。仍被 target 引用的模型 / 仍被引用的 JEV 服务删除时必须提供替代项；仍被数据库模型或画布模型引用的提供方不能删除。确认同步成功后，已打开的画布需要重新加载（或使用“从数据库刷新运行配置”）——本地草稿不会被就地更新。
+- “决策服务”页是目录：左侧列出服务，右侧编辑选中的服务（地址、模型、`key_env`、密钥、超时、指令、State 模板、输入/上下文窗口）并测试连接。窗口属于服务本身，因此画布总是成组替换 JEV 与窗口。环境可用 `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY` 创建 `default` 服务，但只发生一次：仅当目录为空、从未用过环境种子、且 URL 与模型都配置时，启动才会播种。首启没有环境、之后补上环境仍会播种一次；删光所有服务后重启绝不会复活。
+- 编辑或删除仍被画布引用的模型、提供方或 JEV 服务会进入两步确认；没有被任何画布引用的资源会立即写入。第一次写入返回 409，列出每幅受影响画布（名称、id、启用状态、当前 `document_sha256`、使用位置）；确认后原样带回这些哈希，服务端只同步受影响的画布。仍被 target 引用的模型 / 仍被引用的 JEV 服务删除时必须提供替代项；仍被数据库模型或画布模型引用的提供方不能删除。确认同步成功后，已打开的画布需要重新加载（或使用“从数据库刷新运行配置”）——本地草稿不会被就地更新。
 
 ### 模型测试对话
 
@@ -223,7 +223,7 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
 
 四个运行字段的语义见[自包含画布 JSON](#自包含画布-json)。
 
-`tree_revision` 是 `{timezone, sticky, root}` 加四个运行字段的 canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。标题、能力说明、坐标、数组顺序与边 id 变化不影响该值。
+`tree_revision` 是 `{timezone, sticky, root}` 加四个运行字段的 canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。只影响展示的变化不影响该值：节点标题、target 的能力说明、坐标、数组顺序与边 id。会参与该值的是问题选项的能力说明（choice 问题），以及模型 profile 的能力说明与已声明推理档位——它们改变运行行为。
 
 ## 模型与推理
 
@@ -241,7 +241,9 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
 
 `GET /admin/models` 返回的 `profile` 为 JSON 对象；数据库以 JSON 文本存储。控制台与管理目录接口永远只读 SQLite——不再投影活动画布，目录写也不会自行重写任何画布。保存画布时才**选择**模型：所选模型及其提供方被加入快照；快照里已有同 ID 模型时，普通 target 编辑不会覆盖它（差异由检查提示报告，只有显式刷新或确认后的目录同步才会替换）。
 
-旧数据库 profile 仍按兼容规则宽松读取，但响应是脱敏投影：`api_key`、`authorization`、`key_present`、`key_source` 及其大小写/分隔符变体会从 `profile` 中递归剔除。这只是只读投影——合法元数据（`tier`、`domains`、`capability` 等）保留，数据库原行不被改写；图文件与管理写入仍严格拒绝这些字段，而不是清洗后保存。写入还会在落库前以 422 拒绝非 JSON 兼容数值（`NaN`、`Infinity`），读取/检查路径继续容忍旧行。
+旧数据库 profile 仍按兼容规则宽松读取，但响应是脱敏投影：`api_key`、`authorization`、`key_present`、`key_source` 及其大小写/分隔符变体会从 `profile` 中递归剔除。这只是只读投影——合法元数据（`tier`、`domains`、`capability` 等）保留，数据库原行不被改写；图文件与管理写入仍严格拒绝这些字段，而不是清洗后保存。
+
+非 JSON 兼容数值是唯一的例外：管理写入会以 422 拒绝 `NaN` / `Infinity`；若旧行里已经存了这类值，目录读取**不再**容忍——`GET /admin/models` 以及其他回显模型行的响应会 500，需要重新投影该行的确认后目录同步会返回 422。`/admin/try` 的画布与目录差异检查是 JSON 安全的：它在提示参数里把非有限值归一化，检查照常返回，所以检查路由不受影响。升级前请先修好这些行——见[旧 profile 中的非 JSON 兼容数值](#旧-profile-中的非-json-兼容数值)。
 
 删除或更新仍被已保存画布引用的模型/提供方是两步操作：第一次写入返回 409 `impact_confirmation_required`，携带每幅受影响画布与其当前 `document_sha256`；确认后的重试只同步这些画布。被 target 引用的模型删除时必须提供替代模型；被数据库模型或画布模型引用的提供方删除永远被拒绝（`provider_referenced`）——先解除引用。详见[目录影响确认](#目录影响确认)。
 
@@ -287,7 +289,7 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
 
 对既有部署，有两件变化。
 
-1. **SQLite schema 在首次启动时自动迁移。** schema v5 在一个事务内升级到 v6：旧的单行 `jev_config` 变成 id 为 `default` 的 `jev_services` 服务（已存密钥、端点、模型、提示词与超时保留；窗口被夹到合法范围），随后旧表被删除。升级前请备份 `router.db`（连同 `router.db-wal` / `router.db-shm`）；升级后没有回到旧单配置布局的路径。若目录为空，`ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` 会一次性播种该 `default` 服务，`ROUTER_JEV_API_KEY` 作为它的密钥写入。
+1. **SQLite schema 在首次启动时自动迁移。** schema v5 在一个事务内升级到 v6：旧的单行 `jev_config` 变成 id 为 `default` 的 `jev_services` 服务（已存密钥、端点、模型、提示词与超时保留；窗口被夹到合法范围），随后旧表被删除。升级前请备份 `router.db`（连同 `router.db-wal` / `router.db-shm`）；升级后没有回到旧单配置布局的路径。若 JEV 目录为空且从未用过环境种子，`ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` 会一次性创建该 `default` 服务，`ROUTER_JEV_API_KEY` 作为它的密钥写入；`settings.jev_catalog_seeded` 会记录这次播种，因此之后的任何重启都不会再创建 `default` 服务——即使所有服务都已被删除。
 2. **每份已存画布必须已经是完整快照。** 严格解析器会拒绝缺少任一运行字段的画布。升级前：
 
    - 备份 `ROUTER_GRAPH_DIR`（`graphs/*.json` 与 `current`）；
@@ -295,6 +297,32 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
    - 如果旧实例已无法操作，就按[自包含画布 JSON](#自包含画布-json)的结构与画布实际引用的模型、提供方、JEV 服务和时段，手工补齐每个 `graphs/*.json` 的四个字段。
 
 漏改的文件不会被静默修复：启动时记录 `initial graph snapshot is unavailable`，`/readyz` 报告未就绪，`GET /admin/trees` 返回 503 `graph_storage_error`，`/v1` Auto 路由没有可用快照（`no_valid_snapshot`），直到文件修好。启动成功后，旧格式文件仍然只是非法文件——永远不会被隐式接管或迁移。
+
+### 旧 profile 中的非 JSON 兼容数值
+
+还有一项独立于迁移本身的升级前数据检查。Python 的 JSON 读取器接受 `NaN`、`Infinity` 与 `-Infinity`，因此旧行可能在 `models.profile` 里保存这些值；它们不是合法 JSON，严格的目录响应无法序列化。
+
+症状：
+
+- `GET /admin/models`（以及其他回显模型行的响应）返回 **500** —— 序列化器抛出 `Out of range float values are not JSON compliant`；
+- 需要重新投影该行的**确认后**目录同步（例如不改 `profile` 的模型更新）返回 **422**，并点名出问题的路径；
+- `POST /admin/try` 不受影响：画布与目录差异检查会在提示 `params` 里归一化非有限值，检查仍返回 200 并给出 `runtime_mismatch` 提示。
+
+在 SQLite 里定位候选行：
+
+```bash
+sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;"
+```
+
+`json_valid(profile) = 0` 同时覆盖文本本身损坏的行（读取时按 `{}` 处理，无害但仍值得重写）与包含裸 `NaN` / `Infinity` 字面量的行（真正会打挂响应的那种）。要精确区分后者，用 Python 的 `json.loads` 解码每个命中行并查找非有限数值——普通 JSON 解析器会拒绝它们。
+
+修复这些行：
+
+- 首选：在控制台打开该模型，或 `PUT /admin/models/{id}` 提交修正后的有限 `profile`；若画布引用它，还要带上确认后的 409 影响载荷；
+- 最后手段：备份 `router.db` 后直接重写 JSON 文本，例如 `UPDATE models SET profile = '{}' WHERE id = '<model>';`；
+- 复核：`SELECT COUNT(*) FROM models WHERE json_valid(profile) = 0;` 必须返回 0。
+
+无需重启：目录在每次请求时都从 SQLite 读取。
 
 ## 自包含画布 JSON
 
@@ -331,7 +359,7 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
         "provider": "local",
         "profile": {
           "capability": "适合简单请求的本地轻量模型。",
-          "reasoning": { "efforts": { "off": null, "on": null }, "default": "on" }
+          "reasoning": { "format": "qwen-chat-template", "efforts": { "off": null, "on": null }, "default": "on" }
         }
       }
     ]
@@ -457,9 +485,9 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | `ROUTER_GRAPH_WRITER` | `true` | 是否允许写图；只应有一个写者 |
 | `ROUTER_HOST` | `127.0.0.1` | 监听地址 |
 | `ROUTER_PORT` | `8400` | 监听端口 |
-| `ROUTER_JEV_URL` | 空 | 播种 `default` JEV 服务的 base URL；仅在 JEV 目录为空时使用，与 `ROUTER_JEV_MODEL` 配对 |
-| `ROUTER_JEV_MODEL` | 空 | 播种 `default` JEV 服务的模型，与 `ROUTER_JEV_URL` 配对 |
-| `ROUTER_JEV_API_KEY` | 空 | 播种的 `default` 服务存储的密钥（其 `key_env` 为 `ROUTER_JEV_API_KEY`）；不是全局回退 |
+| `ROUTER_JEV_URL` | 空 | 一次性播种 `default` JEV 服务的 base URL；仅当 JEV 目录为空且从未用过环境种子时，随 `ROUTER_JEV_MODEL` 一起生效 |
+| `ROUTER_JEV_MODEL` | 空 | 一次性播种 `default` JEV 服务的模型，与 `ROUTER_JEV_URL` 配对 |
+| `ROUTER_JEV_API_KEY` | 空 | 一次性播种的 `default` 服务存储的密钥（其 `key_env` 为 `ROUTER_JEV_API_KEY`）；不是全局回退 |
 | `ROUTER_JEV_TIMEOUT` | `10` | 决策服务超时（秒） |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量 |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
@@ -516,6 +544,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 
 ```bash
 .venv/bin/python -m pytest -q
+node --test scripts/console_chat_test.mjs
 node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
     scripts/console_runtime_test.mjs scripts/graph_contract_test.mjs \
     scripts/console_impact_test.mjs

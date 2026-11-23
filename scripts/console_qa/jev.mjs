@@ -140,9 +140,8 @@ test('list shows key state without key material and delete removes a fresh servi
   assert.equal(await page.locator('text=' + SECRET).count(), 0,
     'the stored key material leaked into the list');
 
-  /* 未被任何画布引用的新服务可直接删除（两步确认）。 */
-  await page.locator('#jevDelete').click();
-  assert.match(await page.locator('#jevMsg').innerText(), /再次点击确认删除|Click again to confirm/);
+  /* 未被任何画布引用的新服务单击即删：共享影响确认只在有画布引用时介入，
+     本页没有本地的“再次点击确认”二次门。 */
   await page.locator('#jevDelete').click();
   await page.waitForFunction(() =>
     document.querySelectorAll('[data-jev-service-id="jev-key-state"]').length === 0,
@@ -151,8 +150,9 @@ test('list shows key state without key material and delete removes a fresh servi
 });
 
 /* ── Task 10 共享影响确认 + 测试运行态 ──────────────────────────────────
-   真实请求/响应断言：延迟的 test 请求期间按钮禁用；删除的本地上膛状态在保存
-   后复位；409 预览取消不写；确认请求体带精确哈希与 replacement_jev_id。 */
+   真实请求/响应断言：延迟的 test 请求期间按钮禁用；JEV 删除单击直接发
+   DELETE（无本地二次门）；409 预览取消不写；确认请求体带精确哈希与
+   replacement_jev_id。 */
 const IMPACT_HASH_D = 'd'.repeat(64);
 
 async function waitImpactOpen() {
@@ -210,20 +210,10 @@ test('Task 10 · a slow connection test paints the running state and disables se
   }
 });
 
-test('Task 10 · JEV delete resets the delete arm, then confirms exact hashes with replacement_jev_id', async () => {
+test('Task 10 · JEV delete sends one DELETE, then confirms exact hashes with replacement_jev_id', async () => {
   await openPage();
   const id = 'qa-jev-impact';
   await createJev({ id, model: 'd1-impact', input: 1024 });
-  /* 先上膛再保存：保存成功必须复位“确认删除”，否则一次点击就能误删。 */
-  await page.locator('#jevDelete').click();
-  assert.match(await page.locator('#jevDelete').innerText(), /确认删除|Confirm delete/);
-  await page.locator('#jevSave').click();
-  await page.waitForFunction(() => document.getElementById('jevSave').disabled === false,
-    null, { timeout: 8000 });
-  assert.doesNotMatch(await page.locator('#jevDelete').innerText(), /确认删除|Confirm delete/,
-    'the delete button kept the armed label after a successful save');
-  assert.equal(await page.locator('#jevTestResult').evaluate(element => element.dataset.state), 'untested',
-    'a save did not reset the per-service test result');
 
   const writes = [];
   const matcher = '**/admin/jev/' + id;
@@ -259,14 +249,12 @@ test('Task 10 · JEV delete resets the delete arm, then confirms exact hashes wi
   });
   expectHttpStatusError({ url: new RegExp('/admin/jev/' + id + '$'), status: /409/ });
   try {
-    /* 复位后的第一次点击只上膛，不发 DELETE。 */
-    await page.locator('#jevDelete').click();
-    assert.match(await page.locator('#jevMsg').innerText(), /再次点击确认删除|Click again to confirm/);
-    await page.waitForTimeout(200);
-    assert.equal(writes.length, 0, 'the first delete click already sent a DELETE');
+    /* 共享影响确认是唯一确认机制：单击直接发 DELETE。未被引用的服务会立即删除；
+       这里被引用的服务由 409 打开影响框，确认后才带精确哈希重试。 */
     await page.locator('#jevDelete').click();
     await waitImpactOpen();
-    assert.equal(writes.length, 1, 'the 409 preview was followed by a second write');
+    assert.equal(writes.length, 1,
+      'the first delete click did not send exactly one DELETE preview');
     const modalText = (await page.locator('#impactBody').innerText()).replace(/\s+/g, ' ');
     assert.match(modalText, /电力优先决策组/, 'the impact list did not name the affected canvas: ' + modalText);
     /* JEV 被引用时删除必须选替代服务：选择前确认按钮禁用。 */

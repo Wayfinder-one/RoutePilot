@@ -14,9 +14,10 @@
      与连接测试只重绘文案/结果，绝不回填表单值（不覆盖草稿）；
    - 测试结果 / 原始响应属于“当前服务”：切换、新建、保存后复位，避免把上一个
      服务的结果显示在新服务上；
-   - 删除的本地“再次点击确认”只是防误触；真正的影响确认（409
-     `impact_confirmation_required`）走共享 impact.js：确认后带精确哈希与
-     `replacement_jev_id` 重试，取消不发任何写请求，陈旧哈希只提示重新加载。
+   - 删除的唯一确认机制是共享 impact.js（409 `impact_confirmation_required`）：
+     单击直接发 DELETE，被画布引用的服务由影响框确认后带精确哈希与
+     `replacement_jev_id` 重试，取消不发任何写请求，陈旧哈希只提示重新加载；
+     没有本地的“再次点击确认”二次门。
    ------------------------------------------------------------------ */
 import { apiErrText } from './api.js';
 import { LANG, onLangChange, t, tf } from './i18n.js';
@@ -43,8 +44,6 @@ let currentId = null;
 let creating = false;
 let saving = false;
 let testing = false;
-let deleteArmed = false;
-let deleteArmTimer = null;
 let keyPresent = false;
 let lastTest = { state: 'untested', selectedKey: '', ms: null };
 
@@ -337,7 +336,6 @@ function selectService(id) {
   storeCurrentDraft();
   currentId = id;
   creating = false;
-  resetDeleteArm();
   resetTestResult();
   keyPresent = !!service.key_present;
   const draft = drafts.get(id) || draftFromService(service);
@@ -354,7 +352,6 @@ function newService() {
   storeCurrentDraft();
   currentId = null;
   creating = true;
-  resetDeleteArm();
   resetTestResult();
   keyPresent = false;
   fillDraft(blankDraft());
@@ -370,9 +367,7 @@ function newService() {
 function applyService(service) {
   currentId = service.id;
   creating = false;
-  /* 保存/应用成功即重置本地删除上膛与测试结果：配置已变，旧的确认状态与
-     旧测试结果都不能泄漏到下一次交互。 */
-  resetDeleteArm();
+  /* 保存/应用成功即重置测试结果：配置已变，旧结果不能泄漏到下一次交互。 */
   resetTestResult();
   keyPresent = !!service.key_present;
   const draft = draftFromService(service);
@@ -486,48 +481,19 @@ async function runTest() {
   }
 }
 
-function resetDeleteArm() {
-  deleteArmed = false;
-  if (deleteArmTimer) {
-    clearTimeout(deleteArmTimer);
-    deleteArmTimer = null;
-  }
-  const btn = $('#jevDelete');
-  if (!btn) return;
-  btn.dataset.armed = '0';
-  btn.classList.remove('armed');
-  btn.textContent = t('jev.delete');
-}
-
 async function deleteService() {
   if (!ACTIONS || saving) return;
   if (creating || !currentId) {
     showMessage(t('jev.msgPickService'), true);
     return;
   }
-  if (!deleteArmed) {
-    deleteArmed = true;
-    const btn = $('#jevDelete');
-    if (btn) {
-      btn.dataset.armed = '1';
-      btn.classList.add('armed');
-      btn.textContent = t('jev.confirmDelete');
-    }
-    showMessage(tf('jev.msgDeleteArmed', { id: currentId }), false);
-    if (deleteArmTimer) clearTimeout(deleteArmTimer);
-    deleteArmTimer = setTimeout(() => {
-      deleteArmTimer = null;
-      if (deleteArmed) resetDeleteArm();
-    }, 3500);
-    return;
-  }
   const deletedId = currentId;
-  resetDeleteArm();
   saving = true;
   setBusy(true);
   try {
-    /* 被画布引用的服务：第一次 DELETE 只拿 409 影响预览；确认框里必须选择
-       替代服务（replacement_jev_id），取消则不写任何东西。 */
+    /* 单击即发 DELETE：未被画布引用的服务直接删除；被引用的服务第一次 DELETE
+       只拿 409 影响预览，共享影响框是唯一确认机制，确认时必须选择替代服务
+       （replacement_jev_id），取消则不写任何东西。 */
     const outcome = await withImpactConfirmation(context => ACTIONS.deleteService(
       deletedId,
       context ? {
@@ -613,7 +579,6 @@ onLangChange(() => {
   renderList();
   paintStatus();
   paintTestStored();
-  resetDeleteArm();
   /* #jevMsg 里存的是已翻译好的句子：切换语言后清空，避免中英混排。 */
   showMessage('', false);
 });

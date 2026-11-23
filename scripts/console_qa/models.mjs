@@ -346,14 +346,12 @@ test('P0 decision service paints the custom test default in English on first loa
   }
 });
 
-test('P0 decision service deletes an unreferenced service after an explicit confirmation', async () => {
+test('P0 decision service deletes an unreferenced service with one click', async () => {
   await openJevDirectory();
   const id = 'qa-jev-delete';
   await createJevService({ id, model: 'd1-delete' });
   await page.locator('[data-jev-service-id="' + id + '"]').click();
-  /* 删除是两步确认：第一次只上膛，第二次才真正发 DELETE。 */
-  await page.locator('#jevDelete').click();
-  assert.match(await page.locator('#jevMsg').innerText(), /确认删除|Click again to confirm/);
+  /* 共享影响确认是唯一确认机制：没有画布引用的服务单击即删，不存在本地二次门。 */
   await page.locator('#jevDelete').click();
   await page.waitForFunction(serviceId =>
     document.querySelectorAll('[data-jev-service-id="' + serviceId + '"]').length === 0,

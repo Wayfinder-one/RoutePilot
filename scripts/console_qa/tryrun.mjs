@@ -1147,4 +1147,98 @@ test('try result keeps the graph and verdict without an execution trace drawer',
   assert.equal(state.execHeight, false, 'the removed execution resize left a pinned height');
 });
 
+/* ── Task 16 · 画布/目录漂移是 hint-only ───────────────────────────────
+   真实 /admin/try 路径：把**画布草稿快照**里的模型 capability 改成与数据库
+   目录不同，服务端会把它作为 runtime_mismatch（level=hint）返回；控制台必须
+   渲染可见的提示行，且结论/运行态保持正常，不能升级成 routing_error。 */
+test('Task 16 · catalog drift renders hint-only rows and never flips the run to an error', async () => {
+  await prepareTryCanvas();
+  const drift = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const models = app.tree.runtime.backends.models;
+    const model = models.find(item => item && item.profile) || models[0];
+    const previous = {
+      id: model.id,
+      profile: JSON.parse(JSON.stringify(model.profile || {}))
+    };
+    model.profile = Object.assign({}, model.profile || {}, {
+      capability: 'QA 画布快照里的旧能力说明（与数据库目录不同）'
+    });
+    return previous;
+  });
+  try {
+    await runTrySample(0);
+    const snap = await trySnapshot();
+    /* 执行结论仍来自画布快照；提示不许把试算变成失败态。 */
+    assert.equal(snap.final.target_id, 'power-target',
+      'a hint-only drift changed the routing outcome');
+    assert.equal(snap.resultKind, 'target', 'a hint-only drift changed the result kind');
+    assert.equal(snap.resultHidden, false, 'a hint-only drift hid the verdict panel');
+    assert.equal(snap.running, false, 'a hint-only drift left the run lock on');
+    assert.equal(snap.runDisabled, false, 'the run button stayed disabled after a hint-only result');
+    const replay = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        error: app.replay.error || null,
+        warnings: app.replay.warnings.map(item => ({ code: item.code, level: item.level }))
+      };
+    });
+    assert.equal(replay.error, null, 'a catalog drift hint produced a routing error');
+    assert.deepEqual(
+      replay.warnings.filter(item => item.code === 'runtime_mismatch').map(item => item.level),
+      ['hint'], 'runtime_mismatch was not reported as a hint');
+
+    /* 提示列表可见，并逐行给出画布/数据库两侧值。 */
+    const hint = await page.evaluate(() => {
+      const host = document.getElementById('cvTryResult');
+      const box = host.querySelector('[data-runtime-mismatch]');
+      if (!box) return null;
+      const style = getComputedStyle(box);
+      return {
+        count: Number(box.dataset.runtimeMismatch),
+        visible: !!(box.offsetWidth || box.offsetHeight || box.getClientRects().length) &&
+          style.display !== 'none' && style.visibility !== 'hidden',
+        title: (box.querySelector('.rtc-try-cmp-l') || { textContent: '' }).textContent.trim(),
+        rows: [...box.querySelectorAll('.rtc-try-cmp .rtc-try-note')].map(row => ({
+          text: row.textContent.replace(/\s+/g, ' ').trim(),
+          warn: row.classList.contains('is-warn')
+        })),
+        errorBadge: !!host.querySelector('[data-routing-error]'),
+        errorKind: !!host.querySelector('.rtc-try-kind.is-fb'),
+        kind: host.dataset.kind,
+        errorAttr: host.dataset.error || ''
+      };
+    });
+    assert.ok(hint, 'the runtime_mismatch hint list is missing from the result panel');
+    assert.equal(hint.count, 1, 'the result panel reported the wrong hint count: ' + hint.count);
+    assert.equal(hint.visible, true, 'the runtime_mismatch hint list is hidden');
+    assert.match(hint.title, /目录差异|Catalog drift/,
+      'the hint list has no localized title: ' + hint.title);
+    assert.equal(hint.rows.length, 1, 'the hint list did not render exactly one drift row');
+    assert.match(hint.rows[0].text, new RegExp(drift.id),
+      'the drift row does not name the model: ' + hint.rows[0].text);
+    assert.match(hint.rows[0].text, /profile\.capability/,
+      'the drift row does not name the differing field: ' + hint.rows[0].text);
+    assert.match(hint.rows[0].text, /画布|canvas/,
+      'the drift row does not show the canvas value: ' + hint.rows[0].text);
+    assert.match(hint.rows[0].text, /数据库|database/,
+      'the drift row does not show the database value: ' + hint.rows[0].text);
+    assert.equal(hint.rows[0].warn, true, 'the drift row is not styled as a warning hint');
+    assert.equal(hint.errorBadge, false, 'a hint-only drift rendered the routing-error badge');
+    assert.equal(hint.errorKind, false, 'a hint-only drift rendered the error kind badge');
+    assert.equal(hint.kind, 'target', 'a hint-only drift changed the result kind');
+    assert.equal(hint.errorAttr, '', 'a hint-only drift set the error dataset');
+    await screenshot('task16-runtime-mismatch-hint.png');
+  } finally {
+    await page.evaluate(async previous => {
+      const { app } = await import('/console/routing/app.js');
+      const model = app.tree.runtime.backends.models.find(item => item.id === previous.id);
+      if (model) model.profile = previous.profile;
+      const RTTryRun = await import('/console/routing/tryrun.js');
+      RTTryRun.clear();
+    }, drift).catch(() => {});
+    await ensureBaselineTree();
+  }
+});
+
 await runIfMain(import.meta.url);

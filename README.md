@@ -87,10 +87,10 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 ### Common paths
 
 - The decision-group toolbar shows only **Check routing**, the primary action and **More**. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. **More** holds undo/redo, auto-layout, New, Import, Export, Save draft and Disable. The inspector's **Apply** only updates the local draft and never writes to the server.
-- Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
+- Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime config from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
-- The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The first start of an empty catalog can seed a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`.
-- Editing or deleting a model, provider or JEV service that a canvas references raises a two-step confirmation. The first write returns 409 with every affected canvas (name, id, enabled, current `document_sha256`, usage); confirming sends those exact hashes back and the server synchronizes only the affected canvases. Model/JEV deletes that are still referenced need a replacement; a provider that a database model or a canvas model still references cannot be deleted at all. After a confirmed sync, reload every already-open canvas (or use **Refresh runtime from database**) — open drafts are not updated in place.
+- The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The environment can create a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`, but only once: it is seeded on a start where the catalog is empty, no environment seed has ever run, and the URL and model are both set. A first boot without them followed by a boot with them still seeds once; deleting every service and restarting never re-creates it.
+- Editing or deleting a model, provider or JEV service that a canvas references raises a two-step confirmation; a resource that no canvas references is written immediately. The first write returns 409 with every affected canvas (name, id, enabled, current `document_sha256`, usage); confirming sends those exact hashes back and the server synchronizes only the affected canvases. Model/JEV deletes that are still referenced need a replacement; a provider that a database model or a canvas model still references cannot be deleted at all. After a confirmed sync, reload every already-open canvas (or use **Refresh runtime config from database**) — open drafts are not updated in place.
 
 ### Model test chat
 
@@ -223,7 +223,7 @@ This experimental version does not accept legacy NOT graphs. Any `logic/operator
 
 The four run fields are described in [Self-contained canvas JSON](#self-contained-canvas-json).
 
-`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}` plus the four run fields, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Title, capability, position, array order and edge-id changes do not affect it.
+`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}` plus the four run fields, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Display-only changes do not affect it: node titles, target `capability`, positions, array order and edge ids. Question-option `capability` (choice questions) and the model-profile capability and declared reasoning **do** participate, because they change runtime behaviour.
 
 ## Models and reasoning
 
@@ -241,7 +241,9 @@ Reasoning dialects: OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai
 
 `GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text. The console and the admin catalog endpoints always read SQLite — they never project the active canvas, and a catalog write never rewrites a canvas on its own. Saving a canvas **selects** models: the chosen model and its provider are added to the snapshot; a model with the same ID already in the snapshot is not overwritten by normal target editing (drift is reported by the check hints, and replaced only by an explicit refresh or a confirmed catalog sync).
 
-Legacy database profiles are still read leniently, but the response is a sanitized projection: `api_key`, `authorization`, `key_present`, `key_source` and their case/separator variants are removed recursively from `profile`. This is read-only — legal metadata (`tier`, `domains`, `capability`, …) is preserved and the database row is never rewritten. Graph files and management writes still reject those fields rather than cleaning them. Writes also reject non-JSON-compliant numbers (`NaN`, `Infinity`) with 422 before they can reach the database, while the read/check paths keep tolerating old rows.
+Legacy database profiles are still read leniently as a sanitized projection: `api_key`, `authorization`, `key_present`, `key_source` and their case/separator variants are removed recursively from `profile`. This is read-only — legal metadata (`tier`, `domains`, `capability`, …) is preserved and the database row is never rewritten. Graph files and management writes still reject those fields rather than cleaning them.
+
+Non-JSON-compatible numbers are the one exception: management writes reject `NaN` / `Infinity` with 422, and a legacy row that already stores one is **not** tolerated by the catalog response — `GET /admin/models` and every other model echo return 500, and a confirmed catalog sync that has to re-project that row returns 422. The `/admin/try` canvas-vs-catalog drift check is JSON-safe: it normalizes non-finite values inside its hint parameters and keeps answering, so routing checks are unaffected. Fix such rows before upgrading — see [Legacy profiles with non-finite numbers](#legacy-profiles-with-non-finite-numbers).
 
 Deleting or updating a model or provider that a saved canvas references is a two-step operation: the first write returns 409 `impact_confirmation_required` with every affected canvas and its current `document_sha256`; the confirmed retry synchronizes only those canvases. Deleting a model still referenced by a target requires a replacement model; deleting a provider that a database model or a canvas model still references is always rejected (`provider_referenced`) — release the references first. See [Catalog impact confirmation](#catalog-impact-confirmation).
 
@@ -287,7 +289,7 @@ Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUT
 
 Two things change for an existing deployment.
 
-1. **The SQLite schema migrates automatically on first start.** Schema v5 upgrades to v6 inside one transaction: the old single-row `jev_config` becomes the `jev_services` service with id `default` (stored key, endpoint, model, prompts and timeout are preserved; the window is clamped to legal bounds), and the old table is dropped. Back up `router.db` (with `router.db-wal` / `router.db-shm`) before the upgrade; there is no path back to the old single-configuration layout. If the catalog is empty, `ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` seed that `default` service once, and `ROUTER_JEV_API_KEY` is stored as its key.
+1. **The SQLite schema migrates automatically on first start.** Schema v5 upgrades to v6 inside one transaction: the old single-row `jev_config` becomes the `jev_services` service with id `default` (stored key, endpoint, model, prompts and timeout are preserved; the window is clamped to legal bounds), and the old table is dropped. Back up `router.db` (with `router.db-wal` / `router.db-shm`) before the upgrade; there is no path back to the old single-configuration layout. If the JEV catalog is empty and the environment seed has never run, `ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` create that `default` service once, with `ROUTER_JEV_API_KEY` stored as its key; `settings.jev_catalog_seeded` records the seed, so a later restart never re-creates a `default` service — not even after every service was deleted.
 2. **Every stored canvas must already be a full snapshot.** The strict parser rejects a canvas that lacks any of the four run fields. Before upgrading:
 
    - back up `ROUTER_GRAPH_DIR` (the `graphs/*.json` files and `current`);
@@ -295,6 +297,32 @@ Two things change for an existing deployment.
    - if the old instance can no longer be operated, add the four fields to each `graphs/*.json` by hand, following the shape in [Self-contained canvas JSON](#self-contained-canvas-json) and the canvas's actual models, providers, JEV service and periods.
 
 A missed file is not silently repaired: startup logs `initial graph snapshot is unavailable`, `/readyz` reports not ready, `GET /admin/trees` answers 503 `graph_storage_error`, and `/v1` Auto routing has no snapshot (`no_valid_snapshot`) until the file is fixed. After a successful start, an old-format file is still only an invalid file — it is never adopted or migrated implicitly.
+
+### Legacy profiles with non-finite numbers
+
+One pre-upgrade data check is separate from the migration itself. Python's JSON reader accepts `NaN`, `Infinity` and `-Infinity`, so an old row can store them inside `models.profile`; they are not valid JSON and the strict catalog response cannot serialize them.
+
+Symptoms:
+
+- `GET /admin/models` (and other responses that echo the model row) fail with **500** — the serializer raises `Out of range float values are not JSON compliant`;
+- a **confirmed** catalog sync that has to re-project that row (for example a model update that leaves `profile` unchanged) answers **422** and names the offending path;
+- `POST /admin/try` is unaffected: the canvas-vs-catalog drift check normalizes non-finite values in its hint `params`, so checks still answer 200 with `runtime_mismatch` hints.
+
+Locate the candidate rows in SQLite:
+
+```bash
+sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;"
+```
+
+`json_valid(profile) = 0` covers both rows whose text is malformed (read as `{}`, harmless but still worth rewriting) and rows holding a bare `NaN` / `Infinity` token (the breaking case). To spot the latter precisely, decode each hit with Python's `json.loads` and look for non-finite numbers — ordinary JSON parsers reject them.
+
+Repair the rows:
+
+- preferred: open the model in the console, or `PUT /admin/models/{id}` with a corrected finite `profile` and, when a canvas references it, the confirmed 409 impact payload;
+- last resort: back up `router.db`, then rewrite the JSON text directly, e.g. `UPDATE models SET profile = '{}' WHERE id = '<model>';`;
+- verify that every row is valid again: `SELECT COUNT(*) FROM models WHERE json_valid(profile) = 0;` must return 0.
+
+No restart is needed: the catalog is read from SQLite on every request.
 
 ## Self-contained canvas JSON
 
@@ -331,7 +359,7 @@ Every saved canvas is a portable, immutable run snapshot: one file restores a de
         "provider": "local",
         "profile": {
           "capability": "Fast small model for simple requests.",
-          "reasoning": { "efforts": { "off": null, "on": null }, "default": "on" }
+          "reasoning": { "format": "qwen-chat-template", "efforts": { "off": null, "on": null }, "default": "on" }
         }
       }
     ]
@@ -457,9 +485,9 @@ The first start against an empty users table seeds the admin account. An empty g
 | `ROUTER_GRAPH_WRITER` | `true` | Allow graph writes; run exactly one writer |
 | `ROUTER_HOST` | `127.0.0.1` | Listener host |
 | `ROUTER_PORT` | `8400` | Listener port |
-| `ROUTER_JEV_URL` | empty | Seed base URL for the `default` JEV service; only used while the JEV catalog is empty, paired with `ROUTER_JEV_MODEL` |
-| `ROUTER_JEV_MODEL` | empty | Seed model for the `default` JEV service; paired with `ROUTER_JEV_URL` |
-| `ROUTER_JEV_API_KEY` | empty | Key stored for the seeded `default` service (its `key_env` is `ROUTER_JEV_API_KEY`); not a global fallback |
+| `ROUTER_JEV_URL` | empty | One-time seed base URL for the `default` JEV service; used only on a start where the JEV catalog is empty and no environment seed has run yet, paired with `ROUTER_JEV_MODEL` |
+| `ROUTER_JEV_MODEL` | empty | One-time seed model for the `default` JEV service; paired with `ROUTER_JEV_URL` |
+| `ROUTER_JEV_API_KEY` | empty | Key stored for the one-time seeded `default` service (its `key_env` is `ROUTER_JEV_API_KEY`); not a global fallback |
 | `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout, seconds |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity |
 | `ROUTER_USER_AUTH` | `true` | Console authentication |
@@ -516,6 +544,7 @@ Configuration endpoints: `/admin/models`, `/admin/providers`, `/admin/jev`, `/ad
 
 ```bash
 .venv/bin/python -m pytest -q
+node --test scripts/console_chat_test.mjs
 node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
     scripts/console_runtime_test.mjs scripts/graph_contract_test.mjs \
     scripts/console_impact_test.mjs
