@@ -28,7 +28,7 @@
 | 决策服务 | 多服务 JEV 目录中的 `demo-jev` = llama.cpp `d1-2B`（`127.0.0.1:30104`），每服务独立窗口 `2048 / 4096`，单次请求多问题合并打分 |
 | 演示上游 | provider `demo-tap` → `http://127.0.0.1:9300/v1`（tap 代理，映射见 `infra.md` §2.2） |
 | 部署/校验脚本 | `python3 scripts/demo/apply_cases.py [--confirm-sync]`（案例 JSON 是唯一事实源；遇到影响确认默认打印清单并停止） |
-| 图文件 | `configs/cases/case-*.json`（5 份可直接导入的完整 v3 文档）+ `configs/cases/manifest.json`（决策组 id/名称、演示 prompt 与期望） |
+| 图文件 | `configs/cases/case-*.json`（5 份可直接导入的完整 v3 文档，导入路径见 §8.4）+ `configs/cases/manifest.json`（决策组 id/名称、演示 prompt 与期望） |
 
 ### 1.3 5 棵决策组清单
 
@@ -568,12 +568,17 @@ python3 scripts/demo/apply_cases.py --confirm-sync       # 重跑：显式确认
   `document_sha256` 作为 `base_document_sha256`）、否则 `POST`；**从不调用 enable/disable**。
 - 每条 prompt 断言：HTTP 200、`outcome.target_id`、`outcome.model`、`outcome.reasoning`（案例三）、
   `candidates` 集合，以及 `warnings` 为空（启用级校验）。
-- 退出码：0 = 全部通过；1 = 任一目录/画布写入失败、影响确认停止或 dry-run 期望不匹配。
+- 最终状态检查以**部署前**从 `GET /admin/trees` 读到的 enabled 集合为基线：5 棵演示树必须全部
+  未启用，该集合必须原样保持（影响确认同步只更新受影响画布的文档，不改 enabled 状态）。
+  全新实例部署前没有 enabled 组，部署后仍为空即正确——脚本不会凭空启用任何演示树；启用某棵树
+  是单独的演示动作（`POST /admin/trees/{id}/enable`）。
+- 退出码：0 = 全部通过；1 = 任一目录/画布写入失败、影响确认停止、dry-run 期望不匹配或最终状态不符。
 - 可用环境变量覆盖连接参数：`SR_BASE_URL` / `SR_ADMIN_EMAIL` / `SR_ADMIN_PASSWORD`。
 
 ### 8.2 实测结果
 
-2026-11-03 首次部署（严格快照前基线，dry-run 命中结果）：
+2026-11-03 首次部署（严格快照前基线，dry-run 命中结果；当时 76 实例部署前已有 `default-jev`
+处于 enabled）：
 
 ```
 provider demo-tap: base_url=http://127.0.0.1:9300/v1 format=openai
@@ -591,32 +596,49 @@ models: 15 个演示模型就绪（provider=demo-tap），推理声明与能力�
 jev: demo-jev @ http://127.0.0.1:30104 window=2048/4096 就绪
 time_periods: 2 个演示时段就绪（白天, 夜间）
 tree case-industry: created …（5 棵树全部 created，未 enable）
-首次部署 OK；enabled: []
+首次部署 OK；最终状态检查：部署前无 enabled 组，部署后 enabled 仍为空 []
 二次运行：在 provider demo-tap 处 409 impact_confirmation_required 停止，affected: 5
 加 --confirm-sync 重跑：provider/model/JEV/时段目录 409 → 确认哈希后同步成功
 tree case-industry: updated …（5 棵树 updated）→ dry-run 22/22 命中 ✓
 ```
 
-即：未确认时目录、五份画布字节与审计零改动；确认后只同步受影响的画布，画布文件仍是严格
-自包含文档（四运行字段齐全，`GET /admin/trees` 可见四字段与 `document_sha256`）。
+- 上面的 `enabled: []` 是**全新实例**（部署前没有任何 enabled 决策组）的正确终态：脚本只部署
+  5 棵案例画布且保持 `enabled=false`，启用是后续单独的演示动作；最终状态检查以部署前集合为
+  基线，所以不会再误报缺少 `default-jev`（旧实现写死要求 `['default-jev']`，在全新实例上会
+  假失败并以退出码 1 结束）。
+- 在 76 这类既有实例上，部署前 `default-jev` 已 enabled：最终状态检查要求它部署后仍然
+  enabled；若演示树被误启用（集合新增成员）则报错退出 1。
+- 即：未确认时目录、五份画布字节与审计零改动；确认后只同步受影响的画布，画布文件仍是严格
+  自包含文档（四运行字段齐全，`GET /admin/trees` 可见四字段与 `document_sha256`）。
 
 ### 8.3 注意
 
 - 若刚跑过案例五的实时熔断注入（`ha-fail` 处于熔断期），重跑 `apply_cases.py` 时案例五的
   dry-run 会选到 `ha-general` 或直接 503 —— 这是熔断状态的正常副作用，不是配置错误；
   等 300s 半开窗口或按 §7.4 清 `breaker` 表后重跑即恢复。
-- 实时取证会 enable/disable 各树，与「default-jev 最终 enabled」的检查存在时序竞争：
-  以 evidence 取证结束后的状态为准（task-3/4 负责恢复 default-jev）。
+- 实时取证会 enable/disable 各树。`apply_cases.py` 的最终状态检查以**本次运行部署前**的
+  enabled 集合为基线：部署前 `default-jev` enabled → 部署后必须仍 enabled；部署前没有
+  enabled 组（全新实例）→ 部署后为空即正确。若演示树在运行前仍处于 enabled（取证中断未
+  恢复），`step_trees` 会明确报错停止——脚本从不主动 enable/disable 任何树，恢复
+  `default-jev` 仍由取证脚本负责（task-3/4）。
 - 首次部署后如需再次执行，必须按 §8.1 的两种结果处理：默认会在第一个受影响目录写处停止，
   这是有意的安全行为，不是失败；加 `--confirm-sync` 才是「确认同步」。
+- `run_cases.py` 的「默认 409 停止」只保证**不写主证据 JSON**：平台快照阶段（阶段 1）早于
+  后续管理写，若在更晚的 409 处停止，它可能已经创建 `evidence/` 目录并写入平台阶段的
+  `evidence/trees-export.json`——这不代表取证跑完，也不代表主证据已生成。主证据
+  （`case-*.json` / `probes.json` / `platform.json` / `summary.json`）只在完整跑完后写入；
+  判断结果请以退出码（2 = 中止）和停止日志为准，不要把半成品目录当成完整证据。
 
 ### 8.4 严格的运行快照与升级注意
 
 - 每份案例 JSON 都是完整 v3 文档：`kind: "sr-routing-graph"`、`version: 3`、四个必填运行字段
   `backends` / `jev` / `jev_window` / `time_periods`；**没有**外部 `id` / `enabled`（决策组 id
   由 `manifest.json` 的 `tree_file`/文件名关联）。
-- 通过管理 API 部署画布时（`POST /admin/trees` / `PUT /admin/trees/{id}`），请求体携带
-  `name / root / sticky / timezone` + 四个运行字段，剔除 `kind` / `version` / `id` / `enabled`；
+- 「可直接导入」指**控制台/文件导入**路径：导入接口解析完整 v3 文档，`kind` / `version` 信封
+  字段是允许且必需的。`apply_cases.py` 走管理 API（`POST /admin/trees` / `PUT /admin/trees/{id}`），
+  该 DTO 以 `extra="forbid"` 禁止信封字段，因此脚本在提交前显式剔除 `kind` / `version` / `id` /
+  `enabled`（见上游 `test_upsert_tree_strips_envelope_and_carries_runtime`）。
+- 通过管理 API 部署画布时，请求体携带 `name / root / sticky / timezone` + 四个运行字段；
   业务操作（`/admin/try`）同理：带 `tree_id` 时继承已存快照，带完整草稿时必须四字段齐全。
 - 严格拒绝：缺任一个运行字段、只带部分字段、`runtime: null`、旧文档（无运行字段）都会以
   `graph_parse_error` 422 拒绝；不存在从数据库目录补齐运行配置的回退，也没有物化步骤。

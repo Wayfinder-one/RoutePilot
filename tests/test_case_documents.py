@@ -40,8 +40,6 @@ CASES_DIR = REPO_ROOT / "configs" / "cases"
 SCRIPTS_DIR = REPO_ROOT / "scripts" / "demo"
 APPLY_CASES = SCRIPTS_DIR / "apply_cases.py"
 RUN_CASES = SCRIPTS_DIR / "run_cases.py"
-EVIDENCE_PLATFORM = (REPO_ROOT / "docs" / "案例演示-2026-11-03"
-                     / "evidence" / "platform.json")
 
 DEMO_PROVIDER = "demo-tap"
 DEMO_PROVIDER_BASE_URL = "http://127.0.0.1:9300/v1"
@@ -53,6 +51,17 @@ DEMO_JEV_MODEL = "d1-2B"
 DEMO_JEV_TIMEOUT_SECONDS = 10.0
 DEMO_INPUT_TOKENS = 2048
 DEMO_CONTEXT_TOKENS = 4096
+
+#: 五份案例内嵌的 JEV 指令/状态模板（2026-11-03 线上实例实测值，逐字钉死）。
+#: 旧测试只在 gitignore 的 ``docs/.../evidence/platform.json`` 存在时才比对，干净
+#: checkout / CI 里等于没测；现在无条件断言，prompt 被改写会直接失败。
+DEMO_JEV_INSTRUCTIONS = (
+    "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，"
+    "选择最合适处理这条请求的模型。"
+)
+DEMO_JEV_STATE_TEMPLATE = (
+    "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+)
 
 #: 每个案例必须内嵌的模型 ID 全集（按案例文档实际内容钉死，增删即失败）。
 CASE_MODEL_IDS = {
@@ -68,6 +77,32 @@ CASE_MODEL_IDS = {
 
 #: 每个案例实际引用/嵌入的模型数量（设计文档 §案例与脚本）。
 CASE_MODEL_COUNTS = {case_id: len(model_ids) for case_id, model_ids in CASE_MODEL_IDS.items()}
+
+#: 五份案例按 ``case-*.json`` 文件名顺序展开的全部 17 条模型条目
+#: （``{id, upstream, provider, profile}``，含 ha-general / industry-energy 两处共享）
+#: 的规范化指纹：``sha256(json.dumps(entries, ensure_ascii=False, sort_keys=True))``。
+#: profile 在迁移/整理中被悄悄改写会在此失败；更新案例后按上面的方式重算此常量。
+CASE_MODEL_ENTRIES_SHA256 = (
+    "c7ceda8db669da239fed2af9b078803eb45e58606e6a607617b492fc47c0ce69")
+
+#: 15 个唯一模型的 (upstream, provider) 显式表；摘要失败时先查这里是否漂移。
+EXPECTED_MODEL_SOURCES = {
+    "ha-fail": ("fail-upstream", "demo-tap"),
+    "ha-general": ("general-backend", "demo-tap"),
+    "ha-slow-a": ("slow-a", "demo-tap"),
+    "ha-slow-b": ("slow-b", "demo-tap"),
+    "industry-code": ("industry-code", "demo-tap"),
+    "industry-energy": ("industry-energy", "demo-tap"),
+    "industry-finance": ("industry-finance", "demo-tap"),
+    "industry-general": ("industry-general", "demo-tap"),
+    "industry-legal": ("industry-legal", "demo-tap"),
+    "industry-medical": ("industry-medical", "demo-tap"),
+    "reason-deepseek": ("reason-base", "demo-tap"),
+    "reason-openai": ("reason-base", "demo-tap"),
+    "reason-qwen": ("reason-base", "demo-tap"),
+    "text-general": ("general-backend", "demo-tap"),
+    "vl-qwen35-4b": ("vl-model", "demo-tap"),
+}
 
 #: 发布文档 -> (JEV 服务 id, input_tokens, context_tokens)（§画布快照）。
 SHIPPED_DOCUMENTS = {
@@ -229,22 +264,36 @@ def test_case_catalog_is_one_shared_demo_provider_and_jev():
 
 
 def test_all_cases_embed_byte_identical_jev_prompt():
-    """五份案例必须内嵌逐字一致的 JEV 指令/状态模板（证据快照可核对时一并钉死）。"""
+    """五份案例必须内嵌逐字一致、且与线上实测快照一致的 JEV 指令/状态模板。"""
     documents = _case_documents()
     instructions = {document["jev"]["instructions"] for document in documents}
     templates = {document["jev"]["state_template"] for document in documents}
 
-    assert len(instructions) == 1
-    assert len(templates) == 1
-    assert next(iter(instructions)).strip()
-    assert "{request}" in next(iter(templates))
+    assert len(instructions) == 1, "五份案例的 JEV instructions 必须逐字一致"
+    assert len(templates) == 1, "五份案例的 JEV state_template 必须逐字一致"
+    # 钉死实测字面量：不依赖 gitignore 的 evidence/platform.json，干净 checkout 也生效。
+    assert next(iter(instructions)) == DEMO_JEV_INSTRUCTIONS
+    assert next(iter(templates)) == DEMO_JEV_STATE_TEMPLATE
 
-    if EVIDENCE_PLATFORM.is_file():
-        evidence = _read_document(EVIDENCE_PLATFORM)
-        config = evidence["snapshot"]["jev"]["body"]["config"]
-        assert next(iter(instructions)) == config["instructions"]
-        assert next(iter(templates)) == config["state_template"]
-        assert config["timeout_seconds"] == DEMO_JEV_TIMEOUT_SECONDS
+
+def _model_entries(documents: list[dict]) -> list[dict]:
+    return [
+        {"id": model["id"], "upstream": model["upstream"],
+         "provider": model["provider"], "profile": model["profile"]}
+        for document in documents
+        for model in document["backends"]["models"]
+    ]
+
+
+def test_case_model_profiles_match_pinned_snapshot():
+    """15 份模型 profile（含顺序与共享条目）逐字钉死：迁移不得悄悄重写。"""
+    entries = _model_entries(_case_documents())
+    assert len(entries) == 17
+    payload = json.dumps(entries, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    assert digest == CASE_MODEL_ENTRIES_SHA256
+    assert {entry["id"]: (entry["upstream"], entry["provider"]) for entry in entries} == (
+        EXPECTED_MODEL_SOURCES)
 
 
 def test_manifest_tree_files_align_with_case_documents():
@@ -504,6 +553,8 @@ def test_main_stops_cleanly_on_first_attempt_graph_conflict(monkeypatch, capsys)
             calls.append((method, path))
             if path == "/admin/login":
                 return 200, {"token": "fake-token"}
+            if path == "/admin/trees":
+                return 200, {"trees": []}
             return 409, {"detail": GRAPH_CONFLICT_DETAIL}
 
     monkeypatch.setattr(module, "Api", FakeApi)
@@ -516,8 +567,13 @@ def test_main_stops_cleanly_on_first_attempt_graph_conflict(monkeypatch, capsys)
     assert "画布已变化" in output
     assert "actual-hash" in output
     assert "请重新运行" in output
-    # 登录成功后第一个目录写（provider PUT）就停止：没有后续模型/JEV/画布写入。
-    assert calls == [("POST", "/admin/login"), ("PUT", "/admin/providers/demo-tap")]
+    # 登录 → 读部署前 enabled 基线（纯读）→ 第一个目录写（provider PUT）就停止：
+    # 没有后续模型/JEV/画布写入。
+    assert calls == [
+        ("POST", "/admin/login"),
+        ("GET", "/admin/trees"),
+        ("PUT", "/admin/providers/demo-tap"),
+    ]
 
 
 def test_case_runtime_deploys_through_the_real_admin_api(tmp_path):
@@ -540,6 +596,10 @@ def test_case_runtime_deploys_through_the_real_admin_api(tmp_path):
 
     api._raw = fake_raw
 
+    # 全新组合根没有任何 enabled 决策组：最终状态基线必须记录为空。
+    enabled_before = module.enabled_tree_ids(api)
+    assert enabled_before == [], "全新实例部署前不应有 enabled 决策组"
+
     def deploy():
         module.step_providers(api, runtime, False)
         module.step_models(api, runtime, False)
@@ -551,6 +611,9 @@ def test_case_runtime_deploys_through_the_real_admin_api(tmp_path):
     rows = api.trees()
     assert len(rows) == len(manifest["cases"])
     assert not any(row.get("enabled") for row in rows.values())
+    # 全新实例的收尾状态：enabled 仍为空是正确结果，脚本不得误报失败（回归点）。
+    assert module.enabled_tree_ids(api) == []
+    assert module.step_final_state(api, manifest["cases"], enabled_before) == []
     for case in manifest["cases"]:
         tree = tree_from_dict(rows[case["id"]])
         assert tree.runtime.jev.id == DEMO_JEV_ID
@@ -571,6 +634,116 @@ def test_case_runtime_deploys_through_the_real_admin_api(tmp_path):
     assert {tree_id: row["document_sha256"] for tree_id, row in restored.items()} == {
         tree_id: row["document_sha256"] for tree_id, row in rows.items()}
     assert all(tree_from_dict(row).runtime.jev.id == DEMO_JEV_ID for row in restored.values())
+
+
+# --------------------------------------------------------------------------- #
+# 3b. apply_cases.py 最终状态：以部署前 enabled 集合为基线（全新实例不误报）
+# --------------------------------------------------------------------------- #
+def _manifest_cases() -> list[dict]:
+    return json.loads((CASES_DIR / "manifest.json").read_text(encoding="utf-8"))["cases"]
+
+
+def _tree_row(tree_id: str, *, enabled: bool) -> dict:
+    return {
+        "id": tree_id,
+        "enabled": enabled,
+        "document_sha256": hashlib.sha256(tree_id.encode("utf-8")).hexdigest(),
+    }
+
+
+def _deployed_rows(*, enabled: set[str] = frozenset()) -> dict:
+    rows = {case["id"]: _tree_row(case["id"], enabled=case["id"] in enabled)
+            for case in _manifest_cases()}
+    for tree_id in enabled - set(rows):
+        rows[tree_id] = _tree_row(tree_id, enabled=True)
+    return rows
+
+
+def _final_state_api(module, rows: dict):
+    api = module.Api("http://127.0.0.1:1")
+    api.trees = lambda: rows
+    return api
+
+
+def test_final_state_accepts_fresh_instance_without_enabled_group(capsys):
+    """全新实例部署前没有 enabled 决策组 -> 部署后仍为空是正确结果，不是失败。"""
+    module = _load_apply_cases()
+    cases = _manifest_cases()
+    api = _final_state_api(module, _deployed_rows())
+
+    assert module.step_final_state(api, cases, []) == []
+    output = capsys.readouterr().out
+    assert "部署前没有 enabled 决策组" in output
+    assert "仍为空" in output
+    assert "5 棵演示树保持未启用" in output
+
+
+def test_final_state_preserves_preexisting_enabled_group(capsys):
+    """既有实例（如 default-jev enabled）部署后必须原样保持。"""
+    module = _load_apply_cases()
+    cases = _manifest_cases()
+    api = _final_state_api(module, _deployed_rows(enabled={"default-jev"}))
+
+    assert module.step_final_state(api, cases, ["default-jev"]) == []
+    assert "default-jev" in capsys.readouterr().out
+
+
+def test_final_state_rejects_newly_enabled_demo_tree():
+    """最终状态仍必须抓住「演示树被启用」：全新实例的 enabled 集合不得新增成员。"""
+    module = _load_apply_cases()
+    cases = _manifest_cases()
+    api = _final_state_api(module, _deployed_rows(enabled={"case-ha"}))
+
+    problems = module.step_final_state(api, cases, [])
+    assert problems
+    assert "不应新增" in problems[0]
+    assert "case-ha" in problems[0]
+
+
+def test_final_state_rejects_lost_preexisting_enabled_group():
+    """既有 enabled 决策组被停用/删除同样必须失败，不能静默接受空集。"""
+    module = _load_apply_cases()
+    cases = _manifest_cases()
+    api = _final_state_api(module, _deployed_rows())
+
+    problems = module.step_final_state(api, cases, ["default-jev"])
+    assert any("default-jev" in problem for problem in problems)
+
+
+def test_final_state_rejects_missing_case_tree():
+    module = _load_apply_cases()
+    cases = _manifest_cases()
+    rows = _deployed_rows()
+    rows.pop("case-logic")
+    problems = module.step_final_state(_final_state_api(module, rows), cases, [])
+    assert any("case-logic" in problem for problem in problems)
+
+
+def test_main_succeeds_on_fresh_instance_without_false_final_state_failure(monkeypatch, capsys):
+    """main() 在全新实例（部署前无 enabled）上必须退出 0，不得因最终状态误报失败。"""
+    module = _load_apply_cases()
+    rows = _deployed_rows()
+
+    class FakeApi(module.Api):
+        def _raw(self, method, path, body=None, *, auth=True):
+            if path == "/admin/login":
+                return 200, {"token": "fake-token"}
+            if path == "/admin/trees":
+                return 200, {"trees": list(rows.values())}
+            raise AssertionError(f"unexpected 管理请求 {method} {path}")
+
+    monkeypatch.setattr(module, "Api", FakeApi)
+    monkeypatch.setattr(module, "step_providers", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "step_models", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "step_jev_services", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "step_time_periods", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "step_trees", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "step_dry_run", lambda *args, **kwargs: 0)
+
+    assert module.main(["--base-url", "http://127.0.0.1:1"]) == 0
+    output = capsys.readouterr().out
+    assert "部署前没有 enabled 决策组" in output
+    assert "全部通过" in output
 
 
 # --------------------------------------------------------------------------- #

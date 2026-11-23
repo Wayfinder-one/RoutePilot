@@ -16,7 +16,8 @@
    ``time_periods`` 四个运行字段；**不 enable**（试算用 /admin/try tree_id）；
 5. 对每个演示 prompt 调 POST /admin/try，比较 outcome.target_id / model /
    reasoning / candidates 与期望是否一致，并检查 enable 级 warnings 为空；
-6. 最后确认 default-jev 仍是唯一 enabled 的树。
+6. 部署前记录当前 enabled 的决策组，部署后确认这份集合原样保持（全新实例部署前
+   为空时，部署后也必须为空），并确认 5 棵演示树全部未启用、运行字段齐全。
 
 影响确认（409 ``impact_confirmation_required``）默认行为：打印受影响画布清单
 （含当前 ``document_sha256`` 与用途）后停止，不写入任何后续内容；确认同步后
@@ -630,14 +631,48 @@ def step_dry_run(api: Api, cases: list[dict], verbose: bool) -> int:
     return failures
 
 
-def step_final_state(api: Api, cases: list[dict]) -> list[str]:
+def enabled_tree_ids(api: Api) -> list[str]:
+    """当前 enabled 的决策组 id（排序）。部署前后各取一次作为最终状态基线。"""
+    rows = api.trees()
+    return sorted(tree_id for tree_id, row in rows.items() if row.get("enabled"))
+
+
+def step_final_state(api: Api, cases: list[dict], enabled_before: list[str]) -> list[str]:
+    """最终状态校验：以部署前的 enabled 集合为基线，而不是写死 ``default-jev``。
+
+    - 全新实例（部署前没有 enabled 决策组）部署后仍为空是正确结果：脚本只部署、
+      从不启用任何树，启用是单独步骤；
+    - 既有实例（例如 76 上的 ``default-jev``）部署后必须原样保持 enabled；
+    - 5 棵演示树必须全部未启用且带 ``document_sha256``。
+
+    ``enabled_before`` 由调用方在部署前用 :func:`enabled_tree_ids` 记录；影响确认
+    同步会更新受影响画布的文档，但不会改变 enabled 状态。
+    """
     problems: list[str] = []
     rows = api.trees()
     enabled = sorted(tree_id for tree_id, row in rows.items() if row.get("enabled"))
-    if enabled != ["default-jev"]:
-        problems.append(f"enabled 决策组应为 ['default-jev']，实际 {enabled}；请勿启用演示决策组，并恢复 default-jev")
+    expected = sorted(enabled_before)
+    if enabled != expected:
+        if expected:
+            problems.append(
+                f"enabled 决策组应保持部署前的 {expected}，实际 {enabled}；"
+                f"请勿启用演示决策组，并恢复既有 enabled 状态")
+        else:
+            problems.append(
+                f"部署前实例没有 enabled 决策组，部署后不应新增，实际 {enabled}；"
+                f"请勿启用演示决策组")
+    elif expected:
+        print(f"最终状态：部署前 enabled 的决策组 {expected} 保持不变"
+              f"（{len(cases)} 棵演示树保持未启用）")
     else:
-        print("最终状态：default-jev 仍是唯一 enabled 的决策组（5 棵演示树保持未启用）")
+        print(f"最终状态：实例部署前没有 enabled 决策组，部署后仍为空"
+              f"（{len(cases)} 棵演示树保持未启用；启用是单独步骤）")
+    for tree_id in expected:
+        row = rows.get(tree_id)
+        if row is None:
+            problems.append(f"部署前 enabled 的决策组 {tree_id} 不见了")
+        elif not row.get("document_sha256"):
+            problems.append(f"部署前 enabled 的决策组 {tree_id} 缺少 document_sha256")
     for case in cases:
         if case["id"] not in rows:
             problems.append(f"缺少决策组 {case['id']}")
@@ -678,13 +713,15 @@ def main(argv: list[str] | None = None) -> int:
     api.login()
     print(f"已登录 {api.base_url}（email={args.email}）")
     try:
+        # 先记下部署前的 enabled 集合：全新实例为空是合法基线，不能假定 default-jev 存在。
+        enabled_before = enabled_tree_ids(api)
         step_providers(api, runtime, args.verbose)
         step_models(api, runtime, args.verbose)
         step_jev_services(api, runtime, args.verbose)
         step_time_periods(api, runtime, args.verbose)
         step_trees(api, cases, documents, args.verbose)
         failures = step_dry_run(api, cases, args.verbose)
-        problems = step_final_state(api, cases)
+        problems = step_final_state(api, cases, enabled_before)
     except ImpactConfirmationRequired as exc:
         for line in impact_report_lines(exc.detail):
             print(line)
@@ -714,7 +751,8 @@ def main(argv: list[str] | None = None) -> int:
     if failures or problems:
         print(f"{BAD} 失败：{failures} 条 dry-run 不匹配，{len(problems)} 项最终状态问题")
         return 1
-    print(f"{OK} 全部通过：{len(cases)} 个决策组、{total} 条 dry-run 均命中期望，default-jev 未受影响")
+    print(f"{OK} 全部通过：{len(cases)} 个决策组、{total} 条 dry-run 均命中期望，"
+          f"部署前的 enabled 状态未变（{enabled_before or '无'}）")
     return 0
 
 
