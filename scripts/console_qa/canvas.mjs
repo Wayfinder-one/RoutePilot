@@ -4473,6 +4473,45 @@ test('numeric unset and English boolean condition labels stay explicit', async (
 
 
 
+test('P0 route-check copy is consistent in Chinese and English', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  for (const lang of ['zh', 'en']) {
+    await page.evaluate(async next => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang(next);
+    }, lang);
+    const copy = await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return {
+        top: document.getElementById('cvTryBtn').textContent.trim(),
+        run: document.getElementById('cvTryRun').textContent.trim(),
+        placeholder: document.getElementById('cvTryInput').placeholder,
+        expectedTop: t('cv.try'),
+        expectedRun: t('cv.tryRun'),
+        bar: document.getElementById('cvTryBar').textContent.replace(/\s+/g, ' ').trim()
+      };
+    });
+    assert.equal(copy.top, copy.expectedTop);
+    assert.equal(copy.run, copy.expectedRun);
+    if (lang === 'zh') {
+      assert.equal(copy.top, '检查路由');
+      assert.equal(copy.run, '运行检查');
+      assert.match(copy.placeholder, /检查路由/);
+      assert.doesNotMatch(copy.bar, /试算/);
+    } else {
+      assert.equal(copy.top, 'Check routing');
+      assert.equal(copy.run, 'Run check');
+      assert.match(copy.placeholder, /check routing/i);
+      assert.doesNotMatch(copy.bar, /Try run|Run try/);
+    }
+  }
+  await page.evaluate(async () => {
+    const { setLang } = await import('/console/i18n.js');
+    setLang('zh');
+  });
+});
+
 await runIfMain(import.meta.url);
 
 test('inspector · target model row hints when the model declares no reasoning tiers', async () => {

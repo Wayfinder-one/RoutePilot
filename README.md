@@ -17,7 +17,7 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 | Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service |
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
 | Backend selection | Session affinity, `least_inflight` load balancing, per-model circuit breaker |
-| Try run | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models |
+| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models |
 | Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, audit history, role-based users |
 | Console | Bilingual (zh/en) native ES Modules, no build step |
 
@@ -76,7 +76,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 | Page | Content |
 |---|---|
 | Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
-| Decision groups | Canvas editor, graph settings, inspector, validation, dry run, import/export |
+| Decision groups | Canvas editor, graph settings, inspector, validation, routing checks, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
 | Decision service | Read-only service profile (address, model, key status, test status) with a retest; Save and test lives in edit mode; prompts, timeout and the context window live under Advanced |
 | Models | Model registry; Connect models onboards a catalog provider and its models in one save. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
@@ -84,7 +84,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 ### Common paths
 
-- The decision-group toolbar shows only **Try run**, the primary action and **More**. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. **More** holds undo/redo, auto-layout, New, Load example, Import, Export, Save draft and Disable. The inspector's **Apply** only updates the local draft and never writes to the server.
+- The decision-group toolbar shows only **Check routing**, the primary action and **More**. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. **More** holds undo/redo, auto-layout, New, Load example, Import, Export, Save draft and Disable. The inspector's **Apply** only updates the local draft and never writes to the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
 - The **Decision service** page shows connection details and this session's test status by default; **Save and test** saves the service configuration, then the context window, then tests the connection. Prompts, the state template, timeout and token window live under Advanced, and the raw test response expands on demand.
 
@@ -119,9 +119,9 @@ The routing page is split into two zones.
 - Result: final target, model, candidates with priorities, selection reason, waves and call count.
 - Execution trace: one card per wave with hit conditions, plus the full request timeline.
 
-Try runs highlight the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
+A routing check highlights the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
 
-![Try-run replay](assets/routepilot/en/try-run.png)
+![Routing-check replay](assets/routepilot/en/try-run.png)
 
 ### Decision log
 
@@ -364,7 +364,7 @@ The cross-graph update is a batch, not a loop of independent writes. Every basel
 
 1. Start an instance with an empty database and an empty graph directory.
 2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`), then save and enable it.
-3. Run a dry run (`POST /admin/try`) to verify the graph, embedded model catalog, decision service, window and time periods.
+3. Run a routing check (`POST /admin/try`) to verify the graph, embedded model catalog, decision service, window and time periods.
 4. Call `POST /v1/chat/completions` for Auto routing, or use the model test chat with a fixed model.
 5. Provide keys through environment variables only: each provider's `key_env`, and `ROUTER_JEV_API_KEY` when the decision-service endpoint requires authentication.
 
@@ -428,7 +428,7 @@ The first start against an empty users table seeds the admin account.
 | `GET /admin/me` / `POST /admin/me/password` | Current user, password change |
 | `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | Decision groups |
 | `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Group lifecycle |
-| `POST /admin/try` | Dry run against a draft graph |
+| `POST /admin/try` | Routing check against a draft graph |
 | `POST /admin/test/chat/completions` | Admin-only model test chat; JSON or SSE |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry |
 | `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets, upstream model discovery |
