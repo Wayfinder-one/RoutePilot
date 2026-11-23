@@ -5,10 +5,10 @@
 """
 import asyncio
 import json
-from contextlib import contextmanager
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -16,6 +16,7 @@ from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
+from router.jev.window import MAX_TOKENS, MIN_CONTEXT_TOKENS, MIN_INPUT_TOKENS
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
@@ -27,23 +28,6 @@ def _migrated(path):
     conn = connect(path)
     migrate(conn)
     conn.close()
-
-
-class Publisher:
-    """本文件只测目录 CRUD，不需要真实发布骨架。"""
-
-    def __init__(self):
-        self.published = []
-
-    @contextmanager
-    def locked(self):
-        yield self
-
-    def prepare(self, conn, tree, fingerprint):
-        return SimpleNamespace(tree=tree, fingerprint=fingerprint)
-
-    def publish(self, prepared):
-        self.published.append(prepared)
 
 
 def make_client(tmp_path, handler=None, requests=None):
@@ -66,7 +50,6 @@ def make_client(tmp_path, handler=None, requests=None):
     app.state.graph_repo.initialize()
     app.state.http = httpx.AsyncClient(transport=transport)
     app.state.jev_client = JevClient(app.state.http)
-    app.state.publisher = Publisher()
     app.include_router(router, prefix="/admin")
     return TestClient(app), app
 
@@ -149,6 +132,22 @@ def test_create_get_update_delete_roundtrip(tmp_path):
     assert client.delete("/admin/jev/jev-a").status_code == 404
 
 
+def test_catalog_reads_never_echo_secret_from_post_or_put(tmp_path):
+    """POST 新建与 PUT 轮换后的明文密钥都不得出现在任何目录读响应里。"""
+    client, _app = make_client(tmp_path)
+    created = client.post("/admin/jev", json=service_payload(api_key="post-secret"))
+    assert created.status_code == 201, created.text
+    assert "post-secret" not in client.get("/admin/jev").text
+    assert "post-secret" not in client.get("/admin/jev/jev-a").text
+
+    updated = client.put("/admin/jev/jev-a", json={"api_key": "put-secret"})
+    assert updated.status_code == 200, updated.text
+    listing = client.get("/admin/jev").text
+    item = client.get("/admin/jev/jev-a").text
+    assert "post-secret" not in listing + item
+    assert "put-secret" not in listing + item
+
+
 def test_put_without_api_key_preserves_only_for_same_endpoint(tmp_path):
     client, app = make_client(tmp_path)
     client.post("/admin/jev", json=service_payload(api_key="stored-secret"))
@@ -199,31 +198,127 @@ def test_duplicate_id_is_409(tmp_path):
 
 
 def test_unknown_service_is_404(tmp_path):
-    client, _app = make_client(tmp_path)
+    client, app = make_client(tmp_path)
     assert client.get("/admin/jev/missing").status_code == 404
     assert client.put("/admin/jev/missing", json={"model": "m"}).status_code == 404
     assert client.delete("/admin/jev/missing").status_code == 404
     assert client.post("/admin/jev/missing/test", json={}).status_code == 404
+    # 资源存在性先于 body 校验：缺服务时密钥类型 / id / 字段值都不能抢先报 422。
+    for body in ({"api_key": 5}, {"api_key": None}, {"id": "other"},
+                 {"base_url": "not-a-url"}, {"model": ""}):
+        response = client.put("/admin/jev/missing", json=body)
+        assert response.status_code == 404, (body, response.text)
+        assert "unknown jev service missing" in response.json()["detail"]
+    assert _services(app) == []
 
 
-def test_invalid_service_fields_are_422(tmp_path):
+def test_removed_singleton_endpoints_are_405(tmp_path):
+    """旧单配置入口已删且不能静默回退：路径命中但方法不存在 = 405。"""
     client, _app = make_client(tmp_path)
-    for payload in (
-            service_payload(base_url="not-a-url"),
-            service_payload(id="bad id!"),
-            service_payload(key_env="1BAD"),
-            service_payload(input_tokens=10),
-            service_payload(context_tokens=10 ** 9),
-            {**service_payload(), "unknown": 1},
-            {**service_payload(), "api_key": 5},
-            {**service_payload(), "model": None},
-    ):
-        response = client.post("/admin/jev", json=payload)
-        assert response.status_code == 422, (payload, response.text)
-    # PUT 的显式 null 不是「省略」。
-    client.post("/admin/jev", json=service_payload())
-    assert client.put("/admin/jev/jev-a", json={"api_key": None}).status_code == 422
-    assert client.put("/admin/jev/jev-a", json={"id": "other"}).status_code == 422
+    assert client.put("/admin/jev", json=service_payload()).status_code == 405
+    assert client.post("/admin/jev/test", json={"text": "测试"}).status_code == 405
+    # 独立窗口入口没有对应资源路径，保持 404。
+    assert client.get("/admin/jev/window").status_code == 404
+
+
+def _detail_text(response):
+    """422 的 detail 既可能是值校验字符串，也可能是 Pydantic 错误项列表。"""
+    detail = response.json()["detail"]
+    if isinstance(detail, str):
+        return detail
+    return " ".join(f"{item.get('loc')} {item.get('msg')}" for item in detail)
+
+
+#: 非法字段矩阵：同一组值同时驱动 POST（完整 payload）与 PUT（局部 body），
+#: 期望片段来自端点背后的真实校验（JevService/JevSettings/JevWindow 的
+#: ValueError、``extra="forbid"`` 与 ``_validate_api_key``）。
+INVALID_FIELD_CASES = [
+    pytest.param("base_url", "http://jev.test?x=1", "base_url", id="base-url-query"),
+    pytest.param("base_url", "http://jev.test#frag", "base_url", id="base-url-fragment"),
+    pytest.param("base_url", 123, "base_url", id="base-url-non-string"),
+    pytest.param("model", "", "model", id="model-empty"),
+    pytest.param("model", "   ", "model", id="model-blank"),
+    pytest.param("model", 5, "model", id="model-non-string"),
+    pytest.param("key_env", "bad-env", "key_env", id="key-env-dash"),
+    pytest.param("key_env", "1ABC", "key_env", id="key-env-leading-digit"),
+    pytest.param("timeout_seconds", 0, "timeout_seconds", id="timeout-zero"),
+    pytest.param("timeout_seconds", 121, "timeout_seconds", id="timeout-above-max"),
+    pytest.param("timeout_seconds", "abc", "timeout_seconds", id="timeout-non-numeric"),
+    pytest.param("instructions", " ", "instructions", id="instructions-blank"),
+    pytest.param("instructions", 5, "instructions", id="instructions-non-string"),
+    pytest.param("state_template", "没有占位符", "state_template",
+                 id="state-template-no-request"),
+    pytest.param("state_template", "{unknown}", "state_template",
+                 id="state-template-wrong-field"),
+    pytest.param("state_template", "{request", "state_template",
+                 id="state-template-unbalanced"),
+    pytest.param("state_template", 5, "state_template",
+                 id="state-template-non-string"),
+    pytest.param("input_tokens", 8192, "input_tokens", id="input-above-context"),
+    pytest.param("input_tokens", True, "input_tokens", id="input-bool"),
+    pytest.param("input_tokens", "2048", "input_tokens", id="input-string"),
+    pytest.param("input_tokens", MIN_INPUT_TOKENS - 1, "input_tokens",
+                 id="input-below-min"),
+    pytest.param("input_tokens", 10 ** 9, "input_tokens", id="input-above-max"),
+    pytest.param("context_tokens", MIN_CONTEXT_TOKENS - 1, "context_tokens",
+                 id="context-below-min"),
+    pytest.param("context_tokens", MAX_TOKENS + 1, "context_tokens",
+                 id="context-above-max"),
+    pytest.param("context_tokens", True, "context_tokens", id="context-bool"),
+    pytest.param("context_tokens", "4096", "context_tokens", id="context-string"),
+    pytest.param("api_key", 5, "api_key", id="api-key-non-string"),
+    pytest.param("unknown", 1, "Extra inputs are not permitted", id="unknown-field"),
+]
+
+
+@pytest.mark.parametrize(("field", "value", "fragment"), INVALID_FIELD_CASES)
+def test_post_rejects_invalid_field_and_catalog_stays_empty(tmp_path, field, value, fragment):
+    client, app = make_client(tmp_path)
+    response = client.post("/admin/jev", json=service_payload(**{field: value}))
+    assert response.status_code == 422, response.text
+    assert fragment in _detail_text(response), response.text
+    assert client.get("/admin/jev").json() == {"services": []}
+    assert _services(app) == []
+
+
+@pytest.mark.parametrize(("field", "value", "fragment"), INVALID_FIELD_CASES)
+def test_put_rejects_invalid_field_and_catalog_is_unchanged(
+        tmp_path, field, value, fragment):
+    client, app = make_client(tmp_path)
+    created = client.post("/admin/jev", json=service_payload(api_key="stored-secret"))
+    assert created.status_code == 201, created.text
+    baseline = _services(app)
+    response = client.put("/admin/jev/jev-a", json={field: value})
+    assert response.status_code == 422, response.text
+    assert fragment in _detail_text(response), response.text
+    assert _services(app) == baseline
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert JevServiceRepo(conn).stored_api_key(baseline[0]) == "stored-secret"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("service_id", ["-bad", "a b", "", "bad id!"])
+def test_post_rejects_invalid_id_and_catalog_stays_empty(tmp_path, service_id):
+    client, app = make_client(tmp_path)
+    response = client.post("/admin/jev", json=service_payload(id=service_id))
+    assert response.status_code == 422, response.text
+    assert "invalid JEV service id" in _detail_text(response)
+    assert _services(app) == []
+
+
+@pytest.mark.parametrize("body", [
+    {"id": "-bad"}, {"id": "a b"}, {"id": ""}, {"id": "other"}, {"id": None},
+])
+def test_put_rejects_id_that_does_not_match_path(tmp_path, body):
+    client, app = make_client(tmp_path)
+    assert client.post("/admin/jev", json=service_payload()).status_code == 201
+    baseline = _services(app)
+    response = client.put("/admin/jev/jev-a", json=body)
+    assert response.status_code == 422, response.text
+    assert "id in body must match path" in _detail_text(response)
+    assert _services(app) == baseline
 
 
 def test_impact_confirmation_is_accepted_and_ignored(tmp_path):

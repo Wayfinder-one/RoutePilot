@@ -2,7 +2,8 @@
 
 ``POST /admin/test/chat/completions`` shares the real ``/v1/chat/completions``
 executor.  Auto keeps the full routing path (graph + JEV + sticky); a fixed
-model skips graph/JEV/sticky but still uses the published backend snapshot, the
+model skips graph/JEV/sticky and resolves through the SQLite catalog
+(``load_backends``) instead of the active canvas snapshot, but still uses the
 LoadBalancer lease, the CircuitBreaker, the UpstreamProxy and the request log.
 """
 import json

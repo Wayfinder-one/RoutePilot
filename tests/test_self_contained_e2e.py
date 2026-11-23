@@ -4,7 +4,7 @@
 1. 空 SQLite（无 provider/model/时段/JEV 行，仅图目录里一份自包含 JSON）启动快照；
 2. ``/admin/try`` 的 backend URL、upstream、capability、JEV、窗口、时段全部来自 JSON；
 3. ``/v1/chat/completions`` Auto 路由真实到达 JSON 指定的 mock 上游；
-4. ``/admin/test/chat/completions`` 固定模型也到达同一上游；
+4. ``/admin/test/chat/completions`` 固定模型按 SQLite 目录解析（不读画布 JSON）后到达目录配置的上游；
 5. 导出 bytes 在第二个空库实例恢复后结果一致；
 6. 文件 / API envelope / tree / snapshot content 中均无密钥样本。
 """

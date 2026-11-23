@@ -85,12 +85,17 @@ def _provided(body: BaseModel, name: str, fallback):
 
 
 def _validate_api_key(body: BaseModel, *, allow_null: bool) -> None:
+    """校验显式传入的 ``api_key``。
+
+    ``allow_null=True``（POST）把显式 null 当作「不提供密钥」；``allow_null=False``
+    （PUT）下 null 与省略不同：省略表示保留已存密钥，显式 null 是非法值。两种
+    情况下非字符串都是 422。
+    """
     if "api_key" not in body.model_fields_set:
         return
     if body.api_key is None and allow_null:
         return
     if not isinstance(body.api_key, str):
-        # PUT 的显式 null 不是「省略」（省略 = 保留已存密钥），null 是非法值。
         raise HTTPException(422, detail="api_key must be a string")
 
 
@@ -163,11 +168,12 @@ def put_jev_service(
     service_id: str, body: JevServiceIn,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    _validate_api_key(body, allow_null=False)
+    repo = JevServiceRepo(conn)
+    # 资源存在性先于请求体校验：未知服务始终是 404，而不是被 body 细节抢先报 422。
+    existing = _require(repo, service_id)
     if "id" in body.model_fields_set and body.id != service_id:
         raise HTTPException(422, detail="id in body must match path")
-    repo = JevServiceRepo(conn)
-    existing = _require(repo, service_id)
+    _validate_api_key(body, allow_null=False)
     service = _service_from_body(body, _defaults(existing))
     # 未提供 api_key 时交给仓储的端点匹配规则：仅 base_url+model 不变才复用旧密钥。
     repo.save(service, api_key=body.api_key if "api_key" in body.model_fields_set else None)

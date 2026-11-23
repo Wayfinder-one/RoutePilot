@@ -49,18 +49,6 @@ class JevSettings:
         if fields != ["request"]:
             raise ValueError("state_template must contain exactly one {request}")
 
-    def public_dict(self, *, env_key_present: bool) -> dict:
-        key_source = "stored" if self.api_key else "environment" if env_key_present else "none"
-        return {
-            "base_url": self.base_url,
-            "model": self.model,
-            "timeout_seconds": self.timeout_seconds,
-            "instructions": self.instructions,
-            "state_template": self.state_template,
-            "key_present": key_source != "none",
-            "key_source": key_source,
-        }
-
     def behavior_dict(self) -> dict:
         return {
             "base_url": self.base_url,
