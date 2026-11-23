@@ -14,11 +14,12 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 |---|---|
 | Entry point | `POST /v1/chat/completions`, JSON and SSE, `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` response headers |
 | Routing policy | Visual decision graph: conditions, decision-service questions, logic gates, model targets |
-| Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service |
+| Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service; the canvas snapshot fixes which service profile a graph runs with |
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
 | Backend selection | Session affinity, `least_inflight` load balancing, per-model circuit breaker |
-| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models |
-| Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, audit history, role-based users |
+| Portable canvases | Every saved canvas embeds its complete non-secret run configuration, so one JSON file restores it on an empty database |
+| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; database drift is reported as hints only |
+| Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, multi-service JEV catalog, time periods, audit history, role-based users |
 | Console | Bilingual (zh/en) native ES Modules, no build step |
 
 ## Request pipeline
@@ -49,10 +50,10 @@ flowchart LR
 | Layer | Path | Responsibility |
 |---|---|---|
 | API | `router/api/` | DTO parsing, exception-to-HTTP mapping, upstream proxy, presenters |
-| Control plane | `router/control/` | Write use cases for graphs and configuration, enable validation |
-| Routing domain | `router/routing/` | Graph model, validation, compiled topology, evaluator, scheduler |
-| Decision service | `router/jev/` | `systemone` client, settings, input window |
-| Upstream | `router/upstream/` | Backend catalog, proxy transport, circuit breaker and sync worker |
+| Control plane | `router/control/` | Write use cases for graphs and catalog entries, impact lists and confirmed canvas synchronization, enable validation |
+| Routing domain | `router/routing/` | Graph model, validation, compiled topology, evaluator, scheduler, immutable canvas snapshots |
+| Decision service | `router/jev/` | `systemone` client, service settings, input window |
+| Upstream | `router/upstream/` | Fixed-model catalog (`model_id -> Backend`), proxy transport, circuit breaker and sync worker |
 | Storage | `router/store/` | SQLite schema/repositories, graph-file repository |
 | Console | `router/console/` | Bilingual native ES Module UI |
 | Runtime | `router/request_logging.py`, `router/maintenance.py` | Ledger queue/worker, session purge |
@@ -62,7 +63,8 @@ Boundaries:
 - `router/routing/` and `router/upstream/` import neither FastAPI nor SQLite. `router/control/` and `router/store/` do not import `router.api`.
 - The API layer parses DTOs and maps exceptions; it does not write control-plane state. Account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
 - `GraphService` validates, prepares a candidate snapshot, writes the graph file under the single-writer lock, re-checks the document hash, publishes the snapshot, then records the audit entry. A stale draft returns 409.
-- `ConfigurationService` writes rows and the audit entry inside one transaction, re-checks the graph fingerprint inside that transaction, commits, then swaps the in-memory snapshot. An unstable fingerprint raises before COMMIT.
+- `ConfigurationService` commits a catalog write and the canvases confirmed to be affected inside one application transaction: re-check the impact list under the write lock, validate every candidate document, stage/replace graph files (non-active first, active last), re-check the graph fingerprint, record the audit entry, then commit. Only a write that changes the active canvas publishes a new in-memory snapshot; a stale confirmation returns 409 `graph_conflict` before any write.
+- A catalog write that nothing references writes rows and audit only. It never rewrites canvases and never republishes the snapshot.
 - `compile_graph()` runs once per published snapshot. The request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
 - The event loop only enqueues ledger rows into a bounded queue and a 20-entry ring; a 2-second flush projects whitelisted columns and writes them through `asyncio.to_thread`.
 - The breaker worker loads shared quarantine state at startup and syncs local changes every 30 seconds on a worker thread.
@@ -75,24 +77,26 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 | Page | Content |
 |---|---|
-| Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
-| Decision groups | Canvas editor, graph settings, inspector, validation, routing checks, import/export |
+| Test | Admin-only model test chat: Auto routing (active canvas snapshot) or a fixed model (database catalog), SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
+| Decision groups | Canvas editor, graph settings (timezone/sticky/fallback, JEV selection, refresh runtime from the database catalog), inspector, validation, routing checks, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
-| Decision service | Read-only service profile (address, model, key status, test status) with a retest; Save and test lives in edit mode; prompts, timeout and the context window live under Advanced |
-| Models | Model registry; Connect models onboards a catalog provider and its models in one save. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
+| Decision service | Multi-service JEV catalog: service list, create/edit/delete, per-service connection test, prompts, timeout and the per-service context/input window |
+| Models | Model registry and provider catalog; Connect models onboards a catalog provider and its models in one save. Edits and deletes that affect saved canvases preview the impact list and synchronize only after confirmation. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
 | Users | Admin/viewer accounts, passwords, roles, status |
 
 ### Common paths
 
 - The decision-group toolbar shows only **Check routing**, the primary action and **More**. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. **More** holds undo/redo, auto-layout, New, Import, Export, Save draft and Disable. The inspector's **Apply** only updates the local draft and never writes to the server.
+- Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
-- The **Decision service** page shows connection details and this session's test status by default; **Save and test** saves the service configuration, then the context window, then tests the connection. Prompts, the state template, timeout and token window live under Advanced, and the raw test response expands on demand.
+- The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The first start of an empty catalog can seed a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`.
+- Editing or deleting a model, provider or JEV service that a canvas references raises a two-step confirmation. The first write returns 409 with every affected canvas (name, id, enabled, current `document_sha256`, usage); confirming sends those exact hashes back and the server synchronizes only the affected canvases. Model/JEV deletes that are still referenced need a replacement; a provider that a database model or a canvas model still references cannot be deleted at all. After a confirmed sync, reload every already-open canvas (or use **Refresh runtime from database**) — open drafts are not updated in place.
 
 ### Model test chat
 
 The home page (`/console/index.html`) is an admin-only model test chat. It posts to `/admin/test/chat/completions` and shows the actual model in the message metadata (`Auto → <model>` for Auto, `<model> · fixed model` for a fixed model), using the `x-sr-model` response header.
 
-- **Auto or fixed model** — Auto evaluates the current routing snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. Choosing a configured model ID skips the graph and JEV and returns `x-sr-selection: direct`.
+- **Auto or fixed model** — Auto evaluates the active canvas snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. Choosing a configured model ID skips the graph and JEV, resolves the model through the **database catalog** (never through the active canvas), and returns `x-sr-selection: direct`.
 - **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message. A stream counts as complete only when the upstream ends it cleanly — an early EOF is marked incomplete and a provider error is shown inline in the conversation, never silently passed off as a complete answer.
 - **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`, replayed losslessly from the raw assistant message (message-level media renders but never re-enters history); New Chat aborts any in-flight reply, clears the conversation and rotates the session id.
 - **Attachments** — text files are read as text and sent as content parts; images, audio and other files are read to data URLs. A file whose estimated size would break the 10 MiB request limit is rejected inline before it is read, and the exact whole-body size (history + Base64) is checked again before sending.
@@ -190,6 +194,8 @@ Conditions live on edges:
 
 ### Graph document
 
+A v3 document is a complete, portable canvas: the graph plus its four required run fields. A document without them is not a legacy document to adopt — it is rejected.
+
 ```json
 {
   "kind": "sr-routing-graph",
@@ -203,23 +209,27 @@ Conditions live on edges:
     "error_fallback": "safe-target",
     "nodes": [],
     "edges": []
-  }
+  },
+  "backends": { "providers": [], "models": [] },
+  "jev": null,
+  "jev_window": { "input_tokens": 1024, "context_tokens": 4096 },
+  "time_periods": []
 }
 ```
 
-Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot. Structural rejections surface as `graph_parse_error`; the console runs the same validation before applying an import.
+Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot; so is a document that carries only some (or none) of the four run fields. Structural rejections surface as `graph_parse_error`; the console runs the same validation before applying an import. `jev: null` is legal only for a canvas without question nodes.
 
 This experimental version does not accept legacy NOT graphs. Any `logic/operator=not` is rejected without migration, and historical NOT snapshots are not supported. Rewrite the condition manually: `> 0.65 → NOT` becomes `<= 0.65`, and `>= 0.5 → NOT` becomes `< 0.5`.
 
-A v3 document may also carry its run configuration in four optional top-level fields (`backends`, `jev`, `jev_window`, `time_periods`); see [Self-contained canvas JSON](#self-contained-canvas-json).
+The four run fields are described in [Self-contained canvas JSON](#self-contained-canvas-json).
 
-`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}`, plus the four embedded run fields when the document carries them, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Title, capability, position, array order and edge-id changes do not affect it. Only documents that lack embedded run configuration and contain no removed capabilities keep their original behaviour hash. Legacy graphs containing NOT are rejected, so no revision migration occurs.
+`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}` plus the four run fields, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Title, capability, position, array order and edge-id changes do not affect it.
 
 ## Models and reasoning
 
 ![Models](assets/routepilot/en/models.png)
 
-A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; `least_inflight` selects among them.
+A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; `least_inflight` selects among them. The **catalog** (SQLite) is the management source for the console dropdowns and for fixed-model direct requests; a **canvas snapshot** is the only source for Auto routing.
 
 Providers define the OpenAI-compatible base URL, API-key environment variable and reasoning dialect. Model profiles declare:
 
@@ -229,9 +239,11 @@ Providers define the OpenAI-compatible base URL, API-key environment variable an
 
 Reasoning dialects: OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai, Together, string-thinking, Ant Ling. An unsupported requested level is forwarded without reasoning injection and the response carries `x-sr-reasoning-warning`.
 
-`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text. When the active decision group carries an embedded `backends` catalog, `GET /admin/models` and `GET /admin/providers` project that catalog; otherwise they fall back to the database. A configuration write synchronizes the management tables first, so both views converge.
+`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text. The console and the admin catalog endpoints always read SQLite — they never project the active canvas, and a catalog write never rewrites a canvas on its own. Saving a canvas **selects** models: the chosen model and its provider are added to the snapshot; a model with the same ID already in the snapshot is not overwritten by normal target editing (drift is reported by the check hints, and replaced only by an explicit refresh or a confirmed catalog sync).
 
-Legacy database profiles are still read leniently, but the response is a sanitized projection: `api_key`, `authorization`, `key_present`, `key_source` and their case/separator variants are removed recursively from `profile`. This is read-only — legal metadata (`tier`, `domains`, `capability`, …) is preserved and the database row is never rewritten. Graph files and management writes still reject those fields rather than cleaning them.
+Legacy database profiles are still read leniently, but the response is a sanitized projection: `api_key`, `authorization`, `key_present`, `key_source` and their case/separator variants are removed recursively from `profile`. This is read-only — legal metadata (`tier`, `domains`, `capability`, …) is preserved and the database row is never rewritten. Graph files and management writes still reject those fields rather than cleaning them. Writes also reject non-JSON-compliant numbers (`NaN`, `Infinity`) with 422 before they can reach the database, while the read/check paths keep tolerating old rows.
+
+Deleting or updating a model or provider that a saved canvas references is a two-step operation: the first write returns 409 `impact_confirmation_required` with every affected canvas and its current `document_sha256`; the confirmed retry synchronizes only those canvases. Deleting a model still referenced by a target requires a replacement model; deleting a provider that a database model or a canvas model still references is always rejected (`provider_referenced`) — release the references first. See [Catalog impact confirmation](#catalog-impact-confirmation).
 
 A provider API key never appears in a response: the projection exposes `key_present` and `key_source` (`stored` / `env` / `none`) only.
 
@@ -239,19 +251,18 @@ A provider API key never appears in a response: the projection exposes `key_pres
 
 ![Decision service settings (JEV)](assets/routepilot/en/jev.png)
 
-The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. The page opens on a read-only service profile — service address, model, key status and this session's test status — and only **Edit configuration** reveals the address, model and API key fields.
+The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. The console page manages a **catalog of services**, not a single global configuration:
 
-- **Save and test** is the only primary action. It runs `PUT /admin/jev` → `PUT /admin/jev/window` → `POST /admin/jev/test` in that fixed order; the context window is validated locally first, so a validation failure issues no write at all.
-- Partial success names the exact stopping point: configuration not saved (window and test skipped), connection and prompts saved but window not saved (test skipped), configuration and window saved but the test failed, or everything succeeded. A failed test never leaves the previous result or raw response behind.
-- Timeout, clear-key, default instructions, the state template (it must contain exactly one `{request}`), the context/input-token window and custom test text live under **Advanced settings**.
-- After a passing test the raw JSON response is available on demand and collapsed by default; on failure it is hidden and cleared. Oversized input is truncated head/tail, and the context budget and input limit travel with the window configuration.
-
-When the active decision group carries embedded `jev` / `jev_window` fields, that configuration is authoritative and the environment never overwrites it (an embedded `jev: null` also counts as decided). For legacy documents and instances without an active group, `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` seed the database on first start only and the database is authoritative afterwards. JSON never carries `api_key`: an endpoint-matching stored key is reused, otherwise `ROUTER_JEV_API_KEY` is read from the environment when the snapshot is built.
+- The list shows every service with its ID, model and endpoint. Create, edit and delete are per service; the window (`input_tokens` / `context_tokens`) belongs to the service together with its prompts, timeout, `key_env` and key.
+- **Test** calls `POST /admin/jev/{id}/test` and uses the database service configuration, not the active canvas snapshot. Canvas execution is checked by the routing check, which reports drift as hints.
+- A canvas selects one service (`jev.id` + `key_env`) and embeds its complete non-secret profile plus its window. JEV and window are replaced together whenever a canvas selects, refreshes or receives a server-side sync — mixing two services is not representable.
+- Only `key_env` (an environment-variable name) and the service URL/model are portable. The real `api_key` lives only in SQLite and is reused when the service `id`, `base_url` and `model` all still match; otherwise the service's `key_env` environment variable is read when a snapshot is built. A global `ROUTER_JEV_API_KEY` fallback does not exist; the seeded `default` service happens to use that variable name as its `key_env`.
+- Deleting a service that a canvas references requires a replacement service, and synchronizes the affected canvases (JEV profile + window) after confirmation. Updating a referenced service is also confirmed and synchronized the same way.
 
 ## Access and operations
 
 - Email/password login, scrypt hashing, opaque bearer sessions.
-- `admin` can edit graphs, models, JEV settings and users; `viewer` is read-only.
+- `admin` can edit graphs, models, providers, JEV services and users; `viewer` is read-only.
 - The last active admin cannot be demoted, disabled or deleted.
 - User and configuration changes are recorded in the audit log.
 - Graph files are content-addressed by SHA-256 for save conflicts and reload checks; no graph history is retained.
@@ -260,7 +271,7 @@ When the active decision group carries embedded `jev` / `jev_window` fields, tha
 
 ## Graph storage and replicas
 
-Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains the enabled group id. A document may embed its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`) so it restores without the control-plane database; documents without those fields keep using the database catalog.
+Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains the enabled group id. Every document **must** carry its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`), because a saved canvas is the only runtime source for Auto routing. There is no `runtime:null` marker, no "save as legacy document" mode, and no server-side step that materializes configuration into an older file.
 
 - Single writer: the admin API. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the directory read-only and reload every 2 seconds.
 - A replica compiles a candidate snapshot before replacing the serving snapshot; an invalid file leaves the previous snapshot active and `/readyz` reports stale.
@@ -270,17 +281,30 @@ Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUT
 - All writer/reader containers must share the same numeric UID; mode `0600` files are not accessible through GID or `fsGroup` alone.
 - A stale save returns 409 `graph_conflict`; imports only change the draft.
 - `/healthz` is liveness. `/readyz` reports initial-snapshot readiness; 503 means not ready, and a later reload failure keeps the existing snapshot with `"stale": true`.
-- Migration: `python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`. The output directory must not exist; startup never deletes old SQLite graphs.
+- The schema upgrades itself (see [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation)); there is no SQLite-to-graph export script any more — a canvas is moved by exporting/importing its JSON file.
+
+## Upgrading from a pre-snapshot installation
+
+Two things change for an existing deployment.
+
+1. **The SQLite schema migrates automatically on first start.** Schema v5 upgrades to v6 inside one transaction: the old single-row `jev_config` becomes the `jev_services` service with id `default` (stored key, endpoint, model, prompts and timeout are preserved; the window is clamped to legal bounds), and the old table is dropped. Back up `router.db` (with `router.db-wal` / `router.db-shm`) before the upgrade; there is no path back to the old single-configuration layout. If the catalog is empty, `ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` seed that `default` service once, and `ROUTER_JEV_API_KEY` is stored as its key.
+2. **Every stored canvas must already be a full snapshot.** The strict parser rejects a canvas that lacks any of the four run fields. Before upgrading:
+
+   - back up `ROUTER_GRAPH_DIR` (the `graphs/*.json` files and `current`);
+   - on the **old** version, produce a full document for every group: open each decision group and save it once (or `PUT /admin/trees/{id}` with its document). The old version writes the effective run configuration into the file;
+   - if the old instance can no longer be operated, add the four fields to each `graphs/*.json` by hand, following the shape in [Self-contained canvas JSON](#self-contained-canvas-json) and the canvas's actual models, providers, JEV service and periods.
+
+A missed file is not silently repaired: startup logs `initial graph snapshot is unavailable`, `/readyz` reports not ready, `GET /admin/trees` answers 503 `graph_storage_error`, and `/v1` Auto routing has no snapshot (`no_valid_snapshot`) until the file is fixed. After a successful start, an old-format file is still only an invalid file — it is never adopted or migrated implicitly.
 
 ## Self-contained canvas JSON
 
-A v3 document can carry its own run configuration, so one file restores a decision group on an empty database instance. Four optional top-level fields are added to the envelope:
+Every saved canvas is a portable, immutable run snapshot: one file restores a decision group on an empty database instance. Four top-level fields are **required and must appear together**:
 
 | Field | Content |
 |---|---|
 | `backends` | `providers` (name, base URL, API-key environment variable, reasoning dialect) and `models` (id, upstream id, provider, profile) |
-| `jev` | Decision-service endpoint, model, timeout, instructions and state template, or `null` |
-| `jev_window` | `input_tokens` / `context_tokens` for the decision-service input budget |
+| `jev` | the selected decision-service profile: `id`, `base_url`, `model`, `key_env`, timeout, instructions and state template; `null` only for a canvas without question nodes |
+| `jev_window` | `input_tokens` / `context_tokens` **of that same service** |
 | `time_periods` | Time period definitions referenced by `periods` conditions |
 
 ```json
@@ -313,8 +337,10 @@ A v3 document can carry its own run configuration, so one file restores a decisi
     ]
   },
   "jev": {
+    "id": "default",
     "base_url": "http://127.0.0.1:8100",
     "model": "d1-2b",
+    "key_env": "ROUTER_JEV_API_KEY",
     "timeout_seconds": 10.0,
     "instructions": "You are a model router.",
     "state_template": "【待判断的用户请求】\n{request}"
@@ -326,22 +352,25 @@ A v3 document can carry its own run configuration, so one file restores a decisi
 }
 ```
 
-Four rules govern the fields:
+Rules:
 
-- **All four or none.** A document carrying only some of the four fields is rejected with `graph_parse_error` before it can replace a draft or a published snapshot; all four absent means a legacy document.
+- **All four fields, always.** A document carrying only some of them (or none) is rejected with `graph_parse_error` when parsing, importing, saving or checking; there is no database fallback that fills the missing fields and no `runtime:null` control field / materialization step. Old documents are rejected, not upgraded in place.
+- **JEV and window are one unit.** `jev.id` selects the catalog service and `key_env` says how its key is resolved; `jev_window` belongs to that service. Selecting or synchronizing a JEV service replaces `jev` and `jev_window` together.
 - **No secrets, at any depth.** A provider carries `key_env` (an environment variable name) instead of a key, and `jev` never carries `api_key`. Secret and derived-key fields (`api_key`, `authorization`, `key_present`, `key_source`) are rejected wherever they appear inside the four fields, including nested objects and arrays below `backends.models[*].profile`. The match ignores case, `-` and `_` (`API-KEY` is the same as `api_key`) but only covers that fixed set, so ordinary metadata such as `monkey` or `keychain` is preserved. `profile` stays a free-form JSON metadata object otherwise: `capability`, `domains`, `tier` and later metadata are stored unchanged. A local server that needs no authentication may leave `key_env` empty.
-- **Validated at the file boundary.** Provider and model ids, provider references, profiles, reasoning declarations, JEV settings, the window and the periods are all validated while parsing.
-- **Part of the behaviour version.** When present, the fields join `tree_revision` (and the console dirty/undo baseline); canvas coordinates still do not affect behaviour. Only documents that lack embedded run configuration and contain no removed capabilities keep their original behaviour hash. Legacy graphs containing NOT are rejected, so no revision migration occurs.
+- **Validated at the file boundary.** Provider and model ids, provider references, profiles, reasoning declarations, the JEV service profile, the window and the periods are all validated while parsing.
+- **Part of the behaviour version.** The four fields join `tree_revision` (and the console dirty/undo baseline); canvas coordinates still do not affect behaviour.
 
-### Legacy documents
+### Snapshot sources
 
-A v3 document without the four fields is a legacy document: the runtime configuration is assembled from SQLite exactly as before, so reading an old file keeps working after an upgrade. An old document is materialized the first time it is written through the API:
+Only these actions create or change a canvas run snapshot:
 
-- save (`POST` / `PUT /admin/trees`) and enable (`POST /admin/trees/{id}/enable`) write the current effective run configuration — the active group's embedded configuration when present, otherwise the database — into the saved file;
-- copying a group keeps the source group's run configuration;
-- `POST /admin/try` without run fields inherits the referenced group's configuration, then the active group's, then the database.
+1. **New canvas** — the initial snapshot is built from the current database catalog.
+2. **Import a complete JSON document** — the imported snapshot wins.
+3. **Select a model or JEV in the canvas** — the selected non-secret catalog entry is added/replaced in the draft; a JEV selection replaces profile and window atomically.
+4. **Refresh runtime from database** in graph settings.
+5. **Confirm a catalog impact list** — the server synchronizes the affected canvases after the administrator confirms.
 
-A draft that carries no runtime can also ask for explicit materialization: `POST`/`PUT /admin/trees` accept the control field `"runtime": null`, which discards the group's own embedded configuration *before* the normal materialization rule runs (active group first, database otherwise). It is not a file field, it never means "save as a legacy graph", and it cannot be combined with the four flat fields; any non-null value returns 422. Omitted `runtime` keeps the ordinary inheritance of the stored graph, and the console sends the explicit `null` whenever it saves a draft without a runtime.
+A catalog write by itself never rewrites a canvas and never republishes a snapshot. Editing a target with a model ID already present in the snapshot does not overwrite its snapshot entry; drift is reported by the check hints and replaced only by an explicit refresh or a confirmed sync. Copying a group keeps the source group's snapshot, and `POST /admin/try` inherits a stored canvas's snapshot when it is given `tree_id` (a full draft must carry all four fields itself; without either it is 422).
 
 ### Keys
 
@@ -350,15 +379,34 @@ JSON never stores keys; the environment supplies them when a snapshot is built.
 | Secret | Resolution order |
 |---|---|
 | Provider API key | The database provider's stored key **only when `name` and the normalized `base_url` both match**, otherwise none; then `os.environ[key_env]` |
-| Decision-service key | The database JEV configuration's stored key **only when `base_url` and `model` both match**, otherwise none; then `ROUTER_JEV_API_KEY` |
+| Decision-service key | The database service's stored key **only when `id`, `base_url` and `model` all match**, otherwise none; then `os.environ[service.key_env]`. There is no global JEV-key fallback; the seeded `default` service uses `ROUTER_JEV_API_KEY` as its `key_env`. |
 
 An endpoint change therefore never forwards an old key to the new address, environment keys are never written to SQLite or the JSON, derived authorization headers exist only in the in-memory snapshot, and no JSON file, API envelope or graph response contains a real key.
 
-### Configuration writes are global
+### Catalog impact confirmation
 
-The configuration pages keep their global semantics. A successful write to models, providers, JEV, the JEV window or time periods seeds the management tables from the active group's embedded configuration (keeping only endpoint-matched keys), applies the edit, validates the active graph against the result, records the audit entry, and finally writes the resulting run configuration back to **every** decision group JSON. That is why one save affects all groups even when only one group is enabled; no other write path rewrites other groups, and a failed write changes no file.
+Updating or deleting a model, provider or JEV service first scans every canvas. If anything references the resource, the first write returns **409** with `detail.code = "impact_confirmation_required"`:
 
-The cross-graph update is a batch, not a loop of independent writes. Every baseline SHA-256 is preflighted and every target document is staged in its own directory before the first real replacement; replacements then run non-active groups first and the active group last. A configuration write callback only validates, audits and stages the batch; the outer transaction skeleton commits the graph files and builds/re-checks the candidate snapshot. Any catchable failure — staged replacement, candidate snapshot, fingerprint re-check or the database transaction — first lets the database transaction exit (ROLLBACK) and only then restores the original bytes of every file this write replaced; the in-memory snapshot is published only after COMMIT, and refreshed after a failed restore using the already-rolled-back database and the actual active graph. That refresh must never move back inside the database transaction. Staging/rollback makes request-scoped failures whole; it is not a distributed transaction across SQLite and the JSON files, so a process crash between replacements is not rolled back (writing the active group last keeps the live configuration on the old graph until the very last step).
+- `resource`: the kind and id/name being changed;
+- `affected_trees`: for every affected canvas its `id`, `name`, `enabled`, current `document_sha256` and `usage` (target node ids, runtime catalog, JEV id, provider models);
+- `replacements` for deletes (non-secret candidate models or JEV services).
+
+Nothing is written in that state — database, files, audit and snapshot are untouched. The console shows the list; confirming retries the same request with `impact_confirmation = {"trees":[{"id","document_sha256"}, …]}` built from exactly those hashes. If a canvas changed in between, the server answers 409 `graph_conflict` with the **current** hash, and the console asks for a reload instead of applying a stale confirmation.
+
+After confirmation, one use case commits the catalog rows, all affected canvases and the audit row atomically: it re-checks the impact list under the single write lock, validates each candidate document, stages every file (non-active canvases first, the active canvas last), re-checks the graph fingerprint and only then commits. A failure rolls the database back and restores every replaced file; the in-memory snapshot is published only from a committed transaction and only when the active canvas was among the synchronized ones.
+
+Update/delete semantics:
+
+- **Model update** — replaces the model entry (and its provider entry) in every canvas that declares it; target model IDs do not change.
+- **Model delete** — a catalog-only entry is removed; a model referenced by a target requires a replacement model, which replaces the target references, de-duplicates model slots and embeds the replacement (and its provider) in the snapshot.
+- **Provider update** — replaces the provider entry in every canvas that declares it; model references do not change. A model profile that becomes invalid under the new reasoning dialect rejects the whole write (422, nothing written).
+- **JEV update** — synchronizes `jev` + `jev_window` in every canvas whose `runtime.jev.id` matches.
+- **JEV delete** — any canvas referencing the service requires a replacement service; JEV and window are replaced together.
+- **Provider delete** — never bypassable: it is rejected (`409 provider_referenced`) while any database model or canvas model still references the provider, and there is no implicit replacement. Release the references first.
+
+### Canvas-vs-catalog drift
+
+`POST /admin/try` compares the resources a canvas declares (providers, models, the JEV service and its window) with the database catalog and reports every difference or missing row as a hint (`code = "runtime_mismatch"`, `level = "hint"`, both canvas and database values in `params`). Hints never block the check and never change the execution configuration: the run still uses the canvas snapshot. Database resources the canvas does not declare are not conflicts and produce no hint. The console renders these hints under the routing-check result.
 
 ### Restoring from one file
 
@@ -366,9 +414,11 @@ The cross-graph update is a batch, not a loop of independent writes. Every basel
 2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`), then save and enable it.
 3. Run a routing check (`POST /admin/try`) to verify the graph, embedded model catalog, decision service, window and time periods.
 4. Call `POST /v1/chat/completions` for Auto routing, or use the model test chat with a fixed model.
-5. Provide keys through environment variables only: each provider's `key_env`, and `ROUTER_JEV_API_KEY` when the decision-service endpoint requires authentication.
+5. Provide keys through environment variables only: each provider's `key_env`, and the selected service's `key_env` when it requires authentication.
 
-`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, a local decision-service endpoint and the three seeded time periods. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
+`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, the `default` decision-service profile and three time periods. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
+
+The five demo cases in `configs/cases/case-*.json` are complete v3 documents with `kind`/`version`, no external `id`/`enabled`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
 
 ## Quick start
 
@@ -396,7 +446,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 .venv/bin/python -m router
 ```
 
-The first start against an empty users table seeds the admin account.
+The first start against an empty users table seeds the admin account. An empty graph directory serves an empty Auto snapshot; create or import a canvas before routing. Existing installations: read [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation) first.
 
 ## Configuration
 
@@ -407,9 +457,9 @@ The first start against an empty users table seeds the admin account.
 | `ROUTER_GRAPH_WRITER` | `true` | Allow graph writes; run exactly one writer |
 | `ROUTER_HOST` | `127.0.0.1` | Listener host |
 | `ROUTER_PORT` | `8400` | Listener port |
-| `ROUTER_JEV_URL` | empty | Decision-service base URL |
-| `ROUTER_JEV_MODEL` | empty | Decision-service model; paired with `ROUTER_JEV_URL` |
-| `ROUTER_JEV_API_KEY` | empty | Decision-service key |
+| `ROUTER_JEV_URL` | empty | Seed base URL for the `default` JEV service; only used while the JEV catalog is empty, paired with `ROUTER_JEV_MODEL` |
+| `ROUTER_JEV_MODEL` | empty | Seed model for the `default` JEV service; paired with `ROUTER_JEV_URL` |
+| `ROUTER_JEV_API_KEY` | empty | Key stored for the seeded `default` service (its `key_env` is `ROUTER_JEV_API_KEY`); not a global fallback |
 | `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout, seconds |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity |
 | `ROUTER_USER_AUTH` | `true` | Console authentication |
@@ -430,11 +480,11 @@ The first start against an empty users table seeds the admin account.
 | `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Group lifecycle |
 | `POST /admin/try` | Routing check against a draft graph |
 | `POST /admin/test/chat/completions` | Admin-only model test chat; JSON or SSE |
-| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry |
+| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
 | `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets, upstream model discovery |
-| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Providers |
-| `GET/PUT /admin/jev`, `POST /admin/jev/test` | Decision-service settings |
-| `GET/PUT /admin/jev/window` | JEV context and input-token window |
+| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Providers; update previews a 409 impact list, delete is blocked while referenced |
+| `GET/POST /admin/jev`, `GET/PUT/DELETE /admin/jev/{id}` | Multi-service JEV catalog (window belongs to each service) |
+| `POST /admin/jev/{id}/test` | Test one catalog service with its database configuration |
 | `GET/PUT /admin/time-periods` | Time periods |
 | `GET /admin/requests/recent`, `GET /admin/requests/stats` | Live request ring, logger stats |
 | `GET /admin/overview`, `GET /admin/changes` | Overview, audit history |
@@ -447,7 +497,9 @@ The first start against an empty users table seeds the admin account.
 | 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | Malformed body |
 | 413 | `request_too_large` | Body exceeds 10 MiB |
 | 502 | `upstream_error` | Upstream 5xx or network failure |
-| 409 | `graph_conflict` | Graph changed after the draft was loaded |
+| 409 | `graph_conflict` | Graph changed after the draft/impact list was loaded |
+| 409 | `impact_confirmation_required` | Model/provider/JEV write affects canvases; confirm the listed document hashes |
+| 409 | `provider_referenced` | Provider still used by a database model or a canvas model |
 | 409 | `graph_already_exists` | Duplicate graph id |
 | 503 | `graph_read_only` | Reader replica |
 | 503 | `graph_storage_error` | Shared graph storage unreadable |
@@ -458,21 +510,23 @@ The first start against an empty users table seeds the admin account.
 
 Upstream 4xx responses pass through with their status and body.
 
-Configuration endpoints: `/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/jev/window`, `/admin/time-periods`. There is no generic `/admin/settings` API.
+Configuration endpoints: `/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/time-periods`. There is no generic `/admin/settings` API and no standalone JEV-window endpoint: the window lives on each JEV service.
 
 ## Tests
 
 ```bash
 .venv/bin/python -m pytest -q
-node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs
+node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
+    scripts/console_runtime_test.mjs scripts/graph_contract_test.mjs \
+    scripts/console_impact_test.mjs
 npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 ```
 
 - `pytest` collects `tests/` only (`testpaths`), runs unit and FastAPI integration tests, starts no browser and does not collect `experiments/`.
-- `node --test` runs the ES-module suites: graph/canonical behavior, draft state and cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
-- `npm run check:console` runs the three Node suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
+- `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
+- `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
 - `scripts/i18n_dead_keys.py` reports unreferenced dictionary keys.
 
 Experiments are standalone and excluded from the default run:
@@ -487,22 +541,22 @@ Experiments are standalone and excluded from the default run:
 ```
 router/
   api/                 FastAPI routes, DTOs, exception mapping, proxy wiring, presenters
-  control/             control-plane write services and enable validation
+  control/             catalog writes, impact lists, confirmed canvas sync and enable validation
   routing/
     graph/             graph model, validation, conditions, compiler, evaluator
     service.py         evaluate → schedule orchestration
     scheduling.py      sticky selection, lease acquisition, affinity writes
     affinity.py        session-affinity LRU
     scheduler.py       least_inflight balancer and leases
-    snapshot.py        immutable snapshot assembly and compiled topology
+    snapshot.py        immutable canvas snapshot assembly and compiled topology
     tree.py            tree envelope codec and revision
     codec.py           strict field parsing helpers
   request_logging.py   ledger queue/ring and worker-thread writes
-  jev/                 decision-service client, settings, input window
-  upstream/            catalog, proxy transport, circuit breaker + sync worker
+  jev/                 decision-service client, service catalog DTO, input window
+  upstream/            fixed-model catalog, proxy transport, circuit breaker + sync worker
   store/               SQLite schema/repositories, graph-file repository
   console/             bilingual native ES Module console
-configs/               example decision groups
+configs/               example decision groups; configs/cases/ holds the five portable demo cases
 tests/                 pytest suite and contract fixtures
 scripts/               Node contract tests, Playwright QA, deployment helpers
 experiments/jev-batch/ standalone JEV batch spike

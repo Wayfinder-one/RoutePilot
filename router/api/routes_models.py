@@ -20,6 +20,7 @@ provider 删除不提供隐式替换、也不可被确认绕过：只要数据�
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -135,6 +136,25 @@ def _public_model(row: dict, provider_format: str) -> dict:
     }
 
 
+def _reject_non_finite_json(value, path: str = "profile") -> None:
+    """拒绝 JSON 无法表达的浮点值（``NaN`` / ``Infinity`` / ``-Infinity``）。
+
+    ``json.loads`` 默认接受这三个字面量，而 Starlette 的 ``JSONResponse`` 用
+    ``allow_nan=False`` 序列化：把它们写进数据库会让之后的 echo/GET 直接 500。
+    管理写路径必须在落库前拒绝，数据库里已有的旧行由读取/试算路径继续容忍。
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise HTTPException(
+            422,
+            detail=f"profile 包含非 JSON 兼容数值（NaN/Infinity），请改用有限数：{path}")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_non_finite_json(item, f"{path}.{key}" if isinstance(key, str) else path)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _reject_non_finite_json(item, f"{path}[{index}]")
+
+
 def _validated_profile(raw: dict | str | None, provider_format: str) -> str | None:
     if raw is None:
         return None
@@ -147,6 +167,7 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
         parsed = raw
     if not isinstance(parsed, dict):
         raise HTTPException(422, detail="profile 必须是 JSON 对象")
+    _reject_non_finite_json(parsed)
     try:
         reject_runtime_secret_fields(parsed, "profile")
     except ValueError as exc:
@@ -166,7 +187,8 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
             validated["capability"] = capability
         else:
             validated.pop("capability", None)
-    return json.dumps(validated, ensure_ascii=False)
+    # allow_nan=False 是第二道闸：任何未预料到的非有限值都不得进入数据库 JSON TEXT。
+    return json.dumps(validated, ensure_ascii=False, allow_nan=False)
 
 
 # ── 画布同步辅助：数据库目录行 → 非密钥运行时目录项 ────────────────────
@@ -365,7 +387,7 @@ def put_model(
     impacted_trees = _impacted_trees(tree_list, impacts)
     candidates = []
     if impacted_trees:
-        # 只有存在候选画布时才物化运行时目录项：无画布受影响时目录写不应因为
+        # 只有存在受影响画布时才构造运行时目录项：无画布受影响时目录写不应因为
         # 旧库里的历史非法 profile 而失败。
         effective = dict(existing)
         if upstream is not None:

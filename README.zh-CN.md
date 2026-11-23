@@ -14,11 +14,12 @@ RoutePilot 是兼容 OpenAI 协议的路由代理。请求从 `/v1/chat/completi
 |---|---|
 | 入口 | `POST /v1/chat/completions`，支持 JSON 与 SSE；响应头 `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` |
 | 路由策略 | 可视化决策图：输入条件、决策服务问题、逻辑门、模型目标 |
-| 决策服务 | `choice` / `noul` / `score` 三类问题，按波次合并调用 `systemone` 兼容服务 |
+| 决策服务 | `choice` / `noul` / `score` 三类问题，按波次合并调用 `systemone` 兼容服务；画布快照固定该图使用的服务档案 |
 | 目标选择 | 已激活目标按优先级竞争；统一兜底目标 `error_fallback` |
 | 后端选择 | 会话粘性、`least_inflight` 负载均衡、按模型熔断 |
-| 检查路由 | 调用 `/admin/try`，复用同一图执行器与同一轨迹格式，不改变粘性、inflight 与上游模型 |
-| 运维 | 请求账本、决策回放、置信度分布、模型/提供方目录、JEV 配置、时段、审计历史、角色化用户 |
+| 可移植画布 | 每份已保存画布自带完整非密钥运行配置，单份 JSON 即可在空数据库实例上恢复 |
+| 检查路由 | 调用 `/admin/try`，复用同一图执行器与同一轨迹格式，不改变粘性、inflight 与上游模型；数据库差异只作为提示展示 |
+| 运维 | 请求账本、决策回放、置信度分布、模型/提供方目录、多服务 JEV 目录、时段、审计历史、角色化用户 |
 | 控制台 | 中英双语原生 ES Modules，无构建步骤 |
 
 ## 请求路由流程
@@ -49,10 +50,10 @@ flowchart LR
 | 层 | 路径 | 职责 |
 |---|---|---|
 | API | `router/api/` | DTO 解析、异常到 HTTP 映射、上游代理、展示层 |
-| 控制面 | `router/control/` | 图与配置的写用例、启用校验 |
-| 路由领域 | `router/routing/` | 图模型、校验、编译后拓扑、求值器、调度 |
-| 决策服务 | `router/jev/` | `systemone` 客户端、配置、输入窗口 |
-| 上游 | `router/upstream/` | 后端目录、代理传输、熔断器与同步 worker |
+| 控制面 | `router/control/` | 图与目录的写用例、影响清单与确认后的画布同步、启用校验 |
+| 路由领域 | `router/routing/` | 图模型、校验、编译后拓扑、求值器、调度、不可变画布快照 |
+| 决策服务 | `router/jev/` | `systemone` 客户端、服务档案、输入窗口 |
+| 上游 | `router/upstream/` | 固定模型目录（`model_id -> Backend`）、代理传输、熔断器与同步 worker |
 | 存储 | `router/store/` | SQLite schema/仓储、共享图文件仓储 |
 | 控制台 | `router/console/` | 中英双语原生 ES Module 界面 |
 | 运行时 | `router/request_logging.py`、`router/maintenance.py` | 账本队列/worker、会话清理 |
@@ -62,7 +63,8 @@ flowchart LR
 - `router/routing/` 与 `router/upstream/` 不导入 FastAPI，也不导入 SQLite；`router/control/` 与 `router/store/` 不导入 `router.api`。
 - API 层只做 DTO 解析与异常映射，不直接写控制面状态。账号与会话路由（`/admin/login`、`/admin/logout`、`/admin/users`、`/admin/me`）直接调用 `UserRepo`/`SessionRepo`/`ChangeRepo`。
 - `GraphService` 依次完成校验、构造候选快照、在单写锁内写图文件、复核文档哈希、发布快照、记录审计；过期草稿返回 409。
-- `ConfigurationService` 在同一事务内写数据与审计、在事务内复核图指纹，提交后才替换内存快照；指纹不稳定会在 COMMIT 前抛出。
+- `ConfigurationService` 在一个应用事务内提交「目录写 + 已确认受影响的画布」：在写锁内重算影响清单、校验每份候选文档、暂存/替换图文件（非活动画布先写、活动画布最后写）、复核图指纹、写审计，然后提交。只有活动画布被改写时才发布新的内存快照；过期确认在任何写入之前返回 409 `graph_conflict`。
+- 没有任何画布引用的目录写只写目录行与审计，不会重写画布，也不会重新发布快照。
 - `compile_graph()` 对每个已发布快照只执行一次；请求路径读取 `snapshot.require_compiled()`，不重建索引，不访问 SQLite。
 - 事件循环只把账本行写入有界队列与 20 条环形缓冲；每 2 秒 flush 一次，投影白名单列后经 `asyncio.to_thread` 落库。
 - 熔断 worker 启动时载入共享隔离状态，之后每 30 秒在工作线程同步本地变更。
@@ -75,24 +77,26 @@ flowchart LR
 
 | 页面 | 内容 |
 |---|---|
-| 测试 | 仅管理员可用的模型测试对话：Auto 路由或固定模型、SSE 流式、内存内多轮历史、图片/文本/音频/文件附件、安全多模态渲染 |
-| 决策组 | 画布编辑、图设置、检查器、校验、检查路由、导入导出 |
+| 测试 | 仅管理员可用的模型测试对话：Auto 路由（活动画布快照）或固定模型（数据库目录）、SSE 流式、内存内多轮历史、图片/文本/音频/文件附件、安全多模态渲染 |
+| 决策组 | 画布编辑、图设置（时区/粘性/兜底、JEV 选择、从数据库刷新运行配置）、检查器、校验、检查路由、导入导出 |
 | 计算日志 | 最近决策的模型、目标、候选、波次、JEV 概率、推理档位、上游结果与可回放轨迹 |
-| 决策服务 | 只读服务档案（地址、模型、密钥状态、测试状态）可复测；“保存并测试”位于编辑态；提示词、超时和上下文窗口位于高级配置 |
-| 模型 | 模型注册表；以“接入模型”从预置目录一次接入提供方与模型，预置弹窗的高级选项只有连接信息与模型位 ID，推理声明、档位、领域与提供方协议属于自定义表单 |
+| 决策服务 | 多服务 JEV 目录：服务列表、新建/编辑/删除、逐服务连接测试、提示词、超时和该服务自己的上下文/输入窗口 |
+| 模型 | 模型注册表与提供方目录；以“接入模型”从预置目录一次接入提供方与模型。影响已保存画布的编辑/删除会先展示影响清单，确认后才同步。预置弹窗的高级选项只有连接信息与模型位 ID，推理声明、档位、领域与提供方协议属于自定义表单 |
 | 用户 | 管理员/只读账号、密码、角色、状态 |
 
 ### 常用路径
 
 - 决策组顶栏只保留“检查路由”、主按钮与“更多”。新草稿的主按钮显示“保存并启用”；已启用的组显示“已启用”，有未发布修改时显示“保存并更新”。撤销/重做、自动整理、新建、导入、导出、保存草稿与停用都在“更多”里。检查器中的“应用”只更新本地草稿，不写服务端。
+- 图设置（检查器）从数据库 JEV 目录选择服务，并在同一个历史项里应用 **JEV 与其窗口**；“从数据库刷新运行配置”按目录重建草稿的 `backends`/`jev`/`jev_window`/`time_periods`。两者都只改本地草稿，不写服务端。
 - 模型页的“接入模型”是默认入口，可从预置目录一次完成提供方与模型接入；模型 ID 自动生成。预置弹窗的高级选项只放连接信息与模型位 ID，手工 ID、推理声明、档位、领域和提供方协议配置在自定义表单的高级选项里。
-- “决策服务”页默认显示连接信息与本会话的测试状态；“保存并测试”依次保存服务配置、上下文窗口并测试连接。提示词、State 模板、超时和 token 窗口位于高级配置，原始测试响应按需展开。
+- “决策服务”页是目录：左侧列出服务，右侧编辑选中的服务（地址、模型、`key_env`、密钥、超时、指令、State 模板、输入/上下文窗口）并测试连接。窗口属于服务本身，因此画布总是成组替换 JEV 与窗口。空目录首次启动可由 `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY` 播种一个 `default` 服务。
+- 编辑或删除仍被画布引用的模型、提供方或 JEV 服务会进入两步确认：第一次写入返回 409，列出每幅受影响画布（名称、id、启用状态、当前 `document_sha256`、使用位置）；确认后原样带回这些哈希，服务端只同步受影响的画布。仍被 target 引用的模型 / 仍被引用的 JEV 服务删除时必须提供替代项；仍被数据库模型或画布模型引用的提供方不能删除。确认同步成功后，已打开的画布需要重新加载（或使用“从数据库刷新运行配置”）——本地草稿不会被就地更新。
 
 ### 模型测试对话
 
 首页（`/console/index.html`）是仅管理员可用的模型测试对话，请求发往 `/admin/test/chat/completions`，并根据响应头 `x-sr-model` 在消息元信息中显示实际命中的模型（Auto 为 `Auto → <模型>`，固定模型为 `<模型> · 固定模型`）。
 
-- **Auto 与固定模型**：Auto 与 `/v1/chat/completions` 一样评估当前路由快照（决策图、JEV 波次、粘性与负载均衡后端选择）；选择已配置的模型 ID 时跳过决策图与 JEV，返回 `x-sr-selection: direct`。
+- **Auto 与固定模型**：Auto 与 `/v1/chat/completions` 一样评估活动画布快照（决策图、JEV 波次、粘性与负载均衡后端选择）；选择已配置的模型 ID 时跳过决策图与 JEV，模型经**数据库目录**解析（绝不读活动画布），返回 `x-sr-selection: direct`。
 - **流式回复**：回答通过 SSE 逐块返回；停止会中止流并保留已生成内容，复制 / 重试 / 重新生成作用于该条消息。只有上游正常收尾才算完成——提前断流会标记为未完成，提供方错误就地显示在对话里，不会冒充完整回答。
 - **多轮历史**：内存中的对话以 wire-format `messages` 重发，并从原始 assistant 消息无损回放（消息级媒体只渲染、绝不回流进历史）；新建对话会中止在途回复、清空对话并轮换会话 id。
 - **附件**：文本文件按原文读取并作为 content part 发送；图片、音频等其他文件在浏览器内读成 data URL。预估体积会超出 10 MiB 请求上限的文件在读取前就地拒绝，发送前还会对完整 JSON 请求体（含历史与 Base64）做精确复检。
@@ -190,6 +194,8 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 
 ### 图文档
 
+v3 文档就是完整、可移植的画布：图结构加四个必填运行字段。缺少它们的文档不是「待接管的旧文档」，而是直接拒绝。
+
 ```json
 {
   "kind": "sr-routing-graph",
@@ -203,23 +209,27 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
     "error_fallback": "safe-target",
     "nodes": [],
     "edges": []
-  }
+  },
+  "backends": { "providers": [], "models": [] },
+  "jev": null,
+  "jev_window": { "input_tokens": 1024, "context_tokens": 4096 },
+  "time_periods": []
 }
 ```
 
-只接受 `sr-routing-graph` v3。v2 文档、非 v3 的 `kind`、未知节点类型，以及未知的 envelope/节点/边字段，都会在覆盖草稿或已发布快照之前被拒绝。结构性拒绝以 `graph_parse_error` 返回；控制台在导入时执行同一套校验。
+只接受 `sr-routing-graph` v3。v2 文档、非 v3 的 `kind`、未知节点类型，以及未知的 envelope/节点/边字段，都会在覆盖草稿或已发布快照之前被拒绝；只带部分（或完全不带）四个运行字段的文档同样被拒绝。结构性拒绝以 `graph_parse_error` 返回；控制台在导入时执行同一套校验。没有问题节点的画布才允许 `jev: null`。
 
 实验版本不提供旧 NOT 图兼容：任何 `logic/operator=not` 都直接拒绝，不自动迁移，也不保证历史 NOT 快照可展示。需要反向判断时，手工改用布尔槽位取反或数值补比较，例如 `> 0.65 → NOT` 改为 `<= 0.65`，`>= 0.5 → NOT` 改为 `< 0.5`。
 
-v3 文档还可以用四个可选顶层字段自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），见[自包含画布 JSON](#自包含画布-json)。
+四个运行字段的语义见[自包含画布 JSON](#自包含画布-json)。
 
-`tree_revision` 是 `{timezone, sticky, root}`（文档携带内嵌运行配置时再加上四个运行字段）canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。标题、能力说明、坐标、数组顺序与边 id 变化不影响该值；仅缺少内嵌运行配置、且不包含已移除能力的文档保持原有行为哈希；含 NOT 的旧图直接拒绝，不发生 revision 迁移。
+`tree_revision` 是 `{timezone, sticky, root}` 加四个运行字段的 canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。标题、能力说明、坐标、数组顺序与边 id 变化不影响该值。
 
 ## 模型与推理
 
 ![模型](assets/routepilot/zh/models.png)
 
-决策图引用的模型槽位映射到上游模型 id 与提供方。一个目标可包含多个槽位，由 `least_inflight` 在其中选择。
+决策图引用的模型槽位映射到上游模型 id 与提供方。一个目标可包含多个槽位，由 `least_inflight` 在其中选择。**数据库目录**是控制台下拉框与固定模型直连的管理事实源；**画布快照**是 Auto 路由的唯一事实源。
 
 提供方定义 OpenAI 兼容 base URL、API Key 环境变量与推理方言。模型 profile 声明：
 
@@ -229,9 +239,11 @@ v3 文档还可以用四个可选顶层字段自带运行配置（`backends`、`
 
 推理方言：OpenAI、DeepSeek、Qwen、Qwen chat template、OpenRouter、Z.ai、Together、string-thinking、Ant Ling。请求了不支持的档位时不注入推理，响应头携带 `x-sr-reasoning-warning`。
 
-`GET /admin/models` 返回的 `profile` 为 JSON 对象；数据库以 JSON 文本存储。活动决策组携带内嵌 `backends` 目录时，`GET /admin/models` 与 `GET /admin/providers` 投影图内目录，否则回退数据库；配置写操作会先同步管理表，两种视图最终一致。
+`GET /admin/models` 返回的 `profile` 为 JSON 对象；数据库以 JSON 文本存储。控制台与管理目录接口永远只读 SQLite——不再投影活动画布，目录写也不会自行重写任何画布。保存画布时才**选择**模型：所选模型及其提供方被加入快照；快照里已有同 ID 模型时，普通 target 编辑不会覆盖它（差异由检查提示报告，只有显式刷新或确认后的目录同步才会替换）。
 
-旧数据库 profile 仍按兼容规则宽松读取，但响应是脱敏投影：`api_key`、`authorization`、`key_present`、`key_source` 及其大小写/分隔符变体会从 `profile` 中递归剔除。这只是只读投影——合法元数据（`tier`、`domains`、`capability` 等）保留，数据库原行不被改写；图文件与管理写入仍严格拒绝这些字段，而不是清洗后保存。
+旧数据库 profile 仍按兼容规则宽松读取，但响应是脱敏投影：`api_key`、`authorization`、`key_present`、`key_source` 及其大小写/分隔符变体会从 `profile` 中递归剔除。这只是只读投影——合法元数据（`tier`、`domains`、`capability` 等）保留，数据库原行不被改写；图文件与管理写入仍严格拒绝这些字段，而不是清洗后保存。写入还会在落库前以 422 拒绝非 JSON 兼容数值（`NaN`、`Infinity`），读取/检查路径继续容忍旧行。
+
+删除或更新仍被已保存画布引用的模型/提供方是两步操作：第一次写入返回 409 `impact_confirmation_required`，携带每幅受影响画布与其当前 `document_sha256`；确认后的重试只同步这些画布。被 target 引用的模型删除时必须提供替代模型；被数据库模型或画布模型引用的提供方删除永远被拒绝（`provider_referenced`）——先解除引用。详见[目录影响确认](#目录影响确认)。
 
 提供方 API Key 从不出现在响应中：投影只暴露 `key_present` 与 `key_source`（`stored` / `env` / `none`）。
 
@@ -239,19 +251,18 @@ v3 文档还可以用四个可选顶层字段自带运行配置（`backends`、`
 
 ![决策服务设置（JEV）](assets/routepilot/zh/jev.png)
 
-决策服务提供 `POST /v1/systemone`，常见部署为 NeoHorse 或 vLLM。页面默认只显示只读服务档案：服务地址、模型、密钥状态与本会话的测试状态；点“编辑配置”后才显示地址、模型与 API Key 的编辑框。
+决策服务提供 `POST /v1/systemone`，常见部署为 NeoHorse 或 vLLM。控制台页面管理的是**服务目录**，不是单一全局配置：
 
-- “保存并测试”是唯一主动作，按 `PUT /admin/jev` → `PUT /admin/jev/window` → `POST /admin/jev/test` 的固定顺序执行；上下文窗口先在本地校验，校验失败不会发出任何写请求。
-- 部分成功会精确说明停在哪一步：配置未保存（未写窗口、未测试）、连接与提示词已保存但窗口未保存（未测试）、配置与窗口已保存但测试失败、全部成功。测试失败不会留下上一次的测试结果或原始响应。
-- 超时、清除密钥、默认指令、State 模板（必须恰好包含一个 `{request}`）、上下文/输入 token 窗口与自定义测试文本位于“高级配置”。
-- 测试通过后原始 JSON 响应按需展开（默认折叠）；测试失败时原始响应隐藏并清空。超长输入按头尾截断，上下文预算与输入上限随窗口配置一起保存。
-
-活动决策组携带内嵌 `jev` / `jev_window` 时以图内配置为准，环境变量不会覆盖它（图内 `jev: null` 也视为已经确定）。旧文档与无活动组实例仍按原逻辑：`ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` 只在首次启动时写入数据库，之后以数据库为准。JSON 从不携带 `api_key`：仅当端点匹配时复用已存密钥，否则在构建快照时读取环境变量 `ROUTER_JEV_API_KEY`。
+- 列表展示每个服务的 ID、模型与地址；新建、编辑、删除都按服务进行；窗口（`input_tokens` / `context_tokens`）与提示词、超时、`key_env` 和密钥一样属于该服务。
+- **测试**调用 `POST /admin/jev/{id}/test`，使用数据库里的服务配置而不是活动画布快照；画布自身的 JEV 由检查路由以提示形式报告差异。
+- 画布选择一个服务（`jev.id` + `key_env`）并内嵌其完整非密钥档案与窗口。画布在选择、刷新或服务端确认同步时总是成组替换 JEV 与窗口——不存在「两个服务混用」的形态。
+- 只有 `key_env`（环境变量名）与服务地址/模型是可移植的。真实 `api_key` 只存在 SQLite 中，仅当服务 `id`、`base_url`、`model` 全部仍匹配时复用；否则在构建快照时读取该服务 `key_env` 指向的环境变量。不存在全局 `ROUTER_JEV_API_KEY` 回退；播种的 `default` 服务恰好把该变量名作为自己的 `key_env`。
+- 删除仍被画布引用的服务必须提供替代服务，确认后同步受影响画布的 JEV 档案与窗口；更新被引用的服务同样需要确认并同步。
 
 ## 账号与运维
 
 - 邮箱口令登录，scrypt 哈希，不透明 bearer 会话。
-- `admin` 可编辑图、模型、JEV 配置与用户；`viewer` 只读。
+- `admin` 可编辑图、模型、提供方、JEV 服务目录与用户；`viewer` 只读。
 - 最后一个启用的管理员不能被降级、停用或删除。
 - 用户与配置变更写入审计日志。
 - 图文件以 SHA-256 内容寻址，用于保存冲突与重载校验；不保留图历史。
@@ -260,7 +271,7 @@ v3 文档还可以用四个可选顶层字段自带运行配置（`backends`、`
 
 ## 图存储与多副本
 
-图不存于 SQLite。每个决策组是 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json` 下的一份 v3 文档；`ROUTER_GRAPH_DIR/current` 保存已启用组的 id。文档可自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），因此不依赖控制面数据库也能恢复；没有这四个字段的文档继续使用数据库目录。
+图不存于 SQLite。每个决策组是 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json` 下的一份 v3 文档；`ROUTER_GRAPH_DIR/current` 保存已启用组的 id。每份文档**必须**自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），因为已保存画布是 Auto 路由唯一的运行时来源。不存在 `runtime:null` 标记、不存在「保存为旧文档」模式，也没有把配置物化进旧文件的服务端步骤。
 
 - 单写者：管理面 API。其他副本设置 `ROUTER_GRAPH_WRITER=false`，只读挂载目录并每 2 秒重载。
 - 副本在替换服务快照前编译候选快照；文件非法时保留旧快照，`/readyz` 报告 stale。
@@ -270,17 +281,30 @@ v3 文档还可以用四个可选顶层字段自带运行配置（`backends`、`
 - 所有读写容器必须使用同一数值 UID；`0600` 文件无法仅靠 GID 或 `fsGroup` 访问。
 - 过期保存返回 409 `graph_conflict`；导入只改草稿。
 - `/healthz` 为存活探针；`/readyz` 报告初始快照就绪状态，503 表示未就绪，后续重载失败会保留现有快照并标记 `"stale": true`。
-- 迁移：`python scripts/export_sqlite_graphs.py --db router.db --out routing-graph`。输出目录必须不存在；启动过程不会删除旧 SQLite 图。
+- schema 会自行升级（见[从旧版快照前安装升级](#从旧版快照前安装升级)）；不再提供 SQLite→图文件的导出脚本——迁移画布靠导出/导入 JSON 文件。
+
+## 从旧版快照前安装升级
+
+对既有部署，有两件变化。
+
+1. **SQLite schema 在首次启动时自动迁移。** schema v5 在一个事务内升级到 v6：旧的单行 `jev_config` 变成 id 为 `default` 的 `jev_services` 服务（已存密钥、端点、模型、提示词与超时保留；窗口被夹到合法范围），随后旧表被删除。升级前请备份 `router.db`（连同 `router.db-wal` / `router.db-shm`）；升级后没有回到旧单配置布局的路径。若目录为空，`ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` 会一次性播种该 `default` 服务，`ROUTER_JEV_API_KEY` 作为它的密钥写入。
+2. **每份已存画布必须已经是完整快照。** 严格解析器会拒绝缺少任一运行字段的画布。升级前：
+
+   - 备份 `ROUTER_GRAPH_DIR`（`graphs/*.json` 与 `current`）；
+   - 在**旧版本**上为每个决策组生成完整文档：打开每个决策组并保存一次（或对其文档 `PUT /admin/trees/{id}`）。旧版本会把当时有效的运行配置写进文件；
+   - 如果旧实例已无法操作，就按[自包含画布 JSON](#自包含画布-json)的结构与画布实际引用的模型、提供方、JEV 服务和时段，手工补齐每个 `graphs/*.json` 的四个字段。
+
+漏改的文件不会被静默修复：启动时记录 `initial graph snapshot is unavailable`，`/readyz` 报告未就绪，`GET /admin/trees` 返回 503 `graph_storage_error`，`/v1` Auto 路由没有可用快照（`no_valid_snapshot`），直到文件修好。启动成功后，旧格式文件仍然只是非法文件——永远不会被隐式接管或迁移。
 
 ## 自包含画布 JSON
 
-v3 文档可以自带运行配置，因此单份文件就能在空数据库实例上恢复一个决策组。信封新增四个可选顶层字段：
+每份已保存画布都是可移植、不可变的运行快照：单份文件即可在空数据库实例上恢复一个决策组。四个顶层字段**必填且必须成组出现**：
 
 | 字段 | 内容 |
 |---|---|
 | `backends` | `providers`（名称、base URL、密钥环境变量名、推理方言）与 `models`（模型 id、上游 id、提供方、profile） |
-| `jev` | 决策服务端点、模型、超时、提示词与状态模板，或 `null` |
-| `jev_window` | 决策服务输入预算 `input_tokens` / `context_tokens` |
+| `jev` | 所选决策服务档案：`id`、`base_url`、`model`、`key_env`、超时、提示词与状态模板；只有没有问题节点的画布才为 `null` |
+| `jev_window` | **同一服务**的 `input_tokens` / `context_tokens` |
 | `time_periods` | `periods` 条件引用的时段定义 |
 
 ```json
@@ -313,8 +337,10 @@ v3 文档可以自带运行配置，因此单份文件就能在空数据库实�
     ]
   },
   "jev": {
+    "id": "default",
     "base_url": "http://127.0.0.1:8100",
     "model": "d1-2b",
+    "key_env": "ROUTER_JEV_API_KEY",
     "timeout_seconds": 10.0,
     "instructions": "你是一个模型路由器。",
     "state_template": "【待判断的用户请求】\n{request}"
@@ -326,22 +352,25 @@ v3 文档可以自带运行配置，因此单份文件就能在空数据库实�
 }
 ```
 
-四个字段遵循同一组规则：
+规则：
 
-- **要么四个都有，要么四个都没有。** 只出现部分字段的文档会在覆盖草稿或已发布快照之前以 `graph_parse_error` 拒绝；四个都缺失表示旧文档。
+- **四个字段永远齐全。** 只带部分字段（或完全不带）的文档在解析、导入、保存、检查时都以 `graph_parse_error` 拒绝；不存在从数据库补齐缺字段的回退，也不存在 `runtime:null` 控制字段或物化步骤。旧文档被拒绝，不会被就地升级。
+- **JEV 与窗口是一个整体。** `jev.id` 选择目录服务，`key_env` 说明其密钥如何解析；`jev_window` 属于该服务。选择或同步 JEV 服务时，`jev` 与 `jev_window` 一起替换。
 - **不含密钥，且任意层级都拒绝。** 提供方只写 `key_env`（环境变量名），不写 Key；`jev` 不含 `api_key`。密钥与派生的密钥字段（`api_key`、`authorization`、`key_present`、`key_source`）出现在四个字段内部任意位置——包括 `backends.models[*].profile` 下的嵌套对象和数组——都会被拒绝。键名比较忽略大小写与 `-`/`_`（`API-KEY` 等同 `api_key`），但只覆盖这个固定集合，`monkey`、`keychain` 之类正常元数据照旧保留。除此之外 `profile` 仍是自由 JSON 元数据对象：`capability`、`domains`、`tier` 以及后续元数据原样保存。无需鉴权的本地服务可以把 `key_env` 留空。
-- **在文件边界校验。** 提供方与模型 id、提供方引用、profile、推理档位声明、JEV 配置、窗口与时段都在解析时校验。
-- **参与行为版本。** 四个字段存在时进入 `tree_revision`（以及控制台 dirty/undo 基线）；画布坐标仍不影响行为。仅缺少内嵌运行配置、且不包含已移除能力的文档保持原有行为哈希；含 NOT 的旧图直接拒绝，不发生 revision 迁移。
+- **在文件边界校验。** 提供方与模型 id、提供方引用、profile、推理档位声明、JEV 服务档案、窗口与时段都在解析时校验。
+- **参与行为版本。** 四个字段进入 `tree_revision`（以及控制台 dirty/undo 基线）；画布坐标仍不影响行为。
 
-### 旧文档
+### 快照来源
 
-没有四个字段的 v3 文档是旧文档：运行配置仍按原有逻辑从 SQLite 装配，升级后读取旧文件不受影响。旧文档在第一次通过 API 写入时物化：
+只有以下操作会生成或修改画布运行快照：
 
-- 保存（`POST` / `PUT /admin/trees`）与启用（`POST /admin/trees/{id}/enable`）会把当前有效运行配置（活动组的内嵌配置，否则数据库）写进保存后的文件；
-- 复制决策组保留源组的运行配置；
-- `POST /admin/try` 未携带运行字段时，依次继承所引用组的配置、活动组的配置，最后回退数据库。
+1. **新建画布** —— 初始快照从当前数据库目录生成。
+2. **导入完整 JSON 文档** —— 以文件内快照为准。
+3. **在画布中选择模型或 JEV** —— 把所选目录项（非密钥）加入/替换当前草稿；选择 JEV 时档案与窗口原子替换。
+4. **图设置里的「从数据库刷新运行配置」**。
+5. **确认目录影响清单后** —— 服务端同步受影响的画布。
 
-没有 runtime 的草稿还可以显式要求物化：`POST`/`PUT /admin/trees` 接受控制字段 `"runtime": null`，含义是**先丢弃该组自己的内嵌配置**，再按既有规则从活动组/数据库取值。它不是文件字段，也不表示“保存为旧图”，并且不能与四个扁平字段同时出现；任何非 `null` 值返回 422。省略 `runtime` 时仍是普通的“继承已存图”语义；控制台保存没有 runtime 的草稿时总会显式发送 `null`。
+目录写入本身不会重写画布，也不会重新发布快照。target 编辑遇到快照已有的同 ID 模型不会覆盖其快照项；差异由检查提示报告，只有显式刷新或确认同步才替换。复制决策组保留源组快照；`POST /admin/try` 携带 `tree_id` 时继承已存画布快照（完整草稿必须自带四字段；两者都没有则 422）。
 
 ### 密钥
 
@@ -350,15 +379,34 @@ JSON 从不保存密钥，环境在构建快照时提供。
 | 密钥 | 解析顺序 |
 |---|---|
 | 提供方 API Key | 仅当数据库提供方的 `name` 与规范化 `base_url` **都匹配**时复用其已存密钥，否则为空；再取 `os.environ[key_env]` |
-| 决策服务 Key | 仅当数据库 JEV 配置的 `base_url` 与 `model` **都匹配**时复用其已存密钥，否则为空；再取 `ROUTER_JEV_API_KEY` |
+| 决策服务 Key | 仅当数据库服务的 `id`、`base_url` 与 `model` **都匹配**时复用其已存密钥，否则为空；再取 `os.environ[service.key_env]`。不存在全局 JEV Key 回退；播种的 `default` 服务用 `ROUTER_JEV_API_KEY` 作为自己的 `key_env`。 |
 
 因此端点变化不会把旧密钥静默发往新地址；环境变量密钥不会被写进 SQLite 或 JSON；派生鉴权头只存在于内存快照；任何 JSON 文件、API 响应信封或图响应都不包含真实密钥。
 
-### 配置写入是全局的
+### 目录影响确认
 
-配置页保持既有全局语义。模型、提供方、JEV、JEV 窗口或时段的成功写入会先用活动组的内嵌配置回填管理表（只保留端点匹配的密钥），再执行本次编辑、用结果校验活动图、记录审计，最后把结果运行配置写回**所有**决策组 JSON。所以一次保存会影响所有组，即使只有一个组处于启用状态；其它写入路径不会重写别的组，失败写入不改动任何文件。
+更新或删除模型、提供方、JEV 服务前先扫描全部画布。若仍有引用，第一次写入返回 **409**，`detail.code = "impact_confirmation_required"`：
 
-跨图更新是一个批次而不是逐份独立写入：先对所有基线 SHA-256 做预检、把目标文档写进各自的同目录暂存文件，之后才开始第一次正式替换；替换顺序为非活动组在前、活动组最后。配置写回调只做校验、审计与暂存，提交图文件、构造并复核候选快照由外层事务骨架统一执行。请求处理期间的任何可捕获异常（暂存替换、候选快照构造、指纹复核、数据库事务）都先让数据库事务退出（ROLLBACK），随后才恢复本用例替换过的文件原字节；内存快照只在提交成功后才发布，只有文件恢复失败时才按已经回滚的数据库和实际活动图刷新快照。不得把该刷新移回数据库事务内部。暂存/回滚保证的是请求内失败不留下半份配置；它**不是** SQLite 与 JSON 文件之间的分布式事务，进程在替换之间崩溃不会被回滚（活动组最后写，使当前生效配置在最后一步之前仍指向旧图）。
+- `resource`：正在变更的 kind 与 id/name；
+- `affected_trees`：每幅受影响画布的 `id`、`name`、`enabled`、当前 `document_sha256` 与 `usage`（target 节点 id、运行时目录、JEV id、提供方模型）；
+- 删除时的 `replacements`（非密钥的替代模型/服务候选）。
+
+此状态下不写任何东西——数据库、文件、审计与快照都不变。控制台展示清单；确认后用这些哈希原样构造 `impact_confirmation = {"trees":[{"id","document_sha256"}, …]}` 重试同一请求。若期间画布已变化，服务端返回 409 `graph_conflict` 并报告**当前**哈希，控制台要求重新读取而不是应用过期确认。
+
+确认后由同一个用例原子提交目录行、全部受影响画布与审计行：在单写锁内重算影响清单、校验每份候选文档、暂存所有文件（非活动画布先写、活动画布最后写）、复核图指纹后才提交。任一失败都会回滚数据库并恢复所有已替换文件；内存快照只在事务提交后、且活动画布在同步集合中时才发布。
+
+更新/删除语义：
+
+- **模型更新** —— 在每幅声明该模型的画布里替换模型项（连同其提供方项）；target 的模型 ID 不变。
+- **模型删除** —— 仅存在于运行时目录的模型可直接移除；被 target 引用的模型必须提供替代模型，服务端替换 target 引用、去重模型槽位，并把替代模型（及其提供方）补进快照。
+- **提供方更新** —— 在每幅声明该提供方的画布里替换提供方项；模型引用不变。若新推理方言让某模型 profile 非法，整个写入 422 拒绝（零写入）。
+- **JEV 更新** —— 同步所有 `runtime.jev.id` 匹配画布的 `jev` + `jev_window`。
+- **JEV 删除** —— 凡有画布引用都必须提供替代服务；JEV 与窗口一起替换。
+- **提供方删除** —— 永不可绕过：只要还有数据库模型或画布模型引用它，就以 409 `provider_referenced` 拒绝，也不提供隐式替换。需先解除引用。
+
+### 画布与目录差异
+
+`POST /admin/try` 会把画布声明的资源（provider、模型、JEV 服务及其窗口）与数据库目录逐字段比较，把差异或缺失行报告为提示（`code = "runtime_mismatch"`、`level = "hint"`，`params` 同时给出画布值与数据库值）。提示不阻止检查，也不改变执行配置：运行仍严格使用画布快照。数据库里存在但画布未声明的资源不算冲突，也不会产生提示。控制台在检查结果下方渲染这些提示。
 
 ### 用一份 JSON 恢复
 
@@ -366,9 +414,11 @@ JSON 从不保存密钥，环境在构建快照时提供。
 2. 把 JSON 导入决策组（控制台「决策组」页，或 `POST /admin/trees`），保存并启用。
 3. 执行检查路由（`POST /admin/try`），验证图、内嵌模型目录、决策服务、窗口与时段。
 4. 调用 `POST /v1/chat/completions` 走 Auto 路由，或用模型测试对话选择固定模型。
-5. 只需为密钥配置环境变量：各提供方的 `key_env`，以及决策服务端点需要鉴权时的 `ROUTER_JEV_API_KEY`。
+5. 只需为密钥配置环境变量：各提供方的 `key_env`，以及所选服务需要鉴权时的 `key_env`。
 
-`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、本地决策服务端点与三个种子时段。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
+`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、`default` 决策服务档案与三个时段。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
+
+`configs/cases/case-*.json` 里的五个演示案例都是完整 v3 文档：带 `kind`/`version`，不含外部 `id`/`enabled`，provider 为 `demo-tap`，JEV 服务为 `demo-jev`（窗口 `2048 / 4096`），并内嵌其 target 实际引用的全部模型。`scripts/demo/apply_cases.py` 是它们的部署入口：合并案例文件里的目录、播种多服务 JEV 目录与时段、部署五棵画布（不启用）并跑 dry-run。它绝不绕过影响确认——遇到 409 默认打印受影响画布并停止；`--confirm-sync` 才会用预览里的基线哈希显式重试同一批请求。`graph_conflict` 表示画布在预览后变化，重跑脚本即可。
 
 ## 快速开始
 
@@ -396,7 +446,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 .venv/bin/python -m router
 ```
 
-首次对空用户表启动时写入管理员账号。
+首次对空用户表启动时写入管理员账号。空图目录对外只有空 Auto 快照；路由前先新建或导入一份画布。既有部署请先读[从旧版快照前安装升级](#从旧版快照前安装升级)。
 
 ## 配置项
 
@@ -407,9 +457,9 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | `ROUTER_GRAPH_WRITER` | `true` | 是否允许写图；只应有一个写者 |
 | `ROUTER_HOST` | `127.0.0.1` | 监听地址 |
 | `ROUTER_PORT` | `8400` | 监听端口 |
-| `ROUTER_JEV_URL` | 空 | 决策服务 base URL |
-| `ROUTER_JEV_MODEL` | 空 | 决策服务模型，与 `ROUTER_JEV_URL` 配对 |
-| `ROUTER_JEV_API_KEY` | 空 | 决策服务 Key |
+| `ROUTER_JEV_URL` | 空 | 播种 `default` JEV 服务的 base URL；仅在 JEV 目录为空时使用，与 `ROUTER_JEV_MODEL` 配对 |
+| `ROUTER_JEV_MODEL` | 空 | 播种 `default` JEV 服务的模型，与 `ROUTER_JEV_URL` 配对 |
+| `ROUTER_JEV_API_KEY` | 空 | 播种的 `default` 服务存储的密钥（其 `key_env` 为 `ROUTER_JEV_API_KEY`）；不是全局回退 |
 | `ROUTER_JEV_TIMEOUT` | `10` | 决策服务超时（秒） |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量 |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
@@ -430,11 +480,11 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | `POST /admin/trees/{id}/copy`、`/enable`、`/disable` | 组生命周期 |
 | `POST /admin/try` | 针对草稿图的检查路由 |
 | `POST /admin/test/chat/completions` | 仅管理员的模型测试对话；JSON 或 SSE |
-| `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 模型注册表 |
+| `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 模型注册表；更新/删除先返回 409 影响清单，确认后同步画布 |
 | `GET /admin/model-catalog`、`POST /admin/fetch-models` | 提供方预设、上游模型发现 |
-| `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 提供方 |
-| `GET/PUT /admin/jev`、`POST /admin/jev/test` | 决策服务配置 |
-| `GET/PUT /admin/jev/window` | JEV 上下文与输入 token 窗口 |
+| `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 提供方；更新先返回 409 影响清单，仍被引用时不可删除 |
+| `GET/POST /admin/jev`、`GET/PUT/DELETE /admin/jev/{id}` | 多服务 JEV 目录（窗口属于各服务） |
+| `POST /admin/jev/{id}/test` | 用数据库配置测试单个目录服务 |
 | `GET/PUT /admin/time-periods` | 时段 |
 | `GET /admin/requests/recent`、`GET /admin/requests/stats` | 实时请求环形缓冲、logger 统计 |
 | `GET /admin/overview`、`GET /admin/changes` | 概览、审计历史 |
@@ -447,7 +497,9 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | 请求体格式错误 |
 | 413 | `request_too_large` | 请求体超过 10 MiB |
 | 502 | `upstream_error` | 上游 5xx 或网络失败 |
-| 409 | `graph_conflict` | 草稿加载后图已变化 |
+| 409 | `graph_conflict` | 草稿/影响清单加载后图已变化 |
+| 409 | `impact_confirmation_required` | 模型/提供方/JEV 写入影响画布，需确认清单里的文档哈希 |
+| 409 | `provider_referenced` | 提供方仍被数据库模型或画布模型引用 |
 | 409 | `graph_already_exists` | 图 id 重复 |
 | 503 | `graph_read_only` | 只读副本 |
 | 503 | `graph_storage_error` | 共享图存储不可读 |
@@ -458,21 +510,23 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 
 上游 4xx 响应按原状态码与响应体透传。
 
-配置接口：`/admin/models`、`/admin/providers`、`/admin/jev`、`/admin/jev/window`、`/admin/time-periods`。不存在通用 `/admin/settings` 接口。
+配置接口：`/admin/models`、`/admin/providers`、`/admin/jev`、`/admin/time-periods`。不存在通用 `/admin/settings` 接口，也不存在独立的 JEV 窗口端点：窗口属于每个 JEV 服务。
 
 ## 测试
 
 ```bash
 .venv/bin/python -m pytest -q
-node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs scripts/graph_contract_test.mjs
+node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
+    scripts/console_runtime_test.mjs scripts/graph_contract_test.mjs \
+    scripts/console_impact_test.mjs
 npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 ```
 
 - `pytest` 只收集 `tests/`（`testpaths`），运行为单元与 FastAPI 集成测试，不启动浏览器，也不收集 `experiments/`。
-- `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
-- `npm run check:console` 运行三个 Node 套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
+- `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
+- `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
 - `scripts/i18n_dead_keys.py` 报告未被引用的词典键。
 
 实验代码独立运行，不进入默认套件：
@@ -487,22 +541,22 @@ npm run check:console
 ```
 router/
   api/                 FastAPI 路由、DTO、异常映射、代理装配、展示层
-  control/             控制面写服务与启用校验
+  control/             目录写、影响清单、确认后的画布同步与启用校验
   routing/
     graph/             图模型、校验、条件、编译器、求值器
     service.py         求值 → 调度编排
     scheduling.py      粘性选择、租约获取、粘性写入
     affinity.py        会话粘性 LRU
     scheduler.py       least_inflight 均衡器与租约
-    snapshot.py        不可变快照装配与编译后拓扑
+    snapshot.py        不可变画布快照装配与编译后拓扑
     tree.py            树 envelope 编解码与 revision
     codec.py           严格字段解析助手
   request_logging.py   账本队列/环形缓冲与工作线程写入
-  jev/                 决策服务客户端、配置、输入窗口
-  upstream/            目录、代理传输、熔断器 + 同步 worker
+  jev/                 决策服务客户端、服务目录 DTO、输入窗口
+  upstream/            固定模型目录、代理传输、熔断器 + 同步 worker
   store/               SQLite schema/仓储、图文件仓储
   console/             中英双语原生 ES Module 控制台
-configs/               示例决策组
+configs/               示例决策组；configs/cases/ 为五份可移植演示案例
 tests/                 pytest 套件与契约 fixture
 scripts/               Node 契约测试、Playwright QA、部署脚本
 experiments/jev-batch/ 独立 JEV 批量 spike

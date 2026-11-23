@@ -1,8 +1,12 @@
 """上游目录：models ⋈ providers 的模型目录与推理能力归一化。
 
-热路径纪律（设计文档 §4.4）：routing 不访问数据库。应用启动（以及每次
-admin 写 model/provider）时整体重建 ``model_id -> Backend`` 快照，/v1
-只读内存快照。
+本模块是 frozen ``Backend`` 的定义处，并提供「从 SQLite 目录装配
+``model_id -> Backend``」的唯一入口 :func:`load_backends`。它只服务**固定模型
+直连**（管理端测试对话、``/admin/test``）与目录检查：Auto 路由始终读取活动画布
+发布的运行快照（``router.routing.snapshot``，由 ``router.control.runtime`` 按
+画布内嵌运行配置装配），既不访问数据库，也不经过本模块。``/admin/models`` /
+``/admin/providers`` 的目录写不会重写任何画布，因此这里也不存在「每次目录写
+重建快照」的路径。
 
 ``Backend`` 是 frozen dataclass：快照构造时复制 ``headers``/``reasoning``，
 发布后的 MappingProxy 里不再包着可被写者顺手改掉的可变对象。
@@ -38,9 +42,9 @@ def _reasoning_capability(profile_text: str | None,
                           provider_format: str) -> dict | None:
     """Parse profile JSON + normalize; unusable/illegal declarations -> None.
 
-    Hot path does zero parsing: this runs at startup and on every admin write
-    that swaps the snapshot. A corrupt/illegal declaration must never prevent
-    the service from starting (old databases), so fall back to "undeclared".
+    Auto 路由热路径零解析：本函数只在固定模型直连按 SQLite 目录装配
+    ``load_backends`` 时运行。损坏/非法的旧声明绝不能阻止服务启动，因此回退为
+    「未声明」。
     """
     if not profile_text:
         return None
@@ -56,10 +60,11 @@ def _reasoning_capability(profile_text: str | None,
 
 
 def load_backends(conn: sqlite3.Connection) -> dict[str, Backend]:
-    """Build the model_id -> Backend snapshot in one join.
+    """Build the model_id -> Backend catalog for fixed-model direct requests.
 
-    A model whose provider row is missing is simply absent from the snapshot;
-    the /v1 handler then answers 503 ``no_available_backend`` for that model.
+    A model whose provider row is missing is simply absent from the catalog; the
+    fixed-model direct handler then answers 404 ``unknown_model`` for it. Auto
+    routing never calls this: it reads the published canvas snapshot only.
     """
     rows = conn.execute(
         "SELECT m.id AS id, m.upstream AS upstream, m.provider AS provider, "
@@ -89,15 +94,16 @@ def parse_profile_text(text: str | None) -> dict:
 
 def reasoning_map_for_rows(conn: sqlite3.Connection,
                            rows) -> dict[str, dict | None]:
-    """model_id -> normalized reasoning for a model-catalog row set.
+    """model_id -> normalized reasoning for an arbitrary model-catalog row set.
 
     ``rows`` are catalog dicts (``id``/``profile``/``provider``) and may be a
-    **prospective** snapshot that is not stored yet (a pending POST/PUT
-    /admin/models).  The provider ``reasoning_format`` comes from the providers
-    table (missing provider -> ``"openai"``), exactly like
-    :func:`load_backends`/:func:`model_reasoning_from_db`: one rule for boot,
-    hot-path backends and admin-write validation, so a write can never be
-    accepted by the API and rejected by the next startup.
+    prospective set that is not stored yet. The provider ``reasoning_format``
+    comes from the providers table (missing provider -> ``"openai"``), exactly
+    like :func:`load_backends`, so a write can never be accepted by the API and
+    rejected by a later fixed-model direct request.
+
+    画布运行路径不使用本函数：Auto 路由与启用校验的推理能力来自画布内嵌运行
+    配置（``router.control.runtime.enable_context_for_runtime``）。
     """
     formats = {row["name"]: (row["reasoning_format"] or "openai")
                for row in conn.execute(
@@ -112,10 +118,8 @@ def reasoning_map_for_rows(conn: sqlite3.Connection,
 def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
     """model_id -> normalized reasoning capability of the CURRENT catalog.
 
-    Same source for every consumer that must never disagree about a model's
-    declared levels (startup check, ``/admin/trees`` enable validation):
-    rows written straight into the DB (bypassing the API) are judged by the
-    same rule as rows coming through the API.
+    Catalog-only projection for tooling/tests; enable validation and Auto routing
+    judge the canvas's own embedded declarations instead.
     """
     rows = [{"id": row["id"], "profile": row["profile"],
              "provider": row["provider"]}

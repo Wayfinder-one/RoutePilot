@@ -228,7 +228,9 @@ def post_jev(
             "synced_trees": [],
         })
 
-    # 新建服务不可能已被已存画布引用 → 无候选；但目录行与审计仍走共享原子写路径。
+    # 新建目录项不触发任何画布同步：已存画布可能早已声明了一个尚不存在的
+    # jev.id（严格解析只校验结构），新建服务不会替它补齐快照，响应也没有
+    # synced_trees。目录行与审计仍走共享原子写路径（空候选 = 只写 DB）。
     _catalog_service(request, conn, trees).commit(
         db_write=db_write, candidates=[], audit=audit)
     return {"service": _public_service(conn, service)}

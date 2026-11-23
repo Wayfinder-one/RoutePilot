@@ -222,6 +222,65 @@ def test_create_model_rejects_illegal_profile(client, profile):
                                 client.get("/admin/models").json()["models"]}
 
 
+NON_FINITE_LITERALS = ("NaN", "Infinity", "-Infinity")
+
+
+@pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+def test_model_writes_reject_non_finite_profile_floats(client, app, literal):
+    """NaN/Infinity 不是合法 JSON：POST/PUT 在写库前 422，行/审计/快照零改动。
+
+    ``json.loads`` 接受这三个字面量，但 Starlette 的 JSONResponse 用
+    ``allow_nan=False`` 序列化 —— 一旦写进 ``models.profile``，该行之后的
+    echo/GET 直接 500。管理写路径必须落库前拒绝。
+    """
+    conn = connect(app.state.settings.db_path)
+    try:
+        before_rows = conn.execute(
+            "SELECT id, upstream, provider, profile FROM models ORDER BY id").fetchall()
+        before_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+    finally:
+        conn.close()
+    before_revision = app.state.snapshot.snapshot_revision
+
+    # 1) profile 传 JSON 字符串：递归命中嵌套数组里的非有限值，并点名路径。
+    nested = '{"metadata": {"labels": [{"score": %s}]}}' % literal
+    created = client.post("/admin/models", json={
+        "id": "non-finite-model", "upstream": "u", "provider": "local",
+        "profile": nested})
+    assert created.status_code == 422, created.text
+    assert "非 JSON 兼容数值" in created.text
+    assert "profile.metadata.labels[0].score" in created.text
+
+    # 2) 原始 JSON 请求体（httpx 的 json= 会先拒绝 NaN，因此手写 content）。
+    raw = ('{"upstream": "u", "profile": {"metadata": {"threshold": %s}}}'
+           % literal)
+    updated = client.put("/admin/models/qwen3-8b", content=raw,
+                         headers={"Content-Type": "application/json"})
+    assert updated.status_code == 422, updated.text
+    assert "非 JSON 兼容数值" in updated.text
+    assert "profile.metadata.threshold" in updated.text
+
+    # 数据库行、审计与已发布快照均未变化（没有落库，也就不会 echo 500）。
+    conn = connect(app.state.settings.db_path)
+    try:
+        after_rows = conn.execute(
+            "SELECT id, upstream, provider, profile FROM models ORDER BY id").fetchall()
+        after_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+    finally:
+        conn.close()
+    assert after_rows == before_rows
+    assert after_audit == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert client.get("/admin/models").status_code == 200
+
+    # 合法有限浮点元数据照常保存（拒绝只针对非 JSON 兼容值）。
+    ok = client.put("/admin/models/qwen3-8b", json={
+        "profile": {"metadata": {"threshold": 0.5, "count": 2}}})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["model"]["profile"] == {
+        "metadata": {"threshold": 0.5, "count": 2}}
+
+
 def test_create_model_inherits_provider_reasoning_format(client, app):
     r = client.put("/admin/providers/local", json={
         "base_url": "http://127.0.0.1:9000", "reasoning_format": "deepseek"})
