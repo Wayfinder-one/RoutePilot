@@ -154,7 +154,6 @@ test('list shows key state without key material and delete removes a fresh servi
    真实请求/响应断言：延迟的 test 请求期间按钮禁用；删除的本地上膛状态在保存
    后复位；409 预览取消不写；确认请求体带精确哈希与 replacement_jev_id。 */
 const IMPACT_HASH_D = 'd'.repeat(64);
-const IMPACT_HASH_E = 'e'.repeat(64);
 
 async function waitImpactOpen() {
   await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
@@ -296,6 +295,156 @@ test('Task 10 · JEV delete resets the delete arm, then confirms exact hashes wi
     await page.unroute(matcher);
     resetExpectedHttpStatusErrors();
     await api('DELETE', '/admin/jev/' + id).catch(() => {});
+  }
+});
+
+/* 还原被引用的 default 服务：真实两阶段写（409 预览 → 带精确哈希重试）。
+   用例会临时改 default.model，结束时必须恢复，避免污染同进程后续用例。 */
+async function restoreDefaultJevModel(model) {
+  const put = payload => fetch(routerBase + '/admin/jev/default', {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  let response = await put({ model });
+  if (response.status === 409) {
+    const detail = (await response.json()).detail;
+    const confirmation = {
+      trees: (detail.affected_trees || []).map(tree => ({
+        id: tree.id, document_sha256: tree.document_sha256
+      }))
+    };
+    response = await put({ model, impact_confirmation: confirmation });
+  }
+  return response.ok;
+}
+
+test('Task 10 · JEV update confirmation retries with exact hashes and surfaces synced canvases', async () => {
+  await openPage();
+  await page.locator('.langtog button[data-lang="zh"]').click();
+  await page.waitForFunction(() => document.documentElement.lang === 'zh-CN');
+  const before = (await api('GET', '/admin/jev/default')).service;
+  const changed = String(before.model || 'd1') + '-qa-sync';
+  await page.locator('[data-jev-service-id="default"]').click();
+  const writes = [];
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev/default') {
+      writes.push(request.postDataJSON());
+    }
+  };
+  page.on('request', onRequest);
+  expectHttpStatusError({ url: /\/admin\/jev\/default$/, status: /409/ });
+  try {
+    await page.locator('#jevModel').fill(changed);
+    await page.locator('#jevSave').click();
+    await waitImpactOpen();
+    assert.equal(writes.length, 1, 'the 409 preview triggered a second write');
+    assert.equal('impact_confirmation' in writes[0], false,
+      'the preview request already carried a confirmation payload');
+    const modalText = (await page.locator('#impactBody').innerText()).replace(/\s+/g, ' ');
+    assert.match(modalText, /电力优先决策组/,
+      'the impact list did not name the affected canvas: ' + modalText);
+    /* 影响框必须显示被操作资源自身（服务 id），不能只有受影响画布。 */
+    const resourceLine = (await page.locator('#impactResource').innerText()).replace(/\s+/g, ' ');
+    assert.match(resourceLine, /jev/, 'the impact dialog did not show the resource kind: ' + resourceLine);
+    assert.match(resourceLine, /default/, 'the impact dialog did not show the resource id: ' + resourceLine);
+    const affected = await page.locator('#impactTrees [data-tree-id]').count();
+    assert.ok(affected > 0, 'the impact dialog listed no affected canvas');
+    assert.equal(await page.locator('#impactReplacement').count(), 0,
+      'a JEV update incorrectly asked for a replacement');
+    /* 全量 QA 运行里可能有多个画布引用该服务（canvas/runtime 模块先建的树），
+       逐行收集确认框渲染出的精确哈希，重试体必须与它一一对应。 */
+    const shownTrees = await page.locator('#impactTrees [data-tree-id]').evaluateAll(
+      items => items.map(item => ({
+        id: item.dataset.treeId,
+        document_sha256: item.querySelector('code.impact-sha').getAttribute('title')
+      })));
+    assert.equal(shownTrees.length, affected);
+    for (const tree of shownTrees) {
+      assert.match(String(tree.document_sha256), /^[0-9a-f]{64}$/,
+        'the impact dialog did not render the exact canvas hash: ' + tree.document_sha256);
+    }
+    await page.locator('#impactConfirm').click();
+    await waitImpactClosed();
+    assert.equal(writes.length, 2, 'confirm did not retry the update exactly once');
+    const retry = writes[1];
+    assert.deepEqual(retry.impact_confirmation, { trees: shownTrees },
+      'the JEV update confirmation did not carry the exact affected hashes');
+    assert.equal('replacement_id' in retry, false,
+      'the generic replacement_id leaked to the JEV backend');
+    assert.equal('replacement_jev_id' in retry, false,
+      'a JEV update sent a delete-only replacement field');
+    /* 成功提示必须带同步画布数量与「重新加载」（jev.msgSavedSynced 可达）。 */
+    await page.waitForFunction(
+      () => /重新加载/.test(document.getElementById('jevMsg').textContent),
+      null, { timeout: 8000 });
+    const message = (await page.locator('#jevMsg').innerText()).replace(/\s+/g, ' ');
+    assert.match(message, /已保存 default/, 'the update success message is missing: ' + message);
+    assert.match(message, new RegExp('同步 ' + affected + ' 个受影响画布'),
+      'the update message lost the synced-canvas count: ' + message);
+    assert.match(message, /重新加载/,
+      'the update message lost the reload prompt: ' + message);
+    /* 服务确实被持久化：GET 目录读到新 model。 */
+    const persisted = (await api('GET', '/admin/jev/default')).service;
+    assert.equal(persisted.model, changed, 'the confirmed JEV update was not persisted');
+  } finally {
+    page.off('request', onRequest);
+    resetExpectedHttpStatusErrors();
+    try {
+      const current = (await api('GET', '/admin/jev/default')).service;
+      if (current.model !== before.model) {
+        const restored = await restoreDefaultJevModel(before.model);
+        assert.equal(restored, true, 'restoring the default JEV service model failed');
+      }
+    } catch (error) {
+      console.error('[console-qa] restoring the default JEV service failed: ' + error.message);
+    }
+  }
+});
+
+test('Task 10 · a connection test that completes after switching services is discarded', async () => {
+  await openPage();
+  await page.locator('[data-jev-service-id="default"]').click();
+  const matcher = '**/admin/jev/default/test';
+  let release = () => {};
+  const gate = new Promise(resolve => { release = resolve; });
+  await page.route(matcher, async route => {
+    await gate;
+    await route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ selected_key: 'd1-2b', duration_ms: 7, model: 'd1-2b' })
+    });
+  });
+  try {
+    await page.locator('#jevTest').click();
+    await page.waitForFunction(
+      () => document.getElementById('jevTestResult').dataset.state === 'running',
+      null, { timeout: 4000 });
+    /* 测试在途时切到另一个服务：允许切换，但完成后的结果不能画到新服务上。 */
+    await page.locator('[data-jev-service-id="jev-secondary"]').click();
+    assert.equal(await page.locator('#jevStatus').innerText(), 'jev-secondary');
+    release();
+    await page.waitForFunction(
+      () => document.getElementById('jevTest').disabled === false,
+      null, { timeout: 8000 });
+    const crossed = await page.evaluate(() => ({
+      identity: document.getElementById('jevStatus').textContent.trim(),
+      state: document.getElementById('jevTestResult').dataset.state,
+      raw: document.getElementById('jevTestRaw').textContent,
+      rawHidden: document.getElementById('jevTestRawDetails').hidden
+    }));
+    assert.equal(crossed.identity, 'jev-secondary');
+    assert.equal(crossed.state, 'untested',
+      'the in-flight test result crossed into the newly selected service');
+    assert.equal(crossed.rawHidden, true, 'the in-flight raw response leaked into the new service');
+    assert.equal(crossed.raw, '', 'the in-flight raw response leaked into the new service');
+    /* 切回原服务也不能看到那次测试结果（切换复位）。 */
+    await page.locator('[data-jev-service-id="default"]').click();
+    assert.equal(await page.locator('#jevTestResult').evaluate(element => element.dataset.state),
+      'untested', 'the discarded test result resurfaced on the original service');
+  } finally {
+    release();
+    await page.unroute(matcher);
   }
 });
 

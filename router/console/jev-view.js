@@ -420,16 +420,19 @@ async function saveService() {
     } else if (currentId) {
       const id = currentId;
       /* 更新被画布引用的服务：第一次 PUT 只拿 409 影响预览；确认后共享组件
-         用精确哈希重试，取消不产生写请求。 */
+         用精确哈希重试，取消不产生写请求。数据层回完整响应
+         `{service, synced_trees}`：画布同步数量必须进入成功提示。 */
       const outcome = await withImpactConfirmation(context =>
         ACTIONS.updateService(id, draft, context ? context.impact_confirmation : undefined));
       if (!outcome.ok) {
         if (outcome.conflict) showMessage(t('impact.conflictToast'), true);
         return;
       }
-      upsertService(outcome.result);
-      applyService(outcome.result);
-      showSaved(outcome.result.id, outcome.result);
+      const payload = outcome.result && typeof outcome.result === 'object' ? outcome.result : {};
+      const saved = payload.service || payload;
+      upsertService(saved);
+      applyService(saved);
+      showSaved(saved.id, payload);
     } else {
       showMessage(t('jev.msgPickService'), true);
     }
@@ -461,14 +464,22 @@ async function runTest() {
     showMessage(t('jev.msgUnsavedTest'), true);
     return;
   }
+  /* 测试可能跑满 120s：结果只属于发起测试的那个服务。测试期间用户允许切换
+     服务（列表按钮不禁用），完成时若当前服务已不是它，就丢弃这次结果并复位
+     展示状态，绝不能把结果画到另一个服务上。 */
+  const testedId = currentId;
   testing = true;
   setBusy(true);
   showMessage('', false);
   paintTestRunning();
+  const stillSelected = () => !creating && currentId === testedId;
   try {
-    paintTestPass(await ACTIONS.testService(currentId, fieldValue('jevTestText')));
+    const result = await ACTIONS.testService(testedId, fieldValue('jevTestText'));
+    if (stillSelected()) paintTestPass(result);
+    else resetTestResult();
   } catch (error) {
-    paintTestFailure(error);
+    if (stillSelected()) paintTestFailure(error);
+    else resetTestResult();
   } finally {
     testing = false;
     setBusy(false);

@@ -278,6 +278,18 @@ function render() {
     dialog.body.append(hint);
   }
 
+  /* 操作对象自身（资源类型 + ID）：用户必须能确认自己正在改哪个资源，
+     不能只看到受影响画布清单。provider 的资源标识字段是 name。 */
+  const resource = resourceOf();
+  const resourceId = resource.id != null ? resource.id : resource.name;
+  const resourceLine = node('p', 'mut impact-resource');
+  resourceLine.id = 'impactResource';
+  resourceLine.textContent = tf('impact.resourceLine', {
+    kind: resource.kind || '—',
+    id: resourceId == null ? '—' : String(resourceId),
+  });
+  dialog.body.append(resourceLine);
+
   if (current.blocked) {
     const blocked = node('div', 'notice warn');
     blocked.id = 'impactBlocked';
@@ -470,11 +482,21 @@ function normalizeOptions(options) {
  *   重试。`replacement_id` 是**通用**字段，调用方必须映射成
  *   `replacement_model_id` / `replacement_jev_id` 再发送；绝不原样发给后端。
  *
+ * 返回契约（每个 key 始终存在，调用方不必猜缺省值）：
+ * - 成功：`{ok:true, result}`；
+ * - 用户取消确认框：`{ok:false, canceled:true, conflict:false, blocked:false, error:null}`；
+ * - 不可绕过的 provider 引用：`{ok:false, canceled:false, conflict:false, blocked:true, error}`
+ *   （`error` 是第一次写返回的 409）；
+ * - 确认重试时哈希过期：`{ok:false, canceled:false, conflict:true, blocked:false, error}`
+ *   （`error` 是重试时的 `graph_conflict`）；
+ * - 第一次写就命中 `graph_conflict`：同上 `conflict:true`；
+ * - 其他错误原样抛出（调用方的 catch 负责展示）。
+ *
  * @param {(confirmation?: object) => Promise<any>} requestFn
  * @param {string|object} [options] 替代项预选 id，或
  *        `{ operation:'delete', preselectReplacementId, replacements }`
- * @returns {Promise<{ok:boolean, result?:any, canceled?:boolean,
- *                    conflict?:boolean, blocked?:boolean, error?:Error}>}
+ * @returns {Promise<{ok:true, result:any} |
+ *   {ok:false, canceled:boolean, conflict:boolean, blocked:boolean, error:(Error|null)}>}
  */
 export async function withImpactConfirmation(requestFn, options) {
   const opts = normalizeOptions(options);
@@ -484,15 +506,15 @@ export async function withImpactConfirmation(requestFn, options) {
   } catch (error) {
     if (isProviderReferenced(error)) {
       await openImpact({ detail: error.detail, replacements: [], blocked: true });
-      return { ok: false, blocked: true, error };
+      return { ok: false, canceled: false, conflict: false, blocked: true, error };
     }
     if (isGraphConflict(error)) {
       await openImpact({ detail: error.detail, replacements: [], conflict: true });
-      return { ok: false, conflict: true, error };
+      return { ok: false, canceled: false, conflict: true, blocked: false, error };
     }
     if (!isImpactError(error)) throw error;
     const detail = error.detail;
-    let conflict = false;
+    let conflictError = null;
     let result;
     const accepted = await openImpact({
       resource: detail.resource,
@@ -507,13 +529,16 @@ export async function withImpactConfirmation(requestFn, options) {
             replacement_id: replacement && replacement.id != null ? String(replacement.id) : undefined,
           });
         } catch (retryError) {
-          if (isGraphConflict(retryError)) conflict = true;
+          if (isGraphConflict(retryError)) conflictError = retryError;
           throw retryError;
         }
       },
     });
     if (accepted) return { ok: true, result };
-    return { ok: false, canceled: !conflict, conflict };
+    if (conflictError) {
+      return { ok: false, canceled: false, conflict: true, blocked: false, error: conflictError };
+    }
+    return { ok: false, canceled: true, conflict: false, blocked: false, error: null };
   }
   return { ok: true, result: first };
 }

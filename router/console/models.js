@@ -184,23 +184,35 @@ function modalMsg(which, text, bad) {
   el.classList.toggle('ok', !!text && !bad);
 }
 
-/* 影响确认成功后的提示：服务端会改写受影响画布的 runtime 快照，已打开的画布
-   不会自动重载，所以提示里明确要求重新加载（不假定活动画布已更新）。 */
-function notifySynced(result) {
+/* 影响确认成功的提示素材：服务端会改写受影响画布的 runtime 快照，已打开的画布
+   不会自动重载。同步数量必须和操作本身的提示**合并成一条** toast —— 两条 toast
+   在同一固定位置会互相覆盖，后一条会把「已同步 N 个画布 / 请重新加载」遮掉。 */
+function syncedCount(result) {
   const synced = result && Array.isArray(result.synced_trees) ? result.synced_trees : [];
-  if (synced.length) toast(tf('impact.synced', { n: synced.length }), 4200);
+  return synced.length;
 }
-/* 影响确认的取消 / 陈旧结果：陈旧哈希必须重新读取目录与影响清单，绝不盲目重试。 */
-async function settleImpact(outcome, fallbackKey) {
+function syncedSuffix(count) {
+  return count > 0 ? ' · ' + tf('impact.synced', { n: count }) : '';
+}
+/* 影响确认的取消 / 陈旧结果：陈旧哈希必须重新读取目录与影响清单，绝不盲目重试。
+   返回 false 表示这次写没有成功（取消 / 陈旧 / 不可绕过），调用方停止后续 UI。 */
+async function settleImpact(outcome) {
   if (!outcome || outcome.ok) return true;
   if (outcome.conflict) {
     toast(t('impact.conflictToast'), 4600);
     await boot();
   }
-  if (outcome.blocked) return false;
-  if (fallbackKey && outcome.error) toast(tf(fallbackKey, { err: errText(outcome.error) }), 4200);
   return false;
 }
+/* 删除 / 编辑预览的在途保护：确认框还在打开时重复点击不能再发一次写请求 ——
+   第二次 openImpact 会覆盖第一个 settle，让第一个 Promise 永远 pending。 */
+let impactPreviewBusy = false;
+function beginImpactPreview() {
+  if (impactPreviewBusy) return false;
+  impactPreviewBusy = true;
+  return true;
+}
+function endImpactPreview() { impactPreviewBusy = false; }
 
 /* header pill only; the JEV summary (services list) lives on jev.html now.
    旧单配置形态 `{config}` 已被多服务 `{services:[...]}` 取代，这里显示服务数 /
@@ -261,6 +273,7 @@ function renderModels() {
 }
 
 async function deleteModel(id) {
+  if (!beginImpactPreview()) return;
   try {
     /* 第一次 DELETE 原样发出：被画布引用时服务端只回 409 影响预览，确认框里
        取消不产生任何写请求；需要替代项时确认前必须先选择。 */
@@ -272,12 +285,13 @@ async function deleteModel(id) {
         replacement_model_id: context.replacement_id,
       });
     }, { operation: 'delete' });
-    if (!(await settleImpact(outcome, 'models.deleteFail'))) return;
-    toast(t('models.deleted') + ' · ' + id);
-    notifySynced(outcome.result);
+    if (!(await settleImpact(outcome))) return;
+    toast(t('models.deleted') + ' · ' + id + syncedSuffix(syncedCount(outcome.result)));
     await boot();
   } catch (e) {
     toast(tf('models.deleteFail', { err: errText(e) }), 3600);
+  } finally {
+    endImpactPreview();
   }
 }
 
@@ -314,16 +328,19 @@ function renderProviders() {
 }
 
 async function deleteProvider(name) {
+  if (!beginImpactPreview()) return;
   try {
     /* provider 删除不可绕过：引用存在时服务端始终 409 `provider_referenced`；
        共享确认框只展示不可绕过的引用清单（数据库模型 + 受影响画布）。 */
     const outcome = await withImpactConfirmation(() =>
       api.req('DELETE', `/admin/providers/${encodeURIComponent(name)}`));
-    if (!(await settleImpact(outcome, 'models.prov.deleteFail'))) return;
+    if (!(await settleImpact(outcome))) return;
     toast(t('models.deleted') + ' · ' + name);
     await boot();
   } catch (e) {
     toast(tf('models.prov.deleteFail', { err: errText(e) }), 3600);
+  } finally {
+    endImpactPreview();
   }
 }
 
@@ -474,13 +491,15 @@ async function savePreset() {
   try {
     const existing = providerOf(pid);
     const key = (modal.keyValue || '').trim();
+    /* provider upsert 可能同步若干画布：同步数量并入最终的一条 toast。 */
+    let synced = 0;
     if (!existing) {
       const body = { base_url: prov.base_url, key_env: prov.key_env || '',
                      reasoning_format: prov.reasoning_format || 'openai' };
       if (key) body.api_key = key;
       const providerOutcome = await putProvider(pid, body);
-      if (!(await settleImpact(providerOutcome, 'models.prov.saveFail'))) return;
-      notifySynced(providerOutcome.result);
+      if (!(await settleImpact(providerOutcome))) return;
+      synced += syncedCount(providerOutcome.result);
     } else if (key) {
       const providerOutcome = await putProvider(pid, {
         base_url: existing.base_url,
@@ -488,8 +507,8 @@ async function savePreset() {
         reasoning_format: existing.reasoning_format || 'openai',
         api_key: key,
       });
-      if (!(await settleImpact(providerOutcome, 'models.prov.saveFail'))) return;
-      notifySynced(providerOutcome.result);
+      if (!(await settleImpact(providerOutcome))) return;
+      synced += syncedCount(providerOutcome.result);
     }
     for (const { upstream, slot } of pairs) {
       const preset = (prov.models || []).find(m => m.id === upstream) || {};
@@ -498,7 +517,7 @@ async function savePreset() {
         : { domains: preset.domains || [], tier: preset.tier || '' };
       await api.post('/admin/models', { id: slot, upstream, provider: pid, profile });
     }
-    toast(tf('models.preset.added', { n: pairs.length }));
+    toast(tf('models.preset.added', { n: pairs.length }) + syncedSuffix(synced));
     closeModal('modelModal');
     await boot();
   } catch (e) {
@@ -771,6 +790,8 @@ async function saveCustom() {
     // inline "new provider" form wins when open and named
     const inline = $('#cmProvInline');
     let providerReady = providerNames().has(provider);
+    /* provider upsert / 模型编辑都可能同步画布：数量并入最终的一条 toast。 */
+    let synced = 0;
     if (inline && !inline.hidden) {
       const pname = $('#dprovName').value.trim();
       const pbase = $('#dprovBase').value.trim();
@@ -783,8 +804,8 @@ async function saveCustom() {
       const key = ($('#dprovKey').value || '').trim();
       if (key) body.api_key = key;
       const providerOutcome = await putProvider(pname, body);
-      if (!(await settleImpact(providerOutcome, 'models.prov.saveFail'))) return;
-      notifySynced(providerOutcome.result);
+      if (!(await settleImpact(providerOutcome))) return;
+      synced += syncedCount(providerOutcome.result);
       provider = pname;
       providerReady = true;
     }
@@ -818,11 +839,11 @@ async function saveCustom() {
         }
         return;
       }
-      notifySynced(outcome.result);
+      synced += syncedCount(outcome.result);
     } else {
       await api.post('/admin/models', { id, upstream, provider, profile });
     }
-    toast(t('common.saved'));
+    toast(t('common.saved') + syncedSuffix(synced));
     closeModal('modelModal');
     await boot();
   } catch (e) {
@@ -974,8 +995,7 @@ async function saveProviderModal() {
       }
       return;
     }
-    notifySynced(outcome.result);
-    toast(t('common.saved'));
+    toast(t('common.saved') + syncedSuffix(syncedCount(outcome.result)));
     closeModal('provModal');
     await boot();
   } catch (e) {
@@ -986,6 +1006,7 @@ async function saveProviderModal() {
 }
 async function deleteProvInModal() {
   if (!provModal || !provModal.name) return;
+  if (!beginImpactPreview()) return;
   const name = provModal.name;
   try {
     /* 与目录卡片删除同一共享流程：引用存在时只展示不可绕过的清单，不写。 */
@@ -1003,6 +1024,8 @@ async function deleteProvInModal() {
     await boot();
   } catch (e) {
     modalMsg('prov', tf('models.prov.deleteFail', { err: errText(e) }), true);
+  } finally {
+    endImpactPreview();
   }
 }
 

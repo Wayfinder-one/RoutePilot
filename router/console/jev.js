@@ -61,8 +61,9 @@ export async function updateService(id, draft, impactConfirmation) {
   /* 确认载荷只在调用方显式提供时透传；确认内容由共享 impact.js 从 409 detail
      构造，数据层不猜哈希。 */
   if (impactConfirmation) body.impact_confirmation = impactConfirmation;
-  const saved = await api.put('/admin/jev/' + encodeURIComponent(id), body);
-  return saved.service;
+  /* 返回**完整响应** `{service, synced_trees}`：synced_trees 是“已打开画布需
+     重新加载”提示的唯一来源，只回 service 会让 JEV 更新后的同步反馈丢失。 */
+  return api.put('/admin/jev/' + encodeURIComponent(id), body);
 }
 
 export async function deleteService(id, confirmation) {

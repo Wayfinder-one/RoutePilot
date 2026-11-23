@@ -597,6 +597,19 @@ test('P0 model delete needs a replacement and sends exact hashes plus replacemen
       'the delete did not map the replacement to replacement_model_id');
     assert.equal('replacement_id' in retry, false,
       'the generic replacement_id leaked to the backend');
+    /* 同步反馈必须和删除结果合并成一条 toast：两条 toast 会互相覆盖，
+       已同步数量 / 「重新加载」提示就丢了。 */
+    await page.waitForFunction(() => {
+      const toasts = [...document.querySelectorAll('.toast')];
+      return toasts.length > 0 && toasts[toasts.length - 1].textContent.includes('已同步');
+    }, null, { timeout: 4000 });
+    const toasts = await page.locator('.toast').allInnerTexts();
+    assert.equal(toasts.length, 1,
+      'the delete feedback used two overlapping toasts: ' + JSON.stringify(toasts));
+    assert.match(toasts[0], /已同步 2 个受影响画布/,
+      'the single delete toast lost the synced-canvas count: ' + toasts[0]);
+    assert.match(toasts[0], /重新加载/,
+      'the single delete toast lost the reload prompt: ' + toasts[0]);
   } finally {
     await page.unroute(matcher);
     resetExpectedHttpStatusErrors();
@@ -741,6 +754,127 @@ test('P0 provider save shows the shared impact list and cancel writes nothing', 
     await page.unroute(matcher);
     resetExpectedHttpStatusErrors();
     await page.locator('[data-close="provModal"]').click().catch(() => {});
+  }
+});
+
+test('P0 a double-click on model delete opens only one impact dialog and sends one preview', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('#modelTable tr[data-mrow="deepseek-v3"]');
+  let calls = 0;
+  const matcher = '**/admin/models/deepseek-v3';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'DELETE') return route.continue();
+    calls += 1;
+    /* 250ms 延迟制造「预览请求在途」窗口：重复点击必定落在窗口内。 */
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return route.fulfill({
+      status: 409, contentType: 'application/json',
+      body: JSON.stringify({ detail: impactDetail({
+        kind: 'model', id: 'deepseek-v3', trees: [CATALOG_TREE]
+      }) })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/models\/deepseek-v3$/, status: /409/ });
+  expectHttpStatusError({ url: /\/admin\/models\/deepseek-v3$/, status: /409/ });
+  try {
+    /* 在途窗口内的第二次点击不能再发 DELETE（会覆盖第一个确认框的 settle，
+       让第一个 Promise 永远 pending）。 */
+    await page.evaluate(() => document.querySelector('[data-delmodel="deepseek-v3"]').click());
+    await page.evaluate(() => document.querySelector('[data-delmodel="deepseek-v3"]').click());
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    await page.waitForTimeout(400);
+    assert.equal(calls, 1, 'the second delete click sent a duplicate preview request');
+    assert.equal(await page.locator('#impactModal').count(), 1, 'more than one impact dialog exists');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+    /* 取消后 guard 必须复位：下一次点击仍能正常发出预览请求。 */
+    await page.evaluate(() => document.querySelector('[data-delmodel="deepseek-v3"]').click());
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    assert.equal(calls, 2, 'the delete guard stayed armed after the dialog was cancelled');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 impact dialog is localized in English and shows the stale-hash error in English', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('#modelTable tr[data-mrow="qwen3-32b"]');
+  await page.locator('.langtog button[data-lang="en"]').click();
+  await page.waitForFunction(() => document.documentElement.lang === 'en');
+  let calls = 0;
+  const matcher = '**/admin/models/qwen3-32b';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'DELETE') return route.continue();
+    calls += 1;
+    if (calls === 1) {
+      return route.fulfill({
+        status: 409, contentType: 'application/json',
+        body: JSON.stringify({ detail: impactDetail({
+          kind: 'model', id: 'qwen3-32b', trees: [TARGET_TREE, CATALOG_TREE],
+          replacements: [{ id: 'qwen3-8b', upstream: 'qwen3-8b', provider: 'local' }]
+        }) })
+      });
+    }
+    return route.fulfill({
+      status: 409, contentType: 'application/json',
+      body: JSON.stringify({ detail: {
+        code: 'graph_conflict',
+        actual_document_sha256: IMPACT_HASH_C
+      } })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/models\/qwen3-32b$/, status: /409/ });
+  expectHttpStatusError({ url: /\/admin\/models\/qwen3-32b$/, status: /409/ });
+  try {
+    await page.locator('[data-delmodel="qwen3-32b"]').click();
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    const title = (await page.locator('#impactTitle').innerText()).trim();
+    const subtitle = (await page.locator('#impactBody .hint').first().innerText())
+      .replace(/\s+/g, ' ').trim();
+    const confirmLabel = (await page.locator('#impactConfirm').innerText()).trim();
+    const cancelLabel = (await page.locator('#impactCancel').innerText()).trim();
+    const resourceLine = (await page.locator('#impactResource').innerText()).trim();
+    assert.equal(title, 'Confirm model impact and synchronize canvases',
+      'the English impact title is wrong: ' + title);
+    assert.equal(subtitle,
+      'Stored canvases reference this resource. Confirming synchronizes their runtime snapshots ' +
+      'to the latest catalog facts; nothing is written before you confirm.',
+      'the English impact description is wrong: ' + subtitle);
+    assert.equal(confirmLabel, 'Confirm and synchronize',
+      'the English confirm label is wrong: ' + confirmLabel);
+    assert.equal(cancelLabel, 'Cancel', 'the English cancel label is wrong: ' + cancelLabel);
+    assert.equal(resourceLine, 'Target resource: model · qwen3-32b',
+      'the impact dialog does not name the operated resource: ' + resourceLine);
+    for (const [label, text] of Object.entries({ title, subtitle, confirmLabel, cancelLabel, resourceLine })) {
+      assert.doesNotMatch(text, /[\u4e00-\u9fff]/,
+        'the English impact dialog text "' + label + '" contains CJK: ' + text);
+    }
+    /* 英文错误态：陈旧哈希只提示重新加载，不盲目重试。 */
+    await page.locator('#impactReplacement').selectOption('qwen3-8b');
+    await page.locator('#impactConfirm').click();
+    await page.waitForSelector('#impactConflict', { timeout: 8000 });
+    const stale = (await page.locator('#impactConflict').innerText()).replace(/\s+/g, ' ');
+    assert.match(stale, /This confirmation is stale/,
+      'the stale-hash notice is not in English: ' + stale);
+    assert.match(stale, /Reload the canvas and re-read the impact list/,
+      'the English stale notice does not ask for a reload: ' + stale);
+    assert.match(stale, /cccccccccccc/,
+      'the English stale notice does not report the actual hash: ' + stale);
+    assert.equal((await page.locator('#impactCancel').innerText()).trim(), 'Got it',
+      'the English stale dialog close label is wrong');
+    assert.equal(await page.locator('#impactConfirm').evaluate(element => element.hidden), true,
+      'the English stale dialog still offered the confirm action');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+    await page.locator('.langtog button[data-lang="zh"]').click().catch(() => {});
+    await page.waitForFunction(() => document.documentElement.lang === 'zh-CN', null, { timeout: 4000 })
+      .catch(() => {});
   }
 });
 
