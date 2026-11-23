@@ -2,12 +2,17 @@
    the remote JEV service summary. Model profile.capability is the text source
    for single-model JEV targets in routing.html.
 
-   Modal #modelModal has two add paths:
-     - preset: pick a catalog provider, optional API key, tick preset models,
-       optionally rename their model slots (default = upstream id)
-     - custom: define a model slot by hand, wire a provider (existing or inline
+   "Connect models" (#addModel) is the single onboarding entry; #modelModal has
+   two paths:
+     - preset: pick a catalog provider, optional API key, tick preset models.
+       Base URL / env auth and each model slot sit in collapsed advanced
+       sections (slot default = normalized upstream id)
+     - custom: enter the upstream id; a blank slot id is derived from it on
+       save (sanitizeSlot + uniqueSlot), wire a provider (existing or inline
        new), declare its reasoning capability (profile.reasoning) and profile
-   Modal #provModal edits one provider (catalog prefill, api_key three-state).
+   There is no standalone add-provider button: connecting a model creates the
+   provider, and #provModal edits one from its card (catalog prefill, api_key
+   three-state).
 
    Contract: docs/模型目录与推理配置-2026-10-21.md §5/§7. Old backends without
    /admin/model-catalog or without model.reasoning degrade gracefully (catalog
@@ -333,26 +338,37 @@ function presetBody() {
           <span class="pm-up mono">${esc(m.id)}</span>${ctx}
           ${reasonChips(m.reasoning || (m.profile && m.profile.reasoning))}
         </label>
-        <div class="pm-idslot" data-slot="${esc(m.id)}"${checked ? '' : ' hidden'}>
-          <label class="field"><span>${esc(t('models.preset.slot'))}</span>
-            <input class="pm-id" data-mid="${esc(m.id)}" value="${esc(slot)}"></label>
-          <span class="mut pm-slot-hint">${esc(t('models.preset.slotHint'))}</span>
-          <span class="pm-conflict" data-conflict="${esc(m.id)}" hidden>${esc(t('models.preset.slotConflict'))}</span>
-        </div>
+        <details class="pm-advanced">
+          <summary>${esc(t('models.customizeId'))}</summary>
+          <div class="pm-idslot" data-slot="${esc(m.id)}"${checked ? '' : ' hidden'}>
+            <label class="field"><span>${esc(t('models.preset.slot'))}</span>
+              <input class="pm-id" data-mid="${esc(m.id)}" value="${esc(slot)}"></label>
+            <span class="mut pm-slot-hint">${esc(t('models.preset.slotHint'))}</span>
+            <span class="pm-conflict" data-conflict="${esc(m.id)}" hidden>${esc(t('models.preset.slotConflict'))}</span>
+          </div>
+        </details>
       </div>`;
   }).join('');
+  /* Base URL and the env-auth line are read-only context, so they only show up
+     inside the collapsed advanced block; the default view stays provider →
+     API key → model multi-select. */
+  const baseUrlAndEnvironmentFields = `<label class="field">
+      <span>${esc(t('models.preset.baseurl'))}</span>
+      <input id="pmBase" value="${esc(prov.base_url || '')}" readonly>
+    </label>
+    <div class="keyline">${envLine}</div>`;
+  const advancedConnection = `<details class="adv" id="pmAdvanced">
+      <summary>${esc(t('models.advancedConnection'))}</summary>
+      <div id="pmAdvancedBody">${baseUrlAndEnvironmentFields}</div>
+    </details>`;
   return `
-    <div class="form-grid">
-      <label class="field"><span>${esc(t('models.preset.catalog'))}</span>
-        <select id="pmProvider">${list.map(p =>
-          `<option value="${esc(p.id)}"${p.id === pid ? ' selected' : ''}>${esc(p.name)} · ${esc(p.base_url)}</option>`).join('')}</select></label>
-      <label class="field"><span>${esc(t('models.preset.baseurl'))}</span>
-        <input id="pmBase" value="${esc(prov.base_url || '')}" readonly></label>
-    </div>
-    <div class="keyline">${envLine}</div>
+    <label class="field"><span>${esc(t('models.preset.catalog'))}</span>
+      <select id="pmProvider">${list.map(p =>
+        `<option value="${esc(p.id)}"${p.id === pid ? ' selected' : ''}>${esc(p.name)} · ${esc(p.base_url)}</option>`).join('')}</select></label>
     <label class="field"><span>${esc(t('models.preset.key'))}</span>
       <input id="pmKey" type="password" autocomplete="off" value="${esc(modal.keyValue || '')}"
              placeholder="${esc(tf('models.preset.keyPlaceholder', { env: env || '—' }))}"></label>
+    ${advancedConnection}
     <div class="col-h sm">${esc(t('models.preset.pickModels'))}</div>
     <div class="preset-models" id="pmModels">${modelRows || `<div class="empty">${esc(t('common.none'))}</div>`}</div>`;
 }
@@ -466,9 +482,6 @@ function customBody() {
     `<option value="${esc(x.name)}"${x.name === pid ? ' selected' : ''}>${esc(x.name)}${x.base_url ? ' · ' + esc(x.base_url) : ''}</option>`).join('');
   return `
     <div class="form-grid">
-      <label class="field"><span>${esc(t('models.custom.slot'))}</span>
-        <input id="cmId" value="${esc(slot)}"${editing ? ' readonly' : ''} placeholder="my-model-slot">
-        <small>${esc(t('models.custom.slotHint'))}</small></label>
       <label class="field"><span>${esc(t('models.custom.upstream'))}</span>
         <input id="cmUpstream" list="cmUpstreamOpts" value="${esc(upstream)}" placeholder="gpt-5.2">
         <datalist id="cmUpstreamOpts">${upstreamOpts.map(x => `<option value="${esc(x)}">`).join('')}</datalist>
@@ -476,13 +489,10 @@ function customBody() {
           <button type="button" class="btn sm" id="fetchModels">${esc(t('models.custom.fetch'))}</button>
           <span class="mut" id="fetchMsg"></span>
         </small></label>
-    </div>
-    <div class="form-grid">
       <label class="field"><span>${esc(t('models.custom.provider'))}</span>
         <select id="cmProvider">${pidKnown ? provOpts : `<option value="" selected>${esc(t('common.none'))}</option>${provOpts}`}</select>
-        <small><button type="button" class="linkbtn" id="cmNewProvider">${esc(t('models.custom.newProvider'))}</button></small></label>
-      <div class="field"><span>&nbsp;</span>
-        <span class="mut" style="font-size:11px">${esc(t('models.custom.newProviderHint'))}</span></div>
+        <small><button type="button" class="linkbtn" id="cmNewProvider">${esc(t('models.custom.newProvider'))}</button></small>
+        <small>${esc(t('models.custom.newProviderHint'))}</small></label>
     </div>
     <div class="inline-form" id="cmProvInline"${d.provOpen ? '' : ' hidden'}>
       <div class="col-h sm">${esc(t('models.custom.newProvider'))}</div>
@@ -490,11 +500,14 @@ function customBody() {
         <label class="field"><span>${esc(t('models.prov.name'))}</span><input id="dprovName" value="${esc((d.provDraft && d.provDraft.name) || '')}"></label>
         <label class="field"><span>${esc(t('models.prov.baseurl'))}</span><input id="dprovBase" value="${esc((d.provDraft && d.provDraft.base_url) || '')}" placeholder="https://api.example.com/v1"></label>
       </div>
-      <div class="form-grid">
-        <label class="field"><span>${esc(t('models.prov.keyenv'))}</span><input id="dprovKeyEnv" value="${esc((d.provDraft && d.provDraft.key_env) || '')}" placeholder="EXAMPLE_API_KEY"></label>
-        <label class="field"><span>${esc(t('models.prov.format'))}</span>
-          <select id="dprovFormat">${formatOptions((d.provDraft && d.provDraft.reasoning_format) || 'openai')}</select></label>
-      </div>
+      <details class="adv" id="cmProviderAdvanced"${d.provAdvOpen ? ' open' : ''}>
+        <summary>${esc(t('models.advancedConnection'))}</summary>
+        <div class="form-grid">
+          <label class="field"><span>${esc(t('models.prov.keyenv'))}</span><input id="dprovKeyEnv" value="${esc((d.provDraft && d.provDraft.key_env) || '')}" placeholder="EXAMPLE_API_KEY"></label>
+          <label class="field"><span>${esc(t('models.prov.format'))}</span>
+            <select id="dprovFormat">${formatOptions((d.provDraft && d.provDraft.reasoning_format) || 'openai')}</select></label>
+        </div>
+      </details>
       <label class="field"><span>${esc(t('models.prov.apiKey'))}</span>
         <input id="dprovKey" type="password" autocomplete="off" value="${esc((d.provDraft && d.provDraft.api_key) || '')}"
                placeholder="${esc(t('models.prov.keyEmptyHint'))}"></label>
@@ -502,9 +515,12 @@ function customBody() {
     <label class="field"><span>${esc(t('models.custom.capability'))}</span>
       <textarea id="cmCapability" rows="3" placeholder="${esc(t('models.custom.capabilityHint'))}">${esc(capability)}</textarea>
       <small>${esc(t('models.custom.capabilityHint'))}</small></label>
-    <div id="reasonEditor">${reasonEditorBody()}</div>
-    <details class="adv"${d.advOpen ? ' open' : ''}>
+    <details class="adv" id="cmAdvanced"${d.advOpen ? ' open' : ''}>
       <summary>${esc(t('models.custom.advanced'))}</summary>
+      <label class="field"><span>${esc(t('models.custom.slot'))}</span>
+        <input id="cmId" value="${esc(slot)}"${editing ? ' readonly' : ''} placeholder="my-model-slot">
+        <small>${esc(t('models.custom.slotHint'))}</small></label>
+      <div id="reasonEditor">${reasonEditorBody()}</div>
       <div class="form-grid">
         <label class="field"><span>${esc(t('models.custom.tier'))}</span><input id="cmTier" value="${esc(tier)}" placeholder="large / small"></label>
         <label class="field"><span>${esc(t('models.custom.domains'))}</span><input id="cmDomains" value="${esc(domains)}" placeholder="health, computer_science"></label>
@@ -676,20 +692,30 @@ function captureCustom() {
       api_key: g('#dprovKey') || '',
     };
   }
-  d.advOpen = $('details.adv') ? $('details.adv').open : false;
+  d.advOpen = $('#cmAdvanced')?.open ?? false;
+  d.provAdvOpen = $('#cmProviderAdvanced')?.open ?? false;
   const sre = $('#rmSre');
   if (sre) rmState().sre = sre.checked;
 }
 async function saveCustom() {
   const editing = modal.mode === 'edit';
-  const id = ($('#cmId') ? $('#cmId').value.trim() : '');
   const upstream = ($('#cmUpstream') ? $('#cmUpstream').value.trim() : '');
+  const enteredId = ($('#cmId') ? $('#cmId').value.trim() : '');
+  /* A blank slot id is derived from the upstream id; a manual id always wins. */
+  const id = editing ? modal.editId
+    : enteredId || uniqueSlot(sanitizeSlot(upstream), modelIds());
   let provider = ($('#cmProvider') ? $('#cmProvider').value.trim() : '');
   const tier = ($('#cmTier') ? $('#cmTier').value.trim() : '');
   const domains = ($('#cmDomains') ? $('#cmDomains').value : '')
     .split(/[,，]/).map(s => s.trim()).filter(Boolean);
-  if (!editing && !MODEL_ID_RE.test(id)) { modalMsg('model', t('models.custom.idInvalid'), true); return; }
-  if (!upstream || !provider) { modalMsg('model', t('models.custom.required'), true); return; }
+  if (!upstream) {
+    modalMsg('model', t('models.custom.required'), true);
+    return;
+  }
+  if (!editing && !MODEL_ID_RE.test(id)) {
+    modalMsg('model', t('models.custom.idInvalid'), true);
+    return;
+  }
   const btn = $('#modelModalSave');
   btn.disabled = true;
   try {
@@ -758,7 +784,7 @@ function openModelModal(kind, modelId) {
       id: model.id, upstream: model.upstream || '', provider: model.provider || '',
       tier: p.tier || '', domains: Array.isArray(p.domains) ? p.domains.join(', ') : '',
       capability: p.capability || '',
-      provOpen: false, advOpen: false,
+      provOpen: false, provAdvOpen: false, advOpen: false,
     };
   } else {
     rmState();
@@ -767,7 +793,7 @@ function openModelModal(kind, modelId) {
   $('#modelModalTitle').textContent = kind === 'edit' ? t('models.editTitle') : t('models.addTitle');
   $('#modelTabs').hidden = kind === 'edit';
   $$('#modelTabs .mtab').forEach(b => b.classList.toggle('on', b.dataset.tab === modal.tab));
-  $('#modelModalSave').textContent = t('models.save');
+  $('#modelModalSave').textContent = kind === 'edit' ? t('models.save') : t('models.connect');
   modalMsg('model', '');
   renderModelModal();
   openModal('modelModal');
@@ -779,7 +805,7 @@ function renderModelModal() {
   $$('#modelTabs .mtab').forEach(b => b.classList.toggle('on', b.dataset.tab === modal.tab));
   $('#modelModalTitle').textContent = modal.mode === 'edit' ? t('models.editTitle') : t('models.addTitle');
   const save = $('#modelModalSave');
-  if (save) save.textContent = t('models.save');
+  if (save) save.textContent = modal.mode === 'edit' ? t('models.save') : t('models.connect');
   $('#modelModalBody').innerHTML = modal.tab === 'custom' ? customBody() : presetBody();
 }
 
@@ -1056,7 +1082,6 @@ $('#modelModalSave').addEventListener('click', () => {
   else saveCustom();
 });
 
-$('#addProvider').addEventListener('click', () => openProvModal(null));
 $('#provModalBody').addEventListener('change', e => {
   const el = e.target;
   if (!provModal) return;

@@ -583,6 +583,11 @@ body.modal-open{overflow:hidden}
 .pm-up{font-size:10.5px;color:var(--text-3)}
 .pm-idslot{display:flex;align-items:center;gap:8px;margin-top:7px;padding-left:24px;flex-wrap:wrap}
 .pm-idslot[hidden]{display:none}
+/* 每个预置模型的模型位 ID 折叠在 .pm-advanced 内：默认关闭，展开才可改 */
+.pm-advanced{margin-top:6px;padding-left:24px}
+.pm-advanced > summary{cursor:pointer;font-size:10.5px;color:var(--text-3);font-weight:600;line-height:1.5}
+.pm-advanced > summary:hover{color:var(--text-2)}
+.pm-advanced .pm-idslot{padding-left:0}
 .pm-idslot .field{flex:0 1 260px;min-width:170px}
 .pm-slot-hint{font-size:10.5px}
 .pm-conflict{font-size:10.5px;color:var(--red);font-weight:650}
