@@ -3,7 +3,13 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from router.jev.window import DEFAULT_CONTEXT_TOKENS, DEFAULT_INPUT_TOKENS
+from router.jev.window import (
+    DEFAULT_CONTEXT_TOKENS,
+    DEFAULT_INPUT_TOKENS,
+    MAX_TOKENS,
+    MIN_CONTEXT_TOKENS,
+    MIN_INPUT_TOKENS,
+)
 
 SCHEMA_VERSION = 6
 
@@ -265,10 +271,35 @@ def _int_setting(conn: sqlite3.Connection, tables: set[str], key: str, default: 
     if "settings" not in tables:
         return default
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return default
     try:
-        return int(row[0]) if row is not None else default
+        return int(str(row[0]).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _clamped_legacy_window(
+    conn: sqlite3.Connection, tables: set[str]
+) -> tuple[int, int]:
+    """把 v5 ``settings`` 里的窗口值收口到严格 ``JevWindow`` 范围。
+
+    旧运行时 ``read_jev_window`` 在读路径上容忍越界值（按 MIN/MAX 收口并保证
+    input <= context）；v6 的 ``JevService`` 对每一行严格校验。若迁移直接落库
+    越界值，旧表被删后 ``JevServiceRepo.list()`` 会永久 ValueError，所以这里用
+    与旧读路径相同的收口规则先规范化。
+    """
+    context_tokens = min(
+        MAX_TOKENS,
+        max(MIN_CONTEXT_TOKENS,
+            _int_setting(conn, tables, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS)),
+    )
+    input_tokens = min(
+        context_tokens,
+        max(MIN_INPUT_TOKENS,
+            _int_setting(conn, tables, "jev_input_tokens", DEFAULT_INPUT_TOKENS)),
+    )
+    return input_tokens, context_tokens
 
 
 def _upgrade_v5_to_v6(conn: sqlite3.Connection) -> None:
@@ -283,16 +314,15 @@ def _upgrade_v5_to_v6(conn: sqlite3.Connection) -> None:
     if "jev_config" in tables:
         row = conn.execute("SELECT * FROM jev_config WHERE id = 1").fetchone()
         if row is not None:
-            input_tokens = _int_setting(conn, tables, "jev_input_tokens", DEFAULT_INPUT_TOKENS)
-            context_tokens = _int_setting(conn, tables, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS)
-            # 旧表列序：id, base_url, model, api_key, timeout_seconds, instructions,
-            # state_template, updated_at；位置索引同时兼容 Row 与裸连接元组。
+            input_tokens, context_tokens = _clamped_legacy_window(conn, tables)
             conn.execute(
                 "INSERT OR REPLACE INTO jev_services (id, base_url, model, key_env, "
                 "api_key, timeout_seconds, instructions, state_template, input_tokens, "
                 "context_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("default", row[1], row[2], "ROUTER_JEV_API_KEY", row[3], row[4],
-                 row[5], row[6], input_tokens, context_tokens, row[7]),
+                ("default", row["base_url"], row["model"], "ROUTER_JEV_API_KEY",
+                 row["api_key"], row["timeout_seconds"], row["instructions"],
+                 row["state_template"], input_tokens, context_tokens,
+                 row["updated_at"]),
             )
         conn.execute("DROP TABLE jev_config")
     conn.execute("INSERT INTO schema_migrations VALUES (?)", (6,))
@@ -349,7 +379,6 @@ def migrate(conn: sqlite3.Connection) -> None:
             raise RuntimeError("unsupported database contents; use a new database")
         _in_transaction(conn, lambda: _upgrade_v4_to_v5(conn))
         applied = 5
-        tables = _table_names(conn)
     if applied == 5:
         _in_transaction(conn, lambda: _upgrade_v5_to_v6(conn))
         return
