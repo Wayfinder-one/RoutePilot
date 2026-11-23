@@ -7,7 +7,7 @@
    · 不直接改 DOM：渲染/提示通过 hooks 回调交给 app.js。
    ------------------------------------------------------------------ */
 import { api, apiErrText } from '../api.js';
-import { t, tf } from '../i18n.js';
+import { LANG, t, tf } from '../i18n.js';
 import * as RTGraph from './graph.js';
 import { createRuntime } from './runtime.js';
 
@@ -18,6 +18,22 @@ function serverIssues(error) {
     .filter(item => item && typeof item === 'object' && !Array.isArray(item))
     .map(item => Object.assign({ level: 'hard' }, item));
   return issues.length ? issues : null;
+}
+
+/* 导入失败的具体原因：解析/运行配置契约错误没有节点位置，toast 只报
+   「N 个校验问题」会把真正的原因（缺字段、runtime:null、未知字段…）藏起来。
+   优先取首条 graph_parse_error（或首条硬 Issue）的 zh/en，其次退回 parse 结果
+   的 error 文案；都为空时返回空串，由调用方兜底。 */
+function importFailureReason(result, hard) {
+  const localized = issue => {
+    if (!issue) return '';
+    if (LANG === 'en') return issue.en || issue.zh || '';
+    return issue.zh || issue.en || '';
+  };
+  const parseIssue = hard.find(issue => issue && issue.code === 'graph_parse_error');
+  const first = parseIssue || hard[0] || null;
+  const reason = localized(first) || (result && result.error) || '';
+  return String(reason).trim();
 }
 
 function newTreeId() {
@@ -398,12 +414,10 @@ export class RoutingController {
     const hard = issues.filter(issue => issue.level !== 'hint');
     if (!result.ok) {
       this.restoreDraftIssues();
-      if (hard.length) {
-        this.hooks.toast(tf('cv.toastImportIssues', { n: hard.length }), 'error');
-      } else {
-        const reason = result.error || 'invalid import';
-        this.hooks.toast(tf('cv.toastImportRejected', { err: reason }), 'error');
-      }
+      /* 解析级失败（无节点位置）必须把具体原因交给用户：只报问题数量会让人
+         无从下手，且被拒文件的 Issue 已被恢复成当前草稿的 Issue。 */
+      const reason = importFailureReason(result, hard) || 'invalid import';
+      this.hooks.toast(tf('cv.toastImportRejected', { err: reason }), 'error');
       return false;
     }
     if (hard.length) {

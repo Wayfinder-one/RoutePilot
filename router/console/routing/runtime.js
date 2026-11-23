@@ -17,8 +17,12 @@
    置为 null、保留当前 jev_window（Python 同样要求 jev_window 恒为对象，窗口在
    jev:null 时不参与执行）。selectJev()/addRuntimeModel()/refreshRuntime() 都返回
    深拷贝，绝不修改入参。
+
+   错误文案：用户可见的目录缺失错误走 ../i18n.js 的共享键（zh/en 对称）；
+   本模块自身仍不读 DOM、不发请求。
    ------------------------------------------------------------------ */
 import { RUNTIME_DEFAULTS } from './graph.js';
+import { tf } from '../i18n.js';
 
 /* 与 router/jev/window.py 的默认值一致：没有 JEV 服务时的合法窗口。 */
 export const DEFAULT_WINDOW = Object.freeze({ input_tokens: 1024, context_tokens: 4096 });
@@ -28,8 +32,19 @@ const SERVICE_SNAPSHOT_FIELDS = [
   'id', 'base_url', 'model', 'key_env', 'timeout_seconds', 'instructions', 'state_template'
 ];
 
+/* 只接受 JSON 兼容数据：structuredClone 保真度高于 JSON 往返（不把 undefined
+   键静默丢掉），也不存在 Date/Map 等需要特殊语义的输入。 */
 function clone(value) {
-  return value == null ? value : JSON.parse(JSON.stringify(value));
+  return value === undefined ? undefined : structuredClone(value);
+}
+
+/* 用户可见的目录缺失错误：message 按当前界面语言渲染，同时保留 key/params
+   方便测试与调用方定位（不把 zh 文案写死在纯函数层）。 */
+function catalogError(key, params) {
+  const error = new Error(tf(key, params || {}));
+  error.key = key;
+  error.params = params || {};
+  return error;
 }
 
 function isRecord(value) {
@@ -145,20 +160,20 @@ export function createRuntime(catalog, options) {
   const opts = isRecord(options) ? options : {};
   const models = catalogList(catalog, 'models');
   if (!models.length) {
-    throw new Error('模型目录为空：请先在「模型」页添加至少一个模型，再新建画布' +
-      '（catalog has no models）');
+    throw catalogError('cv.runtime.errNoModels');
   }
   const model = hasValue(opts.modelId)
     ? models.find(item => item && item.id === opts.modelId)
     : models[0];
   if (!model) {
-    throw new Error('模型目录中没有请求的模型：' + String(opts.modelId));
+    throw catalogError('cv.runtime.errModelUnknown', { id: String(opts.modelId) });
   }
   const providers = catalogList(catalog, 'providers');
   const provider = providers.find(item => item && item.name === model.provider);
   if (!provider) {
-    throw new Error('模型 ' + String(model.id) + ' 引用的 provider ' +
-      String(model.provider) + ' 不在目录中');
+    throw catalogError('cv.runtime.errProviderMissing', {
+      model: String(model.id), provider: String(model.provider)
+    });
   }
   const runtime = {
     backends: {
@@ -173,15 +188,39 @@ export function createRuntime(catalog, options) {
   if (!hasValue(opts.jevId) || opts.jevId === '') return runtime;
   const service = catalogList(catalog, 'services').find(item => item && item.id === opts.jevId);
   if (!service) {
-    throw new Error('数据库 JEV 目录中没有服务：' + String(opts.jevId));
+    throw catalogError('cv.runtime.errJevUnknown', { id: String(opts.jevId) });
   }
   return selectJev(runtime, service);
 }
 
+/* 条件节点 source=periods 引用的时段名（去重、保持出现顺序）。刷新运行配置时
+   必须确认这些名字仍在数据库目录里：否则刷新后草稿能过本地校验，却会在服务端
+   enable 时以 unknown_period 失败。 */
+function referencedPeriodNames(graph) {
+  const nodes = isRecord(graph) && Array.isArray(graph.nodes) ? graph.nodes : [];
+  const names = [];
+  nodes.forEach(node => {
+    if (!isRecord(node) || node.type !== 'condition' || node.source !== 'periods') return;
+    const periods = Array.isArray(node.periods) ? node.periods : [];
+    periods.forEach(name => {
+      if (typeof name === 'string' && name.trim() !== '' && names.indexOf(name) < 0) names.push(name);
+    });
+  });
+  return names;
+}
+
+function catalogPeriodNames(catalog) {
+  return catalogList(catalog, 'periods')
+    .map(period => (period && typeof period.name === 'string' ? period.name : ''))
+    .filter(name => name !== '');
+}
+
 /* 用户显式「从数据库刷新运行配置」：按画布声明的模型/provider/JEV 重建快照。
-   目录缺少画布声明的模型、provider 或 JEV 时抛明确错误并保持草稿不变，
-   不静默删除引用（删除 target 引用应由用户显式编辑）。返回深拷贝。 */
-export function refreshRuntime(runtime, catalog) {
+   目录缺少画布声明的模型、provider、JEV 或条件节点引用的时段时抛明确错误并
+   保持草稿不变，不静默删除引用（删除 target 引用应由用户显式编辑）。graph 是
+   当前画布 root（含条件节点），用于收集时段引用；缺失时视为无引用节点。
+   返回深拷贝。 */
+export function refreshRuntime(runtime, catalog, graph) {
   const source = isRecord(runtime) ? runtime : {};
   const declaredModels = (isRecord(source.backends) && Array.isArray(source.backends.models))
     ? source.backends.models.filter(isRecord) : [];
@@ -191,7 +230,7 @@ export function refreshRuntime(runtime, catalog) {
     .filter(item => !models.some(candidate => candidate && candidate.id === item.id))
     .map(item => String(item.id));
   if (missing.length) {
-    throw new Error('数据库模型目录缺少画布声明的模型：' + missing.join(', '));
+    throw catalogError('cv.runtime.errModelsMissing', { models: missing.join(', ') });
   }
   const nextProviders = [];
   const nextModels = [];
@@ -199,14 +238,23 @@ export function refreshRuntime(runtime, catalog) {
     const model = models.find(candidate => candidate && candidate.id === declared.id);
     const provider = providers.find(candidate => candidate && candidate.name === model.provider);
     if (!provider) {
-      throw new Error('模型 ' + String(model.id) + ' 引用的 provider ' +
-        String(model.provider) + ' 不在目录中');
+      throw catalogError('cv.runtime.errProviderMissing', {
+        model: String(model.id), provider: String(model.provider)
+      });
     }
     if (!nextModels.some(item => item.id === model.id)) nextModels.push(publicModel(model));
     if (!nextProviders.some(item => item.name === provider.name)) {
       nextProviders.push(publicProvider(provider));
     }
   });
+  /* 刷新会整组替换 time_periods：被条件节点引用、但目录里已不存在的时段必须
+     点名拒绝，不能静默丢失（服务端 enable 会报 unknown_period）。 */
+  const declaredPeriods = referencedPeriodNames(graph);
+  const knownPeriods = catalogPeriodNames(catalog);
+  const missingPeriods = declaredPeriods.filter(name => knownPeriods.indexOf(name) < 0);
+  if (missingPeriods.length) {
+    throw catalogError('cv.runtime.errPeriodsMissing', { periods: missingPeriods.join(', ') });
+  }
   const next = {
     backends: { providers: nextProviders, models: nextModels },
     jev: null,
@@ -218,7 +266,7 @@ export function refreshRuntime(runtime, catalog) {
   if (jevId) {
     const service = catalogList(catalog, 'services').find(item => item && item.id === jevId);
     if (!service) {
-      throw new Error('数据库 JEV 目录缺少画布声明的服务：' + String(jevId));
+      throw catalogError('cv.runtime.errJevMissing', { id: String(jevId) });
     }
     return selectJev(next, service);
   }

@@ -1200,4 +1200,58 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
     '最少在途请求');
 });
 
+test('Task 9 · runtime refresh refuses to drop a period still referenced by a condition node', async () => {
+  const baseline = await ensureBaselineTree();
+  assert.ok(Array.isArray(baseline.time_periods), 'the baseline tree has no runtime periods');
+  /* 模拟 /admin/time-periods 失败/漂移后的目录：少了条件节点 cond-peak 引用的
+     peak（app.js loadCatalog 会吞掉失败并把 periods 置空，后果相同）。 */
+  const catalogPeriods = baseline.time_periods.filter(period => period.name !== 'peak');
+  assert.deepEqual(catalogPeriods.map(period => period.name), ['normal', 'offpeak'],
+    'the baseline catalog periods changed; this case needs peak as a referenced period');
+  const periodsRoute = url => url.pathname === '/admin/time-periods';
+  await page.route(periodsRoute, route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ periods: catalogPeriods })
+  }));
+  try {
+    await openCanvas();
+    await waitInspectorBranch('graph', 'root');
+    const snapshot = () => page.evaluate(async () => {
+      const { app, store } = await import('/console/routing/app.js');
+      const condition = app.graph.nodes.find(node => node.id === 'cond-peak');
+      return {
+        kind: app.kind(),
+        history: store.undoStack.length,
+        runtimePeriods: app.tree.runtime.time_periods.map(period => period.name),
+        conditionPeriods: condition.periods.slice(),
+        enabled: app.tree.enabled
+      };
+    });
+    const before = await snapshot();
+    assert.deepEqual(before.runtimePeriods, ['peak', 'normal', 'offpeak']);
+    assert.deepEqual(before.conditionPeriods, ['peak']);
+    const expected = await page.evaluate(async () => {
+      const { tf } = await import('/console/i18n.js');
+      return tf('cv.runtime.errPeriodsMissing', { periods: 'peak' });
+    });
+    await page.locator('#cvInspectorBody [data-act="ins-refresh-runtime"]').click();
+    /* 刷新必须点名拒绝：静默把 time_periods 刷成 [] 会在服务端 enable 时报
+       unknown_period（本地 validate 不查时段目录）。 */
+    await page.waitForFunction(message => {
+      const box = document.querySelector('#cvInspectorBody [data-ins-error]');
+      return !!box && !box.hidden && box.textContent.includes(message);
+    }, expected, { timeout: 6000 });
+    assert.equal((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(),
+      expected, 'the refresh error did not name the missing period');
+    assert.ok(expected.includes('peak'), 'the refresh error did not name "peak": ' + expected);
+    assert.deepEqual(await snapshot(), before,
+      'a refused refresh mutated the draft runtime or pushed history');
+  } finally {
+    await page.unroute(periodsRoute);
+    await ensureBaselineTree();
+    await openCanvas();
+  }
+});
+
 await runIfMain(import.meta.url);

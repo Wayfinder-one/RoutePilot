@@ -96,6 +96,46 @@ function strictDocument(overrides) {
   return Object.assign(document, overrides || {});
 }
 
+/* 导入被拒的 toast 必须带具体原因：解析/运行配置契约错误没有节点位置，只报
+   「导入失败：」前缀或「N 个校验问题」计数会把真正的原因藏起来。这里断言完整
+   的本地化拒绝文案；若实现退回泛化文案，waitToastIncludes 会超时而失败。 */
+async function expectImportReason(reason) {
+  assert.ok(reason && reason.trim(), 'expected import reason is empty');
+  const generic = await page.evaluate(async () => {
+    const { tf } = await import('/console/i18n.js');
+    return {
+      prefix: tf('cv.toastImportRejected', { err: '__REASON__' }).split('__REASON__')[0].trim(),
+      count: tf('cv.toastImportIssues', { n: 1 }).trim()
+    };
+  });
+  assert.notEqual(reason.trim(), generic.prefix, 'the asserted reason is only the generic prefix');
+  const expected = await page.evaluate(async text => {
+    const { tf } = await import('/console/i18n.js');
+    return tf('cv.toastImportRejected', { err: text });
+  }, reason);
+  await waitToastIncludes(expected);
+  const actual = (await toastText()).trim();
+  assert.ok(actual.includes(reason), 'import rejection dropped the specific reason: ' + actual);
+  assert.notEqual(actual, generic.count,
+    'import rejection still showed only the generic issue count: ' + actual);
+  assert.notEqual(actual, generic.prefix,
+    'import rejection still showed only the generic prefix: ' + actual);
+}
+
+/* 与页面同一份 graph.js 计算「导入会给出的具体原因」：UI 必须把它显示出来，
+   而不是丢掉原因只报问题数量（断言的判别点在 UI 装配，不在文案字面）。 */
+async function parseImportReason(document) {
+  const reason = await page.evaluate(async payload => {
+    const RTGraph = await import('/console/routing/graph.js');
+    const result = RTGraph.parseImport(JSON.stringify(payload));
+    const issues = Array.isArray(result.issues) ? result.issues : [];
+    const issue = issues.find(item => item.code === 'graph_parse_error') || issues[0] || null;
+    return (issue && issue.zh) || result.error || '';
+  }, document);
+  assert.ok(reason, 'parseImport produced no reason for the rejected document');
+  return reason;
+}
+
 test('Task 10 · canvas skeleton renders the graph with no page overflow', async () => {
   await openCanvas();
   const metrics = await page.evaluate(() => ({
@@ -2079,7 +2119,7 @@ test('Task C2 · save carries the runtime and the saved response becomes the dra
   await ensureBaselineTree();
 });
 
-test('Task C2 · import replaces the runtime and an old document materializes on save', async () => {
+test('Task C2 · import replaces the runtime and the imported runtime reaches save, enable and export', async () => {
   await ensureBaselineTree();
   await openCanvas();
   const source = JSON.parse((await exportViaUi()).text);
@@ -2162,10 +2202,8 @@ test('Task C2 · import replaces the runtime and an old document materializes on
 });
   await clearToasts();
   await setImportPayload(legacy, 'legacy-document.json');
-  await waitToastIncludes(await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return t('cv.toastImportRejected').split('{err}')[0];
-}));
+  /* 拒绝原因必须点名缺哪组字段：只显示「导入失败：」前缀或「1 个校验问题」不算数。 */
+  await expectImportReason('运行配置字段必须成组出现，缺少：backends, jev, jev_window, time_periods');
   const legacyState = await page.evaluate(async () => {
     const { app } = await import('/console/routing/app.js');
     return ({
@@ -2434,10 +2472,8 @@ test('shared graph · missing required envelope field keeps the draft', async ()
   delete document.sticky;
 
   await setImportPayload(document, 'missing-sticky.json');
-  await waitToastIncludes(await page.evaluate(async n => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.toastImportIssues', { n }));
-}, 1));
+  /* 缺必需字段是解析级拒绝：原因必须点名缺失字段，而不是只报校验问题数量。 */
+  await expectImportReason('图解析失败：导入 envelope 缺少必需字段：sticky');
 
   assert.deepEqual(await draft(), before, 'a document missing sticky replaced the local draft');
 });
@@ -2468,10 +2504,8 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
     root: { type: 'jev', branches: [] }
 }), 'malformed-v3.json');
 
-  await waitToastIncludes(await page.evaluate(async n => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.toastImportIssues', { n }));
-}, 1));
+  /* root 形状非法没有节点位置：必须显示解析原因本身，而不是「N 个校验问题」。 */
+  await expectImportReason('图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）');
   const issues = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.issues.map(issue => ({
@@ -3289,7 +3323,8 @@ test('Task 14 · a malformed v3 import with non-array fields is rejected before 
       ok: result.ok,
       error: result.error,
       codes: (result.issues || []).map(issue => issue.code),
-      zh: (result.issues || []).map(issue => issue.zh).join(' ')
+      zh: (result.issues || []).map(issue => issue.zh).join(' '),
+      reason: ((result.issues || []).find(issue => issue.code === 'graph_parse_error') || {}).zh || ''
 };
 
 }, strictDocument({
@@ -3300,14 +3335,13 @@ test('Task 14 · a malformed v3 import with non-array fields is rejected before 
   assert.ok(probe.codes.includes('graph_parse_error'), 'missing graph_parse_error issue');
   assert.match(probe.zh, /models/);
 
+  await clearToasts();
   await setImportPayload(strictDocument({
     name: '非法 models',
     timezone: BASELINE.timezone, sticky: BASELINE.sticky, root: malformed
 }), 'malformed-models.json');
-  await waitToastIncludes(await page.evaluate(async n => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.toastImportIssues', { n }));
-}, 1));
+  /* 被拒文件不得只报「1 个校验问题」：必须点名非数组的 models 字段。 */
+  await expectImportReason(probe.reason);
   assert.deepEqual(await draftOf(), kept, 'a rejected malformed v3 import changed the draft');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -4175,15 +4209,14 @@ test('review-slot-limit-import-preserves-draft', async () => {
 });
   const root = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
   root.edges[0].target_port = 'in_9999';
-  await clearToasts();
-  await setImportPayload(strictDocument({
+  const invalidSlotDocument = strictDocument({
     name: '非法槽位',
     timezone: BASELINE.timezone, sticky: BASELINE.sticky, root,
-}), 'invalid-slot-in-9999.json');
-  await waitToastIncludes(await page.evaluate(async n => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.toastImportIssues', { n }));
-}, 1));
+  });
+  await clearToasts();
+  await setImportPayload(invalidSlotDocument, 'invalid-slot-in-9999.json');
+  /* 被拒原因必须点名不存在的槽位，而不是只报校验问题数量。 */
+  await expectImportReason(await parseImportReason(invalidSlotDocument));
   const after = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (({
@@ -4224,14 +4257,13 @@ test('review-import-contract-rejects-before-draft-replacement', async () => {
 
   for (const tree of invalid) {
     await clearToasts();
-    await setImportPayload(Object.assign({
+    const document = Object.assign({
       kind: 'sr-routing-graph', version: 3, name: tree.name,
       timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
-}, runtimeDocumentFields(base.runtime)), 'invalid-contract.json');
-    await waitToastIncludes(await page.evaluate(async n => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.toastImportIssues', { n }));
-}, 1));
+}, runtimeDocumentFields(base.runtime));
+    await setImportPayload(document, 'invalid-contract.json');
+    /* 每种非法契约都要显示它自己的具体原因（未知类型/未知字段/非法时区）。 */
+    await expectImportReason(await parseImportReason(document));
     assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (JSON.stringify(app.tree));
@@ -4261,14 +4293,13 @@ test('review-import-envelope-types-preserve-draft', async () => {
 
   for (const tree of invalid) {
     await clearToasts();
-    await setImportPayload(Object.assign({
+    const document = Object.assign({
       kind: 'sr-routing-graph', version: 3, name: tree.name,
       timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
-}, runtimeDocumentFields(base.runtime)), 'invalid-envelope-value.json');
-    await waitToastIncludes(await page.evaluate(async n => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (tf('cv.toastImportIssues', { n }));
-}, 1));
+}, runtimeDocumentFields(base.runtime));
+    await setImportPayload(document, 'invalid-envelope-value.json');
+    /* envelope 字段类型非法同样要显示具体原因（sticky.enabled / timezone）。 */
+    await expectImportReason(await parseImportReason(document));
     assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (JSON.stringify(app.tree));

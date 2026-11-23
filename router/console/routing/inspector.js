@@ -904,14 +904,15 @@ function onClick(event) {
   }
   if (name === 'ins-refresh-runtime') {
     /* 「从数据库刷新运行配置」：按画布声明的模型/provider/JEV 重建快照，一次历史项。
-       目录缺少画布声明的资源时给出明确错误并保持草稿不变（不静默删除引用）。 */
+       目录缺少画布声明的资源（含条件节点引用的时段）时给出明确错误并保持草稿
+       不变（不静默删除引用）。 */
     const tree = treeNow();
     const form = action.closest('[data-ins-form]');
     const fail = message => showError(form, message);
     if (!tree || !tree.runtime) { fail(t('cv.ins.errRuntimeMissing')); return; }
     let next = null;
     try {
-      next = refreshRuntime(tree.runtime, catalogNow());
+      next = refreshRuntime(tree.runtime, catalogNow(), graphNow());
     } catch (error) {
       fail(String(error && error.message ? error.message : error));
       return;

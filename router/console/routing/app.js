@@ -380,7 +380,6 @@ const hooks = {
   fitAfterReplace: () => fitAfterReplace(),
   renderTreeSelect: () => renderTreeSelect(),
   getCatalog: () => app.catalog,
-  getModels: () => inspectorModels(),
   change: (kind, mutate) => app.change(kind, mutate),
 };
 

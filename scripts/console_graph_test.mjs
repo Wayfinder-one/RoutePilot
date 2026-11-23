@@ -2096,11 +2096,11 @@ test('runtime edits classify as behavior changes, not display or layout', () => 
   moved.root.nodes[0].position = { x: 1, y: 2 };
   assert.equal(RTGraph.changeKind(tree, moved), 'layout');
 
-  /* 旧文档补上 runtime 也是行为变更。 */
-  const legacy = minimalTree();
-  const withRuntime = RTGraph.clone(legacy);
-  withRuntime.runtime = RTGraph.clone(tree.runtime);
-  assert.equal(RTGraph.changeKind(legacy, withRuntime), 'behavior');
+  /* 严格契约下草稿必须自带完整 runtime（没有「保存时再从数据库物化」的路径）；
+     整组换成另一份 runtime 快照仍是行为变更。 */
+  const otherRuntime = RTGraph.clone(minimalTree());
+  otherRuntime.runtime = RTGraph.clone(tree.runtime);
+  assert.equal(RTGraph.changeKind(minimalTree(), otherRuntime), 'behavior');
 });
 
 test('validateRuntime requires a complete runtime and reports graph_parse_error otherwise', () => {
