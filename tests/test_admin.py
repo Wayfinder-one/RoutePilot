@@ -278,9 +278,18 @@ def test_request_snapshot_persistence_excludes_live_request_secrets(tmp_path):
 
     app = create_app(settings, transport=httpx.MockTransport(handler))
     with TestClient(app) as client:
-        assert client.put("/admin/providers/local", json={
+        provider_payload = {
             "base_url": "http://upstream.test/v1", "key_env": "",
             "api_key": upstream_secret,
+        }
+        preview = client.put("/admin/providers/local", json=provider_payload)
+        assert preview.status_code == 409, preview.text
+        confirmation = {"trees": [
+            {"id": item["id"], "document_sha256": item["document_sha256"]}
+            for item in preview.json()["detail"]["affected_trees"]
+        ]}
+        assert client.put("/admin/providers/local", json={
+            **provider_payload, "impact_confirmation": confirmation,
         }).status_code == 200
         response = client.post(
             "/v1/chat/completions",

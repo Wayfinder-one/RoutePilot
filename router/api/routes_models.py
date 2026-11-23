@@ -1,23 +1,61 @@
+"""管理面模型 / provider 目录：读取、影响确认与确认后的原子画布同步。
+
+严格自包含画布语义下，数据库目录是**管理面**事实源：更新/删除模型或 provider
+不会无确认地重写画布。写用例分两阶段：
+
+1. 扫描全部画布得到影响清单，未携带确认的第一次写入返回 409
+   ``impact_confirmation_required``（数据库、画布文件、审计、快照全不变）；
+2. 携带每个画布当前 ``document_sha256`` 的确认重试，由
+   ``CatalogSyncService`` 在单写锁 + 单数据库事务内写目录行、校验并原子替换
+   受影响画布、记录审计，仅当活动画布被修改时发布新快照。
+
+哈希不匹配（过期确认）返回 409 ``graph_conflict`` 并报告当前哈希。provider
+删除不提供隐式替换、也不可被确认绕过：只要数据库模型或画布快照仍引用它就
+拒绝。
+"""
 from __future__ import annotations
 
 import json
 import os
 import re
 import sqlite3
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
 from router.api.deps import get_conn, get_tree_repo
-from router.control.config import ConfigurationService
+from router.control.catalog_sync import CatalogSyncService
+from router.control.errors import AlreadyExists, MissingError, ReferencedByError
+from router.control.impacts import (
+    delete_model as delete_tree_model,
+    model_impacts,
+    provider_impacts,
+    require_confirmation,
+    sync_model,
+    sync_provider,
+)
 from router.presets import PROVIDER_PRESETS
-from router.reasoning import FORMATS, FORMAT_IDS, LEVELS, ReasoningError, normalize_reasoning, validate_model_profile
+from router.reasoning import (
+    FORMATS,
+    FORMAT_IDS,
+    LEVELS,
+    ReasoningError,
+    normalize_reasoning,
+    validate_model_profile,
+)
 from router.routing.runtime import (
     reject_runtime_secret_fields,
     without_runtime_secret_fields,
 )
-from router.store.repositories import ModelRepo, ProviderRepo
+from router.store.repositories import (
+    ChangeRepo,
+    ModelRepo,
+    ProviderRepo,
+    model_ids_using_provider,
+    now_iso,
+)
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import parse_profile_text
 
@@ -127,9 +165,45 @@ def _validated_profile(raw: dict | str | None, provider_format: str) -> str | No
     return json.dumps(validated, ensure_ascii=False)
 
 
-def _service(request: Request, conn: sqlite3.Connection, trees: RoutingTreeRepo):
-    """ConfigurationService 只由 API 在解析 DTO 后构造；写用例本体见 router.control.config。"""
-    return ConfigurationService(conn, trees, request.app.state.publisher)
+# ── 画布同步辅助：数据库目录行 → 非密钥运行时目录项 ────────────────────
+def _runtime_provider_entry(row: dict) -> dict:
+    return {
+        "name": row["name"],
+        "base_url": (row.get("base_url") or "").rstrip("/"),
+        "key_env": row.get("key_env") or "",
+        "reasoning_format": row.get("reasoning_format") or "openai",
+    }
+
+
+def _runtime_model_entry(row: dict, provider_format: str) -> dict:
+    """把数据库模型行投影成画布运行时模型项（只含非密钥字段）。"""
+    profile = parse_profile_text(row.get("profile"))
+    validated = _validated_profile(profile, provider_format)
+    return {
+        "id": row["id"],
+        "upstream": row["upstream"],
+        "provider": row["provider"],
+        "profile": json.loads(validated or "{}"),
+    }
+
+
+def _catalog_service(request: Request, conn: sqlite3.Connection,
+                     trees: RoutingTreeRepo) -> CatalogSyncService:
+    return CatalogSyncService(conn, trees, request.app.state.publisher)
+
+
+def _provider_entries(conn: sqlite3.Connection, names) -> list[dict]:
+    entries = []
+    for name in names:
+        row = ProviderRepo(conn).get(name)
+        if row is not None:
+            entries.append(_runtime_provider_entry(row))
+    return entries
+
+
+def _impacted_trees(tree_list, impacts):
+    impacted = {item["id"] for item in impacts}
+    return [tree for tree in tree_list if tree.id in impacted]
 
 
 @router.get("/model-catalog")
@@ -176,10 +250,20 @@ class ModelIn(BaseModel):
     upstream: str | None = None
     provider: str | None = None
     profile: str | dict | None = None
+    # 影响确认：受影响画画的当前 document_sha256 清单（Task 4 两阶段协议）。
+    impact_confirmation: Any = None
 
 
 class ModelCreateIn(ModelIn):
     id: str
+
+
+class ModelDeleteIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # 被 target 引用时必填：替代模型 id（来自影响预览的 replacements）。
+    replacement_model_id: Any = None
+    impact_confirmation: Any = None
 
 
 @router.post("/models", status_code=201)
@@ -197,10 +281,21 @@ def post_model(
     provider = _clean_text(body.provider, "provider", max_len=64)
     provider_row = _require_provider(conn, provider)
     profile = _validated_profile(body.profile, provider_row.get("reasoning_format") or "openai")
-    _service(request, conn, trees).create_model(
-        model_id=model_id, upstream=upstream, provider=provider,
-        profile_text=profile, audit_profile=body.profile,
-    )
+
+    def db_write(c):
+        if not ModelRepo(c).create(model_id, upstream, provider, profile or "{}"):
+            raise AlreadyExists(f"model {model_id} 已存在")
+
+    def audit(c):
+        ChangeRepo(c).record(now_iso(), "model", {
+            "action": "create", "id": model_id,
+            "upstream": upstream, "provider": provider,
+            "profile": body.profile, "synced_trees": [],
+        })
+
+    # 新建模型不会影响任何已存画布（画布只引用已存在模型）→ 无候选。
+    _catalog_service(request, conn, trees).commit(
+        db_write=db_write, candidates=[], audit=audit)
     return {"ok": True, "model": _public_model(ModelRepo(conn).get(model_id), provider_row.get("reasoning_format") or "openai")}
 
 
@@ -220,22 +315,131 @@ def put_model(
     effective_provider = provider or existing["provider"]
     formats = _provider_formats(conn)
     profile = _validated_profile(body.profile, formats.get(effective_provider, "openai")) if body.profile is not None else None
-    _service(request, conn, trees).update_model(
-        model_id=model_id, upstream=upstream, provider=provider, profile_text=profile,
-        audit_upstream=body.upstream, audit_provider=body.provider, audit_profile=body.profile,
-    )
+
+    tree_list = trees.list()
+    impacts = model_impacts(tree_list, model_id)
+    require_confirmation(
+        impacts, body.impact_confirmation,
+        resource={"kind": "model", "id": model_id}, replacements=[])
+
+    impacted_trees = _impacted_trees(tree_list, impacts)
+    candidates = []
+    if impacted_trees:
+        # 只有存在候选画布时才物化运行时目录项：无画布受影响时目录写不应因为
+        # 旧库里的历史非法 profile 而失败。
+        effective = dict(existing)
+        if upstream is not None:
+            effective["upstream"] = upstream
+        if provider is not None:
+            effective["provider"] = provider
+        if profile is not None:
+            effective["profile"] = profile
+        runtime_model = _runtime_model_entry(
+            effective, formats.get(effective["provider"], "openai"))
+        providers = _provider_entries(conn, [effective["provider"]])
+        candidates = [
+            sync_model(tree, runtime_model, providers)
+            for tree in impacted_trees
+        ]
+    synced = [tree.id for tree in candidates]
+
+    def db_write(c):
+        if not ModelRepo(c).update(
+                model_id, upstream=upstream, provider=provider, profile=profile):
+            raise MissingError(f"unknown model {model_id}")
+
+    def audit(c):
+        ChangeRepo(c).record(now_iso(), "model", {
+            "action": "update", "id": model_id,
+            "upstream": body.upstream, "provider": body.provider,
+            "profile": body.profile, "synced_trees": synced,
+        })
+
+    _catalog_service(request, conn, trees).commit(
+        db_write=db_write, candidates=candidates, audit=audit)
     row = ModelRepo(conn).get(model_id)
-    return {"ok": True, "model": _public_model(row, _provider_formats(conn).get(row["provider"], "openai"))}
+    return {
+        "ok": True,
+        "model": _public_model(
+            row, _provider_formats(conn).get(row["provider"], "openai")),
+        "synced_trees": synced,
+    }
 
 
 @router.delete("/models/{model_id}")
 def delete_model(
     model_id: str, request: Request,
+    body: ModelDeleteIn | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
     trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
-    _service(request, conn, trees).delete_model(model_id)
-    return {"ok": True, "deleted": model_id}
+    existing = ModelRepo(conn).get(model_id)
+    if existing is None:
+        raise HTTPException(404, detail=f"unknown model {model_id}")
+    replacement_id = body.replacement_model_id if body is not None else None
+    replacement_row = None
+    if replacement_id is not None:
+        if not isinstance(replacement_id, str):
+            raise HTTPException(422, detail="replacement_model_id 必须是字符串")
+        replacement_row = ModelRepo(conn).get(replacement_id)
+        if replacement_row is None:
+            raise HTTPException(404, detail=f"unknown model {replacement_id}")
+        if replacement_id == model_id:
+            raise HTTPException(422, detail="replacement_model_id 不能是模型自身")
+
+    formats = _provider_formats(conn)
+    tree_list = trees.list()
+    impacts = model_impacts(tree_list, model_id)
+    replacements = [
+        {"id": row["id"], "upstream": row["upstream"], "provider": row["provider"]}
+        for row in ModelRepo(conn).list() if row["id"] != model_id
+    ]
+    require_confirmation(
+        impacts, body.impact_confirmation if body is not None else None,
+        resource={"kind": "model", "id": model_id}, replacements=replacements)
+
+    target_referenced = any(item["usage"]["targets"] for item in impacts)
+    if target_referenced and replacement_id is None:
+        raise HTTPException(
+            422, detail="模型仍被 target 引用，必须提供 replacement_model_id")
+
+    replacement_entry = None
+    provider_entries: list[dict] = []
+    if replacement_row is not None and target_referenced:
+        replacement_entry = _runtime_model_entry(
+            replacement_row, formats.get(replacement_row["provider"], "openai"))
+        provider_entries = _provider_entries(conn, [replacement_row["provider"]])
+
+    usage_by_id = {item["id"]: item["usage"] for item in impacts}
+    candidates = []
+    for tree in _impacted_trees(tree_list, impacts):
+        needs_replacement = bool(usage_by_id[tree.id]["targets"])
+        candidates.append(delete_tree_model(
+            tree, model_id,
+            replacement=replacement_entry if needs_replacement else None,
+            providers=provider_entries if needs_replacement else (),
+        ))
+    synced = [tree.id for tree in candidates]
+
+    def db_write(c):
+        if not ModelRepo(c).delete(model_id):
+            raise MissingError(f"unknown model {model_id}")
+
+    def audit(c):
+        ChangeRepo(c).record(now_iso(), "model", {
+            "action": "delete", "id": model_id,
+            "replacement_model_id": replacement_id,
+            "synced_trees": synced,
+        })
+
+    _catalog_service(request, conn, trees).commit(
+        db_write=db_write, candidates=candidates, audit=audit)
+    return {
+        "ok": True,
+        "deleted": model_id,
+        "replacement_model_id": replacement_id,
+        "synced_trees": synced,
+    }
 
 
 def _public_provider(row: dict) -> dict:
@@ -260,6 +464,19 @@ class ProviderIn(BaseModel):
     key_env: str | None = None
     reasoning_format: str | None = None
     api_key: str | None = None
+    # 影响确认：受影响画布的当前 document_sha256 清单。
+    impact_confirmation: Any = None
+
+
+class ProviderDeleteIn(BaseModel):
+    """provider 删除 DTO：接受 ``impact_confirmation`` 仅为协议兼容。
+
+    删除不可绕过：只要数据库模型或画布快照仍引用 provider 就始终 409。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    impact_confirmation: Any = None
 
 
 @router.put("/providers/{name}")
@@ -282,17 +499,90 @@ def put_provider(
             and current["base_url"].rstrip("/") != base_url:
         # 端点变了而请求未显式提供密钥：旧密钥不得静默跟随到新地址（spec §5）。
         api_key = ""
-    _service(request, conn, trees).upsert_provider(
-        name=name, base_url=base_url, key_env=key_env,
-        reasoning_format=body.reasoning_format, api_key=api_key,
-    )
-    return {"ok": True, "provider": _public_provider(ProviderRepo(conn).get(name))}
+
+    tree_list = trees.list()
+    impacts = provider_impacts(tree_list, name)
+    require_confirmation(
+        impacts, body.impact_confirmation,
+        resource={"kind": "provider", "name": name})
+
+    runtime_provider = {
+        "name": name,
+        "base_url": base_url,
+        "key_env": key_env if key_env is not None else (current or {}).get("key_env", ""),
+        "reasoning_format": (
+            body.reasoning_format or (current or {}).get("reasoning_format") or "openai"),
+    }
+    candidates = [
+        sync_provider(tree, runtime_provider)
+        for tree in _impacted_trees(tree_list, impacts)
+    ]
+    synced = [tree.id for tree in candidates]
+    audit_key_env = (
+        key_env if key_env is not None else (current or {}).get("key_env", ""))
+    audit_format = (
+        body.reasoning_format or (current or {}).get("reasoning_format", "openai"))
+
+    def db_write(c):
+        ProviderRepo(c).upsert(
+            name, base_url, key_env=key_env,
+            reasoning_format=body.reasoning_format, api_key=api_key)
+
+    def audit(c):
+        ChangeRepo(c).record(now_iso(), "provider", {
+            "action": "upsert", "name": name, "base_url": base_url,
+            "key_env": audit_key_env,
+            "reasoning_format": audit_format,
+            "api_key": "unchanged" if api_key is None else "cleared" if api_key == "" else "set",
+            "synced_trees": synced,
+        })
+
+    _catalog_service(request, conn, trees).commit(
+        db_write=db_write, candidates=candidates, audit=audit)
+    return {
+        "ok": True,
+        "provider": _public_provider(ProviderRepo(conn).get(name)),
+        "synced_trees": synced,
+    }
 
 
 @router.delete("/providers/{name}")
-def delete_provider(name: str, request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                    trees: RoutingTreeRepo = Depends(get_tree_repo)):
-    _service(request, conn, trees).delete_provider(name)
+def delete_provider(
+    name: str, request: Request,
+    body: ProviderDeleteIn | None = None,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
+    # DTO 里的 impact_confirmation 只用于协议兼容，provider 删除不允许绕过检查。
+    if ProviderRepo(conn).get(name) is None:
+        raise MissingError(f"unknown provider {name}")
+    used_by = model_ids_using_provider(conn, name)
+    impacts = provider_impacts(trees.list(), name)
+    if used_by or impacts:
+        if used_by and impacts:
+            message = "provider 同时被数据库模型与自包含画布引用，请先解除引用"
+        elif used_by:
+            message = "provider 被数据库模型引用，请先更新/删除这些模型"
+        else:
+            message = "provider 被自包含画布引用；删除不提供隐式替换，请先解除画布引用"
+        raise ReferencedByError({
+            "message": message,
+            "code": "provider_referenced",
+            "models": used_by,
+            "affected_trees": impacts,
+        })
+
+    def db_write(c):
+        if not ProviderRepo(c).delete(name):
+            raise MissingError(f"unknown provider {name}")
+
+    def audit(c):
+        ChangeRepo(c).record(now_iso(), "provider", {
+            "action": "delete", "name": name, "synced_trees": [],
+        })
+
+    _catalog_service(request, conn, trees).commit(
+        db_write=db_write, candidates=[], audit=audit)
     return {"ok": True, "deleted": name}
 
 

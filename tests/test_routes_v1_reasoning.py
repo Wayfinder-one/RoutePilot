@@ -82,11 +82,36 @@ def activate(h, level=None):
     assert client.post("/admin/trees/default-tree/enable").status_code == 200
 
 
+def _confirmation_from(response):
+    """409 影响预览 → 携带当前画布哈希的确认载荷。"""
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required", response.text
+    return {"trees": [
+        {"id": item["id"], "document_sha256": item["document_sha256"]}
+        for item in detail["affected_trees"]
+    ]}
+
+
+def _put_with_confirmation(client, path, payload):
+    """目录写两阶段：未确认的 409 预览用当前哈希确认重试。"""
+    preview = client.put(path, json=payload)
+    if preview.status_code != 409:
+        return preview
+    return client.put(path, json={
+        **payload, "impact_confirmation": _confirmation_from(preview)})
+
+
 def declare(client, reasoning, *, provider_format=None):
     if provider_format:
-        response = client.put("/admin/providers/local", json={"base_url": "http://upstream.test/v1", "reasoning_format": provider_format})
+        response = _put_with_confirmation(client, "/admin/providers/local", {
+            "base_url": "http://upstream.test/v1",
+            "reasoning_format": provider_format,
+        })
         assert response.status_code == 200, response.text
-    response = client.put("/admin/models/qwen3-8b", json={"profile": {"reasoning": reasoning}})
+    response = _put_with_confirmation(
+        client, "/admin/models/qwen3-8b",
+        {"profile": {"reasoning": reasoning}})
     assert response.status_code == 200, response.text
 
 

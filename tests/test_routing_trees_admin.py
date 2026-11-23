@@ -88,11 +88,22 @@ def _canvas_state(app, tree_ids):
     }
 
 
-def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
-    """严格自包含语义：目录写只改数据库行 + 审计，绝不改写已存画布。
+def _confirmation_from(response) -> dict:
+    """409 影响预览 → 携带当前画布哈希的确认载荷。"""
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required", response.text
+    return {"trees": [
+        {"id": item["id"], "document_sha256": item["document_sha256"]}
+        for item in detail["affected_trees"]
+    ]}
 
-    管理 GET 只读 SQLite 目录（不再因活动画布切换数据源）；快照仍取活动画布
-    内嵌配置，直到显式刷新/确认同步（后续单元）。
+
+def test_unconfirmed_catalog_writes_do_not_rewrite_stored_canvases(client, app):
+    """未确认的目录写只改数据库行 + 审计，绝不改写已存画布。
+
+    严格自包含语义下数据库目录是管理面事实源：受影响画布必须先返回 409 影响
+    清单，确认后才同步。非画布资源（时段/JEV 窗口）的目录写仍不碰画布。
     """
     create_portable_tree(client, "main")
     create_portable_tree(client, "second")
@@ -115,20 +126,46 @@ def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
     assert providers.status_code == 200, providers.text
     assert providers.json()["providers"][0]["base_url"] == "http://database-only.test/v1"
 
-    response = client.put("/admin/providers/local", json={
+    payload = {
         "base_url": "http://changed.test/v1",
         "key_env": "CHANGED_API_KEY",
         "reasoning_format": "openai",
-    })
+    }
+    preview = client.put("/admin/providers/local", json=payload)
+    assert preview.status_code == 409, preview.text
+    assert {item["id"]
+            for item in preview.json()["detail"]["affected_trees"]} == set(tree_ids)
+    # 未确认：数据库行、画布文件、运行快照全都不变。
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert ProviderRepo(conn).get("local")["base_url"] == \
+            "http://database-only.test/v1"
+    finally:
+        conn.close()
+    assert _canvas_state(app, tree_ids) == before
+    assert app.state.snapshot.backends["fast"].url == \
+        "http://json-only.test/v1/chat/completions"
+
+    response = client.put("/admin/providers/local", json={
+        **payload, "impact_confirmation": _confirmation_from(preview)})
     assert response.status_code == 200, response.text
+    assert sorted(response.json()["synced_trees"]) == ["main", "second"]
     conn = connect(app.state.settings.db_path)
     try:
         assert ProviderRepo(conn).get("local")["base_url"] == "http://changed.test/v1"
     finally:
         conn.close()
-    assert _canvas_state(app, tree_ids) == before
-    # 运行快照仍是画布内嵌 provider，不因目录写而改写。
-    assert app.state.snapshot.backends["fast"].url == "http://json-only.test/v1/chat/completions"
+    after_provider = _canvas_state(app, tree_ids)
+    assert all(state != old for state, old in zip(after_provider.values(), before.values()))
+    for tree_id in tree_ids:
+        provider = next(
+            entry for entry in app.state.graph_repo.get(tree_id).runtime.backends.providers
+            if entry["name"] == "local")
+        assert provider["base_url"] == "http://changed.test/v1"
+        assert provider["key_env"] == "CHANGED_API_KEY"
+    # 确认同步后活动画布被修改 → 快照按新画布配置重新发布。
+    assert app.state.snapshot.backends["fast"].url == \
+        "http://changed.test/v1/chat/completions"
 
     response = client.put("/admin/time-periods", json={"periods": [
         {"name": "DB 新时段", "days": [0], "start": "08:00", "end": "17:00"},
@@ -139,7 +176,7 @@ def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
         assert [row["name"] for row in TimePeriodRepo(conn).load()] == ["DB 新时段"]
     finally:
         conn.close()
-    assert _canvas_state(app, tree_ids) == before
+    assert _canvas_state(app, tree_ids) == after_provider
     assert app.state.snapshot.time_periods and [
         period.name for period in app.state.snapshot.time_periods
     ] == ["peak", "normal", "offpeak"]
@@ -160,11 +197,11 @@ def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
         assert (runtime.jev_input_tokens, runtime.jev_context_tokens) == (1024, 4096)
     assert (app.state.snapshot.jev_input_tokens,
             app.state.snapshot.jev_context_tokens) == (1024, 4096)
-    assert _canvas_state(app, tree_ids) == before
+    assert _canvas_state(app, tree_ids) == after_provider
 
 
 def test_catalog_writes_succeed_when_active_canvas_has_no_catalog_rows(client, app):
-    """画布自包含时目录可以完全不登记画布资源：目录写仍照常成功。"""
+    """画布自包含时目录可以完全不登记画布资源：未确认目录写仍照常成功。"""
     create_portable_tree(client, "main")
     assert client.post("/admin/trees/main/enable").status_code == 200
     conn = connect(app.state.settings.db_path)
@@ -183,16 +220,31 @@ def test_catalog_writes_succeed_when_active_canvas_has_no_catalog_rows(client, a
     tree = app.state.graph_repo.get("main")
     assert tree.runtime.backends.models[0]["upstream"] == "json-upstream"
 
-    # 目录补回该模型后写用例照常工作（不写画布）。
+    # 目录补回该模型后：写用例先 409 预览（画布运行时目录包含 fast），确认后
+    # 同步该画布运行时模型项；未确认时画布保持不变。
     conn = connect(app.state.settings.db_path)
     try:
         ModelRepo(conn).create("fast", "db-upstream", "local", "{}")
     finally:
         conn.close()
-    response = client.put("/admin/models/fast", json={"upstream": "edited-upstream"})
+    before_bytes = _canvas_state(app, ("main",))
+    preview = client.put("/admin/models/fast", json={"upstream": "edited-upstream"})
+    assert preview.status_code == 409, preview.text
+    assert [item["id"]
+            for item in preview.json()["detail"]["affected_trees"]] == ["main"]
+    assert app.state.graph_repo.get("main").runtime.backends.models[0]["upstream"] == \
+        "json-upstream"
+    assert _canvas_state(app, ("main",)) == before_bytes
+
+    response = client.put("/admin/models/fast", json={
+        "upstream": "edited-upstream",
+        "impact_confirmation": _confirmation_from(preview),
+    })
     assert response.status_code == 200, response.text
-    assert client.get("/admin/models").json()["models"][0]["upstream"] == "edited-upstream"
-    assert app.state.graph_repo.get("main").runtime.backends.models[0]["upstream"] == "json-upstream"
+    assert client.get("/admin/models").json()["models"][0]["upstream"] == \
+        "edited-upstream"
+    assert app.state.graph_repo.get("main").runtime.backends.models[0]["upstream"] == \
+        "edited-upstream"
 
 
 def test_stale_browser_save_returns_409_and_keeps_file(client):

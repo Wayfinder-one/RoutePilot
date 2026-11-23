@@ -123,6 +123,54 @@ class ConfigurationService:
         fingerprint = self.trees.fingerprint()
         return self.publisher.prepare(self.conn, self.trees.active(), fingerprint)
 
+    # ── 确认后的目录同步（模型/provider/JEV 影响写用例共用骨架）────────────
+    # 与 _write_and_publish 同一套语义：publisher.locked() → 单写事务（目录写/
+    # 候选校验/预检并暂存全部画布/图批次提交/候选快照/复核指纹/审计）→ COMMIT
+    # → 仅在活动画布被修改时发布新快照。候选画布保留原始 document_sha256，
+    # stage_updates() 在事务内逐份核对基线哈希（GraphBatch 负责非活动先写、
+    # 活动最后写与回滚），因此不需要另建多文件写入协议。
+    def commit_catalog_write(self, *, db_write, candidates, audit) -> list[str]:
+        """目录写 + 候选画布原子提交；返回同步的画布 id（候选顺序）。"""
+        candidates = list(candidates)
+        batch: GraphBatch | None = None
+        prepared: PreparedSnapshot | None = None
+        active_changed = False
+        with self.publisher.locked():
+            try:
+                with write_transaction(self.conn):
+                    db_write(self.conn)
+                    for tree in candidates:
+                        issues = tree_issues(self.conn, tree)
+                        if issues:
+                            raise ValidationFailed(issues)
+                    if candidates:
+                        batch = self.trees.stage_updates([
+                            (tree, tree.document_sha256) for tree in candidates
+                        ])
+                        batch.commit()
+                    # 先取指纹再读活动树，保证（树, 指纹）标签一致；图批次提交后
+                    # 读到的是本事务写入的新活动画布。没有候选时目录写不可能改变
+                    # 快照内容（快照只来自活动画布），因此跳过构造与发布。
+                    if candidates:
+                        fingerprint = self.trees.fingerprint()
+                        active = self.trees.active()
+                        prepared = self.publisher.prepare(
+                            self.conn, active, fingerprint)
+                        prepared = self._recheck_fingerprint(prepared)
+                        active_changed = active is not None and any(
+                            tree.id == active.id for tree in candidates)
+                    audit(self.conn)
+            except BaseException:
+                # 数据库事务已自动回滚；图批次在事务外恢复，暂存文件由 rollback
+                # 的 discard 清理。
+                self._rollback_graph_batch(batch)
+                raise
+            if batch is not None:
+                batch.discard()
+            if active_changed and prepared is not None:
+                self.publisher.publish(prepared)
+        return [tree.id for tree in candidates]
+
     def _finish_config_write(self, audit) -> _ConfigWriteResult:
         """校验并记录审计；目录写不再暂存任何图批次（画布由显式同步更新）。"""
         self._require_valid_active_graph()

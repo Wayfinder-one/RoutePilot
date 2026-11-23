@@ -48,6 +48,26 @@ def client(app):
     return TestClient(app)
 
 
+def _confirmation_from(response) -> dict:
+    """409 影响预览 → 携带当前画布哈希的确认载荷。"""
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required", response.text
+    return {"trees": [
+        {"id": item["id"], "document_sha256": item["document_sha256"]}
+        for item in detail["affected_trees"]
+    ]}
+
+
+def put_with_confirmation(client, path: str, payload: dict):
+    """目录写两阶段：先 409 预览，再用预览哈希确认重试。"""
+    preview = client.put(path, json=payload)
+    if preview.status_code != 409:
+        return preview
+    return client.put(path, json={
+        **payload, "impact_confirmation": _confirmation_from(preview)})
+
+
 # --------------------------------------------------------------------------- #
 # 预置目录
 # --------------------------------------------------------------------------- #
@@ -310,10 +330,9 @@ def _direct_graph(models, *, node_id="direct", fallback="direct"):
     }
 
 
-def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
-    """Reference check walks the SAVED routing trees: a direct graph target and
-    a choice option target both block the delete, and every finding names its
-    tree/node (``via``)."""
+def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client, app):
+    """删除被引用模型：未确认 409 影响清单（每幅画布列出 target 使用位置），
+    确认缺替代 → 422，确认带替代 → 200 并同步所有受影响画布。"""
     route_root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref", "root": route_root,
@@ -352,14 +371,33 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
     r = client.delete("/admin/models/qwen3-8b")
     assert r.status_code == 409
     detail = r.json()["detail"]
-    assert "路由树引用" in detail["message"]
-    refs = detail["references"]
-    assert {ref["tree_id"] for ref in refs} == {"ref-tree", "nl-ref"}
-    for ref in refs:
-        assert ref["tree_id"] and ref["node_id"] and ref["via"]
-        assert "tree_revision" in ref
+    assert detail["code"] == "impact_confirmation_required"
+    assert {item["id"] for item in detail["affected_trees"]} == {"ref-tree", "nl-ref"}
+    usages = {item["id"]: item["usage"] for item in detail["affected_trees"]}
+    assert usages["ref-tree"]["targets"] == ["direct"]
+    assert usages["nl-ref"]["targets"] == ["fast-target"]
+    assert all(usage["runtime_catalog"] is True for usage in usages.values())
     assert "qwen3-8b" in {m["id"] for m in
                           client.get("/admin/models").json()["models"]}
+
+    # 确认但缺替代模型 → 422（target 仍引用）；确认带替代模型 → 200 且同步两幅画布。
+    confirmation = _confirmation_from(r)
+    missing = client.request("DELETE", "/admin/models/qwen3-8b", json={
+        "impact_confirmation": confirmation})
+    assert missing.status_code == 422
+    deleted = client.request("DELETE", "/admin/models/qwen3-8b", json={
+        "replacement_model_id": "qwen3-32b",
+        "impact_confirmation": confirmation})
+    assert deleted.status_code == 200, deleted.text
+    assert sorted(deleted.json()["synced_trees"]) == ["nl-ref", "ref-tree"]
+    for tree_id in ("ref-tree", "nl-ref"):
+        target_models = {
+            slot.model
+            for node in app.state.graph_repo.get(tree_id).root.nodes
+            for slot in getattr(node, "models", ())
+        }
+        assert "qwen3-8b" not in target_models
+        assert "qwen3-32b" in target_models
 
     assert client.delete("/admin/models/nope").status_code == 404
     # unreferenced model deletes fine
@@ -390,8 +428,9 @@ def _activate_provider_canvas(client, base_url, model="qwen3-8b", provider="loca
 def test_provider_key_tristate_and_headers(client, app):
     base = {"base_url": "http://127.0.0.1:9000"}
     _activate_provider_canvas(client, base["base_url"])
-    r = client.put("/admin/providers/local", json={**base, "api_key": "sk-secret-1"})
-    assert r.status_code == 200
+    r = put_with_confirmation(
+        client, "/admin/providers/local", {**base, "api_key": "sk-secret-1"})
+    assert r.status_code == 200, r.text
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert "sk-secret-1" not in r.text
@@ -399,7 +438,8 @@ def test_provider_key_tristate_and_headers(client, app):
         "Bearer sk-secret-1"
 
     # omitted -> kept
-    r = client.put("/admin/providers/local", json=base)
+    r = put_with_confirmation(client, "/admin/providers/local", base)
+    assert r.status_code == 200, r.text
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert client.get("/admin/providers").text.count("sk-secret-1") == 0
@@ -407,7 +447,9 @@ def test_provider_key_tristate_and_headers(client, app):
         "Bearer sk-secret-1"
 
     # "" -> cleared
-    r = client.put("/admin/providers/local", json={**base, "api_key": ""})
+    r = put_with_confirmation(
+        client, "/admin/providers/local", {**base, "api_key": ""})
+    assert r.status_code == 200, r.text
     provider = r.json()["provider"]
     assert provider["key_present"] is False
     assert provider["key_source"] == "none"
@@ -429,13 +471,15 @@ def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
     assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
     # a stored key wins over the environment (contract §5.3)
-    client.put("/admin/providers/envprov", json={
+    stored = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": "stored-secret"})
+    assert stored.status_code == 200, stored.text
     assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer stored-secret"
     # clearing the stored key falls back to the env
-    client.put("/admin/providers/envprov", json={
+    cleared = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": ""})
+    assert cleared.status_code == 200, cleared.text
     assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
 
@@ -585,15 +629,13 @@ def _reasoning_tree_root(level="high"):
 
 
 def _declare_high(client):
-    r = client.put("/admin/models/qwen3-8b", json={"profile": OPENAI_REASONING})
+    r = put_with_confirmation(
+        client, "/admin/models/qwen3-8b", {"profile": OPENAI_REASONING})
     assert r.status_code == 200, r.text
 
 
-def _declare_low_only(client):
-    """A declaration that no longer declares the tree's 'high' level."""
-    return client.put("/admin/models/qwen3-8b", json={"profile": {
-        "reasoning": {"efforts": {"off": None, "low": "low"},
-                      "default": "low"}}})
+LOW_ONLY_REASONING = {"reasoning": {
+    "efforts": {"off": None, "low": "low"}, "default": "low"}}
 
 
 def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
@@ -607,29 +649,76 @@ def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
     return created.json()["tree"]
 
 
-def test_model_write_ignores_reasoning_of_a_closed_tree(client):
-    """Only the ACTIVE tree gates model writes: a closed draft does not, and
-    disabling the active tree lifts the constraint again."""
+def test_model_write_previews_then_validates_a_closed_draft_canvas(client, app):
+    """目录写不再以「活动图许可」为门槛，而是对所有受影响画布（含草稿）两阶段。
+
+    旧契约下关闭的草稿不参与目录写校验；严格自包含画布把「数据库目录能否改写
+    画布」变成显式确认：未确认 409 且零写入，确认后同步草稿的运行时模型项；
+    若同步会让草稿的 target 推理档位失效，候选校验返回 422 并整体回滚。
+    """
     _declare_high(client)
     root = _reasoning_tree_root()
     runtime = _tree_runtime(root, model_overrides={"qwen3-8b": OPENAI_REASONING})
     created = client.post("/admin/trees", json={
         "id": "draft-tree", "name": "Draft", "root": root, **runtime})
     assert created.status_code == 201, created.text
-    # No ACTIVE tree: the write cannot break the hot path or the next boot.
-    assert _declare_low_only(client).status_code == 200
+    graph_dir = Path(app.state.settings.graph_dir, "graphs")
 
-    # Same write against a formerly-active but now DISABLED tree is accepted.
-    _declare_high(client)
-    _activate_reasoning_tree(client, tree_id="disabled-tree")
-    assert client.post("/admin/trees/disabled-tree/disable").status_code == 200
-    assert _declare_low_only(client).status_code == 200
+    def canvas_files():
+        return {path.name: path.read_bytes() for path in graph_dir.glob("*.json")}
+
+    def stored_profile():
+        conn = connect(app.state.settings.db_path)
+        try:
+            return json.loads(conn.execute(
+                "SELECT profile FROM models WHERE id = 'qwen3-8b'").fetchone()[0])
+        finally:
+            conn.close()
+
+    before_files = canvas_files()
+    preview = client.put(
+        "/admin/models/qwen3-8b", json={"upstream": "edited-upstream"})
+
+    assert preview.status_code == 409, preview.text
+    detail = preview.json()["detail"]
+    assert [item["id"] for item in detail["affected_trees"]] == ["draft-tree"]
+    assert detail["affected_trees"][0]["enabled"] is False
+    assert stored_profile() == OPENAI_REASONING
+    assert canvas_files() == before_files
+
+    confirmed = client.put("/admin/models/qwen3-8b", json={
+        "upstream": "edited-upstream",
+        "impact_confirmation": _confirmation_from(preview),
+    })
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["synced_trees"] == ["draft-tree"]
+    draft = app.state.graph_repo.get("draft-tree")
+    assert draft.enabled is False
+    assert draft.runtime.backends.models[0]["upstream"] == "edited-upstream"
+    assert draft.runtime.backends.models[0]["profile"] == OPENAI_REASONING
+
+    # 让草稿 target 的 high 档位失效的 profile 更新：确认后候选校验 422 并回滚。
+    before_files = canvas_files()
+    before_profile = stored_profile()
+    preview = client.put(
+        "/admin/models/qwen3-8b", json={"profile": LOW_ONLY_REASONING})
+    assert preview.status_code == 409, preview.text
+    rejected = client.put("/admin/models/qwen3-8b", json={
+        "profile": LOW_ONLY_REASONING,
+        "impact_confirmation": _confirmation_from(preview),
+    })
+
+    assert rejected.status_code == 422, rejected.text
+    assert any(issue["code"] == "reasoning_unsupported"
+               for issue in rejected.json()["detail"])
+    assert stored_profile() == before_profile
+    assert canvas_files() == before_files
 
 
 def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
     _declare_high(client)
     _activate_reasoning_tree(client)
-    r = client.put("/admin/models/qwen3-8b", json={"profile": {
+    r = put_with_confirmation(client, "/admin/models/qwen3-8b", {"profile": {
         "reasoning": {"efforts": {"off": None, "high": "high"},
                       "default": "high"}}})
     assert r.status_code == 200, r.text
@@ -659,7 +748,11 @@ def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     response = client.delete("/admin/models/qwen3-8b")
 
     assert response.status_code == 409
-    assert response.json()["detail"]["message"] == "model qwen3-8b 被路由树引用"
+    detail = response.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required"
+    assert [item["id"] for item in detail["affected_trees"]] == ["ref-tree"]
+    assert detail["affected_trees"][0]["usage"] == {
+        "targets": ["direct"], "runtime_catalog": True}
     conn = connect(app.state.settings.db_path)
     try:
         audit = conn.execute(
@@ -688,66 +781,61 @@ def test_model_and_provider_dtos_reject_unknown_fields(client, method, path, pay
 
 
 # --------------------------------------------------------------------------- #
-# delete-model: the reference check and the delete share the publish lock
-# (the scan lives in the ConfigurationService write path)
+# 确认后的目录写：预览是纯读（不占写锁），提交在 publish 写锁内原子完成
 # --------------------------------------------------------------------------- #
-def _instrument_delete_lock(app, client, monkeypatch):
-    """Record whether ``model_references`` is called while the lock is held."""
-    from router.control import config as control_config
-
+def _instrument_publish_lock(app, monkeypatch):
+    """记录 publish 写锁的进入/退出顺序。"""
     publisher = app.state.publisher
     real_locked = publisher.locked
     trace: list[str] = []
-    state = {"inside": False}
 
     @contextmanager
     def recording_locked():
-        state["inside"] = True
         trace.append("lock-enter")
         try:
             with real_locked():
                 yield publisher
         finally:
-            state["inside"] = False
             trace.append("lock-exit")
 
     monkeypatch.setattr(publisher, "locked", recording_locked)
-
-    real_references = control_config.model_references
-
-    def recording_references(trees, model_id):
-        trace.append("check")
-        assert state["inside"], "reference check must run inside the publish lock"
-        return real_references(trees, model_id)
-
-    monkeypatch.setattr(control_config, "model_references", recording_references)
     return trace
 
 
-def test_delete_model_checks_references_inside_the_publish_lock(
+def test_delete_referenced_model_previews_without_lock_then_commits_under_lock(
         app, client, monkeypatch):
     root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref", "root": root, **_tree_runtime(root)})
     assert created.status_code == 201, created.text
-    trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
+    trace = _instrument_publish_lock(app, monkeypatch)
 
-    response = client.delete("/admin/models/qwen3-8b")
+    preview = client.delete("/admin/models/qwen3-8b")
 
-    assert response.status_code == 409
-    assert trace == ["lock-enter", "check", "lock-exit"]
+    assert preview.status_code == 409
+    # 预览只扫描影响清单，不拿写锁（零写入的纯读阶段）。
+    assert trace == []
+
+    confirmed = client.request("DELETE", "/admin/models/qwen3-8b", json={
+        "replacement_model_id": "qwen3-32b",
+        "impact_confirmation": _confirmation_from(preview),
+    })
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert trace == ["lock-enter", "lock-exit"]
+    assert confirmed.json()["synced_trees"] == ["ref-tree"]
 
 
-def test_delete_free_model_also_checks_inside_the_publish_lock(
+def test_delete_free_model_commits_catalog_write_under_the_publish_lock(
         app, client, monkeypatch):
-    trace = _instrument_delete_lock(app, client, monkeypatch)
+    trace = _instrument_publish_lock(app, monkeypatch)
 
     response = client.delete("/admin/models/qwen3-32b")
 
     assert response.status_code == 200, response.text
-    assert trace[0] == "lock-enter"
-    assert "check" in trace
-    assert trace[-1] == "lock-exit"
+    assert response.json()["synced_trees"] == []
+    # 无候选画布时仍走单写锁 + 单事务的目录写骨架。
+    assert trace == ["lock-enter", "lock-exit"]
 
 
 def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
@@ -772,14 +860,25 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
     assert app.state.snapshot.backends["fast"].headers["Authorization"] == \
         "Bearer sk-json-secret"
     client = TestClient(app)
-    response = client.put("/admin/providers/local",
-                          json={"base_url": "http://new-upstream.test/v1"})
+    preview = client.put(
+        "/admin/providers/local", json={"base_url": "http://new-upstream.test/v1"})
+    assert preview.status_code == 409, preview.text
+    # 未确认：画布与快照都不变。
+    assert app.state.snapshot.backends["fast"].url == \
+        "http://json-only.test/v1/chat/completions"
+    assert app.state.snapshot.backends["fast"].headers["Authorization"] == \
+        "Bearer sk-json-secret"
+
+    response = client.put("/admin/providers/local", json={
+        "base_url": "http://new-upstream.test/v1",
+        "impact_confirmation": _confirmation_from(preview),
+    })
 
     assert response.status_code == 200, response.text
-    # 严格自包含：目录写不改写已存画布；快照仍用画布内嵌端点，旧的已存密钥
-    # 因端点不再匹配而不再注入（DB 行被清空）。
+    # 确认后画布运行时 provider 同步到新端点；请求省略 api_key 且端点变更 →
+    # 旧密钥不再注入（DB 行被清空），快照改用新端点。
     backend = app.state.snapshot.backends["fast"]
-    assert backend.url == "http://json-only.test/v1/chat/completions"
+    assert backend.url == "http://new-upstream.test/v1/chat/completions"
     assert "Authorization" not in backend.headers
     conn = connect(app.state.settings.db_path)
     try:
