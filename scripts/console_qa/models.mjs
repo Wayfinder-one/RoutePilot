@@ -14,7 +14,6 @@ import {
   api,
   appSnapshot,
   expectHttpStatusError,
-  expectedHttpStatusErrors,
   page,
   resetExpectedHttpStatusErrors,
   routerBase,
@@ -82,14 +81,48 @@ test('Task 11 · boot unlocks the canvas before catalogues and late catalogue da
 }
 });
 
-test('review-jev-window-save-error-uses-window-message', async () => {
-  const detail = 'window save rejected by QA';
+test('P0 decision service saves config and window then tests with friendly output', async () => {
+  const calls = [];
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
+    if (request.method() === 'POST' && url.pathname === '/admin/jev/test') calls.push('test');
+};
+  page.on('request', onRequest);
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    assert.equal(await page.locator('#testCard').count(), 0);
+    assert.equal(await page.locator('#saveWindow').count(), 0);
+    await page.locator('#editConfig').click();
+    assert.equal(await page.locator('#instructions').isVisible(), false);
+    assert.equal(await page.locator('#winContext').isVisible(), false);
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
+    assert.deepEqual(calls, ['config', 'window', 'test']);
+    assert.match(await page.locator('#testOut').innerText(), /连接成功|Connection successful/);
+    assert.equal(await page.locator('#testRaw').isVisible(), false);
+} finally {
+    page.off('request', onRequest);
+}
+});
+
+test('P0 decision service reports partial save and skips test after window failure', async () => {
+  const calls = [];
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
+    if (request.method() === 'POST' && url.pathname === '/admin/jev/test') calls.push('test');
+};
+  page.on('request', onRequest);
   await page.route('**/admin/jev/window', async route => {
     if (route.request().method() === 'PUT') {
       await route.fulfill({
         status: 422,
         contentType: 'application/json',
-        body: JSON.stringify({ detail }),
+        body: JSON.stringify({ detail: 'window save rejected by QA' })
 });
       return;
 }
@@ -98,28 +131,114 @@ test('review-jev-window-save-error-uses-window-message', async () => {
   expectHttpStatusError({ url: /\/admin\/jev\/window$/, status: /422/ });
   try {
     await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() =>
-      document.getElementById('winContext').value === '4096' &&
-      document.getElementById('winInput').value === '1024');
-    /* JEV 页面是「只读档案 + 按需编辑」：窗口字段只在编辑态可见，先进编辑态。 */
+    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
     await page.locator('#editConfig').click();
-    await page.waitForSelector('#saveWindow', { state: 'visible', timeout: 15000 });
-    await page.locator('#saveWindow').click();
-    await page.waitForFunction(expected =>
-      document.getElementById('windowMsg').textContent.includes(expected), detail);
-    assert.equal(await page.locator('#saveMsg').textContent(), '');
-    assert.equal(expectedHttpStatusErrors.length, 0,
-      'the expected window PUT 422 was not observed');
-
-    await page.unroute('**/admin/jev/window');
-    const savedResponse = page.waitForResponse(response =>
-      response.url().endsWith('/admin/jev/window') &&
-      response.request().method() === 'PUT' && response.status() === 200);
-    await page.locator('#saveWindow').click();
-    assert.equal((await savedResponse).status(), 200);
-    await page.waitForFunction(() => document.getElementById('windowMsg').textContent === '');
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() =>
+      document.getElementById('saveMsg').textContent.includes('window save rejected by QA'));
+    assert.deepEqual(calls, ['config', 'window']);
+    assert.match(await page.locator('#saveMsg').innerText(), /连接与提示词已保存|Connection and prompts saved/);
+    assert.equal(await page.locator('#editPane').isVisible(), true);
 } finally {
+    page.off('request', onRequest);
     await page.unroute('**/admin/jev/window');
+    resetExpectedHttpStatusErrors();
+}
+});
+
+test('P0 decision service stops after config failure', async () => {
+  const calls = [];
+  const onRequest = request => {
+    const path = new URL(request.url()).pathname;
+    if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
+    if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
+    if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
+};
+  page.on('request', onRequest);
+  await page.route('**/admin/jev', async route => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({
+        status: 422,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'config rejected by QA' })
+});
+      return;
+}
+    await route.continue();
+});
+  expectHttpStatusError({ url: /\/admin\/jev$/, status: /422/ });
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    await page.locator('#editConfig').click();
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() =>
+      document.getElementById('saveMsg').textContent.includes('config rejected by QA'));
+    assert.deepEqual(calls, ['config']);
+    assert.equal(await page.locator('#editPane').isVisible(), true);
+} finally {
+    page.off('request', onRequest);
+    await page.unroute('**/admin/jev');
+    resetExpectedHttpStatusErrors();
+}
+});
+
+test('P0 decision service rejects an invalid window before any write', async () => {
+  const calls = [];
+  const onRequest = request => {
+    const path = new URL(request.url()).pathname;
+    if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
+    if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
+    if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
+};
+  page.on('request', onRequest);
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('winContext').value === '4096');
+    await page.locator('#editConfig').click();
+    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
+    await page.locator('#winContext').fill('1024');
+    await page.locator('#winInput').fill('2048');
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() => document.activeElement.id === 'winInput');
+    assert.deepEqual(calls, []);
+    assert.equal(await page.locator('#editPane').isVisible(), true);
+} finally {
+    page.off('request', onRequest);
+}
+});
+
+test('P0 decision service reports saved config when connection test fails', async () => {
+  const calls = [];
+  const onRequest = request => {
+    const path = new URL(request.url()).pathname;
+    if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
+    if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
+    if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
+};
+  page.on('request', onRequest);
+  await page.route('**/admin/jev/test', async route => {
+    await route.fulfill({
+      status: 502,
+      contentType: 'application/json',
+      body: JSON.stringify({ detail: 'test rejected by QA' })
+});
+});
+  expectHttpStatusError({ url: /\/admin\/jev\/test$/, status: /502/ });
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    await page.locator('#editConfig').click();
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() =>
+      document.getElementById('saveMsg').textContent.includes('test rejected by QA'));
+    assert.deepEqual(calls, ['config', 'window', 'test']);
+    assert.match(await page.locator('#saveMsg').innerText(), /配置已保存|Configuration saved/);
+    assert.equal(await page.locator('#editPane').isVisible(), true);
+    assert.equal(await page.locator('#testRawDetails').isVisible(), false);
+} finally {
+    page.off('request', onRequest);
+    await page.unroute('**/admin/jev/test');
     resetExpectedHttpStatusErrors();
 }
 });

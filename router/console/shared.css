@@ -827,3 +827,14 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
   .lg-raw-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media(prefers-reduced-motion:reduce){.lg-item,.lg-chev{transition:none}}
+
+/* ── decision service page (jev): connection-test result ─────────────── */
+/* #testOut[data-state] is written from the real test response; the badge
+   reads the same state instead of parsing the result text. */
+.test-out{margin-top:12px;padding-top:11px;border-top:1px solid var(--line);
+  min-height:52px;font-size:12px;line-height:1.55;color:var(--text-2)}
+.test-out[data-state="pass"]{color:var(--text)}
+.test-out[data-state="fail"]{color:var(--red)}
+.test-out[data-state="running"]{color:var(--text-3)}
+#testRaw{max-height:280px;overflow:auto;font-family:var(--mono);font-size:10.5px;
+  line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}

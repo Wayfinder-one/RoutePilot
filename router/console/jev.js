@@ -1,5 +1,17 @@
-import { api, apiErrText, esc, toast } from './api.js';
+/* RoutePilot console · 决策服务页数据层（连接 / 提示词 / 上下文窗口 / 测试）
+   ------------------------------------------------------------------
+   本模块是页面唯一入口：静态 import 视图层（jev-view.js），并在启动前用
+   `initJevView({ validateWindow, saveConfig, saveWindow, testConnection })`
+   把四个真实异步动作交给它。依赖是单向的（jev.js → jev-view.js），视图不
+   import 本模块，因此没有循环依赖，也没有合成 click / MutationObserver
+   保存编排：视图直接 await 这些动作。
+
+   动作只负责请求与数据回填（showConfig / renderWindow）；异常原样抛给视图，
+   由视图按阶段给出“什么已保存、什么没做”的部分成功文案。
+   ------------------------------------------------------------------ */
+import { api, apiErrText } from './api.js';
 import { onLangChange, t, tf } from './i18n.js';
+import { initJevView } from './jev-view.js';
 import './nav.js';
 
 const $ = selector => document.querySelector(selector);
@@ -18,34 +30,6 @@ function showConfig(body) {
   $('#apiKey').placeholder = config.key_present ? t('jev.keyKeep') : t('jev.keyEmpty');
   $('#jevStatus').textContent = config.model || t('jev.unconfigured');
 }
-
-$('#saveJev').addEventListener('click', async () => {
-  const body = {
-    base_url: $('#baseUrl').value,
-    model: $('#model').value,
-    timeout_seconds: Number($('#timeout').value),
-    instructions: $('#instructions').value,
-    state_template: $('#stateTemplate').value,
-  };
-  if ($('#clearKey').checked) body.api_key = '';
-  else if ($('#apiKey').value) body.api_key = $('#apiKey').value;
-  try {
-    const saved = await api.put('/admin/jev', body);
-    showConfig(saved);
-    $('#saveMsg').textContent = t('common.saved');
-  } catch (error) { $('#saveMsg').textContent = apiErrText(error); }
-});
-
-$('#testJev').addEventListener('click', async () => {
-  $('#testOut').textContent = t('common.loading');
-  try {
-    /* 决策服务单次测试可能跑满可配置的 120s 超时；全局 15s 管理面超时不能中途掐断。 */
-    const result = await api.post('/admin/jev/test', { text: $('#testText').value }, { timeoutMs: 130000 });
-    $('#testOut').innerHTML = `<div class="card"><div class="col-h">${esc(result.selected_key)}</div><pre>${esc(JSON.stringify(result, null, 2))}</pre></div>`;
-  } catch (error) { $('#testOut').textContent = apiErrText(error); }
-});
-
-$('#testText').value = '请选择一个候选以验证决策服务。';
 
 /* ── 上下文长度（JEV 决策服务输入窗口；自 2026-11-03 从模型与设置迁入） ── */
 const WINDOW_CONTEXT_PRESETS = [2048, 4096, 8192, 16384];
@@ -76,8 +60,6 @@ function paintWindowMsg() {
   const problem = windowProblem(windowValues(), windowLimits);
   const msg = $('#windowMsg');
   if (msg) msg.textContent = problem || '';
-  const save = $('#saveWindow');
-  if (save) save.disabled = !!problem;
 }
 
 function presetButtons(container, values, onPick) {
@@ -95,31 +77,58 @@ function renderWindow(windowConfig) {
   const setVal = (sel, val) => { const el = $(sel); if (el) el.value = val; };
   setVal('#winContext', context);
   setVal('#winInput', input);
-  const pill = $('#windowPill');
-  if (pill) pill.innerHTML = `<b>${input}</b> / ${context} token`;
   presetButtons($('#winContextPresets'), WINDOW_CONTEXT_PRESETS, v => { setVal('#winContext', v); paintWindowMsg(); });
   presetButtons($('#winInputPresets'), WINDOW_INPUT_PRESETS, v => { setVal('#winInput', v); paintWindowMsg(); });
-  ['#winContext', '#winInput'].forEach(sel => {
-    const el = $(sel);
-    if (el) el.addEventListener('input', paintWindowMsg);
-  });
   paintWindowMsg();
 }
 
-$('#saveWindow').addEventListener('click', async () => {
-  const values = windowValues();
-  const problem = windowProblem(values, windowLimits);
-  if (problem) { toast(problem); return; }
-  try {
-    const body = await api.put('/admin/jev/window', {
-      context_tokens: values.context,
-      input_tokens: values.input,
-    });
-    windowLimits = body;
-    renderWindow(body);
-    toast(t('models.window.saved'));
-  } catch (error) { $('#windowMsg').textContent = apiErrText(error); }
+/* 窗口字段的输入监听只挂一次；renderWindow 会在 boot / 保存 / 切语言时重绘预设。 */
+['#winContext', '#winInput'].forEach(sel => {
+  const el = $(sel);
+  if (el) el.addEventListener('input', paintWindowMsg);
 });
+
+/* ── actions handed to the view (never import the view's caller) ────── */
+
+export async function saveConfig() {
+  const body = {
+    base_url: $('#baseUrl').value,
+    model: $('#model').value,
+    timeout_seconds: Number($('#timeout').value),
+    instructions: $('#instructions').value,
+    state_template: $('#stateTemplate').value,
+  };
+  if ($('#clearKey').checked) body.api_key = '';
+  else if ($('#apiKey').value) body.api_key = $('#apiKey').value;
+  const saved = await api.put('/admin/jev', body);
+  showConfig(saved);
+  return saved;
+}
+
+export function validateWindow() {
+  const problem = windowProblem(windowValues(), windowLimits);
+  if (!problem) return;
+  const error = new Error(problem);
+  error.validation = true;
+  throw error;
+}
+
+export async function saveWindow() {
+  validateWindow();
+  const values = windowValues();
+  const body = await api.put('/admin/jev/window', {
+    context_tokens: values.context,
+    input_tokens: values.input,
+  });
+  windowLimits = body;
+  renderWindow(body);
+  return body;
+}
+
+export async function testConnection(text) {
+  /* 决策服务单次测试可能跑满可配置的 120s 超时；全局 15s 管理面超时不能中途掐断。 */
+  return api.post('/admin/jev/test', { text }, { timeoutMs: 130000 });
+}
 
 onLangChange(() => renderWindow(windowLimits));
 
@@ -133,8 +142,7 @@ async function boot() {
   showConfig(jevBody);
 }
 
-boot();
+$('#testText').value = '请选择一个候选以验证决策服务。';
 
-/* 视图层（只读档案 / 编辑态 / 会话测试徽章 / 保存全部拦截）在独立模块里维护；
-   动态导入让它在 jev.js 主体之后执行，页面 HTML 因此只保留一个 script 标签。 */
-import('./jev-view.js');
+initJevView({ validateWindow, saveConfig, saveWindow, testConnection });
+boot();
