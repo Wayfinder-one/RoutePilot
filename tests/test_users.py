@@ -429,10 +429,12 @@ def test_viewer_can_read_trees_but_not_write(tmp_path):
             ("post", "/admin/test/chat/completions",
              {"model": "auto", "messages": []}),
             ("put", "/admin/time-periods", {"periods": []}),
-            ("put", "/admin/jev/window", {"context_tokens": 4096}),
-            ("put", "/admin/jev", {"base_url": "http://jev.test",
-                                   "model": "m1", "instructions": "route",
-                                   "state_template": "{request}"}),
+            ("post", "/admin/jev", {"id": "jev-a", "base_url": "http://jev.test",
+                                    "model": "m1", "instructions": "route",
+                                    "state_template": "{request}"}),
+            ("put", "/admin/jev/jev-a", {"base_url": "http://jev.test",
+                                         "model": "m1"}),
+            ("delete", "/admin/jev/jev-a", None),
             ("post", "/admin/models", {"id": "m1", "upstream": "u",
                                        "provider": "p"})):
         kwargs = {"headers": headers}

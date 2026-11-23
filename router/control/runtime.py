@@ -1,51 +1,46 @@
+"""运行配置装配与密钥解析（过渡层）。
+
+本模块只剩两条路径：
+
+- 图内嵌运行配置（``tree.runtime is not None``）：严格从画布快照读取；
+- 旧图/无活动图：过渡性数据库回退（``runtime_from_db``），由下一单元删除。
+
+密钥纪律：``JevSettings`` 只用于运行态，``resolve_jev_settings`` 按服务端点匹配
+数据库里的已存密钥或读取 ``key_env`` 指向的环境变量；任何密钥都不进入 JSON。
+"""
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import replace
 
 from router.jev.config import JevSettings
-from router.jev.window import (
-    DEFAULT_CONTEXT_TOKENS,
-    DEFAULT_INPUT_TOKENS,
-    MAX_TOKENS,
-    MIN_CONTEXT_TOKENS,
-    MIN_INPUT_TOKENS,
-)
+from router.jev.service import JevService
 from router.reasoning import ReasoningError, normalize_reasoning, validate_model_profile
 from router.routing.graph.validate import EnableContext
 from router.routing.runtime import GraphRuntime, runtime_from_dict
-from router.store.jev_config import JevConfigRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.repositories import (
     ModelRepo,
     ProviderRepo,
-    SettingsRepo,
     TimePeriodRepo,
 )
 from router.upstream.catalog import Backend, _headers_for, parse_profile_text
 
 
-def _int_setting(repo: SettingsRepo, key: str, default: int, minimum: int, maximum: int) -> int:
-    raw = repo.get(key)
-    if raw is None:
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, value))
+def first_jev_settings(conn) -> JevSettings | None:
+    """过渡性回退：目录中 id 最小的 JEV 服务（不含密钥）。
 
-
-def _db_window(conn) -> tuple[int, int]:
-    repo = SettingsRepo(conn)
-    context = _int_setting(
-        repo, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, MAX_TOKENS)
-    input_tokens = _int_setting(
-        repo, "jev_input_tokens", DEFAULT_INPUT_TOKENS, MIN_INPUT_TOKENS, context)
-    return min(input_tokens, context), context
+    旧图/无活动图没有内嵌 JEV 时的唯一来源；多服务画布不在本路径上。
+    """
+    services: list[JevService] = JevServiceRepo(conn).list()
+    return services[0].settings() if services else None
 
 
 def runtime_from_db(conn) -> GraphRuntime:
+    """过渡性数据库回退运行配置（无密钥）；下一单元随旧图兼容路径一并删除。"""
+    # 延迟导入：``router.routing.snapshot`` 在模块级依赖本模块，直接导入会成环。
+    from router.routing.snapshot import read_jev_window
+
     providers = [
         {key: value for key, value in row.items() if key != "api_key"}
         for row in ProviderRepo(conn).list()
@@ -64,8 +59,8 @@ def runtime_from_db(conn) -> GraphRuntime:
             profile = dict(profile)
             profile.pop("reasoning", None)
         models.append({**row, "profile": profile})
-    settings = JevConfigRepo(conn).load()
-    input_tokens, context_tokens = _db_window(conn)
+    settings = first_jev_settings(conn)
+    input_tokens, context_tokens = read_jev_window(conn)
     raw = {
         "backends": {"providers": providers, "models": models},
         "jev": settings.behavior_dict() if settings is not None else None,
@@ -73,44 +68,6 @@ def runtime_from_db(conn) -> GraphRuntime:
         "time_periods": TimePeriodRepo(conn).load(),
     }
     return runtime_from_dict(raw)
-
-
-def sync_db_from_runtime(conn, runtime: GraphRuntime) -> None:
-    existing_providers = {
-        row["name"]: row for row in ProviderRepo(conn).list()
-    }
-    existing_jev = JevConfigRepo(conn).load()
-    conn.execute("DELETE FROM models")
-    conn.execute("DELETE FROM providers")
-    for provider in runtime.backends.providers:
-        existing = existing_providers.get(provider["name"])
-        api_key = ""
-        if existing is not None and \
-                existing["base_url"].rstrip("/") == provider["base_url"].rstrip("/"):
-            api_key = existing.get("api_key") or ""
-        ProviderRepo(conn).upsert(
-            provider["name"], provider["base_url"],
-            key_env=provider.get("key_env") or "",
-            reasoning_format=provider.get("reasoning_format") or "openai",
-            api_key=api_key,
-        )
-    for model in runtime.backends.models:
-        ModelRepo(conn).create(
-            model["id"], model["upstream"], model["provider"],
-            json.dumps(model.get("profile") or {}, ensure_ascii=False),
-        )
-    if runtime.jev is None:
-        conn.execute("DELETE FROM jev_config WHERE id = 1")
-    else:
-        api_key = ""
-        if existing_jev is not None and existing_jev.base_url == runtime.jev.base_url \
-                and existing_jev.model == runtime.jev.model:
-            api_key = existing_jev.api_key
-        JevConfigRepo(conn).save(replace(runtime.jev, api_key=api_key))
-    settings = SettingsRepo(conn)
-    settings.set("jev_input_tokens", str(runtime.jev_input_tokens))
-    settings.set("jev_context_tokens", str(runtime.jev_context_tokens))
-    TimePeriodRepo(conn).save([period.to_dict() for period in runtime.time_periods])
 
 
 def runtime_for_tree(conn, tree) -> GraphRuntime:
@@ -123,48 +80,6 @@ def effective_runtime(conn, trees) -> GraphRuntime:
     return runtime_for_tree(conn, trees.active())
 
 
-# ── 管理面有效配置读取：活动图内嵌配置优先，旧图/无活动图回退数据库 ──────
-# 配置文件（JEV/窗口/时段）不再是非密钥运行配置的必要来源；管理页面展示与
-# 编辑都必须和运行快照消费同一个事实源。
-def stored_jev_key(conn, settings: JevSettings) -> str:
-    """数据库 JEV 密钥：仅当 base_url 与 model 都匹配时复用（spec §5）。"""
-    stored = JevConfigRepo(conn).load()
-    if stored is not None and stored.base_url == settings.base_url \
-            and stored.model == settings.model:
-        return stored.api_key
-    return ""
-
-
-def effective_jev(conn, trees) -> JevSettings | None:
-    """管理面 JEV：活动图内嵌配置优先，旧图回退数据库。
-
-    图内配置本身不带密钥；返回前按端点匹配复用数据库密钥（与运行快照规则一致），
-    环境变量不在这里展开，只体现在 ``key_source``。
-    """
-    active = trees.active()
-    if active is not None and active.runtime is not None:
-        if active.runtime.jev is None:
-            return None
-        return replace(active.runtime.jev, api_key=stored_jev_key(conn, active.runtime.jev))
-    return JevConfigRepo(conn).load()
-
-
-def effective_window(conn, trees) -> tuple[int, int]:
-    """管理面 JEV 输入窗口 (input_tokens, context_tokens)。"""
-    active = trees.active()
-    if active is not None and active.runtime is not None:
-        return active.runtime.jev_input_tokens, active.runtime.jev_context_tokens
-    return _db_window(conn)
-
-
-def effective_periods(conn, trees) -> list[dict]:
-    """管理面时段定义：活动图内嵌配置优先，旧图回退数据库。"""
-    active = trees.active()
-    if active is not None and active.runtime is not None:
-        return [period.to_dict() for period in active.runtime.time_periods]
-    return TimePeriodRepo(conn).load()
-
-
 def enable_context_for_runtime(runtime: GraphRuntime) -> EnableContext:
     formats = {
         provider["name"]: provider.get("reasoning_format") or "openai"
@@ -174,7 +89,7 @@ def enable_context_for_runtime(runtime: GraphRuntime) -> EnableContext:
         known_models={model["id"] for model in runtime.backends.models},
         model_reasoning={
             model["id"]: normalize_reasoning(
-                model.get("profile"), formats.get(model["provider"], "openai"))
+                model.get("profile"), formats.get(model.get("provider"), "openai"))
             for model in runtime.backends.models
         },
         known_periods={period.name for period in runtime.time_periods},
@@ -192,16 +107,35 @@ def _stored_provider_key(conn, provider: dict) -> str:
 
 
 def resolve_jev_settings(conn, settings: JevSettings | None) -> JevSettings | None:
+    """按端点匹配解析 JEV 密钥（过渡语义，spec §5）。
+
+    1. ``base_url`` 与 ``model`` 都匹配的目录服务 → 该服务的已存密钥；
+    2. 未匹配时沿用该服务的 ``key_env`` 环境变量；
+    3. 目录为空时保留旧 ``ROUTER_JEV_API_KEY`` 环境回退。
+
+    环境变量不会被写成 stored，也不进入任何 JSON。
+    """
     if settings is None:
         return None
-    stored = JevConfigRepo(conn).load()
-    stored_key = ""
-    if stored is not None and stored.base_url == settings.base_url and stored.model == settings.model:
-        stored_key = stored.api_key
-    return replace(
-        settings,
-        api_key=stored_key or os.environ.get("ROUTER_JEV_API_KEY", ""),
+    repo = JevServiceRepo(conn)
+    services = repo.list()
+    matched = next(
+        (service for service in services
+         if service.base_url == settings.base_url and service.model == settings.model),
+        None,
     )
+    if matched is not None:
+        key = repo.stored_api_key(matched)
+        if not key and matched.key_env:
+            key = os.environ.get(matched.key_env, "")
+        return replace(
+            settings, api_key=key or os.environ.get("ROUTER_JEV_API_KEY", ""))
+    for service in services:
+        if service.key_env:
+            key = os.environ.get(service.key_env, "")
+            if key:
+                return replace(settings, api_key=key)
+    return replace(settings, api_key=os.environ.get("ROUTER_JEV_API_KEY", ""))
 
 
 def snapshot_parts(conn, runtime: GraphRuntime) -> dict:

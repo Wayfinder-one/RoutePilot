@@ -5,7 +5,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
+from router.jev.service import JevService
 from router.config import Settings
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
@@ -15,7 +15,7 @@ from router.routing.tree import tree_from_dict
 from router.routing.reloader import GraphReloadWorker
 from router.routing.snapshot import SnapshotPublisher, build_snapshot_for_tree, load_snapshot
 from router.store.db import connect, migrate
-from router.store.jev_config import JevConfigRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, runtime_dict, tree_dict
@@ -49,7 +49,10 @@ def conn(settings):
     ProviderRepo(connection).upsert("local", "http://upstream.test/v1", api_key="upstream-secret")
     for model in ("fast", "standard"):
         ModelRepo(connection).create(model, model, "local", json.dumps({"capability": f"{model} 能力"}))
-    JevConfigRepo(connection).save(JevSettings("http://jev.test", "NeoHorse-Jev-4B", "jev-secret", 5, DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE))
+    JevServiceRepo(connection).save(
+        JevService("default", "http://jev.test", "NeoHorse-Jev-4B",
+                   key_env="ROUTER_JEV_API_KEY", timeout_seconds=5.0),
+        api_key="jev-secret")
     yield connection
     connection.close()
 

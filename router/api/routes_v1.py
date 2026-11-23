@@ -42,6 +42,7 @@ from router.routing.types import (
     RoutingRequest,
     session_digest,
 )
+from router.upstream.catalog import load_backends
 from router.upstream.proxy import (
     ProxyResult,
     ProxyStream,
@@ -190,13 +191,19 @@ async def chat_completions(request: Request):
     return await run_chat_completion(request)
 
 
-async def run_chat_completion(request: Request, *, use_requested_model: bool = False):
+async def run_chat_completion(request: Request, *, use_requested_model: bool = False,
+                              conn=None):
     """Shared data-plane executor (``/v1`` and the admin Test chat page).
 
     ``use_requested_model`` is the only difference between the public data plane
     and the admin test endpoint: when false the request ``model`` stays ignored
     and routing decides; when true ``"auto"`` still routes, any other model is a
     fixed direct selection that skips graph/JEV/sticky.
+
+    ``conn`` is the admin catalog connection: a fixed model resolves through the
+    SQLite catalog (``load_backends``) instead of the active snapshot, because
+    the fixed-model test is a catalog check independent of any canvas.  ``/v1``
+    passes no connection, so the public hot path stays snapshot-only.
     """
     started = time.monotonic()
     length = request.headers.get("content-length")
@@ -251,9 +258,9 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         return _error(error_class, status_code)
 
     snapshot = request.app.state.snapshot
-    if snapshot is None:
-        return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
     if fixed_model is None:
+        if snapshot is None:
+            return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
         try:
             decision = await request.app.state.routing_service.route(
                 snapshot,
@@ -269,8 +276,19 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         except Exception:
             logger.exception("routing failed")
             return fail("routing_failed", 503, "graph", "routing failed")
+        backend = snapshot.backends.get(decision.model)
+        # 防御性不变式：正常引擎不可达，decision.model 必来自同一快照的 backends；真到达时无请求记录。
+        if backend is None:
+            decision.release()
+            return _error("no_available_backend", 503)
     else:
-        if snapshot.backends.get(fixed_model) is None:
+        # 固定模型直连是管理目录测试：有连接时只查 SQLite 目录，不依赖活动快照。
+        direct_backends = load_backends(conn) if conn is not None else None
+        if direct_backends is not None:
+            backend = direct_backends.get(fixed_model)
+        else:
+            backend = snapshot.backends.get(fixed_model) if snapshot is not None else None
+        if backend is None:
             return _error("unknown_model", 404)
         try:
             lease = request.app.state.balancer.acquire([fixed_model])
@@ -283,11 +301,6 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             release=lease.release,
         )
     routing_ms = (time.monotonic() - routing_started) * 1000.0
-    backend = snapshot.backends.get(decision.model)
-    # 防御性不变式：正常引擎不可达，decision.model 必来自同一快照的 backends；真到达时无请求记录。
-    if backend is None:
-        decision.release()
-        return _error("no_available_backend", 503)
 
     upstream_body, reasoning_warning = prepare_upstream_request(
         body, backend, decision.reasoning)
@@ -303,9 +316,9 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             "decision": "test",
             "model": fixed_model,
             "target_id": None,
-            "tree_id": snapshot.tree_id,
-            "tree_revision": snapshot.tree_revision,
-            "snapshot_revision": snapshot.snapshot_revision,
+            "tree_id": getattr(snapshot, "tree_id", None),
+            "tree_revision": getattr(snapshot, "tree_revision", None),
+            "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
             "policy_path": None,
             "selection_reason": "direct",
             "fallback_reason": None,

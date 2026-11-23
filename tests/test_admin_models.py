@@ -19,7 +19,7 @@ from router.api.app import create_app
 from router.reasoning import FORMAT_IDS, LEVELS
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.repositories import ProviderRepo, seed_default
+from router.store.repositories import ModelRepo, ProviderRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import load_backends
 from tests.routing_fixtures import portable_tree_dict, test_settings, tree_dict
@@ -808,6 +808,8 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
     try:
         ProviderRepo(conn).upsert(
             "local", "http://json-only.test/v1", api_key="sk-json-secret")
+        # 目录写仍用数据库上下文校验活动画布：目录需登记画布引用的模型。
+        ModelRepo(conn).create("fast", "json-upstream", "local", "{}")
     finally:
         conn.close()
 
@@ -819,12 +821,16 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
                           json={"base_url": "http://new-upstream.test/v1"})
 
     assert response.status_code == 200, response.text
+    # 严格自包含：目录写不改写已存画布；快照仍用画布内嵌端点，旧的已存密钥
+    # 因端点不再匹配而不再注入（DB 行被清空）。
     backend = app.state.snapshot.backends["fast"]
-    assert backend.url == "http://new-upstream.test/v1/chat/completions"
+    assert backend.url == "http://json-only.test/v1/chat/completions"
     assert "Authorization" not in backend.headers
     conn = connect(app.state.settings.db_path)
     try:
-        assert ProviderRepo(conn).get("local")["api_key"] == ""
+        row = ProviderRepo(conn).get("local")
+        assert row["base_url"] == "http://new-upstream.test/v1"
+        assert row["api_key"] == ""
     finally:
         conn.close()
 

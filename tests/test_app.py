@@ -4,16 +4,18 @@ from dataclasses import replace
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
+from router.jev.service import JevService
 from router.control.validation import build_enable_context
 from router.routing.document import parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.jev_config import JevConfigRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.repositories import seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import (
@@ -119,15 +121,57 @@ def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path)
         assert "decision_service_unavailable" in ready.json()["last_load_error"]
 
 
-def test_environment_jev_config_is_seeded_once(tmp_path):
+def test_environment_jev_service_is_seeded_once(tmp_path):
+    """空目录首次启动：环境 URL/model/api_key 创建 ``default`` 服务。"""
     settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
     app = create_app(settings)
+    # 无活动画布：启动快照仍走过渡性数据库回退，按端点匹配解析到种子密钥。
     assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
     assert app.state.snapshot.jev.api_key == "secret"
+    conn = connect(settings.db_path)
+    try:
+        services = JevServiceRepo(conn).list()
+        assert [(service.id, service.model) for service in services] == [
+            ("default", "NeoHorse-Jev-4B")]
+        assert JevServiceRepo(conn).stored_api_key(services[0]) == "secret"
+    finally:
+        conn.close()
+
+    # 第二次启动不重复种子/不覆盖管理结果。
+    create_app(settings)
+    conn = connect(settings.db_path)
+    try:
+        assert len(JevServiceRepo(conn).list()) == 1
+    finally:
+        conn.close()
+
+
+def test_partial_environment_jev_is_a_configuration_error(tmp_path):
+    """URL/model 只配一半仍是启动配置错误（保持原语义）。"""
+    with pytest.raises(RuntimeError, match="configured together"):
+        create_app(test_settings(tmp_path, jev_url="http://jev.test"))
+
+
+def test_environment_seed_never_overwrites_an_existing_catalog(tmp_path):
+    settings = test_settings(tmp_path, **JEV_ENV)
+    conn = connect(settings.db_path)
+    migrate(conn)
+    JevServiceRepo(conn).save(JevService("custom", "http://custom.test", "custom-model"))
+    conn.close()
+
+    app = create_app(settings)
+
+    conn = connect(settings.db_path)
+    try:
+        assert [service.id for service in JevServiceRepo(conn).list()] == ["custom"]
+    finally:
+        conn.close()
+    # 过渡性数据库回退取 id 最小的服务（custom），环境种子没有覆盖它。
+    assert app.state.snapshot.jev.model == "custom-model"
 
 
 def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
-    """活动图已有内嵌 JEV 时，环境种子不得覆盖 JSON，也不写管理表。"""
+    """环境种子只写目录；活动图内嵌 JEV 仍是运行时事实源。"""
     settings = test_settings(tmp_path, **JEV_ENV)
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
@@ -141,7 +185,9 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
     assert app.state.snapshot.jev.model == "json-jev"
     conn = connect(settings.db_path)
     try:
-        assert JevConfigRepo(conn).load() is None
+        services = JevServiceRepo(conn).list()
+        assert [(service.id, service.model) for service in services] == [
+            ("default", "NeoHorse-Jev-4B")]
     finally:
         conn.close()
     stored = app.state.graph_repo.get("main")

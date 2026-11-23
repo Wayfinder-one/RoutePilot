@@ -10,6 +10,9 @@ import json
 import httpx
 from fastapi.testclient import TestClient
 
+from router.api.app import create_app
+from router.store.routing_trees import RoutingTreeRepo
+from tests.routing_fixtures import test_settings
 from tests.test_app import TryHandler, composed_try_app
 
 
@@ -153,3 +156,32 @@ def test_admin_test_rejects_unknown_model(tmp_path):
         })
     assert response.status_code == 404
     assert response.json() == {"error": {"message": "unknown_model"}}
+
+
+def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
+    """固定模型直连是目录测试：活动画布/快照不可用也能工作。"""
+    settings = test_settings(tmp_path)
+    RoutingTreeRepo(settings.graph_dir).initialize()
+    # current 指针指向不存在的图：启动快照构造失败，app.state.snapshot 保持 None。
+    (RoutingTreeRepo(settings.graph_dir).root / "current").write_text(
+        "missing\n", encoding="utf-8")
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    app = create_app(settings, transport=httpx.MockTransport(handler))
+    assert app.state.snapshot is None
+    with TestClient(app) as client:
+        response = client.post("/admin/test/chat/completions", json={
+            "model": "qwen3-8b",
+            "messages": [{"role": "user", "content": "无快照直连"}],
+        })
+
+    assert response.status_code == 200, response.text
+    assert response.headers["x-sr-model"] == "qwen3-8b"
+    assert response.headers["x-sr-selection"] == "direct"
+    assert seen and seen[-1].url.path.endswith("/chat/completions")

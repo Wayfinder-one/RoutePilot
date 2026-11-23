@@ -164,16 +164,16 @@ def test_empty_database_snapshot_reads_everything_from_json(json_only):
     # 非密钥运行配置表仍然为空：JSON 是事实源，启动不物化数据库。
     conn = connect(settings.db_path)
     try:
-        for table in ("providers", "models", "time_periods", "jev_config"):
+        for table in ("providers", "models", "time_periods", "jev_services"):
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0, table
     finally:
         conn.close()
 
-    # 管理面 GET 同样投影 JSON（空库也能编辑）。
-    assert [m["id"] for m in client.get("/admin/models").json()["models"]] == ["fast"]
-    assert [p["name"] for p in client.get("/admin/providers").json()["providers"]] == ["local"]
-    assert client.get("/admin/jev").json()["config"]["model"] == "json-jev"
-    assert [p["name"] for p in client.get("/admin/time-periods").json()["periods"]] == list(PERIODS)
+    # 管理面目录 GET 只查 SQLite：空库就是空目录，不再投影活动画布 JSON。
+    assert client.get("/admin/models").json()["models"] == []
+    assert client.get("/admin/providers").json()["providers"] == []
+    assert client.get("/admin/jev").json() == {"services": []}
+    assert client.get("/admin/time-periods").json()["periods"] == []
 
 
 def test_admin_try_uses_json_backends_jev_window_and_periods(json_only):
@@ -226,8 +226,18 @@ def test_auto_routing_reaches_the_json_mock_upstream(json_only):
     assert upstream["authorization"] == "Bearer " + ENV_SECRET
 
 
-def test_fixed_model_chat_reaches_the_same_json_upstream(json_only):
-    _app, client, _settings, calls = json_only
+def test_fixed_model_uses_db_catalog_instead_of_active_canvas(json_only):
+    """固定模型直连是管理目录测试：读 SQLite 目录，不读活动画布快照。"""
+    _app, client, settings, calls = json_only
+    conn = connect(settings.db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO providers (name, base_url, key_env, reasoning_format, api_key) "
+            "VALUES ('db', 'http://db.test/v1', '', 'openai', '')")
+        conn.execute(
+            "INSERT INTO models (id, upstream, provider, profile) "
+            "VALUES ('fast', 'db-upstream', 'db', '{}')")
+    conn.close()
 
     response = client.post("/admin/test/chat/completions", json={
         "model": "fast",
@@ -235,10 +245,12 @@ def test_fixed_model_chat_reaches_the_same_json_upstream(json_only):
     })
 
     assert response.status_code == 200, response.text
-    assert calls["upstream"], "fixed model chat never reached the JSON upstream"
+    assert calls["upstream"], "fixed model chat never reached the DB upstream"
     upstream = calls["upstream"][-1]
-    assert upstream["body"]["model"] == "json-upstream"
-    assert upstream["url"] == UPSTREAM_ORIGIN + "/v1/chat/completions"
+    assert upstream["body"]["model"] == "db-upstream"
+    assert upstream["url"] == "http://db.test/v1/chat/completions"
+    # 活动画布内嵌的 JSON 上游未被使用。
+    assert calls["upstream"][-1]["url"] != UPSTREAM_ORIGIN + "/v1/chat/completions"
 
 
 def _export_bytes(settings) -> bytes:
@@ -293,6 +305,13 @@ def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
     for marker in ("api_key", "key_source", "key_present", ENV_SECRET):
         assert marker not in exported, marker
 
+    # 目录里放一条只靠环境变量取密钥的 provider，验证派生状态与脱敏投影。
+    conn = connect(settings.db_path)
+    with conn:
+        conn.execute(
+            "INSERT INTO providers (name, base_url, key_env, reasoning_format, api_key) "
+            "VALUES ('env-provider', 'http://env.test/v1', 'JSON_PROVIDER_API_KEY', 'openai', '')")
+    conn.close()
     tree_payload = client.get("/admin/trees").text
     provider_payload = client.get("/admin/providers").text
     jev_payload = client.get("/admin/jev").text
@@ -300,6 +319,7 @@ def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
         assert ENV_SECRET not in payload
         assert "api_key\":" not in payload
     provider = client.get("/admin/providers").json()["providers"][0]
+    assert provider["name"] == "env-provider"
     assert provider["key_env"] == "JSON_PROVIDER_API_KEY"
     assert provider["key_source"] == "env"
     assert "api_key" not in provider

@@ -7,11 +7,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
+from router.control.runtime import first_jev_settings, runtime_from_db
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
+from router.routing.runtime import runtime_to_dict
 from router.routing.snapshot import build_snapshot, model_capability, read_jev_window
 from router.store.db import connect
-from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, TimePeriodRepo
 from router.store.routing_trees import GraphStorageError
 from router.upstream.catalog import load_backends
@@ -63,9 +64,23 @@ def direct_graph(reasoning=None):
     }
 
 
-def activate(client, level=None):
+def activate(h, level=None):
+    """保存并启用一棵画布：运行配置从当前数据库目录显式物化。
+
+    严格自包含语义下目录写不再回写画布，所以这里模拟「按当前目录刷新画布」
+    的显式动作，而不是依赖已删除的全局同步。
+    """
     raw = tree_dict("default-tree", root=direct_graph(level))
-    body = {"id": raw["id"], "name": raw["name"], "root": raw["root"], "sticky": raw["sticky"], "timezone": raw["timezone"]}
+    conn = connect(h.app.state.settings.db_path)
+    try:
+        runtime = runtime_to_dict(runtime_from_db(conn))
+    finally:
+        conn.close()
+    body = {
+        "id": raw["id"], "name": raw["name"], "root": raw["root"],
+        "sticky": raw["sticky"], "timezone": raw["timezone"], **runtime,
+    }
+    client = h.client
     existing = client.get("/admin/trees/default-tree")
     if existing.status_code == 200:
         body["base_document_sha256"] = existing.json()["tree"]["document_sha256"]
@@ -90,7 +105,7 @@ def chat(client, **body):
 
 def test_null_reasoning_is_full_passthrough(tmp_path):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"efforts": {"off": None, "high": "high"}})
     fields = {"reasoning_effort": "client", "reasoning": {"effort": "client"}, "thinking": {"type": "enabled"}, "enable_thinking": True}
     response = chat(h.client, **fields)
@@ -117,9 +132,9 @@ FORMAT_CASES = [
 @pytest.mark.parametrize("fmt,efforts,level,expected", FORMAT_CASES)
 def test_reasoning_injection_per_format(tmp_path, fmt, efforts, level, expected):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"format": fmt, "efforts": efforts})
-    activate(h.client, level)
+    activate(h, level)
     response = chat(h.client, reasoning_effort="client", thinking="client", enable_thinking=False, chat_template_kwargs={"keep": 1})
     assert response.status_code == 200, response.text
     assert response.headers["x-sr-reasoning"] == level
@@ -133,18 +148,18 @@ def test_reasoning_injection_per_format(tmp_path, fmt, efforts, level, expected)
 
 def test_provider_format_inheritance_and_model_override(tmp_path):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"format": "qwen", "efforts": {"off": None, "on": None}}, provider_format="deepseek")
-    activate(h.client, "on")
+    activate(h, "on")
     assert chat(h.client).status_code == 200
     assert h.requests[-1]["body"]["enable_thinking"] is True
 
 
 def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
     h = harness(tmp_path)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"efforts": {"off": None, "high": "high"}})
-    activate(h.client, "high")
+    activate(h, "high")
     conn = connect(h.app.state.settings.db_path)
     with conn:
         conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'", (json.dumps({"reasoning": {"efforts": {"off": None, "low": "low"}}}),))
@@ -163,7 +178,7 @@ def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
         tree=stale_tree,
         backends=load_backends(conn),
         time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
-        jev=JevConfigRepo(conn).load(),
+        jev=first_jev_settings(conn),
         capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,
@@ -178,9 +193,9 @@ def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
 
 def test_streaming_request_injects_reasoning_and_releases(tmp_path):
     h = harness(tmp_path, streaming=True)
-    activate(h.client)
+    activate(h)
     declare(h.client, {"efforts": {"off": None, "high": "high"}})
-    activate(h.client, "high")
+    activate(h, "high")
     response = chat(h.client, stream=True)
     assert response.status_code == 200
     assert response.headers["x-sr-reasoning"] == "high"

@@ -53,7 +53,7 @@ def test_user_auth_enabled_requires_login(tmp_path):
     c = _client(tmp_path, user_auth=True)
     for call in (c.get("/admin/models"), c.get("/admin/changes"),
                  c.get("/admin/users"), c.get("/admin/me"),
-                 c.put("/admin/jev/window", json={})):
+                 c.put("/admin/jev/jev-a", json={})):
         assert call.status_code == 401, call.request.url
         assert call.json() == {"detail": "unauthorized: /admin requires login"}
         assert call.headers["www-authenticate"] == "Bearer"

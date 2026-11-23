@@ -1,7 +1,11 @@
+"""管理面多 JEV 服务目录 API：CRUD、密钥通道、逐条连接测试。
+
+覆盖 spec「多 JEV 目录」：列表/详情/更新/删除/测试都只读数据库目录，不读活动
+画布；公共投影不含 api_key，`key_source` 是 stored|env|none；旧单配置端点已删除。
+"""
 import asyncio
 import json
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -11,52 +15,24 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.api.routes_jev import router
 from router.jev.client import JevClient
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.jev_config import JevConfigRepo
-from router.store.repositories import SettingsRepo, TimePeriodRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import (
-    portable_tree_dict,
-    runtime_dict,
-    tree_dict,
-    test_settings,
-)
+from tests.routing_fixtures import portable_tree_dict, test_settings
 
 
-def direct_graph():
-    """start → 单 target(qwen3-8b)：不触碰决策服务的最小启用树。"""
-    return {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "direct", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}]},
-        ],
-        "edges": [{
-            "id": "e-start-direct", "source": "start", "source_port": "out",
-            "target": "direct", "target_port": "in_1", "condition": None,
-        }],
-        "error_fallback": "direct",
-    }
-
-
-def prepare_active_tree(tmp_path, document):
-    """在临时 graph 目录写入并启用一棵树，供真实 create_app() 使用。"""
-    settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
-    repo.initialize()
-    repo.create(tree_from_dict(document))
-    repo.enable(document["id"])
-    return settings
+def _migrated(path):
+    conn = connect(path)
+    migrate(conn)
+    conn.close()
 
 
 class Publisher:
-    """SnapshotPublisher 桩：本文件其余用例只关心 locked/prepare/publish 次序。"""
+    """本文件只测目录 CRUD，不需要真实发布骨架。"""
 
     def __init__(self):
-        self.prepared = []
         self.published = []
 
     @contextmanager
@@ -64,9 +40,7 @@ class Publisher:
         yield self
 
     def prepare(self, conn, tree, fingerprint):
-        prepared = SimpleNamespace(tree=tree, fingerprint=fingerprint)
-        self.prepared.append(prepared)
-        return prepared
+        return SimpleNamespace(tree=tree, fingerprint=fingerprint)
 
     def publish(self, prepared):
         self.published.append(prepared)
@@ -74,15 +48,14 @@ class Publisher:
 
 def make_client(tmp_path, handler=None, requests=None):
     path = str(tmp_path / "v3.db")
-    conn = connect(path)
-    migrate(conn)
-    conn.close()
+    _migrated(path)
 
     def default_handler(request):
         if requests is not None:
             requests.append(request)
         return httpx.Response(200, json={
-            "answers": {"route": {"type": "choice", "probabilities": {"候选 A": 0.4, "候选 B": 0.6}}},
+            "answers": {"route": {"type": "choice",
+                                  "probabilities": {"候选 A": 0.4, "候选 B": 0.6}}},
             "usage": {"input_tokens": 10, "output_tokens": 0},
         })
 
@@ -98,37 +71,178 @@ def make_client(tmp_path, handler=None, requests=None):
     return TestClient(app), app
 
 
-def payload():
-    return {
-        "base_url": "http://jev.test",
-        "model": "NeoHorse-Jev-4B",
-        "timeout_seconds": 5,
-        "instructions": DEFAULT_INSTRUCTIONS,
-        "state_template": DEFAULT_STATE_TEMPLATE,
+def service_payload(service_id="jev-a", **overrides):
+    payload = {
+        "id": service_id,
+        "base_url": "http://" + service_id + ".test",
+        "model": "d1-a",
+        "key_env": "JEV_TEST_API_KEY",
+        "input_tokens": 1024,
+        "context_tokens": 4096,
     }
+    payload.update(overrides)
+    return payload
 
 
-def test_config_crud_hides_keys_and_preserves_then_clears_secret(tmp_path, monkeypatch):
-    client, app = make_client(tmp_path)
-    response = client.put("/admin/jev", json={**payload(), "api_key": "secret"})
-    assert response.status_code == 200, response.text
-    assert "api_key" not in response.json()["config"]
-    assert response.json()["config"]["key_source"] == "stored"
-    assert client.put("/admin/jev", json=payload()).json()["config"]["key_source"] == "stored"
-    monkeypatch.setenv("ROUTER_JEV_API_KEY", "environment-secret")
-    cleared = client.put("/admin/jev", json={**payload(), "api_key": ""})
-    assert cleared.json()["config"]["key_source"] == "environment"
-    assert len(app.state.publisher.published) == 3
+def _services(app):
     conn = connect(app.state.settings.db_path)
-    assert JevConfigRepo(conn).load().api_key == ""
-    conn.close()
+    try:
+        return JevServiceRepo(conn).list()
+    finally:
+        conn.close()
 
 
+# ── 多服务目录契约 ────────────────────────────────────────────────────
+def test_two_jev_services_have_independent_windows_and_no_keys(tmp_path):
+    client, _app = make_client(tmp_path)
+    for service_id, model, tokens in (("jev-a", "d1-a", 1024), ("jev-b", "d1-b", 2048)):
+        response = client.post("/admin/jev", json={
+            "id": service_id, "base_url": "http://" + service_id + ".test",
+            "model": model, "key_env": "JEV_TEST_API_KEY",
+            "input_tokens": tokens, "context_tokens": 4096,
+        })
+        assert response.status_code == 201, response.text
+        assert "api_key" not in response.text
+    services = client.get("/admin/jev").json()["services"]
+    assert [(s["id"], s["input_tokens"]) for s in services] == [
+        ("jev-a", 1024), ("jev-b", 2048)]
+    assert client.get("/admin/jev/window").status_code == 404
+
+
+def test_create_get_update_delete_roundtrip(tmp_path):
+    client, app = make_client(tmp_path)
+    created = client.post("/admin/jev", json=service_payload(
+        base_url="http://jev-a.test", api_key="stored-secret"))
+    assert created.status_code == 201, created.text
+    body = created.json()["service"]
+    assert body["id"] == "jev-a"
+    assert body["key_source"] == "stored"
+    assert body["key_present"] is True
+    assert "stored-secret" not in created.text
+    assert body["instructions"] == DEFAULT_INSTRUCTIONS
+    assert body["state_template"] == DEFAULT_STATE_TEMPLATE
+    assert (body["input_tokens"], body["context_tokens"]) == (1024, 4096)
+
+    fetched = client.get("/admin/jev/jev-a")
+    assert fetched.status_code == 200
+    assert fetched.json()["service"]["model"] == "d1-a"
+
+    updated = client.put("/admin/jev/jev-a", json={
+        "input_tokens": 2048, "context_tokens": 8192})
+    assert updated.status_code == 200, updated.text
+    assert (updated.json()["service"]["input_tokens"],
+            updated.json()["service"]["context_tokens"]) == (2048, 8192)
+    # 省略 api_key 且端点不变：密钥保留。
+    assert updated.json()["service"]["key_source"] == "stored"
+    conn = connect(app.state.settings.db_path)
+    try:
+        service = JevServiceRepo(conn).get("jev-a")
+        assert JevServiceRepo(conn).stored_api_key(service) == "stored-secret"
+    finally:
+        conn.close()
+
+    deleted = client.delete("/admin/jev/jev-a")
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": "jev-a"}
+    assert _services(app) == []
+    assert client.get("/admin/jev/jev-a").status_code == 404
+    assert client.delete("/admin/jev/jev-a").status_code == 404
+
+
+def test_put_without_api_key_preserves_only_for_same_endpoint(tmp_path):
+    client, app = make_client(tmp_path)
+    client.post("/admin/jev", json=service_payload(api_key="stored-secret"))
+
+    # 同端点省略 api_key → 保留。
+    assert client.put("/admin/jev/jev-a", json={"timeout_seconds": 7}).status_code == 200
+    conn = connect(app.state.settings.db_path)
+    try:
+        service = JevServiceRepo(conn).get("jev-a")
+        assert JevServiceRepo(conn).stored_api_key(service) == "stored-secret"
+    finally:
+        conn.close()
+
+    # 换端点省略 api_key → 旧密钥不得跟随到新地址。
+    response = client.put("/admin/jev/jev-a", json={"base_url": "http://new-jev.test"})
+    assert response.status_code == 200, response.text
+    assert response.json()["service"]["key_source"] == "none"
+    conn = connect(app.state.settings.db_path)
+    try:
+        service = JevServiceRepo(conn).get("jev-a")
+        assert JevServiceRepo(conn).stored_api_key(service) == ""
+    finally:
+        conn.close()
+
+    # api_key="" 显式清除。
+    client.put("/admin/jev/jev-a", json={"api_key": "second-secret"})
+    cleared = client.put("/admin/jev/jev-a", json={"api_key": ""})
+    assert cleared.json()["service"]["key_source"] == "none"
+    assert "second-secret" not in cleared.text
+
+
+def test_key_source_env_when_environment_variable_is_present(tmp_path, monkeypatch):
+    client, _app = make_client(tmp_path)
+    response = client.post("/admin/jev", json=service_payload(key_env="JEV_TEST_API_KEY"))
+    assert response.json()["service"]["key_source"] == "none"
+    monkeypatch.setenv("JEV_TEST_API_KEY", "environment-secret")
+    listed = client.get("/admin/jev").json()["services"]
+    assert listed[0]["key_source"] == "env"
+    assert listed[0]["key_present"] is True
+    assert "environment-secret" not in client.get("/admin/jev").text
+
+
+def test_duplicate_id_is_409(tmp_path):
+    client, _app = make_client(tmp_path)
+    assert client.post("/admin/jev", json=service_payload()).status_code == 201
+    duplicate = client.post("/admin/jev", json=service_payload(model="other"))
+    assert duplicate.status_code == 409, duplicate.text
+
+
+def test_unknown_service_is_404(tmp_path):
+    client, _app = make_client(tmp_path)
+    assert client.get("/admin/jev/missing").status_code == 404
+    assert client.put("/admin/jev/missing", json={"model": "m"}).status_code == 404
+    assert client.delete("/admin/jev/missing").status_code == 404
+    assert client.post("/admin/jev/missing/test", json={}).status_code == 404
+
+
+def test_invalid_service_fields_are_422(tmp_path):
+    client, _app = make_client(tmp_path)
+    for payload in (
+            service_payload(base_url="not-a-url"),
+            service_payload(id="bad id!"),
+            service_payload(key_env="1BAD"),
+            service_payload(input_tokens=10),
+            service_payload(context_tokens=10 ** 9),
+            {**service_payload(), "unknown": 1},
+            {**service_payload(), "api_key": 5},
+            {**service_payload(), "model": None},
+    ):
+        response = client.post("/admin/jev", json=payload)
+        assert response.status_code == 422, (payload, response.text)
+    # PUT 的显式 null 不是「省略」。
+    client.post("/admin/jev", json=service_payload())
+    assert client.put("/admin/jev/jev-a", json={"api_key": None}).status_code == 422
+    assert client.put("/admin/jev/jev-a", json={"id": "other"}).status_code == 422
+
+
+def test_impact_confirmation_is_accepted_and_ignored(tmp_path):
+    client, app = make_client(tmp_path)
+    response = client.post("/admin/jev", json={
+        **service_payload(), "impact_confirmation": {"acknowledged": True}})
+    assert response.status_code == 201, response.text
+    assert "impact_confirmation" not in response.text
+    assert _services(app)[0].model == "d1-a"
+
+
+# ── 连接测试：用数据库服务配置，不读活动画布 ──────────────────────────
 def test_test_endpoint_calls_real_configured_http_service(tmp_path):
     requests = []
     client, _ = make_client(tmp_path, requests=requests)
-    assert client.put("/admin/jev", json=payload()).status_code == 200
-    response = client.post("/admin/jev/test", json={"text": "测试连接"})
+    client.post("/admin/jev", json=service_payload(
+        base_url="http://jev.test", model="NeoHorse-Jev-4B", timeout_seconds=5,
+        instructions=DEFAULT_INSTRUCTIONS, state_template=DEFAULT_STATE_TEMPLATE))
+    response = client.post("/admin/jev/jev-a/test", json={"text": "测试连接"})
     assert response.status_code == 200, response.text
     assert response.json()["selected_key"] == "b"
     assert response.json()["probabilities"] == {"a": 0.4, "b": 0.6}
@@ -148,9 +262,35 @@ def test_test_endpoint_calls_real_configured_http_service(tmp_path):
     }
 
 
-def test_test_endpoint_requires_configuration(tmp_path):
-    client, _ = make_client(tmp_path)
-    assert client.post("/admin/jev/test", json={}).status_code == 422
+def test_test_endpoint_uses_database_config_not_active_canvas(tmp_path):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "answers": {"route": {"type": "choice",
+                                  "probabilities": {"候选 A": 0.4, "候选 B": 0.6}}},
+            "usage": {"input_tokens": 3},
+        })
+
+    settings = test_settings(tmp_path)
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    document = portable_tree_dict("portable")
+    repo.create(tree_from_dict(document))
+    repo.enable(document["id"])
+    app = create_app(settings, transport=httpx.MockTransport(handler))
+    client = TestClient(app)
+
+    created = client.post("/admin/jev", json={
+        "id": "db-jev", "base_url": "http://db-jev.test", "model": "db-model"})
+    assert created.status_code == 201, created.text
+
+    response = client.post("/admin/jev/db-jev/test", json={"text": "测试连接"})
+
+    assert response.status_code == 200, response.text
+    assert str(requests[0].url) == "http://db-jev.test/v1/systemone"
+    assert json.loads(requests[0].content)["model"] == "db-model"
 
 
 def test_test_endpoint_huge_probability_returns_502_not_500(tmp_path):
@@ -169,271 +309,18 @@ def test_test_endpoint_huge_probability_returns_502_not_500(tmp_path):
     client, app = make_client(tmp_path, handler=handler)
     client = TestClient(app, raise_server_exceptions=False)
     try:
-        assert client.put("/admin/jev", json=payload()).status_code == 200
-        response = client.post("/admin/jev/test", json={"text": "测试连接"})
+        client.post("/admin/jev", json=service_payload(base_url="http://jev.test"))
+        response = client.post("/admin/jev/jev-a/test", json={"text": "测试连接"})
         assert response.status_code == 502, response.text
         assert "route" in response.json()["detail"]
     finally:
         asyncio.run(app.state.http.aclose())
 
 
-def test_explicit_null_field_is_validated_not_treated_as_absent(tmp_path):
-    """DTO 迁移不得把「显式 null」误当成「缺省继承」：null 仍走值校验 → 422。"""
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
-    app = create_app(settings)
-    with TestClient(app) as client:
-        assert client.put("/admin/jev", json=payload()).status_code == 200
-
-        response = client.put("/admin/jev", json={"model": None})
-
-        assert response.status_code == 422, response.text
-        assert client.get("/admin/jev").json()["config"]["model"] == "NeoHorse-Jev-4B"
-
-
-def test_failed_jev_save_changes_neither_db_audit_nor_snapshot(tmp_path):
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
-    app = create_app(settings)
-    conn = connect(settings.db_path)
-    conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
-    conn.commit()
-    conn.close()
-    before = app.state.snapshot.snapshot_revision
-    with TestClient(app) as client:
-        response = client.put("/admin/jev", json={
-            "base_url": "http://jev.test", "model": "d1-2B",
-            "instructions": "route", "state_template": "{request}",
-        })
-    assert response.status_code == 422
-    conn = connect(settings.db_path)
-    assert JevConfigRepo(conn).load() is None
-    assert conn.execute("SELECT COUNT(*) FROM changes WHERE kind = 'jev'").fetchone()[0] == 0
-    conn.close()
-    assert app.state.snapshot.snapshot_revision == before
-    assert app.state.snapshot.jev is None
-
-
-def _graph_tree_files(settings):
-    """图目录的全部文件字节：用于证明配置写回图 JSON、publish 本身不触碰文件。"""
-    root = Path(settings.graph_dir)
-    return {path.relative_to(root).as_posix(): path.read_bytes()
-            for path in sorted(root.rglob("*")) if path.is_file()}
-
-
-def test_jev_save_publishes_candidate_snapshot_exactly_once(tmp_path, monkeypatch):
-    """ConfigurationService 写用例契约：真实 SnapshotPublisher 上，
-    ConfigurationService 写用例 = 提交恰在 publish 之前、发布恰好一次；配置写回
-    活动图 JSON（本功能需求），而 publish 本身仍是纯内存替换（不写数据库、不写
-    图文件）。"""
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
-    app = create_app(settings)
-    publisher = app.state.publisher
-    before = app.state.snapshot.snapshot_revision
-    files_before = _graph_tree_files(settings)
-    published = []
-    files_at_publish = []
-    files_after_publish = []
-    real_publish = publisher.publish
-
-    def counting_publish(prepared):
-        # 发布前复核提交可见性：候选快照绝不能依赖尚未提交的写入。
-        probe = connect(settings.db_path)
-        try:
-            assert JevConfigRepo(probe).load().model == "NeoHorse-Jev-4B"
-        finally:
-            probe.close()
-        files_at_publish.append(_graph_tree_files(settings))
-        published.append(prepared)
-        result = real_publish(prepared)
-        files_after_publish.append(_graph_tree_files(settings))
-        return result
-
-    monkeypatch.setattr(publisher, "publish", counting_publish)
-
-    with TestClient(app) as client:
-        response = client.put("/admin/jev", json=payload())
-
-    assert response.status_code == 200, response.text
-    assert len(published) == 1
-    assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
-    assert app.state.snapshot.snapshot_revision != before
-    assert app.state.snapshot.tree_id == "main"          # 内存替换未丢活动树
-    status = publisher.status()
-    assert status["ready"] and status["stale"] is False
-    repo = RoutingTreeRepo(settings.graph_dir)
-    assert status["document_sha256"] == repo.fingerprint()[1]
-
-    # 1) 配置写路径确实把 JEV 写进了活动图 JSON（新需求）。
-    assert files_at_publish[0] != files_before
-    document = json.loads(files_at_publish[0]["graphs/main.json"])
-    assert document["jev"]["model"] == "NeoHorse-Jev-4B"
-    assert document["jev"]["base_url"] == "http://jev.test"
-    assert "backends" in document and "jev_window" in document and "time_periods" in document
-    # 2) 文件不携带任何真实密钥/派生密钥状态。
-    for content in files_at_publish[0].values():
-        text = content.decode("utf-8")
-        assert "api_key" not in text
-        assert "key_source" not in text
-        assert "key_present" not in text
-    # 3) publish 本身是纯内存替换：发布前后图文件逐字节一致。
-    assert files_at_publish[0] == files_after_publish[0]
-
-
-def test_unstable_graph_during_jev_save_rolls_back_db_audit_and_snapshot(tmp_path):
-    settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
-    app = create_app(settings)
-    repo = app.state.graph_repo
-    initial = repo.fingerprint()
-    unstable = [("main", "1" * 64), ("main", "2" * 64)]
-    # 复核会重建一次快照并再取指纹：固定流程读序为 初始 → prepare 读 → 复核读 →
-    # 复核重建后再读。迭代器耗尽后持续返回最后一个不稳定值，保证复核判定“仍不稳定”。
-    values = iter([initial, *unstable])
-    repo.fingerprint = lambda: next(values, unstable[-1])
-    before = app.state.snapshot.snapshot_revision
-    with TestClient(app) as client:
-        response = client.put("/admin/jev", json=payload())
-    assert response.status_code == 503, response.text
-    conn = connect(settings.db_path)
-    assert JevConfigRepo(conn).load() is None
-    assert conn.execute(
-        "SELECT COUNT(*) FROM changes WHERE kind = 'jev'"
-    ).fetchone()[0] == 0
-    conn.close()
-    assert app.state.snapshot.snapshot_revision == before
-    assert app.state.snapshot.jev is None
-
-
-# ── 自包含 JSON：JEV 有效配置来自活动图 runtime（Task B1）───────────────
-def prepare_portable_tree(tmp_path, handler=None):
-    """写入并启用一棵自包含图（JSON 已含 JEV/窗口/时段），再启动真实 app。"""
-    settings = test_settings(tmp_path)
-    repo = RoutingTreeRepo(settings.graph_dir)
-    repo.initialize()
-    document = portable_tree_dict("portable")
-    repo.create(tree_from_dict(document))
-    repo.enable(document["id"])
-    transport = httpx.MockTransport(handler) if handler is not None else None
-    app = create_app(settings, transport=transport)
-    return app, TestClient(app), settings
-
-
-def _jev_answer_handler(requests):
-    def handler(request):
-        requests.append(request)
-        return httpx.Response(200, json={
-            "answers": {"route": {"type": "choice",
-                                  "probabilities": {"候选 A": 0.4, "候选 B": 0.6}}},
-            "usage": {"input_tokens": 3, "output_tokens": 0},
-        })
-    return handler
-
-
-def test_get_jev_and_window_prefer_active_json_over_database(tmp_path):
-    """活动 JSON 与数据库故意冲突：GET 必须展示 JSON 的运行配置。"""
-    app, client, settings = prepare_portable_tree(tmp_path)
-    conn = connect(settings.db_path)
-    try:
-        JevConfigRepo(conn).save(JevSettings(
-            "http://db-jev.test", "db-jev", "", 30,
-            DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE))
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "8192")
-        repo.set("jev_input_tokens", "2048")
-        conn.commit()
-        TimePeriodRepo(conn).save([
-            {"name": "DB 时段", "days": [0], "start": "01:00", "end": "02:00"},
-        ])
-    finally:
-        conn.close()
-
-    jev = client.get("/admin/jev").json()["config"]
-    assert jev["base_url"] == "http://jev-json.test"
-    assert jev["model"] == "json-jev"
-    window = client.get("/admin/jev/window").json()
-    assert (window["input_tokens"], window["context_tokens"]) == (1024, 4096)
-    periods = client.get("/admin/time-periods").json()["periods"]
-    assert [period["name"] for period in periods] == ["peak", "normal", "offpeak"]
-    # 数据库仍是旧值：GET 不改写管理表
-    conn = connect(settings.db_path)
-    try:
-        assert JevConfigRepo(conn).load().model == "db-jev"
-    finally:
-        conn.close()
-
-
-def test_put_jev_without_database_row_edits_active_json(tmp_path):
-    """数据库无 jev_config 行时，仍可编辑活动 JSON 的 JEV；写入后图 JSON 同步。"""
-    app, client, settings = prepare_portable_tree(tmp_path)
-    conn = connect(settings.db_path)
-    assert JevConfigRepo(conn).load() is None
-    conn.close()
-
-    response = client.put("/admin/jev", json={"timeout_seconds": 7})
-
-    assert response.status_code == 200, response.text
-    body = response.json()["config"]
-    assert body["base_url"] == "http://jev-json.test"
-    assert body["model"] == "json-jev"
-    assert body["timeout_seconds"] == 7
-    tree = app.state.graph_repo.get("portable")
-    assert tree.runtime.jev.timeout_seconds == 7
-    document = json.loads(
-        (Path(settings.graph_dir) / "graphs" / "portable.json").read_text())
-    assert document["jev"]["timeout_seconds"] == 7
-    assert app.state.snapshot.jev.model == "json-jev"
-
-
-def test_jev_test_endpoint_uses_published_snapshot_after_row_removal(tmp_path):
-    """/admin/jev/test 优先使用已发布快照的 JEV，不再强制要求数据库配置行。"""
-    requests = []
-    app, client, settings = prepare_portable_tree(
-        tmp_path, handler=_jev_answer_handler(requests))
-    assert client.put("/admin/jev", json={"timeout_seconds": 7}).status_code == 200
-
-    conn = connect(settings.db_path)
-    conn.execute("DELETE FROM jev_config")
-    conn.commit()
-    conn.close()
-
-    response = client.post("/admin/jev/test", json={"text": "测试连接"})
-
-    assert response.status_code == 200, response.text
-    assert response.json()["selected_key"] == "b"
-    assert len(requests) == 1
-    assert str(requests[0].url) == "http://jev-json.test/v1/systemone"
-    assert json.loads(requests[0].content)["model"] == "json-jev"
-
-
-def test_put_jev_reuses_stored_key_only_for_the_same_endpoint(tmp_path, monkeypatch):
-    """省略 api_key 只复用 base_url+model 匹配的数据库 key；环境变量不得写成 stored。"""
-    monkeypatch.setenv("ROUTER_JEV_API_KEY", "environment-secret")
-    app, client, settings = prepare_portable_tree(tmp_path)
-    conn = connect(settings.db_path)
-    JevConfigRepo(conn).save(JevSettings(
-        "http://jev-json.test", "json-jev", "stored-secret", 5,
-        DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE))
-    conn.close()
-
-    initial = client.get("/admin/jev")
-    assert initial.json()["config"]["key_source"] == "stored"
-    assert "stored-secret" not in initial.text
-
-    # 同端点、省略 api_key → 复用 stored key。
-    response = client.put("/admin/jev", json={"timeout_seconds": 9})
-    assert response.status_code == 200, response.text
-    assert response.json()["config"]["key_source"] == "stored"
-    assert "stored-secret" not in response.text
-    assert app.state.snapshot.jev.api_key == "stored-secret"
-    for path in Path(settings.graph_dir).rglob("*.json"):
-        assert "stored-secret" not in path.read_text()
-        assert "environment-secret" not in path.read_text()
-
-    # 改端点、省略 api_key → 旧 key 不得跟随到新地址，环境 key 不落库。
-    response = client.put("/admin/jev", json={"base_url": "http://new-jev.test"})
-    assert response.status_code == 200, response.text
-    assert response.json()["config"]["key_source"] == "environment"
-    conn = connect(settings.db_path)
-    stored = JevConfigRepo(conn).load()
-    conn.close()
-    assert stored.base_url == "http://new-jev.test"
-    assert stored.api_key == ""
-    assert app.state.snapshot.jev.api_key == "environment-secret"
+def test_test_endpoint_validates_text(tmp_path):
+    client, _app = make_client(tmp_path)
+    client.post("/admin/jev", json=service_payload())
+    assert client.post("/admin/jev/jev-a/test",
+                       json={"text": "x" * 10001}).status_code == 422
+    assert client.post("/admin/jev/jev-a/test", json={"text": 5}).status_code == 422
+    assert client.post("/admin/jev/jev-a/test", json={"unknown": 1}).status_code == 422

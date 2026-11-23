@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping
 
-from router.control.runtime import enable_context_for_runtime, snapshot_parts
+from router.control.runtime import (
+    enable_context_for_runtime,
+    first_jev_settings,
+    resolve_jev_settings,
+    snapshot_parts,
+)
 from router.control.validation import build_enable_context
 from router.jev.config import JevSettings
 from router.jev.window import (
@@ -26,7 +31,6 @@ from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
 from router.routing.types import RoutingMiss
-from router.store.jev_config import JevConfigRepo
 from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
 from router.upstream.catalog import Backend, load_backends
@@ -210,7 +214,7 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
         tree=tree,
         backends=load_backends(conn),
         time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
-        jev=JevConfigRepo(conn).load(),
+        jev=resolve_jev_settings(conn, first_jev_settings(conn)),
         capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
         jev_input_tokens=input_tokens,
         jev_context_tokens=context_tokens,

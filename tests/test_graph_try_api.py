@@ -15,7 +15,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.window import MIN_INPUT_TOKENS, estimate_tokens
 from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.scheduling import ModelScheduler
@@ -498,11 +497,10 @@ def test_try_serializes_all_answer_types_and_complete_outcome(client, app):
 def test_try_fixed_peak_scenario_matches_engine(client, app):
     periods = client.put("/admin/time-periods", json={"periods": SCENARIO_DATA["periods"]})
     assert periods.status_code == 200, periods.text
-    jev = client.put("/admin/jev", json={
-        "base_url": "http://jev.test", "model": "NeoHorse-Jev-4B", "timeout_seconds": 5,
-        "instructions": DEFAULT_INSTRUCTIONS, "state_template": DEFAULT_STATE_TEMPLATE,
-    })
-    assert jev.status_code == 200, jev.text
+    # 启动种子（环境 URL/model）已在目录里创建 default 服务；本用例只需确认目录。
+    services = client.get("/admin/jev").json()["services"]
+    assert [(service["id"], service["model"]) for service in services] == [
+        ("default", "d1-2B")]
     install_engine(app, SCENARIO_BY_ID["s3"])
     scenario = SCENARIO_BY_ID["s3"]
 

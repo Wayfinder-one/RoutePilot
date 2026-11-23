@@ -4,12 +4,12 @@ import sqlite3
 
 import pytest
 
-from router.jev.config import JevSettings
+from router.jev.service import JevService
 from router.routing.graph.model import canonical_json
 from router.routing.tree import tree_from_dict, tree_revision_of, tree_storage_dict
 from router.store.db import connect, migrate
 from router.control.graph_migration import export_sqlite_graphs
-from router.store.jev_config import JevConfigRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import tree_dict
@@ -20,7 +20,7 @@ def legacy_database(path, *, active=True, broken=False, mutate=None):
     migrate(conn)
     seed_default(conn)
     ModelRepo(conn).create("fast", "fast", "local", "{}")
-    JevConfigRepo(conn).save(JevSettings("http://jev.test", "test-jev"))
+    JevServiceRepo(conn).save(JevService("default", "http://jev.test", "test-jev"))
     conn.execute(
         "CREATE TABLE routing_trees (id TEXT PRIMARY KEY, name TEXT, enabled INTEGER, "
         "root TEXT, tree_revision TEXT, updated_at TEXT)"

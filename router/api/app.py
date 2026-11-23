@@ -10,7 +10,6 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from router.config import Settings
-from router.control.config import ConfigurationService
 from router.control.errors import (
     AlreadyExists,
     MissingError,
@@ -19,7 +18,7 @@ from router.control.errors import (
 )
 from router.api.issue_presenter import issues_payload
 from router.jev.client import JevClient
-from router.jev.config import JevSettings
+from router.jev.service import JevService
 from router.maintenance import MaintenanceWorker
 from router.request_logging import RequestLogger
 from router.routing.affinity import SessionAffinity
@@ -30,7 +29,7 @@ from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
-from router.store.jev_config import JevConfigRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.repositories import SessionRepo, UserRepo, seed_default
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
@@ -107,37 +106,28 @@ def _install_admin_auth(app: FastAPI, settings: Settings) -> None:
         return _unauthorized()
 
 
-def _seed_jev(conn, state) -> None:
-    """boot 种子：环境配置的 JEV 决策服务经真实 ConfigurationService.save_jev 落库。
+def _seed_jev(conn, settings: Settings) -> None:
+    """boot 种子：环境配置只在空目录首次启动时创建 ``default`` 服务。
 
-    - 活动图内嵌运行配置（``tree.runtime is not None``）时完全跳过：自包含 JSON
-      是事实源，环境种子不得覆盖图内 JEV（``jev: null`` 也视为图内配置已定）。
-    - 旧图/无活动图沿用原种子逻辑（已有配置行则不动；环境未配置则跳过）。
-
-    与路由层写用例同一次序（校验活动图 → 提交 → 候选发布，发布为纯内存替换），
-    不再"先提交后校验"。活动图在校验失败时保持旧 boot 的降级语义：不中止启动，
-    仅跳过本次种子（差别：未通过校验的配置不再残留数据库）。"""
-    active = state.graph_repo.active()
-    if active is not None and active.runtime is not None:
+    - 目录里已有任何服务就完全跳过（数据库目录是事实源，不覆盖管理结果）。
+    - 不读取活动画布、不触发任何图同步：画布启动快照只由画布 JSON 决定。
+    - 环境只配置 URL/model 之一时仍是配置错误（保持原启动失败语义）。
+    """
+    repo = JevServiceRepo(conn)
+    if repo.list():
         return
-    if JevConfigRepo(conn).load() is not None:
-        return
-    settings = state.settings
     if not settings.jev_url and not settings.jev_model:
         return
     if not settings.jev_url or not settings.jev_model:
         raise RuntimeError("ROUTER_JEV_URL and ROUTER_JEV_MODEL must be configured together")
-    seed = JevSettings(
+    service = JevService(
+        id="default",
         base_url=settings.jev_url,
         model=settings.jev_model,
-        api_key=settings.jev_api_key,
+        key_env="ROUTER_JEV_API_KEY",
         timeout_seconds=settings.jev_timeout,
     )
-    service = ConfigurationService(conn, state.graph_repo, state.publisher)
-    try:
-        service.save_jev(seed)
-    except (ValidationFailed, GraphStorageError):
-        logger.exception("boot jev seeding skipped: active graph rejected the context")
+    repo.save(service, api_key=settings.jev_api_key)
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
@@ -195,8 +185,8 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     conn = connect(settings.db_path)
     try:
-        # boot 种子位于 publisher 构造之后：同类服务同一写路径（校验 → 提交 → 发布）。
-        _seed_jev(conn, app.state)
+        # boot 种子只写 JEV 目录；启动快照随后由活动画布（或过渡性数据库回退）构造。
+        _seed_jev(conn, settings)
         app.state.publisher.refresh(conn)
     except GraphStorageError:
         logger.exception("initial graph snapshot is unavailable")

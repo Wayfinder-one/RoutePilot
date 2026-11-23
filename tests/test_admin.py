@@ -8,11 +8,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
+from router.jev.service import JevService
 from router.request_logging import RECENT_LIMIT, RequestLogger
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
-from router.store.jev_config import JevConfigRepo
+from router.store.jev_services import JevServiceRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import test_settings, tree_dict
 
@@ -301,10 +301,10 @@ def test_request_snapshot_persistence_excludes_live_request_secrets(tmp_path):
     conn = connect(settings.db_path)
     try:
         migrate(conn)
-        JevConfigRepo(conn).save(JevSettings(
-            "http://jev.test", "NeoHorse-Jev-4B", "jev-secret-value", 5.0,
-            DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE,
-        ))
+        JevServiceRepo(conn).save(
+            JevService("default", "http://jev.test", "NeoHorse-Jev-4B",
+                       timeout_seconds=5.0),
+            api_key="jev-secret-value")
     finally:
         conn.close()
     repo = RoutingTreeRepo(settings.graph_dir)

@@ -9,7 +9,6 @@ from pydantic import BaseModel, ConfigDict
 from router.api.deps import get_conn, get_tree_repo
 from router.control.config import ConfigurationService
 from router.control.errors import ValidationFailed
-from router.control.runtime import effective_periods
 from router.store.repositories import TimePeriodRepo, now_iso
 from router.store.routing_trees import RoutingTreeRepo
 
@@ -26,10 +25,9 @@ class TimePeriodsIn(BaseModel):
 
 
 @router.get("/time-periods")
-def get_time_periods(request: Request, conn: sqlite3.Connection = Depends(get_conn),
-                     trees: RoutingTreeRepo = Depends(get_tree_repo)):
-    """有效时段定义：活动图内嵌配置优先，旧图/无活动图回退数据库。"""
-    return {"periods": effective_periods(conn, trees), "now": now_iso()}
+def get_time_periods(conn: sqlite3.Connection = Depends(get_conn)):
+    """时段目录读取只查 SQLite：不再因活动画布不同而切换数据源。"""
+    return {"periods": TimePeriodRepo(conn).load(), "now": now_iso()}
 
 
 @router.put("/time-periods")

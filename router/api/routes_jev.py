@@ -1,3 +1,15 @@
+"""管理面多 JEV 服务目录 API（目录式 CRUD + 逐条连接测试）。
+
+目录只存 SQLite（``jev_services``）：列表/详情/测试都以数据库行为准，不再读取
+活动画布快照。画布自身的 JEV 由检查路由（``runtime_mismatch``）验证，见 spec
+「多 JEV 目录」。
+
+密钥通道：真实 ``api_key`` 只存在数据库列里，任何响应都不回显；``key_source``
+是派生状态（stored/env/none），不是密钥本身。
+
+旧单配置形态（单配置 PUT、单一 test 端点、独立 window 读写入口）已删除，
+不保留兼容层。
+"""
 from __future__ import annotations
 
 import os
@@ -7,112 +19,58 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from router.api.deps import get_conn, get_tree_repo
-from router.control.config import ConfigurationService, JevWindow
-from router.control.runtime import effective_jev, effective_window
-from router.jev.client import ChoiceAnswer, DecisionQuestion, JevCandidate, JevClient, JevError
+from router.api.deps import get_conn
+from router.jev.client import (
+    ChoiceAnswer,
+    DecisionQuestion,
+    JevCandidate,
+    JevClient,
+    JevError,
+)
 from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
-    JevSettings,
 )
-from router.jev.window import (
-    DEFAULT_CONTEXT_TOKENS,
-    DEFAULT_INPUT_TOKENS,
-    MAX_TOKENS,
-    MIN_CONTEXT_TOKENS,
-    MIN_INPUT_TOKENS,
-)
-from router.store.routing_trees import RoutingTreeRepo
+from router.jev.service import JevService
+from router.store.jev_services import JevServiceRepo
 
 router = APIRouter()
 
+#: ``JevService`` 的字段集合（api_key 只进数据库列，不属于领域 DTO）。
+_SERVICE_FIELDS = (
+    "id",
+    "base_url",
+    "model",
+    "key_env",
+    "timeout_seconds",
+    "instructions",
+    "state_template",
+    "input_tokens",
+    "context_tokens",
+)
 
-class JevConfigIn(BaseModel):
-    """PUT /admin/jev 请求 DTO：未知字段一律拒绝（替代手写 set(body)-allowed）。
 
-    值的类型与内容校验仍由 JevSettings.__post_init__ 一体完成（原文案保持）。"""
+class JevServiceIn(BaseModel):
+    """``POST /admin/jev`` / ``PUT /admin/jev/{id}`` 请求 DTO：未知字段一律拒绝。
+
+    值的类型与内容校验由 ``JevService.__post_init__`` 一体完成（原文案保持），
+    因此这里只做显式字段过滤。``api_key`` 与 ``impact_confirmation`` 不进
+    ``JevService``：前者单独写入数据库列，后者本单元接受但忽略（Task 5 使用）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
+    id: Any = None
     base_url: Any = None
     model: Any = None
+    key_env: Any = ""
     api_key: Any = None
-    timeout_seconds: Any = None
-    instructions: Any = None
-    state_template: Any = None
-
-
-class JevWindowIn(BaseModel):
-    """PUT /admin/jev/window 请求 DTO：未知字段一律拒绝；数值折算仍走
-    _coerce_tokens（bool/字符串按 422 处理），范围校验在 JevWindow。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    context_tokens: Any = None
-    input_tokens: Any = None
-
-
-def _provided(body: BaseModel, name: str, fallback):
-    """DTO 缺失字段才回落到已存值；显式 null 交给值校验报 422（与旧 dict 语义一致）。"""
-    return getattr(body, name) if name in body.model_fields_set else fallback
-
-
-def _public(settings: JevSettings | None) -> dict:
-    return {
-        "config": settings.public_dict(env_key_present=bool(os.environ.get("ROUTER_JEV_API_KEY"))) if settings else None,
-        "defaults": {"instructions": DEFAULT_INSTRUCTIONS, "state_template": DEFAULT_STATE_TEMPLATE},
-    }
-
-
-@router.get("/jev")
-def get_jev(conn: sqlite3.Connection = Depends(get_conn),
-            trees: RoutingTreeRepo = Depends(get_tree_repo)):
-    """有效 JEV 配置：活动图内嵌配置优先，旧图回退数据库。"""
-    return _public(effective_jev(conn, trees))
-
-
-def _jev_api_key(body: JevConfigIn, existing: JevSettings | None,
-                 base_url: str, model: str) -> str:
-    """PUT 的 api_key 归宿：显式值优先；省略时仅在端点+模型匹配时复用已存密钥。
-
-    端点（base_url/model）改变而请求省略 api_key 时不得把旧密钥带过去——否则
-    旧地址的密钥会被发往新地址（spec §5）。环境变量密钥不在这里展开，也不会
-    被写成 stored。
-    """
-    if "api_key" in body.model_fields_set:
-        return body.api_key
-    if existing is not None and (base_url, model) == (existing.base_url, existing.model):
-        return existing.api_key
-    return ""
-
-
-@router.put("/jev")
-def put_jev(
-    body: JevConfigIn, request: Request,
-    conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
-):
-    # 编辑基线：活动 JSON 的有效配置（含端点匹配的已存密钥），旧图回退数据库。
-    existing = effective_jev(conn, trees)
-    if "api_key" in body.model_fields_set and not isinstance(body.api_key, str):
-        raise HTTPException(422, detail="api_key must be a string")
-    base_url = _provided(body, "base_url", existing.base_url if existing else "")
-    model = _provided(body, "model", existing.model if existing else "")
-    try:
-        settings = JevSettings(
-            base_url=base_url,
-            model=model,
-            api_key=_jev_api_key(body, existing, base_url, model),
-            timeout_seconds=_provided(body, "timeout_seconds", existing.timeout_seconds if existing else 10.0),
-            instructions=_provided(body, "instructions", existing.instructions if existing else DEFAULT_INSTRUCTIONS),
-            state_template=_provided(body, "state_template", existing.state_template if existing else DEFAULT_STATE_TEMPLATE),
-        )
-    except ValueError as exc:
-        raise HTTPException(422, detail=str(exc)) from exc
-    # ValidationFailed（活动图校验失败）由 app 级异常处理器统一映射 422 Issue 数组。
-    ConfigurationService(conn, trees, request.app.state.publisher).save_jev(settings)
-    return _public(settings)
+    timeout_seconds: Any = 10.0
+    instructions: Any = DEFAULT_INSTRUCTIONS
+    state_template: Any = DEFAULT_STATE_TEMPLATE
+    input_tokens: Any = 1024
+    context_tokens: Any = 4096
+    impact_confirmation: Any = None
 
 
 class JevTestIn(BaseModel):
@@ -121,17 +79,120 @@ class JevTestIn(BaseModel):
     text: Any = None
 
 
-@router.post("/jev/test")
-async def test_jev(body: JevTestIn, request: Request,
-                   conn: sqlite3.Connection = Depends(get_conn),
-                   trees: RoutingTreeRepo = Depends(get_tree_repo)):
-    # 优先使用已发布快照的 JEV（含端点匹配的密钥解析结果），不再强制要求数据库
-    # 存在配置行：自包含 JSON 只靠图文件即可试连。
-    published = getattr(request.app.state, "snapshot", None)
-    settings = published.jev if published is not None and published.jev is not None \
-        else effective_jev(conn, trees)
-    if settings is None:
-        raise HTTPException(422, detail="jev_not_configured")
+def _provided(body: BaseModel, name: str, fallback):
+    """DTO 缺失字段才回落到已存值；显式 null 交给值校验报 422（与旧语义一致）。"""
+    return getattr(body, name) if name in body.model_fields_set else fallback
+
+
+def _validate_api_key(body: BaseModel, *, allow_null: bool) -> None:
+    if "api_key" not in body.model_fields_set:
+        return
+    if body.api_key is None and allow_null:
+        return
+    if not isinstance(body.api_key, str):
+        # PUT 的显式 null 不是「省略」（省略 = 保留已存密钥），null 是非法值。
+        raise HTTPException(422, detail="api_key must be a string")
+
+
+def _service_from_body(body: JevServiceIn, defaults: dict | None = None) -> JevService:
+    base = defaults or {}
+    values = {
+        field: _provided(body, field, base.get(field, getattr(body, field)))
+        for field in _SERVICE_FIELDS
+    }
+    try:
+        return JevService(**values)
+    except ValueError as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+
+
+def _public_service(conn: sqlite3.Connection, service: JevService) -> dict:
+    """公共投影：非密钥快照字段 + 窗口 + 派生密钥状态；绝不包含 api_key。"""
+    repo = JevServiceRepo(conn)
+    stored = repo.stored_api_key(service)
+    env_present = bool(service.key_env and os.environ.get(service.key_env))
+    return {
+        **service.snapshot_dict(),
+        **service.window_dict(),
+        "key_present": bool(stored or env_present),
+        "key_source": "stored" if stored else "env" if env_present else "none",
+    }
+
+
+def _require(repo: JevServiceRepo, service_id: str) -> JevService:
+    service = repo.get(service_id)
+    if service is None:
+        raise HTTPException(404, detail=f"unknown jev service {service_id}")
+    return service
+
+
+def _defaults(service: JevService | None) -> dict:
+    if service is None:
+        return {}
+    return {
+        **service.snapshot_dict(),
+        **service.window_dict(),
+    }
+
+
+@router.get("/jev")
+def get_jev(conn: sqlite3.Connection = Depends(get_conn)):
+    repo = JevServiceRepo(conn)
+    return {"services": [_public_service(conn, service) for service in repo.list()]}
+
+
+@router.post("/jev", status_code=201)
+def post_jev(body: JevServiceIn, conn: sqlite3.Connection = Depends(get_conn)):
+    _validate_api_key(body, allow_null=True)
+    service = _service_from_body(body)
+    repo = JevServiceRepo(conn)
+    if repo.get(service.id) is not None:
+        raise HTTPException(409, detail=f"jev service {service.id} 已存在")
+    repo.save(service, api_key=body.api_key)
+    return {"service": _public_service(conn, service)}
+
+
+@router.get("/jev/{service_id}")
+def get_jev_service(service_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    repo = JevServiceRepo(conn)
+    return {"service": _public_service(conn, _require(repo, service_id))}
+
+
+@router.put("/jev/{service_id}")
+def put_jev_service(
+    service_id: str, body: JevServiceIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    _validate_api_key(body, allow_null=False)
+    if "id" in body.model_fields_set and body.id != service_id:
+        raise HTTPException(422, detail="id in body must match path")
+    repo = JevServiceRepo(conn)
+    existing = _require(repo, service_id)
+    service = _service_from_body(body, _defaults(existing))
+    # 未提供 api_key 时交给仓储的端点匹配规则：仅 base_url+model 不变才复用旧密钥。
+    repo.save(service, api_key=body.api_key if "api_key" in body.model_fields_set else None)
+    return {"service": _public_service(conn, service)}
+
+
+@router.delete("/jev/{service_id}")
+def delete_jev_service(service_id: str, conn: sqlite3.Connection = Depends(get_conn)):
+    repo = JevServiceRepo(conn)
+    if not repo.delete(service_id):
+        raise HTTPException(404, detail=f"unknown jev service {service_id}")
+    return {"deleted": service_id}
+
+
+@router.post("/jev/{service_id}/test")
+async def test_jev_service(
+    service_id: str, body: JevTestIn, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    """用数据库目录里的服务配置试连：不读取活动画布快照。"""
+    repo = JevServiceRepo(conn)
+    service = _require(repo, service_id)
+    settings = service.settings(
+        api_key=repo.stored_api_key(service)
+        or (os.environ.get(service.key_env, "") if service.key_env else ""))
     text = body.text if "text" in body.model_fields_set else "请选择一个候选以验证决策服务。"
     if not isinstance(text, str) or len(text) > 10000:
         raise HTTPException(422, detail="text must be a string of at most 10000 characters")
@@ -156,62 +217,3 @@ async def test_jev(body: JevTestIn, request: Request,
         "usage": answer.usage,
         "duration_ms": answer.duration_ms,
     }
-
-
-def _coerce_tokens(value, field: str) -> int:
-    if isinstance(value, bool):
-        raise HTTPException(422, detail=f"{field} 必须是整数")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
-        try:
-            return int(value.strip())
-        except ValueError:
-            pass
-    raise HTTPException(422, detail=f"{field} 必须是整数")
-
-
-@router.get("/jev/window")
-def get_jev_window(conn: sqlite3.Connection = Depends(get_conn),
-                   trees: RoutingTreeRepo = Depends(get_tree_repo)):
-    """JEV 输入窗口：服务上下文预算与发送给决策服务的输入上限。"""
-    input_tokens, context_tokens = effective_window(conn, trees)
-    return {
-        "context_tokens": context_tokens,
-        "input_tokens": input_tokens,
-        "defaults": {"context_tokens": DEFAULT_CONTEXT_TOKENS, "input_tokens": DEFAULT_INPUT_TOKENS},
-        "min_context_tokens": MIN_CONTEXT_TOKENS,
-        "min_input_tokens": MIN_INPUT_TOKENS,
-        "max_tokens": MAX_TOKENS,
-    }
-
-
-@router.put("/jev/window")
-def put_jev_window(
-    body: JevWindowIn, request: Request,
-    conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
-):
-    """保存输入窗口配置（服务层 ConfigurationService.save_window）。
-
-    - context_tokens：JEV 服务每请求上下文预算（= llama.cpp -c/--parallel）；
-    - input_tokens：实际发送给 JEV 的输入上限；超出按首尾保留截断。
-    """
-    # 当前值同样取有效运行配置：省略字段继承活动 JSON，而不是数据库旧值。
-    current_input, current_context = effective_window(conn, trees)
-    if not body.model_fields_set:
-        raise HTTPException(422, detail="至少提供一个字段")
-    context_tokens = (_coerce_tokens(body.context_tokens, "context_tokens")
-                      if "context_tokens" in body.model_fields_set else current_context)
-    input_tokens = (_coerce_tokens(body.input_tokens, "input_tokens")
-                    if "input_tokens" in body.model_fields_set else current_input)
-    try:
-        window = JevWindow(input_tokens=input_tokens, context_tokens=context_tokens)
-    except ValueError as exc:
-        raise HTTPException(422, detail=str(exc)) from exc
-    # ValidationFailed（活动图校验失败）由 app 级异常处理器统一映射；本用例失败时
-    # 窗口 DB 写与审计随事务回滚（brief Step 1 RED 场景）。
-    ConfigurationService(conn, trees, request.app.state.publisher).save_window(window)
-    return get_jev_window(conn, trees)

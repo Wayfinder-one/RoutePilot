@@ -11,9 +11,11 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
+from router.jev.service import JevService
 from router.routing.tree import tree_from_dict
 from router.store.db import connect
-from router.store.repositories import ProviderRepo
+from router.store.jev_services import JevServiceRepo
+from router.store.repositories import ModelRepo, ProviderRepo, TimePeriodRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, huge_chain_graph, runtime_dict, test_settings, tree_dict
 
@@ -55,12 +57,12 @@ def configure_jev(client):
     for model, capability in (("qwen3-8b", "简单通用请求"), ("qwen3-32b", "复杂推理和代码")):
         response = client.put(f"/admin/models/{model}", json={"profile": {"capability": capability}})
         assert response.status_code == 200, response.text
-    response = client.put("/admin/jev", json={
-        "base_url": "http://jev.test", "model": "NeoHorse-Jev-4B",
+    response = client.post("/admin/jev", json={
+        "id": "default", "base_url": "http://jev.test", "model": "NeoHorse-Jev-4B",
         "timeout_seconds": 5, "instructions": DEFAULT_INSTRUCTIONS,
         "state_template": DEFAULT_STATE_TEMPLATE,
     })
-    assert response.status_code == 200, response.text
+    assert response.status_code == 201, response.text
 
 
 def create_portable_tree(client, tree_id):
@@ -70,19 +72,42 @@ def create_portable_tree(client, tree_id):
     assert response.status_code == 201, response.text
 
 
-def test_configuration_writes_update_every_graph_and_gets_prefer_active_json(client, app):
+def _canvas_state(app, tree_ids):
+    """画布文件字节 + document_sha256：目录写不得改动任何已存画布。"""
+    repo = app.state.graph_repo
+    return {
+        tree_id: ((repo.graphs / f"{tree_id}.json").read_bytes(),
+                  repo.get(tree_id).document_sha256)
+        for tree_id in tree_ids
+    }
+
+
+def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
+    """严格自包含语义：目录写只改数据库行 + 审计，绝不改写已存画布。
+
+    管理 GET 只读 SQLite 目录（不再因活动画布切换数据源）；快照仍取活动画布
+    内嵌配置，直到显式刷新/确认同步（后续单元）。
+    """
     create_portable_tree(client, "main")
     create_portable_tree(client, "second")
     assert client.post("/admin/trees/main/enable").status_code == 200
+    tree_ids = ("main", "second")
+    before = _canvas_state(app, tree_ids)
 
     conn = connect(app.state.settings.db_path)
     try:
+        # 画布引用 fast + 问题节点：目录补齐同 id 模型与服务，目录写才能通过启用校验。
+        ModelRepo(conn).create("fast", "json-upstream", "local", "{}")
+        JevServiceRepo(conn).save(JevService(
+            "default", "http://jev.test", "NeoHorse-Jev-4B",
+            input_tokens=1024, context_tokens=4096))
         ProviderRepo(conn).upsert("local", "http://database-only.test/v1")
     finally:
         conn.close()
+    # GET 直接返回数据库行（旧行为会投影活动 JSON 的 json-only.test）。
     providers = client.get("/admin/providers")
     assert providers.status_code == 200, providers.text
-    assert providers.json()["providers"][0]["base_url"] == "http://json-only.test/v1"
+    assert providers.json()["providers"][0]["base_url"] == "http://database-only.test/v1"
 
     response = client.put("/admin/providers/local", json={
         "base_url": "http://changed.test/v1",
@@ -90,42 +115,81 @@ def test_configuration_writes_update_every_graph_and_gets_prefer_active_json(cli
         "reasoning_format": "openai",
     })
     assert response.status_code == 200, response.text
-    for tree_id in ("main", "second"):
-        tree = app.state.graph_repo.get(tree_id)
-        assert tree.runtime.backends.providers[0]["base_url"] == "http://changed.test/v1"
-    assert app.state.snapshot.backends["fast"].url == "http://changed.test/v1/chat/completions"
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert ProviderRepo(conn).get("local")["base_url"] == "http://changed.test/v1"
+    finally:
+        conn.close()
+    assert _canvas_state(app, tree_ids) == before
+    # 运行快照仍是画布内嵌 provider，不因目录写而改写。
+    assert app.state.snapshot.backends["fast"].url == "http://json-only.test/v1/chat/completions"
 
-    response = client.put("/admin/jev/window", json={
+    response = client.put("/admin/time-periods", json={"periods": [
+        {"name": "DB 新时段", "days": [0], "start": "08:00", "end": "17:00"},
+    ]})
+    assert response.status_code == 200, response.text
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert [row["name"] for row in TimePeriodRepo(conn).load()] == ["DB 新时段"]
+    finally:
+        conn.close()
+    assert _canvas_state(app, tree_ids) == before
+    assert app.state.snapshot.time_periods and [
+        period.name for period in app.state.snapshot.time_periods
+    ] == ["peak", "normal", "offpeak"]
+
+    # JEV 目录同理：改窗口只改目录，画布 jev_window 不变。
+    response = client.put("/admin/jev/default", json={
         "input_tokens": 2048, "context_tokens": 8192,
     })
     assert response.status_code == 200, response.text
-    response = client.put("/admin/time-periods", json={"periods": [
-        {"name": "JSON 新时段", "days": [0], "start": "08:00", "end": "17:00"},
-    ]})
-    assert response.status_code == 200, response.text
-    for tree_id in ("main", "second"):
+    conn = connect(app.state.settings.db_path)
+    try:
+        assert (JevServiceRepo(conn).get("default").input_tokens,
+                JevServiceRepo(conn).get("default").context_tokens) == (2048, 8192)
+    finally:
+        conn.close()
+    for tree_id in tree_ids:
         runtime = app.state.graph_repo.get(tree_id).runtime
-        assert runtime.jev_input_tokens == 2048
-        assert runtime.jev_context_tokens == 8192
-        assert [period.name for period in runtime.time_periods] == ["JSON 新时段"]
+        assert (runtime.jev_input_tokens, runtime.jev_context_tokens) == (1024, 4096)
+    assert (app.state.snapshot.jev_input_tokens,
+            app.state.snapshot.jev_context_tokens) == (1024, 4096)
+    assert _canvas_state(app, tree_ids) == before
 
 
-def test_model_edit_uses_active_json_when_database_catalog_is_empty(client, app):
+def test_catalog_gets_read_database_when_active_canvas_exists(client, app):
+    """活动画布存在时目录读取仍是 SQLite；模型写用例也以数据库为基线。"""
     create_portable_tree(client, "main")
     assert client.post("/admin/trees/main/enable").status_code == 200
     conn = connect(app.state.settings.db_path)
     try:
+        # 目录写仍用数据库上下文校验活动画布：目录里要有画布引用的模型与服务。
+        ModelRepo(conn).create("fast", "db-upstream", "local", "{}")
+        JevServiceRepo(conn).save(JevService("default", "http://jev.test", "m"))
         conn.execute("DELETE FROM models")
         conn.commit()
     finally:
         conn.close()
 
+    assert client.get("/admin/models").json()["models"] == []
     response = client.put("/admin/models/fast", json={"upstream": "edited-upstream"})
+    assert response.status_code == 404, response.text
 
-    assert response.status_code == 200, response.text
+    # 画布快照仍是 JSON 事实源，不受数据库空目录影响。
+    assert app.state.snapshot.backends["fast"].upstream_name == "json-upstream"
     tree = app.state.graph_repo.get("main")
-    assert tree.runtime.backends.models[0]["upstream"] == "edited-upstream"
-    assert app.state.snapshot.backends["fast"].upstream_name == "edited-upstream"
+    assert tree.runtime.backends.models[0]["upstream"] == "json-upstream"
+
+    # 目录补回该模型后写用例照常工作（不写画布）。
+    conn = connect(app.state.settings.db_path)
+    try:
+        ModelRepo(conn).create("fast", "db-upstream", "local", "{}")
+    finally:
+        conn.close()
+    response = client.put("/admin/models/fast", json={"upstream": "edited-upstream"})
+    assert response.status_code == 200, response.text
+    assert client.get("/admin/models").json()["models"][0]["upstream"] == "edited-upstream"
+    assert app.state.graph_repo.get("main").runtime.backends.models[0]["upstream"] == "json-upstream"
 
 
 def test_stale_browser_save_returns_409_and_keeps_file(client):
@@ -146,6 +210,8 @@ def test_stale_browser_save_returns_409_and_keeps_file(client):
 
 
 def test_graph_crud_roundtrip_copy_enable_disable(client, app):
+    # 新画布从当前目录物化运行快照：先配置目录，再创建/启用画布。
+    configure_jev(client)
     raw = tree_dict(sticky={"enabled": True, "ttl_seconds": 1800})
     raw["root"] = graph_with_model()
     raw["root"]["nodes"][0]["title"] = "请求入口"
@@ -187,7 +253,6 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     assert copied_tree["enabled"] is False
     assert copied_tree["root"] == saved["root"]
 
-    configure_jev(client)
     enabled = client.post("/admin/trees/main/enable")
     assert enabled.status_code == 200, enabled.text
     assert app.state.snapshot.tree_id == "main"
