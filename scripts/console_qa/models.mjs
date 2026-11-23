@@ -13,6 +13,7 @@ import {
   BASELINE,
   api,
   appSnapshot,
+  ensureBaselineTree,
   expectHttpStatusError,
   page,
   resetExpectedHttpStatusErrors,
@@ -96,8 +97,13 @@ test('P0 decision service saves config and window then tests with friendly outpu
     assert.equal(await page.locator('#testCard').count(), 0);
     assert.equal(await page.locator('#saveWindow').count(), 0);
     await page.locator('#editConfig').click();
-    assert.equal(await page.locator('#instructions').isVisible(), false);
-    assert.equal(await page.locator('#winContext').isVisible(), false);
+    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), false,
+      'the decision-service advanced section must start closed');
+    for (const id of ['timeout', 'clearKey', 'instructions', 'stateTemplate',
+                      'winContext', 'winInput', 'testText']) {
+      assert.equal(await page.locator('#' + id).isVisible(), false,
+        `the advanced field #${id} leaked into the default edit view`);
+    }
     await page.locator('#saveJev').click();
     await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
     assert.deepEqual(calls, ['config', 'window', 'test']);
@@ -107,9 +113,94 @@ test('P0 decision service saves config and window then tests with friendly outpu
     assert.equal(await page.locator('#testRawDetails').isVisible(), true);
     assert.equal(await page.locator('#testRawDetails').evaluate(element => element.open), false);
     /* The successful save leaves edit mode: focus must land on a live control. */
-    await page.waitForFunction(() => document.activeElement.id === 'editConfig');
+    await page.waitForFunction(
+      () => document.activeElement.id === 'editConfig',
+      null,
+      { timeout: 3000 }
+    ).catch(() => assert.fail('save-and-test did not return focus to #editConfig'));
   } finally {
     page.off('request', onRequest);
+  }
+});
+
+test('P0 decision service document title follows the language toggle', async () => {
+  await page.goto(routerBase + '/console/jev.html');
+  await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+  assert.match(await page.title(), /决策服务/, 'the zh document title is not the page label');
+  try {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('en');
+    });
+    await page.waitForFunction(() => document.title.includes('Decision service'), null, { timeout: 3000 });
+    assert.doesNotMatch(await page.title(), /决策服务/,
+      'the document title kept the zh page label after switching to en');
+    assert.equal(await page.evaluate(() => document.documentElement.lang), 'en');
+  } finally {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    });
+    await page.waitForFunction(() => document.title.includes('决策服务'), null, { timeout: 3000 });
+  }
+});
+
+test('P0 decision service paints a running test state while the test request is in flight', async () => {
+  let releaseTest = () => {};
+  const gate = new Promise(resolve => { releaseTest = resolve; });
+  const calls = [];
+  let testSeenResolve = () => {};
+  const testSeen = new Promise(resolve => { testSeenResolve = resolve; });
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
+    if (request.method() === 'POST' && url.pathname === '/admin/jev/test') {
+      calls.push('test');
+      testSeenResolve();
+    }
+  };
+  page.on('request', onRequest);
+  await page.route('**/admin/jev/test', async route => {
+    if (route.request().method() !== 'POST') { await route.continue(); return; }
+    await gate;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ selected_key: 'b', duration_ms: 12, probabilities: { a: 0.4, b: 0.6 } })
+    });
+  });
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    await page.locator('#editConfig').click();
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() =>
+      document.getElementById('testOut').dataset.state === 'running', null, { timeout: 3000 });
+    assert.match(await page.locator('#testBadgeText').innerText(), /测试中|Testing/,
+      'the test badge did not announce the in-flight run');
+    assert.match(await page.locator('#testOut').innerText(), /测试中|Testing/);
+    /* The primary action and every edit control stay disabled while the
+       ordered save-and-test pipeline is still running. */
+    assert.equal(await page.locator('#saveJev').isDisabled(), true);
+    assert.equal(await page.locator('#editConfig').isDisabled(), true);
+    assert.equal(await page.locator('#baseUrl').isDisabled(), true);
+    await Promise.race([
+      testSeen,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('the test request never started')), 3000))
+    ]);
+    assert.deepEqual(calls, ['config', 'window', 'test'],
+      'the running test started before config and window were written');
+    releaseTest();
+    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
+    assert.match(await page.locator('#testBadgeText').innerText(), /测试通过|Test passed/);
+    assert.equal(await page.locator('#testRawDetails').isVisible(), true);
+    assert.equal(await page.locator('#testRawDetails').evaluate(element => element.open), false);
+    assert.match(await page.locator('#testRaw').evaluate(element => element.textContent), /selected_key/);
+  } finally {
+    releaseTest();
+    page.off('request', onRequest);
+    await page.unroute('**/admin/jev/test');
   }
 });
 
@@ -292,6 +383,11 @@ test('P0 preset connection hides model ids by default and uses one save action',
   await page.waitForSelector('#modelTable tr[data-mrow]');
   assert.equal(await page.locator('#addProvider').count(), 0);
   await page.locator('#addModel').click();
+  assert.equal(await page.locator('#pmAdvanced').evaluate(element => element.open), false,
+    'the preset connection advanced section must start closed');
+  assert.equal(await page.locator('#pmAdvancedBody').isVisible(), false);
+  assert.equal(await page.locator('#pmBase').isVisible(), false,
+    'the read-only base URL leaked into the default preset view');
   await page.locator('#pmProvider').selectOption('openai');
   const row = page.locator('#pmModels .preset-model').filter({
     has: page.locator('.pm-check[data-mid="gpt-4.1"]')
@@ -299,6 +395,14 @@ test('P0 preset connection hides model ids by default and uses one save action',
   await row.locator('.pm-check').check();
   assert.equal(await row.locator('.pm-id').isVisible(), false);
   assert.equal(await page.locator('#pmBase').isVisible(), false);
+  await page.locator('#pmAdvanced > summary').click();
+  assert.equal(await page.locator('#pmBase').isVisible(), true,
+    'expanding the preset advanced section did not expose the base URL');
+  assert.equal(await page.locator('#pmBase').getAttribute('readonly'), '');
+  assert.equal(await page.locator('#pmAdvancedBody .keyline').isVisible(), true,
+    'the env-auth line is missing from the expanded advanced section');
+  assert.match((await page.locator('#pmAdvancedBody .keyline').innerText()).trim(), /\S/);
+  await page.locator('#pmAdvanced > summary').click();
   await row.locator('.pm-advanced').evaluate(element => { element.open = true; });
   assert.equal(await row.locator('.pm-id').isVisible(), true);
   await row.locator('.pm-id').fill('gpt-4.1-custom');
@@ -323,8 +427,17 @@ test('P0 custom connection generates a blank model id from upstream', async () =
   await page.locator('#cmProvider').selectOption('local');
   await page.locator('#cmUpstream').fill('vendor/custom-alpha');
   await page.locator('#cmCapability').fill('适合通用问答。');
+  assert.equal(await page.locator('#cmAdvanced').evaluate(element => element.open), false,
+    'the custom connection advanced section must start closed');
   assert.equal(await page.locator('#cmId').isVisible(), false);
+  assert.equal(await page.locator('#reasonEditor').isVisible(), false,
+    'the reasoning declaration leaked into the default custom view');
   await page.locator('#cmAdvanced').evaluate(element => { element.open = true; });
+  assert.equal(await page.locator('#cmId').isVisible(), true);
+  assert.equal(await page.locator('#reasonEditor').isVisible(), true,
+    'expanding advanced did not expose the reasoning declaration');
+  assert.ok(await page.locator('#reasonEditor [data-rl]').count() > 0,
+    'the expanded reasoning declaration has no level controls');
   await page.locator('#cmId').fill('manual-custom');
   await page.evaluate(async () => {
     const { setLang } = await import('/console/i18n.js');
@@ -345,6 +458,67 @@ test('P0 custom connection generates a blank model id from upstream', async () =
     await page.waitForSelector('#modelTable tr[data-mrow="vendor-custom-alpha"]');
   } finally {
     await api('DELETE', '/admin/models/vendor-custom-alpha').catch(() => {});
+  }
+});
+
+test('P0 acceptance · changed console pages do not overflow at 1440×960 or 1280×800 in either language', async () => {
+  await ensureBaselineTree();
+  const targets = [
+    { path: '/console/routing.html', ready: '#cvStage [data-node-id]' },
+    { path: '/console/models.html', ready: '#modelTable tr[data-mrow]' },
+    { path: '/console/jev.html', ready: '#jevStatus' },
+    { path: '/console/logs.html', ready: '#refresh' }
+  ];
+  const viewports = [
+    { width: 1440, height: 960 },
+    { width: 1280, height: 800 }
+  ];
+  try {
+    for (const lang of ['zh', 'en']) {
+      await page.goto(routerBase + '/console/logs.html');
+      await page.evaluate(async next => {
+        const { setLang } = await import('/console/i18n.js');
+        setLang(next);
+      }, lang);
+      for (const viewport of viewports) {
+        await page.setViewportSize(viewport);
+        for (const target of targets) {
+          await page.goto(routerBase + target.path);
+          await page.waitForSelector(target.ready, { timeout: 20000 });
+          if (target.path.endsWith('/jev.html')) {
+            await page.waitForFunction(() => document.getElementById('jevStatus').textContent.trim() !== '');
+          }
+          const size = await page.evaluate(() => ({
+            scroll: document.documentElement.scrollWidth,
+            client: document.documentElement.clientWidth,
+            lang: document.documentElement.lang
+          }));
+          assert.ok(size.scroll <= size.client + 1,
+            `${target.path} overflows horizontally at ${viewport.width}×${viewport.height} (${lang}): ` +
+            `${size.scroll} > ${size.client}`);
+          assert.equal(size.lang, lang === 'zh' ? 'zh-CN' : 'en');
+          if (target.path.endsWith('/routing.html')) {
+            await page.locator('#cvMoreBtn').click();
+            const menu = await page.evaluate(() => {
+              const box = document.querySelector('#cvMore .rtc-more-menu').getBoundingClientRect();
+              return { left: box.left, right: box.right, top: box.top, bottom: box.bottom,
+                width: window.innerWidth, height: window.innerHeight };
+            });
+            assert.ok(menu.left >= -1 && menu.right <= menu.width + 1,
+              `the overflow menu leaves the viewport horizontally at ${viewport.width} (${lang})`);
+            assert.ok(menu.top >= -1 && menu.bottom <= menu.height + 1,
+              `the overflow menu leaves the viewport vertically at ${viewport.width} (${lang})`);
+            await page.keyboard.press('Escape');
+          }
+        }
+      }
+    }
+  } finally {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    }).catch(() => {});
+    await page.setViewportSize({ width: 1440, height: 960 });
   }
 });
 

@@ -559,6 +559,15 @@ test('calculation-log snapshot link opens a read-only graph replay', async () =>
   assert.equal(opened.locked, true, 'the snapshot canvas is not locked');
   assert.equal(opened.snapshotMode, true);
   assert.equal(opened.badgeHidden, false, 'the read-only badge is missing');
+  assert.equal(await page.locator('#cvSnapshotBadge').isVisible(), true,
+    'the snapshot badge is not visible');
+  assert.match(await page.locator('#cvSnapshotBadge').innerText(), /只读|read-only/,
+    'the snapshot badge does not say the replay is read-only');
+  /* No save, enable or overflow affordance may survive in snapshot mode. */
+  for (const id of ['cvSave', 'cvEnable', 'cvMoreBtn', 'cvTryBtn', 'cvDisable']) {
+    assert.equal(await page.locator('#' + id).isVisible(), false,
+      `snapshot mode still exposes #${id}`);
+  }
   for (const key of ['palette', 'inspector', 'actions', 'lifecycle', 'chips']) {
     assert.equal(opened[key], 'none', `snapshot mode still shows ${key}`);
   }

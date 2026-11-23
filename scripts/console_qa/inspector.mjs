@@ -921,18 +921,46 @@ test('P0 inspector applies to draft and lifecycle explains publish state', async
     const { t } = await import('/console/i18n.js');
     return t('cv.ins.apply');
   }));
-  await page.locator('#cvInspectorBody [data-field="instructions"]').fill('P0 只应用到草稿');
-  await apply.click();
-  await waitFor(async () => {
-    const badge = document.getElementById('cvLifecycle');
-    return badge && badge.dataset.state === 'unpublished';
-  });
-  assert.equal(await page.locator('#cvRevision').count(), 0);
-  assert.equal(await page.locator('#cvClean').count(), 0);
-  assert.equal(await page.locator('#cvDirty').count(), 0);
-  assert.equal(await page.locator('#cvEnabled').count(), 0);
-  await saveNow();
-  assert.equal(await page.locator('#cvLifecycle').getAttribute('data-state'), 'running');
+  const writes = [];
+  const onRequest = request => {
+    if (request.method() !== 'PUT' && request.method() !== 'POST') return;
+    const path = new URL(request.url()).pathname;
+    if (path === '/admin/trees/' + TREE_ID || path === '/admin/trees/' + TREE_ID + '/enable') {
+      writes.push(request.method() + ' ' + path);
+    }
+  };
+  page.on('request', onRequest);
+  try {
+    await page.locator('#cvInspectorBody [data-field="instructions"]').fill('P0 只应用到草稿');
+    await apply.click();
+    await waitFor(async () => {
+      const badge = document.getElementById('cvLifecycle');
+      return badge && badge.dataset.state === 'unpublished';
+    });
+    /* Inspector Apply is local-only: no tree write may leave the page. */
+    await page.waitForTimeout(120);
+    assert.deepEqual(writes, [], 'inspector Apply wrote the draft to the server');
+    assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
+      await page.evaluate(async () => {
+        const { t } = await import('/console/i18n.js');
+        return t('cv.publishUpdate');
+      }), 'a dirty enabled group must offer Save and update');
+    /* The toolbar primary is the one action that publishes the draft. */
+    await clickCanvasAction('cvEnable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.kind() === 'clean' &&
+        document.getElementById('cvLifecycle').dataset.state === 'running';
+    }, null, { timeout: 8000 });
+    assert.deepEqual(writes, ['PUT /admin/trees/' + TREE_ID],
+      'the toolbar publish did not issue exactly one server save');
+    assert.equal(await page.locator('#cvRevision').count(), 0);
+    assert.equal(await page.locator('#cvClean').count(), 0);
+    assert.equal(await page.locator('#cvDirty').count(), 0);
+    assert.equal(await page.locator('#cvEnabled').count(), 0);
+  } finally {
+    page.off('request', onRequest);
+  }
 });
 
 test('review-inspector-adds-input-connection', async () => {

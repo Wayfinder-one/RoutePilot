@@ -78,9 +78,15 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 | Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
 | Decision groups | Canvas editor, graph settings, inspector, validation, dry run, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
-| JEV Model | Endpoint, model, prompt/state template, connection test, context and input-token window |
-| Models | Model registry, upstream model ids, providers, reasoning declarations, capability notes |
+| Decision service | Read-only service profile (address, model, key status, test status) with Save and test; prompts, timeout and the context window live under Advanced |
+| Models | Model registry; Connect models onboards a catalog provider and its models in one save, with slot IDs, reasoning declarations and provider protocol under Advanced |
 | Users | Admin/viewer accounts, passwords, roles, status |
+
+### Common paths
+
+- The decision-group toolbar defaults to **Try run** and **Save and enable**; an enabled draft with pending edits reads **Save and update**. **Save draft** and Disable live under **More**. The inspector's **Apply** only updates the local draft and never writes to the server.
+- On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically; manual IDs, reasoning declarations and provider protocol settings stay under Advanced.
+- The **Decision service** page shows only connection details by default; **Save and test** saves the service configuration, then the context window, then tests the connection. Prompts, the state template, timeout and token window live under Advanced, and the raw test response expands on demand.
 
 ### Model test chat
 
@@ -103,7 +109,8 @@ The routing page is split into two zones.
 - Typed wires; a numeric output dropped into a boolean slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
 - Dragging an output onto empty canvas quick-creates a compatible node.
-- Save and enable are separate; dirty and layout-only states are shown in the toolbar.
+- Save and enable stay separate; the lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
+- The inspector's **Apply** commits to the local draft only; the toolbar primary is the only action that writes to the server.
 - Target cards show display name, model list, fallback role and scheduling strategy.
 
 **Execution zone** — docked below the canvas:
@@ -230,14 +237,14 @@ A provider API key never appears in a response: the projection exposes `key_pres
 
 ## Decision service (JEV)
 
-![JEV model settings](assets/routepilot/en/jev.png)
+![Decision service settings (JEV)](assets/routepilot/en/jev.png)
 
-The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. Console settings:
+The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. The page opens on a read-only service profile — service address, model, key status and this session's test status — and only **Edit configuration** reveals the address, model and API key fields.
 
-- base URL, model, API key, timeout;
-- default instructions and state template (must contain `{request}`);
-- connection test with two fixed candidates;
-- context budget and input truncation limit; oversized input is truncated head/tail.
+- **Save and test** is the only primary action. It runs `PUT /admin/jev` → `PUT /admin/jev/window` → `POST /admin/jev/test` in that fixed order; the context window is validated locally first, so a validation failure issues no write at all.
+- Partial success names the exact stopping point: configuration not saved (window and test skipped), connection and prompts saved but window not saved (test skipped), configuration and window saved but the test failed, or everything succeeded. A failed test never leaves the previous result or raw response behind.
+- Timeout, clear-key, default instructions, the state template, the context/input-token window and custom test text live under **Advanced settings**.
+- After a passing test the raw JSON response is available on demand and collapsed by default; on failure it is hidden and cleared. Oversized input is truncated head/tail, and the context budget and input limit travel with the window configuration.
 
 When the active decision group carries embedded `jev` / `jev_window` fields, that configuration is authoritative and the environment never overwrites it (an embedded `jev: null` also counts as decided). For legacy documents and instances without an active group, `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` seed the database on first start only and the database is authoritative afterwards. JSON never carries `api_key`: an endpoint-matching stored key is reused, otherwise `ROUTER_JEV_API_KEY` is read from the environment when the snapshot is built.
 

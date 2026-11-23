@@ -810,6 +810,9 @@ function renderModelModal() {
 }
 
 /* ── provider modal ─────────────────────────────────────────────────── */
+/* `name == null` (add mode) is retained but no longer UI-reachable: providers
+   are created by the preset save or the inline custom-provider form, and
+   #provModal only opens from an existing provider card for editing. */
 function openProvModal(name) {
   const existing = name ? providerOf(name) : null;
   provModal = { name: name || null, mode: name ? 'edit' : 'add',
@@ -942,7 +945,7 @@ async function fetchAvailableModels() {
     if (key) body.api_key = key;
   } else {
     const provider = $('#cmProvider') ? $('#cmProvider').value : '';
-    if (!provider) { msg.textContent = t('models.custom.required'); msg.classList.add('bad'); return; }
+    if (!provider) { msg.textContent = t('models.custom.fetchNeedProvider'); msg.classList.add('bad'); return; }
     body = { provider };
   }
   btn.disabled = true;

@@ -158,6 +158,15 @@ test('P0 toolbar keeps only primary actions visible and overflow remains operabl
   for (const id of ['cvTryBtn', 'cvEnable', 'cvMoreBtn']) {
     assert.equal(await page.locator('#' + id).isVisible(), true, id + ' must be visible');
   }
+  assert.equal(await page.locator('#cvIssuesBtn').isVisible(), true,
+    'the validation entry must stay visible at the right end');
+  const visiblePrimary = await page.evaluate(() =>
+    ['cvTryBtn', 'cvMoreBtn', 'cvEnable', 'cvIssuesBtn'].filter(id => {
+      const element = document.getElementById(id);
+      return !!element && element.getClientRects().length > 0;
+    }));
+  assert.deepEqual(visiblePrimary, ['cvTryBtn', 'cvMoreBtn', 'cvEnable', 'cvIssuesBtn'],
+    'the first screen must expose only the primary actions plus the validation entry');
   for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
                     'cvLoadExample', 'cvImport', 'cvExport']) {
     assert.equal(await page.locator('#' + id).count(), 1, id + ' must still exist in the toolbar');
