@@ -65,13 +65,13 @@ def schema_version(conn):
     return conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
 
 
-def test_v5_schema_is_current_only_idempotent_and_wal(tmp_path):
+def test_v6_schema_is_current_only_idempotent_and_wal(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
     migrate(conn)
     tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {
-        "models", "providers", "time_periods", "jev_config",
+        "models", "providers", "time_periods", "jev_services",
         "request_logs", "changes", "settings", "users",
         "user_sessions", "breaker", "schema_migrations",
         "graph_snapshots", "request_snapshots",
@@ -80,14 +80,14 @@ def test_v5_schema_is_current_only_idempotent_and_wal(tmp_path):
     assert not {"keyword_groups", "sessions", "stations", "nodes", "requests", "request_ledger", "evals"} & tables
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     conn.close()
 
 
-def test_empty_database_is_created_directly_at_v5_with_waves(tmp_path):
+def test_empty_database_is_created_directly_at_v6_with_waves(tmp_path):
     conn = connect(str(tmp_path / "v3.db"))
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     assert "waves" in column_names(conn, "request_logs")
     assert "routing_trees" not in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
@@ -106,7 +106,7 @@ def test_v1_upgrade_adds_waves_and_keeps_old_log_rows(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     assert "waves" in column_names(conn, "request_logs")
     row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
     assert row["id"] == "old-row"
@@ -114,7 +114,7 @@ def test_v1_upgrade_adds_waves_and_keeps_old_log_rows(tmp_path):
     assert row["outcome_state"] == "completed"
     assert row["waves"] is None
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     conn.close()
 
 
@@ -139,13 +139,13 @@ def test_v1_upgrade_keeps_existing_graph_trees(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     assert "waves" in column_names(conn, "request_logs")
     assert conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
     conn.close()
 
 
-def test_v2_upgrade_to_v5_keeps_graph_rows_logs_and_waves(tmp_path):
+def test_v2_upgrade_to_v6_keeps_graph_rows_logs_and_waves(tmp_path):
     path = str(tmp_path / "v2.db")
     old = build_v2_database(path)
     old.execute(
@@ -170,7 +170,7 @@ def test_v2_upgrade_to_v5_keeps_graph_rows_logs_and_waves(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     assert conn.execute("SELECT waves FROM request_logs WHERE id = 'v2-row'").fetchone()[0] == 2
     assert conn.execute("SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
     conn.close()
@@ -245,7 +245,7 @@ def test_old_versioned_database_is_rejected_not_migrated(tmp_path):
     conn = connect(path)
     with pytest.raises(RuntimeError, match="new database"):
         migrate(conn)
-    assert "jev_config" not in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "jev_services" not in {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     conn.close()
 
 
@@ -260,7 +260,7 @@ def test_unversioned_nonempty_database_is_rejected(tmp_path):
     conn.close()
 
 
-def test_v3_upgrade_drops_empty_config_revisions_and_records_v5(tmp_path):
+def test_v3_upgrade_drops_empty_config_revisions_and_records_v6(tmp_path):
     path = str(tmp_path / "v3.db")
     old = build_v3_database(path)
     assert old.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 0
@@ -268,13 +268,13 @@ def test_v3_upgrade_drops_empty_config_revisions_and_records_v5(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     objects = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
     assert "config_revisions" not in objects
     assert "idx_config_revisions_kind" not in objects
     assert {"models", "providers", "request_logs", "changes", "users"} <= objects
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     conn.close()
 
 
@@ -314,7 +314,7 @@ def test_v4_upgrade_adds_snapshots_and_keeps_request_logs(tmp_path):
 
     conn = connect(path)
     migrate(conn)
-    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 5
+    assert conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 6
     assert {"graph_snapshots", "request_snapshots"} <= {
         row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
@@ -324,6 +324,6 @@ def test_v4_upgrade_adds_snapshots_and_keeps_request_logs(tmp_path):
     ).fetchone() is not None
     # 重复迁移幂等：版本不涨、旧行不动。
     migrate(conn)
-    assert schema_version(conn) == 5
+    assert schema_version(conn) == 6
     assert conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0] == 1
     conn.close()
