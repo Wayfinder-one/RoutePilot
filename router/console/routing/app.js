@@ -13,6 +13,7 @@ import { LANG, onLangChange, t, tf } from '../i18n.js';
 import * as RTGraph from './graph.js';
 import { DraftStore } from './draft.js';
 import { RoutingController } from './controller.js';
+import { addRuntimeModel } from './runtime.js';
 import { escape as esc, nodeName, render as renderCards } from './cards.js';
 import { create as createCanvas } from './canvas.js';
 import {
@@ -90,12 +91,15 @@ function kindLabel(kind) {
   return item ? t(item.labelKey) : kind;
 }
 
-/* ── 检查器目录：当前树的内嵌运行配置优先，旧草稿沿用全局目录 ─────
-   树有 runtime 时，模型/时段以文档自带的 backends/time_periods 为准（与运行快照
-   消费同一事实源）；新草稿/旧图没有 runtime 才回退 /admin/models 与
-   /admin/time-periods 的全局目录。 */
+/* ── 目录：数据库目录（/admin/*）与当前树内嵌运行快照 ─────────────────
+   严格自包含画布的编辑语义：
+     · 检查器「模型」下拉来自数据库模型目录（选择 target 模型时把目录项补进
+       画布快照；同 ID 已存在时不覆盖，数据库差异只作为 /admin/try 的检查提示）；
+     · 「JEV」下拉来自数据库 JEV 目录（应用时原子替换 runtime.jev/jev_window）；
+     · 时段复选框以画布 runtime.time_periods 为准 —— 画布引用未声明的时段会被
+       服务端拒绝，所以不能拿全局时段目录当选项源。
+   目录在 boot 时并行加载（app.catalog），新画布创建前必须 await。 */
 function currentRuntime() {
-  /* 旧 graph.js（未带自包含 runtime）也能跑：缺少视图函数时退回全局目录。 */
   if (!store.tree || typeof RTGraph.runtimeBehaviorView !== 'function') return null;
   return RTGraph.runtimeBehaviorView(store.tree);
 }
@@ -150,33 +154,67 @@ function runtimeModels() {
     runtimeModelOption(model, providerFormatOf(runtime, model && model.provider)));
 }
 
-/* 检查器消费者只需要 id / reasoning / profile：runtime 投影与 /admin/models 同形。 */
-function effectiveModels() {
-  const models = runtimeModels();
-  return models || app.models || [];
+/* 数据库模型目录 → 检查器形状；provider 协议取数据库 provider 声明。 */
+function catalogModels() {
+  const providers = (app.catalog && app.catalog.providers) || [];
+  return ((app.catalog && app.catalog.models) || []).map(model => {
+    const provider = providers.find(item => item && item.name === model.provider);
+    return runtimeModelOption(model, provider ? provider.reasoning_format : 'openai');
+  });
 }
 
+/* 检查器模型下拉 = 数据库模型目录（spec「模型下拉框来自数据库模型目录」）。
+   画布快照里数据库已不存在的模型由 modelRowHTML 的「当前值」兜底选项展示。 */
+function inspectorModels() {
+  return catalogModels();
+}
+
+/* 时段选项只认画布运行快照：引用未声明时段会被服务端校验拒绝。 */
 function effectivePeriods() {
   const runtime = currentRuntime();
-  if (!runtime) return app.periods || [];
+  if (!runtime) return [];
   return (Array.isArray(runtime.time_periods) ? runtime.time_periods : [])
     .map(period => (period && period.name) || '')
     .filter(Boolean);
 }
 
+/* 新建 target 的默认模型：优先画布快照里已有的模型（不改快照即可执行），
+   否则用数据库目录第一个（由调用方在同一次 change 里补进快照）。 */
 function defaultModelId() {
-  const models = effectiveModels();
-  if (models.length) return models[0].id;
-  return 'qwen3-8b';
+  const runtimeModelsList = runtimeModels() || [];
+  if (runtimeModelsList.length) return runtimeModelsList[0].id;
+  const models = inspectorModels();
+  return models.length ? models[0].id : '';
 }
 
 function reasoningFor(modelId) {
-  const model = effectiveModels().find(item => item && item.id === modelId);
+  const runtimeModel = (runtimeModels() || []).find(item => item && item.id === modelId);
+  const model = runtimeModel || inspectorModels().find(item => item && item.id === modelId);
   if (!model) return null;
   const reasoning = model.reasoning ||
     (model.profile && typeof model.profile === 'object' ? model.profile.reasoning : null);
   if (!reasoning || reasoning.declared === false || reasoning.supported === false) return null;
   return reasoning.default || null;
+}
+
+/* 把 target 引用的模型及其 provider 的非密钥目录信息补进画布快照。
+   同 ID 已存在时 addRuntimeModel 不覆盖旧快照（数据库漂移只做检查提示）。 */
+function targetModelIds(node) {
+  if (!node || node.type !== 'target' || !Array.isArray(node.models)) return [];
+  return node.models.map(item => item && item.model).filter(Boolean);
+}
+
+function embedRuntimeModels(tree, modelIds) {
+  if (!tree || !tree.runtime || !modelIds || !modelIds.length) return;
+  const models = (app.catalog && app.catalog.models) || [];
+  const providers = (app.catalog && app.catalog.providers) || [];
+  modelIds.forEach(id => {
+    const model = models.find(item => item && item.id === id);
+    if (!model) return;
+    const provider = providers.find(item => item && item.name === model.provider);
+    if (!provider) return;
+    tree.runtime = addRuntimeModel(tree.runtime, model, provider);
+  });
 }
 
 function nextPriority(graph) {
@@ -290,6 +328,10 @@ let confirmState = null;
 /* 装配层暴露给模块与测试观察的只读视图；没有 window 全局。 */
 const app = {
   kit: null,
+  /* 数据库目录（/admin/providers、/admin/models、/admin/jev、/admin/time-periods）。
+     catalogReady 是 boot 里创建的 Promise：新画布创建前必须 await。 */
+  catalog: { providers: [], models: [], services: [], periods: [] },
+  catalogReady: null,
   models: [],
   periods: [],
   issues: [],
@@ -337,7 +379,8 @@ const hooks = {
   isInspectorEditing: () => inspectorEditing(),
   fitAfterReplace: () => fitAfterReplace(),
   renderTreeSelect: () => renderTreeSelect(),
-  getModels: () => app.models,
+  getCatalog: () => app.catalog,
+  getModels: () => inspectorModels(),
   change: (kind, mutate) => app.change(kind, mutate),
 };
 
@@ -1078,6 +1121,7 @@ function createQuick(kind) {
     createdNode = makeNode(kind, { x: context.x + 24, y: context.y - 40 }, tree.root);
     if (!createdNode) return;
     tree.root.nodes.push(createdNode);
+    embedRuntimeModels(tree, targetModelIds(createdNode));
     const result = RTGraph.addEdge(tree.root, {
       source: context.sourceNodeId,
       source_port: context.sourcePort,
@@ -1102,7 +1146,11 @@ function createFromLibrary(kind, position) {
   let created = null;
   change('behavior', tree => {
     created = makeNode(kind, position, tree.root);
-    if (created) tree.root.nodes.push(created);
+    if (created) {
+      tree.root.nodes.push(created);
+      /* 新 target 引用的模型（及其 provider）必须在同一次历史项里补进画布快照。 */
+      embedRuntimeModels(tree, targetModelIds(created));
+    }
   });
   if (!created) return;
   app.kit.select('node', created.id);
@@ -1366,7 +1414,11 @@ function bindToolbar() {
     return action.apply(null, arguments);
   };
   const actions = {
-    cvNewTree: requireBooted(() => controller.newTree()),
+    /* 新建画布必须等数据库目录：目录未到就点「新建」时排队等待而不是造空 runtime。 */
+    cvNewTree: requireBooted(async () => {
+      try { await app.catalogReady; } catch (error) { /* newDraftTree 给出明确错误 */ }
+      return controller.newTree();
+    }),
     cvImport: requireBooted(() => controller.openImport()),
     cvExport: () => controller.exportTree(),
     cvSave: () => controller.save(),
@@ -1552,12 +1604,16 @@ function createKit() {
     store: store,
     getGraph: () => store.graph,
     getTree: () => store.tree,
-    /* 当前树的 runtime 优先；旧草稿回退全局目录（见顶部 effectiveModels）。 */
-    getModels: () => effectiveModels(),
+    /* 模型目录来自数据库（选择时补进画布快照）；时段来自画布运行快照。 */
+    getModels: () => inspectorModels(),
     getPeriods: () => effectivePeriods(),
+    getProviders: () => (app.catalog && app.catalog.providers) || [],
+    getJevServices: () => (app.catalog && app.catalog.services) || [],
+    getCatalog: () => app.catalog,
     getSelection: () => (app.kit ? app.kit.getSelection() : app.selection),
     requestDelete: selection => requestDelete(selection),
     addEdge: draft => app.kit.addEdge(draft),
+    toast: (message, tone) => toast(message, tone),
   });
   configureTryRun({
     store: store,
@@ -1631,20 +1687,50 @@ async function bootLogSnapshot() {
   }
 }
 
+/* 数据库目录：providers / models / JEV 服务 / 时段。四个端点相互独立，任一失败
+   只让对应目录为空（不阻断画布加载）；新画布创建前必须 await 这个 Promise。 */
+async function loadCatalog() {
+  const [providers, models, services, periods] = await Promise.all([
+    api.get('/admin/providers').then(result => result.providers || []).catch(() => []),
+    api.get('/admin/models').then(result => result.models || []).catch(() => []),
+    api.get('/admin/jev').then(result => result.services || []).catch(() => []),
+    api.get('/admin/time-periods').then(result => result.periods || []).catch(() => [])
+  ]);
+  app.catalog = {
+    providers: Array.isArray(providers) ? providers : [],
+    models: Array.isArray(models) ? models : [],
+    services: Array.isArray(services) ? services : [],
+    periods: Array.isArray(periods) ? periods : []
+  };
+  app.models = app.catalog.models;
+  app.periods = app.catalog.periods
+    .map(period => (period && period.name) || '')
+    .filter(Boolean);
+  return app.catalog;
+}
+
+/* boot 兜底 / 新建：创建新画布必须等数据库目录就绪；目录为空或缺少 provider 时
+   controller.newDraftTree() 抛明确错误，这里提示并把画布留在「无草稿」状态。 */
+async function loadDraftTree() {
+  try {
+    await app.catalogReady;
+  } catch (error) { /* 目录加载失败时由 newDraftTree 给出明确错误 */ }
+  try {
+    controller.loadTree(controller.newDraftTree(), false);
+    return true;
+  } catch (error) {
+    toast(String(error && error.message ? error.message : error), 'error');
+    return false;
+  }
+}
+
 async function boot() {
   createKit();
   if (isLogSnapshot()) return bootLogSnapshot();
   bindEvents();
   renderPalette();
-  /* 模型目录与决策组解耦：/admin/models 抖动不能回退或清空已加载的草稿。 */
-  const modelsReady = api.get('/admin/models')
-    .then(result => { app.models = result.models || []; })
-    .catch(() => { app.models = []; });
-  const periodsReady = api.get('/admin/time-periods')
-    .then(result => {
-      app.periods = (result.periods || []).map(period => period && period.name).filter(Boolean);
-    })
-    .catch(() => { app.periods = []; });
+  /* 目录与决策组解耦：目录抖动不能清空已加载的草稿；只有「新建画布」需要目录。 */
+  app.catalogReady = loadCatalog();
   try {
     const treeResult = await api.get('/admin/trees');
     controller.trees = treeResult.trees || [];
@@ -1655,20 +1741,20 @@ async function boot() {
       const result = await api.get('/admin/trees/' + encodeURIComponent(enabled.id));
       const tree = result && result.tree;
       if (tree && tree.root) controller.loadTree(tree, true);
-      else controller.loadTree(controller.newDraftTree(), false);
+      else await loadDraftTree();
     } else {
-      controller.loadTree(controller.newDraftTree(), false);
+      await loadDraftTree();
     }
   } catch (error) {
     controller.trees = [];
     toast(tf('cv.toastLoadFail', { err: apiErrText(error) }), 'error');
-    controller.loadTree(controller.newDraftTree(), false);
+    await loadDraftTree();
   }
-  /* 树加载完成即解锁画布与节点库；模型/时段目录只影响检查器选项，不能阻塞建模。 */
+  /* 树加载完成即解锁画布与节点库；目录只影响检查器选项与新画布。 */
   app.booted = true;
-  await Promise.all([modelsReady, periodsReady]);
+  await app.catalogReady;
   if (!store.tree) return;
-  /* 模型/时段目录晚到：重绘一次让检查器的下拉框拿到最新选项。
+  /* 目录晚到：重绘一次让检查器的下拉框拿到最新选项。
      若用户正在检查器里编辑，跳过这次重绘（下一次选择/保存自然带上新目录），
      否则会清掉还没提交的输入。 */
   if (inspectorEditing()) return;

@@ -25,8 +25,39 @@ function exampleGraph() {
   return RTGraph.clone(readExample());
 }
 
-function minimalTree() {
-  return RTGraph.createMinimalTree('qwen3-8b');
+/* 严格自包含：新草稿的 runtime 必须是完整四字段快照，且 target 模型在快照内。 */
+function minimalRuntime(modelId) {
+  const model = modelId || 'qwen3-8b';
+  return {
+    backends: {
+      providers: [{ name: 'local', base_url: 'http://upstream.test/v1', key_env: '', reasoning_format: 'openai' }],
+      models: [{ id: model, upstream: model, provider: 'local', profile: {} }]
+    },
+    jev: null,
+    jev_window: { input_tokens: 1024, context_tokens: 4096 },
+    time_periods: []
+  };
+}
+
+function minimalTree(modelId) {
+  const model = modelId || 'qwen3-8b';
+  return RTGraph.createMinimalTree(model, minimalRuntime(model));
+}
+
+/* 手工文档的完整 runtime：target 引用的模型必须在快照里（严格契约会拒绝）。 */
+function documentRuntime(modelIds, periods) {
+  const ids = Array.isArray(modelIds) && modelIds.length ? modelIds : ['qwen3-8b'];
+  const runtime = minimalRuntime(ids[0], periods);
+  runtime.backends.models = ids.map(id => ({
+    id: id, upstream: id, provider: 'local', profile: {}
+  }));
+  return runtime;
+}
+
+function exampleRuntime() {
+  const parsed = RTGraph.parseImport(fs.readFileSync(EXAMPLE_URL, 'utf8'));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed.issues));
+  return parsed.tree.runtime;
 }
 
 function targetOf(graph) {
@@ -83,6 +114,10 @@ function importText(tree) {
     sticky: tree.sticky == null ? { enabled: false, ttl_seconds: 1800 } : tree.sticky,
     root: root,
   };
+  /* 严格自包含：导入文档必须带完整四字段快照（helpers 构造的树同样如此）。 */
+  const runtime = tree.runtime;
+  if (!runtime) throw new Error('importText helper needs a tree with a complete runtime');
+  RTGraph.RUNTIME_FIELDS.forEach(field => { document[field] = RTGraph.clone(runtime[field]); });
   if (Object.keys(canvas).length) document.canvas = canvas;
   return JSON.stringify(document);
 }
@@ -130,7 +165,7 @@ function choiceGraph() {
 /* ── 1. 直方示例（brief 原文，不得改动断言） ───────────────────────── */
 
 test('layout-only changes keep behavior canonical and titles are display changes', () => {
-  const before = RTGraph.createMinimalTree('qwen3-8b');
+  const before = minimalTree('qwen3-8b');
   const moved = RTGraph.clone(before);
   moved.root.nodes[0].position = { x: 900, y: 700 };
   assert.equal(RTGraph.behaviorCanonical(before), RTGraph.behaviorCanonical(moved));
@@ -142,7 +177,7 @@ test('layout-only changes keep behavior canonical and titles are display changes
 });
 
 test('slot numbers remain stable and the smallest hole is reused', () => {
-  const graph = RTGraph.createMinimalTree('qwen3-8b');
+  const graph = minimalTree('qwen3-8b');
   const target = graph.root.nodes.find(node => node.type === 'target');
   graph.root.edges[0].target_port = 'in_3';
   assert.equal(RTGraph.nextSlot(graph.root, target.id), 'in_1');
@@ -400,10 +435,10 @@ test('canConnect tolerates malformed edge entries kept by import instead of thro
   assert.equal(RTGraph.canConnect(graph, {
     source: 'start', source_port: 'out', target: target.id, target_port: 'in_1',
   }).ok, false);
-  const imported = RTGraph.parseImport(JSON.stringify({
+  const imported = RTGraph.parseImport(JSON.stringify(Object.assign({
     kind: 'sr-routing-graph', version: 3, name: 'x', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 }, root: graph,
-  }));
+  }, documentRuntime(['qwen3-8b']))));
   assert.equal(imported.ok, false, 'non-object edges made parseImport return ok');
   assert.equal(hardIssues(imported.issues).some(issue => issue.code === 'graph_parse_error'), true,
     'malformed edge entries must still surface as a validation issue');
@@ -574,10 +609,10 @@ test('layoutPositions lays the graph out by DAG depth', () => {
 test('import fills missing positions with the DAG layout', () => {
   const root = readExample();
   root.nodes.forEach(node => { delete node.position; });
-  const text = JSON.stringify({
+  const text = JSON.stringify(Object.assign({
     kind: 'sr-routing-graph', version: 3, name: '电力示例', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 }, root,
-  });
+  }, exampleRuntime()));
   const result = RTGraph.parseImport(text);
   assert.equal(result.ok, true);
   for (const node of result.tree.root.nodes) {
@@ -600,6 +635,7 @@ test('serialize and parseImport round-trip the complete envelope', () => {
     timezone: 'Asia/Shanghai',
     sticky: { enabled: true, ttl_seconds: 1800 },
     root: readExample(),
+    runtime: exampleRuntime(),
   };
   const text = RTGraph.serialize(tree);
   const exported = JSON.parse(text);
@@ -925,6 +961,7 @@ test('parseImport output is behavior-stable across coordinate-only round trips',
   const tree = {
     name: '坐标测试', timezone: 'Asia/Shanghai',
     sticky: { enabled: true, ttl_seconds: 600 }, root: readExample(),
+    runtime: exampleRuntime(),
   };
   const imported = RTGraph.parseImport(RTGraph.serialize(tree));
   assert.equal(imported.ok, true);
@@ -1494,7 +1531,7 @@ test('calculation log model distinguishes failed waves from normal no-candidate 
 /* ── 12. 画布坐标边界：顶层 canvas ⇄ 内部 node.position（Task 3） ──── */
 
 test('import dispatches top-level canvas into node positions', () => {
-  const document = {
+  const document = Object.assign({
     kind: 'sr-routing-graph', version: 3, name: '导入', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: {
@@ -1506,7 +1543,7 @@ test('import dispatches top-level canvas into node positions', () => {
       edges: []
     },
     canvas: { start: { x: 11, y: 22 } }
-  };
+  }, documentRuntime(['fast']));
   const result = RTGraph.parseImport(JSON.stringify(document));
   assert.equal(result.ok, true, JSON.stringify(result.issues));
   const start = result.tree.root.nodes.find(node => node.id === 'start');
@@ -1514,7 +1551,7 @@ test('import dispatches top-level canvas into node positions', () => {
 });
 
 test('export collects node positions into a top-level canvas', () => {
-  const tree = {
+  const tree = Object.assign({
     name: '导出', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: {
@@ -1525,14 +1562,14 @@ test('export collects node positions into a top-level canvas', () => {
       ],
       edges: []
     }
-  };
+  }, { runtime: documentRuntime(['fast']) });
   const document = JSON.parse(RTGraph.serialize(tree));
   assert.deepEqual(document.canvas, { start: { x: 3, y: 4 } });
   for (const node of document.root.nodes) assert.equal('position' in node, false);
 });
 
 test('import rejects a node-level position field', () => {
-  const document = {
+  const document = Object.assign({
     kind: 'sr-routing-graph', version: 3, name: '', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: {
@@ -1540,19 +1577,19 @@ test('import rejects a node-level position field', () => {
       nodes: [{ id: 'start', type: 'start', position: { x: 1, y: 2 } }],
       edges: []
     }
-  };
+  }, documentRuntime(['qwen3-8b']));
   const result = RTGraph.parseImport(JSON.stringify(document));
   assert.equal(result.ok, false);
   assert.ok(result.issues.some(item => item.code === 'graph_parse_error'));
 });
 
 test('invalid canvas shapes are rejected on import', () => {
-  const base = {
+  const base = Object.assign({
     kind: 'sr-routing-graph', version: 3, name: '', timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: { id: 'root', type: 'graph', error_fallback: null,
       nodes: [{ id: 'start', type: 'start' }], edges: [] }
-  };
+  }, documentRuntime(['qwen3-8b']));
   for (const canvas of [[], { ghost: { x: 1, y: 2 } }, { start: { x: 1 } }]) {
     const result = RTGraph.parseImport(JSON.stringify(Object.assign({}, base, { canvas })));
     assert.equal(result.ok, false, JSON.stringify(canvas));
@@ -1601,7 +1638,7 @@ function selfContainedDocument() {
         }
       ]
     },
-    jev: { base_url: 'http://jev.test/v1', model: 'jev-model' },
+    jev: { id: 'jev-test', base_url: 'http://jev.test/v1', model: 'jev-model' },
     jev_window: { input_tokens: 1024, context_tokens: 4096 },
     time_periods: [
       { name: 'peak', days: [0, 1, 2, 3, 4], start: '09:00', end: '18:00' },
@@ -1636,7 +1673,8 @@ function expectedRuntime() {
       ]
     },
     jev: {
-      base_url: 'http://jev.test/v1', model: 'jev-model', timeout_seconds: 10,
+      id: 'jev-test', base_url: 'http://jev.test/v1', model: 'jev-model', key_env: '',
+      timeout_seconds: 10,
       instructions: defaults.instructions, state_template: defaults.state_template
     },
     jev_window: { input_tokens: 1024, context_tokens: 4096 },
@@ -1669,7 +1707,10 @@ test('self-contained documents import, normalize defaults and round-trip the run
   assert.equal(result.tree.name, '自包含决策组');
   assert.equal(hardIssues(result.issues).length, 0);
   assert.equal(RTGraph.hasRuntime(result.tree), true);
-  assert.equal(RTGraph.hasRuntime(minimalTree()), false);
+  /* 严格契约：新草稿同样携带完整运行快照，没有「无 runtime」的第二条路径。 */
+  assert.equal(RTGraph.hasRuntime(minimalTree()), true);
+  assert.deepEqual(Object.keys(minimalTree().runtime).sort(),
+    ['backends', 'jev', 'jev_window', 'time_periods']);
 
   const text = RTGraph.serialize(result.tree);
   const document = JSON.parse(text);
@@ -1691,33 +1732,40 @@ test('self-contained documents import, normalize defaults and round-trip the run
   /* 导出/保存 payload 用的投影：tree 与 runtime 对象两种入参等价。 */
   assert.deepEqual(RTGraph.runtimeDocumentView(result.tree), expectedRuntime());
   assert.deepEqual(RTGraph.runtimeDocumentView(result.tree.runtime), expectedRuntime());
-  assert.equal(RTGraph.runtimeDocumentView(minimalTree()), null);
+  assert.deepEqual(RTGraph.runtimeDocumentView(minimalTree()), minimalTree().runtime);
 });
 
-test('serialize drops secret and derived runtime fields even from a tampered tree', () => {
+test('serialize refuses tampered runtime secrets and never exports key material', () => {
   const imported = importSelfContained();
+  /* 严格导出：运行配置里的密钥/派生密钥字段是解析非法态，serialize 直接拒绝，
+     而不是把内部被污染的草稿「洗一遍」后继续导出（写路径同样会先被拒绝）。 */
   const tampered = RTGraph.clone(imported.tree);
   tampered.runtime.backends.providers[0].api_key = 'sk-should-not-be-exported';
   tampered.runtime.backends.providers[0].key_source = 'stored';
   tampered.runtime.jev.api_key = 'sk-should-not-be-exported';
   tampered.runtime.jev.key_present = true;
-  /* profile 是自由 JSON 元数据：嵌套对象/数组里的密钥同样不得随导出泄漏。 */
-  tampered.runtime.backends.models[0].profile.metadata = {
-    labels: [{ 'API-KEY': 'sk-should-not-be-exported', tier: 'keep-me' }],
-    authorization: 'sk-should-not-be-exported'
-  };
-  const text = RTGraph.serialize(tampered);
-  assert.equal(text.includes('sk-should-not-be-exported'), false);
-  for (const secret of ['api_key', 'key_present', 'key_source', 'authorization', 'API-KEY']) {
+  assert.throws(() => RTGraph.serialize(tampered),
+    /api_key|key_source|未知字段/, 'serialize exported a runtime carrying secret fields');
+
+  /* 合法文档的导出文本只含四字段快照，不含任何密钥/派生字段键名。 */
+  const text = RTGraph.serialize(imported.tree);
+  const runtime = JSON.parse(text);
+  for (const secret of ['api_key', 'key_present', 'key_source', 'authorization']) {
     assert.equal(text.includes(secret), false, 'serialize leaked ' + secret);
   }
-  const runtime = JSON.parse(text);
-  assert.deepEqual(runtime.backends.models[0].profile.metadata, {
-    labels: [{ tier: 'keep-me' }]
-  });
   assert.deepEqual(runtime.backends.providers, expectedRuntime().backends.providers);
   assert.deepEqual(runtime.backends.models[0].id, expectedRuntime().backends.models[0].id);
   assert.deepEqual(runtime.jev, expectedRuntime().jev);
+
+  /* 保存/试算 payload 的投影边界仍然脱敏：profile 里嵌套的密钥元数据被剔除。 */
+  const metadata = RTGraph.clone(imported.tree);
+  metadata.runtime.backends.models[0].profile.metadata = {
+    labels: [{ 'API-KEY': 'sk-should-not-be-exported', tier: 'keep-me' }],
+    authorization: 'sk-should-not-be-exported'
+  };
+  const view = RTGraph.runtimeDocumentView(metadata);
+  assert.deepEqual(view.backends.models[0].profile.metadata, { labels: [{ tier: 'keep-me' }] });
+  assert.equal(JSON.stringify(view).includes('sk-should-not-be-exported'), false);
 });
 
 test('self-contained documents accept a null jev block', () => {
@@ -1733,26 +1781,28 @@ test('self-contained documents accept a null jev block', () => {
   assert.deepEqual(rewritten.tree.runtime, result.tree.runtime);
 });
 
-test('legacy documents keep an explicit null runtime and unchanged canonical', () => {
-  /* 仓库自带 example.json 现在携带运行配置；旧文档用去掉四字段的同一份图验证。 */
+test('legacy documents without the four runtime fields are rejected', () => {
+  /* 旧文档（去掉四字段的同一份图）现在必须在 parseImport 阶段整体拒绝，
+     不再有「无 runtime 文档 + 运行时从数据库补齐」的兼容分支。 */
   const legacyDocument = JSON.parse(fs.readFileSync(EXAMPLE_URL, 'utf8'));
   for (const field of RTGraph.RUNTIME_FIELDS) delete legacyDocument[field];
   const parsed = RTGraph.parseImport(JSON.stringify(legacyDocument));
-  assert.equal(parsed.ok, true, JSON.stringify(parsed.issues));
-  assert.equal(parsed.tree.runtime, null);
-  assert.equal(RTGraph.hasRuntime(parsed.tree), false);
+  assert.equal(parsed.ok, false, 'a legacy document without runtime was accepted');
+  assert.equal(parsed.tree, undefined);
+  const issue = parsed.issues.find(item => item.code === 'graph_parse_error');
+  assert.ok(issue, 'legacy rejection must be graph_parse_error');
+  assert.match(issue.zh, /运行配置字段必须成组出现/);
+  assert.match(issue.en, /Runtime fields must appear together/);
 
-  const document = JSON.parse(RTGraph.serialize(parsed.tree));
-  for (const field of RTGraph.RUNTIME_FIELDS) {
-    assert.equal(Object.prototype.hasOwnProperty.call(document, field), false, field);
-  }
-  /* 显式 runtime:null 与完全缺失必须是同一份 canonical（旧文档逐字节不变）。 */
-  const explicitNull = Object.assign({}, parsed.tree, { runtime: null });
-  assert.equal(RTGraph.behaviorCanonical(explicitNull), RTGraph.behaviorCanonical(parsed.tree));
+  /* 显式 runtime:null 同属被删除的控制契约：顶层 runtime 是未知 envelope 字段。 */
+  const explicitNull = JSON.parse(fs.readFileSync(EXAMPLE_URL, 'utf8'));
+  explicitNull.runtime = null;
+  assert.equal(RTGraph.parseImport(JSON.stringify(explicitNull)).ok, false);
 
-  const minimal = RTGraph.parseImport(RTGraph.serialize(minimalTree()));
-  assert.equal(minimal.ok, true, JSON.stringify(minimal.issues));
-  assert.equal(minimal.tree.runtime, null);
+  /* serialize 也不再输出旧文档形态：缺 runtime 的树导出必须失败。 */
+  const broken = minimalTree();
+  delete broken.runtime;
+  assert.throws(() => RTGraph.serialize(broken), /backends/);
 });
 
 test('runtime fields must appear together and accept no sibling runtime key', () => {
@@ -1884,6 +1934,55 @@ test('invalid jev, window and time period values are rejected', () => {
   for (const [label, mutate] of cases) assertRuntimeRejected(mutate, label);
 });
 
+test('strict runtime contract rejects missing fields, jev.id and runtime:null', () => {
+  const imported = importSelfContained();
+  /* 缺任一运行字段：整体拒绝并点名缺失字段。 */
+  for (const field of RTGraph.RUNTIME_FIELDS) {
+    const document = JSON.parse(RTGraph.serialize(imported.tree));
+    delete document[field];
+    const result = RTGraph.parseImport(JSON.stringify(document));
+    assert.equal(result.ok, false, 'import accepted a document without ' + field);
+    const issue = result.issues.find(item => item.code === 'graph_parse_error');
+    assert.ok(issue && issue.zh.includes(field),
+      'missing ' + field + ' did not produce a field-specific graph_parse_error');
+  }
+  /* JEV 快照必须带服务 id（Python runtime._jev 同规则）。 */
+  const withoutId = JSON.parse(RTGraph.serialize(imported.tree));
+  delete withoutId.jev.id;
+  const rejected = RTGraph.parseImport(JSON.stringify(withoutId));
+  assert.equal(rejected.ok, false);
+  assert.ok(rejected.issues.some(item => item.code === 'graph_parse_error' && /jev\.id/.test(item.zh)));
+  /* runtime 控制字段（嵌套对象 / null）不是文档契约。 */
+  for (const control of [null, { backends: withoutId.backends }]) {
+    const document = JSON.parse(RTGraph.serialize(imported.tree));
+    document.runtime = control;
+    assert.equal(RTGraph.parseImport(JSON.stringify(document)).ok, false,
+      'a runtime control field was accepted: ' + JSON.stringify(control));
+  }
+});
+
+test('complete round-trip preserves the four runtime fields and canvas coordinates', () => {
+  const imported = importSelfContained();
+  /* 给每个节点不同的坐标：导出必须把内部 position 收集到顶层 canvas 并原样保留。 */
+  imported.tree.root.nodes.forEach((node, index) => {
+    node.position = { x: 13 * index + 1, y: 7 * index + 2 };
+  });
+  const document = JSON.parse(RTGraph.serialize(imported.tree));
+  assert.deepEqual(Object.keys(document).sort(), [
+    'backends', 'canvas', 'jev', 'jev_window', 'kind', 'name', 'root', 'sticky',
+    'time_periods', 'timezone', 'version'
+  ].sort());
+  assert.equal(document.runtime, undefined);
+  const parsedBack = RTGraph.parseImport(JSON.stringify(document));
+  assert.equal(parsedBack.ok, true, JSON.stringify(parsedBack.issues));
+  assert.deepEqual(parsedBack.tree.runtime, imported.tree.runtime);
+  assert.deepEqual(parsedBack.tree.root.nodes.map(node => node.position),
+    imported.tree.root.nodes.map(node => node.position),
+    'the top-level canvas coordinates did not survive the round-trip');
+  assert.equal(RTGraph.behaviorCanonical(parsedBack.tree),
+    RTGraph.behaviorCanonical(imported.tree));
+});
+
 test('runtime canonical keeps declared order and normalizes integral numbers', () => {
   const imported = importSelfContained();
   const canonical = RTGraph.behaviorCanonical(imported.tree);
@@ -1942,7 +2041,10 @@ test('runtimeBehaviorView projects only the Python behavior shape', () => {
   assert.deepEqual(RTGraph.runtimeBehaviorView(imported.tree.runtime), view);
   const flat = Object.assign({}, imported.tree.runtime, { name: 'envelope' });
   assert.deepEqual(RTGraph.runtimeBehaviorView(flat), view);
-  assert.equal(RTGraph.runtimeBehaviorView(minimalTree()), null);
+  const minimalView = RTGraph.runtimeBehaviorView(minimalTree());
+  assert.deepEqual(Object.keys(minimalView).sort(), ['backends', 'jev', 'jev_window', 'time_periods']);
+  assert.equal(minimalView.jev, null);
+  /* 投影函数对「完全没有 runtime」保持返回 null（内部草稿兜底）；解析入口已严格拒绝。 */
   assert.equal(RTGraph.runtimeBehaviorView({ runtime: null }), null);
 
   /* 派生/未知字段不进 canonical：即使调用方污染了 runtime。 */
@@ -2001,13 +2103,16 @@ test('runtime edits classify as behavior changes, not display or layout', () => 
   assert.equal(RTGraph.changeKind(legacy, withRuntime), 'behavior');
 });
 
-test('validateRuntime accepts normalized runtimes and reports graph_parse_error otherwise', () => {
+test('validateRuntime requires a complete runtime and reports graph_parse_error otherwise', () => {
   const imported = importSelfContained();
   assert.deepEqual(RTGraph.validateRuntime(imported.tree), []);
   assert.deepEqual(RTGraph.validateRuntime(imported.tree.runtime), []);
-  assert.deepEqual(RTGraph.validateRuntime(null), []);
-  assert.deepEqual(RTGraph.validateRuntime({ runtime: null }), []);
-  /* 旧草稿/裸图没有 runtime 也是合法输入。 */
+  /* 严格契约：没有 runtime / runtime:null 都是硬错误（保存前本地也会拦住）。 */
+  for (const empty of [null, undefined, { runtime: null }, {}]) {
+    const emptyIssues = RTGraph.validateRuntime(empty);
+    assert.ok(emptyIssues.length > 0, 'missing runtime was accepted: ' + JSON.stringify(empty));
+    assert.ok(emptyIssues.every(item => item.code === 'graph_parse_error' && item.level !== 'hint'));
+  }
   assert.deepEqual(RTGraph.validateRuntime(minimalTree()), []);
 
   const broken = RTGraph.clone(imported.tree.runtime);

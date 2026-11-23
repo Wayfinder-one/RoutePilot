@@ -983,11 +983,12 @@ function payloadFor(text, now) {
     text: text,
     session_id: ''
   };
-  /* 草稿的运行配置属于试算输入：有 runtime 时整组平铺进 payload，服务端不再按
-     活动树/数据库继承，试算结果必须与当前草稿看到的目录一致。 */
-  const runtime = typeof RTGraph.runtimeDocumentView === 'function'
-    ? RTGraph.runtimeDocumentView(tree) : null;
+  /* 完整草稿请求无条件携带四运行字段：试算严格使用画布快照，服务端不再按
+     活动树/数据库继承。画布不变量保证 runtime 完整；万一缺失则退回引用已存树
+     （tree_id），由后端继承该树的已存快照，而不是发一个 root-only 半草稿。 */
+  const runtime = RTGraph.runtimeDocumentView(tree);
   if (runtime) Object.assign(payload, runtime);
+  else if (tree && tree.id) payload.tree_id = tree.id;
   if (now) payload.now = now;
   return payload;
 }

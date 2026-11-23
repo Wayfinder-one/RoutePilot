@@ -9,6 +9,7 @@
 import { api, apiErrText } from '../api.js';
 import { t, tf } from '../i18n.js';
 import * as RTGraph from './graph.js';
+import { createRuntime } from './runtime.js';
 
 function serverIssues(error) {
   const detail = error && error.detail;
@@ -30,15 +31,18 @@ function newTreeId() {
   return raw.replace(/[^a-z0-9]/gi, '').slice(0, 12);
 }
 
-/* 服务端树 / 本地新草稿统一补齐 envelope 字段与缺失坐标。 */
+/* 服务端树 / 本地新草稿统一补齐 envelope 字段与缺失坐标。
+   严格契约：envelope 必须携带完整四字段运行快照（API envelope 里是扁平四字段），
+   缺失即拒绝加载，不再有「无 runtime 草稿」分支。 */
 function normaliseTree(raw) {
   const source = raw || {};
   /* API envelope 的坐标在顶层 canvas：先分发回内部 node.position 再做布局补位。 */
   const tree = RTGraph.dispatchCanvas(RTGraph.clone(source));
   delete tree.canvas;
   /* 运行配置在内部树里统一成嵌套 runtime：Python tree_to_dict 的四字段是扁平的，
-     先投影成契约形状再剔除顶层键；旧文档（无 runtime）显式置 null。 */
+     先投影成契约形状再剔除顶层键。 */
   const runtime = RTGraph.runtimeDocumentView(source);
+  if (!runtime) throw new Error('tree envelope is missing the four runtime fields');
   RTGraph.RUNTIME_FIELDS.forEach(field => { delete tree[field]; });
   tree.runtime = runtime;
   tree.root = tree.root || { id: 'root', type: 'graph', nodes: [], edges: [] };
@@ -68,7 +72,7 @@ export class RoutingController {
        isInspectorEditing() -> boolean
        fitAfterReplace()
        renderTreeSelect()
-       getModels() -> []                                        */
+       getCatalog() -> {providers, models, services, periods}    */
   constructor(options) {
     const opts = options || {};
     this.store = opts.store;
@@ -110,15 +114,25 @@ export class RoutingController {
     this.hooks.renderIssues();
   }
 
-  defaultModelId() {
-    const models = (this.hooks.getModels && this.hooks.getModels()) || [];
-    if (models.length) return models[0].id;
-    return 'qwen3-8b';
+  /* 新建与启动兜底共用：前端 UUID 切片 id，保存时 POST 成新组。
+     新画布的初始运行快照必须从当前数据库目录（createRuntime）生成；目录为空或
+     缺少 provider 时抛明确错误，由 app.js 提示并阻止新建（不再造空 runtime）。 */
+  catalogNow() {
+    return (this.hooks.getCatalog && this.hooks.getCatalog()) || null;
   }
 
-  /* 新建与启动兜底共用：前端 UUID 切片 id，保存时 POST 成新组。 */
   newDraftTree() {
-    const tree = RTGraph.createMinimalTree(this.defaultModelId());
+    const catalog = this.catalogNow();
+    const models = catalog && Array.isArray(catalog.models) ? catalog.models : [];
+    if (!models.length) {
+      throw new Error(t('cv.toastCatalogEmpty'));
+    }
+    const services = catalog && Array.isArray(catalog.services) ? catalog.services : [];
+    const runtime = createRuntime(catalog, {
+      modelId: models[0].id,
+      jevId: services.length ? services[0].id : null
+    });
+    const tree = RTGraph.createMinimalTree(runtime.backends.models[0].id, runtime);
     tree.id = newTreeId();
     tree.name = t('cv.default.name');
     return tree;
@@ -148,8 +162,8 @@ export class RoutingController {
     tree.tree_revision = savedTree.tree_revision || '';
     tree.updated_at = savedTree.updated_at || '';
     tree.document_sha256 = savedTree.document_sha256 || '';
-    /* 服务端保存时物化的运行配置就是新基线：不同步回当前草稿的话，
-       刚保存的旧草稿（无 runtime）会立刻被判成 behavior dirty。 */
+    /* 服务端回包的完整运行快照就是新基线：不同步回当前草稿的话，
+       保存后的草稿会立刻被判成 behavior dirty。 */
     tree.runtime = RTGraph.runtimeDocumentView(savedTree);
     this.treeId = tree.id;
     /* 回包是保存基线：坐标同样在顶层 canvas，先分发回内部 position 再入基线，
@@ -167,6 +181,16 @@ export class RoutingController {
   async save() {
     const store = this.store;
     if (!store.tree || store.saving || store.tryRunning) return false;
+    /* 保存前本地硬校验运行配置：四字段缺失/非法一律拒绝（服务端同样 422），
+       不再发送 runtime:null 让服务端从数据库补齐。 */
+    const runtimeIssues = RTGraph.validateRuntime(store.tree)
+      .filter(issue => issue.level !== 'hint');
+    if (runtimeIssues.length) {
+      this.hooks.setIssues(this.mergeIssues(runtimeIssues));
+      this.hooks.revealIssues();
+      this.hooks.toast(tf('cv.toastSaveIssues', { n: runtimeIssues.length }), 'error');
+      return false;
+    }
     store.setSaving(true);
     this.hooks.syncSaving();
     /* 请求发出前记住目标草稿：若期间草稿被切走，回包必须整份丢弃，
@@ -175,8 +199,7 @@ export class RoutingController {
     const targetId = this.treeId;
     const isNew = !store.saved;
     /* 线上 payload 与文件文档同一格式：坐标在顶层 canvas，节点对象不带 position；
-       自包含运行配置按四字段平铺（旧草稿没有 runtime 时发送 runtime:null，由服务端
-       清除当前图继承后按活动图/数据库物化）。 */
+       自包含运行配置按四字段无条件平铺（jev 可为 null，但字段恒在）。 */
     const payload = RTGraph.collectCanvas(RTGraph.clone({
       id: this.treeId,
       name: String(store.tree.name == null ? '' : store.tree.name).trim(),
@@ -184,11 +207,7 @@ export class RoutingController {
       sticky: RTGraph.clone(store.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
       root: store.tree.root,
     }));
-    /* 旧草稿没有 runtime：显式发送 null，让服务端丢弃“当前图继承”再按活动图/
-       数据库物化；省略该键会继承该图自己的旧配置。 */
-    const runtime = RTGraph.runtimeDocumentView(store.tree);
-    if (runtime) Object.assign(payload, runtime);
-    else payload.runtime = null;
+    Object.assign(payload, RTGraph.runtimeDocumentView(store.tree));
     if (!isNew) payload.base_document_sha256 = store.saved.document_sha256 || '';
     try {
       const result = isNew
@@ -327,7 +346,14 @@ export class RoutingController {
       if (!discard) return false;
     }
     /* 确认通过才换树：取消“新建”不能把在途的 switch 判成过期（loadTree 内部 bump）。 */
-    this.loadTree(this.newDraftTree(), false);
+    let tree;
+    try {
+      tree = this.newDraftTree();
+    } catch (error) {
+      this.hooks.toast(String(error && error.message ? error.message : error), 'error');
+      return false;
+    }
+    this.loadTree(tree, false);
     this.hooks.toast(t('cv.toastNewTree'));
     return true;
   }
@@ -386,8 +412,8 @@ export class RoutingController {
       return false;
     }
     /* 导入同样整图替换（不走 loadTree）：应用前让在途的 switch 过期。
-       运行配置也在这一次历史里整体替换 —— 导入旧文档（无 runtime）必须清空
-       载入前的 runtime，撤销能恢复。 */
+       运行配置也在这一次历史里整体替换 —— 导入文档必须自带完整四字段快照，
+       撤销能恢复载入前的 runtime。 */
     this.loadSeq += 1;
     if (this.hooks.change('behavior', tree => {
       tree.name = result.tree.name;

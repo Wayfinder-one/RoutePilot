@@ -11,9 +11,14 @@
    kit 选中）；删除节点/边/选项交给 requestDelete 的确认框（级联清单在那里生成）。
 
    ES module：app.js 装配时调用 configureInspector({ store, getGraph, getTree,
-   getModels, getPeriods, getSelection, requestDelete, addEdge })。
+   getModels, getPeriods, getProviders, getJevServices, getCatalog, getSelection,
+   requestDelete, addEdge, toast })：
+     · getModels 来自数据库模型目录（target 提交时补进画布快照）；
+     · getPeriods 来自画布 runtime（画布不能引用未声明时段）；
+     · getJevServices/getCatalog 用于图设置的 JEV 选择与「从数据库刷新运行配置」。
    ------------------------------------------------------------------ */
 import * as RTGraph from './graph.js';
+import { addRuntimeModel, refreshRuntime, selectJev } from './runtime.js';
 import { t, tf } from '../i18n.js';
 import { nodeName, strategyLabel } from './cards.js';
 import {
@@ -31,6 +36,9 @@ const graphNow = () => (deps && typeof deps.getGraph === 'function' ? deps.getGr
 const treeNow = () => (deps && typeof deps.getTree === 'function' ? deps.getTree() : null);
 const modelsNow = () => (deps && typeof deps.getModels === 'function' ? deps.getModels() : []);
 const periodsNow = () => (deps && typeof deps.getPeriods === 'function' ? deps.getPeriods() : []);
+const servicesNow = () => (deps && typeof deps.getJevServices === 'function' ? deps.getJevServices() : []);
+const catalogNow = () => (deps && typeof deps.getCatalog === 'function' ? deps.getCatalog() : null);
+const toastNow = (message, tone) => { if (deps && deps.toast) deps.toast(message, tone); };
 const selectionNow = () => (deps && typeof deps.getSelection === 'function'
   ? deps.getSelection() : { kind: null, id: null });
 const requestDelete = selection => { if (deps && deps.requestDelete) deps.requestDelete(selection); };
@@ -406,6 +414,69 @@ function edgeBranch(edge) {
     '</form></div>';
 }
 
+/* 图设置里的 JEV 选择：选项来自数据库 JEV 目录（id · 模型 · 地址），
+   「不使用 JEV」值为空串。画布当前 JEV 若已从目录删除，额外保留一个当前值选项，
+   避免打开设置就把漂移中的快照静默清空。 */
+function currentJevId(tree) {
+  return tree && tree.runtime && tree.runtime.jev && tree.runtime.jev.id
+    ? tree.runtime.jev.id : '';
+}
+
+function jevOptionsHTML(tree) {
+  const current = currentJevId(tree);
+  const options = ['<option value=""' + (current ? '' : ' selected') + '>' +
+    esc(t('cv.ins.jevNone')) + '</option>'];
+  let known = false;
+  servicesNow().forEach(service => {
+    if (!service || !service.id) return;
+    if (service.id === current) known = true;
+    const label = [service.id, service.model, service.base_url].filter(Boolean).join(' · ');
+    options.push('<option value="' + esc(service.id) + '"' +
+      (service.id === current ? ' selected' : '') + '>' + esc(label) + '</option>');
+  });
+  if (current && !known) {
+    const model = tree && tree.runtime && tree.runtime.jev ? tree.runtime.jev.model : '';
+    const label = [current, model].filter(Boolean).join(' · ');
+    options.push('<option value="' + esc(current) + '" selected>' +
+      esc(tf('cv.ins.jevMissingOption', { label: label })) + '</option>');
+  }
+  return options.join('');
+}
+
+/* 运行快照摘要：让用户看清当前画布声明的是哪一份目录（而非数据库目录）。 */
+function runtimeSummary(tree) {
+  const runtime = tree && tree.runtime;
+  if (!runtime) return t('cv.ins.errRuntimeMissing');
+  const backends = runtime.backends || {};
+  const providers = Array.isArray(backends.providers) ? backends.providers.length : 0;
+  const models = Array.isArray(backends.models) ? backends.models.length : 0;
+  const periods = Array.isArray(runtime.time_periods) ? runtime.time_periods.length : 0;
+  const window = runtime.jev_window || {};
+  return tf('cv.ins.runtimeSummary', {
+    providers: providers,
+    models: models,
+    periods: periods,
+    input: window.input_tokens == null ? '—' : window.input_tokens,
+    context: window.context_tokens == null ? '—' : window.context_tokens
+  });
+}
+
+/* target 提交：把所选模型（及 provider）的非密钥目录信息补进画布快照。
+   同 ID 已存在时 addRuntimeModel 不覆盖旧快照 —— 数据库漂移只作为检查提示。 */
+function embedTargetModels(tree, modelIds) {
+  if (!tree || !tree.runtime) return;
+  const catalog = catalogNow() || {};
+  const models = Array.isArray(catalog.models) ? catalog.models : [];
+  const providers = Array.isArray(catalog.providers) ? catalog.providers : [];
+  (modelIds || []).forEach(id => {
+    const model = models.find(item => item && item.id === id);
+    if (!model) return;
+    const provider = providers.find(item => item && item.name === model.provider);
+    if (!provider) return;
+    tree.runtime = addRuntimeModel(tree.runtime, model, provider);
+  });
+}
+
 function statCell(value, label) {
   return '<div class="rtc-statcell"><b>' + esc(value) + '</b><span>' + esc(label) + '</span></div>';
 }
@@ -466,6 +537,13 @@ function graphBranch(graph, tree) {
     '<label class="field">' + esc(t('cv.ins.fallback')) +
     '<select data-field="fallback" aria-label="' + esc(t('cv.ins.fallback')) + '">' +
     targetOptions(graph.error_fallback) + '</select></label></div>' +
+    '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.runtime')) + '</div>' +
+    '<label class="field">' + esc(t('cv.ins.jev')) +
+    '<select data-field="jev" aria-label="' + esc(t('cv.ins.jev')) + '">' +
+    jevOptionsHTML(tree) + '</select></label>' +
+    '<div class="rtc-ins-note" data-runtime-summary>' + esc(runtimeSummary(tree)) + '</div>' +
+    '<button type="button" class="btn sm" data-act="ins-refresh-runtime">' +
+    esc(t('cv.ins.refreshRuntime')) + '</button></div>' +
     '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.limits')) + '</div>' +
     limitRow('nodes', nodes, limits.nodes) + limitRow('edges', edges, limits.edges) +
     limitRow('questions', questions, limits.questions) +
@@ -663,16 +741,23 @@ function submitNode(form) {
   const probe = clone(treeNow());
   const check = applyNodeValues(probe.root, target.id, values);
   if (!check.ok) return check;
+  /* target 模型来自数据库目录：所选模型（及 provider）必须在同一次历史项里补进
+     画布快照；同 ID 已存在时 addRuntimeModel 不覆盖旧快照。 */
+  const isTarget = node.type === 'target';
+  if (isTarget) embedTargetModels(probe, (values.models || []).map(item => item.model));
   const before = node;
   const after = RTGraph.findNode(probe.root, target.id);
+  const runtimeChanged = RTGraph.stableStringify(probe.runtime) !==
+    RTGraph.stableStringify(treeNow().runtime);
   /* no-op 提交不产生历史项（与 RTCondPop 的 sameCondition 跳过一致）。 */
-  if (before && after &&
+  if (before && after && !runtimeChanged &&
       RTGraph.stableStringify(before) === RTGraph.stableStringify(after)) {
     return { ok: true, changed: false };
   }
   /* store.change() 在运行锁/保存锁下返回 false：留在编辑器并报错，不能假成功。 */
   if (deps.store.change('behavior', tree => {
     applyNodeValues(tree.root, target.id, values);
+    if (isTarget && probe.runtime) tree.runtime = RTGraph.clone(probe.runtime);
   }) === false) return error(t('cv.saveBlocked'));
   return { ok: true, changed: true };
 }
@@ -710,27 +795,53 @@ function submitGraph(form) {
   const fallback = String(fieldValue(form, 'fallback') || '') || null;
   if (fallback && targetIds.indexOf(fallback) < 0) return error(t('cv.ins.errFallback'));
   const sticky = { enabled: !!fieldValue(form, 'sticky'), ttl_seconds: ttl };
+  if (!tree || !tree.runtime) return error(t('cv.ins.errRuntimeMissing'));
+
+  /* JEV 选择：只有「所选 id 与当前快照不同」时才替换 JEV 快照与窗口（同 ID 不静默
+     覆盖画布快照，数据库漂移留给「从数据库刷新」或 /admin/try 的检查提示）。 */
+  const jevId = String(fieldValue(form, 'jev') || '');
+  const currentId = currentJevId(tree);
+  let runtime = tree.runtime;
+  if (jevId !== currentId) {
+    if (!jevId) {
+      runtime = selectJev(tree.runtime, null);
+    } else {
+      const service = servicesNow().find(item => item && item.id === jevId);
+      if (!service) return error(tf('cv.ins.errJevUnknown', { id: jevId }));
+      runtime = selectJev(tree.runtime, service);
+    }
+  }
+  /* 存在问题节点时 JEV 不能为空：本地与服务端启用校验同一条硬规则。 */
+  const questions = (graph.nodes || []).filter(node => node.type === 'question').length;
+  if (questions && !runtime.jev) return error(t('cv.ins.errJevRequired'));
+
   const committed = {
     name: name,
     timezone: timezone,
     sticky: sticky,
-    fallback: fallback
+    fallback: fallback,
+    jevId: runtime.jev ? runtime.jev.id : null,
+    window: runtime.jev_window
   };
   const previous = {
     name: tree.name,
     timezone: tree.timezone,
     sticky: tree.sticky,
-    fallback: graph.error_fallback
+    fallback: graph.error_fallback,
+    jevId: tree.runtime.jev ? tree.runtime.jev.id : null,
+    window: tree.runtime.jev_window
   };
   /* no-op 提交不产生历史项（与 RTCondPop 的 sameCondition 跳过一致）。 */
   if (RTGraph.stableStringify(previous) === RTGraph.stableStringify(committed)) {
     return { ok: true, changed: false };
   }
-  if (deps.store.change('behavior', tree => {
-    tree.name = name;
-    tree.timezone = timezone;
-    tree.sticky = sticky;
-    tree.root.error_fallback = fallback;
+  /* 名称/时区/粘性/兜底与新 JEV（含窗口）写在同一个历史项里。 */
+  if (deps.store.change('behavior', draft => {
+    draft.name = name;
+    draft.timezone = timezone;
+    draft.sticky = sticky;
+    draft.root.error_fallback = fallback;
+    draft.runtime = RTGraph.clone(runtime);
   }) === false) return error(t('cv.saveBlocked'));
   return { ok: true, changed: true };
 }
@@ -789,6 +900,34 @@ function onClick(event) {
   }
   if (name === 'ins-delete-edge') {
     if (target.kind === 'edge' && target.id) requestDelete({ kind: 'edge', id: target.id });
+    return;
+  }
+  if (name === 'ins-refresh-runtime') {
+    /* 「从数据库刷新运行配置」：按画布声明的模型/provider/JEV 重建快照，一次历史项。
+       目录缺少画布声明的资源时给出明确错误并保持草稿不变（不静默删除引用）。 */
+    const tree = treeNow();
+    const form = action.closest('[data-ins-form]');
+    const fail = message => showError(form, message);
+    if (!tree || !tree.runtime) { fail(t('cv.ins.errRuntimeMissing')); return; }
+    let next = null;
+    try {
+      next = refreshRuntime(tree.runtime, catalogNow());
+    } catch (error) {
+      fail(String(error && error.message ? error.message : error));
+      return;
+    }
+    const questions = ((graphNow() && graphNow().nodes) || [])
+      .filter(item => item && item.type === 'question').length;
+    if (questions && !next.jev) { fail(t('cv.ins.errJevRequired')); return; }
+    if (RTGraph.stableStringify(next) === RTGraph.stableStringify(tree.runtime)) {
+      toastNow(t('cv.ins.runtimeUnchanged'));
+      return;
+    }
+    if (deps.store.change('behavior', draft => { draft.runtime = next; }) === false) {
+      fail(t('cv.saveBlocked'));
+      return;
+    }
+    toastNow(t('cv.ins.runtimeRefreshed'));
     return;
   }
   if (name === 'ins-slot-add') {

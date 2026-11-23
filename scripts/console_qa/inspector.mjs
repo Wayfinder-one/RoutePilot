@@ -12,6 +12,7 @@ import {
   BASELINE,
   EXAMPLE_EDGES,
   EXAMPLE_NODES,
+  SECONDARY_JEV_ID,
   TREE_ID,
   api,
   appSnapshot,
@@ -26,6 +27,7 @@ import {
   ensureBaselineTree,
   expectNever,
   issueCodes,
+  mockBase,
   openCanvas,
   openIssuesPanel,
   page,
@@ -746,6 +748,172 @@ test('Task 11 · graph settings edit name/timezone/sticky/fallbacks, show limits
     app.graph.error_fallback === 'light-target');
 }, BASELINE);
   assert.deepEqual((await appSnapshot()).history, { undo: false, redo: true });
+});
+
+test('Task 9 · graph settings choose a JEV and refresh the runtime from the database catalog', async () => {
+  const baseline = await ensureBaselineTree();
+  await openCanvas();
+  await waitInspectorBranch('graph', 'root');
+
+  /* JEV 下拉来自数据库 JEV 目录；首项是「不使用 JEV」，当前快照的 default 选中。 */
+  const options = await page.evaluate(() => Array.from(
+    document.querySelectorAll('#cvInspectorBody [data-field="jev"] option'))
+    .map(option => ({ value: option.value, text: option.textContent.trim() })));
+  assert.equal(options[0].value, '', 'the JEV select has no "no JEV" option');
+  assert.equal(options[0].text, await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return t('cv.ins.jevNone');
+}));
+  const defaultOption = options.find(option => option.value === 'default');
+  assert.ok(defaultOption, 'the database JEV default service is missing from the select');
+  assert.match(defaultOption.text, /default · d1-2b/, 'JEV option does not show id · model');
+  const secondaryOption = options.find(option => option.value === SECONDARY_JEV_ID);
+  assert.ok(secondaryOption, 'the second database JEV service is missing from the select');
+  assert.match(secondaryOption.text, new RegExp(SECONDARY_JEV_ID + ' · ' + 'd1-2B'),
+    'JEV option label does not include the model');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="jev"]').inputValue(), 'default');
+  assert.match(await page.locator('#cvInspectorBody [data-runtime-summary]').textContent(), /1024\/4096/,
+    'the runtime summary does not show the canvas JEV window');
+
+  /* 应用 JEV 选择 = 同一个历史项里替换 runtime.jev 与 runtime.jev_window（原子）。 */
+  const historyBefore = await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+});
+  await page.locator('#cvInspectorBody [data-field="jev"]').selectOption(SECONDARY_JEV_ID);
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return !!(app.tree.runtime && app.tree.runtime.jev &&
+      app.tree.runtime.jev.id === 'jev-secondary');
+}, null, { timeout: 8000 });
+  const applied = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({
+    jev: app.tree.runtime.jev,
+    window: app.tree.runtime.jev_window,
+    kind: app.kind(),
+    history: store.undoStack.length
+});
+});
+  assert.deepEqual(applied.window, { input_tokens: 2048, context_tokens: 8192 },
+    'the JEV selection did not replace the window from the same service');
+  assert.equal(applied.kind, 'behavior');
+  assert.equal(applied.history, historyBefore + 1,
+    'JEV selection + graph settings were not a single history entry');
+  assert.equal(applied.jev.base_url, mockBase);
+
+  /* 撤销必须同时恢复服务与窗口（不允许混用两个服务的配置）。 */
+  await clickCanvasAction('cvUndo');
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return !!(app.tree.runtime && app.tree.runtime.jev &&
+      app.tree.runtime.jev.id === 'default' &&
+      app.tree.runtime.jev_window.input_tokens === 1024 &&
+      app.tree.runtime.jev_window.context_tokens === 4096);
+}, null, { timeout: 8000 });
+
+  /* 含问题节点时选择「不使用 JEV」是本地硬错误：不写历史、不改草稿。 */
+  const beforeReject = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({ history: store.undoStack.length, jev: app.tree.runtime.jev });
+});
+  await page.locator('#cvInspectorBody [data-field="jev"]').selectOption('');
+  await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+  await page.waitForFunction(() => {
+    const error = document.querySelector('#cvInspectorBody [data-ins-error]');
+    return error && !error.hidden && error.textContent.trim().length > 0;
+});
+  assert.equal((await page.locator('#cvInspectorBody [data-ins-error]').textContent()).trim(),
+    await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return t('cv.ins.errJevRequired');
+}), 'a question canvas accepted "no JEV"');
+  const afterReject = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({ history: store.undoStack.length, jev: app.tree.runtime.jev, kind: app.kind() });
+});
+  assert.deepEqual(afterReject, Object.assign({}, beforeReject, { kind: 'clean' }),
+    'a rejected JEV selection mutated the draft or history');
+
+  /* 「从数据库刷新运行配置」：基线快照与目录逐字段一致 → 无变更提示、不写历史。 */
+  const beforeRefresh = await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+});
+  await page.locator('#cvInspectorBody [data-act="ins-refresh-runtime"]').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const { t } = await import('/console/i18n.js');
+    return app.lastToast === t('cv.ins.runtimeUnchanged');
+}, null, { timeout: 8000 });
+  assert.equal(await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+}), beforeRefresh, 'a no-op runtime refresh pushed history');
+
+  /* 目录漂移的画布：快照 provider/JEV 端点与数据库不同，刷新必须从目录重建快照。 */
+  const drifted = JSON.parse(JSON.stringify(baseline));
+  const driftedId = 'qa-runtime-refresh';
+  drifted.backends.providers = drifted.backends.providers.map(provider =>
+    Object.assign({}, provider, { base_url: 'http://stale-provider.test/v1' }));
+  drifted.jev = Object.assign({}, drifted.jev, { base_url: 'http://stale-jev.test' });
+  await api('POST', '/admin/trees', {
+    id: driftedId,
+    name: '目录漂移的画布',
+    timezone: BASELINE.timezone,
+    sticky: BASELINE.sticky,
+    root: drifted.root,
+    canvas: drifted.canvas,
+    backends: drifted.backends,
+    jev: drifted.jev,
+    jev_window: drifted.jev_window,
+    time_periods: drifted.time_periods
+});
+  await page.evaluate(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return app.selectTree(id);
+}, driftedId);
+  await waitFor(async id => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.treeId === id && app.booted && app.kind() === 'clean');
+}, driftedId, { timeout: 8000 });
+  await waitInspectorBranch('graph', 'root');
+  const refreshHistory = await page.evaluate(async () => {
+    const { store } = await import('/console/routing/app.js');
+    return store.undoStack.length;
+});
+  await page.locator('#cvInspectorBody [data-act="ins-refresh-runtime"]').click();
+  const refreshedProviderUrl = mockBase + '/v1';
+  await waitFor(async expected => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime.backends.providers[0].base_url === expected;
+}, refreshedProviderUrl, { timeout: 8000 });
+  const refreshed = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+    return ({
+    provider: app.tree.runtime.backends.providers[0].base_url,
+    jev: app.tree.runtime.jev.base_url,
+    window: app.tree.runtime.jev_window,
+    kind: app.kind(),
+    history: store.undoStack.length
+});
+});
+  assert.equal(refreshed.jev, mockBase, 'refresh did not replace the canvas JEV endpoint from the catalog');
+  assert.deepEqual(refreshed.window, { input_tokens: 1024, context_tokens: 4096 });
+  assert.equal(refreshed.kind, 'behavior');
+  assert.equal(refreshed.history, refreshHistory + 1, 'refresh was not a single history entry');
+  await clickCanvasAction('cvUndo');
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime.backends.providers[0].base_url === 'http://stale-provider.test/v1';
+}, null, { timeout: 8000 });
+  assert.equal(await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.tree.runtime.jev.base_url;
+}), 'http://stale-jev.test', 'undo did not restore the pre-refresh JEV snapshot');
+  await ensureBaselineTree();
+  await openCanvas();
 });
 
 test('Task 11 · Backspace inside editor inputs is safe, all overlays close with Esc and labels are locatable', async () => {

@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import {
   BASELINE,
+  BASELINE_RUNTIME,
   EXAMPLE,
   EXAMPLE_ROOT,
   EXAMPLE_EDGES,
@@ -65,6 +66,35 @@ import {
   waitInspectorBranch,
   waitToastIncludes
 } from '../console_qa.mjs';
+
+/* 严格自包含 v3 文档：导入/保存只接受带完整四字段运行快照的文档。
+   以仓库示例文档（EXAMPLE）为基线构造，可按用例覆盖 name/sticky/root 等字段。 */
+/* 内部运行快照 → 导入文档的扁平四字段（Node 侧 helper）。 */
+function runtimeDocumentFields(runtime) {
+  return {
+    backends: JSON.parse(JSON.stringify(runtime.backends)),
+    jev: JSON.parse(JSON.stringify(runtime.jev)),
+    jev_window: JSON.parse(JSON.stringify(runtime.jev_window)),
+    time_periods: JSON.parse(JSON.stringify(runtime.time_periods))
+  };
+}
+
+function strictDocument(overrides) {
+  const document = {
+    kind: 'sr-routing-graph',
+    version: 3,
+    name: EXAMPLE.name,
+    timezone: EXAMPLE.timezone,
+    sticky: EXAMPLE.sticky,
+    root: JSON.parse(JSON.stringify(EXAMPLE_ROOT)),
+    backends: JSON.parse(JSON.stringify(EXAMPLE.backends)),
+    jev: JSON.parse(JSON.stringify(EXAMPLE.jev)),
+    jev_window: JSON.parse(JSON.stringify(EXAMPLE.jev_window)),
+    time_periods: JSON.parse(JSON.stringify(EXAMPLE.time_periods))
+  };
+  if (EXAMPLE.canvas) document.canvas = JSON.parse(JSON.stringify(EXAMPLE.canvas));
+  return Object.assign(document, overrides || {});
+}
 
 test('Task 10 · canvas skeleton renders the graph with no page overflow', async () => {
   await openCanvas();
@@ -1818,7 +1848,8 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
       tree: app.tree.id,
       saved: app.saved,
       kind: app.kind(),
-      nodes: app.graph.nodes.length
+      nodes: app.graph.nodes.length,
+      runtime: app.tree.runtime
 }));
 });
     assert.equal(draft.saved, null);
@@ -1827,6 +1858,11 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
     assert.notEqual(draft.treeId, 'local');
     assert.equal(draft.nodes, 2);
     assert.equal(draft.kind, 'behavior');
+    /* 严格自包含：boot 兜底草稿从数据库目录 createRuntime() 得到完整四字段快照。 */
+    assert.deepEqual(Object.keys(draft.runtime).sort(),
+      ['backends', 'jev', 'jev_window', 'time_periods']);
+    assert.ok(draft.runtime.backends.models.length >= 1,
+      'the fallback draft runtime has no model to route to');
 
     const posted = page.waitForRequest(request =>
       request.method() === 'POST' && new URL(request.url()).pathname === '/admin/trees');
@@ -1835,11 +1871,15 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
     const payload = request.postDataJSON();
     assert.match(payload.id, /^[0-9a-f]{12}$/, 'POST /admin/trees did not use the UUID-slice id');
     assert.equal(payload.id, draft.treeId);
-    /* 旧草稿（无 runtime）保存时不带四运行字段：服务端负责物化。 */
+    /* 保存无条件携带四字段完整快照：绝不发送 runtime:null，也不省略运行字段。 */
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, 'runtime'), false,
+      'save payload sent the removed runtime control field');
     ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
-      assert.equal(Object.prototype.hasOwnProperty.call(payload, field), false,
-        'a runtime-less draft save must not send the ' + field + ' runtime field');
+      assert.equal(Object.prototype.hasOwnProperty.call(payload, field), true,
+        'a strict draft save dropped the ' + field + ' runtime field');
 });
+    assert.deepEqual(payload.backends, draft.runtime.backends);
+    assert.deepEqual(payload.jev_window, draft.runtime.jev_window);
     await waitFor(async id => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.changeKind === 'clean' && app.treeId === id);
@@ -1848,13 +1888,14 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
     const listed = (await api('GET', '/admin/trees')).trees.find(tree => tree.id === draft.treeId);
     assert.ok(listed, 'boot fallback save did not create a tree with the draft id');
     assert.equal(listed.enabled, false);
-    /* 保存回包物化的 runtime 同步进草稿与基线：旧草稿保存后也必须 clean。 */
-    const materialized = await page.evaluate(async () => {
+    /* 保存回包的快照同步进草稿与基线：刚保存就必须 clean。 */
+    const saved = await page.evaluate(async () => {
       const { app } = await import('/console/routing/app.js');
-      return (({ kind: app.kind(), runtime: app.tree.runtime }));
+      return (({ kind: app.kind(), runtime: app.tree.runtime, savedRuntime: app.saved.jev_window }));
 });
-    assert.equal(materialized.kind, 'clean', 'the materialized runtime was not synced into the saved draft');
-    assert.ok(materialized.runtime, 'the saved response runtime was not written back to the draft');
+    assert.equal(saved.kind, 'clean', 'the saved snapshot was not synced into the draft');
+    assert.deepEqual(saved.runtime.backends, draft.runtime.backends);
+    assert.deepEqual(saved.savedRuntime, draft.runtime.jev_window);
 } finally {
     await page.unroute(treeListRoute, emptyTreeList);
     await ensureBaselineTree();
@@ -1914,10 +1955,14 @@ test('envelope-roundtrip-preserves-revision', async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.saved === null && app.graph.nodes.length === 2);
 });
-  const newId = await page.evaluate(async () => {
+  const newDraft = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app.treeId);
+    return ({ id: app.treeId, runtime: app.tree.runtime });
 });
+  const newId = newDraft.id;
+  /* 严格契约：新建草稿自带完整四字段快照（撤销导入后回到这份快照，而不是 null）。 */
+  assert.deepEqual(Object.keys(newDraft.runtime).sort(),
+    ['backends', 'jev', 'jev_window', 'time_periods']);
   await setImportPayload(source.text);
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
@@ -1973,8 +2018,8 @@ const RTGraph = await import('/console/routing/graph.js');
     return { edges: app.graph.edges.length, runtime: app.tree.runtime };
 });
   assert.equal(undone.edges, 1, 'one undo did not restore the pre-import draft');
-  assert.equal(undone.runtime, null,
-    'undo did not restore the pre-import old draft without a runtime');
+  assert.deepEqual(undone.runtime, newDraft.runtime,
+    'undo did not restore the pre-import draft runtime snapshot');
 });
 
 test('Task C2 · save carries the runtime and the saved response becomes the draft baseline', async () => {
@@ -2107,66 +2152,65 @@ test('Task C2 · import replaces the runtime and an old document materializes on
   });
   assert.equal(selfContainedExport.jev.model, 'qa-imported-runtime');
 
-  /* 旧文档（无四运行字段）：必须清空上一份 runtime，不能带着它保存。 */
+  /* 旧文档（无四运行字段）：严格契约下必须被拒绝，草稿保持上一份自包含快照。 */
   const legacy = JSON.parse(JSON.stringify(source));
   ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => { delete legacy[field]; });
   legacy.name = '导入旧文档';
-  await setImportPayload(legacy, 'legacy-document.json');
-  await waitFor(async name => {
+  const beforeLegacy = await page.evaluate(async () => {
     const { app } = await import('/console/routing/app.js');
-    return (app.tree.name === name);
-}, legacy.name, { timeout: 8000 });
+    return ({ name: app.tree.name, runtime: app.tree.runtime });
+});
+  await clearToasts();
+  await setImportPayload(legacy, 'legacy-document.json');
+  await waitToastIncludes(await page.evaluate(async () => {
+    const { setLang, t, tf } = await import('/console/i18n.js');
+    return t('cv.toastImportRejected').split('{err}')[0];
+}));
   const legacyState = await page.evaluate(async () => {
     const { app } = await import('/console/routing/app.js');
-    return (({ runtime: app.tree.runtime, kind: app.kind() }));
+    return ({
+    kind: app.kind(),
+    runtime: app.tree.runtime,
+    name: app.tree.name
 });
-  assert.equal(legacyState.runtime, null, 'an old document import kept the previous draft runtime');
-  assert.equal(legacyState.kind, 'behavior');
+});
+  /* 被拒的旧文档不得替换草稿：name/runtime 都保持导入前的值。 */
+  assert.equal(legacyState.name, beforeLegacy.name,
+    'a rejected legacy import replaced the draft name');
+  assert.equal(legacyState.kind, 'clean',
+    'a rejected legacy import left the draft dirty');
+  assert.ok(legacyState.runtime, 'a rejected legacy import cleared the runtime snapshot');
+  assert.deepEqual(legacyState.runtime.backends, beforeLegacy.runtime.backends);
+  assert.equal(await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.issues.every(issue => issue.level === 'hint');
+}), true, 'a rejected legacy import leaked hard issues into the draft validation bar');
 
-  /* 保存旧文档：payload 必须显式 runtime:null，且不带任何扁平四字段。
-     省略该键会让服务端继承该组自己的旧配置，而不是清除后物化。 */
+  /* 保存仍然只发送完整四字段：不存在 runtime:null 这条旧分支。 */
   const legacySave = page.waitForRequest(request =>
     request.method() === 'PUT' && new URL(request.url()).pathname === '/admin/trees/' + TREE_ID);
   await saveNow();
   const legacyPayload = (await legacySave).postDataJSON();
-  assert.equal(legacyPayload.runtime, null,
-    'saving an old document did not send runtime:null');
+  assert.equal(Object.prototype.hasOwnProperty.call(legacyPayload, 'runtime'), false,
+    'saving sent the removed runtime control field');
   ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
-    assert.equal(Object.prototype.hasOwnProperty.call(legacyPayload, field), false,
-      'saving an old document also sent the flat runtime field ' + field);
-  });
-
-  /* 回包物化：草稿与服务器 GET 使用同一份活动图/数据库运行配置。 */
-  const materialized = treeRuntimeFields(await serverTree(TREE_ID));
-  assert.ok(materialized, 'the server did not materialize a runtime for the old document');
-  const afterLegacySave = await page.evaluate(async () => {
-    const { app } = await import('/console/routing/app.js');
-    return (({ kind: app.kind(), runtime: app.tree.runtime }));
+    assert.equal(Object.prototype.hasOwnProperty.call(legacyPayload, field), true,
+      'saving dropped the ' + field + ' runtime field');
 });
-  assert.equal(afterLegacySave.kind, 'clean', 'saving an old document left the draft dirty');
-  assert.deepEqual(afterLegacySave.runtime, materialized,
-    'the saved draft runtime does not match the server materialized runtime');
-
-  /* 刷新页面：仍是 clean、runtime 与 GET 一致、导出文件仍有完整四字段。 */
-  await openCanvas();
-  const reloaded = await page.evaluate(async () => {
-    const { app } = await import('/console/routing/app.js');
-    return (({ kind: app.kind(), runtime: app.tree.runtime }));
-});
-  assert.equal(reloaded.kind, 'clean', 'reloading after the old-document save is not clean');
-  assert.deepEqual(reloaded.runtime, materialized,
-    'the reloaded draft runtime drifted from the server runtime');
-  const exported = JSON.parse((await exportViaUi()).text);
+  const legacyServer = await serverTree(TREE_ID);
+  const expectedRuntimeSnapshot = {};
   ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
-    assert.ok(Object.prototype.hasOwnProperty.call(exported, field),
-      'the exported file dropped the materialized runtime field ' + field);
+    expectedRuntimeSnapshot[field] = beforeLegacy.runtime[field];
   });
+  assert.deepEqual(treeRuntimeFields(legacyServer), expectedRuntimeSnapshot,
+    'the stored canvas runtime drifted from the imported self-contained snapshot');
   await ensureBaselineTree();
 });
 
-test('Task C2 · inspector models and periods follow the current tree runtime', async () => {
+test('Task C2 · inspector models come from the DB catalog, periods from the canvas runtime', async () => {
   await ensureBaselineTree();
   const baseline = await serverTree(TREE_ID);
+  /* 自包含树：runtime 里的模型/时段与数据库目录故意不一致（目录漂移）。 */
   const runtime = {
     backends: {
       providers: JSON.parse(JSON.stringify(baseline.backends.providers)),
@@ -2209,38 +2253,79 @@ test('Task C2 · inspector models and periods follow the current tree runtime', 
     return (app.treeId === id && app.booted && app.kind() === 'clean');
 }, RUNTIME_TREE_ID, { timeout: 8000 });
 
-  /* 目标节点：模型下拉来自文档 runtime，看不到全局目录独有的 tierless-model。 */
+  /* 目标节点：模型下拉来自数据库模型目录（spec「模型下拉框来自数据库模型目录」）。
+     画布快照里数据库已不存在的 runtime-only-model 不作为下拉选项出现（当前值兜底）。 */
   await clickNode('power-target');
   await waitInspectorBranch('node', 'power-target');
   const modelOptions = await page.evaluate(() => Array.from(
     document.querySelectorAll('#cvInspectorBody [data-model-field="model"] option')).map(option => option.value));
-  assert.ok(modelOptions.includes('runtime-only-model'),
-    'inspector models did not come from the tree runtime: ' + modelOptions.join(','));
-  assert.equal(modelOptions.includes('tierless-model'), false,
-    'inspector models still included a global-catalog-only model');
+  assert.ok(modelOptions.includes('tierless-model'),
+    'inspector models did not come from the DB catalog: ' + modelOptions.join(','));
+  assert.equal(modelOptions.includes('runtime-only-model'), false,
+    'inspector models still came from the canvas runtime snapshot');
+  /* 推理档位来自数据库模型 profile：deepseek-v3 声明 low/medium/high。 */
   const reasoningOptions = await page.evaluate(() => Array.from(
     document.querySelectorAll('#cvInspectorBody [data-model-field="reasoning"] option')).map(option => option.value));
   ['low', 'medium', 'high'].forEach(level => {
     assert.ok(reasoningOptions.includes(level),
       'profile.reasoning.efforts map was not projected into the inspector array: ' + reasoningOptions.join(','));
 });
-  assert.deepEqual(await page.evaluate(() => {
-    const select = document.querySelector('#cvInspectorBody [data-model-field="model"]');
-    const reasoning = document.querySelector('#cvInspectorBody [data-model-field="reasoning"]');
-    select.value = 'runtime-only-model';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-    return Array.from(reasoning.querySelectorAll('option')).map(option => option.value);
-}), ['', 'low', 'medium', 'high'],
-  'the runtime model reasoning options are not its declared tiers');
 
-  /* 时段节点：复选框只列文档 runtime 的时段（全局目录还有 normal/offpeak）。 */
+  /* 时段节点：复选框只列画布 runtime 的时段（全局目录还有 normal/offpeak）。 */
   await clickNode('cond-peak');
   await waitInspectorBranch('node', 'cond-peak');
   assert.deepEqual(await page.evaluate(() => Array.from(
     document.querySelectorAll('#cvInspectorBody [data-field="periods"] input')).map(input => input.value)),
-    ['peak'], 'inspector periods did not come from the tree runtime');
+    ['peak'], 'inspector periods did not come from the canvas runtime');
 
-  /* 新草稿没有 runtime：检查器回退 /admin/models 的全局目录。 */
+  /* 选择数据库模型 = 把该模型及 provider 的非密钥目录信息补进画布快照（同一历史项）。 */
+  await clickNode('power-target');
+  await waitInspectorBranch('node', 'power-target');
+  const beforeApply = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return {
+      models: app.tree.runtime.backends.models.map(model => model.id),
+      upstreams: app.tree.runtime.backends.models.map(model => model.upstream),
+      kind: app.kind()
+};
+});
+  assert.equal(beforeApply.models.includes('tierless-model'), false,
+    'the baseline snapshot unexpectedly already declared the DB-only model');
+  await page.locator('#cvInspectorBody [data-model-field="model"]').first().selectOption('tierless-model');
+  await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.tree.runtime.backends.models.some(model => model.id === 'tierless-model'));
+}, null, { timeout: 8000 });
+  const applied = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return {
+      kind: app.kind(),
+      models: app.tree.runtime.backends.models.map(model => model.id),
+      upstreams: app.tree.runtime.backends.models.map(model => model.id + '=' + model.upstream),
+      targetModels: app.graph.nodes.find(node => node.id === 'power-target').models
+};
+});
+  assert.equal(applied.kind, 'behavior', 'embedding a DB model was not a behavior change');
+  assert.ok(applied.models.includes('tierless-model'),
+    'target model submission did not embed the DB model into the canvas snapshot');
+  assert.deepEqual(applied.models.slice(0, beforeApply.models.length), beforeApply.models,
+    'embedding a new model reordered the existing snapshot entries');
+  assert.deepEqual(applied.upstreams.slice(0, beforeApply.upstreams.length),
+    beforeApply.models.map((id, index) => id + '=' + beforeApply.upstreams[index]),
+    'embedding a new model overwrote an existing same-id snapshot entry');
+  assert.equal(applied.targetModels[0].model, 'tierless-model');
+  await clickCanvasAction('cvUndo');
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (!app.tree.runtime.backends.models.some(model => model.id === 'tierless-model'));
+});
+  assert.equal(await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.kind());
+}), 'clean', 'undo did not restore the pre-embed snapshot');
+
+  /* 新建草稿同样从数据库目录生成快照：目录模型（tierless-model）与全部时段可见。 */
   await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
     const { app } = await import('/console/routing/app.js');
@@ -2251,7 +2336,13 @@ test('Task C2 · inspector models and periods follow the current tree runtime', 
   const fallbackModels = await page.evaluate(() => Array.from(
     document.querySelectorAll('#cvInspectorBody [data-model-field="model"] option')).map(option => option.value));
   assert.ok(fallbackModels.includes('tierless-model'),
-    'a new draft without a runtime did not fall back to the global /admin/models catalog');
+    'a new draft did not take its model options from the database catalog');
+  const fallbackPeriods = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.tree.runtime.time_periods.map(period => period.name));
+});
+  assert.deepEqual(fallbackPeriods, ['peak', 'normal', 'offpeak'],
+    'a new draft runtime did not take the periods from the database catalog');
   await ensureBaselineTree();
 });
 
@@ -2370,14 +2461,12 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
   const kept = await draftOf();
 
   await clearToasts();
-  await setImportPayload({
-    kind: 'sr-routing-graph',
-    version: 3,
+  await setImportPayload(strictDocument({
     name: 'v3 但 root 非法',
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
     root: { type: 'jev', branches: [] }
-}, 'malformed-v3.json');
+}), 'malformed-v3.json');
 
   await waitToastIncludes(await page.evaluate(async n => {
     const { setLang, t, tf } = await import('/console/i18n.js');
@@ -2409,14 +2498,14 @@ test('Task 12 · a valid v3 import without positions lays every node out with fi
   await openCanvas();
   const stripped = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
   stripped.nodes.forEach(node => { delete node.position; });
-  await setImportPayload({
-    kind: 'sr-routing-graph',
-    version: 3,
+  await setImportPayload(strictDocument({
     name: BASELINE.name,
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
-    root: stripped
-}, 'missing-positions.json');
+    root: stripped,
+    /* 没有顶层 canvas：节点坐标必须由共享 DAG 布局补齐。 */
+    canvas: undefined
+}), 'missing-positions.json');
   await waitFor(async expected => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.graph.nodes.length === expected && app.graph.nodes.every(node =>
@@ -2442,10 +2531,14 @@ const RTGraph = await import('/console/routing/graph.js');
     assert.deepEqual({ x: node.x, y: node.y }, result.expected[node.id],
       `${node.id} was not placed by the shared DAG layout`);
 });
-  /* 旧文档（无四运行字段）导入必须清空上一份 runtime，所以相对已保存基线是 behavior 变更；
-     缺坐标的自动补位本身仍是 layout 级别的。 */
-  assert.equal(result.runtime, null, 'an old document import kept the previous draft runtime');
-  assert.equal(result.kind, 'behavior', 'importing an old document must clear the previous runtime');
+  /* 完整自包含文档的 runtime 必须原样进入草稿；示例文档端点与 mock 基线不同，
+     所以相对已保存基线是 behavior 变更，缺坐标的自动补位本身仍是 layout 级别的。 */
+  assert.deepEqual(Object.keys(result.runtime || {}).sort(),
+    ['backends', 'jev', 'jev_window', 'time_periods']);
+  assert.equal(result.runtime.jev.id, EXAMPLE.jev.id);
+  assert.deepEqual(result.runtime.backends.providers,
+    JSON.parse(JSON.stringify(EXAMPLE.backends.providers)));
+  assert.equal(result.kind, 'behavior', 'importing a self-contained document must replace the runtime');
 });
 
 test('7.4-12-auto-layout-layout-only', async () => {
@@ -2854,8 +2947,11 @@ test('200-node-400-edge-smoke', async () => {
   await openCanvas();
   const doc = await page.evaluate(async () => {
     const RTGraph = await import('/console/routing/graph.js');
+    const { app } = await import('/console/routing/app.js');
 
     const G = RTGraph;
+    /* 严格自包含：用基线画布的快照作为文档 runtime（模型 deepseek-v3 在快照内）。 */
+    const runtime = JSON.parse(JSON.stringify(app.tree.runtime));
     const graph = {
       id: 'root', type: 'graph', nodes: [], edges: [],
       error_fallback: 't67'
@@ -2906,7 +3002,11 @@ test('200-node-400-edge-smoke', async () => {
 }
     return {
       kind: 'sr-routing-graph', version: 3, name: '极限图 200 节点 / 400 边',
-      timezone: 'Asia/Shanghai', sticky: { enabled: false, ttl_seconds: 1800 }, root: graph
+      timezone: 'Asia/Shanghai', sticky: { enabled: false, ttl_seconds: 1800 }, root: graph,
+      backends: runtime.backends,
+      jev: runtime.jev,
+      jev_window: runtime.jev_window,
+      time_periods: runtime.time_periods
 };
 
 });
@@ -3027,7 +3127,10 @@ test('200-node-400-edge-smoke', async () => {
 test('condition-only-question-is-valid', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  const doc = {
+  assert.ok(BASELINE_RUNTIME, 'bootstrap did not capture the baseline runtime');
+  /* 严格自包含：导入文档必须自带四字段；这份图会真的启用并 /admin/try，
+     所以用 QA 基线的 mock 快照（而不是仓库示例的 127.0.0.1 端点）。 */
+  const doc = Object.assign({
     kind: 'sr-routing-graph',
     version: 3,
     name: '条件可达性图',
@@ -3061,7 +3164,7 @@ test('condition-only-question-is-valid', async () => {
       ],
       error_fallback: 'target-cond'
 }
-};
+}, JSON.parse(JSON.stringify(BASELINE_RUNTIME)));
   /* 新建未启用的组再导入：保存走 POST /admin/trees，不会覆盖已启用的基线组。 */
   await clickCanvasAction('cvNewTree');
   await waitFor(async () => {
@@ -3189,18 +3292,18 @@ test('Task 14 · a malformed v3 import with non-array fields is rejected before 
       zh: (result.issues || []).map(issue => issue.zh).join(' ')
 };
 
-}, {
-    kind: 'sr-routing-graph', version: 3, name: '非法 models',
+}, strictDocument({
+    name: '非法 models',
     timezone: BASELINE.timezone, sticky: BASELINE.sticky, root: malformed
-});
+}));
   assert.equal(probe.ok, false, 'parseImport accepted a non-array models field');
   assert.ok(probe.codes.includes('graph_parse_error'), 'missing graph_parse_error issue');
   assert.match(probe.zh, /models/);
 
-  await setImportPayload({
-    kind: 'sr-routing-graph', version: 3, name: '非法 models',
+  await setImportPayload(strictDocument({
+    name: '非法 models',
     timezone: BASELINE.timezone, sticky: BASELINE.sticky, root: malformed
-}, 'malformed-models.json');
+}), 'malformed-models.json');
   await waitToastIncludes(await page.evaluate(async n => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (tf('cv.toastImportIssues', { n }));
@@ -3320,7 +3423,7 @@ const { setLang, t, tf } = await import('/console/i18n.js');
     const { app, store } = await import('/console/routing/app.js');
 const RTGraph = await import('/console/routing/graph.js');
 
-      const other = RTGraph.createMinimalTree('qwen3-8b');
+      const other = RTGraph.createMinimalTree('qwen3-8b', app.tree.runtime);
       other.id = 'stale-race';
       other.name = 'raced tree';
       app.loadTree(other, true);
@@ -4073,10 +4176,10 @@ test('review-slot-limit-import-preserves-draft', async () => {
   const root = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
   root.edges[0].target_port = 'in_9999';
   await clearToasts();
-  await setImportPayload({
-    kind: 'sr-routing-graph', version: 3, name: '非法槽位',
+  await setImportPayload(strictDocument({
+    name: '非法槽位',
     timezone: BASELINE.timezone, sticky: BASELINE.sticky, root,
-}, 'invalid-slot-in-9999.json');
+}), 'invalid-slot-in-9999.json');
   await waitToastIncludes(await page.evaluate(async n => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (tf('cv.toastImportIssues', { n }));
@@ -4097,7 +4200,8 @@ test('review-import-contract-rejects-before-draft-replacement', async () => {
   await openCanvas();
   const base = await page.evaluate(async () => {
     const RTGraph = await import('/console/routing/graph.js');
-    return (RTGraph.createMinimalTree('qwen3.8-flash-sft'));
+    const { app } = await import('/console/routing/app.js');
+    return (RTGraph.createMinimalTree('qwen3.8-flash-sft', app.tree.runtime));
 });
   const kept = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -4120,10 +4224,10 @@ test('review-import-contract-rejects-before-draft-replacement', async () => {
 
   for (const tree of invalid) {
     await clearToasts();
-    await setImportPayload({
+    await setImportPayload(Object.assign({
       kind: 'sr-routing-graph', version: 3, name: tree.name,
       timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
-}, 'invalid-contract.json');
+}, runtimeDocumentFields(base.runtime)), 'invalid-contract.json');
     await waitToastIncludes(await page.evaluate(async n => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (tf('cv.toastImportIssues', { n }));
@@ -4140,7 +4244,8 @@ test('review-import-envelope-types-preserve-draft', async () => {
   await openCanvas();
   const base = await page.evaluate(async () => {
     const RTGraph = await import('/console/routing/graph.js');
-    return (RTGraph.createMinimalTree('qwen3.8-flash-sft'));
+    const { app } = await import('/console/routing/app.js');
+    return (RTGraph.createMinimalTree('qwen3.8-flash-sft', app.tree.runtime));
 });
   const kept = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -4156,10 +4261,10 @@ test('review-import-envelope-types-preserve-draft', async () => {
 
   for (const tree of invalid) {
     await clearToasts();
-    await setImportPayload({
+    await setImportPayload(Object.assign({
       kind: 'sr-routing-graph', version: 3, name: tree.name,
       timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
-}, 'invalid-envelope-value.json');
+}, runtimeDocumentFields(base.runtime)), 'invalid-envelope-value.json');
     await waitToastIncludes(await page.evaluate(async n => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (tf('cv.toastImportIssues', { n }));

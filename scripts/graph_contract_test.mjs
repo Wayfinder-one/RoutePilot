@@ -191,6 +191,93 @@ test('self-contained runtime fixture imports with normalized defaults', () => {
   assert.ok(rejected.issues.some(issue => issue.code === 'graph_parse_error'));
 });
 
+/* 严格自包含：四字段必须成组出现；全缺失、部分缺失、jev 缺 id、runtime 控制字段
+   一律 graph_parse_error（与 Python tree_from_dict / runtime_from_dict 同规则）。 */
+test('strict runtime document requires all four fields together', () => {
+  const fixture = BY_NAME.get('valid-self-contained-runtime');
+  for (const field of RUNTIME_FIELDS) {
+    const document = JSON.parse(JSON.stringify(fixture.document));
+    delete document[field];
+    const result = RTGraph.parseImport(JSON.stringify(document));
+    assert.equal(result.ok, false, 'import accepted a document without ' + field);
+    assert.equal(result.tree, undefined);
+    const issue = (result.issues || []).find(item => item.code === 'graph_parse_error');
+    assert.ok(issue, 'missing ' + field + ' did not report graph_parse_error');
+    assert.ok(issue.zh.includes(field) && issue.zh.includes('成组出现'),
+      'missing ' + field + ' issue does not name the field: ' + issue.zh);
+    assert.ok(issue.en.includes(field), 'missing ' + field + ' en issue does not name the field');
+  }
+  /* 四个运行字段全缺失 = 旧文档，同样拒绝（不再有旧文档兼容分支）。 */
+  const legacy = JSON.parse(JSON.stringify(fixture.document));
+  for (const field of RUNTIME_FIELDS) delete legacy[field];
+  const legacyResult = RTGraph.parseImport(JSON.stringify(legacy));
+  assert.equal(legacyResult.ok, false, 'a runtime-less legacy document was accepted');
+  assert.ok(legacyResult.issues.some(item => item.code === 'graph_parse_error'));
+});
+
+test('jev.id is required and a nested runtime control field is rejected', () => {
+  const fixture = BY_NAME.get('valid-self-contained-runtime');
+  const withoutId = JSON.parse(JSON.stringify(fixture.document));
+  delete withoutId.jev.id;
+  const rejected = RTGraph.parseImport(JSON.stringify(withoutId));
+  assert.equal(rejected.ok, false, 'a jev snapshot without id was accepted');
+  const issue = rejected.issues.find(item => item.code === 'graph_parse_error');
+  assert.ok(issue);
+  assert.match(issue.zh, /jev\.id/);
+  assert.match(issue.en, /jev\.id/);
+
+  /* runtime 控制字段（旧文档的 runtime:null / 嵌套 runtime）一律拒绝。 */
+  const nestedNull = JSON.parse(JSON.stringify(fixture.document));
+  nestedNull.runtime = null;
+  const nullResult = RTGraph.parseImport(JSON.stringify(nestedNull));
+  assert.equal(nullResult.ok, false, 'a runtime:null control field was accepted');
+  assert.ok(nullResult.issues.some(item => item.code === 'graph_parse_error'));
+  const nestedObject = JSON.parse(JSON.stringify(fixture.document));
+  nestedObject.runtime = { backends: fixture.document.backends };
+  assert.equal(RTGraph.parseImport(JSON.stringify(nestedObject)).ok, false);
+});
+
+test('serialize always emits the four runtime fields and preserves canvas coordinates', () => {
+  const fixture = BY_NAME.get('valid-self-contained-runtime');
+  const parsed = RTGraph.parseImport(JSON.stringify(fixture.document));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed.issues));
+  const document = JSON.parse(RTGraph.serialize(parsed.tree));
+  for (const field of RUNTIME_FIELDS) {
+    assert.ok(Object.prototype.hasOwnProperty.call(document, field),
+      'serialize dropped runtime field ' + field);
+  }
+  assert.deepEqual(document.canvas, fixture.document.canvas,
+    'serialize did not preserve the top-level canvas coordinates');
+  assert.equal(document.jev.id, fixture.document.jev.id);
+  assert.equal(document.jev.key_env, '');
+  assert.equal(document.jev.timeout_seconds, 10);
+  assert.equal(document.jev_window.input_tokens, 1024);
+  assert.deepEqual(document.time_periods, fixture.document.time_periods);
+  /* 序列化文本里只有四字段，没有 runtime:null 或嵌套 runtime 键。 */
+  assert.equal(document.runtime, undefined);
+  assert.equal(RTGraph.serialize(parsed.tree).includes('"runtime"'), false);
+
+  /* serialize 拒绝缺 runtime 的树：导出不维护旧文档分支。 */
+  const broken = RTGraph.clone(parsed.tree);
+  delete broken.runtime;
+  assert.throws(() => RTGraph.serialize(broken), /backends/);
+  const partial = RTGraph.clone(parsed.tree);
+  delete partial.runtime.jev_window;
+  assert.throws(() => RTGraph.serialize(partial), /jev_window/);
+});
+
+test('createMinimalTree requires a complete runtime with the target model', () => {
+  const fixture = BY_NAME.get('valid-self-contained-runtime');
+  const parsed = RTGraph.parseImport(JSON.stringify(fixture.document));
+  const tree = RTGraph.createMinimalTree('fast', parsed.tree.runtime);
+  assert.deepEqual(tree.runtime.backends.models.map(model => model.id), ['fast', 'backup-model'],
+    'createMinimalTree must keep the complete runtime snapshot');
+  assert.equal(tree.root.nodes.find(node => node.type === 'target').models[0].model, 'fast');
+  assert.equal(hardCodes(RTGraph.validate(tree)).length, 0);
+  assert.throws(() => RTGraph.createMinimalTree('fast'), /运行配置/);
+  assert.throws(() => RTGraph.createMinimalTree('unknown-model', parsed.tree.runtime), /unknown-model/);
+});
+
 for (const fixture of FIXTURES) {
   test('graph contract · ' + fixture.name, () => {
     const { codes, digest } = nodeContract(fixture.document);

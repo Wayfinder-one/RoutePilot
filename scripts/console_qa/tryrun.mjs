@@ -979,7 +979,9 @@ test('try-uses-draft-timezone-and-sticky', async () => {
       const { app } = await import('/console/routing/app.js');
       const runtime = app.tree.runtime;
       return {
+        jevId: runtime.jev && runtime.jev.id,
         jevBase: runtime.jev.base_url,
+        jevWindow: runtime.jev_window,
         providerUrl: runtime.backends.providers[0].base_url,
         periods: runtime.time_periods.map(period => period.name)
 };
@@ -1000,6 +1002,14 @@ test('try-uses-draft-timezone-and-sticky', async () => {
       'try payload sent a different runtime catalog than the draft');
     assert.equal(payload.jev.base_url, expectedRuntime.jevBase,
       'try payload did not carry the draft runtime JEV endpoint');
+    /* 严格自包含：payload 带 JEV 服务 id，且不存在 runtime:null / 嵌套 runtime 控制字段。 */
+    assert.ok(expectedRuntime.jevId, 'the draft runtime has no JEV service id');
+    assert.equal(payload.jev.id, expectedRuntime.jevId,
+      'try payload did not carry the draft runtime JEV service id');
+    assert.deepEqual(payload.jev_window, expectedRuntime.jevWindow,
+      'try payload did not carry the draft JEV window');
+    assert.equal(Object.prototype.hasOwnProperty.call(payload, 'runtime'), false,
+      'try payload sent the removed runtime control field');
     assert.equal(payload.backends.providers[0].base_url, expectedRuntime.providerUrl,
       'try payload did not carry the draft runtime provider endpoint');
     assert.ok(payload.root && payload.root.nodes.length === EXAMPLE_NODES,

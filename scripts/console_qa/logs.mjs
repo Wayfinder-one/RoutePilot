@@ -275,7 +275,8 @@ test('calculation-log mobile keeps the main conclusion within the viewport', asy
 
 
 /* 快照被 page.route() 截获后的固定 tree envelope：直接复用示例图，
-   保证节点/边 id 与事件顺序一一对应。 */
+   保证节点/边 id 与事件顺序一一对应。严格契约：tree envelope 必须带完整四字段
+   运行快照（只读回放不会执行，但控制器加载时仍会校验）。 */
 function snapshotTree() {
   return {
     id: 'partial-tree',
@@ -283,7 +284,11 @@ function snapshotTree() {
     timezone: EXAMPLE.timezone,
     sticky: EXAMPLE.sticky,
     root: EXAMPLE_ROOT,
-    canvas: EXAMPLE.canvas
+    canvas: EXAMPLE.canvas,
+    backends: JSON.parse(JSON.stringify(EXAMPLE.backends)),
+    jev: JSON.parse(JSON.stringify(EXAMPLE.jev)),
+    jev_window: JSON.parse(JSON.stringify(EXAMPLE.jev_window)),
+    time_periods: JSON.parse(JSON.stringify(EXAMPLE.time_periods))
   };
 }
 

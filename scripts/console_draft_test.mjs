@@ -9,15 +9,35 @@ import assert from 'node:assert/strict';
 import { DraftStore, HISTORY_LIMIT } from '../router/console/routing/draft.js';
 import { createMinimalTree, clone } from '../router/console/routing/graph.js';
 
+/* 严格自包含：新草稿必须携带完整四字段运行快照（createMinimalTree 不再物化）。
+   model 必须出现在 runtime.backends.models 里，否则 target 会引用快照外的模型。 */
+function minimalRuntime(model, periods) {
+  const modelId = model || 'qwen3-8b';
+  return {
+    backends: {
+      providers: [{ name: 'local', base_url: 'http://upstream.test/v1', key_env: '', reasoning_format: 'openai' }],
+      models: [{ id: modelId, upstream: modelId, provider: 'local', profile: {} }]
+    },
+    jev: null,
+    jev_window: { input_tokens: 1024, context_tokens: 4096 },
+    time_periods: periods || []
+  };
+}
+
+function minimalTree(model, periods) {
+  const modelId = model || 'qwen3-8b';
+  return createMinimalTree(modelId, minimalRuntime(modelId, periods));
+}
+
 function storeWith(model) {
   const store = new DraftStore();
-  store.load(createMinimalTree(model || 'qwen3-8b'), { saved: true });
+  store.load(minimalTree(model), { saved: true });
   return store;
 }
 
 test('change records one undo entry and redo is cleared', () => {
   const store = new DraftStore();
-  store.load(createMinimalTree('qwen3-8b'));
+  store.load(minimalTree('qwen3-8b'));
   /* 不再手工塞一条假历史：若 change() 不记历史，下面的 undoStack 断言会直接失败。 */
   assert.equal(store.change('behavior', tree => { tree.name = 'one'; }), true);
   assert.equal(store.undoStack.length, 1);
@@ -185,28 +205,26 @@ test('markSaved replaces the baseline and resets the dirty kind', () => {
 test('load resets both history stacks and the saved baseline', () => {
   const store = storeWith();
   store.change('behavior', tree => { tree.name = 'dirty'; });
-  store.load(createMinimalTree('qwen3-32b'), { saved: true });
+  store.load(minimalTree('qwen3-32b'), { saved: true });
   assert.equal(store.undoStack.length, 0);
   assert.equal(store.redoStack.length, 0);
   assert.equal(store.dirtyKind, 'clean');
   assert.equal(store.saved.root.nodes[1].models[0].model, 'qwen3-32b');
 
-  store.load(createMinimalTree('qwen3-32b'));
+  store.load(minimalTree('qwen3-32b'));
   assert.equal(store.saved, null);
   assert.equal(store.dirtyKind, 'behavior');
 });
 
 test('runtime travels with the draft and undo/redo keep deep copies', () => {
   const store = new DraftStore();
-  const tree = createMinimalTree('qwen3-8b');
-  /* 新草稿不带 runtime（旧草稿路径：保存时由服务端物化）。 */
-  assert.equal('runtime' in tree, false, 'a brand-new draft must not carry a runtime');
-  tree.runtime = {
-    backends: { providers: [], models: [] },
-    jev: null,
-    jev_window: { input_tokens: 1024, context_tokens: 4096 },
-    time_periods: [{ name: 'peak', days: [0, 1, 2, 3, 4, 5, 6], start: '08:00', end: '11:00' }]
-  };
+  const periods = [{ name: 'peak', days: [0, 1, 2, 3, 4, 5, 6], start: '08:00', end: '11:00' }];
+  const tree = minimalTree('qwen3-8b', periods);
+  /* 严格契约：新草稿直接携带完整四字段运行快照（没有「待保存再物化」的中间态）。 */
+  assert.deepEqual(Object.keys(tree.runtime).sort(),
+    ['backends', 'jev', 'jev_window', 'time_periods']);
+  assert.deepEqual(tree.runtime.time_periods.map(period => period.name), ['peak']);
+  assert.equal(tree.runtime.backends.models[0].id, 'qwen3-8b');
   store.load(tree, { saved: true });
   assert.equal(store.dirtyKind, 'clean');
 
@@ -231,19 +249,27 @@ test('runtime travels with the draft and undo/redo keep deep copies', () => {
   assert.equal(store.undo(), true);
   assert.equal(store.tree.runtime.jev_window.input_tokens, 1024);
 
-  /* 清空 runtime（导入旧文档的等价动作）是可撤销的 behavior 变更。 */
-  assert.equal(store.change('behavior', draft => { draft.runtime = null; }), true);
-  assert.equal(store.tree.runtime, null);
+  /* 整组替换运行快照（例如应用 JEV 选择/导入）是可撤销的 behavior 变更。 */
+  const replacement = clone(store.tree.runtime);
+  replacement.jev = {
+    id: 'jev-b', base_url: 'http://jev-b.test', model: 'd1-b', key_env: '',
+    timeout_seconds: 12, instructions: '选择', state_template: '{request}'
+  };
+  replacement.jev_window = { input_tokens: 2048, context_tokens: 8192 };
+  assert.equal(store.change('behavior', draft => { draft.runtime = clone(replacement); }), true);
+  assert.equal(store.tree.runtime.jev.id, 'jev-b');
+  assert.deepEqual(store.tree.runtime.jev_window, { input_tokens: 2048, context_tokens: 8192 });
   assert.equal(store.undo(), true);
-  assert.deepEqual(store.tree.runtime.time_periods.map(period => period.name), ['normal']);
+  assert.equal(store.tree.runtime.jev, null);
   assert.equal(store.tree.runtime.jev_window.input_tokens, 1024);
+  assert.equal(store.tree.runtime.time_periods[0].name, 'normal');
 });
 
 test('subscribers observe load/change/undo/redo/saved events', () => {
   const store = new DraftStore();
   const seen = [];
   const off = store.subscribe(event => seen.push(event.type));
-  store.load(createMinimalTree('qwen3-8b'), { saved: true });
+  store.load(minimalTree('qwen3-8b'), { saved: true });
   store.change('behavior', tree => { tree.name = 'x'; });
   store.undo();
   store.redo();
