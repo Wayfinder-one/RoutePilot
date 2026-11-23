@@ -91,10 +91,22 @@ test('Task 11 · boot unlocks the canvas before catalogues and late catalogue da
    窗口与密钥都属于“当前选中的服务”：切换服务切换窗口；密钥只进写请求。 */
 const JEV_SERVICE_ID = 'qa-jev-model';
 
+/* 真实就绪：初始占位是 '—'（非空！），所以不能只等“非空文本”。
+   目录加载完成 = #jevStatus 已换成服务 id / “未配置”，且 #jevMode 不再是 '—'。 */
+async function waitJevReady() {
+  await page.waitForFunction(() => {
+    const status = document.getElementById('jevStatus');
+    const mode = document.getElementById('jevMode');
+    const idInput = document.getElementById('jevServiceId');
+    if (!status || !mode || !idInput) return false;
+    const label = status.textContent.trim();
+    return label !== '' && label !== '—' && mode.textContent.trim() !== '—';
+  }, null, { timeout: 20000 });
+}
+
 async function openJevDirectory() {
   await page.goto(routerBase + '/console/jev.html');
-  /* #jevStatus 是基座的单模块入口标记：目录加载完成后才非空。 */
-  await page.waitForFunction(() => document.getElementById('jevStatus').textContent.trim() !== '');
+  await waitJevReady();
 }
 
 async function createJevService({ id, model, key, baseUrl, input = 1024, context = 4096, timeout = 5 }) {
@@ -211,22 +223,44 @@ test('P0 decision service reports a failed test and preserves the unsaved draft'
   }
 });
 
-test('P0 decision service surfaces impact_confirmation_required instead of silently writing', async () => {
+test('P0 decision service shows the shared impact list for a referenced update and cancel writes nothing', async () => {
   await openJevDirectory();
   const before = (await api('GET', '/admin/jev/default')).service;
   await page.locator('[data-jev-service-id="default"]').click();
-  await page.locator('#jevModel').fill('default-canvas-conflict');
+  const changed = 'default-canvas-conflict';
+  await page.locator('#jevModel').fill(changed);
+  const writes = [];
+  const onRequest = request => {
+    const url = new URL(request.url());
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev/default') {
+      writes.push(request.postDataJSON());
+    }
+  };
+  page.on('request', onRequest);
   expectHttpStatusError({ url: /\/admin\/jev\/default$/, status: /409/ });
   try {
     await page.locator('#jevSave').click();
-    await page.waitForFunction(() => {
-      const text = document.getElementById('jevMsg').textContent;
-      return text.includes('确认影响') || text.includes('impact confirmation');
-    }, null, { timeout: 8000 });
+    /* 409 只打开共享影响清单（受影响画布），不出现第二次写请求。 */
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    const modalText = (await page.locator('#impactBody').innerText()).replace(/\s+/g, ' ');
+    assert.match(modalText, /电力优先决策组/,
+      'the impact list does not name the affected canvas: ' + modalText);
+    assert.equal(await page.locator('#impactTrees [data-tree-id]').count() > 0, true,
+      'the impact modal listed no affected canvas');
+    assert.equal(writes.length, 1, 'the 409 preview triggered a second write');
+    assert.equal('impact_confirmation' in writes[0], false,
+      'the preview request already carried a confirmation payload');
+    /* 取消：不发确认、不写服务。 */
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+    await page.waitForTimeout(250);
+    assert.equal(writes.length, 1, 'cancelling the impact dialog still wrote the service');
     const after = (await api('GET', '/admin/jev/default')).service;
     assert.equal(after.model, before.model, 'a 409 response still wrote the referenced service');
-    assert.equal(await page.locator('#jevMsg').evaluate(element => element.classList.contains('bad')), true);
+    /* 取消后编辑草稿仍在（保存动作可以被重试）。 */
+    assert.equal(await page.locator('#jevModel').inputValue(), changed);
   } finally {
+    page.off('request', onRequest);
     resetExpectedHttpStatusErrors();
   }
 });
@@ -287,7 +321,7 @@ test('P0 decision service paints the custom test default in English on first loa
   await page.evaluate(() => localStorage.setItem('router_lang', 'en'));
   try {
     await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('jevStatus').textContent.trim() !== '');
+    await waitJevReady();
     const first = await page.evaluate(() => ({
       lang: document.documentElement.lang,
       text: document.getElementById('jevTestText').value
@@ -410,6 +444,306 @@ test('P0 custom connection generates a blank model id from upstream', async () =
   }
 });
 
+/* ── 共享影响确认（Task 10）────────────────────────────────────────────
+   这些用例用真实页面 + 路由拦截断言**请求/响应语义**（不是只看 UI 文案）：
+   409 预览只出现一次、取消不发第二次写、确认请求体携带精确哈希与正确的
+   replacement 字段、陈旧哈希只提示重载而不盲目重试、provider 删除不可绕过。 */
+const IMPACT_HASH_A = 'a'.repeat(64);
+const IMPACT_HASH_B = 'b'.repeat(64);
+const IMPACT_HASH_C = 'c'.repeat(64);
+
+function impactDetail({ kind, id, trees, replacements = [] }) {
+  return {
+    message: '该资源仍被画布引用，确认影响后才可写入',
+    code: 'impact_confirmation_required',
+    resource: { kind, id },
+    affected_trees: trees,
+    replacements
+  };
+}
+
+const TARGET_TREE = {
+  id: 'power-priority', name: '电力优先决策组', enabled: true,
+  document_sha256: IMPACT_HASH_A,
+  usage: { targets: ['power-target'], runtime_catalog: true }
+};
+const CATALOG_TREE = {
+  id: 'backup-canvas', name: '备份画布', enabled: false,
+  document_sha256: IMPACT_HASH_B,
+  usage: { targets: [], runtime_catalog: true }
+};
+
+function jsonRoute(handler) {
+  return async route => {
+    const request = route.request();
+    return handler(route, request);
+  };
+}
+
+test('P0 model edit shows the shared impact list once and cancel sends no confirmation', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('#modelTable tr[data-mrow="qwen3-8b"]');
+  const writes = [];
+  const matcher = '**/admin/models/qwen3-8b';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'PUT') return route.continue();
+    const body = request.postData() ? JSON.parse(request.postData()) : {};
+    writes.push(body);
+    if (writes.length === 1) {
+      return route.fulfill({
+        status: 409, contentType: 'application/json',
+        body: JSON.stringify({ detail: impactDetail({
+          kind: 'model', id: 'qwen3-8b', trees: [TARGET_TREE, CATALOG_TREE]
+        }) })
+      });
+    }
+    return route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, model: { id: 'qwen3-8b' }, synced_trees: ['power-priority'] })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/models\/qwen3-8b$/, status: /409/ });
+  try {
+    await page.locator('[data-editmodel="qwen3-8b"]').click();
+    await page.locator('#modelModalSave').click();
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    const text = (await page.locator('#impactBody').innerText()).replace(/\s+/g, ' ');
+    assert.match(text, /电力优先决策组/, 'the impact list did not name the affected canvas: ' + text);
+    assert.match(text, /power-target/, 'the target usage was not shown: ' + text);
+    /* 确认框必须在视口内（内容长时用内部滚动，不把页面撑出横向溢出）。 */
+    const box = await page.locator('#impactModal .impact-card').boundingBox();
+    const view = page.viewportSize();
+    assert.ok(box && box.x >= -1 && box.x + box.width <= view.width + 1 &&
+      box.y >= -1 && box.y + box.height <= view.height + 1,
+      'the impact dialog leaves the 1440×960 viewport: ' + JSON.stringify(box));
+    /* 409 预览之后绝不出现第二次写请求。 */
+    await page.waitForTimeout(250);
+    assert.equal(writes.length, 1, 'the 409 preview was followed by a second write');
+    assert.equal('impact_confirmation' in writes[0], false,
+      'the preview request already carried a confirmation payload');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+    await page.waitForTimeout(250);
+    assert.equal(writes.length, 1, 'cancel still sent a confirmation write');
+    /* 取消后编辑框仍打开，草稿可继续修改/重试。 */
+    assert.equal(await page.locator('#modelModal').evaluate(element => element.hidden), false,
+      'cancel closed the model editor and lost the draft');
+    assert.equal(await page.locator('#cmUpstream').inputValue(), 'qwen3-8b');
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+    await page.locator('[data-close="modelModal"]').click().catch(() => {});
+  }
+});
+
+test('P0 model delete needs a replacement and sends exact hashes plus replacement_model_id', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('#modelTable tr[data-mrow="qwen3-32b"]');
+  const writes = [];
+  const matcher = '**/admin/models/qwen3-32b';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'DELETE') return route.continue();
+    const body = request.postData() ? JSON.parse(request.postData()) : undefined;
+    writes.push(body);
+    if (writes.length === 1) {
+      return route.fulfill({
+        status: 409, contentType: 'application/json',
+        body: JSON.stringify({ detail: impactDetail({
+          kind: 'model', id: 'qwen3-32b', trees: [TARGET_TREE, CATALOG_TREE],
+          replacements: [
+            { id: 'qwen3-8b', upstream: 'qwen3-8b', provider: 'local' },
+            { id: 'deepseek-v3', upstream: 'deepseek-v3', provider: 'local' }
+          ]
+        }) })
+      });
+    }
+    return route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, deleted: 'qwen3-32b', replacement_model_id: 'qwen3-8b',
+        synced_trees: ['power-priority', 'backup-canvas'] })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/models\/qwen3-32b$/, status: /409/ });
+  try {
+    await page.locator('[data-delmodel="qwen3-32b"]').click();
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    /* 被 target 引用 → 必须先选替代项；选择前确认按钮禁用。 */
+    assert.equal(await page.locator('#impactConfirm').isDisabled(), true,
+      'delete confirm was enabled before a replacement was chosen');
+    assert.equal(await page.locator('#impactReplacement').count(), 1,
+      'the delete impact dialog did not ask for a replacement');
+    /* 未选择时点击确认不能发出写请求。 */
+    await page.waitForTimeout(150);
+    assert.equal(writes.length, 1);
+    const treeText = (await page.locator('#impactTrees').innerText()).replace(/\s+/g, ' ');
+    assert.match(treeText, /电力优先决策组/);
+    assert.match(treeText, /备份画布/);
+    await page.locator('#impactReplacement').selectOption('qwen3-8b');
+    assert.equal(await page.locator('#impactConfirm').isDisabled(), false,
+      'delete confirm stayed disabled after choosing a replacement');
+    await page.locator('#impactConfirm').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 8000 });
+    assert.equal(writes.length, 2, 'confirm did not retry the delete exactly once');
+    assert.equal(writes[0], undefined,
+      'the first delete already carried a body/confirmation');
+    const retry = writes[1];
+    assert.deepEqual(retry.impact_confirmation, {
+      trees: [
+        { id: 'power-priority', document_sha256: IMPACT_HASH_A },
+        { id: 'backup-canvas', document_sha256: IMPACT_HASH_B }
+      ]
+    }, 'the confirmation did not carry the exact affected hashes');
+    assert.equal(retry.replacement_model_id, 'qwen3-8b',
+      'the delete did not map the replacement to replacement_model_id');
+    assert.equal('replacement_id' in retry, false,
+      'the generic replacement_id leaked to the backend');
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 a stale impact confirmation asks for a reload and never retries blindly', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('#modelTable tr[data-mrow="deepseek-v3"]');
+  let calls = 0;
+  const matcher = '**/admin/models/deepseek-v3';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'DELETE') return route.continue();
+    calls += 1;
+    if (calls === 1) {
+      return route.fulfill({
+        status: 409, contentType: 'application/json',
+        body: JSON.stringify({ detail: impactDetail({
+          kind: 'model', id: 'deepseek-v3', trees: [TARGET_TREE],
+          replacements: [{ id: 'qwen3-8b', upstream: 'qwen3-8b', provider: 'local' }]
+        }) })
+      });
+    }
+    return route.fulfill({
+      status: 409, contentType: 'application/json',
+      body: JSON.stringify({ detail: {
+        code: 'graph_conflict',
+        actual_document_sha256: IMPACT_HASH_C
+      } })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/models\/deepseek-v3$/, status: /409/ });
+  expectHttpStatusError({ url: /\/admin\/models\/deepseek-v3$/, status: /409/ });
+  try {
+    await page.locator('[data-delmodel="deepseek-v3"]').click();
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    await page.locator('#impactReplacement').selectOption('qwen3-8b');
+    await page.locator('#impactConfirm').click();
+    await page.waitForSelector('#impactConflict', { timeout: 8000 });
+    const text = (await page.locator('#impactConflict').innerText()).replace(/\s+/g, ' ');
+    assert.match(text, /重新加载|Reload|reload/,
+      'a stale hash did not ask the user to reload the canvases: ' + text);
+    assert.match(text, /cccccccccccc/,
+      'the reload notice did not report the actual current hash: ' + text);
+    /* 陈旧哈希后没有第三次盲目重试；确认按钮消失，只能关闭。 */
+    await page.waitForTimeout(300);
+    assert.equal(calls, 2, 'a stale confirmation retried the write blindly');
+    assert.equal(await page.locator('#impactConfirm').evaluate(element => element.hidden), true,
+      'the stale dialog still offered the confirm action');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+    await page.waitForTimeout(200);
+    assert.equal(calls, 2, 'closing the stale dialog wrote something');
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 provider delete shows the non-bypassable reference list and cannot be confirmed', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('[data-delprov="local"]');
+  let calls = 0;
+  const matcher = '**/admin/providers/local';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'DELETE') return route.continue();
+    calls += 1;
+    return route.fulfill({
+      status: 409, contentType: 'application/json',
+      body: JSON.stringify({ detail: {
+        code: 'provider_referenced',
+        message: 'provider 同时被数据库模型与自包含画布引用，请先解除引用',
+        models: ['qwen3-8b', 'qwen3-32b'],
+        affected_trees: [{
+          id: 'power-priority', name: '电力优先决策组', enabled: true,
+          document_sha256: IMPACT_HASH_A,
+          usage: { runtime_catalog: true, models: { use: ['qwen3-8b'] } }
+        }]
+      } })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/providers\/local$/, status: /409/ });
+  try {
+    await page.locator('[data-delprov="local"]').click();
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    const text = (await page.locator('#impactBody').innerText()).replace(/\s+/g, ' ');
+    assert.match(text, /不可绕过|cannot be bypassed/,
+      'the provider-reference dialog did not state that deletion cannot be bypassed: ' + text);
+    assert.match(text, /qwen3-8b/,
+      'the provider-reference dialog did not list the database models: ' + text);
+    assert.match(text, /电力优先决策组/,
+      'the provider-reference dialog did not list the affected canvas: ' + text);
+    assert.equal(await page.locator('#impactConfirm').evaluate(element => element.hidden), true,
+      'provider deletion incorrectly offered a confirm action');
+    await page.waitForTimeout(300);
+    assert.equal(calls, 1, 'the blocked provider deletion retried the delete');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 provider save shows the shared impact list and cancel writes nothing', async () => {
+  await page.goto(routerBase + '/console/models.html');
+  await page.waitForSelector('[data-editprov="local"]');
+  const writes = [];
+  const matcher = '**/admin/providers/local';
+  await page.route(matcher, jsonRoute(async (route, request) => {
+    if (request.method() !== 'PUT') return route.continue();
+    writes.push(request.postData() ? JSON.parse(request.postData()) : {});
+    if (writes.length === 1) {
+      return route.fulfill({
+        status: 409, contentType: 'application/json',
+        body: JSON.stringify({ detail: impactDetail({
+          kind: 'provider', id: 'local', trees: [CATALOG_TREE]
+        }) })
+      });
+    }
+    return route.fulfill({
+      status: 200, contentType: 'application/json',
+      body: JSON.stringify({ ok: true, provider: { name: 'local' }, synced_trees: ['backup-canvas'] })
+    });
+  }));
+  expectHttpStatusError({ url: /\/admin\/providers\/local$/, status: /409/ });
+  try {
+    await page.locator('[data-editprov="local"]').click();
+    await page.locator('#provModalSave').click();
+    await page.waitForSelector('#impactModal:not([hidden])', { timeout: 8000 });
+    await page.waitForTimeout(250);
+    assert.equal(writes.length, 1, 'the provider 409 preview was followed by a second write');
+    assert.equal(await page.locator('#impactReplacement').count(), 0,
+      'a provider save incorrectly asked for a replacement');
+    await page.locator('#impactCancel').click();
+    await page.waitForFunction(() => document.getElementById('impactModal').hidden, null, { timeout: 4000 });
+    await page.waitForTimeout(250);
+    assert.equal(writes.length, 1, 'cancelling the provider impact dialog still wrote');
+    assert.equal(await page.locator('#provModal').evaluate(element => element.hidden), false,
+      'cancelling the impact dialog closed the provider editor');
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+    await page.locator('[data-close="provModal"]').click().catch(() => {});
+  }
+});
+
 test('P0 acceptance · changed console pages do not overflow at 1440×960 or 1280×800 in either language', async () => {
   await ensureBaselineTree();
   const targets = [
@@ -434,9 +768,7 @@ test('P0 acceptance · changed console pages do not overflow at 1440×960 or 128
         for (const target of targets) {
           await page.goto(routerBase + target.path);
           await page.waitForSelector(target.ready, { timeout: 20000 });
-          if (target.path.endsWith('/jev.html')) {
-            await page.waitForFunction(() => document.getElementById('jevStatus').textContent.trim() !== '');
-          }
+          if (target.path.endsWith('/jev.html')) await waitJevReady();
           const size = await page.evaluate(() => ({
             scroll: document.documentElement.scrollWidth,
             client: document.documentElement.clientWidth,

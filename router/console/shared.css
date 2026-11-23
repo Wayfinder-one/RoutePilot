@@ -832,7 +832,9 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
 .jev-page{max-width:1180px}
 .jev-layout{display:grid;grid-template-columns:286px minmax(0,1fr);gap:12px;align-items:start}
 .jev-list-card .col-h{margin-bottom:6px}
-.jev-list{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:64vh;overflow:auto}
+.jev-list{display:flex;flex-direction:column;gap:6px;margin:8px 0 0;padding:0;list-style:none;
+  max-height:64vh;overflow:auto}
+.jev-list-row{margin:0;padding:0}
 .jev-list-empty{font-size:11.5px;line-height:1.55;padding:9px 2px}
 .jev-item{display:flex;flex-direction:column;gap:3px;text-align:left;width:100%;
   border:1px solid var(--line);background:var(--panel-2);border-radius:9px;
@@ -858,6 +860,24 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
 .jev-actions .modal-msg{margin-right:auto;max-width:52ch}
 .jev-test-card{margin-top:12px}
 .jev-test-card label.field{margin-bottom:0}
+/* ── shared impact confirmation (models / providers / JEV) ───────────── */
+.impact-modal{z-index:95}
+.impact-card{width:min(640px,100%)}
+.impact-list{display:flex;flex-direction:column;gap:6px;margin:4px 0 10px;padding:0;list-style:none;
+  max-height:38vh;overflow:auto;padding-right:2px}
+.impact-tree{border:1px solid var(--line);border-radius:9px;background:var(--panel-2);
+  padding:7px 9px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.impact-tree-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.impact-tree-head .impact-name{font-size:12.5px;font-weight:650;overflow-wrap:anywhere}
+.impact-tree-head .impact-id{font-size:10.5px;overflow-wrap:anywhere}
+.impact-tree-head .pill{margin-left:auto;font-size:10px;padding:0 7px;flex:none}
+.impact-usage{font-size:11px;color:var(--text-2);line-height:1.5;overflow-wrap:anywhere}
+.impact-sha{font-family:var(--mono);font-size:10px;color:var(--text-3);align-self:flex-start}
+.impact-replacement{border-top:1px dashed var(--line);margin-top:8px;padding-top:8px}
+.impact-replacement .field{max-width:440px}
+.impact-blocked-models{margin:0 0 8px;font-size:11.5px;color:var(--text-2);overflow-wrap:anywhere}
+.impact-conflict{margin-bottom:10px}
+
 /* #jevTestResult[data-state] comes from the real test response. */
 .test-out{margin-top:12px;padding-top:11px;border-top:1px solid var(--line);
   min-height:52px;font-size:12px;line-height:1.55;color:var(--text-2)}
@@ -869,4 +889,5 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
 @media (max-width:900px){
   .jev-layout{grid-template-columns:1fr}
   .jev-list{max-height:40vh}
+  .impact-list{max-height:46vh}
 }

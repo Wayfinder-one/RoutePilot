@@ -7,15 +7,20 @@
 
    职责（只在展示与交互层，不 import 数据层）：
    - 左侧服务目录列表（按 id 排序）：id / model / base_url / 窗口 / 密钥状态，
-     永不渲染密钥材料；
+     永不渲染密钥材料；列表语义是 <ul><li><button>（button 不再被 role=listitem
+     覆盖，键盘/读屏仍按按钮语义工作）；
    - 右侧当前服务编辑器：服务 ID、连接、提示词模板、State 模板、输入/上下文窗口；
    - 每个服务各自的未保存草稿：切换服务时保存当前草稿、恢复目标草稿；语言切换
      与连接测试只重绘文案/结果，绝不回填表单值（不覆盖草稿）；
-   - 409 `impact_confirmation_required` 明确展示“仍被画布引用、需要确认影响”，
-     不静默吞掉、不自动重试（共享影响确认 UI 属于下一控制台单元）。
+   - 测试结果 / 原始响应属于“当前服务”：切换、新建、保存后复位，避免把上一个
+     服务的结果显示在新服务上；
+   - 删除的本地“再次点击确认”只是防误触；真正的影响确认（409
+     `impact_confirmation_required`）走共享 impact.js：确认后带精确哈希与
+     `replacement_jev_id` 重试，取消不发任何写请求，陈旧哈希只提示重新加载。
    ------------------------------------------------------------------ */
 import { apiErrText } from './api.js';
 import { LANG, onLangChange, t, tf } from './i18n.js';
+import { withImpactConfirmation } from './impact.js';
 
 const $ = selector => document.querySelector(selector);
 const $$ = selector => [...document.querySelectorAll(selector)];
@@ -39,6 +44,7 @@ let creating = false;
 let saving = false;
 let testing = false;
 let deleteArmed = false;
+let deleteArmTimer = null;
 let keyPresent = false;
 let lastTest = { state: 'untested', selectedKey: '', ms: null };
 
@@ -155,16 +161,9 @@ function showMessage(text, bad) {
   msg.classList.toggle('ok', !bad && !!text);
 }
 
-/* 409 impact_confirmation_required：服务被已存画布引用。本单元只明确说明需要
-   确认影响，绝不自动重试；共享影响确认 UI 会在下一控制台单元接入。 */
+/* 非影响类错误（404 / 422 / 网络）直接展示服务端 detail；409 影响确认与
+   陈旧哈希由共享 impact.js 组件处理，这里不再重复兜底。 */
 function showActionError(error, fallbackKey) {
-  const detail = error && error.detail;
-  if (error && error.status === 409 && detail && detail.code === 'impact_confirmation_required') {
-    const affected = Array.isArray(detail.affected_trees) ? detail.affected_trees : [];
-    const names = affected.map(tree => tree.name || tree.id).filter(Boolean).join('、');
-    showMessage(tf('jev.impactRequired', { count: affected.length, trees: names || '—' }), true);
-    return;
-  }
   showMessage(tf(fallbackKey, { err: apiErrText(error) }), true);
 }
 
@@ -202,18 +201,21 @@ function renderList() {
   if (!list) return;
   list.textContent = '';
   if (!services.length) {
-    const empty = document.createElement('p');
+    const empty = document.createElement('li');
     empty.className = 'jev-list-empty mut';
     empty.textContent = t('jev.listEmpty');
     list.appendChild(empty);
     return;
   }
   for (const service of services) {
+    /* 列表项是 <li>，可点击主体是 <button>：两者语义分离，不再用
+       role="listitem" 覆盖 button 的角色。 */
+    const row = document.createElement('li');
+    row.className = 'jev-list-row';
     const item = document.createElement('button');
     item.type = 'button';
     item.className = 'jev-item' + (service.id === currentId && !creating ? ' is-on' : '');
     item.dataset.jevServiceId = service.id;
-    item.setAttribute('role', 'listitem');
 
     const head = document.createElement('span');
     head.className = 'ji-row';
@@ -236,7 +238,8 @@ function renderList() {
     item.appendChild(win);
 
     item.addEventListener('click', () => selectService(service.id));
-    list.appendChild(item);
+    row.appendChild(item);
+    list.appendChild(row);
   }
 }
 
@@ -311,6 +314,21 @@ function paintTestStored() {
   /* fail 状态保留服务端错误原文（与语言无关），不做二次翻译。 */
 }
 
+/* 测试结果属于当前服务：切换 / 新建 / 保存后必须复位，绝不能把上一个服务的
+   成功/失败结果或原始响应显示在新服务上。 */
+function resetTestResult() {
+  lastTest = { state: 'untested', selectedKey: '', ms: null };
+  const out = $('#jevTestResult');
+  if (out) {
+    out.dataset.state = 'untested';
+    out.textContent = t('jev.testEmpty');
+  }
+  const details = $('#jevTestRawDetails');
+  if (details) { details.hidden = true; details.open = false; }
+  const raw = $('#jevTestRaw');
+  if (raw) raw.textContent = '';
+}
+
 /* ── selection / new / apply ─────────────────────────────────────────── */
 function selectService(id) {
   const service = services.find(item => item.id === id);
@@ -319,7 +337,8 @@ function selectService(id) {
   storeCurrentDraft();
   currentId = id;
   creating = false;
-  deleteArmed = false;
+  resetDeleteArm();
+  resetTestResult();
   keyPresent = !!service.key_present;
   const draft = drafts.get(id) || draftFromService(service);
   fillDraft(draft);
@@ -335,7 +354,8 @@ function newService() {
   storeCurrentDraft();
   currentId = null;
   creating = true;
-  deleteArmed = false;
+  resetDeleteArm();
+  resetTestResult();
   keyPresent = false;
   fillDraft(blankDraft());
   const idInput = $('#jevServiceId');
@@ -350,6 +370,10 @@ function newService() {
 function applyService(service) {
   currentId = service.id;
   creating = false;
+  /* 保存/应用成功即重置本地删除上膛与测试结果：配置已变，旧的确认状态与
+     旧测试结果都不能泄漏到下一次交互。 */
+  resetDeleteArm();
+  resetTestResult();
   keyPresent = !!service.key_present;
   const draft = draftFromService(service);
   drafts.set(service.id, draft);
@@ -394,10 +418,18 @@ async function saveService() {
       applyService(saved);
       showMessage(tf('jev.msgCreated', { id: saved.id }), false);
     } else if (currentId) {
-      const saved = await ACTIONS.updateService(currentId, draft);
-      upsertService(saved);
-      applyService(saved);
-      showMessage(tf('jev.msgSaved', { id: saved.id }), false);
+      const id = currentId;
+      /* 更新被画布引用的服务：第一次 PUT 只拿 409 影响预览；确认后共享组件
+         用精确哈希重试，取消不产生写请求。 */
+      const outcome = await withImpactConfirmation(context =>
+        ACTIONS.updateService(id, draft, context ? context.impact_confirmation : undefined));
+      if (!outcome.ok) {
+        if (outcome.conflict) showMessage(t('impact.conflictToast'), true);
+        return;
+      }
+      upsertService(outcome.result);
+      applyService(outcome.result);
+      showSaved(outcome.result.id, outcome.result);
     } else {
       showMessage(t('jev.msgPickService'), true);
     }
@@ -407,6 +439,20 @@ async function saveService() {
     saving = false;
     setBusy(false);
   }
+}
+
+/* 服务端同步了哪些画布：已打开的画布不会自动重载，明确提示（与保存/删除文案
+   合并，避免覆盖掉操作本身的反馈）。 */
+function syncedCount(payload) {
+  return payload && Array.isArray(payload.synced_trees) ? payload.synced_trees.length : 0;
+}
+function showSaved(id, payload) {
+  const n = syncedCount(payload);
+  showMessage(n ? tf('jev.msgSavedSynced', { id, n }) : tf('jev.msgSaved', { id }), false);
+}
+function showDeleted(id, payload) {
+  const n = syncedCount(payload);
+  showMessage(n ? tf('jev.msgDeletedSynced', { id, n }) : tf('jev.msgDeleted', { id }), false);
 }
 
 async function runTest() {
@@ -431,6 +477,10 @@ async function runTest() {
 
 function resetDeleteArm() {
   deleteArmed = false;
+  if (deleteArmTimer) {
+    clearTimeout(deleteArmTimer);
+    deleteArmTimer = null;
+  }
   const btn = $('#jevDelete');
   if (!btn) return;
   btn.dataset.armed = '0';
@@ -453,7 +503,11 @@ async function deleteService() {
       btn.textContent = t('jev.confirmDelete');
     }
     showMessage(tf('jev.msgDeleteArmed', { id: currentId }), false);
-    setTimeout(() => { if (deleteArmed) resetDeleteArm(); }, 3500);
+    if (deleteArmTimer) clearTimeout(deleteArmTimer);
+    deleteArmTimer = setTimeout(() => {
+      deleteArmTimer = null;
+      if (deleteArmed) resetDeleteArm();
+    }, 3500);
     return;
   }
   const deletedId = currentId;
@@ -461,7 +515,19 @@ async function deleteService() {
   saving = true;
   setBusy(true);
   try {
-    await ACTIONS.deleteService(deletedId);
+    /* 被画布引用的服务：第一次 DELETE 只拿 409 影响预览；确认框里必须选择
+       替代服务（replacement_jev_id），取消则不写任何东西。 */
+    const outcome = await withImpactConfirmation(context => ACTIONS.deleteService(
+      deletedId,
+      context ? {
+        replacement_jev_id: context.replacement_id,
+        impact_confirmation: context.impact_confirmation,
+      } : undefined), { operation: 'delete' });
+    if (!outcome.ok) {
+      if (outcome.conflict) showMessage(t('impact.conflictToast'), true);
+      else showMessage('', false);
+      return;
+    }
     drafts.delete(deletedId);
     services = services.filter(service => service.id !== deletedId);
     currentId = null;
@@ -469,7 +535,7 @@ async function deleteService() {
     renderList();
     if (services.length) selectService(services[0].id);
     else newService();
-    showMessage(tf('jev.msgDeleted', { id: deletedId }), false);
+    showDeleted(deletedId, outcome.result);
   } catch (error) {
     showActionError(error, 'jev.msgDeleteFail');
   } finally {

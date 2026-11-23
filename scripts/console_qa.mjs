@@ -1046,8 +1046,16 @@ test('bootstrap registers the multi-JEV catalog, periods and the self-contained 
   assert.deepEqual(
     { input_tokens: defaultService.input_tokens, context_tokens: defaultService.context_tokens },
     BASELINE_RUNTIME.jev_window);
-  assert.equal(defaultService.key_present, false);
-  assert.equal('api_key' in defaultService, false);
+  /* 环境里可能恰好设置了该服务的 key_env（例如 ROUTER_JEV_API_KEY）：此时
+     key_source 合法地变成 'env'，真正要钉住的是「密钥材料永不回显」与
+     「key_source 只能是 none/env（bootstrap 从不写存储密钥）」。
+     直接断言 key_present === false 会被 ambient env 误伤。 */
+  assert.equal('api_key' in defaultService, false,
+    'GET /admin/jev exposed an api_key field');
+  assert.ok(['none', 'env'].includes(defaultService.key_source),
+    'unexpected default-service key_source: ' + defaultService.key_source);
+  assert.equal(defaultService.key_present, defaultService.key_source !== 'none',
+    'key_present disagrees with key_source');
   assert.equal(JSON.stringify(jevCatalog).includes('api_key'), false);
   /* 目录 GET 只读 SQLite：未被活动画布引用的服务同样出现，证明它不是画布投影。 */
   const referenced = new Set([BASELINE_RUNTIME.jev.id]);

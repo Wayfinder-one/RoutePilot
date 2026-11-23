@@ -22,7 +22,7 @@
         <span class="pill" id="jevCount">0</span>
         <button class="btn sm pri push-right" id="jevNew" type="button" data-i18n="jev.new"></button>
       </div>
-      <div class="jev-list" id="jevList" role="list"></div>
+      <ul class="jev-list" id="jevList" aria-labelledby="jevListTitle"></ul>
       <p class="footnote" data-i18n="jev.listHint"></p>
     </section>
 
@@ -52,6 +52,7 @@
           <input id="jevApiKey" type="password" autocomplete="off" spellcheck="false"></label>
         <label class="chk"><input type="checkbox" id="jevClearKey"><span data-i18n="jev.clearKey"></span></label>
       </div>
+      <p class="footnote" id="jevKeyHint" data-i18n="jev.keyHint"></p>
 
       <div class="hr"></div>
       <div class="col-h sm" data-i18n="jev.promptTitle"></div>

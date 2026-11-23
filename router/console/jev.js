@@ -13,7 +13,8 @@
    - `DELETE /admin/jev/{id}`（可选 body）  → `{deleted, replacement_jev_id, synced_trees}`
    - `POST   /admin/jev/{id}/test`         → 连接测试结果
    被已存画布引用的服务在更新/删除时会先返回 409 `impact_confirmation_required`；
-   本单元只把错误原样上抛（共享影响确认 UI 属于下一控制台单元），绝不静默重试。
+   数据层只负责把调用方给的确认载荷原样透传（`impact_confirmation`，删除另加
+   `replacement_jev_id`），绝不自行重试；两阶段确认由视图经共享 impact.js 编排。
 
    `nonSecretServiceBody(draft)` 是写请求的完整白名单：api_key 只在用户输入了新
    密钥或勾选“清除”时才随写请求发送，响应/列表状态里永不保存密钥。
@@ -57,13 +58,16 @@ export async function createService(draft) {
 
 export async function updateService(id, draft, impactConfirmation) {
   const body = writeBody(draft);
-  /* 确认载荷只在调用方显式提供时透传；本页面不构造确认，只展示 409。 */
+  /* 确认载荷只在调用方显式提供时透传；确认内容由共享 impact.js 从 409 detail
+     构造，数据层不猜哈希。 */
   if (impactConfirmation) body.impact_confirmation = impactConfirmation;
   const saved = await api.put('/admin/jev/' + encodeURIComponent(id), body);
   return saved.service;
 }
 
 export async function deleteService(id, confirmation) {
+  /* confirmation = { replacement_jev_id?, impact_confirmation? }（共享确认重试时
+     由视图传入）；未被引用的服务不带 body 直接删除。 */
   const body = {};
   if (confirmation && typeof confirmation === 'object') Object.assign(body, confirmation);
   return api.req('DELETE', '/admin/jev/' + encodeURIComponent(id),
