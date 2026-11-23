@@ -160,11 +160,18 @@ test('P0 toolbar keeps only primary actions visible and overflow remains operabl
   }
   assert.equal(await page.locator('#cvIssuesBtn').isVisible(), true,
     'the validation entry must stay visible at the right end');
-  const visiblePrimary = await page.evaluate(() =>
-    ['cvTryBtn', 'cvMoreBtn', 'cvEnable', 'cvIssuesBtn'].filter(id => {
-      const element = document.getElementById(id);
-      return !!element && element.getClientRects().length > 0;
-    }));
+  /* 枚举动作区里所有 button/summary 的真实集合，再逐个问 Playwright 是否可见：
+     不写死白名单（否则多出来的第五个可见按钮永远不会被发现），也不用
+     getClientRects()/checkVisibility()（闭合 <details> 里它们与 Playwright 的
+     可见性判定不一致，只有 isVisible() 与用户所见一致）。 */
+  const toolbarIds = await page.evaluate(() => {
+    const actions = document.querySelector('.rtc-actions');
+    return Array.from(actions.querySelectorAll('button, summary')).map(element => element.id);
+  });
+  const visiblePrimary = [];
+  for (const id of toolbarIds) {
+    if (await page.locator('#' + id).isVisible()) visiblePrimary.push(id);
+  }
   assert.deepEqual(visiblePrimary, ['cvTryBtn', 'cvMoreBtn', 'cvEnable', 'cvIssuesBtn'],
     'the first screen must expose only the primary actions plus the validation entry');
   for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',

@@ -79,13 +79,13 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 | Decision groups | Canvas editor, graph settings, inspector, validation, dry run, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
 | Decision service | Read-only service profile (address, model, key status, test status) with Save and test; prompts, timeout and the context window live under Advanced |
-| Models | Model registry; Connect models onboards a catalog provider and its models in one save, with slot IDs, reasoning declarations and provider protocol under Advanced |
+| Models | Model registry; Connect models onboards a catalog provider and its models in one save. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
 | Users | Admin/viewer accounts, passwords, roles, status |
 
 ### Common paths
 
 - The decision-group toolbar defaults to **Try run** and **Save and enable**; an enabled draft with pending edits reads **Save and update**. **Save draft** and Disable live under **More**. The inspector's **Apply** only updates the local draft and never writes to the server.
-- On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically; manual IDs, reasoning declarations and provider protocol settings stay under Advanced.
+- On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
 - The **Decision service** page shows only connection details by default; **Save and test** saves the service configuration, then the context window, then tests the connection. Prompts, the state template, timeout and token window live under Advanced, and the raw test response expands on demand.
 
 ### Model test chat
@@ -109,8 +109,8 @@ The routing page is split into two zones.
 - Typed wires; a numeric output dropped into a boolean slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
 - Dragging an output onto empty canvas quick-creates a compatible node.
-- Save and enable stay separate; the lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
-- The inspector's **Apply** commits to the local draft only; the toolbar primary is the only action that writes to the server.
+- Saving and publishing are merged into the toolbar primary; **Save draft** under **More** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
+- The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: the primary publishes (saves and enables), **Save draft** saves without enabling, and **Disable** flips the enabled state.
 - Target cards show display name, model list, fallback role and scheduling strategy.
 
 **Execution zone** — docked below the canvas:
