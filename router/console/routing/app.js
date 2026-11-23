@@ -763,13 +763,15 @@ function updateToolbar() {
 
 /* 顶栏状态只由 store 的持久化视图投影：启用与否 + 草稿是否干净 + 是否落过盘。
    dirtyKind 仍保留 behavior/layout/display 分类，供保存语义与 beforeunload 使用；
-   这里只把它折叠成用户需要看的四种生命周期，不再另设第五种“仅布局”状态。 */
+   这里只把它折叠成用户需要看的四种生命周期，不再另设第五种“仅布局”状态。
+   未启用优先：只要落过盘（store.saved）就显示 disabled，无论草稿是否有本地
+   改动（脏状态由主按钮「保存并启用 / 保存并更新」表达）；draft 只留给从未
+   保存过的新草稿。 */
 function lifecycleState() {
   const enabled = !!(store.tree && store.tree.enabled);
   const clean = store.dirtyKind === 'clean';
   if (enabled) return clean ? 'running' : 'unpublished';
-  if (store.saved && clean) return 'disabled';
-  return 'draft';
+  if (!enabled) return store.saved ? 'disabled' : 'draft';
 }
 
 function paintLifecycle() {

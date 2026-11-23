@@ -1291,7 +1291,6 @@ export async function draftStatus() {
     const badge = document.getElementById('cvLifecycle');
     return {
       kind: app.kind(),
-      appKind: app.kind(),
       state: badge.dataset.state,
       text: badge.textContent.trim(),
       revision: badge.title,

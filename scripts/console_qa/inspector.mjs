@@ -966,7 +966,7 @@ test('review-inspector-adds-input-connection', async () => {
     'canvas slot row does not show the new source');
   const badge = await draftStatus();
   assert.equal(badge.visible, true, 'inspector connection did not mark the draft dirty');
-  assert.equal(badge.appKind, 'behavior');
+  assert.equal(badge.kind, 'behavior');
   assert.equal(badge.state, 'unpublished');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');

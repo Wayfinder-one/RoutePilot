@@ -42,7 +42,9 @@
       <div class="rtc-h1">
         <select id="cvTreeSelect" class="rtc-treeselect" data-i18n-aria="cv.group" aria-label="决策组"></select>
         <span class="pill" id="cvLifecycle" data-state="draft">
-          <span class="dot"></span><span id="cvLifecycleLabel"></span>
+          <!-- 首屏（boot 的两次 API 未回包）先显示与 data-state 一致的草稿标签，
+               首次 paintLifecycle() 会覆盖成本地真实状态。 -->
+          <span class="dot"></span><span id="cvLifecycleLabel" data-i18n="cv.status.draft"></span>
         </span>
         <span class="pill" id="cvSnapshotBadge" data-i18n="cv.snapshotBadge" hidden></span>
       </div>
@@ -69,7 +71,9 @@
           </div>
         </details>
         <button type="button" class="btn sm pri" id="cvEnable">
-          <span id="cvEnableLabel" data-i18n="cv.publish"></span>
+          <!-- 文案完全由 paintLifecycle() 拥有；保留静态首屏种子，避免 boot 前空白。
+               不能带 data-i18n：setLang 会把它改回固定 key，覆盖真实状态。 -->
+          <span id="cvEnableLabel">保存并启用</span>
         </button>
         <button type="button" class="pill rtc-issues-btn" id="cvIssuesBtn" aria-expanded="false">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-alert"/></svg>

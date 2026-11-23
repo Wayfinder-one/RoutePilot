@@ -366,7 +366,6 @@ test('7.4-02-node-drag-live-layout-only', async () => {
   const dirty = await draftStatus();
   assert.equal(dirty.visible, true);
   assert.equal(dirty.kind, 'layout');
-  assert.equal(dirty.appKind, 'layout');
   assert.equal(dirty.state, 'unpublished');
   let snapshot = await appSnapshot();
   assert.deepEqual(snapshot.history, { undo: true, redo: false });
@@ -1198,7 +1197,6 @@ test('Task 12 · moving a node saves layout-only: revision unchanged, coordinate
   const badge = await draftStatus();
   assert.equal(badge.visible, true);
   assert.equal(badge.kind, 'layout');
-  assert.equal(badge.appKind, 'layout');
   assert.equal(badge.state, 'unpublished', 'a layout edit is still an unpublished change');
   assert.equal(badge.text, await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
@@ -1484,6 +1482,90 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(ui.disableHidden, true, 'a disabled group must hide the disable action');
   assert.equal((await serverTree(draft.id)).enabled, false, 'disable did not reach the server');
   await ensureBaselineTree();
+});
+
+test('Task 2 fix · a saved disabled group with local edits reads disabled, not draft', async () => {
+  /* 未启用优先：只要落过盘（store.saved），本地脏改动不再把生命周期降级成
+     「草稿未保存」；脏状态由主按钮「保存并启用」表达。 */
+  try {
+    await ensureBaselineTree();
+    await openCanvas();
+    await clickCanvasAction('cvDisable');
+    await waitFor(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+      return (app.tree.enabled === false && app.changeKind === 'clean');
+}, null, { timeout: 8000 });
+    const saved = await page.evaluate(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+      return (app.saved ? { enabled: app.saved.enabled } : null);
+});
+    assert.equal(saved && saved.enabled, false,
+      'disable must keep store.saved; the dirty-disabled regression needs that precondition');
+
+    await dragNodeBy('start', 24, 14);
+    await waitFor(async () => {
+    const { app, store } = await import('/console/routing/app.js');
+      return (app.changeKind !== 'clean');
+});
+
+    const state = await page.locator('#cvLifecycle').getAttribute('data-state');
+    const label = (await page.locator('#cvLifecycleLabel').textContent()).trim();
+    assert.equal(state, 'disabled',
+      `a saved disabled group with local edits must read disabled, got ${state} / ${label}`);
+    assert.equal(label, await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+      return (t('cv.status.disabled'));
+}), 'a saved disabled group must use the disabled label even while dirty');
+    assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
+      await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+        return (t('cv.publish'));
+}), 'a dirty disabled group must offer publish, not a stale published label');
+} finally {
+    await ensureBaselineTree();
+}
+});
+
+test('Task 2 fix · language switch repaints the JS-owned lifecycle and primary labels', async () => {
+  /* #cvEnableLabel 不再带 data-i18n：setLang 只能靠 onLangChange 重绘，
+     这里保证切语言后标签仍与当前生命周期一致，而不是残留旧语言。 */
+  try {
+    await ensureBaselineTree();
+    await openCanvas();
+    const labels = () => page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+      return {
+        lifecycle: document.getElementById('cvLifecycleLabel').textContent.trim(),
+        primary: document.getElementById('cvEnableLabel').textContent.trim(),
+        expectedLifecycle: t('cv.status.running'),
+        expectedPrimary: t('cv.published')
+};
+});
+    await page.evaluate(async () => {
+    const { setLang } = await import('/console/i18n.js');
+      setLang('en');
+});
+    let ui = await labels();
+    assert.equal(ui.lifecycle, ui.expectedLifecycle,
+      'language switch did not repaint the lifecycle label');
+    assert.equal(ui.primary, ui.expectedPrimary,
+      'language switch did not repaint the JS-owned primary label');
+
+    await page.evaluate(async () => {
+    const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+});
+    ui = await labels();
+    assert.equal(ui.lifecycle, ui.expectedLifecycle,
+      'switching back to zh did not repaint the lifecycle label');
+    assert.equal(ui.primary, ui.expectedPrimary,
+      'switching back to zh did not repaint the JS-owned primary label');
+} finally {
+    await page.evaluate(async () => {
+    const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+});
+}
 });
 
 test('7.4-13-save-enable-unsaved-badge', async () => {
