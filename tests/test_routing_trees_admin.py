@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
 
 import httpx
@@ -324,12 +323,12 @@ ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level"}
 
 
 def test_parse_failures_are_issue_arrays(client):
-    response = create_tree(client, {
-        "id": "bad", "name": "", "root": {
-            "id": "root", "type": "graph",
-            "nodes": [{"id": "n", "type": "bogus"}], "edges": [],
-        },
-    })
+    # 必须携带完整运行字段，否则解析器在「四字段必须成组」处就拒绝，永远走不到
+    # 坏 root 的图解析错误。这里断言具体的解析 detail，证明坏节点/旧类型确实被解析。
+    response = create_tree(client, tree_dict("bad", root={
+        "id": "root", "type": "graph",
+        "nodes": [{"id": "n", "type": "bogus"}], "edges": [],
+    }))
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, list) and detail
@@ -338,11 +337,18 @@ def test_parse_failures_are_issue_arrays(client):
     assert issue["code"] == "graph_parse_error"
     assert issue["level"] == "hard"
     assert issue["zh"] and issue["en"]
+    assert "unknown node type 'bogus'" in issue["zh"]
+    assert "unknown node type 'bogus'" in issue["en"]
+    assert "runtime fields must appear together" not in issue["zh"]
     assert client.get("/admin/trees").json()["trees"] == []
 
-    response = create_tree(client, {"id": "old", "name": "", "root": {"id": "x", "type": "jev"}})
-    assert response.status_code == 422
-    assert response.json()["detail"][0]["code"] == "graph_parse_error"
+    response = create_tree(client, tree_dict("old", root={"id": "x", "type": "jev"}))
+    assert response.status_code == 422, response.text
+    legacy = response.json()["detail"][0]
+    assert set(legacy) == ISSUE_KEYS
+    assert legacy["code"] == "graph_parse_error"
+    assert "graph.type must be 'graph', got 'jev'" in legacy["zh"]
+    assert "runtime fields must appear together" not in legacy["zh"]
     assert client.get("/admin/trees").json()["trees"] == []
 
 
@@ -473,6 +479,44 @@ def test_update_explicit_sticky_null_resets_to_default(client):
         "enabled": False, "ttl_seconds": 1800}
 
 
+@pytest.mark.parametrize(("field", "message"), [
+    ("backends", "backends must be an object"),
+    ("jev_window", "jev_window must be an object"),
+    ("time_periods", "time_periods must be a list"),
+])
+def test_update_explicit_null_flat_runtime_field_is_parse_error(client, field, message):
+    """四个扁平运行字段的显式 null 交给解析器，按字段类型 422，且画布不变。"""
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+
+    response = save_tree(client, {field: None})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert isinstance(detail, list) and len(detail) == 1
+    issue = detail[0]
+    assert set(issue) == ISSUE_KEYS
+    assert issue["code"] == "graph_parse_error"
+    assert message in issue["zh"]
+    assert client.get("/admin/trees/main").json()["tree"] == before
+
+
+def test_update_explicit_jev_null_is_saved_and_only_enable_rejects_it(client):
+    """``jev: null`` 是合法图解析（无决策服务）：关闭画布保存 200，启用校验才拒绝。"""
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+
+    response = save_tree(client, {"jev": None})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["jev"] is None
+    assert client.get("/admin/trees/main").json()["tree"]["jev"] is None
+
+    enabled = client.post("/admin/trees/main/enable")
+    assert enabled.status_code == 422, enabled.text
+    assert any(issue["code"] == "decision_service_unavailable"
+               for issue in enabled.json()["detail"])
+
+
 def test_update_absent_fields_inherit_existing_values(client):
     """缺失字段仍走 patch 继承（控制台按部分字段保存时依赖此语义）。"""
     raw = tree_dict(
@@ -599,16 +643,6 @@ def test_tree_writes_reject_nested_profile_secrets(client, app, key):
 # --------------------------------------------------------------------------- #
 # 运行字段按补丁合并：缺失继承已存画布，显式值覆盖
 # --------------------------------------------------------------------------- #
-def test_update_without_runtime_still_inherits_existing_graph_runtime(client):
-    _active, inactive = _active_and_inactive(client)
-
-    response = save_tree(client, {"root": inactive["root"]}, tree_id="b")
-
-    assert response.status_code == 200, response.text
-    # 未提供控制字段 = 普通缺省继承：保留 B 自己的 old-model。
-    assert _model_ids(response.json()["tree"]) == ["old-model"]
-
-
 def _direct_graph(model_id):
     return {
         "id": "root", "type": "graph",

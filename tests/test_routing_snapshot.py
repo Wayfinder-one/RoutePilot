@@ -160,6 +160,50 @@ def test_mismatched_embedded_endpoints_use_environment_keys_only(conn, monkeypat
     assert "jev-secret" not in snapshot.content
 
 
+def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
+    """回归锁定：已删除的跨服务密钥回退不得复活。
+
+    画布选中服务 B，而只有服务 A 的 ``JEV_A_API_KEY`` 在环境里；B 自己的
+    ``JEV_B_API_KEY`` 未设置、数据库里 B 行的端点/模型又与画布不一致（已存密钥
+    不可复用）。快照必须得不到任何 JEV 密钥——尤其不能借用 A 的环境变量或已存密钥。
+    """
+    monkeypatch.delenv("ROUTER_JEV_API_KEY", raising=False)
+    monkeypatch.delenv("JEV_B_API_KEY", raising=False)
+    monkeypatch.setenv("JEV_A_API_KEY", "jev-a-env-secret")
+    with conn:
+        JevServiceRepo(conn).save(JevService(
+            "jev-a", "http://jev-a.test", "jev-a-model",
+            key_env="JEV_A_API_KEY", timeout_seconds=5.0),
+            api_key="jev-a-stored-secret")
+        JevServiceRepo(conn).save(JevService(
+            "jev-b", "http://jev-b-stored.test", "jev-b-stored-model",
+            key_env="JEV_B_API_KEY", timeout_seconds=5.0),
+            api_key="jev-b-stored-secret")
+
+    values = runtime_dict()
+    values["jev"] = {
+        "id": "jev-b",
+        "base_url": "http://jev-b-canvas.test",
+        "model": "jev-b-canvas-model",
+        "key_env": "JEV_B_API_KEY",
+        "timeout_seconds": 5.0,
+        "instructions": runtime_dict()["jev"]["instructions"],
+        "state_template": runtime_dict()["jev"]["state_template"],
+    }
+
+    snapshot = build_snapshot_for_tree(conn, portable_tree(values))
+
+    # 画布按自己的内嵌快照运行（选中的是 B）。
+    assert snapshot.tree.runtime.jev.id == "jev-b"
+    assert snapshot.jev.base_url == "http://jev-b-canvas.test"
+    assert snapshot.jev.model == "jev-b-canvas-model"
+    # B 无可用密钥；A 的环境变量/已存密钥都不得附着到 B 上。
+    assert snapshot.jev.api_key == ""
+    assert "jev-a-env-secret" not in snapshot.content
+    assert "jev-a-stored-secret" not in snapshot.content
+    assert "jev-b-stored-secret" not in snapshot.content
+
+
 def test_embedded_empty_catalog_rejects_model_even_when_database_has_it(conn):
     values = runtime_dict()
     values["backends"]["models"] = []

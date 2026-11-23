@@ -4,7 +4,11 @@ import json
 
 import pytest
 
-from router.routing.document import graph_document_bytes, parse_graph_document
+from router.routing.document import (
+    graph_document,
+    graph_document_bytes,
+    parse_graph_document,
+)
 from router.routing.tree import tree_behavior_dict, tree_from_dict, tree_revision_of
 from tests.routing_fixtures import runtime_dict, tree_dict
 
@@ -92,6 +96,55 @@ def test_jev_id_is_required():
     raw["jev"]["key_present"] = True
     with pytest.raises(ValueError, match="secret field is not allowed"):
         tree_from_dict(raw)
+
+
+#: ``_jev`` 边界的正反用例：key_env 必须是环境变量名，timeout 必须在 [0.1,120]，
+#: 未知字段一律拒绝。``tree_from_dict`` 会走到 ``runtime_from_dict`` 的 ``_jev``。
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("key_env", "bad-env", "invalid JEV key_env"),
+    ("key_env", "1ABC", "invalid JEV key_env"),
+    ("timeout_seconds", 0, "timeout_seconds must be in"),
+    ("timeout_seconds", 121, "timeout_seconds must be in"),
+    ("timeout_seconds", True, "timeout_seconds must be in"),
+    ("foo", "bar", "jev has unknown fields: foo"),
+])
+def test_jev_boundary_validation_rejects_invalid_fields(field, value, message):
+    raw = portable_tree_dict()
+    raw["jev"][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        tree_from_dict(raw)
+
+
+def test_jev_valid_boundary_fields_roundtrip_through_document():
+    """合法的 id/key_env/timeout/instructions/state_template 完整往返，且无密钥字段。"""
+    raw = portable_tree_dict()
+    raw["jev"] = {
+        "id": "roundtrip-jev",
+        "base_url": "http://jev-roundtrip.test",
+        "model": "jev-roundtrip",
+        "key_env": "ROUNDTRIP_JEV_API_KEY",
+        "timeout_seconds": 42.5,
+        "instructions": "自定义决策提示词",
+        "state_template": "请求：{request}",
+    }
+    source = tree_from_dict(raw)
+
+    document = graph_document(source)
+
+    # document 里的 jev 就是 snapshot_dict() 形状：只有非密钥字段。
+    assert document["jev"] == source.runtime.jev.snapshot_dict()
+    assert set(document["jev"]) == {
+        "id", "base_url", "model", "key_env", "timeout_seconds",
+        "instructions", "state_template",
+    }
+    assert "api_key" not in document["jev"]
+
+    loaded = load(graph_document_bytes(source))
+
+    assert loaded.runtime == source.runtime
+    assert loaded.runtime.jev.snapshot_dict() == document["jev"]
+    assert "api_key" not in json.loads(graph_document_bytes(source))["jev"]
 
 
 @pytest.mark.parametrize(("path", "message"), [

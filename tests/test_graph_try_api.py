@@ -606,11 +606,12 @@ ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level"}
 
 def test_try_parse_error_is_issue_array_and_skips_engine(client, app):
     engine, *_rest = install_engine(app)
-    response = client.post("/admin/try", json={
-        "root": {"id": "root", "type": "graph",
-                 "nodes": [{"id": "n", "type": "bogus"}], "edges": []},
-        "text": "你好",
-    })
+    # root-only 草稿必须带完整运行字段：否则先在「四字段成组」处 422，坏节点从未被
+    # 解析。这里断言坏节点的具体解析 detail，证明进入的是图解析路径。
+    response = client.post("/admin/try", json=root_payload(app, {
+        "id": "root", "type": "graph",
+        "nodes": [{"id": "n", "type": "bogus"}], "edges": [],
+    }, text="你好"))
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, list) and detail
@@ -619,6 +620,8 @@ def test_try_parse_error_is_issue_array_and_skips_engine(client, app):
     assert issue["code"] == "graph_parse_error"
     assert issue["level"] == "hard"
     assert issue["zh"] and issue["en"]
+    assert "unknown node type 'bogus'" in issue["zh"]
+    assert "runtime fields must appear together" not in issue["zh"]
     assert engine.calls == 0
 
 

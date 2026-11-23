@@ -577,7 +577,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# model writes are judged against the PROSPECTIVE catalog
+# model writes are judged against the ACTIVE graph's embedded runtime config
 # --------------------------------------------------------------------------- #
 def _reasoning_tree_root(level="high"):
     return _direct_graph((("qwen3-8b", level),), node_id="reasoning-target",
