@@ -9,12 +9,15 @@
 * 缺失的数据库行按字段逐项报告，``database`` 为 ``None``（JSON ``null``）。
 
 密钥纪律：比较只读取白名单里的非密钥字段；``params`` 里的值再经过一次递归脱敏
-（``without_runtime_secret_fields``），``api_key`` / ``authorization`` /
-``key_present`` / ``key_source`` 永远不会出现在 Issue、params、响应或日志中。
-``key_env`` 是环境变量**名**，不是密钥值，允许出现。
+（``without_runtime_secret_fields``）与 JSON 安全归一化（``NaN``/``Infinity`` 等
+非 JSON 标量、非 JSON 类型、非字符串对象键都转成可序列化形态），``api_key`` /
+``authorization`` / ``key_present`` / ``key_source`` 永远不会出现在 Issue、params、
+响应或日志中。``key_env`` 是环境变量**名**，不是密钥值，允许出现。
 """
 from __future__ import annotations
 
+import logging
+import math
 import sqlite3
 from collections.abc import Mapping
 
@@ -39,6 +42,14 @@ _SECRET_KEYS = frozenset({"apikey", "authorization", "keypresent", "keysource"})
 
 _ABSENT = object()
 
+logger = logging.getLogger(__name__)
+
+#: 已记录过失败提示的检查分段（每段只告警一次，避免坏行刷日志）。
+_warned_sections: set[str] = set()
+
+#: 递归 JSON 安全化的最大深度：超过后退化为固定标记，绝不让递归把只读检查打挂。
+_MAX_SAFE_DEPTH = 64
+
 
 def _is_secret_name(name: str) -> bool:
     return name.casefold().replace("-", "").replace("_", "") in _SECRET_KEYS
@@ -62,9 +73,39 @@ def _allowed_field(resource_kind: str, field: str) -> bool:
     return False
 
 
+def _json_safe(value, depth: int = 0):
+    """递归投影成 JSON 安全原语（``allow_nan=False`` 也能序列化）。
+
+    SQLite 里旧模型 ``profile`` 可能来自 ``json.loads`` 的 Python 扩展
+    （``NaN``/``Infinity``/``-Infinity`` 是合法输入），直接放进响应会让
+    FastAPI 的 ``JSONResponse`` 在序列化时抛 ``ValueError`` → ``/admin/try`` 500。
+    这里把非有限浮点转成可读字符串（``"NaN"``/``"Infinity"``/``"-Infinity"``），
+    非 JSON 类型转 ``str()``，并统一对象键为字符串；嵌套过深退化为字符串。
+    """
+    if depth > _MAX_SAFE_DEPTH:
+        # 固定标记而不是 str(value)：敌意深嵌套下 repr 也可能递归爆栈。
+        return "<nested too deep>"
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return value
+        if math.isnan(value):
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, Mapping):
+        return {
+            key if isinstance(key, str) else str(key): _json_safe(item, depth + 1)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, depth + 1) for item in value]
+    return str(value)
+
+
 def _safe_value(value):
-    """递归脱敏副本：值是 JSON 标量/容器，嵌套密钥键在出参里被剔除。"""
-    return without_runtime_secret_fields(value)
+    """递归脱敏 + JSON 安全化副本：密钥键被剔除，其余值可安全进响应。"""
+    return _json_safe(without_runtime_secret_fields(value))
 
 
 def mismatch(resource_kind: str, resource_id: str, field: str,
@@ -72,8 +113,8 @@ def mismatch(resource_kind: str, resource_id: str, field: str,
     """构造一条 ``runtime_mismatch`` hint；只接受白名单字段。
 
     唯一允许把画布/目录值放进 Issue 的入口：字段不在白名单（或路径里出现密钥
-    键名）直接抛 ``ValueError``，值再过一次递归脱敏，保证真实密钥不出现在任何
-    params/响应/日志里。
+    键名）直接抛 ``ValueError``；值再过一次递归脱敏 + JSON 安全归一化，保证真实
+    密钥与旧库里的非 JSON 标量（``NaN``/``Infinity``）都不会进入 params/响应/日志。
     """
     if resource_kind not in RESOURCE_KINDS:
         raise ValueError(f"unknown runtime_mismatch resource kind: {resource_kind!r}")
@@ -259,15 +300,38 @@ def _jev_issues(conn: sqlite3.Connection, runtime: GraphRuntime) -> list[Issue]:
     return issues
 
 
+def _guarded_section(name: str, check, conn: sqlite3.Connection,
+                     runtime: GraphRuntime) -> list[Issue]:
+    """执行一段只读比较；意外异常只跳过该段 hint，绝不把 /admin/try 打挂。
+
+    坏行/非 JSON 值应在 ``mismatch()`` 的归一化里被处理；这里是最后一道防线：
+    任何未预期错误记录一次 warning（每段仅一次）后返回空列表，执行配置仍来自画布。
+    """
+    try:
+        return check(conn, runtime)
+    except Exception:  # noqa: BLE001 - 只读提示的失败绝不能升级为接口错误
+        if name not in _warned_sections:
+            _warned_sections.add(name)
+            logger.warning(
+                "runtime catalog drift check %r failed; skipping its hints",
+                name, exc_info=True)
+        return []
+
+
 def runtime_mismatch_issues(
         conn: sqlite3.Connection, runtime: GraphRuntime) -> list[Issue]:
     """只读比较「画布声明的资源」与数据库目录；返回 hint 级 Issue 列表。
 
     遍历顺序固定（provider → model → JEV，各自按画布声明顺序），同一画布/目录
-    得到相同输出；数据库额外资源不参与比较，也不会产生 Issue。
+    得到相同输出；数据库额外资源不参与比较，也不会产生 Issue。比较层面的任何
+    意外异常都降级为「跳过该段提示」（见 ``_guarded_section``），因为本函数只做
+    只读提示，promise 是绝不阻断 ``/admin/try``。
     """
-    return (
-        _provider_issues(conn, runtime)
-        + _model_issues(conn, runtime)
-        + _jev_issues(conn, runtime)
-    )
+    issues: list[Issue] = []
+    for name, check in (
+        ("provider", _provider_issues),
+        ("model", _model_issues),
+        ("jev", _jev_issues),
+    ):
+        issues.extend(_guarded_section(name, check, conn, runtime))
+    return issues

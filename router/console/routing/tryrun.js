@@ -722,13 +722,23 @@ function factHTML(labelKey, value) {
 }
 
 /* 画布快照与数据库目录的差异只是 hint：展示资源/字段与两侧值，
-   绝不把它升级为运行失败或重跑语义。 */
+   绝不把它升级为运行失败或重跑语义。值可能很长（instructions/state_template/
+   大 profile），单行只展示截断预览；完整值不进 DOM，避免撑爆提示行。 */
+const MISMATCH_VALUE_MAX = 120;
+
 function mismatchValue(value) {
   if (value === null || value === undefined) return '—';
   if (typeof value === 'object') {
     try { return JSON.stringify(value); } catch (error) { return String(value); }
   }
   return rawText(value);
+}
+
+function mismatchPreview(value) {
+  const text = mismatchValue(value);
+  return text.length <= MISMATCH_VALUE_MAX
+    ? text
+    : text.slice(0, MISMATCH_VALUE_MAX - 1) + '…';
 }
 
 function mismatchHTML(replay) {
@@ -743,8 +753,8 @@ function mismatchHTML(replay) {
       kind: kind, id: params.resource_id || '', field: params.field || ''
     });
     const values = tf('cv.tryMismatchValues', {
-      canvas: mismatchValue(params.canvas),
-      database: mismatchValue(params.database)
+      canvas: mismatchPreview(params.canvas),
+      database: mismatchPreview(params.database)
     });
     return '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
       esc(line) + ' · ' + esc(values) + '</span></div>';

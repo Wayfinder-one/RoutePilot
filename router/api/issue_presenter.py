@@ -238,10 +238,12 @@ def present_issue(issue: Issue) -> dict[str, str]:
 
 
 def issues_payload(issues) -> list[dict]:
-    """Issue 列表 → spec §5 的 422 载荷（dict of 双语字段 + 机器定位）。
+    """Issue 列表 → spec §5 的 422/警告载荷（dict of 双语字段 + 机器定位 + params）。
 
-    Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成，
-    控制台收到的键集合与重构前一致。
+    Issue 本身只存机器字段；中文/英文在这里由 issue_presenter 统一生成。
+    除既有的 code/zh/en/node_id/edge_id/port/level 外，``params`` 原样透出给
+    控制台（如 ``runtime_mismatch`` 的 resource_kind/resource_id/field 与
+    canvas/database 两侧值）；敏感字段已在 consistency 侧过滤，呈现层不再改写。
     """
     payload = []
     for issue in issues:
