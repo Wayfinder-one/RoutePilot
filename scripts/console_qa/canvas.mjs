@@ -199,6 +199,38 @@ test('P0 toolbar keeps only primary actions visible and overflow remains operabl
     'an overflow action must close the menu');
 });
 
+test('P0 toolbar · Escape in the More menu keeps the canvas selection and inspector edits', async () => {
+  await ensureBaselineTree();
+  await openCanvas();
+  await clickNode('capability');
+  await waitInspectorBranch('node', 'capability');
+  const field = page.locator('#cvInspectorBody [data-field="instructions"]');
+  const draft = 'Esc 不能丢弃这段未提交的输入';
+  await field.fill(draft);
+  assert.equal(await field.inputValue(), draft);
+
+  await page.locator('#cvMoreBtn').click();
+  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), true,
+    'the overflow menu did not open');
+  await page.keyboard.press('Escape');
+
+  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), false,
+    'Escape did not close the overflow menu');
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'cvMoreBtn',
+    'Escape did not return focus to the More button');
+  /* 菜单自己的 Esc 只能在菜单内生效：它不能再落到画布的文档级 Esc 分支，
+     否则 select(null, null) → renderInspector() 会清掉选中并丢弃未提交输入。 */
+  const selection = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return app.kit.getSelection();
+  });
+  assert.deepEqual(selection, { kind: 'node', id: 'capability' },
+    'Escape in the More menu cleared the canvas selection');
+  await waitInspectorBranch('node', 'capability');
+  assert.equal(await field.inputValue(), draft,
+    'Escape in the More menu discarded the in-progress inspector edit');
+});
+
 test('Task 10 · blank drag, space+drag and middle-button drag all pan the viewport', async () => {
   await openCanvas();
   const start = await page.evaluate(async () => {

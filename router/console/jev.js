@@ -142,7 +142,5 @@ async function boot() {
   showConfig(jevBody);
 }
 
-$('#testText').value = '请选择一个候选以验证决策服务。';
-
 initJevView({ validateWindow, saveConfig, saveWindow, testConnection });
 boot();

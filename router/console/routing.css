@@ -81,7 +81,6 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 5px; }
 .rtc-actions .btn { font-size: 12px; }
 .rtc-actions .btn .rtc-ic { width: 13px; height: 13px; }
-.rtc-iconbtn { padding: 4px 7px; }
 .rtc-issues-btn {
   cursor: pointer; color: var(--text-2); height: 27px;
   border: 1px solid var(--line); background: var(--panel);

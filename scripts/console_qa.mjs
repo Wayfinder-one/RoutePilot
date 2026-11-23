@@ -1342,7 +1342,10 @@ export async function clickCanvasAction(id) {
   if (!(await menu.evaluate(element => element.open))) {
     await page.locator('#cvMoreBtn').click();
   }
-  await button.click();
+  /* 目标可能因生命周期状态本来就不提供（例如已启用时的 #cvDisable）：这时
+     直接失败并说明原因，不要用默认 30s 的 action timeout 换一条含糊的报错。 */
+  assert.ok(await button.isVisible(), '#' + id + ' is not offered in the current lifecycle state');
+  await button.click({ timeout: 4000 });
 }
 
 export async function saveNow() {

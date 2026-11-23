@@ -42,6 +42,7 @@ const X = {
     'test.passBare': '测试通过',
     'test.fail': '测试失败',
     'test.success': '连接成功 · 选中 {key} · {ms}ms',
+    'test.successBare': '连接成功 · 选中 {key}',
     'test.raw': '原始响应',
   },
   en: {
@@ -69,6 +70,7 @@ const X = {
     'test.passBare': 'Test passed',
     'test.fail': 'Test failed',
     'test.success': 'Connection successful · selected {key} · {ms}ms',
+    'test.successBare': 'Connection successful · selected {key}',
     'test.raw': 'Raw response',
   },
 };
@@ -222,10 +224,12 @@ function paintTestBadge() {
 function paintTestText() {
   if (!testOut) return;
   if (testOut.dataset.state === 'pass') {
-    testOut.textContent = fill(tx('test.success'), {
-      key: testOut.dataset.selectedKey || '—',
-      ms: testOut.dataset.durationMs || '—',
-    });
+    /* duration_ms 缺失时不能渲染 "—ms"：直接省略单位与数字。 */
+    const key = testOut.dataset.selectedKey || '—';
+    const ms = testOut.dataset.durationMs;
+    testOut.textContent = ms
+      ? fill(tx('test.success'), { key, ms })
+      : fill(tx('test.successBare'), { key });
   } else if (testOut.dataset.state === 'running') {
     testOut.textContent = tx('test.running');
   }
@@ -439,7 +443,10 @@ function refreshApiKeyPlaceholder() {
 function paintTestDefault() {
   const el = $('#testText');
   if (!el) return;
-  if (el.value === TEST_DEFAULT.zh || el.value === TEST_DEFAULT.en) {
+  /* jev.js 不再种中文默认值：本模块在静态 import 时先于 jev.js 的 boot 执行，
+     所以由这里按 LANG 填一个空字段；用户自己输入的内容不受语言切换影响。 */
+  const value = el.value.trim();
+  if (value === '' || value === TEST_DEFAULT.zh || value === TEST_DEFAULT.en) {
     el.value = TEST_DEFAULT[LANG] || TEST_DEFAULT.zh;
   }
 }
@@ -470,4 +477,7 @@ onLangChange(lang => {
   paintTestText();
   paintTestDefault();
   refreshApiKeyPlaceholder();
+  /* #saveMsg 里存的是已经翻译好的句子；不清空就会在切换语言后留下
+     与页面其余部分不同语言的混合文案。 */
+  showSaveMessage('', false);
 });

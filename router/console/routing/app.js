@@ -859,7 +859,11 @@ function restoreDeleteFocus() {
     return;
   }
   const fallback = $('#cvEnable');
-  if (fallback) fallback.focus();
+  /* 主按钮在「已启用且无改动」时是禁用的（Enabled 只是一个状态），focus()
+     落在禁用按钮上是空操作、焦点会掉回 body，所以再退到常驻可聚焦的控件。 */
+  if (fallback && !fallback.disabled) { fallback.focus(); return; }
+  const alwaysFocusable = $('#cvMoreBtn') || $('#cvIssuesBtn');
+  if (alwaysFocusable) alwaysFocusable.focus();
 }
 
 function onDeleteKeydown(event) {
@@ -1336,8 +1340,9 @@ function bindMoreMenu() {
     if (menu.open && !menu.contains(event.target)) menu.open = false;
   }, true);
   menu.addEventListener('keydown', event => {
-    if (event.key !== 'Escape') return;
+    if (event.key !== 'Escape' || !menu.open) return;
     event.preventDefault();
+    event.stopPropagation();
     menu.open = false;
     $('#cvMoreBtn').focus();
   });

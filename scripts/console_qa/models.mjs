@@ -15,6 +15,7 @@ import {
   appSnapshot,
   ensureBaselineTree,
   expectHttpStatusError,
+  expectedHttpStatusErrors,
   page,
   resetExpectedHttpStatusErrors,
   routerBase,
@@ -145,6 +146,41 @@ test('P0 decision service document title follows the language toggle', async () 
   }
 });
 
+test('P0 decision service paints the custom test default in English on first load', async () => {
+  const EN = 'Pick one of the candidates to verify the decision service.';
+  const ZH = '请选择一个候选以验证决策服务。';
+  /* 语言必须在 i18n 模块求值前落到 localStorage：这是真实的「英文会话首屏」，
+     而不是加载后切换一次。 */
+  await page.goto(routerBase + '/console/logs.html');
+  await page.evaluate(() => localStorage.setItem('router_lang', 'en'));
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    const first = await page.evaluate(() => ({
+      lang: document.documentElement.lang,
+      text: document.getElementById('testText').value
+    }));
+    assert.equal(first.lang, 'en', 'the en preset did not reach the page');
+    assert.equal(first.text, EN,
+      'an English session rendered a non-English custom test default: ' + first.text);
+    /* The language-switch repair path must keep working without the old seed. */
+    const switched = await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+      const zh = document.getElementById('testText').value;
+      setLang('en');
+      return { zh, en: document.getElementById('testText').value };
+    });
+    assert.equal(switched.zh, ZH, 'the custom test default did not follow the switch to zh');
+    assert.equal(switched.en, EN, 'the custom test default did not follow the switch back to en');
+  } finally {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    }).catch(() => {});
+  }
+});
+
 test('P0 decision service paints a running test state while the test request is in flight', async () => {
   let releaseTest = () => {};
   const gate = new Promise(resolve => { releaseTest = resolve; });
@@ -235,6 +271,22 @@ test('P0 decision service reports partial save and skips test after window failu
     assert.deepEqual(calls, ['config', 'window']);
     assert.match(await page.locator('#saveMsg').innerText(), /连接与提示词已保存|Connection and prompts saved/);
     assert.equal(await page.locator('#editPane').isVisible(), true);
+    /* 422 是故意制造的：浏览器那条 console error 必须已被期望消费掉。 */
+    assert.equal(expectedHttpStatusErrors.length, 0,
+      'the expected window PUT 422 was not observed');
+
+    /* A failed write must not wedge the form: with the injected failure gone,
+       the same primary must run the whole chain again and reach success. */
+    await page.unroute('**/admin/jev/window');
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass',
+      null, { timeout: 15000 });
+    assert.equal(await page.locator('#saveJev').isEnabled(), true,
+      'the recovery save left #saveJev disabled');
+    assert.deepEqual(calls, ['config', 'window', 'config', 'window', 'test'],
+      'the retry after a failed window save did not run config → window → test again');
+    assert.match(await page.locator('#saveMsg').innerText(), /已保存，连接测试通过|Saved, connection test passed/,
+      'the successful retry did not paint the success copy');
   } finally {
     page.off('request', onRequest);
     await page.unroute('**/admin/jev/window');
@@ -500,10 +552,18 @@ test('P0 acceptance · changed console pages do not overflow at 1440×960 or 128
           if (target.path.endsWith('/routing.html')) {
             await page.locator('#cvMoreBtn').click();
             const menu = await page.evaluate(() => {
+              const details = document.querySelector('#cvMore');
               const box = document.querySelector('#cvMore .rtc-more-menu').getBoundingClientRect();
-              return { left: box.left, right: box.right, top: box.top, bottom: box.bottom,
+              return { open: details.open,
+                left: box.left, right: box.right, top: box.top, bottom: box.bottom,
+                boxWidth: box.width, boxHeight: box.height,
                 width: window.innerWidth, height: window.innerHeight };
             });
+            assert.equal(menu.open, true,
+              `the overflow menu did not open at ${viewport.width} (${lang})`);
+            /* 全零矩形也能满足下面的边界比较，所以先排除零尺寸菜单。 */
+            assert.ok(menu.boxWidth > 0 && menu.boxHeight > 0,
+              `the overflow menu has no size at ${viewport.width} (${lang})`);
             assert.ok(menu.left >= -1 && menu.right <= menu.width + 1,
               `the overflow menu leaves the viewport horizontally at ${viewport.width} (${lang})`);
             assert.ok(menu.top >= -1 && menu.bottom <= menu.height + 1,

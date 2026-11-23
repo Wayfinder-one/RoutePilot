@@ -17,7 +17,7 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 | Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service |
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
 | Backend selection | Session affinity, `least_inflight` load balancing, per-model circuit breaker |
-| Dry run | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models |
+| Try run | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models |
 | Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, JEV settings, time periods, audit history, role-based users |
 | Console | Bilingual (zh/en) native ES Modules, no build step |
 
@@ -78,15 +78,15 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 | Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
 | Decision groups | Canvas editor, graph settings, inspector, validation, dry run, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
-| Decision service | Read-only service profile (address, model, key status, test status) with Save and test; prompts, timeout and the context window live under Advanced |
+| Decision service | Read-only service profile (address, model, key status, test status) with a retest; Save and test lives in edit mode; prompts, timeout and the context window live under Advanced |
 | Models | Model registry; Connect models onboards a catalog provider and its models in one save. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
 | Users | Admin/viewer accounts, passwords, roles, status |
 
 ### Common paths
 
-- The decision-group toolbar defaults to **Try run** and **Save and enable**; an enabled draft with pending edits reads **Save and update**. **Save draft** and Disable live under **More**. The inspector's **Apply** only updates the local draft and never writes to the server.
+- The decision-group toolbar shows only **Try run**, the primary action and **More**. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. **More** holds undo/redo, auto-layout, New, Load example, Import, Export, Save draft and Disable. The inspector's **Apply** only updates the local draft and never writes to the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
-- The **Decision service** page shows only connection details by default; **Save and test** saves the service configuration, then the context window, then tests the connection. Prompts, the state template, timeout and token window live under Advanced, and the raw test response expands on demand.
+- The **Decision service** page shows connection details and this session's test status by default; **Save and test** saves the service configuration, then the context window, then tests the connection. Prompts, the state template, timeout and token window live under Advanced, and the raw test response expands on demand.
 
 ### Model test chat
 
@@ -105,7 +105,7 @@ The routing page is split into two zones.
 
 **Editor zone** — canvas, node library, inspector, validation:
 
-- Drag nodes from the library, pan/zoom, auto-layout, undo/redo.
+- Drag nodes from the library and pan/zoom; auto-layout and undo/redo live under **More**.
 - Typed wires; a numeric output dropped into a boolean slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
 - Dragging an output onto empty canvas quick-creates a compatible node.
@@ -119,9 +119,9 @@ The routing page is split into two zones.
 - Result: final target, model, candidates with priorities, selection reason, waves and call count.
 - Execution trace: one card per wave with hit conditions, plus the full request timeline.
 
-Dry runs highlight the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
+Try runs highlight the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
 
-![Dry-run replay](assets/routepilot/en/try-run.png)
+![Try-run replay](assets/routepilot/en/try-run.png)
 
 ### Decision log
 
@@ -243,7 +243,7 @@ The decision service exposes `POST /v1/systemone`; typical deployments use NeoHo
 
 - **Save and test** is the only primary action. It runs `PUT /admin/jev` → `PUT /admin/jev/window` → `POST /admin/jev/test` in that fixed order; the context window is validated locally first, so a validation failure issues no write at all.
 - Partial success names the exact stopping point: configuration not saved (window and test skipped), connection and prompts saved but window not saved (test skipped), configuration and window saved but the test failed, or everything succeeded. A failed test never leaves the previous result or raw response behind.
-- Timeout, clear-key, default instructions, the state template, the context/input-token window and custom test text live under **Advanced settings**.
+- Timeout, clear-key, default instructions, the state template (it must contain exactly one `{request}`), the context/input-token window and custom test text live under **Advanced settings**.
 - After a passing test the raw JSON response is available on demand and collapsed by default; on failure it is hidden and cleared. Oversized input is truncated head/tail, and the context budget and input limit travel with the window configuration.
 
 When the active decision group carries embedded `jev` / `jev_window` fields, that configuration is authoritative and the environment never overwrites it (an embedded `jev: null` also counts as decided). For legacy documents and instances without an active group, `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` seed the database on first start only and the database is authoritative afterwards. JSON never carries `api_key`: an endpoint-matching stored key is reused, otherwise `ROUTER_JEV_API_KEY` is read from the environment when the snapshot is built.
