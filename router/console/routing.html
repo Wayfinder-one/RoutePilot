@@ -71,9 +71,11 @@
           </div>
         </details>
         <button type="button" class="btn sm pri" id="cvEnable">
-          <!-- 文案完全由 paintLifecycle() 拥有；保留静态首屏种子，避免 boot 前空白。
-               不能带 data-i18n：setLang 会把它改回固定 key，覆盖真实状态。 -->
-          <span id="cvEnableLabel">保存并启用</span>
+          <!-- 文案完全由 paintLifecycle() 拥有：不能带 data-i18n，否则 setLang 会把它
+               改回固定 key、覆盖真实状态。app.js 在模块加载时同步先画一次（此时
+               DOM 已就绪、store.tree 仍为 null），所以这里不留中文静态种子，
+               英文会话从第一帧起只会看到 cv.publish 的英文。 -->
+          <span id="cvEnableLabel"></span>
         </button>
         <button type="button" class="pill rtc-issues-btn" id="cvIssuesBtn" aria-expanded="false">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-alert"/></svg>

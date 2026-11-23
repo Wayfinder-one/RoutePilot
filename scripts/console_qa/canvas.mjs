@@ -1528,23 +1528,61 @@ test('Task 2 fix · a saved disabled group with local edits reads disabled, not 
 
 test('Task 2 fix · language switch repaints the JS-owned lifecycle and primary labels', async () => {
   /* #cvEnableLabel 不再带 data-i18n：setLang 只能靠 onLangChange 重绘，
-     这里保证切语言后标签仍与当前生命周期一致，而不是残留旧语言。 */
+     这里保证切语言后标签仍与当前生命周期一致，而不是残留旧语言。
+     期望 key 从 #cvLifecycle 的 data-state（以及主按钮当前 zh 文案）推导，
+     基线 fixture 换状态时不会退化成一条误导的「语言切换没有重绘」失败。 */
   try {
     await ensureBaselineTree();
     await openCanvas();
-    const labels = () => page.evaluate(async () => {
-    const { t } = await import('/console/i18n.js');
+    /* 先固定 zh，再从 #cvLifecycle 的 data-state 推导期望：
+       running / unpublished / draft 一对一映射到主按钮 key；只有 disabled 的
+       主按钮是 cv.publish 还是 cv.enable 取决于草稿是否脏，单看 state 不够，
+       所以用同一 owner 画出的 zh 文案反查 key（两者中文不同，不会含糊）。 */
+    const base = await page.evaluate(async () => {
+      const { setLang, t } = await import('/console/i18n.js');
+      setLang('zh');
+      const state = document.getElementById('cvLifecycle').dataset.state;
+      const lifecycleKey = 'cv.status.' + state;
+      const primary = document.getElementById('cvEnableLabel').textContent.trim();
+      const candidates = ['cv.published', 'cv.publishUpdate', 'cv.publish', 'cv.enable'];
+      const primaryFromState = {
+        running: 'cv.published',
+        unpublished: 'cv.publishUpdate',
+        draft: 'cv.publish'
+      }[state] || null;
+      return {
+        state,
+        lifecycleKey,
+        lifecycle: document.getElementById('cvLifecycleLabel').textContent.trim(),
+        lifecycleText: t(lifecycleKey),
+        primary,
+        primaryFromState,
+        primaryKey: candidates.find(key => t(key) === primary) || null
+      };
+    });
+    assert.equal(base.lifecycle, base.lifecycleText,
+      `the lifecycle label does not match its own data-state (${base.state}) in zh`);
+    assert.ok(base.primaryKey,
+      `the primary label (${base.primary}) does not match any known key`);
+    if (base.primaryFromState) {
+      assert.equal(base.primaryKey, base.primaryFromState,
+        `the ${base.state} state must offer ${base.primaryFromState}, got ${base.primaryKey}`);
+    }
+
+    const labels = () => page.evaluate(async ([lifecycleKey, primaryKey]) => {
+      const { t } = await import('/console/i18n.js');
       return {
         lifecycle: document.getElementById('cvLifecycleLabel').textContent.trim(),
         primary: document.getElementById('cvEnableLabel').textContent.trim(),
-        expectedLifecycle: t('cv.status.running'),
-        expectedPrimary: t('cv.published')
-};
-});
+        expectedLifecycle: t(lifecycleKey),
+        expectedPrimary: t(primaryKey)
+      };
+    }, [base.lifecycleKey, base.primaryKey]);
+
     await page.evaluate(async () => {
-    const { setLang } = await import('/console/i18n.js');
+      const { setLang } = await import('/console/i18n.js');
       setLang('en');
-});
+    });
     let ui = await labels();
     assert.equal(ui.lifecycle, ui.expectedLifecycle,
       'language switch did not repaint the lifecycle label');
@@ -1552,20 +1590,75 @@ test('Task 2 fix · language switch repaints the JS-owned lifecycle and primary 
       'language switch did not repaint the JS-owned primary label');
 
     await page.evaluate(async () => {
-    const { setLang } = await import('/console/i18n.js');
+      const { setLang } = await import('/console/i18n.js');
       setLang('zh');
-});
+    });
     ui = await labels();
     assert.equal(ui.lifecycle, ui.expectedLifecycle,
       'switching back to zh did not repaint the lifecycle label');
     assert.equal(ui.primary, ui.expectedPrimary,
       'switching back to zh did not repaint the JS-owned primary label');
-} finally {
+  } finally {
     await page.evaluate(async () => {
-    const { setLang } = await import('/console/i18n.js');
+      const { setLang } = await import('/console/i18n.js');
       setLang('zh');
+    });
+  }
 });
-}
+
+test('Task 2 fix · an English session never paints the primary label in Chinese', async () => {
+  /* 首屏主按钮不再有中文静态种子：app.js 在模块加载时同步 paintLifecycle()。
+     从 document-start 起记录 #cvEnableLabel 的每一个非空值，证明 en 会话
+     哪怕一帧都不会出现中文，且 pre-boot 值本身已是英文 cv.publish。 */
+  try {
+    await ensureBaselineTree();
+    /* 首条用例单跑时页面还是 about:blank，写不了 session/localStorage；
+       先落到同源页面，再设置 en 预设并武装探针（真正的带探针加载在 openCanvas）。 */
+    await page.goto(routerBase + '/console/routing.html');
+    await page.addInitScript(() => {
+      let armed = false;
+      try { armed = sessionStorage.getItem('qa-cv-en-probe') === '1'; } catch (error) { armed = false; }
+      if (!armed) return;
+      window.__cvEnableLabelSeen = [];
+      const record = () => {
+        const el = document.getElementById('cvEnableLabel');
+        if (!el) return;
+        const seen = window.__cvEnableLabelSeen;
+        const text = el.textContent.trim();
+        if (seen[seen.length - 1] !== text) seen.push(text);
+      };
+      new MutationObserver(record).observe(document, { childList: true, subtree: true, characterData: true });
+      document.addEventListener('DOMContentLoaded', record);
+    });
+    /* 语言在 i18n 模块求值前就落到 localStorage；init script 只在本用例武装。 */
+    await page.evaluate(() => {
+      sessionStorage.setItem('qa-cv-en-probe', '1');
+      localStorage.setItem('router_lang', 'en');
+    });
+    await openCanvas();
+    const observed = await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return {
+        lang: document.documentElement.lang,
+        publish: t('cv.publish'),
+        seen: (window.__cvEnableLabelSeen || []).slice()
+      };
+    });
+    assert.equal(observed.lang, 'en', 'the en preset did not reach the page');
+    assert.notEqual(observed.publish, 'cv.publish', 'missing en translation for cv.publish');
+    const seen = observed.seen.filter(Boolean);
+    assert.ok(seen.length > 0, 'the probe never observed a non-empty primary label');
+    seen.forEach(text => assert.doesNotMatch(text, /[\u4e00-\u9fff]/,
+      'an English session rendered a Chinese primary label: ' + text));
+    assert.equal(seen[0], observed.publish,
+      'the pre-boot primary label is not the localized cv.publish');
+  } finally {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+      sessionStorage.removeItem('qa-cv-en-probe');
+    });
+  }
 });
 
 test('7.4-13-save-enable-unsaved-badge', async () => {

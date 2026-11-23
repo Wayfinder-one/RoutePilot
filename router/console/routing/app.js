@@ -771,7 +771,7 @@ function lifecycleState() {
   const enabled = !!(store.tree && store.tree.enabled);
   const clean = store.dirtyKind === 'clean';
   if (enabled) return clean ? 'running' : 'unpublished';
-  if (!enabled) return store.saved ? 'disabled' : 'draft';
+  return store.saved ? 'disabled' : 'draft';
 }
 
 function paintLifecycle() {
@@ -1673,6 +1673,12 @@ async function boot() {
   refreshDirty();
 }
 
+/* 模块在 </body> 前加载，DOM 已就绪：先同步画一次首屏文案，再进入异步 boot。
+   #cvEnableLabel 没有静态种子也没有 data-i18n（唯一 owner 是 paintLifecycle）,
+   此时 store.tree 仍是 null，函数会落到 markup 声明的 draft / cv.publish；
+   语言已由 nav.js 的 setLang(LANG) 在 import 阶段定好，所以英文会话从第一帧
+   起就是英文，而不是先闪一帧中文再被 boot 后的 paintLifecycle 覆盖。 */
+paintLifecycle();
 boot();
 
 /* 装配层视图对象（无 window 全局）：供模块间回调与测试观察使用。 */
