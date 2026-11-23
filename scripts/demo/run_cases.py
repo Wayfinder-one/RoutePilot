@@ -39,7 +39,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -50,6 +49,7 @@ from pathlib import Path
 import requests
 
 from apply_cases import (
+    RUNTIME_FIELDS,
     GraphConflictError,
     ImpactConfirmationRequired,
     confirmation_for,
@@ -242,6 +242,10 @@ class Api:
             return result
         impact = impact_detail(result["body"])
         if impact is None:
+            # 首次响应就是 graph_conflict（画布在读取基线后又被改）也要硬停止。
+            conflict = graph_conflict_detail(result["body"])
+            if conflict is not None:
+                raise GraphConflictError(method, path, conflict)
             return result
         if not CONFIRM_SYNC:
             raise ImpactConfirmationRequired(method, path, impact)
@@ -322,13 +326,19 @@ def enable_and_wait(api: Api, tree_id: str, timeout: float = 20.0) -> dict:
     return result
 
 
-RUNTIME_FIELDS = ("backends", "jev", "jev_window", "time_periods")
-
-
 def tree_runtime_document(tree: dict | None) -> dict:
-    """从 ``/admin/trees`` 导出的树里取四个运行字段（root-only 试算必须携带）。"""
-    tree = tree or {}
-    return {field: tree[field] for field in RUNTIME_FIELDS if field in tree}
+    """从 ``/admin/trees`` 导出的树里取四个运行字段（root-only 试算必须携带）。
+
+    缺字段说明导出/快照不完整：直接 ``Fail`` 报出缺失字段，绝不静默少传后让服务端
+    继承/拒绝（那会把配置错误伪装成路由结果不对）。
+    """
+    if not isinstance(tree, dict):
+        raise Fail(f"无法从 {type(tree).__name__} 取运行字段：期望 /admin/trees 导出的一棵树")
+    missing = [field for field in RUNTIME_FIELDS if field not in tree]
+    if missing:
+        raise Fail(f"决策组 {tree.get('id') or '?'} 缺少运行字段 {missing}；"
+                   f"root-only 试算必须四个字段齐全（{', '.join(RUNTIME_FIELDS)}）")
+    return {field: tree[field] for field in RUNTIME_FIELDS}
 
 
 def jev_window_of(api: Api, service_id: str) -> dict:
@@ -352,9 +362,13 @@ def admin_try(api: Api, *, text: str, tree_id: str | None = None, now: str | Non
         body["now"] = now
     if root is not None:
         body["root"] = root
-    if runtime:
-        # root-only 草稿必须自包含：不带空/缺运行字段的试算 payload。
-        body.update({field: runtime[field] for field in RUNTIME_FIELDS if field in runtime})
+    if runtime is not None:
+        # root-only 草稿必须自包含：四个运行字段缺一不可（缺了直接报错，不静默少传）。
+        missing = [field for field in RUNTIME_FIELDS if field not in runtime]
+        if missing:
+            raise Fail(f"root-only 试算缺少运行字段 {missing}；"
+                       f"必须携带 {', '.join(RUNTIME_FIELDS)}（或改用 tree_id 继承已存快照）")
+        body.update({field: runtime[field] for field in RUNTIME_FIELDS})
     start = time.monotonic()
     try:
         response = api.request("POST", "/admin/try", json_body=body, timeout=timeout)
@@ -642,6 +656,9 @@ class Evidence:
             if isinstance(result, dict):
                 record.update(result)
             record.setdefault("ok", True)
+        except (ImpactConfirmationRequired, GraphConflictError):
+            # 影响确认/画布冲突是全局停止信号（默认不写入任何后续内容），不能记成探针失败继续跑。
+            raise
         except Exception as exc:  # noqa: BLE001 — 探针失败要留下证据而不是中断全流程
             record.update({
                 "ok": False,
@@ -823,6 +840,9 @@ def run_cases(api: Api, manifest: dict, ev: Evidence,
         log(f"[warmup] case-multimodal text status={warm.get('status')} "
             f"model={(warm.get('headers') or {}).get('x-sr-model')} "
             f"{warm.get('elapsed_ms')} ms")
+    except (ImpactConfirmationRequired, GraphConflictError):
+        # enable 命中影响确认/画布冲突时必须让 main 的停止路径处置，不能当热身失败吞掉。
+        raise
     except Exception as exc:  # noqa: BLE001 — 热身失败不阻塞取证
         log(f"[warmup] case-multimodal warmup failed: {type(exc).__name__}: {exc}")
     # 案例五的复杂推理/故障演练走 /v1 会消耗共享熔断器状态，留给 probes.breaker 统一取证；

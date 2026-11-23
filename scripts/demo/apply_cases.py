@@ -266,9 +266,11 @@ class Api:
             status, payload = self._raw(method, path, retry_body)
             if status in ok:
                 return payload
-            conflict = graph_conflict_detail(payload)
-            if conflict is not None:
-                raise GraphConflictError(method, path, conflict)
+        # 首次（或重试后）就拿到 409 graph_conflict 时同样必须走停止路径：
+        # 画布在 upsert_tree 的 GET 与 PUT 之间被改了，基线哈希已经过期。
+        conflict = graph_conflict_detail(payload)
+        if conflict is not None:
+            raise GraphConflictError(method, path, conflict)
         raise ApiError(method, path, status, _detail_of(payload))
 
     # ---------------------------------------------------------------- endpoints
@@ -554,6 +556,13 @@ def step_time_periods(api: Api, runtime: dict, verbose: bool) -> None:
     if current == periods:
         print(f"time_periods: {len(periods)} 个演示时段已就绪（{', '.join(p['name'] for p in periods)}）")
         return
+    # 时段是整表覆盖写入：先打印新增/删除的名字，让破坏性变更可见。
+    before_names = [item.get("name") for item in current if isinstance(item, dict)]
+    after_names = [period["name"] for period in periods]
+    added = [name for name in after_names if name not in before_names]
+    removed = [name for name in before_names if name not in after_names]
+    print(f"time_periods: 覆盖写入 {len(before_names)} → {len(after_names)} 个时段"
+          f"（新增：{added or '无'}；删除：{removed or '无'}）")
     api.save_time_periods(periods)
     rows = api.time_periods()
     if rows != periods:
@@ -682,8 +691,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{BAD} 已停止：未写入任何后续内容（--confirm-sync 才会显式同步受影响画布）")
         return 1
     except GraphConflictError as exc:
-        print(f"{BAD} 画布已变化，确认基线哈希过期（graph_conflict）：{_brief(exc.detail, 300)}")
-        print(f"{BAD} 已停止：请重新运行本脚本以读取最新的影响清单")
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        actual = detail.get("actual_document_sha256") or "-"
+        print(f"{BAD} 画布已变化（409 graph_conflict）：实际 document_sha256={actual}")
+        print(f"{BAD} 画布已变化，请重新运行本脚本以读取最新的影响清单；"
+              f"已停止，未写入任何后续内容")
+        return 1
+    except ApiError as exc:
+        print(f"{BAD} 管理请求失败（{exc.method} {exc.path} → HTTP {exc.status}）："
+              f"{_brief(exc.detail, 400)}")
+        print(f"{BAD} 已停止，未写入任何后续内容")
+        return 1
+    except KeyError as exc:
+        print(f"{BAD} 案例文档缺少字段 {exc}（数据错误，请修正 configs/cases/*.json）")
+        print(f"{BAD} 已停止，未写入任何后续内容")
         return 1
 
     for problem in problems:
