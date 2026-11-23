@@ -191,7 +191,12 @@ def test_admin_try_uses_json_backends_jev_window_and_periods(json_only):
     body = response.json()
     assert body["outcome"]["model"] == "fast"
     assert body["outcome"]["target_id"] == "fast-target"
-    assert body["warnings"] == []
+    # 空数据库：画布声明的 provider/model/JEV 都不在目录里 → 全部是 hint 级差异提示，
+    # 不阻塞执行；具体字段由 tests/test_runtime_consistency.py 精确覆盖。
+    assert body["warnings"]
+    assert {item["code"] for item in body["warnings"]} == {"runtime_mismatch"}
+    assert all(item["level"] == "hint" and item["params"]["database"] is None
+               for item in body["warnings"])
     # 时段来自 JSON：trace 的 time 事件列出活动时段，条件节点命中 peak。
     time_events = [item for item in body["trace"] if item["event"] == "time"]
     assert time_events and "peak" in time_events[0].get("active_periods", [])

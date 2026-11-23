@@ -371,7 +371,8 @@ def test_closed_save_skips_enable_validation_but_enabled_save_uses_it(client, ap
     assert client.post("/admin/trees/main/disable").status_code == 200
 
 
-ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level"}
+ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level",
+              "params"}
 
 
 def test_parse_failures_are_issue_arrays(client):

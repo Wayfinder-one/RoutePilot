@@ -20,6 +20,7 @@ from router.api.deps import get_conn, get_tree_repo
 from router.api.trace_presenter import present_trace
 from router.control.graphs import GraphPatch, GraphService, graph_parse_failed
 from router.api.issue_presenter import issues_payload
+from router.control.consistency import runtime_mismatch_issues
 from router.control.runtime import snapshot_parts
 from router.control.validation import tree_issues
 from router.jev.serialization import answer_to_dict
@@ -340,7 +341,9 @@ async def try_tree(
     if issues:
         raise HTTPException(422, detail=issues_payload(issues))
     # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
-    warnings = issues_payload(tree_issues(conn, tree))
+    # 画布快照与数据库目录的差异也是提示：只读比较、不改变执行配置（spec 保存/启用/检查）。
+    warnings = issues_payload(
+        tree_issues(conn, tree) + runtime_mismatch_issues(conn, tree.runtime))
     snapshot = _try_snapshot(conn, tree)
     trace: list[dict] = []
     try:

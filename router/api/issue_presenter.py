@@ -222,6 +222,17 @@ def present_issue(issue: Issue) -> dict[str, str]:
             "图包含问题节点，但决策服务（JEV）未配置或不可用",
             "The graph contains question nodes but the decision service (JEV) is not configured or unavailable",
         )
+    if code == "runtime_mismatch":
+        # 只给定位，不把画布/目录值拼进文案：值可能很长（instructions/state_template），
+        # 详细值由 params 交给控制台按字段展示（敏感字段在 consistency 侧已过滤）。
+        kind = {"provider": "provider", "model": "model", "jev": "JEV"}.get(
+            _param(issue, "resource_kind"), _param(issue, "resource_kind"))
+        resource_id = _param(issue, "resource_id")
+        field = _param(issue, "field")
+        return _text(
+            f"画布与数据库目录不一致：{kind} {resource_id} 的 {field}（仅提示，不阻断执行）",
+            f"Canvas and database catalog differ: {kind} {resource_id} field {field} (hint only, execution unaffected)",
+        )
     # Defensive: an unmapped code must still render deterministically.
     return _text(code, code)
 
@@ -243,5 +254,6 @@ def issues_payload(issues) -> list[dict]:
             "edge_id": issue.edge_id,
             "port": issue.port,
             "level": issue.level,
+            "params": dict(issue.params or {}),
         })
     return payload

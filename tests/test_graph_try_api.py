@@ -529,7 +529,8 @@ def test_try_serializes_all_answer_types_and_complete_outcome(client, app):
     }
     assert body["draft"] is True
     assert isinstance(body["warnings"], list)
-    assert all(set(issue) == {"code", "zh", "en", "node_id", "edge_id", "port", "level"}
+    assert all(set(issue) == {"code", "zh", "en", "node_id", "edge_id", "port",
+                              "level", "params"}
                for issue in body["warnings"])
 
 
@@ -601,7 +602,8 @@ def test_try_without_period_condition_keeps_time_event_initial(client, app):
 
 # ── 422 / 503 ─────────────────────────────────────────────────────────
 
-ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level"}
+ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level",
+              "params"}
 
 
 def test_try_parse_error_is_issue_array_and_skips_engine(client, app):

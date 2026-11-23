@@ -65,6 +65,13 @@ const KIND_KEYS = {
   error_fallback: 'cv.tryKind.fallback', sticky: 'cv.tryKind.sticky'
 };
 
+/* runtime_mismatch 的资源类型 → i18n 文案键（字面量键便于 i18n 死键检查）。 */
+const MISMATCH_KIND_KEYS = {
+  provider: 'cv.tryMismatchKind.provider',
+  model: 'cv.tryMismatchKind.model',
+  jev: 'cv.tryMismatchKind.jev'
+};
+
 let state = null;        /* 最近一次回放（与 App.replay 同一对象） */
 let lastRun = null;      /* {text, now} 供「重跑」复用固定 now */
 let runSeq = 0;
@@ -714,6 +721,40 @@ function factHTML(labelKey, value) {
   return '<span class="rtc-try-fact"><i>' + esc(t(labelKey)) + '</i><b>' + esc(value) + '</b></span>';
 }
 
+/* 画布快照与数据库目录的差异只是 hint：展示资源/字段与两侧值，
+   绝不把它升级为运行失败或重跑语义。 */
+function mismatchValue(value) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'object') {
+    try { return JSON.stringify(value); } catch (error) { return String(value); }
+  }
+  return rawText(value);
+}
+
+function mismatchHTML(replay) {
+  const warnings = Array.isArray(replay.warnings) ? replay.warnings : [];
+  const drifts = warnings.filter(item => item && item.code === 'runtime_mismatch');
+  if (!drifts.length) return '';
+  const lines = drifts.map(item => {
+    const params = item.params || {};
+    const kindKey = MISMATCH_KIND_KEYS[params.resource_kind];
+    const kind = kindKey ? t(kindKey) : String(params.resource_kind || '');
+    const line = tf('cv.tryMismatchLine', {
+      kind: kind, id: params.resource_id || '', field: params.field || ''
+    });
+    const values = tf('cv.tryMismatchValues', {
+      canvas: mismatchValue(params.canvas),
+      database: mismatchValue(params.database)
+    });
+    return '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
+      esc(line) + ' · ' + esc(values) + '</span></div>';
+  });
+  return '<div class="rtc-try-mismatch" data-runtime-mismatch="' + drifts.length + '">' +
+    '<div class="rtc-try-cmp"><span class="rtc-try-cmp-l">' +
+      esc(t('cv.tryMismatchTitle')) + '</span></div>' +
+    lines.join('') + '</div>';
+}
+
 function candidateChips(replay) {
   const final = replay.final;
   if (!final.candidates.length) {
@@ -776,7 +817,8 @@ function renderResult(replay) {
       (error.message
         ? '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
             esc(error.message) + '</span></div>'
-        : '');
+        : '') +
+      mismatchHTML(replay);
     return;
   }
   const final = replay.final;
@@ -833,7 +875,8 @@ function renderResult(replay) {
       '<span class="rtc-try-note' + (final.kind === 'error_fallback' ? ' is-warn' : '') + '">' +
         esc(candidateNote(replay)) + '</span>' +
     '</div>' +
-    errorMessage;
+    errorMessage +
+    mismatchHTML(replay);
 }
 
 /* ── run 生命周期 ─────────────────────────────────────────────── */
