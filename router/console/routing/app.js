@@ -1256,7 +1256,7 @@ function closeOverlays() {
   return false;
 }
 
-/* ── 丢弃草稿确认（切组 / 载入示例 / 导入 / 新建共用） ───────────── */
+/* ── 丢弃草稿确认（切组 / 导入 / 新建共用） ─────────────────────── */
 const CONFIRM_TITLES = {
   switch: 'cv.confirmSwitchTitle',
   import: 'cv.confirmImportTitle',
@@ -1298,7 +1298,7 @@ function settleConfirm(ok) {
   if (state) state.resolve(!!ok);
 }
 
-/* 导入/载入示例替换整张图后回到「看得见全图」的视口（保持检查器/节点库安全区）。 */
+/* 导入替换整张图后回到「看得见全图」的视口（保持检查器/节点库安全区）。 */
 function fitAfterReplace() {
   if (!app.kit || typeof app.kit.fit !== 'function') return;
   app.kit.fit({ padding: 24 });
