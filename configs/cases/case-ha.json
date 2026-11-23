@@ -1,5 +1,6 @@
 {
-  "id": "case-ha",
+  "kind": "sr-routing-graph",
+  "version": 3,
   "name": "案例五 · 调度与容错",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -152,6 +153,72 @@
     ],
     "error_fallback": "ha-general-target"
   },
+  "backends": {
+    "providers": [
+      {
+        "name": "demo-tap",
+        "base_url": "http://127.0.0.1:9300/v1",
+        "key_env": "",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "ha-slow-a",
+        "upstream": "slow-a",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "调度演示后端（慢响应 A）：模拟带 1.2s 延迟的正常后端，用于并发分摊演示"
+        }
+      },
+      {
+        "id": "ha-slow-b",
+        "upstream": "slow-b",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "调度演示后端（慢响应 B）：与 A 同构的慢后端，用于 least_inflight 分摊与粘滞演示"
+        }
+      },
+      {
+        "id": "ha-general",
+        "upstream": "general-backend",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "通用兜底后端：正常返回 200，用于熔断转移与 otherwise 兜底场景"
+        }
+      },
+      {
+        "id": "ha-fail",
+        "upstream": "fail-upstream",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "故障模拟后端：立即返回 503，用于演示熔断打开与请求转移"
+        }
+      }
+    ]
+  },
+  "jev": {
+    "id": "demo-jev",
+    "base_url": "http://127.0.0.1:30104",
+    "model": "d1-2B",
+    "key_env": "",
+    "timeout_seconds": 10.0,
+    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+    "state_template": "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+  },
+  "jev_window": {
+    "input_tokens": 2048,
+    "context_tokens": 4096
+  },
+  "time_periods": [],
   "canvas": {
     "start": {
       "x": 40.0,

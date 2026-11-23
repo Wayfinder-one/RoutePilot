@@ -422,6 +422,8 @@
     ]
   },
   "jev": {
+    "id": "default",
+    "key_env": "ROUTER_JEV_API_KEY",
     "base_url": "http://127.0.0.1:8100",
     "model": "d1-2b",
     "timeout_seconds": 10.0,

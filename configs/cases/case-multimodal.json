@@ -1,5 +1,6 @@
 {
-  "id": "case-multimodal",
+  "kind": "sr-routing-graph",
+  "version": 3,
   "name": "案例二 · 多模态分流",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -87,6 +88,54 @@
     ],
     "error_fallback": "text-target"
   },
+  "backends": {
+    "providers": [
+      {
+        "name": "demo-tap",
+        "base_url": "http://127.0.0.1:9300/v1",
+        "key_env": "",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "text-general",
+        "upstream": "general-backend",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "通用文本模型：写作、总结、翻译、信息提取等纯文本请求"
+        }
+      },
+      {
+        "id": "vl-qwen35-4b",
+        "upstream": "vl-model",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [
+            "multimodal"
+          ],
+          "tier": "large",
+          "capability": "视觉多模态模型：截图/照片/图表理解，支持图像输入与看图问答"
+        }
+      }
+    ]
+  },
+  "jev": {
+    "id": "demo-jev",
+    "base_url": "http://127.0.0.1:30104",
+    "model": "d1-2B",
+    "key_env": "",
+    "timeout_seconds": 10.0,
+    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+    "state_template": "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+  },
+  "jev_window": {
+    "input_tokens": 2048,
+    "context_tokens": 4096
+  },
+  "time_periods": [],
   "canvas": {
     "start": {
       "x": 40.0,

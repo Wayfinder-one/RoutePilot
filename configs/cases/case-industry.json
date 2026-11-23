@@ -1,5 +1,6 @@
 {
-  "id": "case-industry",
+  "kind": "sr-routing-graph",
+  "version": 3,
   "name": "案例一 · 行业模型分流",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -187,6 +188,102 @@
     ],
     "error_fallback": "industry-general-target"
   },
+  "backends": {
+    "providers": [
+      {
+        "name": "demo-tap",
+        "base_url": "http://127.0.0.1:9300/v1",
+        "key_env": "",
+        "reasoning_format": "openai"
+      }
+    ],
+    "models": [
+      {
+        "id": "industry-medical",
+        "upstream": "industry-medical",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [
+            "health"
+          ],
+          "tier": "small",
+          "capability": "医疗健康行业模型：症状与用药咨询、检查报告解读、病历与临床指南问答"
+        }
+      },
+      {
+        "id": "industry-legal",
+        "upstream": "industry-legal",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [
+            "legal"
+          ],
+          "tier": "small",
+          "capability": "法律合规行业模型：合同审查、劳动争议、诉讼流程与合规风险问答"
+        }
+      },
+      {
+        "id": "industry-finance",
+        "upstream": "industry-finance",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [
+            "finance"
+          ],
+          "tier": "small",
+          "capability": "金融财务行业模型：投资理财、行情分析、信贷风控、财务报表与税务"
+        }
+      },
+      {
+        "id": "industry-energy",
+        "upstream": "industry-energy",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [
+            "energy"
+          ],
+          "tier": "large",
+          "capability": "电力能源行业模型：电网调度、抢修与设备缺陷、安规两票、电价计量"
+        }
+      },
+      {
+        "id": "industry-code",
+        "upstream": "industry-code",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [
+            "computer_science"
+          ],
+          "tier": "large",
+          "capability": "编程代码模型：代码编写、调试排错、代码审查、算法与数据结构"
+        }
+      },
+      {
+        "id": "industry-general",
+        "upstream": "industry-general",
+        "provider": "demo-tap",
+        "profile": {
+          "domains": [],
+          "tier": "large",
+          "capability": "通用对话模型：闲聊、常识问答、写作润色、翻译、摘要"
+        }
+      }
+    ]
+  },
+  "jev": {
+    "id": "demo-jev",
+    "base_url": "http://127.0.0.1:30104",
+    "model": "d1-2B",
+    "key_env": "",
+    "timeout_seconds": 10.0,
+    "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+    "state_template": "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+  },
+  "jev_window": {
+    "input_tokens": 2048,
+    "context_tokens": 4096
+  },
+  "time_periods": [],
   "canvas": {
     "start": {
       "x": 40.0,

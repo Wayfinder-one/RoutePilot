@@ -1,6 +1,5 @@
 import asyncio
 import hashlib
-import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -197,19 +196,9 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
     assert stored.runtime.jev.model == "json-jev"
 
 
-def shipped_graph(name):
-    """解析随仓库发布的图文档。
-
-    发布文件仍是旧形态（``jev`` 缺 ``id``/``key_env``），其补全属于案例/配置迁移
-    单元；这里在测试副本上补两个非密钥字段，保证严格解析器仍能钉住发布文档的
-    结构与模型引用。
-    """
-    document = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
-    jev = document.get("jev")
-    if isinstance(jev, dict):
-        jev.setdefault("id", "default")
-        jev.setdefault("key_env", "ROUTER_JEV_API_KEY")
-    content = json.dumps(document, ensure_ascii=False).encode("utf-8")
+def shipped_document(name):
+    """读取并严格解析随仓库发布的图文档（不改写任何字段）。"""
+    content = (REPO_ROOT / "configs" / name).read_bytes()
     return parse_graph_document(
         content,
         tree_id="default-jev",
@@ -221,13 +210,13 @@ def shipped_graph(name):
 
 def test_shipped_configs_are_v3_export_documents():
     for name in ("default_routing_tree.json", "production_routing_tree.json"):
-        assert validate_graph_structure(shipped_graph(name)) == [], name
+        assert validate_graph_structure(shipped_document(name)) == [], name
 
 
 def test_shipped_graph_configs_pass_enable_validation_with_own_runtime():
     """发布配置必须自包含通过启用校验：模型/provider/时段/JEV 都来自文档自身。"""
     for name in ("default_routing_tree.json", "production_routing_tree.json"):
-        tree = shipped_graph(name)
+        tree = shipped_document(name)
         assert validate_graph_for_enable(
             tree, enable_context_for_runtime(tree.runtime)) == [], name
 
