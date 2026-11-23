@@ -314,11 +314,11 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
 sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;"
 ```
 
-`json_valid(profile) = 0` 同时覆盖文本本身损坏的行（读取时按 `{}` 处理，无害但仍值得重写）与包含裸 `NaN` / `Infinity` 字面量的行（真正会打挂响应的那种）。要精确区分后者，用 Python 的 `json.loads` 解码每个命中行并查找非有限数值——普通 JSON 解析器会拒绝它们。
+`json_valid(profile) = 0` 同时覆盖文本本身损坏的行（读取时按 `{}` 处理，无害但仍值得重写）与包含裸 `NaN` / `Infinity` 字面量的行（真正会打挂响应的那种）。要精确区分后者，用 Python 的 `json.loads` 解码每个命中行（它默认接受这些字面量），并筛出 `math.isfinite` 为假的值；`jq` 等严格 JSON 解析器则会直接拒绝。
 
 修复这些行：
 
-- 首选：在控制台打开该模型，或 `PUT /admin/models/{id}` 提交修正后的有限 `profile`；若画布引用它，还要带上确认后的 409 影响载荷；
+- 首选：`PUT /admin/models/{id}` 提交修正后的有限 `profile`；若画布引用它，还要带上确认后的 409 影响载荷。该行修好前控制台的模型列表本身也可能报错，不要依赖它来完成修复；
 - 最后手段：备份 `router.db` 后直接重写 JSON 文本，例如 `UPDATE models SET profile = '{}' WHERE id = '<model>';`；
 - 复核：`SELECT COUNT(*) FROM models WHERE json_valid(profile) = 0;` 必须返回 0。
 

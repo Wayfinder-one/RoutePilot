@@ -314,11 +314,11 @@ Locate the candidate rows in SQLite:
 sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;"
 ```
 
-`json_valid(profile) = 0` covers both rows whose text is malformed (read as `{}`, harmless but still worth rewriting) and rows holding a bare `NaN` / `Infinity` token (the breaking case). To spot the latter precisely, decode each hit with Python's `json.loads` and look for non-finite numbers — ordinary JSON parsers reject them.
+`json_valid(profile) = 0` covers both rows whose text is malformed (read as `{}`, harmless but still worth rewriting) and rows holding a bare `NaN` / `Infinity` token (the breaking case). To spot the latter precisely, decode each hit with Python's `json.loads` (it accepts these tokens by default) and reject values where `math.isfinite` is false; strict JSON parsers such as `jq` reject them outright.
 
 Repair the rows:
 
-- preferred: open the model in the console, or `PUT /admin/models/{id}` with a corrected finite `profile` and, when a canvas references it, the confirmed 409 impact payload;
+- preferred: `PUT /admin/models/{id}` with a corrected finite `profile` and, when a canvas references it, the confirmed 409 impact payload. The console model list may itself show an error until this row is fixed, so do not rely on it for the repair;
 - last resort: back up `router.db`, then rewrite the JSON text directly, e.g. `UPDATE models SET profile = '{}' WHERE id = '<model>';`;
 - verify that every row is valid again: `SELECT COUNT(*) FROM models WHERE json_valid(profile) = 0;` must return 0.
 
