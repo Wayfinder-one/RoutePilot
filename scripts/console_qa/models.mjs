@@ -1,4 +1,4 @@
-/* RoutePilot 控制台 QA · 模型目录与决策服务用例（catalogue 晚到、JEV 窗口保存错误、P0 接入模型入口）
+/* RoutePilot 控制台 QA · 模型目录与多 JEV 服务目录用例（catalogue 晚到、服务目录 CRUD/测试/影响确认、P0 接入模型入口）
    ------------------------------------------------------------------
    本文件只注册用例，不启动服务，也不持有页面状态：真实启动、mock、浏览器、
    管理面 API 与 teardown 全部由 ../console_qa.mjs 提供（同一进程内单页顺序执行）。
@@ -13,9 +13,10 @@ import {
   BASELINE,
   api,
   appSnapshot,
+  assertIncludes,
   ensureBaselineTree,
   expectHttpStatusError,
-  expectedHttpStatusErrors,
+  mockBase,
   page,
   resetExpectedHttpStatusErrors,
   routerBase,
@@ -83,50 +84,182 @@ test('Task 11 · boot unlocks the canvas before catalogues and late catalogue da
 }
 });
 
-test('P0 decision service saves config and window then tests with friendly output', async () => {
-  const calls = [];
+/* ── 多 JEV 目录页（jev.html）────────────────────────────────────────────
+   页面契约：列表项 [data-jev-service-id]；编辑字段 #jevServiceId/#jevBaseUrl/
+   #jevModel/#jevKeyEnv/#jevTimeout/#jevInstructions/#jevStateTemplate/
+   #jevInputTokens/#jevContextTokens；动作 #jevNew/#jevSave/#jevTest/#jevDelete。
+   窗口与密钥都属于“当前选中的服务”：切换服务切换窗口；密钥只进写请求。 */
+const JEV_SERVICE_ID = 'qa-jev-model';
+
+async function openJevDirectory() {
+  await page.goto(routerBase + '/console/jev.html');
+  /* #jevStatus 是基座的单模块入口标记：目录加载完成后才非空。 */
+  await page.waitForFunction(() => document.getElementById('jevStatus').textContent.trim() !== '');
+}
+
+async function createJevService({ id, model, key, baseUrl, input = 1024, context = 4096, timeout = 5 }) {
+  await page.locator('#jevNew').click();
+  await page.locator('#jevServiceId').fill(id);
+  await page.locator('#jevBaseUrl').fill(baseUrl || mockBase);
+  await page.locator('#jevModel').fill(model);
+  await page.locator('#jevTimeout').fill(String(timeout));
+  await page.locator('#jevInputTokens').fill(String(input));
+  await page.locator('#jevContextTokens').fill(String(context));
+  if (key) await page.locator('#jevApiKey').fill(key);
+  await page.locator('#jevSave').click();
+  await page.waitForSelector('[data-jev-service-id="' + id + '"]');
+}
+
+test('P0 decision service directory creates, lists and edits a service', async () => {
+  await openJevDirectory();
+  /* 旧单服务页面的控件已彻底删除（无双轨残留）。 */
+  assert.equal(await page.locator('#saveJev, #saveWindow, #winInput, #winContext, #baseUrl, #testJev').count(), 0,
+    'legacy single-service controls are still present');
+  assert.equal(await page.locator('#saveWindow').count(), 0);
+
+  await createJevService({ id: JEV_SERVICE_ID, model: 'd1-model-a', key: 'secret-models-sample' });
+  const item = page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]');
+  const listText = (await item.innerText()).replace(/\s+/g, ' ');
+  assertIncludes(listText, JEV_SERVICE_ID);
+  assertIncludes(listText, 'd1-model-a');
+  assertIncludes(listText, mockBase);
+  assertIncludes(listText, '1024 / 4096');
+  assert.equal(await page.locator('#jevStatus').innerText(), JEV_SERVICE_ID);
+  assert.equal(await page.locator('text=secret-models-sample').count(), 0,
+    'the stored key material leaked into the page');
+
+  /* 编辑当前服务：保存只写这一条目录行，列表与状态随之刷新。 */
+  await item.click();
+  await page.locator('#jevModel').fill('d1-model-b');
+  await page.locator('#jevInstructions').fill('多服务编辑后的指令');
+  await page.locator('#jevInputTokens').fill('2048');
+  await page.locator('#jevSave').click();
+  await page.waitForFunction(serviceId => [...document.querySelectorAll('[data-jev-service-id]')]
+    .some(element => element.dataset.jevServiceId === serviceId &&
+      element.textContent.includes('d1-model-b')), JEV_SERVICE_ID, { timeout: 8000 });
+  const saved = (await api('GET', '/admin/jev/' + JEV_SERVICE_ID)).service;
+  assert.equal(saved.instructions, '多服务编辑后的指令');
+  assert.equal(saved.input_tokens, 2048);
+  assert.match((await page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]').innerText()), /d1-model-b/);
+  /* 目录响应永远不含 api_key / 明文密钥。 */
+  const catalog = await (await fetch(routerBase + '/admin/jev')).text();
+  assert.equal(catalog.includes('api_key'), false);
+  assert.equal(catalog.includes('secret-models-sample'), false);
+});
+
+test('P0 decision service rejects an invalid window before any write', async () => {
+  await openJevDirectory();
+  await page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]').click();
+  const writes = [];
   const onRequest = request => {
     const url = new URL(request.url());
-    if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
-    if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
-    if (request.method() === 'POST' && url.pathname === '/admin/jev/test') calls.push('test');
+    if (request.method() === 'PUT' && url.pathname === '/admin/jev/' + JEV_SERVICE_ID) writes.push(url.pathname);
   };
   page.on('request', onRequest);
   try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
-    assert.equal(await page.locator('#testCard').count(), 0);
-    assert.equal(await page.locator('#saveWindow').count(), 0);
-    await page.locator('#editConfig').click();
-    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), false,
-      'the decision-service advanced section must start closed');
-    for (const id of ['timeout', 'clearKey', 'instructions', 'stateTemplate',
-                      'winContext', 'winInput', 'testText']) {
-      assert.equal(await page.locator('#' + id).isVisible(), false,
-        `the advanced field #${id} leaked into the default edit view`);
-    }
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
-    assert.deepEqual(calls, ['config', 'window', 'test']);
-    assert.match(await page.locator('#testOut').innerText(), /连接成功|Connection successful/);
-    /* The raw payload must be revealed-but-collapsed. Asserting #testRaw alone
-       would also pass when the details were never revealed at all. */
-    assert.equal(await page.locator('#testRawDetails').isVisible(), true);
-    assert.equal(await page.locator('#testRawDetails').evaluate(element => element.open), false);
-    /* The successful save leaves edit mode: focus must land on a live control. */
-    await page.waitForFunction(
-      () => document.activeElement.id === 'editConfig',
-      null,
-      { timeout: 3000 }
-    ).catch(() => assert.fail('save-and-test did not return focus to #editConfig'));
+    /* input > context：本地校验先失败，任何写请求都不许发出。 */
+    await page.locator('#jevContextTokens').fill('1024');
+    await page.locator('#jevInputTokens').fill('2048');
+    await page.locator('#jevSave').click();
+    await page.waitForFunction(() => {
+      const text = document.getElementById('jevMsg').textContent;
+      return text.includes('未保存') || text.includes('Not saved');
+    }, null, { timeout: 4000 });
+    assert.deepEqual(writes, [], 'an invalid local window still wrote the service');
+    assert.equal(await page.locator('#jevMsg').evaluate(element => element.classList.contains('bad')), true);
   } finally {
     page.off('request', onRequest);
   }
 });
 
+test('P0 decision service tests the selected service connection with a friendly result', async () => {
+  await openJevDirectory();
+  await page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]').click();
+  await page.locator('#jevTest').click();
+  await page.waitForFunction(() => document.getElementById('jevTestResult').dataset.state === 'pass',
+    null, { timeout: 20000 });
+  assert.match(await page.locator('#jevTestResult').innerText(), /连接成功|Connection successful/);
+  /* 原始响应按需展开：默认可见但收起，不能完全藏掉。 */
+  assert.equal(await page.locator('#jevTestRawDetails').isVisible(), true);
+  assert.equal(await page.locator('#jevTestRawDetails').evaluate(element => element.open), false);
+  assert.match(await page.locator('#jevTestRaw').evaluate(element => element.textContent), /selected_key/);
+});
+
+test('P0 decision service reports a failed test and preserves the unsaved draft', async () => {
+  await openJevDirectory();
+  await page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]').click();
+  await page.locator('#jevInstructions').fill('测试失败也不许覆盖的草稿');
+  const matcher = '**/admin/jev/*/test';
+  await page.route(matcher, route => route.fulfill({
+    status: 502,
+    contentType: 'application/json',
+    body: JSON.stringify({ detail: 'test rejected by QA' })
+  }));
+  expectHttpStatusError({ url: new RegExp('/admin/jev/' + JEV_SERVICE_ID + '/test$'), status: /502/ });
+  try {
+    await page.locator('#jevTest').click();
+    await page.waitForFunction(() => document.getElementById('jevTestResult').dataset.state === 'fail',
+      null, { timeout: 8000 });
+    assert.match(await page.locator('#jevTestResult').innerText(), /test rejected by QA/);
+    /* 失败测试是只读操作：草稿不许被服务端值覆盖，旧的原始响应必须清空。 */
+    assert.equal(await page.locator('#jevInstructions').inputValue(), '测试失败也不许覆盖的草稿');
+    assert.equal(await page.locator('#jevTestRawDetails').isVisible(), false);
+    assert.equal(await page.locator('#jevTestRaw').evaluate(element => element.textContent), '');
+  } finally {
+    await page.unroute(matcher);
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 decision service surfaces impact_confirmation_required instead of silently writing', async () => {
+  await openJevDirectory();
+  const before = (await api('GET', '/admin/jev/default')).service;
+  await page.locator('[data-jev-service-id="default"]').click();
+  await page.locator('#jevModel').fill('default-canvas-conflict');
+  expectHttpStatusError({ url: /\/admin\/jev\/default$/, status: /409/ });
+  try {
+    await page.locator('#jevSave').click();
+    await page.waitForFunction(() => {
+      const text = document.getElementById('jevMsg').textContent;
+      return text.includes('确认影响') || text.includes('impact confirmation');
+    }, null, { timeout: 8000 });
+    const after = (await api('GET', '/admin/jev/default')).service;
+    assert.equal(after.model, before.model, 'a 409 response still wrote the referenced service');
+    assert.equal(await page.locator('#jevMsg').evaluate(element => element.classList.contains('bad')), true);
+  } finally {
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 decision service language switch preserves the unsaved draft', async () => {
+  await openJevDirectory();
+  await page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]').click();
+  await page.locator('#jevInstructions').fill('语言切换保留的草稿');
+  await page.locator('#jevInputTokens').fill('3072');
+  try {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('en');
+    });
+    assert.equal(await page.locator('#jevInstructions').inputValue(), '语言切换保留的草稿');
+    assert.equal(await page.locator('#jevInputTokens').inputValue(), '3072');
+    assert.equal(await page.locator('#jevContextTokens').inputValue(), '4096');
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    });
+    assert.equal(await page.locator('#jevInstructions').inputValue(), '语言切换保留的草稿');
+    assert.equal(await page.locator('#jevInputTokens').inputValue(), '3072');
+  } finally {
+    await page.evaluate(async () => {
+      const { setLang } = await import('/console/i18n.js');
+      setLang('zh');
+    }).catch(() => {});
+  }
+});
+
 test('P0 decision service document title follows the language toggle', async () => {
-  await page.goto(routerBase + '/console/jev.html');
-  await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+  await openJevDirectory();
   assert.match(await page.title(), /决策服务/, 'the zh document title is not the page label');
   try {
     await page.evaluate(async () => {
@@ -149,27 +282,25 @@ test('P0 decision service document title follows the language toggle', async () 
 test('P0 decision service paints the custom test default in English on first load', async () => {
   const EN = 'Pick one of the candidates to verify the decision service.';
   const ZH = '请选择一个候选以验证决策服务。';
-  /* 语言必须在 i18n 模块求值前落到 localStorage：这是真实的「英文会话首屏」，
-     而不是加载后切换一次。 */
+  /* 语言必须在 i18n 模块求值前落到 localStorage：这是真实的「英文会话首屏」。 */
   await page.goto(routerBase + '/console/logs.html');
   await page.evaluate(() => localStorage.setItem('router_lang', 'en'));
   try {
     await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    await page.waitForFunction(() => document.getElementById('jevStatus').textContent.trim() !== '');
     const first = await page.evaluate(() => ({
       lang: document.documentElement.lang,
-      text: document.getElementById('testText').value
+      text: document.getElementById('jevTestText').value
     }));
     assert.equal(first.lang, 'en', 'the en preset did not reach the page');
     assert.equal(first.text, EN,
       'an English session rendered a non-English custom test default: ' + first.text);
-    /* The language-switch repair path must keep working without the old seed. */
     const switched = await page.evaluate(async () => {
       const { setLang } = await import('/console/i18n.js');
       setLang('zh');
-      const zh = document.getElementById('testText').value;
+      const zh = document.getElementById('jevTestText').value;
       setLang('en');
-      return { zh, en: document.getElementById('testText').value };
+      return { zh, en: document.getElementById('jevTestText').value };
     });
     assert.equal(switched.zh, ZH, 'the custom test default did not follow the switch to zh');
     assert.equal(switched.en, EN, 'the custom test default did not follow the switch back to en');
@@ -181,386 +312,19 @@ test('P0 decision service paints the custom test default in English on first loa
   }
 });
 
-test('P0 decision service paints a running test state while the test request is in flight', async () => {
-  let releaseTest = () => {};
-  const gate = new Promise(resolve => { releaseTest = resolve; });
-  const calls = [];
-  let testSeenResolve = () => {};
-  const testSeen = new Promise(resolve => { testSeenResolve = resolve; });
-  const onRequest = request => {
-    const url = new URL(request.url());
-    if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
-    if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
-    if (request.method() === 'POST' && url.pathname === '/admin/jev/test') {
-      calls.push('test');
-      testSeenResolve();
-    }
-  };
-  page.on('request', onRequest);
-  await page.route('**/admin/jev/test', async route => {
-    if (route.request().method() !== 'POST') { await route.continue(); return; }
-    await gate;
-    await route.fulfill({
-      status: 200,
-      contentType: 'application/json',
-      body: JSON.stringify({ selected_key: 'b', duration_ms: 12, probabilities: { a: 0.4, b: 0.6 } })
-    });
-  });
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
-    await page.locator('#editConfig').click();
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() =>
-      document.getElementById('testOut').dataset.state === 'running', null, { timeout: 3000 });
-    assert.match(await page.locator('#testBadgeText').innerText(), /测试中|Testing/,
-      'the test badge did not announce the in-flight run');
-    assert.match(await page.locator('#testOut').innerText(), /测试中|Testing/);
-    /* The primary action and every edit control stay disabled while the
-       ordered save-and-test pipeline is still running. */
-    assert.equal(await page.locator('#saveJev').isDisabled(), true);
-    assert.equal(await page.locator('#editConfig').isDisabled(), true);
-    assert.equal(await page.locator('#baseUrl').isDisabled(), true);
-    await Promise.race([
-      testSeen,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('the test request never started')), 3000))
-    ]);
-    assert.deepEqual(calls, ['config', 'window', 'test'],
-      'the running test started before config and window were written');
-    releaseTest();
-    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
-    assert.match(await page.locator('#testBadgeText').innerText(), /测试通过|Test passed/);
-    assert.equal(await page.locator('#testRawDetails').isVisible(), true);
-    assert.equal(await page.locator('#testRawDetails').evaluate(element => element.open), false);
-    assert.match(await page.locator('#testRaw').evaluate(element => element.textContent), /selected_key/);
-  } finally {
-    releaseTest();
-    page.off('request', onRequest);
-    await page.unroute('**/admin/jev/test');
-  }
-});
-
-test('P0 decision service reports partial save and skips test after window failure', async () => {
-  const calls = [];
-  const onRequest = request => {
-    const url = new URL(request.url());
-    if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
-    if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
-    if (request.method() === 'POST' && url.pathname === '/admin/jev/test') calls.push('test');
-  };
-  page.on('request', onRequest);
-  await page.route('**/admin/jev/window', async route => {
-    if (route.request().method() === 'PUT') {
-      await route.fulfill({
-        status: 422,
-        contentType: 'application/json',
-        body: JSON.stringify({ detail: 'window save rejected by QA' })
-      });
-      return;
-    }
-    await route.continue();
-  });
-  expectHttpStatusError({ url: /\/admin\/jev\/window$/, status: /422/ });
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
-    await page.locator('#editConfig').click();
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() =>
-      document.getElementById('saveMsg').textContent.includes('window save rejected by QA'));
-    assert.deepEqual(calls, ['config', 'window']);
-    assert.match(await page.locator('#saveMsg').innerText(), /连接与提示词已保存|Connection and prompts saved/);
-    assert.equal(await page.locator('#editPane').isVisible(), true);
-    /* 422 是故意制造的：浏览器那条 console error 必须已被期望消费掉。 */
-    assert.equal(expectedHttpStatusErrors.length, 0,
-      'the expected window PUT 422 was not observed');
-
-    /* A failed write must not wedge the form: with the injected failure gone,
-       the same primary must run the whole chain again and reach success. */
-    await page.unroute('**/admin/jev/window');
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass',
-      null, { timeout: 15000 });
-    assert.equal(await page.locator('#saveJev').isEnabled(), true,
-      'the recovery save left #saveJev disabled');
-    assert.deepEqual(calls, ['config', 'window', 'config', 'window', 'test'],
-      'the retry after a failed window save did not run config → window → test again');
-    assert.match(await page.locator('#saveMsg').innerText(), /已保存，连接测试通过|Saved, connection test passed/,
-      'the successful retry did not paint the success copy');
-  } finally {
-    page.off('request', onRequest);
-    await page.unroute('**/admin/jev/window');
-    resetExpectedHttpStatusErrors();
-  }
-});
-
-test('P0 decision service stops after config failure', async () => {
-  const calls = [];
-  const onRequest = request => {
-    const path = new URL(request.url()).pathname;
-    if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
-    if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
-    if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
-  };
-  page.on('request', onRequest);
-  await page.route('**/admin/jev', async route => {
-    if (route.request().method() === 'PUT') {
-      await route.fulfill({
-        status: 422,
-        contentType: 'application/json',
-        body: JSON.stringify({ detail: 'config rejected by QA' })
-      });
-      return;
-    }
-    await route.continue();
-  });
-  expectHttpStatusError({ url: /\/admin\/jev$/, status: /422/ });
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
-    await page.locator('#editConfig').click();
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() =>
-      document.getElementById('saveMsg').textContent.includes('config rejected by QA'));
-    assert.deepEqual(calls, ['config']);
-    /* The reworked copy must say the config was not saved, not just relay the
-       server detail (this case already passed at the Task 4 predecessor). */
-    assert.match(await page.locator('#saveMsg').innerText(), /配置未保存|Configuration not saved/);
-    assert.equal(await page.locator('#editPane').isVisible(), true);
-  } finally {
-    page.off('request', onRequest);
-    await page.unroute('**/admin/jev');
-    resetExpectedHttpStatusErrors();
-  }
-});
-
-test('P0 decision service rejects an invalid window before any write', async () => {
-  const calls = [];
-  const onRequest = request => {
-    const path = new URL(request.url()).pathname;
-    if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
-    if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
-    if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
-  };
-  page.on('request', onRequest);
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('winContext').value === '4096');
-    await page.locator('#editConfig').click();
-    /* The advanced section is left closed on purpose: the page itself must
-       reveal it when it focuses the offending field. Inputs are set through
-       the DOM because a closed <details> hides them from real user actions. */
-    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), false);
-    await page.locator('#winContext').evaluate(element => {
-      element.value = '1024';
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    await page.locator('#winInput').evaluate(element => {
-      element.value = '2048';
-      element.dispatchEvent(new Event('input', { bubbles: true }));
-    });
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() => document.activeElement.id === 'winInput');
-    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), true,
-      'the invalid window did not reveal the advanced section');
-    await page.waitForFunction(() => {
-      const text = document.getElementById('saveMsg').textContent;
-      return text.includes('未保存：上下文长度校验未通过') ||
-        text.includes('Not saved: context length check failed');
-    }, null, { timeout: 3000 });
-    /* The important one: an invalid local window writes nothing at all. */
-    assert.deepEqual(calls, []);
-    assert.equal(await page.locator('#editPane').isVisible(), true);
-  } finally {
-    page.off('request', onRequest);
-  }
-});
-
-test('P0 decision service reports saved config when connection test fails', async () => {
-  const calls = [];
-  const onRequest = request => {
-    const path = new URL(request.url()).pathname;
-    if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
-    if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
-    if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
-  };
-  page.on('request', onRequest);
-  let failTest = false;
-  await page.route('**/admin/jev/test', async route => {
-    if (!failTest) {
-      await route.continue();
-      return;
-    }
-    await route.fulfill({
-      status: 502,
-      contentType: 'application/json',
-      body: JSON.stringify({ detail: 'test rejected by QA' })
-    });
-  });
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
-    /* A passing standalone retest first reveals the raw details and paints a
-       pass badge, so the assertions below cannot pass vacuously (the static
-       HTML ships #testRawDetails with `hidden`). */
-    await page.locator('#testJev').click();
-    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
-    assert.equal(await page.locator('#testRawDetails').isVisible(), true);
-    assert.match(await page.locator('#testRaw').evaluate(element => element.textContent),
-      /selected_key/);
-    calls.length = 0;
-    failTest = true;
-    expectHttpStatusError({ url: /\/admin\/jev\/test$/, status: /502/ });
-    await page.locator('#editConfig').click();
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() =>
-      document.getElementById('saveMsg').textContent.includes('test rejected by QA'));
-    assert.deepEqual(calls, ['config', 'window', 'test']);
-    assert.match(await page.locator('#saveMsg').innerText(), /配置已保存|Configuration saved/);
-    /* data-state is the single source of test status: the stale pass must go. */
-    assert.equal(await page.locator('#testOut').getAttribute('data-state'), 'fail');
-    assert.match(await page.locator('#testBadge').innerText(), /测试失败|Test failed/);
-    assert.equal(await page.locator('#testRawDetails').isVisible(), false);
-    assert.equal(await page.locator('#testRaw').evaluate(element => element.textContent), '');
-    assert.equal(await page.locator('#editPane').isVisible(), true);
-  } finally {
-    page.off('request', onRequest);
-    await page.unroute('**/admin/jev/test');
-    resetExpectedHttpStatusErrors();
-  }
-});
-
-test('P0 decision service cancel keeps saved config but discards failed window draft', async () => {
-  const beforeConfig = await api('GET', '/admin/jev');
-  const beforeWindow = await api('GET', '/admin/jev/window');
-  const changedModel = beforeConfig.config.model + '-saved-before-window-failure';
-  await page.route('**/admin/jev/window', async route => {
-    if (route.request().method() === 'PUT') {
-      await route.fulfill({
-        status: 422,
-        contentType: 'application/json',
-        body: JSON.stringify({ detail: 'window failed after config saved' })
-      });
-      return;
-    }
-    await route.continue();
-  });
-  expectHttpStatusError({ url: /\/admin\/jev\/window$/, status: /422/ });
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('model').value !== '');
-    await page.locator('#editConfig').click();
-    await page.locator('#model').fill(changedModel);
-    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
-    await page.locator('#winContext').fill('8192');
-    await page.locator('#winInput').fill('2048');
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() =>
-      document.getElementById('saveMsg').textContent.includes('window failed after config saved'));
-
-    const savedConfig = await api('GET', '/admin/jev');
-    assert.equal(savedConfig.config.model, changedModel, 'config did not reach the server');
-    await page.locator('#editConfig').click();
-    assert.equal(await page.locator('#roModel').textContent(), changedModel,
-      'cancel restored the pre-edit model instead of the saved model');
-
-    await page.locator('#editConfig').click();
-    assert.equal(await page.locator('#model').inputValue(), changedModel);
-    assert.equal(await page.locator('#winContext').inputValue(),
-      String(beforeWindow.context_tokens), 'the failed window draft became the cancel baseline');
-    assert.equal(await page.locator('#winInput').inputValue(), String(beforeWindow.input_tokens));
-  } finally {
-    await page.unroute('**/admin/jev/window');
-    resetExpectedHttpStatusErrors();
-  }
-});
-
-test('P0 decision service cancel after test failure preserves both saved stages', async () => {
-  const beforeConfig = await api('GET', '/admin/jev');
-  const changedModel = beforeConfig.config.model + '-saved-before-test-failure';
-  await page.route('**/admin/jev/test', async route => {
-    await route.fulfill({
-      status: 502,
-      contentType: 'application/json',
-      body: JSON.stringify({ detail: 'test failed after both saves' })
-    });
-  });
-  expectHttpStatusError({ url: /\/admin\/jev\/test$/, status: /502/ });
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(() => document.getElementById('model').value !== '');
-    await page.locator('#editConfig').click();
-    await page.locator('#model').fill(changedModel);
-    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
-    await page.locator('#winContext').fill('8192');
-    await page.locator('#winInput').fill('2048');
-    await page.locator('#saveJev').click();
-    await page.waitForFunction(() =>
-      document.getElementById('saveMsg').textContent.includes('test failed after both saves'));
-
-    await page.locator('#editConfig').click();
-    assert.equal(await page.locator('#roModel').textContent(), changedModel);
-    await page.locator('#editConfig').click();
-    assert.equal(await page.locator('#model').inputValue(), changedModel);
-    assert.equal(await page.locator('#winContext').inputValue(), '8192');
-    assert.equal(await page.locator('#winInput').inputValue(), '2048');
-    const savedWindow = await api('GET', '/admin/jev/window');
-    assert.equal(savedWindow.context_tokens, 8192);
-    assert.equal(savedWindow.input_tokens, 2048);
-  } finally {
-    await page.unroute('**/admin/jev/test');
-    resetExpectedHttpStatusErrors();
-  }
-});
-
-test('P0 decision service language switch preserves unsaved window draft', async () => {
-  const beforeWindow = await api('GET', '/admin/jev/window');
-  const draftContext = beforeWindow.context_tokens === 8192 ? 16384 : 8192;
-  const draftInput = draftContext / 4;
-  const invalidInput = draftContext * 2;
-  const writes = [];
-  const onRequest = request => {
-    const path = new URL(request.url()).pathname;
-    if ((path === '/admin/jev' || path === '/admin/jev/window') && request.method() === 'PUT') {
-      writes.push(path);
-    }
-  };
-  page.on('request', onRequest);
-  try {
-    await page.goto(routerBase + '/console/jev.html');
-    await page.waitForFunction(expected =>
-      document.getElementById('winContext').value === String(expected), beforeWindow.context_tokens);
-    await page.locator('#editConfig').click();
-    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
-    await page.locator('#winContext').fill(String(draftContext));
-    await page.locator('#winInput').fill(String(draftInput));
-
-    await page.evaluate(async () => {
-      const { setLang } = await import('/console/i18n.js');
-      setLang('en');
-    });
-    assert.equal(await page.locator('#winContext').inputValue(), String(draftContext));
-    assert.equal(await page.locator('#winInput').inputValue(), String(draftInput));
-    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), true);
-
-    await page.locator('#winInput').fill(String(invalidInput));
-    assert.match(await page.locator('#windowMsg').innerText(),
-      /Input limit cannot exceed the service context budget/);
-    await page.evaluate(async () => {
-      const { setLang } = await import('/console/i18n.js');
-      setLang('zh');
-    });
-    assert.equal(await page.locator('#winContext').inputValue(), String(draftContext));
-    assert.equal(await page.locator('#winInput').inputValue(), String(invalidInput));
-    assert.match(await page.locator('#windowMsg').innerText(), /输入截断上限不能大于服务上下文预算/);
-    assert.deepEqual(writes, [], 'language switches must not save the draft');
-  } finally {
-    page.off('request', onRequest);
-    await page.evaluate(async () => {
-      const { setLang } = await import('/console/i18n.js');
-      setLang('zh');
-    }).catch(() => {});
-  }
+test('P0 decision service deletes an unreferenced service after an explicit confirmation', async () => {
+  await openJevDirectory();
+  const id = 'qa-jev-delete';
+  await createJevService({ id, model: 'd1-delete' });
+  await page.locator('[data-jev-service-id="' + id + '"]').click();
+  /* 删除是两步确认：第一次只上膛，第二次才真正发 DELETE。 */
+  await page.locator('#jevDelete').click();
+  assert.match(await page.locator('#jevMsg').innerText(), /确认删除|Click again to confirm/);
+  await page.locator('#jevDelete').click();
+  await page.waitForFunction(serviceId =>
+    document.querySelectorAll('[data-jev-service-id="' + serviceId + '"]').length === 0,
+    id, { timeout: 8000 });
+  await assert.rejects(() => api('GET', '/admin/jev/' + id), /HTTP 404/);
 });
 
 test('P0 preset connection hides model ids by default and uses one save action', async () => {

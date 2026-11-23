@@ -828,13 +828,45 @@ body[data-page="login"]{min-height:100vh;display:flex;flex-direction:column}
 }
 @media(prefers-reduced-motion:reduce){.lg-item,.lg-chev{transition:none}}
 
-/* ── decision service page (jev): connection-test result ─────────────── */
-/* #testOut[data-state] is written from the real test response; the badge
-   reads the same state instead of parsing the result text. */
+/* ── decision service page (jev): multi-service directory + editor ───── */
+.jev-page{max-width:1180px}
+.jev-layout{display:grid;grid-template-columns:286px minmax(0,1fr);gap:12px;align-items:start}
+.jev-list-card .col-h{margin-bottom:6px}
+.jev-list{display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:64vh;overflow:auto}
+.jev-list-empty{font-size:11.5px;line-height:1.55;padding:9px 2px}
+.jev-item{display:flex;flex-direction:column;gap:3px;text-align:left;width:100%;
+  border:1px solid var(--line);background:var(--panel-2);border-radius:9px;
+  padding:8px 10px;color:var(--text);font-family:inherit;transition:border-color .12s,background .12s}
+.jev-item:hover{border-color:var(--line-2);background:var(--panel)}
+.jev-item.is-on{border-color:var(--indigo-line);background:var(--indigo-soft)}
+.jev-item .ji-row{display:flex;align-items:center;gap:6px;min-width:0}
+.jev-item .ji-id{font-family:var(--mono);font-size:12.5px;font-weight:650;min-width:0;overflow-wrap:anywhere}
+.jev-item .ji-row .pill{font-size:10px;padding:0 7px;margin-left:auto;flex:none}
+.jev-item .ji-meta{font-size:11px;color:var(--text-3);line-height:1.45;overflow-wrap:anywhere}
+.jev-item .ji-window{font-family:var(--mono);font-size:10.5px;color:var(--text-3)}
+.jev-editor .field-row{margin-bottom:10px}
+.jev-editor label.field{margin-bottom:10px}
+.jev-editor textarea{width:100%}
+.jev-editor .chk{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--text-2);
+  font-weight:600;padding-bottom:11px;white-space:nowrap}
+.jev-editor .chk input{width:auto}
+.jev-editor .field-narrow{flex:0 1 130px;min-width:96px}
+.jev-window-row .field{flex:0 1 170px;min-width:130px}
+.jev-editor .hr{margin-top:13px}
+.jev-actions{display:flex;align-items:center;gap:8px;justify-content:flex-end;
+  flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.jev-actions .modal-msg{margin-right:auto;max-width:52ch}
+.jev-test-card{margin-top:12px}
+.jev-test-card label.field{margin-bottom:0}
+/* #jevTestResult[data-state] comes from the real test response. */
 .test-out{margin-top:12px;padding-top:11px;border-top:1px solid var(--line);
   min-height:52px;font-size:12px;line-height:1.55;color:var(--text-2)}
 .test-out[data-state="pass"]{color:var(--text)}
 .test-out[data-state="fail"]{color:var(--red)}
 .test-out[data-state="running"]{color:var(--text-3)}
-#testRaw{max-height:280px;overflow:auto;font-family:var(--mono);font-size:10.5px;
+#jevTestRaw{max-height:280px;overflow:auto;font-family:var(--mono);font-size:10.5px;
   line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}
+@media (max-width:900px){
+  .jev-layout{grid-template-columns:1fr}
+  .jev-list{max-height:40vh}
+}

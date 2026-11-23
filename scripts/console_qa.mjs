@@ -2,7 +2,7 @@
    ------------------------------------------------------------------
    本文件只保留：服务启动（Node mock + `python -m router` 子进程）、浏览器、
    管理面 API、用例注册器/执行器、共享断言助手与 teardown。页面用例分别位于
-   scripts/console_qa/{canvas,inspector,tryrun,logs,models,testchat}.mjs，各模块只调用
+   scripts/console_qa/{canvas,inspector,tryrun,logs,models,testchat,jev}.mjs，各模块只调用
    本文件的 test(name, fn) 注册用例，不复制启动逻辑、不持有页面状态。
 
    console_qa.mjs 顶部保留的 9 条用例是基座自检（健康检查 / 原生 ESM / 单模块入口 /
@@ -506,9 +506,8 @@ async function startRouter(port) {
       ROUTER_HOST: '127.0.0.1',
       ROUTER_PORT: String(port),
       ROUTER_USER_AUTH: '0',
-      ROUTER_JEV_URL: mockBase,
-      ROUTER_JEV_MODEL: JEV_MODEL,
-      ROUTER_JEV_TIMEOUT: '5',
+      /* 不设置 ROUTER_JEV_URL/MODEL：多 JEV 目录只由 bootstrap 用
+         POST /admin/jev 显式创建（旧单配置 / 环境种子路径不再参与 QA）。 */
       PYTHONUNBUFFERED: '1'
 },
     stdio: ['ignore', 'pipe', 'pipe']
@@ -599,16 +598,6 @@ export async function api(method, apiPath, body) {
 }
 }
 
-const MODEL_PROFILE = {
-  domains: [],
-  tier: 'large',
-  reasoning: {
-    format: 'openai',
-    efforts: { low: 'low', medium: 'medium', high: 'high' },
-    default: 'medium'
-}
-};
-
 /* Python tree_to_dict 的四运行字段：保存/导入现在会自带 runtime，
    QA 基座必须把它们当一等状态显式恢复（不能让上一个用例残留的 runtime 继承下来）。 */
 const RUNTIME_FIELDS = ['backends', 'jev', 'jev_window', 'time_periods'];
@@ -622,11 +611,78 @@ export function treeRuntimeFields(tree) {
   return runtime;
 }
 
-/* bootstrap 时服务端按数据库目录物化出来的全局运行配置（provider → mock、JEV → mock）。
-   ensureBaselineTree 每次显式带这四字段，恢复的是「示例被保存进基线组之前」的配置。 */
+/* ── 基线画布运行快照（严格自包含画布） ────────────────────────────────
+   `POST/PUT /admin/trees` 现在必须显式带齐四个运行字段；服务端不再按数据库
+   目录物化 runtime。基线快照以共享示例文档 router/console/routing/example.json
+   为唯一来源：读盘后只去掉 API 不接受的文档字段（kind/version/name/timezone/
+   sticky/id 由请求体承担），四个运行字段原样保留，仅把 provider / JEV 的连接
+   端点换成 QA mock —— 这与旧基座「数据库目录指向 mock」的语义一致，指令、
+   模板、窗口、时段全部保持示例文档原值。 */
 export let BASELINE_RUNTIME = null;
 
+/* 第二个目录服务：不写进基线画布快照，用来证明目录 GET 只读 SQLite、不是活动
+   画布投影（旧基座靠服务端物化把两者混在一起，无法区分）。 */
+export const SECONDARY_JEV_ID = 'jev-secondary';
+
+function qaRuntimeFromExample() {
+  const runtime = JSON.parse(JSON.stringify({
+    backends: EXAMPLE.backends,
+    jev: EXAMPLE.jev,
+    jev_window: EXAMPLE.jev_window,
+    time_periods: EXAMPLE.time_periods
+}));
+  runtime.backends.providers = runtime.backends.providers.map(provider =>
+    provider.name === 'local'
+      ? { ...provider, base_url: mockBase + '/v1' }
+      : provider);
+  runtime.jev = { ...runtime.jev, base_url: mockBase };
+  return runtime;
+}
+
+/* 目录服务的非密钥 DTO 与画布快照同源：两边必须逐字段相等，否则 /admin/try 的
+   runtime_mismatch 提示会让基线的「零 warnings」失效。 */
+function jevServiceSeed(service, window) {
+  return {
+    id: service.id,
+    base_url: service.base_url,
+    model: service.model,
+    key_env: service.key_env || '',
+    timeout_seconds: service.timeout_seconds,
+    instructions: service.instructions,
+    state_template: service.state_template,
+    input_tokens: window.input_tokens,
+    context_tokens: window.context_tokens
+};
+}
+
+async function seedJevCatalog(runtime) {
+  const existing = await api('GET', '/admin/jev');
+  const known = new Set((existing.services || []).map(service => service.id));
+  const seeded = jevServiceSeed(runtime.jev, runtime.jev_window);
+  if (known.has(seeded.id)) {
+    await api('PUT', '/admin/jev/' + encodeURIComponent(seeded.id), seeded);
+} else {
+    await api('POST', '/admin/jev', seeded);
+}
+  if (!known.has(SECONDARY_JEV_ID)) {
+    await api('POST', '/admin/jev', {
+      id: SECONDARY_JEV_ID,
+      base_url: mockBase,
+      model: JEV_MODEL,
+      key_env: '',
+      timeout_seconds: 5,
+      instructions: runtime.jev.instructions,
+      state_template: runtime.jev.state_template,
+      input_tokens: 2048,
+      context_tokens: 8192
+});
+}
+}
+
 async function bootstrap() {
+  /* 运行快照必须在浏览器/页面用例之前确定：后续 ensureBaselineTree 用它恢复。 */
+  BASELINE_RUNTIME = qaRuntimeFromExample();
+
   /* 1. local provider → mock（/v1/chat/completions 由 mock 承接）。 */
   await api('PUT', '/admin/providers/local', {
     base_url: mockBase + '/v1',
@@ -634,51 +690,49 @@ async function bootstrap() {
     reasoning_format: 'openai'
 });
 
-  /* 2. 示例图引用的四个模型，均声明 low/medium/high 推理档位。 */
-  for (const modelId of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b']) {
-    await api('PUT', '/admin/models/' + encodeURIComponent(modelId), {
-      upstream: modelId,
+  /* 2. 示例图引用的模型目录：profile 直接取 example.json 的快照，保证目录与
+        基线画布逐字段一致（/admin/try 的 runtime_mismatch 保持为 0）。 */
+  const existingModels = new Set(
+    (await api('GET', '/admin/models')).models.map(model => model.id));
+  for (const model of BASELINE_RUNTIME.backends.models) {
+    const body = { upstream: model.upstream, provider: model.provider, profile: model.profile };
+    if (existingModels.has(model.id)) {
+      await api('PUT', '/admin/models/' + encodeURIComponent(model.id), body);
+} else {
+      await api('POST', '/admin/models', { id: model.id, ...body });
+}
+}
+  /* 未声明推理档位的模型：用于目标检查器空态提示的回归覆盖；画布快照不引用它。 */
+  if (!existingModels.has('tierless-model')) {
+    await api('POST', '/admin/models', {
+      id: 'tierless-model',
+      upstream: 'tierless-model',
       provider: 'local',
-      profile: MODEL_PROFILE
+      profile: { domains: [], tier: 'small' }
 });
 }
-  await api('POST', '/admin/models', {
-    id: 'qwen3.8-flash-sft',
-    upstream: 'qwen3.8-flash-sft',
-    provider: 'local',
-    profile: MODEL_PROFILE
-});
-  /* 未声明推理档位的模型：用于目标检查器空态提示的回归覆盖。 */
-  await api('POST', '/admin/models', {
-    id: 'tierless-model',
-    upstream: 'tierless-model',
-    provider: 'local',
-    profile: { domains: [], tier: 'small' }
-});
 
   /* 3. peak / normal / offpeak 三个固定时段（与 graph_scenarios.json 一致）。 */
   await api('PUT', '/admin/time-periods', { periods: FIXTURE.periods });
 
-  /* 4. 决策服务指向 mock。 */
-  await api('PUT', '/admin/jev', {
-    base_url: mockBase,
-    model: JEV_MODEL,
-    timeout_seconds: 5
-});
+  /* 4. 多 JEV 目录：default 与基线画布快照同源，另加一个未被画布引用的服务。 */
+  await seedJevCatalog(BASELINE_RUNTIME);
 
-  /* 5. 建图并启用（root 原样使用 Task 3 的 graph_power 示例）。 */
+  /* 5. 建图并启用：显式携带四个运行字段；服务端只保存、不再物化/补齐。 */
   const created = await api('POST', '/admin/trees', {
     id: TREE_ID,
     name: BASELINE.name,
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
     root: EXAMPLE_ROOT,
-    canvas: EXAMPLE.canvas
+    canvas: EXAMPLE.canvas,
+    ...BASELINE_RUNTIME
 });
-  /* 服务端保存时物化的运行配置是基线组的「全局目录」快照：控制台载入示例/导入会把
-     文档自带的 runtime 写进草稿，用例保存后这条组会带上示例的 local runtime；
-     ensureBaselineTree 用这份快照显式恢复，后续 tryrun/auto 仍打 mock。 */
-  BASELINE_RUNTIME = treeRuntimeFields(created.tree);
+  /* 自检用例断言存储的画布与这里发出的快照逐字段相等；这里只做一次结构核对，
+     避免把「服务端悄悄改写 / 物化」留到页面用例里才暴露。 */
+  if (!treeRuntimeFields(created.tree)) {
+    throw new Error('bootstrap POST /admin/trees did not return the four runtime fields');
+}
   await api('POST', '/admin/trees/' + TREE_ID + '/enable');
 }
 
@@ -964,7 +1018,7 @@ test('mock upstream returns an OpenAI-format completion', async () => {
 
 /* bootstrap 自检紧跟 bootstrap()：目录/时段/决策服务/初始图一旦被后面的用例
    改动，这条用例就该在基座阶段立刻失败，而不是在 100 多条页面用例之后才报。 */
-test('bootstrap registers catalog, periods, decision service and the enabled power graph', async () => {
+test('bootstrap registers the multi-JEV catalog, periods and the self-contained power graph', async () => {
   const models = await api('GET', '/admin/models');
   const modelIds = models.models.map(model => model.id).sort();
   for (const required of ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft']) {
@@ -978,9 +1032,27 @@ test('bootstrap registers catalog, periods, decision service and the enabled pow
     ['08:00', '11:00'], ['11:00', '18:00'], ['18:00', '08:00']
   ]);
 
-  const jev = await api('GET', '/admin/jev');
-  assert.equal(jev.config.base_url, mockBase);
-  assert.equal(jev.config.model, JEV_MODEL);
+  /* 多 JEV 目录：集合端点返回 services 列表（旧单配置 config 形态已删除）。 */
+  const jevCatalog = await api('GET', '/admin/jev');
+  assert.equal(jevCatalog.config, undefined, 'legacy single-config GET /admin/jev shape returned');
+  const services = jevCatalog.services || [];
+  assert.deepEqual(services.map(service => service.id).sort(), ['default', SECONDARY_JEV_ID]);
+  const defaultService = services.find(service => service.id === 'default');
+  assert.ok(defaultService, 'seeded default JEV service missing');
+  /* 目录服务与基线画布快照同源（逐字段），/admin/try 的 runtime_mismatch 才能为 0。 */
+  for (const [field, value] of Object.entries(BASELINE_RUNTIME.jev)) {
+    assert.deepEqual(defaultService[field], value, 'catalog service ' + field + ' drifted from the canvas snapshot');
+}
+  assert.deepEqual(
+    { input_tokens: defaultService.input_tokens, context_tokens: defaultService.context_tokens },
+    BASELINE_RUNTIME.jev_window);
+  assert.equal(defaultService.key_present, false);
+  assert.equal('api_key' in defaultService, false);
+  assert.equal(JSON.stringify(jevCatalog).includes('api_key'), false);
+  /* 目录 GET 只读 SQLite：未被活动画布引用的服务同样出现，证明它不是画布投影。 */
+  const referenced = new Set([BASELINE_RUNTIME.jev.id]);
+  assert.ok(services.some(service => !referenced.has(service.id)),
+    'catalog GET looks like a projection of the active canvas');
 
   const trees = await api('GET', '/admin/trees');
   const tree = trees.trees.find(item => item.id === TREE_ID);
@@ -992,17 +1064,31 @@ test('bootstrap registers catalog, periods, decision service and the enabled pow
   assert.equal(tree.root.error_fallback, 'light-target');
   assert.match(tree.tree_revision, /^[0-9a-f]{64}$/);
 
-  /* 自包含 runtime：bootstrap 建组时服务端按数据库目录物化四字段并落到文档里。 */
-  assert.ok(BASELINE_RUNTIME, 'bootstrap did not capture the materialized runtime');
+  /* 自包含 runtime：存储的画布原样保留 POST 进来的四字段快照，不做目录物化。 */
+  assert.ok(BASELINE_RUNTIME, 'bootstrap did not capture the baseline runtime');
   assert.deepEqual(Object.keys(BASELINE_RUNTIME).sort(), RUNTIME_FIELDS.slice().sort());
+  assert.deepEqual(treeRuntimeFields(tree), BASELINE_RUNTIME,
+    'the stored canvas runtime differs from the snapshot that was posted');
   assert.deepEqual(BASELINE_RUNTIME.backends.providers.map(provider => [provider.name, provider.base_url]),
     [['local', mockBase + '/v1']]);
   const runtimeModelIds = BASELINE_RUNTIME.backends.models.map(model => model.id);
-  ['deepseek-v3', 'qwen3-8b', 'qwen3-32b', 'qwen3.8-flash-sft', 'tierless-model'].forEach(id => {
-    assert.ok(runtimeModelIds.includes(id), 'materialized runtime is missing model ' + id);
-});
+  assert.deepEqual(runtimeModelIds,
+    ['qwen3-8b', 'qwen3-32b', 'deepseek-v3', 'qwen3.8-flash-sft'],
+    'the canvas runtime is a materialized DB projection instead of the posted snapshot');
+  assert.equal(runtimeModelIds.includes('tierless-model'), false);
   assert.deepEqual(BASELINE_RUNTIME.time_periods.map(period => period.name), ['peak', 'normal', 'offpeak']);
+  assert.equal(BASELINE_RUNTIME.jev.id, 'default');
   assert.equal(BASELINE_RUNTIME.jev.base_url, mockBase);
+
+  /* 落盘文档也必须是严格 v3 自包含形态（kind/version + 四字段）。 */
+  const documentPath = path.join(tempDir, 'routing-graph', 'graphs', TREE_ID + '.json');
+  const document = JSON.parse(fs.readFileSync(documentPath, 'utf8'));
+  assert.equal(document.kind, 'sr-routing-graph');
+  assert.equal(document.version, 3);
+  for (const field of RUNTIME_FIELDS) {
+    assert.deepEqual(document[field], BASELINE_RUNTIME[field],
+      'stored canvas document lost the ' + field + ' snapshot');
+}
 });
 
 
@@ -1271,9 +1357,9 @@ export async function ensureBaselineTree() {
     root: EXAMPLE_ROOT,
     canvas: EXAMPLE.canvas
 };
-  /* 显式带上 bootstrap 物化的运行配置：PUT 缺省会继承该组当前 runtime，
-     而「载入示例 → 保存」的用例会把 local runtime 留在基线组里，
-     不恢复就会让后续 tryrun/auto 打到 127.0.0.1:8000 而不是 QA mock。 */
+  /* 显式带上 bootstrap 捕获的自包含运行快照：PUT 缺省会继承该组当前 runtime，
+     而「载入示例 → 保存」的用例会把用例图的 runtime 留在基线组里，
+     不恢复就会让后续 tryrun/auto 打到错误端点而不是 QA mock。 */
   const runtime = BASELINE_RUNTIME || treeRuntimeFields(await serverTree(TREE_ID));
   if (runtime) Object.assign(payload, treeRuntimeFields(runtime));
   const restored = await putTree(TREE_ID, payload);
@@ -1670,6 +1756,7 @@ async function main() {
   await import('./console_qa/logs.mjs');
   await import('./console_qa/models.mjs');
   await import('./console_qa/testchat.mjs');
+  await import('./console_qa/jev.mjs');
   console.log(`[console-qa] registered cases: ${checks.length}`);
   await runRegisteredCases();
 }

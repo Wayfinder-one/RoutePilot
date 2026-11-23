@@ -3,55 +3,6 @@
 <title>RoutePilot · 决策服务</title>
 <link rel="icon" href="data:">
 <link rel="stylesheet" href="shared.css">
-<style>
-/* ── layout only: one single-column service card, read/edit swap ──
-   Everything visual (card, field, btn, pill, details, modal-msg, test-out…)
-   comes from shared.css and stays exactly as the rest of the console. */
-body[data-page="jev"] .pagehead,
-body[data-page="jev"] main.page{max-width:860px}
-#readPane[hidden],#editPane[hidden],#testRawDetails[hidden]{display:none}
-.archive-head{flex-wrap:wrap}
-.archive-head #testBadge{font-size:11px;padding:2px 9px}
-
-/* read-only service profile */
-.file{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 24px;margin:2px 0 0}
-.file-row{display:flex;flex-direction:column;gap:3px;min-width:0;margin:0}
-.file-row.wide{grid-column:1 / -1}
-.file dt{font-size:11px;font-weight:650;letter-spacing:.02em;color:var(--text-3)}
-.file dd{margin:0;font-size:13px;line-height:1.5;color:var(--text);min-width:0;overflow-wrap:anywhere;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.file dd.mono{font-family:var(--mono);font-size:12.5px}
-.file .pill{font-size:10.5px;padding:1px 8px;gap:5px}
-
-/* edit form */
-.edit-sec-h{margin:2px 0 8px}
-.edit-form .field-row{margin-bottom:10px}
-.edit-form label.field{margin-bottom:10px}
-.edit-form label.field > span{line-height:1.4}
-.edit-form textarea{width:100%}
-.chk{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-2);margin:1px 0 2px}
-.chk input{width:auto}
-.win-row{display:flex;align-items:flex-end;gap:8px;margin-bottom:9px;flex-wrap:wrap}
-.win-row .field{flex:0 1 170px;min-width:130px;margin-bottom:0}
-.win-row .wunit{font-size:11px;color:var(--text-3);padding-bottom:7px}
-.presets{display:flex;flex-wrap:wrap;gap:4px;padding-bottom:1px}
-#jevAdvanced{margin-top:2px}
-.edit-actions{display:flex;align-items:center;gap:8px;justify-content:flex-end;
-  flex-wrap:wrap;margin-top:10px}
-.edit-actions .fnote{font-size:10.5px;color:var(--text-3);margin-right:auto;line-height:1.45}
-.card-foot{display:flex;align-items:center;gap:14px;flex-wrap:wrap;min-height:16px;
-  margin-top:11px;padding-top:9px;border-top:1px solid var(--line)}
-#archiveCard:not(.is-editing) .card-foot .fnote{display:none}
-#archiveCard:not(.is-editing) .card-foot.is-empty{display:none}
-.card-foot .fnote{font-size:10.5px;color:var(--text-3)}
-.card-foot .modal-msg{margin-right:0;max-width:100%}
-
-/* connection test (read-only retest + save-and-test result) */
-.jev-test{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
-.test-run{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.test-hint{font-size:11px;line-height:1.5;max-width:56ch}
-#windowMsg:not(:empty){color:var(--red)}
-@media (max-width:560px){.edit-form .field-row{flex-direction:column;gap:8px}}
-</style>
 </head>
 <body data-page="jev">
 <div class="pagehead">
@@ -59,112 +10,86 @@ body[data-page="jev"] main.page{max-width:860px}
     <div class="crumb" data-i18n="nav.jev"></div>
     <h1><span data-i18n="nav.jev"></span><span class="sub" data-i18n="jev.sub"></span></h1>
   </div>
-  <div class="headmeta"><span class="pill indigo" id="jevStatus"></span></div>
+  <div class="headmeta"><span class="pill indigo" id="jevStatus" aria-live="polite">—</span></div>
 </div>
 
-<main class="page">
-  <section class="card" id="archiveCard">
-    <div class="col-h archive-head">
-      <span data-x="archive.title"></span>
-      <span class="pill" id="testBadge" aria-live="polite"><span class="dot"></span><span id="testBadgeText"></span></span>
-      <button class="btn sm push-right" id="editConfig" type="button"
-              data-x="archive.edit" aria-expanded="false" aria-controls="editPane"></button>
-    </div>
+<main class="page jev-page">
+  <div class="jev-layout">
+    <!-- service directory: one item per DB service, sorted by id -->
+    <section class="card jev-list-card" aria-labelledby="jevListTitle">
+      <div class="col-h">
+        <span id="jevListTitle" data-i18n="jev.listTitle"></span>
+        <span class="pill" id="jevCount">0</span>
+        <button class="btn sm pri push-right" id="jevNew" type="button" data-i18n="jev.new"></button>
+      </div>
+      <div class="jev-list" id="jevList" role="list"></div>
+      <p class="footnote" data-i18n="jev.listHint"></p>
+    </section>
 
-    <!-- read-only service profile (default) -->
-    <dl class="file" id="readPane">
-      <div class="file-row wide">
-        <dt data-i18n="jev.url"></dt>
-        <dd class="mono" id="roBaseUrl">—</dd>
+    <!-- editor for the selected service (or a new one) -->
+    <section class="card jev-editor" id="jevEditor" aria-labelledby="jevEditorTitle">
+      <div class="col-h">
+        <span id="jevEditorTitle" data-i18n="jev.editorTitle"></span>
+        <span class="pill indigo" id="jevMode" aria-live="polite"></span>
       </div>
-      <div class="file-row">
-        <dt data-i18n="jev.model"></dt>
-        <dd class="mono" id="roModel">—</dd>
-      </div>
-      <div class="file-row">
-        <dt data-i18n="jev.key"></dt>
-        <dd><span class="pill" id="roKey">—</span></dd>
-      </div>
-    </dl>
 
-    <!-- in-place edit: connection fields first, everything else collapsed -->
-    <div class="edit-form" id="editPane" hidden>
+      <div class="field-row">
+        <label class="field"><span data-i18n="jev.id"></span>
+          <input id="jevServiceId" type="text" spellcheck="false" autocomplete="off" placeholder="production-d1"></label>
+        <label class="field"><span data-i18n="jev.model"></span>
+          <input id="jevModel" type="text" spellcheck="false" autocomplete="off" placeholder="d1-2B"></label>
+      </div>
       <div class="field-row">
         <label class="field"><span data-i18n="jev.url"></span>
-          <input id="baseUrl" type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:30000"></label>
-        <label class="field"><span data-i18n="jev.model"></span>
-          <input id="model" type="text" spellcheck="false" autocomplete="off" placeholder="NeoHorse-Jev-4B"></label>
+          <input id="jevBaseUrl" type="text" spellcheck="false" autocomplete="off" placeholder="http://127.0.0.1:30104"></label>
+        <label class="field"><span data-i18n="jev.keyEnv"></span>
+          <input id="jevKeyEnv" type="text" spellcheck="false" autocomplete="off" placeholder="ROUTER_JEV_API_KEY"></label>
+        <label class="field field-narrow"><span data-i18n="jev.timeout"></span>
+          <input id="jevTimeout" type="number" min="0.1" max="120" step="0.1"></label>
       </div>
-      <label class="field"><span data-i18n="jev.key"></span>
-        <input id="apiKey" type="password" autocomplete="off" spellcheck="false"></label>
-
-      <details class="adv" id="jevAdvanced">
-        <summary data-x="edit.advanced"></summary>
-        <div class="field-row">
-          <label class="field"><span data-i18n="jev.timeout"></span>
-            <input id="timeout" type="number" min="0.1" max="120" step="0.1"></label>
-        </div>
-        <label class="chk"><input type="checkbox" id="clearKey"><span data-i18n="jev.clearKey"></span></label>
-
-        <div class="hr"></div>
-        <div class="col-h sm edit-sec-h" data-x="edit.prompt"></div>
-        <label class="field"><span data-i18n="jev.instructions"></span>
-          <textarea id="instructions" rows="4"></textarea></label>
-        <label class="field"><span data-i18n="jev.template"></span>
-          <textarea id="stateTemplate" rows="5"></textarea></label>
-
-        <div class="hr"></div>
-        <div id="windowCard">
-          <div class="col-h sm edit-sec-h" data-x="edit.window"></div>
-          <div class="win-row">
-            <label class="field"><span data-i18n="models.window.context"></span>
-              <input id="winContext" type="number" min="512" max="131072" step="1"></label>
-            <span class="wunit mut">token</span>
-            <div class="presets" id="winContextPresets"></div>
-          </div>
-          <div class="win-row">
-            <label class="field"><span data-i18n="models.window.input"></span>
-              <input id="winInput" type="number" min="256" max="131072" step="1"></label>
-            <span class="wunit mut">token</span>
-            <div class="presets" id="winInputPresets"></div>
-          </div>
-          <p class="footnote" data-i18n="models.window.hint"></p>
-          <div class="addrow">
-            <span class="modal-msg" id="windowMsg" role="status" aria-live="polite"></span>
-          </div>
-        </div>
-
-        <div class="hr"></div>
-        <label class="field"><span data-x="test.custom"></span>
-          <textarea id="testText" rows="3" spellcheck="false"></textarea></label>
-      </details>
-
-      <div class="edit-actions">
-        <span class="fnote mut" data-x="edit.saveHint"></span>
-        <button class="btn pri" id="saveJev" type="button" data-x="save.test"></button>
+      <div class="field-row">
+        <label class="field"><span data-i18n="jev.key"></span>
+          <input id="jevApiKey" type="password" autocomplete="off" spellcheck="false"></label>
+        <label class="chk"><input type="checkbox" id="jevClearKey"><span data-i18n="jev.clearKey"></span></label>
       </div>
-    </div>
 
-    <!-- connection test: retest in read mode, friendly result after save-and-test -->
-    <div class="jev-test">
-      <div class="test-run">
-        <button class="btn" id="testJev" type="button" data-i18n="jev.testRun"></button>
-        <span class="test-hint mut" data-i18n="jev.testHint"></span>
-      </div>
-      <div id="testOut" class="test-out" data-state="untested" role="status" aria-live="polite">
-        <span class="mut out-empty" data-x="test.empty"></span>
-      </div>
-      <details class="adv" id="testRawDetails" hidden>
-        <summary data-x="test.raw"></summary>
-        <pre id="testRaw"></pre>
-      </details>
-    </div>
+      <div class="hr"></div>
+      <div class="col-h sm" data-i18n="jev.promptTitle"></div>
+      <label class="field"><span data-i18n="jev.instructions"></span>
+        <textarea id="jevInstructions" rows="3"></textarea></label>
+      <label class="field"><span data-i18n="jev.template"></span>
+        <textarea id="jevStateTemplate" rows="4"></textarea></label>
 
-    <!-- always-visible feedback (save result, boot errors) -->
-    <div class="card-foot">
-      <span class="fnote" data-x="archive.hint"></span>
-      <span class="modal-msg" id="saveMsg" role="status" aria-live="polite"></span>
-    </div>
+      <div class="hr"></div>
+      <div class="col-h sm" data-i18n="jev.windowTitle"></div>
+      <div class="field-row jev-window-row">
+        <label class="field"><span data-i18n="models.window.context"></span>
+          <input id="jevContextTokens" type="number" min="512" max="131072" step="1"></label>
+        <label class="field"><span data-i18n="models.window.input"></span>
+          <input id="jevInputTokens" type="number" min="256" max="131072" step="1"></label>
+      </div>
+      <p class="footnote" data-i18n="models.window.hint"></p>
+
+      <div class="jev-actions">
+        <span class="modal-msg" id="jevMsg" role="status" aria-live="polite"></span>
+        <button class="btn danger" id="jevDelete" type="button" data-i18n="jev.delete"></button>
+        <button class="btn" id="jevTest" type="button" data-i18n="jev.testRun"></button>
+        <button class="btn pri" id="jevSave" type="button" data-i18n="jev.save"></button>
+      </div>
+    </section>
+  </div>
+
+  <!-- per-service connection test: never writes and never touches the draft -->
+  <section class="card jev-test-card" aria-labelledby="jevTestTitle">
+    <div class="col-h" id="jevTestTitle" data-i18n="jev.testTitle"></div>
+    <p class="footnote" data-i18n="jev.testHint"></p>
+    <label class="field"><span data-i18n="jev.testText"></span>
+      <textarea id="jevTestText" rows="3" spellcheck="false"></textarea></label>
+    <div id="jevTestResult" class="test-out" data-state="untested" role="status" aria-live="polite"></div>
+    <details class="adv" id="jevTestRawDetails" hidden>
+      <summary data-i18n="jev.testRaw"></summary>
+      <pre id="jevTestRaw"></pre>
+    </details>
   </section>
 </main>
 

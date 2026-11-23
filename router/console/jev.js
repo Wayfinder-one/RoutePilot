@@ -1,153 +1,79 @@
-/* RoutePilot console · 决策服务页数据层（连接 / 提示词 / 上下文窗口 / 测试）
+/* RoutePilot console · 决策服务目录页数据层（多 JEV 服务 CRUD / 逐条连接测试）
    ------------------------------------------------------------------
-   本模块是页面唯一入口：静态 import 视图层（jev-view.js），并在启动前用
-   `initJevView({ validateWindow, saveConfig, saveWindow, testConnection })`
-   把四个真实异步动作交给它。依赖是单向的（jev.js → jev-view.js），视图不
-   import 本模块，因此没有循环依赖，也没有合成 click / MutationObserver
-   保存编排：视图直接 await 这些动作。
+   本模块是页面唯一入口：静态 import 视图层（jev-view.js），把五个真实异步动作
+   `initJevView({ listServices, createService, updateService, deleteService,
+   testService })` 交给它，然后启动视图。依赖单向（jev.js → jev-view.js），
+   视图不 import 本模块，因此没有循环依赖，也没有合成 click / MutationObserver
+   保存编排。
 
-   动作只负责请求与数据回填（showConfig / renderWindow）；异常原样抛给视图，
-   由视图按阶段给出“什么已保存、什么没做”的部分成功文案。
+   服务端点契约（多 JEV 目录，spec「多 JEV 目录 / 管理 API 与页面」）：
+   - `GET    /admin/jev`                   → `{services: [publicService…]}`
+   - `POST   /admin/jev`                   → `{service}`
+   - `PUT    /admin/jev/{id}`              → `{service, synced_trees}`
+   - `DELETE /admin/jev/{id}`（可选 body）  → `{deleted, replacement_jev_id, synced_trees}`
+   - `POST   /admin/jev/{id}/test`         → 连接测试结果
+   被已存画布引用的服务在更新/删除时会先返回 409 `impact_confirmation_required`；
+   本单元只把错误原样上抛（共享影响确认 UI 属于下一控制台单元），绝不静默重试。
+
+   `nonSecretServiceBody(draft)` 是写请求的完整白名单：api_key 只在用户输入了新
+   密钥或勾选“清除”时才随写请求发送，响应/列表状态里永不保存密钥。
    ------------------------------------------------------------------ */
-import { api, apiErrText } from './api.js';
-import { onLangChange, t, tf } from './i18n.js';
+import { api } from './api.js';
 import { initJevView } from './jev-view.js';
 import './nav.js';
 
-const $ = selector => document.querySelector(selector);
-let defaults = {};
-
-function showConfig(body) {
-  const config = body.config || {};
-  defaults = body.defaults || defaults;
-  $('#baseUrl').value = config.base_url || '';
-  $('#model').value = config.model || '';
-  $('#timeout').value = config.timeout_seconds ?? 10;
-  $('#instructions').value = config.instructions || defaults.instructions || '';
-  $('#stateTemplate').value = config.state_template || defaults.state_template || '';
-  $('#apiKey').value = '';
-  $('#clearKey').checked = false;
-  $('#apiKey').placeholder = config.key_present ? t('jev.keyKeep') : t('jev.keyEmpty');
-  $('#jevStatus').textContent = config.model || t('jev.unconfigured');
-}
-
-/* ── 上下文长度（JEV 决策服务输入窗口；自 2026-11-03 从模型与设置迁入） ── */
-const WINDOW_CONTEXT_PRESETS = [2048, 4096, 8192, 16384];
-const WINDOW_INPUT_PRESETS = [512, 1024, 2048, 4096];
-let windowLimits = null;
-
-function windowValues() {
+/* 写请求的非密钥字段白名单；新增字段必须同时改这里和服务端 DTO。 */
+export function nonSecretServiceBody(draft) {
   return {
-    context: parseInt(($('#winContext') || {}).value, 10),
-    input: parseInt(($('#winInput') || {}).value, 10),
-  };
+    id: draft.id,
+    base_url: draft.baseUrl,
+    model: draft.model,
+    key_env: draft.keyEnv || '',
+    timeout_seconds: Number(draft.timeoutSeconds || 10),
+    instructions: draft.instructions,
+    state_template: draft.stateTemplate,
+    input_tokens: Number(draft.inputTokens),
+    context_tokens: Number(draft.contextTokens)
+};
 }
 
-function windowProblem(values, limits) {
-  const { context, input } = values;
-  const minContext = (limits && limits.min_context_tokens) || 512;
-  const minInput = (limits && limits.min_input_tokens) || 256;
-  const max = (limits && limits.max_tokens) || 131072;
-  if (!Number.isInteger(context) || context < minContext || context > max)
-    return tf('models.window.badContext', { min: minContext, max });
-  if (!Number.isInteger(input) || input < minInput || input > max)
-    return tf('models.window.badInput', { min: minInput, max });
-  if (input > context) return t('models.window.badRelation');
-  return '';
-}
-
-function paintWindowMsg() {
-  const problem = windowProblem(windowValues(), windowLimits);
-  const msg = $('#windowMsg');
-  if (msg) msg.textContent = problem || '';
-}
-
-function presetButtons(container, values, onPick) {
-  if (!container) return;
-  container.innerHTML = values.map(v => `<button class="btn sm" data-story="${v}">${v}</button>`).join(' ');
-  container.querySelectorAll('[data-story]').forEach(btn => {
-    btn.addEventListener('click', () => onPick(parseInt(btn.dataset.story, 10)));
-  });
-}
-
-function renderWindow(windowConfig) {
-  const cfg = windowConfig || {};
-  const context = cfg.context_tokens || 4096;
-  const input = cfg.input_tokens || 1024;
-  const setVal = (sel, val) => { const el = $(sel); if (el) el.value = val; };
-  setVal('#winContext', context);
-  setVal('#winInput', input);
-  presetButtons($('#winContextPresets'), WINDOW_CONTEXT_PRESETS, v => { setVal('#winContext', v); paintWindowMsg(); });
-  presetButtons($('#winInputPresets'), WINDOW_INPUT_PRESETS, v => { setVal('#winInput', v); paintWindowMsg(); });
-  paintWindowMsg();
-}
-
-/* 窗口字段的输入监听只挂一次；renderWindow 只在 boot 与窗口保存成功后回填数值；
-   语言切换仅重算校验消息。预设按钮里只有数字、没有需要翻译的文本，静态窗口
-   说明由全局 data-i18n 处理，所以切语言不需要重建预设按钮，更不能回填数值。 */
-['#winContext', '#winInput'].forEach(sel => {
-  const el = $(sel);
-  if (el) el.addEventListener('input', paintWindowMsg);
-});
-
-/* ── actions handed to the view (never import the view's caller) ────── */
-
-export async function saveConfig() {
-  const body = {
-    base_url: $('#baseUrl').value,
-    model: $('#model').value,
-    timeout_seconds: Number($('#timeout').value),
-    instructions: $('#instructions').value,
-    state_template: $('#stateTemplate').value,
-  };
-  if ($('#clearKey').checked) body.api_key = '';
-  else if ($('#apiKey').value) body.api_key = $('#apiKey').value;
-  const saved = await api.put('/admin/jev', body);
-  showConfig(saved);
-  return saved;
-}
-
-export function validateWindow() {
-  const problem = windowProblem(windowValues(), windowLimits);
-  if (!problem) return;
-  const error = new Error(problem);
-  error.validation = true;
-  throw error;
-}
-
-export async function saveWindow() {
-  validateWindow();
-  const values = windowValues();
-  const body = await api.put('/admin/jev/window', {
-    context_tokens: values.context,
-    input_tokens: values.input,
-  });
-  windowLimits = body;
-  renderWindow(body);
+function writeBody(draft) {
+  const body = nonSecretServiceBody(draft);
+  /* 只在用户显式提供新密钥 / 显式清除时发送 api_key；留空 = 保留已存密钥。 */
+  if (draft.clearKey) body.api_key = '';
+  else if (draft.apiKey) body.api_key = String(draft.apiKey);
   return body;
 }
 
-export async function testConnection(text) {
+export async function listServices() {
+  const body = await api.get('/admin/jev');
+  return Array.isArray(body.services) ? body.services : [];
+}
+
+export async function createService(draft) {
+  const saved = await api.post('/admin/jev', writeBody(draft));
+  return saved.service;
+}
+
+export async function updateService(id, draft, impactConfirmation) {
+  const body = writeBody(draft);
+  /* 确认载荷只在调用方显式提供时透传；本页面不构造确认，只展示 409。 */
+  if (impactConfirmation) body.impact_confirmation = impactConfirmation;
+  const saved = await api.put('/admin/jev/' + encodeURIComponent(id), body);
+  return saved.service;
+}
+
+export async function deleteService(id, confirmation) {
+  const body = {};
+  if (confirmation && typeof confirmation === 'object') Object.assign(body, confirmation);
+  return api.req('DELETE', '/admin/jev/' + encodeURIComponent(id),
+    Object.keys(body).length ? body : undefined);
+}
+
+export async function testService(id, text) {
   /* 决策服务单次测试可能跑满可配置的 120s 超时；全局 15s 管理面超时不能中途掐断。 */
-  return api.post('/admin/jev/test', { text }, { timeoutMs: 130000 });
+  return api.post('/admin/jev/' + encodeURIComponent(id) + '/test',
+    { text: String(text == null ? '' : text) }, { timeoutMs: 130000 });
 }
 
-/* 切语言只重算校验消息：renderWindow() 会用服务端值覆盖输入，把用户还没保存
-   的窗口草稿扔掉（甚至伪造成“已保存基线”）。paintWindowMsg() 从当前 DOM 重新
-   计算，既保留输入，也让已有的校验错误跟着换语言。 */
-onLangChange(() => {
-  paintWindowMsg();
-});
-
-async function boot() {
-  const [jevBody, winBody] = await Promise.all([
-    api.get('/admin/jev').catch(error => ({ error })),
-    api.get('/admin/jev/window').catch(() => null),
-  ]);
-  if (winBody) { windowLimits = winBody; renderWindow(winBody); }
-  if (jevBody.error) { $('#saveMsg').textContent = apiErrText(jevBody.error); return; }
-  showConfig(jevBody);
-}
-
-initJevView({ validateWindow, saveConfig, saveWindow, testConnection });
-boot();
+initJevView({ listServices, createService, updateService, deleteService, testService });
