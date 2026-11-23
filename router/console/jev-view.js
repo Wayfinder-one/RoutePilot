@@ -7,7 +7,8 @@
 
    职责（只在展示与交互层，不 import 数据层）：
    - 文件内中英词典与 data-x 文案渲染；
-   - 只读「服务档案」与编辑态的切换、取消还原快照；
+   - 只读「服务档案」与编辑态的切换；取消恢复到「最近已保存的分阶段状态」
+     —— 每次成功写入只把该阶段的字段写进快照，另一阶段尚未保存的输入仍是草稿；
    - 「保存并测试」的真实 Promise 编排：本地窗口校验 → 保存配置 → 保存窗口
      → 连接测试，逐阶段给出精确的部分成功文案；
    - 只读复测、「本次会话」测试徽章、友好测试摘要与按需展开的原始响应。
@@ -104,6 +105,11 @@ function paintTitle() {
 /* ── read-only profile mirrors the live DOM values ───────────────────── */
 const FIELDS = ['baseUrl', 'model', 'apiKey', 'timeout', 'instructions',
   'stateTemplate', 'winContext', 'winInput'];
+/* 「保存并测试」是两个独立写入阶段，取消基线必须按阶段推进：配置成功后
+   只认配置字段，窗口成功后只认窗口字段。整份刷新会把另一阶段尚未保存的
+   输入伪造成「已保存」，取消时反而留住了本该丢弃的草稿。 */
+const CONFIG_FIELDS = ['baseUrl', 'model', 'apiKey', 'timeout', 'instructions', 'stateTemplate'];
+const WINDOW_FIELDS = ['winContext', 'winInput'];
 const KEY_KEEP = ['留空则保留现有密钥', 'Leave empty to keep the current key'];
 const KEY_EMPTY = ['可选；也可使用 ROUTER_JEV_API_KEY', 'Optional; ROUTER_JEV_API_KEY also works'];
 const TEST_DEFAULT = {
@@ -282,11 +288,23 @@ function paintTestFailure(error) {
 }
 
 /* ── edit ⇄ read only ───────────────────────────────────────────────── */
+/* 快照 = 取消编辑时应该回到的值，即「最近一次成功写入服务端的分阶段状态」。
+   进入编辑时取一次全量基线，之后每成功一个写入阶段就只推进该阶段字段。 */
 function snapshotValues() {
   snapshot = {
     values: FIELDS.map(fieldValue),
     clearKey: !!($('#clearKey') || {}).checked,
   };
+}
+function updateSnapshotAfterSave(fields) {
+  if (!snapshot) return;
+  fields.forEach(field => {
+    const index = FIELDS.indexOf(field);
+    if (index >= 0) snapshot.values[index] = fieldValue(field);
+  });
+  if (fields.includes('apiKey')) {
+    snapshot.clearKey = !!($('#clearKey') || {}).checked;
+  }
 }
 function restoreValues() {
   if (!snapshot) return;
@@ -373,6 +391,7 @@ async function saveAllAndTest() {
     /* 2 · config: a failure here means nothing else was written */
     try {
       await ACTIONS.saveConfig();
+      updateSnapshotAfterSave(CONFIG_FIELDS);
     } catch (error) {
       showSaveError('save.configFail', error);
       return;
@@ -381,6 +400,7 @@ async function saveAllAndTest() {
     /* 3 · window: the config already landed, so a failure is a partial save */
     try {
       await ACTIONS.saveWindow();
+      updateSnapshotAfterSave(WINDOW_FIELDS);
     } catch (error) {
       showSaveError('save.windowPartial', error);
       return;

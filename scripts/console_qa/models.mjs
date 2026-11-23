@@ -430,6 +430,89 @@ test('P0 decision service reports saved config when connection test fails', asyn
   }
 });
 
+test('P0 decision service cancel keeps saved config but discards failed window draft', async () => {
+  const beforeConfig = await api('GET', '/admin/jev');
+  const beforeWindow = await api('GET', '/admin/jev/window');
+  const changedModel = beforeConfig.config.model + '-saved-before-window-failure';
+  await page.route('**/admin/jev/window', async route => {
+    if (route.request().method() === 'PUT') {
+      await route.fulfill({
+        status: 422,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'window failed after config saved' })
+      });
+      return;
+    }
+    await route.continue();
+  });
+  expectHttpStatusError({ url: /\/admin\/jev\/window$/, status: /422/ });
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('model').value !== '');
+    await page.locator('#editConfig').click();
+    await page.locator('#model').fill(changedModel);
+    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
+    await page.locator('#winContext').fill('8192');
+    await page.locator('#winInput').fill('2048');
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() =>
+      document.getElementById('saveMsg').textContent.includes('window failed after config saved'));
+
+    const savedConfig = await api('GET', '/admin/jev');
+    assert.equal(savedConfig.config.model, changedModel, 'config did not reach the server');
+    await page.locator('#editConfig').click();
+    assert.equal(await page.locator('#roModel').textContent(), changedModel,
+      'cancel restored the pre-edit model instead of the saved model');
+
+    await page.locator('#editConfig').click();
+    assert.equal(await page.locator('#model').inputValue(), changedModel);
+    assert.equal(await page.locator('#winContext').inputValue(),
+      String(beforeWindow.context_tokens), 'the failed window draft became the cancel baseline');
+    assert.equal(await page.locator('#winInput').inputValue(), String(beforeWindow.input_tokens));
+  } finally {
+    await page.unroute('**/admin/jev/window');
+    resetExpectedHttpStatusErrors();
+  }
+});
+
+test('P0 decision service cancel after test failure preserves both saved stages', async () => {
+  const beforeConfig = await api('GET', '/admin/jev');
+  const changedModel = beforeConfig.config.model + '-saved-before-test-failure';
+  await page.route('**/admin/jev/test', async route => {
+    await route.fulfill({
+      status: 502,
+      contentType: 'application/json',
+      body: JSON.stringify({ detail: 'test failed after both saves' })
+    });
+  });
+  expectHttpStatusError({ url: /\/admin\/jev\/test$/, status: /502/ });
+  try {
+    await page.goto(routerBase + '/console/jev.html');
+    await page.waitForFunction(() => document.getElementById('model').value !== '');
+    await page.locator('#editConfig').click();
+    await page.locator('#model').fill(changedModel);
+    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
+    await page.locator('#winContext').fill('8192');
+    await page.locator('#winInput').fill('2048');
+    await page.locator('#saveJev').click();
+    await page.waitForFunction(() =>
+      document.getElementById('saveMsg').textContent.includes('test failed after both saves'));
+
+    await page.locator('#editConfig').click();
+    assert.equal(await page.locator('#roModel').textContent(), changedModel);
+    await page.locator('#editConfig').click();
+    assert.equal(await page.locator('#model').inputValue(), changedModel);
+    assert.equal(await page.locator('#winContext').inputValue(), '8192');
+    assert.equal(await page.locator('#winInput').inputValue(), '2048');
+    const savedWindow = await api('GET', '/admin/jev/window');
+    assert.equal(savedWindow.context_tokens, 8192);
+    assert.equal(savedWindow.input_tokens, 2048);
+  } finally {
+    await page.unroute('**/admin/jev/test');
+    resetExpectedHttpStatusErrors();
+  }
+});
+
 test('P0 preset connection hides model ids by default and uses one save action', async () => {
   await page.goto(routerBase + '/console/models.html');
   await page.waitForSelector('#modelTable tr[data-mrow]');
