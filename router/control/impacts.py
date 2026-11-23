@@ -1,4 +1,4 @@
-"""目录资源（模型 / provider）对自包含画布的影响清单与纯转换函数。
+"""目录资源（模型 / provider / JEV）对自包含画布的影响清单与纯转换函数。
 
 本模块不读写数据库、不依赖 FastAPI：输入是已解析的 ``RoutingTree`` 列表与
 非密钥目录投影，输出是影响清单或新的 ``RoutingTree``。写用例先在 API 层用
@@ -7,8 +7,12 @@
 
 纪律：
 - 影响清单只含非密钥的目录事实（id / name / enabled / document_sha256 /
-  使用位置）；替代目录同样只投影 ``{id, upstream, provider}``。
+  使用位置）；替代目录同样只投影非密钥字段（模型 ``{id, upstream, provider}``；
+  JEV ``{id, base_url, model, input_tokens, context_tokens}``）。
 - 所有转换函数深拷贝输入，绝不修改调用方传入的树、root 或 runtime。
+- JEV 的 ``sync_jev`` 同时替换 ``runtime.jev`` 与 ``jev_input_tokens`` /
+  ``jev_context_tokens``：窗口属于服务，绝不允许出现「旧服务配置 + 新窗口」
+  或反过来的混合体。
 - 过期确认必须报告**当前**画布哈希：``require_confirmation()`` 从当前影响
   清单里取第一棵不匹配画布的 ``document_sha256`` 抛 ``GraphConflictError``，
   绝不把客户端提交的期望值当实际值回显。
@@ -19,13 +23,16 @@ import copy
 from dataclasses import replace
 
 from router.control.errors import ReferencedByError
+from router.jev.service import JevService
 from router.reasoning import normalize_reasoning
 from router.routing.runtime import BackendCatalog, GraphRuntime
 from router.store.routing_trees import GraphConflictError
 
 __all__ = [
     "confirmation_mismatch",
+    "delete_jev",
     "delete_model",
+    "jev_impacts",
     "merge_providers",
     "model_impacts",
     "provider_impacts",
@@ -34,6 +41,7 @@ __all__ = [
     "replace_runtime_catalog",
     "replace_target_models",
     "require_confirmation",
+    "sync_jev",
     "sync_model",
     "sync_provider",
 ]
@@ -85,6 +93,19 @@ def provider_impacts(trees, provider_name: str) -> list[dict]:
                 "models": {"use": used_by_models},
             }))
     return impacts
+
+
+def jev_impacts(trees, service_id: str) -> list[dict]:
+    """JEV 影响：运行时 ``runtime.jev.id`` 等于该服务 id 的画布。
+
+    影响位置固定是 JEV（``usage.jev``）：JEV 同步同时替换服务快照与窗口，不像
+    模型那样还有 target 引用；被引用即必须整体同步。
+    """
+    return [
+        _impact(tree, {"jev": service_id})
+        for tree in trees
+        if tree.runtime.jev is not None and tree.runtime.jev.id == service_id
+    ]
 
 
 def _confirmation_map(confirmation) -> dict[str, str]:
@@ -302,6 +323,37 @@ def sync_provider(tree, provider_entry: dict):
         providers.append(copy.deepcopy(provider_entry))
     runtime = replace_runtime_catalog(tree.runtime, providers=providers)
     return replace(tree, runtime=runtime)
+
+
+def sync_jev(tree, service: JevService):
+    """用目录 JEV 服务整体替换画布运行时 JEV 与窗口（同一服务、原子替换）。
+
+    只替换 ``runtime.jev`` 与两个窗口计数；backends / 时段 / graph 结构与
+    ``document_sha256``（提交基线哈希）保持原样。``service`` 深拷贝后写入，
+    调用方的对象不会被候选画布共享或修改。
+    """
+    runtime = replace(
+        tree.runtime,
+        jev=copy.deepcopy(service),
+        jev_input_tokens=service.input_tokens,
+        jev_context_tokens=service.context_tokens,
+    )
+    return replace(tree, runtime=runtime)
+
+
+def delete_jev(tree, service_id: str, *, replacement: JevService | None):
+    """删除画布引用的 JEV 服务：必须用 ``replacement`` 整体替换，不能置空。
+
+    - 画布未引用该服务 → 原样返回（不产生任何变化）。
+    - 引用该服务且 ``replacement is None`` → ``ValueError``（调用方先做 422）。
+    - 否则等价于 ``sync_jev(tree, replacement)``：服务快照与窗口一起换掉，避免
+      留下「无决策服务」的问题节点。
+    """
+    if tree.runtime.jev is None or tree.runtime.jev.id != service_id:
+        return tree
+    if replacement is None:
+        raise ValueError("replacement_jev_id is required when a canvas references the JEV service")
+    return sync_jev(tree, replacement)
 
 
 def delete_model(tree, model_id: str, *, replacement=None, providers=()):

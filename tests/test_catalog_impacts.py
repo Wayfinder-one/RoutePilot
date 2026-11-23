@@ -14,13 +14,14 @@ from dataclasses import replace as dataclass_replace
 import pytest
 from fastapi.testclient import TestClient
 
-from router.api import routes_models
+from router.api import routes_jev, routes_models
 from router.api.app import create_app
 from router.control.config import ConfigurationService
 from router.control.impacts import provider_impacts
 from router.routing.graph.model import TargetNode
 from router.routing.tree import tree_from_dict
 from router.store.db import connect
+from router.store.jev_services import JevServiceRepo
 from tests.routing_fixtures import portable_tree_dict, test_settings
 
 ZERO_SHA = "0" * 64
@@ -139,10 +140,12 @@ def two_canvases(tmp_path):
     fast, backup = _fast_and_backup(seed)
     assert client.post("/admin/models", json=fast).status_code == 201
     assert client.post("/admin/models", json=backup).status_code == 201
-    for service_id in ("jev-a", "jev-b"):
+    # jev-b 使用与 jev-a/画布都不同的窗口：删除替换后能区分「替代服务的窗口」。
+    for service_id, window in (("jev-a", (1024, 4096)), ("jev-b", (2048, 8192))):
         assert client.post("/admin/jev", json={
             "id": service_id, "base_url": "http://" + service_id + ".test",
-            "model": service_id, "input_tokens": 1024, "context_tokens": 4096,
+            "model": service_id,
+            "input_tokens": window[0], "context_tokens": window[1],
         }).status_code == 201
 
     main = portable_tree_dict("main")
@@ -983,3 +986,412 @@ def test_delete_model_with_unknown_replacement_is_404(two_canvases):
     assert _db_row(app, "models", "id", "fast") is not None
     assert _canvas_state(app, ("main", "other")) == before
     assert _audit_count(app) == before_audit
+
+
+# --------------------------------------------------------------------------- #
+# 9. JEV 更新：未确认零写入，确认后 JEV 快照与窗口一起同步
+# --------------------------------------------------------------------------- #
+def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
+        two_canvases):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_main_sha = _tree(app, "main").document_sha256
+    before_other_sha = _tree(app, "other").document_sha256
+    before_row = _db_row(app, "jev_services", "id", "jev-a")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+    instructions = "你是一个模型路由器。请只选择最匹配的模型。"
+    state_template = "【待判断的用户请求】\n{request}"
+
+    payload = {
+        "base_url": "http://jev-a-v2.test",
+        "model": "d1-a-v2",
+        "timeout_seconds": 7.5,
+        "instructions": instructions,
+        "state_template": state_template,
+        "input_tokens": 3072,
+        "context_tokens": 8192,
+    }
+    preview = client.put("/admin/jev/jev-a", json=payload)
+
+    assert preview.status_code == 409, preview.text
+    detail = preview.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required"
+    assert detail["resource"] == {"kind": "jev", "id": "jev-a"}
+    assert detail["replacements"] == []
+    assert [item["id"] for item in detail["affected_trees"]] == ["main"]
+    impact = detail["affected_trees"][0]
+    assert impact["usage"] == {"jev": "jev-a"}
+    assert impact["document_sha256"] == before_main_sha
+    # 两阶段预览：数据库行 / 两幅画布 / 审计 / 快照都没有任何变化。
+    assert _db_row(app, "jev_services", "id", "jev-a") == before_row
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+
+    confirmed = client.put("/admin/jev/jev-a", json={
+        **payload, "impact_confirmation": confirmation_from(preview)})
+
+    assert confirmed.status_code == 200, confirmed.text
+    body = confirmed.json()
+    assert body["synced_trees"] == ["main"]
+    assert body["service"]["base_url"] == "http://jev-a-v2.test"
+    assert body["service"]["model"] == "d1-a-v2"
+    assert "api_key" not in body["service"]
+
+    runtime = _tree(app, "main").runtime
+    assert runtime.jev.id == "jev-a"
+    assert runtime.jev.base_url == "http://jev-a-v2.test"
+    assert runtime.jev.model == "d1-a-v2"
+    assert runtime.jev.timeout_seconds == 7.5
+    assert runtime.jev.instructions == instructions
+    assert runtime.jev.state_template == state_template
+    # JEV 快照与窗口必须来自同一服务：不是「旧服务配置 + 新窗口」的混合体。
+    assert (runtime.jev.input_tokens, runtime.jev.context_tokens) == (3072, 8192)
+    assert (runtime.jev_input_tokens, runtime.jev_context_tokens) == (3072, 8192)
+    # 未受影响的画布字节与哈希完全不变。
+    assert _canvas_bytes(app, "other") == before["other"]
+    assert _tree(app, "other").document_sha256 == before_other_sha
+    assert _canvas_bytes(app, "main") != before["main"]
+    assert _db_row(app, "jev_services", "id", "jev-a")["model"] == "d1-a-v2"
+    # 活动画布被同步 → 快照按新画布配置重新发布。
+    assert app.state.snapshot.jev.base_url == "http://jev-a-v2.test"
+    assert app.state.snapshot.jev.model == "d1-a-v2"
+    assert (app.state.snapshot.jev_input_tokens,
+            app.state.snapshot.jev_context_tokens) == (3072, 8192)
+    assert app.state.snapshot.snapshot_revision != before_revision
+    changes = _changes(app)
+    assert len(changes) == before_audit + 1
+    assert changes[-1]["kind"] == "jev"
+    assert changes[-1]["detail"] == {
+        "action": "update", "id": "jev-a", "model": "d1-a-v2",
+        "synced_trees": ["main"],
+    }
+
+
+def test_jev_window_update_replaces_snapshot_and_window_together(two_canvases):
+    """只改窗口也必须整体替换 JEV 快照：窗口与快照同源，绝不混用旧服务配置。"""
+    app, client = two_canvases
+    preview = client.put("/admin/jev/jev-a", json={
+        "input_tokens": 768, "context_tokens": 3072})
+    assert preview.status_code == 409, preview.text
+    assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
+        "main"]
+
+    confirmed = client.put("/admin/jev/jev-a", json={
+        "input_tokens": 768, "context_tokens": 3072,
+        "impact_confirmation": confirmation_from(preview)})
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["synced_trees"] == ["main"]
+
+    runtime = _tree(app, "main").runtime
+    assert (runtime.jev_input_tokens, runtime.jev_context_tokens) == (768, 3072)
+    assert (runtime.jev.input_tokens, runtime.jev.context_tokens) == (768, 3072)
+    # 画布原 JEV 是 JSON fixture 的 json-jev-service 配置（id 被改成 jev-a），
+    # 同步后必须整体换成数据库 jev-a 服务，而不是保留旧 base_url/model 再套新窗口。
+    assert runtime.jev.base_url == "http://jev-a.test"
+    assert runtime.jev.model == "jev-a"
+    assert runtime.jev.key_env == ""
+    assert _tree(app, "other").runtime.jev.id == "jev-b"
+    assert _tree(app, "other").runtime.jev.base_url == "http://jev-json.test"
+    assert (app.state.snapshot.jev_input_tokens,
+            app.state.snapshot.jev_context_tokens) == (768, 3072)
+
+
+# --------------------------------------------------------------------------- #
+# 10. JEV 删除：预览替代目录，确认必须带替代服务并同步替换
+# --------------------------------------------------------------------------- #
+def test_jev_delete_requires_replacement_and_syncs_replacement_service(
+        two_canvases):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_other_sha = _tree(app, "other").document_sha256
+    before_audit = _audit_count(app)
+
+    preview = client.request("DELETE", "/admin/jev/jev-a", json={})
+    assert preview.status_code == 409, preview.text
+    detail = preview.json()["detail"]
+    assert detail["code"] == "impact_confirmation_required"
+    assert detail["resource"] == {"kind": "jev", "id": "jev-a"}
+    assert [item["id"] for item in detail["affected_trees"]] == ["main"]
+    assert detail["affected_trees"][0]["usage"] == {"jev": "jev-a"}
+    replacements = detail["replacements"]
+    replacement_ids = [item["id"] for item in replacements]
+    assert "jev-b" in replacement_ids
+    assert "jev-a" not in replacement_ids
+    assert all(set(item) == {"id", "base_url", "model", "input_tokens",
+                             "context_tokens"} for item in replacements)
+    jev_b = next(item for item in replacements if item["id"] == "jev-b")
+    assert (jev_b["base_url"], jev_b["model"]) == (
+        "http://jev-b.test", "jev-b")
+    assert (jev_b["input_tokens"], jev_b["context_tokens"]) == (2048, 8192)
+    # 预览零写入。
+    assert _db_row(app, "jev_services", "id", "jev-a") is not None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit
+
+    # 未确认时先返回影响预览：替代服务参数不会被抢先校验成 404。
+    early = client.request("DELETE", "/admin/jev/jev-a", json={
+        "replacement_jev_id": "nope"})
+    assert early.status_code == 409, early.text
+    assert early.json()["detail"]["code"] == "impact_confirmation_required"
+
+    confirmation = confirmation_from(preview)
+
+    # 已确认但没有替代服务 → 422，仍零写入。
+    missing = client.request("DELETE", "/admin/jev/jev-a", json={
+        "impact_confirmation": confirmation})
+    assert missing.status_code == 422, missing.text
+    assert _db_row(app, "jev_services", "id", "jev-a") is not None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit
+
+    # 替代服务不存在 → 404，零写入。
+    unknown = client.request("DELETE", "/admin/jev/jev-a", json={
+        "replacement_jev_id": "nope", "impact_confirmation": confirmation})
+    assert unknown.status_code == 404, unknown.text
+    assert _db_row(app, "jev_services", "id", "jev-a") is not None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit
+
+    # 替代服务不能是被删服务自身 → 422。
+    itself = client.request("DELETE", "/admin/jev/jev-a", json={
+        "replacement_jev_id": "jev-a", "impact_confirmation": confirmation})
+    assert itself.status_code == 422, itself.text
+    assert _db_row(app, "jev_services", "id", "jev-a") is not None
+
+    deleted = client.request("DELETE", "/admin/jev/jev-a", json={
+        "replacement_jev_id": "jev-b",
+        "impact_confirmation": confirmation,
+    })
+
+    assert deleted.status_code == 200, deleted.text
+    body = deleted.json()
+    assert body["deleted"] == "jev-a"
+    assert body["replacement_jev_id"] == "jev-b"
+    assert body["synced_trees"] == ["main"]
+
+    main = _tree(app, "main")
+    assert main.runtime.jev.id == "jev-b"
+    assert main.runtime.jev.base_url == "http://jev-b.test"
+    assert main.runtime.jev.model == "jev-b"
+    # 替换后画布窗口 = 替代服务的窗口（jev-b 的 2048/8192），不是被删服务的。
+    assert (main.runtime.jev_input_tokens,
+            main.runtime.jev_context_tokens) == (2048, 8192)
+    assert (main.runtime.jev.input_tokens, main.runtime.jev.context_tokens) == (
+        2048, 8192)
+    assert _db_row(app, "jev_services", "id", "jev-a") is None
+    assert _db_row(app, "jev_services", "id", "jev-b") is not None
+    # 另一幅画布（本就引用 jev-b）字节与哈希完全不变。
+    assert _canvas_bytes(app, "other") == before["other"]
+    assert _tree(app, "other").document_sha256 == before_other_sha
+    assert app.state.snapshot.jev.base_url == "http://jev-b.test"
+    assert (app.state.snapshot.jev_input_tokens,
+            app.state.snapshot.jev_context_tokens) == (2048, 8192)
+    changes = _changes(app)
+    assert len(changes) == before_audit + 1
+    assert changes[-1]["kind"] == "jev"
+    assert changes[-1]["detail"] == {
+        "action": "delete", "id": "jev-a", "replacement": "jev-b",
+        "synced_trees": ["main"],
+    }
+
+
+def test_jev_delete_without_references_needs_no_confirmation_or_replacement(
+        two_canvases):
+    app, client = two_canvases
+    assert client.post("/admin/jev", json={
+        "id": "jev-orphan", "base_url": "http://jev-orphan.test",
+        "model": "d1-orphan"}).status_code == 201
+    before = _canvas_state(app, ("main", "other"))
+    before_audit = _audit_count(app)
+
+    deleted = client.delete("/admin/jev/jev-orphan")
+
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {
+        "deleted": "jev-orphan", "replacement_jev_id": None, "synced_trees": []}
+    assert _db_row(app, "jev_services", "id", "jev-orphan") is None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit + 1
+
+
+# --------------------------------------------------------------------------- #
+# 11. JEV 过期 / 缺失确认哈希：409 graph_conflict，零写入
+# --------------------------------------------------------------------------- #
+def test_jev_stale_or_missing_confirmation_hash_is_graph_conflict(two_canvases):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "jev_services", "id", "jev-a")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+    preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
+    actual = _tree(app, "main").document_sha256
+    assert confirmation_from(preview)["trees"][0]["document_sha256"] == actual
+
+    for bad in (
+            {"trees": [{"id": "main", "document_sha256": ZERO_SHA}]},
+            {"trees": []},
+    ):
+        response = client.put("/admin/jev/jev-a", json={
+            "model": "d1-a-v2", "impact_confirmation": bad})
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "graph_conflict"
+        assert detail["actual_document_sha256"] == actual
+        assert detail["actual_document_sha256"] != ZERO_SHA
+        assert _canvas_state(app, ("main", "other")) == before
+        assert _db_row(app, "jev_services", "id", "jev-a") == before_row
+        assert _audit_count(app) == before_audit
+        assert app.state.snapshot.snapshot_revision == before_revision
+
+
+# --------------------------------------------------------------------------- #
+# 12. JEV 审计行：create / update / delete 都记 kind=jev 且带 synced_trees
+# --------------------------------------------------------------------------- #
+def test_jev_create_update_delete_write_audit_rows(two_canvases):
+    app, client = two_canvases
+    before = _audit_count(app)
+
+    assert client.post("/admin/jev", json={
+        "id": "jev-c", "base_url": "http://jev-c.test", "model": "d1-c",
+        "input_tokens": 512, "context_tokens": 2048,
+    }).status_code == 201
+    updated = client.put("/admin/jev/jev-c", json={"timeout_seconds": 4.5})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["synced_trees"] == []
+    deleted = client.delete("/admin/jev/jev-c")
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {
+        "deleted": "jev-c", "replacement_jev_id": None, "synced_trees": []}
+
+    new_changes = _changes(app)[before:]
+    assert [change["kind"] for change in new_changes] == ["jev", "jev", "jev"]
+    assert [change["detail"] for change in new_changes] == [
+        {"action": "create", "id": "jev-c", "model": "d1-c", "synced_trees": []},
+        {"action": "update", "id": "jev-c", "model": "d1-c", "synced_trees": []},
+        {"action": "delete", "id": "jev-c", "replacement": None,
+         "synced_trees": []},
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# 13. 秘密纪律：影响清单 / 替代目录 / 审计 / 画布 / 快照都不含密钥
+# --------------------------------------------------------------------------- #
+def test_jev_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
+    app, client = two_canvases
+    secret = "sk-jev-impact-must-not-leak"
+    # 给被画布引用的服务写入真实密钥（行级 api_key 只在数据库列里）。
+    rotation = _confirmed_put(client, "/admin/jev/jev-a", {"api_key": secret})
+    assert rotation.status_code == 200, rotation.text
+    assert secret not in rotation.text
+    conn = connect(app.state.settings.db_path)
+    try:
+        repo = JevServiceRepo(conn)
+        service = repo.get("jev-a")
+        assert repo.stored_api_key(service) == secret
+    finally:
+        conn.close()
+
+    update_preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
+    delete_preview = client.request("DELETE", "/admin/jev/jev-a", json={})
+    assert update_preview.status_code == 409, update_preview.text
+    assert delete_preview.status_code == 409, delete_preview.text
+
+    payloads = "".join([
+        update_preview.text,
+        delete_preview.text,
+        json.dumps(_changes(app), ensure_ascii=False),
+        _canvas_bytes(app, "main").decode("utf-8"),
+        _canvas_bytes(app, "other").decode("utf-8"),
+        app.state.snapshot.content,
+    ])
+    assert secret not in payloads
+    for item in delete_preview.json()["detail"]["replacements"]:
+        assert "api_key" not in item
+        assert "key_env" not in item
+    # 审计只记录非密钥事实，不记录 api_key 状态或明文。
+    jev_changes = [change for change in _changes(app) if change["kind"] == "jev"]
+    assert "api_key" not in json.dumps(jev_changes, ensure_ascii=False)
+    assert "api_key" not in update_preview.text
+    assert "api_key" not in delete_preview.text
+
+
+# --------------------------------------------------------------------------- #
+# 14. 发布门：只同步非活动画布时不发布新快照
+# --------------------------------------------------------------------------- #
+def test_jev_sync_of_only_inactive_canvas_does_not_publish(
+        two_canvases, monkeypatch):
+    app, client = two_canvases
+    publisher = app.state.publisher
+    real_publish = publisher.publish
+    published = []
+
+    def spy(prepared):
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(publisher, "publish", spy)
+    before_revision = app.state.snapshot.snapshot_revision
+    before_main = _canvas_bytes(app, "main")
+    before_other = _canvas_bytes(app, "other")
+
+    preview = client.put("/admin/jev/jev-b", json={"model": "d1-b-v2"})
+    assert preview.status_code == 409, preview.text
+    assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
+        "other"]
+
+    confirmed = client.put("/admin/jev/jev-b", json={
+        "model": "d1-b-v2",
+        "impact_confirmation": confirmation_from(preview),
+    })
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["synced_trees"] == ["other"]
+    assert published == []
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _canvas_bytes(app, "main") == before_main
+    assert _canvas_bytes(app, "other") != before_other
+
+
+# --------------------------------------------------------------------------- #
+# 15. 事务内 recheck：路由层扫描后新出现引用该服务的画布 → 409 零写入
+# --------------------------------------------------------------------------- #
+def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
+        two_canvases, monkeypatch):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "jev_services", "id", "jev-a")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+    preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
+    confirmation = confirmation_from(preview)
+
+    real_impacts = routes_jev.jev_impacts
+    raced = {"done": False, "sha": None}
+
+    def racing_impacts(trees, service_id):
+        impacts = real_impacts(trees, service_id)  # 旧清单：racer 画布还不存在
+        if not raced["done"]:
+            raced["done"] = True
+            document = portable_tree_dict("racer")
+            document["jev"]["id"] = "jev-a"
+            created = app.state.graph_repo.create(tree_from_dict(document))
+            raced["sha"] = created.document_sha256
+        return impacts
+
+    monkeypatch.setattr(routes_jev, "jev_impacts", racing_impacts)
+
+    blocked = client.put("/admin/jev/jev-a", json={
+        "model": "d1-a-v2", "impact_confirmation": confirmation})
+
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["code"] == "graph_conflict"
+    # actual 必须是新出现画布的当前哈希，而不是客户端提交的旧哈希。
+    assert detail["actual_document_sha256"] == raced["sha"]
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _tree(app, "racer").document_sha256 == raced["sha"]
+    assert _db_row(app, "jev_services", "id", "jev-a") == before_row
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision

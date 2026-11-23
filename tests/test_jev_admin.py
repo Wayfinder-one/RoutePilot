@@ -2,6 +2,8 @@
 
 覆盖 spec「多 JEV 目录」：列表/详情/更新/删除/测试都只读数据库目录，不读活动
 画布；公共投影不含 api_key，`key_source` 是 stored|env|none；旧单配置端点已删除。
+本文件的画布目录为空，因此目录写不发生同步（``synced_trees`` 恒为空）；带影响
+画布的两阶段确认同步见 ``tests/test_catalog_impacts.py``。
 """
 import asyncio
 import json
@@ -17,6 +19,7 @@ from router.api.routes_jev import router
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.window import MAX_TOKENS, MIN_CONTEXT_TOKENS, MIN_INPUT_TOKENS
+from router.routing.snapshot import SnapshotPublisher
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
@@ -48,6 +51,8 @@ def make_client(tmp_path, handler=None, requests=None):
     app.state.settings = SimpleNamespace(db_path=path)
     app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
     app.state.graph_repo.initialize()
+    app.state.snapshot = None
+    app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     app.state.http = httpx.AsyncClient(transport=transport)
     app.state.jev_client = JevClient(app.state.http)
     app.include_router(router, prefix="/admin")
@@ -113,6 +118,7 @@ def test_create_get_update_delete_roundtrip(tmp_path):
     updated = client.put("/admin/jev/jev-a", json={
         "input_tokens": 2048, "context_tokens": 8192})
     assert updated.status_code == 200, updated.text
+    assert updated.json()["synced_trees"] == []
     assert (updated.json()["service"]["input_tokens"],
             updated.json()["service"]["context_tokens"]) == (2048, 8192)
     # 省略 api_key 且端点不变：密钥保留。
@@ -126,7 +132,8 @@ def test_create_get_update_delete_roundtrip(tmp_path):
 
     deleted = client.delete("/admin/jev/jev-a")
     assert deleted.status_code == 200
-    assert deleted.json() == {"deleted": "jev-a"}
+    assert deleted.json() == {
+        "deleted": "jev-a", "replacement_jev_id": None, "synced_trees": []}
     assert _services(app) == []
     assert client.get("/admin/jev/jev-a").status_code == 404
     assert client.delete("/admin/jev/jev-a").status_code == 404
@@ -321,13 +328,29 @@ def test_put_rejects_id_that_does_not_match_path(tmp_path, body):
     assert _services(app) == baseline
 
 
-def test_impact_confirmation_is_accepted_and_ignored(tmp_path):
+def test_impact_confirmation_is_irrelevant_without_affected_canvases(tmp_path):
+    """无受影响画布时不需要确认：POST 忽略它，PUT/DELETE 也不因它报错。
+
+    确认协议的功能性行为（预览 409 / 确认同步）由
+    ``tests/test_catalog_impacts.py`` 的双画布用例覆盖。
+    """
     client, app = make_client(tmp_path)
     response = client.post("/admin/jev", json={
         **service_payload(), "impact_confirmation": {"acknowledged": True}})
     assert response.status_code == 201, response.text
     assert "impact_confirmation" not in response.text
     assert _services(app)[0].model == "d1-a"
+
+    updated = client.put("/admin/jev/jev-a", json={
+        "model": "d1-a2", "impact_confirmation": {"trees": []}})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["synced_trees"] == []
+    assert updated.json()["service"]["model"] == "d1-a2"
+
+    deleted = client.request("DELETE", "/admin/jev/jev-a", json={
+        "impact_confirmation": {"trees": []}})
+    assert deleted.status_code == 200, deleted.text
+    assert _services(app) == []
 
 
 # ── 连接测试：用数据库服务配置，不读活动画布 ──────────────────────────
