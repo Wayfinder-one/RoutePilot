@@ -13,7 +13,7 @@
    - 只读复测、「本次会话」测试徽章、友好测试摘要与按需展开的原始响应。
    ------------------------------------------------------------------ */
 import { apiErrText } from './api.js';
-import { LANG, onLangChange } from './i18n.js';
+import { LANG, onLangChange, t } from './i18n.js';
 
 /* ── copy that is not already in i18n.js ─────────────────────────────── */
 const X = {
@@ -88,6 +88,15 @@ function paintX(lang) {
     if (el.dataset.xAttr) el.setAttribute(el.dataset.xAttr, value);
     else el.textContent = value;
   });
+}
+
+/* The document title is shell copy, not page copy: it comes from the shared
+   dictionary (jev.title) and is repainted on a language switch, the way
+   login.js does it. The “RoutePilot · <page>” order matches every other
+   console page's static <title>. */
+function paintTitle() {
+  const title = 'RoutePilot · ' + t('jev.title');
+  if (document.title !== title) document.title = title;
 }
 
 /* ── read-only profile mirrors the live DOM values ───────────────────── */
@@ -220,6 +229,15 @@ function paintTestText() {
   } else if (testOut.dataset.state === 'running') {
     testOut.textContent = tx('test.running');
   }
+}
+
+function paintTestRunning() {
+  if (!testOut) return;
+  testOut.dataset.state = 'running';
+  testOut.dataset.durationMs = '';
+  testOut.dataset.selectedKey = '';
+  paintTestText();
+  paintTestBadge();
 }
 
 function paintTestPass(result) {
@@ -366,12 +384,21 @@ async function saveAllAndTest() {
 
     /* 4 · connection test: config and window are saved; a test failure is
        still a partial success, never “nothing was saved”. */
+    paintTestRunning();
     try {
       const result = await ACTIONS.testConnection(fieldValue('testText'));
       paintTestPass(result);
       showSaveMessage(tx('save.success'), false);
+      /* Re-enable before leaving edit mode: setEditing(false) moves focus to
+         #editConfig, and a disabled button cannot take that focus. */
+      setActionsBusy(false);
       setEditing(false);
     } catch (error) {
+      /* A failed test must not leave the previous run's status behind: hide
+         and clear the stale raw payload, paint the failure as the single
+         source of test status, then add the partial-save wording so both
+         facts stay visible (config + window saved, test failed). */
+      paintTestFailure(error);
       showSaveError('save.testPartial', error);
     }
   } finally {
@@ -384,11 +411,7 @@ async function saveAllAndTest() {
 async function runTest() {
   if (!ACTIONS || saving || !testOut) return;
   setActionsBusy(true);
-  testOut.dataset.state = 'running';
-  testOut.dataset.durationMs = '';
-  testOut.dataset.selectedKey = '';
-  paintTestText();
-  paintTestBadge();
+  paintTestRunning();
   try {
     paintTestPass(await ACTIONS.testConnection(fieldValue('testText')));
   } catch (error) {
@@ -431,6 +454,7 @@ setInterval(() => {
 }, 700);
 
 paintX(LANG);
+paintTitle();
 refreshProfile();
 syncFeedbackStyle();
 paintTestBadge();
@@ -439,6 +463,7 @@ refreshApiKeyPlaceholder();
 
 onLangChange(lang => {
   paintX(lang);
+  paintTitle();
   paintEditButton();
   refreshProfile();
   paintTestBadge();

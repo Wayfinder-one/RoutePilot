@@ -88,7 +88,7 @@ test('P0 decision service saves config and window then tests with friendly outpu
     if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
     if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
     if (request.method() === 'POST' && url.pathname === '/admin/jev/test') calls.push('test');
-};
+  };
   page.on('request', onRequest);
   try {
     await page.goto(routerBase + '/console/jev.html');
@@ -102,10 +102,15 @@ test('P0 decision service saves config and window then tests with friendly outpu
     await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
     assert.deepEqual(calls, ['config', 'window', 'test']);
     assert.match(await page.locator('#testOut').innerText(), /连接成功|Connection successful/);
-    assert.equal(await page.locator('#testRaw').isVisible(), false);
-} finally {
+    /* The raw payload must be revealed-but-collapsed. Asserting #testRaw alone
+       would also pass when the details were never revealed at all. */
+    assert.equal(await page.locator('#testRawDetails').isVisible(), true);
+    assert.equal(await page.locator('#testRawDetails').evaluate(element => element.open), false);
+    /* The successful save leaves edit mode: focus must land on a live control. */
+    await page.waitForFunction(() => document.activeElement.id === 'editConfig');
+  } finally {
     page.off('request', onRequest);
-}
+  }
 });
 
 test('P0 decision service reports partial save and skips test after window failure', async () => {
@@ -115,7 +120,7 @@ test('P0 decision service reports partial save and skips test after window failu
     if (request.method() === 'PUT' && url.pathname === '/admin/jev') calls.push('config');
     if (request.method() === 'PUT' && url.pathname === '/admin/jev/window') calls.push('window');
     if (request.method() === 'POST' && url.pathname === '/admin/jev/test') calls.push('test');
-};
+  };
   page.on('request', onRequest);
   await page.route('**/admin/jev/window', async route => {
     if (route.request().method() === 'PUT') {
@@ -123,11 +128,11 @@ test('P0 decision service reports partial save and skips test after window failu
         status: 422,
         contentType: 'application/json',
         body: JSON.stringify({ detail: 'window save rejected by QA' })
-});
+      });
       return;
-}
+    }
     await route.continue();
-});
+  });
   expectHttpStatusError({ url: /\/admin\/jev\/window$/, status: /422/ });
   try {
     await page.goto(routerBase + '/console/jev.html');
@@ -139,11 +144,11 @@ test('P0 decision service reports partial save and skips test after window failu
     assert.deepEqual(calls, ['config', 'window']);
     assert.match(await page.locator('#saveMsg').innerText(), /连接与提示词已保存|Connection and prompts saved/);
     assert.equal(await page.locator('#editPane').isVisible(), true);
-} finally {
+  } finally {
     page.off('request', onRequest);
     await page.unroute('**/admin/jev/window');
     resetExpectedHttpStatusErrors();
-}
+  }
 });
 
 test('P0 decision service stops after config failure', async () => {
@@ -153,7 +158,7 @@ test('P0 decision service stops after config failure', async () => {
     if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
     if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
     if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
-};
+  };
   page.on('request', onRequest);
   await page.route('**/admin/jev', async route => {
     if (route.request().method() === 'PUT') {
@@ -161,11 +166,11 @@ test('P0 decision service stops after config failure', async () => {
         status: 422,
         contentType: 'application/json',
         body: JSON.stringify({ detail: 'config rejected by QA' })
-});
+      });
       return;
-}
+    }
     await route.continue();
-});
+  });
   expectHttpStatusError({ url: /\/admin\/jev$/, status: /422/ });
   try {
     await page.goto(routerBase + '/console/jev.html');
@@ -175,12 +180,15 @@ test('P0 decision service stops after config failure', async () => {
     await page.waitForFunction(() =>
       document.getElementById('saveMsg').textContent.includes('config rejected by QA'));
     assert.deepEqual(calls, ['config']);
+    /* The reworked copy must say the config was not saved, not just relay the
+       server detail (this case already passed at the Task 4 predecessor). */
+    assert.match(await page.locator('#saveMsg').innerText(), /配置未保存|Configuration not saved/);
     assert.equal(await page.locator('#editPane').isVisible(), true);
-} finally {
+  } finally {
     page.off('request', onRequest);
     await page.unroute('**/admin/jev');
     resetExpectedHttpStatusErrors();
-}
+  }
 });
 
 test('P0 decision service rejects an invalid window before any write', async () => {
@@ -190,22 +198,39 @@ test('P0 decision service rejects an invalid window before any write', async () 
     if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
     if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
     if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
-};
+  };
   page.on('request', onRequest);
   try {
     await page.goto(routerBase + '/console/jev.html');
     await page.waitForFunction(() => document.getElementById('winContext').value === '4096');
     await page.locator('#editConfig').click();
-    await page.locator('#jevAdvanced').evaluate(element => { element.open = true; });
-    await page.locator('#winContext').fill('1024');
-    await page.locator('#winInput').fill('2048');
+    /* The advanced section is left closed on purpose: the page itself must
+       reveal it when it focuses the offending field. Inputs are set through
+       the DOM because a closed <details> hides them from real user actions. */
+    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), false);
+    await page.locator('#winContext').evaluate(element => {
+      element.value = '1024';
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await page.locator('#winInput').evaluate(element => {
+      element.value = '2048';
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+    });
     await page.locator('#saveJev').click();
     await page.waitForFunction(() => document.activeElement.id === 'winInput');
+    assert.equal(await page.locator('#jevAdvanced').evaluate(element => element.open), true,
+      'the invalid window did not reveal the advanced section');
+    await page.waitForFunction(() => {
+      const text = document.getElementById('saveMsg').textContent;
+      return text.includes('未保存：上下文长度校验未通过') ||
+        text.includes('Not saved: context length check failed');
+    }, null, { timeout: 3000 });
+    /* The important one: an invalid local window writes nothing at all. */
     assert.deepEqual(calls, []);
     assert.equal(await page.locator('#editPane').isVisible(), true);
-} finally {
+  } finally {
     page.off('request', onRequest);
-}
+  }
 });
 
 test('P0 decision service reports saved config when connection test fails', async () => {
@@ -215,32 +240,51 @@ test('P0 decision service reports saved config when connection test fails', asyn
     if (path === '/admin/jev' && request.method() === 'PUT') calls.push('config');
     if (path === '/admin/jev/window' && request.method() === 'PUT') calls.push('window');
     if (path === '/admin/jev/test' && request.method() === 'POST') calls.push('test');
-};
+  };
   page.on('request', onRequest);
+  let failTest = false;
   await page.route('**/admin/jev/test', async route => {
+    if (!failTest) {
+      await route.continue();
+      return;
+    }
     await route.fulfill({
       status: 502,
       contentType: 'application/json',
       body: JSON.stringify({ detail: 'test rejected by QA' })
-});
-});
-  expectHttpStatusError({ url: /\/admin\/jev\/test$/, status: /502/ });
+    });
+  });
   try {
     await page.goto(routerBase + '/console/jev.html');
     await page.waitForFunction(() => document.getElementById('baseUrl').value !== '');
+    /* A passing standalone retest first reveals the raw details and paints a
+       pass badge, so the assertions below cannot pass vacuously (the static
+       HTML ships #testRawDetails with `hidden`). */
+    await page.locator('#testJev').click();
+    await page.waitForFunction(() => document.getElementById('testOut').dataset.state === 'pass');
+    assert.equal(await page.locator('#testRawDetails').isVisible(), true);
+    assert.match(await page.locator('#testRaw').evaluate(element => element.textContent),
+      /selected_key/);
+    calls.length = 0;
+    failTest = true;
+    expectHttpStatusError({ url: /\/admin\/jev\/test$/, status: /502/ });
     await page.locator('#editConfig').click();
     await page.locator('#saveJev').click();
     await page.waitForFunction(() =>
       document.getElementById('saveMsg').textContent.includes('test rejected by QA'));
     assert.deepEqual(calls, ['config', 'window', 'test']);
     assert.match(await page.locator('#saveMsg').innerText(), /配置已保存|Configuration saved/);
-    assert.equal(await page.locator('#editPane').isVisible(), true);
+    /* data-state is the single source of test status: the stale pass must go. */
+    assert.equal(await page.locator('#testOut').getAttribute('data-state'), 'fail');
+    assert.match(await page.locator('#testBadge').innerText(), /测试失败|Test failed/);
     assert.equal(await page.locator('#testRawDetails').isVisible(), false);
-} finally {
+    assert.equal(await page.locator('#testRaw').evaluate(element => element.textContent), '');
+    assert.equal(await page.locator('#editPane').isVisible(), true);
+  } finally {
     page.off('request', onRequest);
     await page.unroute('**/admin/jev/test');
     resetExpectedHttpStatusErrors();
-}
+  }
 });
 
 test('P0 preset connection hides model ids by default and uses one save action', async () => {
