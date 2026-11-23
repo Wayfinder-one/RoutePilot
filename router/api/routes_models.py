@@ -9,9 +9,13 @@
    ``CatalogSyncService`` 在单写锁 + 单数据库事务内写目录行、校验并原子替换
    受影响画布、记录审计，仅当活动画布被修改时发布新快照。
 
-哈希不匹配（过期确认）返回 409 ``graph_conflict`` 并报告当前哈希。provider
-删除不提供隐式替换、也不可被确认绕过：只要数据库模型或画布快照仍引用它就
-拒绝。
+哈希不匹配（过期确认）返回 409 ``graph_conflict`` 并报告当前哈希。确认后的
+提交还会在写锁内、事务内重算一次最新引用/影响（``recheck``）：路由层扫描之后
+新出现的画布/模型引用会变成 409，而不是漏同步。
+
+provider 删除不提供隐式替换、也不可被确认绕过：只要数据库模型或**画布模型**
+仍引用它就拒绝；画布运行时目录里只有它的 provider 条目、没有任何模型引用时
+不阻塞删除（影响清单仍如实列出）。
 """
 from __future__ import annotations
 
@@ -206,6 +210,42 @@ def _impacted_trees(tree_list, impacts):
     return [tree for tree in tree_list if tree.id in impacted]
 
 
+def _canvas_models_using_provider(impacts) -> list[dict]:
+    """影响清单里「有画布模型引用该 provider」的条目（裸目录条目不阻塞删除）。"""
+    return [item for item in impacts if item["usage"]["models"]["use"]]
+
+
+def _provider_reference_error(used_by: list[str], canvas_models: list[dict],
+                              impacts: list[dict]) -> ReferencedByError:
+    """provider 删除被引用时的 409 载荷：DB 模型与画布模型都要列出。"""
+    if used_by and canvas_models:
+        message = "provider 同时被数据库模型与自包含画布引用，请先解除引用"
+    elif used_by:
+        message = "provider 被数据库模型引用，请先更新/删除这些模型"
+    else:
+        message = "provider 被自包含画布引用；删除不提供隐式替换，请先解除画布引用"
+    return ReferencedByError({
+        "message": message,
+        "code": "provider_referenced",
+        "models": used_by,
+        "affected_trees": impacts,
+    })
+
+
+def _provider_delete_blockers(conn, trees, name) -> ReferencedByError | None:
+    """provider 删除引用检查（路由层预览与锁内 recheck 共用同一规则）。
+
+    只有数据库模型或**画布模型**引用 provider 时才阻塞：画布运行时目录里仅有
+    它的 provider 条目（没有模型使用它）不影响删除，但影响清单仍完整列出。
+    """
+    used_by = model_ids_using_provider(conn, name)
+    impacts = provider_impacts(trees.list(), name)
+    canvas_models = _canvas_models_using_provider(impacts)
+    if used_by or canvas_models:
+        return _provider_reference_error(used_by, canvas_models, impacts)
+    return None
+
+
 @router.get("/model-catalog")
 def get_model_catalog():
     providers = []
@@ -355,8 +395,15 @@ def put_model(
             "profile": body.profile, "synced_trees": synced,
         })
 
+    def recheck(_conn):
+        # 写锁内、事务内、写目录行之前重算影响清单：路由层扫描之后新出现的
+        # 画布引用会让确认哈希不匹配 → 409，绝不带着过期名单提交。
+        require_confirmation(
+            model_impacts(trees.list(), model_id), body.impact_confirmation,
+            resource={"kind": "model", "id": model_id}, replacements=[])
+
     _catalog_service(request, conn, trees).commit(
-        db_write=db_write, candidates=candidates, audit=audit)
+        db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     row = ModelRepo(conn).get(model_id)
     return {
         "ok": True,
@@ -432,8 +479,19 @@ def delete_model(
             "synced_trees": synced,
         })
 
+    def recheck(_conn):
+        require_confirmation(
+            model_impacts(trees.list(), model_id),
+            body.impact_confirmation if body is not None else None,
+            resource={"kind": "model", "id": model_id},
+            replacements=[
+                {"id": row["id"], "upstream": row["upstream"],
+                 "provider": row["provider"]}
+                for row in ModelRepo(_conn).list() if row["id"] != model_id
+            ])
+
     _catalog_service(request, conn, trees).commit(
-        db_write=db_write, candidates=candidates, audit=audit)
+        db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     return {
         "ok": True,
         "deleted": model_id,
@@ -471,7 +529,7 @@ class ProviderIn(BaseModel):
 class ProviderDeleteIn(BaseModel):
     """provider 删除 DTO：接受 ``impact_confirmation`` 仅为协议兼容。
 
-    删除不可绕过：只要数据库模型或画布快照仍引用 provider 就始终 409。
+    删除不可绕过：只要数据库模型或画布模型仍引用 provider 就始终 409。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -537,8 +595,13 @@ def put_provider(
             "synced_trees": synced,
         })
 
+    def recheck(_conn):
+        require_confirmation(
+            provider_impacts(trees.list(), name), body.impact_confirmation,
+            resource={"kind": "provider", "name": name})
+
     _catalog_service(request, conn, trees).commit(
-        db_write=db_write, candidates=candidates, audit=audit)
+        db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     return {
         "ok": True,
         "provider": _public_provider(ProviderRepo(conn).get(name)),
@@ -556,21 +619,9 @@ def delete_provider(
     # DTO 里的 impact_confirmation 只用于协议兼容，provider 删除不允许绕过检查。
     if ProviderRepo(conn).get(name) is None:
         raise MissingError(f"unknown provider {name}")
-    used_by = model_ids_using_provider(conn, name)
-    impacts = provider_impacts(trees.list(), name)
-    if used_by or impacts:
-        if used_by and impacts:
-            message = "provider 同时被数据库模型与自包含画布引用，请先解除引用"
-        elif used_by:
-            message = "provider 被数据库模型引用，请先更新/删除这些模型"
-        else:
-            message = "provider 被自包含画布引用；删除不提供隐式替换，请先解除画布引用"
-        raise ReferencedByError({
-            "message": message,
-            "code": "provider_referenced",
-            "models": used_by,
-            "affected_trees": impacts,
-        })
+    blocked = _provider_delete_blockers(conn, trees, name)
+    if blocked is not None:
+        raise blocked
 
     def db_write(c):
         if not ProviderRepo(c).delete(name):
@@ -581,8 +632,15 @@ def delete_provider(
             "action": "delete", "name": name, "synced_trees": [],
         })
 
+    def recheck(_conn):
+        # 路由层预览之后、加锁之前可能有画布/模型开始引用 provider；在写锁内
+        # 用同一规则重算一次，命中即 409 且数据库与审计都不变。
+        blocked = _provider_delete_blockers(_conn, trees, name)
+        if blocked is not None:
+            raise blocked
+
     _catalog_service(request, conn, trees).commit(
-        db_write=db_write, candidates=[], audit=audit)
+        db_write=db_write, candidates=[], audit=audit, recheck=recheck)
     return {"ok": True, "deleted": name}
 
 

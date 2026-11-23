@@ -9,6 +9,20 @@
 的确认同步实现）。活动图校验也只读画布自身的内嵌运行配置，因此目录写永远不会
 因为「数据库与画布不一致」而被拒绝。
 
+确认同步（``commit_catalog_write``）在一个写锁 + 一个数据库事务里完成三件事：
+
+1. ``recheck(conn)`` 在事务内、写目录行之前重算最新引用/影响清单。路由层的
+   影响扫描发生在加锁之前，若画布/模型在该窗口内新出现，这里必须把它变成
+   409（``graph_conflict`` / ``ReferencedByError``），而不是漏同步或漏拦引用。
+2. 逐份候选画布先按「即将写出的字节」做一次严格文档解析
+   （``graph_document_bytes`` → ``parse_graph_document``），再做启用级校验。
+   启用级 ``tree_issues`` 不会重新校验模型 profile 与 provider 推理协议是否
+   自洽，只靠它会让无法被 ``RoutingTreeRepo`` 读回的文档落盘（随后
+   ``trees.list()`` 503）；活动与非活动候选都必须过这一关。
+3. 目录写、候选校验、图批次暂存/提交、候选快照构造与指纹复核、审计在同一
+   事务内，失败一起回滚；发布只在 COMMIT 之后、写锁内、且仅活动画布被改写
+   时发生（纯内存替换，绝不进数据库事务）。
+
 服务层异常 → HTTP 的映射关系（routes_* 统一处理）：
 - ``ValidationFailed`` → 422（Issue 数组）
 - ``ValueError`` → 422（detail 字符串）
@@ -20,21 +34,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from router.control.errors import (
-    AlreadyExists,
-    MissingError,
-    ReferencedByError,
-    ValidationFailed,
-)
+from router.control.errors import ValidationFailed
+from router.control.graphs import graph_parse_failed
 from router.control.validation import tree_issues
+from router.routing.document import graph_document_bytes, parse_graph_document
 from router.routing.snapshot import PreparedSnapshot
+from router.routing.tree import RoutingTree
 from router.store.repositories import (
     ChangeRepo,
-    ModelRepo,
-    ProviderRepo,
     TimePeriodRepo,
-    model_ids_using_provider,
-    model_references,
     now_iso,
     write_transaction,
 )
@@ -45,15 +53,18 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class _ConfigWriteResult:
-    """写回调返回候选快照或暂存批次；正式图替换由外层统一执行。
+    """写回调返回候选快照或暂存批次；图批次提交与发布会由外层统一执行。
 
     ``prepared`` 允许为 ``None``：配置写回调只负责校验、审计与暂存图批次，
-    提交图文件与构造候选快照都在 ``_write_and_publish()`` 里完成。
-    目录写不暂存图批次（``graph_batch`` 恒为 ``None``）：画布只由显式同步更新。
+    提交图文件与构造候选快照都在 ``_commit_locked()`` 里完成。
+    ``prepare`` 控制是否在事务内构造并复核候选快照；``publish`` 控制 COMMIT
+    之后是否在写锁内发布（仅活动画布被改写时发布）。
     """
 
     prepared: PreparedSnapshot | None
     graph_batch: GraphBatch | None
+    prepare: bool = True
+    publish: bool = True
 
 
 class ConfigurationService:
@@ -67,24 +78,34 @@ class ConfigurationService:
     #    进行：指纹仍不稳定时在 COMMIT 前抛冲突，DB、审计与候选快照一并回滚，且不发布。
     #    publish 不进数据库事务。exception 分支位于事务之外：数据库先 ROLLBACK，随后
     #    才恢复图文件，回滚失败时的快照刷新因此不会读到未回滚事务。──────────────
-    def _write_and_publish(self, write):
+    def _commit_locked(self, write, *, after_prepare=None) -> _ConfigWriteResult:
+        """目录写与确认同步共用的「锁 + 事务 + 图批次 + 指纹复核 + 发布」骨架。
+
+        ``write(conn)`` 在事务内返回 ``_ConfigWriteResult``；``after_prepare(conn)``
+        在候选快照构造与指纹复核之后、COMMIT 之前执行（审计行用）。整个事务期间
+        持有 ``publisher.locked()``；发布是 COMMIT 之后的纯内存替换。
+        """
         with self.publisher.locked():
-            result = None
+            result: _ConfigWriteResult | None = None
             try:
                 with write_transaction(self.conn):
                     result = write(self.conn)
                     if result.graph_batch is not None:
                         result.graph_batch.commit()
-                        result.prepared = self._prepared_snapshot()
-                    elif result.prepared is None:
-                        result.prepared = self._prepared_snapshot()
-                    result.prepared = self._recheck_fingerprint(result.prepared)
+                    if result.prepare:
+                        if result.prepared is None or result.graph_batch is not None:
+                            result.prepared = self._prepared_snapshot()
+                        result.prepared = self._recheck_fingerprint(result.prepared)
+                    if after_prepare is not None:
+                        after_prepare(self.conn)
             except BaseException:
                 self._rollback_graph_batch(result.graph_batch if result else None)
                 raise
             if result.graph_batch is not None:
                 result.graph_batch.discard()
-            self.publisher.publish(result.prepared)
+            if result.publish and result.prepared is not None:
+                self.publisher.publish(result.prepared)
+        return result
 
     def _recheck_fingerprint(self, prepared):
         """COMMIT 前在同一事务连接上复核磁盘指纹（等价旧 SnapshotPublisher.refresh 的复核语义）。
@@ -102,6 +123,9 @@ class ConfigurationService:
         raise GraphChangedDuringLoad(
             "graph changed between document write and snapshot publish")
 
+    def _write_and_publish(self, write):
+        self._commit_locked(write)
+
     # ── 配置写路径的校验 ────────────────────────────────────────────────
     def _require_valid_active_graph(self) -> None:
         """用画布自身的内嵌运行配置校验活动图。
@@ -116,6 +140,31 @@ class ConfigurationService:
         if issues:
             raise ValidationFailed(issues)
 
+    def _validate_candidate(self, tree: RoutingTree) -> None:
+        """严格校验一份候选画布，保证它写盘后仍能被仓库读回。
+
+        先做启用级 ``tree_issues``（能给出可定位的推理档位等 issue），再按
+        ``stage_updates`` 将会写出的字节做一次完整文档解析：启用级校验只看
+        target 的推理档位是否在画布声明的档位表里，不会用候选的 provider 推理
+        协议重新校验模型 profile；只靠它会让「provider 协议翻转后非活动画布
+        profile 非法」这类候选直接落盘，随后 ``trees.list()`` 抛
+        ``GraphStorageError``。
+        """
+        issues = tree_issues(self.conn, tree)
+        if issues:
+            raise ValidationFailed(issues)
+        try:
+            raw = graph_document_bytes(tree)
+            parse_graph_document(
+                raw,
+                tree_id=tree.id,
+                enabled=tree.enabled,
+                updated_at=tree.updated_at,
+                document_sha256=tree.document_sha256,
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValidationFailed(graph_parse_failed(exc)) from exc
+
     def _prepared_snapshot(self):
         # 必须先取指纹再读树：两次读取之间图若被改写，_recheck_fingerprint 会看到
         # 不匹配并重建一次。反过来（先读树、后取指纹）会产出（过期树, 当前指纹），
@@ -124,51 +173,42 @@ class ConfigurationService:
         return self.publisher.prepare(self.conn, self.trees.active(), fingerprint)
 
     # ── 确认后的目录同步（模型/provider/JEV 影响写用例共用骨架）────────────
-    # 与 _write_and_publish 同一套语义：publisher.locked() → 单写事务（目录写/
-    # 候选校验/预检并暂存全部画布/图批次提交/候选快照/复核指纹/审计）→ COMMIT
-    # → 仅在活动画布被修改时发布新快照。候选画布保留原始 document_sha256，
-    # stage_updates() 在事务内逐份核对基线哈希（GraphBatch 负责非活动先写、
-    # 活动最后写与回滚），因此不需要另建多文件写入协议。
-    def commit_catalog_write(self, *, db_write, candidates, audit) -> list[str]:
-        """目录写 + 候选画布原子提交；返回同步的画布 id（候选顺序）。"""
+    # 与 _write_and_publish 同一套语义：publisher.locked() → 单写事务（引用复核/
+    # 目录写/候选严格校验/预检并暂存全部画布/图批次提交/候选快照/复核指纹/审计）
+    # → COMMIT → 仅在活动画布被修改时发布新快照。候选画布保留原始
+    # document_sha256，stage_updates() 在事务内逐份核对基线哈希（GraphBatch 负责
+    # 非活动先写、活动最后写与回滚），因此不需要另建多文件写入协议。
+    def commit_catalog_write(self, *, db_write, candidates, audit,
+                             recheck=None) -> list[str]:
+        """目录写 + 候选画布原子提交；返回同步的画布 id（候选顺序）。
+
+        ``recheck(conn)``：可选。在写锁内、事务内、``db_write`` 之前执行，用于
+        重算最新引用/影响清单（路由层扫描与加锁之间的竞态不会漏同步或漏拦）。
+        ``audit(conn)``：候选快照构造与指纹复核之后、COMMIT 之前写审计行。
+        """
         candidates = list(candidates)
-        batch: GraphBatch | None = None
-        prepared: PreparedSnapshot | None = None
-        active_changed = False
-        with self.publisher.locked():
-            try:
-                with write_transaction(self.conn):
-                    db_write(self.conn)
-                    for tree in candidates:
-                        issues = tree_issues(self.conn, tree)
-                        if issues:
-                            raise ValidationFailed(issues)
-                    if candidates:
-                        batch = self.trees.stage_updates([
-                            (tree, tree.document_sha256) for tree in candidates
-                        ])
-                        batch.commit()
-                    # 先取指纹再读活动树，保证（树, 指纹）标签一致；图批次提交后
-                    # 读到的是本事务写入的新活动画布。没有候选时目录写不可能改变
-                    # 快照内容（快照只来自活动画布），因此跳过构造与发布。
-                    if candidates:
-                        fingerprint = self.trees.fingerprint()
-                        active = self.trees.active()
-                        prepared = self.publisher.prepare(
-                            self.conn, active, fingerprint)
-                        prepared = self._recheck_fingerprint(prepared)
-                        active_changed = active is not None and any(
-                            tree.id == active.id for tree in candidates)
-                    audit(self.conn)
-            except BaseException:
-                # 数据库事务已自动回滚；图批次在事务外恢复，暂存文件由 rollback
-                # 的 discard 清理。
-                self._rollback_graph_batch(batch)
-                raise
-            if batch is not None:
-                batch.discard()
-            if active_changed and prepared is not None:
-                self.publisher.publish(prepared)
+        active_id = self.trees.active_id()
+        active_changed = any(tree.id == active_id for tree in candidates)
+
+        def write(conn):
+            if recheck is not None:
+                recheck(conn)
+            db_write(conn)
+            for tree in candidates:
+                self._validate_candidate(tree)
+            batch = None
+            if candidates:
+                batch = self.trees.stage_updates([
+                    (tree, tree.document_sha256) for tree in candidates
+                ])
+            # 先取指纹再读活动树，保证（树, 指纹）标签一致；图批次提交后读到的是
+            # 本事务写入的新活动画布。没有候选时目录写不可能改变快照内容（快照
+            # 只来自活动画布），因此跳过构造与发布。
+            return _ConfigWriteResult(
+                prepared=None, graph_batch=batch,
+                prepare=bool(candidates), publish=active_changed)
+
+        self._commit_locked(write, after_prepare=lambda _conn: audit(self.conn))
         return [tree.id for tree in candidates]
 
     def _finish_config_write(self, audit) -> _ConfigWriteResult:
@@ -205,79 +245,3 @@ class ConfigurationService:
             lambda: ChangeRepo(self.conn).record(
                 now_iso(), "time-periods", {"periods": len(periods)}),
         )
-
-    # ── 模型与提供方 ────────────────────────────────────────────────────
-    # audit_* 参数仅为审计行保留请求原始值（与历史 /admin/changes 明细一致）；
-    # 其余参数是已归一化的写值。
-    def create_model(self, *, model_id: str, upstream: str, provider: str,
-                     profile_text: str | None, audit_profile) -> None:
-        def write(conn):
-            if not ModelRepo(conn).create(model_id, upstream, provider, profile_text or "{}"):
-                raise AlreadyExists(f"model {model_id} 已存在")
-            return self._finish_config_write(lambda: ChangeRepo(conn).record(now_iso(), "model", {
-                "action": "create", "id": model_id,
-                "upstream": upstream, "provider": provider,
-                "profile": audit_profile,
-            }))
-        self._write_and_publish(write)
-
-    def update_model(self, *, model_id: str, upstream: str | None,
-                     provider: str | None, profile_text: str | None,
-                     audit_upstream, audit_provider, audit_profile) -> None:
-        def write(conn):
-            if not ModelRepo(conn).update(
-                    model_id, upstream=upstream, provider=provider, profile=profile_text):
-                raise MissingError(f"unknown model {model_id}")
-            return self._finish_config_write(lambda: ChangeRepo(conn).record(now_iso(), "model", {
-                "action": "update", "id": model_id,
-                "upstream": audit_upstream, "provider": audit_provider,
-                "profile": audit_profile,
-            }))
-        self._write_and_publish(write)
-
-    def delete_model(self, model_id: str) -> None:
-        def write(conn):
-            if ModelRepo(conn).get(model_id) is None:
-                raise MissingError(f"unknown model {model_id}")
-            refs = model_references(self.trees.list(), model_id)
-            if refs:
-                raise ReferencedByError({
-                    "message": f"model {model_id} 被路由树引用", "references": refs})
-            if not ModelRepo(conn).delete(model_id):
-                raise MissingError(f"unknown model {model_id}")
-            # 删除未被引用的模型不会让活动图失效，无需启用校验。
-            return self._finish_config_write(
-                lambda: ChangeRepo(conn).record(
-                    now_iso(), "model", {"action": "delete", "id": model_id}),
-            )
-        self._write_and_publish(write)
-
-    def upsert_provider(self, *, name: str, base_url: str, key_env: str | None,
-                        reasoning_format: str | None, api_key: str | None) -> None:
-        def write(conn):
-            existing = ProviderRepo(conn).get(name)
-            ProviderRepo(conn).upsert(
-                name, base_url, key_env=key_env,
-                reasoning_format=reasoning_format, api_key=api_key)
-            return self._finish_config_write(lambda: ChangeRepo(conn).record(now_iso(), "provider", {
-                "action": "upsert", "name": name, "base_url": base_url,
-                "key_env": key_env if key_env is not None else (existing or {}).get("key_env", ""),
-                "reasoning_format": reasoning_format or (existing or {}).get("reasoning_format", "openai"),
-                "api_key": "unchanged" if api_key is None else "cleared" if api_key == "" else "set",
-            }))
-        self._write_and_publish(write)
-
-    def delete_provider(self, name: str) -> None:
-        def write(conn):
-            if ProviderRepo(conn).get(name) is None:
-                raise MissingError(f"unknown provider {name}")
-            used_by = model_ids_using_provider(conn, name)
-            if used_by:
-                raise ReferencedByError({"message": "provider 被模型引用", "models": used_by})
-            if not ProviderRepo(conn).delete(name):
-                raise MissingError(f"unknown provider {name}")
-            return self._finish_config_write(
-                lambda: ChangeRepo(conn).record(
-                    now_iso(), "provider", {"action": "delete", "name": name}),
-            )
-        self._write_and_publish(write)

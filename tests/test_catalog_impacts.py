@@ -9,12 +9,17 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace as dataclass_replace
 
 import pytest
 from fastapi.testclient import TestClient
 
+from router.api import routes_models
 from router.api.app import create_app
+from router.control.config import ConfigurationService
+from router.control.impacts import provider_impacts
 from router.routing.graph.model import TargetNode
+from router.routing.tree import tree_from_dict
 from router.store.db import connect
 from tests.routing_fixtures import portable_tree_dict, test_settings
 
@@ -378,7 +383,10 @@ def test_delete_catalog_only_model_needs_no_replacement(two_canvases):
     models = _runtime_models(_tree(app, "catalog-only"))
     assert "dangling" not in models
     assert "alt-model" in models
-    assert _target(_tree(app, "catalog-only")).models[0].model == "alt-model"
+    # 删除未被 target 引用的模型不触碰槽位表：模型与显式「不指定」档位原样保留。
+    assert [(slot.model, slot.reasoning)
+            for slot in _target(_tree(app, "catalog-only")).models] == [
+        ("alt-model", None)]
 
 
 # --------------------------------------------------------------------------- #
@@ -508,6 +516,10 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     assert {item["id"] for item in detail["affected_trees"]} == {"main", "other"}
     assert all(item["usage"]["runtime_catalog"] is True
                for item in detail["affected_trees"])
+    # provider 影响清单同时给出使用它的画布模型 id（非密钥目录事实）。
+    usages = {item["id"]: item["usage"] for item in detail["affected_trees"]}
+    assert usages["main"]["models"] == {"use": ["fast"]}
+    assert usages["other"]["models"] == {"use": ["backup"]}
     assert _canvas_state(app, ("main", "other", "alt")) == before
     assert _db_row(app, "providers", "name", "local") == before_row
     assert _audit_count(app) == before_audit
@@ -587,6 +599,33 @@ def test_provider_delete_is_blocked_by_db_and_canvas_refs_and_never_bypassable(
         "impact_confirmation": {"trees": []}})
     assert forced.status_code == 409
 
+    # 只有 provider 目录条目、没有任何画布模型引用它 → 不阻塞删除（spec：
+    # 只有数据库模型与画布模型引用才 block）。影响清单仍列出该画布，但删除
+    # 只写目录行 + 审计，不改画布字节、不发布快照。
+    assert client.put("/admin/providers/bare-prov", json={
+        "base_url": "http://bare.test/v1"}).status_code == 200
+    bare = portable_tree_dict("bare-canvas")
+    bare["jev"]["id"] = "jev-b"
+    bare["backends"]["providers"].append({
+        "name": "bare-prov", "base_url": "http://bare.test/v1", "key_env": "",
+        "reasoning_format": "openai",
+    })
+    assert client.post("/admin/trees", json=_strip_enabled(bare)).status_code == 201
+    before_bare = _canvas_bytes(app, "bare-canvas")
+    before_revision = app.state.snapshot.snapshot_revision
+    before_audit = _audit_count(app)
+    bare_impacts = provider_impacts(app.state.graph_repo.list(), "bare-prov")
+    assert [item["id"] for item in bare_impacts] == ["bare-canvas"]
+    assert bare_impacts[0]["usage"]["models"] == {"use": []}
+    deleted_bare = client.delete("/admin/providers/bare-prov")
+    assert deleted_bare.status_code == 200, deleted_bare.text
+    assert _db_row(app, "providers", "name", "bare-prov") is None
+    assert _canvas_bytes(app, "bare-canvas") == before_bare
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _audit_count(app) == before_audit + 1
+    assert _changes(app)[-1]["detail"] == {
+        "action": "delete", "name": "bare-prov", "synced_trees": []}
+
     # 无任何引用 → 直接删除 + 审计，不产生画布同步。
     assert client.put("/admin/providers/tmp-prov", json={
         "base_url": "http://tmp.test/v1"}).status_code == 200
@@ -638,3 +677,309 @@ def test_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
     # 画布文件/快照同样不含密钥。
     assert secret not in _canvas_bytes(app, "main").decode("utf-8")
     assert secret not in app.state.snapshot.content
+
+
+# --------------------------------------------------------------------------- #
+# 8. Review round 1：严格候选校验 + 锁内引用复核 + 发布门/基线门
+# --------------------------------------------------------------------------- #
+#: deepseek 方言下合法（非 off 档 wire 可为 null）、openai 方言下非法（needs_wire）。
+DEEPSEEK_ONLY_PROFILE = {"reasoning": {
+    "efforts": {"off": None, "high": None}, "default": "high"}}
+
+
+def _deepseek_only_model(profile=None) -> dict:
+    return {
+        "id": "fast", "upstream": "json-upstream", "provider": "local",
+        "profile": copy.deepcopy(DEEPSEEK_ONLY_PROFILE if profile is None else profile),
+    }
+
+
+def _assert_provider_row_and_key_unchanged(app, name, before_row):
+    assert _db_row(app, "providers", "name", name) == before_row
+
+
+def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
+        tmp_path):
+    """CRITICAL 1：非活动画布的 profile 只在旧 provider 方言下合法。
+
+    确认同步必须在暂存/写盘之前严格解析每份候选（活动与非活动都一样），返回
+    422 并整体回滚；fix 前它返回 200 把闭画布写成非法文档，随后
+    ``repo.list()`` / ``GET /admin/trees`` 直接 503。
+    """
+    app = create_app(test_settings(tmp_path))
+    client = TestClient(app)
+    assert client.put("/admin/providers/local", json={
+        "base_url": "http://json-only.test/v1",
+        "reasoning_format": "deepseek",
+    }).status_code == 200
+
+    active = portable_tree_dict("main")
+    assert client.post("/admin/trees", json=_strip_enabled(active)).status_code == 201
+    assert client.post("/admin/trees/main/enable").status_code == 200
+
+    closed = portable_tree_dict("closed")
+    closed["backends"]["providers"][0]["reasoning_format"] = "deepseek"
+    closed["backends"]["models"][0] = _deepseek_only_model()
+    for node in closed["root"]["nodes"]:
+        if node["type"] == "target":
+            node["models"][0]["reasoning"] = None
+    assert client.post("/admin/trees", json=_strip_enabled(closed)).status_code == 201
+    assert {tree.id for tree in app.state.graph_repo.list()} == {"main", "closed"}
+
+    before_provider = _db_row(app, "providers", "name", "local")
+    before_files = _canvas_state(app, ("main", "closed"))
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+
+    preview = client.put("/admin/providers/local", json={
+        "base_url": "http://json-only.test/v1", "reasoning_format": "openai"})
+    assert preview.status_code == 409
+    assert {item["id"] for item in preview.json()["detail"]["affected_trees"]} == {
+        "main", "closed"}
+
+    response = client.put("/admin/providers/local", json={
+        "base_url": "http://json-only.test/v1",
+        "reasoning_format": "openai",
+        "impact_confirmation": confirmation_from(preview),
+    })
+
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "graph_parse_error"
+               for issue in response.json()["detail"])
+    _assert_provider_row_and_key_unchanged(app, "local", before_provider)
+    assert _canvas_state(app, ("main", "closed")) == before_files
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+    # 所有画布仍可读（fix 前闭画布已被写坏，这里会抛 GraphStorageError）。
+    assert {tree.id for tree in app.state.graph_repo.list()} == {"main", "closed"}
+    assert client.get("/admin/trees").status_code == 200
+
+
+def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
+    """CRITICAL 1（活动画布变体）：fix 前候选写盘后重读活动画布抛
+    ``GraphStorageError`` → 503；严格候选校验必须在写盘前把它变成 422 并回滚。"""
+    app = create_app(test_settings(tmp_path))
+    client = TestClient(app)
+    assert client.put("/admin/providers/local", json={
+        "base_url": "http://json-only.test/v1",
+        "reasoning_format": "deepseek",
+    }).status_code == 200
+    tree = portable_tree_dict("main")
+    tree["backends"]["providers"][0]["reasoning_format"] = "deepseek"
+    tree["backends"]["models"][0] = _deepseek_only_model()
+    for node in tree["root"]["nodes"]:
+        if node["type"] == "target":
+            node["models"][0]["reasoning"] = None
+    assert client.post("/admin/trees", json=_strip_enabled(tree)).status_code == 201
+    assert client.post("/admin/trees/main/enable").status_code == 200
+
+    before_provider = _db_row(app, "providers", "name", "local")
+    before_file = _canvas_bytes(app, "main")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+
+    preview = client.put("/admin/providers/local", json={
+        "base_url": "http://json-only.test/v1", "reasoning_format": "openai"})
+    assert preview.status_code == 409
+    response = client.put("/admin/providers/local", json={
+        "base_url": "http://json-only.test/v1",
+        "reasoning_format": "openai",
+        "impact_confirmation": confirmation_from(preview),
+    })
+
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "graph_parse_error"
+               for issue in response.json()["detail"])
+    _assert_provider_row_and_key_unchanged(app, "local", before_provider)
+    assert _canvas_bytes(app, "main") == before_file
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert {tree.id for tree in app.state.graph_repo.list()} == {"main"}
+
+
+def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
+        two_canvases, monkeypatch):
+    """CRITICAL 2：路由层影响扫描之后、提交加锁之前新建的画布若引用被改模型，
+    必须在锁内、事务内 recheck 时变成 409 ``graph_conflict``；fix 前数据库会被
+    改写而新画布漏同步。"""
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    real_impacts = routes_models.model_impacts
+    raced = {"done": False, "sha": None}
+
+    def racing_impacts(trees, model_id):
+        impacts = real_impacts(trees, model_id)   # 旧清单：racer 画布还不存在
+        if not raced["done"]:
+            raced["done"] = True
+            created = app.state.graph_repo.create(
+                tree_from_dict(portable_tree_dict("racer")))
+            raced["sha"] = created.document_sha256
+        return impacts
+
+    monkeypatch.setattr(routes_models, "model_impacts", racing_impacts)
+
+    blocked = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["code"] == "graph_conflict"
+    # actual 必须是新出现画布的当前哈希，而不是客户端提交的旧哈希。
+    assert detail["actual_document_sha256"] == raced["sha"]
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _tree(app, "racer").document_sha256 == raced["sha"]
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+
+
+def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
+        two_canvases, monkeypatch):
+    """事务内基线门：影响清单生成后、``stage_updates`` 核对基线前画布被改写 →
+    409 ``graph_conflict``（报告当前哈希）且数据库/审计/快照全部回滚。"""
+    app, client = two_canvases
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+
+    real_validate = ConfigurationService._validate_candidate
+    raced = {}
+
+    def racing_validate(self, candidate):
+        # 影响清单已生成、目录行已写（事务内）之后，另一个进程改写活动画布；
+        # 暂存的候选仍以旧 document_sha256 为基线。
+        if not raced:
+            current = app.state.graph_repo.get("main")
+            replaced = app.state.graph_repo.update(
+                dataclass_replace(current, name="mutated-after-impacts"),
+                base_document_sha256=current.document_sha256)
+            raced["sha"] = replaced.document_sha256
+        return real_validate(self, candidate)
+
+    monkeypatch.setattr(ConfigurationService, "_validate_candidate",
+                        racing_validate)
+
+    blocked = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert blocked.status_code == 409, blocked.text
+    detail = blocked.json()["detail"]
+    assert detail["code"] == "graph_conflict"
+    assert detail["actual_document_sha256"] == raced["sha"]
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _canvas_bytes(app, "other") == before["other"]
+
+
+def test_confirmed_write_touching_only_inactive_canvas_does_not_publish(
+        two_canvases, monkeypatch):
+    """发布门（负向）：确认写只改了非活动画布时不发布新快照。"""
+    app, client = two_canvases
+    publisher = app.state.publisher
+    real_publish = publisher.publish
+    published = []
+
+    def spy(prepared):
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(publisher, "publish", spy)
+    before_revision = app.state.snapshot.snapshot_revision
+    before_main = _canvas_bytes(app, "main")
+    before_other = _canvas_bytes(app, "other")
+
+    preview = client.put("/admin/models/backup", json={
+        "upstream": "backup-upstream-v2"})
+    assert preview.status_code == 409
+    assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
+        "other"]
+
+    confirmed = client.put("/admin/models/backup", json={
+        "upstream": "backup-upstream-v2",
+        "impact_confirmation": confirmation_from(preview),
+    })
+
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["synced_trees"] == ["other"]
+    assert published == []
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _canvas_bytes(app, "main") == before_main
+    assert _canvas_bytes(app, "other") != before_other
+
+
+def test_replacement_model_keeps_supported_reasoning_tier(two_canvases):
+    """替换模型声明了旧档位时保留槽位档位（不落到替代模型默认档）。"""
+    app, client = two_canvases
+    profile = {"reasoning": {
+        "efforts": {"off": None, "low": "low", "high": "high"},
+        "default": "off"}}
+    preview = client.put("/admin/models/backup", json={"profile": profile})
+    assert preview.status_code == 409
+    updated = client.put("/admin/models/backup", json={
+        "profile": profile,
+        "impact_confirmation": confirmation_from(preview),
+    })
+    assert updated.status_code == 200, updated.text
+    # main 的槽位是 fast/high；backup 现在支持 high → 保留 high。
+    assert _target(_tree(app, "main")).models[0].reasoning == "high"
+
+    delete_preview = client.request(
+        "DELETE", "/admin/models/fast", json={"replacement_model_id": "backup"})
+    assert delete_preview.status_code == 409
+    deleted = client.request("DELETE", "/admin/models/fast", json={
+        "replacement_model_id": "backup",
+        "impact_confirmation": confirmation_from(delete_preview),
+    })
+    assert deleted.status_code == 200, deleted.text
+    assert [(slot.model, slot.reasoning) for slot in _target(_tree(app, "main")).models] \
+        == [("backup", "high")]
+
+
+def test_replacement_model_provider_inserted_when_absent_from_canvas(two_canvases):
+    """替代模型的 provider 不在画布运行时目录里时，同步时补入。"""
+    app, client = two_canvases
+    assert client.put("/admin/providers/alt-provider", json={
+        "base_url": "http://alt.test/v1"}).status_code == 200
+    assert client.post("/admin/models", json={
+        "id": "alt-model", "upstream": "alt-upstream",
+        "provider": "alt-provider", "profile": {}}).status_code == 201
+    assert "alt-provider" not in _runtime_providers(_tree(app, "main"))
+
+    delete_preview = client.request(
+        "DELETE", "/admin/models/fast", json={"replacement_model_id": "alt-model"})
+    assert delete_preview.status_code == 409
+    deleted = client.request("DELETE", "/admin/models/fast", json={
+        "replacement_model_id": "alt-model",
+        "impact_confirmation": confirmation_from(delete_preview),
+    })
+    assert deleted.status_code == 200, deleted.text
+
+    main = _tree(app, "main")
+    assert _runtime_providers(main)["alt-provider"]["base_url"] == \
+        "http://alt.test/v1"
+    assert _runtime_models(main)["alt-model"]["provider"] == "alt-provider"
+    assert [(slot.model, slot.reasoning) for slot in _target(main).models] == [
+        ("alt-model", None)]
+
+
+def test_delete_model_with_unknown_replacement_is_404(two_canvases):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_audit = _audit_count(app)
+    response = client.request(
+        "DELETE", "/admin/models/fast", json={"replacement_model_id": "nope"})
+    assert response.status_code == 404
+    assert _db_row(app, "models", "id", "fast") is not None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit

@@ -201,7 +201,9 @@ def replace_target_models(root, model_id: str, replacement_model, *,
     """把所有 target 槽位里的 ``model_id`` 替换成替代模型并按模型 id 去重。
 
     - 替代模型的推理档位受支持时保留槽位原档位；否则使用替代模型默认档位
-      （可为 None）。槽位原本没有档位（None）时继续保持 None。
+      （可为 None）。槽位原本没有档位（None，即「不指定」）时继续保持 None：
+      这是有意的语义——画布作者显式选择「跟随模型默认」，替换模型后也不该被
+      改写成某个具体档位。
     - 每个 target 内按模型 id 去重并保留首次出现的槽位顺序。
     - 没有任何槽位引用 ``model_id`` 时返回深拷贝的 root（不修改输入）。
     """

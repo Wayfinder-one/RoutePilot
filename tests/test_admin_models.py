@@ -15,6 +15,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from router.api import routes_models
 from router.api.app import create_app
 from router.reasoning import FORMAT_IDS, LEVELS
 from router.routing.tree import tree_from_dict
@@ -836,6 +837,70 @@ def test_delete_free_model_commits_catalog_write_under_the_publish_lock(
     assert response.json()["synced_trees"] == []
     # 无候选画布时仍走单写锁 + 单事务的目录写骨架。
     assert trace == ["lock-enter", "lock-exit"]
+
+
+def test_provider_delete_rechecks_references_under_the_publish_lock(
+        app, client, monkeypatch):
+    """provider 删除的引用检查必须在写锁内、事务内重算（CRITICAL 2）。
+
+    路由层扫描之后、加锁之前新建一幅引用该 provider 的画布：锁内 recheck 必须
+    返回 409 ``provider_referenced``，provider 行/审计/画布文件都不变；trace 同时
+    证明第二次「DB 模型引用检查」发生在 lock-enter 之后。
+    """
+    assert client.put("/admin/providers/race-prov", json={
+        "base_url": "http://race.test/v1"}).status_code == 200
+    before_providers = {
+        p["name"]: p for p in client.get("/admin/providers").json()["providers"]}
+    before_changes = len(client.get("/admin/changes").json()["changes"])
+
+    trace = _instrument_publish_lock(app, monkeypatch)
+    real_impacts = routes_models.provider_impacts
+    real_db_refs = routes_models.model_ids_using_provider
+    raced = {"done": False}
+
+    def racing_impacts(trees, name):
+        impacts = real_impacts(trees, name)   # 旧清单：race-canvas 还不存在
+        if not raced["done"]:
+            raced["done"] = True
+            root = _direct_graph((("qwen3-8b", None),))
+            runtime = _tree_runtime(root)
+            runtime["backends"]["providers"].append({
+                "name": "race-prov", "base_url": "http://race.test/v1",
+                "key_env": "", "reasoning_format": "openai"})
+            runtime["backends"]["models"][0]["provider"] = "race-prov"
+            app.state.graph_repo.create(tree_from_dict({
+                "id": "race-canvas", "name": "Race", "root": root,
+                "timezone": "Asia/Shanghai",
+                "sticky": {"enabled": False, "ttl_seconds": 1800},
+                **runtime,
+            }))
+        return impacts
+
+    def traced_db_refs(conn, name):
+        trace.append("db-ref-check")
+        return real_db_refs(conn, name)
+
+    monkeypatch.setattr(routes_models, "provider_impacts", racing_impacts)
+    monkeypatch.setattr(routes_models, "model_ids_using_provider", traced_db_refs)
+
+    response = client.delete("/admin/providers/race-prov")
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "provider_referenced"
+    assert detail["models"] == []            # 数据库里没有模型引用它
+    assert [item["id"] for item in detail["affected_trees"]] == ["race-canvas"]
+    # 路由层检查在锁外；锁内 recheck 的 DB 引用检查发生在 lock-enter 之后。
+    assert trace[:2] == ["db-ref-check", "lock-enter"]
+    assert trace[-1] == "lock-exit"
+    assert trace.count("db-ref-check") == 2
+    assert "db-ref-check" in trace[2:]
+    # 409 在 db_write 之前抛出：provider 行、审计、新画布都保持原值。
+    assert {
+        p["name"]: p for p in client.get("/admin/providers").json()["providers"]
+    } == before_providers
+    assert len(client.get("/admin/changes").json()["changes"]) == before_changes
+    assert app.state.graph_repo.get("race-canvas") is not None
 
 
 def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
