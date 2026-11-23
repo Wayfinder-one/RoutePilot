@@ -68,6 +68,12 @@ class GraphPatch:
 
     四个扁平运行字段同样是补丁字段：缺失继承已存画布的运行配置，显式值覆盖。
     不存在任何运行配置控制字段或「按数据库物化」中间契约。
+
+    注意（仅限原始 API 的扁平 PATCH）：``jev`` 与 ``jev_window`` 是两个独立补丁
+    字段，只显式给 ``jev`` 时会与继承的 ``jev_window`` 组成「新服务 + 旧窗口」
+    的混合输入；这是既有扁平字段的合并语义。console/inspector 与目录确认同步
+    （``router.control.impacts.sync_jev`` / ``delete_jev``）始终把服务快照和窗口
+    成对替换（spec「JEV 服务与窗口同源」），不会产生混合体。
     """
 
     name: str | None | _Unset = UNSET

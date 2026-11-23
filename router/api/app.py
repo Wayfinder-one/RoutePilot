@@ -30,7 +30,13 @@ from router.routing.service import RoutingService
 from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
-from router.store.repositories import SessionRepo, UserRepo, seed_default
+from router.store.repositories import (
+    SessionRepo,
+    SettingsRepo,
+    UserRepo,
+    seed_default,
+    transaction,
+)
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
     GraphConflictError,
@@ -106,15 +112,27 @@ def _install_admin_auth(app: FastAPI, settings: Settings) -> None:
         return _unauthorized()
 
 
+#: ``settings`` 表里的「JEV 目录已用环境种子初始化过」标记。
+#: 与 ``seed_default`` 使用的 ``catalog_seeded``（provider/model 种子）分开：
+#: 该标记只在**确实写入**环境 JEV 时设置，用于保证环境种子只发生一次。
+JEV_SEEDED_SETTING = "jev_catalog_seeded"
+
+
 def _seed_jev(conn, settings: Settings) -> None:
-    """boot 种子：环境配置只在空目录首次启动时创建 ``default`` 服务。
+    """boot 种子：环境配置只在整个生命周期内创建一次 ``default`` 服务。
 
     - 目录里已有任何服务就完全跳过（数据库目录是事实源，不覆盖管理结果）。
+    - 只有从未用环境种子初始化过（``settings`` 表的 ``jev_catalog_seeded``
+      标记缺失）且目录为空时才播种：因此「首启无环境、之后补环境」仍会播种一次，而「全部删除
+      后重启」不会把 ``default`` 复活。
+    - 没有配置环境 URL/model 时不写标记，留给之后带环境启动的机会。
     - 不读取活动画布、不触发任何图同步：画布启动快照只由画布 JSON 决定。
     - 环境只配置 URL/model 之一时仍是配置错误（保持原启动失败语义）。
     """
     repo = JevServiceRepo(conn)
     if repo.list():
+        return
+    if SettingsRepo(conn).get(JEV_SEEDED_SETTING) is not None:
         return
     if not settings.jev_url and not settings.jev_model:
         return
@@ -127,7 +145,9 @@ def _seed_jev(conn, settings: Settings) -> None:
         key_env="ROUTER_JEV_API_KEY",
         timeout_seconds=settings.jev_timeout,
     )
-    repo.save(service, api_key=settings.jev_api_key)
+    with transaction(conn):
+        repo.save(service, api_key=settings.jev_api_key)
+        SettingsRepo(conn).set(JEV_SEEDED_SETTING, "1")
 
 
 def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:

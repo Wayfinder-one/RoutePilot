@@ -178,6 +178,40 @@ def _defaults(service: JevService | None) -> dict:
     }
 
 
+#: 更新审计里逐字段记录的**非密钥**变化（model 单独固定记录）。
+_AUDIT_CHANGE_FIELDS = (
+    "base_url",
+    "instructions",
+    "state_template",
+    "timeout_seconds",
+    "input_tokens",
+    "context_tokens",
+)
+
+
+def _key_state_intent(body: JevServiceIn, existing: JevService,
+                      service: JevService) -> str:
+    """更新审计的密钥意图枚举（set / cleared / preserved），绝不记录密钥值。
+
+    与 ``JevServiceRepo.save(api_key=None)`` 的保留规则一致：只有 base_url 与
+    model 都不变时才保留已存密钥；端点/模型变化但未显式提供 api_key 时旧密钥
+    被清除。
+    """
+    if "api_key" in body.model_fields_set:
+        return "set" if body.api_key else "cleared"
+    if existing.base_url == service.base_url and existing.model == service.model:
+        return "preserved"
+    return "cleared"
+
+
+def _changed_audit_fields(existing: JevService, service: JevService) -> dict:
+    return {
+        field: getattr(service, field)
+        for field in _AUDIT_CHANGE_FIELDS
+        if getattr(service, field) != getattr(existing, field)
+    }
+
+
 def _jev_replacements(conn: sqlite3.Connection, service_id: str) -> list[dict]:
     """删除预览可选的替代目录：仅非密钥字段，供控制台展示 id / 模型 / 地址。"""
     return [
@@ -279,6 +313,9 @@ def put_jev_service(
     def audit(c):
         ChangeRepo(c).record(now_iso(), "jev", {
             "action": "update", "id": service_id, "model": service.model,
+            # 只记录非密钥事实：变化的字段值 + 密钥意图枚举（不含密钥本身）。
+            **_changed_audit_fields(existing, service),
+            "key_state": _key_state_intent(body, existing, service),
             "synced_trees": synced,
         })
 
@@ -351,6 +388,12 @@ def delete_jev_service(
             jev_impacts(trees.list(), service_id), confirmation,
             resource={"kind": "jev", "id": service_id},
             replacements=_jev_replacements(_conn, service_id))
+        # 确认之后才校验替代服务（与路由层同一优先级）：替代服务可能在路由层
+        # 校验之后、加锁之前被删除；锁内重查，404 语义与路由层一致，
+        # 绝不让画布引用一个数据库里已不存在的替代服务。
+        if replacement_id is not None \
+                and JevServiceRepo(_conn).get(replacement_id) is None:
+            raise MissingError(f"unknown jev service {replacement_id}")
 
     _catalog_service(request, conn, trees).commit(
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)

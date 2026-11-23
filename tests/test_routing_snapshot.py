@@ -204,6 +204,33 @@ def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
     assert "jev-b-stored-secret" not in snapshot.content
 
 
+def test_jev_key_env_is_never_replaced_by_the_global_router_variable(conn, monkeypatch):
+    """画布 ``jev.key_env`` 必须被原样使用，不得回退到全局 ``ROUTER_JEV_API_KEY``。
+
+    回归锁定：把 ``resolve_jev_settings`` 里 ``os.environ.get(service.key_env)``
+    改成硬编码 ``ROUTER_JEV_API_KEY`` 的突变目前会躲过整套测试；这里把
+    ``CUSTOM_JEV_KEY`` 置空、全局变量设成明文，快照必须拿不到任何密钥。
+    """
+    monkeypatch.delenv("CUSTOM_JEV_KEY", raising=False)
+    monkeypatch.setenv("ROUTER_JEV_API_KEY", "global-router-jev-secret")
+    values = runtime_dict()
+    values["jev"] = {
+        "id": "custom-jev",
+        "base_url": "http://custom-jev.test",
+        "model": "custom-jev-model",
+        "key_env": "CUSTOM_JEV_KEY",
+        "timeout_seconds": 5.0,
+        "instructions": runtime_dict()["jev"]["instructions"],
+        "state_template": runtime_dict()["jev"]["state_template"],
+    }
+
+    snapshot = build_snapshot_for_tree(conn, portable_tree(values))
+
+    assert snapshot.jev.base_url == "http://custom-jev.test"
+    assert snapshot.jev.api_key == ""
+    assert "global-router-jev-secret" not in snapshot.content
+
+
 def test_embedded_empty_catalog_rejects_model_even_when_database_has_it(conn):
     values = runtime_dict()
     values["backends"]["models"] = []

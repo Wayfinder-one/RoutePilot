@@ -16,7 +16,7 @@ from router.control.runtime import enable_context_for_runtime
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
-from router.store.repositories import seed_default
+from router.store.repositories import SettingsRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import (
     graph_dict,
@@ -144,6 +144,48 @@ def test_environment_jev_service_is_seeded_once(tmp_path):
     conn = connect(settings.db_path)
     try:
         assert len(JevServiceRepo(conn).list()) == 1
+    finally:
+        conn.close()
+
+
+def test_first_boot_without_environment_seeds_when_environment_arrives_later(tmp_path):
+    """首启无环境：不写标记；之后带环境启动仍会播种一次。"""
+    settings = test_settings(tmp_path)
+    create_app(settings)
+    conn = connect(settings.db_path)
+    try:
+        assert JevServiceRepo(conn).list() == []
+        assert SettingsRepo(conn).get("jev_catalog_seeded") is None
+    finally:
+        conn.close()
+
+    create_app(replace(settings, **JEV_ENV))
+
+    conn = connect(settings.db_path)
+    try:
+        assert [service.id for service in JevServiceRepo(conn).list()] == ["default"]
+        assert SettingsRepo(conn).get("jev_catalog_seeded") == "1"
+    finally:
+        conn.close()
+
+
+def test_deleting_all_jev_services_never_resurrects_the_environment_seed(tmp_path):
+    """环境种子只发生一次：全部删除后重启也不会把 ``default`` 复活。"""
+    settings = test_settings(tmp_path, **JEV_ENV)
+    create_app(settings)
+    conn = connect(settings.db_path)
+    try:
+        assert [service.id for service in JevServiceRepo(conn).list()] == ["default"]
+        assert JevServiceRepo(conn).delete("default") is True
+        assert JevServiceRepo(conn).list() == []
+    finally:
+        conn.close()
+
+    create_app(settings)  # 目录为空但标记仍在 → 不再播种
+
+    conn = connect(settings.db_path)
+    try:
+        assert JevServiceRepo(conn).list() == []
     finally:
         conn.close()
 

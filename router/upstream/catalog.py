@@ -90,39 +90,3 @@ def parse_profile_text(text: str | None) -> dict:
     except (TypeError, ValueError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
-
-
-def reasoning_map_for_rows(conn: sqlite3.Connection,
-                           rows) -> dict[str, dict | None]:
-    """model_id -> normalized reasoning for an arbitrary model-catalog row set.
-
-    ``rows`` are catalog dicts (``id``/``profile``/``provider``) and may be a
-    prospective set that is not stored yet. The provider ``reasoning_format``
-    comes from the providers table (missing provider -> ``"openai"``), exactly
-    like :func:`load_backends`, so a write can never be accepted by the API and
-    rejected by a later fixed-model direct request.
-
-    画布运行路径不使用本函数：Auto 路由与启用校验的推理能力来自画布内嵌运行
-    配置（``router.control.runtime.enable_context_for_runtime``）。
-    """
-    formats = {row["name"]: (row["reasoning_format"] or "openai")
-               for row in conn.execute(
-                   "SELECT name, reasoning_format FROM providers")}
-    return {
-        row["id"]: normalize_reasoning(
-            parse_profile_text(row.get("profile")),
-            formats.get(row.get("provider"), "openai"))
-        for row in rows}
-
-
-def model_reasoning_from_db(conn: sqlite3.Connection) -> dict[str, dict | None]:
-    """model_id -> normalized reasoning capability of the CURRENT catalog.
-
-    Catalog-only projection for tooling/tests; enable validation and Auto routing
-    judge the canvas's own embedded declarations instead.
-    """
-    rows = [{"id": row["id"], "profile": row["profile"],
-             "provider": row["provider"]}
-            for row in conn.execute(
-                "SELECT id, profile, provider FROM models")]
-    return reasoning_map_for_rows(conn, rows)

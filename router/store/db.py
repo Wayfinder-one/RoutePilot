@@ -307,6 +307,11 @@ def _upgrade_v5_to_v6(conn: sqlite3.Connection) -> None:
 
     旧单行配置一次性迁移为 ``default`` 服务并保留其已存密钥与窗口，随后删除
     ``jev_config``；这不是运行时兼容层，应用代码之后只读 ``jev_services``。
+
+    legacy ``base_url`` 必须按 ``JevService``（``JevSettings``）的规范化规则落库
+    （strip + 去掉末尾 ``/``）：``stored_api_key()`` 用精确的 base_url/model 比较
+    判断已存密钥能否复用，原样复制带尾斜杠的旧地址会让「同一端点」被误判为不同
+    端点，下一次只改元数据的 ``save(api_key=None)`` 就会清掉密钥。
     """
     tables = _table_names(conn)
     if "jev_services" not in tables:
@@ -319,7 +324,8 @@ def _upgrade_v5_to_v6(conn: sqlite3.Connection) -> None:
                 "INSERT OR REPLACE INTO jev_services (id, base_url, model, key_env, "
                 "api_key, timeout_seconds, instructions, state_template, input_tokens, "
                 "context_tokens, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("default", row["base_url"], row["model"], "ROUTER_JEV_API_KEY",
+                ("default", str(row["base_url"]).strip().rstrip("/"), row["model"],
+                 "ROUTER_JEV_API_KEY",
                  row["api_key"], row["timeout_seconds"], row["instructions"],
                  row["state_template"], input_tokens, context_tokens,
                  row["updated_at"]),

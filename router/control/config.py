@@ -185,10 +185,15 @@ class ConfigurationService:
         ``recheck(conn)``：可选。在写锁内、事务内、``db_write`` 之前执行，用于
         重算最新引用/影响清单（路由层扫描与加锁之间的竞态不会漏同步或漏拦）。
         ``audit(conn)``：候选快照构造与指纹复核之后、COMMIT 之前写审计行。
+
+        「活动画布是否被改写」的发布门必须在写锁内、事务内决定：路由层构造候选
+        之后、本方法拿到写锁之前可能有一笔 enable 落盘；若在加锁前读取
+        ``active_id()``，就会出现「批次写入了刚被启用的画布，却因为旧活动 id
+        不在候选里而跳过发布」的竞态。因此这里在暂存批次之后、同一把锁内重新
+        读取活动 id；没有候选的纯数据库写完全不读活动指针，损坏的 ``current``
+        不会把与图无关的目录写变成 503。
         """
         candidates = list(candidates)
-        active_id = self.trees.active_id()
-        active_changed = any(tree.id == active_id for tree in candidates)
 
         def write(conn):
             if recheck is not None:
@@ -196,17 +201,24 @@ class ConfigurationService:
             db_write(conn)
             for tree in candidates:
                 self._validate_candidate(tree)
-            batch = None
-            if candidates:
-                batch = self.trees.stage_updates([
-                    (tree, tree.document_sha256) for tree in candidates
-                ])
+            if not candidates:
+                # 快照只来自活动画布：没有候选时目录写不可能改变快照内容。
+                return _ConfigWriteResult(
+                    prepared=None, graph_batch=None,
+                    prepare=False, publish=False)
+            batch = self.trees.stage_updates([
+                (tree, tree.document_sha256) for tree in candidates
+            ])
+            # 发布门在写锁内决定，与 ``stage_updates`` 读取活动 id 处于同一临界区；
+            # 加锁前发生的 enable 在这里可见，只有活动画布确实在候选里才发布。
+            active_id = self.trees.active_id()
+            active_changed = active_id is not None and any(
+                tree.id == active_id for tree in candidates)
             # 先取指纹再读活动树，保证（树, 指纹）标签一致；图批次提交后读到的是
-            # 本事务写入的新活动画布。没有候选时目录写不可能改变快照内容（快照
-            # 只来自活动画布），因此跳过构造与发布。
+            # 本事务写入的新活动画布。
             return _ConfigWriteResult(
                 prepared=None, graph_batch=batch,
-                prepare=bool(candidates), publish=active_changed)
+                prepare=True, publish=active_changed)
 
         self._commit_locked(write, after_prepare=lambda _conn: audit(self.conn))
         return [tree.id for tree in candidates]

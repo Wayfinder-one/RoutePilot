@@ -9,10 +9,12 @@
 * 缺失的数据库行按字段逐项报告，``database`` 为 ``None``（JSON ``null``）。
 
 密钥纪律：比较只读取白名单里的非密钥字段；``params`` 里的值再经过一次递归脱敏
-（``without_runtime_secret_fields``）与 JSON 安全归一化（``NaN``/``Infinity`` 等
-非 JSON 标量、非 JSON 类型、非字符串对象键都转成可序列化形态），``api_key`` /
-``authorization`` / ``key_present`` / ``key_source`` 永远不会出现在 Issue、params、
-响应或日志中。``key_env`` 是环境变量**名**，不是密钥值，允许出现。
+（与 ``without_runtime_secret_fields`` 相同的固定密钥字段集合）与 JSON 安全
+归一化（``NaN``/``Infinity`` 等非 JSON 标量、非 JSON 类型、非字符串对象键都转成
+可序列化形态），``api_key`` / ``authorization`` / ``key_present`` / ``key_source``
+永远不会出现在 Issue、params、响应或日志中。``key_env`` 是环境变量**名**，不是
+密钥值，允许出现。脱敏与深度收口共用同一次递归，病态深嵌套不会在脱敏副本阶段
+先抛 ``RecursionError``。
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ from collections.abc import Mapping
 
 from router.reasoning import ReasoningError, validate_model_profile
 from router.routing.graph.validate import Issue
-from router.routing.runtime import GraphRuntime, without_runtime_secret_fields
+from router.routing.runtime import GraphRuntime
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, ProviderRepo
 from router.upstream.catalog import parse_profile_text
@@ -73,17 +75,16 @@ def _allowed_field(resource_kind: str, field: str) -> bool:
     return False
 
 
-def _json_safe(value, depth: int = 0):
-    """递归投影成 JSON 安全原语（``allow_nan=False`` 也能序列化）。
+def _safe_value(value, depth: int = 0):
+    """递归脱敏 + JSON 安全化副本：密钥键被剔除，其余值可安全进响应。
 
-    SQLite 里旧模型 ``profile`` 可能来自 ``json.loads`` 的 Python 扩展
-    （``NaN``/``Infinity``/``-Infinity`` 是合法输入），直接放进响应会让
-    FastAPI 的 ``JSONResponse`` 在序列化时抛 ``ValueError`` → ``/admin/try`` 500。
-    这里把非有限浮点转成可读字符串（``"NaN"``/``"Infinity"``/``"-Infinity"``），
-    非 JSON 类型转 ``str()``，并统一对象键为字符串；嵌套过深退化为字符串。
+    脱敏与深度收口在**同一次**递归里完成：``without_runtime_secret_fields``
+    自己会无限递归，若先把整个值脱敏成副本再做 JSON 安全化，病态深嵌套会在
+    建副本时先炸 ``RecursionError``，docstring 承诺的深度上限就形同虚设。超过
+    ``_MAX_SAFE_DEPTH`` 的子树直接退化为固定标记（不用 ``repr``：敌意深嵌套下
+    repr 也可能递归爆栈）。
     """
     if depth > _MAX_SAFE_DEPTH:
-        # 固定标记而不是 str(value)：敌意深嵌套下 repr 也可能递归爆栈。
         return "<nested too deep>"
     if value is None or isinstance(value, (str, bool, int)):
         return value
@@ -95,17 +96,13 @@ def _json_safe(value, depth: int = 0):
         return "Infinity" if value > 0 else "-Infinity"
     if isinstance(value, Mapping):
         return {
-            key if isinstance(key, str) else str(key): _json_safe(item, depth + 1)
+            key if isinstance(key, str) else str(key): _safe_value(item, depth + 1)
             for key, item in value.items()
+            if not (isinstance(key, str) and _is_secret_name(key))
         }
     if isinstance(value, (list, tuple)):
-        return [_json_safe(item, depth + 1) for item in value]
+        return [_safe_value(item, depth + 1) for item in value]
     return str(value)
-
-
-def _safe_value(value):
-    """递归脱敏 + JSON 安全化副本：密钥键被剔除，其余值可安全进响应。"""
-    return _json_safe(without_runtime_secret_fields(value))
 
 
 def mismatch(resource_kind: str, resource_id: str, field: str,

@@ -355,9 +355,14 @@ def post_model(
             "profile": body.profile, "synced_trees": [],
         })
 
+    def recheck(c):
+        # 路由层校验之后、加锁之前 provider 行可能被删；锁内重查，避免落下一个
+        # 数据库里已无对应 provider 的模型（422 与路由层 ``_require_provider`` 一致）。
+        _require_provider(c, provider)
+
     # 新建模型不会影响任何已存画布（画布只引用已存在模型）→ 无候选。
     _catalog_service(request, conn, trees).commit(
-        db_write=db_write, candidates=[], audit=audit)
+        db_write=db_write, candidates=[], audit=audit, recheck=recheck)
     return {"ok": True, "model": _public_model(ModelRepo(conn).get(model_id), provider_row.get("reasoning_format") or "openai")}
 
 
@@ -420,6 +425,10 @@ def put_model(
     def recheck(_conn):
         # 写锁内、事务内、写目录行之前重算影响清单：路由层扫描之后新出现的
         # 画布引用会让确认哈希不匹配 → 409，绝不带着过期名单提交。
+        if provider is not None:
+            # 请求要换到的 provider 可能在路由层校验之后被删除：锁内重查，
+            # 绝不让数据库模型引用一个已不存在的 provider。
+            _require_provider(_conn, provider)
         require_confirmation(
             model_impacts(trees.list(), model_id), body.impact_confirmation,
             resource={"kind": "model", "id": model_id}, replacements=[])
@@ -502,6 +511,12 @@ def delete_model(
         })
 
     def recheck(_conn):
+        # 替代模型可能在路由层校验之后、加锁之前被删除：锁内重查，404 语义与
+        # 路由层一致（``unknown model {id}``），绝不把画布 target 换成一个数据库
+        # 里已不存在的模型。
+        if replacement_id is not None \
+                and ModelRepo(_conn).get(replacement_id) is None:
+            raise MissingError(f"unknown model {replacement_id}")
         require_confirmation(
             model_impacts(trees.list(), model_id),
             body.impact_confirmation if body is not None else None,

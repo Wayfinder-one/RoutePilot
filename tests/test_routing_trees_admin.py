@@ -308,6 +308,10 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     assert copied_tree["name"] == "副本"
     assert copied_tree["enabled"] is False
     assert copied_tree["root"] == saved["root"]
+    # copy 必须保留完整运行快照（不只 id/name/root）：后端/决策服务/窗口/时段
+    # 逐字段相等，副本才能立即通过启用校验并独立运行。
+    for field in ("backends", "jev", "jev_window", "time_periods"):
+        assert copied_tree[field] == saved[field], field
 
     enabled = client.post("/admin/trees/main/enable")
     assert enabled.status_code == 200, enabled.text

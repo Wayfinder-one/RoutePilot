@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 
 import pytest
@@ -22,6 +23,12 @@ from router.routing.graph.model import TargetNode
 from router.routing.tree import tree_from_dict
 from router.store.db import connect
 from router.store.jev_services import JevServiceRepo
+from router.store.repositories import ChangeRepo, ModelRepo, ProviderRepo
+from router.store.routing_trees import (
+    GraphBatch,
+    GraphChangedDuringLoad,
+    GraphStorageError,
+)
 from tests.routing_fixtures import portable_tree_dict, test_settings
 
 ZERO_SHA = "0" * 64
@@ -1063,8 +1070,16 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     changes = _changes(app)
     assert len(changes) == before_audit + 1
     assert changes[-1]["kind"] == "jev"
+    # 更新审计记录变化的非密钥字段与密钥意图枚举（不含密钥值）。
     assert changes[-1]["detail"] == {
         "action": "update", "id": "jev-a", "model": "d1-a-v2",
+        "base_url": "http://jev-a-v2.test",
+        "instructions": instructions,
+        "state_template": state_template,
+        "timeout_seconds": 7.5,
+        "input_tokens": 3072,
+        "context_tokens": 8192,
+        "key_state": "cleared",
         "synced_trees": ["main"],
     }
 
@@ -1269,7 +1284,8 @@ def test_jev_create_update_delete_write_audit_rows(two_canvases):
     assert [change["kind"] for change in new_changes] == ["jev", "jev", "jev"]
     assert [change["detail"] for change in new_changes] == [
         {"action": "create", "id": "jev-c", "model": "d1-c", "synced_trees": []},
-        {"action": "update", "id": "jev-c", "model": "d1-c", "synced_trees": []},
+        {"action": "update", "id": "jev-c", "model": "d1-c",
+         "timeout_seconds": 4.5, "key_state": "preserved", "synced_trees": []},
         {"action": "delete", "id": "jev-c", "replacement": None,
          "synced_trees": []},
     ]
@@ -1395,3 +1411,292 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
     assert _db_row(app, "jev_services", "id", "jev-a") == before_row
     assert _audit_count(app) == before_audit
     assert app.state.snapshot.snapshot_revision == before_revision
+
+
+# --------------------------------------------------------------------------- #
+# 16. 发布门必须在写锁内决定 + 纯数据库写不读活动指针
+# --------------------------------------------------------------------------- #
+def test_enable_racing_lock_acquisition_still_publishes_newly_active_canvas(
+        two_canvases, monkeypatch):
+    """加锁前落地一笔 enable：确认写必须发布刚被启用的画布。
+
+    旧实现在 ``publisher.locked()`` 之前用旧 ``active_id`` 算好发布门；若该次
+    enable 让「唯一受影响画布」变成活动画布，批次会写入生效配置却跳过发布，内存
+    快照要等 ≤2s 的 reloader 才追上。修复后在锁内重读活动 id。
+    """
+    app, client = two_canvases
+    publisher = app.state.publisher
+    real_locked = publisher.locked
+    enabled = {"done": False}
+
+    @contextmanager
+    def racing_locked():
+        # 候选已在路由层构造完（只含 other）；这里在拿到写锁之前完成 enable。
+        if not enabled["done"]:
+            enabled["done"] = True
+            app.state.graph_repo.enable("other")
+        with real_locked():
+            yield publisher
+
+    monkeypatch.setattr(publisher, "locked", racing_locked)
+
+    preview = client.put("/admin/models/backup", json={"upstream": "raced-upstream"})
+    assert preview.status_code == 409, preview.text
+    assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
+        "other"]
+    before_revision = app.state.snapshot.snapshot_revision
+
+    response = client.put("/admin/models/backup", json={
+        "upstream": "raced-upstream",
+        "impact_confirmation": confirmation_from(preview),
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["synced_trees"] == ["other"]
+    # 新的活动画布已被写入：发布门必须发布它，而不是停留在旧的 main。
+    assert app.state.snapshot.tree_id == "other"
+    assert app.state.snapshot.snapshot_revision != before_revision
+    assert app.state.snapshot.backends["backup"].upstream_name == "raced-upstream"
+    assert app.state.publisher.status()["document_sha256"] == \
+        app.state.graph_repo.fingerprint()[1]
+    assert _tree(app, "other").enabled is True
+
+
+def test_db_only_write_does_not_read_corrupt_active_pointer(two_canvases):
+    """与图无关的纯数据库写不得因为损坏的 ``current`` 指针变成 503。"""
+    app, client = two_canvases
+    app.state.graph_repo.current.write_text("bad id!\n", encoding="utf-8")
+    before_audit = _audit_count(app)
+
+    response = client.post("/admin/models", json={
+        "id": "graph-irrelevant", "upstream": "irrelevant", "provider": "local"})
+
+    assert response.status_code == 201, response.text
+    assert _db_row(app, "models", "id", "graph-irrelevant") is not None
+    assert _audit_count(app) == before_audit + 1
+
+
+# --------------------------------------------------------------------------- #
+# 17. 锁内重查被引用的目录行：路由层校验后、加锁前被删除 → 专用错误 + 零写入
+# --------------------------------------------------------------------------- #
+def _db_action(app, action):
+    """用独立连接执行「并发请求」的写操作。"""
+    conn = connect(app.state.settings.db_path)
+    try:
+        action(conn)
+    finally:
+        conn.close()
+
+
+def _race_before_lock(app, monkeypatch, action):
+    """在确认写的写锁获得之前执行一次副作用，模拟路由层校验与加锁之间的并发写。"""
+    publisher = app.state.publisher
+    real_locked = publisher.locked
+    done = {"value": False}
+
+    @contextmanager
+    def racing_locked():
+        if not done["value"]:
+            done["value"] = True
+            action()
+        with real_locked():
+            yield publisher
+
+    monkeypatch.setattr(publisher, "locked", racing_locked)
+    return done
+
+
+def test_model_create_rechecks_provider_under_lock(two_canvases, monkeypatch):
+    app, client = two_canvases
+    assert client.put("/admin/providers/race-prov", json={
+        "base_url": "http://race-prov.test/v1"}).status_code == 200
+    before = _canvas_state(app, ("main", "other"))
+    before_audit = _audit_count(app)
+    _race_before_lock(app, monkeypatch, lambda: _db_action(
+        app, lambda conn: ProviderRepo(conn).delete("race-prov")))
+
+    response = client.post("/admin/models", json={
+        "id": "race-model", "upstream": "race-upstream", "provider": "race-prov"})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == "unknown provider race-prov"
+    assert _db_row(app, "models", "id", "race-model") is None
+    assert _audit_count(app) == before_audit
+    assert _canvas_state(app, ("main", "other")) == before
+
+
+def test_model_update_rechecks_new_provider_under_lock(two_canvases, monkeypatch):
+    app, client = two_canvases
+    assert client.put("/admin/providers/race-prov", json={
+        "base_url": "http://race-prov.test/v1"}).status_code == 200
+    before_canvas = _canvas_bytes(app, "main")
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    preview = client.put("/admin/models/fast", json={"provider": "race-prov"})
+    confirmation = confirmation_from(preview)
+    _race_before_lock(app, monkeypatch, lambda: _db_action(
+        app, lambda conn: ProviderRepo(conn).delete("race-prov")))
+
+    response = client.put("/admin/models/fast", json={
+        "provider": "race-prov", "impact_confirmation": confirmation})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == "unknown provider race-prov"
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _canvas_bytes(app, "main") == before_canvas
+    assert _audit_count(app) == before_audit
+
+
+def test_delete_model_rechecks_replacement_under_lock(two_canvases, monkeypatch):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_audit = _audit_count(app)
+    preview = client.delete("/admin/models/fast")
+    confirmation = confirmation_from(preview)
+    _race_before_lock(app, monkeypatch, lambda: _db_action(
+        app, lambda conn: ModelRepo(conn).delete("qwen3-32b")))
+
+    response = client.request("DELETE", "/admin/models/fast", json={
+        "replacement_model_id": "qwen3-32b",
+        "impact_confirmation": confirmation,
+    })
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "unknown model qwen3-32b"
+    assert _db_row(app, "models", "id", "fast") is not None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit
+
+
+def test_delete_jev_rechecks_replacement_under_lock(two_canvases, monkeypatch):
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_audit = _audit_count(app)
+    preview = client.request("DELETE", "/admin/jev/jev-a", json={})
+    confirmation = confirmation_from(preview)
+    _race_before_lock(app, monkeypatch, lambda: _db_action(
+        app, lambda conn: JevServiceRepo(conn).delete("jev-b")))
+
+    response = client.request("DELETE", "/admin/jev/jev-a", json={
+        "replacement_jev_id": "jev-b",
+        "impact_confirmation": confirmation,
+    })
+
+    assert response.status_code == 404, response.text
+    assert response.json()["detail"] == "unknown jev service jev-b"
+    assert _db_row(app, "jev_services", "id", "jev-a") is not None
+    assert _db_row(app, "jev_services", "id", "jev-b") is None
+    assert _canvas_state(app, ("main", "other")) == before
+    assert _audit_count(app) == before_audit
+
+
+# --------------------------------------------------------------------------- #
+# 18. 确认同步的提交后原子性：图批次 commit 之后的失败仍整体回滚
+# --------------------------------------------------------------------------- #
+def test_failure_after_graph_commit_restores_files_db_audit_and_snapshot(
+        two_canvases, monkeypatch):
+    """图批次 commit 之后的快照构造/指纹复核失败：文件恢复、数据库回滚、不发布。"""
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    publisher = app.state.publisher
+    real_publish = publisher.publish
+    published = []
+    monkeypatch.setattr(
+        publisher, "publish",
+        lambda prepared: published.append(prepared) or real_publish(prepared))
+
+    def fail_after_commit(self, _prepared):
+        raise GraphChangedDuringLoad(
+            "graph changed between document write and snapshot publish")
+
+    monkeypatch.setattr(ConfigurationService, "_recheck_fingerprint", fail_after_commit)
+
+    response = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "graph_storage_error"
+    assert published == []
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _canvas_state(app, ("main", "other")) == before
+
+
+def test_audit_failure_inside_transaction_rolls_back_everything(
+        two_canvases, monkeypatch):
+    """事务内审计失败：候选文件恢复、数据库行回滚、快照不发布。"""
+    app, client = two_canvases
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_revision = app.state.snapshot.snapshot_revision
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    def failing_record(self, ts, kind, detail):
+        raise RuntimeError(f"injected audit failure for {kind}")
+    monkeypatch.setattr(ChangeRepo, "record", failing_record)
+    publisher = app.state.publisher
+    real_publish = publisher.publish
+    published = []
+    monkeypatch.setattr(
+        publisher, "publish",
+        lambda prepared: published.append(prepared) or real_publish(prepared))
+
+    failing_client = TestClient(app, raise_server_exceptions=False)
+    response = failing_client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert response.status_code == 500, response.text
+    assert published == []
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _canvas_state(app, ("main", "other")) == before
+
+
+def test_rollback_failure_returns_503_and_refreshes_after_db_rollback(
+        two_canvases, monkeypatch):
+    """图文件回滚失败：503，且 ``publisher.refresh`` 必须在数据库 ROLLBACK 之后。"""
+    app, client = two_canvases
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    def fail_after_commit(self, _prepared):
+        raise GraphChangedDuringLoad(
+            "graph changed between document write and snapshot publish")
+    monkeypatch.setattr(ConfigurationService, "_recheck_fingerprint", fail_after_commit)
+
+    def failing_rollback(self):
+        raise GraphStorageError("injected graph rollback failure")
+    monkeypatch.setattr(GraphBatch, "rollback", failing_rollback)
+
+    publisher = app.state.publisher
+    real_refresh = publisher.refresh
+    seen = []
+
+    def spy_refresh(conn):
+        # 事务内的刷新会看到未提交的数据库状态；修复要求先把 ROLLBACK 做完。
+        seen.append(conn.in_transaction)
+        return real_refresh(conn)
+
+    monkeypatch.setattr(publisher, "refresh", spy_refresh)
+
+    response = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "graph_storage_error"
+    assert seen == [False]
+    # 数据库仍整体回滚；审计行不存在。文件回滚失败正是本夹具的注入点。
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
