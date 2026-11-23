@@ -6,7 +6,8 @@
 
 严格自包含画布语义：数据库目录保存本身只写目录行 + 审计，不再无差别重写任何
 画布 JSON。画布运行快照只在新建/导入/显式刷新/确认影响清单后生成（由后续单元
-的确认同步实现）。旧图/无活动图的数据库回退装配仍保留在快照构造路径里。
+的确认同步实现）。活动图校验也只读画布自身的内嵌运行配置，因此目录写永远不会
+因为「数据库与画布不一致」而被拒绝。
 
 服务层异常 → HTTP 的映射关系（routes_* 统一处理）：
 - ``ValidationFailed`` → 422（Issue 数组）
@@ -25,8 +26,7 @@ from router.control.errors import (
     ReferencedByError,
     ValidationFailed,
 )
-from router.control.validation import build_enable_context
-from router.routing.graph.validate import validate_graph_for_enable
+from router.control.validation import tree_issues
 from router.routing.snapshot import PreparedSnapshot
 from router.store.repositories import (
     ChangeRepo,
@@ -49,7 +49,7 @@ class _ConfigWriteResult:
 
     ``prepared`` 允许为 ``None``：配置写回调只负责校验、审计与暂存图批次，
     提交图文件与构造候选快照都在 ``_write_and_publish()`` 里完成。
-    目录写不再暂存图批次（``graph_batch`` 恒为 ``None``），字段仅为过渡骨架保留。
+    目录写不暂存图批次（``graph_batch`` 恒为 ``None``）：画布只由显式同步更新。
     """
 
     prepared: PreparedSnapshot | None
@@ -104,15 +104,15 @@ class ConfigurationService:
 
     # ── 配置写路径的校验 ────────────────────────────────────────────────
     def _require_valid_active_graph(self) -> None:
-        """用「本事务即将提交」的数据库配置校验活动图。
+        """用画布自身的内嵌运行配置校验活动图。
 
-        只读数据库行构造宽松上下文，不得在校验前写图文件：校验失败时数据库回滚，
-        磁盘不应残留半份新配置；旧库的非法历史声明也不能在这里抛 500。
+        数据库目录不参与启用判断：目录行与画布不一致只影响检查提示，不会让
+        目录写失败。校验失败时数据库回滚，磁盘不应残留半份新配置。
         """
         tree = self.trees.active()
         if tree is None:
             return
-        issues = validate_graph_for_enable(tree, build_enable_context(self.conn))
+        issues = tree_issues(self.conn, tree)
         if issues:
             raise ValidationFailed(issues)
 

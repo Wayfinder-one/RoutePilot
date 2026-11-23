@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.routing.document import graph_document_bytes
+from router.routing.snapshot import build_snapshot_for_tree
 from router.store.db import connect, migrate
 from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
@@ -376,39 +377,29 @@ def test_nested_profile_secrets_are_rejected_and_never_exported(json_only):
     assert "review-secret" not in updated.text
     assert (repo.graphs / "portable.json").read_bytes() == before["portable.json"]
 
-    # 旧库物化：数据库 profile 带嵌套密钥 → 保存/启用物化拒绝，密钥不迁移进 JSON。
+    for path in repo.graphs.glob("*.json"):
+        assert "review-secret" not in path.read_text(encoding="utf-8"), path.name
+    assert ENV_SECRET not in app.state.snapshot.content
+
+
+def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
+    """已保存画布的快照是唯一运行事实源：目录行怎么改都不改变它。"""
+    app, _client, settings, _calls = json_only
+    before = app.state.snapshot.content
+    tree = app.state.graph_repo.active()
     conn = connect(settings.db_path)
     try:
         with conn:
             conn.execute(
                 "INSERT INTO providers (name, base_url, key_env, reasoning_format, api_key) "
-                "VALUES ('legacy', 'http://legacy.test/v1', '', 'openai', '')")
+                "VALUES ('other', 'http://other.test/v1', '', 'openai', '')")
             conn.execute(
                 "INSERT INTO models (id, upstream, provider, profile) "
-                "VALUES ('legacy-model', 'legacy-upstream', 'legacy', ?)",
-                (json.dumps({"metadata": {"api_key": "review-secret"}}),))
+                "VALUES ('changed', 'changed', 'other', '{}')")
+            conn.execute(
+                "UPDATE jev_services SET base_url = 'http://db-changed.test'")
+        after = build_snapshot_for_tree(conn, tree)
     finally:
         conn.close()
-    # 无活动图时物化才走数据库回退（活动图有内嵌配置时优先继承活动图）。
-    assert client.post("/admin/trees/portable/disable").status_code == 200
-    legacy_root = {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "target", "type": "target", "priority": 1,
-             "models": [{"model": "legacy-model", "reasoning": None}]},
-        ],
-        "edges": [{"id": "e-start-target", "source": "start", "source_port": "out",
-                   "target": "target", "target_port": "in_1", "condition": None}],
-        "error_fallback": "target",
-    }
-    materialized = client.post("/admin/trees", json={
-        "id": "legacy-materialized", "name": "旧库物化", "root": legacy_root})
-    assert materialized.status_code == 422, materialized.text
-    assert "secret field is not allowed" in materialized.text
-    assert "review-secret" not in materialized.text
-    assert not (repo.graphs / "legacy-materialized.json").exists()
-
-    for path in repo.graphs.glob("*.json"):
-        assert "review-secret" not in path.read_text(encoding="utf-8"), path.name
-    assert ENV_SECRET not in app.state.snapshot.content
+    assert after.content == before
+    assert app.state.snapshot.content == before

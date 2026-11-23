@@ -5,11 +5,8 @@ import math
 import re
 from dataclasses import dataclass
 
-from router.jev.config import (
-    DEFAULT_INSTRUCTIONS,
-    DEFAULT_STATE_TEMPLATE,
-    JevSettings,
-)
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
+from router.jev.service import JevService
 from router.jev.window import JevWindow
 from router.reasoning import FORMAT_IDS, validate_model_profile
 from router.routing.codec import reject_unknown_fields
@@ -29,7 +26,7 @@ class BackendCatalog:
 @dataclass(frozen=True)
 class GraphRuntime:
     backends: BackendCatalog
-    jev: JevSettings | None
+    jev: JevService | None
     jev_input_tokens: int
     jev_context_tokens: int
     time_periods: tuple[TimePeriod, ...]
@@ -185,21 +182,27 @@ def _models(raw, providers: tuple[dict, ...]) -> tuple[dict, ...]:
     return tuple(models)
 
 
-def _jev(raw) -> JevSettings | None:
+def _jev(raw, window: JevWindow) -> JevService | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise ValueError("jev must be an object or null")
     reject_unknown_fields(
         "jev", raw,
-        {"base_url", "model", "timeout_seconds", "instructions", "state_template"})
-    return JevSettings(
+        {"id", "base_url", "model", "key_env", "timeout_seconds",
+         "instructions", "state_template"})
+    if "id" not in raw:
+        raise ValueError("jev.id is required")
+    return JevService(
+        id=raw["id"],
         base_url=raw.get("base_url"),
         model=raw.get("model"),
-        api_key="",
+        key_env=raw.get("key_env", ""),
         timeout_seconds=raw.get("timeout_seconds", 10.0),
         instructions=raw.get("instructions", DEFAULT_INSTRUCTIONS),
         state_template=raw.get("state_template", DEFAULT_STATE_TEMPLATE),
+        input_tokens=window.input_tokens,
+        context_tokens=window.context_tokens,
     )
 
 
@@ -237,7 +240,7 @@ def runtime_from_dict(raw: dict) -> GraphRuntime:
             providers=providers,
             models=_models(backends.get("models"), providers),
         ),
-        jev=_jev(raw["jev"]),
+        jev=_jev(raw["jev"], window),
         jev_input_tokens=window.input_tokens,
         jev_context_tokens=window.context_tokens,
         time_periods=_periods(raw["time_periods"]),
@@ -250,7 +253,7 @@ def runtime_to_dict(runtime: GraphRuntime) -> dict:
             "providers": copy.deepcopy(list(runtime.backends.providers)),
             "models": copy.deepcopy(list(runtime.backends.models)),
         },
-        "jev": runtime.jev.behavior_dict() if runtime.jev is not None else None,
+        "jev": runtime.jev.snapshot_dict() if runtime.jev is not None else None,
         "jev_window": {
             "input_tokens": runtime.jev_input_tokens,
             "context_tokens": runtime.jev_context_tokens,

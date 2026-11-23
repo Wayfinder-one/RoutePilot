@@ -1,9 +1,9 @@
-"""JEV 输入窗口：token 估算/截断、过渡回退读取、发布骨架指纹复核、路由引擎截断。
+"""JEV 输入窗口：token 估算/截断、发布骨架指纹复核、路由引擎截断。
 
 窗口现在是 JEV 服务目录行的一部分（``input_tokens``/``context_tokens``），旧独立
-窗口端点已删除；目录语义（多服务各自窗口、校验边界）由
-``tests/test_jev_admin.py`` 与 ``tests/test_jev_services.py`` 覆盖。本文件保留纯
-窗口逻辑与发布骨架（``_write_and_publish`` 指纹复核）的回归。
+窗口端点与旧图/无活动图的数据库回退读取都已删除；目录语义（多服务各自窗口、
+校验边界）由 ``tests/test_jev_admin.py`` 与 ``tests/test_jev_services.py`` 覆盖。
+本文件保留纯窗口逻辑与发布骨架（``_write_and_publish`` 指纹复核）的回归。
 """
 import asyncio
 from contextlib import contextmanager
@@ -16,19 +16,16 @@ from router.jev.client import ChoiceAnswer
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
-    DEFAULT_INPUT_TOKENS,
-    MIN_CONTEXT_TOKENS,
     MIN_INPUT_TOKENS,
     apply_window,
     estimate_tokens,
 )
 from router.routing.graph.compiled import compile_graph
 from router.routing.graph.evaluator import GraphEvaluator
-from router.routing.snapshot import build_snapshot, read_jev_window
+from router.routing.snapshot import build_snapshot
 from router.routing.tree import tree_from_dict
 from router.routing.types import RoutingRequest
 from router.store.db import connect, migrate
-from router.store.repositories import SettingsRepo
 from router.store.routing_trees import GraphChangedDuringLoad
 from router.upstream.catalog import Backend
 from tests.routing_fixtures import tree_dict
@@ -72,52 +69,6 @@ def test_apply_window_floors_below_minimum_budget():
     result = apply_window(text, 10)
     assert result.truncated is True
     assert result.tokens_after <= MIN_INPUT_TOKENS
-
-
-# ── 过渡性回退读取（旧图/无活动图） ──────────────────────────────────
-
-def _db(tmp_path):
-    path = str(tmp_path / "win.db")
-    conn = connect(path)
-    migrate(conn)
-    return conn
-
-
-def test_read_jev_window_defaults_and_overrides(tmp_path):
-    conn = _db(tmp_path)
-    try:
-        assert read_jev_window(conn) == (DEFAULT_INPUT_TOKENS, DEFAULT_CONTEXT_TOKENS)
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "8192")
-        repo.set("jev_input_tokens", "2048")
-        conn.commit()
-        assert read_jev_window(conn) == (2048, 8192)
-        repo.set("jev_input_tokens", "99999")       # 超过 context -> 收口
-        conn.commit()
-        assert read_jev_window(conn) == (8192, 8192)
-        repo.set("jev_context_tokens", "not-a-number")  # 非法 -> 回默认；input 收口到默认 context
-        conn.commit()
-        assert read_jev_window(conn) == (DEFAULT_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS)
-        repo.set("jev_context_tokens", "256")           # 低于上下限 -> 收口到 512
-        repo.set("jev_input_tokens", "256")
-        conn.commit()
-        assert read_jev_window(conn) == (MIN_INPUT_TOKENS, MIN_CONTEXT_TOKENS)
-    finally:
-        conn.close()
-
-
-def test_read_jev_window_ignores_garbage(tmp_path):
-    conn = _db(tmp_path)
-    try:
-        repo = SettingsRepo(conn)
-        repo.set("jev_context_tokens", "abc")
-        repo.set("jev_input_tokens", "-5")
-        conn.commit()
-        input_tokens, context_tokens = read_jev_window(conn)
-        assert context_tokens == DEFAULT_CONTEXT_TOKENS
-        assert input_tokens == MIN_INPUT_TOKENS
-    finally:
-        conn.close()
 
 
 # ── 发布前指纹复核（共享骨架，目录写不再涉及图批次）────────────────────

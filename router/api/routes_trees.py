@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import replace
 from datetime import datetime
 from typing import Any
 
@@ -21,7 +20,7 @@ from router.api.deps import get_conn, get_tree_repo
 from router.api.trace_presenter import present_trace
 from router.control.graphs import GraphPatch, GraphService, graph_parse_failed
 from router.api.issue_presenter import issues_payload
-from router.control.runtime import effective_runtime, runtime_for_tree, snapshot_parts
+from router.control.runtime import snapshot_parts
 from router.control.validation import tree_issues
 from router.jev.serialization import answer_to_dict
 from router.routing.graph.compiled import compile_graph
@@ -85,9 +84,9 @@ class TreeUpsertIn(BaseModel):
     mismatch）；POST 的 null 语义同样维持 base（如 id=null 生成新 id）。路由用
     ``model_fields_set`` 区分字段缺失与显式 null。
 
-    ``runtime`` 不是文件字段，而是写用例的控制字段：只允许显式 null，表示
-    「丢弃当前图内嵌配置，再由服务端按活动图/数据库物化」。非 null 值或与四个
-    扁平 runtime 字段同时出现都拒绝，避免出现两套来源互相覆盖。"""
+    四个扁平运行字段``backends`` / ``jev`` / ``jev_window`` / ``time_periods``
+    是画布快照的一部分，必须成组出现；不存在运行配置控制字段，也不存在服务端
+    按数据库补齐运行配置的兼容路径。"""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -101,7 +100,6 @@ class TreeUpsertIn(BaseModel):
     jev: Any = None
     jev_window: Any = None
     time_periods: Any = None
-    runtime: Any = None
     base_document_sha256: Any = None
 
 
@@ -139,14 +137,13 @@ def get_trees(request: Request, trees: RoutingTreeRepo = Depends(get_tree_repo))
     return _trees_payload(request, trees)
 
 
-def _validate_runtime_control(body: TreeUpsertIn) -> None:
-    """`runtime` 只能是显式 null，且不能与四个扁平 runtime 字段同时出现。"""
-    if "runtime" not in body.model_fields_set:
-        return
-    if body.runtime is not None:
-        raise HTTPException(422, detail="runtime must be null; use the four runtime fields")
-    if body.model_fields_set & RUNTIME_FIELDS:
-        raise HTTPException(422, detail="runtime cannot accompany runtime fields")
+def _runtime_payload(body: "TreeUpsertIn | TryIn", fields: set[str]) -> dict:
+    """从 DTO 里挑出显式给出的四个扁平运行字段（缺失字段不参与合并）。"""
+    return {
+        field: getattr(body, field)
+        for field in RUNTIME_FIELDS
+        if field in fields
+    }
 
 
 @router.post("/trees", status_code=201)
@@ -162,13 +159,7 @@ def create_tree(
     }
     if "timezone" in body.model_fields_set:
         payload["timezone"] = body.timezone
-    runtime_fields = body.model_fields_set & RUNTIME_FIELDS
-    _validate_runtime_control(body)
-    if runtime_fields:
-        payload.update({
-            field: getattr(body, field)
-            for field in runtime_fields
-        })
+    payload.update(_runtime_payload(body, body.model_fields_set))
     tree = _parse_tree(payload)
     created = _service(request, conn, trees).create(tree)
     return {"tree": tree_to_dict(created), "snapshot_revision": _published_revision(request)}
@@ -202,15 +193,7 @@ def update_tree(
     for field in ("root", "canvas", "sticky", "timezone"):
         if field in fields:
             changes[field] = getattr(body, field)
-    runtime_fields = fields & RUNTIME_FIELDS
-    _validate_runtime_control(body)
-    if "runtime" in fields:
-        changes["runtime"] = None
-    elif runtime_fields:
-        changes["runtime"] = {
-            field: getattr(body, field)
-            for field in runtime_fields
-        }
+    changes.update(_runtime_payload(body, fields))
     updated = _service(request, conn, trees).update(
         tree_id, GraphPatch(**changes), base_document_sha256=body.base_document_sha256)
     return {
@@ -257,6 +240,10 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
 
     显式 null 与缺失不同（base dict 语义）：timezone null 原样交给图解析 → 422，
     sticky null 重置为默认粘性配置。
+
+    运行配置只有两个来源：草稿显式携带的完整四字段，或已存画布的快照。缺任何一个
+    运行字段都拒绝（部分字段绝不从数据库补齐）；既没有 tree_id 也没有完整运行
+    字段的 root-only 草稿同样拒绝。
     """
     root = body.root
     if root is None and stored is None:
@@ -283,8 +270,10 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
     }
     runtime_fields = fields & RUNTIME_FIELDS
     if runtime_fields:
-        payload.update({field: getattr(body, field) for field in runtime_fields})
-    elif stored is not None and stored.runtime is not None:
+        payload.update({
+            field: getattr(body, field) for field in runtime_fields
+        })
+    elif stored is not None:
         payload.update(runtime_to_dict(stored.runtime))
     try:
         return tree_from_dict(payload)
@@ -293,11 +282,10 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
 
 
 def _try_snapshot(conn: sqlite3.Connection, tree: RoutingTree):
-    """草稿快照：与线上 snapshot 使用同一运行配置，但不替换 app.state.snapshot。"""
-    runtime = runtime_for_tree(conn, tree)
+    """草稿快照：运行配置完全来自草稿 envelope / 已存画布，不读数据库目录。"""
     return build_snapshot(
         tree=tree,
-        **snapshot_parts(conn, runtime),
+        **snapshot_parts(conn, tree.runtime),
         compiled=compile_graph(tree.root),
     )
 
@@ -335,8 +323,6 @@ async def try_tree(
             raise HTTPException(422, detail="try tree_id must be a nonempty string")
         stored = _tree_or_404(trees, tree_id)
     tree = draft_tree(body, stored)
-    if tree.runtime is None:
-        tree = replace(tree, runtime=effective_runtime(conn, trees))
     text = body.text
     if not isinstance(text, str):
         raise HTTPException(422, detail="try text must be a string")

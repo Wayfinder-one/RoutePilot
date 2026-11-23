@@ -22,12 +22,11 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
 from router.control.errors import AlreadyExists, MissingError, ValidationFailed
-from router.control.runtime import runtime_from_db
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue, validate_graph_structure
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
-from router.routing.runtime import runtime_to_dict
+from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict
 from router.store.repositories import ChangeRepo, now_iso
 from router.store.routing_trees import (
@@ -67,8 +66,8 @@ class GraphPatch:
     失败 → 422 Issue，sticky → 默认粘性配置。name 的显式 null 由路由折算成 ""
     （清空名称），与 base 的 ``_clean_name(None)`` 一致。
 
-    ``runtime`` 的显式 null 表示「不继承当前图内嵌配置」：随后由 ``_materialize``
-    按活动图/数据库物化；``UNSET`` 才继承已存图；完整四字段对象为普通覆盖。
+    四个扁平运行字段同样是补丁字段：缺失继承已存画布的运行配置，显式值覆盖。
+    不存在任何运行配置控制字段或「按数据库物化」中间契约。
     """
 
     name: str | None | _Unset = UNSET
@@ -76,7 +75,10 @@ class GraphPatch:
     canvas: dict | None | _Unset = UNSET
     sticky: dict | None | _Unset = UNSET
     timezone: str | None | _Unset = UNSET
-    runtime: dict | None | _Unset = UNSET
+    backends: dict | None | _Unset = UNSET
+    jev: dict | None | _Unset = UNSET
+    jev_window: dict | None | _Unset = UNSET
+    time_periods: list | None | _Unset = UNSET
 
 
 class GraphService:
@@ -91,7 +93,6 @@ class GraphService:
         if issues:
             raise ValidationFailed(issues)
         with self.publisher.locked():
-            tree = self._materialize(tree)
             try:
                 created = self.trees.create(tree)
             except GraphAlreadyExistsError:
@@ -106,7 +107,6 @@ class GraphService:
             if current is None:
                 raise MissingError(f"unknown tree {tree_id}")
             tree = self._envelope(current, patch)
-            tree = self._materialize(tree)
             if not isinstance(base_document_sha256, str) \
                     or not _SHA256_RE.fullmatch(base_document_sha256):
                 raise GraphConflictError(current.document_sha256)
@@ -146,14 +146,9 @@ class GraphService:
             tree = self.trees.get(tree_id)
             if tree is None:
                 raise MissingError(f"unknown tree {tree_id}")
-            materialized = tree.runtime is None
-            tree = self._materialize(tree)
             issues = tree_issues(self.conn, tree)
             if issues:
                 raise ValidationFailed(issues)
-            if materialized:
-                tree = self.trees.update(
-                    tree, base_document_sha256=tree.document_sha256)
             enabled_tree = dataclass_replace(tree, enabled=True)
             candidate = self.publisher.prepare(
                 self.conn, enabled_tree, (tree.id, tree.document_sha256))
@@ -179,31 +174,20 @@ class GraphService:
             self._audit("disable", {"id": tree_id})
 
     # ── 内部 ────────────────────────────────────────────────────────────
-    def _materialize(self, tree: RoutingTree) -> RoutingTree:
-        if tree.runtime is not None:
-            return tree
-        active = self.trees.active()
-        runtime = active.runtime if active is not None and active.runtime is not None else None
-        if runtime is not None:
-            return dataclass_replace(tree, runtime=runtime)
-        try:
-            return dataclass_replace(tree, runtime=runtime_from_db(self.conn))
-        except ValueError as exc:
-            # 旧库里的非法历史声明（含密钥）不得在物化时被写进 JSON：宽松读取
-            # 只保护已有旧图的启动，不允许把非法值迁移成新文件。
-            raise ValidationFailed(graph_parse_failed(exc)) from exc
-
     @staticmethod
     def _envelope(current: RoutingTree, patch: GraphPatch) -> RoutingTree:
         """enabled 是外部状态：持久化 envelope 与 current 一致（启停走专用端点）。
 
         patch 缺失（``UNSET``）的字段继承 current；显式 null 原样交给
         ``tree_from_dict``，恢复 base 对 root/timezone/sticky 的 null 语义。
+        四个运行字段同样按补丁合并：缺失 = 继承已存画布运行配置，显式值 = 覆盖
+        （显式 null 交给解析器按字段语义拒绝）。
         """
         if patch.canvas is UNSET:
             canvas = None if patch.root is not UNSET else canvas_to_dict(current.root)
         else:
             canvas = patch.canvas
+        stored_runtime = runtime_to_dict(current.runtime)
         payload = {
             "id": current.id,
             "name": current.name if patch.name is UNSET else patch.name,
@@ -215,13 +199,9 @@ class GraphService:
                        if patch.sticky is UNSET else patch.sticky),
             "timezone": current.timezone if patch.timezone is UNSET else patch.timezone,
         }
-        if patch.runtime is None:
-            # 显式 null：丢弃当前图内嵌配置，交给 _materialize 重新物化。
-            pass
-        elif patch.runtime is not UNSET:
-            payload.update(patch.runtime)
-        elif current.runtime is not None:
-            payload.update(runtime_to_dict(current.runtime))
+        for field in RUNTIME_FIELDS:
+            payload[field] = stored_runtime[field] if getattr(patch, field) is UNSET \
+                else getattr(patch, field)
         try:
             return tree_from_dict(payload)
         except ValueError as exc:

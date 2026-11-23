@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -12,18 +11,12 @@ from typing import Mapping
 
 from router.control.runtime import (
     enable_context_for_runtime,
-    first_jev_settings,
-    resolve_jev_settings,
     snapshot_parts,
 )
-from router.control.validation import build_enable_context
 from router.jev.config import JevSettings
 from router.jev.window import (
     DEFAULT_CONTEXT_TOKENS,
     DEFAULT_INPUT_TOKENS,
-    MAX_TOKENS,
-    MIN_CONTEXT_TOKENS,
-    MIN_INPUT_TOKENS,
 )
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import CompiledGraph, compile_graph
@@ -31,9 +24,8 @@ from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
 from router.routing.types import RoutingMiss
-from router.store.repositories import ModelRepo, SettingsRepo, TimePeriodRepo
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
-from router.upstream.catalog import Backend, load_backends
+from router.upstream.catalog import Backend
 
 
 @dataclass(frozen=True)
@@ -68,23 +60,6 @@ class RoutingSnapshot:
                 "snapshot has no compiled graph; build it with compile_graph(root)"
             )
         return self.compiled
-
-
-def model_capability(row: dict) -> str:
-    """models 行 → capability 文本（profile.capability，缺省空串）。
-
-    公开入口：启动快照、草稿试算快照共用同一读取规则（原私有名 `_capability`）。
-    """
-    profile = row.get("profile")
-    if isinstance(profile, str):
-        try:
-            profile = json.loads(profile)
-        except ValueError:
-            return ""
-    if not isinstance(profile, dict):
-        return ""
-    value = profile.get("capability")
-    return value.strip() if isinstance(value, str) else ""
 
 
 def _snapshot_backend(backend: Backend) -> Backend:
@@ -160,64 +135,30 @@ def build_snapshot(
     )
 
 
-def _int_setting(repo: SettingsRepo, key: str, default: int, minimum: int, maximum: int) -> int:
-    raw = repo.get(key)
-    if raw is None:
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, min(maximum, value))
-
-
-def read_jev_window(conn) -> tuple[int, int]:
-    """返回 (input_tokens, context_tokens)；缺省/非法值回落到默认值。"""
-    repo = SettingsRepo(conn)
-    context_tokens = _int_setting(repo, "jev_context_tokens", DEFAULT_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, MAX_TOKENS)
-    input_tokens = _int_setting(repo, "jev_input_tokens", DEFAULT_INPUT_TOKENS, MIN_INPUT_TOKENS, context_tokens)
-    if input_tokens > context_tokens:
-        input_tokens = context_tokens
-    return input_tokens, context_tokens
-
-
 def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
-    """活动树快照：内嵌运行配置优先，旧图/无活动图回退数据库装配。
+    """活动画布快照：唯一来源是画布内嵌运行配置。
 
-    两条路径的校验上下文严格分开：只有 ``tree.runtime is not None`` 才使用
-    图内配置；旧图继续使用宽松的数据库上下文，避免旧库非法历史声明阻断启动。
+    - ``tree is None``：空 Auto 快照（无活动画布时没有隐式数据库装配）。
+    - ``tree is not None``：用画布自身运行配置做启用校验 → 编译 → 装配快照。
+      数据库只用于解析已存密钥；目录行与画布不一致不改变快照内容。
     """
-    compiled = None
-    if tree is not None and tree.runtime is not None:
-        issues = validate_graph_for_enable(
-            tree, enable_context_for_runtime(tree.runtime))
-        if issues:
-            codes = ",".join(sorted({issue.code for issue in issues}))
-            raise GraphStorageError(f"invalid active graph: {codes}")
-        # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
-        compiled = compile_graph(tree.root)
+    if tree is None:
         return build_snapshot(
-            tree=tree,
-            **snapshot_parts(conn, tree.runtime),
-            compiled=compiled,
+            tree=None,
+            backends={},
+            time_periods=[],
+            jev=None,
+            capabilities={},
         )
-
-    # ── 旧图（无内嵌运行配置）与无活动图：沿用原数据库装配路径 ──────────
-    if tree is not None:
-        issues = validate_graph_for_enable(tree, build_enable_context(conn))
-        if issues:
-            codes = ",".join(sorted({issue.code for issue in issues}))
-            raise GraphStorageError(f"invalid active graph: {codes}")
-        compiled = compile_graph(tree.root)
-    input_tokens, context_tokens = read_jev_window(conn)
+    issues = validate_graph_for_enable(tree, enable_context_for_runtime(tree.runtime))
+    if issues:
+        codes = ",".join(sorted({issue.code for issue in issues}))
+        raise GraphStorageError(f"invalid active graph: {codes}")
+    # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
+    compiled = compile_graph(tree.root)
     return build_snapshot(
         tree=tree,
-        backends=load_backends(conn),
-        time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
-        jev=resolve_jev_settings(conn, first_jev_settings(conn)),
-        capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
-        jev_input_tokens=input_tokens,
-        jev_context_tokens=context_tokens,
+        **snapshot_parts(conn, tree.runtime),
         compiled=compiled,
     )
 

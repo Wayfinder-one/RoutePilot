@@ -20,9 +20,14 @@ from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.store.db import connect
-from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, huge_chain_graph, runtime_dict, test_settings
+from tests.routing_fixtures import (
+    graph_dict,
+    huge_chain_graph,
+    runtime_dict,
+    runtime_from_catalog,
+    test_settings,
+)
 
 
 _DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone", "kind_label"}
@@ -131,6 +136,29 @@ class CapturingService:
         )
 
 
+def catalog_runtime(app):
+    """把当前数据库目录显式固化成一次草稿的运行字段（测试辅助，生产无此回退）。"""
+    conn = connect(app.state.settings.db_path)
+    try:
+        return runtime_from_catalog(conn)
+    finally:
+        conn.close()
+
+
+def models_runtime(*model_ids):
+    runtime = runtime_dict()
+    runtime["backends"]["models"] = [
+        {"id": model_id, "upstream": model_id, "provider": "local", "profile": {}}
+        for model_id in model_ids
+    ]
+    return runtime
+
+
+def root_payload(app, root, *, text="你好", **extra):
+    """root-only 草稿必须携带完整运行字段（不再从数据库生成隐式快照）。"""
+    return {**catalog_runtime(app), "root": root, "text": text, **extra}
+
+
 def install_engine(app, scenario=None):
     jev = FakeJev(THREE_ANSWERS if scenario is None else scenario)
     affinity = RecordingAffinity()
@@ -162,6 +190,7 @@ def create_stored_tree(client, *, root=None, tree_id="main", timezone="Asia/Shan
         "root": graph_dict() if root is None else root,
         "timezone": timezone,
         "sticky": sticky or {"enabled": True, "ttl_seconds": 1800},
+        **models_runtime(*MODELS),
     })
     assert response.status_code == 201, response.text
     return response.json()["tree"]
@@ -207,7 +236,7 @@ def test_create_tree_roundtrips_embedded_runtime_without_keys(client, app):
     assert stored.runtime.backends.models[0]["upstream"] == "json-upstream"
 
 
-def test_legacy_create_materializes_current_database_runtime(client):
+def test_create_without_runtime_fields_is_rejected(client):
     payload = portable_envelope("legacy")
     for field in runtime_dict():
         payload.pop(field)
@@ -215,11 +244,10 @@ def test_legacy_create_materializes_current_database_runtime(client):
 
     response = client.post("/admin/trees", json=payload)
 
-    assert response.status_code == 201, response.text
-    tree = response.json()["tree"]
-    assert all(field in tree for field in runtime_dict())
-    assert "qwen3-8b" in {model["id"] for model in tree["backends"]["models"]}
-    assert tree["jev"]["model"] == "d1-2B"
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["code"] == "graph_parse_error"
+    assert "runtime fields must appear together" in response.text
+    assert client.get("/admin/trees/legacy").status_code == 404
 
 
 def test_partial_runtime_create_returns_graph_parse_error(client):
@@ -262,14 +290,29 @@ def test_try_without_runtime_inherits_stored_tree(client, app):
     assert engine.snapshots[-1].backends["fast"].upstream_name == "json-upstream"
 
 
-def test_root_only_try_inherits_active_embedded_runtime(client, app):
+def test_root_only_try_without_runtime_fields_is_422(client, app):
+    """无 tree_id 且无完整运行字段的草稿检查绝不回退数据库生成隐式快照。"""
     created = client.post("/admin/trees", json=portable_envelope())
     assert created.status_code == 201, created.text
-    enabled = client.post("/admin/trees/portable/enable")
-    assert enabled.status_code == 200, enabled.text
+    assert client.post("/admin/trees/portable/enable").status_code == 200
     engine, _jev, _balancer, _affinity = install_engine(app)
 
     response = client.post("/admin/try", json={"root": portable_graph(), "text": "你好"})
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["code"] == "graph_parse_error"
+    assert "runtime fields must appear together" in response.text
+    assert engine.calls == 0
+
+
+def test_root_only_try_accepts_a_full_self_contained_envelope(client, app):
+    engine, _jev, _balancer, _affinity = install_engine(app)
+    payload = portable_envelope()
+    payload.pop("id")
+    payload.pop("name")
+
+    response = client.post("/admin/try", json={
+        **payload, "root": portable_graph(), "text": "你好"})
 
     assert response.status_code == 200, response.text
     assert engine.snapshots[-1].jev.model == "json-jev"
@@ -284,12 +327,10 @@ def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     before_revision = before_snapshot.snapshot_revision
     before_counts = row_counts(app)
 
-    response = client.post("/admin/try", json={
-        "root": three_answer_graph(),
-        "text": "抢修工单",
-        "session_id": "try-session",
-        "sticky": {"enabled": True, "ttl_seconds": 1800},
-    })
+    response = client.post("/admin/try", json=root_payload(
+        app, three_answer_graph(), text="抢修工单", session_id="try-session",
+        sticky={"enabled": True, "ttl_seconds": 1800},
+    ))
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -320,7 +361,7 @@ def test_root_only_defaults_and_does_not_read_stored_trees(client, app, monkeypa
 
     monkeypatch.setattr(RoutingTreeRepo, "get", forbidden)
 
-    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": "你好"})
+    response = client.post("/admin/try", json=root_payload(app, three_answer_graph()))
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -334,18 +375,16 @@ def test_root_only_defaults_and_does_not_read_stored_trees(client, app, monkeypa
     assert draft.sticky.ttl_seconds == 1800
 
 
-def test_try_uses_live_jev_window_without_publishing(client, app, monkeypatch):
+def test_try_uses_draft_jev_window_without_publishing(client, app, monkeypatch):
     engine, jev, _balancer, _affinity = install_engine(app)
-    conn = connect(app.state.settings.db_path)
-    try:
-        SettingsRepo(conn).set("jev_input_tokens", str(MIN_INPUT_TOKENS))
-        conn.commit()
-    finally:
-        conn.close()
     published_before = app.state.snapshot.snapshot_revision
+    payload = root_payload(app, three_answer_graph())
+    payload["jev_window"] = {
+        "input_tokens": MIN_INPUT_TOKENS, "context_tokens": 4096,
+    }
 
     long_text = "国网营销数字化改造项目背景。" * 500
-    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": long_text})
+    response = client.post("/admin/try", json={**payload, "text": long_text})
 
     assert response.status_code == 200, response.text
     window = next(event for event in response.json()["trace"] if event["event"] == "window")
@@ -437,7 +476,7 @@ def test_try_unknown_tree_id_is_404_and_skips_engine(client, app):
 def test_try_serializes_all_answer_types_and_complete_outcome(client, app):
     _engine, _jev, _balancer, _affinity = install_engine(app)
 
-    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": "抢修工单"})
+    response = client.post("/admin/try", json=root_payload(app, three_answer_graph(), text="抢修工单"))
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -504,7 +543,9 @@ def test_try_fixed_peak_scenario_matches_engine(client, app):
     install_engine(app, SCENARIO_BY_ID["s3"])
     scenario = SCENARIO_BY_ID["s3"]
 
+    runtime = catalog_runtime(app)
     response = client.post("/admin/try", json={
+        **runtime,
         "root": copy.deepcopy(POWER_GRAPH),
         "text": scenario["text"],
         "now": scenario["now"],
@@ -544,7 +585,7 @@ def test_try_without_period_condition_keeps_time_event_initial(client, app):
     assert periods.status_code == 200, periods.text
     install_engine(app)
 
-    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": "你好"})
+    response = client.post("/admin/try", json=root_payload(app, three_answer_graph()))
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -585,7 +626,7 @@ def test_try_structure_errors_are_issue_arrays_with_locators(client, app):
     engine, *_rest = install_engine(app)
     root = three_answer_graph()
     root["nodes"].append({"id": "start-2", "type": "start"})
-    response = client.post("/admin/try", json={"root": root, "text": "你好"})
+    response = client.post("/admin/try", json=root_payload(app, root))
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, list)
@@ -606,7 +647,7 @@ def test_try_structure_errors_are_issue_arrays_with_locators(client, app):
         ],
         "error_fallback": "safe",
     }
-    response = client.post("/admin/try", json={"root": broken, "text": "你好"})
+    response = client.post("/admin/try", json=root_payload(app, broken))
     assert response.status_code == 422, response.text
     issue = next(item for item in response.json()["detail"]
                  if item["code"] == "edge_endpoint_missing")
@@ -619,7 +660,7 @@ def test_try_structure_errors_are_issue_arrays_with_locators(client, app):
 def test_try_huge_chain_returns_422_limit_issue_not_500(client, app):
     """终审 Critical 回归：1200 节点链的草稿试算必须 422 + Issue 数组，绝不 500。"""
     engine, *_rest = install_engine(app)
-    response = client.post("/admin/try", json={"root": huge_chain_graph(), "text": "你好"})
+    response = client.post("/admin/try", json=root_payload(app, huge_chain_graph()))
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
     assert isinstance(detail, list) and detail
@@ -633,9 +674,8 @@ def test_try_invalid_timezone_is_422_without_entering_engine(client, app):
     before_snapshot = app.state.snapshot.snapshot_revision
     before_counts = row_counts(app)
 
-    response = client.post("/admin/try", json={
-        "root": three_answer_graph(), "timezone": "Mars/Olympus", "text": "你好",
-    })
+    response = client.post("/admin/try", json=root_payload(
+        app, three_answer_graph(), timezone="Mars/Olympus"))
 
     assert response.status_code == 422, response.text
     detail = response.json()["detail"]
@@ -696,7 +736,7 @@ def test_try_no_available_backend_is_still_503(client, app):
         if node["type"] == "target":
             node["models"] = []
 
-    response = client.post("/admin/try", json={"root": root, "text": "抢修"})
+    response = client.post("/admin/try", json=root_payload(app, root, text="抢修"))
 
     assert response.status_code == 503, response.text
     assert engine.calls == 1
@@ -710,7 +750,7 @@ def test_try_no_available_backend_is_still_503(client, app):
 def test_try_trace_events_carry_presentation_fields(client, app):
     _engine, _jev, _balancer, _affinity = install_engine(app)
 
-    response = client.post("/admin/try", json={"root": three_answer_graph(), "text": "抢修工单"})
+    response = client.post("/admin/try", json=root_payload(app, three_answer_graph(), text="抢修工单"))
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -726,8 +766,8 @@ def test_try_trace_events_carry_presentation_fields(client, app):
     assert body["trace"][-1]["phase"] == "schedule"
 
 
-def test_try_rejects_runtime_control_field(client):
-    """`runtime: null` 只是树写 DTO 的控制字段：/admin/try 契约不变，必须 422。"""
+def test_try_rejects_removed_runtime_control_field(client):
+    """草稿 DTO 不接受已删除的运行配置控制字段：未知字段必须 422。"""
     payload = portable_envelope()
     payload.pop("id")
     payload.pop("name")

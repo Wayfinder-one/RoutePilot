@@ -284,10 +284,10 @@ def _clamped_legacy_window(
 ) -> tuple[int, int]:
     """把 v5 ``settings`` 里的窗口值收口到严格 ``JevWindow`` 范围。
 
-    旧运行时 ``read_jev_window`` 在读路径上容忍越界值（按 MIN/MAX 收口并保证
-    input <= context）；v6 的 ``JevService`` 对每一行严格校验。若迁移直接落库
-    越界值，旧表被删后 ``JevServiceRepo.list()`` 会永久 ValueError，所以这里用
-    与旧读路径相同的收口规则先规范化。
+    旧运行时在读路径上容忍越界值（按 MIN/MAX 收口并保证 input <= context）；
+    v6 的 ``JevService`` 对每一行严格校验。若迁移直接落库越界值，旧表被删后
+    ``JevServiceRepo.list()`` 会永久 ValueError，所以这里用与旧读路径相同的
+    收口规则先规范化。
     """
     context_tokens = min(
         MAX_TOKENS,

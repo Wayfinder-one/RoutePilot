@@ -22,7 +22,11 @@ from router.store.db import connect, migrate
 from router.store.repositories import ModelRepo, ProviderRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import load_backends
-from tests.routing_fixtures import portable_tree_dict, test_settings, tree_dict
+from tests.routing_fixtures import (
+    portable_tree_dict,
+    runtime_for_models,
+    test_settings,
+)
 
 OPENAI_REASONING = {"reasoning": {
     "efforts": {"off": None, "low": "low", "high": "high"},
@@ -135,7 +139,7 @@ def test_invalid_old_profile_json_normalizes_to_empty_object(tmp_path):
 # --------------------------------------------------------------------------- #
 # POST /admin/models
 # --------------------------------------------------------------------------- #
-def test_create_model_and_swap_backend_snapshot(client, app):
+def test_create_model_records_catalog_state_and_audit(client, app):
     r = client.post("/admin/models", json={
         "id": "my-model", "upstream": "upstream-v1", "provider": "local",
         "profile": OPENAI_REASONING})
@@ -149,12 +153,8 @@ def test_create_model_and_swap_backend_snapshot(client, app):
     assert model["reasoning"]["declared"] is True
     assert model["reasoning"]["format"] == "openai"
     assert client.get("/admin/models").json()["models"]
-    backend = app.state.snapshot.backends["my-model"]
-    assert backend.upstream_name == "upstream-v1"
-    assert backend.provider == "local"
-    assert backend.reasoning["efforts"] == [
-        {"id": "off", "wire": None}, {"id": "low", "wire": "low"},
-        {"id": "high", "wire": "high"}]
+    # 无活动画布：Auto 快照为空，目录写不再投影到 snapshot。
+    assert app.state.snapshot.backends == {}
     # audit row
     changes = client.get("/admin/changes").json()["changes"]
     assert changes[0]["kind"] == "model"
@@ -211,6 +211,17 @@ def test_create_model_inherits_provider_reasoning_format(client, app):
         "profile": {"reasoning": {"efforts": {"off": None, "high": None}}}})
     assert r.status_code == 201, r.text
     assert r.json()["model"]["reasoning"]["format"] == "deepseek"
+    # rationale: 快照来自自包含画布；这里显式把目录事实固化进画布再断言投影。
+    root = _direct_graph((("deep-model", None),))
+    runtime = _tree_runtime(root)
+    runtime["backends"]["providers"][0]["reasoning_format"] = "deepseek"
+    runtime["backends"]["providers"][0]["base_url"] = "http://127.0.0.1:9000"
+    runtime["backends"]["models"][0]["profile"] = {
+        "reasoning": {"efforts": {"off": None, "high": None}}}
+    created = client.post("/admin/trees", json={
+        "id": "deep-canvas", "name": "Deep", "root": root, **runtime})
+    assert created.status_code == 201, created.text
+    assert client.post("/admin/trees/deep-canvas/enable").status_code == 200
     assert app.state.snapshot.backends["deep-model"].reasoning["format"] == "deepseek"
 
 
@@ -262,6 +273,25 @@ def test_put_model_rejects_unknown_provider(client, app):
         conn.close()
 
 
+def _tree_runtime(root, *, model_overrides=None):
+    """root 引用的模型 id → 自包含运行字段（可选覆写 profile）。"""
+    ids: list[str] = []
+    for node in root.get("nodes") or ():
+        if node.get("type") != "target":
+            continue
+        for slot in node.get("models") or ():
+            model = slot.get("model") if isinstance(slot, dict) else slot
+            if isinstance(model, str) and model not in ids:
+                ids.append(model)
+    runtime = runtime_for_models(ids)
+    for override in (model_overrides or {}).items():
+        model_id, profile = override
+        for model in runtime["backends"]["models"]:
+            if model["id"] == model_id:
+                model["profile"] = profile
+    return runtime
+
+
 def _direct_graph(models, *, node_id="direct", fallback="direct"):
     """start → target 的 graph v3 根；用于模型引用/推理档位回归。"""
     return {
@@ -286,7 +316,8 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
     tree/node (``via``)."""
     route_root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref", "root": route_root})
+        "id": "ref-tree", "name": "Ref", "root": route_root,
+        **_tree_runtime(route_root)})
     assert created.status_code == 201, created.text
     nl_root = {
         "id": "root", "type": "graph",
@@ -314,7 +345,8 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
         "error_fallback": "deep-target",
     }
     created = client.post("/admin/trees", json={
-        "id": "nl-ref", "name": "NL Ref", "root": nl_root})
+        "id": "nl-ref", "name": "NL Ref", "root": nl_root,
+        **_tree_runtime(nl_root)})
     assert created.status_code == 201, created.text
 
     r = client.delete("/admin/models/qwen3-8b")
@@ -341,8 +373,23 @@ def test_delete_model_referenced_by_a_tree_is_409_then_free_model_ok(client):
 # --------------------------------------------------------------------------- #
 # Providers: key tri-state / key_source / never returning the secret
 # --------------------------------------------------------------------------- #
+def _activate_provider_canvas(client, base_url, model="qwen3-8b", provider="local",
+                              key_env=""):
+    root = _direct_graph(((model, None),))
+    runtime = _tree_runtime(root)
+    runtime["backends"]["providers"][0].update({
+        "name": provider, "base_url": base_url, "key_env": key_env,
+    })
+    runtime["backends"]["models"][0]["provider"] = provider
+    created = client.post("/admin/trees", json={
+        "id": "provider-canvas", "name": "Provider", "root": root, **runtime})
+    assert created.status_code == 201, created.text
+    assert client.post("/admin/trees/provider-canvas/enable").status_code == 200
+
+
 def test_provider_key_tristate_and_headers(client, app):
     base = {"base_url": "http://127.0.0.1:9000"}
+    _activate_provider_canvas(client, base["base_url"])
     r = client.put("/admin/providers/local", json={**base, "api_key": "sk-secret-1"})
     assert r.status_code == 200
     assert r.json()["provider"]["key_present"] is True
@@ -377,6 +424,8 @@ def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
     assert client.post("/admin/models", json={
         "id": "env-model", "upstream": "u",
         "provider": "envprov"}).status_code == 201
+    _activate_provider_canvas(client, "http://e/v1", model="env-model",
+                              provider="envprov", key_env="SR_TEST_KEY")
     assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
     # a stored key wins over the environment (contract §5.3)
@@ -548,42 +597,24 @@ def _declare_low_only(client):
 
 
 def _activate_reasoning_tree(client, tree_id="reasoning-tree"):
+    root = _reasoning_tree_root()
+    runtime = _tree_runtime(root, model_overrides={"qwen3-8b": OPENAI_REASONING})
     created = client.post("/admin/trees", json={
-        "id": tree_id, "name": "Reasoning", "root": _reasoning_tree_root()})
+        "id": tree_id, "name": "Reasoning", "root": root, **runtime})
     assert created.status_code == 201, created.text
     enabled = client.post(f"/admin/trees/{tree_id}/enable")
     assert enabled.status_code == 200, enabled.text
     return created.json()["tree"]
 
 
-def test_model_write_removing_a_referenced_reasoning_level_is_422(client):
-    """The health check must judge the write with the PROSPECTIVE rows.
-
-    Removing a level the ACTIVE tree references is rejected instead of being
-    accepted, so the next startup can always boot.
-    """
-    _declare_high(client)
-    _activate_reasoning_tree(client)
-    before = {m["id"]: m["profile"] for m in
-              client.get("/admin/models").json()["models"]}
-
-    r = _declare_low_only(client)
-    assert r.status_code == 422, r.text
-    issues = r.json()["detail"]
-    assert any(issue["code"] == "reasoning_unsupported"
-               and issue["node_id"] == "reasoning-target" for issue in issues), issues
-    after = {m["id"]: m["profile"] for m in
-             client.get("/admin/models").json()["models"]}
-    assert after["qwen3-8b"] == before["qwen3-8b"]   # rejected write, DB intact
-
-
 def test_model_write_ignores_reasoning_of_a_closed_tree(client):
     """Only the ACTIVE tree gates model writes: a closed draft does not, and
     disabling the active tree lifts the constraint again."""
     _declare_high(client)
+    root = _reasoning_tree_root()
+    runtime = _tree_runtime(root, model_overrides={"qwen3-8b": OPENAI_REASONING})
     created = client.post("/admin/trees", json={
-        "id": "draft-tree", "name": "Draft",
-        "root": _reasoning_tree_root()})
+        "id": "draft-tree", "name": "Draft", "root": root, **runtime})
     assert created.status_code == 201, created.text
     # No ACTIVE tree: the write cannot break the hot path or the next boot.
     assert _declare_low_only(client).status_code == 200
@@ -609,22 +640,6 @@ def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
         "off", "high"]
 
 
-def test_rejected_model_write_keeps_the_next_startup_healthy(tmp_path):
-    """The old bug: the write was accepted but the next boot refused.  After
-    the 422 the SAME database must still boot with its active reasoning tree."""
-    app = make_app(tmp_path)
-    client = TestClient(app)
-    _declare_high(client)
-    _activate_reasoning_tree(client)
-    assert _declare_low_only(client).status_code == 422
-
-    restarted = make_app(tmp_path)           # create_app on the same DB file
-    assert restarted.state.snapshot.tree_id == "reasoning-tree"
-
-
-# --------------------------------------------------------------------------- #
-# 服务层回滚契约：校验失败必须同时保住 DB、审计与快照
-# --------------------------------------------------------------------------- #
 def test_model_update_rolls_back_when_active_graph_becomes_invalid(client, app):
     """非法提供方写入返回 422，快照不得被替换。"""
     before = app.state.snapshot.snapshot_revision
@@ -633,72 +648,12 @@ def test_model_update_rolls_back_when_active_graph_becomes_invalid(client, app):
     assert app.state.snapshot.snapshot_revision == before
 
 
-def test_rejected_reasoning_write_keeps_snapshot_revision_and_audit_clean(app, client):
-    """服务层写用例同型：in-tx 校验失败 → 数据库/审计/候选发布三者皆未发生。
-
-    与 tests/test_jev_admin 的失败保存契约一致，这里覆盖模型写用例。"""
-    _declare_high(client)
-    _activate_reasoning_tree(client)
-    changes = {row["detail"]["action"] for row in
-               client.get("/admin/changes").json()["changes"]}
-    before_revision = app.state.snapshot.snapshot_revision
-
-    response = _declare_low_only(client)
-
-    assert response.status_code == 422, response.text
-    assert {row["detail"]["action"] for row in
-            client.get("/admin/changes").json()["changes"]} == changes
-    assert app.state.snapshot.snapshot_revision == before_revision
-
-
-def test_failed_provider_upsert_changes_neither_row_nor_snapshot(tmp_path):
-    """提供方写用例的同一契约：启用校验失败 → 数据库行/审计/快照都不得变化。
-
-    自包含 JSON 生效后「只删数据库 model 行」不再制造无效前提（配置写前会从活动
-    JSON 恢复目录）。这里改用真正的旧图数据库回退：活动图没有内嵌运行配置，外部
-    删除它引用的模型后，提供方写必须 422，且 DB/审计/快照不变、图文件不被写坏。
-    """
-    settings = test_settings(tmp_path, db_path=str(tmp_path / "t.db"))
-    client = TestClient(make_app(tmp_path))
-    _declare_high(client)                       # 先在数据库里声明 high
-    repo = RoutingTreeRepo(settings.graph_dir)
-    repo.create(tree_from_dict(tree_dict("reasoning-tree", root=_reasoning_tree_root())))
-    repo.enable("reasoning-tree")               # 旧图：文件里没有运行配置
-
-    app = make_app(tmp_path)                    # 重启：活动图走数据库回退
-    client = TestClient(app)
-    conn = connect(app.state.settings.db_path)
-    try:
-        conn.execute("DELETE FROM models WHERE id = 'qwen3-8b'")
-        conn.commit()
-        base_url_before = dict(
-            conn.execute("SELECT * FROM providers WHERE name = 'local'").fetchone())["base_url"]
-    finally:
-        conn.close()
-    before_revision = app.state.snapshot.snapshot_revision
-
-    response = client.put("/admin/providers/local", json={"base_url": "http://x/v1"})
-
-    assert response.status_code == 422, response.text
-    issue_codes = {issue["code"] for issue in response.json()["detail"]}
-    assert "unknown_model" in issue_codes
-    conn = connect(app.state.settings.db_path)
-    try:
-        row = dict(conn.execute("SELECT * FROM providers WHERE name = 'local'").fetchone())
-        audit = conn.execute(
-            "SELECT COUNT(*) FROM changes WHERE kind = 'provider'").fetchone()[0]
-    finally:
-        conn.close()
-    assert row["base_url"] == base_url_before
-    assert audit == 0
-    assert app.state.snapshot.snapshot_revision == before_revision
-
-
 def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     """删除被引用模型 → 409，且该用例不产生审计行、不改变快照 revision。"""
+    root = _direct_graph((("qwen3-8b", None),))
     assert client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref",
-        "root": _direct_graph((("qwen3-8b", None),))}).status_code == 201
+        "id": "ref-tree", "name": "Ref", "root": root,
+        **_tree_runtime(root)}).status_code == 201
     before_revision = app.state.snapshot.snapshot_revision
 
     response = client.delete("/admin/models/qwen3-8b")
@@ -771,9 +726,9 @@ def _instrument_delete_lock(app, client, monkeypatch):
 
 def test_delete_model_checks_references_inside_the_publish_lock(
         app, client, monkeypatch):
+    root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
-        "id": "ref-tree", "name": "Ref",
-        "root": _direct_graph((("qwen3-8b", None),))})
+        "id": "ref-tree", "name": "Ref", "root": root, **_tree_runtime(root)})
     assert created.status_code == 201, created.text
     trace = _instrument_delete_lock(app, client, monkeypatch)   # after setup
 

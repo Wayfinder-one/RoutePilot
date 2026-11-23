@@ -1,5 +1,4 @@
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 
 import httpx
@@ -7,16 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from router.control.runtime import first_jev_settings, runtime_from_db
-from router.routing.conditions import TimePeriod
-from router.routing.graph.compiled import compile_graph
-from router.routing.runtime import runtime_to_dict
-from router.routing.snapshot import build_snapshot, model_capability, read_jev_window
 from router.store.db import connect
-from router.store.repositories import ModelRepo, TimePeriodRepo
-from router.store.routing_trees import GraphStorageError
-from router.upstream.catalog import load_backends
-from tests.routing_fixtures import test_settings, tree_dict
+from tests.routing_fixtures import runtime_from_catalog, test_settings, tree_dict
 
 TEXT = "今天天气怎么样"
 
@@ -73,7 +64,7 @@ def activate(h, level=None):
     raw = tree_dict("default-tree", root=direct_graph(level))
     conn = connect(h.app.state.settings.db_path)
     try:
-        runtime = runtime_to_dict(runtime_from_db(conn))
+        runtime = runtime_from_catalog(conn)
     finally:
         conn.close()
     body = {
@@ -153,42 +144,6 @@ def test_provider_format_inheritance_and_model_override(tmp_path):
     activate(h, "on")
     assert chat(h.client).status_code == 200
     assert h.requests[-1]["body"]["enable_thinking"] is True
-
-
-def test_stale_reasoning_level_degrades_to_passthrough_with_warning(tmp_path):
-    h = harness(tmp_path)
-    activate(h)
-    declare(h.client, {"efforts": {"off": None, "high": "high"}})
-    activate(h, "high")
-    conn = connect(h.app.state.settings.db_path)
-    with conn:
-        conn.execute("UPDATE models SET profile = ? WHERE id = 'qwen3-8b'", (json.dumps({"reasoning": {"efforts": {"off": None, "low": "low"}}}),))
-    # 自包含 JSON 生效后，活动图内嵌运行配置优先；外部改库要产生「陈旧快照」必须
-    # 让活动图回到旧图形态（无内嵌运行配置），运行配置才以数据库为事实源。
-    repo = h.app.state.graph_repo
-    active = repo.active()
-    repo.update(replace(active, runtime=None),
-                base_document_sha256=active.document_sha256)
-    stale_tree = h.app.state.snapshot.tree
-    with pytest.raises(GraphStorageError):
-        h.app.state.publisher.refresh(conn)
-    assert h.app.state.snapshot.tree is stale_tree
-    input_tokens, context_tokens = read_jev_window(conn)
-    h.app.state.snapshot = build_snapshot(
-        tree=stale_tree,
-        backends=load_backends(conn),
-        time_periods=[TimePeriod.from_dict(row) for row in TimePeriodRepo(conn).load()],
-        jev=first_jev_settings(conn),
-        capabilities={row["id"]: model_capability(row) for row in ModelRepo(conn).list()},
-        jev_input_tokens=input_tokens,
-        jev_context_tokens=context_tokens,
-        compiled=compile_graph(stale_tree.root),
-    )
-    conn.close()
-    response = chat(h.client, reasoning_effort="client")
-    assert response.status_code == 200
-    assert response.headers["x-sr-reasoning-warning"] == "unsupported"
-    assert h.requests[-1]["body"]["reasoning_effort"] == "client"
 
 
 def test_streaming_request_injects_reasoning_and_releases(tmp_path):

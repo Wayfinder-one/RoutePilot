@@ -437,8 +437,8 @@ def test_shared_sample_revision_is_order_and_display_invariant():
     同时锁定重构前的 revision 值：行为不变时 revision 必须逐字节一致。
     """
     samples = {
-        "fixture": (tree_dict(), "81a318d8a40117baa68247c89d835b8d65e3977853c608929f48332cef1ee1f8"),
-        "power": (tree_dict(root=POWER_GRAPH), "971bef4ca5669dfe0bb7874ae9fe582aa8a772051e5315ef3cf78466b6c2b4f1"),
+        "fixture": (tree_dict(), "6031a50f98b932c8bac72f5e8f31ae57a4e06ea6e4b8c624ff908293a1b7c452"),
+        "power": (tree_dict(root=POWER_GRAPH), "8d625f05781e2287dc8e72e0af2514a7514d92086a6340324d8c2c0325947f62"),
     }
     for name, (raw, expected) in samples.items():
         assert tree_revision_of(tree_from_dict(raw)) == expected, name

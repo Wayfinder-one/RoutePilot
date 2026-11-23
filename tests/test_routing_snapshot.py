@@ -21,6 +21,29 @@ from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 from tests.routing_fixtures import graph_dict, runtime_dict, tree_dict
 
 
+def stored_catalog_runtime():
+    """与 ``conn`` fixture 的目录行同端点的自包含运行配置。"""
+    values = runtime_dict()
+    values["backends"]["providers"][0]["base_url"] = "http://upstream.test/v1"
+    values["backends"]["providers"][0]["key_env"] = ""
+    values["backends"]["models"] = [
+        {"id": "fast", "upstream": "fast", "provider": "local",
+         "profile": {"capability": "fast 能力"}},
+        {"id": "standard", "upstream": "standard", "provider": "local",
+         "profile": {"capability": "standard 能力"}},
+    ]
+    values["jev"] = {
+        "id": "default",
+        "base_url": "http://jev.test",
+        "model": "NeoHorse-Jev-4B",
+        "key_env": "ROUTER_JEV_API_KEY",
+        "timeout_seconds": 5.0,
+        "instructions": runtime_dict()["jev"]["instructions"],
+        "state_template": runtime_dict()["jev"]["state_template"],
+    }
+    return values
+
+
 def direct_graph(model):
     return {
         "id": "root", "type": "graph",
@@ -61,7 +84,9 @@ def conn(settings):
 def repo(settings):
     repository = RoutingTreeRepo(settings.graph_dir)
     repository.initialize()
-    repository.create(tree_from_dict(tree_dict(root=direct_graph("fast"))))
+    raw = tree_dict(root=direct_graph("fast"))
+    raw.update(stored_catalog_runtime())
+    repository.create(tree_from_dict(raw))
     repository.enable("main")
     return repository
 
@@ -74,9 +99,10 @@ def app(settings, conn, repo):
     return instance
 
 
-def test_snapshot_loads_current_config_and_revision_excludes_secrets(conn, repo):
+def test_snapshot_loads_canvas_config_and_revision_excludes_secrets(conn, repo):
     snapshot = load_snapshot(conn, repo)
     assert snapshot.tree.id == "main"
+    # 端点匹配的已存密钥只在运行态 Backend 上使用，不进入快照内容。
     assert snapshot.backends["fast"].headers["Authorization"] == "Bearer upstream-secret"
     assert snapshot.capabilities == {"fast": "fast 能力", "standard": "standard 能力"}
     assert snapshot.jev.model == "NeoHorse-Jev-4B"
@@ -110,6 +136,7 @@ def test_embedded_runtime_drives_snapshot_instead_of_database(conn):
 def test_matching_embedded_endpoints_reuse_stored_keys_without_serializing_them(conn):
     values = runtime_dict()
     values["backends"]["providers"][0]["base_url"] = "http://upstream.test/v1/"
+    values["jev"]["id"] = "default"
     values["jev"]["base_url"] = "http://jev.test/"
     values["jev"]["model"] = "NeoHorse-Jev-4B"
 
@@ -152,15 +179,22 @@ def test_embedded_null_jev_rejects_questions_even_when_database_has_jev(conn):
     assert "decision_service_unavailable" in {issue.code for issue in issues}
 
 
-def test_publisher_swaps_whole_snapshot_without_mutating_old_one(conn, repo):
+def test_graph_snapshot_does_not_change_when_db_catalog_changes(conn, repo):
+    """严格自包含：数据库目录行怎么改都不改变活动画布快照。"""
     app = SimpleNamespace(state=SimpleNamespace())
     publisher = SnapshotPublisher(app, repo)
     first = publisher.refresh(conn)
-    ModelRepo(conn).update("fast", upstream="new-upstream")
+    with conn:
+        conn.execute("INSERT INTO providers VALUES ('other', 'http://other.test/v1', '', 'openai', '')")
+        conn.execute("INSERT INTO models VALUES ('changed-model', 'changed', 'other', '{}')")
+        conn.execute("UPDATE providers SET base_url = 'http://db-changed.test/v1' WHERE name = 'local'")
+        conn.execute("UPDATE models SET upstream = 'changed' WHERE id = 'fast'")
+        conn.execute("DELETE FROM jev_services")
+        conn.execute("DELETE FROM time_periods")
     second = publisher.refresh(conn)
-    assert first.backends["fast"].upstream_name == "fast"
-    assert second.backends["fast"].upstream_name == "new-upstream"
-    assert first.snapshot_revision != second.snapshot_revision
+    assert second.content == first.content
+    assert second.snapshot_revision == first.snapshot_revision
+    assert second.backends["fast"].upstream_name == "fast"
     assert app.state.snapshot is second
 
 
@@ -174,6 +208,10 @@ def test_no_active_tree_is_a_valid_snapshot(tmp_path):
     assert snapshot.tree is None
     assert snapshot.tree_id is None
     assert snapshot.backends == {}
+    assert snapshot.jev is None
+    assert snapshot.time_periods == ()
+    assert snapshot.capabilities == {}
+    assert snapshot.jev_input_tokens > 0 and snapshot.jev_context_tokens > 0
     assert snapshot.compiled is None  # no active graph → nothing to compile
     conn.close()
 

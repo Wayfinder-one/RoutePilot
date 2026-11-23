@@ -5,7 +5,7 @@ import json
 import pytest
 
 from router.routing.document import graph_document_bytes, parse_graph_document
-from router.routing.tree import tree_from_dict, tree_revision_of
+from router.routing.tree import tree_behavior_dict, tree_from_dict, tree_revision_of
 from tests.routing_fixtures import runtime_dict, tree_dict
 
 RUNTIME_FIELDS = ("backends", "jev", "jev_window", "time_periods")
@@ -34,32 +34,63 @@ def test_self_contained_document_roundtrip_preserves_runtime_without_keys():
     document = json.loads(content)
     assert document["backends"]["models"][0]["upstream"] == "json-upstream"
     assert document["backends"]["models"][0]["profile"]["capability"] == "来自 JSON 的能力"
+    assert document["jev"]["id"] == "json-jev-service"
     assert document["jev"]["model"] == "json-jev"
+    assert document["jev"]["key_env"] == "ROUTER_JEV_API_KEY"
     assert document["jev_window"] == {"input_tokens": 1024, "context_tokens": 4096}
     assert document["time_periods"][0]["name"] == "peak"
     assert "api_key" not in document["backends"]["providers"][0]
     assert "api_key" not in document["jev"]
+
+    # 运行配置进入行为表单：JEV id/key_env 与窗口都参与 revision。
+    behavior = tree_behavior_dict(source)
+    assert behavior["jev"]["id"] == "json-jev-service"
+    assert behavior["jev"]["key_env"] == "ROUTER_JEV_API_KEY"
+    assert behavior["jev"]["timeout_seconds"] == 5
 
     loaded = load(content)
     assert loaded.runtime == source.runtime
     assert loaded.tree_revision == tree_revision_of(source)
 
 
-def test_legacy_tree_has_no_runtime_and_self_contained_runtime_changes_revision():
-    legacy = tree_from_dict(tree_dict())
-    portable = tree_from_dict(portable_tree_dict())
+def test_tree_requires_a_runtime_and_runtime_changes_revision():
+    raw = tree_dict()
+    for field in RUNTIME_FIELDS:
+        raw.pop(field)
+    with pytest.raises(ValueError, match="runtime fields must appear together"):
+        tree_from_dict(raw)
 
-    assert legacy.runtime is None
-    assert portable.runtime is not None
-    assert tree_revision_of(portable) != tree_revision_of(legacy)
+    first = tree_from_dict(tree_dict())
+    changed = tree_dict()
+    changed["jev_window"] = {"input_tokens": 2048, "context_tokens": 4096}
+    second = tree_from_dict(changed)
+    assert tree_revision_of(first) != tree_revision_of(second)
 
 
 @pytest.mark.parametrize("field", RUNTIME_FIELDS)
 def test_partial_runtime_fields_are_rejected(field):
-    raw = tree_dict()
-    raw[field] = runtime_dict()[field]
+    """四个运行字段必须成组出现：缺任意一个都拒绝解析。"""
+    raw = portable_tree_dict()
+    del raw[field]
 
     with pytest.raises(ValueError, match="runtime fields must appear together"):
+        tree_from_dict(raw)
+
+
+def test_jev_id_is_required():
+    raw = portable_tree_dict()
+    del raw["jev"]["id"]
+    with pytest.raises(ValueError, match="jev.id"):
+        tree_from_dict(raw)
+
+    raw = portable_tree_dict()
+    raw["jev"]["api_key"] = "must-not-be-persisted"
+    with pytest.raises(ValueError, match="secret field is not allowed"):
+        tree_from_dict(raw)
+
+    raw = portable_tree_dict()
+    raw["jev"]["key_present"] = True
+    with pytest.raises(ValueError, match="secret field is not allowed"):
         tree_from_dict(raw)
 
 

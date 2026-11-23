@@ -12,12 +12,19 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.service import JevService
-from router.routing.tree import tree_from_dict
 from router.store.db import connect
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, ProviderRepo, TimePeriodRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import graph_dict, huge_chain_graph, runtime_dict, test_settings, tree_dict
+from tests.routing_fixtures import (
+    GRAPH_CANVAS,
+    graph_dict,
+    huge_chain_graph,
+    runtime_dict,
+    runtime_for_models,
+    test_settings,
+    tree_dict,
+)
 
 
 @pytest.fixture
@@ -96,8 +103,8 @@ def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
 
     conn = connect(app.state.settings.db_path)
     try:
-        # 画布引用 fast + 问题节点：目录补齐同 id 模型与服务，目录写才能通过启用校验。
-        ModelRepo(conn).create("fast", "json-upstream", "local", "{}")
+        # 目录写不要求与画布一致：这里只准备后面要断言的目录行（provider 与 JEV），
+        # 特意不登记画布引用的模型，证明启用校验只读画布自身运行配置。
         JevServiceRepo(conn).save(JevService(
             "default", "http://jev.test", "NeoHorse-Jev-4B",
             input_tokens=1024, context_tokens=4096))
@@ -157,15 +164,12 @@ def test_catalog_writes_do_not_rewrite_stored_canvases(client, app):
     assert _canvas_state(app, tree_ids) == before
 
 
-def test_catalog_gets_read_database_when_active_canvas_exists(client, app):
-    """活动画布存在时目录读取仍是 SQLite；模型写用例也以数据库为基线。"""
+def test_catalog_writes_succeed_when_active_canvas_has_no_catalog_rows(client, app):
+    """画布自包含时目录可以完全不登记画布资源：目录写仍照常成功。"""
     create_portable_tree(client, "main")
     assert client.post("/admin/trees/main/enable").status_code == 200
     conn = connect(app.state.settings.db_path)
     try:
-        # 目录写仍用数据库上下文校验活动画布：目录里要有画布引用的模型与服务。
-        ModelRepo(conn).create("fast", "db-upstream", "local", "{}")
-        JevServiceRepo(conn).save(JevService("default", "http://jev.test", "m"))
         conn.execute("DELETE FROM models")
         conn.commit()
     finally:
@@ -210,10 +214,11 @@ def test_stale_browser_save_returns_409_and_keeps_file(client):
 
 
 def test_graph_crud_roundtrip_copy_enable_disable(client, app):
-    # 新画布从当前目录物化运行快照：先配置目录，再创建/启用画布。
+    # 新画布必须自带运行快照：root 与运行目录同时构造。
     configure_jev(client)
-    raw = tree_dict(sticky={"enabled": True, "ttl_seconds": 1800})
-    raw["root"] = graph_with_model()
+    raw = tree_dict(sticky={"enabled": True, "ttl_seconds": 1800},
+                    root=graph_with_model())
+    raw["canvas"] = {key: dict(value) for key, value in GRAPH_CANVAS.items()}
     raw["root"]["nodes"][0]["title"] = "请求入口"
     raw["canvas"]["start"] = {"x": 40, "y": 60}
     target = next(node for node in raw["root"]["nodes"] if node["type"] == "target")
@@ -591,56 +596,19 @@ def test_tree_writes_reject_nested_profile_secrets(client, app, key):
     assert not (Path(app.state.settings.graph_dir) / "graphs" / "nested.json").exists()
 
 
-def test_legacy_database_secret_profile_blocks_materialization(tmp_path):
-    """旧库 profile 带密钥：旧图仍能启动，但保存/启用物化必须拒绝且不写文件。"""
-    direct = {
-        "id": "root", "type": "graph",
-        "nodes": [
-            {"id": "start", "type": "start"},
-            {"id": "direct", "type": "target", "priority": 1,
-             "models": [{"model": "qwen3-8b", "reasoning": None}]},
-        ],
-        "edges": [{"id": "e-start-direct", "source": "start", "source_port": "out",
-                   "target": "direct", "target_port": "in_1", "condition": None}],
-        "error_fallback": "direct",
-    }
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(200, json={"answers": {}}))
-    app = create_app(test_settings(tmp_path), transport=transport)
-    repo = RoutingTreeRepo(app.state.settings.graph_dir)
-    repo.create(tree_from_dict(tree_dict("legacy", root=direct)))
-    repo.enable("legacy")
-    conn = connect(app.state.settings.db_path)
-    try:
-        with conn:
-            conn.execute(
-                "UPDATE models SET profile = ? WHERE id = 'qwen3-8b'",
-                (json.dumps({"metadata": {"api_key": "review-secret"}}),))
-    finally:
-        conn.close()
-
-    restarted = create_app(test_settings(tmp_path), transport=transport)
-    client = TestClient(restarted)
-    # 旧图（文件无内嵌运行配置）继续走宽松数据库回退：应用可启动。
-    assert restarted.state.snapshot.tree_id == "legacy"
-    before_files = _graph_bytes(restarted)
-
-    created = client.post("/admin/trees", json={
-        "id": "materialized", "name": "物化", "root": direct})
-    assert created.status_code == 422, created.text
-    assert created.json()["detail"][0]["code"] == "graph_parse_error"
-    enabled = client.post("/admin/trees/legacy/enable")
-    assert enabled.status_code == 422, enabled.text
-
-    assert _graph_bytes(restarted) == before_files
-    assert not (Path(restarted.state.settings.graph_dir) /
-                "graphs" / "materialized.json").exists()
-    assert "review-secret" not in b"".join(before_files.values()).decode("utf-8")
-
-
 # --------------------------------------------------------------------------- #
-# Task C：`runtime: null` 只解除「当前图继承」，随后仍按活动图/数据库物化
+# 运行字段按补丁合并：缺失继承已存画布，显式值覆盖
 # --------------------------------------------------------------------------- #
+def test_update_without_runtime_still_inherits_existing_graph_runtime(client):
+    _active, inactive = _active_and_inactive(client)
+
+    response = save_tree(client, {"root": inactive["root"]}, tree_id="b")
+
+    assert response.status_code == 200, response.text
+    # 未提供控制字段 = 普通缺省继承：保留 B 自己的 old-model。
+    assert _model_ids(response.json()["tree"]) == ["old-model"]
+
+
 def _direct_graph(model_id):
     return {
         "id": "root", "type": "graph",
@@ -655,18 +623,9 @@ def _direct_graph(model_id):
     }
 
 
-def _runtime_with_model(model_id, *, upstream="json-upstream"):
-    runtime = runtime_dict()
-    runtime["backends"]["models"] = [{
-        "id": model_id, "upstream": upstream, "provider": "local",
-        "profile": {"capability": f"{model_id} 的能力"},
-    }]
-    return runtime
-
-
 def _portable_payload(tree_id, model_id):
     raw = tree_dict(tree_id, root=_direct_graph(model_id))
-    raw.update(_runtime_with_model(model_id))
+    raw.update(runtime_for_models([model_id]))
     raw.pop("enabled")
     return raw
 
@@ -685,73 +644,31 @@ def _model_ids(tree):
     return [model["id"] for model in tree["backends"]["models"]]
 
 
-def test_update_explicit_null_runtime_clears_and_materializes_from_active(client, app):
-    active, inactive = _active_and_inactive(client)
-    assert _model_ids(inactive) == ["old-model"]
-
-    response = save_tree(
-        client, {"root": inactive["root"], "runtime": None}, tree_id="b")
-
-    assert response.status_code == 200, response.text
-    saved = response.json()["tree"]
-    # 清除的是 B 自己的旧配置；随后物化活动图 A 的完整 runtime（不是跳过物化）。
-    assert _model_ids(saved) == ["active-model"]
-    assert saved["jev"] == active["jev"]
-    assert saved["backends"]["providers"] == active["backends"]["providers"]
-    assert (app.state.graph_repo.get("b").runtime.backends.models[0]["id"]
-            == "active-model")
-    # 活动图不受影响。
-    assert _model_ids(client.get("/admin/trees/a").json()["tree"]) == ["active-model"]
-
-
-def test_update_without_runtime_still_inherits_existing_graph_runtime(client):
+def test_update_without_runtime_inherits_every_stored_runtime_field(client):
     _active, inactive = _active_and_inactive(client)
 
     response = save_tree(client, {"root": inactive["root"]}, tree_id="b")
 
     assert response.status_code == 200, response.text
-    # 未提供控制字段 = 普通缺省继承：保留 B 自己的 old-model。
     assert _model_ids(response.json()["tree"]) == ["old-model"]
+    assert response.json()["tree"]["jev"] == inactive["jev"]
+    assert response.json()["tree"]["jev_window"] == inactive["jev_window"]
+
+    # 只给部分运行字段：给出的覆盖，其余继承已存画布。
+    partial = save_tree(client, {"jev_window": {"input_tokens": 2048, "context_tokens": 4096}},
+                        tree_id="b")
+    assert partial.status_code == 200, partial.text
+    assert partial.json()["tree"]["jev_window"] == {
+        "input_tokens": 2048, "context_tokens": 4096}
+    assert partial.json()["tree"]["jev"] == inactive["jev"]
 
 
-def test_create_explicit_null_runtime_materializes_from_active(client):
-    assert create_tree(client, _portable_payload("a", "active-model")).status_code == 201
-    assert client.post("/admin/trees/a/enable").status_code == 200
+def test_update_with_full_flat_runtime_fields_replaces_snapshot(client):
+    _active, _inactive = _active_and_inactive(client)
+    runtime = runtime_for_models(["replaced-model"])
 
-    response = client.post("/admin/trees", json={
-        "id": "c", "name": "新组", "root": _direct_graph("old-model"), "runtime": None,
-    })
+    response = save_tree(client, {"root": _direct_graph("replaced-model"), **runtime},
+                         tree_id="b")
 
-    assert response.status_code == 201, response.text
-    assert _model_ids(response.json()["tree"]) == ["active-model"]
-
-
-@pytest.mark.parametrize("value", ["text", [], {}, {"backends": {}}])
-def test_tree_dtos_reject_non_null_runtime(client, app, value):
-    _active, inactive = _active_and_inactive(client)
-    updated = save_tree(client, {"root": inactive["root"], "runtime": value}, tree_id="b")
-    assert updated.status_code == 422, updated.text
-    assert "runtime must be null" in updated.text
-    created = client.post("/admin/trees", json={
-        "id": "d", "name": "D", "root": _direct_graph("old-model"), "runtime": value,
-    })
-    assert created.status_code == 422, created.text
-    assert "runtime must be null" in created.text
-    # 拒绝后不落文件。
-    assert not (Path(app.state.settings.graph_dir) / "graphs" / "d.json").exists()
-
-
-def test_tree_dtos_reject_runtime_null_accompanied_by_runtime_fields(client):
-    _active, inactive = _active_and_inactive(client)
-    runtime = _runtime_with_model("old-model")
-    updated = save_tree(
-        client, {"root": inactive["root"], "runtime": None, "jev": runtime["jev"]},
-        tree_id="b")
-    assert updated.status_code == 422, updated.text
-    assert "runtime cannot accompany runtime fields" in updated.text
-    created = client.post("/admin/trees", json={
-        "id": "e", "name": "E", "root": _direct_graph("old-model"),
-        "runtime": None, "backends": runtime["backends"],
-    })
-    assert created.status_code == 422, created.text
-    assert "runtime cannot accompany runtime fields" in created.text
+    assert response.status_code == 200, response.text
+    assert _model_ids(response.json()["tree"]) == ["replaced-model"]

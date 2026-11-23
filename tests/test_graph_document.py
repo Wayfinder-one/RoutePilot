@@ -39,7 +39,10 @@ def test_v3_document_roundtrip_preserves_display_and_external_metadata():
 
     content = graph_document_bytes(source)
     document = json.loads(content)
-    assert set(document) == {"kind", "version", "name", "timezone", "sticky", "root", "canvas"}
+    assert set(document) == {
+        "kind", "version", "name", "timezone", "sticky", "root", "canvas",
+        "backends", "jev", "jev_window", "time_periods",
+    }
     assert document["kind"] == "sr-routing-graph"
     assert document["version"] == 3
     assert "id" not in document and "enabled" not in document
@@ -82,6 +85,17 @@ def test_document_rejects_every_missing_outer_field(field):
 
     with pytest.raises(ValueError):
         load(json.dumps(document).encode())
+
+
+@pytest.mark.parametrize("field", ["backends", "jev", "jev_window", "time_periods"])
+def test_document_rejects_missing_or_partial_runtime_fields(field):
+    """四个运行字段必须成组出现；缺任何一个都拒绝（包括四者全缺）。"""
+    for removed in ({field}, {"backends", "jev", "jev_window", "time_periods"}):
+        document = graph_document(tree_from_dict(tree_dict()))
+        for name in removed:
+            del document[name]
+        with pytest.raises(ValueError, match="runtime fields must appear together"):
+            load(json.dumps(document).encode())
 
 
 def test_deeply_nested_json_maps_to_value_error_not_recursion_error():
@@ -130,6 +144,7 @@ def test_document_rejects_legacy_node_position():
         "kind": "sr-routing-graph", "version": 3, "name": raw.get("name", ""),
         "timezone": raw["timezone"], "sticky": raw["sticky"], "root": raw["root"],
         "canvas": raw["canvas"],
+        **{field: raw[field] for field in ("backends", "jev", "jev_window", "time_periods")},
     }, ensure_ascii=False).encode("utf-8")
     with pytest.raises(ValueError, match="unknown"):
         load(content)
@@ -150,6 +165,7 @@ def test_document_rejects_invalid_canvas(canvas, message):
         "kind": "sr-routing-graph", "version": 3, "name": raw.get("name", ""),
         "timezone": raw["timezone"], "sticky": raw["sticky"], "root": raw["root"],
         "canvas": canvas,
+        **{field: raw[field] for field in ("backends", "jev", "jev_window", "time_periods")},
     }, ensure_ascii=False).encode("utf-8")
     with pytest.raises(ValueError, match=message):
         load(content)

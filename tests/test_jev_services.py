@@ -82,7 +82,7 @@ def test_v5_singleton_migrates_to_default_service(tmp_path):
 @pytest.mark.parametrize(
     ("settings", "expected"),
     [
-        # 旧运行时 read_jev_window 读时收口：context 256 -> 512，input 99999 -> context。
+        # 旧窗口读路径读时收口：context 256 -> 512，input 99999 -> context。
         ((("jev_input_tokens", "99999"), ("jev_context_tokens", "256")),
          (MIN_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS)),
         # 低于下限 -> 各自下限。
@@ -91,7 +91,7 @@ def test_v5_singleton_migrates_to_default_service(tmp_path):
         # input 超过合法 context -> 收口到 context。
         ((("jev_input_tokens", "99999"), ("jev_context_tokens", "4096")),
          (DEFAULT_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS)),
-        # 非数字 -> 回落默认值（与旧 read_jev_window 一致）。
+        # 非数字 -> 回落默认值（与旧窗口读路径一致）。
         ((("jev_input_tokens", "not-a-number"), ("jev_context_tokens", "not-a-number")),
          (DEFAULT_INPUT_TOKENS, DEFAULT_CONTEXT_TOKENS)),
         # settings 缺这两个键 -> 默认值。

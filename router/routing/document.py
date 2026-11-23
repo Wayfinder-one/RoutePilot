@@ -24,8 +24,7 @@ def graph_document(tree: RoutingTree) -> dict:
     canvas = canvas_to_dict(tree.root)
     if canvas:
         document["canvas"] = canvas
-    if tree.runtime is not None:
-        document.update(runtime_to_dict(tree.runtime))
+    document.update(runtime_to_dict(tree.runtime))
     return document
 
 
@@ -49,6 +48,9 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
     missing = sorted(FIELDS - set(raw) - {"canvas", *RUNTIME_FIELDS})
     if missing:
         raise ValueError(f"missing graph document fields: {', '.join(missing)}")
+    runtime_fields = set(raw) & RUNTIME_FIELDS
+    if runtime_fields != RUNTIME_FIELDS:
+        raise ValueError("runtime fields must appear together")
     unknown = sorted(set(raw) - FIELDS)
     if unknown:
         raise ValueError(f"unknown graph document fields: {', '.join(unknown)}")
@@ -62,9 +64,7 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
         "canvas": raw.get("canvas", {}),
         "updated_at": updated_at,
     }
-    runtime_fields = set(raw) & RUNTIME_FIELDS
-    if runtime_fields:
-        payload.update({field: raw[field] for field in RUNTIME_FIELDS if field in raw})
+    payload.update({field: raw[field] for field in RUNTIME_FIELDS})
     tree = tree_from_dict(payload)
     return replace(
         tree,

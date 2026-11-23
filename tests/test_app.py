@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,10 +10,10 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.jev.service import JevService
-from router.control.validation import build_enable_context
 from router.routing.document import parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
+from router.control.runtime import enable_context_for_runtime
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
@@ -113,6 +114,7 @@ def test_startup_with_invalid_active_tree_is_not_ready(tmp_path):
 def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path):
     raw = tree_dict(root=graph_dict())
     raw["root"]["nodes"][2]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
+    raw["jev"] = None  # 画布显式声明“不使用 JEV”：问题节点必须被启用校验拒绝
     settings = prepare_active_tree(tmp_path, raw)
     app = create_app(settings)
     with TestClient(app) as client:
@@ -125,9 +127,10 @@ def test_environment_jev_service_is_seeded_once(tmp_path):
     """空目录首次启动：环境 URL/model/api_key 创建 ``default`` 服务。"""
     settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
     app = create_app(settings)
-    # 无活动画布：启动快照仍走过渡性数据库回退，按端点匹配解析到种子密钥。
-    assert app.state.snapshot.jev.model == "NeoHorse-Jev-4B"
-    assert app.state.snapshot.jev.api_key == "secret"
+    # 无活动画布：Auto 快照为空，种子只写数据库目录，不进入运行快照。
+    assert app.state.snapshot.tree is None
+    assert app.state.snapshot.jev is None
+    assert app.state.snapshot.backends == {}
     conn = connect(settings.db_path)
     try:
         services = JevServiceRepo(conn).list()
@@ -166,8 +169,8 @@ def test_environment_seed_never_overwrites_an_existing_catalog(tmp_path):
         assert [service.id for service in JevServiceRepo(conn).list()] == ["custom"]
     finally:
         conn.close()
-    # 过渡性数据库回退取 id 最小的服务（custom），环境种子没有覆盖它。
-    assert app.state.snapshot.jev.model == "custom-model"
+    # 目录没有被环境种子覆盖；空 Auto 快照不读取目录。
+    assert app.state.snapshot.jev is None
 
 
 def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
@@ -195,7 +198,18 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
 
 
 def shipped_graph(name):
-    content = (REPO_ROOT / "configs" / name).read_bytes()
+    """解析随仓库发布的图文档。
+
+    发布文件仍是旧形态（``jev`` 缺 ``id``/``key_env``），其补全属于案例/配置迁移
+    单元；这里在测试副本上补两个非密钥字段，保证严格解析器仍能钉住发布文档的
+    结构与模型引用。
+    """
+    document = json.loads((REPO_ROOT / "configs" / name).read_text(encoding="utf-8"))
+    jev = document.get("jev")
+    if isinstance(jev, dict):
+        jev.setdefault("id", "default")
+        jev.setdefault("key_env", "ROUTER_JEV_API_KEY")
+    content = json.dumps(document, ensure_ascii=False).encode("utf-8")
     return parse_graph_document(
         content,
         tree_id="default-jev",
@@ -210,17 +224,12 @@ def test_shipped_configs_are_v3_export_documents():
         assert validate_graph_structure(shipped_graph(name)) == [], name
 
 
-def test_shipped_graph_configs_pass_enable_validation_with_seeded_catalog(tmp_path):
-    """钉住发布配置引用的模型 id：seed 目录里改名/删除模型会在这里失败，而不只是结构通过。"""
-    conn = connect(str(tmp_path / "shipped.db"))
-    migrate(conn)
-    seed_default(conn)
-    try:
-        context = replace(build_enable_context(conn), jev_available=True)  # JEV 打桩：只校验配置存在性
-    finally:
-        conn.close()
+def test_shipped_graph_configs_pass_enable_validation_with_own_runtime():
+    """发布配置必须自包含通过启用校验：模型/provider/时段/JEV 都来自文档自身。"""
     for name in ("default_routing_tree.json", "production_routing_tree.json"):
-        assert validate_graph_for_enable(shipped_graph(name), context) == [], name
+        tree = shipped_graph(name)
+        assert validate_graph_for_enable(
+            tree, enable_context_for_runtime(tree.runtime)) == [], name
 
 
 class TryHandler:
