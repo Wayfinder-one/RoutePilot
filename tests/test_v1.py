@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+from dataclasses import replace
+from urllib.parse import quote
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
-from router.api.routes_v1 import router
+from router.api.routes_v1 import router, run_chat_completion
 from router.config import Settings
 from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
@@ -31,6 +33,7 @@ from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import assemble_snapshot_set, build_snapshot
 from router.store.db import connect, migrate
+from router.store.repositories import seed_default
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.catalog import Backend
 from tests.routing_fixtures import tree_dict
@@ -330,11 +333,11 @@ class Harness:
         return upstream_ok(request)
 
 
-async def post(app, body=None, *, headers=None):
+async def post(app, body=None, *, headers=None, path="/v1/chat/completions"):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://router.test",
     ) as client:
-        return await client.post("/v1/chat/completions", json=body or payload(), headers=headers)
+        return await client.post(path, json=body or payload(), headers=headers)
 
 
 def recent(app):
@@ -646,13 +649,13 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         assert record["error_class"] == "no_active_tree"
         failure = record["trace"][-1]
         assert {key: failure[key] for key in ("event", "stage", "error_class", "message")} == {
-            "event": "routing_error", "stage": "graph",
+            "event": "routing_error", "stage": "snapshot",
             "error_class": "no_active_tree", "message": "no routing tree is enabled",
         }
         assert failure["phase"] == "routing_error"
         assert failure["label"] == {"zh": "路由中止", "en": "Routing stopped"}
         facts = failure["facts"]
-        assert facts[0] == [{"zh": "阶段", "en": "Stage"}, "graph"]
+        assert facts[0] == [{"zh": "阶段", "en": "Stage"}, "snapshot"]
         assert facts[1] == [{"zh": "原因", "en": "Reason"}, "no_active_tree"]
         assert facts[2][0] == {"zh": "消息", "en": "Message"}
         assert facts[2][1]
@@ -663,6 +666,10 @@ def test_no_active_tree_creates_a_routing_error_log(tmp_path):
         assert record["node_labels"] == {}
         assert record["model"] is None
         assert record["target_id"] is None
+        assert record["tree_id"] is None
+        assert record["tree_revision"] is None
+        assert record["snapshot_revision"] is None
+        assert record["jev_model"] is None
         assert record["selection_reason"] is None
         assert record["policy_path"] is None
         assert record["fallback_reason"] is None
@@ -781,6 +788,7 @@ def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
         assert record["node_labels"] == {}
         assert record["trace"][-1]["stage"] == "snapshot"
         assert record["trace"][-1]["error_class"] == "no_valid_snapshot"
+        assert record["trace"][-1]["message"] == "no valid snapshot set"
 
     asyncio.run(scenario())
 
@@ -1263,3 +1271,264 @@ def test_real_request_logs_a_graph_snapshot_index(tmp_path):
         assert stored is not None and stored[0] == record["graph_snapshot_id"]
 
     asyncio.run(scenario())
+
+
+# ── standalone data plane: default graph + department header ───────────
+
+
+def encode_department(value):
+    return quote(value, safe='')
+
+
+def add_department_graph(app, *, department='财务部', tree_id='finance'):
+    """把带部门的启用图装配进 app 的路由集（默认图保持 main）。"""
+    base = app.state.snapshot_set.default_snapshot
+    tree = tree_from_dict(tree_dict(
+        tree_id, root=switch_graph(), departments=[department],
+        enabled=True, default=False,
+        sticky={'enabled': False, 'ttl_seconds': 1800},
+    ))
+    snapshot = build_snapshot(
+        tree=tree, backends=base.backends, time_periods=[],
+        jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+        compiled=compile_graph(tree.root),
+    )
+    app.state.snapshot_set = assemble_snapshot_set(
+        [base, snapshot], fingerprint='departments')
+    return app
+
+
+def make_admin_chat_app(tmp_path, handler, *, allow_department_header=True):
+    """真实执行器 + 管理端测试对话路由（正式路由在 Task 7 接入）。"""
+    app = make_app(tmp_path, handler)
+    conn = connect(app.state.settings.db_path)
+    try:
+        seed_default(conn)
+    finally:
+        conn.close()
+
+    @app.post('/admin/test/chat/completions')
+    async def admin_test_chat(request: Request):
+        conn = connect(app.state.settings.db_path)
+        try:
+            return await run_chat_completion(
+                request, use_requested_model=True, conn=conn,
+                allow_department_header=allow_department_header,
+            )
+        finally:
+            conn.close()
+
+    return app
+
+
+def test_public_v1_rejects_client_department_header(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500),
+                       root=direct_graph())
+        response = await post(
+            app,
+            {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]},
+            headers={'x-sr-department': encode_department('财务部')},
+        )
+
+        assert response.status_code == 400
+        assert response.json() == {'error': {'message': 'department_header_not_allowed'}}
+
+    asyncio.run(scenario())
+
+
+def test_public_v1_rejects_empty_department_header_even_for_a_named_model(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500),
+                       root=direct_graph())
+        response = await post(
+            app,
+            {'model': 'fast', 'messages': [{'role': 'user', 'content': '你好'}]},
+            headers={'x-sr-department': ''},
+        )
+
+        # 公开数据面不读取请求模型：只要出现 Header 就拒绝，与 model 无关。
+        assert response.status_code == 400
+        assert response.json() == {'error': {'message': 'department_header_not_allowed'}}
+
+    asyncio.run(scenario())
+
+
+def test_public_v1_uses_default_graph_and_emits_selection_headers(tmp_path):
+    async def scenario():
+        har = Harness({'q': choice(fast=0.9, strong=0.1)})
+        app = make_app(tmp_path, har, root=switch_graph())
+        response = await post(
+            app, {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-graph-selection'] == 'default'
+        assert response.headers['x-sr-tree-id'] == 'main'
+
+    asyncio.run(scenario())
+
+
+def test_public_v1_never_selects_a_department_graph(tmp_path):
+    async def scenario():
+        har = Harness({'q': choice(fast=0.9, strong=0.1)})
+        app = add_department_graph(make_app(tmp_path, har, root=switch_graph()))
+        response = await post(
+            app, {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-graph-selection'] == 'default'
+        assert response.headers['x-sr-tree-id'] == 'main'
+        assert recent(app)['tree_id'] == 'main'
+
+    asyncio.run(scenario())
+
+
+def test_auto_stream_emits_default_graph_selection_headers(tmp_path):
+    async def scenario():
+        body = b'data: {"choices":[]}\n\ndata: [DONE]\n\n'
+
+        class Chunks(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield body
+
+        def handler(request):
+            if request.url.host == 'jev.test':
+                raise AssertionError('direct target must skip JEV')
+            return httpx.Response(
+                200, headers={'content-type': 'text/event-stream'}, stream=Chunks())
+
+        app = make_app(tmp_path, handler, root=direct_graph())
+        response = await post(app, payload(stream=True))
+
+        assert response.status_code == 200
+        assert response.headers['x-sr-graph-selection'] == 'default'
+        assert response.headers['x-sr-tree-id'] == 'main'
+
+    asyncio.run(scenario())
+
+
+def test_missing_default_graph_is_a_no_default_tree_failure(tmp_path):
+    async def scenario():
+        app = make_app(tmp_path, lambda request: httpx.Response(500),
+                       root=direct_graph())
+        app.state.snapshot_set = replace(
+            app.state.snapshot_set, default_tree_id=None)
+        response = await post(app)
+
+        assert response.status_code == 503
+        assert response.json() == {'error': {'message': 'no_default_tree'}}
+        record = recent(app)
+        assert record['outcome_state'] == 'routing_error'
+        assert record['error_class'] == 'no_default_tree'
+        failure = record['trace'][-1]
+        assert failure['stage'] == 'snapshot'
+        assert failure['error_class'] == 'no_default_tree'
+        assert failure['message'] == 'no default routing tree is enabled'
+        # 选图失败发生在快照装配前：失败账本必须以 snapshot=None 安全落表。
+        assert record['node_labels'] == {}
+        assert record['model'] is None
+        assert record['tree_id'] is None
+        assert record['tree_revision'] is None
+        assert record['snapshot_revision'] is None
+        assert record['jev_model'] is None
+
+    asyncio.run(scenario())
+
+
+def test_admin_test_chat_accepts_encoded_department_header(tmp_path):
+    async def scenario():
+        har = Harness({'q': choice(fast=0.9, strong=0.1)})
+        app = add_department_graph(make_admin_chat_app(tmp_path, har))
+        response = await post(
+            app,
+            {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]},
+            headers={'x-sr-department': encode_department('财务部')},
+            path='/admin/test/chat/completions',
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-tree-id'] == 'finance'
+        assert response.headers['x-sr-graph-selection'] == 'department'
+        assert response.headers['x-sr-selection'] == 'target'
+        record = recent(app)
+        assert record['tree_id'] == 'finance'
+
+    asyncio.run(scenario())
+
+
+def test_admin_test_chat_rejects_malformed_department_header(tmp_path):
+    async def scenario():
+        app = make_admin_chat_app(tmp_path, Harness({}))
+        body = {'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]}
+        for raw in ('%zz', '%E4'):
+            response = await post(
+                app, body, headers={'x-sr-department': raw},
+                path='/admin/test/chat/completions')
+            assert response.status_code == 400
+            assert response.json() == {'error': {'message': 'invalid_department'}}
+
+    asyncio.run(scenario())
+
+
+def test_fixed_model_direct_does_not_require_a_route_set(tmp_path):
+    async def scenario():
+        app = make_admin_chat_app(
+            tmp_path, lambda request: httpx.Response(200, json={'choices': []}))
+        body = {'model': 'qwen3-8b', 'messages': [{'role': 'user', 'content': '直连'}]}
+        # 空路由集（无默认图）与未初始化路由集都不影响固定模型直连。
+        for route_set in (assemble_snapshot_set([], fingerprint='empty'), None):
+            app.state.snapshot_set = route_set
+            response = await post(app, body, path='/admin/test/chat/completions')
+            assert response.status_code == 200, response.text
+            assert response.headers['x-sr-model'] == 'qwen3-8b'
+            assert response.headers['x-sr-selection'] == 'direct'
+            assert 'x-sr-graph-selection' not in response.headers
+            assert 'x-sr-tree-id' not in response.headers
+        record = recent(app)
+        assert record['decision'] == 'test'
+        assert record['selection_reason'] == 'direct'
+        assert record['tree_id'] is None
+        assert record['snapshot_revision'] is None
+
+    asyncio.run(scenario())
+
+
+def test_admin_fixed_model_department_header_is_ignored(tmp_path):
+    async def scenario():
+        app = add_department_graph(make_admin_chat_app(
+            tmp_path, lambda request: httpx.Response(200, json={'choices': []})))
+        response = await post(
+            app,
+            {'model': 'qwen3-8b', 'messages': [{'role': 'user', 'content': '直连'}]},
+            headers={'x-sr-department': encode_department('财务部')},
+            path='/admin/test/chat/completions',
+        )
+
+        # 固定模型直连是目录测试：可信 Header 允许出现，但不参与选图/响应头。
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-selection'] == 'direct'
+        assert 'x-sr-graph-selection' not in response.headers
+        assert 'x-sr-tree-id' not in response.headers
+
+    asyncio.run(scenario())
+
+
+def test_decode_department_accepts_encoded_unicode():
+    from router.api.routes_v1 import decode_department
+
+    assert decode_department(None) == ''
+    assert decode_department('') == ''
+    assert decode_department(encode_department(' 财务部 ')) == '财务部'
+    # 先 strip 再查控制字符（brief 的实现顺序）：纯首尾换行/制表符等价于未声明。
+    assert decode_department('%0A') == ''
+    assert decode_department('%20%09%20') == ''
+
+
+@pytest.mark.parametrize('raw', [
+    '%', '%zz', '%E4', 'a' * 769, 'x' * 65, 'a%00b', '%7F', 'a%01b',
+])
+def test_decode_department_rejects_malformed_values(raw):
+    from router.api.routes_v1 import decode_department
+
+    with pytest.raises(ValueError, match='invalid_department'):
+        decode_department(raw)

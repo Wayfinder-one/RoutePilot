@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime
 from types import SimpleNamespace
+from urllib.parse import unquote_to_bytes
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -38,6 +40,7 @@ from router.jev.serialization import answer_to_dict
 from router.routing.types import (
     NoActiveTreeError,
     NoAvailableBackend,
+    NoDefaultTreeError,
     RoutingMiss,
     RoutingRequest,
     session_digest,
@@ -54,6 +57,29 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 MAX_BODY_BYTES = 10 * 1024 * 1024
+
+# 部门 Header 的严格解码只信任 ``%XX`` 形式：裸 ``%`` 或截断的百分号转义都拒绝。
+_BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
+
+
+def decode_department(raw: str | None) -> str:
+    """严格解码 ``x-sr-department``（管理端可信 Header，公开入口禁用）。
+
+    ``None``/空串表示「未声明部门」，返回 ``''``。任何畸形输入（非法百分号
+    转义、非 UTF-8 字节、解码后超过 64 字符、控制字符）都抛
+    ``ValueError('invalid_department')``，由调用方映射成 400。
+    """
+    if raw is None or raw == '':
+        return ''
+    if len(raw) > 768 or _BAD_PERCENT.search(raw):
+        raise ValueError('invalid_department')
+    try:
+        value = unquote_to_bytes(raw).decode('utf-8').strip()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError('invalid_department') from exc
+    if len(value) > 64 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise ValueError('invalid_department')
+    return value
 
 
 def _error(message: str, status_code: int) -> JSONResponse:
@@ -192,23 +218,41 @@ async def chat_completions(request: Request):
 
 
 async def run_chat_completion(request: Request, *, use_requested_model: bool = False,
-                              conn=None):
+                              conn=None, allow_department_header: bool = False):
     """Shared data-plane executor (``/v1`` and the admin Test chat page).
 
-    ``use_requested_model`` is the only difference between the public data plane
-    and the admin test endpoint: when false the request ``model`` stays ignored
-    and routing decides; when true ``"auto"`` still routes, any other model is a
-    fixed direct selection that skips graph/JEV/sticky.
+    ``use_requested_model`` is the only model-selection difference between the
+    public data plane and the admin test endpoint: when false the request
+    ``model`` stays ignored and routing decides; when true ``"auto"`` still
+    routes, any other model is a fixed direct selection that skips
+    graph/JEV/sticky.
 
     ``conn`` is the admin catalog connection: a fixed model resolves through the
     SQLite catalog (``load_backends``) instead of the active snapshot, because
     the fixed-model test is a catalog check independent of any canvas.  ``/v1``
     passes no connection, so the public hot path stays snapshot-only.
+
+    ``allow_department_header`` gates the trusted ``x-sr-department`` header:
+    the admin test chat sets it to let an operator probe department selection,
+    while the public data plane rejects the header outright
+    (``400 department_header_not_allowed``).  Auto requests always select a
+    graph from the snapshot set (department match, else the default graph);
+    fixed-model direct requests never need a route set or a default graph and
+    emit no ``x-sr-graph-selection``.
     """
     started = time.monotonic()
     length = request.headers.get("content-length")
     if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
         return _error("request_too_large", 413)
+    raw_department = request.headers.get("x-sr-department")
+    department = ""
+    if raw_department is not None:
+        if not allow_department_header:
+            return _error("department_header_not_allowed", 400)
+        try:
+            department = decode_department(raw_department)
+        except ValueError:
+            return _error("invalid_department", 400)
     buffer = bytearray()
     async for chunk in request.stream():
         buffer.extend(chunk)
@@ -239,6 +283,9 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
     requestlog = request.app.state.requestlog
     routing_started = time.monotonic()
     trace: list[dict] = []
+    # 选图失败时账本仍要落一条 snapshot=None 的失败记录：fail() 读取调用时
+    # 的 snapshot，默认值必须先存在。
+    snapshot = None
 
     def fail(error_class, status_code, stage, message):
         routing_ms = (time.monotonic() - routing_started) * 1000.0
@@ -257,15 +304,19 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         requestlog.enqueue(record, snapshot=snapshot)
         return _error(error_class, status_code)
 
-    # 公开数据面只使用路由集的默认图（部门选图由 Task 4 接入 select()）。
-    snapshot_set = request.app.state.snapshot_set
-    snapshot = snapshot_set.default_snapshot if snapshot_set is not None else None
+    # 公开数据面严格使用路由集默认图；管理端测试对话凭可信 Header 按部门选图。
+    route_set = request.app.state.snapshot_set
+    selection = None
     if fixed_model is None:
-        if snapshot_set is None:
-            return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
-        if snapshot is None:
-            return fail("no_active_tree", 503, "graph",
-                        "no routing tree is enabled")
+        if route_set is None:
+            return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot set")
+        try:
+            selection = route_set.select(department)
+            snapshot = selection.snapshot
+        except NoActiveTreeError as exc:
+            return fail("no_active_tree", 503, "snapshot", str(exc))
+        except NoDefaultTreeError as exc:
+            return fail("no_default_tree", 503, "snapshot", str(exc))
         try:
             decision = await request.app.state.routing_service.route(
                 snapshot,
@@ -287,7 +338,9 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             decision.release()
             return _error("no_available_backend", 503)
     else:
-        # 固定模型直连是管理目录测试：有连接时只查 SQLite 目录，不依赖活动快照。
+        # 固定模型直连是管理目录测试：只复用默认快照做日志上下文，不要求
+        # 路由集/默认图存在；有连接时只查 SQLite 目录。
+        snapshot = route_set.default_snapshot if route_set is not None else None
         direct_backends = load_backends(conn) if conn is not None else None
         if direct_backends is not None:
             backend = direct_backends.get(fixed_model)
@@ -357,6 +410,10 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
     requestlog.enqueue(record, snapshot=snapshot)
     outcome = OutcomeRecorder(requestlog, record, started)
     headers = {"x-sr-model": decision.model, "x-sr-selection": decision.selection_reason}
+    if fixed_model is None:
+        # 选图证据只属于 Auto 路由：固定模型直连是目录测试，不输出 x-sr-graph-selection。
+        headers["x-sr-tree-id"] = snapshot.tree_id
+        headers["x-sr-graph-selection"] = selection.reason
     if reasoning_warning:
         headers["x-sr-reasoning-warning"] = reasoning_warning
     elif decision.reasoning is not None:
