@@ -200,9 +200,9 @@ export class RoutingController {
   }
 
   /* 生命周期回包刷新当前草稿与保存基线（Task 8）：v4 的 enabled/default 不参与
-     behavior canonical，但启停/设默认会改写目标文档字节 → tree_revision /
-     document_sha256 / updated_at 随之变化。不同步回保存基线，下一次普通保存会
-     拿旧 base_document_sha256 被 409 graph_conflict 拒绝。
+     behavior canonical，启停/设默认也不会改变 tree_revision；它们只改写目标文档
+     字节，因此 document_sha256 与 updated_at 会变。不同步回保存基线，下一次
+     普通保存会拿旧 base_document_sha256 被 409 graph_conflict 拒绝。
      多图语义必须逐字段取服务端值：第一张启用图自动默认，之后启用的图是
      enabled && !default —— 绝不能写 `default = enabled`。
 

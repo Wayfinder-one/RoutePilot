@@ -5027,37 +5027,45 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
   /* Task 9 的真实浏览器场景：默认图 main(fast) + 部门图 finance(strong, 财务部) 由
      真实管理 API 建立（自包含运行快照，无问题节点因此不触发 JEV）。
      route_set 模式必须只发 text/session_id/可选 department；draft 模式必须继续
-     测当前画布（此处是 finance），而不是默认图。 */
+     测当前画布（此处是 finance），而不是默认图。
+     两张图使用不同的开始/目标/边 ID（<id>-start / <id>-target / <id>-edge）：
+     路由集回放一旦被投影到当前草稿画布，错误的高亮、节点重排和 dirty 才可观察。 */
   const MAIN = 'main';
   const FINANCE = 'finance';
-  const directDocument = (id, model, departments) => ({
-    id: id,
-    name: id === MAIN ? '默认图' : '财务图',
-    departments: departments.slice(),
-    timezone: 'Asia/Shanghai',
-    sticky: { enabled: false, ttl_seconds: 1800 },
-    root: {
-      id: 'root', type: 'graph',
-      nodes: [
-        { id: 'start', type: 'start' },
-        { id: 'target', type: 'target', priority: 1, models: [{ model: model, reasoning: null }] }
-      ],
-      edges: [{
-        id: 'e-start-target', source: 'start', source_port: 'out',
-        target: 'target', target_port: 'in_1', condition: null
-      }],
-      error_fallback: 'target'
-    },
-    backends: {
-      providers: [{
-        name: 'local', base_url: mockBase + '/v1', key_env: '', reasoning_format: 'openai'
-      }],
-      models: [{ id: model, upstream: model, provider: 'local', profile: {} }]
-    },
-    jev: null,
-    jev_window: { input_tokens: 1024, context_tokens: 4096 },
-    time_periods: []
-  });
+  const directDocument = (id, model, departments) => {
+    const start = id + '-start';
+    const target = id + '-target';
+    const edge = id + '-edge';
+    return {
+      id: id,
+      name: id === MAIN ? '默认图' : '财务图',
+      departments: departments.slice(),
+      timezone: 'Asia/Shanghai',
+      sticky: { enabled: false, ttl_seconds: 1800 },
+      root: {
+        id: 'root', type: 'graph',
+        nodes: [
+          { id: start, type: 'start', title: id + ' 起始节点' },
+          { id: target, type: 'target', title: id + ' 独立目标', priority: 1,
+            models: [{ model: model, reasoning: null }] }
+        ],
+        edges: [{
+          id: edge, source: start, source_port: 'out',
+          target: target, target_port: 'in_1', condition: null
+        }],
+        error_fallback: target
+      },
+      backends: {
+        providers: [{
+          name: 'local', base_url: mockBase + '/v1', key_env: '', reasoning_format: 'openai'
+        }],
+        models: [{ id: model, upstream: model, provider: 'local', profile: {} }]
+      },
+      jev: null,
+      jev_window: { input_tokens: 1024, context_tokens: 4096 },
+      time_periods: []
+    };
+  };
   const ensureDirectGraph = async (id, model, departments) => {
     /* 早前的多图生命周期用例会用同一 id 复制示例图（并留下停用状态）：这里把文档
        整体改写成自包含的直连图（fast/strong + 财务部），而不是因为 id 已存在就跳过。 */
@@ -5083,6 +5091,32 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
       running: !!app.tryRunning,
       replayText: app.replay ? app.replay.text : ''
     });
+  });
+  /* 画布状态快照：graph.js 没有导出 editableCanonical，这里用整棵内部树（含节点
+     position）的稳定序列化做更严格的等价物——任何重排、增删或 dirty 都会变。 */
+  const canvasState = () => page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    const RTGraph = await import('/console/routing/graph.js');
+    return {
+      canonical: RTGraph.stableStringify(app.tree),
+      dirty: app.changeKind,
+      replayNodes: document.querySelectorAll('#cvNodes .is-replay').length,
+      finalEdges: document.querySelectorAll('#cvEdges .is-final-edge').length
+    };
+  });
+  const resultFinalLabel = () => page.evaluate(() => {
+    const el = document.querySelector('#cvTryResult .rtc-try-final');
+    return el ? el.textContent.trim() : '';
+  });
+  const resultActions = () => page.evaluate(() => {
+    const waves = document.getElementById('cvTryWavesBtn');
+    return {
+      rerun: !!document.getElementById('cvTryRerun'),
+      clear: !!document.getElementById('cvTryClear'),
+      waves: !!waves,
+      wavesVisible: !!(waves && (waves.offsetWidth || waves.offsetHeight ||
+        waves.getClientRects().length))
+    };
   });
   try {
     await ensureBaselineTree();
@@ -5117,6 +5151,12 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
     assert.equal(await page.locator('#cvTryDepartment').isVisible(), false,
       'the department input must be hidden in draft mode');
 
+    /* 打开 finance 草稿后的干净画布快照：路由集结果绝不能投影或修改它。 */
+    const cleanCanvas = await canvasState();
+    assert.equal(cleanCanvas.dirty, 'clean');
+    assert.equal(cleanCanvas.replayNodes, 0);
+    assert.equal(cleanCanvas.finalEdges, 0);
+
     /* 1) route_set + 财务部 → 部门图 finance / graph_selection=department / 模型 strong，
        请求体只含 text/session_id/department（无 root/tree_id/canvas/运行字段）。 */
     const captured = [];
@@ -5147,6 +5187,25 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
       'the route-set result does not report graph_selection=department');
     assertIncludes(snap.resultText, 'strong',
       'the department graph model is not part of the try outcome');
+    /* 路由集结果只显示原始图/节点 ID：当前画布 finance 的标题不得混进来。 */
+    assert.equal(await resultFinalLabel(), FINANCE + '-target',
+      'route-set result rendered the current canvas title instead of the raw target id');
+    assert.equal(snap.resultText.includes('独立目标'), false,
+      'route-set result read target/candidate names from the current canvas');
+    const departmentActions = await resultActions();
+    assert.equal(departmentActions.rerun, true, 'route-set result lost the rerun action');
+    assert.equal(departmentActions.clear, true, 'route-set result lost the clear action');
+    assert.equal(departmentActions.wavesVisible, false,
+      'route-set result must not offer by-waves layout for the current canvas');
+    const afterDepartment = await canvasState();
+    assert.equal(afterDepartment.replayNodes, 0,
+      'route-set replay painted the current finance canvas (department trace)');
+    assert.equal(afterDepartment.finalEdges, 0,
+      'route-set replay painted final edges on the current finance canvas (department trace)');
+    assert.equal(afterDepartment.canonical, cleanCanvas.canonical,
+      'route-set try-run mutated the open draft canvas');
+    assert.equal(afterDepartment.dirty, 'clean',
+      'route-set try-run dirtied the open draft');
     const departmentPayload = captured[captured.length - 1];
     assert.deepEqual(Object.keys(departmentPayload).sort(), ['department', 'session_id', 'text'],
       'route-set try payload leaked draft/run fields instead of sending only text+session_id+department');
@@ -5156,7 +5215,9 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
         'route-set try payload must not carry ' + field);
     }
 
-    /* 2) 未知部门 → 默认图 main / graph_selection=default / 模型 fast。 */
+    /* 2) 未知部门 → 默认图 main / graph_selection=default / 模型 fast。
+       当前画布是 finance，回放却属于 main：结果必须如实指 main，画布毫无动静。 */
+    const beforeDefault = await canvasState();
     await page.locator('#cvTryDepartment').fill('未知部门');
     await page.locator('#cvTryInput').fill('未知部门试算');
     await page.locator('#cvTryRun').click();
@@ -5168,6 +5229,46 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
     assertIncludes(snap.resultText, MAIN, 'unknown department did not fall back to the default graph');
     assertIncludes(snap.resultText, 'default', 'unknown department did not report graph_selection=default');
     assertIncludes(snap.resultText, 'fast', 'the default graph model is not part of the try outcome');
+    assertIncludes(snap.resultText, MAIN + '-target',
+      'the default-graph result did not report the main target');
+    assert.equal(snap.resultText.includes(FINANCE + '-target'), false,
+      'the default-graph result leaked the finance canvas target');
+    const afterDefault = await canvasState();
+    assert.equal(afterDefault.replayNodes, 0,
+      'the main trace painted the finance canvas nodes');
+    assert.equal(afterDefault.finalEdges, 0,
+      'the main trace painted final edges on the finance canvas');
+    assert.equal(afterDefault.canonical, beforeDefault.canonical,
+      'the default-graph route-set result moved or mutated the finance canvas');
+    assert.equal(afterDefault.dirty, 'clean',
+      'the default-graph route-set result dirtied the finance canvas');
+    assert.equal((await resultActions()).wavesVisible, false,
+      'default-graph route-set result offered by-waves layout on the finance canvas');
+
+    /* 2b) 防御守卫：即使绕过隐藏按钮直接调用模块，也不能按 main 的波次重排 finance。 */
+    const blocked = await page.evaluate(async () => {
+      const RTTryRun = await import('/console/routing/tryrun.js');
+      const { app } = await import('/console/routing/app.js');
+      const { t } = await import('/console/i18n.js');
+      const originalToast = app.toast;
+      const toasts = [];
+      app.toast = (message, tone) => {
+        toasts.push({ message: String(message), tone: String(tone || '') });
+      };
+      let result = null;
+      try {
+        result = RTTryRun.layoutByWaves();
+      } finally {
+        app.toast = originalToast;
+      }
+      return { result: result, toasts: toasts, expected: t('cv.tryRouteSetLayoutBlocked') };
+    });
+    assert.equal(blocked.result, false, 'layoutByWaves accepted a route-set replay');
+    assert.ok(blocked.toasts.some(item => item.message === blocked.expected && item.tone === 'warn'),
+      'layoutByWaves on a route-set replay must warn with cv.tryRouteSetLayoutBlocked');
+    const afterBlocked = await canvasState();
+    assert.equal(afterBlocked.canonical, beforeDefault.canonical,
+      'the blocked by-waves layout still moved the finance canvas');
 
     /* 3) route_set 空部门 → 同样走默认图（空部门等价于默认图）。 */
     await page.locator('#cvTryDepartment').fill('');
@@ -5180,9 +5281,14 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
     snap = await trySnapshot();
     assertIncludes(snap.resultText, MAIN, 'an empty department must use the default graph');
     assertIncludes(snap.resultText, 'default', 'an empty department must report graph_selection=default');
+    assert.equal((await resultActions()).wavesVisible, false,
+      'an empty-department route-set result offered by-waves layout on the finance canvas');
+    assert.equal((await canvasState()).canonical, beforeDefault.canonical,
+      'the empty-department route-set result mutated the finance canvas');
 
     /* 4) 切回 draft：测当前画布 finance（模型 strong），不是默认图 main(fast)；
-       请求体重新携带草稿 root/runtime，且不再携带 department。 */
+       请求体重新携带草稿 root/runtime，且不再携带 department。
+       草稿回放必须逐字保留：画布高亮、画布标题、按波次整理入口都还在。 */
     const draftCaptured = [];
     const draftHandler = async route => {
       draftCaptured.push(route.request().postDataJSON());
@@ -5209,6 +5315,95 @@ test('Task 9 · departments: route-set try-run picks the department graph and dr
       'draft mode did not exercise the current canvas (finance/strong)');
     assert.equal(snap.resultText.includes('fast'), false,
       'draft mode fell back to the default graph main(fast) instead of the current canvas');
+    const draftCanvas = await canvasState();
+    assert.ok(draftCanvas.replayNodes > 0,
+      'draft replay stopped highlighting the current canvas nodes');
+    assert.ok(draftCanvas.finalEdges > 0,
+      'draft replay stopped highlighting the final edge on the current canvas');
+    assert.equal(await resultFinalLabel(), FINANCE + ' 独立目标',
+      'draft replay must keep rendering node names from the current canvas');
+    assert.equal(draftCanvas.dirty, 'clean', 'draft replay dirtied the current canvas');
+    const draftActions = await resultActions();
+    assert.equal(draftActions.wavesVisible, true,
+      'draft replay lost the by-waves layout action');
+
+    /* 5) 草稿回放还在画布上时切到 route_set 再跑：前一次草稿高亮必须被清掉，
+       画布只剩静态图，路由集结果也不提供按波次整理。 */
+    await page.locator('#cvTryScope').selectOption('route_set');
+    await page.locator('#cvTryDepartment').fill('财务部');
+    await page.locator('#cvTryInput').fill('清理草稿高亮');
+    await page.locator('#cvTryRun').click();
+    await waitFor(async text => {
+      const { app } = await import('/console/routing/app.js');
+      return !app.tryRunning && app.replay && app.replay.text === text;
+    }, '清理草稿高亮', { timeout: 15000 });
+    const cleared = await canvasState();
+    assert.equal(cleared.replayNodes, 0,
+      'a stale draft replay highlight survived the route-set try-run');
+    assert.equal(cleared.finalEdges, 0,
+      'a stale draft replay final edge survived the route-set try-run');
+    assert.equal(cleared.dirty, 'clean',
+      'the route-set try-run dirtied the canvas after a draft replay');
+    assert.equal((await resultActions()).wavesVisible, false,
+      'route-set result offered by-waves layout after a draft replay');
+
+    /* 6) 再切回 draft：草稿回放与按波次整理仍然逐字保留。 */
+    await page.locator('#cvTryScope').selectOption('draft');
+    await page.locator('#cvTryInput').fill('草稿画布复测');
+    await page.locator('#cvTryRun').click();
+    await waitFor(async text => {
+      const { app } = await import('/console/routing/app.js');
+      return !app.tryRunning && app.replay && app.replay.text === text;
+    }, '草稿画布复测', { timeout: 15000 });
+    const repainted = await canvasState();
+    assert.ok(repainted.replayNodes > 0,
+      'draft replay did not repaint the canvas after a route-set run');
+    assert.ok(repainted.finalEdges > 0,
+      'draft replay did not repaint the final edge after a route-set run');
+
+    /* 按波次整理仍然工作：只改布局、把节点排进波次列，并清掉陈旧回放。 */
+    const positionsBefore = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return Object.fromEntries(app.graph.nodes.map(node => [node.id,
+        { x: node.position.x, y: node.position.y }]));
+    });
+    const waveToasts = await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return { done: t('cv.tryWavesLayoutDone'), same: t('cv.tryWavesLayoutSame') };
+    });
+    await page.locator('#cvTryWavesBtn').click();
+    await page.waitForFunction(expected => {
+      const text = document.getElementById('cvToast').textContent;
+      return text.indexOf(expected.done) >= 0 || text.indexOf(expected.same) >= 0;
+    }, waveToasts, { timeout: 8000 });
+    const waveToast = await toastText();
+    assert.ok(waveToast.includes(waveToasts.done) || waveToast.includes(waveToasts.same),
+      'by-waves layout no longer reports success for a draft replay: ' + waveToast);
+    const afterWaves = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        positions: Object.fromEntries(app.graph.nodes.map(node => [node.id,
+          { x: node.position.x, y: node.position.y }])),
+        kind: app.changeKind,
+        replay: app.replay,
+        resultHidden: document.getElementById('cvTryResult').hidden
+      };
+    });
+    assert.equal(afterWaves.kind, 'layout', 'by-waves layout was not a layout-only edit');
+    assert.equal(afterWaves.replay, null, 'by-waves layout left a stale draft replay');
+    assert.equal(afterWaves.resultHidden, true, 'by-waves layout left the draft result panel open');
+    const startAfter = afterWaves.positions[FINANCE + '-start'];
+    const targetAfter = afterWaves.positions[FINANCE + '-target'];
+    assert.ok(startAfter && targetAfter, 'by-waves layout dropped a canvas node');
+    assert.equal(startAfter.x, targetAfter.x,
+      'by-waves layout did not put wave-0 nodes in the same column');
+    assert.notEqual(startAfter.y, targetAfter.y,
+      'by-waves layout stacked wave-0 nodes on top of each other');
+    const startBefore = positionsBefore[FINANCE + '-start'];
+    const targetBefore = positionsBefore[FINANCE + '-target'];
+    assert.ok(startAfter.x !== startBefore.x || startAfter.y !== startBefore.y ||
+      targetAfter.x !== targetBefore.x || targetAfter.y !== targetBefore.y,
+      'by-waves layout did not move any node');
     const draftPayload = draftCaptured[draftCaptured.length - 1];
     assert.ok(draftPayload && draftPayload.root, 'draft try payload lost the canvas root');
     assert.equal(Object.prototype.hasOwnProperty.call(draftPayload, 'department'), false,

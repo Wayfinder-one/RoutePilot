@@ -35,6 +35,17 @@ const nodeName = id => {
   const node = graph ? RTGraph.findNode(graph, id) : null;
   return node ? nodeNameOf(node, graph) : (id || '—');
 };
+/* 试算范围：只有 select 显式选 route_set 才走已发布路由集，其余（含控件缺失）
+   一律按当前草稿处理，保持既有行为。 */
+function currentScope() {
+  const select = byId('cvTryScope');
+  return select && select.value === 'route_set' ? 'route_set' : 'draft';
+}
+/* 路由集结果只描述已发布图，节点标题不能被当前草稿画布「翻译」：同一 id 在
+   两张图里含义不同，直接显示原始 id 才是结果真正指向的节点。 */
+function resultNodeName(replay, id) {
+  return replay && replay.scope === 'route_set' ? String(id) : nodeName(id);
+}
 const clone = value => (value == null ? value : JSON.parse(JSON.stringify(value)));
 
 /* 五个样例 = 文本 + 固定 now。文本与 tests/fixtures/graph_scenarios.json 完全一致，
@@ -654,7 +665,9 @@ function apply(replay) {
     renderResult(null);
     return;
   }
-  const graph = graphNow();
+  /* 路由集结果没有当前画布坐标：只渲染结论/事实，绝不 paint、也不清掉当前草稿
+     的静态图。草稿与日志快照继续回放到当前画布（逐字保留既有行为）。 */
+  const graph = replay.scope === 'route_set' ? null : graphNow();
   if (graph) {
     /* 先清旧回放样式：无图事件时只保留静态图，绝不能继承上一次回放的涂色。 */
     removeReplayClasses();
@@ -706,16 +719,24 @@ function candidateNote(replay) {
   if (final.candidates.length > 1) {
     const winner = final.candidates.find(candidate => candidate.target_id === final.target_id) || final.candidates[0];
     const rival = final.candidates.find(candidate => candidate.target_id !== final.target_id) || final.candidates[1];
-    if (!rival) return tf('cv.tryUniqueTarget', { target: nodeName(final.target_id), priority: final.priority });
+    if (!rival) {
+      return tf('cv.tryUniqueTarget', {
+        target: resultNodeName(replay, final.target_id), priority: final.priority
+      });
+    }
     if (winner.priority === rival.priority) {
-      return tf('cv.tryPriorityTie', { priority: winner.priority, winner: nodeName(winner.target_id) });
+      return tf('cv.tryPriorityTie', {
+        priority: winner.priority, winner: resultNodeName(replay, winner.target_id)
+      });
     }
     return tf('cv.tryPriorityWin', {
       winner: winner.target_id, priority: winner.priority,
       rival: rival.target_id, rivalPriority: rival.priority
     });
   }
-  return tf('cv.tryUniqueTarget', { target: nodeName(final.target_id), priority: final.priority });
+  return tf('cv.tryUniqueTarget', {
+    target: resultNodeName(replay, final.target_id), priority: final.priority
+  });
 }
 
 function factHTML(labelKey, value) {
@@ -771,7 +792,8 @@ function candidateChips(replay) {
   if (!final.candidates.length) {
     return '<span class="rtc-try-none">' + esc(t('cv.tryNoCandidates')) + '</span>' +
       '<span class="rtc-try-op">→</span>' +
-      '<span class="rtc-try-pick">' + esc(t('cv.tryFallback')) + ' ' + esc(nodeName(final.target_id)) + '</span>';
+      '<span class="rtc-try-pick">' + esc(t('cv.tryFallback')) + ' ' +
+        esc(resultNodeName(replay, final.target_id)) + '</span>';
   }
   return final.candidates.map((candidate, index) => {
     const win = candidate.target_id === final.target_id;
@@ -779,7 +801,7 @@ function candidateChips(replay) {
       '<span class="rtc-try-cand' + (win ? ' is-win' : '') + '"' +
       ' data-candidate="' + esc(candidate.target_id) + '" data-priority="' + esc(candidate.priority) + '"' +
       ' title="' + esc(candidate.target_id) + '">' +
-      esc(nodeName(candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i>' +
+      esc(resultNodeName(replay, candidate.target_id)) + '<i>p' + esc(candidate.priority) + '</i>' +
       (win ? '<em>' + esc(t('cv.tryWin')) + '</em>' : '') +
       '</span>';
   }).join('');
@@ -866,18 +888,24 @@ function renderResult(replay) {
     ? '<div class="rtc-try-cmp"><span class="rtc-try-note is-warn">' +
       esc(replay.error.message) + '</span></div>'
     : '';
+  /* 路由集回放不属于当前草图：不提供「按波次整理」，否则会按另一张图的波次
+     改写当前草稿的节点位置。日志快照（只读）依旧不提供任何写入口。 */
+  const wavesAction = !isReadOnly() && replay.scope !== 'route_set'
+    ? '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
+      esc(t('cv.tryWavesLayout')) + '</button>'
+    : '';
   host.innerHTML =
     '<div class="rtc-try-res-h">' +
       '<span class="rtc-try-kind is-' + kindClass + '">' + esc(finalKindLabel(replay)) + '</span>' +
       errorBadge +
       '<span class="rtc-try-lbl">' + esc(t('cv.tryFinal')) + '</span>' +
-      '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' + esc(nodeName(final.target_id)) + '</b>' +
+      '<b class="rtc-try-final" title="' + esc(final.target_id) + '">' +
+        esc(resultNodeName(replay, final.target_id)) + '</b>' +
       '<span class="rtc-try-id">' + esc(final.target_id) + '</span>' +
       (final.model ? '<span class="rtc-try-model">' + esc(final.model) + '</span>' : '') +
       '<span class="rtc-try-acts">' +
         (isReadOnly() ? '' :
-          '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
-            esc(t('cv.tryWavesLayout')) + '</button>' +
+          wavesAction +
           '<button type="button" class="btn sm" id="cvTryRerun" data-try-act="rerun">' +
             esc(t('cv.tryRerun')) + '</button>' +
           '<button type="button" class="btn sm" id="cvTryClear" data-try-act="clear">' +
@@ -1047,9 +1075,16 @@ async function run(text, options) {
     setBusy(true);
     const input = byId('cvTryInput');
     if (input && input.value !== inputText) input.value = inputText;
+    /* 范围在发请求前定格：运行期间用户改 select 也不能把回放归到另一个范围，
+       回放与请求体（payloadFor 同 tick 读取）必须描述同一次试算。 */
+    const requestScope = currentScope();
     const response = await api.post('/admin/try', payloadFor(inputText, now));
     if (token !== runSeq) return false;
-    const rebuilt = rebuild(response.trace || [], graphNow());
+    /* 路由集回放不属于当前画布：用空图重建，target/candidate/wave 全部来自 trace
+       与 response.outcome；草稿范围才拿当前图作为回放底图。 */
+    const replayGraph = requestScope === 'route_set' ? { nodes: [], edges: [] } : graphNow();
+    const rebuilt = rebuild(response.trace || [], replayGraph);
+    rebuilt.scope = requestScope;
     rebuilt.outcome = response.outcome || null;
     rebuilt.answers = response.answers || null;
     rebuilt.warnings = Array.isArray(response.warnings) ? response.warnings : [];
@@ -1095,6 +1130,12 @@ function rerun() {
 /* ── Step 4 · 按波次整理（只写 position，一次 App.change） ──────── */
 function layoutByWaves() {
   const replay = state;
+  /* 防御：路由集结果描述的是已发布图，绝不能拿它的波次去重排当前草稿画布
+     （按钮已隐藏，这里再拦一次直接调用）。 */
+  if (replay && replay.scope === 'route_set') {
+    toastNow(t('cv.tryRouteSetLayoutBlocked'), 'warn');
+    return false;
+  }
   const graph = graphNow();
   if (!graph) return false;
   if (!replay || !replay.final) {
