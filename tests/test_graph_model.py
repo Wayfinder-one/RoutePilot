@@ -296,9 +296,6 @@ def test_question_fields_are_type_specific():
 def test_display_fields_are_excluded_from_revision():
     base = tree_revision_of(tree_from_dict(tree_dict()))
     changed = tree_dict()
-    changed["root"]["nodes"][2]["capability"] = "新的能力说明"
-    assert tree_revision_of(tree_from_dict(changed)) == base
-    changed = tree_dict()
     changed["root"]["nodes"][1]["title"] = "选择问题"
     changed["root"]["nodes"][2]["title"] = "兜底目标"
     assert tree_revision_of(tree_from_dict(changed)) == base
@@ -383,6 +380,20 @@ def test_otherwise_target_is_rejected_as_an_unknown_field():
         tree_from_dict(raw)
 
 
+def test_legacy_target_strategy_and_capability_are_ignored():
+    """已下线的 target 字段：旧文档仍可读，但解析结果与序列化都不再保留它们。"""
+    raw = tree_dict()
+    target = raw["root"]["nodes"][-1]
+    target["strategy"] = "least_inflight"
+    target["capability"] = "展示说明"
+
+    tree = tree_from_dict(raw)
+    serialized = graph_to_dict(tree.root)["nodes"][-1]
+    assert "strategy" not in serialized
+    assert "capability" not in serialized
+    assert graph_to_dict(graph_from_dict(graph_to_dict(tree.root))) == graph_to_dict(tree.root)
+
+
 def test_huge_int_raises_value_error():
     """溢出量级的整数必须报 ValueError（契约），而不是 OverflowError（Task 2 复审发现）。"""
     raw = tree_dict()
@@ -434,11 +445,11 @@ def test_public_surface_lives_in_concrete_modules():
 def test_shared_sample_revision_is_order_and_display_invariant():
     """共享样例：节点/边输入顺序反转、title/position 编辑都不改变 revision。
 
-    同时锁定重构前的 revision 值：行为不变时 revision 必须逐字节一致。
+    同时锁定当前 revision 值：移除 target.strategy 后的行为 canonical 必须逐字节一致。
     """
     samples = {
-        "fixture": (tree_dict(), "6031a50f98b932c8bac72f5e8f31ae57a4e06ea6e4b8c624ff908293a1b7c452"),
-        "power": (tree_dict(root=POWER_GRAPH), "8d625f05781e2287dc8e72e0af2514a7514d92086a6340324d8c2c0325947f62"),
+        "fixture": (tree_dict(), "72c78103b5d4002fab6ca8a94a340f10172e90d3fccad2f231364d010dbb69d2"),
+        "power": (tree_dict(root=POWER_GRAPH), "7ee317f5be5f82ca5c1792d26dfcb03393e5f46705165928c5e26e462753b495"),
     }
     for name, (raw, expected) in samples.items():
         assert tree_revision_of(tree_from_dict(raw)) == expected, name

@@ -274,7 +274,7 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     raw["root"]["nodes"][0]["title"] = "请求入口"
     raw["canvas"]["start"] = {"x": 40, "y": 60}
     target = next(node for node in raw["root"]["nodes"] if node["type"] == "target")
-    target["capability"] = "展示说明"
+    target["title"] = "展示说明"
 
     response = create_tree(client, raw)
     assert response.status_code == 201, response.text
@@ -287,7 +287,7 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     assert saved["canvas"]["start"] == {"x": 40, "y": 60}
     assert saved["root"]["nodes"][0]["title"] == "请求入口"
     saved_target = next(node for node in saved["root"]["nodes"] if node["type"] == "target")
-    assert saved_target["capability"] == "展示说明"
+    assert saved_target["title"] == "展示说明"
     assert saved["canvas"]["q"] == {"x": 200, "y": 0}
 
     updated_root = copy.deepcopy(saved["root"])

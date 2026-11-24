@@ -433,7 +433,6 @@ body.is-try-running .rtc-stage.is-locked::after {
   border: 1px solid; border-radius: 4px; padding: 0 5px; line-height: 14px;
 }
 .rtc-fb--fallback { color: var(--amber); background: var(--amber-soft); border-color: var(--amber-line); }
-.rtc-tcap-inline { overflow: hidden; text-overflow: ellipsis; color: var(--text-2); }
 .rtc-tfoot {
   display: flex; align-items: center; gap: 6px; height: 21px;
   padding: 0 10px; border-top: 1px solid var(--line);

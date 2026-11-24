@@ -349,12 +349,11 @@ def present_trace_event(event: dict, *, has_time_period: bool) -> dict:
         target = str(event.get("target_id"))
         available = [str(model) for model in event.get("available_models") or []]
         configured = [str(model) for model in event.get("configured_models") or []]
-        strategy = str(event.get("strategy") or _DASH)
         cell = _text("有可用模型" if available else "无可用模型",
                      "Available" if available else "Unavailable")
         summary = _text(
-            f"目标 {target}：{len(available)} 个可用模型，策略 {strategy}",
-            f"Target {target}: {len(available)} available models, strategy {strategy}",
+            f"目标 {target}：{len(available)} 个可用模型",
+            f"Target {target}: {len(available)} available models",
         )
         facts = [_fact("可用模型", "Available models", ", ".join(available) or _DASH)]
         if configured:

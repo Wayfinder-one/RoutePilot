@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import threading
 
 from router.routing.types import NoAvailableBackend
@@ -24,10 +25,17 @@ class Lease:
 
 
 class LoadBalancer:
-    def __init__(self, breaker=None):
+    """Pick a model for a request: sticky/preferred when given, otherwise random.
+
+    In-flight counters are kept for trace/observability only; selection among a
+    multi-model target is uniform random, not least-in-flight.
+    """
+
+    def __init__(self, breaker=None, rng=None):
         self.breaker = breaker
         self._inflight: dict[str, int] = {}
         self._lock = threading.Lock()
+        self._rng = rng or random.Random()
 
     def available(self, models: list[str]) -> list[str]:
         available = []
@@ -65,7 +73,8 @@ class LoadBalancer:
                     )
                 model = preferred
             elif available:
-                model = min(available, key=lambda candidate: self._inflight.get(candidate, 0))
+                # 多模型目标不做负载比较：在可用模型里等概率随机选一个。
+                model = self._rng.choice(available)
             else:
                 raise NoAvailableBackend("no available backend", selection=selection)
             if not dry_run:

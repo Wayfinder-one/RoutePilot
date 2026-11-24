@@ -622,6 +622,7 @@ const NODE_FIELDS = {
   question: ['id', 'type', 'question_type', 'instructions', 'title', 'options', 'criteria'],
   logic: ['id', 'type', 'operator', 'title'],
   condition: ['id', 'type', 'source', 'contains_any', 'periods', 'title'],
+  /* strategy / capability 已下线；仍允许旧文档携带（读取时忽略，导出时丢弃）。 */
   target: ['id', 'type', 'models', 'priority', 'strategy', 'capability', 'title'],
 };
 const EDGE_FIELDS = ['id', 'source', 'source_port', 'target', 'target_port', 'condition'];
@@ -697,10 +698,6 @@ function validateContract(value, graph, issues) {
     if (node.type === 'condition' && ['text', 'periods'].indexOf(node.source) < 0) {
       issues.push(issue('graph_parse_error', '未知条件来源：' + String(node.source),
         'Unknown condition source: ' + String(node.source), { node_id: String(node.id || '') }));
-    }
-    if (node.type === 'target' && node.strategy != null && node.strategy !== 'least_inflight') {
-      issues.push(issue('graph_parse_error', 'target.strategy 必须为 least_inflight',
-        'target.strategy must be least_inflight', { node_id: String(node.id || '') }));
     }
     (Array.isArray(node.options) ? node.options : []).filter(isRecord).forEach(option => {
       addUnknownFields(option, ['key', 'label', 'capability'], 'question option', issues, String(node.id || ''));
@@ -1824,6 +1821,17 @@ function runtimeDocumentView(value) {
 
 /* ── 6. 行为 canonical / changeKind（§2.8） ─────────────────────────── */
 
+/* 已下线的 target 字段：旧文档仍可导入，但不在草稿/导出里继续携带。 */
+function stripRemovedTargetFields(root) {
+  if (!isRecord(root) || !Array.isArray(root.nodes)) return root;
+  root.nodes.forEach(node => {
+    if (!isRecord(node) || node.type !== 'target') return;
+    delete node.strategy;
+    delete node.capability;
+  });
+  return root;
+}
+
 function normalizedNode(node, includeDisplay) {
   const output = { id: String(node.id == null ? '' : node.id), type: node.type };
   if (node.type === 'question') {
@@ -1859,11 +1867,9 @@ function normalizedNode(node, includeDisplay) {
       reasoning: item && item.reasoning != null ? item.reasoning : null
     }));
     output.priority = node.priority;
-    output.strategy = node.strategy || 'least_inflight';
   }
   if (includeDisplay) {
     output.title = node.title == null ? '' : node.title;
-    if (node.type === 'target') output.capability = node.capability == null ? '' : node.capability;
     output.position = isRecord(node.position) &&
       isFiniteNumber(node.position.x) && isFiniteNumber(node.position.y)
       ? { x: node.position.x, y: node.position.y }
@@ -2071,7 +2077,7 @@ function serialize(tree) {
     name: parts.name,
     timezone: parts.timezone,
     sticky: parts.sticky,
-    root: clone(parts.root)
+    root: stripRemovedTargetFields(clone(parts.root))
   };
   /* 自包含文档：四字段无条件平铺（jev 可为 null）；缺字段/部分字段时抛明确错误，
      与 parseImport、服务端 tree_from_dict 一样不维护「旧文档」导出分支。 */
@@ -2142,7 +2148,7 @@ function parseImport(text) {
       issues: [issue('graph_parse_error', PARSE_ERROR_ZH, PARSE_ERROR_EN)]
     };
   }
-  const graph = clone(raw);
+  const graph = stripRemovedTargetFields(clone(raw));
   graph.id = isNonEmptyString(graph.id) ? graph.id : 'root';
   graph.type = 'graph';
   /* 非对象条目不做静默丢弃：保留在 tree 中交给 validate 报 graph_parse_error。 */
@@ -2270,7 +2276,6 @@ function createMinimalTree(model, runtime) {
           type: 'target',
           models: [{ model: targetModel }],
           priority: 1,
-          strategy: 'least_inflight',
           position: { x: 420, y: 180 }
         }
       ],

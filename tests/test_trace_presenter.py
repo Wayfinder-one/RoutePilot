@@ -305,7 +305,7 @@ def test_present_trace_formats_fallback_and_no_candidate_final():
 
 def test_present_trace_formats_schedule_and_scheduled_values():
     schedule = present_trace([{
-        "event": "schedule", "target_id": "power-target", "strategy": "least_inflight",
+        "event": "schedule", "target_id": "power-target",
         "configured_models": ["qwen3-8b", "qwen3-32b"],
         "registered_models": ["qwen3-8b", "qwen3-32b"],
         "available_models": ["qwen3-8b"],
@@ -314,7 +314,7 @@ def test_present_trace_formats_schedule_and_scheduled_values():
         "sticky": {"status": "miss", "preferred_model": "qwen3-8b"},
     }], has_time_period=False)[0]
     assert schedule["kind_label"] == {"zh": "调度", "en": "Schedule"}
-    assert schedule["summary"]["zh"] == "目标 power-target：1 个可用模型，策略 least_inflight"
+    assert schedule["summary"]["zh"] == "目标 power-target：1 个可用模型"
     assert schedule["facts"][0] == [
         {"zh": "可用模型", "en": "Available models"}, "qwen3-8b"]
     assert schedule["facts"][2] == [{"zh": "在途", "en": "In flight"}, "qwen3-8b: 1"]

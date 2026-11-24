@@ -584,7 +584,7 @@ const RTGraph = await import('/console/routing/graph.js');
 }, scoreIds[0]);
 });
 
-test('Task 11 · logic and target inspectors edit operator, models, reasoning, priority and strategy with guards', async () => {
+test('Task 11 · logic and target inspectors edit operator, models, reasoning and priority with guards', async () => {
   await openCanvas();
   await clickNode('and-power');
   await waitInspectorBranch('node', 'and-power');
@@ -636,8 +636,6 @@ const RTGraph = await import('/console/routing/graph.js');
   await page.locator('#cvInspectorBody [data-field="priority"]').fill('7');
   await page.locator('#cvInspectorBody [data-model-field="model"]').first().selectOption('deepseek-v3');
   await page.locator('#cvInspectorBody [data-model-field="reasoning"]').first().selectOption('high');
-  await page.locator('#cvInspectorBody [data-field="strategy"]').selectOption('least_inflight');
-  await page.locator('#cvInspectorBody [data-field="capability"]').fill('强推理通用模型：复杂分析。');
   await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -654,8 +652,9 @@ const RTGraph = await import('/console/routing/graph.js');
     return (JSON.parse(JSON.stringify(
     RTGraph.findNode(app.graph, 'strong-target'))));
 });
-  assert.equal(target.strategy, 'least_inflight');
-  assert.equal(target.capability, '强推理通用模型：复杂分析。');
+  /* 调度策略与目标能力描述已下线：提交后不应再写回这两个字段。 */
+  assert.equal('strategy' in target, false);
+  assert.equal('capability' in target, false);
   await clickCanvasAction('cvUndo');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -1002,7 +1001,7 @@ test('Task 11 · admin API timeout rejects a hung request with a clear localized
 }
 });
 
-test('Task 12 · timezone/sticky are behavior while title/capability/name are display changes', async () => {
+test('Task 12 · timezone/sticky are behavior while title/name are display changes', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
   await waitInspectorBranch('graph', 'root');
@@ -1039,14 +1038,14 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
 
   await clickNode('strong-target');
   await waitInspectorBranch('node', 'strong-target');
-  await page.locator('#cvInspectorBody [data-field="capability"]').fill('强推理（展示说明）');
+  await page.locator('#cvInspectorBody [data-field="title"]').fill('强推理（展示标题）');
   await page.locator('#cvInspectorBody [data-act="ins-save-node"]').click();
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
-    return (app.graph.nodes.find(node => node.id === 'strong-target').capability === '强推理（展示说明）');
+    return (app.graph.nodes.find(node => node.id === 'strong-target').title === '强推理（展示标题）');
 });
   badge = await draftStatus();
-  assert.equal(badge.kind, 'display', 'target capability was not classified as display');
+  assert.equal(badge.kind, 'display', 'target title was not classified as display');
   assert.equal(badge.state, 'unpublished');
 
   await page.evaluate(async () => {
@@ -1074,7 +1073,7 @@ test('Task 12 · timezone/sticky are behavior while title/capability/name are di
     'a display-only save changed the server tree_revision');
   assert.equal(server.name, '展示字段决策组');
   assert.equal(server.root.nodes.find(node => node.id === 'capability').title, '能力分档（展示标题）');
-  assert.equal(server.root.nodes.find(node => node.id === 'strong-target').capability, '强推理（展示说明）');
+  assert.equal(server.root.nodes.find(node => node.id === 'strong-target').title, '强推理（展示标题）');
 });
 
 test('P0 inspector applies to draft and lifecycle explains publish state', async () => {
@@ -1169,7 +1168,7 @@ test('review-inspector-adds-input-connection', async () => {
     'inspector connection did not produce one history entry');
 });
 
-test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', async () => {
+test('review-target-card-shows-name-model-and-fallback-roles', async () => {
   await ensureBaselineTree();
   await openCanvas();
 
@@ -1179,8 +1178,7 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
     'target card header still shows only the model name');
   assert.match(await otherwiseCard.locator('.rtc-tbody').innerText(), /deepseek-v3/,
     'target card body does not show its model');
-  assert.equal((otherwiseText.match(/最少在途请求/g) || []).length, 1,
-    'target card renders the strategy more than once');
+  assert.doesNotMatch(otherwiseText, /最少在途请求|调度策略/);
   assert.doesNotMatch(otherwiseText, /兜底模型/);
 
   const errorCard = page.locator('#cvNodes [data-node-id="light-target"]');
@@ -1193,9 +1191,10 @@ test('review-target-card-shows-name-model-fallback-roles-and-single-strategy', a
 
   await clickNode('standard-target');
   await waitInspectorBranch('node', 'standard-target');
-  assert.equal(
-    (await page.locator('#cvInspectorBody [data-field="strategy"] option:checked').textContent()).trim(),
-    '最少在途请求');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="strategy"]').count(), 0,
+    'target inspector still exposes the removed scheduling strategy');
+  assert.equal(await page.locator('#cvInspectorBody [data-field="capability"]').count(), 0,
+    'target inspector still exposes the removed capability description');
 });
 
 test('Task 9 · runtime refresh refuses to drop a period still referenced by a condition node', async () => {

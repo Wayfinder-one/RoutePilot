@@ -20,7 +20,7 @@
 import * as RTGraph from './graph.js';
 import { addRuntimeModel, refreshRuntime, selectJev } from './runtime.js';
 import { t, tf } from '../i18n.js';
-import { nodeName, strategyLabel } from './cards.js';
+import { nodeName } from './cards.js';
 import {
   canEditCondition,
   conditionText as conditionTextOf,
@@ -346,23 +346,9 @@ function fieldsForNode(node) {
       '<button type="button" class="btn sm" data-act="model-add">' + esc(t('cv.ins.modelAdd')) + '</button>' +
       '<label class="field">' + esc(t('cv.ins.priority')) +
       '<input type="number" min="1" step="1" data-field="priority" value="' +
-      esc(node.priority == null ? 1 : node.priority) + '" aria-label="' + esc(t('cv.ins.priority')) + '"></label>' +
-      '<label class="field">' + esc(t('cv.ins.strategy')) +
-      '<select data-field="strategy" aria-label="' + esc(t('cv.ins.strategy')) + '">' +
-      strategyOptions(node.strategy) + '</select></label>' +
-      '<label class="field">' + esc(t('cv.ins.capability')) +
-      '<textarea rows="2" data-field="capability" aria-label="' + esc(t('cv.ins.capability')) + '">' +
-      esc(node.capability || '') + '</textarea></label></div>';
+      esc(node.priority == null ? 1 : node.priority) + '" aria-label="' + esc(t('cv.ins.priority')) + '"></label></div>';
   }
   return html;
-}
-
-function strategyOptions(selected) {
-  const values = ['least_inflight'];
-  if (selected && values.indexOf(selected) < 0) values.push(selected);
-  return values.map(value => '<option value="' + esc(value) + '"' +
-    (value === selected ? ' selected' : '') + '>' +
-    esc(strategyLabel(value)) + '</option>').join('');
 }
 
 function formTail(saveAction, extraActions, showSave = true) {
@@ -719,10 +705,6 @@ function applyNodeValues(treeRoot, nodeId, values) {
       item && item.type === 'target' && item.id !== node.id && item.priority === priority);
     if (duplicate) return error(tf('cv.ins.errPriorityDup', { value: priority }));
     node.priority = priority;
-    if (values.strategy) node.strategy = values.strategy;
-    const capability = String(values.capability || '').trim();
-    if (capability) node.capability = capability;
-    else delete node.capability;
   }
   return { ok: true };
 }
@@ -739,8 +721,6 @@ function submitNode(form) {
     operator: fieldValue(form, 'operator'),
     keywords: fieldValue(form, 'keywords'),
     priority: fieldValue(form, 'priority'),
-    strategy: fieldValue(form, 'strategy'),
-    capability: fieldValue(form, 'capability'),
     options: optionRows(form),
     models: modelRows(form),
     periods: Array.from(form.querySelectorAll('[data-field="periods"] input:checked'))

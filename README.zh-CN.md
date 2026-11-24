@@ -16,7 +16,7 @@ RoutePilot 是兼容 OpenAI 协议的路由代理。请求从 `/v1/chat/completi
 | 路由策略 | 可视化决策图：输入条件、决策服务问题、逻辑门、模型目标 |
 | 决策服务 | `choice` / `noul` / `score` 三类问题，按波次合并调用 `systemone` 兼容服务；画布快照固定该图使用的服务档案 |
 | 目标选择 | 已激活目标按优先级竞争；统一兜底目标 `error_fallback` |
-| 后端选择 | 会话粘性、`least_inflight` 负载均衡、按模型熔断 |
+| 后端选择 | 会话粘性；多模型目标在可用模型中随机选择；按模型熔断 |
 | 可移植画布 | 每份已保存画布自带完整非密钥运行配置，单份 JSON 即可在空数据库实例上恢复 |
 | 检查路由 | 调用 `/admin/try`，复用同一图执行器与同一轨迹格式，不改变粘性、inflight 与上游模型；数据库差异只作为提示展示 |
 | 运维 | 请求账本、决策回放、置信度分布、模型/提供方目录、多服务 JEV 目录、时段、审计历史、角色化用户 |
@@ -31,7 +31,7 @@ flowchart LR
   G <--> J["决策服务 /v1/systemone"]
   G --> T["目标选择<br/>优先级 · 兜底"]
   T --> A[会话粘性]
-  A --> L["least_inflight<br/>+ 熔断器"]
+  A --> L["随机选择<br/>+ 熔断器"]
   L --> U[上游模型]
   G -. 轨迹 .-> R[(请求账本)]
 ```
@@ -41,7 +41,7 @@ flowchart LR
 3. 写入数值端口与 `selected` 端口，重新评估下游槽位条件与逻辑门。
 4. 逐波重复，直到没有新问题被激活。
 5. 选择优先级最高的已激活目标；否则使用 `error_fallback`。
-6. 应用会话粘性，以 `least_inflight` 选择后端，向上游转发请求。
+6. 应用会话粘性；没有粘性命中时，在目标的可用模型中随机选一个，向上游转发请求。
 
 `unknown` 不会激活问题或目标；与 `unknown` 比较的数值条件保持 `unknown`。
 
@@ -96,7 +96,7 @@ flowchart LR
 
 首页（`/console/index.html`）是仅管理员可用的模型测试对话，请求固定走 Auto 并发送到 `/admin/test/chat/completions`；消息元信息根据响应头 `x-sr-model` 显示本次实际命中的模型（`Auto → <模型>`）。
 
-- **Auto 智能路由**：与 `/v1/chat/completions` 一样评估活动画布快照（决策图、JEV 波次、粘性与负载均衡后端选择）。页面不提供固定模型旁路，测试流量始终经过真实路由；固定模型直连仍只通过 `POST /admin/test/chat/completions` 提供（`x-sr-selection: direct`，经数据库目录解析）。
+- **Auto 智能路由**：与 `/v1/chat/completions` 一样评估活动画布快照（决策图、JEV 波次、粘性与随机后端选择）。页面不提供固定模型旁路，测试流量始终经过真实路由；固定模型直连仍只通过 `POST /admin/test/chat/completions` 提供（`x-sr-selection: direct`，经数据库目录解析）。
 - **流式回复**：回答通过 SSE 逐块返回；停止会中止流并保留已生成内容，复制 / 重试 / 重新生成作用于该条消息。只有上游正常收尾才算完成——提前断流会标记为未完成，提供方错误就地显示在对话里，不会冒充完整回答。
 - **多轮历史**：内存中的对话以 wire-format `messages` 重发，并从原始 assistant 消息无损回放（消息级媒体只渲染、绝不回流进历史）；新建对话会中止在途回复、清空对话并轮换会话 id。
 - **附件**：文本文件按原文读取并作为 content part 发送；图片、音频等其他文件在浏览器内读成 data URL。预估体积会超出 10 MiB 请求上限的文件在读取前就地拒绝，发送前还会对完整 JSON 请求体（含历史与 Base64）做精确复检。
@@ -110,12 +110,12 @@ flowchart LR
 **编辑区** —— 画布、节点库、检查器、校验：
 
 - 从节点库拖拽建节点、平移缩放；自动整理与撤销重做直接放在顶栏。
-- 类型化连线；数值输出拖入布尔槽位时生成默认条件。
+- 类型化连线；数值输出拖入输入槽位时生成默认条件。
 - 每个输入槽位是一个 OR 输入，各自持有边条件。
 - 输出拖到空白处会打开兼容节点选择器；点选后在该位置创建节点并自动连线（Esc 取消）。
 - 保存与发布合并为顶栏主按钮；顶栏的“保存草稿”仍可只保存不启用。生命周期徽标只显示四种状态：运行中、有未发布修改、未启用、草稿未保存。已保存但未启用的组即使有本地改动也显示“未启用”（未启用优先），“草稿未保存”只用于从未保存的新草稿。主按钮随状态显示“保存并启用”“保存并更新”“已启用”“启用”或“保存中…”。
 - 检查器的“应用”只提交到本地草稿；写服务端的动作都在顶栏——主按钮发布（保存并启用），“保存草稿”只保存不启用，“停用”切换启用状态。
-- 目标卡片显示展示名、模型列表、兜底角色与调度策略。
+- 目标卡片显示展示名、模型列表、兜底角色与随机调度提示（多模型目标）。
 
 **执行区** —— 停靠在画布下方：
 
@@ -142,10 +142,10 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 | 类型 | 用途 | 输入 | 输出 |
 |---|---|---|---|
 | `start` | 请求入口，恒为真 | — | 布尔 |
-| `question` | 决策服务问题：`choice`、`noul`、`score` | 布尔槽位 `in_1..in_n`（OR） | choice：`prob.*`、`selected.*`、`p_top`、`margin`；noul：`yes`、`no`；score：`value` |
-| `logic` | 三值逻辑门：`and`、`or` | 布尔槽位 `in_1..in_n`，每槽一条边条件 | 布尔 |
+| `question` | 决策服务问题：`choice`、`noul`、`score` | 槽位 `in_1..in_n`（OR，任一为 true 即激活；类型由入边源端口决定） | choice：`prob.*`、`selected.*`、`p_top`、`margin`；noul：`yes`、`no`；score：`value` |
+| `logic` | 三值逻辑门：`and`、`or` | 槽位 `in_1..in_n`，每槽一条边条件，至少两条 | 布尔 |
 | `condition` | 输入条件：时段或文本关键词 | — | 布尔 |
-| `target` | 模型目标：模型、推理档位、优先级、策略 | 布尔槽位 `in_1..in_n`（OR） | — |
+| `target` | 模型目标：模型、推理档位、优先级（多模型随机选择） | 槽位 `in_1..in_n`（OR） | — |
 
 ### 条件
 
@@ -167,17 +167,18 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 | 数值 | `gt` / `gte` / `lt` / `lte` / `eq` / `neq` + 有限阈值 | 数值比较；unknown 按 unknown 传播 |
 | 布尔 | `null`（等价 `= true`）或 `{ "op": "is", "value": true \| false }` | 布尔期望 |
 
+- 槽位本身不声明类型：合法性只看源端口是数值还是布尔；数值输出可接任意槽位，只要该边带比较条件。
 - 一个输出可接入多个槽位，每个槽位保留各自条件。
 - AND 门的两个槽位可表达区间，例如 `> 0.3` 与 `< 0.8`。
 - 每个输入槽位只接一条边；槽位编号稳定，释放后可复用。
-- `and` / `or` 至少两个槽位。问题与目标的槽位为 OR。
-- 反向判断使用布尔槽位取反，或使用数值比较的反向算子；不提供独立 NOT 节点。
+- `and` / `or` 至少两个槽位。问题与目标的槽位为 OR（true 才激活，unknown 不激活）。
+- 反向判断使用布尔输出取反，或使用数值比较的反向算子；不提供独立 NOT 节点。
 
 ### 执行规则
 
-- 问题按波次执行，一波即一次决策服务调用。
-- 失败波次作废本轮：不写入端口，本轮候选全部丢弃。
-- 目标优先级唯一，数值大者胜出。
+- 问题按波次执行，一波即一次决策服务调用；同一问题在一次请求里最多执行一次。
+- 失败波次不写入任何端口，并清空此前所有波次累积的全部候选，然后进入兜底。
+- 目标优先级唯一，数值大者胜出；候选排序的次键是 target id 字典序。
 - `error_fallback` 同时处理「正常运行但无激活目标」与「决策调用失败、超时或返回非法答案」。
 - 兜底引用必须指向存在的目标。
 
@@ -217,19 +218,21 @@ v3 文档就是完整、可移植的画布：图结构加四个必填运行字�
 }
 ```
 
-只接受 `sr-routing-graph` v3。v2 文档、非 v3 的 `kind`、未知节点类型，以及未知的 envelope/节点/边字段，都会在覆盖草稿或已发布快照之前被拒绝；只带部分（或完全不带）四个运行字段的文档同样被拒绝。结构性拒绝以 `graph_parse_error` 返回；控制台在导入时执行同一套校验。没有问题节点的画布才允许 `jev: null`。
+只接受 `sr-routing-graph` v3。v2 文档、非 v3 的 `kind`、未知节点类型，以及未知的 envelope/节点/边字段，都会在覆盖草稿或已发布快照之前被拒绝；只带部分（或完全不带）四个运行字段的文档同样被拒绝。解析失败（未知字段、类型错误、缺字段）以 `graph_parse_error` 返回；start 数量、端口/槽位、环、可达性、优先级与兜底等结构问题返回各自的 Issue code，不再折叠成解析错误。控制台在导入时执行同一套校验。`jev: null` 在结构上始终合法；含问题节点的图在启用校验时会因 `decision_service_unavailable` 被拒绝。
 
-实验版本不提供旧 NOT 图兼容：任何 `logic/operator=not` 都直接拒绝，不自动迁移，也不保证历史 NOT 快照可展示。需要反向判断时，手工改用布尔槽位取反或数值补比较，例如 `> 0.65 → NOT` 改为 `<= 0.65`，`>= 0.5 → NOT` 改为 `< 0.5`。
+完整字段表、问题码与执行细节见[决策图规范](docs/决策图规范.md)。
+
+实验版本不提供旧 NOT 图兼容：任何 `logic/operator=not` 都直接拒绝，不自动迁移，也不保证历史 NOT 快照可展示。需要反向判断时，手工改用布尔输出取反或数值补比较，例如 `> 0.65 → NOT` 改为 `<= 0.65`，`>= 0.5 → NOT` 改为 `< 0.5`。
 
 四个运行字段的语义见[自包含画布 JSON](#自包含画布-json)。
 
-`tree_revision` 是 `{timezone, sticky, root}` 加四个运行字段的 canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。只影响展示的变化不影响该值：节点标题、target 的能力说明、坐标、数组顺序与边 id。会参与该值的是问题选项的能力说明（choice 问题），以及模型 profile 的能力说明与已声明推理档位——它们改变运行行为。
+`tree_revision` 是 `{timezone, sticky, root}` 加四个运行字段的 canonical JSON 的 SHA-256：节点按 id 排序，边按 `(target, slot, source, source_port)` 排序。Python 与控制台产生同一 canonical 形式；控制台用它判定编辑类型，`tree_revision` 由服务端计算。只影响展示的变化不影响该值：节点标题、坐标、节点/边数组顺序与边 id。列表**顺序**并非全都无关：问题选项、评分档位、`target.models`、提供方/模型目录与时段数组的顺序都参与该值。会参与该值的还有问题选项的能力说明（choice 问题），以及模型 profile 的能力说明与已声明推理档位——它们改变运行行为。
 
 ## 模型与推理
 
 ![模型](assets/routepilot/zh/models.png)
 
-决策图引用的模型槽位映射到上游模型 id 与提供方。一个目标可包含多个槽位，由 `least_inflight` 在其中选择。**数据库目录**是控制台下拉框与固定模型直连的管理事实源；**画布快照**是 Auto 路由的唯一事实源。
+决策图引用的模型槽位映射到上游模型 id 与提供方。一个目标可包含多个槽位；有多个可用模型时随机选择一个。**数据库目录**是控制台下拉框与固定模型直连的管理事实源；**画布快照**是 Auto 路由的唯一事实源。
 
 提供方定义 OpenAI 兼容 base URL、API Key 环境变量与推理方言。模型 profile 声明：
 
@@ -497,46 +500,63 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 
 ## API
 
-| 方法与路径 | 用途 |
-|---|---|
-| `POST /v1/chat/completions` | 路由入口；JSON 或 SSE |
-| `GET /healthz` | 存活探针 |
-| `GET /readyz` | 快照就绪状态 |
-| `POST /admin/login` / `POST /admin/logout` | 控制台会话 |
-| `GET /admin/me` / `POST /admin/me/password` | 当前用户、修改口令 |
-| `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 决策组 |
-| `POST /admin/trees/{id}/copy`、`/enable`、`/disable` | 组生命周期 |
-| `POST /admin/try` | 针对草稿图的检查路由 |
-| `POST /admin/test/chat/completions` | 仅管理员的模型测试对话；JSON 或 SSE |
-| `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 模型注册表；更新/删除先返回 409 影响清单，确认后同步画布 |
-| `GET /admin/model-catalog`、`POST /admin/fetch-models` | 提供方预设、上游模型发现 |
-| `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 提供方；更新先返回 409 影响清单，仍被引用时不可删除 |
-| `GET/POST /admin/jev`、`GET/PUT/DELETE /admin/jev/{id}` | 多服务 JEV 目录（窗口属于各服务） |
-| `POST /admin/jev/{id}/test` | 用数据库配置测试单个目录服务 |
-| `GET/PUT /admin/time-periods` | 时段 |
-| `GET /admin/requests/recent`、`GET /admin/requests/stats` | 实时请求环形缓冲、logger 统计 |
-| `GET /admin/overview`、`GET /admin/changes` | 概览、审计历史 |
-| `GET/POST /admin/users`、`PUT/DELETE /admin/users/{id}`、`POST /admin/users/{id}/password` | 用户 |
+完整字段、请求/响应示例与影响确认流程见[后端接口说明](docs/后端接口说明.md)。
+
+- `/v1/*`、`/healthz`、`/readyz` 与 `/console/*` 不需要鉴权；其余 `/admin/*` 需要 `Authorization: Bearer <token>`。
+- `POST /admin/login` 是唯一公开的管理面端点：用邮箱与口令换 token；会话默认 168 小时，登出、改密或删用户会吊销会话。
+- `viewer` 只能读（`/admin/users*` 也不行）；所有写操作与用户管理需要 `admin`。`ROUTER_USER_AUTH=0` 时完全开放，按服务账号处理。
+- 数据面错误是 `{"error":{"message":"<机器码>"}}`；管理面错误是 `{"detail": ...}`，其中图/配置校验失败为 Issue 数组。
+- `POST /v1/chat/completions` 忽略请求里的 `model`，始终按画布路由；请求头 `x-sr-session-id` 参与粘性。响应头 `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` 说明实际选择。
+- `POST /admin/trees` 必须同时携带 `backends`、`jev`、`jev_window`、`time_periods`；`PUT` 是补丁，且必须带当前 `base_document_sha256`，否则 409。
+
+| 方法与路径 | 权限 | 用途 |
+|---|---|---|
+| `POST /v1/chat/completions` | 公开 | 路由入口；JSON 或 SSE |
+| `GET /healthz` / `GET /readyz` | 公开 | 存活探针 / 快照就绪状态 |
+| `POST /admin/login` / `POST /admin/logout` | 公开 / 登录用户 | 控制台会话 |
+| `GET /admin/me`、`POST /admin/me/password` | 登录用户 | 当前用户、修改口令 |
+| `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 读 / admin | 决策组 |
+| `POST /admin/trees/{id}/copy`、`/enable`、`/disable` | admin | 组生命周期 |
+| `POST /admin/try` | admin | 针对草稿图的检查路由 |
+| `POST /admin/test/chat/completions` | admin | 模型测试对话；`model=auto` 走路由，其他值固定直连 |
+| `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 读 / admin | 模型注册表；更新/删除先返回 409 影响清单，确认后同步画布 |
+| `GET /admin/model-catalog`、`POST /admin/fetch-models` | 读 / admin | 提供方预设、上游模型发现 |
+| `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 读 / admin | 提供方；更新先返回 409 影响清单，仍被引用时不可删除 |
+| `GET/POST /admin/jev`、`GET/PUT/DELETE /admin/jev/{id}` | 读 / admin | 多服务 JEV 目录（窗口属于各服务） |
+| `POST /admin/jev/{id}/test` | admin | 用数据库配置测试单个目录服务 |
+| `GET/PUT /admin/time-periods` | 读 / admin | 时段 |
+| `GET /admin/requests/recent`、`/requests/stats`、`/requests/{id}/snapshot` | viewer | 实时请求环、logger 统计、请求快照 |
+| `GET /admin/overview`、`GET /admin/changes` | viewer | 概览、审计历史 |
+| `GET/POST /admin/users`、`PUT/DELETE /admin/users/{id}`、`POST /admin/users/{id}/password` | admin | 用户 |
 
 ### 错误
 
-| 状态 | 错误 | 含义 |
+管理面与数据面的错误信封不同，见上。数据面：
+
+| 状态 | 错误 `message` | 含义 |
 |---|---|---|
-| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | 请求体格式错误 |
+| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` / `invalid_session_id` | 请求体或会话头格式错误 |
 | 413 | `request_too_large` | 请求体超过 10 MiB |
 | 502 | `upstream_error` | 上游 5xx 或网络失败 |
-| 409 | `graph_conflict` | 草稿/影响清单加载后图已变化 |
-| 409 | `impact_confirmation_required` | 模型/提供方/JEV 写入影响画布，需确认清单里的文档哈希 |
-| 409 | `provider_referenced` | 提供方仍被数据库模型或画布模型引用 |
-| 409 | `graph_already_exists` | 图 id 重复 |
-| 503 | `graph_read_only` | 只读副本 |
-| 503 | `graph_storage_error` | 共享图存储不可读 |
 | 503 | `no_valid_snapshot` | 无初始快照 |
 | 503 | `no_active_tree` | 无已启用决策组 |
 | 503 | `no_available_backend` | 所选目标的全部后端不可用 |
 | 503 | `routing_failed` / `routing_invariant_violation` | 路由内部失败 |
 
-上游 4xx 响应按原状态码与响应体透传。
+管理面：
+
+| 状态 | 错误 | 含义 |
+|---|---|---|
+| 401 / 403 | `unauthorized…` / `forbidden…` | 未登录 / viewer 写操作 |
+| 409 | `graph_conflict` | 基线或影响清单的文档哈希已过期 |
+| 409 | `impact_confirmation_required` | 模型/提供方/JEV 写入影响画布，需确认清单里的文档哈希 |
+| 409 | `provider_referenced` | 提供方仍被数据库模型或画布模型引用 |
+| 409 | `graph_already_exists` | 图 id 重复 |
+| 422 | Issue 数组 | 图/配置校验失败 |
+| 503 | `graph_read_only` / `graph_storage_error` | 只读副本 / 共享图存储不可读 |
+| 502 | 字符串 | JEV 测试或上游模型发现失败 |
+
+上游 4xx 响应按原状态码与响应体透传；`/admin/test/chat/completions` 另有 `404 unknown_model` 与 `422 invalid_model`。
 
 配置接口：`/admin/models`、`/admin/providers`、`/admin/jev`、`/admin/time-periods`。不存在通用 `/admin/settings` 接口，也不存在独立的 JEV 窗口端点：窗口属于每个 JEV 服务。
 
@@ -576,7 +596,7 @@ router/
     service.py         求值 → 调度编排
     scheduling.py      粘性选择、租约获取、粘性写入
     affinity.py        会话粘性 LRU
-    scheduler.py       least_inflight 均衡器与租约
+    scheduler.py       随机模型选择与租约
     snapshot.py        不可变画布快照装配与编译后拓扑
     tree.py            树 envelope 编解码与 revision
     codec.py           严格字段解析助手
@@ -586,6 +606,7 @@ router/
   store/               SQLite schema/仓储、图文件仓储
   console/             中英双语原生 ES Module 控制台
 configs/               示例决策组；configs/cases/ 为五份可移植演示案例
+docs/                  设计与运维记录；后端接口说明.md、决策图规范.md 为对外参考
 tests/                 pytest 套件与契约 fixture
 scripts/               Node 契约测试、Playwright QA、部署脚本
 experiments/jev-batch/ 独立 JEV 批量 spike

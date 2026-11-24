@@ -55,15 +55,6 @@ function nodeName(node, graph) {
   }
 }
 
-function strategyLabel(value) {
-  const strategy = value || 'least_inflight';
-  const key = strategy === 'least_inflight'
-    ? 'cv.strategy.least_inflight'
-    : 'cv.strategy.' + strategy;
-  const label = t(key);
-  return label === key ? strategy : label;
-}
-
 function portHTML(node, port, options) {
   if (!port) return '';
   const opts = options || {};
@@ -285,9 +276,8 @@ function targetCard(graph, node) {
     '</div>' +
     '<div class="rtc-tbody">' +
     (roles.length ? '<div class="rtc-tmeta rtc-tmeta--roles">' + roles.join('') + '</div>' : '') +
-    '<div class="rtc-tmeta"><span>' + esc(models.join(' / ') || t('cv.card.noModels')) + '</span></div>' +
-    '<div class="rtc-tmeta"><span>' + esc(strategyLabel(node.strategy)) + '</span>' +
-    (node.capability ? '<span class="rtc-tcap-inline" title="' + esc(node.capability) + '">' + esc(snippet(node.capability, 38)) + '</span>' : '') +
+    '<div class="rtc-tmeta"><span>' + esc(models.join(' / ') || t('cv.card.noModels')) + '</span>' +
+    (models.length > 1 ? '<span>' + esc(t('cv.card.random')) + '</span>' : '') +
     '</div>' +
     '</div>' +
     slotsHTML(graph, node) +
@@ -322,7 +312,6 @@ export {
   render,
   nodeCard,
   nodeName,
-  strategyLabel,
   portHTML,
   snippet,
   esc as escape

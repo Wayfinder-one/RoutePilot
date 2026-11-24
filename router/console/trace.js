@@ -325,7 +325,6 @@ function scheduleHtml(model) {
   return `<section class="lg-schedule"><div class="lg-sec-h">${esc(t('logs.schedule'))}</div>
     <div class="lg-judgments">
       ${judgment(t('logs.field.target'), nodeRef(model.labels, schedule.target_id))}
-      ${judgment(t('logs.f.strategy'), esc(text(schedule.strategy)))}
       ${judgment(t('logs.f.configured'), esc(listText(schedule.configured_models)))}
       ${judgment(t('logs.f.registered'), esc(listText(schedule.registered_models)))}
       ${judgment(t('logs.f.available'), esc(listText(schedule.available_models)))}

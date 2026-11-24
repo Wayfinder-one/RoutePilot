@@ -105,12 +105,12 @@ def test_layout_and_display_fields_survive_repository_roundtrip(repo):
     raw = tree_dict()
     raw["root"]["nodes"][0]["title"] = "请求入口"
     raw["canvas"]["start"] = {"x": 321, "y": 654}
-    raw["root"]["nodes"][-1]["capability"] = "展示说明"
+    raw["root"]["nodes"][-1]["title"] = "展示说明"
     created = repo.create(tree_from_dict(raw))
     loaded = repo.get("main")
     assert (loaded.root.nodes[0].position.x, loaded.root.nodes[0].position.y) == (321.0, 654.0)
     assert loaded.root.nodes[0].title == "请求入口"
-    assert loaded.root.nodes[-1].capability == "展示说明"
+    assert loaded.root.nodes[-1].title == "展示说明"
     assert loaded.tree_revision == created.tree_revision
 
 
@@ -151,11 +151,11 @@ def test_question_option_order_changes_revision(repo):
     assert [option.key for option in second.root.nodes[1].options] == ["strong", "easy"]
 
 
-def test_copy_preserves_layout_display_and_capability(repo):
+def test_copy_preserves_layout_and_display(repo):
     raw = tree_dict("source")
     raw["root"]["nodes"][0]["title"] = "请求入口"
     raw["canvas"]["start"] = {"x": 40, "y": 60}
-    raw["root"]["nodes"][-1]["capability"] = "展示说明"
+    raw["root"]["nodes"][-1]["title"] = "展示说明"
     source = repo.create(tree_from_dict(raw))
 
     copied = repo.copy("source", "copy", "副本")
@@ -165,7 +165,7 @@ def test_copy_preserves_layout_display_and_capability(repo):
     assert copied.tree_revision == source.tree_revision
     assert copied.root.nodes[0].title == "请求入口"
     assert (copied.root.nodes[0].position.x, copied.root.nodes[0].position.y) == (40.0, 60.0)
-    assert copied.root.nodes[-1].capability == "展示说明"
+    assert copied.root.nodes[-1].title == "展示说明"
 
 
 def test_enable_disable_and_copy_preserve_single_active_invariant(repo):

@@ -81,8 +81,6 @@ class TargetNode:
     id: str
     models: tuple[ModelTarget, ...]
     priority: int
-    strategy: str = "least_inflight"
-    capability: str | None = None
     title: str | None = None
     position: Position | None = None
 
@@ -263,6 +261,8 @@ def _node_from_dict(raw, canvas: dict) -> GraphNode:
             _position(canvas, node_id, "condition"),
         )
     if node_type == "target":
+        # strategy / capability 已下线：仍接受旧文档里的这两个键（读取时忽略），
+        # 以免已保存的画布在新版本里变成非法文件；保存与导出不再写回。
         reject_unknown_fields(
             "target node",
             raw,
@@ -279,20 +279,12 @@ def _node_from_dict(raw, canvas: dict) -> GraphNode:
             raise ValueError("target.priority must be an integer")
         if isinstance(priority, float) and not math.isfinite(priority):
             raise ValueError("target.priority must be an integer")
-        strategy = raw.get("strategy", "least_inflight")
-        if strategy != "least_inflight":
-            raise ValueError(f"target.strategy must be least_inflight, got {strategy!r}")
-        capability = raw.get("capability")
-        if capability is not None and not isinstance(capability, str):
-            raise ValueError("target.capability must be a string")
         return TargetNode(
-            node_id,
-            tuple(_model_target_from_dict(model) for model in models),
-            priority,
-            strategy,
-            capability,
-            optional_title(raw, "target"),
-            _position(canvas, node_id, "target"),
+            id=node_id,
+            models=tuple(_model_target_from_dict(model) for model in models),
+            priority=priority,
+            title=optional_title(raw, "target"),
+            position=_position(canvas, node_id, "target"),
         )
     raise ValueError(f"unknown node type {node_type!r}")
 
@@ -374,10 +366,6 @@ def _node_to_dict(node: GraphNode) -> dict:
             "models": [{"model": item.model, "reasoning": item.reasoning} for item in node.models],
             "priority": node.priority,
         }
-        if node.strategy != "least_inflight":
-            result["strategy"] = node.strategy
-        if node.capability is not None:
-            result["capability"] = node.capability
     else:
         raise TypeError(f"unsupported node {node!r}")
     if node.title is not None:
@@ -442,7 +430,6 @@ def _node_behavior_dict(node: GraphNode) -> dict:
             "type": "target",
             "models": [{"model": item.model, "reasoning": item.reasoning} for item in node.models],
             "priority": node.priority,
-            "strategy": node.strategy,
         }
     raise TypeError(f"unsupported node {node!r}")
 

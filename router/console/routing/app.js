@@ -299,7 +299,6 @@ function makeNode(kind, position, graph, forcedId) {
       type: 'target',
       models: [targetModel],
       priority: nextPriority(graph),
-      strategy: 'least_inflight',
       position: point
     };
   } else {

@@ -12,23 +12,36 @@ class Breaker:
         return model in self.open_models
 
 
-def test_least_inflight_uses_counts_and_stable_tie_order():
-    balancer = LoadBalancer()
+class FixedRng:
+    """Deterministic stand-in for ``random.Random``: always picks one model."""
+
+    def __init__(self, model):
+        self.model = model
+        self.candidates = []
+
+    def choice(self, models):
+        self.candidates.append(list(models))
+        return self.model
+
+
+def test_multi_model_pick_is_random_and_ignores_inflight_counts():
+    rng = FixedRng("a")
+    balancer = LoadBalancer(rng=rng)
     first = balancer.acquire(["a", "b"])
     second = balancer.acquire(["a", "b"])
-    assert {first.model, second.model} == {"a", "b"}
+
+    # 最少在途请求会改选 b；随机调度必须继续按随机源给出的结果选 a。
+    assert (first.model, second.model) == ("a", "a")
+    assert rng.candidates == [["a", "b"], ["a", "b"]]
+    assert balancer.inflight("a") == 2
+    assert balancer.inflight("b") == 0
     first.release()
-    third = balancer.acquire(["a", "b"])
-    assert third.model == "a"
-    third.release()
     second.release()
-    fourth = balancer.acquire(["a", "b"])
-    assert fourth.model == "a"
-    fourth.release()
+    assert balancer.inflight("a") == 0
 
 
 def test_release_is_idempotent_and_dry_run_never_changes_counts():
-    balancer = LoadBalancer()
+    balancer = LoadBalancer(rng=FixedRng("a"))
     lease = balancer.acquire(["a"])
     lease.release()
     lease.release()
@@ -40,7 +53,7 @@ def test_release_is_idempotent_and_dry_run_never_changes_counts():
 
 
 def test_circuit_open_models_are_filtered():
-    balancer = LoadBalancer(Breaker({"a"}))
+    balancer = LoadBalancer(Breaker({"a"}), rng=FixedRng("b"))
     lease = balancer.acquire(["a", "b"])
     assert lease.model == "b"
     lease.release()
@@ -55,7 +68,7 @@ def test_all_unavailable_or_empty_targets_fail_closed():
 
 
 def test_preferred_model_must_still_be_available():
-    balancer = LoadBalancer(Breaker({"a"}))
+    balancer = LoadBalancer(Breaker({"a"}), rng=FixedRng("b"))
     with pytest.raises(NoAvailableBackend):
         balancer.acquire(["a", "b"], preferred="a")
     lease = balancer.acquire(["a", "b"], preferred="b")
@@ -64,12 +77,16 @@ def test_preferred_model_must_still_be_available():
 
 
 def test_selection_snapshot_is_taken_before_increment():
-    balancer = LoadBalancer()
+    balancer = LoadBalancer(rng=FixedRng("a"))
     held = balancer.acquire(["a", "b"])
     preview = balancer.acquire(["a", "b"], dry_run=True)
 
     assert held.model == "a"
-    assert preview.model == "b"
+    assert held.selection == {
+        "available_models": ["a", "b"],
+        "unavailable": {},
+        "inflight": {"a": 0, "b": 0},
+    }
     assert preview.selection == {
         "available_models": ["a", "b"],
         "unavailable": {},

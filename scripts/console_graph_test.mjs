@@ -730,7 +730,8 @@ test('createMinimalTree builds a saveable start-to-target graph', () => {
   assert.equal(targets.length, 1);
   assert.equal(targets[0].priority, 1);
   assert.deepEqual(targets[0].models, [{ model: 'qwen3-8b' }]);
-  assert.equal(targets[0].strategy, 'least_inflight');
+  assert.equal('strategy' in targets[0], false);
+  assert.equal('capability' in targets[0], false);
   assert.equal(graph.error_fallback, targets[0].id);
   assert.equal(graph.edges.length, 1);
   assert.equal(graph.edges[0].source, 'start');
@@ -886,9 +887,11 @@ test('changeKind separates display fields from behavior fields', () => {
   title.root.nodes[1].title = '兜底目标';
   cases.push([title, 'display']);
 
-  const capability = RTGraph.clone(before);
-  capability.root.nodes[1].capability = '兜底说明';
-  cases.push([capability, 'display']);
+  /* 已下线的 target 字段不再参与任何 canonical：改它等同于没有改动。 */
+  const legacy = RTGraph.clone(before);
+  legacy.root.nodes[1].capability = '兜底说明';
+  legacy.root.nodes[1].strategy = 'least_inflight';
+  cases.push([legacy, 'clean']);
 
   const renamed = RTGraph.clone(before);
   renamed.name = '另一个名字';
@@ -953,7 +956,10 @@ test('behaviorCanonical orders nodes by id and edges by slot number', () => {
   assert.equal('id' in payload.root.edges[0], false);
 
   for (const node of payload.root.nodes) {
-    if (node.type === 'target') assert.equal('strategy' in node, true);
+    if (node.type === 'target') {
+      assert.equal('strategy' in node, false);
+      assert.equal('capability' in node, false);
+    }
   }
 });
 
@@ -1098,7 +1104,7 @@ test('edge_cycle issues carry the offending edge id and slot', () => {
   assert.equal(cycle[0].port, 'in_2');
 });
 
-test('serialize round-trip preserves positions, titles and target capability', () => {
+test('serialize round-trip preserves positions and titles, dropping removed target fields', () => {
   const tree = minimalTree();
   const [start, target] = tree.root.nodes;
   start.title = '入口';
@@ -1115,7 +1121,8 @@ test('serialize round-trip preserves positions, titles and target capability', (
   assert.equal(importedStart.title, '入口');
   assert.deepEqual(importedTarget.position, { x: 611, y: 72 });
   assert.equal(importedTarget.title, '兜底目标');
-  assert.equal(importedTarget.capability, '兜底说明');
+  assert.equal('capability' in importedTarget, false);
+  assert.equal('strategy' in importedTarget, false);
   assert.equal(RTGraph.changeKind(tree, result.tree), 'clean');
 });
 
@@ -1145,7 +1152,7 @@ test('validate reports duplicate target priorities', () => {
   const graph = minimalTree().root;
   graph.nodes.push({
     id: 'target-2', type: 'target', models: [{ model: 'qwen3-32b' }], priority: 1,
-    strategy: 'least_inflight', position: { x: 0, y: 0 },
+    position: { x: 0, y: 0 },
   });
   const issues = RTGraph.validate(graph).filter(issue => issue.code === 'target_priority_invalid');
   assert.ok(issues.some(issue => issue.node_id === 'target-2' && /唯一/.test(issue.zh)));
@@ -1475,7 +1482,7 @@ test('calculation log model groups real execution order without dropping slots',
     { event: 'slot', wave: 1, node_id: 't', port: 'in_1', source: 'q', source_port: 'value', raw: 7.5, condition: { op: 'gt', value: 5 }, status: 'true' },
     { event: 'activate', wave: 1, node_id: 't', via_port: 'in_1' },
     { event: 'final', target_id: 't', kind: 'target', priority: 1, candidates: [{ target_id: 't', priority: 1, via_node: 'q', via_port: 'in_1', wave: 1 }] },
-    { event: 'schedule', target_id: 't', strategy: 'least_inflight', configured_models: ['fast'], registered_models: ['fast'], available_models: ['fast'], unavailable: {}, inflight: { fast: 0 }, sticky: { status: 'disabled', preferred_model: null } },
+    { event: 'schedule', target_id: 't', configured_models: ['fast'], registered_models: ['fast'], available_models: ['fast'], unavailable: {}, inflight: { fast: 0 }, sticky: { status: 'disabled', preferred_model: null } },
     { event: 'scheduled', model: 'fast', reason: 'target', dry_run: false },
   ];
   const model = SRTrace.build(trace, { q: { title: '严重度', type: 'question' } });
@@ -1605,8 +1612,8 @@ function selfContainedGraph() {
     id: 'root', type: 'graph', error_fallback: 'fast-target',
     nodes: [
       { id: 'start', type: 'start' },
-      { id: 'fast-target', type: 'target', models: [{ model: 'fast', reasoning: 'high' }], priority: 1, strategy: 'least_inflight' },
-      { id: 'strong-target', type: 'target', models: [{ model: 'strong', reasoning: null }], priority: 2, strategy: 'least_inflight' }
+      { id: 'fast-target', type: 'target', models: [{ model: 'fast', reasoning: 'high' }], priority: 1 },
+      { id: 'strong-target', type: 'target', models: [{ model: 'strong', reasoning: null }], priority: 2 }
     ],
     edges: [
       { id: 'e-start-fast', source: 'start', source_port: 'out', target: 'fast-target', target_port: 'in_1', condition: null },

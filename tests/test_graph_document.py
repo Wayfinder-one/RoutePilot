@@ -34,7 +34,7 @@ def test_v3_document_roundtrip_preserves_display_and_external_metadata():
     raw = tree_dict()
     raw["canvas"]["start"] = {"x": 321, "y": 654}
     raw["root"]["nodes"][0]["title"] = "入口"
-    raw["root"]["nodes"][-1]["capability"] = "展示说明"
+    raw["root"]["nodes"][-1]["title"] = "展示说明"
     source = tree_from_dict(raw)
 
     content = graph_document_bytes(source)
@@ -51,7 +51,7 @@ def test_v3_document_roundtrip_preserves_display_and_external_metadata():
     loaded = load(content)
     assert loaded.id == "file-main" and loaded.enabled is True
     assert loaded.root.nodes[0].position.x == 321
-    assert loaded.root.nodes[-1].capability == "展示说明"
+    assert loaded.root.nodes[-1].title == "展示说明"
     assert loaded.tree_revision == tree_revision_of(source)
     assert loaded.document_sha256 == hashlib.sha256(content).hexdigest()
 

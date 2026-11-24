@@ -90,7 +90,6 @@
         "id": "deep-target",
         "type": "target",
         "priority": 4,
-        "capability": "最深推理：复杂方案与长链分析",
         "models": [
           {
             "model": "deepseek-v3",
@@ -102,7 +101,6 @@
         "id": "power-target",
         "type": "target",
         "priority": 5,
-        "capability": "国网电力专用：设备故障、抢修工单、电力规程",
         "models": [
           {
             "model": "qwen3.8-flash-sft",
@@ -114,7 +112,6 @@
         "id": "strong-target",
         "type": "target",
         "priority": 3,
-        "capability": "强推理通用模型：复杂分析、方案设计",
         "models": [
           {
             "model": "qwen3-32b",
@@ -126,7 +123,6 @@
         "id": "standard-target",
         "type": "target",
         "priority": 2,
-        "capability": "标准档通用模型：写作、总结与纠错",
         "models": [
           {
             "model": "deepseek-v3",
@@ -138,7 +134,6 @@
         "id": "light-target",
         "type": "target",
         "priority": 1,
-        "capability": "轻量快速模型：简单问答与短输出",
         "models": [
           {
             "model": "qwen3-8b",

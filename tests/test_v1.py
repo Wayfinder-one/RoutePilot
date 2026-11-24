@@ -425,11 +425,13 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
         response = await post(app)
         assert response.status_code == 200
         assert response.headers["x-sr-selection"] == "target"
-        assert response.headers["x-sr-model"] == "strong-a"
+        # strong-target 有两个模型：选择是随机的，只断言落在该目标内。
+        model = response.headers["x-sr-model"]
+        assert model in ("strong-a", "strong-b")
         assert [list(request["questions"]) for request in har.jev_requests] == [
             ["q-cap"], ["q-clarify"],
         ]
-        assert har.upstream_models == ["strong-a"]
+        assert har.upstream_models == [model]
         record = recent(app)
         assert record["waves"] == 2
         assert record["jev_choice"] == "strong"
@@ -444,7 +446,7 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
         conn.close()
         assert row["waves"] == 2
         assert "answers" not in columns and "trace" not in columns
-        assert app.state.balancer.inflight("strong-a") == 0
+        assert app.state.balancer.inflight(model) == 0
 
     asyncio.run(scenario())
 
@@ -536,10 +538,11 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         headers = {"x-sr-session-id": "session-1"}
         first = await post(app, headers=headers)
         assert first.status_code == 200
-        assert first.headers["x-sr-model"] == "strong-a"
+        model = first.headers["x-sr-model"]
+        assert model in ("strong-a", "strong-b")
         assert first.headers["x-sr-selection"] == "target"
         assert app.state.balancer.calls[-1]["preferred"] is None
-        assert app.state.balancer.inflight("strong-a") == 0
+        assert app.state.balancer.inflight(model) == 0
         first_revision = app.state.snapshot.tree_revision
 
         # 仅移动节点（canvas 属于纯布局字段）：behavior revision 不变。
@@ -563,12 +566,12 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
 
         second = await post(app, headers=headers)
         assert second.status_code == 200
-        assert second.headers["x-sr-model"] == "strong-a"
+        assert second.headers["x-sr-model"] == model
         assert second.headers["x-sr-selection"] == "sticky"
         # 第二次请求仍先执行被激活的问题，再做 preferred 调度。
         assert [list(request["questions"]) for request in har.jev_requests] == [["q"], ["q"]]
-        assert app.state.balancer.calls[-1]["preferred"] == "strong-a"
-        assert har.upstream_models == ["strong-a", "strong-a"]
+        assert app.state.balancer.calls[-1]["preferred"] == model
+        assert har.upstream_models == [model, model]
         record = recent(app)
         assert record["sticky_hit"] == 1
         assert record["selection_reason"] == "sticky"

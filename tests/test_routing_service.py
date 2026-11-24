@@ -94,7 +94,6 @@ def test_schedule_trace_uses_actual_selection_and_preserves_event_order():
     assert schedule == {
         "event": "schedule",
         "target_id": "power-target",
-        "strategy": "least_inflight",
         "configured_models": ["qwen3.8-flash-sft"],
         "registered_models": ["qwen3.8-flash-sft"],
         "available_models": ["qwen3.8-flash-sft"],
@@ -376,7 +375,7 @@ class DeadPreferredBalancer(RecordingBalancer):
         return LoadBalancer.acquire(self, models, preferred=preferred, dry_run=dry_run)
 
 
-def test_dead_sticky_backend_is_rescheduled_by_least_inflight():
+def test_dead_sticky_backend_is_rescheduled_without_retrying_it():
     """回归：sticky/preferred 在并发下失效必须改用其他可用后端，而不是 503。"""
     nodes = [
         node("start", "start"),
@@ -415,7 +414,8 @@ def test_dead_sticky_backend_is_rescheduled_by_least_inflight():
     assert not [event for event in trace if event["event"] == "sticky_hit"]
     schedule = next(event for event in trace if event["event"] == "schedule")
     assert schedule["sticky"] == {"status": "unavailable", "preferred_model": None}
-    assert schedule["available_models"] == ["deepseek-v3", "qwen3-8b"]
+    # 重试时排除刚失败的 preferred，避免随机再次选中死后端。
+    assert schedule["available_models"] == ["deepseek-v3"]
     assert affinity.puts[-1]["model"] == "deepseek-v3"
     decision.release()
     assert balancer.inflight("deepseek-v3") == 0

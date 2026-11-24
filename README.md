@@ -16,7 +16,7 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 | Routing policy | Visual decision graph: conditions, decision-service questions, logic gates, model targets |
 | Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service; the canvas snapshot fixes which service profile a graph runs with |
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
-| Backend selection | Session affinity, `least_inflight` load balancing, per-model circuit breaker |
+| Backend selection | Session affinity; random pick among a multi-model target's available models; per-model circuit breaker |
 | Portable canvases | Every saved canvas embeds its complete non-secret run configuration, so one JSON file restores it on an empty database |
 | Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; database drift is reported as hints only |
 | Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, multi-service JEV catalog, time periods, audit history, role-based users |
@@ -31,7 +31,7 @@ flowchart LR
   G <--> J["Decision service /v1/systemone"]
   G --> T["Target selection<br/>priority · fallback"]
   T --> A[Session affinity]
-  A --> L["least_inflight<br/>+ circuit breaker"]
+  A --> L["random pick<br/>+ circuit breaker"]
   L --> U[Upstream model]
   G -. trace .-> R[(Request ledger)]
 ```
@@ -41,7 +41,7 @@ flowchart LR
 3. Write numeric and `selected` ports, then re-evaluate downstream slot conditions and logic gates.
 4. Repeat wave by wave until no further question is activated.
 5. Select the highest-priority activated target; otherwise use `error_fallback`.
-6. Apply session affinity, select a backend with `least_inflight`, proxy the request upstream.
+6. Apply session affinity; on a miss, pick one of the target's available models at random, then proxy the request upstream.
 
 `unknown` never activates a question or target. A numeric comparison against an unknown value stays unknown.
 
@@ -96,7 +96,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 The home page (`/console/index.html`) is an admin-only model test chat. Every request is Auto-routed to `/admin/test/chat/completions`, and the message metadata names the upstream model that actually served it (`Auto → <model>`) using the `x-sr-model` response header.
 
-- **Auto smart routing** — evaluates the active canvas snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. The page offers no fixed-model bypass, so test traffic always takes the real routing path; fixed-model direct calls remain available only through `POST /admin/test/chat/completions` (`x-sr-selection: direct`, resolved through the database catalog).
+- **Auto smart routing** — evaluates the active canvas snapshot (decision graph, JEV waves, sticky and random backend selection) exactly like `/v1/chat/completions`. The page offers no fixed-model bypass, so test traffic always takes the real routing path; fixed-model direct calls remain available only through `POST /admin/test/chat/completions` (`x-sr-selection: direct`, resolved through the database catalog).
 - **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message. A stream counts as complete only when the upstream ends it cleanly — an early EOF is marked incomplete and a provider error is shown inline in the conversation, never silently passed off as a complete answer.
 - **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`, replayed losslessly from the raw assistant message (message-level media renders but never re-enters history); New Chat aborts any in-flight reply, clears the conversation and rotates the session id.
 - **Attachments** — text files are read as text and sent as content parts; images, audio and other files are read to data URLs. A file whose estimated size would break the 10 MiB request limit is rejected inline before it is read, and the exact whole-body size (history + Base64) is checked again before sending.
@@ -110,12 +110,12 @@ The routing page is split into two zones.
 **Editor zone** — canvas, node library, inspector, validation:
 
 - Drag nodes from the library and pan/zoom; auto-layout and undo/redo sit directly in the toolbar.
-- Typed wires; a numeric output dropped into a boolean slot creates a default condition.
+- Typed wires; a numeric output dropped into an input slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
 - Dropping an output onto empty canvas opens a picker of compatible node types; choosing one creates the node there and connects it automatically (Esc cancels).
 - Saving and publishing are merged into the toolbar primary; the toolbar's **Save draft** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
 - The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: the primary publishes (saves and enables), **Save draft** saves without enabling, and **Disable** flips the enabled state.
-- Target cards show display name, model list, fallback role and scheduling strategy.
+- Target cards show display name, model list, fallback role and a random-pick hint for multi-model targets.
 
 **Execution zone** — docked below the canvas:
 
@@ -142,10 +142,10 @@ SQLite stores ledger fields only — no request text, trace, per-wave answers or
 | Type | Purpose | Inputs | Outputs |
 |---|---|---|---|
 | `start` | Request entry, always true | — | boolean |
-| `question` | Decision-service question: `choice`, `noul`, `score` | Boolean slots `in_1..in_n` (OR) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
-| `logic` | Three-valued gate: `and`, `or` | Boolean slots `in_1..in_n`, one edge and condition per slot | boolean |
+| `question` | Decision-service question: `choice`, `noul`, `score` | Slots `in_1..in_n` (OR: any true slot activates; the type comes from the incoming edge's source port) | choice: `prob.*`, `selected.*`, `p_top`, `margin`; noul: `yes`, `no`; score: `value` |
+| `logic` | Three-valued gate: `and`, `or` | Slots `in_1..in_n`, one edge condition per slot, at least two | boolean |
 | `condition` | Request condition: time period or text keywords | — | boolean |
-| `target` | Model target: models, reasoning tiers, priority, strategy | Boolean slots `in_1..in_n` (OR) | — |
+| `target` | Model target: models, reasoning tiers, priority (random across multiple models) | Slots `in_1..in_n` (OR) | — |
 
 ### Conditions
 
@@ -167,17 +167,18 @@ Conditions live on edges:
 | number | `gt` / `gte` / `lt` / `lte` / `eq` / `neq` + finite threshold | Value comparison; unknown propagates as unknown |
 | boolean | `null` (equivalent to `= true`) or `{ "op": "is", "value": true \| false }` | Boolean expectation |
 
+- Slots do not declare a type: validity depends only on the source port (number vs boolean). A numeric output can feed any slot as long as the edge carries a comparison.
 - One output can feed multiple slots; every slot keeps its own condition.
 - Two slots of an AND gate can express a range, e.g. `> 0.3` and `< 0.8`.
 - Each input slot accepts one edge. Slot numbers are stable; released slots are reusable.
-- `and` / `or` require at least two slots. Question and target slots are OR.
-- Use boolean-slot negation or the complementary numeric comparison for the opposite test; there is no standalone NOT node.
+- `and` / `or` require at least two slots. Question and target slots are OR (true activates; unknown does not).
+- Use boolean-output negation or the complementary numeric comparison for the opposite test; there is no standalone NOT node.
 
 ### Execution rules
 
-- Questions execute in waves; one wave is one decision-service call.
-- A failed wave voids the round: no ports are written and all candidates from that round are discarded.
-- Target priorities are unique; the larger number wins.
+- Questions execute in waves; one wave is one decision-service call. A question executes at most once per request.
+- A failed wave writes no ports and discards **every** candidate accumulated by earlier waves, then falls back.
+- Target priorities are unique; the larger number wins. Ties in candidate ordering break on target id.
 - `error_fallback` handles a normal run with no activated target, and a decision call that fails, times out or returns an invalid answer.
 - The fallback reference must point to an existing target.
 
@@ -217,19 +218,21 @@ A v3 document is a complete, portable canvas: the graph plus its four required r
 }
 ```
 
-Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot; so is a document that carries only some (or none) of the four run fields. Structural rejections surface as `graph_parse_error`; the console runs the same validation before applying an import. `jev: null` is legal only for a canvas without question nodes.
+Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot; so is a document that carries only some (or none) of the four run fields. Parse failures (unknown fields, wrong types, missing keys) surface as `graph_parse_error`; structural problems such as start count, ports/slots, cycles, reachability, priorities and the fallback carry their own Issue codes instead of being folded into a parse error. The console runs the same validation before applying an import. `jev: null` is always structurally legal; a canvas with question nodes is rejected at enable time with `decision_service_unavailable`.
+
+See the [decision-graph specification](docs/决策图规范.md) for the full field tables, issue codes and execution details (Chinese).
 
 This experimental version does not accept legacy NOT graphs. Any `logic/operator=not` is rejected without migration, and historical NOT snapshots are not supported. Rewrite the condition manually: `> 0.65 → NOT` becomes `<= 0.65`, and `>= 0.5 → NOT` becomes `< 0.5`.
 
 The four run fields are described in [Self-contained canvas JSON](#self-contained-canvas-json).
 
-`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}` plus the four run fields, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Display-only changes do not affect it: node titles, target `capability`, positions, array order and edge ids. Question-option `capability` (choice questions) and the model-profile capability and declared reasoning **do** participate, because they change runtime behaviour.
+`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}` plus the four run fields, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Display-only changes do not affect it: node titles, positions, node/edge array order and edge ids. Not every list is order-insensitive: the order of question options, score criteria, `target.models`, catalog providers/models and time periods **does** participate. Question-option `capability` (choice questions) and the model-profile capability and declared reasoning also participate, because they change runtime behaviour.
 
 ## Models and reasoning
 
 ![Models](assets/routepilot/en/models.png)
 
-A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; `least_inflight` selects among them. The **catalog** (SQLite) is the management source for the console dropdowns and for fixed-model direct requests; a **canvas snapshot** is the only source for Auto routing.
+A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; when more than one is available, one is picked at random. The **catalog** (SQLite) is the management source for the console dropdowns and for fixed-model direct requests; a **canvas snapshot** is the only source for Auto routing.
 
 Providers define the OpenAI-compatible base URL, API-key environment variable and reasoning dialect. Model profiles declare:
 
@@ -497,46 +500,63 @@ The first start against an empty users table seeds the admin account. An empty g
 
 ## API
 
-| Method and path | Purpose |
-|---|---|
-| `POST /v1/chat/completions` | Routing entry; JSON or SSE |
-| `GET /healthz` | Liveness probe |
-| `GET /readyz` | Snapshot readiness |
-| `POST /admin/login` / `POST /admin/logout` | Console session |
-| `GET /admin/me` / `POST /admin/me/password` | Current user, password change |
-| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | Decision groups |
-| `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | Group lifecycle |
-| `POST /admin/try` | Routing check against a draft graph |
-| `POST /admin/test/chat/completions` | Admin-only model test chat; JSON or SSE |
-| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
-| `GET /admin/model-catalog`, `POST /admin/fetch-models` | Provider presets, upstream model discovery |
-| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | Providers; update previews a 409 impact list, delete is blocked while referenced |
-| `GET/POST /admin/jev`, `GET/PUT/DELETE /admin/jev/{id}` | Multi-service JEV catalog (window belongs to each service) |
-| `POST /admin/jev/{id}/test` | Test one catalog service with its database configuration |
-| `GET/PUT /admin/time-periods` | Time periods |
-| `GET /admin/requests/recent`, `GET /admin/requests/stats` | Live request ring, logger stats |
-| `GET /admin/overview`, `GET /admin/changes` | Overview, audit history |
-| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | Users |
+Full field tables, request/response examples and the impact-confirmation flow live in the [backend API reference](docs/后端接口说明.md) (Chinese).
+
+- `/v1/*`, `/healthz`, `/readyz` and `/console/*` need no auth; every other `/admin/*` route needs `Authorization: Bearer <token>`.
+- `POST /admin/login` is the only public admin endpoint: email and password exchange for a token. Sessions default to 168 hours; logout, a password change or deleting the user revokes them.
+- `viewer` can read only (`/admin/users*` is off-limits too); writes and user management need `admin`. With `ROUTER_USER_AUTH=0` everything is open and requests run as the service account.
+- Data-plane errors are `{"error":{"message":"<machine code>"}}`; admin errors are `{"detail": ...}`, where graph/config validation failures carry an Issue array.
+- `POST /v1/chat/completions` ignores the request `model` and always routes through the canvas; the `x-sr-session-id` header drives stickiness. `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` report what actually happened.
+- `POST /admin/trees` must carry `backends`, `jev`, `jev_window` and `time_periods` together; `PUT` is a patch and must carry the current `base_document_sha256`, otherwise 409.
+
+| Method and path | Auth | Purpose |
+|---|---|---|
+| `POST /v1/chat/completions` | public | Routing entry; JSON or SSE |
+| `GET /healthz` / `GET /readyz` | public | Liveness / snapshot readiness |
+| `POST /admin/login` / `POST /admin/logout` | public / signed in | Console session |
+| `GET /admin/me`, `POST /admin/me/password` | signed in | Current user, password change |
+| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | read / admin | Decision groups |
+| `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | admin | Group lifecycle |
+| `POST /admin/try` | admin | Routing check against a draft graph |
+| `POST /admin/test/chat/completions` | admin | Test chat; `model=auto` routes, anything else is a fixed direct call |
+| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | read / admin | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
+| `GET /admin/model-catalog`, `POST /admin/fetch-models` | read / admin | Provider presets, upstream model discovery |
+| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | read / admin | Providers; update previews a 409 impact list, delete is blocked while referenced |
+| `GET/POST /admin/jev`, `GET/PUT/DELETE /admin/jev/{id}` | read / admin | Multi-service JEV catalog (window belongs to each service) |
+| `POST /admin/jev/{id}/test` | admin | Test one catalog service with its database configuration |
+| `GET/PUT /admin/time-periods` | read / admin | Time periods |
+| `GET /admin/requests/recent`, `/requests/stats`, `/requests/{id}/snapshot` | viewer | Live request ring, logger stats, request snapshot |
+| `GET /admin/overview`, `GET /admin/changes` | viewer | Overview, audit history |
+| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | admin | Users |
 
 ### Errors
 
-| Status | Error | Meaning |
+Data-plane:
+
+| Status | Error `message` | Meaning |
 |---|---|---|
-| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` | Malformed body |
+| 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` / `invalid_session_id` | Malformed body or session header |
 | 413 | `request_too_large` | Body exceeds 10 MiB |
 | 502 | `upstream_error` | Upstream 5xx or network failure |
-| 409 | `graph_conflict` | Graph changed after the draft/impact list was loaded |
-| 409 | `impact_confirmation_required` | Model/provider/JEV write affects canvases; confirm the listed document hashes |
-| 409 | `provider_referenced` | Provider still used by a database model or a canvas model |
-| 409 | `graph_already_exists` | Duplicate graph id |
-| 503 | `graph_read_only` | Reader replica |
-| 503 | `graph_storage_error` | Shared graph storage unreadable |
 | 503 | `no_valid_snapshot` | No initial snapshot |
 | 503 | `no_active_tree` | No enabled decision group |
 | 503 | `no_available_backend` | All backends of the selected target unavailable |
 | 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure |
 
-Upstream 4xx responses pass through with their status and body.
+Admin:
+
+| Status | Error | Meaning |
+|---|---|---|
+| 401 / 403 | `unauthorized…` / `forbidden…` | Not signed in / viewer write |
+| 409 | `graph_conflict` | Baseline or impact-list document hash is stale |
+| 409 | `impact_confirmation_required` | Model/provider/JEV write affects canvases; confirm the listed document hashes |
+| 409 | `provider_referenced` | Provider still used by a database model or a canvas model |
+| 409 | `graph_already_exists` | Duplicate graph id |
+| 422 | Issue array | Graph/config validation failed |
+| 503 | `graph_read_only` / `graph_storage_error` | Reader replica / shared graph storage unreadable |
+| 502 | string | JEV test or upstream model discovery failed |
+
+Upstream 4xx responses pass through with their status and body; `/admin/test/chat/completions` additionally returns `404 unknown_model` and `422 invalid_model`.
 
 Configuration endpoints: `/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/time-periods`. There is no generic `/admin/settings` API and no standalone JEV-window endpoint: the window lives on each JEV service.
 
@@ -576,7 +596,7 @@ router/
     service.py         evaluate → schedule orchestration
     scheduling.py      sticky selection, lease acquisition, affinity writes
     affinity.py        session-affinity LRU
-    scheduler.py       least_inflight balancer and leases
+    scheduler.py       random model picker and leases
     snapshot.py        immutable canvas snapshot assembly and compiled topology
     tree.py            tree envelope codec and revision
     codec.py           strict field parsing helpers
@@ -586,6 +606,7 @@ router/
   store/               SQLite schema/repositories, graph-file repository
   console/             bilingual native ES Module console
 configs/               example decision groups; configs/cases/ holds the five portable demo cases
+docs/                  design and operations notes; 后端接口说明.md and 决策图规范.md are the reference docs
 tests/                 pytest suite and contract fixtures
 scripts/               Node contract tests, Playwright QA, deployment helpers
 experiments/jev-batch/ standalone JEV batch spike

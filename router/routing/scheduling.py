@@ -54,7 +54,6 @@ class ModelScheduler:
             events.append({
                 "event": "schedule",
                 "target_id": target.id,
-                "strategy": target.strategy,
                 "configured_models": list(configured_models),
                 "registered_models": list(models),
                 "available_models": list(selection.get("available_models", [])),
@@ -93,14 +92,17 @@ class ModelScheduler:
                 raise
             # The sticky/preferred backend went away between the availability
             # snapshot and the lock (breaker opened or it was removed).  Re-read
-            # the selection under the lock and schedule normally by least
-            # in-flight instead of turning a dead sticky into a 503.
+            # the selection under the lock and schedule normally among the
+            # remaining models (random for multi-model targets) instead of
+            # turning a dead sticky into a 503.
+            dead = preferred
             preferred = None
             sticky_hit = False
             sticky_status = "unavailable"
             selection_reason = outcome.selection_reason
+            remaining = [model for model in models if model != dead]
             try:
-                lease = self.balancer.acquire(models, dry_run=dry_run)
+                lease = self.balancer.acquire(remaining, dry_run=dry_run)
             except NoAvailableBackend as retry_exc:
                 append_schedule(retry_exc.selection)
                 raise
