@@ -38,6 +38,8 @@
                首次 paintLifecycle() 会覆盖成本地真实状态。 -->
           <span class="dot"></span><span id="cvLifecycleLabel" data-i18n="cv.status.draft"></span>
         </span>
+        <!-- 多图生命周期：当前图是默认图（公开 /v1 只用默认图）时显示。 -->
+        <span class="pill ok" id="cvDefaultPill" data-i18n="cv.defaultPill" hidden></span>
         <span class="pill" id="cvSnapshotBadge" data-i18n="cv.snapshotBadge" hidden></span>
       </div>
     </div>
@@ -54,6 +56,8 @@
           <button type="button" class="btn sm" id="cvNewTree" data-i18n="cv.newTree"></button>
           <button type="button" class="btn sm" id="cvImport" data-i18n="cv.import"></button>
           <button type="button" class="btn sm" id="cvExport" data-i18n="cv.export"></button>
+          <!-- 多图生命周期：已启用但非默认的图可一键设为默认（默认图隐藏）。 -->
+          <button type="button" class="btn sm" id="cvDefault" data-i18n="cv.setDefault" hidden></button>
           <button type="button" class="btn sm danger" id="cvDisable" data-i18n="cv.disable" hidden></button>
         </div>
         <button type="button" class="btn sm" id="cvTryBtn">

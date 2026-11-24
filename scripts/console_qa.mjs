@@ -1066,6 +1066,9 @@ test('bootstrap registers the multi-JEV catalog, periods and the self-contained 
   const tree = trees.trees.find(item => item.id === TREE_ID);
   assert.ok(tree, 'power graph tree missing');
   assert.equal(tree.enabled, true);
+  assert.equal(tree.default, true, 'the bootstrap baseline graph must be the default graph');
+  assert.equal(trees.graph_status.default_tree_id, TREE_ID);
+  assert.deepEqual(trees.graph_status.enabled_tree_ids, [TREE_ID]);
   assert.equal(tree.root.nodes.length, EXAMPLE_NODES);
   assert.equal(tree.root.edges.length, EXAMPLE_EDGES);
   assert.equal(tree.root.otherwise_target, undefined);
@@ -1374,8 +1377,18 @@ export async function ensureBaselineTree() {
      不恢复就会让后续 tryrun/auto 打到错误端点而不是 QA mock。 */
   const runtime = BASELINE_RUNTIME || treeRuntimeFields(await serverTree(TREE_ID));
   if (runtime) Object.assign(payload, treeRuntimeFields(runtime));
-  const restored = await putTree(TREE_ID, payload);
-  if (!restored.tree.enabled) await api('POST', '/admin/trees/' + TREE_ID + '/enable');
+  await putTree(TREE_ID, payload);
+  /* 多图生命周期（Task 8）：基线组必须回到「唯一启用图 + 默认图」。
+     两个端点都是幂等 no-op，顺序也合法：先 enable（第一张启用图自动默认，
+     否则只追加启用图），再 set_default（把默认从其它图切回来，旧默认保持启用），
+     最后停用其它启用图（此时它们都已非默认，允许直接停用）。 */
+  await api('POST', '/admin/trees/' + TREE_ID + '/enable');
+  await api('POST', '/admin/trees/' + TREE_ID + '/default');
+  const enabledElsewhere = (await api('GET', '/admin/trees')).trees
+    .filter(tree => tree.id !== TREE_ID && tree.enabled);
+  for (const tree of enabledElsewhere) {
+    await api('POST', '/admin/trees/' + encodeURIComponent(tree.id) + '/disable');
+  }
   return (await api('GET', '/admin/trees/' + TREE_ID)).tree;
 }
 

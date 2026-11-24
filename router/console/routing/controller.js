@@ -199,6 +199,27 @@ export class RoutingController {
     return savedTree;
   }
 
+  /* 生命周期回包刷新当前草稿与保存基线（Task 8）：v4 的 enabled/default 不参与
+     behavior canonical，但启停/设默认会改写目标文档字节 → tree_revision /
+     document_sha256 / updated_at 随之变化。不同步回保存基线，下一次普通保存会
+     拿旧 base_document_sha256 被 409 graph_conflict 拒绝。
+     多图语义必须逐字段取服务端值：第一张启用图自动默认，之后启用的图是
+     enabled && !default —— 绝不能写 `default = enabled`。 */
+  syncLifecycleBaseline(updated) {
+    const tree = this.store.tree;
+    if (!tree || !updated) return;
+    for (const field of ['enabled', 'default', 'tree_revision', 'updated_at',
+      'document_sha256', 'departments']) {
+      const value = field === 'enabled' || field === 'default'
+        ? updated[field] === true
+        : field === 'departments'
+          ? RTGraph.normalizeDepartments(updated.departments)
+          : (updated[field] || '');
+      tree[field] = RTGraph.clone(value);
+      if (this.store.saved) this.store.saved[field] = RTGraph.clone(value);
+    }
+  }
+
   /* 保存 payload 只含完整 envelope 字段：不发送 enabled / tree_revision / updated_at。 */
   async save() {
     const store = this.store;
@@ -300,27 +321,14 @@ export class RoutingController {
       const result = await api.post('/admin/trees/' + encodeURIComponent(this.treeId) + '/' + action);
       if (store.tree !== targetTree || this.treeId !== targetId) return false;
       if (result && Array.isArray(result.trees)) this.trees = result.trees;
-      if (result && result.snapshot_revision != null) this.snapshotRevision = result.snapshot_revision;
-      /* v4：启停同时维护文件里的 enabled/default（default => enabled 不变量）。 */
-      store.tree.enabled = !!enabled;
-      store.tree.default = !!enabled;
-      if (store.saved) {
-        store.saved.enabled = !!enabled;
-        store.saved.default = !!enabled;
-      }
-      /* v4：启停会改写目标文档的 lifecycle 字段，文档哈希/修订随之变化；不同步回
-         保存基线，下一次普通保存会拿旧 base_document_sha256 被 409 graph_conflict 拒绝。 */
+      /* v4：启停只维护目标图的 enabled/default（多图不互斥，第一张启用图自动
+         默认）。生命周期以服务端回包为准 —— 后续启用的图是 enabled && !default，
+         写 `default = enabled` 会让控制台把自己误标成默认图。 */
       const updated = (Array.isArray(result && result.trees) ? result.trees : [])
         .find(item => item && item.id === targetId);
-      if (updated) {
-        for (const field of ['tree_revision', 'updated_at', 'document_sha256', 'departments']) {
-          const value = field === 'departments'
-            ? RTGraph.normalizeDepartments(updated.departments)
-            : (updated[field] || '');
-          store.tree[field] = RTGraph.clone(value);
-          if (store.saved) store.saved[field] = RTGraph.clone(value);
-        }
-      }
+      if (!updated) throw new Error('lifecycle response is missing the current tree');
+      this.syncLifecycleBaseline(updated);
+      if (result && result.snapshot_revision != null) this.snapshotRevision = result.snapshot_revision;
       this.hooks.renderTreeSelect();
       /* 启用成功后重新校验当前草稿：服务端只回新 revision，Issue 条不能停在旧状态。 */
       this.hooks.setIssues(RTGraph.validate(store.tree.root));
@@ -341,6 +349,45 @@ export class RoutingController {
         this.hooks.toast(tf(enabled ? 'cv.toastEnableFail' : 'cv.toastDisableFail',
           { err: apiErrText(error) }), 'error');
       }
+      return false;
+    } finally {
+      store.setSaving(false);
+      this.hooks.syncSaving();
+    }
+  }
+
+  /* 设为默认图（Task 8）：保存脏草稿 → POST /default → 用回包刷新完整 envelope。
+     生命周期写改了文档字节，必须刷新保存基线，否则紧接着的普通保存会 409
+     graph_conflict（brief 的真实浏览器场景会立即再保存一次）。 */
+  async setDefault() {
+    const store = this.store;
+    if (!store.tree || store.saving || store.tryRunning) return false;
+    if (store.dirtyKind !== 'clean' || !store.saved) {
+      const saved = await this.save();
+      if (!saved) return false;
+    }
+    store.setSaving(true);
+    this.hooks.syncSaving();
+    const targetTree = store.tree;
+    const targetId = this.treeId;
+    try {
+      const result = await api.post(
+        '/admin/trees/' + encodeURIComponent(targetId) + '/default');
+      if (store.tree !== targetTree || this.treeId !== targetId) return false;
+      if (Array.isArray(result.trees)) this.trees = result.trees;
+      const current = this.trees.find(item => item.id === targetId);
+      if (!current) throw new Error('default response is missing the current tree');
+      this.applySavedResponse({
+        tree: current,
+        snapshot_revision: result.snapshot_revision,
+      });
+      this.hooks.renderTreeSelect();
+      this.hooks.render();
+      this.hooks.refreshDirty();
+      this.hooks.toast(t('cv.toastDefault'));
+      return true;
+    } catch (error) {
+      this.hooks.toast(tf('cv.toastDefaultFail', { err: apiErrText(error) }), 'error');
       return false;
     } finally {
       store.setSaving(false);

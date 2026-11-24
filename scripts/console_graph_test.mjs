@@ -2264,6 +2264,27 @@ test('v4 serialize writes lifecycle/departments and behavior canonical excludes 
   assert.notEqual(RTGraph.behaviorCanonical(other), canonical);
 });
 
+test('lifecycle flags are outside behavior canonical and changeKind; departments are inside', () => {
+  const imported = RTGraph.parseImport(JSON.stringify(v4Document({ departments: ['财务部'] })));
+  assert.equal(imported.ok, true, JSON.stringify(imported.issues));
+  const tree = imported.tree;
+  /* 启停/默认切换是服务端生命周期写：不得进入 behavior 或 editable canonical，
+     否则一次 lifecycle 回包就会把干净草稿判脏、或把部门编辑当成生命周期丢弃。 */
+  const enabled = Object.assign(RTGraph.clone(tree), { enabled: true, default: true });
+  const disabled = Object.assign(RTGraph.clone(tree), { enabled: false, default: false });
+  assert.equal(RTGraph.changeKind(tree, enabled), 'clean',
+    'enabled/default leaked into the editable canonical');
+  assert.equal(RTGraph.changeKind(enabled, disabled), 'clean');
+  assert.equal(RTGraph.behaviorCanonical(enabled), RTGraph.behaviorCanonical(disabled));
+  /* departments 是行为（参与 tree_revision）：必须判 behavior，不能只判 display。 */
+  const department = Object.assign(RTGraph.clone(tree), { departments: ['财务部', '法务部'] });
+  assert.equal(RTGraph.changeKind(tree, department), 'behavior',
+    'a department edit must be a behavior change');
+  const renamed = Object.assign(RTGraph.clone(tree), { name: '改名' });
+  assert.equal(RTGraph.changeKind(tree, renamed), 'display',
+    'a name edit must stay a display change');
+});
+
 test('createMinimalTree returns v4 lifecycle defaults', () => {
   const tree = RTGraph.createMinimalTree('qwen3-8b', minimalRuntime('qwen3-8b'));
   assert.deepEqual(tree.departments, []);

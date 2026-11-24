@@ -8,6 +8,9 @@ import assert from 'node:assert/strict';
 
 import { DraftStore, HISTORY_LIMIT } from '../router/console/routing/draft.js';
 import { createMinimalTree, clone } from '../router/console/routing/graph.js';
+import * as RTGraph from '../router/console/routing/graph.js';
+import { RoutingController } from '../router/console/routing/controller.js';
+import { api } from '../router/console/api.js';
 
 /* 严格自包含：新草稿必须携带完整四字段运行快照（createMinimalTree 不再物化）。
    model 必须出现在 runtime.backends.models 里，否则 target 会引用快照外的模型。 */
@@ -277,4 +280,219 @@ test('subscribers observe load/change/undo/redo/saved events', () => {
   off();
   store.change('behavior', tree => { tree.name = 'y'; });
   assert.deepEqual(seen, ['load', 'change', 'undo', 'redo', 'saved']);
+});
+
+/* ── v4 生命周期与草稿语义的边界（Task 8 canonical 行为测试）────────────
+   `departments` 是行为（参与 tree_revision/behaviorCanonical）；`enabled` /
+   `default` 是服务端生命周期（只经 enable/disable/default 端点写入，普通保存
+   不得携带）。这条契约一旦反过来，部门编辑会被当生命周期丢弃、或启停被当
+   行为改动导致每次脏检查都误报。 */
+test('departments are behavior while enabled and default are lifecycle only', () => {
+  const store = storeWith();
+  assert.equal(store.change('behavior', tree => { tree.departments = ['财务部']; }), true);
+  assert.equal(store.dirtyKind, 'behavior');
+  store.undo();
+  const before = store.tree;
+  store.tree.enabled = true;
+  store.tree.default = true;
+  assert.equal(RTGraph.behaviorCanonical(before), RTGraph.behaviorCanonical(store.tree));
+});
+
+/* 生命周期回包把 enabled/default 写进基线时不能把草稿判脏；部门改动必须判脏。
+   两者都走 markSaved：changeKind 只比较 behavior/editable canonical。 */
+test('a lifecycle-only baseline keeps the draft clean while departments dirty it', () => {
+  const store = storeWith();
+  const lifecycle = clone(store.tree);
+  lifecycle.enabled = true;
+  lifecycle.default = true;
+  lifecycle.tree_revision = 'rev-2';
+  lifecycle.document_sha256 = 'hash-2';
+  assert.equal(store.markSaved(lifecycle), true);
+  assert.equal(store.dirtyKind, 'clean', 'enabled/default leaked into the behavior canonical');
+
+  const next = clone(store.tree);
+  next.default = false;
+  assert.equal(store.markSaved(next), true);
+  assert.equal(store.dirtyKind, 'clean', 'clearing default must not dirty the draft');
+
+  assert.equal(store.change('behavior', tree => { tree.departments = ['财务部']; }), true);
+  assert.equal(store.dirtyKind, 'behavior', 'departments must be a behavior edit');
+});
+
+/* ── RoutingController 生命周期编排（Task 8 §Step 3）───────────────────
+   controller.js 在 Node 里可装载：api.js / i18n.js 的 DOM 路径都有守卫，
+   管理面请求通过替换 api.post / api.put 的返回值注入回包。 */
+function lifecycleHooks(store) {
+  const events = [];
+  return {
+    events,
+    toast: (message, tone) => events.push({ type: 'toast', message, tone }),
+    askDiscard: async () => true,
+    render: () => events.push({ type: 'render' }),
+    renderIssues: () => {},
+    revealIssues: () => {},
+    refreshDirty: () => events.push({ type: 'refreshDirty' }),
+    syncSaving: () => events.push({ type: 'syncSaving' }),
+    setIssues: () => {},
+    isInspectorEditing: () => false,
+    fitAfterReplace: () => {},
+    renderTreeSelect: () => events.push({ type: 'renderTreeSelect' }),
+    getCatalog: () => null,
+    change: (kind, mutate) => store.change(kind, mutate),
+  };
+}
+
+/* 服务端 GET /admin/trees/{id} / lifecycle 回包里的完整 v4 envelope：
+   serialize 产出的就是 API/文件同一形状（顶层 canvas + 扁平四运行字段）。 */
+function serverDocument(id, overrides) {
+  const document = JSON.parse(RTGraph.serialize(minimalTree()));
+  document.id = id;
+  document.name = 'QA ' + id;
+  document.departments = [];
+  return Object.assign(document, {
+    tree_revision: 'a'.repeat(64),
+    updated_at: '2026-11-24T00:00:00+00:00',
+    document_sha256: 'b'.repeat(64),
+  }, overrides || {});
+}
+
+function lifecycleFixture(id, documentOverrides) {
+  const treeId = id || 'tree-nav';
+  const store = new DraftStore();
+  const hooks = lifecycleHooks(store);
+  const controller = new RoutingController({ store, hooks });
+  controller.loadTree(serverDocument(treeId, documentOverrides), true);
+  return { store, controller, hooks, treeId };
+}
+
+test('setEnabled adopts the server enabled/default flags instead of default = enabled', async () => {
+  const { store, controller, hooks, treeId } = lifecycleFixture('tree-b', {
+    enabled: true,
+    default: true,
+  });
+  /* 控制台里当前图是被启用的默认图；现在用户去启用第二张图（tree-a 已是默认）。 */
+  const originalPost = api.post;
+  const calls = [];
+  api.post = async (path) => {
+    calls.push(path);
+    return {
+      trees: [
+        serverDocument('tree-a', {
+          enabled: true, default: true,
+          tree_revision: 'c'.repeat(64), document_sha256: 'd'.repeat(64),
+          updated_at: '2026-11-24T00:00:01+00:00',
+        }),
+        serverDocument(treeId, {
+          enabled: true, default: false, departments: ['财务部'],
+          tree_revision: 'e'.repeat(64), document_sha256: 'f'.repeat(64),
+          updated_at: '2026-11-24T00:00:02+00:00',
+        }),
+      ],
+      snapshot_revision: 'rev-2',
+      graph_status: { ready: true },
+    };
+  };
+  try {
+    store.tree.enabled = false;
+    store.tree.default = false;
+    store.saved.enabled = false;
+    store.saved.default = false;
+    assert.equal(await controller.setEnabled(true), true);
+    assert.deepEqual(calls, ['/admin/trees/' + treeId + '/enable']);
+    assert.equal(store.tree.enabled, true);
+    assert.equal(store.tree.default, false,
+      'enabling a second graph must not force default = enabled');
+    assert.equal(store.saved.enabled, true);
+    assert.equal(store.saved.default, false,
+      'the save baseline must keep the server-returned default flag');
+    /* 生命周期写改写文件字节：保存基线必须同步 revision/hash/部门，否则下一次
+       普通保存必然 409 graph_conflict。 */
+    assert.equal(store.tree.tree_revision, 'e'.repeat(64));
+    assert.equal(store.saved.tree_revision, 'e'.repeat(64));
+    assert.equal(store.tree.document_sha256, 'f'.repeat(64));
+    assert.equal(store.saved.document_sha256, 'f'.repeat(64));
+    assert.deepEqual(store.tree.departments, ['财务部']);
+    assert.deepEqual(store.saved.departments, ['财务部']);
+    assert.equal(store.dirtyKind, 'clean', 'a lifecycle response must not dirty the draft');
+    assert.equal(controller.snapshotRevision, 'rev-2');
+    assert.equal(controller.trees.length, 2);
+    assert.deepEqual(controller.trees.map(tree => tree.default), [true, false]);
+    assert.ok(hooks.events.some(event => event.type === 'toast' && /已启用/.test(event.message)));
+  } finally {
+    api.post = originalPost;
+  }
+});
+
+test('setDefault exists and merges the returned envelope into the save baseline', async () => {
+  const { store, controller, hooks, treeId } = lifecycleFixture('tree-b', {
+    enabled: true,
+    default: false,
+  });
+  const originalPut = api.put;
+  const originalPost = api.post;
+  const calls = [];
+  let persisted = null;
+  api.put = async (path, payload) => {
+    calls.push(['PUT', path, payload.base_document_sha256]);
+    /* 真实服务端回包 = 提交的 envelope + 服务端生命周期/revision 字段。 */
+    const echoed = clone(payload);
+    delete echoed.base_document_sha256;
+    persisted = Object.assign(echoed, {
+      enabled: true, default: false,
+      tree_revision: '1'.repeat(64), document_sha256: '2'.repeat(64),
+      updated_at: '2026-11-24T00:00:03+00:00',
+    });
+    return { tree: persisted, snapshot_revision: 'rev-save' };
+  };
+  api.post = async (path) => {
+    calls.push(['POST', path]);
+    assert.equal(path, '/admin/trees/' + treeId + '/default');
+    /* /default 回包里的当前图 = 刚才保存落盘的那份 + 新的生命周期/revision。 */
+    const current = Object.assign(clone(persisted), {
+      enabled: true, default: true,
+      tree_revision: '5'.repeat(64), document_sha256: '6'.repeat(64),
+      updated_at: '2026-11-24T00:00:04+00:00',
+    });
+    return {
+      trees: [
+        serverDocument('tree-a', {
+          enabled: true, default: false,
+          tree_revision: '3'.repeat(64), document_sha256: '4'.repeat(64),
+        }),
+        current,
+      ],
+      snapshot_revision: 'rev-default',
+      graph_status: { ready: true },
+    };
+  };
+  try {
+    /* 草稿脏（布局改动）：setDefault 必须先保存草稿，再发 default。 */
+    assert.equal(store.change('layout', tree => {
+      tree.root.nodes[0].position = { x: 99, y: 99 };
+    }), true);
+    assert.equal(store.dirtyKind, 'layout');
+    assert.equal(await controller.setDefault(), true);
+    assert.deepEqual(calls.map(call => call[0] + ' ' + call[1]), [
+      'PUT /admin/trees/' + treeId,
+      'POST /admin/trees/' + treeId + '/default',
+    ], 'setDefault must save the dirty draft before switching the default graph');
+    assert.equal(calls[0][2], 'b'.repeat(64), 'the save must carry the previous baseline hash');
+    assert.equal(store.tree.default, true);
+    assert.equal(store.tree.enabled, true);
+    assert.equal(store.saved.default, true);
+    assert.equal(store.saved.document_sha256, '6'.repeat(64));
+    assert.equal(store.tree.document_sha256, '6'.repeat(64));
+    assert.equal(store.dirtyKind, 'clean');
+    assert.equal(controller.snapshotRevision, 'rev-default');
+    assert.equal(controller.trees.find(tree => tree.id === treeId).default, true);
+    assert.equal(controller.trees.find(tree => tree.id === 'tree-a').default, false);
+    assert.ok(hooks.events.some(event =>
+      event.type === 'toast' && /默认/.test(event.message)),
+    'setDefault must toast the localized success message');
+    assert.ok(hooks.events.some(event => event.type === 'renderTreeSelect'),
+      'setDefault must re-render the tree selector');
+  } finally {
+    api.put = originalPut;
+    api.post = originalPost;
+  }
 });

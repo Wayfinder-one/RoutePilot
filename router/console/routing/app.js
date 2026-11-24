@@ -783,7 +783,8 @@ function updateToolbar() {
     redo.disabled = busy || !store.canRedo;
     redo.title = t('cv.redoTitle');
   }
-  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvImport', 'cvExport', 'cvTryBtn', 'cvDisable']
+  ['cvAutoLayout', 'cvSave', 'cvEnable', 'cvNewTree', 'cvImport', 'cvExport', 'cvTryBtn',
+    'cvDisable', 'cvDefault']
     .forEach(id => {
       const button = document.getElementById(id);
       if (button) button.disabled = busy;
@@ -799,6 +800,18 @@ function updateToolbar() {
   }
   const disable = $('#cvDisable');
   if (disable) disable.hidden = !(store.tree && store.tree.enabled);
+  /* 多图生命周期：默认可切换，但默认图本身不再提供「设为默认」；设默认隐含
+     启用，所以只在已启用且非默认的图上显示（禁用图先走主按钮启用）。
+     默认 pill 与按钮互补：当前图是默认图时显示。 */
+  const defaultButton = $('#cvDefault');
+  if (defaultButton) {
+    defaultButton.hidden = !(store.tree && store.tree.enabled && !store.tree.default);
+  }
+  const defaultPill = $('#cvDefaultPill');
+  if (defaultPill) {
+    /* 只读日志回放不宣传实时生命周期（与隐藏 #cvLifecycle 同一原则）。 */
+    defaultPill.hidden = isLogSnapshot() || !(store.tree && store.tree.default);
+  }
   paintLifecycle();
 }
 
@@ -1400,6 +1413,7 @@ function bindToolbar() {
     cvExport: () => controller.exportTree(),
     cvSave: () => controller.save(),
     cvEnable: () => controller.enable(),
+    cvDefault: () => controller.setDefault(),
     cvDisable: () => controller.disable()
   };
   Object.keys(actions).forEach(id => {
@@ -1508,8 +1522,11 @@ function bindTryBar() {
 function renderTreeSelect() {
   const select = $('#cvTreeSelect');
   if (!select) return;
+  /* 多图生命周期：默认图加「默认」标记。当前活动图由 controller.treeId 决定，
+     不再从唯一 enabled 图推导（可同时启用多张图）。 */
+  const label = tree => esc(tree.name || tree.id) + (tree.default ? esc(t('cv.treeDefault')) : '');
   const options = (controller.trees || []).map(tree =>
-    '<option value="' + esc(tree.id) + '">' + esc(tree.name || tree.id) + '</option>').join('');
+    '<option value="' + esc(tree.id) + '">' + label(tree) + '</option>').join('');
   select.innerHTML = options;
   if (controller.treeId && !(controller.trees || []).some(tree => tree.id === controller.treeId)) {
     select.innerHTML += '<option value="' + esc(controller.treeId) + '">' +
@@ -1547,6 +1564,8 @@ function bindEvents() {
   onLangChange(() => {
     if (!app.booted) return;
     renderPalette();
+    /* 决策组下拉框的「默认」标记是 UI 文案（组名本身是数据），语言切换必须重绘。 */
+    renderTreeSelect();
     refreshTryRun();
     renderAll();
     refreshDirty();
@@ -1713,9 +1732,12 @@ async function boot() {
     controller.trees = treeResult.trees || [];
     controller.snapshotRevision = treeResult.snapshot_revision || '';
     renderTreeSelect();
-    const enabled = controller.trees.find(tree => tree.enabled) || controller.trees[0];
-    if (enabled) {
-      const result = await api.get('/admin/trees/' + encodeURIComponent(enabled.id));
+    /* 多图生命周期：启动优先打开默认图（公开 /v1 使用的图），没有默认图时退回
+       列表第一张。不能用「第一张 enabled 图」推导 —— 有多张启用图时顺序不代表
+       默认关系，而且第一张启用的图未必是默认图。 */
+    const preferred = controller.trees.find(tree => tree.default) || controller.trees[0];
+    if (preferred) {
+      const result = await api.get('/admin/trees/' + encodeURIComponent(preferred.id));
       const tree = result && result.tree;
       if (tree && tree.root) controller.loadTree(tree, true);
       else await loadDraftTree();

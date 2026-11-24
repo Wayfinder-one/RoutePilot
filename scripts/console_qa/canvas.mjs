@@ -235,20 +235,40 @@ test('P0 toolbar exposes every editing action inline, with no More menu', async 
   const tools = await page.evaluate(() =>
     Array.from(document.querySelectorAll('.rtc-tools > button')).map(element => element.id));
   assert.deepEqual(tools, ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
-                           'cvImport', 'cvExport', 'cvDisable'],
+                           'cvImport', 'cvExport', 'cvDefault', 'cvDisable'],
     'the editing actions changed or lost their inline order');
   for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
                     'cvImport', 'cvExport', 'cvTryBtn', 'cvEnable', 'cvIssuesBtn']) {
     assert.equal(await page.locator('#' + id).isVisible(), true, id + ' must be visible');
   }
   /* 停用只在已启用的决策组上出现（基线组是已启用状态）。 */
-  const enabled = await page.evaluate(async () => {
+  const lifecycle = await page.evaluate(async () => {
     const { app } = await import('/console/routing/app.js');
-    return !!(app.tree && app.tree.enabled);
+    return {
+      enabled: !!(app.tree && app.tree.enabled),
+      isDefault: !!(app.tree && app.tree.default)
+    };
   });
   assert.equal(await page.locator('#cvDisable').count(), 1, 'disable must stay in the toolbar');
-  assert.equal(await page.locator('#cvDisable').isVisible(), enabled,
+  assert.equal(await page.locator('#cvDisable').isVisible(), lifecycle.enabled,
     'the disable action must follow the lifecycle state');
+  /* 多图生命周期：默认图隐藏「设为默认」，非默认的启用图才显示；默认 pill 相反。 */
+  assert.equal(lifecycle.isDefault, true, 'the baseline graph must be the default graph');
+  assert.equal(await page.locator('#cvDefault').count(), 1, 'set-default must stay in the toolbar');
+  assert.equal(await page.locator('#cvDefault').isVisible(), lifecycle.enabled && !lifecycle.isDefault,
+    'the set-default action must follow the multi-graph lifecycle');
+  assert.equal(await page.locator('#cvDefaultPill').count(), 1, 'the default pill is missing');
+  assert.equal(await page.locator('#cvDefaultPill').isVisible(), lifecycle.isDefault,
+    'the default pill must follow the multi-graph lifecycle');
+  /* 决策组下拉框标出默认图（不再用唯一 enabled 图推导当前活动图）。 */
+  const defaultMark = await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    const option = Array.from(document.querySelectorAll('#cvTreeSelect option'))
+      .find(item => item.value === document.querySelector('#cvTreeSelect').value);
+    return { expect: t('cv.treeDefault'), label: option ? option.textContent : '' };
+  });
+  assert.ok(defaultMark.label.includes(defaultMark.expect),
+    'the tree selector does not mark the default graph: ' + defaultMark.label);
   assert.equal(await page.locator('#cvLifecycle').count(), 1, 'the lifecycle badge is missing');
   assert.equal(await page.locator('#cvLifecycle').isVisible(), true, 'the lifecycle badge must be visible');
   assert.equal(await page.locator('#cvRevision, #cvEnabled, #cvClean, #cvDirty').count(), 0,
@@ -1539,11 +1559,38 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(ui.label, ui.published, 'a clean enabled group must read as published');
   assert.equal(ui.state, 'running', 'an enabled clean group must be projected as running');
   assert.equal(ui.disabled, true, 'published is a state, not a repeatable action');
+  /* 多图生命周期（Task 8）：启用新图只追加一张启用图，原基线图继续启用并保持
+     默认。草稿是 enabled && !default，绝非「启用即默认」——若把 enabled 当
+     default，下一次普通保存会被 409 graph_conflict 拒绝。 */
   const enabled = await serverTree(draft.id);
   assert.equal(enabled.enabled, true);
+  assert.equal(enabled.default, false, 'a later-enabled graph must not steal default');
   const list = await api('GET', '/admin/trees');
   assert.equal(list.trees.find(tree => tree.id === draft.id).enabled, true);
-  assert.equal(list.trees.find(tree => tree.id === TREE_ID).enabled, false);
+  const baseline = list.trees.find(tree => tree.id === TREE_ID);
+  assert.equal(baseline.enabled, true, 'enabling a draft must not disable the baseline graph');
+  assert.equal(baseline.default, true, 'the baseline graph must stay the default graph');
+  const multi = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return {
+      enabled: !!(app.tree && app.tree.enabled),
+      isDefault: !!(app.tree && app.tree.default),
+      savedDefault: !!(app.saved && app.saved.default),
+      savedHash: app.saved ? app.saved.document_sha256 : '',
+      documentHash: app.tree ? app.tree.document_sha256 : ''
+    };
+  });
+  assert.equal(multi.enabled, true);
+  assert.equal(multi.isDefault, false, 'enabling a second graph must not mark it default');
+  assert.equal(multi.savedDefault, false, 'the save baseline kept the wrong default flag');
+  /* 生命周期写改了文档字节：保存基线必须从回包同步 hash，否则下一次保存 409。 */
+  assert.equal(multi.savedHash, multi.documentHash,
+    'the lifecycle response did not refresh the save baseline hash');
+  assert.equal(multi.savedHash, enabled.document_sha256);
+  assert.equal(await page.locator('#cvDefault').isVisible(), true,
+    'a non-default enabled graph must offer "set as default"');
+  assert.equal(await page.locator('#cvDefaultPill').isVisible(), false,
+    'a non-default graph must not show the default pill');
 
   assert.equal(await page.locator('#cvDisable').isVisible(), true,
     'an enabled group must expose disable inline in the toolbar');
@@ -1557,9 +1604,230 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(ui.state, 'disabled', 'disabling a clean saved group must project disabled');
   assert.equal(ui.disableHidden, true, 'a disabled group must hide the disable action');
   assert.equal((await serverTree(draft.id)).enabled, false, 'disable did not reach the server');
+  assert.equal(await page.locator('#cvDefault').isVisible(), false,
+    'a disabled group must not offer "set as default"');
   await ensureBaselineTree();
 });
 
+test('multi-graph lifecycle: default switch survives a save and disables into an empty route set', async () => {
+  /* brief 的真实浏览器场景（Task 8）：多图同时启用、默认切换、切默认后立即保存
+     不得 409 graph_conflict、停用非默认图成功、停用最后一张默认图后路由集为空。 */
+  const MAIN = 'main';
+  const FINANCE = 'finance';
+  const listedTree = async id =>
+    (await api('GET', '/admin/trees')).trees.find(tree => tree.id === id);
+  try {
+    await ensureBaselineTree();
+    /* 从零启用图（合法空路由集）开始：先建两张关闭副本，再停用唯一启用图。
+       这样第一张启用的图自动成为默认，正好复现 brief 的 main/finance 场景。 */
+    const existing = (await api('GET', '/admin/trees')).trees;
+    for (const [id, name] of [[MAIN, '主图'], [FINANCE, '财务图']]) {
+      if (!existing.some(tree => tree.id === id)) {
+        await api('POST', '/admin/trees/' + TREE_ID + '/copy', { id, name });
+      }
+    }
+    await api('POST', '/admin/trees/' + TREE_ID + '/disable');
+    const emptyStart = await api('GET', '/admin/trees');
+    assert.deepEqual(emptyStart.graph_status.enabled_tree_ids, [],
+      'disabling the last enabled graph must publish an empty route set');
+    assert.equal(emptyStart.graph_status.default_tree_id, null);
+
+    await openCanvas();
+    const select = page.locator('#cvTreeSelect');
+
+    /* 1) 启用 main：空路由集里的第一张启用图自动成为默认图。 */
+    await select.selectOption(MAIN);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.treeId === id && app.changeKind === 'clean');
+}, MAIN, { timeout: 8000 });
+    await clickCanvasAction('cvEnable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.tree && app.tree.enabled === true && app.tree.default === true);
+}, null, { timeout: 8000 });
+    assert.equal((await listedTree(MAIN)).default, true,
+      'the first enabled graph must become the default graph');
+
+    /* 2) 启用 finance：两者都保持启用，main 仍是默认。 */
+    await select.selectOption(FINANCE);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.treeId === id && app.changeKind === 'clean');
+}, FINANCE, { timeout: 8000 });
+    await clickCanvasAction('cvEnable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.tree && app.tree.enabled === true && app.tree.default === false);
+}, null, { timeout: 8000 });
+    const multi = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        enabled: !!(app.tree && app.tree.enabled),
+        isDefault: !!(app.tree && app.tree.default),
+        savedDefault: !!(app.saved && app.saved.default)
+      };
+    });
+    assert.equal(multi.enabled, true);
+    assert.equal(multi.isDefault, false, 'enabling the second graph claimed default');
+    assert.equal(multi.savedDefault, false, 'the save baseline claimed default for a non-default graph');
+    const mainTree = await listedTree(MAIN);
+    const financeTree = await listedTree(FINANCE);
+    assert.equal(mainTree.enabled, true, 'enabling finance disabled the already-enabled main graph');
+    assert.equal(mainTree.default, true, 'enabling finance stole default from main');
+    assert.equal(financeTree.enabled, true);
+    assert.equal(financeTree.default, false);
+    assert.equal(await page.locator('#cvDefault').isVisible(), true,
+      'a non-default enabled graph must offer "set as default"');
+    assert.equal(await page.locator('#cvDefaultPill').isVisible(), false,
+      'a non-default graph must not show the default pill');
+
+    /* 3) 点击 finance 的「设为默认」：finance 默认、main 降级，但两者仍启用。 */
+    const hashBeforeDefault = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.saved.document_sha256;
+    });
+    await clearToasts();
+    await clickCanvasAction('cvDefault');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.tree && app.tree.enabled === true && app.tree.default === true);
+}, null, { timeout: 8000 });
+    await waitToastIncludes(await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return t('cv.toastDefault');
+}));
+    const switchedMain = await listedTree(MAIN);
+    const switchedFinance = await listedTree(FINANCE);
+    assert.equal(switchedFinance.default, true, 'the default switch did not reach the server');
+    assert.equal(switchedFinance.enabled, true);
+    assert.equal(switchedMain.default, false, 'the old default graph was not demoted');
+    assert.equal(switchedMain.enabled, true, 'the old default graph must stay enabled');
+    const multiAfterSwitch = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      const select = document.querySelector('#cvTreeSelect');
+      const option = Array.from(select.options).find(item => item.value === select.value);
+      const { t } = await import('/console/i18n.js');
+      return {
+        kind: app.kind(),
+        isDefault: !!(app.tree && app.tree.default),
+        savedDefault: !!(app.saved && app.saved.default),
+        savedHash: app.saved.document_sha256,
+        documentHash: app.tree.document_sha256,
+        defaultMark: t('cv.treeDefault'),
+        optionLabel: option ? option.textContent : ''
+      };
+    });
+    assert.equal(multiAfterSwitch.kind, 'clean',
+      'a lifecycle response must not dirty the draft');
+    assert.equal(multiAfterSwitch.isDefault, true);
+    assert.equal(multiAfterSwitch.savedDefault, true);
+    /* default 切换会改写目标文档字节：保存基线必须从回包刷新 document_sha256。 */
+    assert.notEqual(multiAfterSwitch.savedHash, hashBeforeDefault,
+      'the default switch did not change the document hash');
+    assert.equal(multiAfterSwitch.savedHash, multiAfterSwitch.documentHash,
+      'the save baseline was not refreshed from the default response');
+    assert.equal(multiAfterSwitch.savedHash, switchedFinance.document_sha256);
+    assert.ok(multiAfterSwitch.optionLabel.includes(multiAfterSwitch.defaultMark),
+      'the tree selector does not mark the new default graph');
+    assert.equal(await page.locator('#cvDefault').isVisible(), false,
+      'the default graph must hide "set as default"');
+    assert.equal(await page.locator('#cvDefaultPill').isVisible(), true,
+      'the default graph must show the default pill');
+
+    /* 4) 立即再保存当前图：基线已刷新，不能出现 409 graph_conflict。 */
+    await clearToasts();
+    await saveNow();
+    await waitToastIncludes(await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return t('cv.toastSaved');
+}));
+    const savedAgain = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      const { t } = await import('/console/i18n.js');
+      return { kind: app.kind(), hash: app.saved.document_sha256, conflict: t('cv.toastSaveConflict') };
+    });
+    assert.equal(savedAgain.kind, 'clean');
+    assert.equal((await toastText()).includes(savedAgain.conflict), false,
+      'the save right after a default switch was rejected with graph_conflict');
+    assert.equal(savedAgain.hash, (await serverTree(FINANCE)).document_sha256,
+      'the save baseline drifted from the server document');
+
+    /* 5) 启动选择默认图：受控列表把非默认的 main 放在 finance 前面。 */
+    const listRoute = async route => {
+      const real = await api('GET', '/admin/trees');
+      const main = real.trees.find(tree => tree.id === MAIN);
+      const finance = real.trees.find(tree => tree.id === FINANCE);
+      const others = real.trees.filter(tree => tree.id !== MAIN && tree.id !== FINANCE);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ ...real, trees: [main, finance, ...others] })
+});
+};
+    await page.route(/\/admin\/trees$/, listRoute);
+    try {
+      await openCanvas();
+    } finally {
+      await page.unroute(/\/admin\/trees$/, listRoute);
+    }
+    assert.equal(await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.treeId;
+}), FINANCE, 'boot must select the default graph, not the first enabled graph');
+
+    /* 6) 停用非默认的 main 成功；再停用默认的 finance（最后一张启用图）→ 空路由集。 */
+    await select.selectOption(MAIN);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.treeId === id && app.changeKind === 'clean' && app.tree.enabled === true);
+}, MAIN, { timeout: 8000 });
+    assert.equal(await page.locator('#cvDisable').isVisible(), true);
+    await clickCanvasAction('cvDisable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.tree && app.tree.enabled === false && app.tree.default === false);
+}, null, { timeout: 8000 });
+    assert.equal((await listedTree(MAIN)).enabled, false, 'disabling a non-default graph failed');
+    assert.equal((await listedTree(FINANCE)).enabled, true,
+      'disabling the non-default graph also disabled the default graph');
+    assert.equal((await listedTree(FINANCE)).default, true);
+
+    await select.selectOption(FINANCE);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.treeId === id && app.changeKind === 'clean' && app.tree.enabled === true);
+}, FINANCE, { timeout: 8000 });
+    await clickCanvasAction('cvDisable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.tree && app.tree.enabled === false);
+}, null, { timeout: 8000 });
+    const empty = await api('GET', '/admin/trees');
+    assert.ok(empty.trees.every(tree => tree.enabled === false),
+      'disabling the last default graph left an enabled graph behind');
+    assert.deepEqual(empty.graph_status.enabled_tree_ids, [],
+      'the route set is not empty after disabling the last enabled graph');
+    assert.equal(empty.graph_status.default_tree_id, null);
+    const disabledUi = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        enabled: !!(app.tree && app.tree.enabled),
+        isDefault: !!(app.tree && app.tree.default),
+        state: document.getElementById('cvLifecycle').dataset.state,
+        defaultHidden: document.getElementById('cvDefault').hidden,
+        pillHidden: document.getElementById('cvDefaultPill').hidden
+      };
+    });
+    assert.equal(disabledUi.enabled, false);
+    assert.equal(disabledUi.isDefault, false);
+    assert.equal(disabledUi.state, 'disabled');
+    assert.equal(disabledUi.defaultHidden, true);
+    assert.equal(disabledUi.pillHidden, true);
+  } finally {
+    await ensureBaselineTree();
+  }
+});
 test('Task 2 fix · a saved disabled group with local edits reads disabled, not draft', async () => {
   /* 未启用优先：只要落过盘（store.saved），本地脏改动不再把生命周期降级成
      「草稿未保存」；脏状态由主按钮「保存并启用」表达。 */
@@ -2808,6 +3076,10 @@ test('Task 12 · an imported graph saves, enables and survives a page refresh wi
   assert.equal(enabledServer.enabled, true);
   assert.equal(enabledServer.tree_revision, revision, 'enabling the imported graph changed its revision');
 
+  /* Task 8 多图语义：启用不再停用其它图（基线图仍启用且仍是默认图），boot 优先
+     打开默认图。把刚启用的导入图设为默认后再刷新，才应该回到它 —— 旧断言
+     「启用后它就是唯一的启用图」已过时。 */
+  await api('POST', '/admin/trees/' + encodeURIComponent(newId) + '/default');
   await openCanvas();
   const after = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
