@@ -1828,6 +1828,132 @@ test('multi-graph lifecycle: default switch survives a save and disables into an
     await ensureBaselineTree();
   }
 });
+test('multi-graph lifecycle: disabling the default graph with other graphs enabled prompts for a default switch', async () => {
+  /* Fix wave 1（设计 §6.2/§8）：默认图还有其它启用图时不能直接停用，必须先切默认图。
+     两条路径都在真实浏览器里锁住：
+     1) 前端拦截：页面列表已知两张图启用 → 点默认图的停用不发 /disable 请求，
+        只弹本地化「先切换默认图」提示；
+     2) 服务端竞态：页面加载后另一会话启用了第二张图（页面列表过期）→ 前端预检查
+        放行 → 服务端 409 default_graph_required → 同一提示，绝不把结构化 detail
+        当原始 JSON 显示；服务器状态与 snapshot_revision 均保持不变。 */
+  const MAIN = 'main';
+  const FINANCE = 'finance';
+  const treesPayload = () => api('GET', '/admin/trees');
+  const listedTree = async id => (await treesPayload()).trees.find(tree => tree.id === id);
+  const publishedRevision = async () => (await treesPayload()).graph_status.snapshot_revision;
+  try {
+    await ensureBaselineTree();
+    const existing = (await treesPayload()).trees;
+    for (const [id, name] of [[MAIN, '主图'], [FINANCE, '财务图']]) {
+      if (!existing.some(tree => tree.id === id)) {
+        await api('POST', '/admin/trees/' + TREE_ID + '/copy', { id, name });
+      }
+    }
+    /* 清空路由集后先启用 main（第一张启用图自动成为默认），再启用 finance。 */
+    await api('POST', '/admin/trees/' + TREE_ID + '/disable');
+    await api('POST', '/admin/trees/' + MAIN + '/enable');
+    await api('POST', '/admin/trees/' + FINANCE + '/enable');
+    assert.equal((await listedTree(MAIN)).default, true);
+    assert.equal((await listedTree(FINANCE)).enabled, true);
+
+    await openCanvas();
+    const blockedCopy = await page.evaluate(async () => {
+      const { t } = await import('/console/i18n.js');
+      return t('cv.toastDisableDefaultBlocked');
+    });
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.treeId === id && app.changeKind === 'clean' &&
+        !!(app.tree && app.tree.enabled && app.tree.default));
+    }, MAIN, { timeout: 8000 });
+    assert.equal(await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.trees.filter(tree => tree.enabled).length;
+    }), 2, 'the console must see both enabled graphs before the guard check');
+
+    /* 1) 前端拦截：默认图 + 另一张启用图 → 不发写请求，只弹切换默认图提示。 */
+    const writes = [];
+    const onRequest = request => {
+      if (request.method() === 'POST' &&
+        new RegExp('/admin/trees/' + MAIN + '/(?:disable|default)$').test(request.url())) {
+        writes.push(request.method() + ' ' + request.url());
+      }
+    };
+    page.on('request', onRequest);
+    let revisionBeforeGuard;
+    try {
+      revisionBeforeGuard = await publishedRevision();
+      await clearToasts();
+      await clickCanvasAction('cvDisable');
+      await waitToastIncludes(blockedCopy);
+    } finally {
+      page.off('request', onRequest);
+    }
+    await page.waitForTimeout(120);
+    assert.deepEqual(writes, [], 'the blocked disable still sent a write request');
+    assert.equal(await toastText(), blockedCopy,
+      'the blocked disable did not use the localized switch prompt');
+    assert.equal((await toastText()).includes('default_graph_required'), false,
+      'the raw backend JSON leaked into the toast');
+    assert.equal(await publishedRevision(), revisionBeforeGuard,
+      'the blocked disable changed the published route set');
+    const mainAfterGuard = await listedTree(MAIN);
+    assert.equal(mainAfterGuard.enabled, true, 'the blocked disable disabled the default graph');
+    assert.equal(mainAfterGuard.default, true, 'the blocked disable dropped the default flag');
+    const uiAfterGuard = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        enabled: !!(app.tree && app.tree.enabled),
+        isDefault: !!(app.tree && app.tree.default),
+        saving: !!app.saving,
+        state: document.getElementById('cvLifecycle').dataset.state
+      };
+    });
+    assert.equal(uiAfterGuard.enabled, true);
+    assert.equal(uiAfterGuard.isDefault, true);
+    assert.equal(uiAfterGuard.saving, false);
+    assert.equal(uiAfterGuard.state, 'running');
+
+    /* 2) 服务端竞态：页面加载时只有 main 启用，随后另一会话启用 finance。 */
+    await api('POST', '/admin/trees/' + FINANCE + '/disable');
+    await openCanvas();
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.treeId === id && app.changeKind === 'clean');
+    }, MAIN, { timeout: 8000 });
+    assert.deepEqual(await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.trees.filter(tree => tree.enabled).map(tree => tree.id);
+    }), [MAIN], 'the page must start from a one-enabled-graph view for the race');
+    await api('POST', '/admin/trees/' + FINANCE + '/enable');
+    const revisionBeforeRace = await publishedRevision();
+    assert.equal((await listedTree(MAIN)).default, true,
+      'the race setup must keep main as the default graph');
+    expectHttpStatusError({ url: new RegExp('/admin/trees/' + MAIN + '/disable$'), status: /409/ });
+    await clearToasts();
+    await clickCanvasAction('cvDisable');
+    await waitToastIncludes(blockedCopy);
+    await page.waitForTimeout(300);
+    assert.equal(expectedHttpStatusErrors.length, 0,
+      'the 409 default_graph_required console error was not observed at the expected URL/status');
+    assert.equal(await toastText(), blockedCopy,
+      'the 409 rejection did not use the localized switch prompt');
+    assert.equal((await toastText()).includes('default_graph_required'), false,
+      'the structured 409 detail leaked into the toast as raw JSON');
+    assert.equal(await publishedRevision(), revisionBeforeRace,
+      'the rejected disable changed the published route set');
+    const mainAfterRace = await listedTree(MAIN);
+    assert.equal(mainAfterRace.enabled, true, 'the rejected disable disabled the default graph');
+    assert.equal(mainAfterRace.default, true, 'the rejected disable dropped the default flag');
+    assert.equal(await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return !!app.saving;
+    }), false, 'a rejected disable left the console stuck in the saving state');
+  } finally {
+    resetExpectedHttpStatusErrors();
+    await ensureBaselineTree();
+  }
+});
 test('Task 2 fix · a saved disabled group with local edits reads disabled, not draft', async () => {
   /* 未启用优先：只要落过盘（store.saved），本地脏改动不再把生命周期降级成
      「草稿未保存」；脏状态由主按钮「保存并启用」表达。 */

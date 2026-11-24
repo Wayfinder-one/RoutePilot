@@ -303,10 +303,24 @@ export class RoutingController {
     return this.setEnabled(true);
   }
 
+  /* 默认图停用保护（设计 §6.2/§8）：默认图仍需保留其它启用图时必须先切换默认图。
+     this.trees 来自 GET /admin/trees 与生命周期回包；不在前端猜测，而是拦下一次
+     注定被服务端以 409 default_graph_required 拒绝的写请求。 */
+  hasOtherEnabledTree(treeId) {
+    const target = treeId || this.treeId;
+    return (this.trees || []).some(tree =>
+      !!tree && tree.enabled === true && tree.id !== target);
+  }
+
   async disable() {
     const store = this.store;
     if (!store.tree || store.tryRunning || store.saving) return false;
     if (!store.tree.enabled) return true;
+    /* 停用默认图但仍有其它启用图：服务端会 409，先提示切换默认图，不发请求。 */
+    if (store.tree.default && this.hasOtherEnabledTree(this.treeId)) {
+      this.hooks.toast(t('cv.toastDisableDefaultBlocked'), 'warn');
+      return false;
+    }
     return this.setEnabled(false);
   }
 
@@ -339,6 +353,14 @@ export class RoutingController {
       return true;
     } catch (error) {
       if (store.tree !== targetTree || this.treeId !== targetId) return false;
+      /* 服务端竞态：页面里的启用图列表可能已过期（另一会话刚启用/切换了其它图），
+         停用默认图仍会被 409 default_graph_required 拒绝。此时服务器状态未变，
+         给与前端拦截相同的「先切换默认图」提示，绝不把结构化 detail 当原始 JSON
+         塞进泛化失败文案。 */
+      if (!enabled && error && error.detail && error.detail.code === 'default_graph_required') {
+        this.hooks.toast(t('cv.toastDisableDefaultBlocked'), 'warn');
+        return false;
+      }
       const issues = serverIssues(error);
       if (issues) {
         this.hooks.setIssues(this.mergeIssues(issues));
