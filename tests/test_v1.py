@@ -945,6 +945,18 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
         assert [pair[0]["en"] for pair in record["metrics"]] == [
             "Decision time", "Decision model time", "Waves"]
 
+        # 熔断键必须带图作用域：再补两次 5xx 达到阈值（threshold=3），作用域键
+        # 打开而裸模型键不打开；stream()/_relay 回退到裸 ``model`` 键时首条断言
+        # 就会失败。每条 5xx 仍各自关闭上游响应、释放租约，结束后 inflight 归零。
+        for _ in range(2):
+            assert (await post(app, payload(stream=True))).status_code == 502
+        assert app.state.breaker.is_open(
+            runtime_model_key(tree_scope("main"), "safe")) is True
+        assert app.state.breaker.is_open("safe") is False
+        assert closes == [True, True, True]
+        assert released == ["safe", "safe", "safe"]
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+
     asyncio.run(scenario())
 
 

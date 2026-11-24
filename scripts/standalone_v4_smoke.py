@@ -34,16 +34,20 @@ Checks
 5. public ``/v1`` SSE -> live streaming, ``[DONE]``, frames measurably spaced;
 6. forged ``X-SR-Department`` -> 400 ``department_header_not_allowed``;
 7. ``/admin/try`` department selection matrix (finance/legal/main/main);
-8. default switch to ``legal`` and public data-plane follow-up;
-9. disabling the default graph while others stay enabled -> 409
-   ``default_graph_required``;
-10. empty enabled set: ``/readyz`` still ready, public ``/v1`` 503
+8. cross-graph same-model isolation: three ``main``/``fast`` upstream 500s -> 502
+   open only main's circuit, a ``twin`` graph (镜像部, same logical model
+   ``fast``, different tree id) still succeeds and its success does not reset
+   main's circuit;
+9. default switch to ``legal`` and public data-plane follow-up;
+10. disabling the default graph while others stay enabled -> 409
+    ``default_graph_required``;
+11. empty enabled set: ``/readyz`` still ready, public ``/v1`` 503
     ``no_active_tree``;
-11. corrupt one enabled graph -> ``stale: true`` and old route set keeps serving;
+12. corrupt one enabled graph -> ``stale: true`` and old route set keeps serving;
     restore the bytes -> ``stale: false``;
-12. read-only replica matches the writer's snapshot revision/fingerprint and
+13. read-only replica matches the writer's snapshot revision/fingerprint and
     tree lifecycle, including catching up after the writer enables a graph;
-13. SIGTERM clean shutdown of both processes, mock shutdown, temp cleanup.
+14. SIGTERM clean shutdown of both processes, mock shutdown, temp cleanup.
 
 Any failure prints the failed check, process log tails and mock evidence, then
 exits non-zero.  ``--keep`` retains the temp workspace for debugging.
@@ -76,6 +80,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -278,6 +283,11 @@ class _RecordingServer(ThreadingHTTPServer):
         super().__init__(address, handler)
         self.records = records
         self.records_lock = lock
+        #: Controllable failure queue: each entry is the HTTP status the next
+        #: request must answer with instead of the normal mock response. The
+        #: smoke uses it to open exactly one graph's circuit on demand.
+        self._failures: list[int] = []
+        self._failures_lock = threading.Lock()
 
     def record(self, entry: dict) -> None:
         with self.records_lock:
@@ -286,6 +296,22 @@ class _RecordingServer(ThreadingHTTPServer):
     def snapshot(self) -> list[dict]:
         with self.records_lock:
             return list(self.records)
+
+    def fail_next(self, count: int, status: int = 500) -> None:
+        with self._failures_lock:
+            self._failures.extend([status] * count)
+
+    def take_failure(self) -> int | None:
+        with self._failures_lock:
+            return self._failures.pop(0) if self._failures else None
+
+    def pending_failures(self) -> int:
+        with self._failures_lock:
+            return len(self._failures)
+
+    def clear_failures(self) -> None:
+        with self._failures_lock:
+            self._failures.clear()
 
 
 class MockUpstreamHandler(BaseHTTPRequestHandler):
@@ -311,8 +337,13 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             "started_at": started,
         }
         self.server.record(entry)
+        failure_status = self.server.take_failure()
+        if failure_status is not None:
+            entry["failure_status"] = failure_status
         try:
-            if entry["stream"]:
+            if failure_status is not None:
+                self._send_failure(failure_status)
+            elif entry["stream"]:
                 self._send_stream()
             else:
                 self._send_json(entry["model"])
@@ -320,6 +351,20 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             pass
         finally:
             entry["finished_at"] = time.monotonic()
+
+    def _send_failure(self, status: int) -> None:
+        payload = json.dumps({
+            "error": {
+                "message": f"mock upstream failure {status}",
+                "type": "upstream_error",
+            },
+        }, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
 
     def _send_json(self, model) -> None:
         payload = json.dumps({
@@ -799,6 +844,90 @@ class Smoke:
                 "dry-run /admin/try must not call the model upstream")
         return "; ".join(observed) + "; JEV mock 0 calls"
 
+    def check_cross_graph_same_model(self) -> str:
+        """Two graphs sharing one logical model must not share circuit state.
+
+        The controllable upstream failure queue answers the next three
+        ``main``/``fast`` requests with 500: only main's circuit opens (public
+        ``/v1`` then fails 503 ``no_available_backend`` before the upstream).
+        The ``twin`` graph (department 镜像部) routes the same logical model
+        ``fast`` under its own tree scope, so its admin test chat still
+        succeeds, reaches the upstream exactly once and must not reset main's
+        failure count. Everything is asserted through real HTTP behaviour and
+        upstream request counts; the router's ``app.state`` is never touched.
+        """
+        twin = graph_doc("twin", "fast", departments=["镜像部"], enabled=True)
+        body = {"model": "auto",
+                "messages": [{"role": "user", "content": "跨图同模型隔离"}]}
+        upstream = self.upstream
+        require(upstream is not None, "mock upstream is not running")
+        created = False
+        try:
+            create_and_enable(APP_BASE, twin)
+            created = True
+            trees = self._trees()
+            require("twin" in trees and trees["twin"]["enabled"],
+                    f"twin graph not enabled: {sorted(trees)}")
+            require(trees["twin"]["departments"] == ["镜像部"],
+                    f"twin departments: {trees['twin']['departments']}")
+            require(self._enabled_ids(trees) == ["finance", "legal", "main", "twin"],
+                    f"enabled trees with twin: {self._enabled_ids(trees)}")
+
+            before_failures = len(upstream.snapshot())
+            upstream.fail_next(3)
+            for attempt in range(3):
+                expect(call(APP_BASE, "POST", MOCK_CHAT_PATH, body), 502,
+                       f"main/fast upstream failure #{attempt + 1}")
+            require(upstream.pending_failures() == 0,
+                    f"failure queue still has {upstream.pending_failures()} entries")
+            require(len(upstream.snapshot()) == before_failures + 3,
+                    "each main/fast failure must reach the upstream")
+
+            before = len(upstream.snapshot())
+            unavailable = expect(call(APP_BASE, "POST", MOCK_CHAT_PATH, body), 503,
+                                 "public /v1 while main circuit is open")
+            message = unavailable.body.get("error", {}).get("message") \
+                if isinstance(unavailable.body, dict) else None
+            require(message == "no_available_backend",
+                    f"open circuit error: {_brief(unavailable.body)}")
+            require(len(upstream.snapshot()) == before,
+                    "an open main circuit must block before the upstream")
+
+            response = expect(call(
+                APP_BASE, "POST", "/admin/test/chat/completions", body,
+                headers={"x-sr-department": quote("镜像部", safe="")}),
+                200, "twin/fast has an independent circuit")
+            require(response.headers.get("x-sr-tree-id") == "twin",
+                    f"twin tree header: {response.headers}")
+            require(response.headers.get("x-sr-graph-selection") == "department",
+                    f"twin graph selection: {response.headers}")
+            require(len(upstream.snapshot()) == before + 1,
+                    "twin/fast did not reach the upstream")
+
+            before = len(upstream.snapshot())
+            expect(call(APP_BASE, "POST", MOCK_CHAT_PATH, body), 503,
+                   "twin success must not reset main circuit")
+            require(len(upstream.snapshot()) == before,
+                    "main upstream should remain blocked after the twin success")
+        finally:
+            # Restore a successful upstream and remove the temporary graph so
+            # the later empty-route-set / replica / cleanup checks are unaffected.
+            upstream.clear_failures()
+            if created:
+                expect(call(APP_BASE, "POST", "/admin/trees/twin/disable"), 200,
+                       "disable twin")
+                self._wait_status(
+                    lambda status: status.get("enabled_tree_ids")
+                    == ["finance", "legal", "main"],
+                    timeout=STALE_TIMEOUT, label="twin disabled back to main/finance/legal")
+                require(self._enabled_ids(self._trees()) == ["finance", "legal", "main"],
+                        "enabled trees after disabling twin")
+        return ("3x main/fast 502 -> main circuit open (next /v1 503 "
+                "no_available_backend, no upstream call); twin/fast 200 via "
+                "department 镜像部 (exactly 1 upstream call); main stayed open "
+                "after the twin success; twin disabled, enabled set restored to "
+                "main/finance/legal")
+
     def check_switch_default(self) -> str:
         before = len(self.upstream.snapshot()) if self.upstream else 0
         expect(call(APP_BASE, "POST", "/admin/trees/legal/default"), 200,
@@ -1172,6 +1301,8 @@ class Smoke:
             ("public /v1 SSE streams live and terminates with [DONE]", self.check_public_sse),
             ("public /v1 rejects forged X-SR-Department", self.check_department_header),
             ("/admin/try selects graphs by department", self.check_try_departments),
+            ("cross-graph same-model isolation keeps circuits independent",
+             self.check_cross_graph_same_model),
             ("legal becomes default and /v1 follows", self.check_switch_default),
             ("default graph cannot be disabled while others stay enabled",
              self.check_disable_guard),

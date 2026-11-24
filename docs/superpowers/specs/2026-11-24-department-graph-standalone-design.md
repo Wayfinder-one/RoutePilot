@@ -183,6 +183,7 @@ RoutePilot 继续负责请求体改写和上游代理，APISIX 不需要 Lua 改
 - 没有可用初始快照返回 `503 no_valid_snapshot`。
 - 响应增加 `x-sr-tree-id` 和 `x-sr-graph-selection: department|default`。
 - 请求账本继续记录实际选中的 `tree_id/tree_revision/snapshot_revision`；不同图的粘性和后端状态不得串用。
+- 熔断与 inflight 的内部运行键按 `tree_scope(tree_id) = tree:<tree_id>`、`runtime_model_key(scope, model) = <scope>:<model>（scope 非空）或 <model>（固定直连）` 构造（详见 `docs/决策图规范.md` §8.3）：只作用于运行状态，不改变图文档、`tree_revision`、响应模型名与账本模型名；同一 scope 跨副本稳定，另一图及固定直连不受故障影响。
 
 ## 6. 管理 API
 

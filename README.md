@@ -17,7 +17,7 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 | Route set | Several decision graphs can be enabled at once; exactly one default graph serves public `/v1`, and department mappings let admin checks target a specific enabled graph |
 | Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service; the canvas snapshot fixes which service profile a graph runs with |
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
-| Backend selection | Session affinity; random pick among a multi-model target's available models; per-model circuit breaker |
+| Backend selection | Session affinity; random pick among a multi-model target's available models; Auto isolates circuit breaking and inflight per graph+model; fixed-model direct stays independent |
 | Portable canvases | Every saved v4 canvas embeds its lifecycle markers, departments and complete non-secret run configuration, so one JSON file restores it on an empty database |
 | Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; it runs either the current draft or the published route set (optionally selected by department), and database drift is reported as hints only |
 | Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, multi-service JEV catalog, time periods, audit history, role-based users |
@@ -121,11 +121,11 @@ The routing page is split into two zones.
 
 **Execution zone** — docked below the canvas:
 
-- Input field, sample prompts, run button, and a **Check routing** scope selector: the current draft, or the published route set with an optional department.
+- Input field, sample prompts, run button, and a **Check routing** scope selector: the current draft, or the published route set with an optional department. A route-set check renders only the selected graph's result and raw node/target IDs, and never replays, paints or lays out the current draft; a draft check keeps the canvas replay.
 - Result: final target, model, candidates with priorities, selection reason, waves and call count. Route-set checks also report the selected `tree_id` and whether it was chosen by department or as the default.
 - Execution trace: one card per wave with hit conditions, plus the full request timeline.
 
-A routing check highlights the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
+A draft routing check highlights the winning path wave by wave and can arrange the nodes by waves. A route-set check leaves the canvas untouched because its result describes the published route set, not the current draft — the result panel is the only evidence. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
 
 ![Routing-check replay](assets/routepilot/en/try-run.png)
 
@@ -634,7 +634,7 @@ npm run check:console
 - `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
 - `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
 - `scripts/i18n_dead_keys.py` reports unreferenced dictionary keys.
-- `scripts/standalone_v4_smoke.py` is the real end-to-end acceptance run: mock model/JEV servers plus real writer and read-only `python -m router` processes on fixed local ports against a throwaway temp database/graph directory, then verifies the public default-graph JSON/SSE path, `/admin/try` department selection, default switching, the 409/503 lifecycle edges, stale recovery and replica route-set parity; it exits non-zero on failure and removes its temp workspace.
+- `scripts/standalone_v4_smoke.py` is the real end-to-end acceptance run: mock model/JEV servers plus real writer and read-only `python -m router` processes on fixed local ports against a throwaway temp database/graph directory, then verifies the public default-graph JSON/SSE path, `/admin/try` department selection, cross-graph same-model breaker isolation, default switching, the 409/503 lifecycle edges, stale recovery and replica route-set parity; it exits non-zero on failure and removes its temp workspace.
 
 Experiments are standalone and excluded from the default run:
 
