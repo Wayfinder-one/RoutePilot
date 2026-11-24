@@ -184,13 +184,28 @@ def row_counts(app) -> dict:
 
 def create_stored_tree(client, *, root=None, tree_id="main", timezone="Asia/Shanghai",
                        sticky=None, name="测试图"):
+    """创建已存画布：保存现在执行画布自身完整校验，运行目录必须覆盖 root 的模型。"""
+    resolved_root = graph_dict() if root is None else root
+    runtime = models_runtime(*MODELS)
+    known = set(MODELS)
+    for node in resolved_root.get("nodes") or ():
+        if not isinstance(node, dict) or node.get("type") != "target":
+            continue
+        for slot in node.get("models") or ():
+            model_id = slot.get("model") if isinstance(slot, dict) else slot
+            if isinstance(model_id, str) and model_id not in known:
+                known.add(model_id)
+                runtime["backends"]["models"].append({
+                    "id": model_id, "upstream": model_id,
+                    "provider": "local", "profile": {},
+                })
     response = client.post("/admin/trees", json={
         "id": tree_id,
         "name": name,
-        "root": graph_dict() if root is None else root,
+        "root": resolved_root,
         "timezone": timezone,
         "sticky": sticky or {"enabled": True, "ttl_seconds": 1800},
-        **models_runtime(*MODELS),
+        **runtime,
     })
     assert response.status_code == 201, response.text
     return response.json()["tree"]

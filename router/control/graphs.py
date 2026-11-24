@@ -1,7 +1,7 @@
 """决策组（graph）写用例：CRUD/启停的校验、候选快照与发布次序（brief Step 3）。
 
-- `create` / `copy`：结构校验 →（锁内）文档写入 → 审计；不发布快照（新图为关闭态）。
-- `update`：锁内按 root 优先合并已存 envelope → 启用与否分档校验 → 已启用图
+- `create` / `copy`：画布自身完整校验（结构 + 启用级；`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（新图为关闭态）。
+- `update`：锁内按 root 优先合并已存 envelope → 画布自身完整校验（启用/未启用同一套）→ 已启用图
   prepare 候选快照 → `base_document_sha256` 冲突检查后文件成功写入 →
   指纹复核（Task 1 review carry-forward：等价于旧 refresh() 的提交前复核，
   不匹配抛 `GraphChangedDuringLoad`）→ publish → 审计。
@@ -24,7 +24,7 @@ from dataclasses import replace as dataclass_replace
 from router.control.errors import AlreadyExists, MissingError, ValidationFailed
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
-from router.routing.graph.validate import Issue, validate_graph_structure
+from router.routing.graph.validate import Issue
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict
@@ -94,7 +94,7 @@ class GraphService:
 
     # ── CRUD ────────────────────────────────────────────────────────────
     def create(self, tree: RoutingTree) -> RoutingTree:
-        issues = validate_graph_structure(tree)
+        issues = tree_issues(self.conn, tree)
         if issues:
             raise ValidationFailed(issues)
         with self.publisher.locked():
@@ -115,10 +115,7 @@ class GraphService:
             if not isinstance(base_document_sha256, str) \
                     or not _SHA256_RE.fullmatch(base_document_sha256):
                 raise GraphConflictError(current.document_sha256)
-            if current.enabled:
-                issues = tree_issues(self.conn, tree)
-            else:
-                issues = validate_graph_structure(tree)
+            issues = tree_issues(self.conn, tree)
             if issues:
                 raise ValidationFailed(issues)
 

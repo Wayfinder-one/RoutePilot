@@ -325,35 +325,32 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     assert not any(tree["enabled"] for tree in disabled.json()["trees"])
 
 
-def test_closed_save_skips_enable_validation_but_enabled_save_uses_it(client, app):
+def test_save_uses_full_canvas_validation_in_every_lifecycle(client, app):
     configure_jev(client)
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
 
-    # 关闭状态：只做结构校验，未知模型可保存
     response = save_tree(client, {"root": graph_with_model("ghost")})
-    assert response.status_code == 200, response.text
-    response = client.post("/admin/trees/main/enable")
-    assert response.status_code == 422
+    assert response.status_code == 422, response.text
     assert any(issue["code"] == "unknown_model" for issue in response.json()["detail"])
+    assert client.get("/admin/trees/main").json()["tree"] == before
 
-    # 空 target.models 可保存，但 enable 拒绝
     root = graph_with_model()
     for node in root["nodes"]:
         if node["type"] == "target":
             node["models"] = []
-    assert save_tree(client, {"root": root}).status_code == 200
-    response = client.post("/admin/trees/main/enable")
-    assert response.status_code == 422
-    codes = {issue["code"] for issue in response.json()["detail"]}
-    assert "target_models_required" in codes
+    response = save_tree(client, {"root": root})
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "target_models_required"
+               for issue in response.json()["detail"])
+    assert client.get("/admin/trees/main").json()["tree"] == before
 
     assert save_tree(client, {"root": graph_with_model()}).status_code == 200
     assert client.post("/admin/trees/main/enable").status_code == 200
     published = app.state.snapshot.snapshot_revision
 
-    # 已启用组保存：按启用校验（未知模型 / 空模型 / 结构错误均 422）
     response = save_tree(client, {"root": graph_with_model("ghost")})
-    assert response.status_code == 422
+    assert response.status_code == 422, response.text
     assert any(issue["code"] == "unknown_model" for issue in response.json()["detail"])
     assert app.state.snapshot.snapshot_revision == published
 
@@ -362,17 +359,17 @@ def test_closed_save_skips_enable_validation_but_enabled_save_uses_it(client, ap
         if node["type"] == "target":
             node["models"] = []
     response = save_tree(client, {"root": root})
-    assert response.status_code == 422
-    assert any(issue["code"] == "target_models_required" for issue in response.json()["detail"])
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "target_models_required"
+               for issue in response.json()["detail"])
+    assert app.state.snapshot.snapshot_revision == published
 
     root = graph_with_model()
     root["nodes"] = [node for node in root["nodes"] if node["type"] != "start"]
     response = save_tree(client, {"root": root})
-    assert response.status_code == 422
+    assert response.status_code == 422, response.text
     assert any(issue["code"] == "start_count" for issue in response.json()["detail"])
     assert app.state.snapshot.snapshot_revision == published
-
-    assert client.post("/admin/trees/main/disable").status_code == 200
 
 
 ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level",
@@ -558,20 +555,28 @@ def test_update_explicit_null_flat_runtime_field_is_parse_error(client, field, m
     assert client.get("/admin/trees/main").json()["tree"] == before
 
 
-def test_update_explicit_jev_null_is_saved_and_only_enable_rejects_it(client):
-    """``jev: null`` 是合法图解析（无决策服务）：关闭画布保存 200，启用校验才拒绝。"""
+def test_update_explicit_jev_null_is_rejected_for_question_graph(client):
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
 
     response = save_tree(client, {"jev": None})
 
-    assert response.status_code == 200, response.text
-    assert response.json()["tree"]["jev"] is None
-    assert client.get("/admin/trees/main").json()["tree"]["jev"] is None
-
-    enabled = client.post("/admin/trees/main/enable")
-    assert enabled.status_code == 422, enabled.text
+    assert response.status_code == 422, response.text
     assert any(issue["code"] == "decision_service_unavailable"
-               for issue in enabled.json()["detail"])
+               for issue in response.json()["detail"])
+    assert client.get("/admin/trees/main").json()["tree"] == before
+
+
+def test_create_question_graph_without_jev_is_rejected(client):
+    raw = tree_dict(root=graph_with_model())
+    raw["jev"] = None
+
+    response = create_tree(client, raw)
+
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "decision_service_unavailable"
+               for issue in response.json()["detail"])
+    assert client.get("/admin/trees").json()["trees"] == []
 
 
 def test_update_absent_fields_inherit_existing_values(client):
