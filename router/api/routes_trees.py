@@ -4,7 +4,9 @@
 与异常映射（ValidationFailed/GraphConflictError/MissingError/
 DefaultGraphRequired 由 app 级处理器映射）。所有校验失败统一返回 `Issue` 数组
 （spec §5）；默认图停用限制返回结构化 409。
-`POST /admin/try` 按 spec §4.3 的 root 优先 envelope 做 dry-run：不落库、不发布
+`POST /admin/try` 有两种路径：带 `tree_id`/`root` 时按 spec §4.3 的 root 优先
+envelope 做 dry-run 草稿试算；两者都不带时按已发布路由集选图（部门精确命中 →
+部门图，未知/空部门 → 默认图）。两条路径都 dry-run：不落库、不发布
 snapshot、不写粘性、不计 inflight。
 """
 from __future__ import annotations
@@ -31,7 +33,13 @@ from router.routing.graph.validate import validate_graph_structure
 from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, Sticky, tree_from_dict, tree_to_dict
 from router.routing.snapshot import build_snapshot
-from router.routing.types import NoAvailableBackend, RoutingMiss, RoutingRequest
+from router.routing.types import (
+    NoActiveTreeError,
+    NoAvailableBackend,
+    NoDefaultTreeError,
+    RoutingMiss,
+    RoutingRequest,
+)
 from router.store.repositories import new_id
 from router.store.routing_trees import RoutingTreeRepo
 
@@ -131,13 +139,16 @@ class DepartmentUpdateIn(BaseModel):
 class TryIn(BaseModel):
     """POST /admin/try 的 DTO：未知字段一律拒绝。
 
-    timezone/sticky 的显式 null 按 base dict 语义处理（timezone null 交给图解析
-    → 422，sticky null 重置为默认粘性配置）；字段缺失才继承已存值。"""
+    ``department`` 只在无 ``tree_id``/``root`` 的实际路由集路径生效（可信部门，
+    由管理端页面填写）；带草稿 envelope 时忽略。timezone/sticky 的显式 null 按
+    base dict 语义处理（timezone null 交给图解析 → 422，sticky null 重置为默认
+    粘性配置）；字段缺失才继承已存值。"""
 
     model_config = ConfigDict(extra="forbid")
 
     tree_id: Any = None
     root: Any = None
+    department: Any = None
     canvas: Any = None
     timezone: Any = None
     sticky: Any = None
@@ -371,13 +382,52 @@ async def try_tree(
     conn: sqlite3.Connection = Depends(get_conn),
     trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
+    """试算：无 ``tree_id``/``root`` 时按部门从已发布路由集选图，否则合并草稿 envelope。
+
+    路由集路径只读已启用图：部门精确命中 → 部门图，未知/空部门 → 默认图；
+    零启用图 503 ``no_active_tree``，启用集合缺默认图 503 ``no_default_tree``，
+    路由集未就绪 503 ``no_valid_snapshot``。响应用 ``graph_selection`` 报告
+    ``department``/``default``；草稿路径该字段为 null。
+    """
     tree_id = body.tree_id
     stored = None
-    if tree_id is not None:
-        if not isinstance(tree_id, str) or not tree_id:
-            raise HTTPException(422, detail="try tree_id must be a nonempty string")
-        stored = _tree_or_404(trees, tree_id)
-    tree = draft_tree(body, stored)
+    selection = None
+    # 两种互斥路径：只有既没有 tree_id 也没有草稿 root 时才使用实际路由集。
+    if tree_id is None and body.root is None:
+        department = body.department if body.department is not None else ""
+        if not isinstance(department, str):
+            raise HTTPException(422, detail="try department must be a string")
+        department = department.strip()
+        if len(department) > 64 or any(
+                ord(char) < 0x20 or ord(char) == 0x7F for char in department):
+            raise HTTPException(422, detail="invalid department")
+        route_set = request.app.state.snapshot_set
+        if route_set is None:
+            raise HTTPException(503, detail="no_valid_snapshot")
+        try:
+            selection = route_set.select(department)
+        except NoActiveTreeError as exc:
+            raise HTTPException(503, detail="no_active_tree") from exc
+        except NoDefaultTreeError as exc:
+            raise HTTPException(503, detail="no_default_tree") from exc
+        # 选中快照已过启用校验并编译，直接复用，不再做草稿结构校验/快照装配。
+        snapshot = selection.snapshot
+        warnings: list[dict] = []
+    else:
+        if tree_id is not None:
+            if not isinstance(tree_id, str) or not tree_id:
+                raise HTTPException(422, detail="try tree_id must be a nonempty string")
+            stored = _tree_or_404(trees, tree_id)
+        tree = draft_tree(body, stored)
+        # 结构校验是编译静态拓扑的前提；启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
+        issues = validate_graph_structure(tree)
+        if issues:
+            raise HTTPException(422, detail=issues_payload(issues))
+        # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
+        # 画布快照与数据库目录的差异也是提示：只读比较、不改变执行配置（spec 保存/启用/检查）。
+        warnings = issues_payload(
+            tree_issues(conn, tree) + runtime_mismatch_issues(conn, tree.runtime))
+        snapshot = _try_snapshot(conn, tree)
     text = body.text
     if not isinstance(text, str):
         raise HTTPException(422, detail="try text must be a string")
@@ -390,15 +440,6 @@ async def try_tree(
             now = datetime.fromisoformat(body.now)
         except (TypeError, ValueError) as exc:
             raise HTTPException(422, detail="now must be an ISO datetime") from exc
-    # 结构校验是编译静态拓扑的前提；启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
-    issues = validate_graph_structure(tree)
-    if issues:
-        raise HTTPException(422, detail=issues_payload(issues))
-    # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
-    # 画布快照与数据库目录的差异也是提示：只读比较、不改变执行配置（spec 保存/启用/检查）。
-    warnings = issues_payload(
-        tree_issues(conn, tree) + runtime_mismatch_issues(conn, tree.runtime))
-    snapshot = _try_snapshot(conn, tree)
     trace: list[dict] = []
     try:
         decision = await request.app.state.routing_service.route(
@@ -424,11 +465,12 @@ async def try_tree(
             },
             "answers": {node_id: answer_to_dict(answer) for node_id, answer in decision.answers.items()},
             "trace": decision.trace,
-            "tree_id": tree.id,
+            "tree_id": snapshot.tree_id,
             "tree_revision": snapshot.tree_revision,
             "snapshot_revision": snapshot.snapshot_revision,
             "warnings": warnings,
             "draft": body.root is not None,
+            "graph_selection": selection.reason if selection is not None else None,
         }
     finally:
         decision.release()

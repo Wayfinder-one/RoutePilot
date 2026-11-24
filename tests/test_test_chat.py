@@ -5,16 +5,28 @@ executor.  Auto keeps the full routing path (graph + JEV + sticky); a fixed
 model skips graph/JEV/sticky and resolves through the SQLite catalog
 (``load_backends``) instead of the active canvas snapshot, but still uses the
 LoadBalancer lease, the CircuitBreaker, the UpstreamProxy and the request log.
+
+管理端测试对话凭可信 ``x-sr-department`` Header 验证部门选图（公开 ``/v1`` 仍然
+拒绝该 Header）：百分号编码的 ``财务部`` 命中部门图，缺失/空 Header 回退默认图，
+固定模型直连完全跳过路由集选择。
 """
 import json
+from dataclasses import replace
+from urllib.parse import quote
 
 import httpx
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import test_settings
-from tests.test_app import TryHandler, composed_try_app
+from tests.routing_fixtures import test_settings, tree_dict
+from tests.test_app import (
+    JEV_ENV,
+    TryHandler,
+    composed_try_app,
+    direct_graph,
+    prepare_active_tree,
+)
 
 
 class _SseBody(httpx.AsyncByteStream):
@@ -186,3 +198,120 @@ def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
     assert response.headers["x-sr-model"] == "qwen3-8b"
     assert response.headers["x-sr-selection"] == "direct"
     assert seen and seen[-1].url.path.endswith("/chat/completions")
+
+
+# ── 管理端测试对话：可信部门 Header 选图 ──────────────────────────────
+
+FINANCE_DEPARTMENT = quote("财务部", safe="")
+
+
+def department_app(tmp_path, handler):
+    """默认图 main(fast) 由启动装配；部门图 finance(strong) 走真实管理 API。"""
+    settings = prepare_active_tree(tmp_path, tree_dict(
+        root=direct_graph(("fast",)),
+        sticky={"enabled": False, "ttl_seconds": 1800},
+    ))
+    return create_app(replace(settings, **JEV_ENV), transport=httpx.MockTransport(handler))
+
+
+def create_direct_model_tree(client, tree_id, model):
+    raw = tree_dict(tree_id, root=direct_graph((model,)))
+    payload = {key: value for key, value in raw.items()
+               if key not in {"enabled", "default"}}
+    response = client.post("/admin/trees", json=payload)
+    assert response.status_code == 201, response.text
+    assert client.post(f"/admin/trees/{tree_id}/enable").status_code == 200
+
+
+def set_departments(client, tree_id, departments):
+    current = client.get(f"/admin/trees/{tree_id}").json()["tree"]
+    response = client.put(f"/admin/trees/{tree_id}/departments", json={
+        "departments": departments,
+        "base_document_sha256": current["document_sha256"],
+    })
+    assert response.status_code == 200, response.text
+
+
+def test_admin_auto_chat_routes_department_header_and_logs_selection(tmp_path):
+    """Auto 测试对话按 Header 选部门图，缺失 Header 回退默认图，账本如实记录。"""
+    app = department_app(tmp_path, TryHandler())
+    with TestClient(app) as client:
+        create_direct_model_tree(client, "finance", "strong")
+        set_departments(client, "finance", ["财务部"])
+
+        default = client.post("/admin/test/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "默认请求"}],
+        })
+        department = client.post("/admin/test/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "部门请求"}],
+        }, headers={"x-sr-department": FINANCE_DEPARTMENT})
+
+        recent = client.get("/admin/requests/recent").json()["requests"]
+
+    assert default.status_code == 200, default.text
+    assert default.headers["x-sr-model"] == "fast"
+    assert default.headers["x-sr-tree-id"] == "main"
+    assert default.headers["x-sr-graph-selection"] == "default"
+    assert department.status_code == 200, department.text
+    assert department.headers["x-sr-model"] == "strong"
+    assert department.headers["x-sr-tree-id"] == "finance"
+    assert department.headers["x-sr-graph-selection"] == "department"
+    assert department.headers["x-sr-selection"] == "target"
+    # 最新请求在前：先默认图后部门图，账本记录每张图自己的模型。
+    assert [row["tree_id"] for row in recent[:2]] == ["finance", "main"]
+    assert recent[0]["model"] == "strong"
+    assert recent[1]["model"] == "fast"
+
+
+def test_admin_auto_chat_empty_department_header_uses_default_graph(tmp_path):
+    app = department_app(tmp_path, TryHandler())
+    with TestClient(app) as client:
+        create_direct_model_tree(client, "finance", "strong")
+        set_departments(client, "finance", ["财务部"])
+        response = client.post("/admin/test/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "空部门"}],
+        }, headers={"x-sr-department": ""})
+
+    assert response.status_code == 200, response.text
+    assert response.headers["x-sr-model"] == "fast"
+    assert response.headers["x-sr-tree-id"] == "main"
+    assert response.headers["x-sr-graph-selection"] == "default"
+
+
+def test_admin_chat_rejects_malformed_department_header(tmp_path):
+    """可信 Header 只在校验通过后参与选图：畸形百分号编码仍是 400。"""
+    app = department_app(tmp_path, TryHandler())
+    with TestClient(app) as client:
+        response = client.post("/admin/test/chat/completions", json={
+            "model": "auto",
+            "messages": [{"role": "user", "content": "坏 Header"}],
+        }, headers={"x-sr-department": "%zz"})
+
+    assert response.status_code == 400, response.text
+    assert response.json() == {"error": {"message": "invalid_department"}}
+
+
+def test_admin_fixed_model_chat_ignores_department_and_bypasses_jev(tmp_path):
+    """固定模型直连是目录测试：可信部门 Header 不参与选图/JEV/响应头。"""
+    handler = TryHandler()
+    app = department_app(tmp_path, handler)
+    with TestClient(app) as client:
+        create_direct_model_tree(client, "finance", "strong")
+        set_departments(client, "finance", ["财务部"])
+        response = client.post("/admin/test/chat/completions", json={
+            "model": "qwen3-32b",
+            "messages": [{"role": "user", "content": "直连测试"}],
+        }, headers={"x-sr-department": FINANCE_DEPARTMENT})
+        rows = app.state.requestlog.recent_requests(1)
+
+    assert response.status_code == 200, response.text
+    assert response.headers["x-sr-model"] == "qwen3-32b"
+    assert response.headers["x-sr-selection"] == "direct"
+    assert "x-sr-graph-selection" not in response.headers
+    assert "x-sr-tree-id" not in response.headers
+    assert handler.jev_paths == []
+    assert rows[0]["decision"] == "test"
+    assert rows[0]["selection_reason"] == "direct"

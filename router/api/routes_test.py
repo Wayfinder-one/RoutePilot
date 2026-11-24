@@ -4,6 +4,11 @@ Shares the ``/v1/chat/completions`` executor; ``use_requested_model=True`` is
 the only difference (the public data plane keeps ignoring the request model).
 The catalog connection is injected here so a fixed model resolves through the
 SQLite catalog, independent of the active canvas snapshot.
+
+``allow_department_header=True`` is the other admin-only capability: the test
+chat trusts the operator-supplied ``x-sr-department`` header so a department
+selection can be exercised end to end, while the public data plane keeps
+rejecting that header.
 """
 import sqlite3
 
@@ -19,4 +24,7 @@ router = APIRouter()
 async def test_chat_completions(
     request: Request, conn: sqlite3.Connection = Depends(get_conn),
 ):
-    return await run_chat_completion(request, use_requested_model=True, conn=conn)
+    return await run_chat_completion(
+        request, use_requested_model=True, conn=conn,
+        allow_department_header=True,
+    )

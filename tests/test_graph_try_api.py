@@ -4,11 +4,16 @@
 序列化、complete outcome（candidates/waves/selection_reason/fallback_reason）、
 503 语义，以及草稿试算的副作用不变量（不落库、不发布 snapshot、不写
 affinity/inflight、不读已存 root）。
+
+无 ``tree_id``/``root`` 的请求走已发布路由集按部门选图（管理端验证部门选择）：
+部门精确命中 → 部门图，未知/空部门 → 默认图，``graph_selection`` 报告原因；
+带 ``tree_id`` 或草稿 ``root`` 的请求保持 spec §4.3 envelope 语义。
 """
 from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -25,8 +30,10 @@ from tests.routing_fixtures import (
     graph_dict,
     huge_chain_graph,
     runtime_dict,
+    runtime_for_models,
     runtime_from_catalog,
     test_settings,
+    tree_dict,
 )
 
 
@@ -238,6 +245,40 @@ def portable_envelope(tree_id="portable"):
     }
 
 
+def create_direct_model_tree(client, tree_id, model):
+    """无问题节点的直连图（start → target(model)）：不触发 JEV，选图断言只看模型。"""
+    root = {
+        'id': 'root', 'type': 'graph',
+        'nodes': [
+            {'id': 'start', 'type': 'start'},
+            {'id': 'target', 'type': 'target', 'priority': 1,
+             'models': [{'model': model, 'reasoning': None}]},
+        ],
+        'edges': [{
+            'id': 'e-start-target', 'source': 'start', 'source_port': 'out',
+            'target': 'target', 'target_port': 'in_1', 'condition': None,
+        }],
+        'error_fallback': 'target',
+    }
+    raw = tree_dict(tree_id, root=root)
+    raw.update(runtime_for_models([model]))
+    payload = {key: value for key, value in raw.items()
+               if key not in {'enabled', 'default'}}
+    response = client.post('/admin/trees', json=payload)
+    assert response.status_code == 201, response.text
+    assert client.post(f'/admin/trees/{tree_id}/enable').status_code == 200
+
+
+def set_departments(client, tree_id, departments):
+    """走真实部门设置 API（普通保存路径：校验 + revision 发布）。"""
+    current = client.get(f'/admin/trees/{tree_id}').json()['tree']
+    response = client.put(f'/admin/trees/{tree_id}/departments', json={
+        'departments': departments,
+        'base_document_sha256': current['document_sha256'],
+    })
+    assert response.status_code == 200, response.text
+
+
 def test_create_tree_roundtrips_embedded_runtime_without_keys(client, app):
     response = client.post("/admin/trees", json=portable_envelope())
 
@@ -334,6 +375,117 @@ def test_root_only_try_accepts_a_full_self_contained_envelope(client, app):
     assert engine.snapshots[-1].capabilities == {"fast": "来自 JSON 的能力"}
 
 
+# ── 实际路由集选图：部门命中 / 未知兜底 / 空部门兜底 ────────────────────
+
+def test_try_without_draft_uses_department_route_set(client, app):
+    """无 root/tree_id 时按已发布路由集选图：部门精确命中否则默认图。"""
+    create_direct_model_tree(client, 'main', 'fast')
+    create_direct_model_tree(client, 'finance', 'strong')
+    set_departments(client, 'finance', ['财务部'])
+
+    response = client.post('/admin/try', json={
+        'department': '财务部', 'text': '请处理这个请求', 'session_id': '',
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['tree_id'] == 'finance'
+    assert body['graph_selection'] == 'department'
+    assert body['outcome']['model'] == 'strong'
+    # 路由集路径是已发布快照，不是草稿：revision 来自选中快照，不发 warnings。
+    selected = app.state.snapshot_set.snapshots['finance']
+    assert body['tree_revision'] == selected.tree_revision
+    assert body['snapshot_revision'] == selected.snapshot_revision
+    assert body['draft'] is False
+    assert body['warnings'] == []
+
+    response = client.post('/admin/try', json={
+        'department': '未知部门', 'text': '请处理这个请求', 'session_id': '',
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['tree_id'] == 'main'
+    assert body['graph_selection'] == 'default'
+    assert body['outcome']['model'] == 'fast'
+
+    # 空 department（显式空串 / 仅空白）都等价于未声明部门 → 默认图。
+    for department in ('', '   ', None):
+        response = client.post('/admin/try', json={
+            'department': department, 'text': '请处理这个请求', 'session_id': '',
+        })
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body['tree_id'] == 'main'
+        assert body['graph_selection'] == 'default'
+        assert body['outcome']['model'] == 'fast'
+
+    # 缺失 department 字段同样走默认图。
+    response = client.post('/admin/try', json={
+        'text': '请处理这个请求', 'session_id': '',
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()['tree_id'] == 'main'
+    assert response.json()['graph_selection'] == 'default'
+
+
+@pytest.mark.parametrize(("department", "detail"), [
+    (123, 'try department must be a string'),
+    (['财务部'], 'try department must be a string'),
+    ({'name': '财务部'}, 'try department must be a string'),
+    ('部' * 65, 'invalid department'),
+    ('a\tb', 'invalid department'),
+    ('a\x00b', 'invalid department'),
+    ('a\x7fb', 'invalid department'),
+])
+def test_try_route_set_rejects_invalid_department(client, department, detail):
+    """department 必须是非空可展示字符串：类型/长度/控制字符在选图前拒绝。"""
+    response = client.post('/admin/try', json={
+        'department': department, 'text': '请处理这个请求', 'session_id': '',
+    })
+    assert response.status_code == 422, response.text
+    assert response.json()['detail'] == detail
+
+
+def test_try_route_set_without_any_tree_is_no_active_tree(client):
+    response = client.post('/admin/try', json={'text': '请处理这个请求'})
+
+    assert response.status_code == 503, response.text
+    assert response.json()['detail'] == 'no_active_tree'
+
+
+def test_try_route_set_without_default_tree_is_no_default_tree(client, app):
+    create_direct_model_tree(client, 'main', 'fast')
+    app.state.snapshot_set = replace(app.state.snapshot_set, default_tree_id=None)
+
+    response = client.post('/admin/try', json={'department': '财务部', 'text': '你好'})
+
+    assert response.status_code == 503, response.text
+    assert response.json()['detail'] == 'no_default_tree'
+
+
+def test_try_route_set_unavailable_is_no_valid_snapshot(client, app):
+    app.state.snapshot_set = None
+
+    response = client.post('/admin/try', json={'text': '你好'})
+
+    assert response.status_code == 503, response.text
+    assert response.json()['detail'] == 'no_valid_snapshot'
+
+
+def test_try_tree_id_ignores_department_and_reports_no_graph_selection(client):
+    """带 tree_id 的既有路径仍是草稿 envelope 语义，不参与路由集部门选择。"""
+    create_direct_model_tree(client, 'main', 'fast')
+    set_departments(client, 'main', ['财务部'])
+
+    response = client.post('/admin/try', json={
+        'tree_id': 'main', 'department': '财务部', 'text': '你好'})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['graph_selection'] is None
+    assert body['draft'] is False
+    assert body['tree_id'] == 'main'
+
+
 # ── 副作用不变量 ───────────────────────────────────────────────────────
 
 def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
@@ -352,6 +504,8 @@ def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     assert body["draft"] is True
     assert body["tree_id"] == "draft"
     assert body["outcome"]["target_id"] == "t-choice"
+    # 草稿路径不参与路由集选图：graph_selection 显式为 null。
+    assert body["graph_selection"] is None
     assert engine.calls == 1
 
     # 不发布 snapshot（对象与 revision 都不变）
@@ -468,6 +622,8 @@ def test_tree_id_only_uses_stored_envelope_and_is_not_draft(client, app):
     assert body["draft"] is False
     assert body["tree_id"] == "main"
     assert body["outcome"]["target_id"] == "t-choice"
+    # 带 tree_id 的草稿路径同样不参与路由集选图。
+    assert body["graph_selection"] is None
     draft = engine.snapshots[0].tree
     assert draft.id == "main"
     assert draft.timezone == "UTC"
@@ -740,11 +896,12 @@ def test_try_explicit_sticky_null_resets_to_default_not_inherited(client, app):
     assert draft.sticky.ttl_seconds == 1800
 
 
-def test_try_requires_root_or_tree_id(client, app):
+def test_try_without_tree_id_or_root_uses_published_route_set(client, app):
+    """无 tree_id/root 不再要求草稿 envelope：改为读已发布路由集（零启用图 503）。"""
     engine, *_rest = install_engine(app)
     response = client.post("/admin/try", json={"text": "你好"})
-    assert response.status_code == 422
-    assert response.json()["detail"] == "try needs root or tree_id"
+    assert response.status_code == 503
+    assert response.json()["detail"] == "no_active_tree"
     assert engine.calls == 0
 
 
