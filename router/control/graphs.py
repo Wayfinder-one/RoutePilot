@@ -1,7 +1,7 @@
 """决策组（graph）写用例：CRUD/启停的校验、候选快照与发布次序（brief Step 3）。
 
 - `create`：画布自身完整校验（结构 + 启用级；`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（新图为关闭态）。
-- `copy`：复制已存画布（源文档此前已通过完整校验）→（锁内）文档写入 → 审计；不重复校验、不发布快照。
+- `copy`：锁内读取源画布并做同一套完整校验（`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（副本为关闭态）。
 - `update`：锁内按 root 优先合并已存 envelope → 画布自身完整校验（启用/未启用同一套）→ 已启用图
   prepare 候选快照 → `base_document_sha256` 冲突检查后文件成功写入 →
   指纹复核（Task 1 review carry-forward：等价于旧 refresh() 的提交前复核，
@@ -134,6 +134,12 @@ class GraphService:
 
     def copy(self, tree_id: str, new_id: str, new_name: str) -> RoutingTree:
         with self.publisher.locked():
+            source = self.trees.get(tree_id)
+            if source is None:
+                raise MissingError(f"unknown tree {tree_id}")
+            issues = tree_issues(self.conn, source)
+            if issues:
+                raise ValidationFailed(issues)
             try:
                 copied = self.trees.copy(tree_id, new_id, new_name)
             except KeyError:

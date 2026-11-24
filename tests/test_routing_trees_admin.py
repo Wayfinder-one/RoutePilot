@@ -14,6 +14,7 @@ from router.jev.service import JevService
 from router.store.db import connect
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, ProviderRepo, TimePeriodRepo
+from router.routing.tree import tree_from_dict
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import (
     GRAPH_CANVAS,
@@ -323,6 +324,32 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
     assert disabled.status_code == 200, disabled.text
     assert app.state.snapshot.tree is None
     assert not any(tree["enabled"] for tree in disabled.json()["trees"])
+
+
+def test_copy_rejects_invalid_source_without_file_or_audit(client, app):
+    raw = tree_dict("invalid-source")
+    raw["root"] = graph_with_model("not-in-snapshot")
+    # 模拟修复前允许落盘的历史数据：target 模型不在该画布运行目录里。
+    # 仓储只用于播种，公开 create/update 仍必须拒绝这类新写入。
+    app.state.graph_repo.create(tree_from_dict(raw))
+    source_before = _canvas_state(app, ("invalid-source",))
+    target = app.state.graph_repo.graphs / "invalid-copy.json"
+    assert not target.exists()
+    conn = connect(app.state.settings.db_path)
+    audit_before = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
+    conn.close()
+
+    response = client.post("/admin/trees/invalid-source/copy", json={
+        "id": "invalid-copy", "name": "无效副本",
+    })
+
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "unknown_model" for issue in response.json()["detail"])
+    assert not target.exists()
+    assert _canvas_state(app, ("invalid-source",)) == source_before
+    conn = connect(app.state.settings.db_path)
+    assert conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0] == audit_before
+    conn.close()
 
 
 def test_save_uses_full_canvas_validation_in_every_lifecycle(client, app):
