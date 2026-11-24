@@ -177,16 +177,17 @@ function slotsSection(node) {
           : '') +
         '</div>';
     }
+    const condition = conditionText(edge);
     return '<div class="rtc-ins-slot" data-slot-wrap="' + esc(port.id) + '" data-slot-row="' + esc(port.id) + '">' +
       '<span class="rtc-ins-slot-id">' + esc(port.id) + '</span>' +
       '<span class="rtc-ins-slot-src" title="' + esc(edge.source + '.' + edge.source_port) + '">' +
       esc(slotSourceLabel(graph, edge)) + '</span>' +
-      '<span class="rtc-ins-slot-cond">' + esc(conditionText(edge)) + '</span>' +
+      (condition ? '<span class="rtc-ins-slot-cond">' + esc(condition) + '</span>' : '') +
       (canEditCondition(edge, graph)
         ? '<button type="button" class="btn sm ghost" data-act="ins-slot-edit" data-edge="' + esc(edge.id) + '">' +
           esc(t('cv.ins.slotEdit')) + '</button>'
         : '') +
-      '<button type="button" class="btn sm ghost" data-act="ins-slot-remove" data-edge="' + esc(edge.id) + '">' +
+      '<button type="button" class="btn sm ghost danger" data-act="ins-slot-remove" data-edge="' + esc(edge.id) + '">' +
       esc(t('cv.ins.slotRemove')) + '</button></div>';
   }).join('');
   const note = (node.type === 'question' || node.type === 'target') && ports.length > 1
@@ -382,6 +383,8 @@ function edgeBranch(edge) {
   const type = RTGraph.edgeType(edge, graph);
   const typeLabel = type === 'number' ? t('cv.ins.typeNumber') : t('cv.ins.typeBoolean');
   const editable = canEditCondition(edge, graph);
+  /* 开始节点的默认边既不可编辑、也没有条件文案：整块条件区域都不渲染。 */
+  const condition = conditionText(edge);
   return '<div class="rtc-ins" data-ins-branch="edge" data-ins-id="' + esc(edge.id) +
     '" data-edge-type="' + esc(type) + '">' +
     '<form data-ins-form="edge" novalidate>' +
@@ -395,11 +398,16 @@ function edgeBranch(edge) {
     esc((target ? nodeName(target, graph) : edge.target) + ' · ' +
       edge.target_port) + '</b></div>' +
     '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.type')) + '</span><b>' + esc(typeLabel) + '</b></div>' +
-    '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.condition')) + '</span><b data-edge-condition>' +
-    esc(conditionText(edge)) + '</b></div></div>' +
-    '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.condition')) + '</div>' +
-    '<div class="rtc-cond-fields" data-cond-fields>' + formHTML(edge, graph) + '</div>' +
-    '<div class="rtc-cond-error" data-cond-error role="alert" hidden></div></div>' +
+    (condition
+      ? '<div class="rtc-ins-row"><span>' + esc(t('cv.ins.condition')) + '</span><b data-edge-condition>' +
+        esc(condition) + '</b></div>'
+      : '') +
+    '</div>' +
+    (editable
+      ? '<div class="rtc-ins-sec"><div class="rtc-ins-sh">' + esc(t('cv.ins.condition')) + '</div>' +
+        '<div class="rtc-cond-fields" data-cond-fields>' + formHTML(edge, graph) + '</div>' +
+        '<div class="rtc-cond-error" data-cond-error role="alert" hidden></div></div>'
+      : '') +
     formTail('ins-save-edge',
       '<button type="button" class="btn sm danger" data-act="ins-delete-edge">' +
       esc(t('cv.ins.deleteEdge')) + '</button>', editable) +

@@ -71,10 +71,12 @@ function canEditCondition(edge, graph) {
 }
 
 function conditionLabel(condition, { start = false } = {}) {
-  if (condition == null) return t(start ? 'cv.cond.startAlways' : 'cv.cond.direct');
+  /* 开始节点的默认出边（condition 为 null 或 is:true）没有可描述的条件：
+     返回空串，让各渲染点整块跳过条件标记，不再显示「总是通过」。 */
+  if (condition == null) return start ? '' : t('cv.cond.direct');
   if (condition.op === 'is' && typeof condition.value === 'boolean') {
     if (condition.value === false) return t('cv.cond.negated');
-    return t(start ? 'cv.cond.startAlways' : 'cv.cond.direct');
+    return start ? '' : t('cv.cond.direct');
   }
   const symbol = RTGraph.OP[condition.op];
   if (symbol && Number.isFinite(Number(condition.value))) {
@@ -127,10 +129,8 @@ function formHTML(edge, graph) {
       '" aria-label="' + esc(t('cv.condValue')) + '"></label>' +
       '</div>';
   }
-  if (!canEditCondition(edge, graph)) {
-    return '<p class="rtc-cond-readonly" data-start-condition>' +
-      esc(t('cv.cond.startAlways')) + '</p>';
-  }
+  /* 开始节点的默认出边不可编辑，也没有条件文案可展示。 */
+  if (!canEditCondition(edge, graph)) return '';
   const negated = booleanValueOf(condition) === false;
   return '<label class="field rtc-cond-negate">' +
     '<input type="checkbox" data-cond-field="negate" aria-label="' + esc(t('cv.condNegate')) + '"' +
@@ -288,15 +288,16 @@ function triggerInfo(pop) {
 }
 
 /* 关闭后把焦点还给触发元素（a11y §6.11）。确认条件会触发 App.change →
-   renderAll 重绘卡片；按条件 edge id 重新定位可编辑 chip 或静态开始边。 */
+   renderAll 重绘卡片；按条件 edge id 重新定位可编辑 chip，静态开始边没有
+   chip 时退回该槽位行（行上带 tabindex="-1"）。 */
 function restoreTrigger(info) {
   if (!info) return;
   let target = info.element && info.element.isConnected ? info.element : null;
   if (!target && info.condEdge) {
     target = Array.from(document.querySelectorAll(
-      '[data-cond-edge], [data-start-condition][tabindex="-1"]'
+      '[data-cond-edge], [data-edge][tabindex="-1"]'
     )).find(element =>
-      (element.dataset.condEdge || element.dataset.startCondition || '') === info.condEdge
+      (element.dataset.condEdge || element.dataset.edge || '') === info.condEdge
     ) || null;
   }
   if (target && typeof target.focus === 'function' && target !== document.activeElement) {

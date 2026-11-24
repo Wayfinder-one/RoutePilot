@@ -784,8 +784,8 @@ test('graph.js is served as a native ES module with a single module entry', asyn
 test('console pages each load through one native module entry', async () => {
   const pages = ['index.html', 'jev.html', 'logs.html', 'models.html', 'users.html', 'login.html'];
   const markers = {
-    /* 只有模块 boot 注入选项后 select 才非空：证明 index.html 的模块真的跑过。 */
-    'index.html': '#testModel:not(:empty)',
+    /* 只有模块 boot 注入 Auto 状态后 #testStatus 才非空：证明 index.html 的模块真的跑过。 */
+    'index.html': '#testStatus:not(:empty)',
     'jev.html': '#jevStatus',
     'logs.html': '#countPill',
     'models.html': '#modelTable tr',
@@ -809,7 +809,7 @@ test('console pages each load through one native module entry', async () => {
   }
   /* 语言开关不再依赖 inline onclick：模块绑定的按钮必须真的切换文案。 */
   await page.goto(routerBase + '/console/index.html');
-  await page.waitForSelector('#testModel');
+  await page.waitForSelector('#testStatus:not(:empty)');
   await page.locator('.langtog button[data-lang="en"]').click();
   await waitFor(() => document.documentElement.lang === 'en');
   const english = await page.evaluate(() => document.querySelector('.top nav a').textContent.trim());
@@ -1330,20 +1330,10 @@ export async function dragNodeBy(nodeId, dx, dy) {
 }, nodeId);
 }
 
-/* 顶栏动作可分为「常驻可见」与「收进 #cvMore 菜单」两类：调用方按 id 点击，
-   由这个助手在需要时展开菜单，避免每个用例都自己关心菜单位置。 */
+/* 顶栏编辑动作已全部平铺（2026-11-23 去掉了「更多」菜单）：调用方按 id 直接点，
+   助手只负责把「当前生命周期本来就不提供这个动作」变成一条明确断言。 */
 export async function clickCanvasAction(id) {
   const button = page.locator('#' + id);
-  if (await button.isVisible()) {
-    await button.click();
-    return;
-  }
-  const menu = page.locator('#cvMore');
-  if (!(await menu.evaluate(element => element.open))) {
-    await page.locator('#cvMoreBtn').click();
-  }
-  /* 目标可能因生命周期状态本来就不提供（例如已启用时的 #cvDisable）：这时
-     直接失败并说明原因，不要用默认 30s 的 action timeout 换一条含糊的报错。 */
   assert.ok(await button.isVisible(), '#' + id + ' is not offered in the current lifecycle state');
   await button.click({ timeout: 4000 });
 }

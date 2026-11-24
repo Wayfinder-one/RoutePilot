@@ -747,7 +747,7 @@ function updateToolbar() {
       const button = document.getElementById(id);
       if (button) button.disabled = busy;
     });
-  /* 保存/启用请求在途：菜单里的 #cvSave 仍要显示忙碌文案，
+  /* 保存/启用请求在途：顶栏的 #cvSave 仍要显示忙碌文案，
      主按钮的 aria-busy 由 paintLifecycle() 统一暴露。 */
   const save = $('#cvSave');
   if (save) {
@@ -862,7 +862,7 @@ function restoreDeleteFocus() {
   /* 主按钮在「已启用且无改动」时是禁用的（Enabled 只是一个状态），focus()
      落在禁用按钮上是空操作、焦点会掉回 body，所以再退到常驻可聚焦的控件。 */
   if (fallback && !fallback.disabled) { fallback.focus(); return; }
-  const alwaysFocusable = $('#cvMoreBtn') || $('#cvIssuesBtn');
+  const alwaysFocusable = $('#cvIssuesBtn');
   if (alwaysFocusable) alwaysFocusable.focus();
 }
 
@@ -1327,28 +1327,7 @@ function autoLayout() {
 }
 
 /* ── 顶栏动作 ─────────────────────────────────────────────────── */
-/* 「更多」菜单是原生 <details>：点菜单项、点菜单外、按 Esc 都要收起，
-   Esc 之后把焦点还给 summary，键盘用户不会掉到文档开头。 */
-function bindMoreMenu() {
-  const menu = $('#cvMore');
-  if (!menu) return;
-  menu.addEventListener('click', event => {
-    if (event.target.closest('button')) menu.open = false;
-  });
-  document.addEventListener('pointerdown', event => {
-    if (menu.open && !menu.contains(event.target)) menu.open = false;
-  }, true);
-  menu.addEventListener('keydown', event => {
-    if (event.key !== 'Escape' || !menu.open) return;
-    event.preventDefault();
-    event.stopPropagation();
-    menu.open = false;
-    $('#cvMoreBtn').focus();
-  });
-}
-
 function bindToolbar() {
-  bindMoreMenu();
   $('#cvUndo').addEventListener('click', () => {
     if (!store.undo()) toast(t('cv.toastNothingUndo'), 'warn');
   });

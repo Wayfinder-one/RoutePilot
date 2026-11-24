@@ -109,14 +109,18 @@ function slotRow(graph, node, port) {
   }
   const kind = RTGraph.edgeType(edge, graph);
   const editable = canEditCondition(edge, graph);
-  const conditionControl = editable
-    ? '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
-      ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
-      ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
-      esc(conditionText(graph, edge)) + '</button>'
-    : '<span class="rtc-cond is-static" data-start-condition="' + esc(edge.id) + '" tabindex="-1">' +
-      esc(conditionText(graph, edge)) + '</span>';
+  /* 开始节点的默认边没有条件文案（conditionText 为空）：不渲染条件标记，
+     槽位行只留来源与状态；行本身带 tabindex="-1"，供条件浮层关闭后回焦。 */
+  const condition = conditionText(graph, edge);
+  const conditionControl = !condition ? ''
+    : editable
+      ? '<button type="button" class="rtc-cond' + (kind === 'number' ? ' is-num' : '') + '"' +
+        ' data-cond-edge="' + esc(edge.id) + '" title="' + esc(t('cv.card.editCondition')) + '"' +
+        ' aria-label="' + esc(tf('cv.card.editConditionAria', { slot: port.id })) + '">' +
+        esc(condition) + '</button>'
+      : '<span class="rtc-cond is-static">' + esc(condition) + '</span>';
   return '<div class="rtc-slot' + (kind === 'number' ? ' is-num' : '') + '"' +
+    (condition ? '' : ' tabindex="-1"') +
     ' data-slot="' + esc(port.id) + '" data-edge="' + esc(edge.id) + '">' +
     portHTML(node, port, { side: 'left' }) +
     '<span class="rtc-slot-id">' + esc(port.id) + '</span>' +

@@ -75,9 +75,9 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 | Page | Content |
 |---|---|
-| Test | Admin-only model test chat: Auto routing or a fixed model, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
+| Test | Admin-only model test chat: Auto smart routing, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
 | Decision groups | Canvas editor, graph settings, inspector, validation, routing checks, import/export |
-| Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, upstream outcome, replayable trace |
+| Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, decision-only latency, replayable trace |
 | Decision service | Read-only service profile (address, model, key status, test status) with a retest; Save and test lives in edit mode; prompts, timeout and the context window live under Advanced |
 | Models | Model registry; Connect models onboards a catalog provider and its models in one save. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
 | Users | Admin/viewer accounts, passwords, roles, status |
@@ -90,9 +90,9 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 ### Model test chat
 
-The home page (`/console/index.html`) is an admin-only model test chat. It posts to `/admin/test/chat/completions` and shows the actual model in the message metadata (`Auto → <model>` for Auto, `<model> · fixed model` for a fixed model), using the `x-sr-model` response header.
+The home page (`/console/index.html`) is an admin-only model test chat. Every request is Auto-routed to `/admin/test/chat/completions`, and the message metadata names the upstream model that actually served it (`Auto → <model>`) using the `x-sr-model` response header.
 
-- **Auto or fixed model** — Auto evaluates the current routing snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. Choosing a configured model ID skips the graph and JEV and returns `x-sr-selection: direct`.
+- **Auto smart routing** — evaluates the current routing snapshot (decision graph, JEV waves, sticky and load-balanced backend selection) exactly like `/v1/chat/completions`. The page offers no fixed-model bypass, so test traffic always takes the real routing path.
 - **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message. A stream counts as complete only when the upstream ends it cleanly — an early EOF is marked incomplete and a provider error is shown inline in the conversation, never silently passed off as a complete answer.
 - **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`, replayed losslessly from the raw assistant message (message-level media renders but never re-enters history); New Chat aborts any in-flight reply, clears the conversation and rotates the session id.
 - **Attachments** — text files are read as text and sent as content parts; images, audio and other files are read to data URLs. A file whose estimated size would break the 10 MiB request limit is rejected inline before it is read, and the exact whole-body size (history + Base64) is checked again before sending.
@@ -127,7 +127,7 @@ A routing check highlights the winning path wave by wave. Selecting a trace row 
 
 ![Calculation log](assets/routepilot/en/logs.png)
 
-Expanded rows show the calculation stages in order: input preparation, initial computation, per-wave JEV, candidates and final pick, model scheduling, execution result. A `routing_error` keeps the partial process up to the failure point: a schedule-stage failure keeps the scheduling snapshot (configured, registered, available, unavailable reasons, pre-selection inflight), and a failed JEV wave voids that round's candidates and falls to `error_fallback`. Records without a scheduling snapshot and restored ledger rows report the missing detail explicitly.
+Expanded rows show the calculation stages in order: input preparation, initial computation, per-wave JEV, candidates and final pick, model scheduling, execution result. Latency is decision time only — entering the router to selecting the model — and never includes upstream generation; upstream status and end-to-end totals stay in the gateway data plane and out of the routing console. A `routing_error` keeps the partial process up to the failure point: a schedule-stage failure keeps the scheduling snapshot (configured, registered, available, unavailable reasons, pre-selection inflight), and a failed JEV wave voids that round's candidates and falls to `error_fallback`. Records without a scheduling snapshot and restored ledger rows report the missing detail explicitly.
 
 SQLite stores ledger fields only — no request text, trace, per-wave answers or node labels. The page reads the last 20 live records from an in-process ring; calculation detail is replica-local and not persisted.
 
@@ -365,7 +365,7 @@ The cross-graph update is a batch, not a loop of independent writes. Every basel
 1. Start an instance with an empty database and an empty graph directory.
 2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`), then save and enable it.
 3. Run a routing check (`POST /admin/try`) to verify the graph, embedded model catalog, decision service, window and time periods.
-4. Call `POST /v1/chat/completions` for Auto routing, or use the model test chat with a fixed model.
+4. Call `POST /v1/chat/completions` for Auto routing, or open the model test chat (also Auto-only) to verify an end-to-end reply.
 5. Provide keys through environment variables only: each provider's `key_env`, and `ROUTER_JEV_API_KEY` when the decision-service endpoint requires authentication.
 
 `configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, a local decision-service endpoint and the three seeded time periods. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
