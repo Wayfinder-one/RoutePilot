@@ -47,7 +47,7 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 
 /* ── 页头 ─────────────────────────────────────────────────────── */
 /* z-index 必须高于画布浮层（节点库/检查器 22、缩放/小地图 23）：
-   「更多」菜单是页头的子元素，页头自身成层，低于浮层就会被检查器挡住点击。 */
+   顶栏动作在浮层上边缘被遮挡时会点不到，页头因此单独成层。 */
 .rtc-pagehead {
   flex: none;
   display: flex; align-items: flex-end; gap: 12px;
@@ -90,20 +90,15 @@ body[data-page="routing"] > .top { flex: none; position: relative; z-index: 40; 
 .rtc-issues-btn.warn { background: var(--amber-soft); border-color: var(--amber-line); color: var(--amber); }
 .rtc-issues-btn.bad { background: var(--red-soft); border-color: var(--red-line); color: var(--red); }
 
-/* 低频动作收进原生 <details> 菜单：summary 就是「更多」按钮，菜单绝对定位于其下方。 */
-.rtc-more { position: relative; }
-.rtc-more > summary { list-style: none; cursor: pointer; user-select: none; }
-.rtc-more > summary::-webkit-details-marker { display: none; }
-.rtc-more-menu {
-  position: absolute; top: calc(100% + 6px); right: 0; z-index: 80;
-  display: grid; grid-template-columns: repeat(2, minmax(128px, 1fr)); gap: 5px;
-  width: 300px; padding: 8px; border: 1px solid var(--line);
-  border-radius: 10px; background: var(--panel); box-shadow: var(--shadow-lg);
+/* 编辑类动作（撤销 / 重做 / 整理 / 保存草稿 / 新建 / 导入导出 / 停用）直接平铺，
+   不再收进「更多」菜单：菜单要多一次点击、展开后还会盖住画布。组内允许换行，
+   窄屏时整组按按钮逐个折行；与右侧主动作之间用一道竖线分隔。 */
+.rtc-tools {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+  padding-right: 8px; border-right: 1px solid var(--line);
 }
-.rtc-more-menu .btn { justify-content: flex-start; width: 100%; box-shadow: none; }
-.rtc-more-menu [hidden] { display: none; }
-@media (max-width: 640px) {
-  .rtc-more-menu { position: fixed; left: 8px; right: 8px; top: 56px; width: auto; }
+@media (max-width: 720px) {
+  .rtc-tools { padding-right: 0; border-right: 0; }
 }
 
 /* ── 校验条 ───────────────────────────────────────────────────── */
@@ -395,14 +390,13 @@ body.is-try-running .rtc-stage.is-locked::after {
   font-family: var(--mono); font-size: 8px; color: var(--text-2);
   cursor: pointer;
 }
-.rtc-cond:not(.is-static):hover { border-color: var(--indigo-line); background: var(--indigo-soft); color: var(--indigo); }
+.rtc-cond:hover { border-color: var(--indigo-line); background: var(--indigo-soft); color: var(--indigo); }
 .rtc-cond.is-num {
   color: var(--teal);
   border-color: color-mix(in srgb, var(--teal) 28%, var(--panel));
   background: color-mix(in srgb, var(--teal) 7%, var(--panel));
 }
-.rtc-cond.is-num:not(.is-static):hover { border-color: var(--teal); }
-.rtc-cond.is-static { cursor: default; }
+.rtc-cond.is-num:hover { border-color: var(--teal); }
 .rtc-slot .rtc-live { margin-left: 2px; }
 
 /* 请求条件 */

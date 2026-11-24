@@ -87,8 +87,10 @@ def test_present_record_labels_hydrated_and_live_rows():
         "routing_ms": 4.0, "total_ms": 12.0, "waves": 1,
     })
     assert hydrated["route_label"] == {"zh": "默认目标兜底", "en": "Default target fallback"}
+    # 计算日志只展示路由决策成本：决策耗时 / 决策模型耗时 / 轮次。
     assert [pair[0]["en"] for pair in hydrated["metrics"]] == [
-        "Upstream", "Routing", "Total", "Waves"]
+        "Decision time", "Decision model time", "Waves"]
+    assert hydrated["metrics"][0][1] == "4ms"
     assert [pair[0]["en"] for pair in hydrated["fields"]][:2] == [
         "Request ID", "Decision group"]
 
@@ -335,3 +337,5 @@ def test_present_result_event_has_outcome_kind_label():
         "upstream_status": 200, "total_ms": 12.0,
     })
     assert outcome["kind_label"] == {"zh": "结果", "en": "Outcome"}
+    # 上游状态与端到端耗时不属于路由决策，不再进入执行结果事实。
+    assert outcome["facts"] == [[{"zh": "模型", "en": "Model"}, "qwen3-8b"]]

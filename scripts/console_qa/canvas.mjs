@@ -222,83 +222,48 @@ test('Task 10 · canvas skeleton renders the graph with no page overflow', async
   await page.setViewportSize({ width: 1440, height: 960 });
 });
 
-test('P0 toolbar keeps only primary actions visible and overflow remains operable', async () => {
+test('P0 toolbar exposes every editing action inline, with no More menu', async () => {
   await ensureBaselineTree();
   await openCanvas();
-  for (const id of ['cvTryBtn', 'cvEnable', 'cvMoreBtn']) {
+  /* 用户明确要求编辑动作全部平铺在顶栏（2026-11-23）：撤销 / 重做 / 自动整理 /
+     保存草稿 / 新建 / 导入 / 导出都在首屏一键可达，不能再有「更多」折叠入口。 */
+  assert.equal(await page.locator('#cvMore, #cvMoreBtn').count(), 0,
+    'the overflow menu must be gone');
+  const tools = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.rtc-tools > button')).map(element => element.id));
+  assert.deepEqual(tools, ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
+                           'cvImport', 'cvExport', 'cvDisable'],
+    'the editing actions changed or lost their inline order');
+  for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
+                    'cvImport', 'cvExport', 'cvTryBtn', 'cvEnable', 'cvIssuesBtn']) {
     assert.equal(await page.locator('#' + id).isVisible(), true, id + ' must be visible');
   }
-  assert.equal(await page.locator('#cvIssuesBtn').isVisible(), true,
-    'the validation entry must stay visible at the right end');
-  /* 枚举动作区里所有 button/summary 的真实集合，再逐个问 Playwright 是否可见：
-     不写死白名单（否则多出来的第五个可见按钮永远不会被发现），也不用
-     getClientRects()/checkVisibility()（闭合 <details> 里它们与 Playwright 的
-     可见性判定不一致，只有 isVisible() 与用户所见一致）。 */
-  const toolbarIds = await page.evaluate(() => {
-    const actions = document.querySelector('.rtc-actions');
-    return Array.from(actions.querySelectorAll('button, summary')).map(element => element.id);
+  /* 停用只在已启用的决策组上出现（基线组是已启用状态）。 */
+  const enabled = await page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return !!(app.tree && app.tree.enabled);
   });
-  const visiblePrimary = [];
-  for (const id of toolbarIds) {
-    if (await page.locator('#' + id).isVisible()) visiblePrimary.push(id);
-  }
-  assert.deepEqual(visiblePrimary, ['cvTryBtn', 'cvMoreBtn', 'cvEnable', 'cvIssuesBtn'],
-    'the first screen must expose only the primary actions plus the validation entry');
-  for (const id of ['cvUndo', 'cvRedo', 'cvAutoLayout', 'cvSave', 'cvNewTree',
-                    'cvImport', 'cvExport']) {
-    assert.equal(await page.locator('#' + id).count(), 1, id + ' must still exist in the toolbar');
-    assert.equal(await page.locator('#cvMore #' + id).count(), 1,
-      id + ' must be a descendant of the overflow menu');
-    assert.equal(await page.locator('#' + id).isVisible(), false,
-      id + ' must start inside the closed overflow menu');
-  }
-  assert.equal(await page.locator('#cvDisable').count(), 1);
-  assert.equal(await page.locator('#cvMore #cvDisable').count(), 1,
-    'disable must live inside the overflow menu');
+  assert.equal(await page.locator('#cvDisable').count(), 1, 'disable must stay in the toolbar');
+  assert.equal(await page.locator('#cvDisable').isVisible(), enabled,
+    'the disable action must follow the lifecycle state');
   assert.equal(await page.locator('#cvLifecycle').count(), 1, 'the lifecycle badge is missing');
   assert.equal(await page.locator('#cvLifecycle').isVisible(), true, 'the lifecycle badge must be visible');
   assert.equal(await page.locator('#cvRevision, #cvEnabled, #cvClean, #cvDirty').count(), 0,
     'legacy status badges must be gone');
-  await page.locator('#cvMoreBtn').click();
-  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), true);
-  await page.keyboard.press('Escape');
-  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), false);
+  /* 平铺后动作区不能溢出：1280×800 是部署文档承诺的最小基线。 */
+  const overflow = await page.evaluate(() => {
+    const actions = document.querySelector('.rtc-actions');
+    return { actions: actions.scrollWidth - actions.clientWidth,
+             page: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+  });
+  assert.ok(overflow.actions <= 1, 'the action row overflows horizontally: ' + overflow.actions);
+  assert.ok(overflow.page <= 1, 'the page overflows horizontally: ' + overflow.page);
 
   await clickCanvasAction('cvAutoLayout');
-  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), false,
-    'an overflow action must close the menu');
-});
-
-test('P0 toolbar · Escape in the More menu keeps the canvas selection and inspector edits', async () => {
-  await ensureBaselineTree();
-  await openCanvas();
-  await clickNode('capability');
-  await waitInspectorBranch('node', 'capability');
-  const field = page.locator('#cvInspectorBody [data-field="instructions"]');
-  const draft = 'Esc 不能丢弃这段未提交的输入';
-  await field.fill(draft);
-  assert.equal(await field.inputValue(), draft);
-
-  await page.locator('#cvMoreBtn').click();
-  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), true,
-    'the overflow menu did not open');
-  await page.keyboard.press('Escape');
-
-  assert.equal(await page.locator('#cvMore').evaluate(element => element.open), false,
-    'Escape did not close the overflow menu');
-  assert.equal(await page.evaluate(() => document.activeElement.id), 'cvMoreBtn',
-    'Escape did not return focus to the More button');
-  /* 菜单自己的 Esc 只能在菜单内生效：它不能再落到画布的文档级 Esc 分支，
-     否则 select(null, null) → renderInspector() 会清掉选中并丢弃未提交输入。 */
-  const selection = await page.evaluate(async () => {
+  assert.ok(await page.evaluate(async () => {
     const { app } = await import('/console/routing/app.js');
-    return app.kit.getSelection();
-  });
-  assert.deepEqual(selection, { kind: 'node', id: 'capability' },
-    'Escape in the More menu cleared the canvas selection');
-  await waitInspectorBranch('node', 'capability');
-  assert.equal(await field.inputValue(), draft,
-    'Escape in the More menu discarded the in-progress inspector edit');
+    return !!(app && app.graph);
+  }), 'an inline action must work without opening a menu');
 });
 
 test('Task 10 · blank drag, space+drag and middle-button drag all pan the viewport', async () => {
@@ -591,11 +556,8 @@ test('7.4-05-numeric-default-and-boolean-true', async () => {
   assert.equal(booleanEdge.condition, null, 'boolean edge did not default to null (passes through)');
   const startSlot = page.locator(`#cvNodes [data-edge="${booleanEdge.id}"]`);
   assert.equal(await startSlot.locator('[data-cond-edge]').count(), 0);
-  assert.equal((await startSlot.locator('[data-start-condition]').textContent()).trim(),
-    await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.cond.startAlways'));
-}));
+  assert.equal(await startSlot.locator('[data-start-condition]').count(), 0,
+    'the start slot still renders a condition chip');
   assert.equal(await page.evaluate(async id => {
     const RTCondPop = await import('/console/routing/condpop.js');
     return (RTCondPop.open(id));
@@ -615,11 +577,8 @@ test('Task 10 · a boolean edge defaults to condition null and does not open the
   assert.equal(edge.condition, null);
   const startSlot = page.locator(`#cvNodes [data-edge="${edge.id}"]`);
   assert.equal(await startSlot.locator('[data-cond-edge]').count(), 0);
-  assert.equal((await startSlot.locator('[data-start-condition]').textContent()).trim(),
-    await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.cond.startAlways'));
-}));
+  assert.equal(await startSlot.locator('[data-start-condition]').count(), 0,
+    'the start slot still renders a condition chip');
   assert.equal(await page.evaluate(async id => {
     const RTCondPop = await import('/console/routing/condpop.js');
     return (RTCondPop.open(id));
@@ -1154,10 +1113,7 @@ const RTCondPop = await import('/console/routing/condpop.js');
 
 }, startEdge.id);
   assert.equal(startView.canEdit, false);
-  assert.equal(startView.label, await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.cond.startAlways'));
-}));
+  assert.equal(startView.label, '', 'the start edge must not describe a condition');
   assert.equal(startView.opened, false);
 });
 
@@ -1586,9 +1542,8 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(list.trees.find(tree => tree.id === draft.id).enabled, true);
   assert.equal(list.trees.find(tree => tree.id === TREE_ID).enabled, false);
 
-  await page.locator('#cvMoreBtn').click();
   assert.equal(await page.locator('#cvDisable').isVisible(), true,
-    'an enabled group must expose disable inside the overflow menu');
+    'an enabled group must expose disable inline in the toolbar');
   await clickCanvasAction('cvDisable');
   await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
@@ -4387,7 +4342,10 @@ test('boolean start is read-only and legacy negation needs an explicit clear', a
   const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
   let slot = page.locator(`#cvNodes [data-edge="${startEdge.id}"]`);
   assert.equal(await slot.locator('[data-cond-edge]').count(), 0);
-  assert.equal(await slot.locator('[data-start-condition]').count(), 1);
+  assert.equal(await slot.locator('[data-start-condition]').count(), 0,
+    'the read-only start slot still renders a condition chip');
+  assert.equal(await slot.getAttribute('tabindex'), '-1',
+    'the condition-less start slot is not reachable for focus restore');
   await screenshot('boolean-start-readonly-1440.png');
 
   await clickEdge(startEdge.id);
@@ -4417,33 +4375,29 @@ test('boolean start is read-only and legacy negation needs an explicit clear', a
   await page.locator('#cvCondPop [data-act="cond-confirm"]').click();
   await waitEdgeCondition(startEdge.id, null);
   assert.equal(await slot.locator('[data-cond-edge]').count(), 0);
-  assert.equal((await slot.locator('[data-start-condition]').textContent()).trim(),
-    await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.cond.startAlways'));
-}));
+  assert.equal(await slot.locator('[data-start-condition]').count(), 0,
+    'clearing the negation brought the start condition chip back');
+  assert.equal(await slot.getAttribute('tabindex'), '-1',
+    'the condition-less start slot is not reachable for focus restore');
   await clickCanvasAction('cvUndo');
   await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
 });
 
-test('static start condition has no editable hover feedback', async () => {
+test('the start slot carries no condition chip and no hover feedback', async () => {
   await openCanvas();
   const startEdge = (await appSnapshot()).edges.find(edge => edge.source === 'start');
-  const condition = page.locator(`#cvNodes [data-edge="${startEdge.id}"] [data-start-condition]`);
-  const style = () => condition.evaluate(element => {
+  const slot = page.locator(`#cvNodes [data-edge="${startEdge.id}"]`);
+  assert.equal(await slot.locator('[data-start-condition], [data-cond-edge]').count(), 0,
+    'the start slot still exposes a condition control');
+  const style = () => slot.evaluate(element => {
     const value = getComputedStyle(element);
-    return {
-      color: value.color,
-      backgroundColor: value.backgroundColor,
-      borderColor: value.borderColor,
-      cursor: value.cursor
-};
+    return { backgroundColor: value.backgroundColor, cursor: value.cursor };
 });
 
   await page.mouse.move(0, 0);
   const resting = await style();
-  assert.equal(resting.cursor, 'default');
-  await condition.hover();
+  assert.notEqual(resting.cursor, 'pointer', 'the start slot looks clickable');
+  await slot.hover();
   assert.deepEqual(await style(), resting);
 });
 
@@ -4472,29 +4426,33 @@ test('clearing legacy start negation restores keyboard focus', async () => {
   await page.keyboard.press('Enter');
   await waitEdgeCondition(startEdge.id, null);
 
-  const focused = await page.evaluate(() => ({
-    tag: document.activeElement && document.activeElement.tagName,
-    startCondition: document.activeElement && document.activeElement.dataset
-      ? document.activeElement.dataset.startCondition || '' : '',
-    tabIndex: document.activeElement ? document.activeElement.tabIndex : null
-}));
-  assert.deepEqual(focused, { tag: 'SPAN', startCondition: startEdge.id, tabIndex: -1 });
+  const focused = await page.evaluate(() => {
+    const element = document.activeElement;
+    return {
+      tag: element ? element.tagName : '',
+      edge: element && element.dataset ? element.dataset.edge || '' : '',
+      tabIndex: element ? element.tabIndex : null
+};
+});
+  assert.deepEqual(focused, { tag: 'DIV', edge: startEdge.id, tabIndex: -1 });
   assert.equal(await page.locator(`#cvNodes [data-cond-edge="${startEdge.id}"]`).count(), 0);
 
   await clickCanvasAction('cvUndo');
   await waitEdgeCondition(startEdge.id, { op: 'is', value: false });
 });
 
-test('replay condition labels use direct, negated and start-only text', async () => {
+test('replay condition labels omit the start edge and keep direct/negated text', async () => {
   await prepareTryCanvas();
   const edges = (await appSnapshot()).edges;
   const startEdge = edges.find(edge => edge.source === 'start');
   const conditionEdge = edges.find(edge => edge.source === 'cond-text');
   await runTrySample(0);
-  assert.match(await page.locator(`#cvNodes [data-edge="${startEdge.id}"]`).getAttribute('title'),
-    /总是通过/);
-  assert.doesNotMatch(await page.locator(`#cvNodes [data-edge="${startEdge.id}"]`).getAttribute('title'),
-    /= true/);
+  const startTitle = await page.locator(`#cvNodes [data-edge="${startEdge.id}"]`).getAttribute('title');
+  assert.doesNotMatch(startTitle, /总是通过|Always passes/,
+    'the start slot still describes an always-pass condition');
+  assert.doesNotMatch(startTitle, /= true/);
+  assert.doesNotMatch(startTitle, / {2,}/,
+    'the start slot title keeps a gap where the condition label used to be');
 
   await page.evaluate(async id => {
     const { app, store } = await import('/console/routing/app.js');
@@ -4584,8 +4542,9 @@ test('numeric unset and English boolean condition labels stay explicit', async (
     const startEdge = edges.find(edge => edge.source === 'start');
     const directEdge = edges.find(edge => edge.id === 'e-cond-text-or');
     assert.equal(
-      (await page.locator(`#cvNodes [data-edge="${startEdge.id}"] [data-start-condition]`).textContent()).trim(),
-      'Always passes'
+      await page.locator(`#cvNodes [data-edge="${startEdge.id}"] [data-start-condition]`).count(),
+      0,
+      'the start slot still renders an English condition chip'
     );
     const chip = page.locator(`#cvNodes [data-cond-edge="${directEdge.id}"]`);
     assert.equal((await chip.textContent()).trim(), 'Pass through');

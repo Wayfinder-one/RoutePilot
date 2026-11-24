@@ -107,7 +107,7 @@ def test_hydrate_recent_restores_persisted_tail_without_live_detail(tmp_path):
     presented = present_record(recent[0])
     assert presented["route_label"] == {"zh": "目标命中", "en": "Target selected"}
     assert [pair[0]["en"] for pair in presented["metrics"]] == [
-        "Upstream", "Routing", "Total", "Waves"]
+        "Decision time", "Decision model time", "Waves"]
     assert presented["fields"][0][0] == {"zh": "请求 ID", "en": "Request ID"}
 
 

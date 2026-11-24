@@ -198,11 +198,9 @@ test('7.4-09-question-target-rows', async () => {
   const rows = page.locator('#cvNodes [data-node-id="capability"] .rtc-slot');
   assert.match(await rows.nth(0).innerText(), /开始/);
   assert.match(await rows.nth(0).innerText(), /in_1/);
-  assert.equal((await rows.nth(0).locator('[data-start-condition]').textContent()).trim(),
-    await page.evaluate(async () => {
-    const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.cond.startAlways'));
-}));
+  assert.equal(await rows.nth(0).locator('[data-start-condition]').count(), 0,
+    'the start slot still renders a condition chip');
+  assert.doesNotMatch(await rows.nth(0).innerText(), /总是通过|Always passes/);
   assert.match(await rows.nth(1).innerText(), /文本条件/);
   assert.equal((await rows.nth(1).locator('[data-cond-edge]').textContent()).trim(),
     await page.evaluate(async () => {

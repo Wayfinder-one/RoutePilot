@@ -102,10 +102,12 @@ def present_record(record: dict) -> dict:
             str(record.get("id") or ""), safe="")
     else:
         record.pop("snapshot_url", None)
+    # 计算日志只呈现路由自己的决策成本：决策耗时（进入路由 → 选出模型，
+    # 含决策模型耗时）与轮次。上游状态、端到端总耗时与 token 用量属于
+    # 网关数据面，不进智能路由的展示口径（"智能路由只负责智能路由的事情"）。
     record["metrics"] = [
-        [_label("上游", "Upstream"), _shown(record.get("upstream_status"))],
-        [_label("路由", "Routing"), _milliseconds(record.get("routing_ms"))],
-        [_label("总耗时", "Total"), _milliseconds(record.get("total_ms"))],
+        [_label("决策耗时", "Decision time"), _milliseconds(record.get("routing_ms"))],
+        [_label("决策模型耗时", "Decision model time"), _milliseconds(record.get("jev_ms"))],
         [_label("轮次", "Waves"), _shown(record.get("waves"))],
     ]
     record["fields"] = [
@@ -118,9 +120,6 @@ def present_record(record: dict) -> dict:
         [_label("JEV 模型", "JEV model"), _shown(record.get("jev_model"))],
         [_label("推理等级", "Reasoning level"), _shown(record.get("reasoning"))],
         [_label("推理回退", "Reasoning fallback"), _shown(record.get("reasoning_warning"))],
-        [_label("首 token 耗时", "Time to first token"), _milliseconds(record.get("ttft_ms"))],
-        [_label("上游模型", "Upstream model"), _shown(record.get("upstream_model"))],
-        [_label("Token 总数", "Total tokens"), _shown(record.get("total_tokens"))],
     ]
     return record
 
@@ -137,10 +136,10 @@ def present_result_event(record: dict) -> dict:
         "label": _label("执行结果", "Execution result"),
         "cell": status, "summary": status,
         "kind_label": _label("结果", "Outcome"),
+        # 上游状态、总耗时属于请求执行结果，不属于路由决策；这里只保留
+        # 路由选出的模型，避免把网关侧指标混进计算日志。
         "facts": [
             [_label("模型", "Model"), _shown(record.get("model"))],
-            [_label("上游状态", "Upstream status"), _shown(record.get("upstream_status"))],
-            [_label("总耗时", "Total time"), _milliseconds(record.get("total_ms"))],
         ],
         "tone": tone, "outcome_state": state,
     }

@@ -66,7 +66,8 @@ const FILTERS = {
   error: record => record.outcome_state === 'routing_error' || record.outcome_state === 'upstream_error',
 };
 function renderKpis() {
-  const timed = requests.map(r => r.total_ms ?? r.latency_ms ?? r.routing_ms)
+  /* 决策耗时：进入路由到选出模型的时间，不含上游生成。 */
+  const timed = requests.map(r => r.routing_ms)
     .filter(value => value != null && value !== '')
     .map(Number).filter(Number.isFinite);
   const average = timed.length ? timed.reduce((a, b) => a + b, 0) / timed.length : null;
@@ -74,9 +75,10 @@ function renderKpis() {
     ['logs.filter.jev', requests.filter(FILTERS.jev).length, 'hit'],
     ['logs.stat.fallback', requests.filter(FILTERS.fallback).length, 'warn'],
     ['logs.filter.error', requests.filter(FILTERS.error).length, 'bad'],
-    ['logs.stat.latency', ms(average), '']];
-  $('#kpis').innerHTML = items.map(([key, value, tone]) =>
-    '<span class="lg-kpi ' + tone + '"><b>' + safe(value) + '</b><small>' + esc(t(key)) + '</small></span>').join('');
+    ['logs.stat.latency', ms(average), '', t('logs.stat.latencyHint')]];
+  $('#kpis').innerHTML = items.map(([key, value, tone, hint]) =>
+    '<span class="lg-kpi ' + tone + '"' + (hint ? ' title="' + esc(hint) + '"' : '') +
+    '><b>' + safe(value) + '</b><small>' + esc(t(key)) + '</small></span>').join('');
 }
 function renderTabs() {
   document.querySelectorAll('#filter button').forEach(button => {
@@ -102,27 +104,49 @@ function renderSpread() {
       }).join('');
 }
 function chainHtml(path) {
-  if (!path.length) return '<span class="lg-path-empty">' + esc(t('logs.traceEmpty')) + '</span>';
-  const description = path.map(s => display(s.label) + ': ' + display(s.summary)).join(' → ');
+  /* 折叠行只画路由决策路径：上游执行结果既不是计算步骤，也会挤掉决策节点；
+     执行结果由行首状态点、行状态和详情的「执行结果」阶段表达。 */
+  const decision = path.filter(stage => stage.id !== 'outcome');
+  if (!decision.length) return '<span class="lg-path-empty">' + esc(t('logs.traceEmpty')) + '</span>';
+  const description = decision.map(s => display(s.label) + ': ' + display(s.summary)).join(' → ');
   return '<span class="lg-chain" role="img" aria-label="' + esc(description) + '">' +
-    path.map((stage, index) => (index ? '<span class="lg-sep" aria-hidden="true">›</span>' : '') +
+    decision.map((stage, index) => (index ? '<span class="lg-sep" aria-hidden="true">›</span>' : '') +
       '<span class="lg-node ' + stage.tone + '" title="' + safe(stage.label) + ' · ' + safe(stage.summary) + '">' +
       '<em>' + safe(stage.label) + '</em><b>' + safe(stage.cell) + '</b></span>').join('') + '</span>';
+}
+function decisionTitle(record) {
+  if (record.routing_ms == null) return '';
+  let title = t('logs.stat.latency') + ' ' + ms(record.routing_ms);
+  if (record.jev_ms != null) title += ' · ' + t('logs.decisionModel') + ' ' + ms(record.jev_ms);
+  return title;
 }
 function rowHtml(record, path, open) {
   const [status, tone] = OUTCOME[record.outcome_state] || OUTCOME.incomplete;
   const text = String(record.text || '').replace(/\s+/g, ' ').trim();
   const timestamp = fmtTime(record.ts);
   const clock = timestamp.split(' ')[0];
-  return '<button type="button" class="lg-row" aria-expanded="' + open +
-    '" aria-controls="detail-' + safe(record.id) + '" title="' + esc(text) + '">' +
+  /* 快照链接放在折叠行上：不必展开就能直接回放当时的决策图。
+     它是这一行唯一的导航动作，做成带图示的实心浅色按钮，避免和右侧的
+     纯文字耗时混在一起看不出来。 */
+  const snapshot = typeof record.snapshot_url === 'string' && record.snapshot_url
+    ? '<a class="lg-snap-btn" href="' + esc(record.snapshot_url) +
+      '" title="' + esc(t('logs.snapshot')) + '" aria-label="' + esc(t('logs.snapshot')) +
+      '"><span class="lg-snap-label">' + esc(t('logs.snapshot')) + '</span>' +
+      '<svg class="lg-snap-ic" viewBox="0 0 16 16" aria-hidden="true" focusable="false">' +
+      '<path d="M5.3 10.7 10.7 5.3M6.6 5.3h4.1v4.1"></path></svg></a>'
+    : '<span class="lg-snap-empty" aria-hidden="true"></span>';
+  return '<div class="lg-row" title="' + esc(text) + '">' +
     '<span class="lg-time" title="' + esc(timestamp) + '" aria-label="' + esc(timestamp) + '"><span class="lg-dot ' + tone + '" aria-hidden="true"></span>' +
     esc(clock) + '</span>' +
     '<span class="lg-text">' + (text ? esc(text) : esc(t('logs.noText'))) + '</span>' +
-    chainHtml(path) + '<span class="lg-model">→ ' + safe(record.model) + '</span>' +
-    '<span class="lg-lat">' + esc(ms(record.total_ms ?? record.latency_ms)) + '</span>' +
-    '<span class="lg-chev" aria-hidden="true">›</span><span class="sr-only">' +
-    esc(t(status)) + '</span></button>';
+    chainHtml(path) + '<span class="lg-model">' + safe(record.model) + '</span>' +
+    '<span class="lg-lat" title="' + esc(decisionTitle(record)) + '">' +
+    esc(ms(record.routing_ms)) + '</span>' + snapshot +
+    '<button type="button" class="lg-chev" aria-expanded="' + open +
+    '" aria-controls="detail-' + safe(record.id) + '" aria-label="' +
+    esc(t(open ? 'logs.collapseRow' : 'logs.expandRow')) +
+    '"><span aria-hidden="true">›</span></button>' +
+    '<span class="sr-only">' + esc(t(status)) + '</span></div>';
 }
 function pairsHtml(items, className) {
   return (Array.isArray(items) ? items : []).filter(pair => Array.isArray(pair) && pair.length >= 2)
@@ -162,15 +186,9 @@ function detailHtml(record, path) {
   const route = record.route_label != null ? safe(record.route_label) : esc(t(status[0]));
   const metrics = Array.isArray(record.metrics) ? record.metrics : [];
   const fields = Array.isArray(record.fields) ? record.fields : [];
-  /* 只有保存了不可变图快照的请求才有链接；旧日志保持纯文字阶段视图。 */
-  const snapshot = typeof record.snapshot_url === 'string' && record.snapshot_url
-    ? '<div class="lg-snapshot"><a class="btn sm lg-snapshot-link" href="' +
-      esc(record.snapshot_url) + '">' + esc(t('logs.snapshot')) + '</a></div>'
-    : '';
   return '<div class="lg-detail-head"><span class="lg-route">' + route + '</span>' +
     '<span class="lg-status ' + status[1] + '">' + esc(t(status[0])) + '</span>' +
     '<span class="lg-detail-metrics">' + pairsHtml(metrics, 'lg-metric') + '</span></div>' +
-    snapshot +
     '<div class="lg-rail" role="group" aria-label="' + esc(t('logs.path')) + '">' +
     '<div class="lg-rail-head" aria-hidden="true"><span></span><span>' + esc(t('logs.stage')) +
     '</span><span>' + esc(t('logs.computation')) + '</span><span>' + esc(t('logs.evidence')) +
@@ -200,13 +218,23 @@ function render() {
     const record = requests.find(entry => entry.id === item.dataset.id);
     if (record) paintDetail(item, record);
   });
+  markClippedChains();
+}
+/* 路径列是摘要而不是滚动区：超出时给右侧一道渐隐，读者不会以为最后一个
+   阶段被裁坏了；完整阶段仍在展开区里。窗口变化后要重新判定。 */
+function markClippedChains() {
+  document.querySelectorAll('#list .lg-chain').forEach(chain => {
+    chain.classList.toggle('is-clipped', chain.scrollWidth > chain.clientWidth + 1);
+  });
 }
 function toggle(item) {
   const id = item.dataset.id;
   const opening = !openIds.has(id);
   if (opening) openIds.add(id); else openIds.delete(id);
   item.classList.toggle('open', opening);
-  item.querySelector('.lg-row').setAttribute('aria-expanded', String(opening));
+  const chevron = item.querySelector('.lg-chev');
+  chevron.setAttribute('aria-expanded', String(opening));
+  chevron.setAttribute('aria-label', t(opening ? 'logs.collapseRow' : 'logs.expandRow'));
   const panel = item.querySelector('.lg-expand');
   panel.hidden = !opening;
   if (opening) {
@@ -222,6 +250,8 @@ $('#filter').addEventListener('click', event => {
   render();
 });
 $('#list').addEventListener('click', event => {
+  /* 快照按钮自己导航，不能顺带折叠/展开这一行。 */
+  if (event.target.closest('.lg-snap-btn')) return;
   const row = event.target.closest('.lg-row');
   if (row) toggle(row.closest('.lg-item'));
 });
@@ -239,4 +269,5 @@ async function load() {
   }
 }
 onLangChange(render);
+window.addEventListener('resize', markClippedChains);
 load();

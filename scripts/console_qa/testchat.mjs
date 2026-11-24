@@ -6,14 +6,13 @@
    * Task 4 安全渲染：Markdown → DOM、恶意 HTML/活动 URL 不执行、
      图片/音频/视频/文件分派、未知 part 折叠、safeMediaUrl 白名单、
      复制链整链失败写进 Copy 按钮标签；
-   * Task 5 首页壳：Test 导航、模型目录、Auto/固定模型状态、390/800/1440
-     首屏适配、空目录时的 #testModelEmpty 模型页入口、viewer 锁定输入区；
+   * Task 5 首页壳：Test 导航、Auto 状态行（不提供模型选择）、390/800/1440
+     首屏适配、viewer 锁定输入区；
    * Task 6 附件：五类文件 chip 与移除、拖拽/粘贴、空文本 + 附件启用 Send、
      文本文件免 Data URL 转换、预估超限先于读取就地拒绝、单文件失败内联；
-   * Task 7 流式（具名）：auto stream / direct stream / multi-turn text /
-     stop / incomplete eof / new generation race（代次守卫回归）/
-     provider stream error；附件 wire、多模态 part、Retry、New Chat 清场
-     仍由 v1 用例覆盖，Task 8 具名收编；
+   * Task 7 流式（具名）：auto stream / multi-turn text / stop / incomplete eof /
+     new generation race（代次守卫回归）/ provider stream error；附件 wire、
+     多模态 part、Retry、New Chat 清场仍由 v1 用例覆盖，Task 8 具名收编；
    * Task 8（具名）：message-level media / content media / attachment wire /
      exact oversize request / retry / regenerate / copy / new chat clears
      media；另有首页截图（仅在 QA_SCREENSHOTS=1 时执行）。
@@ -231,9 +230,8 @@ test('test chat renderer safeMediaUrl whitelist matrix', async () => {
   ]);
 });
 
-/* 计划 Task 5（修订）：首页壳。v1 同名用例的全部断言保留（导航/目录/状态文案），
-   并把 390/800/1440 三档「首屏装下底栏且整页不滚动」断言从流式用例挪到这里——
-   本提交里发送按评审决议 3 暂时禁用，布局回归必须落在不发送就能跑的用例上。 */
+/* 计划 Task 5（修订）：首页壳。页面只保留 Auto，不提供模型选择（2026-11-23
+   决策）；390/800/1440 三档「首屏装下底栏且整页不滚动」的布局回归也在这里。 */
 async function openShellPage(waitMarker, waitState) {
   /* 壳用例都以 zh 断言文案：导航前先把 router_lang 种进 localStorage；
      about:blank 没有同源 storage，先拿一次页面建立 origin。 */
@@ -242,31 +240,25 @@ async function openShellPage(waitMarker, waitState) {
   }
   await page.evaluate(() => localStorage.setItem('router_lang', 'zh'));
   await page.goto(routerBase + '/console/index.html');
-  /* 原生 <optgroup> 在 <select> 里没有布局盒，visible 判定等不到：等 attached
-     （同一断言意图：模型分组已渲染）。#testModelEmpty 是静态节点，必须等
-     visible 才能证明 boot 的 renderModelOptions 真的亮出了空目录提示。 */
-  await page.waitForSelector(waitMarker || '#testModel optgroup', {
-    state: waitState || 'attached', timeout: 15000,
+  /* boot 填充 Auto 状态行之前 #testStatus 是空节点：等它非空即证明模块跑过。 */
+  await page.waitForSelector(waitMarker || '#testStatus:not(:empty)', {
+    state: waitState || 'visible', timeout: 15000,
   });
 }
 
-test('test home replaces overview and lists Auto plus configured models', async () => {
+test('test home replaces overview with an auto-only status line', async () => {
   await openShellPage();
   assert.equal(await page.locator('body').getAttribute('data-page'), 'test');
   assert.equal(await page.locator('.top nav a.on').textContent(), '测试');
-  assert.equal(await page.locator('#testModel').inputValue(), 'auto');
-  /* 提供方分组：bootstrap 注册的模型全部挂在 local 提供方下。 */
-  const groups = await page.evaluate(() =>
-    [...document.querySelectorAll('#testModel optgroup')].map(group => group.label));
-  assert.deepEqual(groups, ['local']);
-  assert.ok(await page.locator('#testModel option[value="qwen3-32b"]').count());
+  /* 模型选择器与空目录入口都已移除：页面只走 Auto。 */
+  assert.equal(await page.locator('#testModel').count(), 0,
+    'the model selector must be gone');
+  assert.equal(await page.locator('#testModelEmpty').count(), 0,
+    'the empty-model notice must be gone');
   assert.equal(await page.locator('#cards').count(), 0);
-  /* 目录非空：空模型提示必须藏起来（Task 5 新 DOM 的另一侧）。 */
-  assert.equal(await page.locator('#testModelEmpty').isHidden(), true);
-  await page.locator('#testModel').selectOption('qwen3-32b');
-  assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
-  await page.locator('#testModel').selectOption('auto');
-  assert.match(await page.locator('#testStatus').textContent(), /智能路由/);
+  const status = await page.locator('#testStatus').textContent();
+  assert.match(status, /^Auto · 智能路由/);
+  assert.doesNotMatch(status, /固定模型/);
 
   /* F2/F3：窄屏（手机 390×844）+ 中档（800×900，shared.css 页头换行断点内）
      + 桌面（1440×1000）三档都必须首屏装下底栏且整页不滚动；桌面尺寸与旧布局一致。 */
@@ -303,36 +295,8 @@ test('test home replaces overview and lists Auto plus configured models', async 
   }
 });
 
-/* 计划 Task 5：/admin/models 返回空目录时 Auto 选项保留，模型页入口
-   （#testModelEmpty + a[href="models.html"]）就地亮出。先红：v1 把链接塞在
-   #testStatus 里，没有 #testModelEmpty 这个节点。 */
-test('test empty models keeps auto and links to the model page', async () => {
-  const modelsMatcher = '**/admin/models';
-  await page.route(modelsMatcher, route => route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({ models: [] }),
-  }));
-  try {
-    await openShellPage('#testModelEmpty', 'visible');
-    assert.equal(await page.locator('#testModel option').count(), 1,
-      'only the Auto option remains');
-    assert.equal(await page.locator('#testModel option[value="auto"]').textContent(),
-      'Auto · 智能路由');
-    assert.equal(await page.locator('#testModelEmpty').isHidden(), false,
-      'the empty-model notice must be visible');
-    assert.match(await page.locator('#testModelEmpty').textContent(), /还没有已配置的模型/);
-    const link = page.locator('#testModelEmpty a[href="models.html"]');
-    assert.equal(await link.count(), 1);
-    assert.equal(await link.isVisible(), true);
-    assert.equal(await link.textContent(), '前往模型页 →');
-  } finally {
-    await page.unroute(modelsMatcher);
-  }
-});
-
 /* 计划 Task 5：viewer 角色锁死整个输入区（textarea/附件/发送），并亮出
-   test.adminOnly 文案。先红：v1 没有独立的 viewer 用例。 */
+   test.adminOnly 文案。 */
 test('test viewer cannot use the composer', async () => {
   const meMatcher = '**/admin/me';
   await page.route(meMatcher, route => route.fulfill({
@@ -341,7 +305,7 @@ test('test viewer cannot use the composer', async () => {
     body: JSON.stringify({ id: 'qa-viewer', email: 'viewer@example.test', role: 'viewer' }),
   }));
   try {
-    await openShellPage('#testModel option[value="auto"]');
+    await openShellPage();
     assert.equal(await page.locator('#testInput').isDisabled(), true,
       'the textarea must be locked for a viewer');
     assert.equal(await page.locator('#testAttach').isDisabled(), true,
@@ -566,10 +530,11 @@ test('test chat attachments read failure shows a per-file inline error', async (
   }
 });
 
-/* ── 计划 Task 7：真实流式对话（修订版 7 条具名用例）──────────────────
-   auto stream / direct stream / multi-turn text / stop / incomplete eof /
+/* ── 计划 Task 7：真实流式对话（修订版具名用例）──────────────────────
+   auto stream / multi-turn text / stop / incomplete eof /
    new generation race（评审发现 1 的回归：旧请求的 finally 不得清掉新
    controller）/ provider stream error（SSE 错误负载内联且绝不完成）。
+   固定模型的直连路径由后端测试覆盖，页面只保留 Auto（2026-11-23）。
    附件 wire 形状、多模态 part、Retry/Regenerate 流程与 New Chat 清场
    仍由 v1 用例覆盖，Task 8 按计划具名重排。
    mock 触发词见 console_qa.mjs 的 mock /v1/chat/completions 分支。 */
@@ -581,7 +546,8 @@ async function openTestPage() {
   }
   await page.evaluate(() => localStorage.setItem('router_lang', 'zh'));
   await page.goto(routerBase + '/console/index.html');
-  await page.waitForSelector('#testModel optgroup', { state: 'attached' });
+  await page.waitForFunction(() =>
+    document.getElementById('testStatus').textContent.includes('智能路由'));
 }
 
 async function sendText(text) {
@@ -601,7 +567,6 @@ test('test chat auto stream', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   const jevCallsBefore = mockState.systemoneCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('auto');
   await sendText('你好，请走智能路由');
   await waitForAssistantText('固定回复');
   await waitFor(() =>
@@ -657,37 +622,12 @@ test('test chat auto stream', async () => {
     'Copy must fall back to execCommand when the Clipboard API is unavailable');
 });
 
-/* 计划 Task 7：固定模型直连 —— 跳过 JEV，元信息带「固定模型」直连标记。 */
-test('test chat direct stream', async () => {
-  const chatCallsBefore = mockState.chatCalls.length;
-  const jevCallsBefore = mockState.systemoneCalls.length;
-  await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
-  assert.match(await page.locator('#testStatus').textContent(), /固定模型/);
-  await sendText('第一轮');
-  await waitFor(() => {
-    const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
-    return bubbles.length === 1 && bubbles[0].textContent.includes('固定回复');
-  });
-  assert.equal(mockState.chatCalls.length, chatCallsBefore + 1, 'one upstream call per send');
-  const lastCall = mockState.chatCalls.at(-1);
-  assert.equal(lastCall.model, 'qwen3-32b', 'the pinned model must reach the upstream verbatim');
-  assert.equal(mockState.systemoneCalls.length, jevCallsBefore,
-    'fixed model mode must not call the decision service');
-  const metas = await page.locator('.tc-message.assistant .tc-message-meta').allTextContents();
-  assert.deepEqual(metas, ['qwen3-32b · 固定模型']);
-  const actions = await page.locator('.tc-message.assistant .tc-message-actions button').allTextContents();
-  assert.deepEqual(actions, ['复制', '重新生成']);
-});
-
 /* 计划 Task 7：多轮文本 —— 第二次请求体必须是 user / 原始 assistant 内容 /
    user（无损历史回放，绝不做渲染往返转换）。重新生成段已按计划 Task 8
    平移进独立的 `test chat regenerate` 用例（断言原样，未弱化）。 */
 test('test chat multi-turn text', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
-  const jevCallsBefore = mockState.systemoneCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('第一轮');
   await waitFor(() => {
     const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
@@ -704,11 +644,10 @@ test('test chat multi-turn text', async () => {
   assert.equal(lastCall.messages[1].content, '固定回复',
     'the second body must replay the ORIGINAL assistant content, not render-derived parts');
   assert.equal(lastCall.messages[2].content, '第二轮');
-  assert.equal(lastCall.model, 'qwen3-32b');
-  assert.equal(mockState.systemoneCalls.length, jevCallsBefore,
-    'fixed model mode must not call the decision service');
+  assert.notEqual(lastCall.model, 'auto', 'auto routing must send a concrete upstream model');
   const metas = await page.locator('.tc-message.assistant .tc-message-meta').allTextContents();
-  assert.deepEqual(metas, ['qwen3-32b · 固定模型', 'qwen3-32b · 固定模型']);
+  assert.equal(metas.length, 2);
+  metas.forEach(meta => assert.match(meta, /^Auto → \S+$/));
   /* M10：旧回答只保留 Copy；Regenerate 只出现在最后一条 assistant 上。 */
   const actionRows = await page.evaluate(() =>
     [...document.querySelectorAll('.tc-message.assistant')].map(view =>
@@ -722,7 +661,6 @@ test('test chat multi-turn text', async () => {
    PDF→file.file_data、YAML 正文进 text part；发送后 chip 清空（v1 断言保留）。 */
 test('test chat attachment wire', async () => {
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   const mp3Body = Buffer.from('ID3qa-audio', 'utf8');
   await page.locator('#testFileInput').setInputFiles([
     { name: 'qa-wire.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64') },
@@ -766,7 +704,6 @@ test('test chat attachment wire', async () => {
 test('test chat message-level media', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('返回多模态');
   await waitFor(() => Boolean(document.querySelector('.tc-message.assistant img.tc-media-image')));
   await waitFor(() =>
@@ -812,7 +749,6 @@ test('test chat message-level media', async () => {
 test('test chat content media', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('返回多模态');
   await waitFor(() => Boolean(document.querySelector('.tc-message.assistant video')));
   await waitFor(() =>
@@ -856,7 +792,6 @@ test('test chat content media', async () => {
 test('test chat exact oversize request', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   /* 小附件：预检（估算）放行。 */
   await page.locator('#testFileInput').setInputFiles({
     name: 'qa-small.png', mimeType: 'image/png', buffer: Buffer.from(QA_PIXEL, 'base64'),
@@ -892,7 +827,6 @@ test('test chat exact oversize request', async () => {
    （R-T5 评审回补 a）、语言重绘不解锁、中止后上游补写不再落地。 */
 test('test chat stop', async () => {
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('延迟流');
   await waitForAssistantText('第一段');
   await waitFor(() => document.getElementById('testSend').textContent === '停止');
@@ -933,7 +867,6 @@ test('test chat stop', async () => {
    保留已收到的文本，绝不落成完成态（没有 Copy/Regenerate）。 */
 test('test chat incomplete eof', async () => {
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('截断流');
   await waitFor(() => {
     const assistants = document.querySelectorAll('.tc-message.assistant');
@@ -968,7 +901,6 @@ test('test chat incomplete eof', async () => {
 test('test chat new generation race', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   const sessionIds = [];
   const captureSession = request => {
     if (request.url().endsWith('/admin/test/chat/completions')) {
@@ -1053,7 +985,6 @@ test('test chat new generation race', async () => {
 test('test chat provider stream error', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('流错误');
   await waitFor(() => {
     const error = document.querySelector('.tc-message.assistant .tc-error');
@@ -1083,7 +1014,6 @@ test('test chat provider stream error', async () => {
 test('test chat retry', async () => {
   const chatCallsBefore = mockState.chatCalls.length;
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   /* 一次性注入队列：先 422（管理面 {detail}），Retry 之后补一次 503（数据面
      {error:{message}}）。中间与之后的请求都走真实 router -> mock 上游。 */
   expectHttpStatusError({ url: /\/admin\/test\/chat\/completions$/, status: /422/ });
@@ -1155,7 +1085,6 @@ test('test chat retry', async () => {
    平移收编，断言原样未弱化）。 */
 test('test chat regenerate', async () => {
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('第一轮');
   await waitFor(() => {
     const bubbles = document.querySelectorAll('.tc-message.assistant .tc-bubble');
@@ -1169,6 +1098,7 @@ test('test chat regenerate', async () => {
   /* F1：点击重新生成 —— 恰好一次真实上游调用，只替换最后一条 assistant。 */
   const callsBeforeRegenerate = mockState.chatCalls.length;
   const firstAnswer = await page.locator('.tc-message.assistant .tc-bubble').first().textContent();
+  const firstMeta = await page.locator('.tc-message.assistant .tc-message-meta').first().textContent();
   await page.locator('.tc-message.assistant').last()
     .locator('.tc-message-actions button', { hasText: '重新生成' }).click();
   await waitFor(() => {
@@ -1191,7 +1121,9 @@ test('test chat regenerate', async () => {
   }));
   assert.equal(afterRegenerate.assistants, 2, 'Regenerate replaces only the last assistant');
   assert.equal(afterRegenerate.firstAnswerText, firstAnswer, 'earlier answers stay untouched');
-  assert.equal(afterRegenerate.firstMeta, 'qwen3-32b · 固定模型');
+  assert.match(afterRegenerate.firstMeta, /^Auto → \S+$/);
+  assert.equal(afterRegenerate.firstMeta, firstMeta,
+    'Regenerate must not rewrite the earlier answer metadata');
   assert.deepEqual(afterRegenerate.actionRows, [['复制'], ['复制', '重新生成']]);
 });
 
@@ -1200,7 +1132,6 @@ test('test chat regenerate', async () => {
    兜底链成功后标签恢复。 */
 test('test chat copy', async () => {
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   await sendText('返回多模态');
   await waitFor(() =>
     document.querySelectorAll('.tc-message.assistant .tc-message-actions button').length === 2);
@@ -1263,7 +1194,6 @@ test('test chat copy', async () => {
    已发送内容渲染用的是 Data URL（读取管线产物），与被回收的 blob 无关。 */
 test('test chat new chat clears media', async () => {
   await openTestPage();
-  await page.locator('#testModel').selectOption('qwen3-32b');
   const sessionIds = [];
   const captureSession = request => {
     if (request.url().endsWith('/admin/test/chat/completions')) {

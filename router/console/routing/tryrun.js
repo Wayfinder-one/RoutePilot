@@ -117,7 +117,8 @@ function slotLine(slot) {
   if (slot.condition !== undefined && slot.condition !== null) pieces.push(label);
   else if (typeof slot.raw === 'boolean') pieces.push(label);
   pieces.push('→', statusText(slot.status));
-  return pieces.join(' ');
+  /* 开始节点的默认边没有条件文案（label 为空）：不要留下空片段和双空格。 */
+  return pieces.filter(piece => piece !== '').join(' ');
 }
 
 /* ── Step 3 · trace-only rebuild ──────────────────────────────── */

@@ -369,9 +369,11 @@ def test_selected_target_uses_real_systemone_chain(tmp_path):
         assert record["waves"] == 1
         assert record["answers"]["q"]["probabilities"]["fast"] == pytest.approx(0.9)
         assert record["route_label"] == {"zh": "目标命中", "en": "Target selected"}
-        assert [pair[0]["en"] for pair in record["metrics"]] == ["Upstream", "Routing", "Total", "Waves"]
-        assert record["metrics"][0][1] == 200
-        assert record["metrics"][3][1] == 1
+        assert [pair[0]["en"] for pair in record["metrics"]] == [
+            "Decision time", "Decision model time", "Waves"]
+        assert record["metrics"][0][1].endswith("ms")
+        assert record["metrics"][2][1] == 1
+        assert record["upstream_status"] == 200
         assert record["fields"][0] == [{"zh": "请求 ID", "en": "Request ID"}, record["id"]]
         assert [event["event"] for event in record["trace"]].count("request_outcome") == 1
         assert record["trace"][-1]["phase"] == "outcome"
@@ -865,7 +867,8 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert record["total_tokens"] == 3
         assert record["answers"] == {}
         assert record["trace"][-1]["event"] == "request_outcome"
-        assert record["fields"][-1][1] == 3
+        # 上游用量仍保存在机器字段里，但不再进入路由控制台的展示字段。
+        assert "Total tokens" not in [pair[0]["en"] for pair in record["fields"]]
 
     asyncio.run(scenario())
 
@@ -913,7 +916,9 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
         record = recent(app)
         assert record["outcome_state"] == "upstream_error"
         assert record["error_class"] == "upstream_error"
-        assert record["metrics"][0][1] == 503
+        assert record["upstream_status"] == 503
+        assert [pair[0]["en"] for pair in record["metrics"]] == [
+            "Decision time", "Decision model time", "Waves"]
 
     asyncio.run(scenario())
 

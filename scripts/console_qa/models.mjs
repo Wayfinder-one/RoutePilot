@@ -910,27 +910,6 @@ test('P0 acceptance · changed console pages do not overflow at 1440×960 or 128
             `${target.path} overflows horizontally at ${viewport.width}×${viewport.height} (${lang}): ` +
             `${size.scroll} > ${size.client}`);
           assert.equal(size.lang, lang === 'zh' ? 'zh-CN' : 'en');
-          if (target.path.endsWith('/routing.html')) {
-            await page.locator('#cvMoreBtn').click();
-            const menu = await page.evaluate(() => {
-              const details = document.querySelector('#cvMore');
-              const box = document.querySelector('#cvMore .rtc-more-menu').getBoundingClientRect();
-              return { open: details.open,
-                left: box.left, right: box.right, top: box.top, bottom: box.bottom,
-                boxWidth: box.width, boxHeight: box.height,
-                width: window.innerWidth, height: window.innerHeight };
-            });
-            assert.equal(menu.open, true,
-              `the overflow menu did not open at ${viewport.width} (${lang})`);
-            /* 全零矩形也能满足下面的边界比较，所以先排除零尺寸菜单。 */
-            assert.ok(menu.boxWidth > 0 && menu.boxHeight > 0,
-              `the overflow menu has no size at ${viewport.width} (${lang})`);
-            assert.ok(menu.left >= -1 && menu.right <= menu.width + 1,
-              `the overflow menu leaves the viewport horizontally at ${viewport.width} (${lang})`);
-            assert.ok(menu.top >= -1 && menu.bottom <= menu.height + 1,
-              `the overflow menu leaves the viewport vertically at ${viewport.width} (${lang})`);
-            await page.keyboard.press('Escape');
-          }
         }
       }
     }

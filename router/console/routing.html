@@ -43,24 +43,23 @@
     </div>
     <div class="rtc-headr">
       <div class="rtc-actions">
+        <!-- 编辑类动作全部平铺：早前收进「更多」折叠菜单，实测多点一次、菜单还会
+             盖住画布，用户明确要求展开直达（2026-11-23）。 -->
+        <div class="rtc-tools" role="group" data-i18n-aria="cv.tools">
+          <button type="button" class="btn sm" id="cvUndo" data-i18n="cv.undo"></button>
+          <button type="button" class="btn sm" id="cvRedo" data-i18n="cv.redo"></button>
+          <button type="button" class="btn sm" id="cvAutoLayout" data-i18n="cv.autoLayout"></button>
+          <!-- 保存按钮保留内层 span：updateToolbar 在请求在途时改写这里的忙碌文案。 -->
+          <button type="button" class="btn sm" id="cvSave"><span data-i18n="cv.saveDraft"></span></button>
+          <button type="button" class="btn sm" id="cvNewTree" data-i18n="cv.newTree"></button>
+          <button type="button" class="btn sm" id="cvImport" data-i18n="cv.import"></button>
+          <button type="button" class="btn sm" id="cvExport" data-i18n="cv.export"></button>
+          <button type="button" class="btn sm danger" id="cvDisable" data-i18n="cv.disable" hidden></button>
+        </div>
         <button type="button" class="btn sm" id="cvTryBtn">
           <svg class="rtc-ic" aria-hidden="true"><use href="#ri-play"/></svg>
           <span data-i18n="cv.try"></span>
         </button>
-        <details class="rtc-more" id="cvMore">
-          <summary class="btn sm" id="cvMoreBtn" data-i18n="cv.more"></summary>
-          <div class="rtc-more-menu" role="group" data-i18n-aria="cv.more">
-            <button type="button" class="btn sm" id="cvUndo" data-i18n="cv.undo"></button>
-            <button type="button" class="btn sm" id="cvRedo" data-i18n="cv.redo"></button>
-            <button type="button" class="btn sm" id="cvAutoLayout" data-i18n="cv.autoLayout"></button>
-            <!-- 保存按钮保留内层 span：updateToolbar 在请求在途时改写这里的忙碌文案。 -->
-            <button type="button" class="btn sm" id="cvSave"><span data-i18n="cv.saveDraft"></span></button>
-            <button type="button" class="btn sm" id="cvNewTree" data-i18n="cv.newTree"></button>
-            <button type="button" class="btn sm" id="cvImport" data-i18n="cv.import"></button>
-            <button type="button" class="btn sm" id="cvExport" data-i18n="cv.export"></button>
-            <button type="button" class="btn sm danger" id="cvDisable" data-i18n="cv.disable" hidden></button>
-          </div>
-        </details>
         <button type="button" class="btn sm pri" id="cvEnable">
           <!-- 文案完全由 paintLifecycle() 拥有：不能带 data-i18n，否则 setLang 会把它
                改回固定 key、覆盖真实状态。app.js 在模块加载时同步先画一次（此时
