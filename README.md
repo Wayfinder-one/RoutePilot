@@ -203,7 +203,7 @@ A v4 document is a complete, portable canvas: its lifecycle markers (`enabled`/`
 {
   "kind": "sr-routing-graph",
   "version": 4,
-  "name": "Default routing",
+  "name": "Example canvas",
   "departments": [],
   "enabled": false,
   "default": false,
@@ -213,10 +213,25 @@ A v4 document is a complete, portable canvas: its lifecycle markers (`enabled`/`
     "id": "root",
     "type": "graph",
     "error_fallback": "safe-target",
-    "nodes": [],
-    "edges": []
+    "nodes": [
+      { "id": "start", "type": "start", "title": "Start" },
+      { "id": "safe-target", "type": "target", "priority": 1,
+        "models": [ { "model": "qwen3-8b", "reasoning": null } ] }
+    ],
+    "edges": [
+      { "id": "e-start-safe", "source": "start", "source_port": "out",
+        "target": "safe-target", "target_port": "in_1", "condition": null }
+    ]
   },
-  "backends": { "providers": [], "models": [] },
+  "backends": {
+    "providers": [
+      { "name": "local", "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "LOCAL_API_KEY", "reasoning_format": "openai" }
+    ],
+    "models": [
+      { "id": "qwen3-8b", "upstream": "qwen3-8b", "provider": "local", "profile": {} }
+    ]
+  },
   "jev": null,
   "jev_window": { "input_tokens": 1024, "context_tokens": 4096 },
   "time_periods": []
@@ -362,13 +377,26 @@ Every saved canvas is a portable, immutable run snapshot: one file restores a de
 {
   "kind": "sr-routing-graph",
   "version": 4,
-  "name": "Default routing",
+  "name": "Example canvas",
   "departments": [],
   "enabled": false,
   "default": false,
   "timezone": "Asia/Shanghai",
   "sticky": { "enabled": true, "ttl_seconds": 1800 },
-  "root": { "id": "root", "type": "graph", "nodes": [], "edges": [], "error_fallback": null },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "error_fallback": "qwen3-target",
+    "nodes": [
+      { "id": "start", "type": "start", "title": "Start" },
+      { "id": "qwen3-target", "type": "target", "priority": 1,
+        "models": [ { "model": "qwen3-8b", "reasoning": null } ] }
+    ],
+    "edges": [
+      { "id": "e-start-qwen3", "source": "start", "source_port": "out",
+        "target": "qwen3-target", "target_port": "in_1", "condition": null }
+    ]
+  },
   "backends": {
     "providers": [
       {
@@ -471,7 +499,7 @@ Update/delete semantics:
 4. Call `POST /v1/chat/completions` for Auto routing through the default graph, or open the model test chat (Auto-only, with an optional Department field) to verify an end-to-end reply.
 5. Provide keys through environment variables only: each provider's `key_env`, and the selected JEV service's `key_env` when its endpoint requires authentication.
 
-`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, the `default` decision-service profile and three time periods. It is a v4 document with `enabled: false, default: false, departments: []`: apply it through the admin API (for example `scripts/apply_default_routing_tree.py`), then enable it — the admin write path ignores nothing, the stored document is created closed. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
+`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, the `default` decision-service profile and three time periods. It is a v4 document with `enabled: false, default: false, departments: []`: apply it through the admin API (for example `scripts/apply_default_routing_tree.py`), then enable it. The admin write path never accepts lifecycle from the payload: new, copied and imported documents are always persisted as `enabled: false, default: false`. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
 
 The five demo cases in `configs/cases/case-*.json` are complete v4 documents with `kind`/`version`, no external `id`, `enabled: false, default: false, departments: []`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
 
@@ -536,13 +564,13 @@ Full field tables, request/response examples and the impact-confirmation flow li
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `POST /v1/chat/completions` | public | Routing entry; JSON or SSE |
-| `GET /healthz` / `GET /readyz` | public | Liveness / snapshot readiness |
+| `GET /healthz` / `GET /readyz` | public | Liveness / route-set readiness (`graph_status`) |
 | `POST /admin/login` / `POST /admin/logout` | public / signed in | Console session |
 | `GET /admin/me`, `POST /admin/me/password` | signed in | Current user, password change |
 | `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | read / admin | Decision groups; create is always closed |
 | `PUT /admin/trees/{id}/departments` | admin | Department mapping for one group |
 | `POST /admin/trees/{id}/copy`, `/enable`, `/disable`, `/default` | admin | Copy and multi-graph lifecycle (first enable becomes default; default switch) |
-| `POST /admin/try` | admin | Routing check against a draft graph |
+| `POST /admin/try` | admin | Routing check against a draft graph or the published route set (optional department) |
 | `POST /admin/test/chat/completions` | admin | Test chat; `model=auto` routes, anything else is a fixed direct call |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | read / admin | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
 | `GET /admin/model-catalog`, `POST /admin/fetch-models` | read / admin | Provider presets, upstream model discovery |
@@ -579,7 +607,7 @@ Admin:
 | 409 | `graph_conflict` | Baseline or impact-list document hash is stale |
 | 409 | `impact_confirmation_required` | Model/provider/JEV write affects canvases; confirm the listed document hashes |
 | 409 | `provider_referenced` | Provider still used by a database model or a canvas model |
-| 409 | `graph_already_exists` | Duplicate graph id |
+| 409 | string `tree <id> already exists` | Duplicate graph id (create/copy); plain string detail, no `code` |
 | 422 | Issue array | Graph/config validation failed |
 | 503 | `graph_read_only` / `graph_storage_error` | Reader replica / shared graph storage unreadable |
 | 502 | string | JEV test or upstream model discovery failed |

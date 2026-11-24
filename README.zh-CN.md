@@ -203,7 +203,7 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
 {
   "kind": "sr-routing-graph",
   "version": 4,
-  "name": "默认路由",
+  "name": "示例画布",
   "departments": [],
   "enabled": false,
   "default": false,
@@ -213,10 +213,25 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
     "id": "root",
     "type": "graph",
     "error_fallback": "safe-target",
-    "nodes": [],
-    "edges": []
+    "nodes": [
+      { "id": "start", "type": "start", "title": "开始" },
+      { "id": "safe-target", "type": "target", "priority": 1,
+        "models": [ { "model": "qwen3-8b", "reasoning": null } ] }
+    ],
+    "edges": [
+      { "id": "e-start-safe", "source": "start", "source_port": "out",
+        "target": "safe-target", "target_port": "in_1", "condition": null }
+    ]
   },
-  "backends": { "providers": [], "models": [] },
+  "backends": {
+    "providers": [
+      { "name": "local", "base_url": "http://127.0.0.1:8000/v1",
+        "key_env": "LOCAL_API_KEY", "reasoning_format": "openai" }
+    ],
+    "models": [
+      { "id": "qwen3-8b", "upstream": "qwen3-8b", "provider": "local", "profile": {} }
+    ]
+  },
   "jev": null,
   "jev_window": { "input_tokens": 1024, "context_tokens": 4096 },
   "time_periods": []
@@ -362,13 +377,26 @@ sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;
 {
   "kind": "sr-routing-graph",
   "version": 4,
-  "name": "默认路由",
+  "name": "示例画布",
   "departments": [],
   "enabled": false,
   "default": false,
   "timezone": "Asia/Shanghai",
   "sticky": { "enabled": true, "ttl_seconds": 1800 },
-  "root": { "id": "root", "type": "graph", "nodes": [], "edges": [], "error_fallback": null },
+  "root": {
+    "id": "root",
+    "type": "graph",
+    "error_fallback": "qwen3-target",
+    "nodes": [
+      { "id": "start", "type": "start", "title": "开始" },
+      { "id": "qwen3-target", "type": "target", "priority": 1,
+        "models": [ { "model": "qwen3-8b", "reasoning": null } ] }
+    ],
+    "edges": [
+      { "id": "e-start-qwen3", "source": "start", "source_port": "out",
+        "target": "qwen3-target", "target_port": "in_1", "condition": null }
+    ]
+  },
   "backends": {
     "providers": [
       {
@@ -471,7 +499,7 @@ JSON 从不保存密钥，环境在构建快照时提供。
 4. 调用 `POST /v1/chat/completions` 走默认图的 Auto 路由，或打开模型测试对话（同样只走 Auto，可填部门）验证端到端回复。
 5. 只需为密钥配置环境变量：各提供方的 `key_env`，以及所选 JEV 服务端点需要鉴权时的 `key_env`。
 
-`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、`default` 决策服务档案与三个时段。它是一份 `enabled: false, default: false, departments: []` 的 v4 文档：通过管理 API（例如 `scripts/apply_default_routing_tree.py`）应用后再启用——管理写路径不会忽略任何东西，落盘文档创建时就是关闭态。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
+`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、`default` 决策服务档案与三个时段。它是一份 `enabled: false, default: false, departments: []` 的 v4 文档：通过管理 API（例如 `scripts/apply_default_routing_tree.py`）应用后再启用。管理写路径从不接受载荷里的生命周期：新建、复制与导入的文档一律以 `enabled: false, default: false` 落盘。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
 
 `configs/cases/case-*.json` 里的五个演示案例都是完整 v4 文档：带 `kind`/`version`，不含外部 `id`，`enabled: false, default: false, departments: []`，provider 为 `demo-tap`，JEV 服务为 `demo-jev`（窗口 `2048 / 4096`），并内嵌其 target 实际引用的全部模型。`scripts/demo/apply_cases.py` 是它们的部署入口：合并案例文件里的目录、播种多服务 JEV 目录与时段、部署五棵画布（不启用）并跑 dry-run。它绝不绕过影响确认——遇到 409 默认打印受影响画布并停止；`--confirm-sync` 才会用预览里的基线哈希显式重试同一批请求。`graph_conflict` 表示画布在预览后变化，重跑脚本即可。
 
@@ -536,13 +564,13 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | 方法与路径 | 权限 | 用途 |
 |---|---|---|
 | `POST /v1/chat/completions` | 公开 | 路由入口；JSON 或 SSE |
-| `GET /healthz` / `GET /readyz` | 公开 | 存活探针 / 快照就绪状态 |
+| `GET /healthz` / `GET /readyz` | 公开 | 存活探针 / 路由集就绪状态（`graph_status`） |
 | `POST /admin/login` / `POST /admin/logout` | 公开 / 登录用户 | 控制台会话 |
 | `GET /admin/me`、`POST /admin/me/password` | 登录用户 | 当前用户、修改口令 |
 | `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 读 / admin | 决策组；新建一律关闭 |
 | `PUT /admin/trees/{id}/departments` | admin | 单张图的部门映射 |
 | `POST /admin/trees/{id}/copy`、`/enable`、`/disable`、`/default` | admin | 复制与多图生命周期（第一张启用图自动默认；默认图切换） |
-| `POST /admin/try` | admin | 针对草稿图的检查路由 |
+| `POST /admin/try` | admin | 针对草稿图或实际路由集的检查路由（可选部门） |
 | `POST /admin/test/chat/completions` | admin | 模型测试对话；`model=auto` 走路由，其他值固定直连 |
 | `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 读 / admin | 模型注册表；更新/删除先返回 409 影响清单，确认后同步画布 |
 | `GET /admin/model-catalog`、`POST /admin/fetch-models` | 读 / admin | 提供方预设、上游模型发现 |
@@ -579,7 +607,7 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | 409 | `graph_conflict` | 基线或影响清单的文档哈希已过期 |
 | 409 | `impact_confirmation_required` | 模型/提供方/JEV 写入影响画布，需确认清单里的文档哈希 |
 | 409 | `provider_referenced` | 提供方仍被数据库模型或画布模型引用 |
-| 409 | `graph_already_exists` | 图 id 重复 |
+| 409 | 字符串 `tree <id> already exists` | 图 id 重复（新建/复制）；`detail` 为纯字符串，无 `code` |
 | 422 | Issue 数组 | 图/配置校验失败 |
 | 503 | `graph_read_only` / `graph_storage_error` | 只读副本 / 共享图存储不可读 |
 | 502 | 字符串 | JEV 测试或上游模型发现失败 |
