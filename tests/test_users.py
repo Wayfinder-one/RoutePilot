@@ -425,6 +425,8 @@ def test_viewer_can_read_trees_but_not_write(tmp_path):
              {"id": "tree-b", "name": "b"}),
             ("post", "/admin/trees/tree-a/enable", None),
             ("post", "/admin/trees/tree-a/disable", None),
+            ("post", "/admin/trees/tree-a/default", None),
+            ("put", "/admin/trees/tree-a/departments", {"departments": ["财务部"]}),
             ("post", "/admin/try", {"tree_id": "tree-a", "text": "hello"}),
             ("post", "/admin/test/chat/completions",
              {"model": "auto", "messages": []}),

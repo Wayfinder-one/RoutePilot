@@ -3,6 +3,8 @@
 - ``ValidationFailed`` → 422（Issue 数组）
 - ``MissingError`` → 404（detail 字符串）
 - ``AlreadyExists`` / ``ReferencedByError`` → 409（detail 字符串 / dict）
+- ``DefaultGraphRequired`` → 409（detail 为
+  ``{"code": "default_graph_required", "tree_id": ...}``）
 """
 
 
@@ -34,3 +36,15 @@ class ReferencedByError(Exception):
     def __init__(self, detail: dict):
         super().__init__(detail.get("message", "referenced"))
         self.detail = detail
+
+
+class DefaultGraphRequired(Exception):
+    """默认图之外仍有启用图时禁止直接停用默认图（服务抛出，API 映射 409）。
+
+    结构化载荷固定为 ``{"code": "default_graph_required", "tree_id": <id>}``：
+    客户端必须先调用 ``POST /admin/trees/{id}/default`` 切换默认图。
+    """
+
+    def __init__(self, tree_id: str):
+        super().__init__("default_graph_required")
+        self.tree_id = tree_id

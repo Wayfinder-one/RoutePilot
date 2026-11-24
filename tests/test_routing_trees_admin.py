@@ -1,4 +1,8 @@
-"""`/admin/trees` graph CRUD：保存载荷、校验分档、enable/copy/disable 语义（Task 7）。"""
+"""`/admin/trees` graph CRUD：保存载荷、校验分档、部门与多图生命周期语义。
+
+Task 7 的 CRUD/校验分档用例，加上 Task 5 的部门设置、独立启停、默认图事务与
+``_commit_enabled_changes()`` 回滚语义。
+"""
 from __future__ import annotations
 
 import copy
@@ -628,7 +632,8 @@ def test_update_absent_fields_inherit_existing_values(client):
         assert after[field] == before[field]
 
 
-def test_enable_switches_single_active_tree(client, app):
+def test_enable_keeps_existing_graphs_enabled_and_default(client, app):
+    """多图独立启停：启用 b 不再停用 a，a 仍是默认图。"""
     configure_jev(client)
     for tree_id in ("a", "b"):
         assert create_tree(client, tree_dict(tree_id, root=graph_with_model())).status_code == 201
@@ -637,12 +642,15 @@ def test_enable_switches_single_active_tree(client, app):
     assert app.state.snapshot_set.default_snapshot.tree_id == "a"
     response = client.post("/admin/trees/b/enable")
     assert response.status_code == 200, response.text
-    assert app.state.snapshot_set.default_snapshot.tree_id == "b"
-    assert [tree["id"] for tree in response.json()["trees"] if tree["enabled"]] == ["b"]
-    assert client.get("/admin/trees/a").json()["tree"]["enabled"] is False
+    assert app.state.snapshot_set.default_snapshot.tree_id == "a"
+    assert sorted(app.state.snapshot_set.snapshots) == ["a", "b"]
+    assert [tree["id"] for tree in response.json()["trees"] if tree["enabled"]] == ["a", "b"]
+    assert client.get("/admin/trees/a").json()["tree"]["enabled"] is True
+    assert client.get("/admin/trees/a").json()["tree"]["default"] is True
 
     assert client.post("/admin/trees/b/disable").status_code == 200
-    assert app.state.snapshot_set.snapshots == {}
+    assert sorted(app.state.snapshot_set.snapshots) == ["a"]
+    assert app.state.snapshot_set.default_tree_id == "a"
 
 
 def test_enable_publishes_candidate_snapshot_exactly_once(app, client, monkeypatch):
@@ -1011,39 +1019,64 @@ def _install_enabled_tree_without_default(app, tree_id):
                 base_document_sha256=current.document_sha256)
 
 
-def test_update_on_invalid_route_set_is_503_not_500(client, app):
-    """Finding 2 回归：``GraphService.update()`` 的候选装配必须映射为 503。"""
+def test_update_on_invalid_route_set_is_422_issue_not_500(client, app):
+    """手装 standalone JSON 造成「有启用图但没有默认图」时，启用图保存必须在
+    写盘前拒绝候选路由集：Task 5 起映射为 422 Issue（不再走 503 存储错误）。"""
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
     assert client.post("/admin/trees/main/enable").status_code == 200
     _install_enabled_tree_without_default(app, "main")
     current = client.get("/admin/trees/main").json()["tree"]
+    before = _canvas_state(app, ("main",))
 
     response = client.put("/admin/trees/main", json={
         "name": "改名", "base_document_sha256": current["document_sha256"]})
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"] == {
-        "code": "graph_storage_error",
-        "message": "invalid route set: no_default_tree",
-    }
+    assert response.status_code == 422, response.text
+    issue = response.json()["detail"][0]
+    assert issue["code"] == "no_default_tree"
+    assert issue["zh"] and issue["en"]
+    assert _canvas_state(app, ("main",)) == before
 
 
-def test_disable_on_invalid_remaining_route_set_is_503_not_500(client, app):
-    """Finding 2 回归：``GraphService.disable()`` 的剩余集合装配同样映射为 503。"""
+def test_disable_default_while_other_enabled_is_structured_409(client, app):
+    """默认图之外仍有启用图时禁止直接停用默认图（Task 5 规则）。
+
+    与「剩余集合不变量损坏」不同，这里在构造候选之前就以
+    ``default_graph_required`` 拒绝，文件与已发布快照都不变。
+    """
     for tree_id in ("a", "b"):
         assert create_tree(
             client, tree_dict(tree_id, root=graph_with_model())).status_code == 201
     assert client.post("/admin/trees/a/enable").status_code == 200
-    # 多启用图过渡态：b 被手装成启用非默认，停用默认图 a 后剩余集合缺默认图。
-    _install_enabled_tree_without_default(app, "b")
+    assert client.post("/admin/trees/b/enable").status_code == 200
+    before = _canvas_state(app, ("a", "b"))
+    revision = app.state.snapshot_set.snapshot_revision
 
     response = client.post("/admin/trees/a/disable")
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"] == {
-        "code": "graph_storage_error",
-        "message": "invalid route set: no_default_tree",
-    }
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {"code": "default_graph_required", "tree_id": "a"}}
+    assert _canvas_state(app, ("a", "b")) == before
+    assert app.state.snapshot_set.snapshot_revision == revision
+
+
+def test_disable_non_default_with_invalid_remaining_route_set_is_422(client, app):
+    """非默认图停用后若剩余集合缺默认图（手装损坏），拒绝为 422 Issue。"""
+    for tree_id in ("a", "b"):
+        assert create_tree(
+            client, tree_dict(tree_id, root=graph_with_model())).status_code == 201
+    # 手装：a、b 都启用且都非默认（集合不变量已损坏）。
+    _install_enabled_tree_without_default(app, "a")
+    _install_enabled_tree_without_default(app, "b")
+    before = _canvas_state(app, ("a", "b"))
+
+    response = client.post("/admin/trees/a/disable")
+
+    assert response.status_code == 422, response.text
+    issue = response.json()["detail"][0]
+    assert issue["code"] == "no_default_tree"
+    assert _canvas_state(app, ("a", "b")) == before
 
 
 def test_confirmed_catalog_write_on_invalid_route_set_is_503_not_500(client, app):
@@ -1064,3 +1097,345 @@ def test_confirmed_catalog_write_on_invalid_route_set_is_503_not_500(client, app
         "code": "graph_storage_error",
         "message": "invalid route set: no_default_tree",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Task 5：部门设置与多图生命周期（独立启停 / 默认图事务）
+# --------------------------------------------------------------------------- #
+def test_departments_multi_enable_default_and_disable_rules(client):
+    """多图同时启用、部门冲突、默认切换与默认图停用限制的完整场景。"""
+    create_portable_tree(client, "main")
+    create_portable_tree(client, "finance")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+
+    trees = {item["id"]: item for item in client.get("/admin/trees").json()["trees"]}
+    assert trees["main"]["default"] is True
+    assert trees["finance"]["enabled"] is True and trees["finance"]["default"] is False
+
+    response = client.put("/admin/trees/finance/departments", json={
+        "departments": ["财务部"],
+        "base_document_sha256": trees["finance"]["document_sha256"],
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["departments"] == ["财务部"]
+
+    response = client.put("/admin/trees/main/departments", json={
+        "departments": ["财务部"],
+        "base_document_sha256": trees["main"]["document_sha256"],
+    })
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["code"] == "department_conflict"
+
+    assert client.post("/admin/trees/main/disable").status_code == 409
+    assert client.post("/admin/trees/finance/default").status_code == 200
+    trees = {item["id"]: item for item in client.get("/admin/trees").json()["trees"]}
+    assert trees["main"]["enabled"] is True and trees["main"]["default"] is False
+    assert trees["finance"]["enabled"] is True and trees["finance"]["default"] is True
+
+    assert client.post("/admin/trees/main/disable").status_code == 200
+    assert client.post("/admin/trees/finance/disable").status_code == 200
+    assert client.get("/admin/trees").json()["graph_status"]["enabled_tree_ids"] == []
+
+
+def test_department_hash_conflict_keeps_file(client, app):
+    """过期 base_document_sha256 → 409 graph_conflict，文件字节保持原样。"""
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    before = _canvas_state(app, ("main",))
+
+    response = client.put("/admin/trees/main/departments", json={
+        "departments": ["财务部"], "base_document_sha256": "0" * 64})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "graph_conflict"
+    assert detail["actual_document_sha256"] == before["main"][1]
+    assert _canvas_state(app, ("main",)) == before
+
+
+def test_departments_update_returns_route_set_payload(client, app):
+    create_portable_tree(client, "main")
+    create_portable_tree(client, "finance")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+    finance = client.get("/admin/trees/finance").json()["tree"]
+
+    response = client.put("/admin/trees/finance/departments", json={
+        "departments": ["财务部", " 法务部 "],
+        "base_document_sha256": finance["document_sha256"],
+    })
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tree"]["departments"] == ["法务部", "财务部"]
+    assert body["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
+    assert body["graph_status"] == app.state.publisher.status()
+    assert body["warnings"] == []
+    assert app.state.snapshot_set.department_tree_ids == {"财务部": "finance", "法务部": "finance"}
+
+
+def test_department_conflict_on_ordinary_update_keeps_files(client, app):
+    """普通 PUT 同样可以改部门，但跨启用图冲突必须在写盘前拒绝。"""
+    create_portable_tree(client, "main")
+    create_portable_tree(client, "finance")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+    finance = client.get("/admin/trees/finance").json()["tree"]
+    assert client.put("/admin/trees/finance/departments", json={
+        "departments": ["财务部"],
+        "base_document_sha256": finance["document_sha256"],
+    }).status_code == 200
+    before = _canvas_state(app, ("main", "finance"))
+
+    response = client.put("/admin/trees/main", json={
+        "departments": ["财务部"],
+        "base_document_sha256": before["main"][1],
+    })
+
+    assert response.status_code == 422, response.text
+    issue = response.json()["detail"][0]
+    assert issue["code"] == "department_conflict"
+    assert issue["params"]["department"] == "财务部"
+    assert sorted(issue["params"]["tree_ids"]) == ["finance", "main"]
+    assert issue["zh"] and issue["en"]
+    assert _canvas_state(app, ("main", "finance")) == before
+
+
+def test_departments_draft_may_repeat_but_enable_rejects_conflict(client, app):
+    """草稿之间允许部门重复；启用时与已启用图冲突必须在写盘前拒绝。"""
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    main = client.get("/admin/trees/main").json()["tree"]
+    assert client.put("/admin/trees/main/departments", json={
+        "departments": ["财务部"],
+        "base_document_sha256": main["document_sha256"],
+    }).status_code == 200
+
+    raw = tree_dict("finance", root=graph_with_model("fast"), departments=["财务部"])
+    raw.update(runtime_dict())
+    assert create_tree(client, raw).status_code == 201
+    before = _canvas_state(app, ("finance",))
+
+    response = client.post("/admin/trees/finance/enable")
+
+    assert response.status_code == 422, response.text
+    issue = response.json()["detail"][0]
+    assert issue["code"] == "department_conflict"
+    assert issue["params"]["department"] == "财务部"
+    assert _canvas_state(app, ("finance",)) == before
+    finance = client.get("/admin/trees/finance").json()["tree"]
+    assert finance["enabled"] is False and finance["default"] is False
+
+
+def test_departments_payload_rejects_unknown_fields_and_invalid_values(client):
+    create_portable_tree(client, "main")
+    current = client.get("/admin/trees/main").json()["tree"]
+
+    extra = client.put("/admin/trees/main/departments", json={
+        "departments": [], "base_document_sha256": current["document_sha256"],
+        "bogus": 1,
+    })
+    assert extra.status_code == 422, extra.text
+    assert any(item["type"] == "extra_forbidden" for item in extra.json()["detail"])
+
+    invalid = client.put("/admin/trees/main/departments", json={
+        "departments": "财务部", "base_document_sha256": current["document_sha256"],
+    })
+    assert invalid.status_code == 422, invalid.text
+    assert invalid.json()["detail"][0]["code"] == "graph_parse_error"
+
+
+def test_first_enable_becomes_default_and_later_enables_keep_it(client, app):
+    for tree_id in ("first", "second", "third"):
+        create_portable_tree(client, tree_id)
+    for tree_id in ("first", "second", "third"):
+        assert client.post(f"/admin/trees/{tree_id}/enable").status_code == 200
+
+    trees = {item["id"]: item for item in client.get("/admin/trees").json()["trees"]}
+    assert trees["first"]["enabled"] is True and trees["first"]["default"] is True
+    assert trees["second"]["enabled"] is True and trees["second"]["default"] is False
+    assert trees["third"]["enabled"] is True and trees["third"]["default"] is False
+    assert app.state.snapshot_set.default_tree_id == "first"
+    assert sorted(app.state.snapshot_set.snapshots) == ["first", "second", "third"]
+    assert app.state.publisher.status()["enabled_tree_ids"] == ["first", "second", "third"]
+
+
+def test_enable_already_enabled_is_noop_without_write(client, app, monkeypatch):
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    before = _canvas_state(app, ("main",))
+    published = []
+    real_publish = app.state.publisher.publish
+
+    def counting_publish(prepared):
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(app.state.publisher, "publish", counting_publish)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("already-enabled tree must not be rewritten")
+
+    monkeypatch.setattr(app.state.graph_repo, "stage_updates", fail)
+    monkeypatch.setattr(app.state.graph_repo, "update", fail)
+
+    response = client.post("/admin/trees/main/enable")
+
+    assert response.status_code == 200, response.text
+    assert published == []
+    assert _canvas_state(app, ("main",)) == before
+
+
+def test_disable_already_disabled_is_noop_without_write(client, app, monkeypatch):
+    create_portable_tree(client, "main")
+    before = _canvas_state(app, ("main",))
+    published = []
+    real_publish = app.state.publisher.publish
+
+    def counting_publish(prepared):
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(app.state.publisher, "publish", counting_publish)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("already-disabled tree must not be rewritten")
+
+    monkeypatch.setattr(app.state.graph_repo, "stage_updates", fail)
+    monkeypatch.setattr(app.state.graph_repo, "update", fail)
+
+    response = client.post("/admin/trees/main/disable")
+
+    assert response.status_code == 200, response.text
+    assert published == []
+    assert _canvas_state(app, ("main",)) == before
+    assert client.get("/admin/trees/main").json()["tree"]["enabled"] is False
+
+
+def test_disable_default_while_other_enabled_is_409_and_keeps_files(client, app):
+    for tree_id in ("main", "finance"):
+        create_portable_tree(client, tree_id)
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+    before = _canvas_state(app, ("main", "finance"))
+    revision = app.state.snapshot_set.snapshot_revision
+
+    response = client.post("/admin/trees/main/disable")
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {"code": "default_graph_required", "tree_id": "main"}}
+    assert _canvas_state(app, ("main", "finance")) == before
+    assert app.state.snapshot_set.snapshot_revision == revision
+
+
+def test_set_default_switches_default_and_enables_target(client, app):
+    for tree_id in ("main", "finance"):
+        create_portable_tree(client, tree_id)
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+    create_portable_tree(client, "draft")
+
+    response = client.post("/admin/trees/draft/default")
+
+    assert response.status_code == 200, response.text
+    trees = {item["id"]: item for item in response.json()["trees"]}
+    assert trees["draft"]["enabled"] is True and trees["draft"]["default"] is True
+    assert trees["main"]["enabled"] is True and trees["main"]["default"] is False
+    assert trees["finance"]["enabled"] is True and trees["finance"]["default"] is False
+    assert app.state.snapshot_set.default_tree_id == "draft"
+    assert sorted(app.state.snapshot_set.snapshots) == ["draft", "finance", "main"]
+    assert response.json()["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
+
+
+def test_set_default_already_default_is_noop_without_write(client, app, monkeypatch):
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    before = _canvas_state(app, ("main",))
+    published = []
+    real_publish = app.state.publisher.publish
+
+    def counting_publish(prepared):
+        published.append(prepared)
+        return real_publish(prepared)
+
+    monkeypatch.setattr(app.state.publisher, "publish", counting_publish)
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("already-default tree must not be rewritten")
+
+    monkeypatch.setattr(app.state.graph_repo, "stage_updates", fail)
+    monkeypatch.setattr(app.state.graph_repo, "update", fail)
+
+    response = client.post("/admin/trees/main/default")
+
+    assert response.status_code == 200, response.text
+    assert published == []
+    assert _canvas_state(app, ("main",)) == before
+
+
+def test_lifecycle_unknown_tree_is_404(client):
+    assert client.post("/admin/trees/missing/enable").status_code == 404
+    assert client.post("/admin/trees/missing/disable").status_code == 404
+    assert client.post("/admin/trees/missing/default").status_code == 404
+    response = client.put("/admin/trees/missing/departments",
+                          json={"departments": []})
+    assert response.status_code == 404, response.text
+
+
+def test_enable_invalid_graph_is_422_and_keeps_file(client, app):
+    raw = tree_dict("broken", root=graph_with_model("ghost"))
+    raw.update(runtime_dict())
+    app.state.graph_repo.create(tree_from_dict(raw))
+    before = _canvas_state(app, ("broken",))
+
+    response = client.post("/admin/trees/broken/enable")
+
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "unknown_model" for issue in response.json()["detail"])
+    assert _canvas_state(app, ("broken",)) == before
+    assert client.get("/admin/trees/broken").json()["tree"]["enabled"] is False
+
+
+def test_last_disable_publishes_empty_route_set_and_public_v1_is_503(client, app):
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.get("/readyz").status_code == 200
+
+    assert client.post("/admin/trees/main/disable").status_code == 200
+
+    ready = client.get("/readyz")
+    assert ready.status_code == 200, ready.text
+    assert ready.json()["ready"] is True
+    assert ready.json()["enabled_tree_ids"] == []
+    assert ready.json()["default_tree_id"] is None
+    assert app.state.snapshot_set.snapshots == {}
+    response = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "你好"}]})
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["message"] == "no_active_tree"
+
+
+def test_update_enabled_graph_republishes_whole_enabled_set(client, app):
+    """启用图普通保存要重算整个启用集合；纯草稿保存不发布。"""
+    for tree_id in ("main", "finance"):
+        create_portable_tree(client, tree_id)
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+    revision = app.state.snapshot_set.snapshot_revision
+
+    assert save_tree(
+        client, {"departments": ["财务部"]}, tree_id="finance").status_code == 200
+    assert app.state.snapshot_set.snapshot_revision != revision
+    assert app.state.snapshot_set.department_tree_ids == {"财务部": "finance"}
+
+    create_portable_tree(client, "draft")
+    draft_revision = app.state.snapshot_set.snapshot_revision
+    draft_row = client.get("/admin/trees/draft").json()["tree"]
+    assert client.put("/admin/trees/draft", json={
+        "name": "纯草稿改名",
+        "base_document_sha256": draft_row["document_sha256"],
+    }).status_code == 200
+    assert app.state.snapshot_set.snapshot_revision == draft_revision
+    assert app.state.snapshot_set.default_tree_id == "main"

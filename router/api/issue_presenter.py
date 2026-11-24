@@ -233,6 +233,21 @@ def present_issue(issue: Issue) -> dict[str, str]:
             f"画布与数据库目录不一致：{kind} {resource_id} 的 {field}（仅提示，不阻断执行）",
             f"Canvas and database catalog differ: {kind} {resource_id} field {field} (hint only, execution unaffected)",
         )
+    if code == "department_conflict":
+        # 跨启用图的部门唯一性冲突：部门名与涉事图 id 都是控制台定位所需。
+        department = _param(issue, "department")
+        tree_ids = list(_param(issue, "tree_ids") or ())
+        joined_zh = "、".join(str(item) for item in tree_ids)
+        joined_en = ", ".join(str(item) for item in tree_ids)
+        return _text(
+            f"部门冲突：{department} 已归属于其他启用图（{joined_zh}）",
+            f"Department conflict: {department} already belongs to another enabled graph ({joined_en})",
+        )
+    if code == "no_default_tree":
+        return _text(
+            "启用集合缺少默认图：有启用图时必须恰好一张默认图",
+            "No default tree: exactly one default graph is required while graphs are enabled",
+        )
     # Defensive: an unmapped code must still render deterministically.
     return _text(code, code)
 

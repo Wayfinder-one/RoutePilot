@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from router.config import Settings
 from router.control.errors import (
     AlreadyExists,
+    DefaultGraphRequired,
     MissingError,
     ReferencedByError,
     ValidationFailed,
@@ -256,6 +257,15 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     @app.exception_handler(ReferencedByError)
     async def referenced_by_error_handler(request: Request, exc: ReferencedByError):
         return JSONResponse(status_code=409, content={"detail": exc.detail})
+
+    @app.exception_handler(DefaultGraphRequired)
+    async def default_graph_required_handler(
+            request: Request, exc: DefaultGraphRequired):
+        """默认图之外仍有启用图时禁止直接停用默认图（结构化 409）。"""
+        return JSONResponse(status_code=409, content={"detail": {
+            "code": "default_graph_required",
+            "tree_id": exc.tree_id,
+        }})
 
     _install_admin_auth(app, settings)
 

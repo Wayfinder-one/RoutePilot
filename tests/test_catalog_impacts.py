@@ -1419,14 +1419,18 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
 # --------------------------------------------------------------------------- #
 # 16. 发布门必须在写锁内决定 + 纯数据库写不读活动指针
 # --------------------------------------------------------------------------- #
-def _emulate_concurrent_enable(app, tree_id):
-    """模拟另一副本的 enable 落盘：只写文件生命周期，不发布内存快照。"""
+def _emulate_concurrent_default_switch(app, tree_id):
+    """模拟另一副本的默认图切换落盘：只写文件生命周期，不发布内存快照。
+
+    Task 5 起多图独立启停：默认切换写目标图 ``enabled=True, default=True``，
+    旧默认图保持启用但改为非默认（再启用一张图不会停用其它图）。
+    """
     repo = app.state.graph_repo
     target = repo.get(tree_id)
     updates = [
-        (dataclass_replace(other, enabled=False, default=False),
+        (dataclass_replace(other, enabled=True, default=False),
          other.document_sha256)
-        for other in repo.enabled() if other.id != tree_id
+        for other in repo.enabled() if other.id != tree_id and other.default
     ]
     updates.append(
         (dataclass_replace(target, enabled=True, default=True),
@@ -1436,14 +1440,14 @@ def _emulate_concurrent_enable(app, tree_id):
     batch.discard()
 
 
-def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
+def test_default_switch_racing_lock_acquisition_invalidates_stale_confirmation(
         two_canvases, monkeypatch):
-    """v4：enable 会改写目标文件里的 enabled/default，确认哈希随之失效。
+    """v4：生命周期写会改写目标文件里的 enabled/default，确认哈希随之失效。
 
-    v3 时代 enable 只写 ``current`` 指针，画布字节不变；v4 文档自带生命周期字段，
-    因此「预览后、加锁前被 enable」必须 409 ``graph_conflict``（实际哈希是 enable 后
-    的新哈希），客户端只能重新预览确认。重新确认后发布门仍必须在锁内重读默认图：
-    刚被启用的 other 必须被发布，而不是停留在旧的 main。
+    v3 时代切换默认图只写 ``current`` 指针，画布字节不变；v4 文档自带生命周期
+    字段，因此「预览后、加锁前默认图被切换」必须 409 ``graph_conflict``（实际哈希
+    是写后的新哈希），客户端只能重新预览确认。重新确认后发布门仍必须在锁内重读
+    默认图：刚成为默认图的 other 必须被发布，而不是停留在旧的 main。
     """
     app, client = two_canvases
     publisher = app.state.publisher
@@ -1455,7 +1459,7 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
         # 候选已在路由层构造完（只含 other）；这里在拿到写锁之前完成 enable。
         if not enabled["done"]:
             enabled["done"] = True
-            _emulate_concurrent_enable(app, "other")
+            _emulate_concurrent_default_switch(app, "other")
         with real_locked():
             yield publisher
 
@@ -1495,9 +1499,11 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
     assert app.state.snapshot_set.default_snapshot.backends["backup"].upstream_name == "raced-upstream"
     status = app.state.publisher.status()
     assert status["default_tree_id"] == "other"
-    assert status["enabled_tree_ids"] == ["other"]
+    assert status["enabled_tree_ids"] == ["main", "other"]
     assert status["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
     assert _tree(app, "other").enabled is True
+    assert _tree(app, "main").enabled is True
+    assert _tree(app, "main").default is False
 
 
 def test_db_only_write_does_not_read_legacy_current_pointer(two_canvases):

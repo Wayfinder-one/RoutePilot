@@ -1,8 +1,9 @@
-"""决策组管理面：graph CRUD/enable/copy/disable 与完整 envelope 草稿试算。
+"""决策组管理面：graph CRUD、启停/默认图、部门设置与完整 envelope 草稿试算。
 
 写用例全部在 `router.control.graphs.GraphService`：API 只做 DTO 解析
-与异常映射（ValidationFailed/GraphConflictError/MissingError 由 app 级处理器
-映射）。所有校验失败统一返回 `Issue` 数组（spec §5）。
+与异常映射（ValidationFailed/GraphConflictError/MissingError/
+DefaultGraphRequired 由 app 级处理器映射）。所有校验失败统一返回 `Issue` 数组
+（spec §5）；默认图停用限制返回结构化 409。
 `POST /admin/try` 按 spec §4.3 的 root 优先 envelope 做 dry-run：不落库、不发布
 snapshot、不写粘性、不计 inflight。
 """
@@ -110,6 +111,21 @@ class TreeCopyIn(BaseModel):
 
     id: Any = None
     name: Any = None
+
+
+class DepartmentUpdateIn(BaseModel):
+    """PUT /admin/trees/{tree_id}/departments 的 DTO：未知字段一律拒绝。
+
+    departments 的类型/长度/重复校验与普通保存共用 ``tree_from_dict``
+    （非法值 → 422 ``graph_parse_error``）；``base_document_sha256`` 与普通保存
+    同语义（过期/非法 → 409 ``graph_conflict``）。显式省略 departments 清空该图
+    的部门列表。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    departments: Any = None
+    base_document_sha256: Any = None
 
 
 class TryIn(BaseModel):
@@ -237,6 +253,38 @@ def disable_tree(
     trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     _service(request, conn, trees).disable(tree_id)
+    return _trees_payload(request, trees)
+
+
+@router.put("/trees/{tree_id}/departments")
+def update_departments(
+    tree_id: str, body: DepartmentUpdateIn, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
+    """部门设置：与普通保存共用校验/写入/发布/审计路径。
+
+    返回更新后的 tree、路由集 snapshot_revision、发布器 graph_status 与
+    warnings（部门设置不产生警告，保留字段与普通保存一致）。
+    """
+    updated = _service(request, conn, trees).set_departments(
+        tree_id, body.departments, base_document_sha256=body.base_document_sha256)
+    return {
+        "tree": tree_to_dict(updated),
+        "snapshot_revision": _published_revision(request),
+        "graph_status": request.app.state.publisher.status(),
+        "warnings": [],
+    }
+
+
+@router.post("/trees/{tree_id}/default")
+def set_default(
+    tree_id: str, request: Request,
+    conn: sqlite3.Connection = Depends(get_conn),
+    trees: RoutingTreeRepo = Depends(get_tree_repo),
+):
+    """默认图事务：目标设默认并启用，旧默认图保持启用但改为非默认。"""
+    _service(request, conn, trees).set_default(tree_id)
     return _trees_payload(request, trees)
 
 
