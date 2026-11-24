@@ -697,6 +697,57 @@ def test_tree_writes_reject_nested_profile_secrets(client, app, key):
     assert not (Path(app.state.settings.graph_dir) / "graphs" / "nested.json").exists()
 
 
+def test_update_jev_service_change_requires_matching_window(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+    new_jev = copy.deepcopy(before["jev"])
+    new_jev["id"] = "other-service"
+
+    response = save_tree(client, {"jev": new_jev})
+
+    assert response.status_code == 422, response.text
+    issue = response.json()["detail"][0]
+    assert issue["code"] == "graph_parse_error"
+    assert "jev_window is required when changing JEV service id" in issue["zh"]
+    assert client.get("/admin/trees/main").json()["tree"] == before
+
+
+def test_update_jev_service_change_accepts_service_and_matching_window(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+    new_jev = copy.deepcopy(before["jev"])
+    new_jev["id"] = "other-service"
+    new_window = {"input_tokens": 2048, "context_tokens": 8192}
+
+    response = save_tree(client, {"jev": new_jev, "jev_window": new_window})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["jev"]["id"] == "other-service"
+    assert response.json()["tree"]["jev_window"] == new_window
+
+
+def test_update_same_jev_without_window_keeps_stored_window(client):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    before = client.get("/admin/trees/main").json()["tree"]
+    changed = copy.deepcopy(before["jev"])
+    changed["instructions"] = "只修改同一服务的提示词"
+
+    response = save_tree(client, {"jev": changed})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["jev"]["instructions"] == "只修改同一服务的提示词"
+    assert response.json()["tree"]["jev_window"] == before["jev_window"]
+
+
+def test_clear_jev_without_questions_does_not_require_window(client):
+    assert create_tree(client, tree_dict(root=_direct_graph("fast"))).status_code == 201
+
+    response = save_tree(client, {"jev": None})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["tree"]["jev"] is None
+
+
 # --------------------------------------------------------------------------- #
 # 运行字段按补丁合并：缺失继承已存画布，显式值覆盖
 # --------------------------------------------------------------------------- #

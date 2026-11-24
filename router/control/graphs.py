@@ -69,11 +69,10 @@ class GraphPatch:
     四个扁平运行字段同样是补丁字段：缺失继承已存画布的运行配置，显式值覆盖。
     不存在任何运行配置控制字段或「按数据库物化」中间契约。
 
-    注意（仅限原始 API 的扁平 PATCH）：``jev`` 与 ``jev_window`` 是两个独立补丁
-    字段，只显式给 ``jev`` 时会与继承的 ``jev_window`` 组成「新服务 + 旧窗口」
-    的混合输入；这是既有扁平字段的合并语义。console/inspector 与目录确认同步
-    （``router.control.impacts.sync_jev`` / ``delete_jev``）始终把服务快照和窗口
-    成对替换（spec「JEV 服务与窗口同源」），不会产生混合体。
+    原始 API 的扁平 PATCH 中，若 ``jev`` 改为不同的非空服务 ID，必须在同一请求
+    显式携带对应的 ``jev_window``；服务端拒绝继承旧服务窗口。相同服务 ID 的
+    非窗口字段更新可以继承窗口，``jev: null`` 由图校验决定。console/inspector
+    与目录确认同步始终把服务快照和窗口成对替换。
     """
 
     name: str | None | _Unset = UNSET
@@ -208,6 +207,14 @@ class GraphService:
         for field in RUNTIME_FIELDS:
             payload[field] = stored_runtime[field] if getattr(patch, field) is UNSET \
                 else getattr(patch, field)
+        if patch.jev_window is UNSET and isinstance(patch.jev, dict):
+            new_service_id = patch.jev.get("id")
+            current_service_id = (
+                current.runtime.jev.id if current.runtime.jev is not None else None)
+            if isinstance(new_service_id, str) and new_service_id \
+                    and new_service_id != current_service_id:
+                raise ValidationFailed(graph_parse_failed(ValueError(
+                    "jev_window is required when changing JEV service id")))
         try:
             return tree_from_dict(payload)
         except ValueError as exc:
