@@ -86,7 +86,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 ### Common paths
 
-- The decision-group toolbar shows only **Check routing**, the primary action and **More**. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. **More** holds undo/redo, auto-layout, New, Import, Export, Save draft and Disable. The inspector's **Apply** only updates the local draft and never writes to the server.
+- The decision-group toolbar shows every editing action directly: undo/redo, auto-layout, **Save draft**, New, Import, Export and (for an enabled group) **Disable**, next to **Check routing**, the primary action and the issue counter. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. The inspector's **Apply** only updates the local draft and never writes to the server.
 - Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime config from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
 - The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The environment can create a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`, but only once: it is seeded on a start where the catalog is empty, no environment seed has ever run, and the URL and model are both set. A first boot without them followed by a boot with them still seeds once; deleting every service and restarting never re-creates it.
@@ -109,11 +109,11 @@ The routing page is split into two zones.
 
 **Editor zone** — canvas, node library, inspector, validation:
 
-- Drag nodes from the library and pan/zoom; auto-layout and undo/redo live under **More**.
+- Drag nodes from the library and pan/zoom; auto-layout and undo/redo sit directly in the toolbar.
 - Typed wires; a numeric output dropped into a boolean slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
-- Dragging an output onto empty canvas quick-creates a compatible node.
-- Saving and publishing are merged into the toolbar primary; **Save draft** under **More** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
+- Dropping an output onto empty canvas opens a picker of compatible node types; choosing one creates the node there and connects it automatically (Esc cancels).
+- Saving and publishing are merged into the toolbar primary; the toolbar's **Save draft** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
 - The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: the primary publishes (saves and enables), **Save draft** saves without enabling, and **Disable** flips the enabled state.
 - Target cards show display name, model list, fallback role and scheduling strategy.
 
