@@ -606,6 +606,7 @@ def test_graph_snapshot_id_hashes_identity_behavior_and_layout_only(tmp_path):
     variant = replace(
         base,
         enabled=True,
+        default=True,
         tree_revision="a" * 64,
         updated_at="2026-11-21T00:00:00+08:00",
         document_sha256="b" * 64,
@@ -617,7 +618,8 @@ def test_graph_snapshot_id_hashes_identity_behavior_and_layout_only(tmp_path):
         return item["graph_snapshot_id"]
 
     canonical = snapshot_id(1, base)
-    # Enabled/revision/updated_at/document hash are display metadata, not identity.
+    # Enabled/default/revision/updated_at/document hash are display metadata,
+    # not identity: lifecycle must not split graph dedup.
     assert snapshot_id(2, variant) == canonical
 
     canvas = {node_id: dict(coords) for node_id, coords in GRAPH_CANVAS.items()}

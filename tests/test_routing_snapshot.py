@@ -159,6 +159,22 @@ def test_snapshot_set_distinguishes_empty_and_missing_default(conn):
     assert missing.value.code == 'no_default_tree'
 
 
+def test_snapshot_set_rejects_disabled_tree(conn):
+    """路由集只装启用图：手工传入停用图快照必须被拒绝，绝不静默发布。
+
+    ``assemble_snapshot_set()`` 的契约是「全部启用图」，此前只是隐含依赖调用
+    方过滤；缺默认图/部门冲突有路由集不变量兜底，但一张停用图能混进集合让
+    ``select()`` 选出它。
+    """
+    enabled = build_snapshot_for_tree(conn, portable_tree())
+    disabled = build_snapshot_for_tree(
+        conn, portable_tree(tree_id='draft', enabled=False, default=False))
+
+    with pytest.raises(ValueError) as rejected:
+        assemble_snapshot_set([enabled, disabled], fingerprint='fp')
+    assert 'enabled' in str(rejected.value)
+
+
 def test_snapshot_set_content_is_version_only_and_revision_hashes_it(conn):
     main = build_snapshot_for_tree(conn, portable_tree())
     finance_raw = tree_dict('finance', enabled=True, departments=['财务部'])

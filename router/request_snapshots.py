@@ -6,7 +6,7 @@
 
 * 图快照按内容寻址：``graph`` 列存 ``canonical_graph_document()`` 产出的
   canonical JSON（键排序、无空格），``snapshot_id`` 是它的 SHA-256；同一张图的
-  多条请求只落一行图。canonical 文档只删除 ``enabled``/``tree_revision``/
+  多条请求只落一行图。canonical 文档只删除 ``enabled``/``default``/``tree_revision``/
   ``updated_at``/``document_sha256`` 这些派生或易变 envelope 元数据——它们不属于
   「图身份 + 行为 + 布局」，留在文档里会让同一张图每次保存都产生新快照、把图去重
   打散。存储、ID 与内存展示共用同一份文档；逐请求 revision 仍由该请求的账本字段
@@ -35,10 +35,14 @@ REQUEST_FIELDS = (
 )
 
 
-#: Envelope metadata that changes on save/publish without changing the graph.
-#: They are display-only: storage, content addressing and the read outlet all
-#: drop them so one graph keeps one snapshot row and one payload.
-_VOLATILE_FIELDS = frozenset({"enabled", "tree_revision", "updated_at", "document_sha256"})
+#: Envelope metadata that changes on save/lifecycle/publish without changing the
+#: graph.  ``default`` is lifecycle state like ``enabled``: switching the default
+#: graph must not split graph dedup.  They are display-only: storage, content
+#: addressing and the read outlet all drop them so one graph keeps one snapshot
+#: row and one payload, while behaviour fields (``departments``, ``root``, run
+#: fields) are always kept.
+_VOLATILE_FIELDS = frozenset(
+    {"enabled", "default", "tree_revision", "updated_at", "document_sha256"})
 
 
 def canonical_graph_document(document: dict) -> dict:

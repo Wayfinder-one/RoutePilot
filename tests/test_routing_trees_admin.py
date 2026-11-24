@@ -1439,3 +1439,62 @@ def test_update_enabled_graph_republishes_whole_enabled_set(client, app):
     }).status_code == 200
     assert app.state.snapshot_set.snapshot_revision == draft_revision
     assert app.state.snapshot_set.default_tree_id == "main"
+
+
+# --------------------------------------------------------------------------- #
+# 终审修复：审计行记录提交后的真实 tree_revision
+# --------------------------------------------------------------------------- #
+def test_update_audit_records_committed_tree_revision(client):
+    """启用图保存 / 部门设置 / 草稿保存的审计行带真实 tree_revision。
+
+    回归：启用分支曾把 ``_envelope()`` 预写对象的 ``tree_revision``（恒为 ""）
+    写进审计，``GET /admin/changes`` 里启用保存的 revision 是空串；草稿分支
+    （以及 /departments 复用的同一条路径）记录的是重读后的真实 revision。
+    """
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+
+    current = client.get("/admin/trees/main").json()["tree"]
+    saved = client.put("/admin/trees/main", json={
+        "name": "重命名后的图",
+        "base_document_sha256": current["document_sha256"],
+    })
+    assert saved.status_code == 200, saved.text
+    saved_tree = saved.json()["tree"]
+    assert saved_tree["tree_revision"]
+    row = client.get("/admin/changes").json()["changes"][0]
+    assert row["kind"] == "tree"
+    assert row["detail"] == {
+        "action": "update", "id": "main",
+        "tree_revision": saved_tree["tree_revision"],
+    }
+
+    current = client.get("/admin/trees/main").json()["tree"]
+    departments = client.put("/admin/trees/main/departments", json={
+        "departments": ["财务部"],
+        "base_document_sha256": current["document_sha256"],
+    })
+    assert departments.status_code == 200, departments.text
+    departments_tree = departments.json()["tree"]
+    assert departments_tree["tree_revision"]
+    row = client.get("/admin/changes").json()["changes"][0]
+    assert row["detail"] == {
+        "action": "update", "id": "main",
+        "tree_revision": departments_tree["tree_revision"],
+    }
+
+    # 停用草稿分支本来就记录重读后的 revision；一并锁住。
+    create_portable_tree(client, "draft")
+    draft = client.get("/admin/trees/draft").json()["tree"]
+    saved = client.put("/admin/trees/draft", json={
+        "name": "草稿改名",
+        "base_document_sha256": draft["document_sha256"],
+    })
+    assert saved.status_code == 200, saved.text
+    saved_draft = saved.json()["tree"]
+    assert saved_draft["tree_revision"]
+    row = client.get("/admin/changes").json()["changes"][0]
+    assert row["detail"] == {
+        "action": "update", "id": "draft",
+        "tree_revision": saved_draft["tree_revision"],
+    }

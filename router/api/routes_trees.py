@@ -325,8 +325,8 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
         "id": stored.id if stored else "draft",
         "name": stored.name if stored else "",
         "enabled": False, "default": False,
-        "departments": (body.departments if "departments" in fields
-                        else (list(stored.departments) if stored else [])),
+        # TryIn 没有 departments 字段且 extra="forbid"：草稿部门只继承已存图。
+        "departments": list(stored.departments) if stored else [],
         "root": root if root is not None else graph_to_dict(stored.root),
         "canvas": canvas,
         "timezone": body.timezone if "timezone" in fields else timezone_default,

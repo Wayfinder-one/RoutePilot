@@ -134,7 +134,8 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
     repo.initialize()
     canvas = {"start": {"x": 12, "y": 34}, "direct": {"x": 260, "y": 34}}
     repo.create(tree_from_dict(tree_dict(
-        root=_snapshot_tree_root(), canvas=canvas, enabled=True, default=True)))
+        root=_snapshot_tree_root(), canvas=canvas, enabled=True, default=True,
+        departments=["财务部"])))
     app = create_app(settings)
     snapshot = app.state.snapshot_set.default_snapshot
     trace = [
@@ -179,9 +180,10 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
         # 同一张图的第二份请求：行为/布局相同，只有 envelope 元数据不同。
         # 内容寻址必须共享同一份 canonical 图与 ID，但 revision 各归各请求。
         first_live = client.get("/admin/requests/snapshot-request/snapshot").json()
+        # 生命周期 default 是易变 envelope 元数据：改成非默认也不得拆分图去重。
         changed_tree = replace(
             snapshot.tree,
-            enabled=True,
+            default=False,
             tree_revision="second-tree-revision",
             updated_at="2026-11-21T01:00:00+08:00",
             document_sha256="second-document-hash",
@@ -204,8 +206,10 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
         assert second_live["graph_snapshot_id"] == first_live["graph_snapshot_id"]
         assert second_live["tree"] == first_live["tree"]
         assert not {
-            "enabled", "tree_revision", "updated_at", "document_sha256"
+            "enabled", "default", "tree_revision", "updated_at", "document_sha256"
         } & set(second_live["tree"])
+        # 部门是行为字段：必须保留在 canonical 图里，不参与元数据过滤。
+        assert first_live["tree"]["departments"] == ["财务部"]
         assert second_live["request"]["tree_revision"] == "second-tree-revision"
         assert second_live["request"]["snapshot_revision"] == "second-snapshot-revision"
 
@@ -423,7 +427,7 @@ def test_request_snapshot_normalizes_legacy_v5_display_metadata(tmp_path):
     """Rows written before canonical storage keep their ID but hide note metadata."""
     app = create_app(test_settings(tmp_path))
     document = dict(
-        tree_dict(),
+        tree_dict(departments=["财务部"]),
         enabled=True,
         tree_revision="legacy-tree-revision",
         updated_at="2026-11-20T00:00:00+08:00",
@@ -455,5 +459,6 @@ def test_request_snapshot_normalizes_legacy_v5_display_metadata(tmp_path):
         assert body["graph_snapshot_id"] == "legacy-v5"
         assert body["tree"]["canvas"] == document["canvas"]
         assert not {
-            "enabled", "tree_revision", "updated_at", "document_sha256"
+            "enabled", "default", "tree_revision", "updated_at", "document_sha256"
         } & set(body["tree"])
+        assert body["tree"]["departments"] == ["财务部"]

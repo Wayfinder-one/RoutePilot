@@ -98,7 +98,7 @@ flowchart LR
 
 首页（`/console/index.html`）是仅管理员可用的模型测试对话，请求固定走 Auto 并发送到 `/admin/test/chat/completions`；消息元信息根据响应头 `x-sr-model` 显示本次实际命中的模型（`Auto → <模型>`）。
 
-- **Auto 智能路由**：与 `/v1/chat/completions` 一样评估已发布路由集：默认图，或由可选**部门**输入（`x-sr-department`，百分号编码）选中的启用图；决策图、JEV 波次、粘性与随机后端选择全部生效。页面不提供固定模型旁路，测试流量始终经过真实路由；固定模型直连仍只通过 `POST /admin/test/chat/completions` 提供（`x-sr-selection: direct`，经数据库目录解析，没有图响应头）。回复元信息使用 `x-sr-model`，Auto 回复还会给出实际选中的 `x-sr-tree-id` / `x-sr-graph-selection`。
+- **Auto 智能路由**：与 `/v1/chat/completions` 一样评估已发布路由集：默认图，或由可选**部门**输入（`x-sr-department`，百分号编码）选中的启用图；决策图、JEV 波次、粘性与随机后端选择全部生效。页面不提供固定模型旁路，测试流量始终经过真实路由；固定模型直连仍只通过 `POST /admin/test/chat/completions` 提供（`x-sr-selection: direct`，经数据库目录解析，没有图响应头）。页面用 `x-sr-model` 响应头显示回复元信息（`Auto → <模型>`）；Auto 回复的响应头还带实际选中的 `x-sr-tree-id` / `x-sr-graph-selection`，但页面不渲染这两个头。
 - **流式回复**：回答通过 SSE 逐块返回；停止会中止流并保留已生成内容，复制 / 重试 / 重新生成作用于该条消息。只有上游正常收尾才算完成——提前断流会标记为未完成，提供方错误就地显示在对话里，不会冒充完整回答。
 - **多轮历史**：内存中的对话以 wire-format `messages` 重发，并从原始 assistant 消息无损回放（消息级媒体只渲染、绝不回流进历史）；新建对话会中止在途回复、清空对话并轮换会话 id。
 - **附件**：文本文件按原文读取并作为 content part 发送；图片、音频等其他文件在浏览器内读成 data URL。预估体积会超出 10 MiB 请求上限的文件在读取前就地拒绝，发送前还会对完整 JSON 请求体（含历史与 Base64）做精确复检。
@@ -197,7 +197,7 @@ SQLite 只保存账本字段，不含请求文本、轨迹、逐轮答案与节�
 
 ### 图文档
 
-v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`default`）、部门映射（`departments`）、图结构加四个必填运行字段。生命周期持久化在每份文档里——不再有 `ROUTER_GRAPH_DIR/current` 指针。新建、复制与导入的文档一律以 `enabled: false, default: false` 保存；通过生命周期 API 启用的第一张图会自动成为默认图。
+v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`default`）、部门映射（`departments`）、图结构加四个必填运行字段。生命周期持久化在每份文档里——不再有 `ROUTER_GRAPH_DIR/current` 指针。新建与复制的文档一律以 `enabled: false, default: false` 保存；导入只替换草稿内容、不改生命周期——作为新组保存时是关闭态，保存到已有组则继承该组已存的生命周期（已启用的组保持启用）。通过生命周期 API 启用的第一张图会自动成为默认图。
 
 ```json
 {
@@ -258,7 +258,7 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
 - **唯一默认图**：有启用图时恰好一张默认图。通过 API 启用的第一张图自动成为默认图；之后再启用别的图不改变默认图。`POST /admin/trees/{id}/default` 原子切换默认图（旧默认图保持启用但不再是默认）。默认图之外仍有启用图时停用默认图返回 `409 {"detail":{"code":"default_graph_required","tree_id":"…"}}`；停用最后一张启用图后路由集为空——`/readyz` 仍就绪，`/v1` 返回 `503 no_active_tree`。
 - **部门**：`departments` 是规范化、排序后的字符串数组（去空白、1–64 码点、无控制字符、文档内唯一）。一个部门只能归属**一张启用图**；禁用草稿之间允许重复，只有真正同时启用时才会以 `422 department_conflict`（带 `department` 与 `tree_ids`）拒绝。部门匹配是精确、大小写敏感的；请求的部门没有命中任何启用图时使用默认图。
 - **公开数据面只用默认图**：`POST /v1/chat/completions` 永远使用默认图，出现 `x-sr-department` 头一律 `400 department_header_not_allowed`。部门选图是管理端验证能力：测试对话发送可信的百分号编码 `x-sr-department` 头，检查路由有**实际路由集**范围并可选部门。Auto 路由用 `x-sr-tree-id` 与 `x-sr-graph-selection`（`department` / `default`）报告选中的图；固定模型直连保持 `x-sr-selection: direct` 且没有图响应头。
-- **生命周期是服务端状态**：新建、复制与导入的文档一律保存为 `enabled: false, default: false`。只有专用端点能改生命周期；普通保存可以改 `departments`，但永远写不了 `enabled`/`default`。
+- **生命周期是服务端状态**：新建与复制的文档一律保存为 `enabled: false, default: false`。导入只替换草稿：作为新组保存是关闭态，保存到已有组则继承该组已存的生命周期。只有专用端点能改生命周期；普通保存可以改 `departments`，但永远写不了 `enabled`/`default`。
 - **路由集 revision**：`snapshot_revision` 是 canonical `{default_tree_id, department_tree_ids, 每图 snapshot_revision}` 的 SHA-256；`route_fingerprint` 覆盖启用图 id、默认标记与文档哈希，所以只改草稿永远不会触发重载。两者与 `default_tree_id`、`enabled_tree_ids` 一起暴露在 `graph_status`（`/readyz` 对象与每个决策组列表响应）。
 
 ## 模型与推理
@@ -440,7 +440,7 @@ sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;
 - **JEV 与窗口是一个整体。** `jev.id` 选择目录服务，`key_env` 说明其密钥如何解析；`jev_window` 属于该服务。选择或同步 JEV 服务时，`jev` 与 `jev_window` 一起替换。原始 `PUT /admin/trees/{id}` 补丁若改变 `jev.id`，必须同时携带新服务的 `jev_window`；否则返回 422，不继承旧服务窗口。
 - **不含密钥，且任意层级都拒绝。** 提供方只写 `key_env`（环境变量名），不写 Key；`jev` 不含 `api_key`。密钥与派生的密钥字段（`api_key`、`authorization`、`key_present`、`key_source`）出现在四个字段内部任意位置——包括 `backends.models[*].profile` 下的嵌套对象和数组——都会被拒绝。键名比较忽略大小写与 `-`/`_`（`API-KEY` 等同 `api_key`），但只覆盖这个固定集合，`monkey`、`keychain` 之类正常元数据照旧保留。除此之外 `profile` 仍是自由 JSON 元数据对象：`capability`、`domains`、`tier` 以及后续元数据原样保存。无需鉴权的本地服务可以把 `key_env` 留空。
 - **在文件边界校验。** 提供方与模型 id、提供方引用、profile、推理档位声明、JEV 服务档案、窗口与时段都在解析时校验。
-- **生命周期必填但普通保存不可写。** `enabled`/`default` 是必填文档字段，但新建/复制/导入一律保存为关闭且非默认；启停与设为默认都走专用生命周期端点，普通保存可以改 `departments`，但永远不能改生命周期。`default: true` 必须同时 `enabled: true`。
+- **生命周期必填但普通保存不可写。** `enabled`/`default` 是必填文档字段，但新建/复制一律保存为关闭且非默认，导入只替换草稿（新组保存为关闭态，已有组保持已存生命周期）；启停与设为默认都走专用生命周期端点，普通保存可以改 `departments`，但永远不能改生命周期。`default: true` 必须同时 `enabled: true`。
 - **参与行为版本。** 四个运行字段加 `departments` 进入 `tree_revision`（以及控制台 dirty/undo 基线）；`enabled`/`default` 进入路由集指纹与 `snapshot_revision`。画布坐标仍不影响行为。
 
 ### 快照来源
@@ -494,12 +494,12 @@ JSON 从不保存密钥，环境在构建快照时提供。
 ### 用一份 JSON 恢复
 
 1. 启动一个空数据库、空图目录的实例。
-2. 把 JSON 导入决策组（控制台「决策组」页，或 `POST /admin/trees`）。新建、复制与导入的组一定是关闭态；从顶栏或 `POST /admin/trees/{id}/enable` 启用它——第一张启用的图成为默认图。若这张图要服务某个部门，在图设置里补部门。
+2. 把 JSON 导入决策组（控制台「决策组」页，或 `POST /admin/trees`）。导入只替换草稿，作为新组保存时一定是关闭态；从顶栏或 `POST /admin/trees/{id}/enable` 启用它——第一张启用的图成为默认图。（导入到已有启用组再保存则保持启用。）若这张图要服务某个部门，在图设置里补部门。
 3. 对草稿执行检查路由（`POST /admin/try`），验证图、内嵌模型目录、决策服务、窗口与时段。把检查范围切到**实际路由集**（可填部门）验证选中的是哪张启用图；响应里的 `tree_id` / `graph_selection` 给出证据。
 4. 调用 `POST /v1/chat/completions` 走默认图的 Auto 路由，或打开模型测试对话（同样只走 Auto，可填部门）验证端到端回复。
 5. 只需为密钥配置环境变量：各提供方的 `key_env`，以及所选 JEV 服务端点需要鉴权时的 `key_env`。
 
-`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、`default` 决策服务档案与三个时段。它是一份 `enabled: false, default: false, departments: []` 的 v4 文档：通过管理 API（例如 `scripts/apply_default_routing_tree.py`）应用后再启用。管理写路径从不接受载荷里的生命周期：新建、复制与导入的文档一律以 `enabled: false, default: false` 落盘。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
+`configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、`default` 决策服务档案与三个时段。它是一份 `enabled: false, default: false, departments: []` 的 v4 文档：通过管理 API（例如 `scripts/apply_default_routing_tree.py`）应用后再启用。管理写路径从不接受载荷里的生命周期：新建与复制的文档一律以 `enabled: false, default: false` 落盘，导入只替换草稿（保存到已有组则继承其已存生命周期）。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
 
 `configs/cases/case-*.json` 里的五个演示案例都是完整 v4 文档：带 `kind`/`version`，不含外部 `id`，`enabled: false, default: false, departments: []`，provider 为 `demo-tap`，JEV 服务为 `demo-jev`（窗口 `2048 / 4096`），并内嵌其 target 实际引用的全部模型。`scripts/demo/apply_cases.py` 是它们的部署入口：合并案例文件里的目录、播种多服务 JEV 目录与时段、部署五棵画布（不启用）并跑 dry-run。它绝不绕过影响确认——遇到 409 默认打印受影响画布并停止；`--confirm-sync` 才会用预览里的基线哈希显式重试同一批请求。`graph_conflict` 表示画布在预览后变化，重跑脚本即可。
 

@@ -431,7 +431,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
 
     def failing_replace(staged_path, path):
         calls["count"] += 1
-        if calls["count"] >= 2:            # 第二份文件（活动画布最后写）失败
+        if calls["count"] >= 2:            # 第二份文件（默认图最后写）失败
             raise OSError("injected graph write failure")
         return real_replace(staged_path, path)
 

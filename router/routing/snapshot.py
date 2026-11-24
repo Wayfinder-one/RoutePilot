@@ -214,12 +214,19 @@ def assemble_snapshot_set(
         snapshots: Iterable[RoutingSnapshot], fingerprint: str) -> RoutingSnapshotSet:
     """把各启用图快照装配成不可变路由集（集合不变量在装配点校验）。
 
-    路由集成员必须都带树：空 Auto 快照不属于路由集。``RouteSetInvariantError``
-    由调用方决定如何呈现；``load_snapshot_set()`` 在装配边界转成存储错误。
+    路由集成员必须都带树且都是**启用**图：空 Auto 快照与停用草稿都不属于
+    路由集（``select()`` 只会选启用图，混入停用图会让它被当作可服务图）。
+    ``RouteSetInvariantError`` 由调用方决定如何呈现；``load_snapshot_set()``
+    在装配边界转成存储错误。
     """
     ordered = list(snapshots)
     if any(item.tree is None for item in ordered):
         raise ValueError('routing snapshot set requires snapshots with a tree')
+    disabled = sorted(item.tree.id for item in ordered if not item.tree.enabled)
+    if disabled:
+        raise ValueError(
+            'routing snapshot set requires enabled graphs only: '
+            + ', '.join(disabled))
     ordered.sort(key=lambda item: item.tree.id)
     default_id, mapping = route_set_indices([item.tree for item in ordered])
     department_tree_ids = dict(sorted(mapping.items()))

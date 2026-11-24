@@ -49,7 +49,7 @@ from router.routing.graph.validate import Issue
 from router.routing.route_set import RouteSetInvariantError, route_set_indices
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
-from router.routing.tree import RoutingTree, tree_from_dict
+from router.routing.tree import RoutingTree, tree_from_dict, tree_revision_of
 from router.store.repositories import ChangeRepo, now_iso
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
@@ -181,7 +181,9 @@ class GraphService:
                 [(tree, base_document_sha256)],
                 candidate_enabled=candidate_enabled,
                 action="update",
-                detail={"id": tree_id, "tree_revision": tree.tree_revision},
+                # 审计记录写入文档的行为 revision：``_envelope()`` 产出的对象只有
+                # 解析层字段（tree_revision 恒为 ""），必须从同一份树现算。
+                detail={"id": tree_id, "tree_revision": tree_revision_of(tree)},
             )
             return self.trees.get(tree_id)
 
