@@ -36,6 +36,7 @@ from router.store.db import connect, migrate
 from router.store.repositories import seed_default
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.catalog import Backend
+from router.upstream.runtime_keys import runtime_model_key, tree_scope
 from tests.routing_fixtures import tree_dict
 
 
@@ -46,6 +47,8 @@ JEV_SETTINGS = JevSettings(
 SELECTION_VALUES = {"target", "sticky", "otherwise", "error_fallback"}
 MODELS = ("fast", "strong", "power", "strong-a", "strong-b", "safe")
 CAPABILITIES = {model: f"{model} 能力" for model in MODELS}
+#: ``make_app`` 默认图 tree.id = "main"；Auto 调度的作用域必须与之一致。
+MAIN_SCOPE = tree_scope("main")
 
 
 class RecordingBalancer(LoadBalancer):
@@ -55,9 +58,11 @@ class RecordingBalancer(LoadBalancer):
         super().__init__(breaker)
         self.calls = []
 
-    def acquire(self, models, *, preferred=None, dry_run=False):
-        self.calls.append({"models": list(models), "preferred": preferred, "dry_run": dry_run})
-        return super().acquire(models, preferred=preferred, dry_run=dry_run)
+    def acquire(self, models, *, preferred=None, dry_run=False, scope=''):
+        self.calls.append({"models": list(models), "preferred": preferred,
+                           "dry_run": dry_run, "scope": scope})
+        return super().acquire(
+            models, preferred=preferred, dry_run=dry_run, scope=scope)
 
 
 class BlockingTransport(httpx.AsyncBaseTransport):
@@ -385,7 +390,7 @@ def test_selected_target_uses_real_systemone_chain(tmp_path):
         assert record["trace"][-1]["phase"] == "outcome"
         assert record["trace"][-1]["tone"] == "hit"
         assert len(app.state.requestlog.recent_requests()) == 1
-        assert app.state.balancer.inflight("fast") == 0
+        assert app.state.balancer.inflight("fast", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -419,7 +424,7 @@ def test_numeric_and_merges_two_questions_into_one_systemone_call(tmp_path):
         assert row["jev_choice"] == "strong"
         assert set(LOG_COLUMNS) & {"answers", "trace", "text", "route_label", "metrics", "fields"} == set()
         assert "answers" in recent(app) and "trace" in recent(app)
-        assert app.state.balancer.inflight("power") == 0
+        assert app.state.balancer.inflight("power", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -452,7 +457,7 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
         conn.close()
         assert row["waves"] == 2
         assert "answers" not in columns and "trace" not in columns
-        assert app.state.balancer.inflight(model) == 0
+        assert app.state.balancer.inflight(model, scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -499,7 +504,7 @@ def test_missing_answer_key_uses_error_fallback(tmp_path):
         assert record["waves"] == 1
         failed = [event for event in record["trace"] if event["event"] == "wave"]
         assert failed[0]["failed"] is True and failed[0]["error"]
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -548,7 +553,7 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         assert model in ("strong-a", "strong-b")
         assert first.headers["x-sr-selection"] == "target"
         assert app.state.balancer.calls[-1]["preferred"] is None
-        assert app.state.balancer.inflight(model) == 0
+        assert app.state.balancer.inflight(model, scope=MAIN_SCOPE) == 0
         first_revision = app.state.snapshot_set.default_snapshot.tree_revision
 
         # 仅移动节点（canvas 属于纯布局字段）：behavior revision 不变。
@@ -593,15 +598,17 @@ def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(tmp_path, har, root=priority_graph())
         for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure("power")
-        assert app.state.breaker.is_open("power") is True
+            app.state.breaker.failure(runtime_model_key(MAIN_SCOPE, "power"))
+        assert app.state.breaker.is_open(
+            runtime_model_key(MAIN_SCOPE, "power")) is True
+        assert app.state.breaker.is_open("power") is False
         response = await post(app)
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_available_backend"
         # p1 power-target 熔断后直接 503，不静默改选 p2 strong-target 上游。
         assert har.upstream_models == []
-        assert app.state.balancer.inflight("power") == 0
-        assert app.state.balancer.inflight("strong-a") == 0
+        assert app.state.balancer.inflight("power", scope=MAIN_SCOPE) == 0
+        assert app.state.balancer.inflight("strong-a", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "routing_error"
         assert record["error_class"] == "no_available_backend"
@@ -719,7 +726,9 @@ def test_no_candidate_schedule_failure_preserves_fallback_target(tmp_path):
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(tmp_path, har, root=no_target_graph())
         for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure("safe")
+            app.state.breaker.failure(runtime_model_key(MAIN_SCOPE, "safe"))
+        # 熔断只作用于 Auto 图的运行键；裸键属于固定模型直连，必须保持关闭。
+        assert app.state.breaker.is_open("safe") is False
 
         response = await post(app)
 
@@ -810,7 +819,7 @@ def test_time_event_stays_initial_when_no_period_condition_ran(tmp_path):
         assert time_event["event"] == "time"
         assert time_event["phase"] == "initial"
         assert time_event["label"] == {"zh": "初始计算", "en": "Initial evaluation"}
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -831,7 +840,7 @@ def test_time_event_is_period_when_a_real_period_condition_ran(tmp_path):
         assert condition["source"] == "periods"
         assert condition["value"] is True
         assert condition["phase"] == "period"
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -877,7 +886,7 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert response.status_code == 200
         assert b"[DONE]" in response.content
         assert jev_calls == []
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "completed"
         assert record["total_tokens"] == 3
@@ -928,7 +937,7 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
         # 上游响应恰好关闭一次，租约恰好释放一次（未移交 _relay，也没有 double release）。
         assert closes == [True]
         assert released == ["safe"]
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "upstream_error"
         assert record["error_class"] == "upstream_error"
@@ -1015,7 +1024,7 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
                     break
             # 第一个 SSE 分片已发出，第二个仍被上游 gate 挡住：租约必须被持有。
             assert first == b"data: first\n\n"
-            assert app.state.balancer.inflight("safe") == 1
+            assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 1
             assert released == []
             gate.set()
             chunks = [first]
@@ -1034,7 +1043,7 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
         assert b"".join(chunks) == b"data: first\n\ndata: second\n\n"
         assert closes == [True]
         assert released == ["safe"]
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         assert recent(app)["outcome_state"] == "completed"
 
     asyncio.run(scenario())
@@ -1069,7 +1078,7 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
         app = make_app(tmp_path, handler, root=direct_graph())
         response = await post(app)
         assert response.status_code == 502
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "upstream_error"
         assert record["trace"][-1]["event"] == "request_outcome"
@@ -1090,7 +1099,7 @@ def test_cancellation_during_upstream_records_terminal_state_and_releases(tmp_pa
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        assert app.state.balancer.inflight("safe") == 0
+        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         assert recent(app)["outcome_state"] == "cancelled"
 
     asyncio.run(scenario())
@@ -1135,9 +1144,10 @@ def test_stream_disconnect_does_not_count_as_upstream_failure(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=Breaker())
-        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
-                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
-                                 release=lambda: released.append(True))
+        generator = proxy._relay(
+            response, model="safe", breaker_key="safe", outcome=outcome,
+            is_disconnected=None, backend=backend, upstream_started=0.0,
+            upstream_ms=1.0, release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
         await generator.aclose()
         assert response.closed is True
@@ -1174,9 +1184,10 @@ def test_mid_stream_upstream_error_counts_in_breaker(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=CircuitBreaker(threshold=1))
-        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
-                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
-                                 release=lambda: released.append(True))
+        generator = proxy._relay(
+            response, model="safe", breaker_key="safe", outcome=outcome,
+            is_disconnected=None, backend=backend, upstream_started=0.0,
+            upstream_ms=1.0, release=lambda: released.append(True))
         assert await generator.__anext__() == b"data: first\n\n"
         with pytest.raises(httpx.ReadError):
             await generator.__anext__()
@@ -1218,9 +1229,10 @@ def test_stream_generator_closes_response_and_releases_lease_once(tmp_path):
         released = []
         backend = Backend(url="", headers={}, upstream_name="safe")
         proxy = UpstreamProxy(client=None, breaker=Breaker())
-        generator = proxy._relay(response, model="safe", outcome=outcome, is_disconnected=None,
-                                 backend=backend, upstream_started=0.0, upstream_ms=1.0,
-                                 release=lambda: released.append(True))
+        generator = proxy._relay(
+            response, model="safe", breaker_key="safe", outcome=outcome,
+            is_disconnected=None, backend=backend, upstream_started=0.0,
+            upstream_ms=1.0, release=lambda: released.append(True))
         chunks = [chunk async for chunk in generator]
         assert chunks == [b"data: a\n\n", b"data: b\n\n"]
         assert response.closes == 1
@@ -1298,9 +1310,9 @@ def add_department_graph(app, *, department='财务部', tree_id='finance'):
     return app
 
 
-def make_admin_chat_app(tmp_path, handler, *, allow_department_header=True):
+def make_admin_chat_app(tmp_path, handler, *, allow_department_header=True, root=None):
     """真实执行器 + 管理端测试对话路由（正式路由在 Task 7 接入）。"""
-    app = make_app(tmp_path, handler)
+    app = make_app(tmp_path, handler, root=root)
     conn = connect(app.state.settings.db_path)
     try:
         seed_default(conn)
@@ -1466,6 +1478,60 @@ def test_admin_test_chat_rejects_malformed_department_header(tmp_path):
                 path='/admin/test/chat/completions')
             assert response.status_code == 400
             assert response.json() == {'error': {'message': 'invalid_department'}}
+
+    asyncio.run(scenario())
+
+
+def test_same_model_failure_in_main_does_not_block_finance(tmp_path):
+    async def scenario():
+        state = {'fail': True, 'calls': []}
+
+        def handler(request):
+            if request.url.host.endswith('.test') and request.url.path.endswith('/chat/completions'):
+                state['calls'].append(request.url.host)
+                if state['fail']:
+                    return httpx.Response(500)
+                return upstream_ok(request)
+            return httpx.Response(200, json={'answers': {}})
+
+        app = make_admin_chat_app(tmp_path, handler, root=direct_graph())
+        base = app.state.snapshot_set.default_snapshot
+        # 部门图与默认图使用同一直连结构、同一 safe 逻辑模型和同一运行目录。
+        tree = tree_from_dict(tree_dict(
+            'finance', root=direct_graph(), departments=['财务部'],
+            enabled=True, default=False))
+        finance = build_snapshot(
+            tree=tree, backends=base.backends,
+            time_periods=[], jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+            compiled=compile_graph(tree.root))
+        app.state.snapshot_set = assemble_snapshot_set(
+            [base, finance], fingerprint='same-model')
+
+        # 公开默认图持续失败，直到 main:safe 对应的电路打开。
+        for _ in range(app.state.breaker.threshold):
+            response = await post(app, payload())
+            assert response.status_code == 502
+        main_key = runtime_model_key(MAIN_SCOPE, 'safe')
+        assert app.state.breaker.is_open(main_key) is True
+        # 熔断只落在 main 的运行键上：裸键属于固定模型直连，不能被 Auto 污染。
+        assert app.state.breaker.is_open('safe') is False
+
+        state['fail'] = False
+        before = len(state['calls'])
+        response = await post(
+            app, {**payload(), 'model': 'auto'},
+            headers={'x-sr-department': encode_department('财务部')},
+            path='/admin/test/chat/completions')
+        assert response.status_code == 200, response.text
+        assert response.headers['x-sr-tree-id'] == 'finance'
+        assert len(state['calls']) == before + 1, 'finance was blocked before its upstream call'
+
+        # 财务图成功不能重置 main 的电路；默认图再次请求仍应在调度前阻断。
+        before = len(state['calls'])
+        response = await post(app, payload())
+        assert response.status_code == 503
+        assert response.json()['error']['message'] == 'no_available_backend'
+        assert len(state['calls']) == before, 'main circuit should remain open'
 
     asyncio.run(scenario())
 

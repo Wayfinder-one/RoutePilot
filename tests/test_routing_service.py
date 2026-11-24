@@ -15,6 +15,7 @@ from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import build_snapshot
 from router.routing.types import NoAvailableBackend, RoutingRequest
+from router.upstream.runtime_keys import runtime_model_key, tree_scope
 from tests.test_graph_evaluator import (
     FakeJev,
     MODELS,
@@ -28,6 +29,12 @@ from tests.test_graph_evaluator import (
     power_tree,
     run_scenario,
 )
+
+
+#: ``run_scenario`` 默认 power_tree 的 tree.id；Auto 调度作用域必须与它一致。
+POWER_SCOPE = tree_scope("power-priority")
+#: ``custom_tree`` 的 tree.id：粘性/重试测试使用的自定义图作用域。
+CUSTOM_SCOPE = tree_scope("custom")
 
 
 class _OpenBreaker:
@@ -220,7 +227,9 @@ def test_dry_run_writes_nothing_and_trace_matches_decision():
     assert affinity.puts == []
     assert affinity.gets and affinity.gets[-1]["touch"] is False
     assert balancer.calls[-1]["dry_run"] is True
-    assert all(balancer.inflight(model) == 0 for model in MODELS)
+    # Auto 调度必须把图作用域传给 LoadBalancer：裸键断言会漏掉跨图共享缺陷。
+    assert balancer.calls[-1]["scope"] == POWER_SCOPE
+    assert all(balancer.inflight(model, scope=POWER_SCOPE) == 0 for model in MODELS)
     scheduled = [event for event in decision.trace if event["event"] == "scheduled"]
     assert scheduled[-1]["dry_run"] is True
 
@@ -253,11 +262,12 @@ def test_dry_run_writes_nothing_and_trace_matches_decision():
     }
     decision.release()
     decision.release()
-    assert all(balancer.inflight(model) == 0 for model in MODELS)
+    assert all(balancer.inflight(model, scope=POWER_SCOPE) == 0 for model in MODELS)
 
 
 def test_preferred_target_circuit_open_does_not_fall_to_next_priority():
-    balancer = RecordingBalancer(_OpenBreaker("qwen3.8-flash-sft"))
+    balancer = RecordingBalancer(
+        _OpenBreaker(runtime_model_key(POWER_SCOPE, "qwen3.8-flash-sft")))
     with pytest.raises(NoAvailableBackend):
         run_scenario("s1", balancer=balancer)
     # 只在最终 target 内调度；没有任何 acquire 尝试，更不会改选 strong-target(p3)。
@@ -279,7 +289,8 @@ def test_fallback_model_without_backend_fails_closed():
 
 def test_no_available_backend_keeps_schedule_trace_without_acquire_or_affinity_read():
     trace = []
-    balancer = RecordingBalancer(_OpenBreaker("qwen3.8-flash-sft"))
+    balancer = RecordingBalancer(
+        _OpenBreaker(runtime_model_key(POWER_SCOPE, "qwen3.8-flash-sft")))
     affinity = RecordingAffinity()
     tree = power_tree(sticky={"enabled": True, "ttl_seconds": 60})
 
@@ -347,11 +358,11 @@ def test_sticky_shared_model_keeps_original_target_reasoning():
 def test_release_is_idempotent_and_lease_is_the_only_release_point():
     decision, _jev, balancer, _affinity = run_scenario("s1")
     assert not hasattr(decision, "_released")
-    assert balancer.inflight(decision.model) == 1
+    assert balancer.inflight(decision.model, scope=POWER_SCOPE) == 1
 
     decision.release()
     decision.release()
-    assert balancer.inflight(decision.model) == 0
+    assert balancer.inflight(decision.model, scope=POWER_SCOPE) == 0
 
 
 class DeadPreferredBalancer(RecordingBalancer):
@@ -362,17 +373,19 @@ class DeadPreferredBalancer(RecordingBalancer):
         self.dead_model = dead_model
         self.rejected = False
 
-    def acquire(self, models, *, preferred=None, dry_run=False):
-        self.calls.append({"models": list(models), "preferred": preferred, "dry_run": dry_run})
+    def acquire(self, models, *, preferred=None, dry_run=False, scope=''):
+        self.calls.append({"models": list(models), "preferred": preferred,
+                           "dry_run": dry_run, "scope": scope})
         if preferred == self.dead_model and not self.rejected:
             self.rejected = True
-            selection = self.selection(models)
+            selection = self.selection(models, scope=scope)
             selection["available_models"] = [
                 model for model in selection["available_models"] if model != self.dead_model
             ]
             selection["unavailable"] = {**selection["unavailable"], self.dead_model: "breaker_open"}
             raise NoAvailableBackend("preferred backend went away", selection=selection)
-        return LoadBalancer.acquire(self, models, preferred=preferred, dry_run=dry_run)
+        return LoadBalancer.acquire(
+            self, models, preferred=preferred, dry_run=dry_run, scope=scope)
 
 
 def test_dead_sticky_backend_is_rescheduled_without_retrying_it():
@@ -411,6 +424,8 @@ def test_dead_sticky_backend_is_rescheduled_without_retrying_it():
     assert decision.sticky_hit is False
     assert decision.selection_reason == "target"
     assert [call["preferred"] for call in balancer.calls] == ["qwen3-8b", None]
+    # initial selection 与 sticky 失效后的 retry 必须使用同一个图作用域。
+    assert [call["scope"] for call in balancer.calls] == [CUSTOM_SCOPE, CUSTOM_SCOPE]
     assert not [event for event in trace if event["event"] == "sticky_hit"]
     schedule = next(event for event in trace if event["event"] == "schedule")
     assert schedule["sticky"] == {"status": "unavailable", "preferred_model": None}
@@ -418,4 +433,5 @@ def test_dead_sticky_backend_is_rescheduled_without_retrying_it():
     assert schedule["available_models"] == ["deepseek-v3"]
     assert affinity.puts[-1]["model"] == "deepseek-v3"
     decision.release()
-    assert balancer.inflight("deepseek-v3") == 0
+    assert balancer.inflight("deepseek-v3", scope=CUSTOM_SCOPE) == 0
+    assert balancer.inflight("deepseek-v3") == 0  # 裸键不得被 Auto 调度污染

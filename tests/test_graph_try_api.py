@@ -26,6 +26,7 @@ from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.store.db import connect
 from router.store.routing_trees import RoutingTreeRepo
+from router.upstream.runtime_keys import tree_scope
 from tests.routing_fixtures import (
     graph_dict,
     huge_chain_graph,
@@ -517,9 +518,10 @@ def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     assert len(affinity) == 0
     assert affinity.puts == []
     assert affinity.gets and all(item["touch"] is False for item in affinity.gets)
-    # dry-run 不计 inflight
+    # dry-run 不计 inflight（root-only 草稿图的 tree.id 是 "draft"）
     assert balancer.calls and all(item["dry_run"] is True for item in balancer.calls)
-    assert all(balancer.inflight(model) == 0 for model in MODELS)
+    assert all(item["scope"] == tree_scope("draft") for item in balancer.calls)
+    assert all(balancer.inflight(model, scope=tree_scope("draft")) == 0 for model in MODELS)
 
 
 def test_root_only_defaults_and_does_not_read_stored_trees(client, app, monkeypatch):

@@ -183,7 +183,8 @@ class UpstreamProxy:
         self.breaker = breaker
 
     async def send(self, *, backend: Backend, body: dict, headers: dict,
-                   model: str, outcome: OutcomeSink, release) -> ProxyResult:
+                   model: str, breaker_key: str, outcome: OutcomeSink,
+                   release) -> ProxyResult:
         """Non-streaming POST; the lease is released in this method scope."""
         release_once = _once(release)
         started = time.monotonic()
@@ -192,14 +193,14 @@ class UpstreamProxy:
                 backend.url, json=body, headers=backend.headers)
             upstream_ms = (time.monotonic() - started) * 1000.0
             if response.status_code >= 500:
-                self.breaker.failure(model)
+                self.breaker.failure(breaker_key)
                 outcome.finish(
                     outcome_state=OUTCOME_UPSTREAM_ERROR, error_class="upstream_error",
                     upstream_model=backend.upstream_name,
                     upstream_status=response.status_code, upstream_ms=upstream_ms)
                 return _upstream_error(headers)
             if response.status_code < 400:
-                self.breaker.success(model)
+                self.breaker.success(breaker_key)
             try:
                 content = response.json()
             except json.JSONDecodeError:
@@ -219,7 +220,7 @@ class UpstreamProxy:
                 upstream_ms=(time.monotonic() - started) * 1000.0)
             raise
         except httpx.HTTPError:
-            self.breaker.failure(model)
+            self.breaker.failure(breaker_key)
             outcome.finish(
                 outcome_state=OUTCOME_UPSTREAM_ERROR, error_class="upstream_error",
                 upstream_model=backend.upstream_name,
@@ -229,8 +230,8 @@ class UpstreamProxy:
             release_once()
 
     async def stream(self, *, backend: Backend, body: dict, headers: dict,
-                     model: str, outcome: OutcomeSink, release,
-                     is_disconnected: DisconnectCheck | None = None,
+                     model: str, breaker_key: str, outcome: OutcomeSink,
+                     release, is_disconnected: DisconnectCheck | None = None,
                      ) -> ProxyResult | ProxyStream:
         """Streaming POST; a successful response hands ownership to the relay."""
         release_once = _once(release)
@@ -247,7 +248,7 @@ class UpstreamProxy:
                 try:
                     raw = await response.aread()
                     if response.status_code >= 500:
-                        self.breaker.failure(model)
+                        self.breaker.failure(breaker_key)
                         outcome.finish(
                             outcome_state=OUTCOME_UPSTREAM_ERROR,
                             error_class="upstream_error",
@@ -268,13 +269,14 @@ class UpstreamProxy:
                 finally:
                     # This method owns the response on the non-streaming exits.
                     await _close_upstream(response)
-            self.breaker.success(model)
+            self.breaker.success(breaker_key)
             streamed = ProxyStream(
                 status_code=200,
                 headers=headers,
                 media_type="text/event-stream",
                 body=self._relay(
-                    response, backend=backend, model=model, outcome=outcome,
+                    response, backend=backend, model=model,
+                    breaker_key=breaker_key, outcome=outcome,
                     is_disconnected=is_disconnected, upstream_started=started,
                     upstream_ms=upstream_ms, release=release_once),
             )
@@ -287,7 +289,7 @@ class UpstreamProxy:
                 upstream_ms=(time.monotonic() - started) * 1000.0)
             raise
         except httpx.HTTPError:
-            self.breaker.failure(model)
+            self.breaker.failure(breaker_key)
             outcome.finish(
                 outcome_state=OUTCOME_UPSTREAM_ERROR, error_class="upstream_error",
                 upstream_model=backend.upstream_name,
@@ -300,7 +302,8 @@ class UpstreamProxy:
                 release_once()
 
     async def _relay(self, response, *, backend: Backend, model: str,
-                     outcome: OutcomeSink, is_disconnected: DisconnectCheck | None,
+                     breaker_key: str, outcome: OutcomeSink,
+                     is_disconnected: DisconnectCheck | None,
                      upstream_started: float, upstream_ms: float, release):
         """SSE relay; owns ``response`` and the lease, closing each once here."""
         usage_sniffer = _SseUsage()
@@ -327,7 +330,7 @@ class UpstreamProxy:
             # An upstream stream that dies after headers is an upstream fault
             # (breaker), unlike a client disconnect handled above.
             state = OUTCOME_UPSTREAM_ERROR
-            self.breaker.failure(model)
+            self.breaker.failure(breaker_key)
             raise
         finally:
             await _close_upstream(response)

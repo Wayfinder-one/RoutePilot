@@ -18,6 +18,7 @@ from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import SettingsRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
+from router.upstream.runtime_keys import runtime_model_key, tree_scope
 from tests.routing_fixtures import (
     graph_dict,
     portable_tree_dict,
@@ -312,8 +313,11 @@ def test_try_through_app_composition_routes_graph(tmp_path):
 def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
     handler = TryHandler()
     app = composed_try_app(tmp_path, handler)
+    # /admin/try 是 Auto 图路径：熔断键必须带 try 快照的图作用域。
+    key = runtime_model_key(tree_scope("main"), "qwen3-8b")
     for _ in range(app.state.breaker.threshold):
-        app.state.breaker.failure("qwen3-8b")
+        app.state.breaker.failure(key)
+    assert app.state.breaker.is_open("qwen3-8b") is False
     with TestClient(app) as client:
         response = client.post("/admin/try", json={"tree_id": "main", "text": "你好"})
     assert response.status_code == 503, response.text

@@ -85,15 +85,17 @@ class FakeJev:
 
 
 class RecordingBalancer(LoadBalancer):
-    """记录 acquire 的 models/preferred/dry_run，其余调度语义复用真实 LoadBalancer。"""
+    """记录 acquire 的 models/preferred/dry_run/scope，其余调度语义复用真实 LoadBalancer。"""
 
     def __init__(self, breaker=None):
         super().__init__(breaker)
         self.calls = []
 
-    def acquire(self, models, *, preferred=None, dry_run=False):
-        self.calls.append({"models": list(models), "preferred": preferred, "dry_run": dry_run})
-        return super().acquire(models, preferred=preferred, dry_run=dry_run)
+    def acquire(self, models, *, preferred=None, dry_run=False, scope=''):
+        self.calls.append({"models": list(models), "preferred": preferred,
+                           "dry_run": dry_run, "scope": scope})
+        return super().acquire(
+            models, preferred=preferred, dry_run=dry_run, scope=scope)
 
 
 class RecordingAffinity(SessionAffinity):

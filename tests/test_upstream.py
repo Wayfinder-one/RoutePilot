@@ -236,6 +236,31 @@ def test_breaker_state_shared_across_replicas(tmp_path):
     assert b.is_open("m")               # ... a latched replica stays conservative
 
 
+def test_scoped_runtime_key_round_trips_through_replica_sync(tmp_path):
+    """Scoped breaker keys are plain TEXT rows: a second replica imports them
+    verbatim, while the same logical model in another tree and the bare
+    fixed-direct key stay closed."""
+    from router.upstream.runtime_keys import runtime_model_key, tree_scope
+
+    db = _breaker_db(tmp_path)
+    main_key = runtime_model_key(tree_scope('main'), 'shared')
+    finance_key = runtime_model_key(tree_scope('finance'), 'shared')
+    assert main_key == 'tree:main:shared'
+
+    a, worker_a = _replica(db, threshold=1)
+    a.failure(main_key)
+    assert a.is_open(main_key) is True
+    _sync(worker_a)
+    assert _stored(db, main_key)[0] == 1      # TEXT key persisted verbatim
+    assert _stored(db, 'shared') is None
+
+    b, worker_b = _replica(db, threshold=1)
+    _sync(worker_b)
+    assert b.is_open(main_key) is True
+    assert b.is_open(finance_key) is False
+    assert b.is_open('shared') is False
+
+
 def test_recovery_is_not_undone_by_the_same_tick_import(tmp_path):
     """Regression repro: 3 failures -> sync -> success() -> sync.
 

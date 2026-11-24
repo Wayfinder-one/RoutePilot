@@ -16,6 +16,7 @@ from router.routing.types import (
     RoutingRequest,
     session_digest,
 )
+from router.upstream.runtime_keys import tree_scope
 
 
 class ModelScheduler:
@@ -34,6 +35,10 @@ class ModelScheduler:
     ) -> RoutingDecision:
         events: list[dict] = [] if trace_sink is None else trace_sink
         tree = snapshot.tree
+        # 熔断/inflight 的内部键按图作用域隔离：本次调度只计算一次，initial
+        # selection、正常 acquire 和 sticky 失效后的 retry 必须用同一个 scope，
+        # 否则会出现「可用性快照看的是这个键、租约记到另一个键」的漏隔离。
+        scope = tree_scope(snapshot.tree.id)
         target = outcome.target
         configured_models = [item.model for item in target.models]
         models = [item.model for item in target.models if item.model in snapshot.backends]
@@ -62,7 +67,7 @@ class ModelScheduler:
                 "sticky": {"status": sticky_status, "preferred_model": preferred},
             })
 
-        initial_selection = self.balancer.selection(models)
+        initial_selection = self.balancer.selection(models, scope=scope)
         available = list(initial_selection["available_models"])
         if not available:
             append_schedule(initial_selection)
@@ -85,7 +90,8 @@ class ModelScheduler:
                 selection_reason = "sticky"
 
         try:
-            lease = self.balancer.acquire(models, preferred=preferred, dry_run=dry_run)
+            lease = self.balancer.acquire(
+                models, preferred=preferred, dry_run=dry_run, scope=scope)
         except NoAvailableBackend as exc:
             if preferred is None:
                 append_schedule(exc.selection)
@@ -102,7 +108,7 @@ class ModelScheduler:
             selection_reason = outcome.selection_reason
             remaining = [model for model in models if model != dead]
             try:
-                lease = self.balancer.acquire(remaining, dry_run=dry_run)
+                lease = self.balancer.acquire(remaining, dry_run=dry_run, scope=scope)
             except NoAvailableBackend as retry_exc:
                 append_schedule(retry_exc.selection)
                 raise

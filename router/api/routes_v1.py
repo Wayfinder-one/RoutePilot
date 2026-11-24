@@ -52,6 +52,7 @@ from router.upstream.proxy import (
     UpstreamProxy,
     prepare_upstream_request,
 )
+from router.upstream.runtime_keys import runtime_model_key, tree_scope
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -418,11 +419,16 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         headers["x-sr-reasoning-warning"] = reasoning_warning
     elif decision.reasoning is not None:
         headers["x-sr-reasoning"] = decision.reasoning
+    # 熔断/inflight 的内部键按图作用域隔离：固定模型直连保持裸模型键，Auto
+    # 必须与 ModelScheduler 的 tree_scope(snapshot.tree.id) 完全一致；
+    # snapshot.tree_id 就是 tree.id（跨副本稳定），固定路径可能没有路由集。
+    scope = '' if fixed_model is not None else tree_scope(snapshot.tree_id)
+    breaker_key = runtime_model_key(scope, decision.model)
     proxy = UpstreamProxy(request.app.state.http, request.app.state.breaker)
     if body.get("stream"):
         streamed = await proxy.stream(
             backend=backend, body=upstream_body, headers=headers,
-            model=decision.model, outcome=outcome,
+            model=decision.model, breaker_key=breaker_key, outcome=outcome,
             is_disconnected=request.is_disconnected,
             release=decision.release,
         )
@@ -436,5 +442,6 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         return _json_response(streamed)
     return _json_response(await proxy.send(
         backend=backend, body=upstream_body, headers=headers,
-        model=decision.model, outcome=outcome, release=decision.release,
+        model=decision.model, breaker_key=breaker_key, outcome=outcome,
+        release=decision.release,
     ))

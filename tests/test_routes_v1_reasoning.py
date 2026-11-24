@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.store.db import connect
+from router.upstream.runtime_keys import tree_scope
 from tests.routing_fixtures import runtime_from_catalog, test_settings, tree_dict
 
 TEXT = "今天天气怎么样"
@@ -181,4 +182,6 @@ def test_streaming_request_injects_reasoning_and_releases(tmp_path):
     assert response.headers["x-sr-reasoning"] == "high"
     assert response.text == "data: hi\n\n"
     assert h.requests[-1]["body"]["reasoning_effort"] == "high"
-    assert h.app.state.balancer.inflight("qwen3-8b") == 0
+    # 公开 /v1 是 Auto 路由：活动图的 tree.id 为 default-tree。
+    assert h.app.state.balancer.inflight(
+        "qwen3-8b", scope=tree_scope("default-tree")) == 0
