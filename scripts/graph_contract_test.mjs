@@ -31,6 +31,7 @@ const REQUIRED_FIXTURES = [
   'valid-condition-periods',
   'valid-small-float-threshold',
   'valid-envelope-variation',
+  'valid-unicode-departments',
   'valid-old-field-control',
   'valid-self-contained-runtime',
   'invalid-runtime-api-key',
@@ -141,6 +142,11 @@ test('graph contract fixtures cover choice/noul/score, boolean/numeric edges and
 
   const envelope = BY_NAME.get('valid-envelope-variation').document;
   assert.notEqual(envelope.timezone, 'Asia/Shanghai');
+  const unicodeDepartments = BY_NAME.get('valid-unicode-departments').document.departments;
+  assert.ok(unicodeDepartments.length > 0 &&
+    unicodeDepartments.some(value => Array.from(value).some(char => char.codePointAt(0) > 0xFFFF)),
+  'no non-BMP department in the valid fixture set');
+
   assert.deepEqual(envelope.sticky, { enabled: false, ttl_seconds: 600 });
   assert.equal(envelope.root.error_fallback, 'target-a');
 

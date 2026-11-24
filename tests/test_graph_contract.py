@@ -39,6 +39,7 @@ REQUIRED_FIXTURES = {
     "valid-condition-periods",
     "valid-small-float-threshold",
     "valid-envelope-variation",
+    "valid-unicode-departments",
     "valid-old-field-control",
     "valid-self-contained-runtime",
     "invalid-runtime-api-key",
@@ -147,6 +148,11 @@ def test_fixture_set_covers_the_contract_matrix() -> None:
     )
     envelope = BY_NAME["valid-envelope-variation"]["document"]
     assert envelope["timezone"] != "Asia/Shanghai"
+    unicode_departments = BY_NAME["valid-unicode-departments"]["document"]["departments"]
+    assert unicode_departments and any(
+        ord(char) > 0xFFFF for value in unicode_departments for char in value
+    ), "no non-BMP department in the valid fixture set"
+
     assert envelope["sticky"] == {"enabled": False, "ttl_seconds": 600}
     assert envelope["root"]["error_fallback"] == "target-a"
     old_document = BY_NAME["invalid-old-otherwise-target"]["document"]

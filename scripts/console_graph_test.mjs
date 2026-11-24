@@ -2274,3 +2274,18 @@ test('createMinimalTree returns v4 lifecycle defaults', () => {
   assert.throws(() => RTGraph.normalizeDepartments(['a', 'a']), /duplicate department/);
   assert.throws(() => RTGraph.normalizeDepartments('x'), /list of strings/);
 });
+
+/* Python 侧 len()/sorted() 按 Unicode 码点计数与排序；非 BMP 字符（emoji）在
+   UTF-16 下是代理对，用 .length / 默认 sort() 会与 Python 分歧，进而导致
+   behavior_sha256 跨运行时不一致。此用例锁定码点口径。 */
+test('v4 departments use Python code-point length and ordering', () => {
+  assert.deepEqual(
+    RTGraph.normalizeDepartments(['😀', 'Ａ', '财务部']),
+    ['财务部', 'Ａ', '😀'],
+    'departments must sort in code-point order (Python sorted), not UTF-16 order');
+  const sixtyFour = '😀'.repeat(64);
+  assert.deepEqual(RTGraph.normalizeDepartments([sixtyFour]), [sixtyFour],
+    '64 code points must be accepted even though they are 128 UTF-16 code units');
+  assert.throws(() => RTGraph.normalizeDepartments(['😀'.repeat(65)]),
+    /department is empty, too long, or contains control characters/);
+});

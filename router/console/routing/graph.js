@@ -1947,6 +1947,20 @@ function rootView(graph, includeDisplay) {
   };
 }
 
+/* Python len()/sorted() 的 Unicode 语义：按码点（而不是 UTF-16 码元）计数与排序。
+   非 BMP 字符（如 emoji）在 UTF-16 里是代理对，`.length` 与默认 `sort()` 会与服务端
+   码点口径分歧，进而让 behavior canonical / behavior_sha256 跨运行时不一致。 */
+function compareCodePoints(left, right) {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = a[index].codePointAt(0) - b[index].codePointAt(0);
+    if (difference !== 0) return difference;
+  }
+  return a.length - b.length;
+}
+
 /* 部门规范化：唯一实现。导入、API envelope 与 createMinimalTree 共用；
    失败一律抛 Error，由调用方（parseImport）转成 graph_parse_error。 */
 function normalizeDepartments(value) {
@@ -1955,13 +1969,16 @@ function normalizeDepartments(value) {
   const values = value.map(item => {
     if (typeof item !== 'string') throw new Error('departments must be a list of strings');
     const department = item.trim();
-    if (!department || department.length > 64 || /[\u0000-\u001f\u007f]/.test(department)) {
+    /* 与 Python 的 len(value) > 64 及控制字符检查一样按码点扫描。 */
+    const codePoints = Array.from(department);
+    if (!codePoints.length || codePoints.length > 64 ||
+        codePoints.some(char => char.codePointAt(0) < 0x20 || char.codePointAt(0) === 0x7f)) {
       throw new Error('department is empty, too long, or contains control characters');
     }
     return department;
   });
   if (new Set(values).size !== values.length) throw new Error('duplicate department');
-  return values.sort();
+  return values.sort(compareCodePoints);
 }
 
 /* 宽松版本：行为/可编辑 canonical 必须永远可计算（changeKind 对任意草稿调用），

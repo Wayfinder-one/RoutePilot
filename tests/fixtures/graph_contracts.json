@@ -2450,6 +2450,289 @@
     "behavior_sha256": "1bda6fa32c12908976bede4202e4ccc9e4188ee964d08e3a65090bc95be8bb4f"
   },
   {
+    "name": "valid-unicode-departments",
+    "document": {
+      "kind": "sr-routing-graph",
+      "version": 4,
+      "name": "contract-unicode",
+      "timezone": "Asia/Shanghai",
+      "sticky": {
+        "enabled": true,
+        "ttl_seconds": 1800
+      },
+      "backends": {
+        "providers": [
+          {
+            "name": "local",
+            "base_url": "http://json-only.test/v1",
+            "key_env": "JSON_PROVIDER_API_KEY",
+            "reasoning_format": "openai"
+          }
+        ],
+        "models": [
+          {
+            "id": "qwen3-32b",
+            "upstream": "qwen3-32b",
+            "provider": "local",
+            "profile": {}
+          },
+          {
+            "id": "qwen3-8b",
+            "upstream": "qwen3-8b",
+            "provider": "local",
+            "profile": {}
+          }
+        ]
+      },
+      "jev": {
+        "id": "demo-jev",
+        "base_url": "http://jev.test",
+        "model": "json-jev",
+        "key_env": "ROUTER_JEV_API_KEY",
+        "timeout_seconds": 10.0,
+        "instructions": "你是一个模型路由器。下面是一条用户请求，请根据每个模型的能力说明，选择最合适处理这条请求的模型。",
+        "state_template": "【待判断的用户请求】\n{request}\n\n【任务】请选择最合适处理这条请求的模型。"
+      },
+      "jev_window": {
+        "input_tokens": 1024,
+        "context_tokens": 4096
+      },
+      "time_periods": [],
+      "root": {
+        "id": "root",
+        "type": "graph",
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start",
+            "title": "开始"
+          },
+          {
+            "id": "cond-text",
+            "type": "condition",
+            "source": "text",
+            "contains_any": [
+              "故障",
+              "抢修"
+            ],
+            "title": "文本条件"
+          },
+          {
+            "id": "gate-and",
+            "type": "logic",
+            "operator": "and"
+          },
+          {
+            "id": "q-choice",
+            "type": "question",
+            "question_type": "choice",
+            "instructions": "选择处理档位。",
+            "title": "能力分档",
+            "options": [
+              {
+                "key": "fast",
+                "label": "快速",
+                "capability": "简单问答"
+              },
+              {
+                "key": "strong",
+                "label": "增强",
+                "capability": "复杂分析"
+              }
+            ]
+          },
+          {
+            "id": "q-noul",
+            "type": "question",
+            "question_type": "noul",
+            "instructions": "是否需要电力行业知识？"
+          },
+          {
+            "id": "q-score",
+            "type": "question",
+            "question_type": "score",
+            "instructions": "给请求的复杂度打分。",
+            "criteria": [
+              2.5,
+              5,
+              8.5
+            ]
+          },
+          {
+            "id": "target-a",
+            "type": "target",
+            "models": [
+              {
+                "model": "qwen3-8b",
+                "reasoning": "low"
+              }
+            ],
+            "priority": 1,
+            "strategy": "least_inflight",
+            "capability": "轻量"
+          },
+          {
+            "id": "target-b",
+            "type": "target",
+            "models": [
+              {
+                "model": "qwen3-32b",
+                "reasoning": "high"
+              }
+            ],
+            "priority": 2,
+            "strategy": "least_inflight",
+            "capability": "强推理"
+          }
+        ],
+        "edges": [
+          {
+            "id": "e-start-gate",
+            "source": "start",
+            "source_port": "out",
+            "target": "gate-and",
+            "target_port": "in_1",
+            "condition": null
+          },
+          {
+            "id": "e-cond-gate",
+            "source": "cond-text",
+            "source_port": "out",
+            "target": "gate-and",
+            "target_port": "in_2",
+            "condition": {
+              "op": "is",
+              "value": true
+            }
+          },
+          {
+            "id": "e-gate-choice",
+            "source": "gate-and",
+            "source_port": "out",
+            "target": "q-choice",
+            "target_port": "in_1",
+            "condition": null
+          },
+          {
+            "id": "e-choice-fast-a",
+            "source": "q-choice",
+            "source_port": "selected.fast",
+            "target": "target-a",
+            "target_port": "in_1",
+            "condition": null
+          },
+          {
+            "id": "e-choice-strong-b",
+            "source": "q-choice",
+            "source_port": "selected.strong",
+            "target": "target-b",
+            "target_port": "in_1",
+            "condition": {
+              "op": "is",
+              "value": true
+            }
+          },
+          {
+            "id": "e-choice-prob-noul",
+            "source": "q-choice",
+            "source_port": "prob.strong",
+            "target": "q-noul",
+            "target_port": "in_1",
+            "condition": {
+              "op": "gt",
+              "value": 0.65
+            }
+          },
+          {
+            "id": "e-choice-fast-score",
+            "source": "q-choice",
+            "source_port": "selected.fast",
+            "target": "q-score",
+            "target_port": "in_1",
+            "condition": null
+          },
+          {
+            "id": "e-noul-yes-a",
+            "source": "q-noul",
+            "source_port": "yes",
+            "target": "target-a",
+            "target_port": "in_2",
+            "condition": {
+              "op": "gte",
+              "value": 0.5
+            }
+          },
+          {
+            "id": "e-noul-no-b",
+            "source": "q-noul",
+            "source_port": "no",
+            "target": "target-b",
+            "target_port": "in_2",
+            "condition": {
+              "op": "lte",
+              "value": 0.5
+            }
+          },
+          {
+            "id": "e-score-value-b",
+            "source": "q-score",
+            "source_port": "value",
+            "target": "target-b",
+            "target_port": "in_3",
+            "condition": {
+              "op": "lte",
+              "value": 8.5
+            }
+          }
+        ],
+        "error_fallback": "target-b"
+      },
+      "canvas": {
+        "start": {
+          "x": 78,
+          "y": 360
+        },
+        "cond-text": {
+          "x": 260,
+          "y": 360
+        },
+        "gate-and": {
+          "x": 440,
+          "y": 360
+        },
+        "q-choice": {
+          "x": 640,
+          "y": 360
+        },
+        "q-noul": {
+          "x": 840,
+          "y": 360
+        },
+        "q-score": {
+          "x": 1040,
+          "y": 360
+        },
+        "target-a": {
+          "x": 1240,
+          "y": 300
+        },
+        "target-b": {
+          "x": 1240,
+          "y": 460
+        }
+      },
+      "departments": [
+        "😀",
+        "Ａ",
+        "财务部"
+      ],
+      "enabled": false,
+      "default": false
+    },
+    "issue_codes": [],
+    "behavior_sha256": "ce059d30a0bee9eea552427517302d995d2e364df54675fe6ce31c0df435d4f2"
+  },
+  {
     "name": "valid-self-contained-runtime",
     "document": {
       "kind": "sr-routing-graph",
