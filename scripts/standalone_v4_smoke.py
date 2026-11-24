@@ -27,25 +27,30 @@ What runs
 
 Checks
 ------
-1. ``/readyz`` polling until ready (never a blind sleep);
-2. main (default) + finance (财务部) + legal (法务部) v4 graphs created/enabled;
-3. public ``/v1`` JSON -> default graph ``main``/``fast`` (+ response headers);
-4. public ``/v1`` SSE -> live streaming, ``[DONE]``, frames measurably spaced;
-5. forged ``X-SR-Department`` -> 400 ``department_header_not_allowed``;
-6. ``/admin/try`` department selection matrix (finance/legal/main/main);
-7. default switch to ``legal`` and public data-plane follow-up;
-8. disabling the default graph while others stay enabled -> 409
+1. mock model upstream + JEV servers start after the four ports are preflighted;
+2. ``/readyz`` polling until ready (never a blind sleep);
+3. main (default) + finance (财务部) + legal (法务部) v4 graphs created/enabled;
+4. public ``/v1`` JSON -> default graph ``main``/``fast`` (+ response headers);
+5. public ``/v1`` SSE -> live streaming, ``[DONE]``, frames measurably spaced;
+6. forged ``X-SR-Department`` -> 400 ``department_header_not_allowed``;
+7. ``/admin/try`` department selection matrix (finance/legal/main/main);
+8. default switch to ``legal`` and public data-plane follow-up;
+9. disabling the default graph while others stay enabled -> 409
    ``default_graph_required``;
-9. empty enabled set: ``/readyz`` still ready, public ``/v1`` 503
-   ``no_active_tree``;
-10. corrupt one enabled graph -> ``stale: true`` and old route set keeps serving;
+10. empty enabled set: ``/readyz`` still ready, public ``/v1`` 503
+    ``no_active_tree``;
+11. corrupt one enabled graph -> ``stale: true`` and old route set keeps serving;
     restore the bytes -> ``stale: false``;
-11. read-only replica matches the writer's snapshot revision/fingerprint and
+12. read-only replica matches the writer's snapshot revision/fingerprint and
     tree lifecycle, including catching up after the writer enables a graph;
-12. SIGTERM clean shutdown of both processes, mock shutdown, temp cleanup.
+13. SIGTERM clean shutdown of both processes, mock shutdown, temp cleanup.
 
 Any failure prints the failed check, process log tails and mock evidence, then
 exits non-zero.  ``--keep`` retains the temp workspace for debugging.
+
+The run is interrupt-safe: SIGINT/SIGTERM handlers terminate the spawned router
+processes and stop the mock servers before exiting non-zero (130/143).  The temp
+workspace is still removed unless ``--keep`` was passed.
 
 Ports 18080/18081/18082/18400 must be free; the script fails fast otherwise.
 No third-party imports are used here (the project venv is only used to run the
@@ -58,6 +63,7 @@ import http.client
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -103,6 +109,21 @@ class SmokeFailure(RuntimeError):
 
 class TransportError(RuntimeError):
     """The app was not reachable yet (used by /readyz polling)."""
+
+
+class SmokeInterrupted(BaseException):
+    """Raised from the SIGINT/SIGTERM handler so the cleanup path always runs."""
+
+    def __init__(self, signum: int):
+        self.signum = signum
+        super().__init__(f"interrupted by {_signal_name(signum)}")
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:  # pragma: no cover - unknown/real-time signal number
+        return f"signal {signum}"
 
 
 @dataclass(frozen=True)
@@ -433,6 +454,9 @@ class Smoke:
         self._shutdown_done = False
         self._shutdown_errors: list[str] = []
         self._shutdown_detail = ""
+        self._previous_signal_handlers: dict[int, Any] = {}
+        self._interrupted: int | None = None
+        self._cleanup_started = False
         self._started = time.monotonic()
 
     # -- workspace / checks -------------------------------------------------
@@ -776,6 +800,7 @@ class Smoke:
         return "; ".join(observed) + "; JEV mock 0 calls"
 
     def check_switch_default(self) -> str:
+        before = len(self.upstream.snapshot()) if self.upstream else 0
         expect(call(APP_BASE, "POST", "/admin/trees/legal/default"), 200,
                "POST /admin/trees/legal/default")
         trees = self._trees()
@@ -793,9 +818,11 @@ class Smoke:
                 f"x-sr-tree-id: {response.headers.get('x-sr-tree-id')!r}")
         require(response.headers.get("x-sr-graph-selection") == "default",
                 f"x-sr-graph-selection: {response.headers.get('x-sr-graph-selection')!r}")
-        records = self.upstream.snapshot() if self.upstream else []
-        require(records and records[-1]["model"] == "legal",
-                f"upstream model after switch: {records[-1]['model'] if records else None!r}")
+        records = (self.upstream.snapshot() if self.upstream else [])[before:]
+        require(len(records) == 1,
+                f"upstream requests after switch: expected 1, got {len(records)}")
+        require(records[0]["model"] == "legal",
+                f"upstream model after switch: {records[0]['model']!r}")
         ready = self._readyz()
         require(ready.get("default_tree_id") == "legal",
                 f"/readyz default after switch: {_brief(ready)}")
@@ -963,6 +990,40 @@ class Smoke:
                 f"route_fingerprint={initial.get('route_fingerprint', '')[:12]}… matched; "
                 f"enable main -> replica caught up in {catchup:.2f}s; trees matched")
 
+    # -- signal handling / interrupt safety ---------------------------------
+    def _install_signal_handlers(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            return  # signals are only deliverable to the main thread
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._previous_signal_handlers[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle_signal)
+            except (ValueError, OSError):  # pragma: no cover - hostile environment
+                self._previous_signal_handlers.pop(signum, None)
+
+    def _restore_signal_handlers(self) -> None:
+        for signum, previous in self._previous_signal_handlers.items():
+            try:
+                signal.signal(signum, previous)
+            except (ValueError, OSError, TypeError):  # pragma: no cover
+                pass
+        self._previous_signal_handlers.clear()
+
+    def _handle_signal(self, signum: int, _frame: Any) -> None:
+        name = _signal_name(signum)
+        if self._cleanup_started:
+            # Cleanup is already running/completed; a repeated Ctrl-C must not
+            # abort it and orphan the spawned router processes.
+            print(f"\n{name} received during cleanup; finishing cleanup",
+                  file=sys.stderr, flush=True)
+            return
+        if self._interrupted is not None:
+            return
+        self._interrupted = signum
+        print(f"\n{name} received during {self._current_check or 'startup'}; "
+              f"cleaning up", file=sys.stderr, flush=True)
+        raise SmokeInterrupted(signum)
+
     # -- shutdown / cleanup -------------------------------------------------
     def _stop_process(self, label: str, process: subprocess.Popen) -> list[str]:
         errors: list[str] = []
@@ -1085,6 +1146,22 @@ class Smoke:
         if self.keep and self.workspace:
             print(f"workspace retained at {self.workspace}")
 
+    def _print_interrupted(self, evidence: str, shutdown_errors: list[str],
+                           shutdown_detail: str) -> None:
+        assert self._interrupted is not None
+        name = _signal_name(self._interrupted)
+        print("\n" + "=" * 78)
+        print(f"INTERRUPTED: {name} during {self._current_check or 'startup'}")
+        print(f"           {shutdown_detail}")
+        print("=" * 78)
+        if evidence:
+            print(evidence)
+        for error in shutdown_errors:
+            print(f"  - cleanup problem: {error}")
+        if self.keep and self.workspace:
+            print(f"workspace retained at {self.workspace}")
+        print(f"exiting with code {128 + self._interrupted}", flush=True)
+
     # -- main ----------------------------------------------------------------
     def run(self) -> int:
         checks: list[tuple[str, Callable[[], str | None]]] = [
@@ -1105,18 +1182,42 @@ class Smoke:
             ("read-only replica matches writer route set", self.check_replica),
         ]
         self.failure: SmokeFailure | None = None
+        self._install_signal_handlers()
+        evidence = ""
+        shutdown_errors: list[str] = []
+        shutdown_detail = ""
+        shutdown_elapsed = 0.0
         try:
-            self._make_workspace()
-            for name, action in checks:
-                self._run_check(name, action)
-        except SmokeFailure as exc:
-            self.failure = exc
-        except Exception as exc:  # defensive: never hide an unexpected traceback
-            self.failure = SmokeFailure(f"{type(exc).__name__}: {exc}")
-        evidence = self._failure_evidence() if self.failure is not None else ""
-        shutdown_started = time.monotonic()
-        shutdown_errors, shutdown_detail = self._shutdown()
-        shutdown_elapsed = time.monotonic() - shutdown_started
+            try:
+                self._make_workspace()
+                for name, action in checks:
+                    self._run_check(name, action)
+            except SmokeFailure as exc:
+                self.failure = exc
+            except Exception as exc:  # defensive: never hide an unexpected traceback
+                self.failure = SmokeFailure(f"{type(exc).__name__}: {exc}")
+            except KeyboardInterrupt:  # defensive: SIGINT that bypassed the handler
+                self._interrupted = signal.SIGINT
+            finally:
+                # Unconditional cleanup: neither a failed check nor a signal may
+                # leave router processes or a temp workspace behind.
+                self._cleanup_started = True
+                if self.failure is not None or self._interrupted is not None:
+                    evidence = self._failure_evidence()
+                started = time.monotonic()
+                shutdown_errors, shutdown_detail = self._shutdown()
+                shutdown_elapsed = time.monotonic() - started
+        except SmokeInterrupted as exc:
+            # A signal raced with the cleanup entry; ``_shutdown()`` is idempotent.
+            self._cleanup_started = True
+            if self._interrupted is None:
+                self._interrupted = exc.signum
+            shutdown_errors, shutdown_detail = self._shutdown()
+        finally:
+            self._restore_signal_handlers()
+        if self._interrupted is not None:
+            self._print_interrupted(evidence, shutdown_errors, shutdown_detail)
+            return 128 + self._interrupted
         if self.failure is None and shutdown_errors:
             self._current_check = "clean shutdown and temp workspace cleanup"
             self.failure = SmokeFailure("; ".join(shutdown_errors))
