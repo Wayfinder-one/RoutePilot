@@ -124,7 +124,7 @@ def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
             conn, _Trees(["sha-a", "sha-b"]), publisher)
 
         def write(_conn):
-            prepared = service._prepared_snapshot()  # 指纹 sha-a
+            prepared = service._prepared_snapshot_set()  # 指纹 sha-a
             return _ConfigWriteResult(prepared, None)
 
         service._write_and_publish(write)
@@ -146,7 +146,7 @@ def test_publish_refuses_when_fingerprint_keeps_changing(tmp_path):
         )
         with pytest.raises(GraphChangedDuringLoad):
             service._write_and_publish(
-                lambda _conn: _ConfigWriteResult(service._prepared_snapshot(), None))
+                lambda _conn: _ConfigWriteResult(service._prepared_snapshot_set(), None))
         assert publisher.published == []
     finally:
         conn.close()
@@ -188,7 +188,7 @@ def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
         service = ConfigurationService(conn, trees, publisher)
 
         service._write_and_publish(
-            lambda _conn: _ConfigWriteResult(service._prepared_snapshot(), None))
+            lambda _conn: _ConfigWriteResult(service._prepared_snapshot_set(), None))
 
         assert len(publisher.published) == 1
         published = publisher.published[0]
@@ -198,6 +198,33 @@ def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
         assert published.snapshot_set[0] is doc_b[1][0]
         assert published.fingerprint == doc_b[0]
         assert trees.calls[:2] == ["route_fingerprint", "enabled"]
+    finally:
+        conn.close()
+
+
+def test_recheck_rebuilds_complete_enabled_set(tmp_path):
+    """指纹不符时的重考必须用完整启用集合重建，绝不回退到默认图/单图。"""
+    doc_a = ("sha-a", [_default_tree("tree-a1"), _default_tree("tree-a2")])
+    doc_b = ("sha-b", [_default_tree("tree-b1"), _default_tree("tree-b2")])
+    conn = _fresh_conn(tmp_path)
+    try:
+        publisher = Publisher()
+        # 前两次读取（初建候选快照）看到 doc-a，之后磁盘变成 doc-b。
+        trees = _SwappingTrees(doc_a, doc_b, swap_after=2)
+        service = ConfigurationService(conn, trees, publisher)
+
+        service._write_and_publish(
+            lambda _conn: _ConfigWriteResult(
+                service._prepared_snapshot_set(), None))
+
+        assert len(publisher.published) == 1
+        published = publisher.published[0]
+        # 重考重建的是当前完整启用集合（两张图都在），不是单图回退。
+        assert published.snapshot_set is doc_b[1]
+        assert [tree.id for tree in published.snapshot_set] == [
+            "tree-b1", "tree-b2"]
+        assert published.fingerprint == "sha-b"
+        assert trees.calls.count("enabled") == 2
     finally:
         conn.close()
 

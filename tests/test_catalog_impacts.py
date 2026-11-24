@@ -1747,3 +1747,141 @@ def test_rollback_failure_returns_503_and_refreshes_after_db_rollback(
     # 数据库仍整体回滚；审计行不存在。文件回滚失败正是本夹具的注入点。
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
+
+
+# --------------------------------------------------------------------------- #
+# 19. 目录影响同步：必须重建「完整启用集合」路由集（多启用图）
+# --------------------------------------------------------------------------- #
+def _portable_tree_for_provider(tree_id: str, provider: str,
+                                base_url: str) -> dict:
+    """自包含便携画布，把运行时目录换成指定 provider（用于区分目录影响范围）。"""
+    document = portable_tree_dict(tree_id)
+    document["backends"]["providers"][0].update(
+        {"name": provider, "base_url": base_url})
+    document["backends"]["models"][0]["provider"] = provider
+    return document
+
+
+@pytest.fixture
+def multi_graph_canvases(tmp_path):
+    """三张自包含画布：
+
+    - ``main``：启用且默认，provider ``main-local``（不受 ``local`` 目录写影响）；
+    - ``finance``：启用非默认，provider ``local``（受 ``local`` 目录写影响）；
+    - ``draft``：未启用，provider ``draft-local``（不受 ``local`` 影响）。
+
+    默认图不在受影响候选里，正是旧发布门（只看默认图是否被改写）漏发布的场景。
+    """
+    app = create_app(test_settings(tmp_path))
+    client = TestClient(app)
+    for tree_id, provider, base_url in (
+        ("main", "main-local", "http://main-local.test/v1"),
+        ("finance", "local", "http://json-only.test/v1"),
+        ("draft", "draft-local", "http://draft-local.test/v1"),
+    ):
+        created = client.post("/admin/trees", json=_strip_enabled(
+            _portable_tree_for_provider(tree_id, provider, base_url)))
+        assert created.status_code == 201, created.text
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    assert client.post("/admin/trees/finance/enable").status_code == 200
+    return app, client
+
+
+def _confirmed_provider_put(client, name: str, payload: dict):
+    """先取 409 影响预览，再带预览里的基线哈希确认重试。"""
+    preview = client.put(f"/admin/providers/{name}", json=payload)
+    assert preview.status_code == 409, preview.text
+    return client.put(f"/admin/providers/{name}", json={
+        **payload, "impact_confirmation": confirmation_from(preview)})
+
+
+def test_catalog_sync_updates_each_enabled_graph_but_not_draft(
+        multi_graph_canvases):
+    """目录写只改写非默认启用图时，也要重建完整启用路由集并发布。
+
+    旧发布门只在「默认图是候选」时发布：这里默认图 ``main`` 不受 provider
+    ``local`` 目录写影响，受影响的是非默认启用图 ``finance``；修复前磁盘画布
+    已更新但内存路由集仍是旧快照，直到 reloader 轮询。
+    """
+    app, client = multi_graph_canvases
+    before_set = app.state.snapshot_set
+    before_draft = _tree(app, "draft").document_sha256
+    assert before_set.default_tree_id == "main"
+    assert sorted(before_set.snapshots) == ["finance", "main"]
+    assert before_set.snapshots["finance"].backends["fast"].url == \
+        "http://json-only.test/v1/chat/completions"
+
+    response = _confirmed_provider_put(client, "local", {
+        "base_url": "http://changed.test/v1",
+        "reasoning_format": "openai",
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["synced_trees"] == ["finance"]
+    route_set = app.state.snapshot_set
+    # 非默认启用图被改写 → 必须发布新的完整路由集（不是只等 reloader 轮询）。
+    assert route_set is not before_set
+    assert route_set.snapshot_revision != before_set.snapshot_revision
+    assert route_set.snapshots["finance"].backends["fast"].url == \
+        "http://changed.test/v1/chat/completions"
+    # 默认图快照仍来自它自己的画布配置，不被别的图的目录写牵连。
+    assert route_set.default_snapshot.tree_id == "main"
+    assert route_set.default_snapshot.backends["fast"].url == \
+        "http://main-local.test/v1/chat/completions"
+    assert app.state.publisher.status()["snapshot_revision"] == \
+        route_set.snapshot_revision
+    # 草稿既不在候选里，也不被改写。
+    assert app.state.graph_repo.get("draft").document_sha256 == before_draft
+
+
+def test_draft_only_catalog_sync_does_not_republish(multi_graph_canvases):
+    """只有草稿被目录写影响时：候选快照仍按完整启用集复核，但绝不发布。
+
+    发布门看的是「候选是否改写了启用图」，不是「是否有候选」：草稿同步不得
+    触发不必要的路由集替换（对象身份与 revision 都必须保持不变）。
+    """
+    app, client = multi_graph_canvases
+    before_set = app.state.snapshot_set
+    before_revision = before_set.snapshot_revision
+    before_draft = _canvas_bytes(app, "draft")
+
+    response = _confirmed_provider_put(client, "draft-local", {
+        "base_url": "http://draft-changed.test/v1",
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["synced_trees"] == ["draft"]
+    assert _canvas_bytes(app, "draft") != before_draft
+    assert app.state.snapshot_set is before_set
+    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert app.state.publisher.status()["snapshot_revision"] == before_revision
+
+
+# --------------------------------------------------------------------------- #
+# 20. 图批次暂存后的异常必须撤销暂存文件（隐藏临时文件不得泄漏）
+# --------------------------------------------------------------------------- #
+def test_stage_failure_before_batch_commit_discards_staged_temp_files(
+        two_canvases, monkeypatch):
+    """``stage_updates()`` 之后、批次交出之前的异常不得把暂存临时文件留在盘上。"""
+    app, client = two_canvases
+    repo = app.state.graph_repo
+    before = _canvas_state(app, ("main", "other"))
+    before_revision = app.state.snapshot_set.snapshot_revision
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    def fail_after_staging():
+        raise RuntimeError("injected failure after graph staging")
+    # 发布门在 stage_updates() 之后读取启用集合：这里注入异常，模拟暂存完成
+    # 但批次尚未交给外层事务时的失败窗口。
+    monkeypatch.setattr(repo, "enabled", fail_after_staging)
+
+    with pytest.raises(RuntimeError, match="injected failure after graph staging"):
+        client.put("/admin/models/fast", json={
+            "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    # 暂存文件与已提交画布都没有残留；快照也未发布。
+    assert [path.name for path in repo.graphs.iterdir()
+            if path.name.startswith(".")] == []
+    assert _canvas_state(app, ("main", "other")) == before
+    assert app.state.snapshot_set.snapshot_revision == before_revision
