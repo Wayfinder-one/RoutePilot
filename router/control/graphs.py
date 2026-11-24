@@ -1,6 +1,7 @@
 """决策组（graph）写用例：CRUD/启停的校验、候选快照与发布次序（brief Step 3）。
 
-- `create` / `copy`：画布自身完整校验（结构 + 启用级；`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（新图为关闭态）。
+- `create`：画布自身完整校验（结构 + 启用级；`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（新图为关闭态）。
+- `copy`：复制已存画布（源文档此前已通过完整校验）→（锁内）文档写入 → 审计；不重复校验、不发布快照。
 - `update`：锁内按 root 优先合并已存 envelope → 画布自身完整校验（启用/未启用同一套）→ 已启用图
   prepare 候选快照 → `base_document_sha256` 冲突检查后文件成功写入 →
   指纹复核（Task 1 review carry-forward：等价于旧 refresh() 的提交前复核，
