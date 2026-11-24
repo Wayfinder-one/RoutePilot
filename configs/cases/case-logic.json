@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "案例四 · 请求条件与逻辑门",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -441,5 +441,8 @@
       "x": 970.0,
       "y": 720.0
     }
-  }
+  },
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

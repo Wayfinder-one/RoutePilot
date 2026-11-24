@@ -36,12 +36,12 @@ def present_issue(issue: Issue) -> dict[str, str]:
         detail = _param(issue, "detail")
         if detail:
             return _text(
-                f"图解析失败：root 不符合 sr-routing-graph v3 结构（{detail}）",
-                f"Graph parse failed: root does not conform to the sr-routing-graph v3 structure ({detail})",
+                f"图解析失败：root 不符合 sr-routing-graph v4 结构（{detail}）",
+                f"Graph parse failed: root does not conform to the sr-routing-graph v4 structure ({detail})",
             )
         return _text(
-            "图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）",
-            "Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)",
+            "图解析失败：root 不符合 sr-routing-graph v4 结构（未知字段或类型非法）",
+            "Graph parse failed: root does not conform to the sr-routing-graph v4 structure (unknown fields or invalid types)",
         )
     if code == "invalid_timezone":
         timezone = _param(issue, "timezone")

@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "默认决策组",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -219,5 +219,8 @@
       "start": "00:00",
       "end": "00:00"
     }
-  ]
+  ],
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

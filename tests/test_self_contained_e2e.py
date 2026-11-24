@@ -489,9 +489,10 @@ def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
 
 
 def _create_payload(tree_id):
-    """POST /admin/trees 的 DTO 不接受 enabled：从文档 fixture 里去掉。"""
+    """POST /admin/trees 的 DTO 不接受 enabled/default：从文档 fixture 里去掉。"""
     document = _portable_document(tree_id)
     document.pop("enabled", None)
+    document.pop("default", None)
     return document
 
 

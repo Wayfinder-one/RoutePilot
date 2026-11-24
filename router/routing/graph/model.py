@@ -1,4 +1,4 @@
-"""Graph v3 数据模型：五类节点、边、条件与两个序列化视图（storage/behavior）。"""
+"""Graph v4 数据模型：五类节点、边、条件与两个序列化视图（storage/behavior）。"""
 from __future__ import annotations
 
 import hashlib

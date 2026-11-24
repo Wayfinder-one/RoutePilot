@@ -108,8 +108,11 @@ function importText(tree) {
   });
   const document = {
     kind: 'sr-routing-graph',
-    version: 3,
+    version: 4,
     name: tree.name == null ? '' : tree.name,
+    departments: RTGraph.normalizeDepartments(tree.departments),
+    enabled: tree.enabled === true,
+    default: tree.default === true,
     timezone: tree.timezone == null ? 'Asia/Shanghai' : tree.timezone,
     sticky: tree.sticky == null ? { enabled: false, ttl_seconds: 1800 } : tree.sticky,
     root: root,
@@ -436,7 +439,7 @@ test('canConnect tolerates malformed edge entries kept by import instead of thro
     source: 'start', source_port: 'out', target: target.id, target_port: 'in_1',
   }).ok, false);
   const imported = RTGraph.parseImport(JSON.stringify(Object.assign({
-    kind: 'sr-routing-graph', version: 3, name: 'x', timezone: 'Asia/Shanghai',
+    kind: 'sr-routing-graph', version: 4, name: 'x', departments: [], enabled: false, default: false, timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 }, root: graph,
   }, documentRuntime(['qwen3-8b']))));
   assert.equal(imported.ok, false, 'non-object edges made parseImport return ok');
@@ -610,7 +613,7 @@ test('import fills missing positions with the DAG layout', () => {
   const root = readExample();
   root.nodes.forEach(node => { delete node.position; });
   const text = JSON.stringify(Object.assign({
-    kind: 'sr-routing-graph', version: 3, name: '电力示例', timezone: 'Asia/Shanghai',
+    kind: 'sr-routing-graph', version: 4, name: '电力示例', departments: [], enabled: false, default: false, timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 }, root,
   }, exampleRuntime()));
   const result = RTGraph.parseImport(text);
@@ -640,8 +643,11 @@ test('serialize and parseImport round-trip the complete envelope', () => {
   const text = RTGraph.serialize(tree);
   const exported = JSON.parse(text);
   assert.equal(exported.kind, 'sr-routing-graph');
-  assert.equal(exported.version, 3);
+  assert.equal(exported.version, 4);
   assert.equal(exported.name, tree.name);
+  assert.deepEqual(exported.departments, []);
+  assert.equal(exported.enabled, false);
+  assert.equal(exported.default, false);
   assert.equal(exported.timezone, tree.timezone);
   assert.deepEqual(exported.sticky, tree.sticky);
   assert.equal(exported.root.nodes.length, 14);
@@ -662,7 +668,7 @@ test('serialize and parseImport round-trip the complete envelope', () => {
 });
 
 test('legacy and version-2 imports are rejected with the fixed message', () => {
-  const expected = '只接受 sr-routing-graph v3（本期不做旧格式兼容与转换）';
+  const expected = '只接受 sr-routing-graph v4（本期不做旧格式兼容与转换）';
   const payloads = [
     JSON.stringify({ kind: 'sr-routing-graph', version: 2, name: '旧版本', root: { type: 'graph', nodes: [], edges: [] } }),
     JSON.stringify({ kind: 'sr-routing-graph', version: '2', root: { type: 'graph', nodes: [], edges: [] } }),
@@ -684,9 +690,9 @@ test('legacy and version-2 imports are rejected with the fixed message', () => {
 
 test('kind/version-correct v3 documents with a malformed root report graph_parse_error', () => {
   const payloads = [
-    JSON.stringify({ kind: 'sr-routing-graph', version: 3, root: { type: 'jev', branches: [] } }),
-    JSON.stringify({ kind: 'sr-routing-graph', version: 3, root: { type: 'graph', nodes: {} } }),
-    JSON.stringify({ kind: 'sr-routing-graph', version: 3, name: '没有 root' }),
+    JSON.stringify({ kind: 'sr-routing-graph', version: 4, root: { type: 'jev', branches: [] } }),
+    JSON.stringify({ kind: 'sr-routing-graph', version: 4, root: { type: 'graph', nodes: {} } }),
+    JSON.stringify({ kind: 'sr-routing-graph', version: 4, name: '没有 root' }),
   ];
   for (const text of payloads) {
     const result = RTGraph.parseImport(text);
@@ -1539,7 +1545,7 @@ test('calculation log model distinguishes failed waves from normal no-candidate 
 
 test('import dispatches top-level canvas into node positions', () => {
   const document = Object.assign({
-    kind: 'sr-routing-graph', version: 3, name: '导入', timezone: 'Asia/Shanghai',
+    kind: 'sr-routing-graph', version: 4, name: '导入', departments: [], enabled: false, default: false, timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: {
       id: 'root', type: 'graph', error_fallback: 't1',
@@ -1577,7 +1583,7 @@ test('export collects node positions into a top-level canvas', () => {
 
 test('import rejects a node-level position field', () => {
   const document = Object.assign({
-    kind: 'sr-routing-graph', version: 3, name: '', timezone: 'Asia/Shanghai',
+    kind: 'sr-routing-graph', version: 4, name: '', departments: [], enabled: false, default: false, timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: {
       id: 'root', type: 'graph', error_fallback: null,
@@ -1592,7 +1598,7 @@ test('import rejects a node-level position field', () => {
 
 test('invalid canvas shapes are rejected on import', () => {
   const base = Object.assign({
-    kind: 'sr-routing-graph', version: 3, name: '', timezone: 'Asia/Shanghai',
+    kind: 'sr-routing-graph', version: 4, name: '', departments: [], enabled: false, default: false, timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     root: { id: 'root', type: 'graph', error_fallback: null,
       nodes: [{ id: 'start', type: 'start' }], edges: [] }
@@ -1627,7 +1633,7 @@ function selfContainedGraph() {
    capability 带空白、profile 里放整数值数字（131072）与指数浮点（1e-5）。 */
 function selfContainedDocument() {
   return {
-    kind: 'sr-routing-graph', version: 3, name: '自包含决策组', timezone: 'Asia/Shanghai',
+    kind: 'sr-routing-graph', version: 4, name: '自包含决策组', departments: [], enabled: false, default: false, timezone: 'Asia/Shanghai',
     sticky: { enabled: true, ttl_seconds: 600 },
     backends: {
       providers: [
@@ -1976,8 +1982,8 @@ test('complete round-trip preserves the four runtime fields and canvas coordinat
   });
   const document = JSON.parse(RTGraph.serialize(imported.tree));
   assert.deepEqual(Object.keys(document).sort(), [
-    'backends', 'canvas', 'jev', 'jev_window', 'kind', 'name', 'root', 'sticky',
-    'time_periods', 'timezone', 'version'
+    'backends', 'canvas', 'default', 'departments', 'enabled', 'jev', 'jev_window',
+    'kind', 'name', 'root', 'sticky', 'time_periods', 'timezone', 'version'
   ].sort());
   assert.equal(document.runtime, undefined);
   const parsedBack = RTGraph.parseImport(JSON.stringify(document));
@@ -2170,4 +2176,101 @@ test('parseImport keeps runtime on the tree and validate covers envelope runtime
   const badEnvelopeIssues = hardIssues(RTGraph.validate(badEnvelope));
   assert.ok(badEnvelopeIssues.some(item => item.code === 'graph_parse_error'),
     JSON.stringify(badEnvelopeIssues));
+});
+
+/* ── 14. v4 文档契约：departments / enabled / default ──────────────── */
+
+function v4Document(overrides) {
+  /* 导入文档的坐标只能来自顶层 canvas：把内部 position 收集到 canvas。 */
+  const root = RTGraph.clone(minimalTree().root);
+  const canvas = {};
+  root.nodes.forEach(node => {
+    if (!node || !node.position) return;
+    canvas[node.id] = node.position;
+    delete node.position;
+  });
+  const document = Object.assign({
+    kind: 'sr-routing-graph', version: 4, name: 'v4', departments: [],
+    enabled: false, default: false, timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: root,
+  }, documentRuntime(['qwen3-8b']), overrides || {});
+  if (Object.keys(canvas).length) document.canvas = canvas;
+  return document;
+}
+
+test('v4 documents require departments, enabled and default', () => {
+  for (const field of ['departments', 'enabled', 'default']) {
+    const document = v4Document();
+    delete document[field];
+    const result = RTGraph.parseImport(JSON.stringify(document));
+    assert.equal(result.ok, false, 'import accepted a v4 document without ' + field);
+    assert.equal(result.tree, undefined);
+    const issue = (result.issues || []).find(item => item.code === 'graph_parse_error');
+    assert.ok(issue, 'missing ' + field + ' did not report graph_parse_error');
+    assert.ok(issue.zh.includes(field), 'issue does not name ' + field + ': ' + issue.zh);
+  }
+});
+
+test('v4 import normalizes and sorts departments', () => {
+  const result = RTGraph.parseImport(JSON.stringify(
+    v4Document({ departments: [' 法务部 ', '财务部'] })));
+  assert.equal(result.ok, true, JSON.stringify(result.issues));
+  assert.deepEqual(result.tree.departments, ['法务部', '财务部']);
+  /* 内部树固定 lifecycle off：导入永远不产生启用/默认图。 */
+  assert.equal(result.tree.enabled, false);
+  assert.equal(result.tree.default, false);
+});
+
+test('v4 rejects duplicate, empty, control-character and non-string departments', () => {
+  for (const departments of [['a', 'a'], ['  '], [1], 'x', ['a'.repeat(65)], ['a\u0001']]) {
+    const result = RTGraph.parseImport(JSON.stringify(v4Document({ departments })));
+    assert.equal(result.ok, false, 'import accepted departments ' + JSON.stringify(departments));
+    assert.ok((result.issues || []).some(item => item.code === 'graph_parse_error'),
+      'invalid departments did not report graph_parse_error');
+  }
+});
+
+test('v4 rejects a default graph that is not enabled', () => {
+  const result = RTGraph.parseImport(JSON.stringify(
+    v4Document({ enabled: false, default: true })));
+  assert.equal(result.ok, false);
+  assert.ok(result.issues.some(item =>
+    item.code === 'graph_parse_error' && /default graph must be enabled/.test(item.en)));
+  for (const enabled of ['yes', 1, null]) {
+    const rejected = RTGraph.parseImport(JSON.stringify(v4Document({ enabled })));
+    assert.equal(rejected.ok, false, 'non-boolean enabled was accepted: ' + String(enabled));
+  }
+});
+
+test('v4 serialize writes lifecycle/departments and behavior canonical excludes lifecycle', () => {
+  const imported = RTGraph.parseImport(JSON.stringify(
+    v4Document({ departments: ['财务部'] })));
+  assert.equal(imported.ok, true, JSON.stringify(imported.issues));
+  const exported = JSON.parse(RTGraph.serialize(imported.tree));
+  assert.equal(exported.version, 4);
+  assert.deepEqual(exported.departments, ['财务部']);
+  assert.equal(exported.enabled, false);
+  assert.equal(exported.default, false);
+
+  const canonical = RTGraph.behaviorCanonical(imported.tree);
+  assert.ok(canonical.includes('"departments":["财务部"]'), canonical);
+  /* 生命周期不参与行为 canonical；部门参与。 */
+  const enabled = Object.assign(RTGraph.clone(imported.tree), { enabled: true, default: true });
+  assert.equal(RTGraph.behaviorCanonical(enabled), canonical);
+  const other = Object.assign(RTGraph.clone(imported.tree), {
+    departments: ['财务部', '法务部'],
+  });
+  assert.notEqual(RTGraph.behaviorCanonical(other), canonical);
+});
+
+test('createMinimalTree returns v4 lifecycle defaults', () => {
+  const tree = RTGraph.createMinimalTree('qwen3-8b', minimalRuntime('qwen3-8b'));
+  assert.deepEqual(tree.departments, []);
+  assert.equal(tree.enabled, false);
+  assert.equal(tree.default, false);
+  assert.deepEqual(RTGraph.normalizeDepartments(undefined), []);
+  assert.deepEqual(RTGraph.normalizeDepartments(['财务部', '法务部']), ['法务部', '财务部']);
+  assert.throws(() => RTGraph.normalizeDepartments(['a', 'a']), /duplicate department/);
+  assert.throws(() => RTGraph.normalizeDepartments('x'), /list of strings/);
 });

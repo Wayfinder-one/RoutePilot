@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "案例三 · 推理等级",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -232,5 +232,8 @@
       "x": 930.0,
       "y": 540.0
     }
-  }
+  },
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

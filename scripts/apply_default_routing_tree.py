@@ -35,7 +35,7 @@ def call(method: str, path: str, body=None) -> dict:
 
 def main() -> int:
     global TOKEN
-    parser = argparse.ArgumentParser(description="Apply a v3 routing graph through the admin API")
+    parser = argparse.ArgumentParser(description="Apply a v4 routing graph through the admin API")
     parser.add_argument("--tree-json", default=str(Path(__file__).resolve().parent.parent / "configs" / "default_routing_tree.json"))
     parser.add_argument("--tree-id", required=True)
     parser.add_argument("--enable", action="store_true")
@@ -44,7 +44,6 @@ def main() -> int:
     tree = parse_graph_document(
         content,
         tree_id=args.tree_id,
-        enabled=False,
         updated_at="",
         document_sha256=hashlib.sha256(content).hexdigest(),
     )
@@ -52,6 +51,9 @@ def main() -> int:
     if not TOKEN:
         raise SystemExit("login returned no session token")
     payload = graph_document(tree)
+    # 管理 DTO 只接受 departments；文件信封字段与生命周期不能出现在写请求里。
+    for envelope_field in ("kind", "version", "enabled", "default"):
+        payload.pop(envelope_field, None)
     existing = {item["id"] for item in call("GET", "/admin/trees")["trees"]}
     if args.tree_id in existing:
         current = call("GET", f"/admin/trees/{args.tree_id}")["tree"]

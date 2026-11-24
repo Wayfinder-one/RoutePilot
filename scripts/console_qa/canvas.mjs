@@ -67,7 +67,7 @@ import {
   waitToastIncludes
 } from '../console_qa.mjs';
 
-/* 严格自包含 v3 文档：导入/保存只接受带完整四字段运行快照的文档。
+/* 严格自包含 v4 文档：导入/保存只接受带完整四字段运行快照的文档。
    以仓库示例文档（EXAMPLE）为基线构造，可按用例覆盖 name/sticky/root 等字段。 */
 /* 内部运行快照 → 导入文档的扁平四字段（Node 侧 helper）。 */
 function runtimeDocumentFields(runtime) {
@@ -82,8 +82,11 @@ function runtimeDocumentFields(runtime) {
 function strictDocument(overrides) {
   const document = {
     kind: 'sr-routing-graph',
-    version: 3,
+    version: 4,
     name: EXAMPLE.name,
+    departments: JSON.parse(JSON.stringify(EXAMPLE.departments || [])),
+    enabled: EXAMPLE.enabled === true,
+    default: EXAMPLE.default === true,
     timezone: EXAMPLE.timezone,
     sticky: EXAMPLE.sticky,
     root: JSON.parse(JSON.stringify(EXAMPLE_ROOT)),
@@ -1897,14 +1900,19 @@ test('Task 12 · a boot fallback draft saves as a new UUID-slice tree, not "loca
 }
 });
 
-test('Task 12 · export downloads the complete v3 envelope including timezone and sticky', async () => {
+test('Task 12 · export downloads the complete v4 envelope including timezone and sticky', async () => {
   const baseline = await ensureBaselineTree();
   await openCanvas();
   const download = await exportViaUi();
-  assert.equal(download.name, TREE_ID + '.sr-routing-graph-v3.json');
+  assert.equal(download.name, TREE_ID + '.sr-routing-graph-v4.json');
   const parsed = JSON.parse(download.text);
   assert.equal(parsed.kind, 'sr-routing-graph');
-  assert.equal(parsed.version, 3);
+  assert.equal(parsed.version, 4);
+  assert.deepEqual(parsed.departments, []);
+  /* 生命周期随服务端：基线组是启用图，导出必须保留 enabled/default=true。 */
+  assert.equal(parsed.enabled, baseline.enabled === true);
+  assert.equal(parsed.default, baseline.default === true);
+  assert.equal(parsed.default, parsed.enabled);
   assert.equal(parsed.name, baseline.name);
   assert.equal(parsed.timezone, BASELINE.timezone);
   assert.deepEqual(parsed.sticky, BASELINE.sticky);
@@ -1912,7 +1920,7 @@ test('Task 12 · export downloads the complete v3 envelope including timezone an
   assert.equal(parsed.root.edges.length, EXAMPLE_EDGES);
   assert.equal(parsed.root.otherwise_target, undefined);
   assert.equal(parsed.root.error_fallback, EXAMPLE_TARGETS.fallback);
-  /* 自包含文档：导出的 v3 文件必须带四运行字段（与保存 payload 同一形状），
+  /* 自包含文档：导出的 v4 文件必须带四运行字段（与保存 payload 同一形状），
      且服务端密钥/密钥状态不得出现在文件里。 */
   ['backends', 'jev', 'jev_window', 'time_periods'].forEach(field => {
     assert.ok(Object.prototype.hasOwnProperty.call(parsed, field),
@@ -1942,7 +1950,7 @@ test('envelope-roundtrip-preserves-revision', async () => {
     return parsed.ok ? RTGraph.behaviorCanonical(parsed.tree) : null;
 
 }, source.text);
-  assert.ok(sourceCanonical, 'the exported document no longer parses as a self-contained v3 document');
+  assert.ok(sourceCanonical, 'the exported document no longer parses as a self-contained v4 document');
   const parsedSource = JSON.parse(source.text);
 
   await clickCanvasAction('cvNewTree');
@@ -2339,14 +2347,17 @@ test('Task C2 · inspector models come from the DB catalog, periods from the can
   await ensureBaselineTree();
 });
 
-test('7.4-14-import-export-v3-only', async () => {
-  await ensureBaselineTree();
+test('7.4-14-import-export-v4-only', async () => {
+  const baseline = await ensureBaselineTree();
   await openCanvas();
-  /* 导出只产出 sr-routing-graph v3；导入下面只接受同一格式。 */
+  /* 导出只产出 sr-routing-graph v4；导入下面只接受同一格式。 */
   const exported = await exportViaUi();
   const exportedDoc = JSON.parse(exported.text);
   assert.equal(exportedDoc.kind, 'sr-routing-graph');
-  assert.equal(exportedDoc.version, 3);
+  assert.equal(exportedDoc.version, 4);
+  assert.deepEqual(exportedDoc.departments, []);
+  assert.equal(exportedDoc.enabled, baseline.enabled === true);
+  assert.equal(exportedDoc.default, baseline.default === true);
   assert.equal(exportedDoc.root.type, 'graph');
   await dragNodeBy('start', 36, 24);
 
@@ -2433,7 +2444,7 @@ test('shared graph · missing required envelope field keeps the draft', async ()
   assert.deepEqual(await draft(), before, 'a document missing sticky replaced the local draft');
 });
 
-test('Task 12 · a v3 document with a malformed root reports graph_parse_error and keeps the draft', async () => {
+test('Task 12 · a v4 document with a malformed root reports graph_parse_error and keeps the draft', async () => {
   await ensureBaselineTree();
   await openCanvas();
   await dragNodeBy('start', 34, 22);
@@ -2453,14 +2464,14 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
 
   await clearToasts();
   await setImportPayload(strictDocument({
-    name: 'v3 但 root 非法',
+    name: 'v4 但 root 非法',
     timezone: BASELINE.timezone,
     sticky: BASELINE.sticky,
     root: { type: 'jev', branches: [] }
-}), 'malformed-v3.json');
+}), 'malformed-v4.json');
 
   /* root 形状非法没有节点位置：必须显示解析原因本身，而不是「N 个校验问题」。 */
-  await expectImportReason('图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）');
+  await expectImportReason('图解析失败：root 不符合 sr-routing-graph v4 结构（未知字段或类型非法）');
   const issues = await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.issues.map(issue => ({
@@ -2471,7 +2482,7 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
   /* 被拒文件的 Issue 不能留在校验条：否则「定位」会指向草稿里不存在的节点。
      校验条恢复为当前草稿的 4 条提示（§5.3）。 */
   assert.deepEqual(issues.map(issue => issue.code), ['hint', 'hint', 'hint', 'hint'],
-    'a malformed v3 import leaked its parse issue into the draft validation bar');
+    'a malformed v4 import leaked its parse issue into the draft validation bar');
   assert.equal(issues.every(issue => issue.level === 'hint'), true);
   assert.deepEqual(issues.map(issue => [issue.node_id, issue.edge_id]),
     [['', ''], ['', ''], ['', ''], ['', '']]);
@@ -2479,10 +2490,10 @@ test('Task 12 · a v3 document with a malformed root reports graph_parse_error a
     'the validation bar rendered the rejected file as a hard issue');
   assert.equal(await page.locator('#cvIssues [data-locate]').count(), 0,
     'the rejected file left locatable issues pointing at draft nodes');
-  assert.deepEqual(await draftOf(), kept, 'a malformed v3 import changed the draft');
+  assert.deepEqual(await draftOf(), kept, 'a malformed v4 import changed the draft');
 });
 
-test('Task 12 · a valid v3 import without positions lays every node out with finite coordinates', async () => {
+test('Task 12 · a valid v4 import without positions lays every node out with finite coordinates', async () => {
   await ensureBaselineTree();
   await openCanvas();
   const stripped = JSON.parse(JSON.stringify(EXAMPLE_ROOT));
@@ -2514,7 +2525,7 @@ const RTGraph = await import('/console/routing/graph.js');
 })
 }));
 });
-  assert.deepEqual(result.issues, [], 'position-less valid v3 import failed structure validation');
+  assert.deepEqual(result.issues, [], 'position-less valid v4 import failed structure validation');
   result.nodes.forEach(node => {
     assert.ok(Number.isFinite(node.x) && Number.isFinite(node.y), `${node.id} has no finite position`);
     assert.deepEqual({ x: node.x, y: node.y }, result.expected[node.id],
@@ -2990,7 +3001,8 @@ test('200-node-400-edge-smoke', async () => {
       addEdge('l' + (i % 98), 'out', target, G.nextSlot(graph, target));
 }
     return {
-      kind: 'sr-routing-graph', version: 3, name: '极限图 200 节点 / 400 边',
+      kind: 'sr-routing-graph', version: 4, name: '极限图 200 节点 / 400 边',
+      departments: [], enabled: false, default: false,
       timezone: 'Asia/Shanghai', sticky: { enabled: false, ttl_seconds: 1800 }, root: graph,
       backends: runtime.backends,
       jev: runtime.jev,
@@ -3121,7 +3133,8 @@ test('condition-only-question-is-valid', async () => {
      所以用 QA 基线的 mock 快照（而不是仓库示例的 127.0.0.1 端点）。 */
   const doc = Object.assign({
     kind: 'sr-routing-graph',
-    version: 3,
+    version: 4,
+    departments: [], enabled: false, default: false,
     name: '条件可达性图',
     timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
@@ -3252,7 +3265,7 @@ test('layout-persists-across-save-and-reload', async () => {
   assert.ok(Math.abs(after.positions.start.x - moved.x) < 0.01, 'the dragged layout was not persisted');
 });
 
-test('Task 14 · a malformed v3 import with non-array fields is rejected before applying', async () => {
+test('Task 14 · a malformed v4 import with non-array fields is rejected before applying', async () => {
   await ensureBaselineTree();
   await openCanvas();
   const draftOf = () => page.evaluate(async () => {
@@ -3297,7 +3310,7 @@ test('Task 14 · a malformed v3 import with non-array fields is rejected before 
 }), 'malformed-models.json');
   /* 被拒文件不得只报「1 个校验问题」：必须点名非数组的 models 字段。 */
   await expectImportReason(probe.reason);
-  assert.deepEqual(await draftOf(), kept, 'a rejected malformed v3 import changed the draft');
+  assert.deepEqual(await draftOf(), kept, 'a rejected malformed v4 import changed the draft');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.issues.every(issue => issue.level === 'hint'));
@@ -4213,7 +4226,8 @@ test('review-import-contract-rejects-before-draft-replacement', async () => {
   for (const tree of invalid) {
     await clearToasts();
     const document = Object.assign({
-      kind: 'sr-routing-graph', version: 3, name: tree.name,
+      kind: 'sr-routing-graph', version: 4, name: tree.name,
+      departments: [], enabled: false, default: false,
       timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
 }, runtimeDocumentFields(base.runtime));
     await setImportPayload(document, 'invalid-contract.json');
@@ -4249,7 +4263,8 @@ test('review-import-envelope-types-preserve-draft', async () => {
   for (const tree of invalid) {
     await clearToasts();
     const document = Object.assign({
-      kind: 'sr-routing-graph', version: 3, name: tree.name,
+      kind: 'sr-routing-graph', version: 4, name: tree.name,
+      departments: [], enabled: false, default: false,
       timezone: tree.timezone, sticky: tree.sticky, root: tree.root,
 }, runtimeDocumentFields(base.runtime));
     await setImportPayload(document, 'invalid-envelope-value.json');

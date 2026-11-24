@@ -1088,11 +1088,15 @@ test('bootstrap registers the multi-JEV catalog, periods and the self-contained 
   assert.equal(BASELINE_RUNTIME.jev.id, 'default');
   assert.equal(BASELINE_RUNTIME.jev.base_url, mockBase);
 
-  /* 落盘文档也必须是严格 v3 自包含形态（kind/version + 四字段）。 */
+  /* 落盘文档也必须是严格 v4 自包含形态（kind/version + 部门/生命周期 + 四字段）。 */
   const documentPath = path.join(tempDir, 'routing-graph', 'graphs', TREE_ID + '.json');
   const document = JSON.parse(fs.readFileSync(documentPath, 'utf8'));
   assert.equal(document.kind, 'sr-routing-graph');
-  assert.equal(document.version, 3);
+  assert.equal(document.version, 4);
+  assert.deepEqual(document.departments, []);
+  /* 基线组在 bootstrap 里已启用：文件生命周期必须与 current 指针一致。 */
+  assert.equal(document.enabled, true);
+  assert.equal(document.default, true);
   for (const field of RUNTIME_FIELDS) {
     assert.deepEqual(document[field], BASELINE_RUNTIME[field],
       'stored canvas document lost the ' + field + ' snapshot');
@@ -1460,7 +1464,7 @@ export async function exportViaUi() {
 
 export async function setImportPayload(payload, name) {
   await page.locator('#cvImportFile').setInputFiles({
-    name: name || 'graph.sr-routing-graph-v3.json',
+    name: name || 'graph.sr-routing-graph-v4.json',
     mimeType: 'application/json',
     buffer: Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload))
 });

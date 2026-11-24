@@ -1,4 +1,4 @@
-"""Graph v3 校验器测试：结构码表（spec §5.2）+ 启用码表（spec §5.3）+ Task-1 冻结修正。"""
+"""Graph v4 校验器测试：结构码表（spec §5.2）+ 启用码表（spec §5.3）+ Task-1 冻结修正。"""
 import json
 from pathlib import Path
 

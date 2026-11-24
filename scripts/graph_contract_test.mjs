@@ -1,6 +1,6 @@
 /* 跨运行时图契约（Node 侧）：与 tests/test_graph_contract.py 共用同一份 fixture。
    ------------------------------------------------------------------
-   每个 fixture 是手写的 sr-routing-graph v3 文档；Node 侧走控制台的真实入口：
+   每个 fixture 是手写的 sr-routing-graph v4 文档；Node 侧走控制台的真实入口：
    `RTGraph.parseImport`（严格解析 + 校验）→ `RTGraph.validate`（硬错误码）→
    `RTGraph.behaviorCanonical`（canonical JSON）→ node:crypto sha256。
    Python 侧由 tests/test_graph_contract.py 对同一 fixture 断言同一组 issue code

@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "案例一 · 行业模型分流",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -317,5 +317,8 @@
       "x": 660.0,
       "y": 740.0
     }
-  }
+  },
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

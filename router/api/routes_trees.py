@@ -97,6 +97,7 @@ class TreeUpsertIn(BaseModel):
     canvas: Any = None
     sticky: Any = None
     timezone: Any = None
+    departments: Any = None
     backends: Any = None
     jev: Any = None
     jev_window: Any = None
@@ -155,11 +156,14 @@ def create_tree(
 ):
     payload = {
         "id": _clean_id(body.id), "name": _clean_name(body.name),
-        "enabled": False,
+        # 生命周期是服务端状态：新建图一律关闭、非默认，客户端不能写入。
+        "enabled": False, "default": False,
         "root": body.root, "canvas": body.canvas, "sticky": body.sticky,
     }
     if "timezone" in body.model_fields_set:
         payload["timezone"] = body.timezone
+    if "departments" in body.model_fields_set:
+        payload["departments"] = body.departments
     payload.update(_runtime_payload(body, body.model_fields_set))
     tree = _parse_tree(payload)
     created = _service(request, conn, trees).create(tree)
@@ -191,7 +195,7 @@ def update_tree(
     changes: dict[str, Any] = {}
     if "name" in fields:
         changes["name"] = _clean_name(body.name)  # 显式 null → ""（清空名称）
-    for field in ("root", "canvas", "sticky", "timezone"):
+    for field in ("root", "canvas", "sticky", "timezone", "departments"):
         if field in fields:
             changes[field] = getattr(body, field)
     changes.update(_runtime_payload(body, fields))
@@ -261,7 +265,9 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
     payload = {
         "id": stored.id if stored else "draft",
         "name": stored.name if stored else "",
-        "enabled": False,
+        "enabled": False, "default": False,
+        "departments": (body.departments if "departments" in fields
+                        else (list(stored.departments) if stored else [])),
         "root": root if root is not None else graph_to_dict(stored.root),
         "canvas": canvas,
         "timezone": body.timezone if "timezone" in fields else timezone_default,

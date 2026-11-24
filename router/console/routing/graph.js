@@ -1,14 +1,14 @@
-/* RTGraph · 画布 v3 纯函数层（规格 §2.2–§2.8 / §5 / §6.1）
+/* RTGraph · 画布 v4 纯函数层（规格 §2.2–§2.8 / §5 / §6.1）
    ------------------------------------------------------------------
    ES module（浏览器 <script type="module"> / Node import 同一份源码）。
 
    约束：
    · 只做纯函数（不读 DOM、不读 window.MOCK、不发请求），可被 node 直测；
    · 所有函数显式接收 graph（root：{id,type,nodes,edges,error_fallback}）
-     或完整 envelope（{name,timezone,sticky,root}）；
+     或完整 envelope（{name,departments,enabled,default,timezone,sticky,root}）；
    · 算法移植自 docs/od-design/routing-canvas-2026-11-02/mock.js，但去掉了固定场景与组状态。
    ------------------------------------------------------------------ */
-const VERSION = 3;
+const VERSION = 4;
 const KIND = 'sr-routing-graph';
 const LIMITS = {
   nodes: 200,
@@ -28,9 +28,9 @@ const LOGIC = {
 };
 const NODE_TYPES = ['start', 'question', 'logic', 'condition', 'target'];
 const NODE_ORDER = { start: 0, condition: 1, question: 2, logic: 3, target: 4 };
-const REJECT_MESSAGE = '只接受 sr-routing-graph v3（本期不做旧格式兼容与转换）';
-const PARSE_ERROR_ZH = '图解析失败：root 不符合 sr-routing-graph v3 结构（未知字段或类型非法）';
-const PARSE_ERROR_EN = 'Graph parse failed: root does not conform to the sr-routing-graph v3 structure (unknown fields or invalid types)';
+const REJECT_MESSAGE = '只接受 sr-routing-graph v4（本期不做旧格式兼容与转换）';
+const PARSE_ERROR_ZH = '图解析失败：root 不符合 sr-routing-graph v4 结构（未知字段或类型非法）';
+const PARSE_ERROR_EN = 'Graph parse failed: root does not conform to the sr-routing-graph v4 structure (unknown fields or invalid types)';
 const HINTS = [
   '比较条件写在输入槽位上：数值线拖进任何布尔槽位后，点条件即可改成 > 0.75 这类阈值，不需要再放比较门。',
   '同一数值端口可以连到同一个判断门的两个槽位，分别写 > 0.3 与 < 0.8，就是区间条件。',
@@ -611,10 +611,15 @@ const RUNTIME_DEFAULTS = {
 
 /* ── 导入契约白名单：未知字段/未知类型/非法时区一律 graph_parse_error / invalid_timezone ── */
 /* canvas 是可选顶层字段：画布坐标只出现在文档顶层，节点对象不再携带 position。 */
-const IMPORT_FIELDS = ['kind', 'version', 'name', 'timezone', 'sticky', 'root', 'canvas'].concat(RUNTIME_FIELDS);
+const IMPORT_FIELDS = [
+  'kind', 'version', 'name', 'departments', 'enabled', 'default',
+  'timezone', 'sticky', 'root', 'canvas'
+].concat(RUNTIME_FIELDS);
 /* API envelope 是内部树形态：runtime 以嵌套对象携带；扁平四字段也接受（Python tree_to_dict）。 */
-const ENVELOPE_FIELDS = ['id', 'name', 'enabled', 'timezone', 'sticky', 'root', 'tree_revision',
-  'updated_at', 'runtime'].concat(RUNTIME_FIELDS);
+const ENVELOPE_FIELDS = [
+  'id', 'name', 'enabled', 'default', 'departments', 'timezone', 'sticky',
+  'root', 'tree_revision', 'updated_at', 'runtime', 'document_sha256'
+].concat(RUNTIME_FIELDS);
 const ROOT_FIELDS = ['id', 'type', 'nodes', 'edges', 'error_fallback'];
 /* 导入文档的节点契约：只有逻辑字段。内部草稿节点仍保留 position 工作状态。 */
 const NODE_FIELDS = {
@@ -716,6 +721,24 @@ function validateContract(value, graph, issues) {
     addUnknownFields(value, ENVELOPE_FIELDS, 'tree', issues, '');
     if (typeof value.name !== 'string') {
       issues.push(issue('graph_parse_error', 'tree.name 必须是字符串', 'tree.name must be a string'));
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'enabled') && typeof value.enabled !== 'boolean') {
+      issues.push(issue('graph_parse_error', 'enabled 必须是 boolean', 'enabled must be a boolean'));
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'default') && typeof value.default !== 'boolean') {
+      issues.push(issue('graph_parse_error', 'default 必须是 boolean', 'default must be a boolean'));
+    }
+    if (value.default === true && value.enabled !== true) {
+      issues.push(issue('graph_parse_error', 'default graph must be enabled',
+        'default graph must be enabled'));
+    }
+    if (Object.prototype.hasOwnProperty.call(value, 'departments')) {
+      try {
+        normalizeDepartments(value.departments);
+      } catch (error) {
+        issues.push(issue('graph_parse_error', 'departments 非法：' + error.message,
+          'Invalid departments: ' + error.message));
+      }
     }
     if (!isNonEmptyString(value.timezone)) {
       issues.push(issue('graph_parse_error', 'timezone 必须是非空字符串', 'timezone must be a nonempty string'));
@@ -1698,8 +1721,8 @@ function addRuntimeEnvelopeIssues(value, issues) {
   const hasNested = hasOwnField(value, 'runtime');
   if (hasNested) {
     if (!isRecord(value.runtime)) {
-      runtimeIssue(issues, '运行配置必须是对象：不接受 runtime:null（旧文档请重新导入完整 v3 文档）',
-        'Runner config must be an object: runtime:null is not accepted (re-import a complete v3 document)');
+      runtimeIssue(issues, '运行配置必须是对象：不接受 runtime:null（旧文档请重新导入完整 v4 文档）',
+        'Runner config must be an object: runtime:null is not accepted (re-import a complete v4 document)');
       return;
     }
     addRuntimeGroupIssues(value.runtime, issues, false);
@@ -1924,11 +1947,39 @@ function rootView(graph, includeDisplay) {
   };
 }
 
+/* 部门规范化：唯一实现。导入、API envelope 与 createMinimalTree 共用；
+   失败一律抛 Error，由调用方（parseImport）转成 graph_parse_error。 */
+function normalizeDepartments(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error('departments must be a list of strings');
+  const values = value.map(item => {
+    if (typeof item !== 'string') throw new Error('departments must be a list of strings');
+    const department = item.trim();
+    if (!department || department.length > 64 || /[\u0000-\u001f\u007f]/.test(department)) {
+      throw new Error('department is empty, too long, or contains control characters');
+    }
+    return department;
+  });
+  if (new Set(values).size !== values.length) throw new Error('duplicate department');
+  return values.sort();
+}
+
+/* 宽松版本：行为/可编辑 canonical 必须永远可计算（changeKind 对任意草稿调用），
+   非法部门在 validate 里作为硬 Issue 报告，不在这里抛异常。 */
+function departmentsOf(tree) {
+  try {
+    return normalizeDepartments(isRecord(tree) ? tree.departments : undefined);
+  } catch (error) {
+    return [];
+  }
+}
+
 function envelopeParts(tree) {
   const value = isRecord(tree) ? tree : {};
   const sticky = isRecord(value.sticky) ? value.sticky : {};
   return {
     name: value.name == null ? '' : value.name,
+    departments: departmentsOf(value),
     timezone: isNonEmptyString(value.timezone) ? value.timezone : 'Asia/Shanghai',
     sticky: {
       enabled: sticky.enabled === true,
@@ -1941,6 +1992,7 @@ function envelopeParts(tree) {
 function behaviorCanonical(tree) {
   const parts = envelopeParts(tree);
   const view = {
+    departments: parts.departments,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: rootView(parts.root, false)
@@ -1960,6 +2012,7 @@ function editableCanonical(tree, stripPosition) {
   }
   const canonical = {
     name: parts.name,
+    departments: parts.departments,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: view
@@ -2075,6 +2128,9 @@ function serialize(tree) {
     kind: KIND,
     version: VERSION,
     name: parts.name,
+    departments: parts.departments,
+    enabled: isRecord(tree) && tree.enabled === true,
+    default: isRecord(tree) && tree.default === true,
     timezone: parts.timezone,
     sticky: parts.sticky,
     root: stripRemovedTargetFields(clone(parts.root))
@@ -2124,6 +2180,31 @@ function parseImport(text) {
       )]
     };
   }
+  /* v4 envelope：enabled/default 必须是 boolean 且 default => enabled；
+     departments 必须能规范化（失败转成 graph_parse_error，绝不让异常中断导入）。 */
+  const lifecycleIssues = [];
+  if (typeof data.enabled !== 'boolean') {
+    lifecycleIssues.push(issue('graph_parse_error', 'enabled 必须是 boolean',
+      'enabled must be a boolean'));
+  }
+  if (typeof data.default !== 'boolean') {
+    lifecycleIssues.push(issue('graph_parse_error', 'default 必须是 boolean',
+      'default must be a boolean'));
+  }
+  if (data.default === true && data.enabled !== true) {
+    lifecycleIssues.push(issue('graph_parse_error', 'default graph must be enabled',
+      'default graph must be enabled'));
+  }
+  let departments = [];
+  try {
+    departments = normalizeDepartments(data.departments);
+  } catch (error) {
+    lifecycleIssues.push(issue('graph_parse_error', 'departments 非法：' + error.message,
+      'Invalid departments: ' + error.message));
+  }
+  if (lifecycleIssues.length) {
+    return { ok: false, error: PARSE_ERROR_ZH, issues: finishIssues(lifecycleIssues) };
+  }
   /* 密钥与派生的密钥状态只存在于服务端：文档任意层级出现即整体拒绝。 */
   const secretField = findSecretField(data);
   if (secretField) {
@@ -2140,7 +2221,7 @@ function parseImport(text) {
   }
   const raw = data.root;
   if (!isRecord(raw) || raw.type !== 'graph' || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
-    /* kind/version 正确的 v3 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
+    /* kind/version 正确的 v4 但 root 形状非法：按 §5.2 报 graph_parse_error（zh/en），
        固定拒绝文案只留给旧 jev / version 2 / 错误 kind。 */
     return {
       ok: false,
@@ -2212,6 +2293,9 @@ function parseImport(text) {
   const rawSticky = data.sticky === null ? {} : data.sticky;
   const tree = {
     name: data.name,
+    departments: departments,
+    enabled: false,
+    default: false,
     timezone: data.timezone,
     sticky: rawSticky,
     root: graph,
@@ -2263,6 +2347,9 @@ function createMinimalTree(model, runtime) {
   }
   return {
     name: '新决策组',
+    departments: [],
+    enabled: false,
+    default: false,
     timezone: 'Asia/Shanghai',
     sticky: { enabled: false, ttl_seconds: 1800 },
     runtime: normalized,
@@ -2316,6 +2403,7 @@ export {
   REASONING_FORMATS,
   clone,
   stableStringify,
+  normalizeDepartments,
   graphOf,
   findNode,
   portsOf,

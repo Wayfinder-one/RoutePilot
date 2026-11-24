@@ -36,6 +36,17 @@ class GraphConflictError(GraphStorageError):
         self.actual_document_sha256 = actual_document_sha256
 
 
+def document_tree(tree: RoutingTree, active_id: str | None) -> RoutingTree:
+    """写盘文档的生命周期归一：既有 current 指针是唯一活动权威。
+
+    v4 文档自带 ``enabled`` / ``default``，过渡期两者必须与 ``current`` 指针一致：
+    活动图（指针目标）写 ``enabled=True, default=True``，其余图一律两者皆 False。
+    不变量：``default => enabled``，且已保存文件中最多一份 enabled（即指针目标）。
+    """
+    enabled = active_id == tree.id
+    return replace(tree, enabled=enabled, default=enabled)
+
+
 @dataclass(frozen=True)
 class _StagedGraph:
     """一份待替换的图：原字节、目标字节与同目录暂存文件。"""
@@ -151,15 +162,14 @@ class RoutingTreeRepo:
         path = self.graphs / f"{tree_id}.json"
         if not path.exists():
             return None
-        return self._read_tree(path, tree_id, self.active_id())
+        return self._read_tree(path, tree_id)
 
     def list(self) -> list[RoutingTree]:
-        active_id = self.active_id()
         trees = []
         for path in self.graphs.glob("*.json"):
             tree_id = path.stem
             self._validate_id(tree_id)
-            trees.append(self._read_tree(path, tree_id, active_id))
+            trees.append(self._read_tree(path, tree_id))
         return sorted(trees, key=lambda tree: (tree.updated_at, tree.id))
 
     def create(self, tree: RoutingTree) -> RoutingTree:
@@ -168,8 +178,8 @@ class RoutingTreeRepo:
         path = self.graphs / f"{tree.id}.json"
         if path.exists():
             raise GraphAlreadyExistsError(tree.id)
-        self._atomic_write(path, graph_document_bytes(replace(tree, enabled=False)))
-        return self._read_tree(path, tree.id, self.active_id())
+        self._atomic_write(path, graph_document_bytes(replace(tree, enabled=False, default=False)))
+        return self._read_tree(path, tree.id)
 
     def update(self, tree: RoutingTree, *, base_document_sha256: str) -> RoutingTree:
         self._require_writer()
@@ -183,8 +193,8 @@ class RoutingTreeRepo:
         if not base_document_sha256 or actual != base_document_sha256:
             raise GraphConflictError(actual)
         active_id = self.active_id()
-        self._atomic_write(path, graph_document_bytes(replace(tree, enabled=active_id == tree.id)))
-        return self._read_tree(path, tree.id, active_id)
+        self._atomic_write(path, graph_document_bytes(document_tree(tree, active_id)))
+        return self._read_tree(path, tree.id)
 
     def stage_updates(self, updates) -> GraphBatch:
         """预检所有基线哈希并暂存目标文档，返回可提交/回滚的批次。
@@ -208,7 +218,7 @@ class RoutingTreeRepo:
                 actual = hashlib.sha256(original).hexdigest() if original is not None else None
                 if not expected_sha256 or actual != expected_sha256:
                     raise GraphConflictError(actual)
-                target = graph_document_bytes(replace(tree, enabled=active_id == tree.id))
+                target = graph_document_bytes(document_tree(tree, active_id))
                 staged_path = self._stage_file(path, target)
                 entries.append(_StagedGraph(path, original, target, staged_path))
             return batch
@@ -220,32 +230,49 @@ class RoutingTreeRepo:
         source = self.get(source_id)
         if source is None:
             raise KeyError(source_id)
-        return self.create(replace(source, id=new_id, name=new_name, enabled=False))
+        return self.create(replace(source, id=new_id, name=new_name, enabled=False, default=False))
 
     def enable(self, tree_id: str) -> RoutingTree:
+        """过渡期启停：文件生命周期字段与 current 指针在同一写路径里保持一致。
+
+        先把旧的指针目标改写成 ``enabled=False, default=False``（避免留下两份 enabled
+        文件），再把目标文件改写成 ``enabled=True, default=True``，最后写指针。
+        """
         self._require_writer()
         tree = self.get(tree_id)
         if tree is None:
             raise KeyError(tree_id)
+        previous_id = self.active_id()
+        if previous_id is not None and previous_id != tree_id:
+            previous = self.get(previous_id)
+            if previous is not None and (previous.enabled or previous.default):
+                self._atomic_write(
+                    self.graphs / f"{previous_id}.json",
+                    graph_document_bytes(replace(previous, enabled=False, default=False)))
+        path = self.graphs / f"{tree_id}.json"
+        self._atomic_write(path, graph_document_bytes(replace(tree, enabled=True, default=True)))
         self._atomic_write(self.current, (tree_id + "\n").encode("utf-8"))
-        return self._read_tree(self.graphs / f"{tree_id}.json", tree_id, tree_id)
+        return self._read_tree(path, tree_id)
 
     def disable(self, tree_id: str) -> bool:
         self._require_writer()
-        if self.get(tree_id) is None:
+        tree = self.get(tree_id)
+        if tree is None:
             return False
         if self.active_id() == tree_id:
+            self._atomic_write(
+                self.graphs / f"{tree_id}.json",
+                graph_document_bytes(replace(tree, enabled=False, default=False)))
             self._atomic_write(self.current, b"")
         return True
 
-    def _read_tree(self, path: Path, tree_id: str, active_id: str | None) -> RoutingTree:
+    def _read_tree(self, path: Path, tree_id: str) -> RoutingTree:
         try:
             content = path.read_bytes()
             modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
             return parse_graph_document(
                 content,
                 tree_id=tree_id,
-                enabled=active_id == tree_id,
                 updated_at=modified,
                 document_sha256=hashlib.sha256(content).hexdigest(),
             )

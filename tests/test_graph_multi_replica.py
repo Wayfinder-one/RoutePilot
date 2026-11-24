@@ -45,12 +45,14 @@ def test_reader_loads_writer_change_and_survives_failures(tmp_path):
         with TestClient(writer_app) as writer:
             created_payload = direct_tree("qwen3-8b")
             created_payload.pop("enabled")
+            created_payload.pop("default")
             assert writer.post("/admin/trees", json=created_payload).status_code == 201
             assert writer.post("/admin/trees/main/enable").status_code == 200
             asyncio.run(reader_app.state.graph_reloader.poll_once())
             saved = writer.get("/admin/trees/main").json()["tree"]
             updated = direct_tree("qwen3-32b")
             updated.pop("enabled")
+            updated.pop("default")
             updated["base_document_sha256"] = saved["document_sha256"]
             assert writer.put("/admin/trees/main", json=updated).status_code == 200
             asyncio.run(reader_app.state.graph_reloader.poll_once())

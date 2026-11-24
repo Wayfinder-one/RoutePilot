@@ -61,6 +61,10 @@ function normaliseTree(raw) {
   if (!runtime) throw new Error('tree envelope is missing the four runtime fields');
   RTGraph.RUNTIME_FIELDS.forEach(field => { delete tree[field]; });
   tree.runtime = runtime;
+  /* v4 envelope：部门规范化（重复/空部门/控制字符在这里就拒绝），并保留服务端
+     返回的 default（生命周期由启停端点维护，普通保存不写）。 */
+  tree.departments = RTGraph.normalizeDepartments(tree.departments);
+  tree.default = source.default === true;
   tree.root = tree.root || { id: 'root', type: 'graph', nodes: [], edges: [] };
   if (!tree.name) tree.name = t('cv.default.name');
   if (!tree.timezone) tree.timezone = 'Asia/Shanghai';
@@ -175,6 +179,8 @@ export class RoutingController {
     if (savedTree.name != null) tree.name = savedTree.name; /* 服务端会 trim 名称 */
     tree.id = savedTree.id || this.treeId;
     tree.enabled = !!savedTree.enabled;
+    tree.default = !!savedTree.default;
+    tree.departments = RTGraph.normalizeDepartments(savedTree.departments);
     tree.tree_revision = savedTree.tree_revision || '';
     tree.updated_at = savedTree.updated_at || '';
     tree.document_sha256 = savedTree.document_sha256 || '';
@@ -219,6 +225,7 @@ export class RoutingController {
     const payload = RTGraph.collectCanvas(RTGraph.clone({
       id: this.treeId,
       name: String(store.tree.name == null ? '' : store.tree.name).trim(),
+      departments: RTGraph.normalizeDepartments(store.tree.departments),
       timezone: store.tree.timezone || 'Asia/Shanghai',
       sticky: RTGraph.clone(store.tree.sticky || { enabled: false, ttl_seconds: 1800 }),
       root: store.tree.root,
@@ -294,8 +301,26 @@ export class RoutingController {
       if (store.tree !== targetTree || this.treeId !== targetId) return false;
       if (result && Array.isArray(result.trees)) this.trees = result.trees;
       if (result && result.snapshot_revision != null) this.snapshotRevision = result.snapshot_revision;
+      /* v4：启停同时维护文件里的 enabled/default（default => enabled 不变量）。 */
       store.tree.enabled = !!enabled;
-      if (store.saved) store.saved.enabled = !!enabled;
+      store.tree.default = !!enabled;
+      if (store.saved) {
+        store.saved.enabled = !!enabled;
+        store.saved.default = !!enabled;
+      }
+      /* v4：启停会改写目标文档的 lifecycle 字段，文档哈希/修订随之变化；不同步回
+         保存基线，下一次普通保存会拿旧 base_document_sha256 被 409 graph_conflict 拒绝。 */
+      const updated = (Array.isArray(result && result.trees) ? result.trees : [])
+        .find(item => item && item.id === targetId);
+      if (updated) {
+        for (const field of ['tree_revision', 'updated_at', 'document_sha256', 'departments']) {
+          const value = field === 'departments'
+            ? RTGraph.normalizeDepartments(updated.departments)
+            : (updated[field] || '');
+          store.tree[field] = RTGraph.clone(value);
+          if (store.saved) store.saved[field] = RTGraph.clone(value);
+        }
+      }
       this.hooks.renderTreeSelect();
       /* 启用成功后重新校验当前草稿：服务端只回新 revision，Issue 条不能停在旧状态。 */
       this.hooks.setIssues(RTGraph.validate(store.tree.root));
@@ -383,7 +408,7 @@ export class RoutingController {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = String(this.treeId || tree.id || 'tree') + '.sr-routing-graph-v3.json';
+      link.download = String(this.treeId || tree.id || 'tree') + '.sr-routing-graph-v4.json';
       link.rel = 'noopener';
       document.body.appendChild(link);
       link.click();
@@ -401,7 +426,7 @@ export class RoutingController {
     }
   }
 
-  /* 导入只接受 v3：先校验 kind/version（固定拒绝文案），再做结构校验；
+  /* 导入只接受 v4：先校验 kind/version（固定拒绝文案），再做结构校验；
      任何失败都保留当前草稿，合法导入作为一次历史操作替换完整 envelope。 */
   applyImport(text) {
     const result = RTGraph.parseImport(text);
@@ -431,6 +456,7 @@ export class RoutingController {
     this.loadSeq += 1;
     if (this.hooks.change('behavior', tree => {
       tree.name = result.tree.name;
+      tree.departments = RTGraph.clone(result.tree.departments);
       tree.timezone = result.tree.timezone;
       tree.sticky = RTGraph.clone(result.tree.sticky);
       tree.root = RTGraph.clone(result.tree.root);

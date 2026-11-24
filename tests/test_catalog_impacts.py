@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
@@ -49,8 +50,10 @@ def confirmation_from(response) -> dict:
 
 
 def _strip_enabled(document: dict) -> dict:
+    """管理 DTO 只接受 departments；生命周期 enabled/default 由服务端/启停端点写入。"""
     payload = copy.deepcopy(document)
     payload.pop("enabled", None)
+    payload.pop("default", None)
     return payload
 
 
@@ -1416,13 +1419,14 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
 # --------------------------------------------------------------------------- #
 # 16. 发布门必须在写锁内决定 + 纯数据库写不读活动指针
 # --------------------------------------------------------------------------- #
-def test_enable_racing_lock_acquisition_still_publishes_newly_active_canvas(
+def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
         two_canvases, monkeypatch):
-    """加锁前落地一笔 enable：确认写必须发布刚被启用的画布。
+    """v4 过渡期：enable 会改写目标文件里的 enabled/default，确认哈希随之失效。
 
-    旧实现在 ``publisher.locked()`` 之前用旧 ``active_id`` 算好发布门；若该次
-    enable 让「唯一受影响画布」变成活动画布，批次会写入生效配置却跳过发布，内存
-    快照要等 ≤2s 的 reloader 才追上。修复后在锁内重读活动 id。
+    v3 时代 enable 只写 ``current`` 指针，画布字节不变；v4 文档自带生命周期字段，
+    因此「预览后、加锁前被 enable」必须 409 ``graph_conflict``（实际哈希是 enable 后
+    的新哈希），客户端只能重新预览确认。重新确认后发布门仍必须在锁内重读活动 id：
+    刚被启用的 other 必须被发布，而不是停留在旧的 main。
     """
     app, client = two_canvases
     publisher = app.state.publisher
@@ -1446,6 +1450,22 @@ def test_enable_racing_lock_acquisition_still_publishes_newly_active_canvas(
         "other"]
     before_revision = app.state.snapshot.snapshot_revision
 
+    stale = client.put("/admin/models/backup", json={
+        "upstream": "raced-upstream",
+        "impact_confirmation": confirmation_from(preview),
+    })
+
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "graph_conflict"
+    # 实际哈希必须是 enable 改写后的新文档哈希，而不是客户端提交的旧哈希。
+    assert stale.json()["detail"]["actual_document_sha256"] == hashlib.sha256(
+        _canvas_bytes(app, "other")).hexdigest()
+    assert app.state.snapshot.snapshot_revision == before_revision
+    assert _tree(app, "other").enabled is True
+
+    # 重新预览并确认：生命周期已稳定，发布门必须在写锁内识别出新活动画布。
+    preview = client.put("/admin/models/backup", json={"upstream": "raced-upstream"})
+    assert preview.status_code == 409, preview.text
     response = client.put("/admin/models/backup", json={
         "upstream": "raced-upstream",
         "impact_confirmation": confirmation_from(preview),
@@ -1453,7 +1473,6 @@ def test_enable_racing_lock_acquisition_still_publishes_newly_active_canvas(
 
     assert response.status_code == 200, response.text
     assert response.json()["synced_trees"] == ["other"]
-    # 新的活动画布已被写入：发布门必须发布它，而不是停留在旧的 main。
     assert app.state.snapshot.tree_id == "other"
     assert app.state.snapshot.snapshot_revision != before_revision
     assert app.state.snapshot.backends["backup"].upstream_name == "raced-upstream"

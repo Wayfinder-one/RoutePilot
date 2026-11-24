@@ -2,8 +2,9 @@
 
 覆盖（Task 7）：
 
-1. 每份 ``configs/cases/case-*.json`` 都是可直接导入的 ``sr-routing-graph`` v3
-   文档：无外部状态 ``id``/``enabled``，四个运行字段齐全，内存无密钥；
+1. 每份 ``configs/cases/case-*.json`` 都是可直接导入的 ``sr-routing-graph`` v4
+   文档：无外部状态 ``id``，生命周期 ``enabled``/``default`` 恒为 False，四个运行字段齐全，
+    内存无密钥；
 2. 每个案例只嵌入自身 target 实际使用的模型与完整 profile，provider 统一为
    ``demo-tap``，JEV 统一为 ``demo-jev`` / 窗口 ``2048 / 4096``；
 3. ``configs/default_routing_tree.json``、``configs/production_routing_tree.json``、
@@ -127,7 +128,6 @@ def _parse(path: Path, tree_id: str):
     return parse_graph_document(
         content,
         tree_id=tree_id,
-        enabled=False,
         updated_at="",
         document_sha256=hashlib.sha256(content).hexdigest(),
     )
@@ -199,9 +199,10 @@ def test_case_document_is_strict_self_contained(path: Path):
     text = path.read_text(encoding="utf-8")
 
     assert raw["kind"] == "sr-routing-graph"
-    assert raw["version"] == 3
+    assert raw["version"] == 4
     assert "id" not in raw, "部署 ID 由 manifest.json + 文件名提供，案例文件不保存外部状态"
-    assert "enabled" not in raw
+    assert raw["departments"] == []
+    assert raw["enabled"] is False and raw["default"] is False
     assert "api_key" not in text
 
     tree = _parse(path, tree_id=path.stem)
@@ -426,8 +427,9 @@ def test_upsert_tree_strips_envelope_and_carries_runtime():
     method, path, body = calls[0]
     assert (method, path) == ("POST", "/admin/trees")
     assert body["id"] == "case-multimodal"
-    for stripped in ("kind", "version", "enabled"):
+    for stripped in ("kind", "version", "enabled", "default"):
         assert stripped not in body
+    assert body["departments"] == document["departments"]
     for runtime_field in ("backends", "jev", "jev_window", "time_periods"):
         assert body[runtime_field] == document[runtime_field]
     assert body["name"] == document["name"]

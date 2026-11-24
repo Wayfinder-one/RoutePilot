@@ -81,6 +81,7 @@ class GraphPatch:
     canvas: dict | None | _Unset = UNSET
     sticky: dict | None | _Unset = UNSET
     timezone: str | None | _Unset = UNSET
+    departments: list | None | _Unset = UNSET
     backends: dict | None | _Unset = UNSET
     jev: dict | None | _Unset = UNSET
     jev_window: dict | None | _Unset = UNSET
@@ -122,9 +123,11 @@ class GraphService:
 
             candidate = None
             if current.enabled:
+                # 写盘路径会把活动图归一成 enabled/default=True；指纹必须对应同一份字节。
+                document = dataclass_replace(tree, enabled=True, default=True)
                 fingerprint = (
-                    tree.id, hashlib.sha256(graph_document_bytes(tree)).hexdigest())
-                candidate = self.publisher.prepare(self.conn, tree, fingerprint)
+                    tree.id, hashlib.sha256(graph_document_bytes(document)).hexdigest())
+                candidate = self.publisher.prepare(self.conn, document, fingerprint)
             updated = self.trees.update(tree, base_document_sha256=base_document_sha256)
             if candidate is not None:
                 self._require_fingerprint(candidate.fingerprint)
@@ -158,9 +161,14 @@ class GraphService:
             issues = tree_issues(self.conn, tree)
             if issues:
                 raise ValidationFailed(issues)
-            enabled_tree = dataclass_replace(tree, enabled=True)
-            candidate = self.publisher.prepare(
-                self.conn, enabled_tree, (tree.id, tree.document_sha256))
+            # 过渡期 enable 会把目标文件改写成 enabled/default=True，因此候选快照的
+            # 指纹必须是「改写后」的文档哈希，提交前复核才能通过。
+            enabled_tree = dataclass_replace(tree, enabled=True, default=True)
+            fingerprint = (
+                tree.id,
+                hashlib.sha256(graph_document_bytes(enabled_tree)).hexdigest(),
+            )
+            candidate = self.publisher.prepare(self.conn, enabled_tree, fingerprint)
             try:
                 self.trees.enable(tree_id)
             except KeyError:
@@ -201,6 +209,9 @@ class GraphService:
             "id": current.id,
             "name": current.name if patch.name is UNSET else patch.name,
             "enabled": current.enabled,
+            "default": current.default,
+            "departments": (list(current.departments) if patch.departments is UNSET
+                            else patch.departments),
             "root": graph_to_dict(current.root) if patch.root is UNSET else patch.root,
             "canvas": canvas,
             "sticky": ({"enabled": current.sticky.enabled,

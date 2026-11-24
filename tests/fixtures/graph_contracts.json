@@ -3,7 +3,7 @@
     "name": "valid-choice-noul-score",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -270,16 +270,19 @@
           "x": 1240,
           "y": 460
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "578ee6689d85be7e922d793159b29ddc8201ef92c587d6fa969aee4445f346e8"
+    "behavior_sha256": "1bda6fa32c12908976bede4202e4ccc9e4188ee964d08e3a65090bc95be8bb4f"
   },
   {
     "name": "valid-node-edge-shuffle",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract-shuffled",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -546,16 +549,19 @@
           "x": 78,
           "y": 360
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "578ee6689d85be7e922d793159b29ddc8201ef92c587d6fa969aee4445f346e8"
+    "behavior_sha256": "1bda6fa32c12908976bede4202e4ccc9e4188ee964d08e3a65090bc95be8bb4f"
   },
   {
     "name": "valid-display-edits",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract-display",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -827,16 +833,19 @@
           "x": 87,
           "y": 111
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "578ee6689d85be7e922d793159b29ddc8201ef92c587d6fa969aee4445f346e8"
+    "behavior_sha256": "1bda6fa32c12908976bede4202e4ccc9e4188ee964d08e3a65090bc95be8bb4f"
   },
   {
     "name": "valid-integral-numbers",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract-integral",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -993,16 +1002,19 @@
           }
         ],
         "error_fallback": "target-b"
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "4d69b417fb6493c8a3b2fb8bd3e1960808724a5f34eaae0f2c8aa5723049ea0c"
+    "behavior_sha256": "8e8158154dc2023ab45bf85faf1caee08a4abd0039d99951ef9556ba8e5f51fc"
   },
   {
     "name": "invalid-empty-graph",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -1040,7 +1052,10 @@
         "nodes": [],
         "edges": [],
         "error_fallback": null
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [
       "fallback_missing",
@@ -1052,7 +1067,7 @@
     "name": "invalid-old-otherwise-target",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -1320,7 +1335,10 @@
           "x": 1240,
           "y": 460
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [
       "graph_parse_error"
@@ -1331,7 +1349,7 @@
     "name": "invalid-choice-single-option",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -1579,7 +1597,10 @@
           "x": 1240,
           "y": 460
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [
       "question_incomplete"
@@ -1590,7 +1611,7 @@
     "name": "invalid-numeric-condition-missing",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -1854,7 +1875,10 @@
           "x": 1240,
           "y": 460
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [
       "numeric_edge_condition_missing"
@@ -1865,7 +1889,7 @@
     "name": "valid-condition-periods",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract-periods",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -1952,16 +1976,19 @@
           }
         ],
         "error_fallback": "target-a"
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "5619f85c5f9e42093d669b78281fbe914b85410919e4d686710e003030bce16a"
+    "behavior_sha256": "0655f03d2abad1cb00f1c36776d663ad63787a773fd367e2e6447207f702e46a"
   },
   {
     "name": "valid-small-float-threshold",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract-small-float",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -2053,16 +2080,19 @@
           }
         ],
         "error_fallback": "target-a"
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "74bb450c79560ca798fa37fbb71048a72b5c243db8e15e73ce819cc58030caf0"
+    "behavior_sha256": "75963a6b63fd5f7c11c17cc5b00fc8f1acdbb6c574cde7ec6f01c33039afda6d"
   },
   {
     "name": "valid-envelope-variation",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract-envelope",
       "timezone": "Europe/Berlin",
       "sticky": {
@@ -2132,16 +2162,19 @@
           }
         ],
         "error_fallback": "target-a"
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "f195359ff71da452ebfe620597f45d33893e69f9a53cf378ccf33260d6f8c365"
+    "behavior_sha256": "3c7aac5c3c3e7f4b8c20ae0a89799219089f07b02102b3c65adf9e314b5e74ba"
   },
   {
     "name": "valid-old-field-control",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "contract",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -2408,16 +2441,19 @@
           "x": 1240,
           "y": 460
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "578ee6689d85be7e922d793159b29ddc8201ef92c587d6fa969aee4445f346e8"
+    "behavior_sha256": "1bda6fa32c12908976bede4202e4ccc9e4188ee964d08e3a65090bc95be8bb4f"
   },
   {
     "name": "valid-self-contained-runtime",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "自包含契约",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -2562,16 +2598,19 @@
           "x": 320,
           "y": 260
         }
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [],
-    "behavior_sha256": "32bbcd9689841e0084354d0a35462ac1c42eebb6dda00e132d28d0159d232594"
+    "behavior_sha256": "1fb2445db5b3187edbe7c9ceb166d3a0b2986ce91455339387ea221e63f04fd7"
   },
   {
     "name": "invalid-runtime-api-key",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "自包含契约",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -2634,7 +2673,10 @@
           }
         ],
         "error_fallback": "fast-target"
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [
       "graph_parse_error"
@@ -2645,7 +2687,7 @@
     "name": "invalid-runtime-nested-secret",
     "document": {
       "kind": "sr-routing-graph",
-      "version": 3,
+      "version": 4,
       "name": "自包含契约",
       "timezone": "Asia/Shanghai",
       "sticky": {
@@ -2717,7 +2759,10 @@
           }
         ],
         "error_fallback": "fast-target"
-      }
+      },
+      "departments": [],
+      "enabled": false,
+      "default": false
     },
     "issue_codes": [
       "graph_parse_error"

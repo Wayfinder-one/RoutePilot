@@ -19,7 +19,6 @@ def load(content):
     return parse_graph_document(
         content,
         tree_id="portable",
-        enabled=False,
         updated_at="",
         document_sha256=hashlib.sha256(content).hexdigest(),
     )

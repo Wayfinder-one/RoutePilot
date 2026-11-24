@@ -31,11 +31,13 @@ def test_create_stores_export_document_and_external_identity(repo):
     created = repo.create(tree_from_dict(tree_dict()))
     path = repo.root / "graphs" / "main.json"
     document = json.loads(path.read_text(encoding="utf-8"))
-    assert document["kind"] == "sr-routing-graph" and document["version"] == 3
-    assert "id" not in document and "enabled" not in document
+    assert document["kind"] == "sr-routing-graph" and document["version"] == 4
+    assert "id" not in document
+    assert document["departments"] == [] and document["enabled"] is False
+    assert document["default"] is False
     assert created.document_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
     assert repo.active_id() is None
-    assert created.enabled is False
+    assert created.enabled is False and created.default is False
 
 
 def test_duplicate_create_is_rejected(repo):
@@ -182,6 +184,37 @@ def test_enable_disable_and_copy_preserve_single_active_invariant(repo):
     assert repo.disable("b") is True
     assert not any(tree.enabled for tree in repo.list())
     assert repo.disable("missing") is False
+
+
+def test_lifecycle_fields_follow_the_current_pointer(repo):
+    """过渡期：文件里的 enabled/default 必须与 current 指针一致，最多一份 enabled。"""
+    first = repo.create(tree_from_dict(tree_dict("a")))
+    second = repo.create(tree_from_dict(tree_dict("b", enabled=True, default=True)))
+
+    assert first.enabled is False and second.enabled is False, "create must force lifecycle off"
+    documents = {
+        tree_id: json.loads((repo.root / "graphs" / f"{tree_id}.json").read_text(encoding="utf-8"))
+        for tree_id in ("a", "b")
+    }
+    assert all(document["enabled"] is False and document["default"] is False
+               for document in documents.values())
+
+    enabled = repo.enable("a")
+    assert enabled.enabled is True and enabled.default is True
+    assert repo.get("a").enabled is True and repo.get("a").default is True
+    assert {tree.id: tree.enabled for tree in repo.list()} == {"a": True, "b": False}
+    assert sum(tree.enabled for tree in repo.list()) == 1
+
+    repo.enable("b")
+    assert repo.active_id() == "b"
+    assert repo.get("a").enabled is False and repo.get("a").default is False
+    assert repo.get("b").enabled is True and repo.get("b").default is True
+    assert sum(tree.enabled for tree in repo.list()) == 1
+
+    assert repo.disable("b") is True
+    assert repo.active_id() is None
+    assert repo.get("b").enabled is False and repo.get("b").default is False
+    assert not any(tree.enabled for tree in repo.list())
 
 
 def test_invalid_document_and_missing_active_file_raise_storage_error(repo):

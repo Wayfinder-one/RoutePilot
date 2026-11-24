@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "案例五 · 调度与容错",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -248,5 +248,8 @@
       "x": 720.0,
       "y": 740.0
     }
-  }
+  },
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

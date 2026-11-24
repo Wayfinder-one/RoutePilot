@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""把 5 个演示决策组幂等部署到 RoutePilot（sr-routing-graph v3）并逐条 dry-run 验证。
+"""把 5 个演示决策组幂等部署到 RoutePilot（sr-routing-graph v4）并逐条 dry-run 验证。
 
 案例 JSON 是唯一事实源：本脚本不再维护任何硬编码的 provider / 模型 / JEV /
 时段目录，而是读取 ``configs/cases/case-*.json``（每份都是可直接导入的完整 v3
@@ -58,7 +58,8 @@ DEFAULT_PASSWORD = os.environ.get("SR_ADMIN_PASSWORD", "1qaz@WSX")
 #: 画布文档的四个运行字段：必须成组出现在部署请求里。
 RUNTIME_FIELDS = ("backends", "jev", "jev_window", "time_periods")
 #: 管理 DTO 允许、但由 manifest + 文件名决定的信封字段：部署前必须剔除。
-ENVELOPE_FIELDS = ("kind", "version", "id", "enabled")
+#: 生命周期（enabled/default）只能由管理端启停端点写入；departments 保留为普通字段。
+ENVELOPE_FIELDS = ("kind", "version", "id", "enabled", "default")
 
 #: JEV 服务的完整非密钥字段（``id`` 决定 POST / PUT 路径）。
 JEV_FIELDS = (
@@ -335,6 +336,7 @@ class Api:
         body = {
             "name": document.get("name", ""),
             "root": document["root"],
+            "departments": list(document.get("departments") or []),
             "sticky": document.get("sticky") or {"enabled": False, "ttl_seconds": 1800},
             "timezone": document.get("timezone") or "Asia/Shanghai",
         }

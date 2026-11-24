@@ -8,8 +8,11 @@ from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict, tree_revision_of
 
 KIND = "sr-routing-graph"
-VERSION = 3
-FIELDS = {"kind", "version", "name", "timezone", "sticky", "root", "canvas", *RUNTIME_FIELDS}
+VERSION = 4
+FIELDS = {
+    "kind", "version", "name", "departments", "enabled", "default",
+    "timezone", "sticky", "root", "canvas", *RUNTIME_FIELDS,
+}
 
 
 def graph_document(tree: RoutingTree) -> dict:
@@ -17,6 +20,9 @@ def graph_document(tree: RoutingTree) -> dict:
         "kind": KIND,
         "version": VERSION,
         "name": tree.name,
+        "departments": list(tree.departments),
+        "enabled": tree.enabled,
+        "default": tree.default,
         "timezone": tree.timezone,
         "sticky": {"enabled": tree.sticky.enabled, "ttl_seconds": tree.sticky.ttl_seconds},
         "root": graph_to_dict(tree.root),
@@ -33,7 +39,7 @@ def graph_document_bytes(tree: RoutingTree) -> bytes:
     return text.encode("utf-8")
 
 
-def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
+def parse_graph_document(content: bytes, *, tree_id: str,
                          updated_at: str, document_sha256: str) -> RoutingTree:
     try:
         raw = json.loads(content.decode("utf-8"))
@@ -44,7 +50,7 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
     if not isinstance(raw, dict):
         raise ValueError("graph document must be an object")
     if raw.get("kind") != KIND or isinstance(raw.get("version"), bool) or raw.get("version") != VERSION:
-        raise ValueError("only sr-routing-graph v3 is accepted")
+        raise ValueError("only sr-routing-graph v4 is accepted")
     missing = sorted(FIELDS - set(raw) - {"canvas", *RUNTIME_FIELDS})
     if missing:
         raise ValueError(f"missing graph document fields: {', '.join(missing)}")
@@ -57,7 +63,9 @@ def parse_graph_document(content: bytes, *, tree_id: str, enabled: bool,
     payload = {
         "id": tree_id,
         "name": raw["name"],
-        "enabled": enabled,
+        "enabled": raw["enabled"],
+        "default": raw["default"],
+        "departments": raw["departments"],
         "timezone": raw["timezone"],
         "sticky": raw["sticky"],
         "root": raw["root"],

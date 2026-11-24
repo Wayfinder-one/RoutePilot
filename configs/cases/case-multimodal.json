@@ -1,6 +1,6 @@
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "案例二 · 多模态分流",
   "timezone": "Asia/Shanghai",
   "sticky": {
@@ -153,5 +153,8 @@
       "x": 680.0,
       "y": 330.0
     }
-  }
+  },
+  "departments": [],
+  "enabled": false,
+  "default": false
 }

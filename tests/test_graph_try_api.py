@@ -721,7 +721,7 @@ def test_try_explicit_timezone_null_is_parse_error_not_inherited(client, app):
     issue = response.json()["detail"][0]
     assert issue["code"] == "graph_parse_error"
     assert issue["zh"] == (
-        "图解析失败：root 不符合 sr-routing-graph v3 结构（timezone must be a nonempty string）")
+        "图解析失败：root 不符合 sr-routing-graph v4 结构（timezone must be a nonempty string）")
     assert engine.calls == 0
 
 

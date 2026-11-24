@@ -113,8 +113,8 @@ def runtime_for_models(model_ids, *, base_url=DEFAULT_PROVIDER_BASE_URL,
     }
 
 
-def tree_dict(tree_id="main", *, root=None, enabled=False, sticky=None, canvas=None,
-              runtime=None):
+def tree_dict(tree_id="main", *, root=None, enabled=False, default=False,
+              departments=None, sticky=None, canvas=None, runtime=None):
     """自包含决策组文档：root 的 target 模型自动进入运行目录。
 
     严格契约下不存在「无运行字段」的树文档；需要测试缺字段拒绝时显式删除字段。
@@ -124,6 +124,8 @@ def tree_dict(tree_id="main", *, root=None, enabled=False, sticky=None, canvas=N
         root = graph_dict()
     raw = {
         "id": tree_id, "name": "测试图", "enabled": enabled,
+        "default": default,
+        "departments": list(departments or []),
         "timezone": "Asia/Shanghai",
         "sticky": sticky or {"enabled": False, "ttl_seconds": 1800},
         "root": root,

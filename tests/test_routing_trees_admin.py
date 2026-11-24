@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 import httpx
@@ -41,7 +42,9 @@ def client(app):
 
 
 def create_tree(client, raw):
-    payload = {key: value for key, value in raw.items() if key != "enabled"}
+    """管理 DTO 只接受 departments；生命周期 enabled/default 由服务端/启停端点写入。"""
+    payload = {key: value for key, value in raw.items()
+               if key not in ("enabled", "default")}
     return client.post("/admin/trees", json=payload)
 
 
@@ -251,9 +254,11 @@ def test_catalog_writes_succeed_when_active_canvas_has_no_catalog_rows(client, a
 def test_stale_browser_save_returns_409_and_keeps_file(client):
     create_payload = tree_dict()
     create_payload.pop("enabled")
+    create_payload.pop("default")
     created = client.post("/admin/trees", json=create_payload).json()["tree"]
     payload = tree_dict()
     payload.pop("enabled")
+    payload.pop("default")
     payload["base_document_sha256"] = created["document_sha256"]
     payload["name"] = "第一次修改"
     assert client.put("/admin/trees/main", json=payload).status_code == 200
@@ -526,7 +531,7 @@ def test_update_explicit_root_null_is_parse_error(client):
     assert set(issue) == ISSUE_KEYS
     assert issue["code"] == "graph_parse_error"
     assert issue["zh"] == (
-        "图解析失败：root 不符合 sr-routing-graph v3 结构（graph must be an object）")
+        "图解析失败：root 不符合 sr-routing-graph v4 结构（graph must be an object）")
     assert client.get("/admin/trees/main").json()["tree"] == before
 
 
@@ -543,7 +548,7 @@ def test_update_explicit_timezone_null_is_parse_error(client):
     assert set(issue) == ISSUE_KEYS
     assert issue["code"] == "graph_parse_error"
     assert issue["zh"] == (
-        "图解析失败：root 不符合 sr-routing-graph v3 结构（timezone must be a nonempty string）")
+        "图解析失败：root 不符合 sr-routing-graph v4 结构（timezone must be a nonempty string）")
     assert client.get("/admin/trees/main").json()["tree"] == before
 
 
@@ -710,6 +715,7 @@ def test_tree_writes_reject_nested_profile_secrets(client, app, key):
     payload = tree_dict("nested", root=graph_with_model("fast"))
     payload.update(runtime_dict())
     payload.pop("enabled")
+    payload.pop("default")
     payload["backends"]["models"][0]["profile"]["metadata"] = [
         {"tier": "x", key: "review-secret"}]
     created = client.post("/admin/trees", json=payload)
@@ -801,6 +807,7 @@ def _portable_payload(tree_id, model_id):
     raw = tree_dict(tree_id, root=_direct_graph(model_id))
     raw.update(runtime_for_models([model_id]))
     raw.pop("enabled")
+    raw.pop("default")
     return raw
 
 
@@ -846,3 +853,66 @@ def test_update_with_full_flat_runtime_fields_replaces_snapshot(client):
 
     assert response.status_code == 200, response.text
     assert _model_ids(response.json()["tree"]) == ["replaced-model"]
+
+
+# ── v4：departments 可写、生命周期不可写 ───────────────────────────────
+
+
+def test_put_accepts_departments_but_lifecycle_is_not_writable(client):
+    create_tree(client, tree_dict(root=graph_with_model()))
+    created = client.get("/admin/trees/main").json()["tree"]
+    assert created["departments"] == []
+    assert created["enabled"] is False and created["default"] is False
+
+    updated = client.put("/admin/trees/main", json={
+        "departments": ["财务部", "法务部"],
+        "base_document_sha256": created["document_sha256"],
+    })
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["tree"]["departments"] == ["法务部", "财务部"]
+    assert updated.json()["tree"]["enabled"] is False
+    assert updated.json()["tree"]["default"] is False
+
+    # 生命周期是服务端状态：普通 PUT 不能写 enabled/default。
+    current = client.get("/admin/trees/main").json()["tree"]
+    for lifecycle in ({"enabled": True}, {"default": True}):
+        assert client.put("/admin/trees/main", json={
+            **lifecycle, "base_document_sha256": current["document_sha256"],
+        }).status_code == 422
+
+
+def test_create_accepts_departments_and_forces_lifecycle_off(client):
+    raw = tree_dict(root=graph_with_model())
+    raw.pop("enabled")
+    raw.pop("default")
+    raw["departments"] = ["财务部"]
+    created = client.post("/admin/trees", json=raw)
+    assert created.status_code == 201, created.text
+    assert created.json()["tree"]["departments"] == ["财务部"]
+    assert created.json()["tree"]["enabled"] is False
+    assert created.json()["tree"]["default"] is False
+
+    duplicate = tree_dict("dupe", root=graph_with_model())
+    duplicate.pop("enabled")
+    duplicate.pop("default")
+    duplicate["departments"] = ["财务部", "财务部"]
+    response = client.post("/admin/trees", json=duplicate)
+    assert response.status_code == 422, response.text
+    assert any(issue["code"] == "graph_parse_error" for issue in response.json()["detail"])
+
+
+def test_enable_disable_persists_lifecycle_in_document(client, app):
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    enabled = client.get("/admin/trees/main").json()["tree"]
+    assert enabled["enabled"] is True and enabled["default"] is True
+    document = json.loads(
+        (Path(app.state.settings.graph_dir) / "graphs" / "main.json").read_text(encoding="utf-8"))
+    assert document["enabled"] is True and document["default"] is True
+
+    assert client.post("/admin/trees/main/disable").status_code == 200
+    disabled = client.get("/admin/trees/main").json()["tree"]
+    assert disabled["enabled"] is False and disabled["default"] is False
+    document = json.loads(
+        (Path(app.state.settings.graph_dir) / "graphs" / "main.json").read_text(encoding="utf-8"))
+    assert document["enabled"] is False and document["default"] is False

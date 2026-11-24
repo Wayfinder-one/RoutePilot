@@ -46,7 +46,12 @@ from router.store.repositories import (
     now_iso,
     write_transaction,
 )
-from router.store.routing_trees import GraphBatch, GraphChangedDuringLoad, GraphStorageError
+from router.store.routing_trees import (
+    GraphBatch,
+    GraphChangedDuringLoad,
+    GraphStorageError,
+    document_tree,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,11 +159,12 @@ class ConfigurationService:
         if issues:
             raise ValidationFailed(issues)
         try:
-            raw = graph_document_bytes(tree)
+            # 校验「即将写出的字节」：写盘路径会把 enabled/default 归一成与 current
+            # 指针一致，因此这里用同一份归一后的文档做严格解析。
+            raw = graph_document_bytes(document_tree(tree, self.trees.active_id()))
             parse_graph_document(
                 raw,
                 tree_id=tree.id,
-                enabled=tree.enabled,
                 updated_at=tree.updated_at,
                 document_sha256=tree.document_sha256,
             )

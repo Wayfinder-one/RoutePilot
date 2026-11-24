@@ -448,8 +448,8 @@ def test_shared_sample_revision_is_order_and_display_invariant():
     同时锁定当前 revision 值：移除 target.strategy 后的行为 canonical 必须逐字节一致。
     """
     samples = {
-        "fixture": (tree_dict(), "72c78103b5d4002fab6ca8a94a340f10172e90d3fccad2f231364d010dbb69d2"),
-        "power": (tree_dict(root=POWER_GRAPH), "7ee317f5be5f82ca5c1792d26dfcb03393e5f46705165928c5e26e462753b495"),
+        "fixture": (tree_dict(), "bf07cc90acf8112514f0e8e72bb571e48cc9b9de29d70e09a25753fa8790c638"),
+        "power": (tree_dict(root=POWER_GRAPH), "589b1be6285b297d5685aea1e102c6846c9252c510e4277dc8f208e6b12f3cd5"),
     }
     for name, (raw, expected) in samples.items():
         assert tree_revision_of(tree_from_dict(raw)) == expected, name
