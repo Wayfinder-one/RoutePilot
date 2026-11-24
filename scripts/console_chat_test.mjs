@@ -12,6 +12,7 @@ import {
   MAX_REQUEST_BYTES,
   appendMessageDelta,
   attachmentPart,
+  chatHeaders,
   estimateAttachmentBytes,
   historyMessages,
   isTextFile,
@@ -71,6 +72,26 @@ test('requestBytes measures the complete UTF-8 envelope', () => {
   const body = { messages: [{ role: 'user', content: '你好' }] };
   assert.equal(requestBytes(body), Buffer.byteLength(JSON.stringify(body)));
   assert.equal(MAX_REQUEST_BYTES, 10 * 1024 * 1024);
+});
+
+/* ---- Task 9 · 管理端测试对话的可信部门 Header ---- */
+
+test('admin chat sends a percent-encoded department when provided', () => {
+  const headers = chatHeaders({ sessionId: 's1', department: '财务部' });
+  assert.equal(headers['x-sr-session-id'], 's1');
+  assert.equal(headers['x-sr-department'], encodeURIComponent('财务部'));
+  /* 部门只作为可信 Header 传输，绝不进入 OpenAI 请求体（body 契约由
+     requestAssistant 保持原样：model/messages/stream 三字段）。 */
+  assert.deepEqual(Object.keys(headers).sort(), ['x-sr-department', 'x-sr-session-id']);
+});
+
+test('admin chat omits the department header when empty or absent', () => {
+  for (const department of [undefined, null, '']) {
+    const headers = chatHeaders({ sessionId: 's2', department: department });
+    assert.equal(headers['x-sr-session-id'], 's2');
+    assert.equal('x-sr-department' in headers, false,
+      `department ${JSON.stringify(department)} must not add a header`);
+  }
 });
 
 test('normalizeContent keeps text and known/unknown multimodal parts', () => {

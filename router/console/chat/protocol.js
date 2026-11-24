@@ -13,6 +13,15 @@
 
 export const MAX_REQUEST_BYTES = 10 * 1024 * 1024;
 
+/* 管理端测试对话的请求头：会话 id 恒在；部门是可信管理端 Header，只有非空时
+   才发送，并按百分号编码（服务端 decode_department 严格解码）。部门绝不进入
+   OpenAI 请求体 —— 选图是控制台的 Header 能力，不是模型输入。 */
+export function chatHeaders({ sessionId, department }) {
+  const headers = { 'x-sr-session-id': sessionId };
+  if (department) headers['x-sr-department'] = encodeURIComponent(department);
+  return headers;
+}
+
 const TEXT_EXTENSION = /\.(?:txt|md|markdown|csv|json|jsonl|py|js|mjs|ts|tsx|html|css|xml|ya?ml|log)$/i;
 
 export function requestBytes(body) {

@@ -204,12 +204,20 @@ export class RoutingController {
      document_sha256 / updated_at 随之变化。不同步回保存基线，下一次普通保存会
      拿旧 base_document_sha256 被 409 graph_conflict 拒绝。
      多图语义必须逐字段取服务端值：第一张启用图自动默认，之后启用的图是
-     enabled && !default —— 绝不能写 `default = enabled`。 */
+     enabled && !default —— 绝不能写 `default = enabled`。
+
+     departments 例外（Task 9）：启停端点从不修改部门，服务端回包里的 departments
+     只是「上一次保存的基线」。草稿有未保存的部门编辑时（dirtyKind !== 'clean'）
+     把它同步回草稿会静默丢弃用户的部门输入。因此这里只在草稿干净时同步
+     departments；脏草稿保留本地编辑，saved 基线也保持原值，下一次保存会带着
+     本地部门一起提交（enable/setDefault 已经先保存脏草稿，走到这里时通常是 clean）。 */
   syncLifecycleBaseline(updated) {
     const tree = this.store.tree;
     if (!tree || !updated) return;
+    const keepDirtyDepartments = this.store.dirtyKind !== 'clean';
     for (const field of ['enabled', 'default', 'tree_revision', 'updated_at',
       'document_sha256', 'departments']) {
+      if (field === 'departments' && keepDirtyDepartments) continue;
       const value = field === 'enabled' || field === 'default'
         ? updated[field] === true
         : field === 'departments'

@@ -20,7 +20,7 @@
 import { api, apiErrText, esc, toast } from './api.js';
 import { onLangChange, t } from './i18n.js';
 import {
-  MAX_REQUEST_BYTES, appendMessageDelta, attachmentPart, estimateAttachmentBytes,
+  MAX_REQUEST_BYTES, appendMessageDelta, attachmentPart, chatHeaders, estimateAttachmentBytes,
   historyMessages, isTextFile, normalizeMessage, requestBytes,
 } from './chat/protocol.js';
 import { createSseParser } from './chat/stream.js';
@@ -45,6 +45,9 @@ const state = {
   messages: [], attachments: [],
   controller: null, conversationId: 0, sessionId: newId(), role: null,
   activeTree: '', bootError: '', uploadEpoch: 0,
+  /* 测试对话的可信部门 Header（Task 9）：只影响 /admin/test/chat/completions 的
+     选图，绝不进入 OpenAI 请求体；每次发送前从 #testDepartment 读取并 trim。 */
+  department: '',
 };
 /* 发送 / 停止 / 复制 / 重试 / 重新生成与提示文案键，统一从这里取。 */
 const COPY = Object.freeze({
@@ -55,6 +58,8 @@ const COPY = Object.freeze({
 });
 const $ = selector => document.querySelector(selector);
 const CHAT_ENDPOINT = '/admin/test/chat/completions';
+/* 输入区锁定/清空的唯一控件清单：textarea、可信部门 Header 输入、附件与文件入口。 */
+const COMPOSER_CONTROLS = ['#testInput', '#testDepartment', '#testAttach', '#testFileInput'];
 /* 页面只演示线上智能路由：请求模型恒为 auto，不给用户旁路决策图的机会。 */
 const CHAT_MODEL = 'auto';
 
@@ -74,10 +79,17 @@ function renderStatus() {
 function renderAccessState() {
   const admin = state.role === 'admin';
   const locked = Boolean(state.bootError) || !admin;
-  ['#testInput', '#testAttach', '#testFileInput'].forEach(selector => {
+  COMPOSER_CONTROLS.forEach(selector => {
     const element = $(selector);
     if (element) element.disabled = locked;
   });
+  /* 角色门控同时清掉可信部门：viewer / 启动失败时既不能发送也不能留下会误导
+     下一次发送的部门状态。busy 锁只禁用、不清除（发送期间值属于在途请求）。 */
+  if (locked) {
+    const department = $('#testDepartment');
+    if (department) department.value = '';
+    state.department = '';
+  }
   const input = $('#testInput');
   if (state.bootError) input.placeholder = t('test.placeholder');
   else if (state.role !== null && !admin) input.placeholder = t(COPY.adminOnly);
@@ -109,7 +121,7 @@ function hasComposerContent() {
 function updateSendState() {
   const busy = Boolean(state.controller);
   if (busy) {
-    ['#testInput', '#testAttach', '#testFileInput'].forEach(selector => {
+    COMPOSER_CONTROLS.forEach(selector => {
       const element = $(selector);
       if (element) element.disabled = true;
     });
@@ -430,7 +442,8 @@ async function requestAssistant() {
   try {
     const response = await api.stream(CHAT_ENDPOINT, body, {
       signal: controller.signal,
-      headers: { 'x-sr-session-id': state.sessionId },
+      /* 部门是管理端可信 Header：百分号编码后随请求发送，绝不进入 body。 */
+      headers: chatHeaders({ sessionId: state.sessionId, department: state.department }),
     });
     if (!isCurrent()) return;
     assistant.actualModel = response.headers.get('x-sr-model') || CHAT_MODEL;
@@ -505,6 +518,8 @@ function regenerateLast() {
 async function sendCurrent() {
   /* 同时最多一个在途请求；viewer/未知角色 fail closed。 */
   if (state.controller || state.role !== 'admin') return;
+  /* 发送前读取可信部门（Task 9）：它只影响服务端按部门选图，与对话内容无关。 */
+  state.department = ($('#testDepartment').value || '').trim();
   const input = $('#testInput');
   const text = input.value;
   if (!text.trim() && !state.attachments.length) return;
@@ -548,7 +563,10 @@ function newChat() {
   clearAttachments();
   clearMessages();
   state.sessionId = newId();
+  state.department = '';
   $('#testInput').value = '';
+  const department = $('#testDepartment');
+  if (department) department.value = '';
   $('#testFileInput').value = '';
   autoResize();
   updateSendState();
@@ -627,8 +645,10 @@ async function boot() {
   const [me, trees] = await Promise.all([api.me(), api.get('/admin/trees')]);
   /* 未知角色 fail closed：只有明确的 admin 才能发测试请求。 */
   state.role = me.role || 'viewer';
-  const active = (trees.trees || []).find(tree => tree.enabled);
-  state.activeTree = active ? (active.name || active.id) : '';
+  /* 状态行展示默认图（公开 /v1 使用的那张），而不是列表里第一张启用的图：
+     多图同时启用时顺序不代表默认关系（Task 8）。 */
+  const preferred = (trees.trees || []).find(tree => tree.default);
+  state.activeTree = preferred ? (preferred.name || preferred.id) : '';
   renderAccessState();
   renderStatus();
   updateSendState();

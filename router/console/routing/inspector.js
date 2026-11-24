@@ -517,6 +517,13 @@ function graphBranch(graph, tree) {
     '<label class="field">' + esc(t('cv.ins.graphName')) +
     '<input type="text" data-field="name" value="' + esc((tree && tree.name) || '') +
     '" aria-label="' + esc(t('cv.ins.graphName')) + '"></label>' +
+    /* 部门（Task 9）：逗号或换行分隔；保存仍统一走 controller.save()，由其携带
+       departments。为空 = 该图不参与部门路由。 */
+    '<label class="field">' + esc(t('cv.ins.departments')) +
+    '<input id="cvDepartments" type="text" data-field="departments" value="' +
+    esc((tree && tree.departments || []).join(', ')) +
+    '" placeholder="财务部, 法务部" aria-label="' + esc(t('cv.ins.departments')) + '">' +
+    '<span class="rtc-ins-note">' + esc(t('cv.ins.departmentsHint')) + '</span></label>' +
     '<label class="field">' + esc(t('cv.ins.timezone')) +
     '<input type="text" list="cvTzList" data-field="timezone" value="' + esc(currentZone) +
     '" aria-label="' + esc(t('cv.ins.timezone')) + '">' +
@@ -770,11 +777,44 @@ function isTimeZone(value) {
   return RTGraph.isTimeZone(value);
 }
 
+/* 部门输入 → 规范化数组：按逗号（含全角）或换行拆分、去空白、丢空、去重、排序。
+   排序复用 graph.js 的码点比较（与 Python sorted() 同一口径），因此前端本地结果
+   与服务端回包一致，不会因为默认 UTF-16 sort() 的顺序差异制造假 dirty。
+   重复部门不是硬错误：去重后在提交成功时给一条本地化提示。 */
+function readDepartments(form) {
+  const value = fieldValue(form, 'departments');
+  const raw = String(value == null ? '' : value);
+  const seen = Object.create(null);
+  const duplicates = [];
+  const values = [];
+  raw.split(/[,，\r\n]+/).forEach(part => {
+    const department = String(part).trim();
+    if (!department) return;
+    if (seen[department]) {
+      if (duplicates.indexOf(department) < 0) duplicates.push(department);
+      return;
+    }
+    seen[department] = true;
+    values.push(department);
+  });
+  try {
+    return { ok: true, departments: RTGraph.normalizeDepartments(values), duplicates: duplicates };
+  } catch (error) {
+    return {
+      ok: false,
+      message: tf('cv.ins.errDepartments', { err: String(error && error.message ? error.message : error) })
+    };
+  }
+}
+
 function submitGraph(form) {
   const graph = graphNow();
   const tree = treeNow();
   const name = String(fieldValue(form, 'name') || '').trim();
   if (!name) return error(t('cv.ins.errName'));
+  const parsedDepartments = readDepartments(form);
+  if (!parsedDepartments.ok) return error(parsedDepartments.message);
+  const departments = parsedDepartments.departments;
   const timezone = String(fieldValue(form, 'timezone') || '').trim();
   if (!isTimeZone(timezone)) return error(tf('cv.ins.errTimezone', { value: timezone }));
   const ttl = Number(fieldValue(form, 'stickyTtl'));
@@ -805,6 +845,7 @@ function submitGraph(form) {
 
   const committed = {
     name: name,
+    departments: departments,
     timezone: timezone,
     sticky: sticky,
     fallback: fallback,
@@ -813,24 +854,33 @@ function submitGraph(form) {
   };
   const previous = {
     name: tree.name,
+    departments: tree.departments || [],
     timezone: tree.timezone,
     sticky: tree.sticky,
     fallback: graph.error_fallback,
     jevId: tree.runtime.jev ? tree.runtime.jev.id : null,
     window: tree.runtime.jev_window
   };
+  /* 本地重复部门已去重：提交成功（含 no-op）时给一条本地化提示，用户才能知道
+     「输入里的两个财务部只留下一个」，而不是以为丢了一个部门。 */
+  const duplicateHint = parsedDepartments.duplicates.length
+    ? tf('cv.ins.departmentsDupHint', { departments: parsedDepartments.duplicates.join(', ') })
+    : '';
   /* no-op 提交不产生历史项（与 RTCondPop 的 sameCondition 跳过一致）。 */
   if (RTGraph.stableStringify(previous) === RTGraph.stableStringify(committed)) {
+    if (duplicateHint) toastNow(duplicateHint, 'warn');
     return { ok: true, changed: false };
   }
-  /* 名称/时区/粘性/兜底与新 JEV（含窗口）写在同一个历史项里。 */
+  /* 名称/部门/时区/粘性/兜底与新 JEV（含窗口）写在同一个历史项里。 */
   if (deps.store.change('behavior', draft => {
     draft.name = name;
+    draft.departments = departments.slice();
     draft.timezone = timezone;
     draft.sticky = sticky;
     draft.root.error_fallback = fallback;
     draft.runtime = RTGraph.clone(runtime);
   }) === false) return error(t('cv.saveBlocked'));
+  if (duplicateHint) toastNow(duplicateHint, 'warn');
   return { ok: true, changed: true };
 }
 

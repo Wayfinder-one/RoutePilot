@@ -20,11 +20,13 @@ import {
   clickCanvasAction,
   clickEdge,
   clickNode,
+  clearToasts,
   danglingEdgeIds,
   draftStatus,
   dragPort,
   edgeOf,
   ensureBaselineTree,
+  expectHttpStatusError,
   expectNever,
   issueCodes,
   mockBase,
@@ -36,9 +38,11 @@ import {
   screenshot,
   serverTree,
   test,
+  toastText,
   waitCondPop,
   waitFor,
-  waitInspectorBranch
+  waitInspectorBranch,
+  waitToastIncludes
 } from '../console_qa.mjs';
 
 test('7.4-07-selected-edge-inspector', async () => {
@@ -1248,6 +1252,130 @@ test('Task 9 · runtime refresh refuses to drop a period still referenced by a c
     await page.unroute(periodsRoute);
     await ensureBaselineTree();
     await openCanvas();
+  }
+});
+
+
+test('Task 9 · departments: graph settings edit/sort, duplicate hint and cross-graph conflict', async () => {
+  /* Task 9 的真实浏览器场景：部门编辑在「图设置」里完成，保存仍走 controller.save()；
+     服务端负责排序与跨启用图唯一性。本地重复只提示；跨图冲突必须显示服务端
+     department_conflict Issue（含部门名与涉事图 id），且第一张图的服务端部门不变。
+     场景末尾顺带锁住 dirty 草稿在启停时保留未保存部门编辑（syncLifecycleBaseline）。 */
+  const OTHER = 'dept-conflict';
+  const listedTree = async id =>
+    (await api('GET', '/admin/trees')).trees.find(tree => tree.id === id);
+  try {
+    await ensureBaselineTree();
+    /* 先建第二张图并启用：副本继承源图当时的部门（基线为空），因此后续给源图
+       配部门不会先在副本里制造冲突。 */
+    if (!(await listedTree(OTHER))) {
+      await api('POST', '/admin/trees/' + TREE_ID + '/copy', { id: OTHER, name: '部门冲突图' });
+    }
+    await api('POST', '/admin/trees/' + OTHER + '/enable');
+
+    await openCanvas();
+    await waitInspectorBranch('graph', 'root');
+    assert.equal(await page.locator('#cvDepartments').count(), 1,
+      'graph settings must offer a departments input');
+    assert.equal(await page.locator('#cvDepartments').inputValue(), '',
+      'a fresh baseline graph must start with no departments');
+    assert.equal(await page.locator('#cvDepartments').getAttribute('data-field'), 'departments');
+
+    /* 1) 输入含重复 + 未排序：本地去重并立即给本地化提示；提交后草稿已排序。 */
+    const duplicateHint = await page.evaluate(async () => {
+      const { tf } = await import('/console/i18n.js');
+      return tf('cv.ins.departmentsDupHint', { departments: '财务部' });
+    });
+    await clearToasts();
+    await page.locator('#cvDepartments').fill('财务部, 财务部, 法务部');
+    await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+    await waitToastIncludes(duplicateHint);
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return JSON.stringify(app.tree.departments) === JSON.stringify(['法务部', '财务部']);
+    }, null, { timeout: 5000 });
+    assert.equal(await page.locator('#cvDepartments').inputValue(), '法务部, 财务部',
+      'the graph settings input must round-trip the sorted departments');
+    assert.equal((await appSnapshot()).kind, 'behavior',
+      'editing departments must be a behavior change');
+
+    /* 2) 保存：服务端排序后的部门原样落盘（服务端是排序的事实源）。 */
+    await saveNow();
+    const source = await serverTree(TREE_ID);
+    assert.deepEqual(source.departments, ['法务部', '财务部'],
+      'saved departments are not sorted by the server');
+    assert.deepEqual((await listedTree(OTHER)).departments, [],
+      'the other enabled graph must not inherit the source departments');
+
+    /* 3) 在另一张启用图配置同一部门：保存被 422 department_conflict 拒绝，
+        Issues 条展示部门名与冲突图 id，第一张图服务端部门保持不变。 */
+    await page.locator('#cvTreeSelect').selectOption(OTHER);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return app.treeId === id && app.changeKind === 'clean';
+    }, OTHER, { timeout: 8000 });
+    await waitInspectorBranch('graph', 'root');
+    await page.locator('#cvDepartments').fill('财务部');
+    await page.locator('#cvInspectorBody [data-act="ins-save-graph"]').click();
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return JSON.stringify(app.tree.departments) === JSON.stringify(['财务部']);
+    }, null, { timeout: 5000 });
+    expectHttpStatusError({ url: new RegExp('/admin/trees/' + OTHER + '$'), status: /422/ });
+    await clickCanvasAction('cvSave');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return (app.issues || []).some(issue => issue.code === 'department_conflict');
+    }, null, { timeout: 10000 });
+    assert.deepEqual(await issueCodes(), ['department_conflict'],
+      'the conflict was not surfaced as a single hard department_conflict issue');
+    await waitFor(() => !document.getElementById('cvIssues').hidden);
+    const issueText = (await page.locator('#cvIssues').innerText()).replace(/\s+/g, ' ');
+    assert.ok(issueText.includes('财务部'), 'the conflict issue does not name the department');
+    assert.ok(issueText.includes(TREE_ID), 'the conflict issue does not name the conflicting graph id');
+    assert.deepEqual((await serverTree(TREE_ID)).departments, ['法务部', '财务部'],
+      'a rejected save mutated the first graph departments');
+    assert.deepEqual((await serverTree(OTHER)).departments, [],
+      'a rejected save wrote the conflicting departments');
+
+    /* 4) 已知问题的回归（Task 9）：脏草稿的部门编辑不得被启停回包覆盖。
+       当前图仍是脏的（财务部 未保存）——直接停用，本地部门必须原样保留，
+       服务端仍是空部门（未保存的编辑不落盘）。 */
+    await clearToasts();
+    await clickCanvasAction('cvDisable');
+    await waitFor(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return app.tree && app.tree.enabled === false;
+    }, null, { timeout: 8000 });
+    const preserved = await page.evaluate(async () => {
+      const { app } = await import('/console/routing/app.js');
+      return {
+        departments: (app.tree.departments || []).slice(),
+        savedDepartments: (app.saved && app.saved.departments || []).slice(),
+        kind: app.changeKind,
+        input: document.getElementById('cvDepartments').value,
+        enabled: !!app.tree.enabled
+      };
+    });
+    assert.equal(preserved.enabled, false);
+    assert.deepEqual(preserved.departments, ['财务部'],
+      'a lifecycle call silently discarded unsaved department edits');
+    assert.deepEqual(preserved.savedDepartments, [],
+      'the save baseline claimed departments that were never saved');
+    assert.notEqual(preserved.kind, 'clean', 'the dirty department edit was marked saved by the lifecycle call');
+    assert.equal(preserved.input, '财务部', 'the graph settings input lost the unsaved edit');
+    assert.deepEqual((await serverTree(OTHER)).departments, [],
+      'disabling the graph saved the unsaved departments unexpectedly');
+  } finally {
+    /* 清理：源图部门恢复为空 + 基线（启用/默认）恢复；副本保持停用即可。 */
+    const current = await serverTree(TREE_ID).catch(() => null);
+    if (current && Array.isArray(current.departments) && current.departments.length) {
+      await api('PUT', '/admin/trees/' + TREE_ID + '/departments', {
+        departments: [],
+        base_document_sha256: current.document_sha256
+      });
+    }
+    await ensureBaselineTree();
   }
 });
 

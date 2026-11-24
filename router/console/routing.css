@@ -746,6 +746,32 @@ body.is-try-running .rtc-stage.is-locked::after {
   background: var(--panel-2); padding: 5px 8px; font-size: 11.5px;
 }
 .rtc-try-row input:focus { background: var(--panel); }
+/* 试算范围（Task 9）：范围选择常驻；部门输入只在 route_set 模式出现。
+   [hidden] 必须显式压过组件的 flex/inline-block 规则，否则隐藏不生效。 */
+.rtc-try-scope {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 5px; padding-left: 2px;
+}
+.rtc-try-scope [hidden] { display: none; }
+.rtc-try-scope-field {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 9px; color: var(--text-3); min-width: 0;
+}
+.rtc-try-scope-field select,
+.rtc-try-scope-field input {
+  border: 1px solid var(--line); border-radius: 6px; background: var(--panel-2);
+  padding: 2px 5px; font: inherit; font-size: 10px; color: var(--text);
+}
+.rtc-try-scope-field input { width: 132px; }
+.rtc-try-scope-field select:focus,
+.rtc-try-scope-field input:focus {
+  background: var(--panel); border-color: var(--indigo);
+  box-shadow: 0 0 0 2px var(--indigo-soft);
+}
+.rtc-try-scope-field input:disabled { color: var(--text-3); cursor: not-allowed; }
+.rtc-try-scope-hint {
+  flex: 1 1 180px; min-width: 0; font-size: 8.5px; line-height: 1.5; color: var(--text-3);
+}
 .rtc-try-chips { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; margin-top: 5px; padding-left: 2px; }
 .rtc-trychip {
   border: 1px solid var(--line); background: var(--panel); border-radius: 99px;
@@ -1033,7 +1059,8 @@ body.is-log-snapshot .rtc-issues-btn,
 body.is-log-snapshot #cvLifecycle { display: none; }
 /* 快照只读：默认不显示试算输入与样例；请求正文存在时把问题放回输入位（只读）。 */
 body.is-log-snapshot .rtc-try-row,
-body.is-log-snapshot .rtc-try-chips { display: none; }
+body.is-log-snapshot .rtc-try-chips,
+body.is-log-snapshot .rtc-try-scope { display: none; }
 body.is-log-snapshot.has-snapshot-request .rtc-try-row { display: flex; }
 body.is-log-snapshot .rtc-try-ico,
 body.is-log-snapshot #cvTryRun { display: none; }

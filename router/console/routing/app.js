@@ -813,6 +813,32 @@ function updateToolbar() {
     defaultPill.hidden = isLogSnapshot() || !(store.tree && store.tree.default);
   }
   paintLifecycle();
+  applyTryScope();
+}
+
+/* 试算范围（Task 9）：draft 保持既有全草稿请求；route_set 只按部门/默认图从
+   已发布路由集选图，因此部门输入只在 route_set 模式下显示并可用。运行/保存在途
+   时范围与部门一起禁用（由 updateToolbar 统一调用，tryrun.setBusy 会再次触发）。 */
+function applyTryScope() {
+  const scope = $('#cvTryScope');
+  if (!scope) return;
+  const department = $('#cvTryDepartment');
+  const label = $('#cvTryDepartmentLabel');
+  const routeSet = scope.value === 'route_set';
+  const busy = !!(store.tryRunning || store.saving);
+  scope.disabled = busy;
+  if (label) label.hidden = !routeSet;
+  if (department) {
+    department.hidden = !routeSet;
+    department.disabled = !routeSet || busy;
+  }
+}
+
+function bindTryScope() {
+  const scope = $('#cvTryScope');
+  if (!scope) return;
+  scope.addEventListener('change', applyTryScope);
+  applyTryScope();
 }
 
 /* 顶栏状态只由 store 的持久化视图投影：启用与否 + 草稿是否干净 + 是否落过盘。
@@ -1555,6 +1581,7 @@ function bindEvents() {
   bindTreeSelect();
   bindOverlays();
   bindTryBar();
+  bindTryScope();
   /* 只有存在未保存改动（clean 之外）时才拦截关闭/刷新。 */
   window.addEventListener('beforeunload', event => {
     if (!store.tree || store.dirtyKind === 'clean') return;

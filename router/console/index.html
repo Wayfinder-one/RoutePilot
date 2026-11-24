@@ -35,6 +35,12 @@
     </div>
     <footer class="tc-composer">
       <div class="tc-attachments" id="testFiles"></div>
+      <!-- 可信部门（Task 9）：只作为 x-sr-department Header 发送，不进 OpenAI 请求体。 -->
+      <label class="tc-department">
+        <span data-i18n="test.department"></span>
+        <input id="testDepartment" type="text" autocomplete="off"
+               data-i18n-placeholder="test.departmentPlaceholder">
+      </label>
       <textarea id="testInput" rows="1" data-i18n-placeholder="test.placeholder"></textarea>
       <div class="tc-composer-row">
         <input id="testFileInput" type="file" multiple hidden>

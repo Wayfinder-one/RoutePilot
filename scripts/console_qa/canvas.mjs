@@ -43,6 +43,7 @@ import {
   expectNever,
   exportViaUi,
   issueCodes,
+  mockBase,
   openCanvas,
   openIssuesPanel,
   page,
@@ -59,6 +60,7 @@ import {
   test,
   toastText,
   treeRuntimeFields,
+  trySnapshot,
   waitCondPop,
   waitConfirmDialog,
   waitEdgeCondition,
@@ -5018,6 +5020,204 @@ test('P0 route-check copy is consistent in Chinese and English', async () => {
     const { setLang } = await import('/console/i18n.js');
     setLang('zh');
   });
+});
+
+
+test('Task 9 · departments: route-set try-run picks the department graph and draft keeps the canvas', async () => {
+  /* Task 9 的真实浏览器场景：默认图 main(fast) + 部门图 finance(strong, 财务部) 由
+     真实管理 API 建立（自包含运行快照，无问题节点因此不触发 JEV）。
+     route_set 模式必须只发 text/session_id/可选 department；draft 模式必须继续
+     测当前画布（此处是 finance），而不是默认图。 */
+  const MAIN = 'main';
+  const FINANCE = 'finance';
+  const directDocument = (id, model, departments) => ({
+    id: id,
+    name: id === MAIN ? '默认图' : '财务图',
+    departments: departments.slice(),
+    timezone: 'Asia/Shanghai',
+    sticky: { enabled: false, ttl_seconds: 1800 },
+    root: {
+      id: 'root', type: 'graph',
+      nodes: [
+        { id: 'start', type: 'start' },
+        { id: 'target', type: 'target', priority: 1, models: [{ model: model, reasoning: null }] }
+      ],
+      edges: [{
+        id: 'e-start-target', source: 'start', source_port: 'out',
+        target: 'target', target_port: 'in_1', condition: null
+      }],
+      error_fallback: 'target'
+    },
+    backends: {
+      providers: [{
+        name: 'local', base_url: mockBase + '/v1', key_env: '', reasoning_format: 'openai'
+      }],
+      models: [{ id: model, upstream: model, provider: 'local', profile: {} }]
+    },
+    jev: null,
+    jev_window: { input_tokens: 1024, context_tokens: 4096 },
+    time_periods: []
+  });
+  const ensureDirectGraph = async (id, model, departments) => {
+    /* 早前的多图生命周期用例会用同一 id 复制示例图（并留下停用状态）：这里把文档
+       整体改写成自包含的直连图（fast/strong + 财务部），而不是因为 id 已存在就跳过。 */
+    const doc = directDocument(id, model, departments);
+    const listed = (await api('GET', '/admin/trees')).trees;
+    if (!listed.some(tree => tree.id === id)) {
+      await api('POST', '/admin/trees', doc);
+      return;
+    }
+    const existing = await serverTree(id);
+    await api('PUT', '/admin/trees/' + id, {
+      ...doc,
+      base_document_sha256: existing.document_sha256
+    });
+  };
+  const current = async () => page.evaluate(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return ({
+      treeId: app.treeId,
+      kind: app.changeKind,
+      enabled: !!(app.tree && app.tree.enabled),
+      departments: (app.tree && app.tree.departments || []).slice(),
+      running: !!app.tryRunning,
+      replayText: app.replay ? app.replay.text : ''
+    });
+  });
+  try {
+    await ensureBaselineTree();
+    await ensureDirectGraph(MAIN, 'fast', []);
+    await ensureDirectGraph(FINANCE, 'strong', ['财务部']);
+
+    /* 路由集 = main(默认) + finance(财务部)；先停用基线图得到合法空路由集，
+       再按「第一张启用图自动默认」启用 main，最后启用 finance。 */
+    await api('POST', '/admin/trees/' + TREE_ID + '/disable');
+    await api('POST', '/admin/trees/' + MAIN + '/enable');
+    await api('POST', '/admin/trees/' + FINANCE + '/enable');
+    const routeSet = await api('GET', '/admin/trees');
+    assert.equal(routeSet.graph_status.default_tree_id, MAIN);
+    assert.deepEqual(routeSet.graph_status.enabled_tree_ids.slice().sort(), [FINANCE, MAIN]);
+
+    /* boot 打开默认图 main；切到 finance，让 draft 模式测「当前画布 ≠ 默认图」。 */
+    await openCanvas();
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return app.treeId === id && app.changeKind === 'clean';
+    }, MAIN, { timeout: 10000 });
+    await page.locator('#cvTreeSelect').selectOption(FINANCE);
+    await waitFor(async id => {
+      const { app } = await import('/console/routing/app.js');
+      return app.treeId === id && app.changeKind === 'clean' && !!(app.tree && app.tree.enabled);
+    }, FINANCE, { timeout: 10000 });
+    assert.deepEqual((await current()).departments, ['财务部']);
+
+    /* 范围选择默认 draft，且部门输入在 draft 模式隐藏。 */
+    assert.equal(await page.locator('#cvTryScope').inputValue(), 'draft',
+      'the try scope must default to the current draft');
+    assert.equal(await page.locator('#cvTryDepartment').isVisible(), false,
+      'the department input must be hidden in draft mode');
+
+    /* 1) route_set + 财务部 → 部门图 finance / graph_selection=department / 模型 strong，
+       请求体只含 text/session_id/department（无 root/tree_id/canvas/运行字段）。 */
+    const captured = [];
+    const matcher = url => url.pathname === '/admin/try';
+    const handler = async route => {
+      captured.push(route.request().postDataJSON());
+      await route.continue();
+    };
+    await page.route(matcher, handler);
+    try {
+      await page.locator('#cvTryScope').selectOption('route_set');
+      assert.equal(await page.locator('#cvTryDepartment').isVisible(), true,
+        'route_set mode must reveal the department input');
+      await page.locator('#cvTryDepartment').fill('财务部');
+      await page.locator('#cvTryInput').fill('部门路由试算');
+      await page.locator('#cvTryRun').click();
+      await waitFor(async text => {
+        const { app } = await import('/console/routing/app.js');
+        return !app.tryRunning && app.replay && app.replay.text === text;
+      }, '部门路由试算', { timeout: 15000 });
+    } finally {
+      await page.unroute(matcher, handler);
+    }
+    let snap = await trySnapshot();
+    assertIncludes(snap.resultText, FINANCE,
+      'the route-set result does not report the selected tree_id');
+    assertIncludes(snap.resultText, 'department',
+      'the route-set result does not report graph_selection=department');
+    assertIncludes(snap.resultText, 'strong',
+      'the department graph model is not part of the try outcome');
+    const departmentPayload = captured[captured.length - 1];
+    assert.deepEqual(Object.keys(departmentPayload).sort(), ['department', 'session_id', 'text'],
+      'route-set try payload leaked draft/run fields instead of sending only text+session_id+department');
+    for (const field of ['root', 'tree_id', 'canvas', 'timezone', 'sticky',
+      'backends', 'jev', 'jev_window', 'time_periods', 'now']) {
+      assert.equal(Object.prototype.hasOwnProperty.call(departmentPayload, field), false,
+        'route-set try payload must not carry ' + field);
+    }
+
+    /* 2) 未知部门 → 默认图 main / graph_selection=default / 模型 fast。 */
+    await page.locator('#cvTryDepartment').fill('未知部门');
+    await page.locator('#cvTryInput').fill('未知部门试算');
+    await page.locator('#cvTryRun').click();
+    await waitFor(async text => {
+      const { app } = await import('/console/routing/app.js');
+      return !app.tryRunning && app.replay && app.replay.text === text;
+    }, '未知部门试算', { timeout: 15000 });
+    snap = await trySnapshot();
+    assertIncludes(snap.resultText, MAIN, 'unknown department did not fall back to the default graph');
+    assertIncludes(snap.resultText, 'default', 'unknown department did not report graph_selection=default');
+    assertIncludes(snap.resultText, 'fast', 'the default graph model is not part of the try outcome');
+
+    /* 3) route_set 空部门 → 同样走默认图（空部门等价于默认图）。 */
+    await page.locator('#cvTryDepartment').fill('');
+    await page.locator('#cvTryInput').fill('空部门试算');
+    await page.locator('#cvTryRun').click();
+    await waitFor(async text => {
+      const { app } = await import('/console/routing/app.js');
+      return !app.tryRunning && app.replay && app.replay.text === text;
+    }, '空部门试算', { timeout: 15000 });
+    snap = await trySnapshot();
+    assertIncludes(snap.resultText, MAIN, 'an empty department must use the default graph');
+    assertIncludes(snap.resultText, 'default', 'an empty department must report graph_selection=default');
+
+    /* 4) 切回 draft：测当前画布 finance（模型 strong），不是默认图 main(fast)；
+       请求体重新携带草稿 root/runtime，且不再携带 department。 */
+    const draftCaptured = [];
+    const draftHandler = async route => {
+      draftCaptured.push(route.request().postDataJSON());
+      await route.continue();
+    };
+    await page.route(matcher, draftHandler);
+    try {
+      await page.locator('#cvTryScope').selectOption('draft');
+      assert.equal(await page.locator('#cvTryDepartment').isVisible(), false,
+        'the department input must hide again in draft mode');
+      await page.locator('#cvTryInput').fill('草稿画布试算');
+      await page.locator('#cvTryRun').click();
+      await waitFor(async text => {
+        const { app } = await import('/console/routing/app.js');
+        return !app.tryRunning && app.replay && app.replay.text === text;
+      }, '草稿画布试算', { timeout: 15000 });
+    } finally {
+      await page.unroute(matcher, draftHandler);
+    }
+    snap = await trySnapshot();
+    assertIncludes(snap.resultText, 'draft',
+      'draft mode must return the canvas snapshot id (draft), not a route-set tree_id');
+    assertIncludes(snap.resultText, 'strong',
+      'draft mode did not exercise the current canvas (finance/strong)');
+    assert.equal(snap.resultText.includes('fast'), false,
+      'draft mode fell back to the default graph main(fast) instead of the current canvas');
+    const draftPayload = draftCaptured[draftCaptured.length - 1];
+    assert.ok(draftPayload && draftPayload.root, 'draft try payload lost the canvas root');
+    assert.equal(Object.prototype.hasOwnProperty.call(draftPayload, 'department'), false,
+      'draft try payload must not send a department');
+    assert.equal(Object.prototype.hasOwnProperty.call(draftPayload, 'tree_id'), false,
+      'draft try payload must stay a self-contained canvas envelope');
+  } finally {
+    await ensureBaselineTree();
+  }
 });
 
 await runIfMain(import.meta.url);

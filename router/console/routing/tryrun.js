@@ -795,6 +795,8 @@ function renderResult(replay) {
     delete host.dataset.kind;
     delete host.dataset.selection;
     delete host.dataset.error;
+    delete host.dataset.tree;
+    delete host.dataset.graphSelection;
     return;
   }
   /* error 与 final 独立维护：后续调度/上游失败既不清除 final，也不被 final 掩盖。 */
@@ -807,6 +809,10 @@ function renderResult(replay) {
     delete host.dataset.final;
     host.dataset.kind = 'routing_error';
     host.dataset.selection = 'routing_error';
+    /* 失败回放也可能带选图证据（route_set 选图后执行失败）：照样暴露，避免
+       dataset.tree 停在上一次成功回放的旧值。 */
+    host.dataset.tree = replay.treeId || '';
+    host.dataset.graphSelection = replay.graphSelection || '';
     host.innerHTML =
       '<div class="rtc-try-res-h">' +
         '<span class="rtc-try-kind is-fb">' + esc(t('cv.tryRoutingFailed')) + '</span>' +
@@ -837,6 +843,10 @@ function renderResult(replay) {
   host.dataset.final = final.target_id;
   host.dataset.kind = final.kind;
   host.dataset.selection = final.sticky_hit ? 'sticky' : (final.selection_reason || final.kind);
+  /* 实际选图证据与最终目标分离：tree_id / graph_selection 描述「选了哪张图」，
+     dataset.selection 描述「目标为什么胜出」，两者不能互相覆盖。 */
+  host.dataset.tree = replay.treeId || '';
+  host.dataset.graphSelection = replay.graphSelection || '';
   const kindClass = final.kind === 'target' && !final.sticky_hit ? 'ok'
     : final.kind === 'otherwise' ? 'cand' : 'fb';
   const priorityText = final.priority === null || final.priority === undefined
@@ -875,6 +885,8 @@ function renderResult(replay) {
       '</span>' +
     '</div>' +
     '<div class="rtc-try-facts">' +
+      factHTML('cv.tryFactTree', replay.treeId || '—') +
+      factHTML('cv.tryFactSelection', replay.graphSelection == null ? '—' : replay.graphSelection) +
       factHTML('cv.tryFactPriority', priorityText) +
       factHTML('cv.tryFactWaves', waveText) +
       factHTML('cv.tryFactCost', ms(totalDuration(replay))) +
@@ -972,6 +984,20 @@ function clear() {
 }
 
 function payloadFor(text, now) {
+  /* 试算范围必须先判断（Task 9）：route_set 是「真实已发布路由集」请求，只带
+     text/session_id/可选 department/now，绝不携带草稿的 root/tree_id/canvas/
+     timezone/sticky 与四运行字段 —— 这些字段一旦出现，服务端就会切到草稿路径，
+     按部门选图就不会发生。 */
+  const scopeSelect = byId('cvTryScope');
+  const scope = scopeSelect ? String(scopeSelect.value || 'draft') : 'draft';
+  if (scope === 'route_set') {
+    const payload = { text: text, session_id: '' };
+    const departmentInput = byId('cvTryDepartment');
+    const department = departmentInput ? String(departmentInput.value || '').trim() : '';
+    if (department) payload.department = department;
+    if (now) payload.now = now;
+    return payload;
+  }
   const graph = graphNow();
   const tree = treeNow();
   /* 画布坐标是内部工作状态：试算 payload 顶层只带 canvas，节点对象不带 position。 */
@@ -1028,6 +1054,11 @@ async function run(text, options) {
     rebuilt.answers = response.answers || null;
     rebuilt.warnings = Array.isArray(response.warnings) ? response.warnings : [];
     rebuilt.draft = response.draft === true;
+    /* 实际选图证据（Task 9）：route_set 路径返回 tree_id + graph_selection；
+       草稿路径的 graph_selection 是 null，tree_id 是服务端的草稿快照 id（draft）。 */
+    rebuilt.treeId = typeof response.tree_id === 'string' ? response.tree_id : '';
+    rebuilt.graphSelection = typeof response.graph_selection === 'string'
+      ? response.graph_selection : null;
     rebuilt.trace = Array.isArray(response.trace) ? response.trace : [];
     rebuilt.text = inputText;
     rebuilt.now = now;
@@ -1149,6 +1180,33 @@ function layoutByWaves() {
 }
 
 /* ── 试算台绑定 ───────────────────────────────────────────────── */
+/* 试算范围（Task 9）：draft = 当前草稿（默认，既有行为）；route_set = 已发布
+   实际路由集，按部门选图。控件由模块注入到输入行与样例 chips 之间，不新增
+   静态 HTML；可见性与禁用状态由 app.js 的 applyTryScope() 统一维护。 */
+function ensureScopeControls() {
+  const bar = byId('cvTryBar');
+  if (!bar || byId('cvTryScope')) return;
+  const host = document.createElement('div');
+  host.className = 'rtc-try-scope';
+  host.id = 'cvTryScopeRow';
+  host.innerHTML =
+    '<label class="rtc-try-scope-field">' +
+      '<span data-i18n="cv.tryScope">' + esc(t('cv.tryScope')) + '</span>' +
+      '<select id="cvTryScope" data-i18n-aria="cv.tryScope" aria-label="' + esc(t('cv.tryScope')) + '">' +
+        '<option value="draft" data-i18n="cv.tryScopeDraft">' + esc(t('cv.tryScopeDraft')) + '</option>' +
+        '<option value="route_set" data-i18n="cv.tryScopeRouteSet">' + esc(t('cv.tryScopeRouteSet')) + '</option>' +
+      '</select></label>' +
+    '<label class="rtc-try-scope-field" id="cvTryDepartmentLabel" hidden>' +
+      '<span data-i18n="cv.tryDepartment">' + esc(t('cv.tryDepartment')) + '</span>' +
+      '<input id="cvTryDepartment" type="text" autocomplete="off" spellcheck="false"' +
+      ' data-i18n-placeholder="cv.tryDepartmentPlaceholder" aria-label="' + esc(t('cv.tryDepartment')) +
+      '" placeholder="' + esc(t('cv.tryDepartmentPlaceholder')) + '"></label>' +
+    '<span class="rtc-try-scope-hint" data-i18n="cv.tryScopeHint">' + esc(t('cv.tryScopeHint')) + '</span>';
+  const row = bar.querySelector('.rtc-try-row');
+  if (row && row.nextSibling) bar.insertBefore(host, row.nextSibling);
+  else bar.appendChild(host);
+}
+
 function renderChips() {
   const host = byId('cvTryChips');
   if (!host) return;
@@ -1174,6 +1232,7 @@ function onAction(event) {
 function init() {
   if (bound) return;
   bound = true;
+  ensureScopeControls();
   renderChips();
   const input = byId('cvTryInput');
   if (input) {
@@ -1217,6 +1276,7 @@ function init() {
 }
 
 function refresh() {
+  ensureScopeControls();
   renderChips();
   renderWaveHeader();
   if (state) apply(state);
