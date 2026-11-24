@@ -1,7 +1,7 @@
 """画布运行配置装配与密钥解析。
 
 运行配置只有一个事实源：已保存画布的四个扁平运行字段（``backends`` / ``jev`` /
-``jev_window`` / ``time_periods``）。本模块不再包含任何「旧图/无活动图 → 数据库」
+``jev_window`` / ``time_periods``）。本模块不包含任何「旧图/无启用图 → 数据库」
 的过渡回退；数据库目录只用于管理面读取与密钥存储。
 
 密钥纪律：``JevService`` 只保存非密钥字段；``resolve_jev_settings`` 按 JEV 服务

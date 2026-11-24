@@ -1,7 +1,7 @@
 """管理面多 JEV 服务目录 API（目录式 CRUD + 影响确认同步 + 逐条连接测试）。
 
-目录只存 SQLite（``jev_services``）：列表/详情/测试都以数据库行为准，不再读取
-活动画布快照。画布自身的 JEV 由检查路由（``runtime_mismatch``）验证，见 spec
+目录只存 SQLite（``jev_services``）：列表/详情/测试都以数据库行为准，不读取
+任何图的画布快照。画布自身的 JEV 由检查路由（``runtime_mismatch``）验证，见 spec
 「多 JEV 目录」。
 
 更新/删除采用与模型、provider 相同的两阶段协议（spec「引用影响与确认同步」）：
@@ -11,8 +11,9 @@
    清单（含当前 ``document_sha256``）与删除可选的替代服务目录。此阶段数据库、
    审计、画布文件、快照都不变。
 2. 带确认重试时，由 ``CatalogSyncService`` 在单写锁 + 单数据库事务内重算影响
-   （``recheck``）、写目录行与审计行、严格校验候选画布并原子替换，仅当活动画布
-   被同步时发布新快照。确认哈希过期 → 409 ``graph_conflict``（报告当前哈希）。
+   （``recheck``）、写目录行与审计行、严格校验候选画布并原子替换；同步集合里含
+   任一启用图时重发布完整启用路由集。确认哈希过期 → 409 ``graph_conflict``（报
+   告当前哈希）。
 3. JEV 同步永远把服务快照与窗口一起替换；删除 JEV 时凡有画布引用都必须提供
    替代服务（确认后缺失 → 422，未知 → 404，自身 → 422），保证不留下无决策
    服务的问题节点。新建/更新/删除都在同一事务里写 ``changes`` 审计行
@@ -409,7 +410,7 @@ async def test_jev_service(
     service_id: str, body: JevTestIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    """用数据库目录里的服务配置试连：不读取活动画布快照。"""
+    """用数据库目录里的服务配置试连：不读取任何图的画布快照。"""
     repo = JevServiceRepo(conn)
     service = _require(repo, service_id)
     settings = service.settings(

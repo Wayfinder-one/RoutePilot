@@ -2,7 +2,7 @@
 """把 5 个演示决策组幂等部署到 RoutePilot（sr-routing-graph v4）并逐条 dry-run 验证。
 
 案例 JSON 是唯一事实源：本脚本不再维护任何硬编码的 provider / 模型 / JEV /
-时段目录，而是读取 ``configs/cases/case-*.json``（每份都是可直接导入的完整 v3
+时段目录，而是读取 ``configs/cases/case-*.json``（每份都是可直接导入的完整 v4
 文档）合并出数据库下拉框目录，再按 ``manifest.json`` 的案例清单部署画布。
 
 做的事（全部走管理 API，不落本地状态）：
@@ -12,8 +12,9 @@
    providers → models → JEV 服务与各自窗口 → 时段；
 3. 用合并结果幂等写入目录（已存在则 PUT，缺则 POST），并回读校验；
 4. 按 manifest 逐个案例 POST/PUT 决策组画布：剔除 ``kind``/``version``/
-   ``id``/``enabled``，携带 ``backends``/``jev``/``jev_window``/
-   ``time_periods`` 四个运行字段；**不 enable**（试算用 /admin/try tree_id）；
+   ``id``/``enabled``/``default``（生命周期与文件信封不进管理写请求），携带
+   ``departments`` 与 ``backends``/``jev``/``jev_window``/``time_periods``
+   四个运行字段；**不 enable**（试算用 /admin/try tree_id）；
 5. 对每个演示 prompt 调 POST /admin/try，比较 outcome.target_id / model /
    reasoning / candidates 与期望是否一致，并检查 enable 级 warnings 为空；
 6. 部署前记录当前 enabled 的决策组，部署后确认这份集合原样保持（全新实例部署前

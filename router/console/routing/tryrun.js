@@ -1010,8 +1010,8 @@ function payloadFor(text, now) {
     text: text,
     session_id: ''
   };
-  /* 完整草稿请求无条件携带四运行字段：试算严格使用画布快照，服务端不再按
-     活动树/数据库继承。画布不变量保证 runtime 完整；万一缺失则退回引用已存树
+  /* 完整草稿请求无条件携带四运行字段：试算严格使用画布快照，服务端不按任何
+     图或数据库继承。画布不变量保证 runtime 完整；万一缺失则退回引用已存树
      （tree_id），由后端继承该树的已存快照，而不是发一个 root-only 半草稿。 */
   const runtime = RTGraph.runtimeDocumentView(tree);
   if (runtime) Object.assign(payload, runtime);

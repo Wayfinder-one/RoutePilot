@@ -109,7 +109,7 @@ class ModelRepo:
 
 
 def model_references(trees: list[RoutingTree], model_id: str) -> list[dict]:
-    # Graph v3 is the only persisted tree shape: target nodes carry their model
+    # Graph v4 is the only persisted tree shape: target nodes carry their model
     # list and every other node type has no `models` attribute, so a plain walk
     # over each tree's nodes is the model-reference scan.
     refs = []

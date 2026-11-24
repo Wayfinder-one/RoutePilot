@@ -1057,10 +1057,10 @@ test('bootstrap registers the multi-JEV catalog, periods and the self-contained 
   assert.equal(defaultService.key_present, defaultService.key_source !== 'none',
     'key_present disagrees with key_source');
   assert.equal(JSON.stringify(jevCatalog).includes('api_key'), false);
-  /* 目录 GET 只读 SQLite：未被活动画布引用的服务同样出现，证明它不是画布投影。 */
+  /* 目录 GET 只读 SQLite：未被任何启用图引用的服务同样出现，证明它不是画布投影。 */
   const referenced = new Set([BASELINE_RUNTIME.jev.id]);
   assert.ok(services.some(service => !referenced.has(service.id)),
-    'catalog GET looks like a projection of the active canvas');
+    'catalog GET looks like a projection of an enabled graph canvas');
 
   const trees = await api('GET', '/admin/trees');
   const tree = trees.trees.find(item => item.id === TREE_ID);
@@ -1097,7 +1097,7 @@ test('bootstrap registers the multi-JEV catalog, periods and the self-contained 
   assert.equal(document.kind, 'sr-routing-graph');
   assert.equal(document.version, 4);
   assert.deepEqual(document.departments, []);
-  /* 基线组在 bootstrap 里已启用：文件生命周期必须与 current 指针一致。 */
+  /* 基线组在 bootstrap 里已启用：文件生命周期必须与 v4 文档字段一致（没有 current 指针）。 */
   assert.equal(document.enabled, true);
   assert.equal(document.default, true);
   for (const field of RUNTIME_FIELDS) {

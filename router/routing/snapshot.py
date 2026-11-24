@@ -138,9 +138,9 @@ def build_snapshot(
 
 
 def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
-    """活动画布快照：唯一来源是画布内嵌运行配置。
+    """单图运行快照：唯一来源是画布内嵌运行配置。
 
-    - ``tree is None``：空 Auto 快照（无活动画布时没有隐式数据库装配）。
+    - ``tree is None``：空 Auto 快照（没有启用图时没有隐式数据库装配）。
     - ``tree is not None``：用画布自身运行配置做启用校验 → 编译 → 装配快照。
       数据库只用于解析已存密钥；目录行与画布不一致不改变快照内容。
     """
@@ -155,7 +155,7 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
     issues = validate_graph_for_enable(tree, enable_context_for_runtime(tree.runtime))
     if issues:
         codes = ",".join(sorted({issue.code for issue in issues}))
-        raise GraphStorageError(f"invalid active graph: {codes}")
+        raise GraphStorageError(f"invalid enabled graph: {codes}")
     # 只有通过启用校验的图才编译静态拓扑；重复 id / 未知端口已在上述校验中拒绝。
     compiled = compile_graph(tree.root)
     return build_snapshot(
@@ -251,8 +251,8 @@ def invalid_route_set_error(exc: RouteSetInvariantError) -> GraphStorageError:
     """装配边界的统一错误映射：路由集不变量损坏 → 存储错误（HTTP 503）。
 
     ``assemble_snapshot_set()`` 是纯函数，继续抛 ``RouteSetInvariantError``；
-    凡是把磁盘/候选树交给它（或直接索引启用集合）的边界都经这里转换，避免
-    损坏的 standalone JSON 把管理写路径打成 500。
+    凡是在加载/发布边界把磁盘或候选树交给它（或直接索引启用集合）的地方都经
+    这里转换，避免损坏的 standalone JSON 把管理写路径打成 500。
     """
     return GraphStorageError(f"invalid route set: {exc.code}")
 

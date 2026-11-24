@@ -262,7 +262,7 @@ test('P0 toolbar exposes every editing action inline, with no More menu', async 
   assert.equal(await page.locator('#cvDefaultPill').count(), 1, 'the default pill is missing');
   assert.equal(await page.locator('#cvDefaultPill').isVisible(), lifecycle.isDefault,
     'the default pill must follow the multi-graph lifecycle');
-  /* 决策组下拉框标出默认图（不再用唯一 enabled 图推导当前活动图）。 */
+  /* 决策组下拉框标出默认图（默认标记来自 enabled/default，不由唯一启用图推导）。 */
   const defaultMark = await page.evaluate(async () => {
     const { t } = await import('/console/i18n.js');
     const option = Array.from(document.querySelectorAll('#cvTreeSelect option'))

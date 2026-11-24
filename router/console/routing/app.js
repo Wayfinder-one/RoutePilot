@@ -1548,7 +1548,7 @@ function bindTryBar() {
 function renderTreeSelect() {
   const select = $('#cvTreeSelect');
   if (!select) return;
-  /* 多图生命周期：默认图加「默认」标记。当前活动图由 controller.treeId 决定，
+  /* 多图生命周期：默认图加「默认」标记。当前编辑图由 controller.treeId 决定，
      不再从唯一 enabled 图推导（可同时启用多张图）。 */
   const label = tree => esc(tree.name || tree.id) + (tree.default ? esc(t('cv.treeDefault')) : '');
   const options = (controller.trees || []).map(tree =>

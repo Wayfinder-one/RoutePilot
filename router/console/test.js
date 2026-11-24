@@ -63,7 +63,7 @@ const COMPOSER_CONTROLS = ['#testInput', '#testDepartment', '#testAttach', '#tes
 /* 页面只演示线上智能路由：请求模型恒为 auto，不给用户旁路决策图的机会。 */
 const CHAT_MODEL = 'auto';
 
-/* ── Auto 状态行：附带当前启用的决策组名 ── */
+/* ── Auto 状态行：附带默认图名（公开 /v1 使用的那张） ── */
 function renderStatus() {
   const status = $('#testStatus');
   status.replaceChildren();

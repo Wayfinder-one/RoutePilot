@@ -7,7 +7,7 @@
    ``impact_confirmation_required``（数据库、画布文件、审计、快照全不变）；
 2. 携带每个画布当前 ``document_sha256`` 的确认重试，由
    ``CatalogSyncService`` 在单写锁 + 单数据库事务内写目录行、校验并原子替换
-   受影响画布、记录审计，仅当活动画布被修改时发布新快照。
+   受影响画布、记录审计；同步集合里含任一启用图时重发布完整启用路由集。
 
 哈希不匹配（过期确认）返回 409 ``graph_conflict`` 并报告当前哈希。确认后的
 提交还会在写锁内、事务内重算一次最新引用/影响（``recheck``）：路由层扫描之后
@@ -297,7 +297,7 @@ def get_model_catalog():
 
 @router.get("/models")
 def get_models(conn: sqlite3.Connection = Depends(get_conn)):
-    # 目录读取只查 SQLite：不再因活动画布不同而切换为活动画布内嵌配置。
+    # 目录读取只查 SQLite：不因任何图的内嵌运行配置而切换数据源。
     formats = _provider_formats(conn)
     rows = ModelRepo(conn).list()
     return {"models": [

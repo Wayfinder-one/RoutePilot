@@ -35,7 +35,7 @@ test('calculation-log renders staged process from a real request', async () => {
   await page.waitForSelector('.lg-item.open .lg-rail');
 
   const open = page.locator('.lg-item.open');
-  /* 图 v3 展示契约：只渲染 trace 里实际出现的阶段，阶段 id 即引擎的 phase。 */
+  /* 计算日志展示契约：只渲染 trace 里实际出现的阶段，阶段 id 即引擎的 phase。 */
   const phases = (await open.locator('.lg-stage-name small').allInnerTexts())
     .map(text => text.split(' · ')[0]);
   assert.deepEqual(phases,
@@ -127,7 +127,7 @@ test('calculation-log restored row states that detail is absent', async () => {
   try {
     await page.goto(routerBase + '/console/logs.html');
     await page.locator('.lg-row').first().click();
-    /* 图 v3 不再区分「历史记录」：没有 trace 的记录统一显示 traceEmpty。 */
+    /* 计算日志不再区分「历史记录」：没有 trace 的记录统一显示 traceEmpty。 */
     const expected = await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
     return (t('logs.traceEmpty'));

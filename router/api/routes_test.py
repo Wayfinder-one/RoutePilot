@@ -3,7 +3,7 @@
 Shares the ``/v1/chat/completions`` executor; ``use_requested_model=True`` is
 the only difference (the public data plane keeps ignoring the request model).
 The catalog connection is injected here so a fixed model resolves through the
-SQLite catalog, independent of the active canvas snapshot.
+SQLite catalog, independent of the published route set.
 
 ``allow_department_header=True`` is the other admin-only capability: the test
 chat trusts the operator-supplied ``x-sr-department`` header so a department

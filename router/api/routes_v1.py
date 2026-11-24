@@ -228,7 +228,7 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
     graph/JEV/sticky.
 
     ``conn`` is the admin catalog connection: a fixed model resolves through the
-    SQLite catalog (``load_backends``) instead of the active snapshot, because
+    SQLite catalog (``load_backends``) instead of the published route set, because
     the fixed-model test is a catalog check independent of any canvas.  ``/v1``
     passes no connection, so the public hot path stays snapshot-only.
 

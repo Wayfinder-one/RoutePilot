@@ -12,13 +12,14 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 
 | Area | Capability |
 |---|---|
-| Entry point | `POST /v1/chat/completions`, JSON and SSE, `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` response headers |
+| Entry point | `POST /v1/chat/completions`, JSON and SSE, `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` response headers |
 | Routing policy | Visual decision graph: conditions, decision-service questions, logic gates, model targets |
+| Route set | Several decision graphs can be enabled at once; exactly one default graph serves public `/v1`, and department mappings let admin checks target a specific enabled graph |
 | Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service; the canvas snapshot fixes which service profile a graph runs with |
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
 | Backend selection | Session affinity; random pick among a multi-model target's available models; per-model circuit breaker |
-| Portable canvases | Every saved canvas embeds its complete non-secret run configuration, so one JSON file restores it on an empty database |
-| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; database drift is reported as hints only |
+| Portable canvases | Every saved v4 canvas embeds its lifecycle markers, departments and complete non-secret run configuration, so one JSON file restores it on an empty database |
+| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; it runs either the current draft or the published route set (optionally selected by department), and database drift is reported as hints only |
 | Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, multi-service JEV catalog, time periods, audit history, role-based users |
 | Console | Bilingual (zh/en) native ES Modules, no build step |
 
@@ -36,12 +37,13 @@ flowchart LR
   G -. trace .-> R[(Request ledger)]
 ```
 
-1. Load the immutable routing snapshot and evaluate request conditions (time period, text keywords).
-2. Activate the first question wave; all questions in one wave are merged into one decision-service call.
-3. Write numeric and `selected` ports, then re-evaluate downstream slot conditions and logic gates.
-4. Repeat wave by wave until no further question is activated.
-5. Select the highest-priority activated target; otherwise use `error_fallback`.
-6. Apply session affinity; on a miss, pick one of the target's available models at random, then proxy the request upstream.
+1. Pick the graph from the published route set: public `/v1` always uses the default graph, while admin checks may select an enabled graph by department.
+2. Load that graph's immutable snapshot and evaluate request conditions (time period, text keywords).
+3. Activate the first question wave; all questions in one wave are merged into one decision-service call.
+4. Write numeric and `selected` ports, then re-evaluate downstream slot conditions and logic gates.
+5. Repeat wave by wave until no further question is activated.
+6. Select the highest-priority activated target; otherwise use `error_fallback`.
+7. Apply session affinity; on a miss, pick one of the target's available models at random, then proxy the request upstream.
 
 `unknown` never activates a question or target. A numeric comparison against an unknown value stays unknown.
 
@@ -51,7 +53,7 @@ flowchart LR
 |---|---|---|
 | API | `router/api/` | DTO parsing, exception-to-HTTP mapping, upstream proxy, presenters |
 | Control plane | `router/control/` | Write use cases for graphs and catalog entries, impact lists and confirmed canvas synchronization, enable validation |
-| Routing domain | `router/routing/` | Graph model, validation, compiled topology, evaluator, scheduler, immutable canvas snapshots |
+| Routing domain | `router/routing/` | Graph model, validation, compiled topology, evaluator, scheduler, immutable route-set snapshots |
 | Decision service | `router/jev/` | `systemone` client, service settings, input window |
 | Upstream | `router/upstream/` | Fixed-model catalog (`model_id -> Backend`), proxy transport, circuit breaker and sync worker |
 | Storage | `router/store/` | SQLite schema/repositories, graph-file repository |
@@ -62,10 +64,10 @@ Boundaries:
 
 - `router/routing/` and `router/upstream/` import neither FastAPI nor SQLite. `router/control/` and `router/store/` do not import `router.api`.
 - The API layer parses DTOs and maps exceptions; it does not write control-plane state. Account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
-- `GraphService` validates, prepares a candidate snapshot, writes the graph file under the single-writer lock, re-checks the document hash, publishes the snapshot, then records the audit entry. A stale draft returns 409.
-- `ConfigurationService` commits a catalog write and the canvases confirmed to be affected inside one application transaction: re-check the impact list under the write lock, validate every candidate document, stage/replace graph files (non-active first, active last), re-check the graph fingerprint, record the audit entry, then commit. Only a write that changes the active canvas publishes a new in-memory snapshot; a stale confirmation returns 409 `graph_conflict` before any write.
+- `GraphService` validates, prepares the candidate route set, writes lifecycle documents under the single-writer lock, re-checks the route fingerprint, publishes the complete enabled set, then records the audit entry. A stale draft returns 409.
+- `ConfigurationService` commits a catalog write and the canvases confirmed to be affected inside one application transaction: re-check the impact list under the write lock, validate every candidate document, stage/replace graph files (non-default enabled graphs first, the default graph last), re-check the route-set fingerprint, record the audit entry, then commit. A write that synchronizes at least one enabled graph republishes the whole enabled set; a draft-only sync publishes nothing; a stale confirmation returns 409 `graph_conflict` before any write.
 - A catalog write that nothing references writes rows and audit only. It never rewrites canvases and never republishes the snapshot.
-- `compile_graph()` runs once per published snapshot. The request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
+- `compile_graph()` runs once per enabled graph in a published route set. The request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
 - The event loop only enqueues ledger rows into a bounded queue and a 20-entry ring; a 2-second flush projects whitelisted columns and writes them through `asyncio.to_thread`.
 - The breaker worker loads shared quarantine state at startup and syncs local changes every 30 seconds on a worker thread.
 
@@ -77,8 +79,8 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 | Page | Content |
 |---|---|
-| Test | Admin-only model test chat: Auto-only smart routing through the active canvas snapshot, SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
-| Decision groups | Canvas editor, graph settings (timezone/sticky/fallback, JEV selection, refresh runtime from the database catalog), inspector, validation, routing checks, import/export |
+| Test | Admin-only model test chat: Auto-only smart routing through the published route set (default graph, or a trusted department header), SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
+| Decision groups | Canvas editor, multi-graph lifecycle (enable/disable, set as default, default marker), departments in graph settings, layout and runtime settings (timezone/sticky/fallback, JEV selection, refresh runtime from the database catalog), inspector, validation, routing checks, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, decision-only latency, replayable trace |
 | Decision service | Multi-service JEV catalog: service list, create/edit/delete, per-service connection test, prompts, timeout and the per-service context/input window |
 | Models | Model registry and provider catalog; Connect models onboards a catalog provider and its models in one save. Edits and deletes that affect saved canvases preview the impact list and synchronize only after confirmation. The preset dialog's Advanced holds only connection details and slot IDs; reasoning declarations, tiers, domains and provider protocol belong to the custom form |
@@ -86,7 +88,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 ### Common paths
 
-- The decision-group toolbar shows every editing action directly: undo/redo, auto-layout, **Save draft**, New, Import, Export and (for an enabled group) **Disable**, next to **Check routing**, the primary action and the issue counter. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. The inspector's **Apply** only updates the local draft and never writes to the server.
+- The decision-group toolbar shows every editing action directly: undo/redo, auto-layout, **Save draft**, New, Import, Export and (for an enabled group) **Disable**, next to **Check routing**, the primary action and the issue counter. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. Several groups can be enabled at once and the selector marks the default graph; an enabled non-default group also offers **Set as default**. **Disable** is blocked for the default graph while another enabled group remains — switch the default first. Departments are edited in graph settings. The inspector's **Apply** only updates the local draft and never writes to the server.
 - Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime config from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
 - The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The environment can create a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`, but only once: it is seeded on a start where the catalog is empty, no environment seed has ever run, and the URL and model are both set. A first boot without them followed by a boot with them still seeds once; deleting every service and restarting never re-creates it.
@@ -96,7 +98,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 The home page (`/console/index.html`) is an admin-only model test chat. Every request is Auto-routed to `/admin/test/chat/completions`, and the message metadata names the upstream model that actually served it (`Auto → <model>`) using the `x-sr-model` response header.
 
-- **Auto smart routing** — evaluates the active canvas snapshot (decision graph, JEV waves, sticky and random backend selection) exactly like `/v1/chat/completions`. The page offers no fixed-model bypass, so test traffic always takes the real routing path; fixed-model direct calls remain available only through `POST /admin/test/chat/completions` (`x-sr-selection: direct`, resolved through the database catalog).
+- **Auto smart routing** — evaluates the published route set exactly like `/v1/chat/completions`: the default graph, or an enabled graph selected by the optional **Department** field (`x-sr-department`, percent-encoded). The decision graph, JEV waves, sticky and random backend selection all apply. The page offers no fixed-model bypass, so test traffic always takes the real routing path; fixed-model direct calls remain available only through `POST /admin/test/chat/completions` (`x-sr-selection: direct`, resolved through the database catalog, no graph headers). The reply metadata uses the `x-sr-model` header, and Auto replies also expose `x-sr-tree-id` / `x-sr-graph-selection` for the graph that served them.
 - **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message. A stream counts as complete only when the upstream ends it cleanly — an early EOF is marked incomplete and a provider error is shown inline in the conversation, never silently passed off as a complete answer.
 - **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`, replayed losslessly from the raw assistant message (message-level media renders but never re-enters history); New Chat aborts any in-flight reply, clears the conversation and rotates the session id.
 - **Attachments** — text files are read as text and sent as content parts; images, audio and other files are read to data URLs. A file whose estimated size would break the 10 MiB request limit is rejected inline before it is read, and the exact whole-body size (history + Base64) is checked again before sending.
@@ -113,14 +115,14 @@ The routing page is split into two zones.
 - Typed wires; a numeric output dropped into an input slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
 - Dropping an output onto empty canvas opens a picker of compatible node types; choosing one creates the node there and connects it automatically (Esc cancels).
-- Saving and publishing are merged into the toolbar primary; the toolbar's **Save draft** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly.
-- The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: the primary publishes (saves and enables), **Save draft** saves without enabling, and **Disable** flips the enabled state.
+- Saving and publishing are merged into the toolbar primary; the toolbar's **Save draft** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly. The graph selector marks the default graph; an enabled non-default group shows **Set as default**, and **Disable** is refused for the default graph while other enabled graphs remain.
+- Graph settings hold the **Departments** mapping (comma or newline separated). A department may belong to only one enabled graph; disabled drafts may overlap, and enabling a conflicting graph is rejected with a `department_conflict` issue. The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: the primary publishes (saves, and enabling republishes the complete enabled route set), **Save draft** saves without enabling, **Disable** flips the enabled state, and **Set as default** switches the default graph atomically.
 - Target cards show display name, model list, fallback role and a random-pick hint for multi-model targets.
 
 **Execution zone** — docked below the canvas:
 
-- Input field, sample prompts, run button.
-- Result: final target, model, candidates with priorities, selection reason, waves and call count.
+- Input field, sample prompts, run button, and a **Check routing** scope selector: the current draft, or the published route set with an optional department.
+- Result: final target, model, candidates with priorities, selection reason, waves and call count. Route-set checks also report the selected `tree_id` and whether it was chosen by department or as the default.
 - Execution trace: one card per wave with hit conditions, plus the full request timeline.
 
 A routing check highlights the winning path wave by wave. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
@@ -195,13 +197,16 @@ Conditions live on edges:
 
 ### Graph document
 
-A v3 document is a complete, portable canvas: the graph plus its four required run fields. A document without them is not a legacy document to adopt — it is rejected.
+A v4 document is a complete, portable canvas: its lifecycle markers (`enabled`/`default`), its department mapping (`departments`), the graph and its four required run fields. Lifecycle is persisted inside every document — there is no `ROUTER_GRAPH_DIR/current` pointer any more. New, copied and imported documents are always saved with `enabled: false, default: false`; the first graph enabled through the lifecycle API automatically becomes the default graph.
 
 ```json
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "Default routing",
+  "departments": [],
+  "enabled": false,
+  "default": false,
   "timezone": "Asia/Shanghai",
   "sticky": { "enabled": true, "ttl_seconds": 1800 },
   "root": {
@@ -218,7 +223,9 @@ A v3 document is a complete, portable canvas: the graph plus its four required r
 }
 ```
 
-Only `sr-routing-graph` v3 is accepted. Version-2 documents, non-v3 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot; so is a document that carries only some (or none) of the four run fields. Parse failures (unknown fields, wrong types, missing keys) surface as `graph_parse_error`; structural problems such as start count, ports/slots, cycles, reachability, priorities and the fallback carry their own Issue codes instead of being folded into a parse error. The console runs the same validation before applying an import. `jev: null` is always structurally legal; a canvas with question nodes is rejected at enable time with `decision_service_unavailable`.
+Only `sr-routing-graph` v4 is accepted. Version-3 and version-2 documents, non-v4 `kind` values, unknown node types and unknown envelope/node/edge fields are rejected before they replace a draft or a published snapshot; so is a document that carries only some (or none) of the four run fields, and so is `default: true` without `enabled: true`. `departments` is a hard string array: each entry is trimmed, 1–64 code points, free of control characters, unique within the document, and the server stores it sorted; a department may belong to only one **enabled** graph, while disabled drafts may overlap. Parse failures (unknown fields, wrong types, missing keys, invalid departments) surface as `graph_parse_error`; structural problems such as start count, ports/slots, cycles, reachability, priorities and the fallback carry their own Issue codes instead of being folded into a parse error. The console runs the same validation before applying an import. `jev: null` is always structurally legal; a canvas with question nodes is rejected at enable time with `decision_service_unavailable`.
+
+Lifecycle rules live in [Multi-graph route sets](#multi-graph-route-sets): exactly one default graph while any graph is enabled, zero enabled graphs is a legal empty route set, disabling the default graph while others stay enabled returns `409 default_graph_required`, and departments are unique across enabled graphs only.
 
 See the [decision-graph specification](docs/决策图规范.md) for the full field tables, issue codes and execution details (Chinese).
 
@@ -226,13 +233,24 @@ This experimental version does not accept legacy NOT graphs. Any `logic/operator
 
 The four run fields are described in [Self-contained canvas JSON](#self-contained-canvas-json).
 
-`tree_revision` is the SHA-256 of canonical JSON over `{timezone, sticky, root}` plus the four run fields, with nodes sorted by id and edges by `(target, slot, source, source_port)`. Python and the console produce the same canonical form; the console uses it to classify edits, and `tree_revision` is computed by the server. Display-only changes do not affect it: node titles, positions, node/edge array order and edge ids. Not every list is order-insensitive: the order of question options, score criteria, `target.models`, catalog providers/models and time periods **does** participate. Question-option `capability` (choice questions) and the model-profile capability and declared reasoning also participate, because they change runtime behaviour.
+`tree_revision` is the SHA-256 of canonical JSON over `{departments, timezone, sticky, root}` plus the four run fields, with nodes sorted by id, edges by `(target, slot, source, source_port)` and departments by code point. Python and the console produce the same canonical form (departments are ordered by Unicode code point on both sides and numbers render as Python's float repr); the console uses it to classify edits, and `tree_revision` is computed by the server. Display-only changes and lifecycle changes do not affect it: node titles, positions, node/edge array order, edge ids, `id`, `name`, `enabled` and `default` are all excluded. Not every list is order-insensitive: departments are sorted and order-insensitive, but the order of question options, score criteria, `target.models`, catalog providers/models and time periods **does** participate. Question-option `capability` (choice questions) and the model-profile capability and declared reasoning also participate, because they change runtime behaviour.
+
+## Multi-graph route sets
+
+Every decision group is one v4 JSON file carrying `departments`, `enabled` and `default`; files on disk are the only lifecycle source (there is no `current` pointer). The **enabled** graphs form the published route set:
+
+- **Snapshot set.** All enabled graphs are validated and compiled together on load. Any invalid enabled graph skips the whole publish: a previously published route set keeps serving and `/readyz` reports `stale: true` with `last_load_error`; if no publish ever succeeded, `/readyz` is not ready (503).
+- **Unique default.** While any graph is enabled there is exactly one default graph. The first graph enabled through the API automatically becomes the default; later enables keep it. `POST /admin/trees/{id}/default` switches the default atomically (the old default stays enabled but stops being default). Disabling the default while another enabled graph remains returns `409 {"detail":{"code":"default_graph_required","tree_id":"…"}}`; disable the last enabled graph and the route set becomes empty — `/readyz` is still ready, and `/v1` answers `503 no_active_tree`.
+- **Departments.** `departments` is a normalized, sorted string array per graph (trimmed, 1–64 code points, no control characters, unique within the file). A department may belong to only **one enabled** graph; disabled drafts may overlap and are only rejected when they would both be enabled (`422 department_conflict` with `department` and `tree_ids`). Department matching is exact and case-sensitive; a request whose department matches no enabled graph uses the default graph.
+- **Default-only public data plane.** `POST /v1/chat/completions` always uses the default graph and rejects any `x-sr-department` header with `400 department_header_not_allowed`. Department selection is an admin verification surface: the test chat sends a trusted percent-encoded `x-sr-department` header, and the routing check has a **Published route set** scope with an optional department. Auto routing reports the chosen graph through `x-sr-tree-id` and `x-sr-graph-selection` (`department` / `default`); fixed-model direct calls keep `x-sr-selection: direct` and emit no graph headers.
+- **Lifecycle is server state.** New, copied and imported documents are always stored as `enabled: false, default: false`. Only the dedicated endpoints change lifecycle; an ordinary save may change `departments` but can never write `enabled`/`default`.
+- **Route-set revision.** `snapshot_revision` is the SHA-256 of the canonical `{default_tree_id, department_tree_ids, per-graph snapshot revisions}`; `route_fingerprint` covers the enabled ids, their default flags and their document hashes, so draft-only edits never reload anything. Both are exposed with `default_tree_id` and `enabled_tree_ids` in `graph_status` (the `/readyz` object and every tree-list response).
 
 ## Models and reasoning
 
 ![Models](assets/routepilot/en/models.png)
 
-A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; when more than one is available, one is picked at random. The **catalog** (SQLite) is the management source for the console dropdowns and for fixed-model direct requests; a **canvas snapshot** is the only source for Auto routing.
+A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; when more than one is available, one is picked at random. The **catalog** (SQLite) is the management source for the console dropdowns and for fixed-model direct requests; each **enabled graph's canvas snapshot** is the only source for Auto routing.
 
 Providers define the OpenAI-compatible base URL, API-key environment variable and reasoning dialect. Model profiles declare:
 
@@ -242,7 +260,7 @@ Providers define the OpenAI-compatible base URL, API-key environment variable an
 
 Reasoning dialects: OpenAI, DeepSeek, Qwen, Qwen chat template, OpenRouter, Z.ai, Together, string-thinking, Ant Ling. An unsupported requested level is forwarded without reasoning injection and the response carries `x-sr-reasoning-warning`.
 
-`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text. The console and the admin catalog endpoints always read SQLite — they never project the active canvas, and a catalog write never rewrites a canvas on its own. Saving a canvas **selects** models: the chosen model and its provider are added to the snapshot; a model with the same ID already in the snapshot is not overwritten by normal target editing (drift is reported by the check hints, and replaced only by an explicit refresh or a confirmed catalog sync).
+`GET /admin/models` returns `profile` as a JSON object; the database stores it as JSON text. The console and the admin catalog endpoints always read SQLite — they never project an enabled graph's canvas, and a catalog write never rewrites a canvas on its own. Saving a canvas **selects** models: the chosen model and its provider are added to the snapshot; a model with the same ID already in the snapshot is not overwritten by normal target editing (drift is reported by the check hints, and replaced only by an explicit refresh or a confirmed catalog sync).
 
 Legacy database profiles are still read leniently as a sanitized projection: `api_key`, `authorization`, `key_present`, `key_source` and their case/separator variants are removed recursively from `profile`. This is read-only — legal metadata (`tier`, `domains`, `capability`, …) is preserved and the database row is never rewritten. Graph files and management writes still reject those fields rather than cleaning them.
 
@@ -259,7 +277,7 @@ A provider API key never appears in a response: the projection exposes `key_pres
 The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. The console page manages a **catalog of services**, not a single global configuration:
 
 - The list shows every service with its ID, model and endpoint. Create, edit and delete are per service; the window (`input_tokens` / `context_tokens`) belongs to the service together with its prompts, timeout, `key_env` and key.
-- **Test** calls `POST /admin/jev/{id}/test` and uses the database service configuration, not the active canvas snapshot. Canvas execution is checked by the routing check, which reports drift as hints.
+- **Test** calls `POST /admin/jev/{id}/test` and uses the database service configuration, not any graph's canvas snapshot. Canvas execution is checked by the routing check, which reports drift as hints.
 - A canvas selects one service (`jev.id` + `key_env`) and embeds its complete non-secret profile plus its window. JEV and window are replaced together whenever a canvas selects, refreshes or receives a server-side sync — mixing two services is not representable.
 - Only `key_env` (an environment-variable name) and the service URL/model are portable. The real `api_key` lives only in SQLite and is reused when the service `id`, `base_url` and `model` all still match; otherwise the service's `key_env` environment variable is read when a snapshot is built. A global `ROUTER_JEV_API_KEY` fallback does not exist; the seeded `default` service happens to use that variable name as its `key_env`.
 - Deleting a service that a canvas references requires a replacement service, and synchronizes the affected canvases (JEV profile + window) after confirmation. Updating a referenced service is also confirmed and synchronized the same way.
@@ -276,16 +294,17 @@ The decision service exposes `POST /v1/systemone`; typical deployments use NeoHo
 
 ## Graph storage and replicas
 
-Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; `ROUTER_GRAPH_DIR/current` contains the enabled group id. Every document **must** carry its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`), because a saved canvas is the only runtime source for Auto routing. There is no `runtime:null` marker, no "save as legacy document" mode, and no server-side step that materializes configuration into an older file.
+Graphs are not stored in SQLite. Each decision group is one v4 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; lifecycle comes from the document's own `enabled`/`default` fields — the old `ROUTER_GRAPH_DIR/current` pointer is neither read nor written. Every document **must** carry its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`), because a saved canvas is the only runtime source for Auto routing. There is no `runtime:null` marker, no "save as legacy document" mode, and no server-side step that materializes configuration into an older file.
 
-- Single writer: the admin API. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the directory read-only and reload every 2 seconds.
-- A replica compiles a candidate snapshot before replacing the serving snapshot; an invalid file leaves the previous snapshot active and `/readyz` reports stale.
+- Single writer: the admin API. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the directory read-only and reload every 2 seconds when the route fingerprint changes.
+- A replica validates and compiles **every** enabled graph before replacing the serving route set; any invalid enabled graph skips the publish, a previously published set keeps serving, and `/readyz` reports `stale: true` with `last_load_error` (not ready if no publish ever succeeded).
+- Enable/disable and default switches are ordinary document writes: non-default enabled graphs are staged first and the default graph last, then the complete enabled set is republished.
 - Writes are atomic through temporary files with mode `0600`.
 - Kubernetes: ReadWriteMany PVC for graph files; SQLite on local storage for the writer.
 - Docker: mount the same NFS export into every container.
 - All writer/reader containers must share the same numeric UID; mode `0600` files are not accessible through GID or `fsGroup` alone.
 - A stale save returns 409 `graph_conflict`; imports only change the draft.
-- `/healthz` is liveness. `/readyz` reports initial-snapshot readiness; 503 means not ready, and a later reload failure keeps the existing snapshot with `"stale": true`.
+- `/healthz` is liveness. `/readyz` reports route-set readiness and exposes `default_tree_id`, `enabled_tree_ids`, `snapshot_revision` and `route_fingerprint`; 503 means not ready, and a later reload failure keeps the existing route set with `"stale": true`.
 - The schema upgrades itself (see [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation)); there is no SQLite-to-graph export script any more — a canvas is moved by exporting/importing its JSON file.
 
 ## Upgrading from a pre-snapshot installation
@@ -293,13 +312,14 @@ Graphs are not stored in SQLite. Each decision group is one v3 document at `ROUT
 Two things change for an existing deployment.
 
 1. **The SQLite schema migrates automatically on first start.** Schema v5 upgrades to v6 inside one transaction: the old single-row `jev_config` becomes the `jev_services` service with id `default` (stored key, endpoint, model, prompts and timeout are preserved; the window is clamped to legal bounds), and the old table is dropped. Back up `router.db` (with `router.db-wal` / `router.db-shm`) before the upgrade; there is no path back to the old single-configuration layout. If the JEV catalog is empty and the environment seed has never run, `ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` create that `default` service once, with `ROUTER_JEV_API_KEY` stored as its key; `settings.jev_catalog_seeded` records the seed, so a later restart never re-creates a `default` service — not even after every service was deleted.
-2. **Every stored canvas must already be a full snapshot.** The strict parser rejects a canvas that lacks any of the four run fields. Before upgrading:
+2. **Every stored canvas must already be a full v4 snapshot.** The strict parser only accepts `sr-routing-graph` version 4 documents: in addition to the four run fields each file must carry `departments`, `enabled` and `default`. Before upgrading:
 
-   - back up `ROUTER_GRAPH_DIR` (the `graphs/*.json` files and `current`);
-   - on the **old** version, produce a full document for every group: open each decision group and save it once (or `PUT /admin/trees/{id}` with its document). The old version writes the effective run configuration into the file;
-   - if the old instance can no longer be operated, add the four fields to each `graphs/*.json` by hand, following the shape in [Self-contained canvas JSON](#self-contained-canvas-json) and the canvas's actual models, providers, JEV service and periods.
+   - back up `ROUTER_GRAPH_DIR` (the `graphs/*.json` files; a legacy `current` pointer is no longer read, so record which graph was active and discard it);
+   - on the **old** version, produce a full run snapshot for every group: open each decision group and save it once (or `PUT /admin/trees/{id}` with its document). The old version writes the effective run configuration into the file as a version-3 document;
+   - convert each `graphs/*.json` to v4 by hand: bump `version` to `4`, add `"departments": []`, and set `enabled`/`default` from the old reality (the previously active graph is `true`/`true`; every other graph is `false`/`false`). If the old instance can no longer be operated, add the four run fields as described in [Self-contained canvas JSON](#self-contained-canvas-json) at the same time;
+   - the resulting document must parse under the v4 rules in [Decision graph](#decision-graph) and the canvas's actual models, providers, JEV service and periods.
 
-A missed file is not silently repaired: startup logs `initial graph snapshot is unavailable`, `/readyz` reports not ready, `GET /admin/trees` answers 503 `graph_storage_error`, and `/v1` Auto routing has no snapshot (`no_valid_snapshot`) until the file is fixed. After a successful start, an old-format file is still only an invalid file — it is never adopted or migrated implicitly.
+A missed file is not silently repaired: startup logs `initial graph snapshot is unavailable`, `/readyz` reports not ready (or `stale`), `GET /admin/trees` answers 503 `graph_storage_error`, and `/v1` Auto routing has no route set (`no_valid_snapshot`) until the file is fixed. After a successful start, a v3 file is still only an invalid file — it is never adopted or migrated implicitly.
 
 ### Legacy profiles with non-finite numbers
 
@@ -329,7 +349,7 @@ No restart is needed: the catalog is read from SQLite on every request.
 
 ## Self-contained canvas JSON
 
-Every saved canvas is a portable, immutable run snapshot: one file restores a decision group on an empty database instance. Four top-level fields are **required and must appear together**:
+Every saved canvas is a portable, immutable run snapshot: one file restores a decision group on an empty database instance. A v4 file also carries its lifecycle markers and departments; four top-level fields are **required and must appear together**:
 
 | Field | Content |
 |---|---|
@@ -341,8 +361,11 @@ Every saved canvas is a portable, immutable run snapshot: one file restores a de
 ```json
 {
   "kind": "sr-routing-graph",
-  "version": 3,
+  "version": 4,
   "name": "Default routing",
+  "departments": [],
+  "enabled": false,
+  "default": false,
   "timezone": "Asia/Shanghai",
   "sticky": { "enabled": true, "ttl_seconds": 1800 },
   "root": { "id": "root", "type": "graph", "nodes": [], "edges": [], "error_fallback": null },
@@ -389,7 +412,8 @@ Rules:
 - **JEV and window are one unit.** `jev.id` selects the catalog service and `key_env` says how its key is resolved; `jev_window` belongs to that service. Selecting or synchronizing a JEV service replaces `jev` and `jev_window` together. When a raw `PUT /admin/trees/{id}` patch changes `jev.id`, it must also include the new service's `jev_window`; the request fails with 422 instead of inheriting the previous service's window.
 - **No secrets, at any depth.** A provider carries `key_env` (an environment variable name) instead of a key, and `jev` never carries `api_key`. Secret and derived-key fields (`api_key`, `authorization`, `key_present`, `key_source`) are rejected wherever they appear inside the four fields, including nested objects and arrays below `backends.models[*].profile`. The match ignores case, `-` and `_` (`API-KEY` is the same as `api_key`) but only covers that fixed set, so ordinary metadata such as `monkey` or `keychain` is preserved. `profile` stays a free-form JSON metadata object otherwise: `capability`, `domains`, `tier` and later metadata are stored unchanged. A local server that needs no authentication may leave `key_env` empty.
 - **Validated at the file boundary.** Provider and model ids, provider references, profiles, reasoning declarations, the JEV service profile, the window and the periods are all validated while parsing.
-- **Part of the behaviour version.** The four fields join `tree_revision` (and the console dirty/undo baseline); canvas coordinates still do not affect behaviour.
+- **Lifecycle is required but not ordinary-save writable.** `enabled`/`default` are required document fields, but new/copied/imported documents are always saved disabled and non-default; enable/disable/set-default go through the dedicated lifecycle endpoints, and an ordinary save can change `departments` but never lifecycle. `default: true` requires `enabled: true`.
+- **Part of the behaviour version.** The four run fields plus `departments` join `tree_revision` (and the console dirty/undo baseline); `enabled`/`default` join the route-set fingerprint and `snapshot_revision` instead. Canvas coordinates still do not affect behaviour.
 
 ### Snapshot sources
 
@@ -401,7 +425,7 @@ Only these actions create or change a canvas run snapshot:
 4. **Refresh runtime from database** in graph settings.
 5. **Confirm a catalog impact list** — the server synchronizes the affected canvases after the administrator confirms.
 
-A catalog write by itself never rewrites a canvas and never republishes a snapshot. Editing a target with a model ID already present in the snapshot does not overwrite its snapshot entry; drift is reported by the check hints and replaced only by an explicit refresh or a confirmed sync. Copying a group keeps the source group's snapshot, and `POST /admin/try` inherits a stored canvas's snapshot when it is given `tree_id` (a full draft must carry all four fields itself; without either it is 422).
+A catalog write by itself never rewrites a canvas and never republishes a snapshot. Editing a target with a model ID already present in the snapshot does not overwrite its snapshot entry; drift is reported by the check hints and replaced only by an explicit refresh or a confirmed sync. Copying a group keeps the source group's snapshot and departments but forces it closed, and `POST /admin/try` inherits a stored canvas's snapshot when it is given `tree_id` (a full draft must carry all four fields itself; without `tree_id` and `root` the check runs against the published route set instead).
 
 ### Keys
 
@@ -424,7 +448,7 @@ Updating or deleting a model, provider or JEV service first scans every canvas. 
 
 Nothing is written in that state — database, files, audit and snapshot are untouched. The console shows the list; confirming retries the same request with `impact_confirmation = {"trees":[{"id","document_sha256"}, …]}` built from exactly those hashes. If a canvas changed in between, the server answers 409 `graph_conflict` with the **current** hash, and the console asks for a reload instead of applying a stale confirmation.
 
-After confirmation, one use case commits the catalog rows, all affected canvases and the audit row atomically: it re-checks the impact list under the single write lock, validates each candidate document, stages every file (non-active canvases first, the active canvas last), re-checks the graph fingerprint and only then commits. A failure rolls the database back and restores every replaced file; the in-memory snapshot is published only from a committed transaction and only when the active canvas was among the synchronized ones.
+After confirmation, one use case commits the catalog rows, all affected canvases and the audit row atomically: it re-checks the impact list under the single write lock, validates each candidate document, stages every file (non-default enabled graphs first, the default graph last), re-checks the route-set fingerprint and only then commits. A failure rolls the database back and restores every replaced file. The in-memory route set is republished only from a committed transaction and only when at least one synchronized canvas is an enabled graph; a draft-only sync publishes nothing.
 
 Update/delete semantics:
 
@@ -442,14 +466,14 @@ Update/delete semantics:
 ### Restoring from one file
 
 1. Start an instance with an empty database and an empty graph directory.
-2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`), then save and enable it.
-3. Run a routing check (`POST /admin/try`) to verify the graph, embedded model catalog, decision service, window and time periods.
-4. Call `POST /v1/chat/completions` for Auto routing, or open the model test chat (also Auto-only) to verify an end-to-end reply.
+2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`). New, copied and imported groups are always closed; enable it from the toolbar or `POST /admin/trees/{id}/enable` — the first enabled graph becomes the default graph. Add departments in graph settings if this graph should serve a department.
+3. Run a routing check (`POST /admin/try`) against the draft to verify the graph, embedded model catalog, decision service, window and time periods. Run it with scope **Published route set** (and optionally a department) to verify which enabled graph is selected; `tree_id` / `graph_selection` report the evidence.
+4. Call `POST /v1/chat/completions` for Auto routing through the default graph, or open the model test chat (Auto-only, with an optional Department field) to verify an end-to-end reply.
 5. Provide keys through environment variables only: each provider's `key_env`, and the selected JEV service's `key_env` when its endpoint requires authentication.
 
-`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, the `default` decision-service profile and three time periods. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
+`configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, the `default` decision-service profile and three time periods. It is a v4 document with `enabled: false, default: false, departments: []`: apply it through the admin API (for example `scripts/apply_default_routing_tree.py`), then enable it — the admin write path ignores nothing, the stored document is created closed. `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
 
-The five demo cases in `configs/cases/case-*.json` are complete v3 documents with `kind`/`version`, no external `id`/`enabled`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
+The five demo cases in `configs/cases/case-*.json` are complete v4 documents with `kind`/`version`, no external `id`, `enabled: false, default: false, departments: []`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
 
 ## Quick start
 
@@ -477,14 +501,14 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 .venv/bin/python -m router
 ```
 
-The first start against an empty users table seeds the admin account. An empty graph directory serves an empty Auto snapshot; create or import a canvas before routing. Existing installations: read [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation) first.
+The first start against an empty users table seeds the admin account. An empty graph directory is a legal empty route set: `/readyz` is ready but `/v1` answers 503 `no_active_tree`. Create or import a canvas, then enable it; the first enabled graph becomes the default graph that serves public `/v1`. Existing installations: read [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation) first.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ROUTER_DB` | `router.db` | SQLite control-plane database |
-| `ROUTER_GRAPH_DIR` | `./routing-graph` | Graph files and enabled pointer |
+| `ROUTER_GRAPH_DIR` | `./routing-graph` | Graph documents; lifecycle lives inside each document |
 | `ROUTER_GRAPH_WRITER` | `true` | Allow graph writes; run exactly one writer |
 | `ROUTER_HOST` | `127.0.0.1` | Listener host |
 | `ROUTER_PORT` | `8400` | Listener port |
@@ -506,8 +530,8 @@ Full field tables, request/response examples and the impact-confirmation flow li
 - `POST /admin/login` is the only public admin endpoint: email and password exchange for a token. Sessions default to 168 hours; logout, a password change or deleting the user revokes them.
 - `viewer` can read only (`/admin/users*` is off-limits too); writes and user management need `admin`. With `ROUTER_USER_AUTH=0` everything is open and requests run as the service account.
 - Data-plane errors are `{"error":{"message":"<machine code>"}}`; admin errors are `{"detail": ...}`, where graph/config validation failures carry an Issue array.
-- `POST /v1/chat/completions` ignores the request `model` and always routes through the canvas; the `x-sr-session-id` header drives stickiness. `x-sr-model` / `x-sr-selection` / `x-sr-reasoning*` report what actually happened.
-- `POST /admin/trees` must carry `backends`, `jev`, `jev_window` and `time_periods` together; `PUT` is a patch and must carry the current `base_document_sha256`, otherwise 409.
+- `POST /v1/chat/completions` ignores the request `model` and always routes through the default graph of the enabled route set; the `x-sr-session-id` header drives stickiness, and an `x-sr-department` header is rejected with `400 department_header_not_allowed`. `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` report what actually happened.
+- `POST /admin/trees` must carry `backends`, `jev`, `jev_window` and `time_periods` together and accepts `departments`; new groups are always closed. `PUT` is a patch and must carry the current `base_document_sha256`, otherwise 409. Lifecycle is written only by `POST /admin/trees/{id}/enable`, `/disable` and `/default`; `departments` can also be written by `PUT /admin/trees/{id}/departments`.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
@@ -515,8 +539,9 @@ Full field tables, request/response examples and the impact-confirmation flow li
 | `GET /healthz` / `GET /readyz` | public | Liveness / snapshot readiness |
 | `POST /admin/login` / `POST /admin/logout` | public / signed in | Console session |
 | `GET /admin/me`, `POST /admin/me/password` | signed in | Current user, password change |
-| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | read / admin | Decision groups |
-| `POST /admin/trees/{id}/copy`, `/enable`, `/disable` | admin | Group lifecycle |
+| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | read / admin | Decision groups; create is always closed |
+| `PUT /admin/trees/{id}/departments` | admin | Department mapping for one group |
+| `POST /admin/trees/{id}/copy`, `/enable`, `/disable`, `/default` | admin | Copy and multi-graph lifecycle (first enable becomes default; default switch) |
 | `POST /admin/try` | admin | Routing check against a draft graph |
 | `POST /admin/test/chat/completions` | admin | Test chat; `model=auto` routes, anything else is a fixed direct call |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | read / admin | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
@@ -536,10 +561,12 @@ Data-plane:
 | Status | Error `message` | Meaning |
 |---|---|---|
 | 400 | `invalid_json` / `body_must_be_object` / `messages_must_be_list` / `invalid_session_id` | Malformed body or session header |
+| 400 | `department_header_not_allowed` | Public `/v1` request carried `x-sr-department` |
 | 413 | `request_too_large` | Body exceeds 10 MiB |
 | 502 | `upstream_error` | Upstream 5xx or network failure |
-| 503 | `no_valid_snapshot` | No initial snapshot |
-| 503 | `no_active_tree` | No enabled decision group |
+| 503 | `no_valid_snapshot` | No route set has ever been assembled |
+| 503 | `no_active_tree` | Empty route set: no enabled decision group |
+| 503 | `no_default_tree` | Enabled graphs exist but none is the default graph |
 | 503 | `no_available_backend` | All backends of the selected target unavailable |
 | 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure |
 
@@ -548,6 +575,7 @@ Admin:
 | Status | Error | Meaning |
 |---|---|---|
 | 401 / 403 | `unauthorized…` / `forbidden…` | Not signed in / viewer write |
+| 409 | `default_graph_required` | Disabling the default graph while other graphs stay enabled |
 | 409 | `graph_conflict` | Baseline or impact-list document hash is stale |
 | 409 | `impact_confirmation_required` | Model/provider/JEV write affects canvases; confirm the listed document hashes |
 | 409 | `provider_referenced` | Provider still used by a database model or a canvas model |
@@ -556,7 +584,7 @@ Admin:
 | 503 | `graph_read_only` / `graph_storage_error` | Reader replica / shared graph storage unreadable |
 | 502 | string | JEV test or upstream model discovery failed |
 
-Upstream 4xx responses pass through with their status and body; `/admin/test/chat/completions` additionally returns `404 unknown_model` and `422 invalid_model`.
+Upstream 4xx responses pass through with their status and body; `/admin/test/chat/completions` additionally returns `404 unknown_model`, `422 invalid_model` and `400 invalid_department` (malformed trusted department header).
 
 Configuration endpoints: `/admin/models`, `/admin/providers`, `/admin/jev`, `/admin/time-periods`. There is no generic `/admin/settings` API and no standalone JEV-window endpoint: the window lives on each JEV service.
 
@@ -597,7 +625,8 @@ router/
     scheduling.py      sticky selection, lease acquisition, affinity writes
     affinity.py        session-affinity LRU
     scheduler.py       random model picker and leases
-    snapshot.py        immutable canvas snapshot assembly and compiled topology
+    snapshot.py        immutable route-set snapshot assembly and compiled topology
+    route_set.py       route-set invariants: the default graph and department index
     tree.py            tree envelope codec and revision
     codec.py           strict field parsing helpers
   request_logging.py   ledger queue/ring and worker-thread writes

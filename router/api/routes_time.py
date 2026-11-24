@@ -26,7 +26,7 @@ class TimePeriodsIn(BaseModel):
 
 @router.get("/time-periods")
 def get_time_periods(conn: sqlite3.Connection = Depends(get_conn)):
-    """时段目录读取只查 SQLite：不再因活动画布不同而切换数据源。"""
+    """时段目录读取只查 SQLite：不因任何图的内嵌配置而切换数据源。"""
     return {"periods": TimePeriodRepo(conn).load(), "now": now_iso()}
 
 
@@ -43,7 +43,7 @@ def put_time_periods(
     try:
         service.save_periods(periods)
     except ValidationFailed:
-        raise  # 活动图校验失败：交给 app 级处理器返回 422 + Issue 数组（spec §5）
+        raise  # 启用图校验失败：交给 app 级处理器返回 422 + Issue 数组（spec §5）
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
     return {"ok": True, "periods": TimePeriodRepo(conn).load()}

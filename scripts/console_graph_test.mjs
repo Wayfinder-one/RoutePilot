@@ -13,7 +13,7 @@ import * as SRTrace from '../router/console/trace.js';
 const EXAMPLE_URL = new URL('../router/console/routing/example.json', import.meta.url);
 
 function readExample() {
-  /* 示例文件是完整 v3 文档：parseImport 校验并把顶层 canvas 分发回内部 node.position，
+  /* 示例文件是完整 v4 文档：parseImport 校验并把顶层 canvas 分发回内部 node.position，
      返回带坐标的 root（沿用旧 helper「返回 root」的契约）。 */
   const parsed = RTGraph.parseImport(fs.readFileSync(EXAMPLE_URL, 'utf8'));
   assert.equal(parsed.ok, true,
@@ -288,7 +288,7 @@ test('invalid conditions are reported with a specific reason', () => {
 
 /* ── 3. 端口 / 类型 ─────────────────────────────────────────────────── */
 
-test('port registry matches the graph v3 contract', () => {
+test('port registry matches the graph v4 contract', () => {
   const graph = exampleGraph();
   const capability = graph.nodes.find(node => node.id === 'capability');
   const selected = RTGraph.portOf(capability, 'selected.easy', graph);
@@ -688,7 +688,7 @@ test('legacy and version-2 imports are rejected with the fixed message', () => {
   assert.equal(RTGraph.parseImport('[]').ok, false);
 });
 
-test('kind/version-correct v3 documents with a malformed root report graph_parse_error', () => {
+test('kind/version-correct v4 documents with a malformed root report graph_parse_error', () => {
   const payloads = [
     JSON.stringify({ kind: 'sr-routing-graph', version: 4, root: { type: 'jev', branches: [] } }),
     JSON.stringify({ kind: 'sr-routing-graph', version: 4, root: { type: 'graph', nodes: {} } }),
@@ -1259,7 +1259,7 @@ test('logs render presenter fields and keep no legacy adapters', () => {
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
   assert.match(logs, /\['error_fallback', 'fallback', 'otherwise'\]/,
-    'logs fallback filter does not know the graph v3 enum');
+    'logs fallback filter does not know the graph fallback enum');
   assert.doesNotMatch(logs, /selection_reason === 'fallback'/,
     'logs still uses the pre-graph fallback enum');
   /* Task 7：展示字段全部由 API presenter 生成，控制台不再适配旧事件。 */
@@ -1281,7 +1281,7 @@ test('calculation log detail shows the process inline and keeps technical facts 
   const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
   const logs = read('logs.js');
 
-  /* 图 v3：详情按 trace 事件分阶段内联渲染，不再交给 SRTrace 的旧分节渲染器。 */
+  /* 计算日志：详情按 trace 事件分阶段内联渲染，不再交给 SRTrace 的旧分节渲染器。 */
   assert.match(logs, /function stages\(record\)/);
   assert.match(logs, /path\.length \? path\.map\(stageHtml\)\.join/);
   assert.match(logs, /class="lg-stage /);
@@ -1362,8 +1362,8 @@ test('review-import-rejects-invalid-envelope-timezone', () => {
   assert.ok(result.issues.some(issue => issue.code === 'invalid_timezone'));
 });
 
-test('review-import-keeps-valid-v3-example-accepted', () => {
-  /* 示例文件本身就是完整 v3 文档（画布坐标在顶层 canvas），直接导入验证契约。 */
+test('review-import-keeps-valid-v4-example-accepted', () => {
+  /* 示例文件本身就是完整 v4 文档（画布坐标在顶层 canvas），直接导入验证契约。 */
   const result = RTGraph.parseImport(fs.readFileSync(EXAMPLE_URL, 'utf8'));
   assert.equal(result.ok, true, JSON.stringify(result.issues));
   assert.equal(hardIssues(result.issues).length, 0);
