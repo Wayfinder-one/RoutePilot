@@ -1419,13 +1419,30 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
 # --------------------------------------------------------------------------- #
 # 16. 发布门必须在写锁内决定 + 纯数据库写不读活动指针
 # --------------------------------------------------------------------------- #
+def _emulate_concurrent_enable(app, tree_id):
+    """模拟另一副本的 enable 落盘：只写文件生命周期，不发布内存快照。"""
+    repo = app.state.graph_repo
+    target = repo.get(tree_id)
+    updates = [
+        (dataclass_replace(other, enabled=False, default=False),
+         other.document_sha256)
+        for other in repo.enabled() if other.id != tree_id
+    ]
+    updates.append(
+        (dataclass_replace(target, enabled=True, default=True),
+         target.document_sha256))
+    batch = repo.stage_updates(updates)
+    batch.commit()
+    batch.discard()
+
+
 def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
         two_canvases, monkeypatch):
-    """v4 过渡期：enable 会改写目标文件里的 enabled/default，确认哈希随之失效。
+    """v4：enable 会改写目标文件里的 enabled/default，确认哈希随之失效。
 
     v3 时代 enable 只写 ``current`` 指针，画布字节不变；v4 文档自带生命周期字段，
     因此「预览后、加锁前被 enable」必须 409 ``graph_conflict``（实际哈希是 enable 后
-    的新哈希），客户端只能重新预览确认。重新确认后发布门仍必须在锁内重读活动 id：
+    的新哈希），客户端只能重新预览确认。重新确认后发布门仍必须在锁内重读默认图：
     刚被启用的 other 必须被发布，而不是停留在旧的 main。
     """
     app, client = two_canvases
@@ -1438,7 +1455,7 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
         # 候选已在路由层构造完（只含 other）；这里在拿到写锁之前完成 enable。
         if not enabled["done"]:
             enabled["done"] = True
-            app.state.graph_repo.enable("other")
+            _emulate_concurrent_enable(app, "other")
         with real_locked():
             yield publisher
 
@@ -1477,14 +1494,17 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
     assert app.state.snapshot.snapshot_revision != before_revision
     assert app.state.snapshot.backends["backup"].upstream_name == "raced-upstream"
     assert app.state.publisher.status()["document_sha256"] == \
-        app.state.graph_repo.fingerprint()[1]
+        _tree(app, "other").document_sha256
     assert _tree(app, "other").enabled is True
 
 
-def test_db_only_write_does_not_read_corrupt_active_pointer(two_canvases):
-    """与图无关的纯数据库写不得因为损坏的 ``current`` 指针变成 503。"""
+def test_db_only_write_does_not_read_legacy_current_pointer(two_canvases):
+    """与图无关的纯数据库写不得因为盘上遗留的 ``current`` 指针变成 503。
+
+    v4 仓储没有指针；回归锁定旧文件里的垃圾内容不参与任何读取。
+    """
     app, client = two_canvases
-    app.state.graph_repo.current.write_text("bad id!\n", encoding="utf-8")
+    (app.state.graph_repo.root / "current").write_text("bad id!\n", encoding="utf-8")
     before_audit = _audit_count(app)
 
     response = client.post("/admin/models", json={

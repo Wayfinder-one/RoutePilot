@@ -133,8 +133,8 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     canvas = {"start": {"x": 12, "y": 34}, "direct": {"x": 260, "y": 34}}
-    repo.create(tree_from_dict(tree_dict(root=_snapshot_tree_root(), canvas=canvas)))
-    repo.enable("main")
+    repo.create(tree_from_dict(tree_dict(
+        root=_snapshot_tree_root(), canvas=canvas, enabled=True, default=True)))
     app = create_app(settings)
     snapshot = app.state.snapshot
     trace = [
@@ -251,8 +251,8 @@ def test_request_snapshot_persistence_excludes_live_request_secrets(tmp_path):
         conn.close()
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=_question_root())))
-    repo.enable("main")
+    repo.create(tree_from_dict(tree_dict(
+        root=_question_root(), enabled=True, default=True)))
 
     upstream_secret = "upstream-secret-value"
     jev_secret = "jev-secret-value"
@@ -336,8 +336,8 @@ def test_request_snapshot_pending_beyond_the_ring_is_served(tmp_path):
     settings = test_settings(tmp_path)
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=_snapshot_tree_root())))
-    repo.enable("main")
+    repo.create(tree_from_dict(tree_dict(
+        root=_snapshot_tree_root(), enabled=True, default=True)))
     app = create_app(settings)
     for index in range(RECENT_LIMIT + 1):
         app.state.requestlog.enqueue({
@@ -381,8 +381,8 @@ def test_request_snapshot_url_encodes_request_id(tmp_path):
     settings = test_settings(tmp_path)
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create(tree_from_dict(tree_dict(root=_snapshot_tree_root())))
-    repo.enable("main")
+    repo.create(tree_from_dict(tree_dict(
+        root=_snapshot_tree_root(), enabled=True, default=True)))
     app = create_app(settings)
     app.state.requestlog.enqueue({
         "id": "id with/space?",

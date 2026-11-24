@@ -34,6 +34,7 @@ from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
+    default_tree,
     portable_tree_dict,
     test_settings,
 )
@@ -149,9 +150,10 @@ def _empty_database(path: str) -> None:
 def _install_document(settings, document, *, enable: bool = True) -> None:
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create(tree_from_dict(document))
+    payload = dict(document)
     if enable:
-        repo.enable(document["id"])
+        payload.update({"enabled": True, "default": True})
+    repo.create(tree_from_dict(payload))
 
 
 def _instance(path, monkeypatch, documents=(), *, active_id: str | None = None):
@@ -164,9 +166,13 @@ def _instance(path, monkeypatch, documents=(), *, active_id: str | None = None):
     if documents:
         repo = RoutingTreeRepo(settings.graph_dir)
         repo.initialize()
+        active = active_id or documents[-1]["id"]
         for document in documents:
-            repo.create(tree_from_dict(document))
-        repo.enable(active_id or documents[-1]["id"])
+            payload = dict(document)
+            is_active = document["id"] == active
+            payload["enabled"] = is_active
+            payload["default"] = is_active
+            repo.create(tree_from_dict(payload))
     calls = {"jev": [], "upstream": []}
     app = create_app(settings, transport=_mock_transport(calls))
     return SimpleNamespace(
@@ -183,7 +189,6 @@ def _instance_from_export(path, monkeypatch, tree_id: str, payload: bytes):
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     (repo.graphs / f"{tree_id}.json").write_bytes(payload)
-    (repo.current).write_text(tree_id + "\n", encoding="utf-8")
     calls = {"jev": [], "upstream": []}
     app = create_app(settings, transport=_mock_transport(calls))
     return SimpleNamespace(
@@ -438,7 +443,6 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     repo = RoutingTreeRepo(second.graph_dir)
     repo.initialize()
     (repo.graphs / "portable.json").write_bytes(exported)
-    (repo.current).write_text("portable\n", encoding="utf-8")
     calls_two = {"jev": [], "upstream": []}
     app_two = create_app(second, transport=_mock_transport(calls_two))
 
@@ -546,7 +550,7 @@ def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
     """已保存画布的快照是唯一运行事实源：目录行怎么改都不改变它。"""
     app, _client, settings, _calls = json_only
     before = app.state.snapshot.content
-    tree = app.state.graph_repo.active()
+    tree = default_tree(app.state.graph_repo)
     conn = connect(settings.db_path)
     try:
         with conn:
@@ -575,7 +579,7 @@ def test_acceptance_json_selects_jev_a_and_fast_and_calls_succeed(tmp_path, monk
     app, client, calls = instance.app, instance.client, instance.calls
     snapshot = app.state.snapshot
 
-    tree = app.state.graph_repo.active()
+    tree = default_tree(app.state.graph_repo)
     assert tree.runtime.jev.id == "jev-a"
     assert [model["id"] for model in tree.runtime.backends.models] == ["fast"]
     assert (tree.runtime.jev_input_tokens, tree.runtime.jev_context_tokens) == (1024, 4096)
@@ -617,7 +621,7 @@ def test_acceptance_exported_bytes_alone_reproduce_the_snapshot(tmp_path, monkey
     assert second_snapshot.tree_revision == first_snapshot.tree_revision
     assert second_snapshot.content == first_snapshot.content
     assert second_snapshot.snapshot_revision == first_snapshot.snapshot_revision
-    assert second.app.state.graph_repo.active().runtime.jev.id == "jev-a"
+    assert default_tree(second.app.state.graph_repo).runtime.jev.id == "jev-a"
 
     # 第二个实例的数据库目录确实为空：唯一输入是导出的画布字节。
     conn = connect(second.settings.db_path)

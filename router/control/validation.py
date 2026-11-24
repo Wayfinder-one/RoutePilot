@@ -13,8 +13,9 @@ import sqlite3
 
 from router.control.runtime import enable_context_for_runtime
 from router.routing.graph.validate import Issue, validate_graph_for_enable
+from router.routing.route_set import RouteSetInvariantError, default_enabled_tree
 from router.routing.tree import RoutingTree
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 
 
 def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:
@@ -26,5 +27,12 @@ def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:
 
 
 def active_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> list[Issue]:
-    tree = trees.active()
+    """校验默认启用图（名字为过渡期兼容；Task 3 改为 ``enabled_tree_issues``）。
+
+    路由集不变量损坏按存储错误上报（API 503），与快照装配边界一致。
+    """
+    try:
+        tree = default_enabled_tree(trees.enabled())
+    except RouteSetInvariantError as exc:
+        raise GraphStorageError(f"invalid route set: {exc.code}") from exc
     return [] if tree is None else tree_issues(conn, tree)

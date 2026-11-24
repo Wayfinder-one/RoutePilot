@@ -160,12 +160,12 @@ def test_admin_test_rejects_unknown_model(tmp_path):
 
 
 def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
-    """固定模型直连是目录测试：活动画布/快照不可用也能工作。"""
+    """固定模型直连是目录测试：画布文件损坏、快照不可用也能工作。"""
     settings = test_settings(tmp_path)
-    RoutingTreeRepo(settings.graph_dir).initialize()
-    # current 指针指向不存在的图：启动快照构造失败，app.state.snapshot 保持 None。
-    (RoutingTreeRepo(settings.graph_dir).root / "current").write_text(
-        "missing\n", encoding="utf-8")
+    repo = RoutingTreeRepo(settings.graph_dir)
+    repo.initialize()
+    # 启用文档损坏：启动快照构造失败，app.state.snapshot 保持 None。
+    (repo.graphs / "main.json").write_bytes(b"{broken")
     seen = []
 
     def handler(request):

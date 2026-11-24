@@ -86,8 +86,7 @@ def repo(settings):
     repository.initialize()
     raw = tree_dict(root=direct_graph("fast"))
     raw.update(stored_catalog_runtime())
-    repository.create(tree_from_dict(raw))
-    repository.enable("main")
+    repository.create(tree_from_dict({**raw, "enabled": True, "default": True}))
     return repository
 
 
@@ -269,6 +268,17 @@ def test_graph_snapshot_does_not_change_when_db_catalog_changes(conn, repo):
     assert app.state.snapshot is second
 
 
+def test_load_snapshot_uses_default_enabled_tree_not_non_default(conn, repo):
+    """非默认启用图存在时，公开快照仍取默认图。"""
+    raw = tree_dict("other", root=direct_graph("fast"))
+    raw.update(stored_catalog_runtime())
+    repo.create(tree_from_dict({**raw, "enabled": True, "default": False}))
+
+    snapshot = load_snapshot(conn, repo)
+
+    assert snapshot.tree.id == "main"
+
+
 def test_no_active_tree_is_a_valid_snapshot(tmp_path):
     settings = Settings(db_path=str(tmp_path / "control.db"), graph_dir=str(tmp_path / "routing-graph"))
     conn = connect(settings.db_path)
@@ -302,29 +312,47 @@ def test_bad_new_file_keeps_old_snapshot_and_recovers_after_repair(conn, repo, a
     assert app.state.publisher.status()["stale"] is False
 
 
-@pytest.mark.parametrize(
-    ("relative_path", "error_message"),
-    [
-        ("current", "current pointer is unavailable"),
-        ("graphs/main.json", "active graph is unavailable: main"),
-    ],
-)
-def test_first_fingerprint_read_failure_marks_stale_and_recovers(
-    conn, repo, app, relative_path, error_message,
-):
+def test_corrupt_graph_file_marks_stale_and_recovers(conn, repo, app):
+    """路由集扫描读失败：保留旧快照并报告 stale，修复后恢复。"""
     original = app.state.snapshot
-    path = repo.root / relative_path
+    path = repo.root / "graphs" / "main.json"
     content = path.read_bytes()
-    path.unlink()
+    path.write_bytes(b"{broken")
 
-    with pytest.raises(GraphStorageError, match=error_message):
+    with pytest.raises(GraphStorageError, match="invalid graph document: main"):
         app.state.publisher.refresh_if_changed(conn)
 
     assert app.state.snapshot is original
     status = app.state.publisher.status()
     assert status["ready"] is True
     assert status["stale"] is True
-    assert error_message in status["last_load_error"]
+    assert "invalid graph document: main" in status["last_load_error"]
+
+    path.write_bytes(content)
+    app.state.publisher.refresh_if_changed(conn)
+    recovered = app.state.publisher.status()
+    assert recovered["stale"] is False
+    assert recovered["last_load_error"] == ""
+    assert recovered["document_sha256"] == status["document_sha256"]
+
+
+def test_invalid_route_set_marks_stale_and_recovers(conn, repo, app):
+    """集合不变量失败（有启用图但没有默认图）在装配边界转成存储错误。"""
+    original = app.state.snapshot
+    path = repo.root / "graphs" / "main.json"
+    content = path.read_bytes()
+    raw = tree_dict(root=direct_graph("fast"), enabled=True, default=False)
+    raw.update(stored_catalog_runtime())
+    path.write_bytes(graph_document_bytes(tree_from_dict(raw)))
+
+    with pytest.raises(GraphStorageError, match="invalid route set: no_default_tree"):
+        app.state.publisher.refresh_if_changed(conn)
+
+    assert app.state.snapshot is original
+    status = app.state.publisher.status()
+    assert status["ready"] is True
+    assert status["stale"] is True
+    assert "no_default_tree" in status["last_load_error"]
 
     path.write_bytes(content)
     app.state.publisher.refresh_if_changed(conn)
@@ -347,6 +375,7 @@ def test_worker_polls_once_and_skips_unchanged_fingerprint(conn, repo, app, monk
     monkeypatch.setattr(snapshot_module, "load_snapshot", counted_load)
     updated = tree_from_dict(tree_dict(
         root=direct_graph("fast"), sticky={"enabled": True, "ttl_seconds": 60},
+        enabled=True, default=True,
     ))
     repo.update(updated, base_document_sha256=repo.get("main").document_sha256)
     worker = GraphReloadWorker(app, poll_seconds=0.01)
@@ -354,12 +383,14 @@ def test_worker_polls_once_and_skips_unchanged_fingerprint(conn, repo, app, monk
     asyncio.run(worker.poll_once())
     assert calls == 1
     assert app.state.snapshot.tree.sticky.ttl_seconds == 60
-    assert app.state.publisher.status()["document_sha256"] == repo.fingerprint()[1]
+    assert app.state.publisher.status()["document_sha256"] == \
+        repo.get("main").document_sha256
 
 
 def test_worker_real_background_loop_loads_change(repo, app):
     updated = tree_from_dict(tree_dict(
         root=direct_graph("fast"), sticky={"enabled": True, "ttl_seconds": 60},
+        enabled=True, default=True,
     ))
     repo.update(updated, base_document_sha256=repo.get("main").document_sha256)
 
@@ -416,7 +447,7 @@ def test_published_snapshot_compiles_after_enable_validation(conn, repo):
 
 def test_invalid_active_graph_is_rejected_before_compilation(conn, repo, app):
     original = app.state.snapshot
-    raw = tree_dict()
+    raw = tree_dict(enabled=True, default=True)
     raw["root"]["nodes"].append(copy.deepcopy(raw["root"]["nodes"][1]))  # duplicate node id q
     path = repo.root / "graphs" / "main.json"
     path.write_bytes(graph_document_bytes(tree_from_dict(raw)))

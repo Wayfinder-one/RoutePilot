@@ -22,6 +22,7 @@ from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import CompiledGraph, compile_graph
 from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
+from router.routing.route_set import RouteSetInvariantError, default_enabled_tree
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
 from router.routing.types import RoutingMiss
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
@@ -164,13 +165,22 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
 
 
 def load_snapshot(conn, trees: RoutingTreeRepo) -> RoutingSnapshot:
-    return build_snapshot_for_tree(conn, trees.active())
+    """从磁盘扫描结果构造默认启用图的快照；零启用图为空快照。
+
+    集合不变量（恰好一张默认图、部门唯一）在装配边界转成 ``GraphStorageError``：
+    发布器保留旧快照并报告 ``stale``，而不是把损坏文件打成 500。
+    """
+    try:
+        tree = default_enabled_tree(trees.enabled())
+    except RouteSetInvariantError as exc:
+        raise GraphStorageError(f"invalid route set: {exc.code}") from exc
+    return build_snapshot_for_tree(conn, tree)
 
 
 @dataclass(frozen=True)
 class PreparedSnapshot:
     snapshot: RoutingSnapshot
-    fingerprint: tuple[str | None, str]
+    fingerprint: str
 
 
 class SnapshotPublisher:
@@ -178,7 +188,7 @@ class SnapshotPublisher:
         self.app = app
         self.trees = trees
         self._lock = threading.RLock()
-        self._fingerprint: tuple[str | None, str] | None = None
+        self._fingerprint: str | None = None
         self._loaded_at = ""
         self._last_error = ""
 
@@ -188,7 +198,7 @@ class SnapshotPublisher:
             yield self
 
     def prepare(self, conn, tree: RoutingTree | None,
-                fingerprint: tuple[str | None, str]) -> PreparedSnapshot:
+                fingerprint: str) -> PreparedSnapshot:
         return PreparedSnapshot(build_snapshot_for_tree(conn, tree), fingerprint)
 
     def publish(self, prepared: PreparedSnapshot) -> RoutingSnapshot:
@@ -202,9 +212,9 @@ class SnapshotPublisher:
     def refresh(self, conn) -> RoutingSnapshot:
         with self._lock:
             try:
-                fingerprint = self.trees.fingerprint()
+                fingerprint = self.trees.route_fingerprint()
                 prepared = PreparedSnapshot(load_snapshot(conn, self.trees), fingerprint)
-                if self.trees.fingerprint() != fingerprint:
+                if self.trees.route_fingerprint() != fingerprint:
                     raise GraphChangedDuringLoad("graph changed while building snapshot")
                 return self.publish(prepared)
             except Exception as exc:
@@ -214,7 +224,7 @@ class SnapshotPublisher:
     def refresh_if_changed(self, conn) -> RoutingSnapshot | None:
         with self._lock:
             try:
-                if self._fingerprint is not None and self.trees.fingerprint() == self._fingerprint:
+                if self._fingerprint is not None and self.trees.route_fingerprint() == self._fingerprint:
                     # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
                     self._last_error = ""
                     return self.app.state.snapshot
@@ -224,12 +234,15 @@ class SnapshotPublisher:
                 raise
 
     def status(self) -> dict:
-        fingerprint = self._fingerprint or (None, "")
+        # 过渡期状态字段：Task 3 换成 routing snapshot set 的 schema。
+        # ``active_id`` 是默认启用图的 id，``document_sha256`` 是那份文档的哈希。
+        snapshot = self.app.state.snapshot
+        tree = snapshot.tree if snapshot is not None else None
         return {
-            "ready": self.app.state.snapshot is not None,
+            "ready": snapshot is not None,
             "stale": bool(self._last_error),
-            "active_id": fingerprint[0],
-            "document_sha256": fingerprint[1],
+            "active_id": tree.id if tree is not None else None,
+            "document_sha256": tree.document_sha256 if tree is not None else "",
             "loaded_at": self._loaded_at,
             "last_load_error": self._last_error,
         }

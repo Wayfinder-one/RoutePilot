@@ -395,8 +395,7 @@ def test_test_endpoint_uses_database_config_not_active_canvas(tmp_path):
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     document = portable_tree_dict("portable")
-    repo.create(tree_from_dict(document))
-    repo.enable(document["id"])
+    repo.create(tree_from_dict({**document, "enabled": True, "default": True}))
     app = create_app(settings, transport=httpx.MockTransport(handler))
     client = TestClient(app)
 

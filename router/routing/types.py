@@ -13,6 +13,10 @@ class NoActiveTreeError(RuntimeError):
     pass
 
 
+class NoDefaultTreeError(RuntimeError):
+    pass
+
+
 class RoutingMiss(RuntimeError):
     pass
 

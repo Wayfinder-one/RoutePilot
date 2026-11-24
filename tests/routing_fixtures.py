@@ -202,6 +202,12 @@ def portable_tree_dict(tree_id="portable", *, root=None):
     return raw
 
 
+def default_tree(repo):
+    """测试辅助：扫描仓储得到默认启用图（过渡期等价旧 ``repo.active()``）。"""
+    from router.routing.route_set import default_enabled_tree
+    return default_enabled_tree(repo.enabled())
+
+
 def runtime_from_catalog(conn) -> dict:
     """从数据库目录构造一组四字段运行配置（测试辅助，生产已无此回退）。
 

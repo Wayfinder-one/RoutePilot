@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.jev.service import JevService
-from router.routing.document import parse_graph_document
+from router.routing.document import graph_document_bytes, parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.graph.validate import validate_graph_for_enable, validate_graph_structure
 from router.control.runtime import enable_context_for_runtime
@@ -67,23 +67,24 @@ def prepare_active_tree(tmp_path, raw):
     conn.close()
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    repo.create(tree_from_dict(raw))
-    repo.enable("main")
+    repo.create(tree_from_dict({**raw, "enabled": True, "default": True}))
     return settings
 
 
 def test_missing_snapshot_is_not_ready_and_disabled_snapshot_is_ready(tmp_path):
+    """损坏的启用文档 -> 启动快照不可用；改为关闭态文档 -> 空快照就绪。"""
     settings = test_settings(tmp_path)
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    (repo.root / "current").write_text("missing\n", encoding="utf-8")
+    path = repo.graphs / "main.json"
+    path.write_bytes(b"{broken")
     app = create_app(settings)
     with TestClient(app) as client:
         assert client.get("/readyz").status_code == 503
         assert client.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hello"}],
         }).status_code == 503
-        (repo.root / "current").write_bytes(b"")
+        path.write_bytes(graph_document_bytes(tree_from_dict(tree_dict())))
         asyncio.run(app.state.graph_reloader.poll_once())
         assert client.get("/readyz").status_code == 200
 
@@ -220,8 +221,7 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     document = portable_tree_dict("main")
-    repo.create(tree_from_dict(document))
-    repo.enable("main")
+    repo.create(tree_from_dict({**document, "enabled": True, "default": True}))
 
     app = create_app(settings)
 

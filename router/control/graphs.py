@@ -1,13 +1,22 @@
 """决策组（graph）写用例：CRUD/启停的校验、候选快照与发布次序（brief Step 3）。
 
-- `create`：画布自身完整校验（结构 + 启用级；`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（新图为关闭态）。
-- `copy`：锁内读取源画布并做同一套完整校验（`tree_issues`）→（锁内）文档写入 → 审计；不发布快照（副本为关闭态）。
-- `update`：锁内按 root 优先合并已存 envelope → 画布自身完整校验（启用/未启用同一套）→ 已启用图
-  prepare 候选快照 → `base_document_sha256` 冲突检查后文件成功写入 →
-  指纹复核（Task 1 review carry-forward：等价于旧 refresh() 的提交前复核，
-  不匹配抛 `GraphChangedDuringLoad`）→ publish → 审计。
-- `enable` / `disable`：启用校验 → prepare（候选，内存只读）→ 文件成功写入
-  （current 指针）→ 指纹复核 → publish → 审计。
+v4 文档自带 ``enabled`` / ``default``，仓储只按文件内容扫描：本服务是生命周期
+的唯一写入方。
+
+- `create`：强制 ``enabled=False, default=False``（生命周期是服务端状态）→
+  画布自身完整校验（结构 + 启用级；`tree_issues`）→（锁内）文档写入 → 审计；
+  不发布快照。
+- `copy`：锁内读取源画布并做同一套完整校验（`tree_issues`）→（锁内）文档写入
+  （副本强制关闭）→ 审计；不发布快照。
+- `update`：锁内按 root 优先合并已存 envelope → 画布自身完整校验（启用/未启用
+  同一套）→ 已启用图先 prepare 候选快照 → `base_document_sha256` 冲突检查后按
+  给定文档原样写入 → 核对落盘哈希 → 用当前路由集指纹 publish → 审计。草稿
+  （未启用图）更新不发布。
+- `enable`：启用校验 → 先 prepare 候选快照（不可构建的候选绝不落盘）→ 一个
+  ``stage_updates`` 批次把其它启用图写成关闭、目标写成默认启用 → 核对每份
+  落盘文档哈希 → 用当前路由集指纹 publish → 审计。
+- `disable`：把目标写成关闭；它原本是默认启用图时发布空快照（无启用图是合法
+  路由集）→ 审计。
 
 发布是纯内存替换（`SnapshotPublisher.publish`），绝不改文件或数据库；
 服务抛出的异常由 API 层映射（ValidationFailed→422、GraphConflictError→409、
@@ -26,14 +35,17 @@ from router.control.errors import AlreadyExists, MissingError, ValidationFailed
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue
+from router.routing.route_set import RouteSetInvariantError, route_set_indices
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict
 from router.store.repositories import ChangeRepo, now_iso
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
+    GraphBatch,
     GraphChangedDuringLoad,
     GraphConflictError,
+    GraphStorageError,
     RoutingTreeRepo,
 )
 
@@ -96,6 +108,8 @@ class GraphService:
 
     # ── CRUD ────────────────────────────────────────────────────────────
     def create(self, tree: RoutingTree) -> RoutingTree:
+        # 生命周期是服务端状态：新建图一律关闭、非默认（仓储只按给定文档落盘）。
+        tree = dataclass_replace(tree, enabled=False, default=False)
         issues = tree_issues(self.conn, tree)
         if issues:
             raise ValidationFailed(issues)
@@ -122,16 +136,19 @@ class GraphService:
                 raise ValidationFailed(issues)
 
             candidate = None
+            expected_sha = None
             if current.enabled:
-                # 写盘路径会把活动图归一成 enabled/default=True；指纹必须对应同一份字节。
-                document = dataclass_replace(tree, enabled=True, default=True)
-                fingerprint = (
-                    tree.id, hashlib.sha256(graph_document_bytes(document)).hexdigest())
-                candidate = self.publisher.prepare(self.conn, document, fingerprint)
+                # 先构造候选快照（内存只读）：不可构建的候选绝不落盘。写入按给定
+                # 文档原样落盘，因此发布指纹在写盘后由当前路由集重新计算；候选树
+                # 的 document_sha256 换成即将写出的字节哈希，快照元数据才与磁盘一致。
+                expected_sha = hashlib.sha256(graph_document_bytes(tree)).hexdigest()
+                document = dataclass_replace(tree, document_sha256=expected_sha)
+                candidate = self.publisher.prepare(self.conn, document, "")
             updated = self.trees.update(tree, base_document_sha256=base_document_sha256)
             if candidate is not None:
-                self._require_fingerprint(candidate.fingerprint)
-                self.publisher.publish(candidate)
+                self._require_document_sha(updated, expected_sha)
+                self._publish_candidate(
+                    candidate, default_tree_id=tree_id, document_sha256=expected_sha)
             self._audit("update", {"id": tree_id, "tree_revision": updated.tree_revision})
             return updated
 
@@ -152,8 +169,14 @@ class GraphService:
             self._audit("copy", {"source": tree_id, "id": new_id})
         return copied
 
-    # ── 启停 ────────────────────────────────────────────────────────────
+    # ── 启停（过渡期单默认图语义；Task 5 扩展为多图启停）───────────────
     def enable(self, tree_id: str) -> None:
+        """启用一张图 = 让它成为唯一启用且默认的图。
+
+        过渡期保持旧的单活动图语义：一个批次里把其它启用图写成关闭、目标写成
+        ``enabled=True, default=True``。候选快照在写盘前构造，落盘后核对每份文档
+        哈希，再用当前路由集指纹发布。
+        """
         with self.publisher.locked():
             tree = self.trees.get(tree_id)
             if tree is None:
@@ -161,39 +184,56 @@ class GraphService:
             issues = tree_issues(self.conn, tree)
             if issues:
                 raise ValidationFailed(issues)
-            # 过渡期 enable 会把目标文件改写成 enabled/default=True，因此候选快照的
-            # 指纹必须是「改写后」的文档哈希，提交前复核才能通过。
             enabled_tree = dataclass_replace(tree, enabled=True, default=True)
-            fingerprint = (
-                tree.id,
-                hashlib.sha256(graph_document_bytes(enabled_tree)).hexdigest(),
-            )
-            candidate = self.publisher.prepare(self.conn, enabled_tree, fingerprint)
+            enabled_sha = hashlib.sha256(graph_document_bytes(enabled_tree)).hexdigest()
+            # 候选快照树携带即将写出的文档哈希（与磁盘一致）。
+            enabled_tree = dataclass_replace(enabled_tree, document_sha256=enabled_sha)
+            candidate = self.publisher.prepare(self.conn, enabled_tree, "")
+            updates = [
+                (dataclass_replace(other, enabled=False, default=False),
+                 other.document_sha256)
+                for other in self.trees.enabled() if other.id != tree_id
+            ]
+            updates.append((enabled_tree, tree.document_sha256))
+            expected = {
+                update[0].id: hashlib.sha256(graph_document_bytes(update[0])).hexdigest()
+                for update in updates
+            }
+            batch = self.trees.stage_updates(updates)
             try:
-                self.trees.enable(tree_id)
-            except KeyError:
-                raise MissingError(f"unknown tree {tree_id}") from None
-            self._require_fingerprint(candidate.fingerprint)
-            self.publisher.publish(candidate)
+                batch.commit()
+            except BaseException:
+                self._rollback_batch(batch)
+                raise
+            batch.discard()
+            for written_id, expected_sha in expected.items():
+                self._require_document_sha(self.trees.get(written_id), expected_sha)
+            self._publish_candidate(
+                candidate, default_tree_id=tree_id, document_sha256=enabled_sha)
             self._audit("enable", {"id": tree_id})
 
     def disable(self, tree_id: str) -> None:
         with self.publisher.locked():
-            candidate = (
-                self.publisher.prepare(self.conn, None, (None, ""))
-                if self.trees.active_id() == tree_id else None
-            )
-            if not self.trees.disable(tree_id):
+            tree = self.trees.get(tree_id)
+            if tree is None:
                 raise MissingError(f"unknown tree {tree_id}")
+            was_enabled = tree.enabled
+            candidate = (
+                self.publisher.prepare(self.conn, None, "") if was_enabled else None)
+            disabled = dataclass_replace(tree, enabled=False, default=False)
+            expected_sha = hashlib.sha256(graph_document_bytes(disabled)).hexdigest()
+            updated = self.trees.update(disabled, base_document_sha256=tree.document_sha256)
+            self._require_document_sha(updated, expected_sha)
             if candidate is not None:
-                self._require_fingerprint(candidate.fingerprint)
-                self.publisher.publish(candidate)
+                # 过渡期：唯一启用图被关闭后没有默认图，镜像旧行为发布空快照。
+                self._publish_candidate(
+                    candidate, default_tree_id=None, document_sha256="")
             self._audit("disable", {"id": tree_id})
 
     # ── 内部 ────────────────────────────────────────────────────────────
     @staticmethod
     def _envelope(current: RoutingTree, patch: GraphPatch) -> RoutingTree:
-        """enabled 是外部状态：持久化 envelope 与 current 一致（启停走专用端点）。
+        """enabled/default 是外部状态：持久化 envelope 与已存画布一致（启停走专用端点）。
 
         patch 缺失（``UNSET``）的字段继承 current；显式 null 原样交给
         ``tree_from_dict``，恢复 base 对 root/timezone/sticky 的 null 语义。
@@ -235,11 +275,49 @@ class GraphService:
         except ValueError as exc:
             raise ValidationFailed(graph_parse_failed(exc)) from exc
 
-    def _require_fingerprint(self, fingerprint: tuple[str | None, str]) -> None:
-        """发布前复核：内存候选指纹必须与磁盘一致（等价旧 refresh() 的复核语义）。"""
-        if self.trees.fingerprint() != fingerprint:
+    @staticmethod
+    def _require_document_sha(tree: RoutingTree | None, expected_sha: str) -> None:
+        """写盘后核对：磁盘文档哈希必须等于本服务打算写出的字节哈希。"""
+        if tree is None or tree.document_sha256 != expected_sha:
             raise GraphChangedDuringLoad(
                 "graph changed between document write and snapshot publish")
+
+    def _publish_candidate(self, candidate, *, default_tree_id: str | None,
+                           document_sha256: str) -> None:
+        """发布前复核默认图仍指向刚写入的文档，再用当前路由集指纹发布。
+
+        写盘与发布之间可能插入其它副本的启停：复核默认图 id 与文档哈希，
+        不匹配时抛与旧 refresh() 一致的冲突，绝不把自相矛盾的（快照, 指纹）
+        组合发布出去。
+        """
+        for _attempt in range(2):
+            fingerprint = self.trees.route_fingerprint()
+            try:
+                enabled = self.trees.enabled()
+                current_default, _ = route_set_indices(enabled)
+            except RouteSetInvariantError:
+                continue
+            tree = (
+                next((item for item in enabled if item.id == current_default), None)
+                if current_default is not None else None
+            )
+            current_sha = tree.document_sha256 if tree is not None else ""
+            if current_default == default_tree_id and current_sha == document_sha256:
+                self.publisher.publish(
+                    dataclass_replace(candidate, fingerprint=fingerprint))
+                return
+        raise GraphChangedDuringLoad(
+            "graph changed between document write and snapshot publish")
+
+    def _rollback_batch(self, batch: GraphBatch) -> None:
+        """批次提交失败时尽力恢复旧文件；回滚失败留给调用方/刷新兜底。"""
+        try:
+            batch.rollback()
+        except GraphStorageError:
+            logger.exception("graph batch rollback failed")
+            raise
+        finally:
+            batch.discard()
 
     def _audit(self, action: str, detail: dict) -> None:
         try:

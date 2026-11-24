@@ -38,6 +38,7 @@ from router.control.errors import ValidationFailed
 from router.control.graphs import graph_parse_failed
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes, parse_graph_document
+from router.routing.route_set import RouteSetInvariantError, default_enabled_tree
 from router.routing.snapshot import PreparedSnapshot
 from router.routing.tree import RoutingTree
 from router.store.repositories import (
@@ -50,7 +51,6 @@ from router.store.routing_trees import (
     GraphBatch,
     GraphChangedDuringLoad,
     GraphStorageError,
-    document_tree,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,11 +120,11 @@ class ConfigurationService:
         相同的冲突并回滚，绝不把过期指纹打给已发布快照。
         """
         for _attempt in range(2):
-            fingerprint = self.trees.fingerprint()
+            fingerprint = self.trees.route_fingerprint()
             if fingerprint == prepared.fingerprint:
                 return prepared
             prepared = self.publisher.prepare(
-                self.conn, self.trees.active(), fingerprint)
+                self.conn, self._default_enabled_tree(), fingerprint)
         raise GraphChangedDuringLoad(
             "graph changed between document write and snapshot publish")
 
@@ -132,13 +132,20 @@ class ConfigurationService:
         self._commit_locked(write)
 
     # ── 配置写路径的校验 ────────────────────────────────────────────────
+    def _default_enabled_tree(self) -> RoutingTree | None:
+        """默认启用图（零启用图为 ``None``）；集合不变量损坏按存储错误上报。"""
+        try:
+            return default_enabled_tree(self.trees.enabled())
+        except RouteSetInvariantError as exc:
+            raise GraphStorageError(f"invalid route set: {exc.code}") from exc
+
     def _require_valid_active_graph(self) -> None:
-        """用画布自身的内嵌运行配置校验活动图。
+        """用画布自身的内嵌运行配置校验默认启用图。
 
         数据库目录不参与启用判断：目录行与画布不一致只影响检查提示，不会让
         目录写失败。校验失败时数据库回滚，磁盘不应残留半份新配置。
         """
-        tree = self.trees.active()
+        tree = self._default_enabled_tree()
         if tree is None:
             return
         issues = tree_issues(self.conn, tree)
@@ -159,9 +166,9 @@ class ConfigurationService:
         if issues:
             raise ValidationFailed(issues)
         try:
-            # 校验「即将写出的字节」：写盘路径会把 enabled/default 归一成与 current
-            # 指针一致，因此这里用同一份归一后的文档做严格解析。
-            raw = graph_document_bytes(document_tree(tree, self.trees.active_id()))
+            # 校验「即将写出的字节」：仓储按给定 v4 文档原样落盘，生命周期字段
+            # 不再在写盘路径上归一，因此直接解析这份文档。
+            raw = graph_document_bytes(tree)
             parse_graph_document(
                 raw,
                 tree_id=tree.id,
@@ -175,8 +182,9 @@ class ConfigurationService:
         # 必须先取指纹再读树：两次读取之间图若被改写，_recheck_fingerprint 会看到
         # 不匹配并重建一次。反过来（先读树、后取指纹）会产出（过期树, 当前指纹），
         # 复核只看指纹标签，于是把过期树当最新快照发布出去。
-        fingerprint = self.trees.fingerprint()
-        return self.publisher.prepare(self.conn, self.trees.active(), fingerprint)
+        fingerprint = self.trees.route_fingerprint()
+        return self.publisher.prepare(
+            self.conn, self._default_enabled_tree(), fingerprint)
 
     # ── 确认后的目录同步（模型/provider/JEV 影响写用例共用骨架）────────────
     # 与 _write_and_publish 同一套语义：publisher.locked() → 单写事务（引用复核/
@@ -192,12 +200,10 @@ class ConfigurationService:
         重算最新引用/影响清单（路由层扫描与加锁之间的竞态不会漏同步或漏拦）。
         ``audit(conn)``：候选快照构造与指纹复核之后、COMMIT 之前写审计行。
 
-        「活动画布是否被改写」的发布门必须在写锁内、事务内决定：路由层构造候选
-        之后、本方法拿到写锁之前可能有一笔 enable 落盘；若在加锁前读取
-        ``active_id()``，就会出现「批次写入了刚被启用的画布，却因为旧活动 id
-        不在候选里而跳过发布」的竞态。因此这里在暂存批次之后、同一把锁内重新
-        读取活动 id；没有候选的纯数据库写完全不读活动指针，损坏的 ``current``
-        不会把与图无关的目录写变成 503。
+        「默认启用图是否被改写」的发布门必须在写锁内、事务内决定：路由层构造
+        候选之后、本方法拿到写锁之前可能有一笔 enable 落盘；若在加锁前读取
+        默认图 id，就会出现「批次写入了刚被启用的画布，却因为旧 id 不在候选里
+        而跳过发布」的竞态。因此这里在暂存批次之后、同一把锁内重新扫描默认图。
         """
         candidates = list(candidates)
 
@@ -215,16 +221,17 @@ class ConfigurationService:
             batch = self.trees.stage_updates([
                 (tree, tree.document_sha256) for tree in candidates
             ])
-            # 发布门在写锁内决定，与 ``stage_updates`` 读取活动 id 处于同一临界区；
-            # 加锁前发生的 enable 在这里可见，只有活动画布确实在候选里才发布。
-            active_id = self.trees.active_id()
-            active_changed = active_id is not None and any(
-                tree.id == active_id for tree in candidates)
-            # 先取指纹再读活动树，保证（树, 指纹）标签一致；图批次提交后读到的是
-            # 本事务写入的新活动画布。
+            # 发布门在写锁内决定，与 ``stage_updates`` 读取默认图处于同一临界区；
+            # 加锁前发生的 enable 在这里可见，只有默认启用图确实在候选里才发布。
+            default = self._default_enabled_tree()
+            default_id = default.id if default is not None else None
+            default_changed = default_id is not None and any(
+                tree.id == default_id for tree in candidates)
+            # 先取指纹再读默认树，保证（树, 指纹）标签一致；图批次提交后读到的是
+            # 本事务写入的新默认画布。
             return _ConfigWriteResult(
                 prepared=None, graph_batch=batch,
-                prepare=True, publish=active_changed)
+                prepare=True, publish=default_changed)
 
         self._commit_locked(write, after_prepare=lambda _conn: audit(self.conn))
         return [tree.id for tree in candidates]

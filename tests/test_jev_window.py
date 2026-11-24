@@ -90,19 +90,23 @@ class Publisher:
         self.published.append(prepared)
 
 
+def _default_tree(tree_id="tree-1"):
+    return SimpleNamespace(id=tree_id, default=True, departments=())
+
+
 class _Trees:
-    """最小树仓库桩：按队列吐指纹，队列耗尽后停在最后一个。"""
+    """最小树仓库桩：按队列吐路由集指纹，队列耗尽后停在最后一个。"""
 
     def __init__(self, fingerprints):
         self._fingerprints = list(fingerprints)
 
-    def fingerprint(self):
+    def route_fingerprint(self):
         if len(self._fingerprints) > 1:
             return self._fingerprints.pop(0)
         return self._fingerprints[0]
 
-    def active(self):
-        return None
+    def enabled(self):
+        return [_default_tree()]
 
 
 def _fresh_conn(tmp_path):
@@ -117,7 +121,7 @@ def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
     try:
         publisher = Publisher()
         service = ConfigurationService(
-            conn, _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b")]), publisher)
+            conn, _Trees(["sha-a", "sha-b"]), publisher)
 
         def write(_conn):
             prepared = service._prepared_snapshot()  # 指纹 sha-a
@@ -125,7 +129,7 @@ def test_publish_rechecks_fingerprint_and_rebuilds(tmp_path):
 
         service._write_and_publish(write)
         assert len(publisher.published) == 1
-        assert publisher.published[0].fingerprint == ("tree-1", "sha-b")
+        assert publisher.published[0].fingerprint == "sha-b"
     finally:
         conn.close()
 
@@ -137,7 +141,7 @@ def test_publish_refuses_when_fingerprint_keeps_changing(tmp_path):
         publisher = Publisher()
         service = ConfigurationService(
             conn,
-            _Trees([("tree-1", "sha-a"), ("tree-1", "sha-b"), ("tree-1", "sha-c")]),
+            _Trees(["sha-a", "sha-b", "sha-c"]),
             publisher,
         )
         with pytest.raises(GraphChangedDuringLoad):
@@ -152,31 +156,31 @@ class _SwappingTrees:
     """最小树仓库桩：底层文档在两次读取之间被改写，模拟磁盘竞态。"""
 
     def __init__(self, before, after, *, swap_after=1):
-        self._document = before              # ((tree_id, sha256), tree)
+        self._document = before              # (route_fingerprint, enabled trees)
         self._after = after
         self._reads = 0
         self._swap_after = swap_after
         self.calls = []
 
     def _read(self, name):
-        fingerprint, tree = self._document
+        fingerprint, trees = self._document
         self.calls.append(name)
         self._reads += 1
         if self._reads >= self._swap_after:
             self._document = self._after
-        return fingerprint, tree
+        return fingerprint, trees
 
-    def fingerprint(self):
-        return self._read("fingerprint")[0]
+    def route_fingerprint(self):
+        return self._read("route_fingerprint")[0]
 
-    def active(self):
-        return self._read("active")[1]
+    def enabled(self):
+        return self._read("enabled")[1]
 
 
 def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
     """指纹必须先于树读取：两次读取之间图变了，绝不能把过期树配当前指纹发布。"""
-    doc_a = (("tree-a", "sha-a"), SimpleNamespace(id="doc-a"))
-    doc_b = (("tree-b", "sha-b"), SimpleNamespace(id="doc-b"))
+    doc_a = ("sha-a", [_default_tree("doc-a")])
+    doc_b = ("sha-b", [_default_tree("doc-b")])
     conn = _fresh_conn(tmp_path)
     try:
         publisher = Publisher()
@@ -190,9 +194,9 @@ def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
         published = publisher.published[0]
         # 重考发现「树过期、指纹是当前」，用当前文档重建一次；绝不发布
         # (doc-a 的树, doc-b 的指纹) 这种自相矛盾的快照。
-        assert published.tree is doc_b[1]
+        assert published.tree is doc_b[1][0]
         assert published.fingerprint == doc_b[0]
-        assert trees.calls[:2] == ["fingerprint", "active"]
+        assert trees.calls[:2] == ["route_fingerprint", "enabled"]
     finally:
         conn.close()
 

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -36,8 +37,65 @@ def test_create_stores_export_document_and_external_identity(repo):
     assert document["departments"] == [] and document["enabled"] is False
     assert document["default"] is False
     assert created.document_sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert repo.active_id() is None
     assert created.enabled is False and created.default is False
+
+
+def test_initialize_only_creates_graphs_and_never_touches_legacy_pointer(tmp_path):
+    """v4 仓储没有 current 指针：旧文件在盘上也不得被创建、读取或改写。"""
+    root = tmp_path / "routing-graph"
+    root.mkdir()
+    legacy = root / "current"
+    legacy.write_text("not-a-tree!!\n", encoding="utf-8")
+    repo = RoutingTreeRepo(root)
+    repo.initialize()
+    assert repo.graphs.is_dir()
+    assert legacy.read_text(encoding="utf-8") == "not-a-tree!!\n"
+    assert repo.list() == [] and repo.enabled() == []
+    assert repo.route_fingerprint()
+
+
+def test_create_writes_given_lifecycle_verbatim(repo):
+    """仓储只按给定 v4 文档落盘；新建图强制关闭由 GraphService 负责。"""
+    created = repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    assert created.enabled is True and created.default is True
+    document = json.loads((repo.root / "graphs" / "main.json").read_text(encoding="utf-8"))
+    assert document["enabled"] is True and document["default"] is True
+
+
+def test_route_fingerprint_ignores_draft_only_changes(repo):
+    repo.create(tree_from_dict(tree_dict('main', enabled=True, default=True)))
+    repo.create(tree_from_dict(tree_dict('draft')))
+    before = repo.route_fingerprint()
+    draft = repo.get('draft')
+    raw = tree_dict('draft')
+    raw['name'] = '只改草稿'
+    repo.update(tree_from_dict(raw), base_document_sha256=draft.document_sha256)
+    assert repo.route_fingerprint() == before
+    main = repo.get('main')
+    raw = tree_dict('main', enabled=True, default=True)
+    raw['name'] = '改启用图'
+    repo.update(tree_from_dict(raw), base_document_sha256=main.document_sha256)
+    assert repo.route_fingerprint() != before
+
+
+def test_route_fingerprint_tracks_lifecycle_and_default_switch(repo):
+    main = repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    other = repo.create(tree_from_dict(tree_dict("other")))
+    before = repo.route_fingerprint()
+
+    # 文件内启停（GraphService 的写路径）：新增启用图改变路由集指纹。
+    enabled_other = replace(other, enabled=True)
+    repo.update(enabled_other, base_document_sha256=other.document_sha256)
+    assert [tree.id for tree in repo.enabled()] == ["main", "other"]
+    assert repo.route_fingerprint() != before
+
+    # 默认图切换同样改变指纹（id/default 都进入指纹行）。
+    with_default = repo.route_fingerprint()
+    repo.update(replace(main, default=False),
+                base_document_sha256=repo.get("main").document_sha256)
+    repo.update(replace(repo.get("other"), default=True),
+                base_document_sha256=repo.get("other").document_sha256)
+    assert repo.route_fingerprint() != with_default
 
 
 def test_duplicate_create_is_rejected(repo):
@@ -57,22 +115,37 @@ def test_stale_or_missing_base_hash_cannot_overwrite(repo):
     assert (repo.root / "graphs" / "main.json").read_bytes() == before
 
 
-def test_read_only_repo_cannot_write_and_bad_pointer_is_not_disabled(repo):
+def test_read_only_repo_cannot_write(repo):
+    repo.create(tree_from_dict(tree_dict()))
     reader = RoutingTreeRepo(repo.root, writer=False)
     with pytest.raises(GraphReadOnlyError):
         reader.initialize()
     with pytest.raises(GraphReadOnlyError):
         reader.create(tree_from_dict(tree_dict("other")))
     with pytest.raises(GraphReadOnlyError):
-        reader.enable("main")
+        reader.update(tree_from_dict(tree_dict()), base_document_sha256="0" * 64)
     with pytest.raises(GraphReadOnlyError):
-        reader.disable("main")
-    (repo.root / "current").write_text("../main\n", encoding="utf-8")
-    with pytest.raises(GraphStorageError):
-        reader.fingerprint()
-    (repo.root / "current").unlink()
-    with pytest.raises(GraphStorageError):
-        reader.fingerprint()
+        reader.stage_updates([])
+    # 只读仓储仍可扫描现有文档。
+    assert reader.get("main") is not None
+    assert [tree.id for tree in reader.list()] == ["main"]
+
+
+def test_legacy_pointer_pointing_at_garbage_or_non_default_is_ignored(repo):
+    """回归锁定：旧 ``current`` 即使指向垃圾 id 或非默认图，也不参与任何读取。"""
+    repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    repo.create(tree_from_dict(tree_dict("other")))
+    before = repo.route_fingerprint()
+    (repo.root / "current").write_text("other\n", encoding="utf-8")
+
+    assert repo.get("main").enabled is True and repo.get("main").default is True
+    assert repo.get("other").enabled is False and repo.get("other").default is False
+    assert [tree.id for tree in repo.enabled()] == ["main"]
+    assert repo.route_fingerprint() == before
+
+    (repo.root / "current").write_text("../escape\n", encoding="utf-8")
+    assert [tree.id for tree in repo.enabled()] == ["main"]
+    assert repo.route_fingerprint() == before
 
 
 def test_atomic_replace_never_exposes_partial_json(repo):
@@ -132,16 +205,22 @@ def test_layout_only_update_keeps_revision_but_changes_file_hash(repo):
     assert (repo.root / "graphs" / "main.json").read_bytes() != before
 
 
-def test_update_changes_content_but_never_enabled(repo):
-    tree = repo.create(tree_from_dict(tree_dict()))
-    repo.enable(tree.id)
-    raw = tree_dict(sticky={"enabled": False, "ttl_seconds": 60})
+def test_update_writes_document_verbatim_including_lifecycle(repo):
+    created = repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    raw = tree_dict("main", enabled=True, default=True, sticky={"enabled": False, "ttl_seconds": 60})
     raw["root"]["nodes"][1]["instructions"] = "重新选择能力"
-    updated = repo.update(tree_from_dict(raw), base_document_sha256=repo.get("main").document_sha256)
-    assert updated.enabled is True
+    updated = repo.update(tree_from_dict(raw),
+                          base_document_sha256=repo.get("main").document_sha256)
+    assert updated.enabled is True and updated.default is True
     assert updated.root.nodes[1].instructions == "重新选择能力"
     assert updated.sticky.enabled is False
-    assert updated.tree_revision != tree.tree_revision
+    assert updated.tree_revision != created.tree_revision
+
+    # 仓储不强制生命周期：启用状图也可以按给定文档写成关闭态（GraphService 负责语义）。
+    raw = tree_dict("main")
+    downgraded = repo.update(tree_from_dict(raw),
+                             base_document_sha256=updated.document_sha256)
+    assert downgraded.enabled is False and downgraded.default is False
 
 
 def test_question_option_order_changes_revision(repo):
@@ -170,65 +249,64 @@ def test_copy_preserves_layout_and_display(repo):
     assert copied.root.nodes[-1].title == "展示说明"
 
 
-def test_enable_disable_and_copy_preserve_single_active_invariant(repo):
-    first = repo.create(tree_from_dict(tree_dict("a")))
-    second = repo.create(tree_from_dict(tree_dict("b")))
-    repo.enable(first.id)
-    repo.enable(second.id)
-    assert [tree.id for tree in repo.list() if tree.enabled] == ["b"]
-    copied = repo.copy("b", "copy", "副本")
-    assert copied.enabled is False
-    assert copied.tree_revision == second.tree_revision
-    assert repo.disable("a") is True
-    assert [tree.id for tree in repo.list() if tree.enabled] == ["b"]
-    assert repo.disable("b") is True
-    assert not any(tree.enabled for tree in repo.list())
-    assert repo.disable("missing") is False
+def test_copy_of_enabled_default_forces_lifecycle_off(repo):
+    source = repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    copied = repo.copy("main", "copy", "副本")
+    assert copied.enabled is False and copied.default is False
+    assert copied.tree_revision == source.tree_revision
+    assert [tree.id for tree in repo.enabled()] == ["main"]
 
 
-def test_lifecycle_fields_follow_the_current_pointer(repo):
-    """过渡期：文件里的 enabled/default 必须与 current 指针一致，最多一份 enabled。"""
-    first = repo.create(tree_from_dict(tree_dict("a")))
-    second = repo.create(tree_from_dict(tree_dict("b", enabled=True, default=True)))
+def test_stage_updates_orders_default_last_and_commits(repo):
+    main = repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    other = repo.create(tree_from_dict(tree_dict("other")))
+    updates = [
+        (replace(main, name="默认图改名"), main.document_sha256),
+        (replace(other, enabled=True), other.document_sha256),
+    ]
+    batch = repo.stage_updates(updates)
+    try:
+        assert [entry.path.stem for entry in batch.entries] == ["other", "main"]
+        batch.commit()
+    finally:
+        batch.discard()
 
-    assert first.enabled is False and second.enabled is False, "create must force lifecycle off"
-    documents = {
-        tree_id: json.loads((repo.root / "graphs" / f"{tree_id}.json").read_text(encoding="utf-8"))
-        for tree_id in ("a", "b")
-    }
-    assert all(document["enabled"] is False and document["default"] is False
-               for document in documents.values())
-
-    enabled = repo.enable("a")
-    assert enabled.enabled is True and enabled.default is True
-    assert repo.get("a").enabled is True and repo.get("a").default is True
-    assert {tree.id: tree.enabled for tree in repo.list()} == {"a": True, "b": False}
-    assert sum(tree.enabled for tree in repo.list()) == 1
-
-    repo.enable("b")
-    assert repo.active_id() == "b"
-    assert repo.get("a").enabled is False and repo.get("a").default is False
-    assert repo.get("b").enabled is True and repo.get("b").default is True
-    assert sum(tree.enabled for tree in repo.list()) == 1
-
-    assert repo.disable("b") is True
-    assert repo.active_id() is None
-    assert repo.get("b").enabled is False and repo.get("b").default is False
-    assert not any(tree.enabled for tree in repo.list())
+    assert repo.get("main").name == "默认图改名"
+    assert repo.get("main").enabled is True and repo.get("main").default is True
+    assert repo.get("other").enabled is True and repo.get("other").default is False
 
 
-def test_invalid_document_and_missing_active_file_raise_storage_error(repo):
+def test_stage_updates_rejects_stale_base_and_cleans_staged_files(repo):
+    other = repo.create(tree_from_dict(tree_dict("other")))
+    before = (repo.root / "graphs" / "other.json").read_bytes()
+    with pytest.raises(GraphConflictError) as stale:
+        repo.stage_updates([(replace(other, enabled=True), "0" * 64)])
+    assert stale.value.actual_document_sha256 == other.document_sha256
+    assert (repo.root / "graphs" / "other.json").read_bytes() == before
+    assert list(repo.graphs.glob(".*")) == []
+
+
+def test_stage_updates_rollback_restores_committed_files(repo):
+    main = repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
+    other = repo.create(tree_from_dict(tree_dict("other")))
+    before_main = (repo.root / "graphs" / "main.json").read_bytes()
+    before_other = (repo.root / "graphs" / "other.json").read_bytes()
+    batch = repo.stage_updates([
+        (replace(other, enabled=True), other.document_sha256),
+        (replace(main, name="改名"), main.document_sha256),
+    ])
+    batch.commit()
+    assert (repo.root / "graphs" / "main.json").read_bytes() != before_main
+    batch.rollback()
+    assert (repo.root / "graphs" / "main.json").read_bytes() == before_main
+    assert (repo.root / "graphs" / "other.json").read_bytes() == before_other
+
+
+def test_invalid_document_raises_storage_error(repo):
     repo.create(tree_from_dict(tree_dict()))
     path = repo.root / "graphs" / "main.json"
     path.write_bytes(b"{broken")
     with pytest.raises(GraphStorageError):
         repo.get("main")
-    path.write_bytes(tree_document_bytes(repo, "main"))
-    (repo.root / "current").write_text("missing\n", encoding="utf-8")
     with pytest.raises(GraphStorageError):
-        repo.active()
-
-
-def tree_document_bytes(repo, tree_id):
-    from router.routing.document import graph_document_bytes
-    return graph_document_bytes(tree_from_dict(tree_dict(tree_id)))
+        repo.enabled()

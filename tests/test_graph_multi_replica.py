@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -85,20 +86,30 @@ def test_reader_loads_writer_change_and_survives_failures(tmp_path):
         asyncio.run(reader_app.state.graph_reloader.poll_once())
         assert reader.get("/readyz").json()["stale"] is False
 
-        pointer = Path(settings.graph_dir) / "current"
-        pointer.unlink()
+        # 路由集不变量失败（启用但非默认）：保留旧快照并报告 stale；修复后恢复。
+        document = json.loads(good)
+        document["default"] = False
+        broken_route_set = (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
+        path.with_suffix(".test-tmp").write_bytes(broken_route_set)
+        os.replace(path.with_suffix(".test-tmp"), path)
         asyncio.run(reader_app.state.graph_reloader.poll_once())
         unavailable = reader.get("/readyz")
         assert unavailable.status_code == 200
         assert unavailable.json()["stale"] is True
-        assert "current pointer is unavailable" in unavailable.json()["last_load_error"]
+        assert "no_default_tree" in unavailable.json()["last_load_error"]
         assert reader.post("/v1/chat/completions", json={
             "messages": [{"role": "user", "content": "hello"}],
         }).status_code == 200
 
-        pointer.write_text("main\n", encoding="utf-8")
+        path.with_suffix(".test-tmp").write_bytes(good)
+        os.replace(path.with_suffix(".test-tmp"), path)
         asyncio.run(reader_app.state.graph_reloader.poll_once())
         recovered = reader.get("/readyz")
         assert recovered.status_code == 200
         assert recovered.json()["stale"] is False
         assert recovered.json()["last_load_error"] == ""
+
+        # 盘上遗留的 current 指针不再被读取：垃圾内容也不影响就绪状态。
+        (Path(settings.graph_dir) / "current").write_text("garbage!\n", encoding="utf-8")
+        asyncio.run(reader_app.state.graph_reloader.poll_once())
+        assert reader.get("/readyz").json()["stale"] is False

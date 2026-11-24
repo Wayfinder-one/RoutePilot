@@ -31,7 +31,7 @@ from router.routing.graph.validate import Issue
 from router.store.db import connect
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, ProviderRepo
-from tests.routing_fixtures import portable_tree_dict
+from tests.routing_fixtures import default_tree, portable_tree_dict
 from tests.test_self_contained_e2e import json_only, self_contained_root
 
 TRY_BODY = {
@@ -42,7 +42,7 @@ TRY_BODY = {
 
 
 def _runtime(app):
-    return app.state.graph_repo.active().runtime
+    return default_tree(app.state.graph_repo).runtime
 
 
 def _seed_catalog(conn, runtime) -> None:

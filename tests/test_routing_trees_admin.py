@@ -16,7 +16,7 @@ from router.store.db import connect
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ModelRepo, ProviderRepo, TimePeriodRepo
 from router.routing.tree import tree_from_dict
-from router.store.routing_trees import RoutingTreeRepo
+from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 from tests.routing_fixtures import (
     GRAPH_CANVAS,
     graph_dict,
@@ -671,7 +671,55 @@ def test_enable_publishes_candidate_snapshot_exactly_once(app, client, monkeypat
     assert status["active_id"] == "main" and status["stale"] is False
     # 候选快照指纹与文件一致：发布内容 = 刚写入的文档（内存替换，无文件操作）
     repo = RoutingTreeRepo(app.state.settings.graph_dir)
-    assert status["document_sha256"] == repo.fingerprint()[1]
+    assert status["document_sha256"] == repo.get("main").document_sha256
+
+
+def test_enable_disable_unknown_tree_is_404(client):
+    assert client.post("/admin/trees/missing/enable").status_code == 404
+    assert client.post("/admin/trees/missing/disable").status_code == 404
+
+
+def test_enable_prepares_candidate_before_writing(client, app, monkeypatch):
+    """候选快照构造失败（不可构建）时绝不落盘，文档生命周期保持关闭。"""
+    configure_jev(client)
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    repo = RoutingTreeRepo(app.state.settings.graph_dir)
+    before = (repo.graphs / "main.json").read_bytes()
+
+    def failing_prepare(_conn, _tree, _fingerprint):
+        raise GraphStorageError("candidate snapshot is unbuildable")
+
+    monkeypatch.setattr(app.state.publisher, "prepare", failing_prepare)
+    response = client.post("/admin/trees/main/enable")
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "graph_storage_error"
+    assert (repo.graphs / "main.json").read_bytes() == before
+    assert app.state.publisher.status()["active_id"] is None
+
+
+def test_update_enabled_prepares_candidate_before_writing(client, app, monkeypatch):
+    """启用图更新的候选快照构造失败时，文件与已发布快照都不变。"""
+    configure_jev(client)
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    repo = RoutingTreeRepo(app.state.settings.graph_dir)
+    saved = client.get("/admin/trees/main").json()["tree"]
+    before = (repo.graphs / "main.json").read_bytes()
+    revision = app.state.snapshot.snapshot_revision
+
+    def failing_prepare(_conn, _tree, _fingerprint):
+        raise GraphStorageError("candidate snapshot is unbuildable")
+
+    monkeypatch.setattr(app.state.publisher, "prepare", failing_prepare)
+    response = client.put("/admin/trees/main", json={
+        "sticky": {"enabled": True, "ttl_seconds": 60},
+        "base_document_sha256": saved["document_sha256"],
+    })
+
+    assert response.status_code == 503, response.text
+    assert (repo.graphs / "main.json").read_bytes() == before
+    assert app.state.snapshot.snapshot_revision == revision
 
 
 def test_tree_dtos_reject_unknown_fields(client):
