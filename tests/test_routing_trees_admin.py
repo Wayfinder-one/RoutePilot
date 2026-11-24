@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -967,3 +968,99 @@ def test_enable_disable_persists_lifecycle_in_document(client, app):
     document = json.loads(
         (Path(app.state.settings.graph_dir) / "graphs" / "main.json").read_text(encoding="utf-8"))
     assert document["enabled"] is False and document["default"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Fix wave 1：发布指纹与损坏路由集的错误映射
+# --------------------------------------------------------------------------- #
+def test_lifecycle_writes_stamp_published_route_set_fingerprint(client, app):
+    """Finding 1 回归：发布的路由集 ``fingerprint`` 必须等于发布时使用的指纹。
+
+    GraphService 在写盘前用占位指纹装配候选路由集，``_publish_candidate()``
+    只给外层 ``PreparedRouteSet`` 换标签；发布点必须把同一个指纹同步盖到
+    ``RoutingSnapshotSet`` 上，否则 ``app.state.snapshot_set.fingerprint`` 会
+    一直停在占位空串，而 ``status()["route_fingerprint"]`` 却是正确值。
+    """
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    repo = app.state.graph_repo
+
+    response = client.post("/admin/trees/main/enable")
+    assert response.status_code == 200, response.text
+    published = app.state.snapshot_set
+    assert published.fingerprint
+    assert published.fingerprint == repo.route_fingerprint()
+    assert app.state.publisher.status()["route_fingerprint"] == repo.route_fingerprint()
+
+    response = client.post("/admin/trees/main/disable")
+    assert response.status_code == 200, response.text
+    published = app.state.snapshot_set
+    assert published.snapshots == {}
+    assert published.fingerprint == repo.route_fingerprint()
+    assert app.state.publisher.status()["route_fingerprint"] == repo.route_fingerprint()
+
+
+def _install_enabled_tree_without_default(app, tree_id):
+    """手装 standalone JSON：启用图但没有默认图（本项目支持直接编辑文件）。
+
+    仓储只按给定 v4 文档原样落盘，生命周期不变量只由装配边界校验。
+    """
+    repo = app.state.graph_repo
+    current = repo.get(tree_id)
+    assert current is not None
+    repo.update(replace(current, enabled=True, default=False),
+                base_document_sha256=current.document_sha256)
+
+
+def test_update_on_invalid_route_set_is_503_not_500(client, app):
+    """Finding 2 回归：``GraphService.update()`` 的候选装配必须映射为 503。"""
+    assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    _install_enabled_tree_without_default(app, "main")
+    current = client.get("/admin/trees/main").json()["tree"]
+
+    response = client.put("/admin/trees/main", json={
+        "name": "改名", "base_document_sha256": current["document_sha256"]})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {
+        "code": "graph_storage_error",
+        "message": "invalid route set: no_default_tree",
+    }
+
+
+def test_disable_on_invalid_remaining_route_set_is_503_not_500(client, app):
+    """Finding 2 回归：``GraphService.disable()`` 的剩余集合装配同样映射为 503。"""
+    for tree_id in ("a", "b"):
+        assert create_tree(
+            client, tree_dict(tree_id, root=graph_with_model())).status_code == 201
+    assert client.post("/admin/trees/a/enable").status_code == 200
+    # 多启用图过渡态：b 被手装成启用非默认，停用默认图 a 后剩余集合缺默认图。
+    _install_enabled_tree_without_default(app, "b")
+
+    response = client.post("/admin/trees/a/disable")
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {
+        "code": "graph_storage_error",
+        "message": "invalid route set: no_default_tree",
+    }
+
+
+def test_confirmed_catalog_write_on_invalid_route_set_is_503_not_500(client, app):
+    """Finding 2 回归：``commit_catalog_write()`` 发布门的直接索引同样映射为 503。"""
+    create_portable_tree(client, "main")
+    assert client.post("/admin/trees/main/enable").status_code == 200
+    _install_enabled_tree_without_default(app, "main")
+
+    payload = {"base_url": "http://changed.test/v1"}
+    preview = client.put("/admin/providers/local", json=payload)
+    confirmation = _confirmation_from(preview)
+
+    response = client.put("/admin/providers/local", json={
+        **payload, "impact_confirmation": confirmation})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {
+        "code": "graph_storage_error",
+        "message": "invalid route set: no_default_tree",
+    }

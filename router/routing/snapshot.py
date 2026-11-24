@@ -247,6 +247,16 @@ def build_snapshot_set_for_trees(conn, trees: Iterable[RoutingTree],
         [build_snapshot_for_tree(conn, tree) for tree in trees], fingerprint)
 
 
+def invalid_route_set_error(exc: RouteSetInvariantError) -> GraphStorageError:
+    """装配边界的统一错误映射：路由集不变量损坏 → 存储错误（HTTP 503）。
+
+    ``assemble_snapshot_set()`` 是纯函数，继续抛 ``RouteSetInvariantError``；
+    凡是把磁盘/候选树交给它（或直接索引启用集合）的边界都经这里转换，避免
+    损坏的 standalone JSON 把管理写路径打成 500。
+    """
+    return GraphStorageError(f"invalid route set: {exc.code}")
+
+
 def load_snapshot_set(conn, repo: RoutingTreeRepo) -> RoutingSnapshotSet:
     """从磁盘扫描结果构造完整启用路由集。
 
@@ -258,7 +268,7 @@ def load_snapshot_set(conn, repo: RoutingTreeRepo) -> RoutingSnapshotSet:
     try:
         return build_snapshot_set_for_trees(conn, repo.enabled(), fingerprint)
     except RouteSetInvariantError as exc:
-        raise GraphStorageError(f"invalid route set: {exc.code}") from exc
+        raise invalid_route_set_error(exc) from exc
 
 
 @dataclass(frozen=True)
@@ -285,16 +295,31 @@ class SnapshotPublisher:
 
     def prepare(self, conn, trees: Iterable[RoutingTree],
                 fingerprint: str) -> PreparedRouteSet:
-        return PreparedRouteSet(
-            build_snapshot_set_for_trees(conn, trees, fingerprint), fingerprint)
+        """装配候选路由集；不变量损坏在装配边界转成 ``GraphStorageError``。
+
+        候选树可能来自手装的 standalone JSON（如启用图但没有默认图），
+        与 ``load_snapshot_set()`` 一样走存储错误（503），而不是把
+        GraphService/ConfigurationService 的写路径打成 500。
+        """
+        try:
+            snapshot_set = build_snapshot_set_for_trees(conn, trees, fingerprint)
+        except RouteSetInvariantError as exc:
+            raise invalid_route_set_error(exc) from exc
+        return PreparedRouteSet(snapshot_set, fingerprint)
 
     def publish(self, prepared: PreparedRouteSet) -> RoutingSnapshotSet:
         with self._lock:
-            self.app.state.snapshot_set = prepared.snapshot_set
+            snapshot_set = prepared.snapshot_set
+            if snapshot_set.fingerprint != prepared.fingerprint:
+                # GraphService 的候选路由集在写盘前只能带占位指纹；发布是唯一
+                # 确定「发布时指纹」的点，必须把它盖到集合上，发布状态里的
+                # 集合指纹才与 ``status()["route_fingerprint"]`` 一致。
+                snapshot_set = replace(snapshot_set, fingerprint=prepared.fingerprint)
+            self.app.state.snapshot_set = snapshot_set
             self._fingerprint = prepared.fingerprint
             self._loaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._last_error = ""
-            return prepared.snapshot_set
+            return snapshot_set
 
     def refresh(self, conn) -> RoutingSnapshotSet:
         with self._lock:

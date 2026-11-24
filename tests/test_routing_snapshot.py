@@ -447,6 +447,35 @@ def test_invalid_route_set_marks_stale_and_recovers(conn, repo, app):
     assert recovered["snapshot_revision"] == status["snapshot_revision"]
 
 
+def test_publisher_prepare_maps_invalid_route_set_to_storage_error(conn, repo, app):
+    """装配边界回归：``prepare()`` 必须把不变量损坏转成存储错误（503 路径）。
+
+    ``assemble_snapshot_set()`` 保持纯函数语义（继续抛 ``RouteSetInvariantError``），
+    由发布器/加载器在边界统一映射为 ``GraphStorageError``，损坏的路由集不会
+    把 GraphService 的 update/enable/disable 打成 500。
+    """
+    broken = portable_tree(enabled=True, default=False)
+
+    with pytest.raises(GraphStorageError, match="invalid route set: no_default_tree"):
+        app.state.publisher.prepare(conn, [broken], "")
+
+    with pytest.raises(RouteSetInvariantError) as invariant:
+        assemble_snapshot_set([build_snapshot_for_tree(conn, broken)], fingerprint="")
+    assert invariant.value.code == "no_default_tree"
+
+
+def test_publisher_publish_stamps_route_set_fingerprint(conn, repo, app):
+    """发布的路由集指纹必须等于发布时使用的指纹。"""
+    prepared = app.state.publisher.prepare(conn, [portable_tree()], "")
+
+    published = app.state.publisher.publish(
+        replace(prepared, fingerprint=repo.route_fingerprint()))
+
+    assert published.fingerprint == repo.route_fingerprint()
+    assert app.state.snapshot_set.fingerprint == repo.route_fingerprint()
+    assert app.state.publisher.status()["route_fingerprint"] == repo.route_fingerprint()
+
+
 def test_worker_polls_once_and_skips_unchanged_fingerprint(conn, repo, app, monkeypatch):
     calls = 0
     import router.routing.snapshot as snapshot_module

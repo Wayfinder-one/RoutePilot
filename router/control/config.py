@@ -38,8 +38,8 @@ from router.control.errors import ValidationFailed
 from router.control.graphs import graph_parse_failed
 from router.control.validation import enabled_tree_issues, tree_issues
 from router.routing.document import graph_document_bytes, parse_graph_document
-from router.routing.route_set import route_set_indices
-from router.routing.snapshot import PreparedRouteSet
+from router.routing.route_set import RouteSetInvariantError, route_set_indices
+from router.routing.snapshot import PreparedRouteSet, invalid_route_set_error
 from router.routing.tree import RoutingTree
 from router.store.repositories import (
     ChangeRepo,
@@ -215,8 +215,12 @@ class ConfigurationService:
             ])
             # 发布门在写锁内决定，与 ``stage_updates`` 处于同一临界区；加锁前
             # 发生的启停在这里可见。只有默认启用图确实在候选里才发布（多启用图的
-            # 发布门由 Task 6 改为「任一启用图被改写」）。
-            default_id, _ = route_set_indices(self.trees.enabled())
+            # 发布门由 Task 6 改为「任一启用图被改写」）。手装的 standalone JSON
+            # 可能让启用集合缺默认图：与装配边界一致地转成存储错误（503）。
+            try:
+                default_id, _ = route_set_indices(self.trees.enabled())
+            except RouteSetInvariantError as exc:
+                raise invalid_route_set_error(exc) from exc
             default_changed = default_id is not None and any(
                 tree.id == default_id for tree in candidates)
             # 先取指纹再读启用图，保证（路由集, 指纹）标签一致；图批次提交后读到
