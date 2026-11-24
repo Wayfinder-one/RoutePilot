@@ -880,8 +880,20 @@ class Smoke:
                        f"main/fast upstream failure #{attempt + 1}")
             require(upstream.pending_failures() == 0,
                     f"failure queue still has {upstream.pending_failures()} entries")
-            require(len(upstream.snapshot()) == before_failures + 3,
-                    "each main/fast failure must reach the upstream")
+            failures = upstream.snapshot()[before_failures:]
+            require(len(failures) == 3,
+                    f"each main/fast failure must reach the upstream: got {len(failures)}")
+            # Self-verify the injected failures through the recording the mock
+            # upstream already keeps: each one reached it as logical model
+            # ``fast`` and was answered with the injected 500 -- not another
+            # model, and not a short-circuited/cached response.
+            for index, record in enumerate(failures):
+                require(record.get("model") == "fast",
+                        f"failure #{index + 1} upstream model: "
+                        f"{record.get('model')!r}")
+                require(record.get("failure_status") == 500,
+                        f"failure #{index + 1} did not receive the injected 500: "
+                        f"{record.get('failure_status')!r}")
 
             before = len(upstream.snapshot())
             unavailable = expect(call(APP_BASE, "POST", MOCK_CHAT_PATH, body), 503,
@@ -904,6 +916,10 @@ class Smoke:
             require(len(upstream.snapshot()) == before + 1,
                     "twin/fast did not reach the upstream")
 
+            # Deliberately leave tree:main:fast's circuit open for the rest of
+            # this smoke process: later steps route legal/finance (and only
+            # re-enable main), so none of them may expect a 200 from
+            # ``main/fast`` or depend on this circuit closing again.
             before = len(upstream.snapshot())
             expect(call(APP_BASE, "POST", MOCK_CHAT_PATH, body), 503,
                    "twin success must not reset main circuit")
