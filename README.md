@@ -627,12 +627,14 @@ node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
 npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
+.venv/bin/python scripts/standalone_v4_smoke.py
 ```
 
 - `pytest` collects `tests/` only (`testpaths`), runs unit and FastAPI integration tests, starts no browser and does not collect `experiments/`.
 - `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
 - `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
 - `scripts/i18n_dead_keys.py` reports unreferenced dictionary keys.
+- `scripts/standalone_v4_smoke.py` is the real end-to-end acceptance run: mock model/JEV servers plus real writer and read-only `python -m router` processes on fixed local ports against a throwaway temp database/graph directory, then verifies the public default-graph JSON/SSE path, `/admin/try` department selection, default switching, the 409/503 lifecycle edges, stale recovery and replica route-set parity; it exits non-zero on failure and removes its temp workspace.
 
 Experiments are standalone and excluded from the default run:
 

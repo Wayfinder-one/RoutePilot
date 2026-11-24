@@ -627,12 +627,14 @@ node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
 npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
+.venv/bin/python scripts/standalone_v4_smoke.py
 ```
 
 - `pytest` 只收集 `tests/`（`testpaths`），运行为单元与 FastAPI 集成测试，不启动浏览器，也不收集 `experiments/`。
 - `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
 - `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
 - `scripts/i18n_dead_keys.py` 报告未被引用的词典键。
+- `scripts/standalone_v4_smoke.py` 是真实端到端验收：用临时数据库与图目录，在固定本机端口上启动模拟模型/JEV 服务以及真实 `python -m router` 写者与只读副本进程，验证公开默认图 JSON/SSE 数据面、`/admin/try` 部门选图、默认图切换、409/503 生命周期边界、stale 恢复与副本路由集一致性；失败时非零退出并清理临时工作区。
 
 实验代码独立运行，不进入默认套件：
 
