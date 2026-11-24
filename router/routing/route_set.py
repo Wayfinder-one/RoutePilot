@@ -6,9 +6,9 @@ v4 文档自带 ``enabled`` / ``default``，仓储只按文件内容扫描。路
 - 有启用图时恰好一张默认图；零启用图合法（返回 ``None``）。
 - 部门在所有启用图之间唯一，默认图负责兜底。
 
-本模块只做索引，不构造快照、不做部门选图执行（后续单元实现
-``RoutingSnapshotSet.select()``）。``RouteSetInvariantError`` 由装配边界
-（仓储读取、快照发布）转换成存储错误，避免损坏的文件把请求打成 500。
+本模块只做索引，不构造快照；``RoutingSnapshotSet`` 在装配时调用它，并在
+``RouteSetInvariantError`` 上决定如何呈现（``load_snapshot_set()`` 在装配边界
+转成存储错误），避免损坏的文件把请求打成 500。
 """
 from __future__ import annotations
 
@@ -43,16 +43,3 @@ def route_set_indices(trees: Iterable[RoutingTree]) -> tuple[str | None, dict[st
                     tree_ids=(mapping[department], tree.id))
             mapping[department] = tree.id
     return default, mapping
-
-
-def default_enabled_tree(trees: Iterable[RoutingTree]) -> RoutingTree | None:
-    """过渡期辅助：路由集中唯一的默认启用图；零启用图返回 ``None``。
-
-    集合不变量被破坏时抛 ``RouteSetInvariantError``。Task 3 引入
-    ``RoutingSnapshotSet`` 后，本函数的调用点全部改为 ``default_snapshot``。
-    """
-    rows = list(trees)
-    default_id, _ = route_set_indices(rows)
-    if default_id is None:
-        return None
-    return next(tree for tree in rows if tree.id == default_id)

@@ -174,8 +174,8 @@ def test_create_model_records_catalog_state_and_audit(client, app):
     assert model["reasoning"]["declared"] is True
     assert model["reasoning"]["format"] == "openai"
     assert client.get("/admin/models").json()["models"]
-    # 无活动画布：Auto 快照为空，目录写不再投影到 snapshot。
-    assert app.state.snapshot.backends == {}
+    # 零启用图：路由集为空，目录写不再投影到 snapshot。
+    assert app.state.snapshot_set.snapshots == {}
     # audit row
     changes = client.get("/admin/changes").json()["changes"]
     assert changes[0]["kind"] == "model"
@@ -240,7 +240,7 @@ def test_model_writes_reject_non_finite_profile_floats(client, app, literal):
         before_audit = conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]
     finally:
         conn.close()
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     # 1) profile 传 JSON 字符串：递归命中嵌套数组里的非有限值，并点名路径。
     nested = '{"metadata": {"labels": [{"score": %s}]}}' % literal
@@ -270,7 +270,7 @@ def test_model_writes_reject_non_finite_profile_floats(client, app, literal):
         conn.close()
     assert after_rows == before_rows
     assert after_audit == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert client.get("/admin/models").status_code == 200
 
     # 合法有限浮点元数据照常保存（拒绝只针对非 JSON 兼容值）。
@@ -302,7 +302,7 @@ def test_create_model_inherits_provider_reasoning_format(client, app):
         "id": "deep-canvas", "name": "Deep", "root": root, **runtime})
     assert created.status_code == 201, created.text
     assert client.post("/admin/trees/deep-canvas/enable").status_code == 200
-    assert app.state.snapshot.backends["deep-model"].reasoning["format"] == "deepseek"
+    assert app.state.snapshot_set.default_snapshot.backends["deep-model"].reasoning["format"] == "deepseek"
 
 
 # --------------------------------------------------------------------------- #
@@ -494,7 +494,7 @@ def test_provider_key_tristate_and_headers(client, app):
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert "sk-secret-1" not in r.text
-    assert app.state.snapshot.backends["qwen3-8b"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers["Authorization"] == \
         "Bearer sk-secret-1"
 
     # omitted -> kept
@@ -503,7 +503,7 @@ def test_provider_key_tristate_and_headers(client, app):
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert client.get("/admin/providers").text.count("sk-secret-1") == 0
-    assert app.state.snapshot.backends["qwen3-8b"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers["Authorization"] == \
         "Bearer sk-secret-1"
 
     # "" -> cleared
@@ -513,7 +513,7 @@ def test_provider_key_tristate_and_headers(client, app):
     provider = r.json()["provider"]
     assert provider["key_present"] is False
     assert provider["key_source"] == "none"
-    assert "Authorization" not in app.state.snapshot.backends["qwen3-8b"].headers
+    assert "Authorization" not in app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers
 
 
 def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
@@ -528,19 +528,19 @@ def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
         "provider": "envprov"}).status_code == 201
     _activate_provider_canvas(client, "http://e/v1", model="env-model",
                               provider="envprov", key_env="SR_TEST_KEY")
-    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
     # a stored key wins over the environment (contract §5.3)
     stored = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": "stored-secret"})
     assert stored.status_code == 200, stored.text
-    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer stored-secret"
     # clearing the stored key falls back to the env
     cleared = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": ""})
     assert cleared.status_code == 200, cleared.text
-    assert app.state.snapshot.backends["env-model"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
         "Bearer env-secret"
 
 
@@ -673,7 +673,7 @@ def test_old_illegal_declaration_does_not_break_startup(tmp_path):
     conn.close()
     # a missing provider and an illegal declaration must both be tolerated
     app = make_app(tmp_path)
-    assert app.state.snapshot.backends == {}
+    assert app.state.snapshot_set.snapshots == {}
     client = TestClient(app)
     models = {m["id"]: m for m in client.get("/admin/models").json()["models"]}
     assert models["qwen3-8b"]["reasoning"]["declared"] is False
@@ -791,10 +791,10 @@ def test_model_write_keeping_the_referenced_reasoning_level_is_200(client):
 
 def test_model_update_rolls_back_when_active_graph_becomes_invalid(client, app):
     """非法提供方写入返回 422，快照不得被替换。"""
-    before = app.state.snapshot.snapshot_revision
+    before = app.state.snapshot_set.snapshot_revision
     response = client.put("/admin/models/qwen3-8b", json={"provider": "missing-provider"})
     assert response.status_code == 422
-    assert app.state.snapshot.snapshot_revision == before
+    assert app.state.snapshot_set.snapshot_revision == before
 
 
 def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
@@ -803,7 +803,7 @@ def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     assert client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref", "root": root,
         **_tree_runtime(root)}).status_code == 201
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     response = client.delete("/admin/models/qwen3-8b")
 
@@ -820,7 +820,7 @@ def test_delete_referenced_model_is_409_and_changes_nothing(client, app):
     finally:
         conn.close()
     assert audit == 0
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
 
 @pytest.mark.parametrize(("method", "path", "payload"), [
@@ -980,16 +980,16 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
         conn.close()
 
     app = make_app(tmp_path)
-    assert app.state.snapshot.backends["fast"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"] == \
         "Bearer sk-json-secret"
     client = TestClient(app)
     preview = client.put(
         "/admin/providers/local", json={"base_url": "http://new-upstream.test/v1"})
     assert preview.status_code == 409, preview.text
     # 未确认：画布与快照都不变。
-    assert app.state.snapshot.backends["fast"].url == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
         "http://json-only.test/v1/chat/completions"
-    assert app.state.snapshot.backends["fast"].headers["Authorization"] == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"] == \
         "Bearer sk-json-secret"
 
     response = client.put("/admin/providers/local", json={
@@ -1000,7 +1000,7 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
     assert response.status_code == 200, response.text
     # 确认后画布运行时 provider 同步到新端点；请求省略 api_key 且端点变更 →
     # 旧密钥不再注入（DB 行被清空），快照改用新端点。
-    backend = app.state.snapshot.backends["fast"]
+    backend = app.state.snapshot_set.default_snapshot.backends["fast"]
     assert backend.url == "http://new-upstream.test/v1/chat/completions"
     assert "Authorization" not in backend.headers
     conn = connect(app.state.settings.db_path)
@@ -1022,7 +1022,7 @@ SECRET_KEY_SPELLINGS = ["api_key", "API-KEY", "authorization", "key_present", "k
 def test_model_writes_reject_nested_profile_secrets(client, app, key):
     """模型 POST/PUT 收到嵌套密钥 → 422，且数据库/审计/快照/图文件都不变。"""
     profile = {"metadata": {"labels": [{"tier": "x", key: "review-secret"}]}}
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     conn = connect(app.state.settings.db_path)
     try:
         before_profile = conn.execute(
@@ -1052,7 +1052,7 @@ def test_model_writes_reject_nested_profile_secrets(client, app, key):
     assert after_profile == before_profile
     assert after_audit == before_audit
     assert after_models == before_models
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert {path.name: path.read_bytes() for path in graph_dir.glob("*.json")} == before_files
 
 

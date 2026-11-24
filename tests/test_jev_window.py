@@ -83,8 +83,8 @@ class Publisher:
     def locked(self):
         yield self
 
-    def prepare(self, conn, tree, fingerprint):
-        return SimpleNamespace(tree=tree, fingerprint=fingerprint)
+    def prepare(self, conn, trees, fingerprint):
+        return SimpleNamespace(snapshot_set=trees, fingerprint=fingerprint)
 
     def publish(self, prepared):
         self.published.append(prepared)
@@ -194,7 +194,8 @@ def test_prepared_snapshot_reads_fingerprint_before_tree(tmp_path):
         published = publisher.published[0]
         # 重考发现「树过期、指纹是当前」，用当前文档重建一次；绝不发布
         # (doc-a 的树, doc-b 的指纹) 这种自相矛盾的快照。
-        assert published.tree is doc_b[1][0]
+        assert published.snapshot_set is doc_b[1]
+        assert published.snapshot_set[0] is doc_b[1][0]
         assert published.fingerprint == doc_b[0]
         assert trees.calls[:2] == ["route_fingerprint", "enabled"]
     finally:

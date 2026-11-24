@@ -58,13 +58,13 @@ def test_legacy_signal_and_eval_apis_are_gone(client, path):
 
 
 def test_time_periods_roundtrip_is_catalog_only(client):
-    """时段目录写只改数据库；无活动画布的空 Auto 快照不投影目录。"""
+    """时段目录写只改数据库；零启用图的空路由集不投影目录。"""
     response = client.put("/admin/time-periods", json={"periods": [{"name": "值班", "days": [0, 1], "start": "22:00", "end": "06:00"}]})
     assert response.status_code == 200, response.text
     body = client.get("/admin/time-periods").json()
     assert body["periods"][0]["name"] == "值班"
     assert "now" in body
-    assert client.app.state.snapshot.time_periods == ()
+    assert client.app.state.snapshot_set.snapshots == {}
 
 
 def test_request_recent_returns_memory_ring(client):
@@ -136,7 +136,7 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
     repo.create(tree_from_dict(tree_dict(
         root=_snapshot_tree_root(), canvas=canvas, enabled=True, default=True)))
     app = create_app(settings)
-    snapshot = app.state.snapshot
+    snapshot = app.state.snapshot_set.default_snapshot
     trace = [
         {"event": "final", "target_id": "direct", "kind": "target", "priority": 1,
          "candidates": []},
@@ -347,7 +347,7 @@ def test_request_snapshot_pending_beyond_the_ring_is_served(tmp_path):
             "decision": "route",
             "model": "qwen3-8b",
             "outcome_state": "incomplete",
-        }, snapshot=app.state.snapshot)
+        }, snapshot=app.state.snapshot_set.default_snapshot)
     with TestClient(app) as client:
         response = client.get("/admin/requests/pending-0/snapshot")
         assert response.status_code == 200
@@ -390,7 +390,7 @@ def test_request_snapshot_url_encodes_request_id(tmp_path):
         "decision": "route",
         "model": "qwen3-8b",
         "outcome_state": "completed",
-    }, snapshot=app.state.snapshot)
+    }, snapshot=app.state.snapshot_set.default_snapshot)
     with TestClient(app) as client:
         listed = client.get("/admin/requests/recent").json()["requests"][0]
         assert listed["snapshot_url"] == "/console/routing.html?request=id%20with%2Fspace%3F"

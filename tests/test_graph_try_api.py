@@ -338,7 +338,7 @@ def test_root_only_try_accepts_a_full_self_contained_envelope(client, app):
 
 def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     engine, _jev, balancer, affinity = install_engine(app)
-    before_snapshot = app.state.snapshot
+    before_snapshot = app.state.snapshot_set
     before_revision = before_snapshot.snapshot_revision
     before_counts = row_counts(app)
 
@@ -355,8 +355,8 @@ def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     assert engine.calls == 1
 
     # 不发布 snapshot（对象与 revision 都不变）
-    assert app.state.snapshot is before_snapshot
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set is before_snapshot
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     # 不落库
     assert row_counts(app) == before_counts
     # 不写粘性：只读 affinity（dry-run touch=False），绝不 put
@@ -392,7 +392,7 @@ def test_root_only_defaults_and_does_not_read_stored_trees(client, app, monkeypa
 
 def test_try_uses_draft_jev_window_without_publishing(client, app, monkeypatch):
     engine, jev, _balancer, _affinity = install_engine(app)
-    published_before = app.state.snapshot.snapshot_revision
+    published_before = app.state.snapshot_set.snapshot_revision
     payload = root_payload(app, three_answer_graph())
     payload["jev_window"] = {
         "input_tokens": MIN_INPUT_TOKENS, "context_tokens": 4096,
@@ -407,7 +407,7 @@ def test_try_uses_draft_jev_window_without_publishing(client, app, monkeypatch):
     assert window["tokens_after"] <= MIN_INPUT_TOKENS
     assert window["tokens_before"] > MIN_INPUT_TOKENS
     assert estimate_tokens(jev.calls[0]["text"]) <= MIN_INPUT_TOKENS
-    assert app.state.snapshot.snapshot_revision == published_before
+    assert app.state.snapshot_set.snapshot_revision == published_before
 
 
 # ── envelope 合并矩阵 ─────────────────────────────────────────────────
@@ -476,7 +476,8 @@ def test_tree_id_only_uses_stored_envelope_and_is_not_draft(client, app):
     assert affinity.puts == []
     assert len(affinity) == 0
     assert all(item["dry_run"] is True for item in balancer.calls)
-    assert app.state.snapshot.tree is None
+    # /admin/try 不发布路由集：存储画布仍是草稿，启用集合保持为空。
+    assert app.state.snapshot_set.snapshots == {}
 
 
 def test_try_unknown_tree_id_is_404_and_skips_engine(client, app):
@@ -691,7 +692,7 @@ def test_try_huge_chain_returns_422_limit_issue_not_500(client, app):
 
 def test_try_invalid_timezone_is_422_without_entering_engine(client, app):
     engine, *_rest = install_engine(app)
-    before_snapshot = app.state.snapshot.snapshot_revision
+    before_snapshot = app.state.snapshot_set.snapshot_revision
     before_counts = row_counts(app)
 
     response = client.post("/admin/try", json=root_payload(
@@ -703,7 +704,7 @@ def test_try_invalid_timezone_is_422_without_entering_engine(client, app):
     issue = next(item for item in detail if item["code"] == "invalid_timezone")
     assert set(issue) == ISSUE_KEYS
     assert engine.calls == 0
-    assert app.state.snapshot.snapshot_revision == before_snapshot
+    assert app.state.snapshot_set.snapshot_revision == before_snapshot
     assert row_counts(app) == before_counts
 
 
@@ -749,7 +750,7 @@ def test_try_requires_root_or_tree_id(client, app):
 
 def test_try_no_available_backend_is_still_503(client, app):
     engine, *_rest = install_engine(app)
-    before_snapshot = app.state.snapshot.snapshot_revision
+    before_snapshot = app.state.snapshot_set.snapshot_revision
     before_counts = row_counts(app)
     root = three_answer_graph()
     for node in root["nodes"]:
@@ -760,7 +761,7 @@ def test_try_no_available_backend_is_still_503(client, app):
 
     assert response.status_code == 503, response.text
     assert engine.calls == 1
-    assert app.state.snapshot.snapshot_revision == before_snapshot
+    assert app.state.snapshot_set.snapshot_revision == before_snapshot
     assert row_counts(app) == before_counts
 
 

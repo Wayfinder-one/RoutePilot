@@ -13,9 +13,8 @@ import sqlite3
 
 from router.control.runtime import enable_context_for_runtime
 from router.routing.graph.validate import Issue, validate_graph_for_enable
-from router.routing.route_set import RouteSetInvariantError, default_enabled_tree
 from router.routing.tree import RoutingTree
-from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
+from router.store.routing_trees import RoutingTreeRepo
 
 
 def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:
@@ -26,13 +25,14 @@ def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:
     return validate_graph_for_enable(tree, enable_context_for_runtime(tree.runtime))
 
 
-def active_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> list[Issue]:
-    """校验默认启用图（名字为过渡期兼容；Task 3 改为 ``enabled_tree_issues``）。
+def enabled_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> list[Issue]:
+    """校验所有启用图，按树 id 排序、逐图 Issue 顺序合并。
 
-    路由集不变量损坏按存储错误上报（API 503），与快照装配边界一致。
+    快照发布会装配全部启用图，因此任何一份启用图校验失败都必须整体拒绝；
+    集合不变量（默认图/部门唯一）由装配边界 ``load_snapshot_set()`` 负责，
+    本函数只做逐图启用校验，不重复推导路由集索引。
     """
-    try:
-        tree = default_enabled_tree(trees.enabled())
-    except RouteSetInvariantError as exc:
-        raise GraphStorageError(f"invalid route set: {exc.code}") from exc
-    return [] if tree is None else tree_issues(conn, tree)
+    issues: list[Issue] = []
+    for tree in sorted(trees.enabled(), key=lambda item: item.id):
+        issues.extend(tree_issues(conn, tree))
+    return issues

@@ -9,14 +9,14 @@ v4 文档自带 ``enabled`` / ``default``，仓储只按文件内容扫描：本
 - `copy`：锁内读取源画布并做同一套完整校验（`tree_issues`）→（锁内）文档写入
   （副本强制关闭）→ 审计；不发布快照。
 - `update`：锁内按 root 优先合并已存 envelope → 画布自身完整校验（启用/未启用
-  同一套）→ 已启用图先 prepare 候选快照 → `base_document_sha256` 冲突检查后按
+  同一套）→ 已启用图先 prepare 候选路由集 → `base_document_sha256` 冲突检查后按
   给定文档原样写入 → 核对落盘哈希 → 用当前路由集指纹 publish → 审计。草稿
   （未启用图）更新不发布。
-- `enable`：启用校验 → 先 prepare 候选快照（不可构建的候选绝不落盘）→ 一个
+- `enable`：启用校验 → 先 prepare 候选路由集（不可构建的候选绝不落盘）→ 一个
   ``stage_updates`` 批次把其它启用图写成关闭、目标写成默认启用 → 核对每份
   落盘文档哈希 → 用当前路由集指纹 publish → 审计。
-- `disable`：把目标写成关闭；它原本是默认启用图时发布空快照（无启用图是合法
-  路由集）→ 审计。
+- `disable`：把目标写成关闭；它原本是启用图时发布剩余启用图构成的（可能为空）
+  路由集 → 审计。
 
 发布是纯内存替换（`SnapshotPublisher.publish`），绝不改文件或数据库；
 服务抛出的异常由 API 层映射（ValidationFailed→422、GraphConflictError→409、
@@ -36,6 +36,7 @@ from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue
 from router.routing.route_set import RouteSetInvariantError, route_set_indices
+from router.routing.snapshot import PreparedRouteSet
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict
@@ -138,12 +139,15 @@ class GraphService:
             candidate = None
             expected_sha = None
             if current.enabled:
-                # 先构造候选快照（内存只读）：不可构建的候选绝不落盘。写入按给定
-                # 文档原样落盘，因此发布指纹在写盘后由当前路由集重新计算；候选树
-                # 的 document_sha256 换成即将写出的字节哈希，快照元数据才与磁盘一致。
+                # 先构造候选路由集（内存只读）：不可构建的候选绝不落盘。写入按给定
+                # 文档原样落盘，因此发布指纹在写盘后由当前路由集重新计算；候选树的
+                # document_sha256 换成即将写出的字节哈希，快照元数据才与磁盘一致。
                 expected_sha = hashlib.sha256(graph_document_bytes(tree)).hexdigest()
                 document = dataclass_replace(tree, document_sha256=expected_sha)
-                candidate = self.publisher.prepare(self.conn, document, "")
+                candidate_trees = [
+                    document if item.id == tree_id else item
+                    for item in self.trees.enabled()]
+                candidate = self.publisher.prepare(self.conn, candidate_trees, "")
             updated = self.trees.update(tree, base_document_sha256=base_document_sha256)
             if candidate is not None:
                 self._require_document_sha(updated, expected_sha)
@@ -186,9 +190,10 @@ class GraphService:
                 raise ValidationFailed(issues)
             enabled_tree = dataclass_replace(tree, enabled=True, default=True)
             enabled_sha = hashlib.sha256(graph_document_bytes(enabled_tree)).hexdigest()
-            # 候选快照树携带即将写出的文档哈希（与磁盘一致）。
+            # 候选路由集只含即将启用的目标图；候选树携带即将写出的文档哈希
+            # （与磁盘一致）。
             enabled_tree = dataclass_replace(enabled_tree, document_sha256=enabled_sha)
-            candidate = self.publisher.prepare(self.conn, enabled_tree, "")
+            candidate = self.publisher.prepare(self.conn, [enabled_tree], "")
             updates = [
                 (dataclass_replace(other, enabled=False, default=False),
                  other.document_sha256)
@@ -218,14 +223,18 @@ class GraphService:
             if tree is None:
                 raise MissingError(f"unknown tree {tree_id}")
             was_enabled = tree.enabled
-            candidate = (
-                self.publisher.prepare(self.conn, None, "") if was_enabled else None)
+            candidate = None
+            if was_enabled:
+                remaining = [
+                    item for item in self.trees.enabled() if item.id != tree_id]
+                candidate = self.publisher.prepare(self.conn, remaining, "")
             disabled = dataclass_replace(tree, enabled=False, default=False)
             expected_sha = hashlib.sha256(graph_document_bytes(disabled)).hexdigest()
             updated = self.trees.update(disabled, base_document_sha256=tree.document_sha256)
             self._require_document_sha(updated, expected_sha)
             if candidate is not None:
-                # 过渡期：唯一启用图被关闭后没有默认图，镜像旧行为发布空快照。
+                # 过渡期单默认图语义：唯一启用图被关闭后发布空路由集。多启用图
+                # 的启停规则由 Task 5 的完整启用集合写语义实现。
                 self._publish_candidate(
                     candidate, default_tree_id=None, document_sha256="")
             self._audit("disable", {"id": tree_id})
@@ -304,7 +313,7 @@ class GraphService:
             current_sha = tree.document_sha256 if tree is not None else ""
             if current_default == default_tree_id and current_sha == document_sha256:
                 self.publisher.publish(
-                    dataclass_replace(candidate, fingerprint=fingerprint))
+                    PreparedRouteSet(candidate.snapshot_set, fingerprint))
                 return
         raise GraphChangedDuringLoad(
             "graph changed between document write and snapshot publish")

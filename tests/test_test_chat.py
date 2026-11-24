@@ -164,7 +164,7 @@ def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
     settings = test_settings(tmp_path)
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
-    # 启用文档损坏：启动快照构造失败，app.state.snapshot 保持 None。
+    # 启用文档损坏：启动路由集构造失败，app.state.snapshot_set 保持 None。
     (repo.graphs / "main.json").write_bytes(b"{broken")
     seen = []
 
@@ -175,7 +175,7 @@ def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
         })
 
     app = create_app(settings, transport=httpx.MockTransport(handler))
-    assert app.state.snapshot is None
+    assert app.state.snapshot_set is None
     with TestClient(app) as client:
         response = client.post("/admin/test/chat/completions", json={
             "model": "qwen3-8b",

@@ -65,7 +65,7 @@ def _tree_or_404(trees: RoutingTreeRepo, tree_id: str) -> RoutingTree:
 
 
 def _published_revision(request: Request) -> str:
-    return getattr(request.app.state.snapshot, "snapshot_revision", "")
+    return getattr(request.app.state.snapshot_set, "snapshot_revision", "")
 
 
 def _trees_payload(request: Request, trees: RoutingTreeRepo) -> dict:

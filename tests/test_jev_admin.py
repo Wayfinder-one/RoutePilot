@@ -51,7 +51,7 @@ def make_client(tmp_path, handler=None, requests=None):
     app.state.settings = SimpleNamespace(db_path=path)
     app.state.graph_repo = RoutingTreeRepo(tmp_path / "routing-graph")
     app.state.graph_repo.initialize()
-    app.state.snapshot = None
+    app.state.snapshot_set = None
     app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     app.state.http = httpx.AsyncClient(transport=transport)
     app.state.jev_client = JevClient(app.state.http)

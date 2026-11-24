@@ -203,9 +203,13 @@ def portable_tree_dict(tree_id="portable", *, root=None):
 
 
 def default_tree(repo):
-    """测试辅助：扫描仓储得到默认启用图（过渡期等价旧 ``repo.active()``）。"""
-    from router.routing.route_set import default_enabled_tree
-    return default_enabled_tree(repo.enabled())
+    """测试辅助：扫描仓储得到默认启用图（路由集默认图）。"""
+    from router.routing.route_set import route_set_indices
+    trees = repo.enabled()
+    default_id, _ = route_set_indices(trees)
+    if default_id is None:
+        return None
+    return next(tree for tree in trees if tree.id == default_id)
 
 
 def runtime_from_catalog(conn) -> dict:

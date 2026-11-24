@@ -38,7 +38,7 @@ def test_worker_background_loop_loads_changed_file(tmp_path):
     repo.initialize()
     repo.create(tree_from_dict(tree_dict(
         root=direct_graph("fast"), enabled=True, default=True)))
-    app = SimpleNamespace(state=SimpleNamespace(settings=settings, snapshot=None))
+    app = SimpleNamespace(state=SimpleNamespace(settings=settings, snapshot_set=None))
     app.state.publisher = SnapshotPublisher(app, repo)
     app.state.publisher.refresh(conn)
 
@@ -53,7 +53,7 @@ def test_worker_background_loop_loads_changed_file(tmp_path):
         await worker.start()
         try:
             for _ in range(100):
-                if app.state.snapshot.tree.sticky.ttl_seconds == 60:
+                if app.state.snapshot_set.default_snapshot.tree.sticky.ttl_seconds == 60:
                     return
                 await asyncio.sleep(0.01)
             raise AssertionError("background reload did not converge within one second")

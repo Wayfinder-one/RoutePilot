@@ -309,17 +309,17 @@ def json_only(tmp_path, monkeypatch):
 def test_empty_database_snapshot_reads_everything_from_json(json_only):
     app, client, settings, _calls = json_only
 
-    assert app.state.snapshot.tree_id == "portable"
-    backend = app.state.snapshot.backends["fast"]
+    assert app.state.snapshot_set.default_snapshot.tree_id == "portable"
+    backend = app.state.snapshot_set.default_snapshot.backends["fast"]
     assert backend.url == UPSTREAM_ORIGIN + "/v1/chat/completions"
     assert backend.upstream_name == "json-upstream"
     assert backend.provider == "local"
-    assert app.state.snapshot.capabilities["fast"] == "来自 JSON 的能力"
-    assert app.state.snapshot.jev.base_url == JEV_ORIGIN
-    assert app.state.snapshot.jev.model == "json-jev"
-    assert (app.state.snapshot.jev_input_tokens,
-            app.state.snapshot.jev_context_tokens) == (1024, 4096)
-    assert [period.name for period in app.state.snapshot.time_periods] == list(PERIODS)
+    assert app.state.snapshot_set.default_snapshot.capabilities["fast"] == "来自 JSON 的能力"
+    assert app.state.snapshot_set.default_snapshot.jev.base_url == JEV_ORIGIN
+    assert app.state.snapshot_set.default_snapshot.jev.model == "json-jev"
+    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
+            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (1024, 4096)
+    assert [period.name for period in app.state.snapshot_set.default_snapshot.time_periods] == list(PERIODS)
 
     # 非密钥运行配置表仍然为空：JSON 是事实源，启动不物化数据库。
     conn = connect(settings.db_path)
@@ -364,7 +364,7 @@ def test_admin_try_uses_json_backends_jev_window_and_periods(json_only):
     # 窗口来自 JSON（input_tokens=1024）：超长输入被截断并记录在 trace。
     window_events = [item for item in body["trace"] if item["event"] == "window"]
     assert window_events and window_events[0]["truncated"] is True
-    assert window_events[0]["tokens_after"] <= app.state.snapshot.jev_input_tokens
+    assert window_events[0]["tokens_after"] <= app.state.snapshot_set.default_snapshot.jev_input_tokens
     # JEV 调用来自 JSON 的 base_url / model / state_template，输入经过 JSON 窗口约束。
     assert calls["jev"], "graph question did not call the JSON-configured JEV"
     sent = calls["jev"][0]
@@ -446,11 +446,11 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     calls_two = {"jev": [], "upstream": []}
     app_two = create_app(second, transport=_mock_transport(calls_two))
 
-    assert app_two.state.snapshot.tree_revision == app_one.state.snapshot.tree_revision
-    assert app_two.state.snapshot.content == app_one.state.snapshot.content
-    assert app_two.state.snapshot.backends["fast"].url == \
-        app_one.state.snapshot.backends["fast"].url
-    assert app_two.state.snapshot.jev.model == app_one.state.snapshot.jev.model
+    assert app_two.state.snapshot_set.default_snapshot.tree_revision == app_one.state.snapshot_set.default_snapshot.tree_revision
+    assert app_two.state.snapshot_set.default_snapshot.content == app_one.state.snapshot_set.default_snapshot.content
+    assert app_two.state.snapshot_set.default_snapshot.backends["fast"].url == \
+        app_one.state.snapshot_set.default_snapshot.backends["fast"].url
+    assert app_two.state.snapshot_set.default_snapshot.jev.model == app_one.state.snapshot_set.default_snapshot.jev.model
 
     client_two = TestClient(app_two)
     response = client_two.post("/admin/try", json={
@@ -459,7 +459,7 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     })
     assert response.status_code == 200, response.text
     assert response.json()["outcome"]["model"] == "fast"
-    assert response.json()["tree_revision"] == app_one.state.snapshot.tree_revision
+    assert response.json()["tree_revision"] == app_one.state.snapshot_set.default_snapshot.tree_revision
 
 
 def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
@@ -488,8 +488,8 @@ def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
     assert provider["key_source"] == "env"
     assert "api_key" not in provider
 
-    assert ENV_SECRET not in app.state.snapshot.content
-    assert "api_key" not in app.state.snapshot.content
+    assert ENV_SECRET not in app.state.snapshot_set.default_snapshot.content
+    assert "api_key" not in app.state.snapshot_set.default_snapshot.content
 
 
 def _create_payload(tree_id):
@@ -543,13 +543,13 @@ def test_nested_profile_secrets_are_rejected_and_never_exported(json_only):
 
     for path in repo.graphs.glob("*.json"):
         assert "review-secret" not in path.read_text(encoding="utf-8"), path.name
-    assert ENV_SECRET not in app.state.snapshot.content
+    assert ENV_SECRET not in app.state.snapshot_set.default_snapshot.content
 
 
 def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
     """已保存画布的快照是唯一运行事实源：目录行怎么改都不改变它。"""
     app, _client, settings, _calls = json_only
-    before = app.state.snapshot.content
+    before = app.state.snapshot_set.default_snapshot.content
     tree = default_tree(app.state.graph_repo)
     conn = connect(settings.db_path)
     try:
@@ -566,7 +566,7 @@ def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
     finally:
         conn.close()
     assert after.content == before
-    assert app.state.snapshot.content == before
+    assert app.state.snapshot_set.default_snapshot.content == before
 
 
 # ────────────────────────────────────────────────────────────────────────��──
@@ -577,7 +577,7 @@ def test_acceptance_json_selects_jev_a_and_fast_and_calls_succeed(tmp_path, monk
     instance = _instance(tmp_path / "first", monkeypatch,
                          documents=[_acceptance_document()])
     app, client, calls = instance.app, instance.client, instance.calls
-    snapshot = app.state.snapshot
+    snapshot = app.state.snapshot_set.default_snapshot
 
     tree = default_tree(app.state.graph_repo)
     assert tree.runtime.jev.id == "jev-a"
@@ -615,8 +615,8 @@ def test_acceptance_exported_bytes_alone_reproduce_the_snapshot(tmp_path, monkey
     second = _instance_from_export(
         tmp_path / "second", monkeypatch, "portable", exported)
 
-    first_snapshot = first.app.state.snapshot
-    second_snapshot = second.app.state.snapshot
+    first_snapshot = first.app.state.snapshot_set.default_snapshot
+    second_snapshot = second.app.state.snapshot_set.default_snapshot
     assert second_snapshot is not None
     assert second_snapshot.tree_revision == first_snapshot.tree_revision
     assert second_snapshot.content == first_snapshot.content
@@ -705,8 +705,8 @@ def test_acceptance_unconfirmed_catalog_change_changes_nothing(tmp_path, monkeyp
     before_files = _canvas_files(instance.settings)
     before_rows = _model_rows(instance.settings)
     before_audit = _audit_count(instance.settings)
-    before_tree_revision = app.state.snapshot.tree_revision
-    before_snapshot_revision = app.state.snapshot.snapshot_revision
+    before_tree_revision = app.state.snapshot_set.default_snapshot.tree_revision
+    before_snapshot_revision = app.state.snapshot_set.snapshot_revision
     assert set(before_files) == {"portable.json", "other.json"}
 
     response = client.put("/admin/models/fast", json={"upstream": "changed-upstream"})
@@ -718,8 +718,8 @@ def test_acceptance_unconfirmed_catalog_change_changes_nothing(tmp_path, monkeyp
     assert _canvas_files(instance.settings) == before_files
     assert _model_rows(instance.settings) == before_rows
     assert _audit_count(instance.settings) == before_audit
-    assert app.state.snapshot.tree_revision == before_tree_revision
-    assert app.state.snapshot.snapshot_revision == before_snapshot_revision
+    assert app.state.snapshot_set.default_snapshot.tree_revision == before_tree_revision
+    assert app.state.snapshot_set.snapshot_revision == before_snapshot_revision
 
 
 def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path, monkeypatch):
@@ -727,8 +727,8 @@ def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path
     instance = _impact_instance(tmp_path, monkeypatch)
     app, client = instance.app, instance.client
     before_files = _canvas_files(instance.settings)
-    before_tree_revision = app.state.snapshot.tree_revision
-    before_snapshot_revision = app.state.snapshot.snapshot_revision
+    before_tree_revision = app.state.snapshot_set.default_snapshot.tree_revision
+    before_snapshot_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "changed-upstream"})
     confirmation = _confirmation_from(preview)
@@ -744,7 +744,7 @@ def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path
     assert rows["fast"][1] == "changed-upstream"
     assert rows["backup"][1] == "backup-upstream"
 
-    snapshot = app.state.snapshot
+    snapshot = app.state.snapshot_set.default_snapshot
     assert snapshot.tree_revision != before_tree_revision
     assert snapshot.snapshot_revision != before_snapshot_revision
     assert snapshot.backends["fast"].upstream_name == "changed-upstream"
@@ -770,8 +770,8 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
 
     # 密钥只解析进内存快照（headers / JevSettings），且已存密钥优先于环境变量。
     assert STORED_PROVIDER_SECRET in \
-        app.state.snapshot.backends["fast"].headers["Authorization"]
-    assert app.state.snapshot.jev.api_key == STORED_JEV_SECRET
+        app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"]
+    assert app.state.snapshot_set.default_snapshot.jev.api_key == STORED_JEV_SECRET
 
     tried = client.post("/admin/try", json={
         "tree_id": "portable", "text": "帮我分析这段复杂代码"})
@@ -814,6 +814,6 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
 
     # 4) 已发布快照内容不含密钥材料。
     for secret in secrets:
-        assert secret not in app.state.snapshot.content
+        assert secret not in app.state.snapshot_set.default_snapshot.content
     for name in derived:
-        assert name not in app.state.snapshot.content
+        assert name not in app.state.snapshot_set.default_snapshot.content

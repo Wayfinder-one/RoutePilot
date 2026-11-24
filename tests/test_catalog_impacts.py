@@ -188,7 +188,7 @@ def test_model_update_preview_is_pure_then_confirmed_syncs_only_affected(two_can
     before_other_sha = _tree(app, "other").document_sha256
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
 
@@ -206,7 +206,7 @@ def test_model_update_preview_is_pure_then_confirmed_syncs_only_affected(two_can
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _canvas_state(app, ("main", "other")) == before
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
     confirmed = client.put("/admin/models/fast", json={
         "upstream": "new-upstream",
@@ -225,7 +225,7 @@ def test_model_update_preview_is_pure_then_confirmed_syncs_only_affected(two_can
     models = _runtime_models(_tree(app, "main"))
     assert models["fast"]["upstream"] == "new-upstream"
     assert _db_row(app, "models", "id", "fast")["upstream"] == "new-upstream"
-    assert app.state.snapshot.backends["fast"].upstream_name == "new-upstream"
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].upstream_name == "new-upstream"
     # 恰好一条模型审计行，带同步画布 id。
     changes = _changes(app)
     assert len(changes) == before_audit + 1
@@ -287,7 +287,7 @@ def test_delete_model_requires_confirmation_replacement_and_syncs_targets(two_ca
     models = _runtime_models(main_tree)
     assert "fast" not in models
     assert models["backup"]["upstream"] == "backup-upstream"
-    assert "fast" not in app.state.snapshot.backends
+    assert "fast" not in app.state.snapshot_set.default_snapshot.backends
     assert _db_row(app, "models", "id", "fast") is None
     assert _canvas_bytes(app, "other") == before["other"]
     changes = _changes(app)
@@ -305,7 +305,7 @@ def test_stale_confirmation_hash_returns_graph_conflict_and_writes_nothing(two_c
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
@@ -324,7 +324,7 @@ def test_stale_confirmation_hash_returns_graph_conflict_and_writes_nothing(two_c
     assert _canvas_state(app, ("main", "other")) == before
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -416,7 +416,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
     before = _canvas_state(app, tree_ids)
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     assert preview.status_code == 409
@@ -446,7 +446,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
     # 数据库 / 审计 / 快照 / 三个画布文件全部保持原值（含已替换的第一份文件）。
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _canvas_state(app, tree_ids) == before
 
 
@@ -517,7 +517,7 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     before = _canvas_state(app, ("main", "other", "alt"))
     before_row = _db_row(app, "providers", "name", "local")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/providers/local",
                          json={"base_url": "http://new.test/v1"})
@@ -536,7 +536,7 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     assert _canvas_state(app, ("main", "other", "alt")) == before
     assert _db_row(app, "providers", "name", "local") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
     confirmed = client.put("/admin/providers/local", json={
         "base_url": "http://new.test/v1",
@@ -553,7 +553,7 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     # 未受影响的画布保持原字节。
     assert _canvas_bytes(app, "alt") == before["alt"]
     assert _db_row(app, "providers", "name", "local")["base_url"] == "http://new.test/v1"
-    assert app.state.snapshot.backends["fast"].url == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
         "http://new.test/v1/chat/completions"
     changes = _changes(app)
     assert len(changes) == before_audit + 1
@@ -625,7 +625,7 @@ def test_provider_delete_is_blocked_by_db_and_canvas_refs_and_never_bypassable(
     })
     assert client.post("/admin/trees", json=_strip_enabled(bare)).status_code == 201
     before_bare = _canvas_bytes(app, "bare-canvas")
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     before_audit = _audit_count(app)
     bare_impacts = provider_impacts(app.state.graph_repo.list(), "bare-prov")
     assert [item["id"] for item in bare_impacts] == ["bare-canvas"]
@@ -634,7 +634,7 @@ def test_provider_delete_is_blocked_by_db_and_canvas_refs_and_never_bypassable(
     assert deleted_bare.status_code == 200, deleted_bare.text
     assert _db_row(app, "providers", "name", "bare-prov") is None
     assert _canvas_bytes(app, "bare-canvas") == before_bare
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _audit_count(app) == before_audit + 1
     assert _changes(app)[-1]["detail"] == {
         "action": "delete", "name": "bare-prov", "synced_trees": []}
@@ -689,7 +689,7 @@ def test_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
     assert provider_changes[-1]["detail"]["api_key"] == "set"
     # 画布文件/快照同样不含密钥。
     assert secret not in _canvas_bytes(app, "main").decode("utf-8")
-    assert secret not in app.state.snapshot.content
+    assert secret not in app.state.snapshot_set.default_snapshot.content
 
 
 # --------------------------------------------------------------------------- #
@@ -742,7 +742,7 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
     before_provider = _db_row(app, "providers", "name", "local")
     before_files = _canvas_state(app, ("main", "closed"))
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1", "reasoning_format": "openai"})
@@ -762,7 +762,7 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
     _assert_provider_row_and_key_unchanged(app, "local", before_provider)
     assert _canvas_state(app, ("main", "closed")) == before_files
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     # 所有画布仍可读（fix 前闭画布已被写坏，这里会抛 GraphStorageError）。
     assert {tree.id for tree in app.state.graph_repo.list()} == {"main", "closed"}
     assert client.get("/admin/trees").status_code == 200
@@ -789,7 +789,7 @@ def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
     before_provider = _db_row(app, "providers", "name", "local")
     before_file = _canvas_bytes(app, "main")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1", "reasoning_format": "openai"})
@@ -806,7 +806,7 @@ def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
     _assert_provider_row_and_key_unchanged(app, "local", before_provider)
     assert _canvas_bytes(app, "main") == before_file
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert {tree.id for tree in app.state.graph_repo.list()} == {"main"}
 
 
@@ -819,7 +819,7 @@ def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
@@ -850,7 +850,7 @@ def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
     assert _tree(app, "racer").document_sha256 == raced["sha"]
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
 
 def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
@@ -863,7 +863,7 @@ def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     real_validate = ConfigurationService._validate_candidate
     raced = {}
@@ -891,7 +891,7 @@ def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
     assert detail["actual_document_sha256"] == raced["sha"]
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _canvas_bytes(app, "other") == before["other"]
 
 
@@ -908,7 +908,7 @@ def test_confirmed_write_touching_only_inactive_canvas_does_not_publish(
         return real_publish(prepared)
 
     monkeypatch.setattr(publisher, "publish", spy)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     before_main = _canvas_bytes(app, "main")
     before_other = _canvas_bytes(app, "other")
 
@@ -926,7 +926,7 @@ def test_confirmed_write_touching_only_inactive_canvas_does_not_publish(
     assert confirmed.status_code == 200, confirmed.text
     assert confirmed.json()["synced_trees"] == ["other"]
     assert published == []
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _canvas_bytes(app, "main") == before_main
     assert _canvas_bytes(app, "other") != before_other
 
@@ -1009,7 +1009,7 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     before_other_sha = _tree(app, "other").document_sha256
     before_row = _db_row(app, "jev_services", "id", "jev-a")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     instructions = "你是一个模型路由器。请只选择最匹配的模型。"
     state_template = "【待判断的用户请求】\n{request}"
 
@@ -1037,7 +1037,7 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     assert _db_row(app, "jev_services", "id", "jev-a") == before_row
     assert _canvas_state(app, ("main", "other")) == before
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
     confirmed = client.put("/admin/jev/jev-a", json={
         **payload, "impact_confirmation": confirmation_from(preview)})
@@ -1065,11 +1065,11 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     assert _canvas_bytes(app, "main") != before["main"]
     assert _db_row(app, "jev_services", "id", "jev-a")["model"] == "d1-a-v2"
     # 活动画布被同步 → 快照按新画布配置重新发布。
-    assert app.state.snapshot.jev.base_url == "http://jev-a-v2.test"
-    assert app.state.snapshot.jev.model == "d1-a-v2"
-    assert (app.state.snapshot.jev_input_tokens,
-            app.state.snapshot.jev_context_tokens) == (3072, 8192)
-    assert app.state.snapshot.snapshot_revision != before_revision
+    assert app.state.snapshot_set.default_snapshot.jev.base_url == "http://jev-a-v2.test"
+    assert app.state.snapshot_set.default_snapshot.jev.model == "d1-a-v2"
+    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
+            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (3072, 8192)
+    assert app.state.snapshot_set.snapshot_revision != before_revision
     changes = _changes(app)
     assert len(changes) == before_audit + 1
     assert changes[-1]["kind"] == "jev"
@@ -1112,8 +1112,8 @@ def test_jev_window_update_replaces_snapshot_and_window_together(two_canvases):
     assert runtime.jev.key_env == ""
     assert _tree(app, "other").runtime.jev.id == "jev-b"
     assert _tree(app, "other").runtime.jev.base_url == "http://jev-json.test"
-    assert (app.state.snapshot.jev_input_tokens,
-            app.state.snapshot.jev_context_tokens) == (768, 3072)
+    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
+            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (768, 3072)
 
 
 # --------------------------------------------------------------------------- #
@@ -1203,9 +1203,9 @@ def test_jev_delete_requires_replacement_and_syncs_replacement_service(
     # 另一幅画布（本就引用 jev-b）字节与哈希完全不变。
     assert _canvas_bytes(app, "other") == before["other"]
     assert _tree(app, "other").document_sha256 == before_other_sha
-    assert app.state.snapshot.jev.base_url == "http://jev-b.test"
-    assert (app.state.snapshot.jev_input_tokens,
-            app.state.snapshot.jev_context_tokens) == (2048, 8192)
+    assert app.state.snapshot_set.default_snapshot.jev.base_url == "http://jev-b.test"
+    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
+            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (2048, 8192)
     changes = _changes(app)
     assert len(changes) == before_audit + 1
     assert changes[-1]["kind"] == "jev"
@@ -1242,7 +1242,7 @@ def test_jev_stale_or_missing_confirmation_hash_is_graph_conflict(two_canvases):
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "jev_services", "id", "jev-a")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
     actual = _tree(app, "main").document_sha256
     assert confirmation_from(preview)["trees"][0]["document_sha256"] == actual
@@ -1261,7 +1261,7 @@ def test_jev_stale_or_missing_confirmation_hash_is_graph_conflict(two_canvases):
         assert _canvas_state(app, ("main", "other")) == before
         assert _db_row(app, "jev_services", "id", "jev-a") == before_row
         assert _audit_count(app) == before_audit
-        assert app.state.snapshot.snapshot_revision == before_revision
+        assert app.state.snapshot_set.snapshot_revision == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -1323,7 +1323,7 @@ def test_jev_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
         json.dumps(_changes(app), ensure_ascii=False),
         _canvas_bytes(app, "main").decode("utf-8"),
         _canvas_bytes(app, "other").decode("utf-8"),
-        app.state.snapshot.content,
+        app.state.snapshot_set.default_snapshot.content,
     ])
     assert secret not in payloads
     for item in delete_preview.json()["detail"]["replacements"]:
@@ -1351,7 +1351,7 @@ def test_jev_sync_of_only_inactive_canvas_does_not_publish(
         return real_publish(prepared)
 
     monkeypatch.setattr(publisher, "publish", spy)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     before_main = _canvas_bytes(app, "main")
     before_other = _canvas_bytes(app, "other")
 
@@ -1368,7 +1368,7 @@ def test_jev_sync_of_only_inactive_canvas_does_not_publish(
     assert confirmed.status_code == 200, confirmed.text
     assert confirmed.json()["synced_trees"] == ["other"]
     assert published == []
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _canvas_bytes(app, "main") == before_main
     assert _canvas_bytes(app, "other") != before_other
 
@@ -1382,7 +1382,7 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "jev_services", "id", "jev-a")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
     confirmation = confirmation_from(preview)
 
@@ -1413,7 +1413,7 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
     assert _tree(app, "racer").document_sha256 == raced["sha"]
     assert _db_row(app, "jev_services", "id", "jev-a") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -1465,7 +1465,7 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
     assert preview.status_code == 409, preview.text
     assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
         "other"]
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
 
     stale = client.put("/admin/models/backup", json={
         "upstream": "raced-upstream",
@@ -1477,7 +1477,7 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
     # 实际哈希必须是 enable 改写后的新文档哈希，而不是客户端提交的旧哈希。
     assert stale.json()["detail"]["actual_document_sha256"] == hashlib.sha256(
         _canvas_bytes(app, "other")).hexdigest()
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _tree(app, "other").enabled is True
 
     # 重新预览并确认：生命周期已稳定，发布门必须在写锁内识别出新活动画布。
@@ -1490,11 +1490,13 @@ def test_enable_racing_lock_acquisition_invalidates_stale_confirmation(
 
     assert response.status_code == 200, response.text
     assert response.json()["synced_trees"] == ["other"]
-    assert app.state.snapshot.tree_id == "other"
-    assert app.state.snapshot.snapshot_revision != before_revision
-    assert app.state.snapshot.backends["backup"].upstream_name == "raced-upstream"
-    assert app.state.publisher.status()["document_sha256"] == \
-        _tree(app, "other").document_sha256
+    assert app.state.snapshot_set.default_snapshot.tree_id == "other"
+    assert app.state.snapshot_set.snapshot_revision != before_revision
+    assert app.state.snapshot_set.default_snapshot.backends["backup"].upstream_name == "raced-upstream"
+    status = app.state.publisher.status()
+    assert status["default_tree_id"] == "other"
+    assert status["enabled_tree_ids"] == ["other"]
+    assert status["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
     assert _tree(app, "other").enabled is True
 
 
@@ -1639,7 +1641,7 @@ def test_failure_after_graph_commit_restores_files_db_audit_and_snapshot(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
@@ -1664,7 +1666,7 @@ def test_failure_after_graph_commit_restores_files_db_audit_and_snapshot(
     assert published == []
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _canvas_state(app, ("main", "other")) == before
 
 
@@ -1675,7 +1677,7 @@ def test_audit_failure_inside_transaction_rolls_back_everything(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
@@ -1697,7 +1699,7 @@ def test_audit_failure_inside_transaction_rolls_back_everything(
     assert published == []
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot.snapshot_revision == before_revision
+    assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _canvas_state(app, ("main", "other")) == before
 
 

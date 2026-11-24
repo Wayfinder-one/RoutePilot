@@ -201,11 +201,11 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.state.graph_repo = RoutingTreeRepo(settings.graph_dir, writer=settings.graph_writer)
     if settings.graph_writer:
         app.state.graph_repo.initialize()
-    app.state.snapshot = None
+    app.state.snapshot_set = None
     app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     conn = connect(settings.db_path)
     try:
-        # boot 种子只写 JEV 目录；启动快照只由活动画布 JSON 构造（无活动画布为空快照）。
+        # boot 种子只写 JEV 目录；启动路由集只由启用图文档构造（零启用图为空集）。
         _seed_jev(conn, settings)
         app.state.publisher.refresh(conn)
     except GraphStorageError:

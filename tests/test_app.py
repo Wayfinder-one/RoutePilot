@@ -51,7 +51,8 @@ def test_health_console_and_empty_tree_boot(tmp_path):
     client = TestClient(app)
     assert client.get("/healthz").json() == {"ok": True}
     assert client.get("/console/index.html").status_code == 200
-    assert app.state.snapshot.tree is None
+    assert app.state.snapshot_set.snapshots == {}
+    assert app.state.snapshot_set.default_snapshot is None
     assert client.get("/admin/trees").json()["trees"] == []
     response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
     assert response.status_code == 503
@@ -92,8 +93,8 @@ def test_missing_snapshot_is_not_ready_and_disabled_snapshot_is_ready(tmp_path):
 def test_startup_accepts_valid_direct_target(tmp_path):
     settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
     app = create_app(settings)
-    assert app.state.snapshot.tree_id == "main"
-    targets = [node for node in app.state.snapshot.tree.root.nodes if isinstance(node, TargetNode)]
+    assert app.state.snapshot_set.default_snapshot.tree_id == "main"
+    targets = [node for node in app.state.snapshot_set.default_snapshot.tree.root.nodes if isinstance(node, TargetNode)]
     assert [(node.id, [item.model for item in node.models]) for node in targets] == [
         ("direct", ["qwen3-8b"]),
     ]
@@ -127,10 +128,9 @@ def test_environment_jev_service_is_seeded_once(tmp_path):
     """空目录首次启动：环境 URL/model/api_key 创建 ``default`` 服务。"""
     settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
     app = create_app(settings)
-    # 无活动画布：Auto 快照为空，种子只写数据库目录，不进入运行快照。
-    assert app.state.snapshot.tree is None
-    assert app.state.snapshot.jev is None
-    assert app.state.snapshot.backends == {}
+    # 无启用图：路由集为空，种子只写数据库目录，不进入运行快照。
+    assert app.state.snapshot_set.snapshots == {}
+    assert app.state.snapshot_set.default_snapshot is None
     conn = connect(settings.db_path)
     try:
         services = JevServiceRepo(conn).list()
@@ -211,8 +211,8 @@ def test_environment_seed_never_overwrites_an_existing_catalog(tmp_path):
         assert [service.id for service in JevServiceRepo(conn).list()] == ["custom"]
     finally:
         conn.close()
-    # 目录没有被环境种子覆盖；空 Auto 快照不读取目录。
-    assert app.state.snapshot.jev is None
+    # 目录没有被环境种子覆盖；空路由集不读取目录。
+    assert app.state.snapshot_set.snapshots == {}
 
 
 def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
@@ -225,8 +225,8 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
 
     app = create_app(settings)
 
-    assert app.state.snapshot.jev.base_url == "http://jev-json.test"
-    assert app.state.snapshot.jev.model == "json-jev"
+    assert app.state.snapshot_set.default_snapshot.jev.base_url == "http://jev-json.test"
+    assert app.state.snapshot_set.default_snapshot.jev.model == "json-jev"
     conn = connect(settings.db_path)
     try:
         services = JevServiceRepo(conn).list()

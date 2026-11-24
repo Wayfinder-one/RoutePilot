@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import threading
+from collections.abc import Iterable
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -22,9 +23,9 @@ from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import CompiledGraph, compile_graph
 from router.routing.graph.model import canonical_json
 from router.routing.graph.validate import validate_graph_for_enable
-from router.routing.route_set import RouteSetInvariantError, default_enabled_tree
+from router.routing.route_set import RouteSetInvariantError, route_set_indices
 from router.routing.tree import RoutingTree, tree_behavior_dict, tree_revision_of
-from router.routing.types import RoutingMiss
+from router.routing.types import NoActiveTreeError, NoDefaultTreeError, RoutingMiss
 from router.store.routing_trees import GraphChangedDuringLoad, GraphStorageError, RoutingTreeRepo
 from router.upstream.catalog import Backend
 
@@ -164,22 +165,107 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
     )
 
 
-def load_snapshot(conn, trees: RoutingTreeRepo) -> RoutingSnapshot:
-    """从磁盘扫描结果构造默认启用图的快照；零启用图为空快照。
+@dataclass(frozen=True)
+class RouteSetSelection:
+    """一次按部门选图的结果：``reason`` 为 ``department`` / ``default``。"""
 
-    集合不变量（恰好一张默认图、部门唯一）在装配边界转成 ``GraphStorageError``：
-    发布器保留旧快照并报告 ``stale``，而不是把损坏文件打成 500。
-    """
-    try:
-        tree = default_enabled_tree(trees.enabled())
-    except RouteSetInvariantError as exc:
-        raise GraphStorageError(f"invalid route set: {exc.code}") from exc
-    return build_snapshot_for_tree(conn, tree)
+    snapshot: RoutingSnapshot
+    reason: str
 
 
 @dataclass(frozen=True)
-class PreparedSnapshot:
-    snapshot: RoutingSnapshot
+class RoutingSnapshotSet:
+    """不可变发布单元：所有启用图的快照 + 默认图/部门索引。
+
+    ``snapshots`` / ``department_tree_ids`` 用 ``MappingProxyType`` 固定；
+    ``content`` 只含非密钥版本信息（默认图 id、排序后的部门映射、每图
+    ``snapshot_revision``），``snapshot_revision`` 是它的 sha256。
+    """
+
+    snapshots: Mapping[str, RoutingSnapshot]
+    default_tree_id: str | None
+    department_tree_ids: Mapping[str, str]
+    snapshot_revision: str
+    content: str
+    fingerprint: str
+
+    @property
+    def default_snapshot(self) -> RoutingSnapshot | None:
+        """默认启用图的快照；零启用图返回 ``None``。"""
+        return self.snapshots.get(self.default_tree_id) if self.default_tree_id else None
+
+    def select(self, department: str = "") -> RouteSetSelection:
+        """按部门选图：精确匹配部门图，否则回退默认图。
+
+        零启用图抛 ``NoActiveTreeError``；有启用图但缺默认图（不变量损坏）
+        抛 ``NoDefaultTreeError``。
+        """
+        if not self.snapshots:
+            raise NoActiveTreeError('no routing tree is enabled')
+        tree_id = self.department_tree_ids.get(department) if department else None
+        if tree_id is not None:
+            return RouteSetSelection(self.snapshots[tree_id], 'department')
+        if self.default_tree_id is None:
+            raise NoDefaultTreeError('no default routing tree is enabled')
+        return RouteSetSelection(self.snapshots[self.default_tree_id], 'default')
+
+
+def assemble_snapshot_set(
+        snapshots: Iterable[RoutingSnapshot], fingerprint: str) -> RoutingSnapshotSet:
+    """把各启用图快照装配成不可变路由集（集合不变量在装配点校验）。
+
+    路由集成员必须都带树：空 Auto 快照不属于路由集。``RouteSetInvariantError``
+    由调用方决定如何呈现；``load_snapshot_set()`` 在装配边界转成存储错误。
+    """
+    ordered = list(snapshots)
+    if any(item.tree is None for item in ordered):
+        raise ValueError('routing snapshot set requires snapshots with a tree')
+    ordered.sort(key=lambda item: item.tree.id)
+    default_id, mapping = route_set_indices([item.tree for item in ordered])
+    department_tree_ids = dict(sorted(mapping.items()))
+    document = {
+        'default_tree_id': default_id,
+        'department_tree_ids': department_tree_ids,
+        'snapshots': {item.tree_id: item.snapshot_revision for item in ordered},
+    }
+    content = canonical_json(document)
+    revision = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    return RoutingSnapshotSet(
+        snapshots=MappingProxyType({item.tree_id: item for item in ordered}),
+        default_tree_id=default_id,
+        department_tree_ids=MappingProxyType(department_tree_ids),
+        snapshot_revision=revision,
+        content=content,
+        fingerprint=fingerprint,
+    )
+
+
+def build_snapshot_set_for_trees(conn, trees: Iterable[RoutingTree],
+                                 fingerprint: str) -> RoutingSnapshotSet:
+    """对每份启用图执行启用校验/编译/装配，再装配成路由集。"""
+    return assemble_snapshot_set(
+        [build_snapshot_for_tree(conn, tree) for tree in trees], fingerprint)
+
+
+def load_snapshot_set(conn, repo: RoutingTreeRepo) -> RoutingSnapshotSet:
+    """从磁盘扫描结果构造完整启用路由集。
+
+    先取指纹再读树；集合不变量（恰好一张默认图、部门唯一）在装配边界转成
+    ``GraphStorageError``：发布器保留旧路由集并报告 ``stale``，而不是把损坏
+    文件打成 500。
+    """
+    fingerprint = repo.route_fingerprint()
+    try:
+        return build_snapshot_set_for_trees(conn, repo.enabled(), fingerprint)
+    except RouteSetInvariantError as exc:
+        raise GraphStorageError(f"invalid route set: {exc.code}") from exc
+
+
+@dataclass(frozen=True)
+class PreparedRouteSet:
+    """待发布的路由集及其指纹（COMMIT 前复核用）。"""
+
+    snapshot_set: RoutingSnapshotSet
     fingerprint: str
 
 
@@ -197,52 +283,51 @@ class SnapshotPublisher:
         with self._lock:
             yield self
 
-    def prepare(self, conn, tree: RoutingTree | None,
-                fingerprint: str) -> PreparedSnapshot:
-        return PreparedSnapshot(build_snapshot_for_tree(conn, tree), fingerprint)
+    def prepare(self, conn, trees: Iterable[RoutingTree],
+                fingerprint: str) -> PreparedRouteSet:
+        return PreparedRouteSet(
+            build_snapshot_set_for_trees(conn, trees, fingerprint), fingerprint)
 
-    def publish(self, prepared: PreparedSnapshot) -> RoutingSnapshot:
+    def publish(self, prepared: PreparedRouteSet) -> RoutingSnapshotSet:
         with self._lock:
-            self.app.state.snapshot = prepared.snapshot
+            self.app.state.snapshot_set = prepared.snapshot_set
             self._fingerprint = prepared.fingerprint
             self._loaded_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self._last_error = ""
-            return prepared.snapshot
+            return prepared.snapshot_set
 
-    def refresh(self, conn) -> RoutingSnapshot:
+    def refresh(self, conn) -> RoutingSnapshotSet:
         with self._lock:
             try:
-                fingerprint = self.trees.route_fingerprint()
-                prepared = PreparedSnapshot(load_snapshot(conn, self.trees), fingerprint)
-                if self.trees.route_fingerprint() != fingerprint:
+                route_set = load_snapshot_set(conn, self.trees)
+                if self.trees.route_fingerprint() != route_set.fingerprint:
                     raise GraphChangedDuringLoad("graph changed while building snapshot")
-                return self.publish(prepared)
+                return self.publish(PreparedRouteSet(route_set, route_set.fingerprint))
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
-    def refresh_if_changed(self, conn) -> RoutingSnapshot | None:
+    def refresh_if_changed(self, conn) -> RoutingSnapshotSet | None:
         with self._lock:
             try:
                 if self._fingerprint is not None and self.trees.route_fingerprint() == self._fingerprint:
                     # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
                     self._last_error = ""
-                    return self.app.state.snapshot
+                    return self.app.state.snapshot_set
                 return self.refresh(conn)
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
     def status(self) -> dict:
-        # 过渡期状态字段：Task 3 换成 routing snapshot set 的 schema。
-        # ``active_id`` 是默认启用图的 id，``document_sha256`` 是那份文档的哈希。
-        snapshot = self.app.state.snapshot
-        tree = snapshot.tree if snapshot is not None else None
+        route_set = self.app.state.snapshot_set
         return {
-            "ready": snapshot is not None,
+            "ready": route_set is not None,
             "stale": bool(self._last_error),
-            "active_id": tree.id if tree is not None else None,
-            "document_sha256": tree.document_sha256 if tree is not None else "",
+            "default_tree_id": route_set.default_tree_id if route_set is not None else None,
+            "enabled_tree_ids": sorted(route_set.snapshots) if route_set is not None else [],
+            "snapshot_revision": route_set.snapshot_revision if route_set is not None else "",
+            "route_fingerprint": self._fingerprint or "",
             "loaded_at": self._loaded_at,
             "last_load_error": self._last_error,
         }

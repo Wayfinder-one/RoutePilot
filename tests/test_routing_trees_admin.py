@@ -147,7 +147,7 @@ def test_unconfirmed_catalog_writes_do_not_rewrite_stored_canvases(client, app):
     finally:
         conn.close()
     assert _canvas_state(app, tree_ids) == before
-    assert app.state.snapshot.backends["fast"].url == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
         "http://json-only.test/v1/chat/completions"
 
     response = client.put("/admin/providers/local", json={
@@ -168,7 +168,7 @@ def test_unconfirmed_catalog_writes_do_not_rewrite_stored_canvases(client, app):
         assert provider["base_url"] == "http://changed.test/v1"
         assert provider["key_env"] == "CHANGED_API_KEY"
     # 确认同步后活动画布被修改 → 快照按新画布配置重新发布。
-    assert app.state.snapshot.backends["fast"].url == \
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
         "http://changed.test/v1/chat/completions"
 
     response = client.put("/admin/time-periods", json={"periods": [
@@ -181,8 +181,8 @@ def test_unconfirmed_catalog_writes_do_not_rewrite_stored_canvases(client, app):
     finally:
         conn.close()
     assert _canvas_state(app, tree_ids) == after_provider
-    assert app.state.snapshot.time_periods and [
-        period.name for period in app.state.snapshot.time_periods
+    assert app.state.snapshot_set.default_snapshot.time_periods and [
+        period.name for period in app.state.snapshot_set.default_snapshot.time_periods
     ] == ["peak", "normal", "offpeak"]
 
     # JEV 目录同理：改窗口只改目录，画布 jev_window 不变。
@@ -199,8 +199,8 @@ def test_unconfirmed_catalog_writes_do_not_rewrite_stored_canvases(client, app):
     for tree_id in tree_ids:
         runtime = app.state.graph_repo.get(tree_id).runtime
         assert (runtime.jev_input_tokens, runtime.jev_context_tokens) == (1024, 4096)
-    assert (app.state.snapshot.jev_input_tokens,
-            app.state.snapshot.jev_context_tokens) == (1024, 4096)
+    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
+            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (1024, 4096)
     assert _canvas_state(app, tree_ids) == after_provider
 
 
@@ -220,7 +220,7 @@ def test_catalog_writes_succeed_when_active_canvas_has_no_catalog_rows(client, a
     assert response.status_code == 404, response.text
 
     # 画布快照仍是 JSON 事实源，不受数据库空目录影响。
-    assert app.state.snapshot.backends["fast"].upstream_name == "json-upstream"
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].upstream_name == "json-upstream"
     tree = app.state.graph_repo.get("main")
     assert tree.runtime.backends.models[0]["upstream"] == "json-upstream"
 
@@ -321,13 +321,13 @@ def test_graph_crud_roundtrip_copy_enable_disable(client, app):
 
     enabled = client.post("/admin/trees/main/enable")
     assert enabled.status_code == 200, enabled.text
-    assert app.state.snapshot.tree_id == "main"
+    assert app.state.snapshot_set.default_snapshot.tree_id == "main"
     assert [tree["id"] for tree in enabled.json()["trees"] if tree["enabled"]] == ["main"]
-    assert enabled.json()["snapshot_revision"] == app.state.snapshot.snapshot_revision
+    assert enabled.json()["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
 
     disabled = client.post("/admin/trees/main/disable")
     assert disabled.status_code == 200, disabled.text
-    assert app.state.snapshot.tree is None
+    assert app.state.snapshot_set.snapshots == {}
     assert not any(tree["enabled"] for tree in disabled.json()["trees"])
 
 
@@ -379,12 +379,12 @@ def test_save_uses_full_canvas_validation_in_every_lifecycle(client, app):
 
     assert save_tree(client, {"root": graph_with_model()}).status_code == 200
     assert client.post("/admin/trees/main/enable").status_code == 200
-    published = app.state.snapshot.snapshot_revision
+    published = app.state.snapshot_set.snapshot_revision
 
     response = save_tree(client, {"root": graph_with_model("ghost")})
     assert response.status_code == 422, response.text
     assert any(issue["code"] == "unknown_model" for issue in response.json()["detail"])
-    assert app.state.snapshot.snapshot_revision == published
+    assert app.state.snapshot_set.snapshot_revision == published
 
     root = graph_with_model()
     for node in root["nodes"]:
@@ -394,14 +394,14 @@ def test_save_uses_full_canvas_validation_in_every_lifecycle(client, app):
     assert response.status_code == 422, response.text
     assert any(issue["code"] == "target_models_required"
                for issue in response.json()["detail"])
-    assert app.state.snapshot.snapshot_revision == published
+    assert app.state.snapshot_set.snapshot_revision == published
 
     root = graph_with_model()
     root["nodes"] = [node for node in root["nodes"] if node["type"] != "start"]
     response = save_tree(client, {"root": root})
     assert response.status_code == 422, response.text
     assert any(issue["code"] == "start_count" for issue in response.json()["detail"])
-    assert app.state.snapshot.snapshot_revision == published
+    assert app.state.snapshot_set.snapshot_revision == published
 
 
 ISSUE_KEYS = {"code", "zh", "en", "node_id", "edge_id", "port", "level",
@@ -633,15 +633,15 @@ def test_enable_switches_single_active_tree(client, app):
         assert create_tree(client, tree_dict(tree_id, root=graph_with_model())).status_code == 201
 
     assert client.post("/admin/trees/a/enable").status_code == 200
-    assert app.state.snapshot.tree_id == "a"
+    assert app.state.snapshot_set.default_snapshot.tree_id == "a"
     response = client.post("/admin/trees/b/enable")
     assert response.status_code == 200, response.text
-    assert app.state.snapshot.tree_id == "b"
+    assert app.state.snapshot_set.default_snapshot.tree_id == "b"
     assert [tree["id"] for tree in response.json()["trees"] if tree["enabled"]] == ["b"]
     assert client.get("/admin/trees/a").json()["tree"]["enabled"] is False
 
     assert client.post("/admin/trees/b/disable").status_code == 200
-    assert app.state.snapshot.tree is None
+    assert app.state.snapshot_set.snapshots == {}
 
 
 def test_enable_publishes_candidate_snapshot_exactly_once(app, client, monkeypatch):
@@ -650,7 +650,7 @@ def test_enable_publishes_candidate_snapshot_exactly_once(app, client, monkeypat
     configure_jev(client)
     assert create_tree(client, tree_dict(root=graph_with_model())).status_code == 201
     publisher = app.state.publisher
-    before_revision = app.state.snapshot.snapshot_revision
+    before_revision = app.state.snapshot_set.snapshot_revision
     published = []
     real_publish = publisher.publish
 
@@ -664,14 +664,17 @@ def test_enable_publishes_candidate_snapshot_exactly_once(app, client, monkeypat
 
     assert response.status_code == 200, response.text
     assert len(published) == 1
-    assert app.state.snapshot.tree_id == "main"
-    assert app.state.snapshot.snapshot_revision != before_revision
-    assert response.json()["snapshot_revision"] == app.state.snapshot.snapshot_revision
+    assert app.state.snapshot_set.default_snapshot.tree_id == "main"
+    assert app.state.snapshot_set.snapshot_revision != before_revision
+    assert response.json()["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
     status = publisher.status()
-    assert status["active_id"] == "main" and status["stale"] is False
-    # 候选快照指纹与文件一致：发布内容 = 刚写入的文档（内存替换，无文件操作）
+    assert status["default_tree_id"] == "main"
+    assert status["enabled_tree_ids"] == ["main"]
+    assert status["stale"] is False
+    assert status["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
+    # 候选路由集指纹与文件一致：发布内容 = 刚写入的文档（内存替换，无文件操作）
     repo = RoutingTreeRepo(app.state.settings.graph_dir)
-    assert status["document_sha256"] == repo.get("main").document_sha256
+    assert status["route_fingerprint"] == repo.route_fingerprint()
 
 
 def test_enable_disable_unknown_tree_is_404(client):
@@ -686,7 +689,7 @@ def test_enable_prepares_candidate_before_writing(client, app, monkeypatch):
     repo = RoutingTreeRepo(app.state.settings.graph_dir)
     before = (repo.graphs / "main.json").read_bytes()
 
-    def failing_prepare(_conn, _tree, _fingerprint):
+    def failing_prepare(_conn, _trees, _fingerprint):
         raise GraphStorageError("candidate snapshot is unbuildable")
 
     monkeypatch.setattr(app.state.publisher, "prepare", failing_prepare)
@@ -695,7 +698,7 @@ def test_enable_prepares_candidate_before_writing(client, app, monkeypatch):
     assert response.status_code == 503, response.text
     assert response.json()["detail"]["code"] == "graph_storage_error"
     assert (repo.graphs / "main.json").read_bytes() == before
-    assert app.state.publisher.status()["active_id"] is None
+    assert app.state.publisher.status()["enabled_tree_ids"] == []
 
 
 def test_update_enabled_prepares_candidate_before_writing(client, app, monkeypatch):
@@ -706,9 +709,9 @@ def test_update_enabled_prepares_candidate_before_writing(client, app, monkeypat
     repo = RoutingTreeRepo(app.state.settings.graph_dir)
     saved = client.get("/admin/trees/main").json()["tree"]
     before = (repo.graphs / "main.json").read_bytes()
-    revision = app.state.snapshot.snapshot_revision
+    revision = app.state.snapshot_set.snapshot_revision
 
-    def failing_prepare(_conn, _tree, _fingerprint):
+    def failing_prepare(_conn, _trees, _fingerprint):
         raise GraphStorageError("candidate snapshot is unbuildable")
 
     monkeypatch.setattr(app.state.publisher, "prepare", failing_prepare)
@@ -719,7 +722,7 @@ def test_update_enabled_prepares_candidate_before_writing(client, app, monkeypat
 
     assert response.status_code == 503, response.text
     assert (repo.graphs / "main.json").read_bytes() == before
-    assert app.state.snapshot.snapshot_revision == revision
+    assert app.state.snapshot_set.snapshot_revision == revision
 
 
 def test_tree_dtos_reject_unknown_fields(client):

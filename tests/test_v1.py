@@ -29,7 +29,7 @@ from router.routing.tree import tree_from_dict
 from router.routing.scheduler import LoadBalancer
 from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
-from router.routing.snapshot import build_snapshot
+from router.routing.snapshot import assemble_snapshot_set, build_snapshot
 from router.store.db import connect, migrate
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.catalog import Backend
@@ -270,19 +270,22 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
         )
         for model in MODELS
     }
-    tree = None
     if active:
         tree = tree_from_dict(tree_dict(
             "main",
             root=root or switch_graph(),
             sticky=sticky or {"enabled": False, "ttl_seconds": 1800},
+            enabled=True, default=True,
         ))
-    app.state.snapshot = build_snapshot(
-        tree=tree, backends=backends,
-        time_periods=[] if time_periods is None else time_periods,
-        jev=JEV_SETTINGS, capabilities=CAPABILITIES,
-        compiled=compile_graph(tree.root) if tree is not None else None,
-    )
+        snapshot = build_snapshot(
+            tree=tree, backends=backends,
+            time_periods=[] if time_periods is None else time_periods,
+            jev=JEV_SETTINGS, capabilities=CAPABILITIES,
+            compiled=compile_graph(tree.root),
+        )
+        app.state.snapshot_set = assemble_snapshot_set([snapshot], fingerprint="test")
+    else:
+        app.state.snapshot_set = assemble_snapshot_set([], fingerprint="empty")
     app.include_router(router, prefix="/v1")
     return app
 
@@ -543,7 +546,7 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         assert first.headers["x-sr-selection"] == "target"
         assert app.state.balancer.calls[-1]["preferred"] is None
         assert app.state.balancer.inflight(model) == 0
-        first_revision = app.state.snapshot.tree_revision
+        first_revision = app.state.snapshot_set.default_snapshot.tree_revision
 
         # 仅移动节点（canvas 属于纯布局字段）：behavior revision 不变。
         moved = copy.deepcopy(switch_graph())
@@ -554,15 +557,17 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         moved_tree = tree_from_dict(tree_dict(
             "main", root=moved, canvas=moved_canvas,
             sticky={"enabled": True, "ttl_seconds": 1800},
+            enabled=True, default=True,
         ))
         moved_snapshot = build_snapshot(
             tree=moved_tree,
-            backends=app.state.snapshot.backends, time_periods=[],
+            backends=app.state.snapshot_set.default_snapshot.backends, time_periods=[],
             jev=JEV_SETTINGS, capabilities=CAPABILITIES,
             compiled=compile_graph(moved_tree.root),
         )
         assert moved_snapshot.tree_revision == first_revision
-        app.state.snapshot = moved_snapshot
+        app.state.snapshot_set = assemble_snapshot_set(
+            [moved_snapshot], fingerprint="moved")
 
         second = await post(app, headers=headers)
         assert second.status_code == 200
@@ -767,7 +772,7 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
 def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
-        app.state.snapshot = None
+        app.state.snapshot_set = None
         response = await post(app)
 
         assert response.status_code == 503

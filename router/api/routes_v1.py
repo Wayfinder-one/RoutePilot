@@ -257,10 +257,15 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         requestlog.enqueue(record, snapshot=snapshot)
         return _error(error_class, status_code)
 
-    snapshot = request.app.state.snapshot
+    # 公开数据面只使用路由集的默认图（部门选图由 Task 4 接入 select()）。
+    snapshot_set = request.app.state.snapshot_set
+    snapshot = snapshot_set.default_snapshot if snapshot_set is not None else None
     if fixed_model is None:
-        if snapshot is None:
+        if snapshot_set is None:
             return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot")
+        if snapshot is None:
+            return fail("no_active_tree", 503, "graph",
+                        "no routing tree is enabled")
         try:
             decision = await request.app.state.routing_service.route(
                 snapshot,
