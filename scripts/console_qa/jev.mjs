@@ -7,12 +7,14 @@
          `npm run check:console`（全量；基座在 main() 里显式 import 本模块）。
 
    页面契约（本任务的实现依据）：
-   - `#jevNew` 开启新服务草稿；`#jevServiceId/#jevBaseUrl/#jevModel/#jevKeyEnv/
+   - `#jevNew` 开启新服务草稿；`#jevServiceId/#jevBaseUrl/#jevModel/
       #jevTimeout/#jevInstructions/#jevStateTemplate/#jevInputTokens/
       #jevContextTokens` 是编辑字段；`#jevSave/#jevTest/#jevDelete` 是动作；
    - 列表项带 `[data-jev-service-id]`，按服务 id 排序；
    - 窗口属于服务：切换服务必须切换 `#jevInputTokens`；
-   - 密钥只进写请求：任何响应/列表/重渲染都不出现密钥材料，只展示密钥状态。
+   - 密钥不是目录字段（v7）：没有 #jevApiKey/#jevClearKey/#jevKeyEnv 控件，
+     API/列表/页面都不出现密钥材料或密钥派生状态；#jevKeyHint 说明密钥由
+     内核环境变量 ROUTER_JEV_API_KEY 提供。
    ------------------------------------------------------------------ */
 
 import assert from 'node:assert/strict';
@@ -25,8 +27,6 @@ import {
   runIfMain,
   test
 } from '../console_qa.mjs';
-
-const SECRET = 'secret-sample';
 
 async function openPage() {
   await page.goto(routerBase + '/console/jev.html');
@@ -44,7 +44,7 @@ async function openPage() {
 }
 
 /* 计划里的 createJev 契约（adapted）：新建 → 填字段 → 保存 → 等列表项出现。 */
-async function createJev({ id, model, input, key, baseUrl }) {
+async function createJev({ id, model, input, baseUrl }) {
   await page.locator('#jevNew').click();
   await page.locator('#jevServiceId').fill(id);
   await page.locator('#jevBaseUrl').fill(baseUrl || 'http://' + id + '.test');
@@ -53,7 +53,6 @@ async function createJev({ id, model, input, key, baseUrl }) {
   await page.locator('#jevTimeout').fill('1');
   await page.locator('#jevInputTokens').fill(String(input));
   await page.locator('#jevContextTokens').fill('4096');
-  if (key) await page.locator('#jevApiKey').fill(key);
   await page.locator('#jevSave').click();
   await page.waitForSelector('[data-jev-service-id="' + id + '"]');
   await page.waitForFunction(serviceId =>
@@ -68,7 +67,7 @@ async function serviceIds() {
 
 test('creates and selects two JEV services with independent windows', async () => {
   await openPage();
-  await createJev({ id: 'jev-a', model: 'd1-a', input: 1024, key: SECRET });
+  await createJev({ id: 'jev-a', model: 'd1-a', input: 1024 });
   await createJev({ id: 'jev-b', model: 'd1-b', input: 2048 });
 
   const ids = await serviceIds();
@@ -85,14 +84,17 @@ test('creates and selects two JEV services with independent windows', async () =
   assert.equal(await page.locator('#jevInputTokens').inputValue(), '2048');
   assert.equal(await page.locator('#jevServiceId').inputValue(), 'jev-b');
 
-  /* 密钥只进写请求：页面文本、列表重渲染与目录响应都不能带出密钥材料。 */
-  assert.equal(await page.locator('text=' + SECRET).count(), 0,
-    'the stored key material leaked into the page');
+  /* v7：页面没有密钥输入/回显，目录响应也没有密钥材料或派生状态。 */
+  for (const selector of ['#jevApiKey', '#jevClearKey', '#jevKeyEnv']) {
+    assert.equal(await page.locator(selector).count(), 0,
+      'the removed JEV key control ' + selector + ' is still present');
+  }
   await page.locator('[data-jev-service-id="jev-a"]').click();
-  assert.equal(await page.locator('#jevApiKey').inputValue(), '',
-    'the stored key was rendered back into the key input');
   const catalog = await (await fetch(routerBase + '/admin/jev')).text();
-  assert.equal(catalog.includes(SECRET), false, 'GET /admin/jev returned the stored key material');
+  for (const removed of ['api_key', 'key_source', 'key_present']) {
+    assert.equal(catalog.includes(removed), false,
+      'GET /admin/jev still exposes removed key field ' + removed);
+  }
 });
 
 test('language switch and a failed connection test preserve the current service draft', async () => {
@@ -105,10 +107,11 @@ test('language switch and a failed connection test preserve the current service 
   await page.waitForFunction(() => document.documentElement.lang === 'en');
   assert.equal(await page.locator('#jevInstructions').inputValue(), '未保存的多服务提示词');
   assert.equal(await page.locator('#jevInputTokens').inputValue(), '2048');
-  /* 密钥保留提示必须说明“仅当地址与模型不变”：英文页不能出现中文标点/旧文案。 */
+  /* v7 密钥提示必须说明密钥由内核环境变量提供：英文页不能出现中文标点/旧文案。 */
   const enHint = (await page.locator('#jevKeyHint').innerText()).replace(/\s+/g, ' ');
-  assert.match(enHint, /base URL/i, 'the key-retention hint does not mention the base URL: ' + enHint);
-  assert.match(enHint, /model/i, 'the key-retention hint does not mention the model: ' + enHint);
+  assert.match(enHint, /ROUTER_JEV_API_KEY/,
+    'the key hint does not name the kernel environment variable: ' + enHint);
+  assert.match(enHint, /kernel/i, 'the key hint does not attribute the key to the kernel: ' + enHint);
   assert.doesNotMatch(enHint, /[、，。；：（）]/, 'the English key hint contains Chinese punctuation: ' + enHint);
 
   try {
@@ -130,21 +133,22 @@ test('language switch and a failed connection test preserve the current service 
   }
 });
 
-test('list shows key state without key material and delete removes a fresh service', async () => {
+test('list never renders key state or material and delete removes a fresh service', async () => {
   await openPage();
-  /* 独立创建一个带密钥的新服务（不依赖上一条用例的残留状态）。 */
-  await createJev({ id: 'jev-key-state', model: 'd1-key', input: 1024, key: SECRET });
-  const keyText = await page.locator('[data-jev-service-id="jev-key-state"] .pill').innerText();
-  assert.match(keyText, /密钥已存|Key stored/,
-    'the list does not report the stored-key state: ' + keyText);
-  assert.equal(await page.locator('text=' + SECRET).count(), 0,
-    'the stored key material leaked into the list');
+  /* 独立创建一个新服务（不依赖上一条用例的残留状态）。 */
+  await createJev({ id: 'jev-delete-me', model: 'd1-key', input: 1024 });
+  /* 列表项只展示 id/model/address/window，不再有密钥状态 pill。 */
+  assert.equal(await page.locator('[data-jev-service-id="jev-delete-me"] .pill').count(), 0,
+    'the service directory still renders a key-state pill');
+  const catalog = await (await fetch(routerBase + '/admin/jev')).text();
+  assert.equal(catalog.includes('key_source'), false,
+    'GET /admin/jev returned a removed key-state field');
 
   /* 未被任何画布引用的新服务单击即删：共享影响确认只在有画布引用时介入，
      本页没有本地的“再次点击确认”二次门。 */
   await page.locator('#jevDelete').click();
   await page.waitForFunction(() =>
-    document.querySelectorAll('[data-jev-service-id="jev-key-state"]').length === 0,
+    document.querySelectorAll('[data-jev-service-id="jev-delete-me"]').length === 0,
     null, { timeout: 8000 });
   assert.match(await page.locator('#jevMsg').innerText(), /已删除|Deleted/);
 });

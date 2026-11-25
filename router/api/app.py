@@ -14,8 +14,10 @@ The peripheral owns everything user-facing and execution-related:
 * the decision-event receiver and the volatile 20-event memory log.
 
 Deliberately absent (kernel-owned): graph JSON, routing/JEV execution, decision
-events production, model upstream calls during a decision, request logging and
-decision snapshots.  The only kernel boundary is ``app.state.core`` (CoreClient).
+events production and model upstream calls during a decision.  The peripheral
+also keeps no request-log database and no graph snapshots any more: the only
+decision log is the volatile in-memory event ring.  The only kernel boundary is
+``app.state.core`` (CoreClient).
 
 Readiness reflects peripheral state only (SQLite migrated).  An unreachable
 kernel is a data-plane/management error, never a readiness failure: the
@@ -150,6 +152,9 @@ JEV_SEEDED_SETTING = "jev_catalog_seeded"
 def _seed_jev(conn, settings: Settings) -> None:
     """boot 种子：环境配置只在整个生命周期内创建一次 ``default`` 服务。
 
+    种子只写非密钥目录字段：JEV 密钥由内核从 ``ROUTER_JEV_API_KEY`` 读取，
+    v7 起不再写入 SQLite（``settings.jev_api_key`` 仅留给本进程连接测试）。
+
     - 目录里已有任何服务就完全跳过（数据库目录是事实源，不覆盖管理结果）。
     - 只有从未用环境种子初始化过（``settings`` 表的 ``jev_catalog_seeded``
       标记缺失）且目录为空时才播种：因此「首启无环境、之后补环境」仍会播种一次，而「全部删除
@@ -171,11 +176,10 @@ def _seed_jev(conn, settings: Settings) -> None:
         id="default",
         base_url=settings.jev_url,
         model=settings.jev_model,
-        key_env="ROUTER_JEV_API_KEY",
         timeout_seconds=settings.jev_timeout,
     )
     with transaction(conn):
-        repo.save(service, api_key=settings.jev_api_key)
+        repo.save(service)
         SettingsRepo(conn).set(JEV_SEEDED_SETTING, "1")
 
 

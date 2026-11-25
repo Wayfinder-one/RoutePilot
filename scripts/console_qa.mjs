@@ -748,7 +748,6 @@ function jevServiceSeed(service, window) {
     id: service.id,
     base_url: service.base_url,
     model: service.model,
-    key_env: service.key_env || '',
     timeout_seconds: service.timeout_seconds,
     instructions: service.instructions,
     state_template: service.state_template,
@@ -771,7 +770,6 @@ async function seedJevCatalog(runtime) {
       id: SECONDARY_JEV_ID,
       base_url: mockBase,
       model: JEV_MODEL,
-      key_env: '',
       timeout_seconds: 5,
       instructions: runtime.jev.instructions,
       state_template: runtime.jev.state_template,
@@ -1148,17 +1146,16 @@ test('bootstrap registers the multi-JEV catalog, periods and the self-contained 
   assert.deepEqual(
     { input_tokens: defaultService.input_tokens, context_tokens: defaultService.context_tokens },
     BASELINE_RUNTIME.jev_window);
-  /* 环境里可能恰好设置了该服务的 key_env（例如 ROUTER_JEV_API_KEY）：此时
-     key_source 合法地变成 'env'，真正要钉住的是「密钥材料永不回显」与
-     「key_source 只能是 none/env（bootstrap 从不写存储密钥）」。
-     直接断言 key_present === false 会被 ambient env 误伤。 */
-  assert.equal('api_key' in defaultService, false,
-    'GET /admin/jev exposed an api_key field');
-  assert.ok(['none', 'env'].includes(defaultService.key_source),
-    'unexpected default-service key_source: ' + defaultService.key_source);
-  assert.equal(defaultService.key_present, defaultService.key_source !== 'none',
-    'key_present disagrees with key_source');
-  assert.equal(JSON.stringify(jevCatalog).includes('api_key'), false);
+  /* v7 起 JEV 目录没有密钥通道：api_key/key_source/key_present 全部从响应消失，
+     密钥只由内核从 ROUTER_JEV_API_KEY 环境变量读取。 */
+  for (const removed of ['api_key', 'key_source', 'key_present']) {
+    assert.equal(removed in defaultService, false,
+      'GET /admin/jev still exposes removed field ' + removed);
+    assert.equal(JSON.stringify(jevCatalog).includes(removed), false,
+      'GET /admin/jev still serializes removed field ' + removed);
+  }
+  assert.equal(defaultService.key_env, 'ROUTER_JEV_API_KEY',
+    'the catalog no longer pins key_env to the kernel environment variable');
   /* 目录 GET 只读 SQLite：未被任何启用图引用的服务同样出现，证明它不是画布投影。 */
   const referenced = new Set([BASELINE_RUNTIME.jev.id]);
   assert.ok(services.some(service => !referenced.has(service.id)),

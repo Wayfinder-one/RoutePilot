@@ -62,9 +62,10 @@ RUNTIME_FIELDS = ("backends", "jev", "jev_window", "time_periods")
 #: 生命周期（enabled/default）只能由管理端启停端点写入；departments 保留为普通字段。
 ENVELOPE_FIELDS = ("kind", "version", "id", "enabled", "default")
 
-#: JEV 服务的完整非密钥字段（``id`` 决定 POST / PUT 路径）。
+#: JEV 服务的完整非密钥字段（``id`` 决定 POST / PUT 路径）。v7 起目录 DTO 不再
+#: 接受 ``key_env``（固定为内核环境变量名），这里同步剔除。
 JEV_FIELDS = (
-    "id", "base_url", "model", "key_env", "timeout_seconds",
+    "id", "base_url", "model", "timeout_seconds",
     "instructions", "state_template", "input_tokens", "context_tokens",
 )
 

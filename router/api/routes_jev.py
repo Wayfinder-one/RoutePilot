@@ -20,15 +20,16 @@
    服务的问题节点。新建/更新/删除都在同一事务里写 ``changes`` 审计行
    （``kind="jev"``，含 ``synced_trees``）。
 
-密钥通道：真实 ``api_key`` 只存在数据库列里，任何响应、影响清单、替代目录与
-审计都不回显；``key_source`` 是派生状态（stored/env/none），不是密钥本身。
+密钥通道（v7 起彻底移出外围）：目录不再保存、查询或回显任何 JEV 密钥材料，
+``api_key`` 是未知字段（422），``key_source``/``key_present`` 派生状态已删除；
+真实密钥只由内核从 ``ROUTER_JEV_API_KEY`` 环境变量读取。目录投影里的
+``key_env`` 固定为该环境变量名，仅供图文档/画布运行配置 schema 兼容。
 
 旧单配置形态（单配置 PUT、单一 test 端点、独立 window 读写入口）已删除，
 不保留兼容层。
 """
 from __future__ import annotations
 
-import os
 import sqlite3
 from typing import Any
 
@@ -58,18 +59,18 @@ from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
 )
-from router.jev.service import JevService
+from router.jev.service import JEV_KEY_ENV, JevService
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ChangeRepo, now_iso
 
 router = APIRouter()
 
-#: ``JevService`` 的字段集合（api_key 只进数据库列，不属于领域 DTO）。
+#: DTO 可写的 ``JevService`` 非密钥字段；``key_env`` 固定为内核环境变量名，
+#: 不再由请求体决定（密钥本身 v7 起根本不进外围）。
 _SERVICE_FIELDS = (
     "id",
     "base_url",
     "model",
-    "key_env",
     "timeout_seconds",
     "instructions",
     "state_template",
@@ -82,9 +83,9 @@ class JevServiceIn(BaseModel):
     """``POST /admin/jev`` / ``PUT /admin/jev/{id}`` 请求 DTO：未知字段一律拒绝。
 
     值的类型与内容校验由 ``JevService.__post_init__`` 一体完成（原文案保持），
-    因此这里只做显式字段过滤。``api_key`` 单独写入数据库列，不进 ``JevService``；
-    ``impact_confirmation`` 在 PUT（更新被引用服务）时是两阶段确认载荷，POST
-    （新建）没有受影响画布而忽略。
+    因此这里只做显式字段过滤。``api_key``/``key_env`` 已随 v7 删除：密钥只在
+    内核环境变量里，未知字段一律 422；``impact_confirmation`` 在 PUT（更新被
+    引用服务）时是两阶段确认载荷，POST（新建）没有受影响画布而忽略。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -92,8 +93,6 @@ class JevServiceIn(BaseModel):
     id: Any = None
     base_url: Any = None
     model: Any = None
-    key_env: Any = ""
-    api_key: Any = None
     timeout_seconds: Any = 10.0
     instructions: Any = DEFAULT_INSTRUCTIONS
     state_template: Any = DEFAULT_STATE_TEMPLATE
@@ -126,43 +125,25 @@ def _provided(body: BaseModel, name: str, fallback):
     return getattr(body, name) if name in body.model_fields_set else fallback
 
 
-def _validate_api_key(body: BaseModel, *, allow_null: bool) -> None:
-    """校验显式传入的 ``api_key``。
-
-    ``allow_null=True``（POST）把显式 null 当作「不提供密钥」；``allow_null=False``
-    （PUT）下 null 与省略不同：省略表示保留已存密钥，显式 null 是非法值。两种
-    情况下非字符串都是 422。
-    """
-    if "api_key" not in body.model_fields_set:
-        return
-    if body.api_key is None and allow_null:
-        return
-    if not isinstance(body.api_key, str):
-        raise HTTPException(422, detail="api_key must be a string")
-
-
 def _service_from_body(body: JevServiceIn, defaults: dict | None = None) -> JevService:
     base = defaults or {}
     values = {
         field: _provided(body, field, base.get(field, getattr(body, field)))
         for field in _SERVICE_FIELDS
     }
+    # key_env 是图文档兼容字段：固定内核环境变量名，请求体无法改写。
+    values["key_env"] = JEV_KEY_ENV
     try:
         return JevService(**values)
     except ValueError as exc:
         raise HTTPException(422, detail=str(exc)) from exc
 
 
-def _public_service(conn: sqlite3.Connection, service: JevService) -> dict:
-    """公共投影：非密钥快照字段 + 窗口 + 派生密钥状态；绝不包含 api_key。"""
-    repo = JevServiceRepo(conn)
-    stored = repo.stored_api_key(service)
-    env_present = bool(service.key_env and os.environ.get(service.key_env))
+def _public_service(service: JevService) -> dict:
+    """公共投影：非密钥快照字段 + 窗口；没有任何密钥材料或密钥派生状态。"""
     return {
         **service.snapshot_dict(),
         **service.window_dict(),
-        "key_present": bool(stored or env_present),
-        "key_source": "stored" if stored else "env" if env_present else "none",
     }
 
 
@@ -193,21 +174,6 @@ _AUDIT_CHANGE_FIELDS = (
 )
 
 
-def _key_state_intent(body: JevServiceIn, existing: JevService,
-                      service: JevService) -> str:
-    """更新审计的密钥意图枚举（set / cleared / preserved），绝不记录密钥值。
-
-    与 ``JevServiceRepo.save(api_key=None)`` 的保留规则一致：只有 base_url 与
-    model 都不变时才保留已存密钥；端点/模型变化但未显式提供 api_key 时旧密钥
-    被清除。
-    """
-    if "api_key" in body.model_fields_set:
-        return "set" if body.api_key else "cleared"
-    if existing.base_url == service.base_url and existing.model == service.model:
-        return "preserved"
-    return "cleared"
-
-
 def _changed_audit_fields(existing: JevService, service: JevService) -> dict:
     return {
         field: getattr(service, field)
@@ -234,7 +200,7 @@ def _jev_replacements(conn: sqlite3.Connection, service_id: str) -> list[dict]:
 @router.get("/jev")
 def get_jev(conn: sqlite3.Connection = Depends(get_conn)):
     repo = JevServiceRepo(conn)
-    return {"services": [_public_service(conn, service) for service in repo.list()]}
+    return {"services": [_public_service(service) for service in repo.list()]}
 
 
 @router.post("/jev", status_code=201)
@@ -242,7 +208,6 @@ async def post_jev(
     body: JevServiceIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    _validate_api_key(body, allow_null=True)
     service = _service_from_body(body)
     repo = JevServiceRepo(conn)
     if repo.get(service.id) is not None:
@@ -252,7 +217,7 @@ async def post_jev(
         # 锁内再查一次：路由层检查与事务之间可能有另一个请求抢先创建同 id。
         if JevServiceRepo(c).get(service.id) is not None:
             raise AlreadyExists(f"jev service {service.id} 已存在")
-        JevServiceRepo(c).save(service, api_key=body.api_key)
+        JevServiceRepo(c).save(service)
 
     def audit(c):
         ChangeRepo(c).record(now_iso(), "jev", {
@@ -267,13 +232,13 @@ async def post_jev(
     await commit_catalog_write(
         request, catalog_service(request, conn),
         db_write=db_write, candidates=[], audit=audit)
-    return {"service": _public_service(conn, service)}
+    return {"service": _public_service(service)}
 
 
 @router.get("/jev/{service_id}")
 def get_jev_service(service_id: str, conn: sqlite3.Connection = Depends(get_conn)):
     repo = JevServiceRepo(conn)
-    return {"service": _public_service(conn, _require(repo, service_id))}
+    return {"service": _public_service(_require(repo, service_id))}
 
 
 @router.put("/jev/{service_id}")
@@ -286,7 +251,6 @@ async def put_jev_service(
     existing = _require(repo, service_id)
     if "id" in body.model_fields_set and body.id != service_id:
         raise HTTPException(422, detail="id in body must match path")
-    _validate_api_key(body, allow_null=False)
     service = _service_from_body(body, _defaults(existing))
 
     tree_list = await request.app.state.core.list_graphs()
@@ -304,17 +268,13 @@ async def put_jev_service(
     def db_write(c):
         if JevServiceRepo(c).get(service_id) is None:
             raise MissingError(f"unknown jev service {service_id}")
-        # 未提供 api_key 时交给仓储的端点匹配规则：仅 base_url+model 不变才复用旧密钥。
-        JevServiceRepo(c).save(
-            service,
-            api_key=body.api_key if "api_key" in body.model_fields_set else None)
+        JevServiceRepo(c).save(service)
 
     def audit(c):
         ChangeRepo(c).record(now_iso(), "jev", {
             "action": "update", "id": service_id, "model": service.model,
-            # 只记录非密钥事实：变化的字段值 + 密钥意图枚举（不含密钥本身）。
+            # 只记录非密钥事实：变化的目录字段（不存在密钥或密钥意图）。
             **_changed_audit_fields(existing, service),
-            "key_state": _key_state_intent(body, existing, service),
             "synced_trees": synced,
         })
 
@@ -329,7 +289,7 @@ async def put_jev_service(
     await commit_catalog_write(
         request, catalog_service(request, conn),
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
-    return {"service": _public_service(conn, service), "synced_trees": synced}
+    return {"service": _public_service(service), "synced_trees": synced}
 
 
 @router.delete("/jev/{service_id}")
@@ -411,12 +371,15 @@ async def test_jev_service(
     service_id: str, body: JevTestIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    """用数据库目录里的服务配置试连：不读取任何图的画布快照。"""
+    """用数据库目录里的服务配置试连：不读取任何图的画布快照。
+
+    JEV 密钥属于内核：外围进程只在显式配置了 ``settings.jev_api_key`` 时带上它
+    （分裂部署的外围容器没有该环境变量），绝不再读 SQLite 或页面输入。
+    """
     repo = JevServiceRepo(conn)
     service = _require(repo, service_id)
     settings = service.settings(
-        api_key=repo.stored_api_key(service)
-        or (os.environ.get(service.key_env, "") if service.key_env else ""))
+        api_key=getattr(request.app.state.settings, "jev_api_key", ""))
     text = body.text if "text" in body.model_fields_set else "请选择一个候选以验证决策服务。"
     if not isinstance(text, str) or len(text) > 10000:
         raise HTTPException(422, detail="text must be a string of at most 10000 characters")

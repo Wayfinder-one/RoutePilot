@@ -48,7 +48,6 @@ def test_lower_layers_never_import_api():
     roots = [
         Path("router/control"), Path("router/routing"),
         Path("router/upstream"), Path("router/store"),
-        Path("router/request_logging.py"),
     ]
     paths = [path for root in roots
              for path in ([root] if root.is_file() else root.rglob("*.py"))]
@@ -66,6 +65,17 @@ def test_lower_layers_never_import_api():
                    for module in modules):
                 offenders.append(str(path))
     assert offenders == []
+
+
+def test_sqlite_decision_log_writer_is_deleted():
+    """v7 起外围没有 SQLite 决策日志 writer / 图快照序列化模块（只留内存事件）。"""
+    assert not Path("router/request_logging.py").exists()
+    assert not Path("router/request_snapshots.py").exists()
+    for path in Path("router").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        assert "RequestLogger" not in text, path
+        assert "router.request_snapshots" not in text, path
+        assert "router.request_logging" not in text, path
 
 
 def test_no_legacy_runtime_fallback_symbols():

@@ -83,8 +83,7 @@ def conn(settings):
         ModelRepo(connection).create(model, model, "local", json.dumps({"capability": f"{model} 能力"}))
     JevServiceRepo(connection).save(
         JevService("default", "http://jev.test", "NeoHorse-Jev-4B",
-                   key_env="ROUTER_JEV_API_KEY", timeout_seconds=5.0),
-        api_key="jev-secret")
+                   key_env="ROUTER_JEV_API_KEY", timeout_seconds=5.0))
     yield connection
     connection.close()
 
@@ -303,12 +302,10 @@ def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
     with conn:
         JevServiceRepo(conn).save(JevService(
             "jev-a", "http://jev-a.test", "jev-a-model",
-            key_env="JEV_A_API_KEY", timeout_seconds=5.0),
-            api_key="jev-a-stored-secret")
+            key_env="JEV_A_API_KEY", timeout_seconds=5.0))
         JevServiceRepo(conn).save(JevService(
             "jev-b", "http://jev-b-stored.test", "jev-b-stored-model",
-            key_env="JEV_B_API_KEY", timeout_seconds=5.0),
-            api_key="jev-b-stored-secret")
+            key_env="JEV_B_API_KEY", timeout_seconds=5.0))
 
     values = runtime_dict()
     values["jev"] = {
@@ -327,11 +324,9 @@ def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
     assert snapshot.tree.runtime.jev.id == "jev-b"
     assert snapshot.jev.base_url == "http://jev-b-canvas.test"
     assert snapshot.jev.model == "jev-b-canvas-model"
-    # B 无可用密钥；A 的环境变量/已存密钥都不得附着到 B 上。
+    # B 无可用密钥；A 的环境变量都不得附着到 B 上（目录已不再有密钥列）。
     assert snapshot.jev.api_key == ""
     assert "jev-a-env-secret" not in snapshot.content
-    assert "jev-a-stored-secret" not in snapshot.content
-    assert "jev-b-stored-secret" not in snapshot.content
 
 
 def test_jev_key_env_is_never_replaced_by_the_global_router_variable(conn, monkeypatch):

@@ -1038,27 +1038,6 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_terminal_result_is_appended_only_once():
-    import time
-    from router.api.request_presenter import OutcomeRecorder
-
-    class Logger:
-        def __init__(self):
-            self.results = []
-
-        def enqueue_result(self, record):
-            self.results.append(record)
-
-    logger = Logger()
-    record = {"trace": [], "model": "safe", "routing_ms": 2.0, "waves": 0}
-    outcome = OutcomeRecorder(logger, record, time.monotonic())
-    assert outcome.finish(outcome_state="completed", upstream_status=200) is True
-    assert outcome.finish(outcome_state="upstream_error", upstream_status=503) is False
-    assert len(logger.results) == 1
-    assert [event["event"] for event in record["trace"]] == ["request_outcome"]
-    assert record["trace"][0]["outcome_state"] == "completed"
-
-
 def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
     async def scenario():
         def handler(request):

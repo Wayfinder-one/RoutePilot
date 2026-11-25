@@ -99,23 +99,29 @@ def test_request_recent_returns_memory_ring(client):
 
 
 def test_restart_never_restores_decision_logs_from_sqlite(tmp_path):
-    """决策日志只存在内存：旧 SQLite 账本行重启后既不进水台列表也不可回放。"""
+    """决策日志只存在内存：v6 旧 SQLite 账本行在 v7 迁移后既不进水台列表也不可回放。"""
+    from tests.test_db import build_v6_database
+
     settings = test_settings(tmp_path)
-    conn = connect(settings.db_path)
-    try:
-        migrate(conn)
-        conn.execute(
-            "INSERT INTO request_logs (id, ts, decision, model) "
-            "VALUES ('legacy-row', '2026-11-03T18:59:00+08:00', 'route', 'fast')")
-        conn.commit()
-    finally:
-        conn.close()
+    conn = build_v6_database(settings.db_path)
+    conn.execute(
+        "INSERT INTO request_logs (id, ts, decision, model) "
+        "VALUES ('legacy-row', '2026-11-03T18:59:00+08:00', 'route', 'fast')")
+    conn.commit()
+    conn.close()
 
     app = create_app(settings)
     with TestClient(app) as client:
         assert client.get("/admin/requests/recent").json() == {"requests": []}
         assert client.get("/admin/requests/legacy-row/replay").status_code == 404
         assert client.get("/admin/requests/stats").json()["ring_size"] == 0
+    conn = connect(settings.db_path)
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert not {"request_logs", "graph_snapshots", "request_snapshots"} & tables
+    finally:
+        conn.close()
 
 
 def _receive_event(client, event):
@@ -164,15 +170,14 @@ def test_replay_url_encodes_decision_id(tmp_path):
 
 
 def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_path):
-    """Upstream Authorization / JEV key / raw session never enter the decision event."""
+    """Upstream Authorization / caller key / raw session never enter the decision event."""
     settings = test_settings(tmp_path)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
         JevServiceRepo(conn).save(
             JevService("default", "http://jev.test", "NeoHorse-Jev-4B",
-                       timeout_seconds=5.0),
-            api_key="jev-secret-value")
+                       timeout_seconds=5.0))
     finally:
         conn.close()
     repo = RoutingTreeRepo(settings.graph_dir)
@@ -181,7 +186,6 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
         root=_question_root(), enabled=True, default=True)))
 
     upstream_secret = "upstream-secret-value"
-    jev_secret = "jev-secret-value"
     session_secret = "raw-session-secret-value"
     caller_secret = "caller-secret-value"
     body_text = "正文机密-value"
@@ -246,7 +250,7 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
         assert body["tree"]["root"]["type"] == "graph"
         assert any(event["event"] == "final" for event in body["trace"])
         assert isinstance(body["request"].get("session_hash"), str)
-        for secret in (upstream_secret, jev_secret, session_secret, caller_secret):
+        for secret in (upstream_secret, session_secret, caller_secret):
             assert secret not in replay.text, f"memory decision log leaked {secret}"
             assert secret not in kernel_event_text, f"kernel event leaked {secret}"
 

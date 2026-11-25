@@ -184,10 +184,13 @@ def install_engine(app, scenario=None):
 def row_counts(app) -> dict:
     conn = connect(app.state.settings.db_path)
     try:
-        return {
-            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("changes", "request_logs")
-        }
+        # v7 没有 SQLite 决策日志表：账本写只有 changes 审计行。
+        counts = {"changes": conn.execute("SELECT COUNT(*) FROM changes").fetchone()[0]}
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        counts["legacy_log_tables"] = len(
+            {"request_logs", "graph_snapshots", "request_snapshots"} & tables)
+        return counts
     finally:
         conn.close()
 

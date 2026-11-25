@@ -3,7 +3,7 @@
 The kernel owns the graph JSON, graph management (create/update/enable/try),
 graph execution/JEV selection and the decision event output.  It deliberately
 contains **none** of the peripheral capabilities: no SQLite (no
-migration/seed/catalog/breaker store), no ``RequestLogger`` or maintenance
+migration/seed/catalog/breaker store), no request-log writer or maintenance
 worker, no console static mount, no users/providers/logs/admin routes and no
 model upstream execution (``UpstreamProxy`` is never constructed here).  The
 only HTTP client it holds is used by the configured JEV service and by the

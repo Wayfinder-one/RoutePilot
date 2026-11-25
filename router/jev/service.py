@@ -1,9 +1,12 @@
 """多 JEV 服务的公开配置模型。
 
 这里只保存可写入画布快照与运行时的非密钥字段：服务 ``id``、连接地址、模型、
-``key_env``、超时与提示词模板，以及属于同一服务的输入/上下文窗口。真实密钥
-永远留在 ``jev_services`` 表或 ``key_env`` 指向的环境变量里，不出现在
-``snapshot_dict()`` 或任何图 JSON 中。
+超时与提示词模板，以及属于同一服务的输入/上下文窗口。真实密钥不再由本进程或
+SQLite 管理：内核只从环境变量（``ROUTER_JEV_API_KEY``）读取。
+
+``key_env`` 是图文档/画布运行配置里的**环境变量名**字段（非密钥、schema 兼容）；
+目录 API 与仓储读取都把它固定为 :data:`JEV_KEY_ENV`，只有从图 JSON 解析出的
+运行时快照会保留文档里已有的旧值，保证图文档读写往返不丢字段。
 """
 
 from __future__ import annotations
@@ -16,6 +19,9 @@ from router.jev.config import (
 )
 from router.jev.window import JevWindow
 
+#: 图文档兼容字段：JEV 密钥只由内核从该环境变量读取。
+JEV_KEY_ENV = "ROUTER_JEV_API_KEY"
+
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -25,7 +31,7 @@ class JevService:
     id: str
     base_url: str
     model: str
-    key_env: str = ""
+    key_env: str = JEV_KEY_ENV
     timeout_seconds: float = 10.0
     instructions: str = DEFAULT_INSTRUCTIONS
     state_template: str = DEFAULT_STATE_TEMPLATE
@@ -51,6 +57,8 @@ class JevService:
         )
 
     def snapshot_dict(self) -> dict:
+        # key_env 只是环境变量名（图文档兼容字段），不是密钥；目录构造/读取都把
+        # 它固定为 JEV_KEY_ENV，真实密钥值永远不进入快照。
         return {
             "id": self.id, "base_url": self.base_url, "model": self.model,
             "key_env": self.key_env, "timeout_seconds": self.timeout_seconds,

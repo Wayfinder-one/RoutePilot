@@ -256,7 +256,8 @@ def test_restart_clears_the_memory_decision_logs(tmp_path):
     assert restarted.get("/admin/requests/volatile/replay").status_code == 404
 
 
-def test_memory_logs_never_write_the_legacy_sqlite_log_tables(tmp_path):
+def test_decision_log_store_has_no_sqlite_log_tables(tmp_path):
+    """v7 迁移删除了三张旧日志表：内存事件没有任何 SQLite 落点。"""
     settings = test_settings(tmp_path)
     app = create_app(settings)
     client = TestClient(app)
@@ -264,9 +265,9 @@ def test_memory_logs_never_write_the_legacy_sqlite_log_tables(tmp_path):
         assert _receive(client, _event(f"mem-{index}")).status_code == 200
     conn = connect(settings.db_path)
     try:
-        for table in ("request_logs", "graph_snapshots", "request_snapshots"):
-            count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            assert count == 0, f"decision log event wrote the legacy table {table}"
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert not {"request_logs", "graph_snapshots", "request_snapshots"} & tables
     finally:
         conn.close()
 

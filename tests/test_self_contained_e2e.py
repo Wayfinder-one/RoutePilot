@@ -44,7 +44,6 @@ UPSTREAM_ORIGIN = "http://json-only.test"
 JEV_ORIGIN = "http://jev-json.test"
 ENV_SECRET = "sk-env-json-secret"
 STORED_PROVIDER_SECRET = "sk-stored-provider-sample"
-STORED_JEV_SECRET = "sk-stored-jev-sample"
 PERIODS = ("peak", "normal", "offpeak")
 
 
@@ -247,11 +246,11 @@ def _seed_matching_catalog(settings) -> None:
 
 
 def _seed_secret_matching_catalog(settings, document=None) -> None:
-    """目录里放端点匹配的已存密钥：provider local + 画布模型 + JEV 服务。
+    """目录里放端点匹配的已存 Provider Key + 画布模型 + 非密钥 JEV 服务。
 
     拆分后 Auto 执行必须能在外围目录里解析出内核决策的逻辑模型，因此这里与
     ``_seed_matching_catalog`` 一样写入画布声明的模型，只是 Provider Key 用
-    已存密钥而不是环境变量。
+    已存密钥而不是环境变量。JEV Key 属于内核环境，v7 起目录不保存它。
     """
     document = _portable_document() if document is None else document
     service = document["jev"]
@@ -279,7 +278,7 @@ def _seed_secret_matching_catalog(settings, document=None) -> None:
             state_template=service["state_template"],
             input_tokens=window["input_tokens"],
             context_tokens=window["context_tokens"],
-        ), api_key=STORED_JEV_SECRET)
+        ))
     finally:
         conn.close()
 
@@ -798,7 +797,7 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     settings = test_settings(base)
     _empty_database(settings.db_path)
     _install_document(settings, _portable_document())
-    # 端点匹配的已存密钥：provider local（与画布 base_url/key_env 匹配）与 jev-a。
+    # 端点匹配的已存密钥：provider local（与画布 base_url/key_env 匹配）。
     _seed_secret_matching_catalog(settings)
     calls = {"jev": [], "upstream": []}
     app = _split_app(settings, calls)
@@ -819,7 +818,7 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     assert calls["upstream"][-1]["authorization"] == \
         f"Bearer {STORED_PROVIDER_SECRET}"
 
-    secrets = (ENV_SECRET, STORED_PROVIDER_SECRET, STORED_JEV_SECRET)
+    secrets = (ENV_SECRET, STORED_PROVIDER_SECRET)
     derived = ("api_key", "authorization", "key_present", "key_source")
 
     # 1) 图目录的所有文件（画布 JSON + current）不含密钥或派生密钥字段。

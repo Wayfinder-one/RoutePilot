@@ -1,166 +1,103 @@
-import pytest
+"""``jev_services`` 存储：只保存非密钥目录字段，密钥不再进入 SQLite。
+
+v7 删除了 ``api_key`` 列与 ``stored_api_key()`` 读取接口；``snapshot_dict()``
+仍输出固定的内核环境变量名，仅供图文档/画布运行配置兼容。
+"""
+import inspect
 
 from router.jev.service import JevService
-from router.jev.window import (
-    DEFAULT_CONTEXT_TOKENS,
-    DEFAULT_INPUT_TOKENS,
-    MIN_CONTEXT_TOKENS,
-    MIN_INPUT_TOKENS,
-    JevWindow,
-)
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
 
 
-def service(service_id="jev-a", model="d1-a", base_url="http://jev-a.test"):
-    return JevService(
-        id=service_id, base_url=base_url, model=model,
-        key_env="JEV_A_API_KEY", input_tokens=2048, context_tokens=4096,
-    )
+def service(service_id="jev-a", model="d1-a", base_url="http://jev-a.test", **overrides):
+    values = {
+        "id": service_id, "base_url": base_url, "model": model,
+        "key_env": "JEV_A_API_KEY", "input_tokens": 2048, "context_tokens": 4096,
+    }
+    values.update(overrides)
+    return JevService(**values)
 
 
-def build_v5_database(path, settings, *, create_settings=True):
-    """Build a legacy v5 database: version 5, singleton ``jev_config`` + settings."""
-    conn = connect(path)
-    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
-    conn.execute("INSERT INTO schema_migrations VALUES (5)")
-    conn.execute("""CREATE TABLE jev_config (
-        id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL,
-        model TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '',
-        timeout_seconds REAL NOT NULL, instructions TEXT NOT NULL,
-        state_template TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-    if create_settings:
-        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
-        conn.executemany("INSERT INTO settings VALUES (?, ?)", settings)
-    conn.execute("""INSERT INTO jev_config VALUES
-        (1, 'http://old-jev.test', 'd1-old', 'old-secret', 5.0, '指令',
-         '【请求】{request}', '2026-11-01T00:00:00+00:00')""")
-    conn.commit()
-    return conn
+def _columns(conn):
+    return {row[1] for row in conn.execute("PRAGMA table_info(jev_services)")}
 
 
-def test_service_roundtrip_has_no_secret_in_snapshot(tmp_path):
+def test_service_roundtrip_has_no_secret_and_fixed_kernel_key_env(tmp_path):
     conn = connect(str(tmp_path / "new.db"))
     migrate(conn)
     repo = JevServiceRepo(conn)
-    repo.save(service(), api_key="secret-sample")
+    repo.save(service())
     loaded = repo.get("jev-a")
+    assert loaded.id == "jev-a"
+    assert loaded.base_url == "http://jev-a.test"
+    assert loaded.model == "d1-a"
     assert loaded.snapshot_dict() == {
         "id": "jev-a", "base_url": "http://jev-a.test", "model": "d1-a",
-        "key_env": "JEV_A_API_KEY", "timeout_seconds": 10.0,
+        "key_env": "ROUTER_JEV_API_KEY", "timeout_seconds": 10.0,
         "instructions": loaded.instructions, "state_template": loaded.state_template,
     }
     assert loaded.window_dict() == {"input_tokens": 2048, "context_tokens": 4096}
-    assert repo.stored_api_key(loaded) == "secret-sample"
     assert "api_key" not in loaded.snapshot_dict()
+    assert "api_key" not in _columns(conn)
+    conn.close()
 
 
-def test_v5_singleton_migrates_to_default_service(tmp_path):
-    path = str(tmp_path / "old.db")
-    conn = connect(path)
-    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
-    conn.execute("INSERT INTO schema_migrations VALUES (5)")
-    conn.execute("""CREATE TABLE jev_config (
-        id INTEGER PRIMARY KEY CHECK (id = 1), base_url TEXT NOT NULL,
-        model TEXT NOT NULL, api_key TEXT NOT NULL DEFAULT '',
-        timeout_seconds REAL NOT NULL, instructions TEXT NOT NULL,
-        state_template TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-    conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
-    conn.execute("INSERT INTO settings VALUES ('jev_input_tokens', '2048')")
-    conn.execute("INSERT INTO settings VALUES ('jev_context_tokens', '4096')")
-    conn.execute("""INSERT INTO jev_config VALUES
-        (1, 'http://old-jev.test', 'd1-old', 'old-secret', 5.0, '指令',
-         '【请求】{request}', '2026-11-01T00:00:00+00:00')""")
-    migrate(conn)
-    loaded = JevServiceRepo(conn).get("default")
-    assert loaded.base_url == "http://old-jev.test"
-    assert loaded.input_tokens == 2048 and loaded.context_tokens == 4096
-    assert JevServiceRepo(conn).stored_api_key(loaded) == "old-secret"
-    assert conn.execute("SELECT 1 FROM sqlite_master WHERE name='jev_config'").fetchone() is None
-
-
-@pytest.mark.parametrize(
-    ("settings", "expected"),
-    [
-        # 旧窗口读路径读时收口：context 256 -> 512，input 99999 -> context。
-        ((("jev_input_tokens", "99999"), ("jev_context_tokens", "256")),
-         (MIN_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS)),
-        # 低于下限 -> 各自下限。
-        ((("jev_input_tokens", "-5"), ("jev_context_tokens", "256")),
-         (MIN_INPUT_TOKENS, MIN_CONTEXT_TOKENS)),
-        # input 超过合法 context -> 收口到 context。
-        ((("jev_input_tokens", "99999"), ("jev_context_tokens", "4096")),
-         (DEFAULT_CONTEXT_TOKENS, DEFAULT_CONTEXT_TOKENS)),
-        # 非数字 -> 回落默认值（与旧窗口读路径一致）。
-        ((("jev_input_tokens", "not-a-number"), ("jev_context_tokens", "not-a-number")),
-         (DEFAULT_INPUT_TOKENS, DEFAULT_CONTEXT_TOKENS)),
-        # settings 缺这两个键 -> 默认值。
-        ((), (DEFAULT_INPUT_TOKENS, DEFAULT_CONTEXT_TOKENS)),
-    ],
-)
-def test_v5_out_of_range_window_migrates_clamped_and_listable(tmp_path, settings, expected):
-    conn = build_v5_database(str(tmp_path / "old.db"), settings)
-    migrate(conn)
-    services = JevServiceRepo(conn).list()  # 严格校验：非法窗口会让这里永久 ValueError
-    assert [item.id for item in services] == ["default"]
-    loaded = services[0]
-    assert (loaded.input_tokens, loaded.context_tokens) == expected
-    JevWindow(loaded.input_tokens, loaded.context_tokens)
-
-
-def test_v5_missing_settings_table_falls_back_to_default_window(tmp_path):
-    conn = build_v5_database(str(tmp_path / "old.db"), (), create_settings=False)
-    migrate(conn)
-    loaded = JevServiceRepo(conn).get("default")
-    assert (loaded.input_tokens, loaded.context_tokens) == (
-        DEFAULT_INPUT_TOKENS, DEFAULT_CONTEXT_TOKENS)
-
-
-def test_save_none_api_key_preserves_key_when_endpoint_and_model_unchanged(tmp_path):
+def test_save_takes_no_api_key_argument(tmp_path):
     conn = connect(str(tmp_path / "new.db"))
     migrate(conn)
     repo = JevServiceRepo(conn)
-    repo.save(service(), api_key="secret-sample")
-    repo.save(service(), api_key=None)  # 仅更新非密钥字段
-    assert repo.stored_api_key(service()) == "secret-sample"
+    parameters = inspect.signature(JevServiceRepo.save).parameters
+    assert list(parameters) == ["self", "service"]
+    assert "api_key" not in inspect.signature(repo.save).parameters
+    assert not hasattr(repo, "stored_api_key")
+    conn.close()
 
 
-@pytest.mark.parametrize("changed", [
-    {"base_url": "http://jev-b.test"},
-    {"model": "d1-b"},
-])
-def test_save_none_api_key_drops_old_key_when_endpoint_or_model_changes(tmp_path, changed):
+def test_catalog_read_fixes_key_env_to_the_kernel_variable(tmp_path):
+    """旧数据可能带着任意环境变量名；目录读取只输出内核固定变量名。"""
     conn = connect(str(tmp_path / "new.db"))
     migrate(conn)
     repo = JevServiceRepo(conn)
-    repo.save(service(), api_key="secret-sample")
-    repo.save(service(**changed), api_key=None)
-    row = conn.execute(
-        "SELECT base_url, model, api_key FROM jev_services WHERE id = 'jev-a'"
-    ).fetchone()
-    assert row["api_key"] == ""
-    assert repo.stored_api_key(service(**changed)) == ""
-
-
-def test_save_empty_api_key_clears_stored_key(tmp_path):
-    conn = connect(str(tmp_path / "new.db"))
-    migrate(conn)
-    repo = JevServiceRepo(conn)
-    repo.save(service(), api_key="secret-sample")
-    repo.save(service(), api_key="")
-    assert repo.stored_api_key(service()) == ""
+    repo.save(service(key_env="LEGACY_JEV_API_KEY"))
+    loaded = repo.get("jev-a")
+    assert loaded.key_env == "ROUTER_JEV_API_KEY"
+    assert loaded.snapshot_dict()["key_env"] == "ROUTER_JEV_API_KEY"
+    # 列值只是历史数据，升级时按非密钥列保留；读取投影不再使用它。
     assert conn.execute(
-        "SELECT api_key FROM jev_services WHERE id = 'jev-a'").fetchone()["api_key"] == ""
+        "SELECT key_env FROM jev_services WHERE id = 'jev-a'").fetchone()[0] == (
+            "LEGACY_JEV_API_KEY")
+    conn.close()
 
 
-@pytest.mark.parametrize("changed", [
-    {"base_url": "http://jev-b.test"},
-    {"model": "d1-b"},
-])
-def test_stored_api_key_requires_endpoint_and_model_match(tmp_path, changed):
+def test_upsert_updates_non_secret_config_and_window(tmp_path):
     conn = connect(str(tmp_path / "new.db"))
     migrate(conn)
     repo = JevServiceRepo(conn)
-    repo.save(service(), api_key="secret-sample")
-    assert repo.stored_api_key(service(**changed)) == ""
-    assert repo.stored_api_key(service()) == "secret-sample"
+    repo.save(service())
+    repo.save(service(model="d1-b", base_url="http://jev-b.test",
+                      timeout_seconds=4.5, instructions="新指令",
+                      state_template="新模板 {request}",
+                      input_tokens=1024, context_tokens=3072))
+    loaded = repo.get("jev-a")
+    assert (loaded.base_url, loaded.model) == ("http://jev-b.test", "d1-b")
+    assert loaded.timeout_seconds == 4.5
+    assert loaded.instructions == "新指令"
+    assert loaded.state_template == "新模板 {request}"
+    assert loaded.window_dict() == {"input_tokens": 1024, "context_tokens": 3072}
+    assert len(repo.list()) == 1
+    conn.close()
+
+
+def test_list_is_ordered_by_id_and_delete_reports_missing(tmp_path):
+    conn = connect(str(tmp_path / "new.db"))
+    migrate(conn)
+    repo = JevServiceRepo(conn)
+    for service_id in ("jev-c", "jev-a", "jev-b"):
+        repo.save(service(service_id))
+    assert [item.id for item in repo.list()] == ["jev-a", "jev-b", "jev-c"]
+    assert repo.delete("jev-b") is True
+    assert repo.delete("jev-b") is False
+    assert [item.id for item in repo.list()] == ["jev-a", "jev-c"]
+    assert repo.get("missing") is None
+    conn.close()

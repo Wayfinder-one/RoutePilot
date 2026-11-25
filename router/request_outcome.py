@@ -1,17 +1,19 @@
 """Neutral request-outcome vocabulary shared by the transport and the API layer.
 
-``outcome_state`` is persisted by ``router.request_logging``, recorded by the
-upstream transport and rendered by the console, so the state names are a
-cross-layer contract rather than a presentation detail.  They live in this
-module — not in ``router.api.request_presenter`` — so ``router.upstream`` can
-record an outcome without importing FastAPI, Starlette or ``router.api``.
+``outcome_state`` is recorded by the upstream transport and rendered by the
+console, so the state names are a cross-layer contract rather than a
+presentation detail.  They live in this module — not in
+``router.api.request_presenter`` — so ``router.upstream`` can record an outcome
+without importing FastAPI, Starlette or ``router.api``.
 
 ``OutcomeSink`` is the structural contract the transport records through.  The
 peripheral ``/v1`` data plane passes :class:`DiscardOutcome` (the kernel emits the
 only decision event; execution results are not stored); the admin Test chat and
 unit tests pass lighter fakes that only implement ``finish()``.
-``router.api.request_presenter.OutcomeRecorder`` remains the exactly-once
-finaliser used by callers that do keep a record.
+
+There is no persistent outcome recorder any more: SQLite request logging was
+removed by the core/peripheral split, so the only outcome the peripheral keeps is
+the volatile in-memory decision event.
 """
 from __future__ import annotations
 
@@ -37,9 +39,9 @@ OUTCOME_STATES = (
 class DiscardOutcome:
     """Execution-outcome sink for the peripheral data plane: nothing is stored.
 
-    The peripheral no longer keeps request logs or execution results (design
-    §3.2: the kernel only emits decision events); the upstream transport still
-    reports its terminal outcome through the same structural contract, and this
+    The peripheral keeps no request logs or execution results (design §3.2: the
+    kernel only emits decision events); the upstream transport still reports its
+    terminal outcome through the same structural contract, and this
     implementation deliberately throws every field away.
     """
 
@@ -50,9 +52,8 @@ class DiscardOutcome:
 class OutcomeSink(Protocol):
     """Terminal-outcome recorder owned by the caller, not by the transport.
 
-    Implementations finalise a request record; the first ``finish()`` call wins
-    and later calls are no-ops (``OutcomeRecorder`` enforces this and returns
-    ``False`` for the losers).
+    The first ``finish()`` call wins; later calls are no-ops for implementations
+    that finalise a record.  ``DiscardOutcome`` simply always succeeds.
     """
 
     def finish(

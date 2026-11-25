@@ -1,7 +1,8 @@
-"""管理面多 JEV 服务目录 API：CRUD、密钥通道、逐条连接测试。
+"""管理面多 JEV 服务目录 API：CRUD、非密钥字段与逐条连接测试。
 
 覆盖 spec「多 JEV 目录」：列表/详情/更新/删除/测试都只读数据库目录，不读活动
-画布；公共投影不含 api_key，`key_source` 是 stored|env|none；旧单配置端点已删除。
+画布；目录不再保存或回显任何密钥材料（``api_key``/``key_source``/``key_present``
+全部消失，JEV Key 只由内核环境变量读取）；旧单配置端点已删除。
 本文件的画布目录为空，因此目录写不发生同步（``synced_trees`` 恒为空）；带影响
 画布的两阶段确认同步见 ``tests/test_catalog_impacts.py``。
 """
@@ -71,7 +72,6 @@ def service_payload(service_id="jev-a", **overrides):
         "id": service_id,
         "base_url": "http://" + service_id + ".test",
         "model": "d1-a",
-        "key_env": "JEV_TEST_API_KEY",
         "input_tokens": 1024,
         "context_tokens": 4096,
     }
@@ -88,16 +88,17 @@ def _services(app):
 
 
 # ── 多服务目录契约 ────────────────────────────────────────────────────
-def test_two_jev_services_have_independent_windows_and_no_keys(tmp_path):
+def test_two_jev_services_have_independent_windows_and_no_key_channel(tmp_path):
     client, _app = make_client(tmp_path)
     for service_id, model, tokens in (("jev-a", "d1-a", 1024), ("jev-b", "d1-b", 2048)):
         response = client.post("/admin/jev", json={
             "id": service_id, "base_url": "http://" + service_id + ".test",
-            "model": model, "key_env": "JEV_TEST_API_KEY",
-            "input_tokens": tokens, "context_tokens": 4096,
+            "model": model, "input_tokens": tokens, "context_tokens": 4096,
         })
         assert response.status_code == 201, response.text
-        assert "api_key" not in response.text
+        for removed in ("api_key", "key_source", "key_present"):
+            assert removed not in response.text
+        assert response.json()["service"]["key_env"] == "ROUTER_JEV_API_KEY"
     services = client.get("/admin/jev").json()["services"]
     assert [(s["id"], s["input_tokens"]) for s in services] == [
         ("jev-a", 1024), ("jev-b", 2048)]
@@ -107,13 +108,13 @@ def test_two_jev_services_have_independent_windows_and_no_keys(tmp_path):
 def test_create_get_update_delete_roundtrip(tmp_path):
     client, app = make_client(tmp_path)
     created = client.post("/admin/jev", json=service_payload(
-        base_url="http://jev-a.test", api_key="stored-secret"))
+        base_url="http://jev-a.test"))
     assert created.status_code == 201, created.text
     body = created.json()["service"]
     assert body["id"] == "jev-a"
-    assert body["key_source"] == "stored"
-    assert body["key_present"] is True
-    assert "stored-secret" not in created.text
+    assert body["key_env"] == "ROUTER_JEV_API_KEY"
+    for removed in ("api_key", "key_source", "key_present"):
+        assert removed not in created.text
     assert body["instructions"] == DEFAULT_INSTRUCTIONS
     assert body["state_template"] == DEFAULT_STATE_TEMPLATE
     assert (body["input_tokens"], body["context_tokens"]) == (1024, 4096)
@@ -128,12 +129,13 @@ def test_create_get_update_delete_roundtrip(tmp_path):
     assert updated.json()["synced_trees"] == []
     assert (updated.json()["service"]["input_tokens"],
             updated.json()["service"]["context_tokens"]) == (2048, 8192)
-    # 省略 api_key 且端点不变：密钥保留。
-    assert updated.json()["service"]["key_source"] == "stored"
     conn = connect(app.state.settings.db_path)
     try:
         service = JevServiceRepo(conn).get("jev-a")
-        assert JevServiceRepo(conn).stored_api_key(service) == "stored-secret"
+        assert service is not None
+        assert service.snapshot_dict()["key_env"] == "ROUTER_JEV_API_KEY"
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jev_services)")}
+        assert "api_key" not in columns
     finally:
         conn.close()
 
@@ -146,62 +148,30 @@ def test_create_get_update_delete_roundtrip(tmp_path):
     assert client.delete("/admin/jev/jev-a").status_code == 404
 
 
-def test_catalog_reads_never_echo_secret_from_post_or_put(tmp_path):
-    """POST 新建与 PUT 轮换后的明文密钥都不得出现在任何目录读响应里。"""
-    client, _app = make_client(tmp_path)
-    created = client.post("/admin/jev", json=service_payload(api_key="post-secret"))
-    assert created.status_code == 201, created.text
-    assert "post-secret" not in client.get("/admin/jev").text
-    assert "post-secret" not in client.get("/admin/jev/jev-a").text
-
-    updated = client.put("/admin/jev/jev-a", json={"api_key": "put-secret"})
-    assert updated.status_code == 200, updated.text
-    listing = client.get("/admin/jev").text
-    item = client.get("/admin/jev/jev-a").text
-    assert "post-secret" not in listing + item
-    assert "put-secret" not in listing + item
-
-
-def test_put_without_api_key_preserves_only_for_same_endpoint(tmp_path):
+def test_catalog_rejects_and_never_exposes_key_fields(tmp_path):
+    """目录不再有密钥通道：api_key 是未知字段，读取投影也没有任何密钥状态。"""
     client, app = make_client(tmp_path)
-    client.post("/admin/jev", json=service_payload(api_key="stored-secret"))
-
-    # 同端点省略 api_key → 保留。
-    assert client.put("/admin/jev/jev-a", json={"timeout_seconds": 7}).status_code == 200
+    created = client.post("/admin/jev", json={"id": "jev-a",
+                                              "base_url": "http://jev-a.test",
+                                              "model": "d1-a"})
+    assert created.status_code == 201, created.text
+    for path in ("/admin/jev", "/admin/jev/jev-a"):
+        payload = client.get(path).text
+        for removed in ("api_key", "key_source", "key_present"):
+            assert removed not in payload, (path, removed)
+    rejected = client.post("/admin/jev", json={
+        **service_payload("jev-b"), "api_key": "must-not-be-stored"})
+    assert rejected.status_code == 422, rejected.text
+    assert "Extra inputs are not permitted" in _detail_text(rejected)
+    updated = client.put("/admin/jev/jev-a", json={"api_key": ""})
+    assert updated.status_code == 422, updated.text
+    assert "Extra inputs are not permitted" in _detail_text(updated)
     conn = connect(app.state.settings.db_path)
     try:
-        service = JevServiceRepo(conn).get("jev-a")
-        assert JevServiceRepo(conn).stored_api_key(service) == "stored-secret"
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jev_services)")}
+        assert "api_key" not in columns
     finally:
         conn.close()
-
-    # 换端点省略 api_key → 旧密钥不得跟随到新地址。
-    response = client.put("/admin/jev/jev-a", json={"base_url": "http://new-jev.test"})
-    assert response.status_code == 200, response.text
-    assert response.json()["service"]["key_source"] == "none"
-    conn = connect(app.state.settings.db_path)
-    try:
-        service = JevServiceRepo(conn).get("jev-a")
-        assert JevServiceRepo(conn).stored_api_key(service) == ""
-    finally:
-        conn.close()
-
-    # api_key="" 显式清除。
-    client.put("/admin/jev/jev-a", json={"api_key": "second-secret"})
-    cleared = client.put("/admin/jev/jev-a", json={"api_key": ""})
-    assert cleared.json()["service"]["key_source"] == "none"
-    assert "second-secret" not in cleared.text
-
-
-def test_key_source_env_when_environment_variable_is_present(tmp_path, monkeypatch):
-    client, _app = make_client(tmp_path)
-    response = client.post("/admin/jev", json=service_payload(key_env="JEV_TEST_API_KEY"))
-    assert response.json()["service"]["key_source"] == "none"
-    monkeypatch.setenv("JEV_TEST_API_KEY", "environment-secret")
-    listed = client.get("/admin/jev").json()["services"]
-    assert listed[0]["key_source"] == "env"
-    assert listed[0]["key_present"] is True
-    assert "environment-secret" not in client.get("/admin/jev").text
 
 
 def test_duplicate_id_is_409(tmp_path):
@@ -217,9 +187,9 @@ def test_unknown_service_is_404(tmp_path):
     assert client.put("/admin/jev/missing", json={"model": "m"}).status_code == 404
     assert client.delete("/admin/jev/missing").status_code == 404
     assert client.post("/admin/jev/missing/test", json={}).status_code == 404
-    # 资源存在性先于 body 校验：缺服务时密钥类型 / id / 字段值都不能抢先报 422。
-    for body in ({"api_key": 5}, {"api_key": None}, {"id": "other"},
-                 {"base_url": "not-a-url"}, {"model": ""}):
+    # 资源存在性先于字段值校验：缺服务时 id / 字段值都不能抢先报 422。
+    # （未知字段由 Pydantic 在进入路由前拒绝，这不属于资源存在性语义。）
+    for body in ({"id": "other"}, {"base_url": "not-a-url"}, {"model": ""}):
         response = client.put("/admin/jev/missing", json=body)
         assert response.status_code == 404, (body, response.text)
         assert "unknown jev service missing" in response.json()["detail"]
@@ -245,7 +215,7 @@ def _detail_text(response):
 
 #: 非法字段矩阵：同一组值同时驱动 POST（完整 payload）与 PUT（局部 body），
 #: 期望片段来自端点背后的真实校验（JevService/JevSettings/JevWindow 的
-#: ValueError、``extra="forbid"`` 与 ``_validate_api_key``）。
+#: ValueError 与 ``extra="forbid"``）以及已经移除的密钥字段。
 INVALID_FIELD_CASES = [
     pytest.param("base_url", "http://jev.test?x=1", "base_url", id="base-url-query"),
     pytest.param("base_url", "http://jev.test#frag", "base_url", id="base-url-fragment"),
@@ -253,8 +223,7 @@ INVALID_FIELD_CASES = [
     pytest.param("model", "", "model", id="model-empty"),
     pytest.param("model", "   ", "model", id="model-blank"),
     pytest.param("model", 5, "model", id="model-non-string"),
-    pytest.param("key_env", "bad-env", "key_env", id="key-env-dash"),
-    pytest.param("key_env", "1ABC", "key_env", id="key-env-leading-digit"),
+    pytest.param("key_env", "", "Extra inputs are not permitted", id="key-env-removed"),
     pytest.param("timeout_seconds", 0, "timeout_seconds", id="timeout-zero"),
     pytest.param("timeout_seconds", 121, "timeout_seconds", id="timeout-above-max"),
     pytest.param("timeout_seconds", "abc", "timeout_seconds", id="timeout-non-numeric"),
@@ -280,7 +249,7 @@ INVALID_FIELD_CASES = [
                  id="context-above-max"),
     pytest.param("context_tokens", True, "context_tokens", id="context-bool"),
     pytest.param("context_tokens", "4096", "context_tokens", id="context-string"),
-    pytest.param("api_key", 5, "api_key", id="api-key-non-string"),
+    pytest.param("api_key", 5, "Extra inputs are not permitted", id="api-key-removed"),
     pytest.param("unknown", 1, "Extra inputs are not permitted", id="unknown-field"),
 ]
 
@@ -299,18 +268,13 @@ def test_post_rejects_invalid_field_and_catalog_stays_empty(tmp_path, field, val
 def test_put_rejects_invalid_field_and_catalog_is_unchanged(
         tmp_path, field, value, fragment):
     client, app = make_client(tmp_path)
-    created = client.post("/admin/jev", json=service_payload(api_key="stored-secret"))
+    created = client.post("/admin/jev", json=service_payload())
     assert created.status_code == 201, created.text
     baseline = _services(app)
     response = client.put("/admin/jev/jev-a", json={field: value})
     assert response.status_code == 422, response.text
     assert fragment in _detail_text(response), response.text
     assert _services(app) == baseline
-    conn = connect(app.state.settings.db_path)
-    try:
-        assert JevServiceRepo(conn).stored_api_key(baseline[0]) == "stored-secret"
-    finally:
-        conn.close()
 
 
 @pytest.mark.parametrize("service_id", ["-bad", "a b", "", "bad id!"])
@@ -375,6 +339,8 @@ def test_test_endpoint_calls_real_configured_http_service(tmp_path):
 
     assert len(requests) == 1
     assert requests[0].url == "http://jev.test/v1/systemone"
+    # 外围连接测试没有 JEV 密钥通道：不发送 Authorization（密钥只在核心里）。
+    assert "authorization" not in requests[0].headers
     body = json.loads(requests[0].content)
     assert body["model"] == "NeoHorse-Jev-4B"
     assert list(body["questions"]) == ["route"]

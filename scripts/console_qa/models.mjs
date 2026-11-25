@@ -86,9 +86,10 @@ test('Task 11 · boot unlocks the canvas before catalogues and late catalogue da
 
 /* ── 多 JEV 目录页（jev.html）────────────────────────────────────────────
    页面契约：列表项 [data-jev-service-id]；编辑字段 #jevServiceId/#jevBaseUrl/
-   #jevModel/#jevKeyEnv/#jevTimeout/#jevInstructions/#jevStateTemplate/
+   #jevModel/#jevTimeout/#jevInstructions/#jevStateTemplate/
    #jevInputTokens/#jevContextTokens；动作 #jevNew/#jevSave/#jevTest/#jevDelete。
-   窗口与密钥都属于“当前选中的服务”：切换服务切换窗口；密钥只进写请求。 */
+   窗口属于“当前选中的服务”：切换服务切换窗口；v7 起没有密钥输入/状态控件，
+   密钥只由内核从环境变量读取。 */
 const JEV_SERVICE_ID = 'qa-jev-model';
 
 /* 真实就绪：初始占位是 '—'（非空！），所以不能只等“非空文本”。
@@ -109,7 +110,7 @@ async function openJevDirectory() {
   await waitJevReady();
 }
 
-async function createJevService({ id, model, key, baseUrl, input = 1024, context = 4096, timeout = 5 }) {
+async function createJevService({ id, model, baseUrl, input = 1024, context = 4096, timeout = 5 }) {
   await page.locator('#jevNew').click();
   await page.locator('#jevServiceId').fill(id);
   await page.locator('#jevBaseUrl').fill(baseUrl || mockBase);
@@ -117,7 +118,6 @@ async function createJevService({ id, model, key, baseUrl, input = 1024, context
   await page.locator('#jevTimeout').fill(String(timeout));
   await page.locator('#jevInputTokens').fill(String(input));
   await page.locator('#jevContextTokens').fill(String(context));
-  if (key) await page.locator('#jevApiKey').fill(key);
   await page.locator('#jevSave').click();
   await page.waitForSelector('[data-jev-service-id="' + id + '"]');
 }
@@ -127,9 +127,12 @@ test('P0 decision service directory creates, lists and edits a service', async (
   /* 旧单服务页面的控件已彻底删除（无双轨残留）。 */
   assert.equal(await page.locator('#saveJev, #saveWindow, #winInput, #winContext, #baseUrl, #testJev').count(), 0,
     'legacy single-service controls are still present');
+  /* v7：JEV 目录没有密钥输入/状态控件（密钥只在核心环境里）。 */
+  assert.equal(await page.locator('#jevApiKey, #jevClearKey, #jevKeyEnv').count(), 0,
+    'removed JEV key controls are still present');
   assert.equal(await page.locator('#saveWindow').count(), 0);
 
-  await createJevService({ id: JEV_SERVICE_ID, model: 'd1-model-a', key: 'secret-models-sample' });
+  await createJevService({ id: JEV_SERVICE_ID, model: 'd1-model-a' });
   const item = page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]');
   const listText = (await item.innerText()).replace(/\s+/g, ' ');
   assertIncludes(listText, JEV_SERVICE_ID);
@@ -137,8 +140,6 @@ test('P0 decision service directory creates, lists and edits a service', async (
   assertIncludes(listText, mockBase);
   assertIncludes(listText, '1024 / 4096');
   assert.equal(await page.locator('#jevStatus').innerText(), JEV_SERVICE_ID);
-  assert.equal(await page.locator('text=secret-models-sample').count(), 0,
-    'the stored key material leaked into the page');
 
   /* 编辑当前服务：保存只写这一条目录行，列表与状态随之刷新。 */
   await item.click();
@@ -153,10 +154,12 @@ test('P0 decision service directory creates, lists and edits a service', async (
   assert.equal(saved.instructions, '多服务编辑后的指令');
   assert.equal(saved.input_tokens, 2048);
   assert.match((await page.locator('[data-jev-service-id="' + JEV_SERVICE_ID + '"]').innerText()), /d1-model-b/);
-  /* 目录响应永远不含 api_key / 明文密钥。 */
+  /* 目录响应永远不含密钥材料或密钥派生状态。 */
   const catalog = await (await fetch(routerBase + '/admin/jev')).text();
-  assert.equal(catalog.includes('api_key'), false);
-  assert.equal(catalog.includes('secret-models-sample'), false);
+  for (const removed of ['api_key', 'key_source', 'key_present']) {
+    assert.equal(catalog.includes(removed), false,
+      'GET /admin/jev still exposes removed key field ' + removed);
+  }
 });
 
 test('P0 decision service rejects an invalid window before any write', async () => {

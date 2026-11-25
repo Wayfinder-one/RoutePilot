@@ -295,19 +295,18 @@ def test_secrets_never_leak_into_drift_payloads(json_only):
     runtime = _runtime(app)
     provider = runtime.backends.providers[0]
     env_secret = os.environ["JSON_PROVIDER_API_KEY"]
-    stored_secret = "sk-db-jev-secret-value"
 
     conn = connect(settings.db_path)
     try:
-        # 差异 + 已存真实密钥：provider 的 api_key 与环境变量同值，JEV 再存一个密钥。
+        # 差异 + 已存 Provider 真实密钥：provider 的 api_key 与环境变量同值。
+        # JEV 目录 v7 起没有任何密钥列/参数，真实 JEV Key 只在核心环境里。
         ProviderRepo(conn).upsert(
             provider["name"], "http://drifted-provider.test/v1",
             key_env=provider["key_env"],
             reasoning_format=provider["reasoning_format"],
             api_key=env_secret)
         JevServiceRepo(conn).save(
-            replace(runtime.jev, base_url="http://drifted-jev.test"),
-            api_key=stored_secret)
+            replace(runtime.jev, base_url="http://drifted-jev.test"))
     finally:
         conn.close()
 
@@ -315,14 +314,12 @@ def test_secrets_never_leak_into_drift_payloads(json_only):
     assert response.status_code == 200, response.text
     text = response.text
     assert env_secret not in text
-    assert stored_secret not in text
 
     drifts = _drift_issues(response.json())
     assert drifts, "drifted catalog must produce hints"
     for item in drifts:
         dumped = json.dumps(item, ensure_ascii=False)
         assert env_secret not in dumped
-        assert stored_secret not in dumped
         assert "api_key" not in dumped
         assert "key_present" not in dumped
         assert "key_source" not in dumped
@@ -332,7 +329,6 @@ def test_secrets_never_leak_into_drift_payloads(json_only):
     for path in graph_files:
         raw = path.read_bytes()
         assert env_secret.encode() not in raw
-        assert stored_secret.encode() not in raw
 
 
 # ── 7. 呈现层：params 透出，level 永远是 hint ──────────────────────────

@@ -1,7 +1,7 @@
 """Presentation-boundary tests: machine events/records -> console fields."""
 from __future__ import annotations
 
-from router.api.request_presenter import present_record, present_result_event
+from router.api.request_presenter import present_record
 from router.api.trace_presenter import present_trace
 
 _DISPLAY_FIELDS = {"phase", "label", "cell", "summary", "facts", "tone", "kind_label"}
@@ -329,13 +329,3 @@ def test_present_trace_formats_schedule_and_scheduled_values():
         [{"zh": "模型", "en": "Model"}, "qwen3-8b"],
         [{"zh": "原因", "en": "Reason"}, "target"],
     ]
-
-
-def test_present_result_event_has_outcome_kind_label():
-    outcome = present_result_event({
-        "outcome_state": "completed", "model": "qwen3-8b",
-        "upstream_status": 200, "total_ms": 12.0,
-    })
-    assert outcome["kind_label"] == {"zh": "结果", "en": "Outcome"}
-    # 上游状态与端到端耗时不属于路由决策，不再进入执行结果事实。
-    assert outcome["facts"] == [[{"zh": "模型", "en": "Model"}, "qwen3-8b"]]

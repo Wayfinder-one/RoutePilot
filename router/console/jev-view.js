@@ -44,7 +44,6 @@ let currentId = null;
 let creating = false;
 let saving = false;
 let testing = false;
-let keyPresent = false;
 let lastTest = { state: 'untested', selectedKey: '', ms: null };
 
 /* ── DOM helpers ─────────────────────────────────────────────────────── */
@@ -55,14 +54,6 @@ function fieldValue(id) {
 function setValue(id, value) {
   const el = $('#' + id);
   if (el) el.value = value == null ? '' : String(value);
-}
-function checked(id) {
-  const el = $('#' + id);
-  return !!(el && el.checked);
-}
-function setChecked(id, value) {
-  const el = $('#' + id);
-  if (el) el.checked = !!value;
 }
 function focusField(id) {
   const el = $('#' + id);
@@ -75,14 +66,11 @@ function readDraft() {
     id: fieldValue('jevServiceId').trim(),
     baseUrl: fieldValue('jevBaseUrl').trim(),
     model: fieldValue('jevModel').trim(),
-    keyEnv: fieldValue('jevKeyEnv').trim(),
     timeoutSeconds: fieldValue('jevTimeout'),
     instructions: fieldValue('jevInstructions'),
     stateTemplate: fieldValue('jevStateTemplate'),
     inputTokens: fieldValue('jevInputTokens'),
-    contextTokens: fieldValue('jevContextTokens'),
-    apiKey: fieldValue('jevApiKey'),
-    clearKey: checked('jevClearKey')
+    contextTokens: fieldValue('jevContextTokens')
   };
 }
 
@@ -91,14 +79,11 @@ function draftFromService(service) {
     id: service.id || '',
     baseUrl: service.base_url || '',
     model: service.model || '',
-    keyEnv: service.key_env || '',
     timeoutSeconds: service.timeout_seconds == null ? 10 : service.timeout_seconds,
     instructions: service.instructions || '',
     stateTemplate: service.state_template || '',
     inputTokens: service.input_tokens == null ? 1024 : service.input_tokens,
-    contextTokens: service.context_tokens == null ? 4096 : service.context_tokens,
-    apiKey: '',
-    clearKey: false
+    contextTokens: service.context_tokens == null ? 4096 : service.context_tokens
   };
 }
 
@@ -107,33 +92,25 @@ function fillDraft(draft) {
   setValue('jevServiceId', source.id);
   setValue('jevBaseUrl', source.baseUrl);
   setValue('jevModel', source.model);
-  setValue('jevKeyEnv', source.keyEnv);
   setValue('jevTimeout', source.timeoutSeconds);
   setValue('jevInstructions', source.instructions);
   setValue('jevStateTemplate', source.stateTemplate);
   setValue('jevInputTokens', source.inputTokens);
   setValue('jevContextTokens', source.contextTokens);
-  /* 密钥输入永远不回填；草稿也不保留密钥。 */
-  setValue('jevApiKey', '');
-  setChecked('jevClearKey', false);
 }
 
 function blankDraft() {
   return {
-    id: '', baseUrl: '', model: '', keyEnv: '', timeoutSeconds: 10,
+    id: '', baseUrl: '', model: '', timeoutSeconds: 10,
     instructions: DEFAULT_INSTRUCTIONS, stateTemplate: DEFAULT_STATE_TEMPLATE,
-    inputTokens: 1024, contextTokens: 4096, apiKey: '', clearKey: false
+    inputTokens: 1024, contextTokens: 4096
   };
 }
 
 function storeCurrentDraft() {
   if (!currentId || creating) return;
-  /* 草稿只保留非密钥字段：用户输入的 api_key 只在写请求那一刻读取，
-     不进入按服务缓存的草稿表，切换/重绘都不可能把它带回来。 */
-  const draft = readDraft();
-  delete draft.apiKey;
-  delete draft.clearKey;
-  drafts.set(currentId, draft);
+  /* 目录草稿只有非密钥字段：JEV Key 不属于页面状态。 */
+  drafts.set(currentId, readDraft());
 }
 
 /* ── window validation (local, before any write) ─────────────────────── */
@@ -174,24 +151,6 @@ function setBusy(busy) {
   $$('#jevEditor input, #jevEditor textarea').forEach(el => { el.disabled = busy; });
 }
 
-/* ── key state (never the key material) ──────────────────────────────── */
-function paintKeyPlaceholder(state) {
-  const input = $('#jevApiKey');
-  if (!input) return;
-  input.placeholder = state ? t('jev.keyKeep') : t('jev.keyEmpty');
-}
-function keyPill(service) {
-  const pill = document.createElement('span');
-  pill.className = 'pill';
-  let key = 'jev.keyNone';
-  if (service.key_present) {
-    key = service.key_source === 'env' ? 'jev.keyFromEnv' : 'jev.keyPresent';
-    pill.classList.add(service.key_source === 'env' ? 'indigo' : 'ok');
-  }
-  pill.textContent = t(key);
-  return pill;
-}
-
 /* ── list rendering ──────────────────────────────────────────────────── */
 function renderList() {
   const list = $('#jevList');
@@ -222,7 +181,6 @@ function renderList() {
     id.className = 'ji-id';
     id.textContent = service.id;
     head.appendChild(id);
-    head.appendChild(keyPill(service));
     item.appendChild(head);
 
     const meta = document.createElement('span');
@@ -337,12 +295,10 @@ function selectService(id) {
   currentId = id;
   creating = false;
   resetTestResult();
-  keyPresent = !!service.key_present;
   const draft = drafts.get(id) || draftFromService(service);
   fillDraft(draft);
   const idInput = $('#jevServiceId');
   if (idInput) idInput.readOnly = true;
-  paintKeyPlaceholder(keyPresent);
   paintStatus();
   markSelected();
   showMessage('', false);
@@ -353,11 +309,9 @@ function newService() {
   currentId = null;
   creating = true;
   resetTestResult();
-  keyPresent = false;
   fillDraft(blankDraft());
   const idInput = $('#jevServiceId');
   if (idInput) idInput.readOnly = false;
-  paintKeyPlaceholder(false);
   paintStatus();
   markSelected();
   showMessage('', false);
@@ -369,13 +323,11 @@ function applyService(service) {
   creating = false;
   /* 保存/应用成功即重置测试结果：配置已变，旧结果不能泄漏到下一次交互。 */
   resetTestResult();
-  keyPresent = !!service.key_present;
   const draft = draftFromService(service);
   drafts.set(service.id, draft);
   fillDraft(draft);
   const idInput = $('#jevServiceId');
   if (idInput) idInput.readOnly = true;
-  paintKeyPlaceholder(keyPresent);
   renderList();
   paintStatus();
   markSelected();
@@ -575,7 +527,6 @@ async function boot() {
 onLangChange(() => {
   paintTitle();
   paintTestDefault();
-  paintKeyPlaceholder(keyPresent);
   renderList();
   paintStatus();
   paintTestStored();

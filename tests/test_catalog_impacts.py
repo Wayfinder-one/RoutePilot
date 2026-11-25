@@ -1090,7 +1090,7 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     changes = _changes(app)
     assert len(changes) == before_audit + 1
     assert changes[-1]["kind"] == "jev"
-    # 更新审计记录变化的非密钥字段与密钥意图枚举（不含密钥值）。
+    # 更新审计只记录变化的非密钥目录字段（v7 起目录里没有密钥或密钥意图）。
     assert changes[-1]["detail"] == {
         "action": "update", "id": "jev-a", "model": "d1-a-v2",
         "base_url": "http://jev-a-v2.test",
@@ -1099,7 +1099,6 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
         "timeout_seconds": 7.5,
         "input_tokens": 3072,
         "context_tokens": 8192,
-        "key_state": "cleared",
         "synced_trees": ["main"],
     }
 
@@ -1126,7 +1125,8 @@ def test_jev_window_update_replaces_snapshot_and_window_together(two_canvases):
     # 同步后必须整体换成数据库 jev-a 服务，而不是保留旧 base_url/model 再套新窗口。
     assert runtime.jev.base_url == "http://jev-a.test"
     assert runtime.jev.model == "jev-a"
-    assert runtime.jev.key_env == ""
+    # 目录服务同步进画布快照：key_env 固定内核环境变量名（v7 不再存密钥）。
+    assert runtime.jev.key_env == "ROUTER_JEV_API_KEY"
     assert _tree(app, "other").runtime.jev.id == "jev-b"
     assert _tree(app, "other").runtime.jev.base_url == "http://jev-json.test"
     assert (kernel_state(app).snapshot_set.default_snapshot.jev_input_tokens,
@@ -1305,7 +1305,7 @@ def test_jev_create_update_delete_write_audit_rows(two_canvases):
     assert [change["detail"] for change in new_changes] == [
         {"action": "create", "id": "jev-c", "model": "d1-c", "synced_trees": []},
         {"action": "update", "id": "jev-c", "model": "d1-c",
-         "timeout_seconds": 4.5, "key_state": "preserved", "synced_trees": []},
+         "timeout_seconds": 4.5, "synced_trees": []},
         {"action": "delete", "id": "jev-c", "replacement": None,
          "synced_trees": []},
     ]
@@ -1317,17 +1317,12 @@ def test_jev_create_update_delete_write_audit_rows(two_canvases):
 def test_jev_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
     app, client = two_canvases
     secret = "sk-jev-impact-must-not-leak"
-    # 给被画布引用的服务写入真实密钥（行级 api_key 只在数据库列里）。
-    rotation = _confirmed_put(client, "/admin/jev/jev-a", {"api_key": secret})
-    assert rotation.status_code == 200, rotation.text
-    assert secret not in rotation.text
-    conn = connect(app.state.settings.db_path)
-    try:
-        repo = JevServiceRepo(conn)
-        service = repo.get("jev-a")
-        assert repo.stored_api_key(service) == secret
-    finally:
-        conn.close()
+    # v7 起目录不再有密钥通道：带 api_key 的写请求是未知字段（422），零写入。
+    before_row = _db_row(app, "jev_services", "id", "jev-a")
+    rejected = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2",
+                                                    "api_key": secret})
+    assert rejected.status_code == 422, rejected.text
+    assert _db_row(app, "jev_services", "id", "jev-a") == before_row
 
     update_preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
     delete_preview = client.request("DELETE", "/admin/jev/jev-a", json={})
@@ -1346,7 +1341,13 @@ def test_jev_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
     for item in delete_preview.json()["detail"]["replacements"]:
         assert "api_key" not in item
         assert "key_env" not in item
-    # 审计只记录非密钥事实，不记录 api_key 状态或明文。
+    # 目录行无 api_key 列，审计/响应也不含密钥字段。
+    conn = connect(app.state.settings.db_path)
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jev_services)")}
+    finally:
+        conn.close()
+    assert "api_key" not in columns
     jev_changes = [change for change in _changes(app) if change["kind"] == "jev"]
     assert "api_key" not in json.dumps(jev_changes, ensure_ascii=False)
     assert "api_key" not in update_preview.text

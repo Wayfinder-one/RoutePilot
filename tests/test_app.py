@@ -142,7 +142,10 @@ def test_environment_jev_service_is_seeded_once(tmp_path):
         services = JevServiceRepo(conn).list()
         assert [(service.id, service.model) for service in services] == [
             ("default", "NeoHorse-Jev-4B")]
-        assert JevServiceRepo(conn).stored_api_key(services[0]) == "secret"
+        # v7：目录不再保存 JEV Key；种子只写非密钥字段，key_env 固定内核变量名。
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(jev_services)")}
+        assert "api_key" not in columns
+        assert services[0].snapshot_dict()["key_env"] == "ROUTER_JEV_API_KEY"
     finally:
         conn.close()
 
