@@ -104,9 +104,15 @@ class CoreClient:
             "X-SR-Session-Id": session_id,
             "X-Request-ID": request_id,
         }
-        response = await self.http.post(
-            self.base_url + "/internal/v1/route-decision",
-            json=body, headers=headers, timeout=self.timeout_seconds)
+        try:
+            response = await self.http.post(
+                self.base_url + "/internal/v1/route-decision",
+                json=body, headers=headers, timeout=self.timeout_seconds)
+        except httpx.HTTPError as exc:
+            # Kernel unreachable is a 503 data-plane failure, never a 500: the
+            # standalone peripheral keeps the APISIX/route-decision error class.
+            raise CoreDecisionError(
+                503, {"error": {"message": "core_unavailable"}}) from exc
         payload = _json_body(response)
         if response.status_code != 200:
             raise CoreDecisionError(response.status_code, payload)

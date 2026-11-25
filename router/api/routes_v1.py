@@ -1,52 +1,42 @@
-"""Data-plane entry point: validate, route, hand the decision to the proxy.
+"""Peripheral data-plane entry: validate, ask the kernel, execute the model call.
 
-This module keeps only the HTTP-facing request work:
+The peripheral owns the Provider Key and the SQLite execution catalog; the
+kernel owns graph selection and JEV.  For Auto requests this module:
 
-1. request size / JSON / ``messages`` / session validation,
-2. one ``RoutingService.route()`` call and its exception mapping,
-3. initial request-record construction (machine fields),
-4. one ``UpstreamProxy`` call for the upstream exchange, and the framework
-   response around the proxy's neutral result.
+1. validates the request (size / JSON / ``messages`` / session / trusted
+   department) exactly as before,
+2. posts the original body to the kernel decision endpoint
+   (``app.state.core.decide``) — the user ``Authorization`` is never forwarded,
+3. resolves the decided logical model against the peripheral execution catalog
+   (``backend_for_decision``); a catalog that disagrees with the kernel decision
+   is a 503 ``execution_catalog_mismatch`` and no upstream is called,
+4. rewrites the request body to the kernel's real model plus the peripheral
+   Provider Key / reasoning support and hands it to ``UpstreamProxy`` (JSON or
+   SSE).  Execution results are discarded (``DiscardOutcome``): the peripheral
+   keeps no request log and the kernel already emitted the decision event.
 
-Presentation lives in ``request_presenter``/``trace_presenter``; transport and
-lease ownership live in ``router.upstream.proxy``.  The proxy never builds a
-framework response: it returns ``ProxyResult``/``ProxyStream`` and this module
-renders them.
+Fixed-model requests (admin Test chat only) stay peripheral-local: they resolve
+the requested model directly from the SQLite catalog (``load_backends``) and
+never call the kernel.
+
+Presentation, routing and event construction live in the kernel; transport and
+lease ownership live in ``router.upstream.proxy``.
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
-import time
-import uuid
-from datetime import datetime
-from types import SimpleNamespace
 from urllib.parse import unquote_to_bytes
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from router.api.request_presenter import (
-    OUTCOME_INCOMPLETE,
-    OUTCOME_ROUTING_ERROR,
-    OutcomeRecorder,
-    node_labels,
-    present_record,
-)
-from router.api.trace_presenter import present_trace
-from router.decision_events import build_decision_event
-from router.jev.client import ChoiceAnswer
-from router.jev.serialization import answer_to_dict
-from router.routing.types import (
-    NoActiveTreeError,
-    NoAvailableBackend,
-    NoDefaultTreeError,
-    RoutingMiss,
-    RoutingRequest,
-    session_digest,
-)
+from router.api.deps import get_conn
+from router.core_client import CoreDecisionError
+from router.request_outcome import DiscardOutcome
 from router.upstream.catalog import load_backends
+from router.upstream.execution import ExecutionCatalogMismatch, backend_for_decision
 from router.upstream.proxy import (
     ProxyResult,
     ProxyStream,
@@ -88,30 +78,6 @@ def _error(message: str, status_code: int) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"message": message}})
 
 
-def log_decision_event(request, record: dict, snapshot, *,
-                       department: str, requested_model: str) -> None:
-    """Retain the local decision in the peripheral memory log (transitional).
-
-    Until the standalone peripheral routes through the kernel (Task 8), the
-    peripheral's own data plane still decides locally; this bridge builds the
-    same self-contained event the kernel emits and stores it in the volatile
-    20-event memory log so ``/admin/requests/recent`` and replay keep working.
-
-    Logging is best-effort by contract: a broken/over-limit event can never turn
-    a decision response into a 500.  Graphs rejected before selection produce no
-    replayable event (``snapshot is None``), exactly like the kernel.
-    """
-    store = getattr(request.app.state, "decision_logs", None)
-    if store is None or snapshot is None:
-        return
-    try:
-        store.add(build_decision_event(
-            record, snapshot, department=department,
-            requested_model=requested_model))
-    except Exception:  # noqa: BLE001 - the memory log must never affect the decision
-        logger.exception("decision log event dropped")
-
-
 def _json_response(result: ProxyResult) -> JSONResponse:
     """Render a neutral proxy result; the JSON bytes stay Starlette's canonical ones."""
     return JSONResponse(status_code=result.status_code, content=result.content,
@@ -129,123 +95,77 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
-def _first_wave_choice(decision):
-    """第一波按 node_id 排序后的首个 ChoiceAnswer（日志兼容列，spec §3.8）。"""
-    first_wave = decision.waves[0] if decision.waves else None
-    if first_wave is None:
-        return None
-    for node_id in sorted(first_wave.questions):
-        answer = decision.answers.get(node_id)
-        if isinstance(answer, ChoiceAnswer):
-            return answer
-    return None
+def _kernel_error(exc: CoreDecisionError) -> JSONResponse:
+    """Map a kernel decision failure to the same HTTP status + detail.
 
-
-def _decision_record(decision, snapshot, text: str, reasoning_warning,
-                     routing_ms: float, started: float) -> dict:
-    """Initial record for a completed routing decision (machine fields only).
-
-    The trace is presented here (idempotently) so every consumer of the record —
-    the peripheral ledger and the kernel's decision event — gets exactly the
-    replay-ready events the console renders, without a second presentation step.
+    The kernel answers with the same flat ``{"error": {"message": ...}}`` body the
+    peripheral used to produce locally (400/413/422 validation, 503
+    ``no_active_tree``/``no_default_tree``/``no_available_backend``/...), so the
+    standalone data plane keeps its existing error contract byte for byte.
     """
-    first_wave = decision.waves[0] if decision.waves else None
-    answer = _first_wave_choice(decision)
-    return {
-        "id": uuid.uuid4().hex,
-        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "text": text,
-        "decision": "route",
-        "model": decision.model,
-        "target_id": decision.target_id,
-        "tree_id": snapshot.tree_id,
-        "tree_revision": snapshot.tree_revision,
-        "snapshot_revision": snapshot.snapshot_revision,
-        "policy_path": decision.policy_path,
-        "selection_reason": decision.selection_reason,
-        "fallback_reason": decision.fallback_reason,
-        "sticky_hit": 1 if decision.sticky_hit else 0,
-        "session_hash": decision.session_hash,
-        "jev_model": snapshot.jev.model if first_wave is not None and snapshot.jev else None,
-        "jev_choice": answer.selected_key if answer else None,
-        "jev_top": answer.p_top if answer else None,
-        "jev_margin": answer.margin if answer else None,
-        "jev_ms": first_wave.duration_ms if first_wave is not None else None,
-        "jev_probabilities": dict(answer.probabilities) if answer else None,
-        "waves": len(decision.waves),
-        "answers": {node_id: answer_to_dict(value) for node_id, value in decision.answers.items()},
-        "reasoning": decision.reasoning,
-        "reasoning_warning": reasoning_warning,
-        "routing_ms": routing_ms,
-        "latency_ms": (time.monotonic() - started) * 1000.0,
-        "trace": present_trace(list(decision.trace)),
-        "node_labels": node_labels(snapshot),
-        "upstream_model": None,
-        "upstream_status": None,
-        "upstream_ms": None,
-        "ttft_ms": None,
-        "total_ms": None,
-        "prompt_tokens": None,
-        "completion_tokens": None,
-        "total_tokens": None,
-        "error_class": None,
-        "outcome_state": OUTCOME_INCOMPLETE,
+    payload = exc.payload
+    if isinstance(payload, dict) and payload:
+        return JSONResponse(status_code=exc.status_code, content=payload)
+    return _error("routing_failed", exc.status_code)
+
+
+def _auto_headers(decision: dict) -> dict:
+    """Response ``x-sr-*`` facts, all read from the kernel decision payload."""
+    headers = {
+        "x-sr-model": decision["model"],
+        "x-sr-selection": decision["selection_reason"],
     }
+    if decision.get("tree_id") is not None:
+        headers["x-sr-tree-id"] = decision["tree_id"]
+    if decision.get("graph_selection") is not None:
+        headers["x-sr-graph-selection"] = decision["graph_selection"]
+    if decision.get("reasoning_warning"):
+        headers["x-sr-reasoning-warning"] = decision["reasoning_warning"]
+    elif decision.get("reasoning") is not None:
+        headers["x-sr-reasoning"] = decision["reasoning"]
+    return headers
 
 
-def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
-                            routing_ms, total_ms):
-    # 调度失败 ≠ 图没有决策：恢复 trace 中最后一个 final 的目标元数据；
-    # 无 final（图前失败）时保持 None，不从 sticky/schedule 推断成功结论。
-    final = next(
-        (
-            event for event in reversed(trace)
-            if isinstance(event, dict) and event.get("event") == "final"
-        ),
-        None,
-    )
-    target_id = final.get("target_id") if final is not None else None
-    final_kind = final.get("kind") if final is not None else None
-    if final_kind == "target":
-        selection_reason = "target"
-        fallback_reason = None
-    elif final_kind in {"otherwise", "error_fallback"}:
-        selection_reason = "error_fallback"
-        fallback_reason = "error_fallback"
-    else:
-        selection_reason = None
-        fallback_reason = None
-    return {
-        "id": uuid.uuid4().hex,
-        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "text": text,
-        "decision": "route",
-        "model": None,
-        "target_id": target_id,
-        "tree_id": getattr(snapshot, "tree_id", None),
-        "tree_revision": getattr(snapshot, "tree_revision", None),
-        "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
-        "policy_path": target_id,
-        "selection_reason": selection_reason,
-        "fallback_reason": fallback_reason,
-        "sticky_hit": 0,
-        "session_hash": session_digest(session_id),
-        "jev_model": snapshot.jev.model if snapshot is not None and snapshot.jev else None,
-        "waves": sum(event.get("event") == "wave" for event in trace),
-        "answers": {},
-        "routing_ms": routing_ms,
-        "latency_ms": total_ms,
-        "total_ms": total_ms,
-        "trace": present_trace(list(trace)),
-        "node_labels": node_labels(snapshot),
-        "outcome_state": OUTCOME_ROUTING_ERROR,
-        "error_class": error_class,
-    }
+async def _execute(request: Request, body: dict, *, backend, reasoning,
+                   headers: dict, breaker_key: str):
+    """Prepare the upstream body and run one JSON/SSE exchange (no outcome log)."""
+    upstream_body, reasoning_warning = prepare_upstream_request(body, backend, reasoning)
+    if reasoning_warning:
+        headers["x-sr-reasoning-warning"] = reasoning_warning
+    elif reasoning is not None:
+        headers["x-sr-reasoning"] = reasoning
+    proxy = UpstreamProxy(request.app.state.http, request.app.state.breaker)
+    outcome = DiscardOutcome()
+    if body.get("stream"):
+        streamed = await proxy.stream(
+            backend=backend, body=upstream_body, headers=headers,
+            model=backend.upstream_name, breaker_key=breaker_key, outcome=outcome,
+            is_disconnected=request.is_disconnected,
+            release=lambda: None,
+        )
+        if isinstance(streamed, ProxyStream):
+            # ``streamed.body`` owns the upstream response; the server closes it.
+            return StreamingResponse(
+                streamed.body, status_code=streamed.status_code,
+                media_type=streamed.media_type, headers=streamed.headers,
+            )
+        return _json_response(streamed)
+    return _json_response(await proxy.send(
+        backend=backend, body=upstream_body, headers=headers,
+        model=backend.upstream_name, breaker_key=breaker_key, outcome=outcome,
+        release=lambda: None,
+    ))
 
 
-@router.post("/chat/completions")
-async def chat_completions(request: Request):
-    return await run_chat_completion(request)
+def _fixed_backend(request: Request, conn, fixed_model: str):
+    """Peripheral-local fixed-model resolution; ``(backend, error_response)``."""
+    backend = load_backends(conn).get(fixed_model)
+    if backend is None:
+        return None, _error("unknown_model", 404)
+    breaker_key = runtime_model_key("", fixed_model)
+    if request.app.state.breaker.is_open(breaker_key):
+        return None, _error("no_available_backend", 503)
+    return (backend, breaker_key), None
 
 
 async def run_chat_completion(request: Request, *, use_requested_model: bool = False,
@@ -254,24 +174,19 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
 
     ``use_requested_model`` is the only model-selection difference between the
     public data plane and the admin test endpoint: when false the request
-    ``model`` stays ignored and routing decides; when true ``"auto"`` still
-    routes, any other model is a fixed direct selection that skips
-    graph/JEV/sticky.
+    ``model`` stays ignored and the kernel decides; when true ``"auto"`` still
+    calls the kernel, any other model is a fixed direct selection that resolves
+    through the peripheral SQLite catalog and never calls the kernel.
 
-    ``conn`` is the admin catalog connection: a fixed model resolves through the
-    SQLite catalog (``load_backends``) instead of the published route set, because
-    the fixed-model test is a catalog check independent of any canvas.  ``/v1``
-    passes no connection, so the public hot path stays snapshot-only.
+    ``conn`` is the peripheral catalog connection (both endpoints pass one); the
+    fixed-model test uses it directly, while Auto uses it only for
+    ``backend_for_decision``.
 
-    ``allow_department_header`` gates the trusted ``x-sr-department`` header:
-    the admin test chat sets it to let an operator probe department selection,
-    while the public data plane rejects the header outright
-    (``400 department_header_not_allowed``).  Auto requests always select a
-    graph from the snapshot set (department match, else the default graph);
-    fixed-model direct requests never need a route set or a default graph and
-    emit no ``x-sr-graph-selection``.
+    ``allow_department_header`` gates the trusted ``x-sr-department`` header: the
+    admin test chat sets it so an operator can probe department selection, while
+    the public data plane rejects the header outright
+    (``400 department_header_not_allowed``).
     """
-    started = time.monotonic()
     length = request.headers.get("content-length")
     if length and length.isdigit() and int(length) > MAX_BODY_BYTES:
         return _error("request_too_large", 413)
@@ -301,11 +216,6 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
     session_id = request.headers.get("x-sr-session-id", "").strip()
     if len(session_id) > 256:
         return _error("invalid_session_id", 400)
-    # 事件里的「请求模型」是事实字段：/v1 不按它选路，但内核事件仍记录原值。
-    # 非字符串（恶意 ``"model": {...}``、JSON ``NaN``）归一为空串，事件仍可校验。
-    event_requested_model = body.get("model", "auto")
-    if not isinstance(event_requested_model, str):
-        event_requested_model = ""
 
     fixed_model = None
     if use_requested_model:
@@ -315,176 +225,45 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
         requested_model = requested_model.strip()
         fixed_model = None if requested_model == "auto" else requested_model
 
-    text = _last_user_text(messages)
-    requestlog = request.app.state.requestlog
-    routing_started = time.monotonic()
-    trace: list[dict] = []
-    # 选图失败时账本仍要落一条 snapshot=None 的失败记录：fail() 读取调用时
-    # 的 snapshot，默认值必须先存在。
-    snapshot = None
-
-    def fail(error_class, status_code, stage, message):
-        routing_ms = (time.monotonic() - routing_started) * 1000.0
-        total_ms = (time.monotonic() - started) * 1000.0
-        trace.append({
-            "event": "routing_error",
-            "stage": stage,
-            "error_class": error_class,
-            "message": message,
-        })
-        trace[:] = present_trace(trace)
-        record = present_record(_routing_failure_record(
-            snapshot, text, session_id, trace,
-            error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
-        ))
-        requestlog.enqueue(record, snapshot=snapshot)
-        log_decision_event(
-            request, record, snapshot, department=department,
-            requested_model=event_requested_model)
-        return _error(error_class, status_code)
-
-    # 公开数据面严格使用路由集默认图；管理端测试对话凭可信 Header 按部门选图。
-    route_set = request.app.state.snapshot_set
-    selection = None
-    if fixed_model is None:
-        if route_set is None:
-            return fail("no_valid_snapshot", 503, "snapshot", "no valid snapshot set")
-        try:
-            selection = route_set.select(department)
-            snapshot = selection.snapshot
-        except NoActiveTreeError as exc:
-            return fail("no_active_tree", 503, "snapshot", str(exc))
-        except NoDefaultTreeError as exc:
-            return fail("no_default_tree", 503, "snapshot", str(exc))
-        try:
-            decision = await request.app.state.routing_service.route(
-                snapshot,
-                RoutingRequest(text=text, session_id=session_id),
-                trace_sink=trace,
-            )
-        except NoActiveTreeError as exc:
-            return fail("no_active_tree", 503, "graph", str(exc))
-        except NoAvailableBackend as exc:
-            return fail("no_available_backend", 503, "schedule", str(exc))
-        except RoutingMiss as exc:
-            return fail("routing_invariant_violation", 503, "graph", str(exc))
-        except Exception:
-            logger.exception("routing failed")
-            return fail("routing_failed", 503, "graph", "routing failed")
-        backend = snapshot.backends.get(decision.model)
-        # 防御性不变式：正常引擎不可达，decision.model 必来自同一快照的 backends；真到达时无请求记录。
-        if backend is None:
-            decision.release()
-            return _error("no_available_backend", 503)
-    else:
-        # 固定模型直连是管理目录测试：只复用默认快照做日志上下文，不要求
-        # 路由集/默认图存在；有连接时只查 SQLite 目录。
-        snapshot = route_set.default_snapshot if route_set is not None else None
-        direct_backends = load_backends(conn) if conn is not None else None
-        if direct_backends is not None:
-            backend = direct_backends.get(fixed_model)
-        else:
-            backend = snapshot.backends.get(fixed_model) if snapshot is not None else None
-        if backend is None:
-            return _error("unknown_model", 404)
-        try:
-            lease = request.app.state.balancer.acquire([fixed_model])
-        except NoAvailableBackend:
-            return _error("no_available_backend", 503)
-        decision = SimpleNamespace(
-            model=fixed_model,
-            reasoning=None,
-            selection_reason="direct",
-            release=lease.release,
+    if fixed_model is not None:
+        resolved, error = _fixed_backend(request, conn, fixed_model)
+        if error is not None:
+            return error
+        backend, breaker_key = resolved
+        # 固定模型直连是管理目录测试：不参与选图，不输出 x-sr-graph-selection。
+        return await _execute(
+            request, body, backend=backend, reasoning=None,
+            headers={"x-sr-model": fixed_model, "x-sr-selection": "direct"},
+            breaker_key=breaker_key,
         )
-    routing_ms = (time.monotonic() - routing_started) * 1000.0
 
-    upstream_body, reasoning_warning = prepare_upstream_request(
-        body, backend, decision.reasoning)
-    trace[:] = present_trace(trace)
-    if fixed_model is None:
-        record = present_record(_decision_record(
-            decision, snapshot, text, reasoning_warning, routing_ms, started))
-    else:
-        record = present_record({
-            "id": uuid.uuid4().hex,
-            "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
-            "text": text,
-            "decision": "test",
-            "model": fixed_model,
-            "target_id": None,
-            "tree_id": getattr(snapshot, "tree_id", None),
-            "tree_revision": getattr(snapshot, "tree_revision", None),
-            "snapshot_revision": getattr(snapshot, "snapshot_revision", None),
-            "policy_path": None,
-            "selection_reason": "direct",
-            "fallback_reason": None,
-            "sticky_hit": 0,
-            "session_hash": session_digest(session_id),
-            "jev_model": None,
-            "jev_choice": None,
-            "jev_top": None,
-            "jev_margin": None,
-            "jev_ms": None,
-            "jev_probabilities": None,
-            "waves": 0,
-            "answers": {},
-            "reasoning": None,
-            "reasoning_warning": None,
-            "routing_ms": routing_ms,
-            "latency_ms": (time.monotonic() - started) * 1000.0,
-            "trace": [],
-            "node_labels": node_labels(snapshot),
-            "upstream_model": None,
-            "upstream_status": None,
-            "upstream_ms": None,
-            "ttft_ms": None,
-            "total_ms": None,
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-            "error_class": None,
-            "outcome_state": OUTCOME_INCOMPLETE,
-        })
-    requestlog.enqueue(record, snapshot=snapshot)
-    if fixed_model is None:
-        # 固定模型直连是管理目录测试，不是内核路由决策：生产内核不会为它发事件。
-        log_decision_event(
-            request, record, snapshot, department=department,
-            requested_model=event_requested_model)
-    outcome = OutcomeRecorder(requestlog, record, started)
-    headers = {"x-sr-model": decision.model, "x-sr-selection": decision.selection_reason}
-    if fixed_model is None:
-        # 选图证据只属于 Auto 路由：固定模型直连是目录测试，不输出 x-sr-graph-selection。
-        headers["x-sr-tree-id"] = snapshot.tree_id
-        headers["x-sr-graph-selection"] = selection.reason
-    if reasoning_warning:
-        headers["x-sr-reasoning-warning"] = reasoning_warning
-    elif decision.reasoning is not None:
-        headers["x-sr-reasoning"] = decision.reasoning
-    # 熔断/inflight 的内部键按图作用域隔离：固定模型直连保持裸模型键，Auto
-    # 必须与 ModelScheduler 的 tree_scope(snapshot.tree.id) 完全一致；
-    # snapshot.tree_id 就是 tree.id（跨副本稳定），固定路径可能没有路由集。
-    scope = '' if fixed_model is not None else tree_scope(snapshot.tree_id)
-    breaker_key = runtime_model_key(scope, decision.model)
-    proxy = UpstreamProxy(request.app.state.http, request.app.state.breaker)
-    if body.get("stream"):
-        streamed = await proxy.stream(
-            backend=backend, body=upstream_body, headers=headers,
-            model=decision.model, breaker_key=breaker_key, outcome=outcome,
-            is_disconnected=request.is_disconnected,
-            release=decision.release,
+    try:
+        decision = await request.app.state.core.decide(
+            body, department=department, session_id=session_id,
+            request_id=request.headers.get("x-request-id", ""),
         )
-        if isinstance(streamed, ProxyStream):
-            # ``streamed.body`` owns the upstream response and the lease; the
-            # server closes that iterator, so the route releases nothing.
-            return StreamingResponse(
-                streamed.body, status_code=streamed.status_code,
-                media_type=streamed.media_type, headers=streamed.headers,
-            )
-        return _json_response(streamed)
-    return _json_response(await proxy.send(
-        backend=backend, body=upstream_body, headers=headers,
-        model=decision.model, breaker_key=breaker_key, outcome=outcome,
-        release=decision.release,
-    ))
+    except CoreDecisionError as exc:
+        return _kernel_error(exc)
+    try:
+        backend = backend_for_decision(decision, conn)
+    except ExecutionCatalogMismatch:
+        # 目录与内核决策不一致：返回 503，不调用上游，也不拿其它 Provider 凭据顶替。
+        logger.warning(
+            "execution catalog mismatch logical_model=%r provider=%r",
+            decision.get("logical_model"), (decision.get("provider") or {}).get("name"))
+        return _error("execution_catalog_mismatch", 503)
+    breaker_key = runtime_model_key(
+        tree_scope(decision["tree_id"]), decision["model"])
+    if request.app.state.breaker.is_open(breaker_key):
+        return _error("no_available_backend", 503)
+    return await _execute(
+        request, body, backend=backend, reasoning=decision.get("reasoning"),
+        headers=_auto_headers(decision), breaker_key=breaker_key,
+    )
+
+
+@router.post("/chat/completions")
+async def chat_completions(
+    request: Request, conn=Depends(get_conn),
+):
+    return await run_chat_completion(request, conn=conn)

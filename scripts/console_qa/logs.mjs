@@ -21,7 +21,8 @@ import {
   routerBase,
   runIfMain,
   test,
-  waitFor
+  waitFor,
+  waitForDecisionLogs
 } from '../console_qa.mjs';
 
 test('calculation-log renders staged process from a real request', async () => {
@@ -30,6 +31,7 @@ test('calculation-log renders staged process from a real request', async () => {
     messages: [{ role: 'user', content: S1_TEXT }],
     stream: false,
 });
+  await waitForDecisionLogs();
   await page.goto(routerBase + '/console/logs.html');
   await page.waitForSelector('.lg-row');
   await page.locator('.lg-row').first().click();
@@ -78,6 +80,7 @@ test('calculation-log-phase-order-matches-engine', async () => {
     messages: [{ role: 'user', content: S1_TEXT }],
     stream: false,
 });
+  await waitForDecisionLogs();
   await page.goto(routerBase + '/console/logs.html');
   await page.locator('.lg-row').first().click();
   await page.waitForSelector('.lg-item.open .lg-rail');
@@ -111,6 +114,7 @@ test('calculation-log keeps two request details open together', async () => {
   await api('POST', '/v1/chat/completions', {
     model: 'ignored', messages: [{ role: 'user', content: S1_TEXT }], stream: false,
 });
+  await waitForDecisionLogs();
   await page.goto(routerBase + '/console/logs.html');
   await page.locator('.lg-row').nth(0).click();
   await page.locator('.lg-row').nth(1).click();
@@ -265,6 +269,7 @@ test('calculation-log shows JEV values and comparisons without clicking a stage'
     messages: [{ role: 'user', content: S1_TEXT }],
     stream: false,
   });
+  await waitForDecisionLogs();
   await page.goto(routerBase + '/console/logs.html');
   await page.locator('.lg-row').first().click();
   await page.waitForSelector('.lg-item.open .lg-rail');
@@ -547,6 +552,7 @@ test('calculation-log replay link opens a read-only decision replay', async () =
     messages: [{ role: 'user', content: S1_TEXT }],
     stream: false,
   });
+  await waitForDecisionLogs();
   await page.goto(routerBase + '/console/logs.html');
   /* 回放入口在折叠行上，不需要先展开计算过程。 */
   const link = page.locator('.lg-item .lg-snap-btn').first();
@@ -752,6 +758,7 @@ test('decision replay keeps the events own graph and the memory log is volatile'
     messages: [{ role: 'user', content: S1_TEXT }],
     stream: false,
   });
+  await waitForDecisionLogs();
   await page.goto(routerBase + '/console/logs.html');
   const link = page.locator('.lg-item .lg-snap-btn').first();
   await link.waitFor({ state: 'visible' });

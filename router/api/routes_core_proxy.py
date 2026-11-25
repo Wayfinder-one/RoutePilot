@@ -9,6 +9,11 @@ Design rules:
 
 * exactly the ten routes below are proxied — no catch-all, so a new kernel
   management route is a conscious change here (and a visible one in the API);
+* ``/try`` is the one deliberate exception to "reply verbatim": the kernel has no
+  SQLite, so the peripheral re-attaches the read-only canvas-vs-catalog drift
+  hints (``runtime_mismatch``, hint level) to the kernel's ``warnings``.  This is
+  the only place the comparison can run after the split, and a comparison
+  failure is dropped instead of failing the dry-run;
 * the request JSON body is forwarded untouched (validation, including the 422
   issue arrays, belongs to the kernel) and the kernel status/body are returned
   verbatim (a non-object body is wrapped under ``detail``);
@@ -31,6 +36,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from router.api.deps import get_conn
+from router.api.issue_presenter import issues_payload
+from router.control.consistency import runtime_mismatch_issues
+from router.routing.runtime import RUNTIME_FIELDS, runtime_from_dict
 from router.store.repositories import ChangeRepo, now_iso
 
 router = APIRouter()
@@ -200,6 +208,67 @@ async def set_default(
 
 
 @router.post("/try")
-async def try_tree(request: Request):
-    # Dry-run only: never writes a graph, so there is nothing to audit.
-    return await _forward(request, "POST", "/try")
+async def try_tree(request: Request, conn: sqlite3.Connection = Depends(get_conn)):
+    """Dry-run via the kernel; re-attach the peripheral catalog drift hints."""
+    payload = await _payload(request)
+    try:
+        status, body = await request.app.state.core.admin_json(
+            "POST", "/try", payload)
+    except httpx.HTTPError:
+        logger.exception("kernel graph request failed: POST /try")
+        return JSONResponse(
+            status_code=503, content={"detail": {"code": "core_unavailable"}})
+    if status == 200 and isinstance(body, dict) and isinstance(payload, dict):
+        await _merge_runtime_mismatch(request, conn, payload, body)
+    return _json_response(status, body)
+
+
+async def _merge_runtime_mismatch(request: Request, conn, payload: dict,
+                                  body: dict) -> None:
+    """Append canvas-vs-catalog hint issues to the kernel dry-run warnings.
+
+    The kernel decides/dry-runs from the self-contained canvas; only the
+    peripheral has the SQLite catalog, so the comparison belongs here.  Any
+    failure is swallowed: a hint must never turn a dry-run into an error.
+    """
+    if conn is None or not isinstance(body.get("warnings"), list):
+        return
+    try:
+        runtime = await _try_runtime(request, payload)
+        if runtime is None:
+            return
+        issues = runtime_mismatch_issues(conn, runtime)
+        if issues:
+            body["warnings"] = body["warnings"] + issues_payload(issues)
+    except Exception:  # noqa: BLE001 - hints are best-effort by contract
+        logger.exception("peripheral /try drift comparison failed")
+
+
+async def _try_runtime(request: Request, payload: dict):
+    """Resolve the runtime the kernel dry-runs: explicit draft fields or stored tree.
+
+    Mirrors the kernel's envelope merge (per-field override): a field absent from
+    the request is read from the stored graph returned by the kernel.  Returns
+    ``None`` when the runtime cannot be resolved, in which case no hints are
+    produced e.g. for the published-route-set dry run (no draft).
+    """
+    runtime = {name: payload[name] for name in RUNTIME_FIELDS if name in payload}
+    missing = [name for name in RUNTIME_FIELDS if name not in runtime]
+    if missing:
+        tree_id = payload.get("tree_id")
+        if not isinstance(tree_id, str) or not tree_id:
+            return None
+        try:
+            status, tree_body = await request.app.state.core.admin_json(
+                "GET", _tree_path(tree_id))
+        except httpx.HTTPError:
+            return None
+        document = tree_body.get("tree") if isinstance(tree_body, dict) else None
+        if status != 200 or not isinstance(document, dict):
+            return None
+        for name in missing:
+            runtime[name] = document.get(name)
+    try:
+        return runtime_from_dict(runtime)
+    except (TypeError, ValueError):
+        return None

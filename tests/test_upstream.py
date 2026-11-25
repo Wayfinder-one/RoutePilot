@@ -408,25 +408,27 @@ def test_worker_start_loads_shared_quarantine_before_returning(tmp_path):
     asyncio.run(scenario())
 
 
-def test_app_lifespan_loads_shared_quarantine_before_traffic(tmp_path):
-    """The app serves traffic only after the shared quarantine is in memory."""
-    import time
+def test_app_lifespan_needs_no_shared_breaker_store(tmp_path):
+    """The peripheral only keeps a volatile execution breaker (no BreakerStore).
 
+    Cross-replica quarantine (BreakerStore/BreakerSyncWorker) was removed by the
+    core/peripheral split: the kernel decides, the peripheral just executes.
+    """
     from fastapi.testclient import TestClient
 
     from router.api.app import create_app
+    from router.request_outcome import DiscardOutcome
     from tests.routing_fixtures import test_settings
 
     settings = test_settings(tmp_path)
-    conn = connect(settings.db_path)
-    migrate(conn)
-    conn.close()
-    BreakerStore(settings.db_path).write_failure("fast", 3, time.time())
-
     app = create_app(settings)
+    assert not hasattr(app.state, "breaker_store")
+    assert not hasattr(app.state, "breaker_worker")
+    assert not hasattr(app.state, "maintenance")
+    assert app.state.breaker.is_open("fast") is False
     with TestClient(app) as client:
-        assert app.state.breaker.is_open("fast") is True
         assert client.get("/healthz").json() == {"ok": True}
+    assert DiscardOutcome().finish(outcome_state="completed") is True
 
 
 # --------------------------------------------------------------------------- #

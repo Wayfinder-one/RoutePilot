@@ -21,29 +21,148 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from router.api.routes_v1 import (
-    MAX_BODY_BYTES,
-    _decision_record,
-    _last_user_text,
-    _routing_failure_record,
-    decode_department,
+from router.api.request_presenter import (
+    OUTCOME_INCOMPLETE,
+    OUTCOME_ROUTING_ERROR,
+    node_labels,
 )
+# 部门 Header 的严格解码与请求体上限属于数据面共享校验语义：外围在转发前先做
+# 一次，内核仍独立校验（内核不信任外围入站校验）。
+from router.api.routes_v1 import MAX_BODY_BYTES, _last_user_text, decode_department
+from router.api.trace_presenter import present_trace
 from router.decision_events import build_decision_event
+from router.jev.client import ChoiceAnswer
+from router.jev.serialization import answer_to_dict
 from router.routing.types import (
     NoActiveTreeError,
     NoAvailableBackend,
     NoDefaultTreeError,
     RoutingMiss,
     RoutingRequest,
+    session_digest,
 )
 from router.upstream.proxy import prepare_upstream_request
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+
+def _first_wave_choice(decision):
+    """第一波按 node_id 排序后的首个 ChoiceAnswer（日志兼容列，spec §3.8）。"""
+    first_wave = decision.waves[0] if decision.waves else None
+    if first_wave is None:
+        return None
+    for node_id in sorted(first_wave.questions):
+        answer = decision.answers.get(node_id)
+        if isinstance(answer, ChoiceAnswer):
+            return answer
+    return None
+
+
+def _decision_record(decision, snapshot, text: str, reasoning_warning,
+                     routing_ms: float, started: float) -> dict:
+    """Initial record for a completed routing decision (machine fields only).
+
+    The trace is presented here (idempotently) so the decision event carries the
+    replay-ready events the console renders, without a second presentation step.
+    """
+    first_wave = decision.waves[0] if decision.waves else None
+    answer = _first_wave_choice(decision)
+    return {
+        "id": uuid.uuid4().hex,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "text": text,
+        "decision": "route",
+        "model": decision.model,
+        "target_id": decision.target_id,
+        "tree_id": snapshot.tree_id,
+        "tree_revision": snapshot.tree_revision,
+        "policy_path": decision.policy_path,
+        "selection_reason": decision.selection_reason,
+        "fallback_reason": decision.fallback_reason,
+        "sticky_hit": 1 if decision.sticky_hit else 0,
+        "session_hash": decision.session_hash,
+        "jev_model": snapshot.jev.model if first_wave is not None and snapshot.jev else None,
+        "jev_choice": answer.selected_key if answer else None,
+        "jev_top": answer.p_top if answer else None,
+        "jev_margin": answer.margin if answer else None,
+        "jev_ms": first_wave.duration_ms if first_wave is not None else None,
+        "jev_probabilities": dict(answer.probabilities) if answer else None,
+        "waves": len(decision.waves),
+        "answers": {node_id: answer_to_dict(value) for node_id, value in decision.answers.items()},
+        "reasoning": decision.reasoning,
+        "reasoning_warning": reasoning_warning,
+        "routing_ms": routing_ms,
+        "latency_ms": (time.monotonic() - started) * 1000.0,
+        "trace": present_trace(list(decision.trace)),
+        "node_labels": node_labels(snapshot),
+        "upstream_model": None,
+        "upstream_status": None,
+        "upstream_ms": None,
+        "ttft_ms": None,
+        "total_ms": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "total_tokens": None,
+        "error_class": None,
+        "outcome_state": OUTCOME_INCOMPLETE,
+    }
+
+
+def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
+                            routing_ms, total_ms):
+    # 调度失败 ≠ 图没有决策：恢复 trace 中最后一个 final 的目标元数据；
+    # 无 final（图前失败）时保持 None，不从 sticky/schedule 推断成功结论。
+    final = next(
+        (
+            event for event in reversed(trace)
+            if isinstance(event, dict) and event.get("event") == "final"
+        ),
+        None,
+    )
+    target_id = final.get("target_id") if final is not None else None
+    final_kind = final.get("kind") if final is not None else None
+    if final_kind == "target":
+        selection_reason = "target"
+        fallback_reason = None
+    elif final_kind in {"otherwise", "error_fallback"}:
+        selection_reason = "error_fallback"
+        fallback_reason = "error_fallback"
+    else:
+        selection_reason = None
+        fallback_reason = None
+    return {
+        "id": uuid.uuid4().hex,
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "text": text,
+        "decision": "route",
+        "model": None,
+        "target_id": target_id,
+        "tree_id": getattr(snapshot, "tree_id", None),
+        "tree_revision": getattr(snapshot, "tree_revision", None),
+        "policy_path": target_id,
+        "selection_reason": selection_reason,
+        "fallback_reason": fallback_reason,
+        "sticky_hit": 0,
+        "session_hash": session_digest(session_id),
+        "jev_model": snapshot.jev.model if snapshot is not None and snapshot.jev else None,
+        "waves": sum(event.get("event") == "wave" for event in trace),
+        "answers": {},
+        "routing_ms": routing_ms,
+        "latency_ms": total_ms,
+        "total_ms": total_ms,
+        "trace": present_trace(list(trace)),
+        "node_labels": node_labels(snapshot),
+        "outcome_state": OUTCOME_ROUTING_ERROR,
+        "error_class": error_class,
+    }
 
 
 class DecisionRequestError(Exception):

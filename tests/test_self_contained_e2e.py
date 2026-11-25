@@ -23,9 +23,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from router.api.app import create_app
 from router.jev.service import JevService
-from router.routing.document import graph_document_bytes
 from router.routing.snapshot import build_snapshot_for_tree
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
@@ -33,10 +31,11 @@ from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import (
     DEFAULT_INSTRUCTIONS,
-    core_app_for,
     DEFAULT_STATE_TEMPLATE,
     default_tree,
+    kernel_state,
     portable_tree_dict,
+    split_app_for,
     test_settings,
 )
 from router.routing.tree import tree_from_dict
@@ -157,6 +156,18 @@ def _install_document(settings, document, *, enable: bool = True) -> None:
     repo.create(tree_from_dict(payload))
 
 
+def _split_app(settings, calls):
+    """Peripheral app + in-process kernel; both share the mock JEV/upstream handler.
+
+    After the core/peripheral split the kernel performs the JEV calls (and the
+    decision events) while the peripheral performs the model-upstream calls, so
+    the same recording handler feeds both HTTP clients.
+    """
+    return split_app_for(
+        settings=settings, transport=_mock_transport(calls),
+        kernel_transport=_mock_transport(calls))
+
+
 def _instance(path, monkeypatch, documents=(), *, active_id: str | None = None):
     """空数据库实例：只装给定的自包含画布，mock JEV/上游。"""
     monkeypatch.setenv("JSON_PROVIDER_API_KEY", ENV_SECRET)
@@ -175,9 +186,7 @@ def _instance(path, monkeypatch, documents=(), *, active_id: str | None = None):
             payload["default"] = is_active
             repo.create(tree_from_dict(payload))
     calls = {"jev": [], "upstream": []}
-    app = create_app(
-        settings, transport=_mock_transport(calls),
-        core_transport=core_app_for(graph_dir=settings.graph_dir))
+    app = _split_app(settings, calls)
     return SimpleNamespace(
         settings=settings, app=app, client=TestClient(app), calls=calls)
 
@@ -193,9 +202,7 @@ def _instance_from_export(path, monkeypatch, tree_id: str, payload: bytes):
     repo.initialize()
     (repo.graphs / f"{tree_id}.json").write_bytes(payload)
     calls = {"jev": [], "upstream": []}
-    app = create_app(
-        settings, transport=_mock_transport(calls),
-        core_transport=core_app_for(graph_dir=settings.graph_dir))
+    app = _split_app(settings, calls)
     return SimpleNamespace(
         settings=settings, app=app, client=TestClient(app), calls=calls)
 
@@ -240,7 +247,12 @@ def _seed_matching_catalog(settings) -> None:
 
 
 def _seed_secret_matching_catalog(settings, document=None) -> None:
-    """目录里放端点匹配的已存密钥：provider local + 画布所选 JEV 服务。"""
+    """目录里放端点匹配的已存密钥：provider local + 画布模型 + JEV 服务。
+
+    拆分后 Auto 执行必须能在外围目录里解析出内核决策的逻辑模型，因此这里与
+    ``_seed_matching_catalog`` 一样写入画布声明的模型，只是 Provider Key 用
+    已存密钥而不是环境变量。
+    """
     document = _portable_document() if document is None else document
     service = document["jev"]
     window = document["jev_window"]
@@ -250,6 +262,12 @@ def _seed_secret_matching_catalog(settings, document=None) -> None:
             "INSERT INTO providers (name, base_url, key_env, reasoning_format, api_key) "
             "VALUES ('local', ?, 'JSON_PROVIDER_API_KEY', 'openai', ?)",
             (UPSTREAM_ORIGIN + "/v1", STORED_PROVIDER_SECRET))
+        for model in document["backends"]["models"]:
+            conn.execute(
+                "INSERT OR IGNORE INTO models (id, upstream, provider, profile) "
+                "VALUES (?, ?, ?, ?)",
+                (model["id"], model["upstream"], model["provider"],
+                 json.dumps(model["profile"], ensure_ascii=False)))
         conn.commit()
         JevServiceRepo(conn).save(JevService(
             id=service["id"],
@@ -307,26 +325,24 @@ def json_only(tmp_path, monkeypatch):
     _empty_database(settings.db_path)
     _install_document(settings, _portable_document())
     calls = {"jev": [], "upstream": []}
-    app = create_app(
-        settings, transport=_mock_transport(calls),
-        core_transport=core_app_for(graph_dir=settings.graph_dir))
+    app = _split_app(settings, calls)
     return app, TestClient(app), settings, calls
 
 
 def test_empty_database_snapshot_reads_everything_from_json(json_only):
     app, client, settings, _calls = json_only
 
-    assert app.state.snapshot_set.default_snapshot.tree_id == "portable"
-    backend = app.state.snapshot_set.default_snapshot.backends["fast"]
+    assert kernel_state(app).snapshot_set.default_snapshot.tree_id == "portable"
+    backend = kernel_state(app).snapshot_set.default_snapshot.backends["fast"]
     assert backend.url == UPSTREAM_ORIGIN + "/v1/chat/completions"
     assert backend.upstream_name == "json-upstream"
     assert backend.provider == "local"
-    assert app.state.snapshot_set.default_snapshot.capabilities["fast"] == "来自 JSON 的能力"
-    assert app.state.snapshot_set.default_snapshot.jev.base_url == JEV_ORIGIN
-    assert app.state.snapshot_set.default_snapshot.jev.model == "json-jev"
-    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
-            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (1024, 4096)
-    assert [period.name for period in app.state.snapshot_set.default_snapshot.time_periods] == list(PERIODS)
+    assert kernel_state(app).snapshot_set.default_snapshot.capabilities["fast"] == "来自 JSON 的能力"
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.base_url == JEV_ORIGIN
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.model == "json-jev"
+    assert (kernel_state(app).snapshot_set.default_snapshot.jev_input_tokens,
+            kernel_state(app).snapshot_set.default_snapshot.jev_context_tokens) == (1024, 4096)
+    assert [period.name for period in kernel_state(app).snapshot_set.default_snapshot.time_periods] == list(PERIODS)
 
     # 非密钥运行配置表仍然为空：JSON 是事实源，启动不物化数据库。
     conn = connect(settings.db_path)
@@ -371,7 +387,7 @@ def test_admin_try_uses_json_backends_jev_window_and_periods(json_only):
     # 窗口来自 JSON（input_tokens=1024）：超长输入被截断并记录在 trace。
     window_events = [item for item in body["trace"] if item["event"] == "window"]
     assert window_events and window_events[0]["truncated"] is True
-    assert window_events[0]["tokens_after"] <= app.state.snapshot_set.default_snapshot.jev_input_tokens
+    assert window_events[0]["tokens_after"] <= kernel_state(app).snapshot_set.default_snapshot.jev_input_tokens
     # JEV 调用来自 JSON 的 base_url / model / state_template，输入经过 JSON 窗口约束。
     assert calls["jev"], "graph question did not call the JSON-configured JEV"
     sent = calls["jev"][0]
@@ -382,7 +398,11 @@ def test_admin_try_uses_json_backends_jev_window_and_periods(json_only):
 
 
 def test_auto_routing_reaches_the_json_mock_upstream(json_only):
-    _app, client, _settings, calls = json_only
+    """Auto 决策来自 JSON 画布；执行目录（SQLite）与画布一致后由外围调用上游。"""
+    _app, client, settings, calls = json_only
+    # 拆分后 Provider Key 与执行目录只属于外围：目录行必须与内核决策的
+    # provider/base_url 一致，否则 503 execution_catalog_mismatch（不调用上游）。
+    _seed_matching_catalog(settings)
 
     response = client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "帮我分析这段复杂代码"}],
@@ -394,9 +414,8 @@ def test_auto_routing_reaches_the_json_mock_upstream(json_only):
     upstream = calls["upstream"][-1]
     assert upstream["url"] == UPSTREAM_ORIGIN + "/v1/chat/completions"
     assert upstream["body"]["model"] == "json-upstream"
-    # 内核快照不持有 Provider Key：Auto 路径不向上游发送 Authorization；
-    # Provider Key 的注入属于外围执行层（后续任务）。
-    assert upstream["authorization"] is None
+    # Provider Key 只出现在外围上游请求里（目录 key_env 指向的环境变量）。
+    assert upstream["authorization"] == f"Bearer {ENV_SECRET}"
 
 
 def test_fixed_model_uses_db_catalog_instead_of_active_canvas(json_only):
@@ -439,9 +458,7 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     _empty_database(first.db_path)
     _install_document(first, _portable_document())
     calls_one = {"jev": [], "upstream": []}
-    app_one = create_app(
-        first, transport=_mock_transport(calls_one),
-        core_transport=core_app_for(graph_dir=first.graph_dir))
+    app_one = _split_app(first, calls_one)
 
     exported = _export_bytes(first)
     assert b"api_key" not in exported
@@ -454,15 +471,13 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     repo.initialize()
     (repo.graphs / "portable.json").write_bytes(exported)
     calls_two = {"jev": [], "upstream": []}
-    app_two = create_app(
-        second, transport=_mock_transport(calls_two),
-        core_transport=core_app_for(graph_dir=second.graph_dir))
+    app_two = _split_app(second, calls_two)
 
-    assert app_two.state.snapshot_set.default_snapshot.tree_revision == app_one.state.snapshot_set.default_snapshot.tree_revision
-    assert app_two.state.snapshot_set.default_snapshot.content == app_one.state.snapshot_set.default_snapshot.content
-    assert app_two.state.snapshot_set.default_snapshot.backends["fast"].url == \
-        app_one.state.snapshot_set.default_snapshot.backends["fast"].url
-    assert app_two.state.snapshot_set.default_snapshot.jev.model == app_one.state.snapshot_set.default_snapshot.jev.model
+    assert kernel_state(app_two).snapshot_set.default_snapshot.tree_revision == kernel_state(app_one).snapshot_set.default_snapshot.tree_revision
+    assert kernel_state(app_two).snapshot_set.default_snapshot.content == kernel_state(app_one).snapshot_set.default_snapshot.content
+    assert kernel_state(app_two).snapshot_set.default_snapshot.backends["fast"].url == \
+        kernel_state(app_one).snapshot_set.default_snapshot.backends["fast"].url
+    assert kernel_state(app_two).snapshot_set.default_snapshot.jev.model == kernel_state(app_one).snapshot_set.default_snapshot.jev.model
 
     client_two = TestClient(app_two)
     response = client_two.post("/admin/try", json={
@@ -471,7 +486,7 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     })
     assert response.status_code == 200, response.text
     assert response.json()["outcome"]["model"] == "fast"
-    assert response.json()["tree_revision"] == app_one.state.snapshot_set.default_snapshot.tree_revision
+    assert response.json()["tree_revision"] == kernel_state(app_one).snapshot_set.default_snapshot.tree_revision
 
 
 def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
@@ -500,8 +515,8 @@ def test_no_secret_leaks_into_files_api_or_snapshot(json_only):
     assert provider["key_source"] == "env"
     assert "api_key" not in provider
 
-    assert ENV_SECRET not in app.state.snapshot_set.default_snapshot.content
-    assert "api_key" not in app.state.snapshot_set.default_snapshot.content
+    assert ENV_SECRET not in kernel_state(app).snapshot_set.default_snapshot.content
+    assert "api_key" not in kernel_state(app).snapshot_set.default_snapshot.content
 
 
 def _create_payload(tree_id):
@@ -515,7 +530,7 @@ def _create_payload(tree_id):
 def test_nested_profile_secrets_are_rejected_and_never_exported(json_only):
     """合法 profile 元数据照常保存；嵌套密钥经 POST/PUT/旧库物化都进不了 JSON。"""
     app, client, settings, _calls = json_only
-    repo = app.state.graph_repo
+    repo = kernel_state(app).graph_repo
     before = {path.name: path.read_bytes() for path in repo.graphs.glob("*.json")}
 
     # 合法元数据：不影响主流程，并原样写进文件。
@@ -555,14 +570,14 @@ def test_nested_profile_secrets_are_rejected_and_never_exported(json_only):
 
     for path in repo.graphs.glob("*.json"):
         assert "review-secret" not in path.read_text(encoding="utf-8"), path.name
-    assert ENV_SECRET not in app.state.snapshot_set.default_snapshot.content
+    assert ENV_SECRET not in kernel_state(app).snapshot_set.default_snapshot.content
 
 
 def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
     """已保存画布的快照是唯一运行事实源：目录行怎么改都不改变它。"""
     app, _client, settings, _calls = json_only
-    before = app.state.snapshot_set.default_snapshot.content
-    tree = default_tree(app.state.graph_repo)
+    before = kernel_state(app).snapshot_set.default_snapshot.content
+    tree = default_tree(kernel_state(app).graph_repo)
     conn = connect(settings.db_path)
     try:
         with conn:
@@ -578,7 +593,7 @@ def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
     finally:
         conn.close()
     assert after.content == before
-    assert app.state.snapshot_set.default_snapshot.content == before
+    assert kernel_state(app).snapshot_set.default_snapshot.content == before
 
 
 # ────────────────────────────────────────────────────────────────────────��──
@@ -589,9 +604,9 @@ def test_acceptance_json_selects_jev_a_and_fast_and_calls_succeed(tmp_path, monk
     instance = _instance(tmp_path / "first", monkeypatch,
                          documents=[_acceptance_document()])
     app, client, calls = instance.app, instance.client, instance.calls
-    snapshot = app.state.snapshot_set.default_snapshot
+    snapshot = kernel_state(app).snapshot_set.default_snapshot
 
-    tree = default_tree(app.state.graph_repo)
+    tree = default_tree(kernel_state(app).graph_repo)
     assert tree.runtime.jev.id == "jev-a"
     assert [model["id"] for model in tree.runtime.backends.models] == ["fast"]
     assert (tree.runtime.jev_input_tokens, tree.runtime.jev_context_tokens) == (1024, 4096)
@@ -608,15 +623,17 @@ def test_acceptance_json_selects_jev_a_and_fast_and_calls_succeed(tmp_path, monk
     assert calls["jev"], "JEV 调用没有到达 JSON 声明的 jev-a 端点"
     assert calls["jev"][0]["model"] == "json-jev"
 
-    # 真实调用 2：/v1 Auto 路由到达 JSON 声明的上游，密钥来自环境变量。
+    # 真实调用 2：外围执行目录与画布声明一致后，Auto 路由到达 JSON 声明的上游。
+    # 决策仍只来自 JSON；Provider Key 由外围（SQLite 目录 + 环境变量）解析。
+    _seed_matching_catalog(instance.settings)
     answered = client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "帮我分析这段复杂代码"}]})
     assert answered.status_code == 200, answered.text
     assert calls["upstream"], "Auto 路由没有到达 JSON 上游"
     assert calls["upstream"][-1]["url"] == UPSTREAM_ORIGIN + "/v1/chat/completions"
     assert calls["upstream"][-1]["body"]["model"] == "json-upstream"
-    # 内核快照不携带 Provider Key（执行层注入留给外围）。
-    assert calls["upstream"][-1]["authorization"] is None
+    # Provider Key 只出现在外围上游请求里，从不进入内核/决策事件。
+    assert calls["upstream"][-1]["authorization"] == f"Bearer {ENV_SECRET}"
 
 
 def test_acceptance_exported_bytes_alone_reproduce_the_snapshot(tmp_path, monkeypatch):
@@ -628,13 +645,13 @@ def test_acceptance_exported_bytes_alone_reproduce_the_snapshot(tmp_path, monkey
     second = _instance_from_export(
         tmp_path / "second", monkeypatch, "portable", exported)
 
-    first_snapshot = first.app.state.snapshot_set.default_snapshot
-    second_snapshot = second.app.state.snapshot_set.default_snapshot
+    first_snapshot = kernel_state(first.app).snapshot_set.default_snapshot
+    second_snapshot = kernel_state(second.app).snapshot_set.default_snapshot
     assert second_snapshot is not None
     assert second_snapshot.tree_revision == first_snapshot.tree_revision
     assert second_snapshot.content == first_snapshot.content
     assert second_snapshot.snapshot_revision == first_snapshot.snapshot_revision
-    assert default_tree(second.app.state.graph_repo).runtime.jev.id == "jev-a"
+    assert default_tree(kernel_state(second.app).graph_repo).runtime.jev.id == "jev-a"
 
     # 第二个实例的数据库目录确实为空：唯一输入是导出的画布字节。
     conn = connect(second.settings.db_path)
@@ -644,7 +661,9 @@ def test_acceptance_exported_bytes_alone_reproduce_the_snapshot(tmp_path, monkey
     finally:
         conn.close()
 
-    # 只凭字节复制出来的实例也能真实执行。
+    # 只凭字节复制出来的实例也能真实执行：画布（图/运行配置）来自字节，
+    # 外围执行目录（Provider）是独立的外围配置，需与画布声明一致。
+    _seed_matching_catalog(second.settings)
     answered = second.client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "帮我分析这段复杂代码"}]})
     assert answered.status_code == 200, answered.text
@@ -659,6 +678,9 @@ def test_acceptance_auto_reads_json_while_fixed_model_reads_db(tmp_path, monkeyp
     second = _instance_from_export(
         tmp_path / "second", monkeypatch, "portable", exported)
 
+    # 外围执行目录：与画布声明一致的一行（Auto 用），以及只存在于数据库的
+    # db-only provider/model（固定模型直连用）。
+    _seed_matching_catalog(second.settings)
     conn = connect(second.settings.db_path)
     try:
         with conn:
@@ -667,7 +689,7 @@ def test_acceptance_auto_reads_json_while_fixed_model_reads_db(tmp_path, monkeyp
                 "VALUES ('db-only', 'http://db-only.test/v1', '', 'openai', '')")
             conn.execute(
                 "INSERT INTO models (id, upstream, provider, profile) "
-                "VALUES ('fast', 'db-upstream', 'db-only', '{}')")
+                "VALUES ('db-fast', 'db-upstream', 'db-only', '{}')")
         JevServiceRepo(conn).save(JevService(
             id="db-jev",
             base_url="http://db-jev.test",
@@ -693,7 +715,7 @@ def test_acceptance_auto_reads_json_while_fixed_model_reads_db(tmp_path, monkeyp
 
     # 固定模型直连：管理目录测试，读 SQLite 目录而非活动画布快照。
     fixed = second.client.post("/admin/test/chat/completions", json={
-        "model": "fast",
+        "model": "db-fast",
         "messages": [{"role": "user", "content": "固定模型直连"}],
     })
     assert fixed.status_code == 200, fixed.text
@@ -718,8 +740,8 @@ def test_acceptance_unconfirmed_catalog_change_changes_nothing(tmp_path, monkeyp
     before_files = _canvas_files(instance.settings)
     before_rows = _model_rows(instance.settings)
     before_audit = _audit_count(instance.settings)
-    before_tree_revision = app.state.snapshot_set.default_snapshot.tree_revision
-    before_snapshot_revision = app.state.snapshot_set.snapshot_revision
+    before_tree_revision = kernel_state(app).snapshot_set.default_snapshot.tree_revision
+    before_snapshot_revision = kernel_state(app).snapshot_set.snapshot_revision
     assert set(before_files) == {"portable.json", "other.json"}
 
     response = client.put("/admin/models/fast", json={"upstream": "changed-upstream"})
@@ -731,8 +753,8 @@ def test_acceptance_unconfirmed_catalog_change_changes_nothing(tmp_path, monkeyp
     assert _canvas_files(instance.settings) == before_files
     assert _model_rows(instance.settings) == before_rows
     assert _audit_count(instance.settings) == before_audit
-    assert app.state.snapshot_set.default_snapshot.tree_revision == before_tree_revision
-    assert app.state.snapshot_set.snapshot_revision == before_snapshot_revision
+    assert kernel_state(app).snapshot_set.default_snapshot.tree_revision == before_tree_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_snapshot_revision
 
 
 def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path, monkeypatch):
@@ -740,8 +762,8 @@ def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path
     instance = _impact_instance(tmp_path, monkeypatch)
     app, client = instance.app, instance.client
     before_files = _canvas_files(instance.settings)
-    before_tree_revision = app.state.snapshot_set.default_snapshot.tree_revision
-    before_snapshot_revision = app.state.snapshot_set.snapshot_revision
+    before_tree_revision = kernel_state(app).snapshot_set.default_snapshot.tree_revision
+    before_snapshot_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "changed-upstream"})
     confirmation = _confirmation_from(preview)
@@ -757,13 +779,13 @@ def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path
     assert rows["fast"][1] == "changed-upstream"
     assert rows["backup"][1] == "backup-upstream"
 
-    snapshot = app.state.snapshot_set.default_snapshot
+    snapshot = kernel_state(app).snapshot_set.default_snapshot
     assert snapshot.tree_revision != before_tree_revision
     assert snapshot.snapshot_revision != before_snapshot_revision
     assert snapshot.backends["fast"].upstream_name == "changed-upstream"
     assert "changed-upstream" in snapshot.content
     # 非活动画布未被同步：仍只声明 backup。
-    other = app.state.graph_repo.get("other")
+    other = kernel_state(app).graph_repo.get("other")
     assert other.runtime.backends.models[0]["id"] == "backup"
 
 
@@ -779,13 +801,11 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     # 端点匹配的已存密钥：provider local（与画布 base_url/key_env 匹配）与 jev-a。
     _seed_secret_matching_catalog(settings)
     calls = {"jev": [], "upstream": []}
-    app = create_app(
-        settings, transport=_mock_transport(calls),
-        core_transport=core_app_for(graph_dir=settings.graph_dir))
+    app = _split_app(settings, calls)
     client = TestClient(app)
 
     # 内核快照不持有 Provider Key，也不读数据库已存 JEV Key：密钥只来自环境变量。
-    snapshot = app.state.snapshot_set.default_snapshot
+    snapshot = kernel_state(app).snapshot_set.default_snapshot
     assert snapshot.backends["fast"].headers == {}
     assert snapshot.jev.api_key == ""
 
@@ -795,7 +815,9 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     answered = client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "帮我分析这段复杂代码"}]})
     assert answered.status_code == 200, answered.text
-    assert calls["upstream"][-1]["authorization"] is None
+    # 已存 Provider Key 只注入外围执行的上游请求；内核请求/事件/文件都不含它。
+    assert calls["upstream"][-1]["authorization"] == \
+        f"Bearer {STORED_PROVIDER_SECRET}"
 
     secrets = (ENV_SECRET, STORED_PROVIDER_SECRET, STORED_JEV_SECRET)
     derived = ("api_key", "authorization", "key_present", "key_source")
@@ -830,6 +852,6 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
 
     # 4) 已发布快照内容不含密钥材料。
     for secret in secrets:
-        assert secret not in app.state.snapshot_set.default_snapshot.content
+        assert secret not in kernel_state(app).snapshot_set.default_snapshot.content
     for name in derived:
-        assert name not in app.state.snapshot_set.default_snapshot.content
+        assert name not in kernel_state(app).snapshot_set.default_snapshot.content

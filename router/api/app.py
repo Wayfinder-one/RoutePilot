@@ -1,7 +1,30 @@
+"""Peripheral application factory: console, SQLite configuration and execution.
+
+The peripheral owns everything user-facing and execution-related:
+
+* the console static mount, personnel/session login and the ``/admin`` APIs that
+  read or write peripheral SQLite (people, providers, model catalog, non-secret
+  JEV catalog, time periods, changes);
+* the graph-management **proxy** (``routes_core_proxy``): every graph request is
+  authenticated here and executed by the kernel — the peripheral has no graph
+  repository, publisher or routing service of its own;
+* the standalone data plane (``/v1/chat/completions``): ask the kernel for a
+  decision, resolve the Provider Key from peripheral SQLite and execute the
+  model request; fixed-model admin test chat resolves the catalog directly;
+* the decision-event receiver and the volatile 20-event memory log.
+
+Deliberately absent (kernel-owned): graph JSON, routing/JEV execution, decision
+events production, model upstream calls during a decision, request logging and
+decision snapshots.  The only kernel boundary is ``app.state.core`` (CoreClient).
+
+Readiness reflects peripheral state only (SQLite migrated).  An unreachable
+kernel is a data-plane/management error, never a readiness failure: the
+peripheral stays healthy so operators can still open the console and inspect the
+configuration while the kernel is being restarted.
+"""
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -10,6 +33,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from router.api.issue_presenter import issues_payload
+from router.api.routes_core_proxy import router as core_proxy_router
 from router.config import Settings
 from router.control.errors import (
     AlreadyExists,
@@ -18,7 +43,6 @@ from router.control.errors import (
     ReferencedByError,
     ValidationFailed,
 )
-from router.api.issue_presenter import issues_payload
 from router.control.remote_catalog_sync import (
     CatalogSyncDiverged,
     RemoteCatalogSyncService,
@@ -27,15 +51,6 @@ from router.core_client import CoreClient, CoreGraphError
 from router.decision_log_store import DecisionLogStore
 from router.jev.client import JevClient
 from router.jev.service import JevService
-from router.maintenance import MaintenanceWorker
-from router.request_logging import RequestLogger
-from router.routing.affinity import SessionAffinity
-from router.routing.graph.evaluator import GraphEvaluator
-from router.routing.reloader import GraphReloadWorker
-from router.routing.scheduler import LoadBalancer
-from router.routing.scheduling import ModelScheduler
-from router.routing.service import RoutingService
-from router.routing.snapshot import SnapshotPublisher
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import (
@@ -50,11 +65,8 @@ from router.store.routing_trees import (
     GraphConflictError,
     GraphReadOnlyError,
     GraphStorageError,
-    RoutingTreeRepo,
 )
 from router.upstream.breaker import CircuitBreaker
-from router.upstream.breaker_store import BreakerStore
-from router.upstream.breaker_worker import BreakerSyncWorker
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 logger = logging.getLogger(__name__)
@@ -173,41 +185,31 @@ def create_app(
     transport: httpx.BaseTransport | None = None,
     core_transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
-    requestlog = RequestLogger(settings.db_path)
+    """Build the peripheral service: no graph ownership, no local routing."""
     conn = connect(settings.db_path)
     try:
         migrate(conn)
         seed_default(conn)
         if settings.user_auth:
             UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
-        requestlog.hydrate_recent(conn)
+        _seed_jev(conn, settings)
     finally:
         conn.close()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # 共享熔断 quarantine 必须在接收流量之前进入内存：start() 先 await
-        # 一次跨副本同步，然后才启动后台轮询。
-        await app.state.breaker_worker.start()
-        await app.state.maintenance.start()
-        await requestlog.start()
-        await app.state.graph_reloader.start()
         try:
             yield
         finally:
-            # 先停全部后台 worker（它们可能仍在用数据库/外部资源），最后才
-            # 关闭 HTTP client。
-            await app.state.breaker_worker.close()
-            await app.state.maintenance.close()
-            await app.state.graph_reloader.close()
-            await requestlog.close()
+            # The kernel boundary first, then the model-upstream client: no
+            # background worker or SQLite connection is owned by this app.
             await app.state.core.aclose()
             await app.state.http.aclose()
 
     app = FastAPI(title="RoutePilot", lifespan=lifespan)
     app.state.settings = settings
-    # JEV Key 只从环境变量读取：图运行装配不再打开 SQLite 解析已存密钥。
-    app.state.jev_api_key = os.environ.get(settings.jev_api_key_env, "")
+    #: SQLite migrated at construction: readiness does not depend on the kernel.
+    app.state.db_ready = True
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
     # 内核客户端自备 AsyncClient：浏览器/上游 transport 不复用到内核管理面。
     app.state.core = CoreClient(
@@ -219,37 +221,11 @@ def create_app(
     # 目录写（模型 / provider / JEV / 时段）的跨服务事务：SQLite 单写事务 +
     # 内核条件图批次 + 反向补偿。路由只做 DTO 与影响预览。
     app.state.catalog_sync_factory = _catalog_sync_factory(app.state.core)
+    # 外围执行层的上游熔断（只记录本进程的上游执行结果，不参与内核调度）。
     app.state.breaker = CircuitBreaker()
-    app.state.breaker_store = BreakerStore(settings.db_path)
-    app.state.breaker_worker = BreakerSyncWorker(
-        app.state.breaker, app.state.breaker_store)
-    app.state.maintenance = MaintenanceWorker(settings.db_path)
-    app.state.balancer = LoadBalancer(app.state.breaker)
-    app.state.affinity = SessionAffinity(max_entries=settings.session_max_entries)
     app.state.jev_client = JevClient(app.state.http)
-    app.state.routing_service = RoutingService(
-        GraphEvaluator(app.state.jev_client),
-        ModelScheduler(app.state.affinity, app.state.balancer),
-    )
-    app.state.requestlog = requestlog
     # 决策日志只保存在内存：完整事件来自内核事件接收口，重启即清空（Global Constraint 5）。
     app.state.decision_logs = DecisionLogStore()
-
-    app.state.graph_repo = RoutingTreeRepo(settings.graph_dir, writer=settings.graph_writer)
-    if settings.graph_writer:
-        app.state.graph_repo.initialize()
-    app.state.snapshot_set = None
-    app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
-    conn = connect(settings.db_path)
-    try:
-        # boot 种子只写 JEV 目录；启动路由集只由启用图文档构造（零启用图为空集）。
-        _seed_jev(conn, settings)
-        app.state.publisher.refresh()
-    except GraphStorageError:
-        logger.exception("initial graph snapshot is unavailable")
-    finally:
-        conn.close()
-    app.state.graph_reloader = GraphReloadWorker(app)
 
     @app.exception_handler(GraphConflictError)
     async def graph_conflict_handler(request: Request, exc: GraphConflictError):
@@ -332,8 +308,12 @@ def create_app(
 
     @app.get("/readyz")
     def readyz():
-        status = app.state.publisher.status()
-        return JSONResponse(status_code=200 if status["ready"] else 503, content=status)
+        """Peripheral readiness: SQLite migrated. The kernel is not probed."""
+        ready = bool(app.state.db_ready)
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"ready": ready, "database": "ok" if ready else "unavailable"},
+        )
 
     @app.middleware("http")
     async def console_nocache(request: Request, call_next):
@@ -351,13 +331,13 @@ def create_app(
     from router.api.routes_models import router as models_router
     from router.api.routes_test import router as test_router
     from router.api.routes_time import router as time_router
-    from router.api.routes_trees import router as trees_router
     from router.api.routes_users import router as users_router
     from router.api.routes_v1 import router as v1_router
 
     app.include_router(models_router, prefix="/admin")
     app.include_router(time_router, prefix="/admin")
-    app.include_router(trees_router, prefix="/admin")
+    # 图管理经内核执行：外围只保留 /admin/trees、/admin/try 的鉴权与代理契约。
+    app.include_router(core_proxy_router, prefix="/admin")
     app.include_router(jev_router, prefix="/admin")
     app.include_router(logs_router, prefix="/admin")
     app.include_router(users_router, prefix="/admin")

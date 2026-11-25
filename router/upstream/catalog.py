@@ -1,12 +1,11 @@
 """上游目录：models ⋈ providers 的模型目录与推理能力归一化。
 
 本模块是 frozen ``Backend`` 的定义处，并提供「从 SQLite 目录装配
-``model_id -> Backend``」的唯一入口 :func:`load_backends`。它只服务**固定模型
-直连**（管理端测试对话、``/admin/test``）与目录检查：Auto 路由始终读取启用图
-发布的运行快照（``router.routing.snapshot``，由 ``router.control.runtime`` 按
-画布内嵌运行配置装配），既不访问数据库，也不经过本模块。``/admin/models`` /
-``/admin/providers`` 的目录写不会重写任何画布，因此这里也不存在「每次目录写
-重建快照」的路径。
+``model_id -> Backend``」的唯一入口 :func:`load_backends`。拆分后它服务两条
+外围执行路径：**固定模型直连**（管理端测试对话、``/admin/test``）与 Auto 的
+执行映射（``router.upstream.execution.backend_for_decision`` 用内核决策的逻辑
+模型在此解析 Provider Key/URL，目录与内核决策不一致时拒绝执行）。内核决策
+本身不读 SQLite：决策只来自启用图发布的路由快照。
 
 ``Backend`` 是 frozen dataclass：快照构造时复制 ``headers``/``reasoning``，
 发布后的 MappingProxy 里不再包着可被写者顺手改掉的可变对象。

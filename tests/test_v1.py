@@ -16,14 +16,11 @@ from urllib.parse import quote
 
 import httpx
 import pytest
-from fastapi import FastAPI, Request
 
-from router.api.routes_v1 import router, run_chat_completion
-from router.config import Settings
-from router.jev.client import JevClient
+from router.api.request_presenter import present_record
+from router.api.routes_v1 import decode_department
+from router.decision_events import replay_payload, summary_payload
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE, JevSettings
-from router.request_logging import LOG_COLUMNS, RequestLogger
-from router.routing.affinity import SessionAffinity
 from router.routing.conditions import TimePeriod
 from router.routing.graph.compiled import compile_graph
 from router.routing.graph.evaluator import GraphEvaluator
@@ -33,11 +30,18 @@ from router.routing.scheduling import ModelScheduler
 from router.routing.service import RoutingService
 from router.routing.snapshot import assemble_snapshot_set, build_snapshot
 from router.store.db import connect, migrate
-from router.store.repositories import seed_default
 from router.upstream.breaker import CircuitBreaker
 from router.upstream.catalog import Backend
 from router.upstream.runtime_keys import runtime_model_key, tree_scope
-from tests.routing_fixtures import tree_dict
+from tests.routing_fixtures import (
+    deliver_decision_events,
+    kernel_state,
+    recording_core_app,
+    seed_execution_catalog,
+    split_app,
+    test_settings,
+    tree_dict,
+)
 
 
 JEV_SETTINGS = JevSettings(
@@ -255,22 +259,38 @@ def priority_graph():
 
 def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transport=None,
              time_periods=None):
-    path = str(tmp_path / "v1.db")
-    conn = connect(path)
+    """Peripheral app + in-process kernel running the real routing service.
+
+    The kernel owns the route set and executes the decision; the peripheral only
+    executes the model call (mock ``handler``) and receives the decision event.
+    The test route set is built directly (like the pre-split harness) so these
+    data-plane cases can keep their exact graphs; kernel-side enable validation is
+    covered by the kernel tests.  ``app.test_kernel`` / ``app.test_sink`` expose
+    the kernel state and the captured decisions.
+    """
+    settings = test_settings(tmp_path)
+    conn = connect(settings.db_path)
     migrate(conn)
+    # 外围执行目录：Auto 执行按内核决策的逻辑模型解析 Provider Key 与上游 URL。
+    seed_execution_catalog(
+        conn, key="peripheral-secret",
+        models=[(model, model, "{}") for model in MODELS])
     conn.close()
-    app = FastAPI()
-    app.state.settings = Settings(db_path=path)
-    app.state.http = httpx.AsyncClient(transport=transport or httpx.MockTransport(handler))
-    app.state.breaker = CircuitBreaker()
-    app.state.balancer = RecordingBalancer(app.state.breaker)
-    app.state.affinity = SessionAffinity()
-    app.state.jev_client = JevClient(app.state.http)
-    app.state.routing_service = RoutingService(
-        GraphEvaluator(app.state.jev_client),
-        ModelScheduler(app.state.affinity, app.state.balancer),
+
+    def kernel_only_handler(request):
+        raise AssertionError(
+            f"kernel made an external request: {request.method} {request.url}")
+
+    kernel, sink = recording_core_app(
+        graph_dir=settings.graph_dir,
+        transport=(httpx.MockTransport(handler) if handler is not None
+                   else httpx.MockTransport(kernel_only_handler)),
     )
-    app.state.requestlog = RequestLogger(app.state.settings.db_path)
+    kernel.state.balancer = RecordingBalancer(kernel.state.breaker)
+    kernel.state.routing_service = RoutingService(
+        GraphEvaluator(kernel.state.jev_client),
+        ModelScheduler(kernel.state.affinity, kernel.state.balancer),
+    )
     backends = {
         model: Backend(
             url=f"http://{model}.test/v1/chat/completions",
@@ -291,10 +311,15 @@ def make_app(tmp_path, handler, *, root=None, active=True, sticky=None, transpor
             jev=JEV_SETTINGS, capabilities=CAPABILITIES,
             compiled=compile_graph(tree.root),
         )
-        app.state.snapshot_set = assemble_snapshot_set([snapshot], fingerprint="test")
+        kernel.state.snapshot_set = assemble_snapshot_set(
+            [snapshot], fingerprint="test")
     else:
-        app.state.snapshot_set = assemble_snapshot_set([], fingerprint="empty")
-    app.include_router(router, prefix="/v1")
+        kernel.state.snapshot_set = assemble_snapshot_set(
+            [], fingerprint="empty")
+    if transport is None:
+        transport = httpx.MockTransport(handler)
+    app = split_app(settings=settings, kernel=kernel, transport=transport)
+    app.test_sink = sink
     return app
 
 
@@ -346,11 +371,22 @@ async def post(app, body=None, *, headers=None, path="/v1/chat/completions"):
 
 
 def recent(app):
-    return app.state.requestlog.recent_requests(1)[0]
+    """Presented summary of the last kernel decision event.
+
+    The peripheral keeps no request log after the split: every decision fact is
+    read from the kernel's complete event (same projection the console list
+    endpoint uses).
+    """
+    return present_record(summary_payload(app.test_sink.events[-1]))
+
+
+def last_event(app):
+    return app.test_sink.events[-1]
 
 
 async def flush(app):
-    await app.state.requestlog.flush()
+    """Kept as a no-op: execution results are discarded, there is no local queue."""
+    return None
 
 
 # ── selected direct / numeric AND / waves ──────────────────────────────
@@ -384,13 +420,13 @@ def test_selected_target_uses_real_systemone_chain(tmp_path):
             "Decision time", "Decision model time", "Waves"]
         assert record["metrics"][0][1].endswith("ms")
         assert record["metrics"][2][1] == 1
-        assert record["upstream_status"] == 200
         assert record["fields"][0] == [{"zh": "请求 ID", "en": "Request ID"}, record["id"]]
-        assert [event["event"] for event in record["trace"]].count("request_outcome") == 1
-        assert record["trace"][-1]["phase"] == "outcome"
-        assert record["trace"][-1]["tone"] == "hit"
-        assert len(app.state.requestlog.recent_requests()) == 1
-        assert app.state.balancer.inflight("fast", scope=MAIN_SCOPE) == 0
+        # 外围不再记录执行结果：决策事件只描述路由决策本身。
+        assert record["outcome_state"] == "completed"
+        assert "request_outcome" not in [
+            event["event"] for event in record["trace"]]
+        assert len(app.test_sink.events) == 1
+        assert kernel_state(app).balancer.inflight("fast", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -416,15 +452,10 @@ def test_numeric_and_merges_two_questions_into_one_systemone_call(tmp_path):
         assert record["jev_choice"] == "strong"
         assert record["jev_top"] == pytest.approx(0.9)
         assert record["jev_ms"] == pytest.approx(record["answers"]["q-cap"]["duration_ms"])
-        await flush(app)
-        conn = connect(app.state.settings.db_path)
-        row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
-        conn.close()
-        assert row["waves"] == 1
-        assert row["jev_choice"] == "strong"
-        assert set(LOG_COLUMNS) & {"answers", "trace", "text", "route_label", "metrics", "fields"} == set()
+        # 决策事件自包含：answers/trace 只在事件里，不再有 SQLite 请求账本列。
+        assert set(last_event(app)["answers"]) == {"q-cap", "q-domain"}
         assert "answers" in recent(app) and "trace" in recent(app)
-        assert app.state.balancer.inflight("power", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("power", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -450,14 +481,7 @@ def test_two_wave_clarify_calls_systemone_once_per_wave_and_logs_wave_count(tmp_
         wave_events = [event for event in record["trace"] if event["event"] == "wave"]
         assert [event["wave"] for event in wave_events] == [1, 2]
         assert set(record["answers"]) == {"q-cap", "q-clarify"}
-        await flush(app)
-        conn = connect(app.state.settings.db_path)
-        row = dict(conn.execute("SELECT * FROM request_logs").fetchone())
-        columns = {item[1] for item in conn.execute("PRAGMA table_info(request_logs)")}
-        conn.close()
-        assert row["waves"] == 2
-        assert "answers" not in columns and "trace" not in columns
-        assert app.state.balancer.inflight(model, scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight(model, scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -476,10 +500,8 @@ def test_fallback_model_when_no_target_activates(tmp_path):
         assert record["fallback_reason"] == "error_fallback"
         assert record["route_label"] == {"zh": "默认目标兜底", "en": "Default target fallback"}
         assert record["jev_choice"] == "strong"
-        await flush(app)
-        conn = connect(app.state.settings.db_path)
-        assert conn.execute("SELECT waves FROM request_logs").fetchone()[0] == 1
-        conn.close()
+        # 决策事件自包含：波次计数只来自事件本身，不再写 SQLite 请求账本。
+        assert last_event(app)["decision"]["waves"] == 1
 
     asyncio.run(scenario())
 
@@ -504,7 +526,7 @@ def test_missing_answer_key_uses_error_fallback(tmp_path):
         assert record["waves"] == 1
         failed = [event for event in record["trace"] if event["event"] == "wave"]
         assert failed[0]["failed"] is True and failed[0]["error"]
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -552,9 +574,9 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         model = first.headers["x-sr-model"]
         assert model in ("strong-a", "strong-b")
         assert first.headers["x-sr-selection"] == "target"
-        assert app.state.balancer.calls[-1]["preferred"] is None
-        assert app.state.balancer.inflight(model, scope=MAIN_SCOPE) == 0
-        first_revision = app.state.snapshot_set.default_snapshot.tree_revision
+        assert kernel_state(app).balancer.calls[-1]["preferred"] is None
+        assert kernel_state(app).balancer.inflight(model, scope=MAIN_SCOPE) == 0
+        first_revision = kernel_state(app).snapshot_set.default_snapshot.tree_revision
 
         # 仅移动节点（canvas 属于纯布局字段）：behavior revision 不变。
         moved = copy.deepcopy(switch_graph())
@@ -569,12 +591,12 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         ))
         moved_snapshot = build_snapshot(
             tree=moved_tree,
-            backends=app.state.snapshot_set.default_snapshot.backends, time_periods=[],
+            backends=kernel_state(app).snapshot_set.default_snapshot.backends, time_periods=[],
             jev=JEV_SETTINGS, capabilities=CAPABILITIES,
             compiled=compile_graph(moved_tree.root),
         )
         assert moved_snapshot.tree_revision == first_revision
-        app.state.snapshot_set = assemble_snapshot_set(
+        kernel_state(app).snapshot_set = assemble_snapshot_set(
             [moved_snapshot], fingerprint="moved")
 
         second = await post(app, headers=headers)
@@ -583,7 +605,7 @@ def test_sticky_second_request_reruns_question_then_prefers_model(tmp_path):
         assert second.headers["x-sr-selection"] == "sticky"
         # 第二次请求仍先执行被激活的问题，再做 preferred 调度。
         assert [list(request["questions"]) for request in har.jev_requests] == [["q"], ["q"]]
-        assert app.state.balancer.calls[-1]["preferred"] == model
+        assert kernel_state(app).balancer.calls[-1]["preferred"] == model
         assert har.upstream_models == [model, model]
         record = recent(app)
         assert record["sticky_hit"] == 1
@@ -597,26 +619,28 @@ def test_preferred_target_circuit_open_returns_503_without_calling_next_upstream
     async def scenario():
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(tmp_path, har, root=priority_graph())
-        for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure(runtime_model_key(MAIN_SCOPE, "power"))
-        assert app.state.breaker.is_open(
+        for _ in range(kernel_state(app).breaker.threshold):
+            kernel_state(app).breaker.failure(runtime_model_key(MAIN_SCOPE, "power"))
+        assert kernel_state(app).breaker.is_open(
             runtime_model_key(MAIN_SCOPE, "power")) is True
-        assert app.state.breaker.is_open("power") is False
+        assert kernel_state(app).breaker.is_open("power") is False
         response = await post(app)
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_available_backend"
         # p1 power-target 熔断后直接 503，不静默改选 p2 strong-target 上游。
         assert har.upstream_models == []
-        assert app.state.balancer.inflight("power", scope=MAIN_SCOPE) == 0
-        assert app.state.balancer.inflight("strong-a", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("power", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("strong-a", scope=MAIN_SCOPE) == 0
+        # 决策事件（内核产生）完整保留调度失败 trace；执行结果本就不在事件里。
+        event = last_event(app)
         record = recent(app)
         assert record["outcome_state"] == "routing_error"
-        assert record["error_class"] == "no_available_backend"
-        assert [event["event"] for event in record["trace"][-2:]] == ["schedule", "routing_error"]
-        assert record["trace"][-2]["unavailable"] == {"power": "breaker_open"}
-        assert record["trace"][-1]["stage"] == "schedule"
+        assert [item["event"] for item in event["trace"][-2:]] == [
+            "schedule", "routing_error"]
+        assert event["trace"][-2]["unavailable"] == {"power": "breaker_open"}
+        assert event["trace"][-1]["stage"] == "schedule"
+        assert event["trace"][-1]["error_class"] == "no_available_backend"
         assert record["routing_ms"] > 0
-        assert record["total_ms"] >= record["routing_ms"]
         assert record["target_id"] == "power-target"
         assert record["selection_reason"] == "target"
         assert record["policy_path"] == "power-target"
@@ -644,42 +668,16 @@ def test_live_log_uses_node_titles_from_the_serving_snapshot(tmp_path):
     asyncio.run(scenario())
 
 
-def test_no_active_tree_creates_a_routing_error_log(tmp_path):
+def test_no_active_tree_is_rejected_before_any_replayable_event(tmp_path):
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), active=False)
         response = await post(app)
 
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_active_tree"
-        record = recent(app)
-        assert record["outcome_state"] == "routing_error"
-        assert record["error_class"] == "no_active_tree"
-        failure = record["trace"][-1]
-        assert {key: failure[key] for key in ("event", "stage", "error_class", "message")} == {
-            "event": "routing_error", "stage": "snapshot",
-            "error_class": "no_active_tree", "message": "no routing tree is enabled",
-        }
-        assert failure["phase"] == "routing_error"
-        assert failure["label"] == {"zh": "路由中止", "en": "Routing stopped"}
-        facts = failure["facts"]
-        assert facts[0] == [{"zh": "阶段", "en": "Stage"}, "snapshot"]
-        assert facts[1] == [{"zh": "原因", "en": "Reason"}, "no_active_tree"]
-        assert facts[2][0] == {"zh": "消息", "en": "Message"}
-        assert facts[2][1]
-        assert failure["tone"] == "bad"
-        assert record["route_label"] == {"zh": "路由中止", "en": "Routing stopped"}
-        assert not any(event["event"] == "request_outcome" for event in record["trace"])
-        assert len(app.state.requestlog.recent_requests()) == 1
-        assert record["node_labels"] == {}
-        assert record["model"] is None
-        assert record["target_id"] is None
-        assert record["tree_id"] is None
-        assert record["tree_revision"] is None
-        assert record["snapshot_revision"] is None
-        assert record["jev_model"] is None
-        assert record["selection_reason"] is None
-        assert record["policy_path"] is None
-        assert record["fallback_reason"] is None
+        # 内核在选图之前拒绝：不产生可回放事件，外围内存日志保持为空（设计 §7.1）。
+        assert app.test_sink.events == []
+        assert app.state.decision_logs.recent(20) == []
 
     asyncio.run(scenario())
 
@@ -695,7 +693,8 @@ def test_invalid_json_does_not_create_a_calculation_log(tmp_path):
                 headers={"content-type": "application/json"},
             )
         assert response.status_code == 400
-        assert app.state.requestlog.recent_requests() == []
+        assert app.test_sink.events == []
+        assert app.state.decision_logs.recent(20) == []
 
     asyncio.run(scenario())
 
@@ -725,10 +724,10 @@ def test_no_candidate_schedule_failure_preserves_fallback_target(tmp_path):
     async def scenario():
         har = Harness({"q": choice(fast=0.1, strong=0.9)})
         app = make_app(tmp_path, har, root=no_target_graph())
-        for _ in range(app.state.breaker.threshold):
-            app.state.breaker.failure(runtime_model_key(MAIN_SCOPE, "safe"))
+        for _ in range(kernel_state(app).breaker.threshold):
+            kernel_state(app).breaker.failure(runtime_model_key(MAIN_SCOPE, "safe"))
         # 熔断只作用于 Auto 图的运行键；裸键属于固定模型直连，必须保持关闭。
-        assert app.state.breaker.is_open("safe") is False
+        assert kernel_state(app).breaker.is_open("safe") is False
 
         response = await post(app)
 
@@ -744,20 +743,9 @@ def test_no_candidate_schedule_failure_preserves_fallback_target(tmp_path):
         assert record["policy_path"] == "safe"
         assert record["fallback_reason"] == "error_fallback"
 
-        await flush(app)
-        conn = connect(app.state.settings.db_path)
-        try:
-            row = dict(conn.execute(
-                "SELECT target_id, selection_reason, policy_path, outcome_state FROM request_logs"
-            ).fetchone())
-        finally:
-            conn.close()
-        assert row == {
-            "target_id": "safe",
-            "selection_reason": "error_fallback",
-            "policy_path": "safe",
-            "outcome_state": "routing_error",
-        }
+        # 决策事件自包含：失败决策的目标/原因都在事件本身（外围不再写请求账本）。
+        assert last_event(app)["decision"]["status"] == "routing_error"
+        assert last_event(app)["decision"]["target_id"] == "safe"
 
     asyncio.run(scenario())
 
@@ -772,15 +760,18 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
 
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
-        app.state.routing_service = BrokenEngine()
+        kernel_state(app).routing_service = BrokenEngine()
         response = await post(app)
 
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "routing_failed"
         record = recent(app)
-        assert record["error_class"] == "routing_failed"
-        assert record["trace"][-1]["message"] == "routing failed"
-        assert "sensitive internal detail" not in str(record)
+        failure = record["trace"][-1]
+        assert failure["event"] == "routing_error"
+        assert failure["error_class"] == "routing_failed"
+        assert failure["message"] == "routing failed"
+        assert "sensitive internal detail" not in json.dumps(
+            last_event(app), ensure_ascii=False)
 
     asyncio.run(scenario())
 
@@ -788,16 +779,13 @@ def test_unknown_routing_failure_uses_a_safe_console_message(tmp_path):
 def test_missing_snapshot_creates_a_snapshot_stage_failure(tmp_path):
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500), root=direct_graph())
-        app.state.snapshot_set = None
+        kernel_state(app).snapshot_set = None
         response = await post(app)
 
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_valid_snapshot"
-        record = recent(app)
-        assert record["node_labels"] == {}
-        assert record["trace"][-1]["stage"] == "snapshot"
-        assert record["trace"][-1]["error_class"] == "no_valid_snapshot"
-        assert record["trace"][-1]["message"] == "no valid snapshot set"
+        # 选图前失败：内核不产生可回放事件。
+        assert app.test_sink.events == []
 
     asyncio.run(scenario())
 
@@ -819,7 +807,7 @@ def test_time_event_stays_initial_when_no_period_condition_ran(tmp_path):
         assert time_event["event"] == "time"
         assert time_event["phase"] == "initial"
         assert time_event["label"] == {"zh": "初始计算", "en": "Initial evaluation"}
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -840,7 +828,7 @@ def test_time_event_is_period_when_a_real_period_condition_ran(tmp_path):
         assert condition["source"] == "periods"
         assert condition["value"] is True
         assert condition["phase"] == "period"
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
     asyncio.run(scenario())
 
@@ -886,14 +874,13 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
         assert response.status_code == 200
         assert b"[DONE]" in response.content
         assert jev_calls == []
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         record = recent(app)
         assert record["outcome_state"] == "completed"
-        assert record["total_tokens"] == 3
         assert record["answers"] == {}
-        assert record["trace"][-1]["event"] == "request_outcome"
-        # 上游用量仍保存在机器字段里，但不再进入路由控制台的展示字段。
-        assert "Total tokens" not in [pair[0]["en"] for pair in record["fields"]]
+        # 外围不再记录执行结果（token/outcome），事件只描述决策。
+        assert "total_tokens" not in record
+        assert "request_outcome" not in [item["event"] for item in record["trace"]]
 
     asyncio.run(scenario())
 
@@ -934,28 +921,19 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
         assert response.headers["x-sr-model"] == "safe"
         assert response.headers["x-sr-selection"] == "target"
         assert response.json() == {"error": {"message": "upstream_error"}}
-        # 上游响应恰好关闭一次，租约恰好释放一次（未移交 _relay，也没有 double release）。
+        # 上游响应恰好关闭一次；内核决策租约在内核返回决策时已释放。
         assert closes == [True]
-        assert released == ["safe"]
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
-        record = recent(app)
-        assert record["outcome_state"] == "upstream_error"
-        assert record["error_class"] == "upstream_error"
-        assert record["upstream_status"] == 503
-        assert [pair[0]["en"] for pair in record["metrics"]] == [
-            "Decision time", "Decision model time", "Waves"]
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
 
-        # 熔断键必须带图作用域：再补两次 5xx 达到阈值（threshold=3），作用域键
-        # 打开而裸模型键不打开；stream()/_relay 回退到裸 ``model`` 键时首条断言
-        # 就会失败。每条 5xx 仍各自关闭上游响应、释放租约，结束后 inflight 归零。
+        # 执行失败不再回写内核事件：事件仍是决策成功；上游熔断键属于外围执行层，
+        # 带图作用域（裸模型键只属于固定模型直连），达到阈值后打开。
         for _ in range(2):
             assert (await post(app, payload(stream=True))).status_code == 502
         assert app.state.breaker.is_open(
             runtime_model_key(tree_scope("main"), "safe")) is True
         assert app.state.breaker.is_open("safe") is False
         assert closes == [True, True, True]
-        assert released == ["safe", "safe", "safe"]
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert recent(app)["outcome_state"] == "completed"
 
     asyncio.run(scenario())
 
@@ -1034,10 +1012,10 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
                 elif message["type"] == "http.response.body" and message.get("body"):
                     first = message["body"]
                     break
-            # 第一个 SSE 分片已发出，第二个仍被上游 gate 挡住：租约必须被持有。
+            # 第一个 SSE 分片已发出，第二个仍被上游 gate 挡住：内核决策租约早已
+            # 释放（决策与执行分离），上游响应由外围 relay 持有。
             assert first == b"data: first\n\n"
-            assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 1
-            assert released == []
+            assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
             gate.set()
             chunks = [first]
             while True:
@@ -1054,8 +1032,7 @@ def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
 
         assert b"".join(chunks) == b"data: first\n\ndata: second\n\n"
         assert closes == [True]
-        assert released == ["safe"]
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
         assert recent(app)["outcome_state"] == "completed"
 
     asyncio.run(scenario())
@@ -1090,11 +1067,11 @@ def test_upstream_5xx_maps_to_502_and_releases_lease(tmp_path):
         app = make_app(tmp_path, handler, root=direct_graph())
         response = await post(app)
         assert response.status_code == 502
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        # 上游 5xx 只影响外围执行（不写日志）；决策事件仍是成功决策。
         record = recent(app)
-        assert record["outcome_state"] == "upstream_error"
-        assert record["trace"][-1]["event"] == "request_outcome"
-        assert record["trace"][-1]["tone"] == "bad"
+        assert record["outcome_state"] == "completed"
+        assert "request_outcome" not in [item["event"] for item in record["trace"]]
 
     asyncio.run(scenario())
 
@@ -1111,8 +1088,9 @@ def test_cancellation_during_upstream_records_terminal_state_and_releases(tmp_pa
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-        assert app.state.balancer.inflight("safe", scope=MAIN_SCOPE) == 0
-        assert recent(app)["outcome_state"] == "cancelled"
+        # 客户端取消只中止外围上游执行；内核决策已完成且租约已释放，事件是决策。
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+        assert recent(app)["outcome_state"] == "completed"
 
     asyncio.run(scenario())
 
@@ -1270,30 +1248,30 @@ def test_invalid_json_is_a_client_error(tmp_path):
     asyncio.run(scenario())
 
 
-def test_real_request_logs_a_graph_snapshot_index(tmp_path):
+def test_real_request_produces_a_self_contained_decision_event(tmp_path):
+    """One real Auto request: the kernel emits one replayable, self-contained event.
+
+    The split removed SQLite decision-log snapshots; replay reads the graph/trace
+    embedded in the same event (design §7).
+    """
     async def scenario():
         har = Harness({"q": choice(fast=0.9, strong=0.1)})
         app = make_app(tmp_path, har, root=direct_graph())
         response = await post(app)
         assert response.status_code == 200
-        record = recent(app)
-        assert record["graph_snapshot_id"]
-        assert record["_graph_snapshot"]["snapshot_id"] == record["graph_snapshot_id"]
-        # 决策日志页面不再从账本记录生成快照链接（回放入口只属于内存决策事件）。
-        assert "snapshot_url" not in record
-        snapshot = app.state.requestlog.snapshot_for(record["id"])
-        assert snapshot["tree"]["root"]["type"] == "graph"
-        assert snapshot["trace"] == record["trace"]
-        await flush(app)
-        conn = connect(app.state.settings.db_path)
-        try:
-            stored = conn.execute(
-                "SELECT graph_snapshot_id FROM request_snapshots WHERE request_id = ?",
-                (record["id"],),
-            ).fetchone()
-        finally:
-            conn.close()
-        assert stored is not None and stored[0] == record["graph_snapshot_id"]
+
+        event = last_event(app)
+        replay = replay_payload(event)
+        assert replay["tree"]["root"]["type"] == "graph"
+        assert replay["trace"] == event["trace"]
+        assert event["request"]["text"] == "请求"
+        assert "graph_snapshot_id" not in event
+        assert "snapshot_revision" not in event["request"]
+
+        # 内存日志接收口：投递后可回放，且回放与当前图无关。
+        deliver_decision_events(app, app.test_sink)
+        assert app.state.decision_logs.get(event["id"]) is not None
+        assert app.state.decision_logs.recent(1)[0]["graph"] == event["graph"]
 
     asyncio.run(scenario())
 
@@ -1307,7 +1285,7 @@ def encode_department(value):
 
 def add_department_graph(app, *, department='财务部', tree_id='finance'):
     """把带部门的启用图装配进 app 的路由集（默认图保持 main）。"""
-    base = app.state.snapshot_set.default_snapshot
+    base = kernel_state(app).snapshot_set.default_snapshot
     tree = tree_from_dict(tree_dict(
         tree_id, root=switch_graph(), departments=[department],
         enabled=True, default=False,
@@ -1318,32 +1296,18 @@ def add_department_graph(app, *, department='财务部', tree_id='finance'):
         jev=JEV_SETTINGS, capabilities=CAPABILITIES,
         compiled=compile_graph(tree.root),
     )
-    app.state.snapshot_set = assemble_snapshot_set(
+    kernel_state(app).snapshot_set = assemble_snapshot_set(
         [base, snapshot], fingerprint='departments')
     return app
 
 
-def make_admin_chat_app(tmp_path, handler, *, allow_department_header=True, root=None):
-    """真实执行器 + 管理端测试对话路由（正式路由在 Task 7 接入）。"""
-    app = make_app(tmp_path, handler, root=root)
-    conn = connect(app.state.settings.db_path)
-    try:
-        seed_default(conn)
-    finally:
-        conn.close()
+def make_admin_chat_app(tmp_path, handler, *, root=None):
+    """真实组合根：``/admin/test/chat/completions`` 由 create_app 挂载。
 
-    @app.post('/admin/test/chat/completions')
-    async def admin_test_chat(request: Request):
-        conn = connect(app.state.settings.db_path)
-        try:
-            return await run_chat_completion(
-                request, use_requested_model=True, conn=conn,
-                allow_department_header=allow_department_header,
-            )
-        finally:
-            conn.close()
-
-    return app
+    管理端测试对话与 ``/v1`` 共用同一外围执行器：Auto 走内核决策、固定模型只查
+    外围 SQLite 目录（拆分后不再需要额外路由）。
+    """
+    return make_app(tmp_path, handler, root=root)
 
 
 def test_public_v1_rejects_client_department_header(tmp_path):
@@ -1436,26 +1400,14 @@ def test_missing_default_graph_is_a_no_default_tree_failure(tmp_path):
     async def scenario():
         app = make_app(tmp_path, lambda request: httpx.Response(500),
                        root=direct_graph())
-        app.state.snapshot_set = replace(
-            app.state.snapshot_set, default_tree_id=None)
+        kernel_state(app).snapshot_set = replace(
+            kernel_state(app).snapshot_set, default_tree_id=None)
         response = await post(app)
 
         assert response.status_code == 503
         assert response.json() == {'error': {'message': 'no_default_tree'}}
-        record = recent(app)
-        assert record['outcome_state'] == 'routing_error'
-        assert record['error_class'] == 'no_default_tree'
-        failure = record['trace'][-1]
-        assert failure['stage'] == 'snapshot'
-        assert failure['error_class'] == 'no_default_tree'
-        assert failure['message'] == 'no default routing tree is enabled'
-        # 选图失败发生在快照装配前：失败账本必须以 snapshot=None 安全落表。
-        assert record['node_labels'] == {}
-        assert record['model'] is None
-        assert record['tree_id'] is None
-        assert record['tree_revision'] is None
-        assert record['snapshot_revision'] is None
-        assert record['jev_model'] is None
+        # 选图前失败：内核不产生可回放事件。
+        assert app.test_sink.events == []
 
     asyncio.run(scenario())
 
@@ -1495,20 +1447,16 @@ def test_admin_test_chat_rejects_malformed_department_header(tmp_path):
     asyncio.run(scenario())
 
 
-def test_same_model_failure_in_main_does_not_block_finance(tmp_path):
+def test_kernel_breaker_scope_isolates_main_from_finance(tmp_path):
+    """内核调度熔断按图作用域隔离：main 的键不阻断 finance 图。
+
+    拆分后内核不再接收上游执行结果（无回写接口），因此这里直接构造调度熔断
+    状态来验证作用域隔离——这正是内核选路阶段的行为。
+    """
     async def scenario():
-        state = {'fail': True, 'calls': []}
-
-        def handler(request):
-            if request.url.host.endswith('.test') and request.url.path.endswith('/chat/completions'):
-                state['calls'].append(request.url.host)
-                if state['fail']:
-                    return httpx.Response(500)
-                return upstream_ok(request)
-            return httpx.Response(200, json={'answers': {}})
-
-        app = make_admin_chat_app(tmp_path, handler, root=direct_graph())
-        base = app.state.snapshot_set.default_snapshot
+        app = make_admin_chat_app(
+            tmp_path, lambda request: httpx.Response(200, json={'choices': []}))
+        base = kernel_state(app).snapshot_set.default_snapshot
         # 部门图与默认图使用同一直连结构、同一 safe 逻辑模型和同一运行目录。
         tree = tree_from_dict(tree_dict(
             'finance', root=direct_graph(), departments=['财务部'],
@@ -1517,34 +1465,29 @@ def test_same_model_failure_in_main_does_not_block_finance(tmp_path):
             tree=tree, backends=base.backends,
             time_periods=[], jev=JEV_SETTINGS, capabilities=CAPABILITIES,
             compiled=compile_graph(tree.root))
-        app.state.snapshot_set = assemble_snapshot_set(
+        kernel_state(app).snapshot_set = assemble_snapshot_set(
             [base, finance], fingerprint='same-model')
 
-        # 公开默认图持续失败，直到 main:safe 对应的电路打开。
-        for _ in range(app.state.breaker.threshold):
-            response = await post(app, payload())
-            assert response.status_code == 502
+        # 只打开 main 图的运行键：finance 图的同名模型不受影响。
         main_key = runtime_model_key(MAIN_SCOPE, 'safe')
-        assert app.state.breaker.is_open(main_key) is True
-        # 熔断只落在 main 的运行键上：裸键属于固定模型直连，不能被 Auto 污染。
-        assert app.state.breaker.is_open('safe') is False
+        for _ in range(kernel_state(app).breaker.threshold):
+            kernel_state(app).breaker.failure(main_key)
+        assert kernel_state(app).breaker.is_open(main_key) is True
+        # 裸键属于固定模型直连，不能被 Auto 污染。
+        assert kernel_state(app).breaker.is_open('safe') is False
 
-        state['fail'] = False
-        before = len(state['calls'])
-        response = await post(
+        default = await post(app, payload())
+        assert default.status_code == 503
+        assert default.json()['error']['message'] == 'no_available_backend'
+        # main 的熔断在调度阶段拒绝请求：没有任何上游执行。
+        assert kernel_state(app).balancer.inflight("safe", scope=MAIN_SCOPE) == 0
+
+        finance_response = await post(
             app, {**payload(), 'model': 'auto'},
             headers={'x-sr-department': encode_department('财务部')},
             path='/admin/test/chat/completions')
-        assert response.status_code == 200, response.text
-        assert response.headers['x-sr-tree-id'] == 'finance'
-        assert len(state['calls']) == before + 1, 'finance was blocked before its upstream call'
-
-        # 财务图成功不能重置 main 的电路；默认图再次请求仍应在调度前阻断。
-        before = len(state['calls'])
-        response = await post(app, payload())
-        assert response.status_code == 503
-        assert response.json()['error']['message'] == 'no_available_backend'
-        assert len(state['calls']) == before, 'main circuit should remain open'
+        assert finance_response.status_code == 200, finance_response.text
+        assert finance_response.headers['x-sr-tree-id'] == 'finance'
 
     asyncio.run(scenario())
 
@@ -1552,22 +1495,25 @@ def test_same_model_failure_in_main_does_not_block_finance(tmp_path):
 def test_fixed_model_direct_does_not_require_a_route_set(tmp_path):
     async def scenario():
         app = make_admin_chat_app(
-            tmp_path, lambda request: httpx.Response(200, json={'choices': []}))
+            tmp_path, lambda request: httpx.Response(200, json={'choices': []}),
+            root=direct_graph())
         body = {'model': 'qwen3-8b', 'messages': [{'role': 'user', 'content': '直连'}]}
-        # 空路由集（无默认图）与未初始化路由集都不影响固定模型直连。
+        # 空路由集 / 未初始化路由集都不影响固定模型直连（它只查外围 SQLite 目录）。
         for route_set in (assemble_snapshot_set([], fingerprint='empty'), None):
-            app.state.snapshot_set = route_set
+            kernel_state(app).snapshot_set = route_set
             response = await post(app, body, path='/admin/test/chat/completions')
             assert response.status_code == 200, response.text
             assert response.headers['x-sr-model'] == 'qwen3-8b'
             assert response.headers['x-sr-selection'] == 'direct'
             assert 'x-sr-graph-selection' not in response.headers
             assert 'x-sr-tree-id' not in response.headers
-        record = recent(app)
-        assert record['decision'] == 'test'
-        assert record['selection_reason'] == 'direct'
-        assert record['tree_id'] is None
-        assert record['snapshot_revision'] is None
+        # 固定模型直连不调用内核，也不产生决策事件。
+        assert app.test_sink.events == []
+        auto = await post(
+            app, {'model': 'auto', 'messages': [{'role': 'user', 'content': 'auto'}]},
+            path='/admin/test/chat/completions')
+        assert auto.status_code == 503
+        assert auto.json()['error']['message'] == 'no_valid_snapshot'
 
     asyncio.run(scenario())
 

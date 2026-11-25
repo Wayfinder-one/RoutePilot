@@ -10,7 +10,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from contextlib import contextmanager
 from dataclasses import replace as dataclass_replace
 
 import pytest
@@ -27,6 +26,7 @@ from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ChangeRepo, ModelRepo, ProviderRepo
 from router.store.routing_trees import GraphStorageError
 from tests.routing_fixtures import (
+    kernel_state,
     core_app,
     core_app_for,
     portable_tree_dict,
@@ -59,7 +59,7 @@ def _strip_enabled(document: dict) -> dict:
 
 
 def _canvas_bytes(app, tree_id: str) -> bytes:
-    return (app.state.graph_repo.graphs / f"{tree_id}.json").read_bytes()
+    return (kernel_state(app).graph_repo.graphs / f"{tree_id}.json").read_bytes()
 
 
 def _canvas_state(app, tree_ids) -> dict[str, bytes]:
@@ -100,7 +100,7 @@ def _audit_count(app) -> int:
 
 
 def _tree(app, tree_id: str):
-    return app.state.graph_repo.get(tree_id)
+    return kernel_state(app).graph_repo.get(tree_id)
 
 
 def _target(tree):
@@ -141,12 +141,12 @@ def _fast_and_backup(runtime: dict) -> tuple[dict, dict]:
 @pytest.fixture
 def two_canvases(tmp_path):
     # 跨服务目录写：真实 create_app + 进程内内核（共享同一图目录）。内核实例留在
-    # ``app.state.kernel_app`` 供故障注入用例（内核侧图写失败、临时文件清理）。
+    # ``app.test_kernel`` 供故障注入用例（内核侧图写失败、临时文件清理）。
     kernel = core_app(tmp_path)
     app = create_app(
         test_settings(tmp_path),
         core_transport=core_app_for(tmp_path, app=kernel))
-    app.state.kernel_app = kernel
+    app.test_kernel = kernel
     client = TestClient(app)
 
     seed = portable_tree_dict("seed")
@@ -195,7 +195,7 @@ def test_model_update_preview_is_pure_then_confirmed_syncs_only_affected(two_can
     before_other_sha = _tree(app, "other").document_sha256
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
 
@@ -213,7 +213,7 @@ def test_model_update_preview_is_pure_then_confirmed_syncs_only_affected(two_can
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _canvas_state(app, ("main", "other")) == before
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
     confirmed = client.put("/admin/models/fast", json={
         "upstream": "new-upstream",
@@ -232,7 +232,7 @@ def test_model_update_preview_is_pure_then_confirmed_syncs_only_affected(two_can
     models = _runtime_models(_tree(app, "main"))
     assert models["fast"]["upstream"] == "new-upstream"
     assert _db_row(app, "models", "id", "fast")["upstream"] == "new-upstream"
-    assert app.state.snapshot_set.default_snapshot.backends["fast"].upstream_name == "new-upstream"
+    assert kernel_state(app).snapshot_set.default_snapshot.backends["fast"].upstream_name == "new-upstream"
     # 恰好一条模型审计行，带同步画布 id。
     changes = _changes(app)
     assert len(changes) == before_audit + 1
@@ -294,7 +294,7 @@ def test_delete_model_requires_confirmation_replacement_and_syncs_targets(two_ca
     models = _runtime_models(main_tree)
     assert "fast" not in models
     assert models["backup"]["upstream"] == "backup-upstream"
-    assert "fast" not in app.state.snapshot_set.default_snapshot.backends
+    assert "fast" not in kernel_state(app).snapshot_set.default_snapshot.backends
     assert _db_row(app, "models", "id", "fast") is None
     assert _canvas_bytes(app, "other") == before["other"]
     changes = _changes(app)
@@ -312,7 +312,7 @@ def test_stale_confirmation_hash_returns_graph_conflict_and_writes_nothing(two_c
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
@@ -331,7 +331,7 @@ def test_stale_confirmation_hash_returns_graph_conflict_and_writes_nothing(two_c
     assert _canvas_state(app, ("main", "other")) == before
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -428,7 +428,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
     before = _canvas_state(app, tree_ids)
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     assert preview.status_code == 409
@@ -437,7 +437,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
         "main", "second-fast"}
     confirmation = confirmation_from(preview)
 
-    kernel_repo = app.state.kernel_app.state.graph_repo
+    kernel_repo = kernel_state(app).graph_repo
     real_replace = kernel_repo._replace_staged
     calls = {"count": 0}
 
@@ -458,13 +458,16 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
     # 数据库 / 审计 / 快照 / 三个画布文件全部保持原值（含内核已替换的第一份）。
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _canvas_state(app, tree_ids) == before
 
 
 def test_candidate_validation_failure_writes_nothing(tmp_path):
     """provider 推理协议改为 openai 让画布的 null-wire 档位非法 → 422 全回滚。"""
-    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
+    kernel = core_app(tmp_path)
+    app = create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path, app=kernel))
+    app.test_kernel = kernel
     client = TestClient(app)
     assert client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1",
@@ -529,7 +532,7 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     before = _canvas_state(app, ("main", "other", "alt"))
     before_row = _db_row(app, "providers", "name", "local")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/providers/local",
                          json={"base_url": "http://new.test/v1"})
@@ -548,7 +551,7 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     assert _canvas_state(app, ("main", "other", "alt")) == before
     assert _db_row(app, "providers", "name", "local") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
     confirmed = client.put("/admin/providers/local", json={
         "base_url": "http://new.test/v1",
@@ -565,7 +568,7 @@ def test_provider_update_preview_is_pure_then_confirmed_syncs_affected(two_canva
     # 未受影响的画布保持原字节。
     assert _canvas_bytes(app, "alt") == before["alt"]
     assert _db_row(app, "providers", "name", "local")["base_url"] == "http://new.test/v1"
-    assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
+    assert kernel_state(app).snapshot_set.default_snapshot.backends["fast"].url == \
         "http://new.test/v1/chat/completions"
     changes = _changes(app)
     assert len(changes) == before_audit + 1
@@ -637,16 +640,16 @@ def test_provider_delete_is_blocked_by_db_and_canvas_refs_and_never_bypassable(
     })
     assert client.post("/admin/trees", json=_strip_enabled(bare)).status_code == 201
     before_bare = _canvas_bytes(app, "bare-canvas")
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     before_audit = _audit_count(app)
-    bare_impacts = provider_impacts(app.state.graph_repo.list(), "bare-prov")
+    bare_impacts = provider_impacts(kernel_state(app).graph_repo.list(), "bare-prov")
     assert [item["id"] for item in bare_impacts] == ["bare-canvas"]
     assert bare_impacts[0]["usage"]["models"] == {"use": []}
     deleted_bare = client.delete("/admin/providers/bare-prov")
     assert deleted_bare.status_code == 200, deleted_bare.text
     assert _db_row(app, "providers", "name", "bare-prov") is None
     assert _canvas_bytes(app, "bare-canvas") == before_bare
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _audit_count(app) == before_audit + 1
     assert _changes(app)[-1]["detail"] == {
         "action": "delete", "name": "bare-prov", "synced_trees": []}
@@ -701,7 +704,7 @@ def test_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
     assert provider_changes[-1]["detail"]["api_key"] == "set"
     # 画布文件/快照同样不含密钥。
     assert secret not in _canvas_bytes(app, "main").decode("utf-8")
-    assert secret not in app.state.snapshot_set.default_snapshot.content
+    assert secret not in kernel_state(app).snapshot_set.default_snapshot.content
 
 
 # --------------------------------------------------------------------------- #
@@ -731,7 +734,10 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
     422 并整体回滚；fix 前它返回 200 把闭画布写成非法文档，随后
     ``repo.list()`` / ``GET /admin/trees`` 直接 503。
     """
-    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
+    kernel = core_app(tmp_path)
+    app = create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path, app=kernel))
+    app.test_kernel = kernel
     client = TestClient(app)
     assert client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1",
@@ -749,12 +755,12 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
         if node["type"] == "target":
             node["models"][0]["reasoning"] = None
     assert client.post("/admin/trees", json=_strip_enabled(closed)).status_code == 201
-    assert {tree.id for tree in app.state.graph_repo.list()} == {"main", "closed"}
+    assert {tree.id for tree in kernel_state(app).graph_repo.list()} == {"main", "closed"}
 
     before_provider = _db_row(app, "providers", "name", "local")
     before_files = _canvas_state(app, ("main", "closed"))
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1", "reasoning_format": "openai"})
@@ -774,16 +780,19 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
     _assert_provider_row_and_key_unchanged(app, "local", before_provider)
     assert _canvas_state(app, ("main", "closed")) == before_files
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     # 所有画布仍可读（fix 前闭画布已被写坏，这里会抛 GraphStorageError）。
-    assert {tree.id for tree in app.state.graph_repo.list()} == {"main", "closed"}
+    assert {tree.id for tree in kernel_state(app).graph_repo.list()} == {"main", "closed"}
     assert client.get("/admin/trees").status_code == 200
 
 
 def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
     """CRITICAL 1（活动画布变体）：fix 前候选写盘后重读活动画布抛
     ``GraphStorageError`` → 503；严格候选校验必须在写盘前把它变成 422 并回滚。"""
-    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
+    kernel = core_app(tmp_path)
+    app = create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path, app=kernel))
+    app.test_kernel = kernel
     client = TestClient(app)
     assert client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1",
@@ -801,7 +810,7 @@ def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
     before_provider = _db_row(app, "providers", "name", "local")
     before_file = _canvas_bytes(app, "main")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1", "reasoning_format": "openai"})
@@ -818,8 +827,8 @@ def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
     _assert_provider_row_and_key_unchanged(app, "local", before_provider)
     assert _canvas_bytes(app, "main") == before_file
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
-    assert {tree.id for tree in app.state.graph_repo.list()} == {"main"}
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
+    assert {tree.id for tree in kernel_state(app).graph_repo.list()} == {"main"}
 
 
 def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
@@ -831,7 +840,7 @@ def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
@@ -843,7 +852,7 @@ def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
         impacts = real_impacts(trees, model_id)   # 旧清单：racer 画布还不存在
         if not raced["done"]:
             raced["done"] = True
-            created = app.state.graph_repo.create(
+            created = kernel_state(app).graph_repo.create(
                 tree_from_dict(portable_tree_dict("racer")))
             raced["sha"] = created.document_sha256
         return impacts
@@ -862,7 +871,7 @@ def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
     assert _tree(app, "racer").document_sha256 == raced["sha"]
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
 
 def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
@@ -878,7 +887,7 @@ def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     real_batch = app.state.core.replace_graph_batch
     raced = {}
@@ -887,8 +896,8 @@ def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
         # 目录行已在 SQLite 事务内写入、内核批次尚未执行时，另一个进程改写活动
         # 画布；候选仍以旧 document_sha256 为基线。
         if not raced:
-            current = app.state.graph_repo.get("main")
-            replaced = app.state.graph_repo.update(
+            current = kernel_state(app).graph_repo.get("main")
+            replaced = kernel_state(app).graph_repo.update(
                 dataclass_replace(current, name="mutated-after-impacts"),
                 base_document_sha256=current.document_sha256)
             raced["sha"] = replaced.document_sha256
@@ -905,24 +914,19 @@ def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
     assert detail["actual_document_sha256"] == raced["sha"]
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _canvas_bytes(app, "other") == before["other"]
 
 
-def test_confirmed_write_touching_only_inactive_canvas_does_not_publish(
+def test_confirmed_write_touching_only_inactive_canvas_keeps_the_route_set(
         two_canvases, monkeypatch):
-    """发布门（负向）：确认写只改了非活动画布时不发布新快照。"""
+    """确认写只改了非活动画布：发布的路由集内容/revision 保持不变。
+
+    内核图批次总是按完整启用集合重建（Task 7 语义），但当候选全是草稿时重建
+    结果与旧路由集内容一致，因此 revision 不变、活动图的运行配置不被牵连。
+    """
     app, client = two_canvases
-    publisher = app.state.publisher
-    real_publish = publisher.publish
-    published = []
-
-    def spy(prepared):
-        published.append(prepared)
-        return real_publish(prepared)
-
-    monkeypatch.setattr(publisher, "publish", spy)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     before_main = _canvas_bytes(app, "main")
     before_other = _canvas_bytes(app, "other")
 
@@ -939,8 +943,7 @@ def test_confirmed_write_touching_only_inactive_canvas_does_not_publish(
 
     assert confirmed.status_code == 200, confirmed.text
     assert confirmed.json()["synced_trees"] == ["other"]
-    assert published == []
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _canvas_bytes(app, "main") == before_main
     assert _canvas_bytes(app, "other") != before_other
 
@@ -1023,7 +1026,7 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     before_other_sha = _tree(app, "other").document_sha256
     before_row = _db_row(app, "jev_services", "id", "jev-a")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     instructions = "你是一个模型路由器。请只选择最匹配的模型。"
     state_template = "【待判断的用户请求】\n{request}"
 
@@ -1051,7 +1054,7 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     assert _db_row(app, "jev_services", "id", "jev-a") == before_row
     assert _canvas_state(app, ("main", "other")) == before
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
     confirmed = client.put("/admin/jev/jev-a", json={
         **payload, "impact_confirmation": confirmation_from(preview)})
@@ -1079,11 +1082,11 @@ def test_jev_update_preview_is_pure_then_confirmed_syncs_service_and_window(
     assert _canvas_bytes(app, "main") != before["main"]
     assert _db_row(app, "jev_services", "id", "jev-a")["model"] == "d1-a-v2"
     # 活动画布被同步 → 快照按新画布配置重新发布。
-    assert app.state.snapshot_set.default_snapshot.jev.base_url == "http://jev-a-v2.test"
-    assert app.state.snapshot_set.default_snapshot.jev.model == "d1-a-v2"
-    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
-            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (3072, 8192)
-    assert app.state.snapshot_set.snapshot_revision != before_revision
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.base_url == "http://jev-a-v2.test"
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.model == "d1-a-v2"
+    assert (kernel_state(app).snapshot_set.default_snapshot.jev_input_tokens,
+            kernel_state(app).snapshot_set.default_snapshot.jev_context_tokens) == (3072, 8192)
+    assert kernel_state(app).snapshot_set.snapshot_revision != before_revision
     changes = _changes(app)
     assert len(changes) == before_audit + 1
     assert changes[-1]["kind"] == "jev"
@@ -1126,8 +1129,8 @@ def test_jev_window_update_replaces_snapshot_and_window_together(two_canvases):
     assert runtime.jev.key_env == ""
     assert _tree(app, "other").runtime.jev.id == "jev-b"
     assert _tree(app, "other").runtime.jev.base_url == "http://jev-json.test"
-    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
-            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (768, 3072)
+    assert (kernel_state(app).snapshot_set.default_snapshot.jev_input_tokens,
+            kernel_state(app).snapshot_set.default_snapshot.jev_context_tokens) == (768, 3072)
 
 
 # --------------------------------------------------------------------------- #
@@ -1217,9 +1220,9 @@ def test_jev_delete_requires_replacement_and_syncs_replacement_service(
     # 另一幅画布（本就引用 jev-b）字节与哈希完全不变。
     assert _canvas_bytes(app, "other") == before["other"]
     assert _tree(app, "other").document_sha256 == before_other_sha
-    assert app.state.snapshot_set.default_snapshot.jev.base_url == "http://jev-b.test"
-    assert (app.state.snapshot_set.default_snapshot.jev_input_tokens,
-            app.state.snapshot_set.default_snapshot.jev_context_tokens) == (2048, 8192)
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.base_url == "http://jev-b.test"
+    assert (kernel_state(app).snapshot_set.default_snapshot.jev_input_tokens,
+            kernel_state(app).snapshot_set.default_snapshot.jev_context_tokens) == (2048, 8192)
     changes = _changes(app)
     assert len(changes) == before_audit + 1
     assert changes[-1]["kind"] == "jev"
@@ -1256,7 +1259,7 @@ def test_jev_stale_or_missing_confirmation_hash_is_graph_conflict(two_canvases):
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "jev_services", "id", "jev-a")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
     actual = _tree(app, "main").document_sha256
     assert confirmation_from(preview)["trees"][0]["document_sha256"] == actual
@@ -1275,7 +1278,7 @@ def test_jev_stale_or_missing_confirmation_hash_is_graph_conflict(two_canvases):
         assert _canvas_state(app, ("main", "other")) == before
         assert _db_row(app, "jev_services", "id", "jev-a") == before_row
         assert _audit_count(app) == before_audit
-        assert app.state.snapshot_set.snapshot_revision == before_revision
+        assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -1337,7 +1340,7 @@ def test_jev_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
         json.dumps(_changes(app), ensure_ascii=False),
         _canvas_bytes(app, "main").decode("utf-8"),
         _canvas_bytes(app, "other").decode("utf-8"),
-        app.state.snapshot_set.default_snapshot.content,
+        kernel_state(app).snapshot_set.default_snapshot.content,
     ])
     assert secret not in payloads
     for item in delete_preview.json()["detail"]["replacements"]:
@@ -1353,19 +1356,11 @@ def test_jev_impacts_replacements_and_audit_never_expose_secrets(two_canvases):
 # --------------------------------------------------------------------------- #
 # 14. 发布门：只同步非活动画布时不发布新快照
 # --------------------------------------------------------------------------- #
-def test_jev_sync_of_only_inactive_canvas_does_not_publish(
+def test_jev_sync_of_only_inactive_canvas_keeps_the_route_set(
         two_canvases, monkeypatch):
+    """JEV 同步只改非活动画布：完整启用集合重建后的 revision 保持不变。"""
     app, client = two_canvases
-    publisher = app.state.publisher
-    real_publish = publisher.publish
-    published = []
-
-    def spy(prepared):
-        published.append(prepared)
-        return real_publish(prepared)
-
-    monkeypatch.setattr(publisher, "publish", spy)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     before_main = _canvas_bytes(app, "main")
     before_other = _canvas_bytes(app, "other")
 
@@ -1381,8 +1376,7 @@ def test_jev_sync_of_only_inactive_canvas_does_not_publish(
 
     assert confirmed.status_code == 200, confirmed.text
     assert confirmed.json()["synced_trees"] == ["other"]
-    assert published == []
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _canvas_bytes(app, "main") == before_main
     assert _canvas_bytes(app, "other") != before_other
 
@@ -1396,7 +1390,7 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "jev_services", "id", "jev-a")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     preview = client.put("/admin/jev/jev-a", json={"model": "d1-a-v2"})
     confirmation = confirmation_from(preview)
 
@@ -1409,7 +1403,7 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
             raced["done"] = True
             document = portable_tree_dict("racer")
             document["jev"]["id"] = "jev-a"
-            created = app.state.graph_repo.create(tree_from_dict(document))
+            created = kernel_state(app).graph_repo.create(tree_from_dict(document))
             raced["sha"] = created.document_sha256
         return impacts
 
@@ -1427,7 +1421,7 @@ def test_canvas_appearing_between_jev_impact_scan_and_commit_is_graph_conflict(
     assert _tree(app, "racer").document_sha256 == raced["sha"]
     assert _db_row(app, "jev_services", "id", "jev-a") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -1439,7 +1433,7 @@ def _emulate_concurrent_default_switch(app, tree_id):
     Task 5 起多图独立启停：默认切换写目标图 ``enabled=True, default=True``，
     旧默认图保持启用但改为非默认（再启用一张图不会停用其它图）。
     """
-    repo = app.state.graph_repo
+    repo = kernel_state(app).graph_repo
     target = repo.get(tree_id)
     updates = [
         (dataclass_replace(other, enabled=True, default=False),
@@ -1471,7 +1465,7 @@ def test_default_switch_racing_lock_acquisition_invalidates_stale_confirmation(
     assert preview.status_code == 409, preview.text
     assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
         "other"]
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
 
     # 预览之后、确认之前：另一个副本切换默认图（写文件生命周期，不发布内存快照）。
     _emulate_concurrent_default_switch(app, "other")
@@ -1486,7 +1480,7 @@ def test_default_switch_racing_lock_acquisition_invalidates_stale_confirmation(
     # 实际哈希必须是生命周期改写后的新文档哈希，而不是客户端提交的旧哈希。
     assert stale.json()["detail"]["actual_document_sha256"] == hashlib.sha256(
         _canvas_bytes(app, "other")).hexdigest()
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _tree(app, "other").enabled is True
 
     # 重新预览并确认：生命周期已稳定，提交后发布新的默认图。
@@ -1499,13 +1493,13 @@ def test_default_switch_racing_lock_acquisition_invalidates_stale_confirmation(
 
     assert response.status_code == 200, response.text
     assert response.json()["synced_trees"] == ["other"]
-    assert app.state.snapshot_set.default_snapshot.tree_id == "other"
-    assert app.state.snapshot_set.snapshot_revision != before_revision
-    assert app.state.snapshot_set.default_snapshot.backends["backup"].upstream_name == "raced-upstream"
-    status = app.state.publisher.status()
+    assert kernel_state(app).snapshot_set.default_snapshot.tree_id == "other"
+    assert kernel_state(app).snapshot_set.snapshot_revision != before_revision
+    assert kernel_state(app).snapshot_set.default_snapshot.backends["backup"].upstream_name == "raced-upstream"
+    status = kernel_state(app).publisher.status()
     assert status["default_tree_id"] == "other"
     assert status["enabled_tree_ids"] == ["main", "other"]
-    assert status["snapshot_revision"] == app.state.snapshot_set.snapshot_revision
+    assert status["snapshot_revision"] == kernel_state(app).snapshot_set.snapshot_revision
     assert _tree(app, "other").enabled is True
     assert _tree(app, "main").enabled is True
     assert _tree(app, "main").default is False
@@ -1517,7 +1511,7 @@ def test_db_only_write_does_not_read_legacy_current_pointer(two_canvases):
     v4 仓储没有指针；回归锁定旧文件里的垃圾内容不参与任何读取。
     """
     app, client = two_canvases
-    (app.state.graph_repo.root / "current").write_text("bad id!\n", encoding="utf-8")
+    (kernel_state(app).graph_repo.root / "current").write_text("bad id!\n", encoding="utf-8")
     before_audit = _audit_count(app)
 
     response = client.post("/admin/models", json={
@@ -1649,33 +1643,36 @@ def test_delete_jev_rechecks_replacement_under_lock(two_canvases, monkeypatch):
 # --------------------------------------------------------------------------- #
 # 18. 确认同步的提交后原子性：图批次 commit 之后的失败仍整体回滚
 # --------------------------------------------------------------------------- #
-def test_snapshot_refresh_failure_after_commit_does_not_undo_committed_write(
+def test_kernel_publication_failure_rolls_back_the_whole_catalog_write(
         two_canvases, monkeypatch):
-    """内核已提交 + SQLite 已提交后的外围快照刷新失败：不回退、不报错。
+    """内核批次落盘后的发布失败：整批回滚 + SQLite 回滚，两侧都不留半份写。
 
-    跨服务后「图批次 commit 之后」的失败窗口只剩外围的派生快照刷新；内核与
-    SQLite 都已提交，此时再返回错误或回滚都会把已确认的写说成失败。刷新是
-    best-effort：记日志、由 reloader 重试，响应仍是 200。
+    跨服务后发布发生在内核批次提交的同一次调用里（Task 7 语义）；发布失败让内核
+    回滚本批文件，外围收到 503 后回滚 SQLite —— 目录行、审计、画布与快照全部
+    保持写入前状态。
     """
     app, client = two_canvases
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before = _canvas_state(app, ("main", "other"))
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
-    def fail_refresh():
-        raise GraphStorageError("injected snapshot refresh failure")
+    def fail_publish(prepared):
+        raise GraphStorageError("injected snapshot publication failure")
 
-    monkeypatch.setattr(app.state.publisher, "refresh_if_changed", fail_refresh)
+    monkeypatch.setattr(kernel_state(app).publisher, "publish", fail_publish)
 
     response = client.put("/admin/models/fast", json={
         "upstream": "new-upstream", "impact_confirmation": confirmation})
 
-    assert response.status_code == 200, response.text
-    assert _db_row(app, "models", "id", "fast")["upstream"] == "new-upstream"
-    assert _changes(app)[-1]["detail"]["action"] == "update"
-    assert _runtime_models(_tree(app, "main"))["fast"]["upstream"] == "new-upstream"
-    # 派生快照保持旧对象（刷新失败），reloader 之后会补上；无数据库/审计遗留。
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "graph_storage_error"
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
+    assert _canvas_state(app, ("main", "other")) == before
 
 
 def test_audit_failure_inside_transaction_rolls_back_everything(
@@ -1685,29 +1682,22 @@ def test_audit_failure_inside_transaction_rolls_back_everything(
     before = _canvas_state(app, ("main", "other"))
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
     def failing_record(self, ts, kind, detail):
         raise RuntimeError(f"injected audit failure for {kind}")
     monkeypatch.setattr(ChangeRepo, "record", failing_record)
-    publisher = app.state.publisher
-    real_publish = publisher.publish
-    published = []
-    monkeypatch.setattr(
-        publisher, "publish",
-        lambda prepared: published.append(prepared) or real_publish(prepared))
 
     failing_client = TestClient(app, raise_server_exceptions=False)
     response = failing_client.put("/admin/models/fast", json={
         "upstream": "new-upstream", "impact_confirmation": confirmation})
 
     assert response.status_code == 500, response.text
-    assert published == []
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     assert _canvas_state(app, ("main", "other")) == before
 
 
@@ -1726,11 +1716,20 @@ def test_compensation_failure_is_503_catalog_sync_diverged_after_db_rollback(
 
     real_batch = app.state.core.replace_graph_batch
     calls = {"count": 0}
+    db_state_seen = []
 
     async def batch_with_failing_compensation(writes):
         calls["count"] += 1
         if calls["count"] == 1:
             return await real_batch(writes)
+        # 反向补偿发生在 SQLite ROLLBACK 之后：新连接上读不到本次目录写。
+        probe = connect(app.state.settings.db_path)
+        try:
+            row = probe.execute(
+                "SELECT upstream FROM models WHERE id = 'fast'").fetchone()
+            db_state_seen.append(row["upstream"])
+        finally:
+            probe.close()
         raise CoreBatchError(503)
 
     monkeypatch.setattr(
@@ -1741,23 +1740,6 @@ def test_compensation_failure_is_503_catalog_sync_diverged_after_db_rollback(
         raise RuntimeError(f"injected audit failure for {kind}")
 
     monkeypatch.setattr(ChangeRepo, "record", failing_record)
-
-    publisher = app.state.publisher
-    real_refresh = publisher.refresh_if_changed
-    db_state_seen = []
-
-    def spy_refresh():
-        # 刷新发生在数据库 ROLLBACK 之后：新连接上读不到本次目录写。
-        probe = connect(app.state.settings.db_path)
-        try:
-            row = probe.execute(
-                "SELECT upstream FROM models WHERE id = 'fast'").fetchone()
-            db_state_seen.append(row["upstream"])
-        finally:
-            probe.close()
-        return real_refresh()
-
-    monkeypatch.setattr(publisher, "refresh_if_changed", spy_refresh)
 
     failing_client = TestClient(app, raise_server_exceptions=False)
     response = failing_client.put("/admin/models/fast", json={
@@ -1794,7 +1776,10 @@ def multi_graph_canvases(tmp_path):
 
     默认图不在受影响候选里，正是旧发布门（只看默认图是否被改写）漏发布的场景。
     """
-    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
+    kernel = core_app(tmp_path)
+    app = create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path, app=kernel))
+    app.test_kernel = kernel
     client = TestClient(app)
     for tree_id, provider, base_url in (
         ("main", "main-local", "http://main-local.test/v1"),
@@ -1826,7 +1811,7 @@ def test_catalog_sync_updates_each_enabled_graph_but_not_draft(
     已更新但内存路由集仍是旧快照，直到 reloader 轮询。
     """
     app, client = multi_graph_canvases
-    before_set = app.state.snapshot_set
+    before_set = kernel_state(app).snapshot_set
     before_draft = _tree(app, "draft").document_sha256
     assert before_set.default_tree_id == "main"
     assert sorted(before_set.snapshots) == ["finance", "main"]
@@ -1840,7 +1825,7 @@ def test_catalog_sync_updates_each_enabled_graph_but_not_draft(
 
     assert response.status_code == 200, response.text
     assert response.json()["synced_trees"] == ["finance"]
-    route_set = app.state.snapshot_set
+    route_set = kernel_state(app).snapshot_set
     # 非默认启用图被改写 → 必须发布新的完整路由集（不是只等 reloader 轮询）。
     assert route_set is not before_set
     assert route_set.snapshot_revision != before_set.snapshot_revision
@@ -1850,21 +1835,20 @@ def test_catalog_sync_updates_each_enabled_graph_but_not_draft(
     assert route_set.default_snapshot.tree_id == "main"
     assert route_set.default_snapshot.backends["fast"].url == \
         "http://main-local.test/v1/chat/completions"
-    assert app.state.publisher.status()["snapshot_revision"] == \
+    assert kernel_state(app).publisher.status()["snapshot_revision"] == \
         route_set.snapshot_revision
     # 草稿既不在候选里，也不被改写。
-    assert app.state.graph_repo.get("draft").document_sha256 == before_draft
+    assert kernel_state(app).graph_repo.get("draft").document_sha256 == before_draft
 
 
 def test_draft_only_catalog_sync_does_not_republish(multi_graph_canvases):
-    """只有草稿被目录写影响时：候选快照仍按完整启用集复核，但绝不发布。
+    """只有草稿被目录写影响时：重建的路由集内容与旧路由集完全一致。
 
-    发布门看的是「候选是否改写了启用图」，不是「是否有候选」：草稿同步不得
-    触发不必要的路由集替换（对象身份与 revision 都必须保持不变）。
+    内核图批次按完整启用集合重建（Task 7 语义），但草稿不在启用集合里，因此
+    重建结果内容不变——``snapshot_revision`` 与发布集内容都必须保持不变。
     """
     app, client = multi_graph_canvases
-    before_set = app.state.snapshot_set
-    before_revision = before_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     before_draft = _canvas_bytes(app, "draft")
 
     response = _confirmed_provider_put(client, "draft-local", {
@@ -1874,9 +1858,8 @@ def test_draft_only_catalog_sync_does_not_republish(multi_graph_canvases):
     assert response.status_code == 200, response.text
     assert response.json()["synced_trees"] == ["draft"]
     assert _canvas_bytes(app, "draft") != before_draft
-    assert app.state.snapshot_set is before_set
-    assert app.state.snapshot_set.snapshot_revision == before_revision
-    assert app.state.publisher.status()["snapshot_revision"] == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).publisher.status()["snapshot_revision"] == before_revision
 
 
 # --------------------------------------------------------------------------- #
@@ -1890,9 +1873,9 @@ def test_kernel_batch_failure_leaves_no_staged_temp_files(
     事务回滚、发布集不变。
     """
     app, client = two_canvases
-    kernel_repo = app.state.kernel_app.state.graph_repo
+    kernel_repo = kernel_state(app).graph_repo
     before = _canvas_state(app, ("main", "other"))
-    before_revision = app.state.snapshot_set.snapshot_revision
+    before_revision = kernel_state(app).snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
@@ -1909,4 +1892,4 @@ def test_kernel_batch_failure_leaves_no_staged_temp_files(
     assert [path.name for path in kernel_repo.graphs.iterdir()
             if path.name.startswith(".")] == []
     assert _canvas_state(app, ("main", "other")) == before
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision

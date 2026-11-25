@@ -17,9 +17,18 @@ from urllib.parse import quote
 import httpx
 from fastapi.testclient import TestClient
 
-from router.api.app import create_app
+from router.store.db import connect
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import test_settings, tree_dict
+from tests.routing_fixtures import (
+    DEFAULT_PROVIDER_BASE_URL,
+    deliver_decision_events,
+    kernel_state,
+    recording_core_app,
+    split_app,
+    split_app_for,
+    test_settings,
+    tree_dict,
+)
 from tests.test_app import (
     JEV_ENV,
     TryHandler,
@@ -65,7 +74,8 @@ def test_admin_fixed_model_bypasses_jev_and_uses_selected_backend(tmp_path):
     assert response.headers["x-sr-model"] == "qwen3-32b"
     assert response.headers["x-sr-selection"] == "direct"
     assert handler.jev_paths == []
-    assert app.state.balancer.inflight("qwen3-32b") == 0
+    # 固定模型直连不经过内核：内核调度器没有任何 inflight 记录。
+    assert kernel_state(app).balancer.inflight("qwen3-32b") == 0
 
 
 def test_admin_fixed_model_preserves_multimodal_content(tmp_path):
@@ -116,24 +126,19 @@ def test_admin_fixed_model_open_breaker_is_503_without_upstream_call(tmp_path):
     assert calls == []
 
 
-def test_admin_fixed_model_logs_test_decision_and_direct_reason(tmp_path):
-    """The shared request log stores fixed-mode rows as decision=test/direct."""
+def test_admin_fixed_model_keeps_no_decision_log(tmp_path):
+    """Fixed-model admin chat is a peripheral catalog test: no decision event is
+    emitted (the kernel is not called at all) and nothing enters the memory log."""
     app = composed_try_app(tmp_path, TryHandler())
     with TestClient(app) as client:
         response = client.post("/admin/test/chat/completions", json={
             "model": "qwen3-32b",
             "messages": [{"role": "user", "content": "记录"}],
         })
+        recent = client.get("/admin/requests/recent").json()["requests"]
     assert response.status_code == 200, response.text
-    rows = app.state.requestlog.recent_requests(1)
-    assert len(rows) == 1
-    record = rows[0]
-    assert record["decision"] == "test"
-    assert record["selection_reason"] == "direct"
-    assert record["model"] == "qwen3-32b"
-    # OutcomeRecorder refreshed the same row: the terminal (not the half) record wins.
-    assert record["outcome_state"] == "completed"
-    assert record["route_label"] == {"zh": "固定模型测试", "en": "Direct model test"}
+    assert recent == []
+    assert app.state.decision_logs.recent(20) == []
 
 
 def test_admin_fixed_model_streams_sse_and_releases_lease(tmp_path):
@@ -158,7 +163,7 @@ def test_admin_fixed_model_streams_sse_and_releases_lease(tmp_path):
     assert response.headers["x-sr-model"] == "qwen3-32b"
     assert "第一段" in response.text
     assert "第二段" in response.text
-    assert app.state.balancer.inflight("qwen3-32b") == 0
+    assert kernel_state(app).balancer.inflight("qwen3-32b") == 0
 
 
 def test_admin_test_rejects_unknown_model(tmp_path):
@@ -186,8 +191,8 @@ def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
             "choices": [{"message": {"role": "assistant", "content": "ok"}}],
         })
 
-    app = create_app(settings, transport=httpx.MockTransport(handler))
-    assert app.state.snapshot_set is None
+    app = split_app_for(settings=settings, transport=httpx.MockTransport(handler))
+    assert kernel_state(app).snapshot_set is None
     with TestClient(app) as client:
         response = client.post("/admin/test/chat/completions", json={
             "model": "qwen3-8b",
@@ -205,13 +210,39 @@ def test_admin_fixed_model_works_without_an_active_snapshot(tmp_path):
 FINANCE_DEPARTMENT = quote("财务部", safe="")
 
 
+def _align_execution_catalog(settings, models):
+    """Make the peripheral execution catalog match the canvas runtime.
+
+    Auto requests resolve the decided logical model in peripheral SQLite; the
+    catalog provider/base_url must equal the graph's non-secret provider facts.
+    """
+    conn = connect(settings.db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE providers SET base_url = ? WHERE name = 'local'",
+                (DEFAULT_PROVIDER_BASE_URL,))
+            for model in models:
+                conn.execute(
+                    "INSERT OR REPLACE INTO models (id, upstream, provider, profile) "
+                    "VALUES (?, ?, 'local', '{}')", (model, model))
+    finally:
+        conn.close()
+
+
 def department_app(tmp_path, handler):
     """默认图 main(fast) 由启动装配；部门图 finance(strong) 走真实管理 API。"""
-    settings = prepare_active_tree(tmp_path, tree_dict(
+    settings = replace(prepare_active_tree(tmp_path, tree_dict(
         root=direct_graph(("fast",)),
         sticky={"enabled": False, "ttl_seconds": 1800},
-    ))
-    return create_app(replace(settings, **JEV_ENV), transport=httpx.MockTransport(handler))
+    )), **JEV_ENV)
+    _align_execution_catalog(settings, ("fast", "strong"))
+    kernel, sink = recording_core_app(
+        graph_dir=settings.graph_dir, transport=httpx.MockTransport(handler))
+    app = split_app(
+        settings=settings, kernel=kernel, transport=httpx.MockTransport(handler))
+    app.test_sink = sink
+    return app
 
 
 def create_direct_model_tree(client, tree_id, model):
@@ -248,6 +279,7 @@ def test_admin_auto_chat_routes_department_header_and_logs_selection(tmp_path):
             "messages": [{"role": "user", "content": "部门请求"}],
         }, headers={"x-sr-department": FINANCE_DEPARTMENT})
 
+        deliver_decision_events(app, app.test_sink)
         recent = client.get("/admin/requests/recent").json()["requests"]
 
     assert default.status_code == 200, default.text
@@ -305,7 +337,7 @@ def test_admin_fixed_model_chat_ignores_department_and_bypasses_jev(tmp_path):
             "model": "qwen3-32b",
             "messages": [{"role": "user", "content": "直连测试"}],
         }, headers={"x-sr-department": FINANCE_DEPARTMENT})
-        rows = app.state.requestlog.recent_requests(1)
+        recent = client.get("/admin/requests/recent").json()["requests"]
 
     assert response.status_code == 200, response.text
     assert response.headers["x-sr-model"] == "qwen3-32b"
@@ -313,5 +345,5 @@ def test_admin_fixed_model_chat_ignores_department_and_bypasses_jev(tmp_path):
     assert "x-sr-graph-selection" not in response.headers
     assert "x-sr-tree-id" not in response.headers
     assert handler.jev_paths == []
-    assert rows[0]["decision"] == "test"
-    assert rows[0]["selection_reason"] == "direct"
+    # 固定模型直连不产生内核决策事件。
+    assert recent == []

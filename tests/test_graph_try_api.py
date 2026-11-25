@@ -19,7 +19,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from router.api.app import create_app
 from router.jev.window import MIN_INPUT_TOKENS, estimate_tokens
 from router.routing.graph.evaluator import GraphEvaluator
 from router.routing.scheduling import ModelScheduler
@@ -28,7 +27,8 @@ from router.store.db import connect
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.runtime_keys import tree_scope
 from tests.routing_fixtures import (
-    core_app_for,
+    kernel_state,
+    split_app_for,
     graph_dict,
     huge_chain_graph,
     runtime_dict,
@@ -63,11 +63,11 @@ def handler(request: httpx.Request) -> httpx.Response:
 
 @pytest.fixture
 def app(tmp_path):
-    return create_app(
-        # 预置决策服务配置：graph 引擎要求 snapshot.jev 存在（网络调用由 FakeJev 接管）。
-        test_settings(tmp_path, jev_url="http://jev.test", jev_model="d1-2B"),
+    # 外围代理 + 进程内内核：/admin/try 与图管理都由内核执行，JEV 调用走 mock handler。
+    return split_app_for(
+        settings=test_settings(tmp_path, jev_url="http://jev.test", jev_model="d1-2B"),
         transport=httpx.MockTransport(handler),
-        core_transport=core_app_for(tmp_path),
+        kernel_transport=httpx.MockTransport(handler),
     )
 
 
@@ -172,13 +172,13 @@ def root_payload(app, root, *, text="你好", **extra):
 def install_engine(app, scenario=None):
     jev = FakeJev(THREE_ANSWERS if scenario is None else scenario)
     affinity = RecordingAffinity()
-    balancer = RecordingBalancer(app.state.breaker)
-    app.state.affinity = affinity
-    app.state.balancer = balancer
-    app.state.routing_service = CapturingService(
+    balancer = RecordingBalancer(kernel_state(app).breaker)
+    kernel_state(app).affinity = affinity
+    kernel_state(app).balancer = balancer
+    kernel_state(app).routing_service = CapturingService(
         RoutingService(GraphEvaluator(jev), ModelScheduler(affinity, balancer)),
     )
-    return app.state.routing_service, jev, balancer, affinity
+    return kernel_state(app).routing_service, jev, balancer, affinity
 
 
 def row_counts(app) -> dict:
@@ -290,7 +290,7 @@ def test_create_tree_roundtrips_embedded_runtime_without_keys(client, app):
     assert tree["backends"]["models"][0]["upstream"] == "json-upstream"
     assert tree["jev"]["model"] == "json-jev"
     assert "api_key" not in json.dumps(tree)
-    stored = app.state.graph_repo.get("portable")
+    stored = kernel_state(app).graph_repo.get("portable")
     assert stored.runtime is not None
     assert stored.runtime.backends.models[0]["upstream"] == "json-upstream"
 
@@ -395,7 +395,7 @@ def test_try_without_draft_uses_department_route_set(client, app):
     assert body['graph_selection'] == 'department'
     assert body['outcome']['model'] == 'strong'
     # 路由集路径是已发布快照，不是草稿：revision 来自选中快照，不发 warnings。
-    selected = app.state.snapshot_set.snapshots['finance']
+    selected = kernel_state(app).snapshot_set.snapshots['finance']
     assert body['tree_revision'] == selected.tree_revision
     assert body['snapshot_revision'] == selected.snapshot_revision
     assert body['draft'] is False
@@ -457,7 +457,7 @@ def test_try_route_set_without_any_tree_is_no_active_tree(client):
 
 def test_try_route_set_without_default_tree_is_no_default_tree(client, app):
     create_direct_model_tree(client, 'main', 'fast')
-    app.state.snapshot_set = replace(app.state.snapshot_set, default_tree_id=None)
+    kernel_state(app).snapshot_set = replace(kernel_state(app).snapshot_set, default_tree_id=None)
 
     response = client.post('/admin/try', json={'department': '财务部', 'text': '你好'})
 
@@ -466,7 +466,7 @@ def test_try_route_set_without_default_tree_is_no_default_tree(client, app):
 
 
 def test_try_route_set_unavailable_is_no_valid_snapshot(client, app):
-    app.state.snapshot_set = None
+    kernel_state(app).snapshot_set = None
 
     response = client.post('/admin/try', json={'text': '你好'})
 
@@ -493,7 +493,7 @@ def test_try_tree_id_ignores_department_and_reports_no_graph_selection(client):
 
 def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     engine, _jev, balancer, affinity = install_engine(app)
-    before_snapshot = app.state.snapshot_set
+    before_snapshot = kernel_state(app).snapshot_set
     before_revision = before_snapshot.snapshot_revision
     before_counts = row_counts(app)
 
@@ -512,8 +512,8 @@ def test_root_draft_is_side_effect_free_and_marks_draft(client, app):
     assert engine.calls == 1
 
     # 不发布 snapshot（对象与 revision 都不变）
-    assert app.state.snapshot_set is before_snapshot
-    assert app.state.snapshot_set.snapshot_revision == before_revision
+    assert kernel_state(app).snapshot_set is before_snapshot
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_revision
     # 不落库
     assert row_counts(app) == before_counts
     # 不写粘性：只读 affinity（dry-run touch=False），绝不 put
@@ -550,7 +550,7 @@ def test_root_only_defaults_and_does_not_read_stored_trees(client, app, monkeypa
 
 def test_try_uses_draft_jev_window_without_publishing(client, app, monkeypatch):
     engine, jev, _balancer, _affinity = install_engine(app)
-    published_before = app.state.snapshot_set.snapshot_revision
+    published_before = kernel_state(app).snapshot_set.snapshot_revision
     payload = root_payload(app, three_answer_graph())
     payload["jev_window"] = {
         "input_tokens": MIN_INPUT_TOKENS, "context_tokens": 4096,
@@ -565,7 +565,7 @@ def test_try_uses_draft_jev_window_without_publishing(client, app, monkeypatch):
     assert window["tokens_after"] <= MIN_INPUT_TOKENS
     assert window["tokens_before"] > MIN_INPUT_TOKENS
     assert estimate_tokens(jev.calls[0]["text"]) <= MIN_INPUT_TOKENS
-    assert app.state.snapshot_set.snapshot_revision == published_before
+    assert kernel_state(app).snapshot_set.snapshot_revision == published_before
 
 
 # ── envelope 合并矩阵 ─────────────────────────────────────────────────
@@ -637,7 +637,7 @@ def test_tree_id_only_uses_stored_envelope_and_is_not_draft(client, app):
     assert len(affinity) == 0
     assert all(item["dry_run"] is True for item in balancer.calls)
     # /admin/try 不发布路由集：存储画布仍是草稿，启用集合保持为空。
-    assert app.state.snapshot_set.snapshots == {}
+    assert kernel_state(app).snapshot_set.snapshots == {}
 
 
 def test_try_unknown_tree_id_is_404_and_skips_engine(client, app):
@@ -852,7 +852,7 @@ def test_try_huge_chain_returns_422_limit_issue_not_500(client, app):
 
 def test_try_invalid_timezone_is_422_without_entering_engine(client, app):
     engine, *_rest = install_engine(app)
-    before_snapshot = app.state.snapshot_set.snapshot_revision
+    before_snapshot = kernel_state(app).snapshot_set.snapshot_revision
     before_counts = row_counts(app)
 
     response = client.post("/admin/try", json=root_payload(
@@ -864,7 +864,7 @@ def test_try_invalid_timezone_is_422_without_entering_engine(client, app):
     issue = next(item for item in detail if item["code"] == "invalid_timezone")
     assert set(issue) == ISSUE_KEYS
     assert engine.calls == 0
-    assert app.state.snapshot_set.snapshot_revision == before_snapshot
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_snapshot
     assert row_counts(app) == before_counts
 
 
@@ -911,7 +911,7 @@ def test_try_without_tree_id_or_root_uses_published_route_set(client, app):
 
 def test_try_no_available_backend_is_still_503(client, app):
     engine, *_rest = install_engine(app)
-    before_snapshot = app.state.snapshot_set.snapshot_revision
+    before_snapshot = kernel_state(app).snapshot_set.snapshot_revision
     before_counts = row_counts(app)
     root = three_answer_graph()
     for node in root["nodes"]:
@@ -922,7 +922,7 @@ def test_try_no_available_backend_is_still_503(client, app):
 
     assert response.status_code == 503, response.text
     assert engine.calls == 1
-    assert app.state.snapshot_set.snapshot_revision == before_snapshot
+    assert kernel_state(app).snapshot_set.snapshot_revision == before_snapshot
     assert row_counts(app) == before_counts
 
 

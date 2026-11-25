@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
@@ -9,13 +11,29 @@ from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.decision_fixtures import valid_event
-from tests.routing_fixtures import core_app_for, test_settings, tree_dict
+from tests.routing_fixtures import (
+    core_app,
+    core_app_for,
+    deliver_decision_events,
+    kernel_state,
+    recording_core_app,
+    test_settings,
+    tree_dict,
+)
 
 
 @pytest.fixture
-def client(tmp_path):
-    return TestClient(create_app(
-        test_settings(tmp_path), core_transport=core_app_for(tmp_path)))
+def app(tmp_path):
+    kernel = core_app(tmp_path)
+    peripheral = create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path, app=kernel))
+    peripheral.test_kernel = kernel
+    return peripheral
+
+
+@pytest.fixture
+def client(app):
+    return TestClient(app)
 
 
 def _question_root():
@@ -72,7 +90,7 @@ def test_time_periods_roundtrip_is_catalog_only(client):
     body = client.get("/admin/time-periods").json()
     assert body["periods"][0]["name"] == "值班"
     assert "now" in body
-    assert client.app.state.snapshot_set.snapshots == {}
+    assert kernel_state(client.app).snapshot_set.snapshots == {}
 
 
 def test_request_recent_returns_memory_ring(client):
@@ -184,9 +202,13 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
         })
 
+    # 拆分后：内核执行决策与 JEV（mock transport），外围执行模型上游并接收事件。
+    # 内核决策事件先由 recording sink 捕获，再按真实 sink 的 POST 语义投递给外围。
+    kernel, sink = recording_core_app(
+        graph_dir=settings.graph_dir, transport=httpx.MockTransport(handler))
     app = create_app(
         settings, transport=httpx.MockTransport(handler),
-        core_transport=core_app_for(tmp_path))
+        core_transport=core_app_for(graph_dir=settings.graph_dir, app=kernel))
     with TestClient(app) as client:
         provider_payload = {
             "base_url": "http://upstream.test/v1", "key_env": "",
@@ -208,9 +230,12 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
                      "authorization": f"Bearer {caller_secret}"},
         )
         assert response.status_code == 200, response.text
-        # 内核快照不持有 Provider Key：Auto 路径不再把目录密钥解析进后端 headers，
-        # 因此上游请求不带 Authorization（密钥注入属于外围执行层，见 Task 8）。
-        assert seen.get("authorization") is None
+        # Provider Key 只在围外执行层解析：上游请求带目录已存密钥。
+        assert seen.get("authorization") == f"Bearer {upstream_secret}"
+        # 内核发出的完整事件不含任何用户/上游/JEV 密钥。
+        assert len(sink.events) == 1
+        kernel_event_text = json.dumps(sink.events[0], ensure_ascii=False)
+        deliver_decision_events(app, sink)
         event = app.state.decision_logs.recent(1)[0]
         request_id = event["id"]
         replay = client.get(f"/admin/requests/{request_id}/replay")
@@ -223,11 +248,12 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
         assert isinstance(body["request"].get("session_hash"), str)
         for secret in (upstream_secret, jev_secret, session_secret, caller_secret):
             assert secret not in replay.text, f"memory decision log leaked {secret}"
+            assert secret not in kernel_event_text, f"kernel event leaked {secret}"
 
     # 重启：内存日志清空，历史回放 404，不尝试从 SQLite 恢复。
     restarted = create_app(
         settings, transport=httpx.MockTransport(handler),
-        core_transport=core_app_for(tmp_path))
+        core_transport=core_app_for(graph_dir=settings.graph_dir, app=kernel))
     with TestClient(restarted) as client:
         assert client.get(f"/admin/requests/{request_id}/replay").status_code == 404
         assert client.get("/admin/requests/recent").json() == {"requests": []}

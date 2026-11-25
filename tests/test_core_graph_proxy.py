@@ -385,9 +385,10 @@ def test_create_app_builds_an_independent_core_client(tmp_path):
     # (and its pool) is never shared with the kernel management plane.
     assert app.state.core.http is not app.state.http
     with TestClient(app) as client:
-        # Task 6 keeps the local graph mount; the proxy mount is Task 8's swap.
+        # Task 8 swapped the local graph mount for the proxy: the same call now
+        # reaches the kernel management plane through the dedicated client.
         assert client.get("/admin/trees").json()["trees"] == []
-        assert core_calls == []
+        assert core_calls == ["http://kernel:8400/internal/v1/trees"]
     assert app.state.core.http.is_closed
     assert app.state.http.is_closed
 

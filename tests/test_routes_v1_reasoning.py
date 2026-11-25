@@ -5,11 +5,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from router.api.app import create_app
 from router.store.db import connect
 from router.upstream.runtime_keys import tree_scope
 from tests.routing_fixtures import (
-    core_app_for,
+    deliver_decision_events,
+    kernel_state,
+    recording_core_app,
+    split_app,
     runtime_from_catalog,
     test_settings,
     tree_dict,
@@ -33,6 +35,8 @@ class StreamingTransport(httpx.AsyncBaseTransport):
 
 
 def harness(tmp_path, *, streaming=False):
+    """Peripheral app + in-process kernel; the kernel only decides, the
+    peripheral performs the (mock) upstream call and its execution is observed."""
     requests = []
 
     def handler(request):
@@ -40,10 +44,12 @@ def harness(tmp_path, *, streaming=False):
         return httpx.Response(200, json={"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
 
     transport = StreamingTransport() if streaming else httpx.MockTransport(handler)
-    app = create_app(
-        test_settings(tmp_path), transport=transport,
-        core_transport=core_app_for(tmp_path))
-    return SimpleNamespace(app=app, client=TestClient(app), requests=transport.requests if streaming else requests)
+    settings = test_settings(tmp_path)
+    kernel, sink = recording_core_app(graph_dir=settings.graph_dir)
+    app = split_app(settings=settings, kernel=kernel, transport=transport)
+    return SimpleNamespace(
+        app=app, client=TestClient(app), sink=sink,
+        requests=transport.requests if streaming else requests)
 
 
 def direct_graph(reasoning=None):
@@ -165,6 +171,8 @@ def test_reasoning_injection_per_format(tmp_path, fmt, efforts, level, expected)
     sent = h.requests[-1]["body"]
     for key, value in expected.items():
         assert sent[key] == value, (fmt, key)
+    # 决策事件由内核产生（外围不再有请求日志）：投递给外围接收口后读取。
+    deliver_decision_events(h.app, h.sink)
     record = h.client.get("/admin/requests/recent").json()["requests"][0]
     assert record["reasoning"] == level
     assert record["tree_id"] == "default-tree"
@@ -190,5 +198,5 @@ def test_streaming_request_injects_reasoning_and_releases(tmp_path):
     assert response.text == "data: hi\n\n"
     assert h.requests[-1]["body"]["reasoning_effort"] == "high"
     # 公开 /v1 是 Auto 路由：活动图的 tree.id 为 default-tree。
-    assert h.app.state.balancer.inflight(
+    assert kernel_state(h.app).balancer.inflight(
         "qwen3-8b", scope=tree_scope("default-tree")) == 0

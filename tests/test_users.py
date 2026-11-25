@@ -18,7 +18,7 @@ from router.maintenance import MaintenanceWorker
 from router.store.db import connect, migrate
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
                                        UserRepo)
-from tests.routing_fixtures import core_app_for, test_settings
+from tests.routing_fixtures import core_app_for, split_app_for, test_settings
 
 # --------------------------------------------------------------------------- #
 # Task 1：口令哈希 / email 规范化 / UserRepo / SessionRepo
@@ -281,10 +281,14 @@ def test_update_and_delete(conn):
 # Task 2：/admin 鉴权中间件 + 登录 / 用户管理 API
 # --------------------------------------------------------------------------- #
 def api_client(tmp_path, *, name="api.db", user_auth=True, **overrides):
-    """TestClient with the login-based /admin gate (user_auth=True by default)."""
+    """TestClient with the login-based /admin gate (user_auth=True by default).
+
+    Tree management is proxied to an in-process kernel, so the read-only tree
+    list returns the kernel route set (empty here) instead of 404.
+    """
     settings = test_settings(tmp_path, db_path=str(tmp_path / name), user_auth=user_auth,
                              **overrides)
-    return TestClient(create_app(settings))
+    return TestClient(split_app_for(settings=settings))
 
 
 def bearer(token):

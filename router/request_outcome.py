@@ -7,8 +7,11 @@ module — not in ``router.api.request_presenter`` — so ``router.upstream`` ca
 record an outcome without importing FastAPI, Starlette or ``router.api``.
 
 ``OutcomeSink`` is the structural contract the transport records through.  The
-route passes ``router.api.request_presenter.OutcomeRecorder`` (exactly-once
-finalisation); tests pass lighter fakes that only implement ``finish()``.
+peripheral ``/v1`` data plane passes :class:`DiscardOutcome` (the kernel emits the
+only decision event; execution results are not stored); the admin Test chat and
+unit tests pass lighter fakes that only implement ``finish()``.
+``router.api.request_presenter.OutcomeRecorder`` remains the exactly-once
+finaliser used by callers that do keep a record.
 """
 from __future__ import annotations
 
@@ -29,6 +32,19 @@ OUTCOME_STATES = (
     OUTCOME_INCOMPLETE,
     OUTCOME_ROUTING_ERROR,
 )
+
+
+class DiscardOutcome:
+    """Execution-outcome sink for the peripheral data plane: nothing is stored.
+
+    The peripheral no longer keeps request logs or execution results (design
+    §3.2: the kernel only emits decision events); the upstream transport still
+    reports its terminal outcome through the same structural contract, and this
+    implementation deliberately throws every field away.
+    """
+
+    def finish(self, **fields) -> bool:
+        return True
 
 
 class OutcomeSink(Protocol):

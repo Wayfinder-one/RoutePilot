@@ -4,7 +4,6 @@ Global Constraint 4/5/6：内核只输出事件；外围把通过校验的完整
 ``deque(maxlen=20)``，不写 SQLite、重启不恢复、第 21 条淘汰最旧事件；回放只读
 同一条事件里的 ``graph``/``trace``/``request``，不依赖当前图或任何快照表。
 """
-from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +15,7 @@ from router.routing.tree import tree_from_dict
 from router.store.db import connect
 from router.store.routing_trees import RoutingTreeRepo
 from tests.decision_fixtures import decision_record, decision_snapshot, valid_event
-from tests.routing_fixtures import test_settings, tree_dict
+from tests.routing_fixtures import split_app_for, test_settings, tree_dict
 
 
 def _event(event_id, *, ts="2026-11-25T10:00:00+08:00", model="fast",
@@ -114,28 +113,6 @@ def test_stored_event_is_not_mutated_by_a_later_outcome_refresh():
     assert store.get("immutable")["trace"] == before
 
 
-def test_a_broken_memory_log_cannot_break_a_decision_response():
-    """Logging is best-effort: the memory log never affects the decision response."""
-    from types import SimpleNamespace
-
-    from router.api.routes_v1 import log_decision_event
-
-    class BrokenStore:
-        def add(self, event):
-            raise RuntimeError("memory log is down")
-
-    request = SimpleNamespace(app=SimpleNamespace(
-        state=SimpleNamespace(decision_logs=BrokenStore())))
-    # 不抛异常即为通过：外层 run_chat_completion 的响应不会被日志故障变成 500。
-    log_decision_event(
-        request, decision_record("best-effort"), decision_snapshot(),
-        department="", requested_model="auto")
-    # 选图前失败（无图）也不生成/不写任何可回放事件。
-    log_decision_event(
-        request, decision_record("no-graph"), None,
-        department="", requested_model="auto")
-
-
 def test_recent_is_newest_first_and_the_limit_is_bounded():
     store = DecisionLogStore()
     for index in range(5):
@@ -231,19 +208,20 @@ def test_replay_serves_the_events_own_graph_after_the_current_graph_moved(tmp_pa
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
-    app = create_app(settings)
+    app = split_app_for(settings=settings)
     client = TestClient(app)
 
     logged = _event("old-graph")
     logged["graph"]["name"] = "日志里的旧图"
     assert _receive(client, logged).status_code == 200
 
-    current = repo.get("main")
-    repo.update(
-        replace(current, name="后来的当前图"),
-        base_document_sha256=current.document_sha256,
-    )
-    assert client.get("/admin/trees/main").json()["tree"]["name"] == "后来的当前图"
+    # 当前图后来被修改（经外围代理写入内核）：历史回放仍只读日志事件里的旧图。
+    current = client.get("/admin/trees/main").json()["tree"]
+    moved = client.put("/admin/trees/main", json={
+        "name": "后来的当前图",
+        "base_document_sha256": current["document_sha256"],
+    })
+    assert moved.status_code == 200, moved.text
 
     replay = client.get("/admin/requests/old-graph/replay")
     assert replay.status_code == 200, replay.text

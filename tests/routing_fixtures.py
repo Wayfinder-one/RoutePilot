@@ -312,14 +312,158 @@ def default_graph_dir(base) -> str:
     return str(Path(base) / "routing-graph")
 
 
-def core_app(base=None, *, graph_dir=None):
+def core_app(base=None, *, graph_dir=None, transport=None):
     """A real ``create_core_app`` over the peripheral's graph directory."""
     from router.api.core_app import create_core_app
     from router.core_config import CoreSettings, LogSinkSettings
 
     directory = str(graph_dir) if graph_dir is not None else default_graph_dir(base)
-    return create_core_app(CoreSettings(
-        graph_dir=directory, logging=LogSinkSettings(type="disabled")))
+    return create_core_app(
+        CoreSettings(graph_dir=directory, logging=LogSinkSettings(type="disabled")),
+        transport=transport)
+
+
+class RecordingSink:
+    """Synchronous in-memory decision-event sink for split-app tests.
+
+    The kernel emits through ``app.state.decision_sink``; tests substitute this
+    object to observe the exact event that a real peripheral would receive.
+    """
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+    async def start(self):
+        pass
+
+    async def close(self):
+        pass
+
+
+def recording_core_app(base=None, *, graph_dir=None, transport=None):
+    """Kernel app + substituted ``RecordingSink`` (``(app, sink)``)."""
+    kernel = core_app(base, graph_dir=graph_dir, transport=transport)
+    sink = RecordingSink()
+    kernel.state.decision_sink = sink
+    return kernel, sink
+
+
+def split_app(base=None, *, kernel=None, settings=None, transport=None,
+              graph_dir=None, core_transport=None):
+    """Peripheral app wired to an in-process kernel (``core_transport``).
+
+    ``base`` is the directory passed to :func:`test_settings`; pass ``settings``
+    for a custom peripheral layout and ``graph_dir`` when the kernel graph
+    directory is not ``<base>/routing-graph``.  ``core_transport`` overrides the
+    kernel transport entirely (unreachable-kernel / forbidden-call tests); the
+    kernel app itself stays reachable from tests as ``app.test_kernel`` (never
+    read by the application itself).
+    """
+    from router.api.app import create_app
+
+    settings = settings if settings is not None else test_settings(base)
+    if core_transport is None:
+        core_transport = core_app_for(
+            graph_dir=settings.graph_dir, app=kernel)
+    app = create_app(
+        settings, transport=transport, core_transport=core_transport)
+    app.test_kernel = kernel
+    return app
+
+
+def split_app_for(base=None, *, settings=None, transport=None,
+                  kernel_transport=None):
+    """Peripheral app backed by a fresh in-process kernel over the same directory.
+
+    ``transport`` serves the peripheral's model-upstream client; ``kernel_transport``
+    serves the kernel's own HTTP client (JEV calls).  Graph files already written
+    to ``<settings.graph_dir>`` are loaded by the kernel at construction.
+    """
+    settings = settings if settings is not None else test_settings(base)
+    kernel = core_app(graph_dir=settings.graph_dir, transport=kernel_transport)
+    return split_app(settings=settings, kernel=kernel, transport=transport)
+
+
+def kernel_state(app):
+    """State of the in-process kernel behind a split-test peripheral app.
+
+    Graph/routing assertions belong to the kernel after the split: tests keep
+    using the peripheral ``app`` for HTTP and SQLite, and reach the kernel app
+    explicitly (``app.test_kernel`` / ``app.state.kernel_app``) for the route
+    set, graph repository and graph publisher.
+    """
+    kernel = getattr(app, "test_kernel", None)
+    if kernel is None:
+        kernel = app.state.kernel_app
+    return kernel.state
+
+
+def install_graph(kernel, document):
+    """Create or replace one graph document in the kernel and republish it."""
+    from router.routing.tree import tree_from_dict
+
+    repo = kernel.state.graph_repo
+    tree = tree_from_dict(document)
+    current = repo.get(tree.id)
+    if current is None:
+        repo.create(tree)
+    else:
+        repo.update(tree, base_document_sha256=current.document_sha256)
+    kernel.state.publisher.refresh()
+    return tree
+
+
+def remove_graph(kernel, tree_id: str) -> None:
+    """Delete one graph file from the kernel store and republish."""
+    path = Path(kernel.state.settings.graph_dir) / "graphs" / f"{tree_id}.json"
+    path.unlink(missing_ok=True)
+    kernel.state.publisher.refresh()
+
+
+def seed_execution_catalog(conn, *, provider="local",
+                           base_url=DEFAULT_PROVIDER_BASE_URL,
+                           key="peripheral-secret",
+                           reasoning_format="openai",
+                           models=None) -> None:
+    """Insert one provider + its models into the peripheral SQLite catalog.
+
+    ``models`` is a list of ``(model_id, upstream, profile_json)`` triples; the
+    default mirrors :data:`DEFAULT_PROVIDER`/graph fixture model ids with
+    ``upstream == model_id`` and an empty profile.
+    """
+    rows = models if models is not None else [
+        (model, model, "{}") for model in ("fast", "strong", "power", "safe")
+    ]
+    conn.execute(
+        "INSERT INTO providers (name, base_url, key_env, reasoning_format, api_key) "
+        "VALUES (?, ?, '', ?, ?)",
+        (provider, base_url, reasoning_format, key))
+    for model_id, upstream, profile in rows:
+        conn.execute(
+            "INSERT INTO models (id, upstream, provider, profile) "
+            "VALUES (?, ?, ?, ?)",
+            (model_id, upstream, provider, profile))
+    conn.commit()
+
+
+def deliver_decision_events(peripheral, sink) -> list[dict]:
+    """Feed captured kernel events into the peripheral's receiver endpoint.
+
+    Equivalent to the kernel sink's real POST (which the dedicated end-to-end
+    test exercises with live lifespans); the receiver contract is identical.
+    """
+    from fastapi.testclient import TestClient
+
+    client = TestClient(peripheral)
+    received = []
+    for event in sink.events:
+        response = client.post("/internal/v1/decision-logs", json=event)
+        assert response.status_code == 200, response.text
+        received.append(event)
+    return received
 
 
 def core_app_for(base=None, *, graph_dir=None, app=None) -> httpx.AsyncBaseTransport:

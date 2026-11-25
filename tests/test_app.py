@@ -20,8 +20,12 @@ from router.store.repositories import SettingsRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.runtime_keys import runtime_model_key, tree_scope
 from tests.routing_fixtures import (
+    DEFAULT_PROVIDER_BASE_URL,
+    core_app,
     graph_dict,
+    kernel_state,
     portable_tree_dict,
+    split_app_for,
     test_settings,
     tree_dict,
 )
@@ -48,12 +52,13 @@ def direct_graph(models=("qwen3-8b",)):
 
 
 def test_health_console_and_empty_tree_boot(tmp_path):
-    app = create_app(test_settings(tmp_path))
+    # 外围 + 进程内内核：图管理经代理读取内核的空调度集。
+    app = split_app_for(tmp_path)
     client = TestClient(app)
     assert client.get("/healthz").json() == {"ok": True}
     assert client.get("/console/index.html").status_code == 200
-    assert app.state.snapshot_set.snapshots == {}
-    assert app.state.snapshot_set.default_snapshot is None
+    assert kernel_state(app).snapshot_set.snapshots == {}
+    assert kernel_state(app).snapshot_set.default_snapshot is None
     assert client.get("/admin/trees").json()["trees"] == []
     response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
     assert response.status_code == 503
@@ -74,26 +79,26 @@ def prepare_active_tree(tmp_path, raw):
 
 
 def test_missing_snapshot_is_not_ready_and_disabled_snapshot_is_ready(tmp_path):
-    """损坏的启用文档 -> 启动快照不可用；改为关闭态文档 -> 空快照就绪。"""
+    """损坏的启用文档 -> 内核启动快照不可用；改为关闭态文档 -> 空快照就绪。"""
     settings = test_settings(tmp_path)
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     path = repo.graphs / "main.json"
     path.write_bytes(b"{broken")
-    app = create_app(settings)
-    with TestClient(app) as client:
-        assert client.get("/readyz").status_code == 503
-        assert client.post("/v1/chat/completions", json={
-            "messages": [{"role": "user", "content": "hello"}],
-        }).status_code == 503
-        path.write_bytes(graph_document_bytes(tree_from_dict(tree_dict())))
-        asyncio.run(app.state.graph_reloader.poll_once())
-        assert client.get("/readyz").status_code == 200
+    app = core_app(graph_dir=settings.graph_dir)
+    client = TestClient(app)
+    assert client.get("/readyz").status_code == 503
+    assert client.post("/internal/v1/route-decision", json={
+        "messages": [{"role": "user", "content": "hello"}],
+    }).status_code == 503
+    path.write_bytes(graph_document_bytes(tree_from_dict(tree_dict())))
+    asyncio.run(app.state.graph_reloader.poll_once())
+    assert client.get("/readyz").status_code == 200
 
 
 def test_startup_accepts_valid_direct_target(tmp_path):
     settings = prepare_active_tree(tmp_path, tree_dict(root=direct_graph()))
-    app = create_app(settings)
+    app = core_app(graph_dir=settings.graph_dir)
     assert app.state.snapshot_set.default_snapshot.tree_id == "main"
     targets = [node for node in app.state.snapshot_set.default_snapshot.tree.root.nodes if isinstance(node, TargetNode)]
     assert [(node.id, [item.model for item in node.models]) for node in targets] == [
@@ -105,10 +110,10 @@ def test_startup_with_invalid_active_tree_is_not_ready(tmp_path):
     raw = tree_dict(root=direct_graph())
     del raw["root"]["error_fallback"]
     settings = prepare_active_tree(tmp_path, raw)
-    app = create_app(settings)
+    app = core_app(graph_dir=settings.graph_dir)
     with TestClient(app) as client:
         assert client.get("/readyz").status_code == 503
-        response = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hello"}]})
+        response = client.post("/internal/v1/route-decision", json={"messages": [{"role": "user", "content": "hello"}]})
         assert response.status_code == 503
         assert response.json()["error"]["message"] == "no_valid_snapshot"
 
@@ -118,7 +123,7 @@ def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path)
     raw["root"]["nodes"][2]["models"] = [{"model": "qwen3-8b", "reasoning": None}]
     raw["jev"] = None  # 画布显式声明“不使用 JEV”：问题节点必须被启用校验拒绝
     settings = prepare_active_tree(tmp_path, raw)
-    app = create_app(settings)
+    app = core_app(graph_dir=settings.graph_dir)
     with TestClient(app) as client:
         ready = client.get("/readyz")
         assert ready.status_code == 503
@@ -128,10 +133,10 @@ def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path)
 def test_environment_jev_service_is_seeded_once(tmp_path):
     """空目录首次启动：环境 URL/model/api_key 创建 ``default`` 服务。"""
     settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
-    app = create_app(settings)
-    # 无启用图：路由集为空，种子只写数据库目录，不进入运行快照。
-    assert app.state.snapshot_set.snapshots == {}
-    assert app.state.snapshot_set.default_snapshot is None
+    app = split_app_for(settings=settings)
+    # 无启用图：内核路由集为空；种子只写外围数据库目录，不进入运行快照。
+    assert kernel_state(app).snapshot_set.snapshots == {}
+    assert kernel_state(app).snapshot_set.default_snapshot is None
     conn = connect(settings.db_path)
     try:
         services = JevServiceRepo(conn).list()
@@ -205,15 +210,15 @@ def test_environment_seed_never_overwrites_an_existing_catalog(tmp_path):
     JevServiceRepo(conn).save(JevService("custom", "http://custom.test", "custom-model"))
     conn.close()
 
-    app = create_app(settings)
+    app = split_app_for(settings=settings)
 
     conn = connect(settings.db_path)
     try:
         assert [service.id for service in JevServiceRepo(conn).list()] == ["custom"]
     finally:
         conn.close()
-    # 目录没有被环境种子覆盖；空路由集不读取目录。
-    assert app.state.snapshot_set.snapshots == {}
+    # 目录没有被环境种子覆盖；内核空路由集不读取外围目录。
+    assert kernel_state(app).snapshot_set.snapshots == {}
 
 
 def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
@@ -224,10 +229,10 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
     document = portable_tree_dict("main")
     repo.create(tree_from_dict({**document, "enabled": True, "default": True}))
 
-    app = create_app(settings)
+    app = split_app_for(settings=settings)
 
-    assert app.state.snapshot_set.default_snapshot.jev.base_url == "http://jev-json.test"
-    assert app.state.snapshot_set.default_snapshot.jev.model == "json-jev"
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.base_url == "http://jev-json.test"
+    assert kernel_state(app).snapshot_set.default_snapshot.jev.model == "json-jev"
     conn = connect(settings.db_path)
     try:
         services = JevServiceRepo(conn).list()
@@ -235,7 +240,7 @@ def test_embedded_runtime_jev_wins_over_environment_seed(tmp_path):
             ("default", "NeoHorse-Jev-4B")]
     finally:
         conn.close()
-    stored = app.state.graph_repo.get("main")
+    stored = kernel_state(app).graph_repo.get("main")
     assert stored.runtime.jev.model == "json-jev"
 
 
@@ -289,9 +294,22 @@ def question_graph(model="qwen3-8b"):
 
 
 def composed_try_app(tmp_path, handler):
-    """真实组合根：engine/jev_client/breaker 全部由 create_app 构造，测试不注入 engine。"""
-    settings = prepare_active_tree(tmp_path, tree_dict(root=question_graph()))
-    return create_app(replace(settings, **JEV_ENV), transport=httpx.MockTransport(handler))
+    """真实组合根：外围代理 + 进程内内核（JEV/上游都由 mock handler 承接）。"""
+    settings = replace(
+        prepare_active_tree(tmp_path, tree_dict(root=question_graph())), **JEV_ENV)
+    app = split_app_for(
+        settings=settings, transport=httpx.MockTransport(handler),
+        kernel_transport=httpx.MockTransport(handler))
+    # 拆分后 Auto 执行目录属于外围：把种子 provider 指到画布声明的 mock 上游。
+    conn = connect(settings.db_path)
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE providers SET base_url = ? WHERE name = 'local'",
+                (DEFAULT_PROVIDER_BASE_URL,))
+    finally:
+        conn.close()
+    return app
 
 
 def test_try_through_app_composition_routes_graph(tmp_path):
@@ -315,9 +333,9 @@ def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
     app = composed_try_app(tmp_path, handler)
     # /admin/try 是 Auto 图路径：熔断键必须带 try 快照的图作用域。
     key = runtime_model_key(tree_scope("main"), "qwen3-8b")
-    for _ in range(app.state.breaker.threshold):
-        app.state.breaker.failure(key)
-    assert app.state.breaker.is_open("qwen3-8b") is False
+    for _ in range(kernel_state(app).breaker.threshold):
+        kernel_state(app).breaker.failure(key)
+    assert kernel_state(app).breaker.is_open("qwen3-8b") is False
     with TestClient(app) as client:
         response = client.post("/admin/try", json={"tree_id": "main", "text": "你好"})
     assert response.status_code == 503, response.text

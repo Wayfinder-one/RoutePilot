@@ -506,8 +506,9 @@ function captureKernel(child) {
 }
 
 /* 决策内核子进程：图 JSON 的唯一写者。外围目录写（模型/provider/JEV/时段）
-   现在通过 /internal/v1/graph-batches 提交，因此 QA 必须同时起内核并让外围
-   的 CoreClient 指向它（Task 7 的跨服务目录同步）。 */
+   通过 /internal/v1/graph-batches 提交，决策事件由内核 best-effort POST 到
+   外围的 /internal/v1/decision-logs（Task 8 的完整双服务调用链），因此 QA 必须
+   同时起内核并让两边互相指向。 */
 function kernelConfigPath() {
   return path.join(tempDir, 'core.json');
 }
@@ -517,23 +518,25 @@ function writeKernelConfig(port) {
     server: { host: '127.0.0.1', port },
     graphs: { directory: path.join(tempDir, 'routing-graph') },
     jev: { api_key_env: 'ROUTER_JEV_API_KEY' },
-    logging: { type: 'disabled' }
+    /* 决策事件 → 外围内存日志（最近 20 条回放来自这里）。 */
+    logging: {
+      type: 'routepilot',
+      url: `http://127.0.0.1:${routerPort}/internal/v1/decision-logs`,
+      timeout_ms: 1000
+    }
   }));
 }
 
-const KERNEL_BOOT = [
-  'import uvicorn',
-  'from router.api.core_app import create_core_app',
-  'from router.core_config import CoreSettings',
-  'settings = CoreSettings.from_file(__import__("sys").argv[1])',
-  'uvicorn.run(create_core_app(settings), host=settings.host, port=settings.port, log_level="warning")',
-].join('\n');
-
 async function startKernel(port) {
   writeKernelConfig(port);
-  const child = spawn(pythonExecutable(), ['-c', KERNEL_BOOT, kernelConfigPath()], {
+  /* 真实入口：python -m router core（Task 8 拆分的两个服务入口之一）。 */
+  const child = spawn(pythonExecutable(), ['-m', 'router', 'core'], {
     cwd: ROOT,
-    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    env: {
+      ...process.env,
+      ROUTER_CONFIG: kernelConfigPath(),
+      PYTHONUNBUFFERED: '1'
+    },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   kernelChild = child;
@@ -680,6 +683,21 @@ export async function api(method, apiPath, body) {
 } finally {
     clearTimeout(timer);
 }
+}
+
+/* 内核决策事件是 best-effort 异步投递（真实双服务时序）：读取"最近日志"的
+   用例必须先等本次决策真的进入外围内存日志，而不是在 POST 完成、事件尚未
+   POST 到 /internal/v1/decision-logs 时渲染空列表。 */
+export async function waitForDecisionLogs(predicate = requests => requests.length > 0, timeout = 15000) {
+  const deadline = Date.now() + timeout;
+  let last = [];
+  while (Date.now() < deadline) {
+    const payload = await api('GET', '/admin/requests/recent');
+    last = payload.requests || [];
+    if (predicate(last)) return last;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('decision logs did not reach the peripheral in time; last=' + JSON.stringify(last.map(item => item.id)));
 }
 
 /* Python tree_to_dict 的四运行字段：保存/导入现在会自带 runtime，
@@ -1817,9 +1835,10 @@ export async function runRegisteredCases() {
     mockServer = await startMock();
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rt-console-qa-'));
     kernelPort = await freePort();
-    await startKernel(kernelPort);
+    /* 内核配置里的日志接收 URL 需要外围端口，因此先分配两个端口再启动内核。 */
     routerPort = await freePort();
     routerBase = `http://127.0.0.1:${routerPort}`;
+    await startKernel(kernelPort);
     await startRouter(routerPort);
     await bootstrap();
     await startBrowser();
