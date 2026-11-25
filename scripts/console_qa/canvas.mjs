@@ -1968,7 +1968,7 @@ test('multi-graph lifecycle: disabling the default graph with other graphs enabl
 });
 test('Task 2 fix · a saved disabled group with local edits reads disabled, not draft', async () => {
   /* 未启用优先：只要落过盘（store.saved），本地脏改动不再把生命周期降级成
-     「草稿未保存」；脏状态由主按钮「保存并启用」表达。 */
+     「草稿未保存」；脏状态由独立的保存按钮表达，主按钮只表达启用状态。 */
   try {
     await ensureBaselineTree();
     await openCanvas();
