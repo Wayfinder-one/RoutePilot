@@ -1,0 +1,57 @@
+# Standalone RoutePilot: the decision kernel plus the optional peripheral
+# console (design §3/§4.1/§8).  Both containers are built from the same image
+# path (scripts/docker/docker-build.sh); only the entry-point argument differs.
+#
+#   core    — owns the graph JSON directory; reads the JEV key from its env and
+#             sends decision events to the console; never calls a model upstream.
+#   console — console/SQLite/standalone model data plane; graph admin is proxied
+#             to the kernel.  Published on host port 8401.
+#
+# Only non-secret values are interpolated.  Put the kernel JEV key in the
+# shell/CI secret store (compose reads it from the environment), never in this
+# file; see env.compose.example.
+name: routepilot
+
+services:
+  core:
+    image: ${CORE_IMAGE:-routepilot-core:latest}
+    command: ["core"]
+    restart: unless-stopped
+    environment:
+      ROUTER_CONFIG: /etc/routepilot/config.json
+      ROUTER_JEV_API_KEY: ${ROUTER_JEV_API_KEY:-}
+    volumes:
+      - ./core-config.json:/etc/routepilot/config.json:ro
+      - core-graphs:/data/graphs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8400/healthz', timeout=2).status == 200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  console:
+    image: ${CONSOLE_IMAGE:-routepilot-console:latest}
+    command: ["peripheral"]
+    restart: unless-stopped
+    environment:
+      ROUTER_CORE_URL: http://core:8400
+      ROUTER_DB: /data/routepilot.db
+    ports:
+      - "8401:8400"
+    volumes:
+      - console-data:/data
+    depends_on:
+      core:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8400/healthz', timeout=2).status == 200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  # Kernel graph JSON only; never shared with the console SQLite volume.
+  core-graphs:
+  console-data:
