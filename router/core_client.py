@@ -62,11 +62,19 @@ class CoreBatchError(CoreGraphError):
     ``RemoteCatalogSyncService`` maps the structured kernel answer back to the
     peripheral domain errors; the graph write either happened completely or not
     at all (the kernel verifies every base hash before touching a file).
+
+    ``uncertain`` marks a transport failure where the request may already have
+    reached (and been committed by) the kernel — e.g. a read timeout or a
+    connection dropped after sending. The catalog sync service probes the kernel
+    and compensates when the candidates are already committed. A clean kernel
+    answer (409/422/503) and a definitely-not-sent failure (``ConnectError`` /
+    ``ConnectTimeout`` / ...) leave ``uncertain`` false.
     """
 
-    def __init__(self, status_code: int, payload=None):
+    def __init__(self, status_code: int, payload=None, *, uncertain: bool = False):
         super().__init__(status_code, payload)
         self.args = (f"graph batch failed: {status_code}",)
+        self.uncertain = bool(uncertain)
 
 
 def _json_body(response: httpx.Response):
@@ -81,6 +89,34 @@ def _unavailable(exc: BaseException) -> CoreGraphError:
     """Kernel unreachable/transport broken → the same 503 class as a 503 answer."""
     return CoreGraphError(
         503, {"detail": {"code": "core_unavailable", "message": str(exc)}})
+
+
+#: Transport failures raised before any byte of the request can reach the kernel:
+#: the graph batch is definitely not committed, so the catalog sync only has to
+#: roll back SQLite. Every other transport error is ambiguous: the request may
+#: have been sent and committed while the response was lost.
+_NOT_SENT_TRANSPORT_ERRORS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.LocalProtocolError,
+    httpx.UnsupportedProtocol,
+)
+
+
+def _batch_transport_error(exc: httpx.HTTPError) -> CoreBatchError:
+    """Classify a transport failure of ``POST /internal/v1/graph-batches``.
+
+    ``ConnectError``/``ConnectTimeout``/pool/protocol setup failures happen
+    before the request is sent: the kernel state is unchanged and the caller
+    can roll back SQLite without compensating. Read timeouts, dropped
+    connections and protocol errors on the reply are **unknown**: the kernel may
+    already have committed the batch (the response was lost), so the caller must
+    probe and compensate.
+    """
+    return CoreBatchError(
+        503, {"detail": {"code": "core_unavailable", "message": str(exc)}},
+        uncertain=not isinstance(exc, _NOT_SENT_TRANSPORT_ERRORS))
 
 
 class CoreClient:
@@ -181,8 +217,7 @@ class CoreClient:
             status, body = await self.admin_json(
                 "POST", "/graph-batches", payload)
         except httpx.HTTPError as exc:
-            raise CoreBatchError(503, {"detail": {
-                "code": "core_unavailable", "message": str(exc)}}) from exc
+            raise _batch_transport_error(exc) from exc
         if status != 200:
             raise CoreBatchError(status, body)
         if not isinstance(body, dict):

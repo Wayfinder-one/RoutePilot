@@ -16,6 +16,9 @@
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import sqlite3
 from dataclasses import replace
 
@@ -32,6 +35,7 @@ from router.control.remote_catalog_sync import (
 )
 from router.core_client import CoreClient
 from router.core_config import CoreSettings
+from router.routing.document import graph_document_bytes
 from router.routing.tree import RoutingTree, tree_from_dict, tree_to_dict
 from router.store.db import connect
 from router.store.routing_trees import GraphConflictError
@@ -549,3 +553,330 @@ def test_kernel_batch_unknown_tree_id_is_a_conflict(tmp_path):
     assert response.status_code == 409, response.text
     assert response.json()["detail"] == {
         "code": "graph_conflict", "actual_document_sha256": None}
+
+
+# --------------------------------------------------------------------------- #
+# 评审修复 1：进程内提交协调器 —— 补偿窗口内的第二笔 commit 不得穿插
+# --------------------------------------------------------------------------- #
+def document_sha(item: RoutingTree) -> str:
+    """一份画布即将落盘字节的 SHA-256（内核 ``document_sha256`` 的定义）。"""
+    return hashlib.sha256(graph_document_bytes(item)).hexdigest()
+
+
+def document_tree(tree_id: str, **overrides) -> RoutingTree:
+    """带真实 ``document_sha256`` 的画布（模拟内核读取结果）。"""
+    raw = tree_from_dict(tree_dict(tree_id, **overrides))
+    return replace(raw, document_sha256=document_sha(raw))
+
+
+def fresh_conn(path) -> sqlite3.Connection:
+    connection = connect(str(path))
+    connection.execute("CREATE TABLE catalog_writes (id TEXT PRIMARY KEY)")
+    connection.execute(
+        "CREATE TABLE audit (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT)")
+    connection.commit()
+    return connection
+
+
+class InterleavingCoreClient:
+    """Stateful kernel fake：第一笔提交的补偿批次会挂起，等测试释放。
+
+    这样测试可以在「内核已提交、SQLite 已回滚、反向批次进行中」的补偿窗口里
+    启动第二笔 ``commit()``，验证进程内协调器阻止其穿插。
+    """
+
+    def __init__(self, *graphs):
+        self.documents = {item.id: item for item in graphs}
+        self.batch_calls: list[list[str]] = []
+        self.forward_committed = asyncio.Event()
+        self.reverse_entered = asyncio.Event()
+        self.allow_reverse = asyncio.Event()
+
+    async def list_graphs(self):
+        return list(self.documents.values())
+
+    async def replace_graph_batch(self, writes):
+        self.batch_calls.append([write["tree"].id for write in writes])
+        if len(self.batch_calls) == 1:
+            reply = self._apply(writes)
+            self.forward_committed.set()
+            return reply
+        if len(self.batch_calls) == 2:
+            self.reverse_entered.set()
+            await self.allow_reverse.wait()
+        return self._apply(writes)
+
+    def _apply(self, writes):
+        for write in writes:
+            current = self.documents[write["tree"].id]
+            assert current.document_sha256 == write["base_document_sha256"], (
+                "stale writer: base " + write["base_document_sha256"]
+                + " != current " + current.document_sha256)
+        reply = []
+        for write in writes:
+            stored = replace(write["tree"],
+                             document_sha256=document_sha(write["tree"]))
+            self.documents[stored.id] = stored
+            reply.append(tree_to_dict(stored))
+        return {"trees": reply}
+
+
+@async_test
+async def test_second_commit_cannot_interleave_with_compensation(tmp_path):
+    """补偿窗口内的第二笔目录写必须等待，不能制造伪 ``catalog_sync_diverged``。
+
+    A：内核批次提交成功 → SQLite 审计失败 → SQLite 回滚 → 反向批次（挂起）。
+    补偿窗口内启动 B（其候选基于 A 已提交后的扫描视图）。没有协调器时 B 会先用
+    这个临时视图再写一次内核图，A 的反向批次基线过期 → 伪分歧且原图不恢复。
+    协调器保证 A 的 SQLite 事务 + 内核批次 + 补偿整体串行：B 在 A 恢复原图后才
+    进入提交，于是它的过期基线得到 409 ``graph_conflict``（重新预览即可），
+    两侧一致且原图恢复。
+    """
+    old = document_tree("main")
+    client = InterleavingCoreClient(old)
+    conn_a = fresh_conn(tmp_path / "a.db")
+    conn_b = fresh_conn(tmp_path / "b.db")
+    try:
+        service_a = RemoteCatalogSyncService(conn_a, client)
+        service_b = RemoteCatalogSyncService(conn_b, client)
+
+        def failing_audit(conn):
+            raise sqlite3.Error("audit failed")
+
+        task_a = asyncio.create_task(service_a.commit(
+            db_write=write_catalog_row,
+            candidates=[replace(old, name="a-v2")],
+            audit=failing_audit,
+        ))
+        await asyncio.wait_for(client.forward_committed.wait(), timeout=2)
+        await asyncio.wait_for(client.reverse_entered.wait(), timeout=2)
+
+        # A 的内核批次已提交：第二笔写扫描到的是临时提交视图（新基线）。
+        concurrent_view = client.documents["main"]
+        candidate_b = replace(concurrent_view, name="b-v2")
+        task_b = asyncio.create_task(service_b.commit(
+            db_write=write_catalog_row,
+            candidates=[candidate_b],
+            audit=record_audit,
+        ))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # 协调器：B 在 A 完成补偿前不能进入提交，也不会发出第二次内核批次。
+        assert client.batch_calls == [["main"], ["main"]]
+        assert not task_b.done()
+
+        client.allow_reverse.set()
+        with pytest.raises(sqlite3.Error, match="audit failed"):
+            await task_a
+        # A 已恢复原图；B 的基线来自临时视图，事务前基线门 409 且零写入。
+        with pytest.raises(GraphConflictError):
+            await task_b
+
+        restored = client.documents["main"]
+        assert document_sha(restored) == old.document_sha256
+        assert restored.name == old.name
+        assert _db_rows(conn_a, "catalog_writes") == []
+        assert _db_rows(conn_a, "audit") == []
+        assert _db_rows(conn_b, "catalog_writes") == []
+        assert _db_rows(conn_b, "audit") == []
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+
+# --------------------------------------------------------------------------- #
+# 评审修复 2：传输失败歧义 —— 「确定未发出」vs「内核状态未知」
+# --------------------------------------------------------------------------- #
+class StatefulKernelTransport:
+    """``httpx.MockTransport`` 级别的有状态内核（trees + graph-batches）。"""
+
+    def __init__(self, *graphs):
+        self.documents = {item.id: item for item in graphs}
+        self.calls: list[tuple[str, str]] = []
+        self.batch_failures: list[BaseException] = []
+        # 传输失败前内核是否已经提交（模拟「请求已送达、响应丢失」）。
+        self.commit_before_failure = False
+        # 提交前只应用第一份写（模拟无法解释的部分状态）。
+        self.partial_commit_before_failure = False
+        # 失败后让 probe（GET /trees）也失败。
+        self.fail_reads_after_failure = False
+        self.fail_reads = False
+
+    def __call__(self, request):
+        self.calls.append((request.method, request.url.path))
+        if request.url.path == "/internal/v1/trees":
+            if self.fail_reads:
+                raise httpx.ConnectError("kernel probe failed", request=request)
+            return httpx.Response(200, json={
+                "trees": [tree_to_dict(item) for item in self.documents.values()]})
+        if request.url.path == "/internal/v1/graph-batches":
+            writes = json.loads(request.content)["writes"]
+            if self.batch_failures:
+                failure = self.batch_failures.pop(0)
+                if self.commit_before_failure:
+                    self._apply(writes,
+                                partial=self.partial_commit_before_failure)
+                if self.fail_reads_after_failure:
+                    self.fail_reads = True
+                raise failure
+            return self._apply(writes)
+        raise AssertionError(
+            f"unexpected kernel call {request.method} {request.url.path}")
+
+    def _apply(self, writes, *, partial=False):
+        if partial:
+            writes = writes[:1]
+        for write in writes:
+            current = self.documents[write["tree"]["id"]]
+            if current.document_sha256 != write["base_document_sha256"]:
+                return httpx.Response(409, json={"detail": {
+                    "code": "graph_conflict",
+                    "actual_document_sha256": current.document_sha256}})
+        reply = []
+        for write in writes:
+            item = tree_from_dict(write["tree"])
+            stored = replace(item, document_sha256=document_sha(item))
+            self.documents[stored.id] = stored
+            reply.append(tree_to_dict(stored))
+        return httpx.Response(200, json={"trees": reply})
+
+    def batch_count(self) -> int:
+        return sum(1 for _method, path in self.calls
+                   if path == "/internal/v1/graph-batches")
+
+    def tree_read_count(self) -> int:
+        return sum(1 for _method, path in self.calls
+                   if path == "/internal/v1/trees")
+
+
+def kernel_client(transport: StatefulKernelTransport) -> CoreClient:
+    return CoreClient(
+        "http://kernel:8400",
+        http=httpx.AsyncClient(transport=httpx.MockTransport(transport)),
+    )
+
+
+@async_test
+async def test_definitely_not_sent_transport_failure_skips_compensation(conn):
+    """连接失败 = 请求确定未发出：SQLite 回滚，无需 probe/补偿。"""
+    old = document_tree("main")
+    transport = StatefulKernelTransport(old)
+    transport.batch_failures.append(httpx.ConnectError("connection refused"))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CoreBatchError) as caught:
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(old, name="v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert caught.value.status_code == 503
+    assert caught.value.uncertain is False
+    assert transport.tree_read_count() == 1        # 只有提交前的原图读取
+    assert transport.batch_count() == 1            # 没有反向批次
+    assert document_sha(transport.documents["main"]) == old.document_sha256
+    assert _db_rows(conn, "catalog_writes") == []
+    assert _db_rows(conn, "audit") == []
+
+
+@async_test
+async def test_unknown_transport_failure_compensates_a_committed_batch(conn):
+    """未知状态（读超时 + 内核已提交）：probe 发现候选已提交 → 原图反向补偿。"""
+    old = document_tree("main")
+    transport = StatefulKernelTransport(old)
+    transport.commit_before_failure = True
+    transport.batch_failures.append(httpx.ReadTimeout("response lost"))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CoreBatchError) as caught:
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(old, name="v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert caught.value.uncertain is True
+    assert transport.tree_read_count() == 2        # 原图读取 + 状态 probe
+    assert transport.batch_count() == 2            # 候选批次 + 反向补偿批次
+    restored = transport.documents["main"]
+    assert document_sha(restored) == old.document_sha256
+    assert restored.name == old.name
+    assert _db_rows(conn, "catalog_writes") == []
+    assert _db_rows(conn, "audit") == []
+
+
+@async_test
+async def test_unknown_transport_failure_without_commit_skips_compensation(conn):
+    """未知状态但 probe 证明候选未提交：只需 SQLite 回滚，不补偿。"""
+    old = document_tree("main")
+    transport = StatefulKernelTransport(old)
+    transport.batch_failures.append(httpx.ReadTimeout("response lost"))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CoreBatchError) as caught:
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(old, name="v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert caught.value.uncertain is True
+    assert transport.tree_read_count() == 2        # probe 执行了
+    assert transport.batch_count() == 1            # 没有反向批次
+    assert document_sha(transport.documents["main"]) == old.document_sha256
+    assert _db_rows(conn, "catalog_writes") == []
+
+
+@async_test
+async def test_unknown_transport_failure_without_probe_is_explicit_divergence(conn):
+    """未知状态且 probe 也失败：无法判断内核是否已提交 → 显式 503 分歧。"""
+    old = document_tree("main")
+    transport = StatefulKernelTransport(old)
+    transport.commit_before_failure = True
+    transport.fail_reads_after_failure = True
+    transport.batch_failures.append(httpx.ReadTimeout("response lost"))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CatalogSyncDiverged, match="catalog_sync_diverged"):
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(old, name="v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert _db_rows(conn, "catalog_writes") == []
+    assert _db_rows(conn, "audit") == []
+
+
+@async_test
+async def test_unknown_transport_failure_with_mixed_state_is_explicit_divergence(conn):
+    """probe 只能解释部分候选（原子批次本不该出现）：按无法确认处理 → 分歧。"""
+    first = document_tree("first")
+    second = document_tree("second")
+    transport = StatefulKernelTransport(first, second)
+    transport.commit_before_failure = True
+    transport.partial_commit_before_failure = True
+    transport.batch_failures.append(httpx.ReadTimeout("response lost"))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CatalogSyncDiverged, match="catalog_sync_diverged"):
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(first, name="first-v2"),
+                            replace(second, name="second-v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert transport.batch_count() == 1            # 不尝试用局部状态补偿
+    assert _db_rows(conn, "catalog_writes") == []

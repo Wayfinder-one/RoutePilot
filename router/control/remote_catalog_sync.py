@@ -17,6 +17,20 @@
 边界内不做图文件 I/O、不持有发布锁：内核是唯一图写者（全局约束 2）。没有候选
 画布的纯 SQLite 写只提交数据库，不调用图批次。
 
+**进程内串行**：``commit()`` 的 SQLite 写事务 + 内核条件批次 + 反向补偿整体持有
+一个进程级（按事件循环）提交协调器。否则第二笔目录写可能在「内核已提交、SQLite
+已回滚、反向批次进行中」的补偿窗口穿插，改写候选图让反向批次基线过期——报告伪
+``catalog_sync_diverged`` 且原图无法恢复。协调器只覆盖本进程的
+``RemoteCatalogSyncService``：多进程/多副本部署时不同进程的提交仍可能交错，它们的
+正向图写由内核基线的 ``document_sha256`` 校验（409 整批拒绝），但补偿窗口内的跨进程
+交错仍会以 ``catalog_sync_diverged`` 暴露为需要人工核对的显式分歧。
+
+**传输失败歧义**：内核批次请求的 ``httpx`` 失败分两类。``ConnectError`` /
+``ConnectTimeout`` / pool/protocol 准备失败 = 请求确定未发出，内核未变，只需回滚
+SQLite；读超时、连接中断等 = 内核状态未知（请求可能已提交、响应丢失），必须
+``list_graphs()`` 探测：候选已提交则用原图 + 探测到的新基线补偿，未提交则不补偿，
+探测也失败则显式 ``catalog_sync_diverged``。
+
 异常映射保持既有目录写契约：
 - 内核 409 ``graph_conflict`` → ``GraphConflictError(actual)`` → 409；
 - 内核 422 Issue 数组 → ``ValidationFailed`` → 422；
@@ -25,12 +39,15 @@
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import logging
 
 from router.control.errors import ValidationFailed
 from router.control.graphs import candidate_document_issues
 from router.core_client import CoreBatchError
+from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue
 from router.routing.tree import RoutingTree
 from router.store.repositories import write_transaction
@@ -51,6 +68,37 @@ class CatalogSyncDiverged(RuntimeError):
     这是「目录写失败但图已改、且补偿也失败」的显式信号：部署需要人工核对内核
     图目录与 SQLite 目录。调用方绝不能把它当成功，也不能覆盖成普通错误。
     """
+
+
+#: Attribute that keeps the per-loop commit coordinator on the event loop object
+#: itself. Production runs one event loop, so this is effectively the process-wide
+#: ``asyncio.Lock`` shared by every ``RemoteCatalogSyncService`` instance. The test
+#: suite creates a fresh ``asyncio.run()`` loop per case: a module-level lock would
+#: bind to the first loop that contends it (``asyncio`` caches the loop on the
+#: lock), so it could neither be reused across test loops nor be garbage collected
+#: (the lock references its loop). Keeping it on the loop gives one coordinator per
+#: loop and lets a closed loop and its lock be collected together.
+_COORDINATOR_ATTR = "_routepilot_catalog_commit_coordinator"
+
+
+def _commit_coordinator() -> asyncio.Lock:
+    """The per-process (per-event-loop) serialization point of catalog commits.
+
+    A whole commit — originals read, SQLite write transaction, kernel conditional
+    batch, audit/COMMIT and the reverse compensation — runs under this lock. It
+    prevents a second in-process catalog commit from interleaving with the
+    compensation window: without it a concurrent commit can move a candidate
+    graph after the first kernel batch commit, so the reverse batch sees a stale
+    base, reports a false ``catalog_sync_diverged`` and leaves the original graph
+    unrestored. Cross-process writers are not serialized here; their graph writes
+    stay kernel-verified by ``document_sha256`` base hashes.
+    """
+    loop = asyncio.get_running_loop()
+    lock = getattr(loop, _COORDINATOR_ATTR, None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(loop, _COORDINATOR_ATTR, lock)
+    return lock
 
 
 def _issues_from_payload(payload) -> list[Issue] | None:
@@ -127,13 +175,20 @@ class RemoteCatalogSyncService:
                      recheck=None) -> list[str]:
         """原子提交目录写 + 候选画布；返回同步的画布 id 列表（候选顺序）。
 
-        ``recheck(conn)``：可选。在 SQLite 写事务内、``db_write`` 之前执行；它可以
-        是协程函数（例如需要重新读取内核影响清单），也可以保持同步。它新增引用时
-        必须让事务回滚（409），绝不带着过期名单提交。
-        ``db_write(conn)``：写数据库目录行；``audit(conn)``：写审计行。二者都在同一
-        事务内，任一异常（含 COMMIT）都触发内核反向批次补偿。
+        整个提交（SQLite 写事务 + 内核条件批次 + 反向补偿）在本进程内串行执行，
+        详情见 :func:`_commit_coordinator`。``recheck(conn)`` 是可选回调，在 SQLite
+        写事务内、``db_write`` 之前执行；可以是协程（例如需要重新读取内核影响
+        清单）。``db_write(conn)`` / ``audit(conn)`` 在同一事务内。
         ``candidates`` 是保留原始 ``document_sha256`` 的新 ``RoutingTree``。
         """
+        async with _commit_coordinator():
+            return await self._commit_serialized(
+                db_write=db_write, candidates=candidates, audit=audit,
+                recheck=recheck)
+
+    async def _commit_serialized(self, *, db_write, candidates, audit,
+                                 recheck=None) -> list[str]:
+        """``commit`` 的串行主体：必须在协调器内调用（测试也可直接驱动）。"""
         candidates = list(candidates)
         if not candidates:
             # 纯 SQLite 目录写：不改变任何画布，绝不调用图批次。
@@ -151,6 +206,7 @@ class RemoteCatalogSyncService:
             for tree in candidates
         ]
         kernel_committed = False
+        kernel_uncertain = False
         new_hashes: dict[str, str] = {}
         try:
             with write_transaction(self.conn):
@@ -165,7 +221,13 @@ class RemoteCatalogSyncService:
                 try:
                     reply = await self.client.replace_graph_batch(writes)
                 except CoreBatchError as exc:
-                    raise _domain_error(exc) or exc from exc
+                    domain = _domain_error(exc)
+                    if domain is not None:
+                        raise domain from exc
+                    # 传输层无法区分「未发出」与「已提交但响应丢失」：先让
+                    # SQLite 事务回滚，事务之外再 probe/补偿。
+                    kernel_uncertain = bool(getattr(exc, "uncertain", False))
+                    raise
                 kernel_committed = True
                 new_hashes = _committed_hashes(reply)
                 audit(self.conn)
@@ -176,6 +238,10 @@ class RemoteCatalogSyncService:
                 _rollback_sqlite_best_effort(self.conn)
                 await self._restore_after_kernel_commit(
                     candidates, originals, new_hashes, exc)
+            elif kernel_uncertain:
+                # 请求可能已送达内核：回滚 SQLite 后探测内核状态，必要时补偿。
+                _rollback_sqlite_best_effort(self.conn)
+                await self._reconcile_uncertain_batch(candidates, originals, exc)
             raise
         return [tree.id for tree in candidates]
 
@@ -191,6 +257,59 @@ class RemoteCatalogSyncService:
                 raise GraphConflictError(actual)
             originals[candidate.id] = original
         return originals
+
+    async def _reconcile_uncertain_batch(
+            self, candidates: list[RoutingTree],
+            originals: dict[str, RoutingTree],
+            cause: BaseException) -> None:
+        """内核批次传输失败后的状态探测（请求可能已提交、响应丢失）。
+
+        用内核当前文档的 ``document_sha256`` 对比「候选即将写出的字节」：
+        - 全部候选已提交 → 用原图 + 探测到的当前基线调用反向批次恢复；
+        - 全部候选未提交 → 内核未变，只需已完成的 SQLite 回滚；
+        - 部分已提交（内核批次是原子的，正常不会出现）或探测失败 → 无法确认
+          两侧一致，抛 ``CatalogSyncDiverged``。
+        """
+        try:
+            current = {tree.id: tree for tree in await self.client.list_graphs()}
+        except Exception as probe_error:  # noqa: BLE001 - 探测失败即无法确认
+            logger.critical(
+                "catalog sync cannot determine kernel state after an ambiguous "
+                "graph-batch transport failure (graphs: %s)",
+                [candidate.id for candidate in candidates],
+                exc_info=probe_error)
+            raise CatalogSyncDiverged("catalog_sync_diverged") from probe_error
+        expected = {
+            candidate.id: hashlib.sha256(
+                graph_document_bytes(candidate)).hexdigest()
+            for candidate in candidates
+        }
+        committed = [
+            candidate for candidate in candidates
+            if current.get(candidate.id) is not None
+            and current[candidate.id].document_sha256 == expected[candidate.id]
+        ]
+        if not committed:
+            logger.warning(
+                "graph-batch transport failure happened before commit; kernel "
+                "graphs are unchanged (graphs: %s)",
+                [candidate.id for candidate in candidates])
+            return
+        if len(committed) != len(candidates):
+            committed_ids = {candidate.id for candidate in committed}
+            logger.critical(
+                "ambiguous kernel graph state after transport failure: committed "
+                "%s, not committed %s",
+                sorted(committed_ids),
+                sorted(candidate.id for candidate in candidates
+                       if candidate.id not in committed_ids))
+            raise CatalogSyncDiverged("catalog_sync_diverged") from cause
+        new_hashes = {
+            candidate.id: current[candidate.id].document_sha256
+            for candidate in candidates
+        }
+        await self._restore_after_kernel_commit(
+            candidates, originals, new_hashes, cause)
 
     async def _restore_after_kernel_commit(
             self, candidates: list[RoutingTree],
