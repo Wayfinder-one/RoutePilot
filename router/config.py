@@ -29,6 +29,9 @@ class Settings:
     admin_password: str = "1qaz@WSX"
     session_ttl_hours: int = 168
     gateway_token: str = ''
+    # 决策内核的内部 API（图管理 + 决策）；外围不再直接写图 JSON。
+    core_url: str = "http://127.0.0.1:8400"
+    core_timeout_seconds: float = 60.0
 
     @staticmethod
     def from_env() -> "Settings":
@@ -48,4 +51,7 @@ class Settings:
             admin_password=os.environ.get("ROUTER_ADMIN_PASSWORD", "1qaz@WSX"),
             session_ttl_hours=int(os.environ.get("ROUTER_SESSION_TTL_HOURS", "168")),
             gateway_token=os.environ.get("ROUTER_GATEWAY_TOKEN", ""),
+            core_url=os.environ.get("ROUTER_CORE_URL", "http://127.0.0.1:8400"),
+            core_timeout_seconds=float(
+                os.environ.get("ROUTER_CORE_TIMEOUT_SECONDS", "60")),
         )

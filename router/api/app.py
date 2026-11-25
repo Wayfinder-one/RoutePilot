@@ -19,6 +19,7 @@ from router.control.errors import (
     ValidationFailed,
 )
 from router.api.issue_presenter import issues_payload
+from router.core_client import CoreClient
 from router.decision_log_store import DecisionLogStore
 from router.jev.client import JevClient
 from router.jev.service import JevService
@@ -153,7 +154,12 @@ def _seed_jev(conn, settings: Settings) -> None:
         SettingsRepo(conn).set(JEV_SEEDED_SETTING, "1")
 
 
-def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = None) -> FastAPI:
+def create_app(
+    settings: Settings,
+    *,
+    transport: httpx.BaseTransport | None = None,
+    core_transport: httpx.AsyncBaseTransport | None = None,
+) -> FastAPI:
     requestlog = RequestLogger(settings.db_path)
     conn = connect(settings.db_path)
     try:
@@ -182,6 +188,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
             await app.state.maintenance.close()
             await app.state.graph_reloader.close()
             await requestlog.close()
+            await app.state.core.aclose()
             await app.state.http.aclose()
 
     app = FastAPI(title="RoutePilot", lifespan=lifespan)
@@ -189,6 +196,13 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     # JEV Key 只从环境变量读取：图运行装配不再打开 SQLite 解析已存密钥。
     app.state.jev_api_key = os.environ.get(settings.jev_api_key_env, "")
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
+    # 内核客户端自备 AsyncClient：浏览器/上游 transport 不复用到内核管理面。
+    app.state.core = CoreClient(
+        settings.core_url,
+        http=httpx.AsyncClient(
+            timeout=settings.core_timeout_seconds, transport=core_transport),
+        timeout_seconds=settings.core_timeout_seconds,
+    )
     app.state.breaker = CircuitBreaker()
     app.state.breaker_store = BreakerStore(settings.db_path)
     app.state.breaker_worker = BreakerSyncWorker(
@@ -306,7 +320,6 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     from router.api.routes_time import router as time_router
     from router.api.routes_trees import router as trees_router
     from router.api.routes_users import router as users_router
-    from router.api.routes_internal import router as internal_router
     from router.api.routes_v1 import router as v1_router
 
     app.include_router(models_router, prefix="/admin")
@@ -317,7 +330,8 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.include_router(users_router, prefix="/admin")
     app.include_router(test_router, prefix="/admin")
     # 内核事件接收口：挂在 /admin 之外，内核无需管理面登录即可投递完整决策事件。
+    # 决策端点（/internal/v1/route-decision）只属于内核：外围不挂载它；
+    # 外围与内核的 HTTP 边界是 app.state.core（CoreClient）。
     app.include_router(logs_internal_router, prefix="/internal/v1")
-    app.include_router(internal_router, prefix="/internal/v1")
     app.include_router(v1_router, prefix="/v1")
     return app

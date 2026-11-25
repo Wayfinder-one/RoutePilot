@@ -52,7 +52,8 @@ def test_user_auth_enabled_requires_login(tmp_path):
     """生产默认（user_auth=True）：无会话一律 401；默认管理员登录后放行。"""
     c = _client(tmp_path, user_auth=True)
     for call in (c.get("/admin/models"), c.get("/admin/changes"),
-                 c.get("/admin/users"), c.get("/admin/me"),
+                 c.get("/admin/trees"), c.get("/admin/users"),
+                 c.get("/admin/me"),
                  c.put("/admin/jev/jev-a", json={})):
         assert call.status_code == 401, call.request.url
         assert call.json() == {"detail": "unauthorized: /admin requires login"}
