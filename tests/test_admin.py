@@ -213,6 +213,13 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
         assert second_live["request"]["tree_revision"] == "second-tree-revision"
         assert second_live["request"]["snapshot_revision"] == "second-snapshot-revision"
 
+    # 请求记录之后当前图又变了：历史回放只能读日志存储里的旧图，不能读当前图文件。
+    current = repo.get("main")
+    repo.update(
+        replace(current, name="后来的当前图"),
+        base_document_sha256=current.document_sha256,
+    )
+
     # 重启后账本行仍在、快照可从 SQLite 重放；正文/原始 trace 不在账本里。
     restarted = create_app(settings)
     with TestClient(restarted) as client:
@@ -225,6 +232,9 @@ def test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace(tmp_pa
         response = client.get("/admin/requests/snapshot-request/snapshot")
         assert response.status_code == 200
         body = response.json()
+        # 当前图文件已被改成「后来的当前图」，历史响应仍必须是首次请求时的图。
+        assert body["tree"]["name"] == "测试图"
+        assert body["tree"]["name"] != "后来的当前图"
         assert body["tree"]["canvas"]["start"] == {"x": 12, "y": 34}
         assert body["trace"] == trace
         assert "text" not in body["request"]
