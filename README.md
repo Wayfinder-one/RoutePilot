@@ -534,7 +534,22 @@ The internal endpoint requires `X-SR-Gateway-Token` and fails closed (`503 gatew
 | Route publishing, shadow first then production | `scripts/apisix/configure_routepilot_routes.py` |
 | End-to-end acceptance matrix | `scripts/apisix/verify_routepilot_e2e.py` |
 
-Rollout order: deploy the pod → configure graphs → register the plugin → publish the shadow routes and run the matrix → publish production routes and re-run the matrix with `--expect-production`. Code and offline tests are in the tree; the 163 rollout and the on-cluster matrix require the deployment credentials and have not been executed yet, so no cluster verification result is claimed here.
+Split the rollout by what is actually verified:
+
+- **Done on 163 (2026-11-25):** the image `routepilot:amd64-e014ae2` is built and running (1/1), the ClusterIP Service, NFS PVC and NetworkPolicy are applied, the four graphs (`main` default, `finance`, `legal`, `jev-smoke`) are published, and direct requests to the in-pod internal endpoint were verified: 财务部 → `finance`/`department`, 法务部 → `legal`/`department`, unknown and empty department → `main`/`default`, each with the real upstream model and a real answer; a missing or wrong `X-SR-Gateway-Token` is rejected with 401.
+- **Fixed and verified offline only:** remote-failure redaction, the `nginx_config.envs` worker-token declaration, fail-closed drift detection on the shared APISIX objects, the route publish/delete/rollback state machine (all post-apply failures restore, restore failures are reported separately), E2E response ownership, forced model assertions, two-content-frame SSE evidence with a measurable gap, conditional ledger waits, `TreeUpsertIn`-whitelisted JEV graph writes with nested restore, fail-stop failure drills, and a final `--since-time` secret scan over the current and previous containers.
+- **Not executed yet (needs a maintenance window):** newapi release carrying `X-SR-Department` (out of scope for the review-fix plan), the shared APISIX patch (plugin registration + Lua mount + token env), shadow route publication, the full shadow matrix, and every failure/rollback drill. Until those run, no end-to-end gateway result is claimed.
+
+Rollout order once the window is approved: release newapi → `patch_apisix_deployment.py --dry-run` then apply → `configure_routepilot_routes.py --mode shadow --dry-run` then publish → the shadow gate:
+
+```bash
+python3 scripts/apisix/verify_routepilot_e2e.py \
+  --base-path /routepilot-smoke/chat/completions \
+  --ssh-target root@192.168.95.163 \
+  --complete-shadow --include-disruptive
+```
+
+The gate requires the exact shadow path, the SSH target for in-pod ledger/JEV evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`) can never be reported as complete. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
 
 ## Quick start
 

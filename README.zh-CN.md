@@ -534,7 +534,22 @@ RoutePilot 以仅 ClusterIP 的形态部署在 163 共享 APISIX 之后（`sandl
 | Route 发布（先影子、后生产） | `scripts/apisix/configure_routepilot_routes.py` |
 | 端到端验收矩阵 | `scripts/apisix/verify_routepilot_e2e.py` |
 
-上线顺序：部署 Pod → 配置图 → 注册插件 → 发布影子 Route 并跑矩阵 → 发布生产 Route 并用 `--expect-production` 重跑矩阵。代码与离线测试已入库；163 的实际发布与集群侧矩阵需要部署凭据，尚未执行，因此本文不声称已有集群实测结论。
+按“已验证”与“未执行”分开记录：
+
+- **163 上已完成（2026-11-25）**：镜像 `routepilot:amd64-e014ae2` 已构建并运行（1/1），ClusterIP Service、NFS PVC、NetworkPolicy 已应用，四张图（`main` 默认、`finance`、`legal`、`jev-smoke`）已发布；Pod 内直连内部端点实测：财务部→`finance`/`department`、法务部→`legal`/`department`、未知与空部门→`main`/`default`，均返回真实上游模型与真实答案；缺失或错误 `X-SR-Gateway-Token` 返回 401。
+- **仅完成离线验证**：远程失败脱敏、`nginx_config.envs` 让 worker 能读到网关 Token、共享 APISIX 对象漂移时 fail-closed、Route 发布/删除/回滚状态机（应用后任何异常都恢复，恢复失败单独报告）、E2E 响应所有权、强制模型断言、至少两个内容帧且有时延证据的 SSE、账号本条件等待、`TreeUpsertIn` 白名单的 JEV 图写回与嵌套恢复、fail-stop 故障演练，以及运行结束后按 `--since-time` 对当前/上一容器做密钥扫描。
+- **尚未执行（需要维护窗口）**：带 `X-SR-Department` 的 newapi 发布（不在本次修复计划范围内）、共享 APISIX 变更（插件注册 + Lua 挂载 + Token env）、shadow Route 发布、完整 shadow 矩阵以及全部故障/回滚演练。在这些执行之前，本文不声称网关全链路已验证。
+
+窗口批准后的顺序：发布 newapi → `patch_apisix_deployment.py --dry-run` 后正式执行 → `configure_routepilot_routes.py --mode shadow --dry-run` 后发布 → shadow 完整门禁：
+
+```bash
+python3 scripts/apisix/verify_routepilot_e2e.py \
+  --base-path /routepilot-smoke/chat/completions \
+  --ssh-target root@192.168.95.163 \
+  --complete-shadow --include-disruptive
+```
+
+完整门禁要求精确 shadow 路径、Pod 内账本/JEV 证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`）不能被表述为完整验收。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
 
 ## 快速开始
 
