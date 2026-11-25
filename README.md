@@ -592,13 +592,19 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
 
 The gate requires the exact shadow path, the SSH target for in-pod kernel decision evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`) can never be reported as complete. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
 
-### Known accepted residuals (split)
+### APISIX rollout residuals (split)
 
-- The peripheral JEV **Test connection** button is only meaningful when the peripheral process itself has `ROUTER_JEV_API_KEY`; a production split has no peripheral JEV key (the key belongs to the kernel).
-- The kernel scheduling circuit breaker no longer sees real model-upstream failures — by design, because the kernel produces no execution write-back. The standalone peripheral keeps its own execution-side breaker; the APISIX form lets newapi own retries/health.
 - A `routepilot-decision` upstream object may remain inert in the live etcd from the pre-split APISIX configuration; it is unreferenced and can be pruned manually later.
-- VictoriaLogs output is not implemented; the kernel-only 163 deployment uses `logging.type=disabled` rather than pretending decision events are persisted.
 - The peripheral console service is not deployed on 163 in this period.
+
+## Known limitations (split)
+
+- **Cross-service catalog commit crash window.** A catalog write commits the kernel graph batch first and the peripheral SQLite rows second. A SIGKILL between the two commits leaves the kernel graphs ahead of SQLite until the next catalog write; kernel graphs are the base of that next batch, and standalone execution fails closed with 503 `execution_catalog_mismatch` until both sides agree. There is no crash recovery in this iteration — a deliberate non-goal.
+- **Decision-log receiver is network-boundary-only.** `POST /internal/v1/decision-logs` has no shared token; isolate it with the network boundary. The receiver accepts at most 10 MiB per event and retains 20 events in memory (the 21st evicts the oldest, and a restart clears the log).
+- **Peripheral JEV test needs a peripheral key.** The console's "Test connection" only works when the peripheral process itself is explicitly configured with `ROUTER_JEV_API_KEY`; in the split deployment that key lives only in the kernel, so the button reports a missing key unless the value is deliberately duplicated.
+- **Kernel scheduling breaker no longer sees upstream execution.** It observes decisions only: there is no execution write-back by design. The standalone peripheral keeps its own execution-side breaker; the APISIX form lets newapi own retries and channel health.
+- **VictoriaLogs output adapter is not implemented.** `logging.type` supports only `routepilot` and `disabled`; the event schema is fixed so a future `logging.type=victorialogs` adapter can serialize the same objects.
+- **Expired console sessions are no longer purged automatically.** The old `MaintenanceWorker` is no longer wired into the peripheral app (plan Task 8), so expired `user_sessions` rows accumulate in SQLite until manual cleanup.
 
 ## Quick start
 
@@ -657,6 +663,8 @@ The **kernel** is configured by `config.json` (path via `ROUTER_CONFIG`, default
   }
 }
 ```
+
+The sample URL is the compose peripheral service name (`console:8400`), matching `configs/core.example.json` and `scripts/docker/core-config.json`. In the Quick start layout the peripheral is published on 8401, so use `http://127.0.0.1:8401/internal/v1/decision-logs`; when no receiver is reachable keep `logging.type=disabled`.
 
 | Kernel `config.json` field | Default | Purpose |
 |---|---|---|
@@ -778,9 +786,10 @@ npm run check:console
 docker compose -f scripts/docker/compose.yml config
 ```
 
-- `pytest` collects `tests/` only (`testpaths`), runs unit and FastAPI integration tests, starts no browser and does not collect `experiments/`. `tests/test_service_split_e2e.py` is the real two-app acceptance run: in-process kernel + peripheral over real HTTP, graph creation/enable through the peripheral proxy, `auto` decision, peripheral model execution, JSON/SSE, kernel event → peripheral memory log, recent/replay, 21st-event eviction, current-graph edits not affecting replays, restart clearing the log, and a log-sink failure not blocking decisions.
+- `pytest` collects `tests/`, `scripts/apisix/` and `scripts/docker/` (`testpaths` in `pyproject.toml`), runs unit, service-split and deployment static tests, starts no browser and does not collect `experiments/`. `tests/test_service_split_e2e.py` is the real two-app acceptance run: in-process kernel + peripheral over real HTTP, graph creation/enable through the peripheral proxy, `auto` decision, peripheral model execution, JSON/SSE, kernel event → peripheral memory log, recent/replay, 21st-event eviction, current-graph edits not affecting replays, restart clearing the log, and a log-sink failure not blocking decisions.
 - `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
 - `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
+- `.venv/bin/python scripts/i18n_dead_keys.py` lists console-dictionary keys that no page references (exit code 1 when any exist) so dead translations can be deleted; it is a CI lint and is not part of the Playwright matrix.
 - `docker compose -f scripts/docker/compose.yml config` statically validates the two-service standalone deployment (two services, separate volumes, healthchecks, no secret values).
 - `scripts/standalone_v4_smoke.py` is a **legacy pre-split** acceptance run (single-service writer/replica assumptions); it is kept for history and must not be used to validate the split. The split gates are `tests/test_service_split_e2e.py`, `scripts/docker/test_deploy_163.py` and `scripts/apisix/verify_routepilot_e2e.py` (against a real deployment).
 

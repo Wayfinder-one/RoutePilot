@@ -11,7 +11,7 @@
   },
   "logging": {
     "type": "routepilot",
-    "url": "http://routepilot-console:8401/internal/v1/decision-logs",
+    "url": "http://console:8400/internal/v1/decision-logs",
     "timeout_ms": 1000
   }
 }

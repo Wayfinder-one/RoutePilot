@@ -28,6 +28,12 @@
 
 依赖：本机 python3 的 requests（已装）、Pillow（已装）、ssh 免密到 76（读 tap 日志）。
 所有证据均来自线上真实请求；失败项如实记录（ok=false + error）。
+
+历史定位：本脚本是**拆分前单服务形态**的演示取证脚本，仅作历史留存（对应
+docs/案例演示-2026-11-03 的既有证据）。拆分后没有 SQLite 请求台账，
+``/admin/requests/recent`` 只返回内核决策事件（不含执行结果），因此本脚本与它
+生成的文档里出现的 ``outcome_state``/``error_class``/``upstream_status`` 只属于
+该历史形态；不要用本脚本验证拆分后的双服务链路。
 """
 
 from __future__ import annotations
@@ -1483,7 +1489,8 @@ def finalize(api: Api, ev: Evidence) -> None:
             "tree": "case-ha",
             "tree_revision": (tree or {}).get("tree_revision"),
             "rows": rows[:10],
-            "note": "熔断/502/503 的日志行：outcome_state / error_class / upstream_status / model / target_id",
+            "note": "熔断/502/503 的日志行（拆分前单服务台账）：outcome_state / error_class / "
+                    "upstream_status / model / target_id；拆分后决策事件不含执行结果字段",
         }
 
     ev.platform["breaker_logs"] = ev.probe("platform.log_excerpt", breaker_logs)
@@ -1732,8 +1739,8 @@ def build_readme(ev: Evidence, manifest: dict, meta: dict) -> str:
     add("- **A. dry-run 路由证据**：`POST /admin/try`（`tree_id`+`text`，时段类 prompt 另带 `now`）。"
         "它返回 outcome/candidates/waves/answers/trace，是「决策组配置是否符合期望」的直接证据；")
     add("- **B. 实时链路证据**：`POST /v1/chat/completions`（`model=auto`）真实走路由 + 上游推理。"
-        "命中看响应头 `x-sr-model`/`x-sr-selection`，以及 `/admin/requests/recent` 里该请求的 "
-        "`target_id`/`model`/`outcome_state`。")
+        "命中看响应头 `x-sr-model`/`x-sr-selection` 与 `/admin/requests/recent` 里该请求的 "
+        "`target_id`/`model`（拆分后的日志只有决策事件，没有 `outcome_state` 等执行结果字段）。")
     add("- 时段语义差异：`/v1` 无法传 `now`，按服务器墙钟时间（本次取证 14:2x = 白天）判定；"
         "案例四的夜间/白天对比使用 A 类 dry-run + manifest 的 `now` 覆盖，"
         "**不要**把 dry-run 与实时结果混为一谈（见案例四）。")
@@ -1921,8 +1928,11 @@ def build_readme(ev: Evidence, manifest: dict, meta: dict) -> str:
             text_head(log_row.get("error_class"), 40),
         ])
     add(md_table(["轮次", "复杂推理 target [ha-fail, ha-general]",
-                  "故障演练 target [ha-fail]", "台账 outcome_state", "error_class"],
+                  "故障演练 target [ha-fail]", "历史台账 outcome_state", "error_class"],
                  sequence_rows))
+    add("")
+    add("> 本表的 `outcome_state`/`error_class` 是拆分前单服务的请求台账字段；"
+        "拆分后内核只产生决策事件，执行结果（如上游 502）不落任何存储。")
     add("")
     add("> 熔断器语义：同一模型连续 3 次上游 5xx 打开；半开窗口 300s。"
         "复杂推理第 1-3 次由 ha-fail 承担（502），第 4 次熔断打开后由 ha-general 接管（200）；"
@@ -2020,7 +2030,8 @@ def build_readme(ev: Evidence, manifest: dict, meta: dict) -> str:
                          row.get("upstream_status"), row.get("prompt_tokens"),
                          round(row.get("total_ms") or 0, 1)])
     add("熔断/502 对应的请求日志行（GET /admin/requests/recent；"
-        "控制台日志页的「关键事实」展示上游状态/耗时，上游模型名 `upstream_model` 在 JSON 与下表可见）：")
+        "以下 `outcome_state`/`error_class`/`upstream_status` 是拆分前单服务台账字段，"
+        "拆分后只有内核决策事件、没有执行结果）：")
     add("")
     add(md_table(["target", "决策模型", "上游模型", "outcome_state", "error_class",
                   "upstream_status", "prompt_tokens", "total_ms"], log_rows))
@@ -2091,7 +2102,8 @@ def build_readme(ev: Evidence, manifest: dict, meta: dict) -> str:
     add("- `/v1` 响应 body 的 `model` 字段是上游真实模型名（本实现透传上游 body），"
         "入站 `model=auto` 的路由结果看响应头 `x-sr-model`。")
     add("- 503 `no_available_backend`（路由阶段拒绝）不产生可回放决策事件；"
-        "502 upstream_error 会落库并带 error_class/upstream_status。")
+        "拆分后执行结果（如上游 502 upstream_error）不写任何存储，决策事件也不带 "
+        "error_class/upstream_status（本脚本的台账字段只适用于拆分前单服务证据）。")
     add("- 多模态探针用的是本地生成的示意图；VL 模型对小字号文字偶有识别偏差，"
         "但形状/颜色已真实命中。")
     restore = meta.get("restore") or ev.meta.get("restore") or {}

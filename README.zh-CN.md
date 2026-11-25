@@ -592,13 +592,19 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
 
 完整门禁要求精确 shadow 路径、Pod 内内核决策证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`）不能被表述为完整验收。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
 
-### 已知且接受的残留（拆分）
+### APISIX 发布残留（拆分）
 
-- 外围 JEV **测试连接**按钮只有在外围进程自身配置了 `ROUTER_JEV_API_KEY` 时才有意义；生产分裂部署没有外围 JEV Key（Key 属于内核）。
-- 内核调度熔断不再感知真实模型上游失败——设计使然，因为内核不做执行结果回写。standalone 的外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
 - 分裂前 APISIX 配置里的 `routepilot-decision` upstream 对象可能仍以惰性形式留在现网 etcd；它已无引用，可后续手工删除。
-- VictoriaLogs 输出未实现；163 内核-only 部署使用 `logging.type=disabled`，而不是假装决策事件已持久化。
 - 本期 163 不部署外围控制台服务。
+
+## 已知限制（拆分）
+
+- **跨服务目录提交的崩溃窗口。** 目录写先提交内核图批次、再提交外围 SQLite 行。若在两次提交之间被 SIGKILL，内核图会领先 SQLite，直到下一次目录写才对齐；内核图是下一批次的基线，而对齐前 standalone 执行会以 503 `execution_catalog_mismatch` 失败关闭。本迭代不做崩溃恢复——这是有意的非目标。
+- **决策日志接收口只靠网络边界保护。** `POST /internal/v1/decision-logs` 没有共享 Token，需用网络策略隔离；接收口单条事件上限 10 MiB，只在内存保留 20 条（第 21 条淘汰最旧一条，重启即清空）。
+- **外围 JEV「测试连接」需要外围 Key。** 只有外围进程自身显式配置 `ROUTER_JEV_API_KEY` 时按钮才有效；拆分部署中该 Key 只在内核，因此不刻意复制 Key 时按钮会报缺少 Key。
+- **内核调度熔断不再感知上游执行失败。** 它只观察决策：设计上内核不做执行结果回写。standalone 外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
+- **VictoriaLogs 输出适配器未实现。** `logging.type` 只支持 `routepilot` 与 `disabled`；事件结构已固定，供将来 `logging.type=victorialogs` 适配器序列化同一批对象。
+- **过期控制台会话不再自动清理。** 外围应用已不再接入旧的 `MaintenanceWorker`（计划 Task 8），过期 `user_sessions` 行会留在 SQLite，直到人工清理。
 
 ## 快速开始
 
@@ -657,6 +663,8 @@ ROUTER_JEV_API_KEY='<jev-key>' \
   }
 }
 ```
+
+示例地址是 compose 中 peripheral 服务名（`console:8400`），与 `configs/core.example.json`、`scripts/docker/core-config.json` 一致。快速开始形态下外围发布在 8401，应使用 `http://127.0.0.1:8401/internal/v1/decision-logs`；没有可达接收口时保持 `logging.type=disabled`。
 
 | 内核 `config.json` 字段 | 默认值 | 说明 |
 |---|---|---|
@@ -778,9 +786,10 @@ npm run check:console
 docker compose -f scripts/docker/compose.yml config
 ```
 
-- `pytest` 只收集 `tests/`（`testpaths`），运行为单元与 FastAPI 集成测试，不启动浏览器，也不收集 `experiments/`。`tests/test_service_split_e2e.py` 是真实双 app 验收：进程内内核 + 外围走真实 HTTP，经外围代理建图/启用 → `auto` 决策 → 外围执行模型 → JSON/SSE → 内核事件写入外围内存日志 → recent/replay → 第 21 条淘汰 → 改当前图不影响旧回放 → 外围重启日志消失 → 日志 sink 故障不阻断决策。
+- `pytest` 收集 `tests/`、`scripts/apisix/` 与 `scripts/docker/`（`pyproject.toml` 的 `testpaths`），运行单元、服务拆分与部署静态测试，不启动浏览器，也不收集 `experiments/`。`tests/test_service_split_e2e.py` 是真实双 app 验收：进程内内核 + 外围走真实 HTTP，经外围代理建图/启用 → `auto` 决策 → 外围执行模型 → JSON/SSE → 内核事件写入外围内存日志 → recent/replay → 第 21 条淘汰 → 改当前图不影响旧回放 → 外围重启日志消失 → 日志 sink 故障不阻断决策。
 - `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
 - `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
+- `.venv/bin/python scripts/i18n_dead_keys.py` 列出控制台词典中已无页面引用的 key（存在死 key 时 exit 1），用于删除无用翻译；它是 CI lint，不属于 Playwright 矩阵。
 - `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。
 - `scripts/standalone_v4_smoke.py` 是**拆分前的 legacy** 验收脚本（单服务写者/只读副本假设），仅作历史留存，不能用于验证拆分。拆分门禁是 `tests/test_service_split_e2e.py`、`scripts/docker/test_deploy_163.py` 与针对真实部署的 `scripts/apisix/verify_routepilot_e2e.py`。
 

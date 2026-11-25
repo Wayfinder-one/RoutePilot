@@ -3,9 +3,10 @@
 本模块是 frozen ``Backend`` 的定义处，并提供「从 SQLite 目录装配
 ``model_id -> Backend``」的唯一入口 :func:`load_backends`。拆分后它服务两条
 外围执行路径：**固定模型直连**（管理端测试对话、``/admin/test``）与 Auto 的
-执行映射（``router.upstream.execution.backend_for_decision`` 用内核决策的逻辑
-模型在此解析 Provider Key/URL，目录与内核决策不一致时拒绝执行）。内核决策
-本身不读 SQLite：决策只来自启用图发布的路由快照。
+执行映射（``router.upstream.execution.backend_for_decision`` 会调用
+:func:`load_backends`，用内核决策的逻辑模型在此解析 Provider Key/URL，目录与
+内核决策不一致时拒绝执行）。内核决策本身不读 SQLite：决策只来自启用图发布的
+路由快照。
 
 ``Backend`` 是 frozen dataclass：快照构造时复制 ``headers``/``reasoning``，
 发布后的 MappingProxy 里不再包着可被写者顺手改掉的可变对象。
@@ -41,9 +42,11 @@ def _reasoning_capability(profile_text: str | None,
                           provider_format: str) -> dict | None:
     """Parse profile JSON + normalize; unusable/illegal declarations -> None.
 
-    Auto 路由热路径零解析：本函数只在固定模型直连按 SQLite 目录装配
-    ``load_backends`` 时运行。损坏/非法的旧声明绝不能阻止服务启动，因此回退为
-    「未声明」。
+    仅由 :func:`load_backends` 在装配外围 SQLite 目录时调用：固定模型直连需要
+    完整的 Backend（含 ``reasoning``）；Auto 路径由
+    ``router.upstream.execution.backend_for_decision`` 解析内核决策的
+    ``logical_model`` 时同样经该目录取 Provider 与推理能力，不在决策热路径上
+    重复解析。损坏/非法的旧声明绝不能阻止服务启动，因此回退为「未声明」。
     """
     if not profile_text:
         return None
@@ -59,11 +62,15 @@ def _reasoning_capability(profile_text: str | None,
 
 
 def load_backends(conn: sqlite3.Connection) -> dict[str, Backend]:
-    """Build the model_id -> Backend catalog for fixed-model direct requests.
+    """Build the model_id -> Backend catalog for the peripheral execution paths.
 
-    A model whose provider row is missing is simply absent from the catalog; the
-    fixed-model direct handler then answers 404 ``unknown_model`` for it. Auto
-    routing never calls this: it reads the published canvas snapshot only.
+    The peripheral uses it for fixed-model direct requests (a missing model or
+    provider row simply makes the key absent, and the direct handler answers 404
+    ``unknown_model``) and for Auto execution: ``backend_for_decision`` resolves
+    the kernel decision's ``logical_model`` here to fetch the Provider key/URL
+    and reasoning profile, rejecting a catalog that disagrees with the decision.
+    The kernel never calls this; decisions read the published canvas snapshot
+    only.
     """
     rows = conn.execute(
         "SELECT m.id AS id, m.upstream AS upstream, m.provider AS provider, "

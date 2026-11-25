@@ -1,7 +1,7 @@
 # RoutePilot 内核与外围服务拆分设计
 
 日期：2026-11-25
-状态：已与用户逐节确认；实施计划已完成，尚未实施
+状态：已实施（分支 feat/core-peripheral-split，2026-11-26）；历史实施细节见计划与 .superpowers/sdd/core-split-2026-11-25/
 
 ## 1. 背景与目标
 
