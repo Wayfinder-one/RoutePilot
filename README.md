@@ -4,7 +4,7 @@
 
 English | [简体中文](README.zh-CN.md)
 
-RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/chat/completions`; a versioned decision graph selects the upstream model. Graphs are edited, validated, dry-run and published in the built-in console.
+RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/chat/completions`; a versioned decision graph selects the upstream model. Graphs are edited, validated, dry-run, saved and enabled in the built-in console.
 
 ![RoutePilot decision canvas](assets/routepilot/en/routing-canvas.png)
 
@@ -19,7 +19,7 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 | Target selection | Priority competition among activated targets; one fallback target `error_fallback` |
 | Backend selection | Session affinity; random pick among a multi-model target's available models; Auto isolates circuit breaking and inflight per graph+model; fixed-model direct stays independent |
 | Portable canvases | Every saved v4 canvas embeds its lifecycle markers, departments and complete non-secret run configuration, so one JSON file restores it on an empty database |
-| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; it runs either the current draft or the published route set (optionally selected by department), and database drift is reported as hints only |
+| Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; it runs either the current draft or the active route set (optionally selected by department), and database drift is reported as hints only |
 | Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, multi-service JEV catalog, time periods, audit history, role-based users |
 | Console | Bilingual (zh/en) native ES Modules, no build step |
 
@@ -37,7 +37,7 @@ flowchart LR
   G -. trace .-> R[(Request ledger)]
 ```
 
-1. Pick the graph from the published route set: public `/v1` always uses the default graph, while admin checks may select an enabled graph by department.
+1. Pick the graph from the active route set: public `/v1` always uses the default graph, while admin checks may select an enabled graph by department.
 2. Load that graph's immutable snapshot and evaluate request conditions (time period, text keywords).
 3. Activate the first question wave; all questions in one wave are merged into one decision-service call.
 4. Write numeric and `selected` ports, then re-evaluate downstream slot conditions and logic gates.
@@ -68,7 +68,7 @@ Boundaries:
 - `ConfigurationService` commits a catalog write and the canvases confirmed to be affected inside one application transaction: re-check the impact list under the write lock, validate every candidate document, stage/replace graph files (non-default enabled graphs first, the default graph last), re-check the route-set fingerprint, record the audit entry, then commit. A write that synchronizes at least one enabled graph republishes the whole enabled set; a draft-only sync publishes nothing; a stale confirmation returns 409 `graph_conflict` before any write.
 - A catalog write that nothing references writes rows and audit only. It never rewrites canvases and never republishes the snapshot.
 - `compile_graph()` runs once per enabled graph in a published route set. The request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
-- The event loop only enqueues ledger rows into a bounded queue and a 20-entry ring; a 2-second flush projects whitelisted columns and writes them through `asyncio.to_thread`.
+- The event loop only enqueues ledger rows into a bounded queue and a 20-entry ring; a 2-second flush projects the whitelisted ledger columns, pairs each request's captured graph snapshot with its trace, and writes both through `asyncio.to_thread`.
 - The breaker worker loads shared quarantine state at startup and syncs local changes every 30 seconds on a worker thread.
 
 ## Console
@@ -79,7 +79,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 | Page | Content |
 |---|---|
-| Test | Admin-only model test chat: Auto-only smart routing through the published route set (default graph, or a trusted department header), SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
+| Test | Admin-only model test chat: Auto-only smart routing through the active route set (default graph, or a trusted department header), SSE streaming, in-memory multi-turn history, image/text/audio/file attachments, safe multimodal rendering |
 | Decision groups | Canvas editor, multi-graph lifecycle (enable/disable, set as default, default marker), departments in graph settings, layout and runtime settings (timezone/sticky/fallback, JEV selection, refresh runtime from the database catalog), inspector, validation, routing checks, import/export |
 | Calc Log | Recent decisions with model, target, candidates, waves, JEV probabilities, reasoning, decision-only latency, replayable trace |
 | Decision service | Multi-service JEV catalog: service list, create/edit/delete, per-service connection test, prompts, timeout and the per-service context/input window |
@@ -88,7 +88,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 ### Common paths
 
-- The decision-group toolbar shows every editing action directly: undo/redo, auto-layout, **Save draft**, New, Import, Export and (for an enabled group) **Disable**, next to **Check routing**, the primary action and the issue counter. A new draft's primary reads **Save and enable**; an enabled group reads **Enabled** or, with pending edits, **Save and update**. Several groups can be enabled at once and the selector marks the default graph; an enabled non-default group also offers **Set as default**. **Disable** is blocked for the default graph while another enabled group remains — switch the default first. Departments are edited in graph settings. The inspector's **Apply** only updates the local draft and never writes to the server.
+- The decision-group toolbar shows every editing action directly: undo/redo, auto-layout, **Save**, New, Import, Export and (for an enabled group) **Disable**, next to **Check routing**, the primary button and the issue counter. Saving is the standalone **Save** button; the primary button only expresses enablement — **Enable** for a new or saved disabled group, **Enabled** (disabled) for an enabled group, **Saving…** while a save or enable is in flight. The core version operations are **Save** and **Enable**: saving an enabled graph takes effect for later requests immediately, saving a disabled draft leaves the running route set untouched, and enabling a graph with unsaved edits saves it first. **Disable** and **Set as default** are separate lifecycle controls. Several groups can be enabled at once and the selector marks the default graph; an enabled non-default group also offers **Set as default**. **Disable** is blocked for the default graph while another enabled group remains — switch the default first. Departments are edited in graph settings. The inspector's **Apply** only updates the local draft and never writes to the server.
 - Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime config from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
 - The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The environment can create a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`, but only once: it is seeded on a start where the catalog is empty, no environment seed has ever run, and the URL and model are both set. A first boot without them followed by a boot with them still seeds once; deleting every service and restarting never re-creates it.
@@ -98,7 +98,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 
 The home page (`/console/index.html`) is an admin-only model test chat. Every request is Auto-routed to `/admin/test/chat/completions`, and the message metadata names the upstream model that actually served it (`Auto → <model>`) using the `x-sr-model` response header.
 
-- **Auto smart routing** — evaluates the published route set exactly like `/v1/chat/completions`: the default graph, or an enabled graph selected by the optional **Department** field (`x-sr-department`, percent-encoded). The decision graph, JEV waves, sticky and random backend selection all apply. The page offers no fixed-model bypass, so test traffic always takes the real routing path; fixed-model direct calls remain available only through `POST /admin/test/chat/completions` (`x-sr-selection: direct`, resolved through the database catalog, no graph headers). The reply metadata rendered by the page comes from the `x-sr-model` header; the response headers also carry `x-sr-tree-id` / `x-sr-graph-selection` for the graph that served an Auto reply, but the page does not render those two headers.
+- **Auto smart routing** — evaluates the active route set exactly like `/v1/chat/completions`: the default graph, or an enabled graph selected by the optional **Department** field (`x-sr-department`, percent-encoded). The decision graph, JEV waves, sticky and random backend selection all apply. The page offers no fixed-model bypass, so test traffic always takes the real routing path; fixed-model direct calls remain available only through `POST /admin/test/chat/completions` (`x-sr-selection: direct`, resolved through the database catalog, no graph headers). The reply metadata rendered by the page comes from the `x-sr-model` header; the response headers also carry `x-sr-tree-id` / `x-sr-graph-selection` for the graph that served an Auto reply, but the page does not render those two headers.
 - **Streaming** — answers stream over SSE; Stop aborts the stream and keeps the partial answer, and Copy / Retry / Regenerate act on the message. A stream counts as complete only when the upstream ends it cleanly — an early EOF is marked incomplete and a provider error is shown inline in the conversation, never silently passed off as a complete answer.
 - **Multi-turn history** — the in-memory transcript is resent as wire-format `messages`, replayed losslessly from the raw assistant message (message-level media renders but never re-enters history); New Chat aborts any in-flight reply, clears the conversation and rotates the session id.
 - **Attachments** — text files are read as text and sent as content parts; images, audio and other files are read to data URLs. A file whose estimated size would break the 10 MiB request limit is rejected inline before it is read, and the exact whole-body size (history + Base64) is checked again before sending.
@@ -115,17 +115,17 @@ The routing page is split into two zones.
 - Typed wires; a numeric output dropped into an input slot creates a default condition.
 - Each input slot is an OR input with its own edge condition.
 - Dropping an output onto empty canvas opens a picker of compatible node types; choosing one creates the node there and connects it automatically (Esc cancels).
-- Saving and publishing are merged into the toolbar primary; the toolbar's **Save draft** still saves without enabling. The lifecycle badge has exactly four states — Running, Unpublished changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The primary button reads Save and enable, Save and update, Enabled, Enable or Saving… accordingly. The graph selector marks the default graph; an enabled non-default group shows **Set as default**, and **Disable** is refused for the default graph while other enabled graphs remain.
-- Graph settings hold the **Departments** mapping (comma or newline separated). A department may belong to only one enabled graph; disabled drafts may overlap, and enabling a conflicting graph is rejected with a `department_conflict` issue. The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: the primary publishes (saves, and enabling republishes the complete enabled route set), **Save draft** saves without enabling, **Disable** flips the enabled state, and **Set as default** switches the default graph atomically.
+- The core version operations are **Save** and **Enable**. **Save** writes the draft without changing enablement: saving an enabled graph makes the saved version serve later requests immediately, saving a disabled draft does not touch the running route set, and enabling a graph with unsaved edits saves it first. The primary button only expresses enablement — **Enable** for a new or saved disabled group, **Enabled** (disabled) for an enabled group, **Saving…** while a save or enable is in flight. The lifecycle badge has exactly four states — Running, Unsaved changes, Disabled, Unsaved draft. A saved but disabled group reads Disabled even with local edits (disabled wins), and Unsaved draft is reserved for a group that was never saved. The graph selector marks the default graph; an enabled non-default group shows **Set as default**, and **Disable** is refused for the default graph while other enabled graphs remain.
+- Graph settings hold the **Departments** mapping (comma or newline separated). A department may belong to only one enabled graph; disabled drafts may overlap, and enabling a conflicting graph is rejected with a `department_conflict` issue. The inspector's **Apply** commits to the local draft only. Everything that writes to the server lives in the toolbar: **Save** writes the draft (an enabled graph's save republishes the complete enabled route set), **Enable** switches the graph into the active route set after saving pending edits, **Disable** flips the enabled state, and **Set as default** switches the default graph atomically. There is no separate user-facing "publish" or "save and update" action.
 - Target cards show display name, model list, fallback role and a random-pick hint for multi-model targets.
 
 **Execution zone** — docked below the canvas:
 
-- Input field, sample prompts, run button, and a **Check routing** scope selector: the current draft, or the published route set with an optional department. A route-set check renders only the selected graph's result and raw node/target IDs, and never replays, paints or lays out the current draft; a draft check keeps the canvas replay.
+- Input field, sample prompts, run button, and a **Check routing** scope selector: the current draft, or the active route set with an optional department. A route-set check renders only the selected graph's result and raw node/target IDs, and never replays, paints or lays out the current draft; a draft check keeps the canvas replay.
 - Result: final target, model, candidates with priorities, selection reason, waves and call count. Route-set checks also report the selected `tree_id` and whether it was chosen by department or as the default.
 - Execution trace: one card per wave with hit conditions, plus the full request timeline.
 
-A draft routing check highlights the winning path wave by wave and can arrange the nodes by waves. A route-set check leaves the canvas untouched because its result describes the published route set, not the current draft — the result panel is the only evidence. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
+A draft routing check highlights the winning path wave by wave and can arrange the nodes by waves. A route-set check leaves the canvas untouched because its result describes the active route set, not the current draft — the result panel is the only evidence. Selecting a trace row pans the canvas to the corresponding edge or node; editing entry points are the canvas and inspector.
 
 ![Routing-check replay](assets/routepilot/en/try-run.png)
 
@@ -135,7 +135,7 @@ A draft routing check highlights the winning path wave by wave and can arrange t
 
 Expanded rows show the calculation stages in order: input preparation, initial computation, per-wave JEV, candidates and final pick, model scheduling, execution result. Latency is decision time only — entering the router to selecting the model — and never includes upstream generation; upstream status and end-to-end totals stay in the gateway data plane and out of the routing console. A `routing_error` keeps the partial process up to the failure point: a schedule-stage failure keeps the scheduling snapshot (configured, registered, available, unavailable reasons, pre-selection inflight), and a failed JEV wave voids that round's candidates and falls to `error_fallback`. Records without a scheduling snapshot and restored ledger rows report the missing detail explicitly.
 
-SQLite stores ledger fields only — no request text, trace, per-wave answers or node labels. The page reads the last 20 live records from an in-process ring; calculation detail is replica-local and not persisted.
+SQLite keeps two kinds of rows. **Ledger rows** (`request_logs`) hold the whitelisted decision columns only — no request text, per-wave answers or node labels. **Request snapshots** are captured when the request is logged: the selected graph's complete canonical document plus the request trace, written as one content-addressed `graph_snapshots` row (SHA-256 over the canonical graph content; identical content from several requests reuses one row, and only real behaviour, layout or identity changes create a new version — `enabled`/`default`, revisions, `updated_at` and the document hash never split it) plus one `request_snapshots` row per request that references that graph and keeps its trace. The page reads the last 20 live records from an in-process ring; opening a record's log snapshot starts a read-only replay that reads the memory ring first and then the immutable SQLite rows — never the current graph file or the current route set. Changing the current graph or restarting the process therefore still replays the graph and trace captured at request time. Snapshot writes stay best-effort: a failed pair is retried on later flushes, and when no snapshot exists the page reports that it cannot load the log snapshot instead of faking history. This phase adds no automatic deletion or retention policy, so log capacity is driven by the number of distinct graph contents and retained requests, not by how often a graph is saved or enabled.
 
 ## Decision graph
 
@@ -303,7 +303,7 @@ The decision service exposes `POST /v1/systemone`; typical deployments use NeoHo
 - `admin` can edit graphs, models, providers, JEV services and users; `viewer` is read-only.
 - The last active admin cannot be demoted, disabled or deleted.
 - User and configuration changes are recorded in the audit log.
-- Graph files are content-addressed by SHA-256 for save conflicts and reload checks; no graph history is retained.
+- Graph files are content-addressed by SHA-256 for save conflicts and reload checks; the graph store keeps no version history — replacing the in-memory route set is not a persisted release. Historical replay instead uses the request-time snapshots in SQLite.
 - Control-plane state is SQLite (WAL); routing graphs are shared JSON files. Ledger writes run on a worker thread.
 - Session affinity and inflight counters are process-local.
 
@@ -503,6 +503,39 @@ Update/delete semantics:
 
 The five demo cases in `configs/cases/case-*.json` are complete v4 documents with `kind`/`version`, no external `id`, `enabled: false, default: false, departments: []`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
 
+## Behind APISIX (department routing on 163)
+
+RoutePilot runs as a ClusterIP-only service behind the shared APISIX on 163 (`sandlake` namespace). Public `/v1` stays default-graph-only; department routing is a second entry point:
+
+```text
+client (department API key)
+  → APISIX Auto route      vars: post_arg.model == "auto"   priority 1001/101
+  → forward-auth           GET http://sandlake-api…:8888/v1/models (Authorization)
+  → X-SR-Department        injected by newapi from the already-validated token.Department
+  → sr-auto-router         priority 2001: strip client copies of the internal headers,
+                           rewrite URI to /internal/v1/chat/completions,
+                           drop Authorization, inject X-SR-Gateway-Token
+  → RoutePilot internal    POST /internal/v1/chat/completions (department-aware graph selection)
+  → graph executor          model rewritten, provider key = ROUTE_PILOT_UPSTREAM_API_KEY
+  → APISIX gateway         http://apisix-gateway.sandlake.svc.cluster.local/apiuser/v1
+```
+
+Any other model on the same path is handled by the fixed route (priority 1000/100): it is deep-copied from the existing `/apiuser/*` route and goes straight to newapi with no RoutePilot involvement, so fixed models keep their original path and never loop back into routing.
+
+The internal endpoint requires `X-SR-Gateway-Token` and fails closed (`503 gateway_auth_not_configured`) when `ROUTER_GATEWAY_TOKEN` is unset; a wrong token is `401 gateway_unauthorized`. The token is compared in constant time and never logged. See the [backend API reference](docs/后端接口说明.md) §3.4.
+
+| Piece | Location |
+|---|---|
+| Cluster manifests (ClusterIP Service, NFS PVC, NetworkPolicy) | `scripts/docker/k8s-163/*.yaml` |
+| Build + deploy script (secrets from env only) | `scripts/docker/deploy-163.sh` |
+| Graph configuration (main/finance/legal/jev-smoke) | `scripts/configure_163_routepilot.py` |
+| APISIX plugin | `scripts/apisix/sr-auto-router.lua` |
+| Plugin registration (idempotent; APISIX 3.15 registers via the `apisix.plugins` list) | `scripts/apisix/patch_apisix_deployment.py` |
+| Route publishing, shadow first then production | `scripts/apisix/configure_routepilot_routes.py` |
+| End-to-end acceptance matrix | `scripts/apisix/verify_routepilot_e2e.py` |
+
+Rollout order: deploy the pod → configure graphs → register the plugin → publish the shadow routes and run the matrix → publish production routes and re-run the matrix with `--expect-production`. Code and offline tests are in the tree; the 163 rollout and the on-cluster matrix require the deployment credentials and have not been executed yet, so no cluster verification result is claimed here.
+
 ## Quick start
 
 ```bash
@@ -539,6 +572,7 @@ The first start against an empty users table seeds the admin account. An empty g
 | `ROUTER_GRAPH_DIR` | `./routing-graph` | Graph documents; lifecycle lives inside each document |
 | `ROUTER_GRAPH_WRITER` | `true` | Allow graph writes; run exactly one writer |
 | `ROUTER_HOST` | `127.0.0.1` | Listener host |
+| `ROUTER_GATEWAY_TOKEN` | empty | Shared gateway credential for `POST /internal/v1/chat/completions`; empty means the internal endpoint fails closed with 503 |
 | `ROUTER_PORT` | `8400` | Listener port |
 | `ROUTER_JEV_URL` | empty | One-time seed base URL for the `default` JEV service; used only on a start where the JEV catalog is empty and no environment seed has run yet, paired with `ROUTER_JEV_MODEL` |
 | `ROUTER_JEV_MODEL` | empty | One-time seed model for the `default` JEV service; paired with `ROUTER_JEV_URL` |
@@ -570,7 +604,7 @@ Full field tables, request/response examples and the impact-confirmation flow li
 | `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | read / admin | Decision groups; create is always closed |
 | `PUT /admin/trees/{id}/departments` | admin | Department mapping for one group |
 | `POST /admin/trees/{id}/copy`, `/enable`, `/disable`, `/default` | admin | Copy and multi-graph lifecycle (first enable becomes default; default switch) |
-| `POST /admin/try` | admin | Routing check against a draft graph or the published route set (optional department) |
+| `POST /admin/try` | admin | Routing check against a draft graph or the active route set (optional department) |
 | `POST /admin/test/chat/completions` | admin | Test chat; `model=auto` routes, anything else is a fixed direct call |
 | `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | read / admin | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
 | `GET /admin/model-catalog`, `POST /admin/fetch-models` | read / admin | Provider presets, upstream model discovery |

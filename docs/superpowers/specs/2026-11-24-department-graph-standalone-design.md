@@ -76,7 +76,7 @@ RoutePilot 当前已经具备完整的智能路由后端：自包含图 JSON、�
 
 只有 `model: "auto"` 进入智能路由。固定模型请求保持原直连链路，不经过 RoutePilot，避免再次进入路由形成循环。
 
-RoutePilot 继续负责请求体改写和上游代理，APISIX 不需要 Lua 改写插件。外部用户 Authorization 不转发给模型上游；RoutePilot 使用图配置对应的内部服务 Key。
+RoutePilot 继续负责请求体改写和上游代理；APISIX 侧只需要一个轻量编排插件（`sr-auto-router`，priority 2001），它不做任何路由决策、不解析也不改写请求体，只负责：在 rewrite 阶段清除客户端伪造的 `X-SR-Department`/`X-SR-Gateway-Token` 并把 URI 指向 `/internal/v1/chat/completions`，在 access 阶段（forward-auth 之后）校验部门 Header 已注入、删除用户 Authorization、注入 `X-SR-Gateway-Token`。Auto/fixed 分流本身由 Route 的 `vars`（`post_arg.model == "auto"`）完成，不在插件里判断模型。外部用户 Authorization 不转发给模型上游；RoutePilot 使用图配置对应的内部服务 Key。
 
 未来 newapi 替换为 token-factory 时，内核不变，只需要复用 Auto 拦截行为并切换图内的网关地址和服务 Key。Auto 拦截是转发行为改造，不新增 token-factory API。
 
@@ -297,12 +297,27 @@ main 控制台与后端同步升级：
 
 ### 9.3 Auto 中间件位置
 
-当前 newapi 在 `TokenAuth` 之后、`Distribute` 之前拦截 `model: "auto"`：
+本阶段未改动 newapi 的 Auto 拦截逻辑（`Distribute` 未新增分支）：Auto/fixed 分流上移到 APISIX Route 层。
 
-- 复用已经校验的 `token.Department`，不增加按 Key 查询部门的网络调用。
-- 保留 JSON/SSE 转发，不缓冲完整流式响应。
-- 固定模型继续走原 `Distribute` 和模型 relay。
+- newapi 只在鉴权链路里为 `GET /v1/models` 追加 `X-SR-Department`（`middleware/auth.go` 的 `setDepartmentHeader`），复用已经校验的 `token.Department`，不增加按 Key 查询部门的网络调用。
+- APISIX 用 `vars: [["post_arg.model", "==", "auto"]]` 区分 Auto，固定模型继续走既有 `/apiuser/*` 链路（由 fixed Route 直接代理到 `sandlake-api-gateway` upstream）。
+- 保留 JSON/SSE 透传，APISIX 与 RoutePilot 都不缓冲完整流式响应。
 - 未来 token-factory 复用同一行为，但不新增部门内省、路由配置目录或模型目录接口。
+
+### 9.4 已实现的 163 组件清单
+
+| 组件 | 位置 | 契约 |
+|---|---|---|
+| 内部数据面 | `router/api/routes_internal.py`，`POST /internal/v1/chat/completions` | `X-SR-Gateway-Token` 常量时间比较；未配置凭据 503 `gateway_auth_not_configured`，凭据错误 401 `gateway_unauthorized`；与公开 `/v1` 共用执行器但 `allow_department_header=True` |
+| 网关凭据 | `ROUTER_GATEWAY_TOKEN`（RoutePilot 与 APISIX 共享，来自 Secret `routepilot-runtime`） | 不进日志、不进镜像 |
+| 编排插件 | `scripts/apisix/sr-auto-router.lua`，priority 2001 | 只做 Header 清洗/URI 改写/凭据替换；不读 body、不改 model |
+| 插件注册 | `scripts/apisix/patch_apisix_deployment.py` | 幂等写入 `apisix.plugins` 列表（APISIX 3.15 无 `custom_plugins` 键）、挂载 Lua、注入 env，改前备份到 `/root/routepilot-backups/` |
+| Route 发布 | `scripts/apisix/configure_routepilot_routes.py` | shadow（`/routepilot-smoke/chat/completions`，priority 1001/1000）与 production（`/apiuser/v1/chat/completions`，priority 101/100）分离；改 `apisix-init-files` 后重跑 `apisix-init` Job 并回读 Admin API 校验；失败回滚 |
+| 端到端验收 | `scripts/apisix/verify_routepilot_e2e.py` | 无/错 Key、财务/法务/未知/空部门、伪造部门头、固定模型绕过、JSON/SSE、JEV、内部端点 401、forward-auth 失败 |
+| 部署 | `scripts/docker/k8s-163/*.yaml`、`scripts/docker/deploy-163.sh` | ClusterIP + NFS PVC + `routepilot-runtime`/`routepilot-harbor` Secret；1 replica；NetworkPolicy 仅放行 APISIX 入站 |
+
+实现状态：以上代码与离线测试已入库；163 上的镜像构建、Secret 创建、插件挂载、Route 发布与端到端矩阵需要在拿到部署凭据后按计划 Task 3–7 执行，尚无集群实测结论。
+
 
 ## 10. 部门、模型与 JEV 接口证据
 
