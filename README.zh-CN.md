@@ -538,7 +538,7 @@ RoutePilot 以仅 ClusterIP 的形态部署在 163 共享 APISIX 之后（`sandl
 按“已验证”与“未执行”分开记录：
 
 - **163 上已完成（2026-11-25）**：镜像 `routepilot:amd64-e014ae2` 已构建并运行（1/1），ClusterIP Service、NFS PVC、NetworkPolicy 已应用，四张图（`main` 默认、`finance`、`legal`、`jev-smoke`）已发布；Pod 内直连内部端点实测：财务部→`finance`/`department`、法务部→`legal`/`department`、未知与空部门→`main`/`default`，均返回真实上游模型与真实答案；缺失或错误 `X-SR-Gateway-Token` 返回 401。
-- **仅完成离线验证**：远程失败脱敏、`nginx_config.envs` 让 worker 能读到网关 Token、共享 APISIX 对象漂移时 fail-closed、Route 发布/删除/回滚状态机（应用后任何异常都恢复，恢复失败单独报告）、E2E 响应所有权、强制模型断言、至少两个内容帧且有时延证据的 SSE、账号本条件等待、`TreeUpsertIn` 白名单的 JEV 图写回与嵌套恢复、fail-stop 故障演练，以及运行结束后按 `--since-time` 对当前/上一容器做密钥扫描。
+- **仅完成离线验证**：远程失败脱敏、`nginx_config.envs` 让 worker 能读到网关 Token、共享 APISIX 对象漂移时 fail-closed、Route 发布/删除/回滚状态机（应用后任何异常都恢复，恢复失败单独报告）、E2E 响应所有权、强制模型断言、至少两个内容帧且有时延证据的 SSE、账号本条件等待、`TreeUpsertIn` 白名单的 JEV 图写回与嵌套恢复、fail-stop 故障演练、核心失败门禁（模型/case/内部端点失败不进入 JEV 或任何 drill）、按请求 ID 的持久化 `client_disconnected` 证据（初始 `incomplete` 不计通过）、`/root/routepilot-backups/<时间戳>/drill.json` 持久化备份与独立 `--restore-drill-backup` 恢复入口、primary/restore/verification 失败分别报告、基于 Pod 元数据的 previous 日志检测、RoutePilot 停机前的旧 Pod 日志扫描，以及运行结束后按 `--since-time` 对当前/上一容器做密钥扫描。
 - **已在 76 上脱离 newapi 验证（2026-11-25）**：按[本机联调部署指南](docs/APISIX-本机联调部署.md)手工拉起 docker 栈，跑通 APISIX 3.15 → forward-auth 替身 → `sr-auto-router` → RoutePilot 内部端点 → 部门选图 → 本机 vLLM 模型。财务/法务/未知部门选图、伪造部门头不可覆盖、无/错 Key 401、公开入口只用默认图、SSE 实时到达（47 个内容帧 + `[DONE]`）均符合契约。这证明的是 APISIX→RoutePilot 链路；部门头来自测试替身而不是 newapi。
 - **尚未执行（需要维护窗口）**：带 `X-SR-Department` 的 newapi 发布（不在本次修复计划范围内）、共享 APISIX 变更（插件注册 + Lua 挂载 + Token env）、shadow Route 发布、完整 shadow 矩阵以及全部故障/回滚演练。在这些执行之前，不声称经 newapi 鉴权的网关全链路已验证。
 
