@@ -86,14 +86,17 @@ def build_decision_event(record, snapshot, *, department, requested_model):
 def validate_decision_event(value):
     """Validate and return ``value`` (the single event-shape/secret gate).
 
-    Rejects anything that is not a ``routepilot.decision`` v1 object with an
-    embedded graph, any dict key anywhere in the tree that names a secret field,
-    and values that cannot be sent as one canonical JSON object.
+    Rejects anything that is not a ``routepilot.decision`` v1 object, any
+    missing required field the read projections index directly (a structurally
+    incomplete event must never enter the memory log), any dict key anywhere in
+    the tree that names a secret field, and values that cannot be sent as one
+    canonical JSON object.
     """
     if not isinstance(value, dict) or not isinstance(value.get("graph"), dict):
         raise ValueError("decision event requires graph")
     if value.get("event_type") != EVENT_TYPE or value.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("unsupported decision event")
+    _require_event_shape(value)
 
     def walk(item):
         if isinstance(item, dict):
@@ -109,6 +112,65 @@ def validate_decision_event(value):
     walk(value)
     json.dumps(value, ensure_ascii=False, allow_nan=False)
     return value
+
+
+def _require_non_empty_text(event: dict, field: str) -> None:
+    value = event.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"decision event requires non-empty {field}")
+
+
+def _require_object(event: dict, field: str) -> dict:
+    value = event.get(field)
+    if not isinstance(value, dict):
+        raise ValueError(f"decision event requires {field} object")
+    return value
+
+
+def _require_keys(value: dict, field: str, keys: tuple[str, ...]) -> None:
+    missing = [key for key in keys if key not in value]
+    if missing:
+        raise ValueError(f"decision event requires {field}." + ", ".join(missing))
+
+
+#: 外围列表/回放投影直接索引的字段：缺一个就会让读取端点 500，因此必须在入队前校验。
+REQUEST_FIELDS = ("text", "requested_model", "department", "session_hash")
+DECISION_FIELDS = (
+    "status", "model", "upstream_model", "target_id", "tree_id", "tree_revision",
+    "graph_selection", "selection_reason", "fallback_reason", "sticky_hit",
+    "policy_path", "reasoning", "reasoning_warning", "routing_ms", "waves",
+)
+JEV_FIELDS = ("model", "choice", "top", "margin", "ms", "probabilities")
+
+
+def _require_event_shape(event: dict) -> None:
+    """Design §7.2: required structure is checked before an event is stored.
+
+    ``summary_payload()``/``replay_payload()``/``DecisionLogStore.get()`` index
+    these fields directly; a hand-crafted event missing any of them would
+    otherwise be accepted and turn the read endpoints into 500s.
+    """
+    _require_non_empty_text(event, "id")
+    _require_non_empty_text(event, "ts")
+    graph = event["graph"]
+    graph_id = graph.get("id")
+    if not isinstance(graph_id, str) or not graph_id:
+        raise ValueError("decision event requires non-empty graph.id")
+    root = graph.get("root")
+    if not isinstance(root, dict):
+        raise ValueError("decision event requires graph.root object")
+    if not isinstance(root.get("nodes"), list):
+        raise ValueError("decision event requires graph.root.nodes list")
+    request = _require_object(event, "request")
+    _require_keys(request, "request", REQUEST_FIELDS)
+    decision = _require_object(event, "decision")
+    _require_keys(decision, "decision", DECISION_FIELDS)
+    jev = _require_object(event, "jev")
+    _require_keys(jev, "jev", JEV_FIELDS)
+    for field in ("answers", "node_labels"):
+        _require_object(event, field)
+    if not isinstance(event.get("trace"), list):
+        raise ValueError("decision event requires trace list")
 
 
 def summary_payload(event):

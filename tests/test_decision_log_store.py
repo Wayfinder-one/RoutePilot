@@ -69,6 +69,35 @@ def test_store_rejects_invalid_events_and_keeps_existing_ones():
     assert [item["id"] for item in store.recent()] == ["kept"]
 
 
+def test_store_rejects_structurally_incomplete_events():
+    """Design §7.2: required fields are validated before the deque insert."""
+    store = DecisionLogStore()
+    # 评审探针：只有 schema/type/graph={} 的事件此前会被当成“完整事件”收下。
+    probe = {"schema_version": 1, "event_type": "routepilot.decision", "graph": {}}
+    with pytest.raises(ValueError):
+        store.add(probe)
+    no_request = valid_event(id="incomplete")
+    del no_request["request"]
+    with pytest.raises(ValueError, match="request"):
+        store.add(no_request)
+    assert store.recent() == []
+
+
+def test_receiver_rejects_incomplete_events_and_keeps_the_log_readable(tmp_path):
+    app = create_app(test_settings(tmp_path))
+    client = TestClient(app)
+    assert _receive(client, _event("good-before-probe")).status_code == 200
+    # 坏事件：422 且不进入 deque，已保留事件与读取端点都不受影响。
+    probe = {"schema_version": 1, "event_type": "routepilot.decision", "graph": {}}
+    assert _receive(client, probe).status_code == 422
+    listed = client.get("/admin/requests/recent")
+    assert listed.status_code == 200
+    assert [item["id"] for item in listed.json()["requests"]] == ["good-before-probe"]
+    assert client.get("/admin/requests/good-before-probe/replay").status_code == 200
+    assert [event["id"] for event in app.state.decision_logs.recent()] == [
+        "good-before-probe"]
+
+
 def test_stored_event_is_not_mutated_by_a_later_outcome_refresh():
     """The memory event is a decision-time snapshot, not a live record alias.
 

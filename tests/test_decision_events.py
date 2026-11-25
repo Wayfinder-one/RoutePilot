@@ -1,4 +1,5 @@
 """Self-contained decision events: complete current graph, no snapshot ids, no secrets."""
+import copy
 import json
 
 import pytest
@@ -104,3 +105,42 @@ def test_validate_rejects_non_serialisable_and_non_object_events():
 
 def test_event_type_constant_is_the_console_contract():
     assert EVENT_TYPE == "routepilot.decision"
+
+
+def test_validate_rejects_structurally_incomplete_events():
+    """Design §7.2: required fields are checked before an event can be stored.
+
+    A structurally incomplete event must never enter the memory log: the read
+    projections index these fields directly, so validation is the only gate that
+    keeps ``/admin/requests/recent`` and replay from raising on a bad event.
+    """
+    def mutated(mutate):
+        event = copy.deepcopy(valid_event())
+        mutate(event)
+        return event
+
+    probes = [
+        (lambda event: event.pop("id"), r"non-empty id"),
+        (lambda event: event.__setitem__("id", 7), r"non-empty id"),
+        (lambda event: event.__setitem__("ts", ""), r"non-empty ts"),
+        (lambda event: event["graph"].pop("id"), r"graph\.id"),
+        (lambda event: event["graph"].__setitem__("root", []), r"graph\.root"),
+        (lambda event: event["graph"]["root"].__setitem__("nodes", {}),
+         r"graph\.root\.nodes"),
+        (lambda event: event["request"].pop("text"), r"request"),
+        (lambda event: event["decision"].pop("status"), r"decision"),
+        (lambda event: event["jev"].pop("probabilities"), r"jev"),
+        (lambda event: event.__setitem__("answers", []), r"answers"),
+        (lambda event: event.__setitem__("trace", {}), r"trace"),
+        (lambda event: event.__setitem__("node_labels", []), r"node_labels"),
+    ]
+    for mutate, match in probes:
+        with pytest.raises(ValueError, match=match):
+            validate_decision_event(mutated(mutate))
+
+
+def test_build_decision_event_output_still_validates_unchanged():
+    event = build_decision_event(
+        decision_record("shape"), decision_snapshot(),
+        department="", requested_model="auto")
+    assert validate_decision_event(event) is event
