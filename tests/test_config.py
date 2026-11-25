@@ -50,3 +50,8 @@ def test_user_auth_defaults_and_override(monkeypatch):
     assert settings.admin_email == "root@example.com"
     assert settings.admin_password == "root-pass-1"
     assert settings.session_ttl_hours == 12
+
+
+def test_gateway_token_from_env(monkeypatch):
+    monkeypatch.setenv('ROUTER_GATEWAY_TOKEN', 'gateway-secret')
+    assert Settings.from_env().gateway_token == 'gateway-secret'

@@ -299,6 +299,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     from router.api.routes_time import router as time_router
     from router.api.routes_trees import router as trees_router
     from router.api.routes_users import router as users_router
+    from router.api.routes_internal import router as internal_router
     from router.api.routes_v1 import router as v1_router
 
     app.include_router(models_router, prefix="/admin")
@@ -308,5 +309,6 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.include_router(logs_router, prefix="/admin")
     app.include_router(users_router, prefix="/admin")
     app.include_router(test_router, prefix="/admin")
+    app.include_router(internal_router, prefix="/internal/v1")
     app.include_router(v1_router, prefix="/v1")
     return app

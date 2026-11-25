@@ -25,6 +25,7 @@ class Settings:
     admin_email: str = "admin@test.com"
     admin_password: str = "1qaz@WSX"
     session_ttl_hours: int = 168
+    gateway_token: str = ''
 
     @staticmethod
     def from_env() -> "Settings":
@@ -43,4 +44,5 @@ class Settings:
             admin_email=os.environ.get("ROUTER_ADMIN_EMAIL", "admin@test.com"),
             admin_password=os.environ.get("ROUTER_ADMIN_PASSWORD", "1qaz@WSX"),
             session_ttl_hours=int(os.environ.get("ROUTER_SESSION_TTL_HOURS", "168")),
+            gateway_token=os.environ.get("ROUTER_GATEWAY_TOKEN", ""),
         )
