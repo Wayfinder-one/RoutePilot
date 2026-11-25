@@ -299,7 +299,8 @@ export class RoutingController {
     const store = this.store;
     if (!store.tree || store.tryRunning || store.saving) return false;
     /* 启用前先落盘：保存失败（含 422 issue 数组）绝不发 enable。
-       已启用的组若有 dirty 改动，也要先保存（点击启用 = “保存并启用”）。 */
+       未保存或已落盘的脏草稿都走同一条“先保存、后启用”编排；保存本身仍是
+       用户可见的独立动作（#cvSave），主按钮只负责启用。 */
     if (store.dirtyKind !== 'clean' || !store.saved) {
       const saved = await this.save();
       if (!saved) return false;

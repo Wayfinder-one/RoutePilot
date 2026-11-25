@@ -35,13 +35,13 @@ const nodeName = id => {
   const node = graph ? RTGraph.findNode(graph, id) : null;
   return node ? nodeNameOf(node, graph) : (id || '—');
 };
-/* 试算范围：只有 select 显式选 route_set 才走已发布路由集，其余（含控件缺失）
+/* 试算范围：只有 select 显式选 route_set 才走当前生效路由集，其余（含控件缺失）
    一律按当前草稿处理，保持既有行为。 */
 function currentScope() {
   const select = byId('cvTryScope');
   return select && select.value === 'route_set' ? 'route_set' : 'draft';
 }
-/* 路由集结果只描述已发布图，节点标题不能被当前草稿画布「翻译」：同一 id 在
+/* 路由集结果只描述当前生效图，节点标题不能被当前草稿画布「翻译」：同一 id 在
    两张图里含义不同，直接显示原始 id 才是结果真正指向的节点。 */
 function resultNodeName(replay, id) {
   return replay && replay.scope === 'route_set' ? String(id) : nodeName(id);
@@ -1012,7 +1012,7 @@ function clear() {
 }
 
 function payloadFor(text, now) {
-  /* 试算范围必须先判断（Task 9）：route_set 是「真实已发布路由集」请求，只带
+  /* 试算范围必须先判断（Task 9）：route_set 是「真实当前生效路由集」请求，只带
      text/session_id/可选 department/now，绝不携带草稿的 root/tree_id/canvas/
      timezone/sticky 与四运行字段 —— 这些字段一旦出现，服务端就会切到草稿路径，
      按部门选图就不会发生。 */
@@ -1130,7 +1130,7 @@ function rerun() {
 /* ── Step 4 · 按波次整理（只写 position，一次 App.change） ──────── */
 function layoutByWaves() {
   const replay = state;
-  /* 防御：路由集结果描述的是已发布图，绝不能拿它的波次去重排当前草稿画布
+  /* 防御：路由集结果描述的是当前生效图，绝不能拿它的波次去重排当前草稿画布
      （按钮已隐藏，这里再拦一次直接调用）。 */
   if (replay && replay.scope === 'route_set') {
     toastNow(t('cv.tryRouteSetLayoutBlocked'), 'warn');
@@ -1221,8 +1221,8 @@ function layoutByWaves() {
 }
 
 /* ── 试算台绑定 ───────────────────────────────────────────────── */
-/* 试算范围（Task 9）：draft = 当前草稿（默认，既有行为）；route_set = 已发布
-   实际路由集，按部门选图。控件由模块注入到输入行与样例 chips 之间，不新增
+/* 试算范围（Task 9）：draft = 当前草稿（默认，既有行为）；route_set = 当前生效
+   路由集，按部门选图。控件由模块注入到输入行与样例 chips 之间，不新增
    静态 HTML；可见性与禁用状态由 app.js 的 applyTryScope() 统一维护。 */
 function ensureScopeControls() {
   const bar = byId('cvTryBar');

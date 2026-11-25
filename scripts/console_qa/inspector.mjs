@@ -1080,7 +1080,7 @@ test('Task 12 · timezone/sticky are behavior while title/name are display chang
   assert.equal(server.root.nodes.find(node => node.id === 'strong-target').title, '强推理（展示标题）');
 });
 
-test('P0 inspector applies to draft and lifecycle explains publish state', async () => {
+test('P0 inspector applies to draft and lifecycle explains the enable state', async () => {
   await ensureBaselineTree();
   await openCanvas();
   await clickNode('capability');
@@ -1112,17 +1112,19 @@ test('P0 inspector applies to draft and lifecycle explains publish state', async
     assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
       await page.evaluate(async () => {
         const { t } = await import('/console/i18n.js');
-        return t('cv.publishUpdate');
-      }), 'a dirty enabled group must offer Save and update');
-    /* The toolbar primary is the one action that publishes the draft. */
-    await clickCanvasAction('cvEnable');
+        return t('cv.published');
+      }), 'a dirty enabled group must keep the primary on the Enabled state');
+    assert.equal(await page.locator('#cvEnable').isDisabled(), true,
+      'a dirty enabled group must not offer enable again');
+    /* 独立保存按钮是唯一落盘入口，主按钮停在「已启用」状态。 */
+    await clickCanvasAction('cvSave');
     await waitFor(async () => {
       const { app } = await import('/console/routing/app.js');
       return app.kind() === 'clean' &&
         document.getElementById('cvLifecycle').dataset.state === 'running';
     }, null, { timeout: 8000 });
     assert.deepEqual(writes, ['PUT /admin/trees/' + TREE_ID],
-      'the toolbar publish did not issue exactly one server save');
+      'the toolbar save did not issue exactly one server save');
     assert.equal(await page.locator('#cvRevision').count(), 0);
     assert.equal(await page.locator('#cvClean').count(), 0);
     assert.equal(await page.locator('#cvDirty').count(), 0);

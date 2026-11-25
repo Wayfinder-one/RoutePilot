@@ -1515,16 +1515,24 @@ const RTGraph = await import('/console/routing/graph.js');
     const badge = document.getElementById('cvLifecycle');
     return {
       label: document.getElementById('cvEnableLabel').textContent.trim(),
-      publish: t('cv.publish'),
+      saveLabel: document.querySelector('#cvSave span[data-i18n]').textContent.trim(),
+      save: t('cv.save'),
       published: t('cv.published'),
       enable: t('cv.enable'),
       state: badge && badge.dataset.state,
       disabled: document.getElementById('cvEnable').disabled,
+      saveDisabled: document.getElementById('cvSave').disabled,
       disableHidden: document.getElementById('cvDisable').hidden
     };
 });
   let ui = await primaryUi();
-  assert.equal(ui.label, ui.publish, 'a new draft must offer to publish');
+  /* 核心版本操作只有两个：独立的保存按钮 + 只表达启用与否的主按钮。 */
+  assert.equal(await page.locator('#cvSave').textContent(), ui.save,
+    'the standalone save button must read Save');
+  assert.equal(ui.saveLabel, ui.save);
+  assert.equal(ui.saveDisabled, false, 'a new draft must be savable');
+  assert.equal(ui.label, ui.enable, 'a new draft must offer enable, not save-and-enable');
+  assert.equal(ui.disabled, false, 'a new draft must offer a clickable Enable');
   assert.equal(ui.state, 'draft', 'an unsaved draft must be projected as draft');
   assert.equal(ui.disableHidden, true, 'a disabled draft must not offer disable');
 
@@ -1561,6 +1569,8 @@ const RTGraph = await import('/console/routing/graph.js');
   assert.equal(ui.label, ui.published, 'a clean enabled group must read as published');
   assert.equal(ui.state, 'running', 'an enabled clean group must be projected as running');
   assert.equal(ui.disabled, true, 'published is a state, not a repeatable action');
+  assert.equal(ui.saveLabel, ui.save, 'the standalone save button keeps its label when enabled');
+  assert.equal(ui.saveDisabled, false, 'a clean enabled group can still be saved');
   /* 多图生命周期（Task 8）：启用新图只追加一张启用图，原基线图继续启用并保持
      默认。草稿是 enabled && !default，绝非「启用即默认」——若把 enabled 当
      default，下一次普通保存会被 409 graph_conflict 拒绝。 */
@@ -1991,8 +2001,15 @@ test('Task 2 fix · a saved disabled group with local edits reads disabled, not 
     assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
       await page.evaluate(async () => {
     const { t } = await import('/console/i18n.js');
-        return (t('cv.publish'));
-}), 'a dirty disabled group must offer publish, not a stale published label');
+        return (t('cv.enable'));
+}), 'a dirty disabled group must offer enable, not save-and-enable');
+    assert.equal(await page.locator('#cvEnable').isDisabled(), false,
+      'a dirty disabled group still needs a clickable Enable');
+    assert.equal((await page.locator('#cvSave span[data-i18n]').textContent()).trim(),
+      await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+        return (t('cv.save'));
+}), 'the standalone save button must keep the Save label while dirty');
 } finally {
     await ensureBaselineTree();
 }
@@ -2007,20 +2024,21 @@ test('Task 2 fix · language switch repaints the JS-owned lifecycle and primary 
     await ensureBaselineTree();
     await openCanvas();
     /* 先固定 zh，再从 #cvLifecycle 的 data-state 推导期望：
-       running / unpublished / draft 一对一映射到主按钮 key；只有 disabled 的
-       主按钮是 cv.publish 还是 cv.enable 取决于草稿是否脏，单看 state 不够，
-       所以用同一 owner 画出的 zh 文案反查 key（两者中文不同，不会含糊）。 */
+       启用两态（running / unpublished）的主按钮只表达「已启用」→ cv.published；
+       未启用（disabled）与从未保存（draft）一律是「启用」→ cv.enable。
+       主按钮不再兼任保存，所以 state 足以唯一确定文案。 */
     const base = await page.evaluate(async () => {
       const { setLang, t } = await import('/console/i18n.js');
       setLang('zh');
       const state = document.getElementById('cvLifecycle').dataset.state;
       const lifecycleKey = 'cv.status.' + state;
       const primary = document.getElementById('cvEnableLabel').textContent.trim();
-      const candidates = ['cv.published', 'cv.publishUpdate', 'cv.publish', 'cv.enable'];
+      const candidates = ['cv.published', 'cv.enable'];
       const primaryFromState = {
         running: 'cv.published',
-        unpublished: 'cv.publishUpdate',
-        draft: 'cv.publish'
+        unpublished: 'cv.published',
+        draft: 'cv.enable',
+        disabled: 'cv.enable'
       }[state] || null;
       return {
         state,
@@ -2081,7 +2099,8 @@ test('Task 2 fix · language switch repaints the JS-owned lifecycle and primary 
 test('Task 2 fix · an English session never paints the primary label in Chinese', async () => {
   /* 首屏主按钮不再有中文静态种子：app.js 在模块加载时同步 paintLifecycle()。
      从 document-start 起记录 #cvEnableLabel 的每一个非空值，证明 en 会话
-     哪怕一帧都不会出现中文，且 pre-boot 值本身已是英文 cv.publish。 */
+     哪怕一帧都不会出现中文，且 pre-boot 值（store.tree 仍是 null = 未启用）
+     本身已是英文 cv.enable。 */
   try {
     await ensureBaselineTree();
     /* 首条用例单跑时页面还是 about:blank，写不了 session/localStorage；
@@ -2112,18 +2131,18 @@ test('Task 2 fix · an English session never paints the primary label in Chinese
       const { t } = await import('/console/i18n.js');
       return {
         lang: document.documentElement.lang,
-        publish: t('cv.publish'),
+        enable: t('cv.enable'),
         seen: (window.__cvEnableLabelSeen || []).slice()
       };
     });
     assert.equal(observed.lang, 'en', 'the en preset did not reach the page');
-    assert.notEqual(observed.publish, 'cv.publish', 'missing en translation for cv.publish');
+    assert.notEqual(observed.enable, 'cv.enable', 'missing en translation for cv.enable');
     const seen = observed.seen.filter(Boolean);
     assert.ok(seen.length > 0, 'the probe never observed a non-empty primary label');
     seen.forEach(text => assert.doesNotMatch(text, /[\u4e00-\u9fff]/,
       'an English session rendered a Chinese primary label: ' + text));
-    assert.equal(seen[0], observed.publish,
-      'the pre-boot primary label is not the localized cv.publish');
+    assert.equal(seen[0], observed.enable,
+      'the pre-boot primary label is not the localized cv.enable');
   } finally {
     await page.evaluate(async () => {
       const { setLang } = await import('/console/i18n.js');
@@ -2149,11 +2168,24 @@ test('7.4-13-save-enable-unsaved-badge', async () => {
   assert.equal((await page.locator('#cvEnableLabel').textContent()).trim(),
     await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.publishUpdate'));
-}));
-  await saveNow();
+    return (t('cv.published'));
+}), 'an enabled dirty group must keep the primary on the Enabled state');
+  assert.equal(await page.locator('#cvEnable').isDisabled(), true,
+    'an enabled graph cannot be enabled again from the primary');
+  assert.equal((await page.locator('#cvSave span[data-i18n]').textContent()).trim(),
+    await page.evaluate(async () => {
+    const { setLang, t, tf } = await import('/console/i18n.js');
+    return (t('cv.save'));
+}), 'the standalone save button owns the save action');
+  /* 保存只由独立按钮触发：主按钮在启用状态是禁用的。 */
+  await page.locator('#cvSave').click();
+  await waitFor(async () => {
+    const { app } = await import('/console/routing/app.js');
+    return (app.changeKind === 'clean');
+});
   badge = await draftStatus();
-  assert.equal(badge.state, 'running', 'save left the draft unpublished');
+  assert.equal(await page.locator('#cvLifecycle').getAttribute('data-state'), 'running',
+    'the standalone save did not return the lifecycle to running');
   assert.equal(await page.evaluate(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.kind());
@@ -2190,10 +2222,28 @@ test('7.4-13-save-enable-unsaved-badge', async () => {
 }
 });
 
-test('Task 12 · enabling an already-enabled dirty draft saves it first and never re-enables', async () => {
+test('Task 12 · an enabled dirty draft saves via the standalone button and never re-enables', async () => {
   await ensureBaselineTree();
   await openCanvas();
   await dragNodeBy('start', 30, 20);
+  /* 已启用图的主按钮只表达「已启用」且禁用；脏改动只由独立保存按钮落盘，
+     点击主按钮既不会再发 /enable，也不该是保存的入口。 */
+  const primary = await page.evaluate(async () => {
+    const { t } = await import('/console/i18n.js');
+    return {
+      label: document.getElementById('cvEnableLabel').textContent.trim(),
+      expected: t('cv.published'),
+      disabled: document.getElementById('cvEnable').disabled,
+      saveLabel: document.querySelector('#cvSave span[data-i18n]').textContent.trim(),
+      expectedSave: t('cv.save')
+    };
+});
+  assert.equal(primary.label, primary.expected,
+    'an enabled dirty group must read Enabled on the primary');
+  assert.equal(primary.disabled, true,
+    'an enabled graph must not offer enable again');
+  assert.equal(primary.saveLabel, primary.expectedSave,
+    'the standalone save button must own the save action');
   const requests = [];
   const onRequest = request => {
     const url = new URL(request.url());
@@ -2202,18 +2252,18 @@ test('Task 12 · enabling an already-enabled dirty draft saves it first and neve
 };
   page.on('request', onRequest);
   try {
-    await clickCanvasAction('cvEnable');
+    await clickCanvasAction('cvSave');
     await waitFor(async () => {
     const { app, store } = await import('/console/routing/app.js');
     return (app.changeKind === 'clean');
 });
     await waitToastIncludes(await page.evaluate(async () => {
     const { setLang, t, tf } = await import('/console/i18n.js');
-    return (t('cv.toastAlreadyEnabled'));
+    return (t('cv.toastSaved'));
 }));
     await page.waitForTimeout(250);
     assert.deepEqual(requests, ['save'],
-      'enable short-circuited on an enabled tree before saving its dirty draft');
+      'saving an enabled draft re-enabled the tree instead of only saving it');
     assert.equal((await draftStatus()).state, 'running');
     assert.equal((await serverTree(TREE_ID)).enabled, true);
 } finally {

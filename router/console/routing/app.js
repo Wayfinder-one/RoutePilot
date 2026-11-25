@@ -796,7 +796,7 @@ function updateToolbar() {
     save.setAttribute('aria-busy', String(!!store.saving));
     save.classList.toggle('is-saving', !!store.saving);
     const label = save.querySelector('span[data-i18n]');
-    if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.saveDraft');
+    if (label) label.textContent = store.saving ? t('cv.saving') : t('cv.save');
   }
   const disable = $('#cvDisable');
   if (disable) disable.hidden = !(store.tree && store.tree.enabled);
@@ -817,7 +817,7 @@ function updateToolbar() {
 }
 
 /* 试算范围（Task 9）：draft 保持既有全草稿请求；route_set 只按部门/默认图从
-   已发布路由集选图，因此部门输入只在 route_set 模式下显示并可用。运行/保存在途
+   当前生效路由集选图，因此部门输入只在 route_set 模式下显示并可用。运行/保存在途
    时范围与部门一起禁用（由 updateToolbar 统一调用，tryrun.setBusy 会再次触发）。 */
 function applyTryScope() {
   const scope = $('#cvTryScope');
@@ -845,7 +845,7 @@ function bindTryScope() {
    dirtyKind 仍保留 behavior/layout/display 分类，供保存语义与 beforeunload 使用；
    这里只把它折叠成用户需要看的四种生命周期，不再另设第五种“仅布局”状态。
    未启用优先：只要落过盘（store.saved）就显示 disabled，无论草稿是否有本地
-   改动（脏状态由主按钮「保存并启用 / 保存并更新」表达）；draft 只留给从未
+   改动（脏状态由独立的保存按钮表达，主按钮只表达启用状态）；draft 只留给从未
    保存过的新草稿。 */
 function lifecycleState() {
   const enabled = !!(store.tree && store.tree.enabled);
@@ -867,16 +867,19 @@ function paintLifecycle() {
     badge.title = revision ? tf('cv.revision', { rev: String(revision).slice(0, 10) }) : t('cv.unpublished');
   }
   const enabled = !!(store.tree && store.tree.enabled);
-  const dirty = store.dirtyKind !== 'clean' || !store.saved;
-  const primaryKey = store.saving ? 'cv.saving'
-    : enabled ? (dirty ? 'cv.publishUpdate' : 'cv.published')
-    : (dirty ? 'cv.publish' : 'cv.enable');
+  /* 主按钮只表达启用生命周期：未启用 →「启用」，已启用 →「已启用」（禁用），
+     保存在途 →「保存中…」。保存是独立的 #cvSave，不在这里兼任。 */
+  const primaryKey = store.saving
+    ? 'cv.saving'
+    : enabled
+      ? 'cv.published'
+      : 'cv.enable';
   const primary = $('#cvEnable');
   const primaryLabel = $('#cvEnableLabel');
   if (primaryLabel) primaryLabel.textContent = t(primaryKey);
   if (primary) {
     primary.setAttribute('aria-busy', String(!!store.saving));
-    primary.disabled = !!store.tryRunning || !!store.saving || (enabled && !dirty);
+    primary.disabled = !!store.tryRunning || !!store.saving || enabled;
   }
 }
 
@@ -1790,7 +1793,7 @@ async function boot() {
 
 /* 模块在 </body> 前加载，DOM 已就绪：先同步画一次首屏文案，再进入异步 boot。
    #cvEnableLabel 没有静态种子也没有 data-i18n（唯一 owner 是 paintLifecycle）,
-   此时 store.tree 仍是 null，函数会落到 markup 声明的 draft / cv.publish；
+   此时 store.tree 仍是 null，函数会落到 markup 声明的 draft / cv.enable；
    语言已由 nav.js 的 setLang(LANG) 在 import 阶段定好，所以英文会话从第一帧
    起就是英文，而不是先闪一帧中文再被 boot 后的 paintLifecycle 覆盖。 */
 paintLifecycle();

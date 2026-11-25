@@ -51,8 +51,8 @@
           <button type="button" class="btn sm" id="cvUndo" data-i18n="cv.undo"></button>
           <button type="button" class="btn sm" id="cvRedo" data-i18n="cv.redo"></button>
           <button type="button" class="btn sm" id="cvAutoLayout" data-i18n="cv.autoLayout"></button>
-          <!-- 保存按钮保留内层 span：updateToolbar 在请求在途时改写这里的忙碌文案。 -->
-          <button type="button" class="btn sm" id="cvSave"><span data-i18n="cv.saveDraft"></span></button>
+          <!-- 保存按钮是唯一的保存入口；保留内层 span：updateToolbar 在请求在途时改写忙碌文案。 -->
+          <button type="button" class="btn sm" id="cvSave"><span data-i18n="cv.save"></span></button>
           <button type="button" class="btn sm" id="cvNewTree" data-i18n="cv.newTree"></button>
           <button type="button" class="btn sm" id="cvImport" data-i18n="cv.import"></button>
           <button type="button" class="btn sm" id="cvExport" data-i18n="cv.export"></button>
@@ -68,7 +68,7 @@
           <!-- 文案完全由 paintLifecycle() 拥有：不能带 data-i18n，否则 setLang 会把它
                改回固定 key、覆盖真实状态。app.js 在模块加载时同步先画一次（此时
                DOM 已就绪、store.tree 仍为 null），所以这里不留中文静态种子，
-               英文会话从第一帧起只会看到 cv.publish 的英文。 -->
+               英文会话从第一帧起只会看到 cv.enable 的英文。 -->
           <span id="cvEnableLabel"></span>
         </button>
         <button type="button" class="pill rtc-issues-btn" id="cvIssuesBtn" aria-expanded="false">
