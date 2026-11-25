@@ -88,3 +88,31 @@ def test_public_v1_rejects_forged_department_header(tmp_path):
         json={'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
     assert response.status_code == 400
     assert response.json() == {'error': {'message': 'department_header_not_allowed'}}
+
+
+def test_internal_route_rejects_invalid_department_before_executor(tmp_path):
+    """Malformed percent-encoding is rejected before any routing work happens."""
+    client = make_client(tmp_path, token="expected")
+    response = client.post(
+        "/internal/v1/chat/completions",
+        headers={"X-SR-Gateway-Token": "expected", "X-SR-Department": "%zz"},
+        json={"model": "auto", "messages": [{"role": "user", "content": "你好"}]},
+    )
+    assert response.status_code == 400
+    assert response.json() == {"error": {"message": "invalid_department"}}
+
+
+def test_internal_route_forwards_valid_department_without_monkeypatch(tmp_path):
+    """A valid header reaches the real executor path (not just the DTO echo)."""
+    client = make_client(tmp_path, token="expected")
+    # Empty route set in this test workspace: the shared executor answers 503
+    # no_active_tree, which proves the request passed auth and department
+    # decoding rather than being rejected before routing.
+    response = client.post(
+        "/internal/v1/chat/completions",
+        headers={"X-SR-Gateway-Token": "expected",
+                 "X-SR-Department": "%E8%B4%A2%E5%8A%A1%E9%83%A8"},
+        json={"model": "auto", "messages": [{"role": "user", "content": "你好"}]},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"error": {"message": "no_active_tree"}}
