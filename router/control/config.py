@@ -127,7 +127,7 @@ class ConfigurationService:
             if fingerprint == prepared.fingerprint:
                 return prepared
             prepared = self.publisher.prepare(
-                self.conn, self.trees.enabled(), fingerprint)
+                self.trees.enabled(), fingerprint)
         raise GraphChangedDuringLoad(
             "graph changed between document write and snapshot publish")
 
@@ -142,7 +142,7 @@ class ConfigurationService:
         数据库目录不参与启用判断：目录行与画布不一致只影响检查提示，不会让
         目录写失败。校验失败时数据库回滚，磁盘不应残留半份新配置。
         """
-        issues = enabled_tree_issues(self.conn, self.trees)
+        issues = enabled_tree_issues(self.trees)
         if issues:
             raise ValidationFailed(issues)
 
@@ -156,7 +156,7 @@ class ConfigurationService:
         profile 非法」这类候选直接落盘，随后 ``trees.list()`` 抛
         ``GraphStorageError``。
         """
-        issues = tree_issues(self.conn, tree)
+        issues = tree_issues(tree)
         if issues:
             raise ValidationFailed(issues)
         try:
@@ -182,8 +182,7 @@ class ConfigurationService:
         装配边界统一映射成 ``GraphStorageError``（503），本方法不再另做索引推导。
         """
         fingerprint = self.trees.route_fingerprint()
-        return self.publisher.prepare(
-            self.conn, self.trees.enabled(), fingerprint)
+        return self.publisher.prepare(self.trees.enabled(), fingerprint)
 
     # ── 确认后的目录同步（模型/provider/JEV 影响写用例共用骨架）────────────
     # 与 _write_and_publish 同一套语义：publisher.locked() → 单写事务（引用复核/
@@ -266,7 +265,7 @@ class ConfigurationService:
         except GraphStorageError:
             logger.exception("graph batch rollback failed")
             try:
-                self.publisher.refresh(self.conn)
+                self.publisher.refresh()
             except Exception:
                 logger.exception("snapshot refresh after rollback failure also failed")
             raise

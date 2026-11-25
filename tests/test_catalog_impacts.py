@@ -1731,10 +1731,11 @@ def test_rollback_failure_returns_503_and_refreshes_after_db_rollback(
     real_refresh = publisher.refresh
     seen = []
 
-    def spy_refresh(conn):
-        # 事务内的刷新会看到未提交的数据库状态；修复要求先把 ROLLBACK 做完。
-        seen.append(conn.in_transaction)
-        return real_refresh(conn)
+    def spy_refresh():
+        # 发布器刷新只重扫图目录、不打开 SQLite，因此回滚失败后的刷新与数据库
+        # 事务状态无关；这里只锁定「回滚失败后仍会重建内存快照」。
+        seen.append(True)
+        return real_refresh()
 
     monkeypatch.setattr(publisher, "refresh", spy_refresh)
 
@@ -1743,7 +1744,7 @@ def test_rollback_failure_returns_503_and_refreshes_after_db_rollback(
 
     assert response.status_code == 503, response.text
     assert response.json()["detail"]["code"] == "graph_storage_error"
-    assert seen == [False]
+    assert seen == [True]
     # 数据库仍整体回滚；审计行不存在。文件回滚失败正是本夹具的注入点。
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit

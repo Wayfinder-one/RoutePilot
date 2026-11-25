@@ -137,12 +137,13 @@ def build_snapshot(
     )
 
 
-def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
+def build_snapshot_for_tree(
+        tree: RoutingTree | None, *, jev_api_key: str = "") -> RoutingSnapshot:
     """单图运行快照：唯一来源是画布内嵌运行配置。
 
     - ``tree is None``：空 Auto 快照（没有启用图时没有隐式数据库装配）。
     - ``tree is not None``：用画布自身运行配置做启用校验 → 编译 → 装配快照。
-      数据库只用于解析已存密钥；目录行与画布不一致不改变快照内容。
+      ``jev_api_key`` 是唯一密钥来源，装配不打开 SQLite、也不读取环境变量。
     """
     if tree is None:
         return build_snapshot(
@@ -160,7 +161,7 @@ def build_snapshot_for_tree(conn, tree: RoutingTree | None) -> RoutingSnapshot:
     compiled = compile_graph(tree.root)
     return build_snapshot(
         tree=tree,
-        **snapshot_parts(conn, tree.runtime),
+        **snapshot_parts(tree.runtime, jev_api_key=jev_api_key),
         compiled=compiled,
     )
 
@@ -247,11 +248,13 @@ def assemble_snapshot_set(
     )
 
 
-def build_snapshot_set_for_trees(conn, trees: Iterable[RoutingTree],
-                                 fingerprint: str) -> RoutingSnapshotSet:
+def build_snapshot_set_for_trees(
+        trees: Iterable[RoutingTree], fingerprint: str, *,
+        jev_api_key: str = "") -> RoutingSnapshotSet:
     """对每份启用图执行启用校验/编译/装配，再装配成路由集。"""
     return assemble_snapshot_set(
-        [build_snapshot_for_tree(conn, tree) for tree in trees], fingerprint)
+        [build_snapshot_for_tree(tree, jev_api_key=jev_api_key) for tree in trees],
+        fingerprint)
 
 
 def invalid_route_set_error(exc: RouteSetInvariantError) -> GraphStorageError:
@@ -264,16 +267,18 @@ def invalid_route_set_error(exc: RouteSetInvariantError) -> GraphStorageError:
     return GraphStorageError(f"invalid route set: {exc.code}")
 
 
-def load_snapshot_set(conn, repo: RoutingTreeRepo) -> RoutingSnapshotSet:
+def load_snapshot_set(
+        repo: RoutingTreeRepo, *, jev_api_key: str = "") -> RoutingSnapshotSet:
     """从磁盘扫描结果构造完整启用路由集。
 
     先取指纹再读树；集合不变量（恰好一张默认图、部门唯一）在装配边界转成
     ``GraphStorageError``：发布器保留旧路由集并报告 ``stale``，而不是把损坏
-    文件打成 500。
+    文件打成 500。装配不打开 SQLite：``jev_api_key`` 由调用方显式传入。
     """
     fingerprint = repo.route_fingerprint()
     try:
-        return build_snapshot_set_for_trees(conn, repo.enabled(), fingerprint)
+        return build_snapshot_set_for_trees(
+            repo.enabled(), fingerprint, jev_api_key=jev_api_key)
     except RouteSetInvariantError as exc:
         raise invalid_route_set_error(exc) from exc
 
@@ -300,16 +305,18 @@ class SnapshotPublisher:
         with self._lock:
             yield self
 
-    def prepare(self, conn, trees: Iterable[RoutingTree],
+    def prepare(self, trees: Iterable[RoutingTree],
                 fingerprint: str) -> PreparedRouteSet:
         """装配候选路由集；不变量损坏在装配边界转成 ``GraphStorageError``。
 
         候选树可能来自手装的 standalone JSON（如启用图但没有默认图），
         与 ``load_snapshot_set()`` 一样走存储错误（503），而不是把
-        GraphService/ConfigurationService 的写路径打成 500。
+        GraphService/ConfigurationService 的写路径打成 500。不打开 SQLite：
+        JEV Key 只来自 ``app.state.jev_api_key``。
         """
         try:
-            snapshot_set = build_snapshot_set_for_trees(conn, trees, fingerprint)
+            snapshot_set = build_snapshot_set_for_trees(
+                trees, fingerprint, jev_api_key=self.app.state.jev_api_key)
         except RouteSetInvariantError as exc:
             raise invalid_route_set_error(exc) from exc
         return PreparedRouteSet(snapshot_set, fingerprint)
@@ -328,10 +335,11 @@ class SnapshotPublisher:
             self._last_error = ""
             return snapshot_set
 
-    def refresh(self, conn) -> RoutingSnapshotSet:
+    def refresh(self) -> RoutingSnapshotSet:
         with self._lock:
             try:
-                route_set = load_snapshot_set(conn, self.trees)
+                route_set = load_snapshot_set(
+                    self.trees, jev_api_key=self.app.state.jev_api_key)
                 if self.trees.route_fingerprint() != route_set.fingerprint:
                     raise GraphChangedDuringLoad("graph changed while building snapshot")
                 return self.publish(PreparedRouteSet(route_set, route_set.fingerprint))
@@ -339,14 +347,14 @@ class SnapshotPublisher:
                 self._last_error = str(exc)
                 raise
 
-    def refresh_if_changed(self, conn) -> RoutingSnapshotSet | None:
+    def refresh_if_changed(self) -> RoutingSnapshotSet | None:
         with self._lock:
             try:
                 if self._fingerprint is not None and self.trees.route_fingerprint() == self._fingerprint:
                     # 文件恢复成最后成功内容时，指纹不变，也必须清除旧读取错误。
                     self._last_error = ""
                     return self.app.state.snapshot_set
-                return self.refresh(conn)
+                return self.refresh()
             except Exception as exc:
                 self._last_error = str(exc)
                 raise

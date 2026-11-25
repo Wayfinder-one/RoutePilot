@@ -387,8 +387,9 @@ def test_auto_routing_reaches_the_json_mock_upstream(json_only):
     upstream = calls["upstream"][-1]
     assert upstream["url"] == UPSTREAM_ORIGIN + "/v1/chat/completions"
     assert upstream["body"]["model"] == "json-upstream"
-    # provider 的 key_env 在运行时解析：旧密钥不来自 JSON 文件，但环境变量生效。
-    assert upstream["authorization"] == "Bearer " + ENV_SECRET
+    # 内核快照不持有 Provider Key：Auto 路径不向上游发送 Authorization；
+    # Provider Key 的注入属于外围执行层（后续任务）。
+    assert upstream["authorization"] is None
 
 
 def test_fixed_model_uses_db_catalog_instead_of_active_canvas(json_only):
@@ -562,7 +563,7 @@ def test_graph_snapshot_does_not_change_when_db_catalog_changes(json_only):
                 "VALUES ('changed', 'changed', 'other', '{}')")
             conn.execute(
                 "UPDATE jev_services SET base_url = 'http://db-changed.test'")
-        after = build_snapshot_for_tree(conn, tree)
+        after = build_snapshot_for_tree(tree)
     finally:
         conn.close()
     assert after.content == before
@@ -603,7 +604,8 @@ def test_acceptance_json_selects_jev_a_and_fast_and_calls_succeed(tmp_path, monk
     assert calls["upstream"], "Auto 路由没有到达 JSON 上游"
     assert calls["upstream"][-1]["url"] == UPSTREAM_ORIGIN + "/v1/chat/completions"
     assert calls["upstream"][-1]["body"]["model"] == "json-upstream"
-    assert calls["upstream"][-1]["authorization"] == "Bearer " + ENV_SECRET
+    # 内核快照不携带 Provider Key（执行层注入留给外围）。
+    assert calls["upstream"][-1]["authorization"] is None
 
 
 def test_acceptance_exported_bytes_alone_reproduce_the_snapshot(tmp_path, monkeypatch):
@@ -757,6 +759,7 @@ def test_acceptance_confirmed_catalog_change_syncs_only_affected_canvas(tmp_path
 def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch):
     """⑥ 全流程（try + Auto + 目录读取）不把密钥材料写进文件/API/快照内容。"""
     monkeypatch.setenv("JSON_PROVIDER_API_KEY", ENV_SECRET)
+    monkeypatch.delenv("ROUTER_JEV_API_KEY", raising=False)
     base = tmp_path / "secrets"
     base.mkdir()
     settings = test_settings(base)
@@ -768,10 +771,10 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     app = create_app(settings, transport=_mock_transport(calls))
     client = TestClient(app)
 
-    # 密钥只解析进内存快照（headers / JevSettings），且已存密钥优先于环境变量。
-    assert STORED_PROVIDER_SECRET in \
-        app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"]
-    assert app.state.snapshot_set.default_snapshot.jev.api_key == STORED_JEV_SECRET
+    # 内核快照不持有 Provider Key，也不读数据库已存 JEV Key：密钥只来自环境变量。
+    snapshot = app.state.snapshot_set.default_snapshot
+    assert snapshot.backends["fast"].headers == {}
+    assert snapshot.jev.api_key == ""
 
     tried = client.post("/admin/try", json={
         "tree_id": "portable", "text": "帮我分析这段复杂代码"})
@@ -779,7 +782,7 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     answered = client.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "帮我分析这段复杂代码"}]})
     assert answered.status_code == 200, answered.text
-    assert calls["upstream"][-1]["authorization"] == "Bearer " + STORED_PROVIDER_SECRET
+    assert calls["upstream"][-1]["authorization"] is None
 
     secrets = (ENV_SECRET, STORED_PROVIDER_SECRET, STORED_JEV_SECRET)
     derived = ("api_key", "authorization", "key_present", "key_source")

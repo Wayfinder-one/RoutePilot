@@ -312,8 +312,9 @@ def test_request_snapshot_persistence_excludes_live_request_secrets(tmp_path):
                      "authorization": f"Bearer {caller_secret}"},
         )
         assert response.status_code == 200, response.text
-        # 真实密钥确实在运行态 Backend 上使用过，只是不该被快照持久化。
-        assert seen.get("authorization") == f"Bearer {upstream_secret}"
+        # 内核快照不持有 Provider Key：Auto 路径不再把目录密钥解析进后端 headers，
+        # 因此上游请求不带 Authorization（密钥注入属于外围执行层，见后续任务）。
+        assert seen.get("authorization") is None
         request_id = app.state.requestlog.recent_requests(1)[0]["id"]
         client.portal.call(app.state.requestlog.flush)
 

@@ -1,13 +1,10 @@
 import asyncio
-import json
 from types import SimpleNamespace
 
 from router.config import Settings
 from router.routing.tree import tree_from_dict
 from router.routing.reloader import GraphReloadWorker
 from router.routing.snapshot import SnapshotPublisher
-from router.store.db import connect, migrate
-from router.store.repositories import ModelRepo, ProviderRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import tree_dict
 
@@ -29,18 +26,16 @@ def direct_graph(model):
 
 
 def test_worker_background_loop_loads_changed_file(tmp_path):
+    # 重载器只轮询图目录：不创建 SQLite，也不需要连接。
     settings = Settings(db_path=str(tmp_path / "control.db"), graph_dir=str(tmp_path / "routing-graph"))
-    conn = connect(settings.db_path)
-    migrate(conn)
-    ProviderRepo(conn).upsert("local", "http://upstream.test/v1")
-    ModelRepo(conn).create("fast", "fast", "local", json.dumps({"capability": "快速"}))
     repo = RoutingTreeRepo(settings.graph_dir)
     repo.initialize()
     repo.create(tree_from_dict(tree_dict(
         root=direct_graph("fast"), enabled=True, default=True)))
-    app = SimpleNamespace(state=SimpleNamespace(settings=settings, snapshot_set=None))
+    app = SimpleNamespace(state=SimpleNamespace(
+        settings=settings, snapshot_set=None, jev_api_key=""))
     app.state.publisher = SnapshotPublisher(app, repo)
-    app.state.publisher.refresh(conn)
+    app.state.publisher.refresh()
 
     updated = tree_from_dict(tree_dict(
         root=direct_graph("fast"), sticky={"enabled": True, "ttl_seconds": 60},
@@ -59,6 +54,5 @@ def test_worker_background_loop_loads_changed_file(tmp_path):
             raise AssertionError("background reload did not converge within one second")
         finally:
             await worker.close()
-            conn.close()
 
     asyncio.run(scenario())

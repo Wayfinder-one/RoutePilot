@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -247,8 +246,8 @@ class JevClient:
             "state": settings.state_template.format(request=text),
             "questions": {key: _wire_question(question) for key, question in questions.items()},
         }
-        api_key = settings.api_key or os.environ.get("ROUTER_JEV_API_KEY", "")
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        # 密钥来源唯一：JevSettings.api_key（由内核装配显式注入），不再隐式读取环境变量。
+        headers = {"Authorization": f"Bearer {settings.api_key}"} if settings.api_key else {}
         started = time.monotonic()
         try:
             response = await self.http.post(

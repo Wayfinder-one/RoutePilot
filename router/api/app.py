@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -184,6 +185,8 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
 
     app = FastAPI(title="RoutePilot", lifespan=lifespan)
     app.state.settings = settings
+    # JEV Key 只从环境变量读取：图运行装配不再打开 SQLite 解析已存密钥。
+    app.state.jev_api_key = os.environ.get(settings.jev_api_key_env, "")
     app.state.http = httpx.AsyncClient(timeout=60.0, transport=transport)
     app.state.breaker = CircuitBreaker()
     app.state.breaker_store = BreakerStore(settings.db_path)
@@ -208,7 +211,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     try:
         # boot 种子只写 JEV 目录；启动路由集只由启用图文档构造（零启用图为空集）。
         _seed_jev(conn, settings)
-        app.state.publisher.refresh(conn)
+        app.state.publisher.refresh()
     except GraphStorageError:
         logger.exception("initial graph snapshot is unavailable")
     finally:

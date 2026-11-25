@@ -3,8 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from router.store.db import connect
-
 logger = logging.getLogger(__name__)
 
 
@@ -19,15 +17,9 @@ class GraphReloadWorker:
             self._task = asyncio.create_task(self._loop())
 
     async def poll_once(self) -> None:
-        def refresh():
-            conn = connect(self.app.state.settings.db_path)
-            try:
-                self.app.state.publisher.refresh_if_changed(conn)
-            finally:
-                conn.close()
-
+        # 发布器只轮询图目录，不打开 SQLite：重载器不再需要数据库连接。
         try:
-            await asyncio.to_thread(refresh)
+            await asyncio.to_thread(self.app.state.publisher.refresh_if_changed)
         except Exception:
             logger.exception("graph snapshot reload failed")
 

@@ -83,7 +83,7 @@ class Publisher:
     def locked(self):
         yield self
 
-    def prepare(self, conn, trees, fingerprint):
+    def prepare(self, trees, fingerprint):
         return SimpleNamespace(snapshot_set=trees, fingerprint=fingerprint)
 
     def publish(self, prepared):

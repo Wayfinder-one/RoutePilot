@@ -698,7 +698,7 @@ def test_enable_prepares_candidate_before_writing(client, app, monkeypatch):
     repo = RoutingTreeRepo(app.state.settings.graph_dir)
     before = (repo.graphs / "main.json").read_bytes()
 
-    def failing_prepare(_conn, _trees, _fingerprint):
+    def failing_prepare(_trees, _fingerprint):
         raise GraphStorageError("candidate snapshot is unbuildable")
 
     monkeypatch.setattr(app.state.publisher, "prepare", failing_prepare)
@@ -720,7 +720,7 @@ def test_update_enabled_prepares_candidate_before_writing(client, app, monkeypat
     before = (repo.graphs / "main.json").read_bytes()
     revision = app.state.snapshot_set.snapshot_revision
 
-    def failing_prepare(_conn, _trees, _fingerprint):
+    def failing_prepare(_trees, _fingerprint):
         raise GraphStorageError("candidate snapshot is unbuildable")
 
     monkeypatch.setattr(app.state.publisher, "prepare", failing_prepare)

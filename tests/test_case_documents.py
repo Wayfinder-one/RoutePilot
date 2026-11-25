@@ -218,7 +218,7 @@ def test_case_document_is_strict_self_contained(path: Path):
     assert tree.runtime.jev_context_tokens == DEMO_CONTEXT_TOKENS
 
     # 启用级校验只读画布自带运行配置，不依赖数据库目录。
-    assert tree_issues(None, tree) == []
+    assert tree_issues(tree) == []
 
     used = _used_target_models(tree)
     embedded = _embedded_models(tree)
@@ -328,7 +328,7 @@ def test_shipped_document_is_strict_and_carries_jev_identity(path: Path, expecte
     assert tree.runtime.jev_input_tokens == input_tokens
     assert tree.runtime.jev_context_tokens == context_tokens
     # 四个运行字段成组出现且启用级校验通过（严格解析已保证字段齐全）。
-    assert tree_issues(None, tree) == []
+    assert tree_issues(tree) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -621,7 +621,7 @@ def test_case_runtime_deploys_through_the_real_admin_api(tmp_path):
         assert tree.runtime.jev.id == DEMO_JEV_ID
         assert tree.runtime.jev_input_tokens == DEMO_INPUT_TOKENS
         assert tree.runtime.jev_context_tokens == DEMO_CONTEXT_TOKENS
-        assert tree_issues(None, tree) == []
+        assert tree_issues(tree) == []
 
     # 第二次部署：目录条目已被画布引用 → 默认必须停在影响确认，不得静默覆盖。
     with pytest.raises(module.ImpactConfirmationRequired) as info:

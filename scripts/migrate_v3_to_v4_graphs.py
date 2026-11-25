@@ -88,7 +88,7 @@ def _validate(plans: list[dict]) -> None:
             updated_at="",
             document_sha256="",
         )
-        issues = tree_issues(None, tree)
+        issues = tree_issues(tree)
         if item["raw"].get("enabled") and issues:
             codes = ",".join(sorted({issue.code for issue in issues}))
             raise SystemExit(f"{item['path']}: enabled graph fails validation: {codes}")

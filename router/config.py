@@ -19,6 +19,9 @@ class Settings:
     jev_url: str = ""
     jev_model: str = ""
     jev_api_key: str = ""
+    # 内核 JEV Key 的环境变量名（与 CoreSettings.jev_api_key_env 同义）；
+    # 图运行装配只读该变量，不再从 SQLite 解析已存密钥。
+    jev_api_key_env: str = "ROUTER_JEV_API_KEY"
     jev_timeout: float = 10.0
     session_max_entries: int = 10000
     user_auth: bool = True

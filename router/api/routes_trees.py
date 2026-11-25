@@ -11,6 +11,7 @@ snapshot、不写粘性、不计 inflight。
 """
 from __future__ import annotations
 
+import logging
 import re
 import sqlite3
 from datetime import datetime
@@ -40,15 +41,29 @@ from router.routing.types import (
     RoutingMiss,
     RoutingRequest,
 )
-from router.store.repositories import new_id
+from router.store.repositories import ChangeRepo, new_id, now_iso
 from router.store.routing_trees import RoutingTreeRepo
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
+def _audit_writer(conn: sqlite3.Connection):
+    """审计回调：GraphService 不再持有 SQLite，由 API 层注入 ChangeRepo 写入。"""
+    def audit(action: str, detail: dict) -> None:
+        try:
+            with conn:
+                ChangeRepo(conn).record(now_iso(), "tree", {"action": action, **detail})
+        except sqlite3.Error:
+            logger.exception("graph change committed but audit write failed: %s", action)
+    return audit
+
+
 def _service(request: Request, conn: sqlite3.Connection, trees: RoutingTreeRepo) -> GraphService:
-    return GraphService(conn, trees, request.app.state.publisher)
+    return GraphService(
+        trees, request.app.state.publisher, audit=_audit_writer(conn))
 
 
 def _clean_id(raw) -> str:
@@ -347,11 +362,14 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
         raise HTTPException(422, detail=issues_payload(graph_parse_failed(exc))) from exc
 
 
-def _try_snapshot(conn: sqlite3.Connection, tree: RoutingTree):
-    """草稿快照：运行配置完全来自草稿 envelope / 已存画布，不读数据库目录。"""
+def _try_snapshot(request: Request, tree: RoutingTree):
+    """草稿快照：运行配置完全来自草稿 envelope / 已存画布，不读数据库目录。
+
+    JEV Key 只来自应用启动时注入的 ``app.state.jev_api_key``。
+    """
     return build_snapshot(
         tree=tree,
-        **snapshot_parts(conn, tree.runtime),
+        **snapshot_parts(tree.runtime, jev_api_key=request.app.state.jev_api_key),
         compiled=compile_graph(tree.root),
     )
 
@@ -426,8 +444,8 @@ async def try_tree(
         # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
         # 画布快照与数据库目录的差异也是提示：只读比较、不改变执行配置（spec 保存/启用/检查）。
         warnings = issues_payload(
-            tree_issues(conn, tree) + runtime_mismatch_issues(conn, tree.runtime))
-        snapshot = _try_snapshot(conn, tree)
+            tree_issues(tree) + runtime_mismatch_issues(conn, tree.runtime))
+        snapshot = _try_snapshot(request, tree)
     text = body.text
     if not isinstance(text, str):
         raise HTTPException(422, detail="try text must be a string")

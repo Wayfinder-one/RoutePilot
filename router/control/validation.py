@@ -9,23 +9,21 @@
 """
 from __future__ import annotations
 
-import sqlite3
-
 from router.control.runtime import enable_context_for_runtime
 from router.routing.graph.validate import Issue, validate_graph_for_enable
 from router.routing.tree import RoutingTree
 from router.store.routing_trees import RoutingTreeRepo
 
 
-def tree_issues(conn: sqlite3.Connection, tree: RoutingTree) -> list[Issue]:
+def tree_issues(tree: RoutingTree) -> list[Issue]:
     """启用级校验任意树（active/草稿/已存关闭树共此入口）。
 
-    ``conn`` 仅为调用方签名兼容保留：启用上下文完全来自画布内嵌运行配置。
+    不需要数据库连接：启用上下文完全来自画布内嵌运行配置。
     """
     return validate_graph_for_enable(tree, enable_context_for_runtime(tree.runtime))
 
 
-def enabled_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> list[Issue]:
+def enabled_tree_issues(trees: RoutingTreeRepo) -> list[Issue]:
     """校验所有启用图，按树 id 排序、逐图 Issue 顺序合并。
 
     快照发布会装配全部启用图，因此任何一份启用图校验失败都必须整体拒绝；
@@ -34,5 +32,5 @@ def enabled_tree_issues(conn: sqlite3.Connection, trees: RoutingTreeRepo) -> lis
     """
     issues: list[Issue] = []
     for tree in sorted(trees.enabled(), key=lambda item: item.id):
-        issues.extend(tree_issues(conn, tree))
+        issues.extend(tree_issues(tree))
     return issues

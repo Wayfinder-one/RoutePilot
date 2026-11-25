@@ -267,7 +267,8 @@ def test_transport_timeout_raises_jev_error():
     assert "TimeoutException" in str(excinfo.value)
 
 
-def test_environment_key_is_used_when_stored_key_is_empty(monkeypatch):
+def test_environment_key_is_not_used_implicitly(monkeypatch):
+    """密钥来源唯一：``JevSettings.api_key`` 为空时不得回退到环境变量。"""
     monkeypatch.setenv("ROUTER_JEV_API_KEY", "environment-secret")
     requests = []
 
@@ -277,7 +278,7 @@ def test_environment_key_is_used_when_stored_key_is_empty(monkeypatch):
 
     client = JevClient(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     asyncio.run(client.choose_many(settings(api_key=""), "请求", QUESTIONS))
-    assert requests[0].headers["authorization"] == "Bearer environment-secret"
+    assert "authorization" not in requests[0].headers
 
 
 def test_choose_many_requires_a_nonempty_question_mapping():

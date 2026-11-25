@@ -7,8 +7,8 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from router.jev.service import JevService
 from router.config import Settings
+from router.jev.service import JevService
 from router.control.validation import tree_issues
 from router.routing.document import graph_document_bytes
 from router.routing.graph.compiled import CompiledGraph, edge_order_key, compile_graph
@@ -100,18 +100,45 @@ def repo(settings):
 
 
 @pytest.fixture
-def app(settings, conn, repo):
-    instance = SimpleNamespace(state=SimpleNamespace(settings=settings, snapshot_set=None))
+def app(settings, repo):
+    # 内核运行态只带一个 JEV Key 值：装配不再打开 SQLite 读取已存密钥。
+    instance = SimpleNamespace(state=SimpleNamespace(
+        settings=settings, snapshot_set=None, jev_api_key="jev-secret"))
     instance.state.publisher = SnapshotPublisher(instance, repo)
-    instance.state.publisher.refresh(conn)
+    instance.state.publisher.refresh()
     return instance
 
 
-def test_snapshot_loads_canvas_config_and_revision_excludes_secrets(conn, repo):
-    snapshot = load_snapshot_set(conn, repo).default_snapshot
+@pytest.fixture
+def publisher(app):
+    return app.state.publisher
+
+
+def test_snapshot_parts_build_decision_backends_without_sqlite(monkeypatch):
+    from router.control.runtime import snapshot_parts
+    from router.routing.runtime import runtime_from_dict
+    from tests.routing_fixtures import runtime_dict
+
+    monkeypatch.setenv("ROUTE_PILOT_UPSTREAM_API_KEY", "must-not-be-used")
+    parts = snapshot_parts(runtime_from_dict(runtime_dict()), jev_api_key="jev-secret")
+    assert parts["backends"]["fast"].headers == {}
+    assert parts["backends"]["fast"].upstream_name == "json-upstream"
+    assert parts["jev"].api_key == "jev-secret"
+    assert "api_key" not in parts["jev"].behavior_dict()
+
+
+def test_graph_service_accepts_no_connection_or_audit(repo, publisher):
+    from router.control.graphs import GraphService
+    service = GraphService(repo, publisher)
+    assert service.audit is None
+
+
+def test_snapshot_loads_canvas_config_and_revision_excludes_secrets(repo):
+    snapshot = load_snapshot_set(repo).default_snapshot
     assert snapshot.tree.id == "main"
-    # 端点匹配的已存密钥只在运行态 Backend 上使用，不进入快照内容。
-    assert snapshot.backends["fast"].headers["Authorization"] == "Bearer upstream-secret"
+    # 内核快照不持有 Provider Key：后端 headers 恒为空，目录/环境密钥都不进入。
+    assert snapshot.backends["fast"].headers == {}
+    assert snapshot.jev.api_key == ""
     assert snapshot.capabilities == {"fast": "fast 能力", "standard": "standard 能力"}
     assert snapshot.jev.model == "NeoHorse-Jev-4B"
     assert "upstream-secret" not in snapshot.content
@@ -128,11 +155,11 @@ def portable_tree(values=None, tree_id='main', enabled=True, default=True,
     return tree_from_dict(raw)
 
 
-def test_snapshot_set_selects_department_then_default(conn):
-    main = build_snapshot_for_tree(conn, portable_tree())
+def test_snapshot_set_selects_department_then_default():
+    main = build_snapshot_for_tree(portable_tree())
     finance_raw = tree_dict('finance', enabled=True, departments=['财务部'])
     finance_raw.update(stored_catalog_runtime())
-    finance = build_snapshot_for_tree(conn, tree_from_dict(finance_raw))
+    finance = build_snapshot_for_tree(tree_from_dict(finance_raw))
     route_set = assemble_snapshot_set([main, finance], fingerprint='fp')
     assert route_set.select('财务部').snapshot is finance
     assert route_set.select('财务部').reason == 'department'
@@ -141,12 +168,12 @@ def test_snapshot_set_selects_department_then_default(conn):
     assert route_set.select('').snapshot is main
 
 
-def test_snapshot_set_distinguishes_empty_and_missing_default(conn):
+def test_snapshot_set_distinguishes_empty_and_missing_default():
     empty = assemble_snapshot_set([], fingerprint='empty')
     with pytest.raises(NoActiveTreeError):
         empty.select('')
 
-    valid = assemble_snapshot_set([build_snapshot_for_tree(conn, portable_tree())], fingerprint='valid')
+    valid = assemble_snapshot_set([build_snapshot_for_tree(portable_tree())], fingerprint='valid')
     broken = replace(valid, default_tree_id=None)
     with pytest.raises(NoDefaultTreeError):
         broken.select('')
@@ -155,31 +182,31 @@ def test_snapshot_set_distinguishes_empty_and_missing_default(conn):
     raw.update(stored_catalog_runtime())
     with pytest.raises(RouteSetInvariantError) as missing:
         assemble_snapshot_set(
-            [build_snapshot_for_tree(conn, tree_from_dict(raw))], fingerprint='broken')
+            [build_snapshot_for_tree(tree_from_dict(raw))], fingerprint='broken')
     assert missing.value.code == 'no_default_tree'
 
 
-def test_snapshot_set_rejects_disabled_tree(conn):
+def test_snapshot_set_rejects_disabled_tree():
     """路由集只装启用图：手工传入停用图快照必须被拒绝，绝不静默发布。
 
     ``assemble_snapshot_set()`` 的契约是「全部启用图」，此前只是隐含依赖调用
     方过滤；缺默认图/部门冲突有路由集不变量兜底，但一张停用图能混进集合让
     ``select()`` 选出它。
     """
-    enabled = build_snapshot_for_tree(conn, portable_tree())
+    enabled = build_snapshot_for_tree(portable_tree())
     disabled = build_snapshot_for_tree(
-        conn, portable_tree(tree_id='draft', enabled=False, default=False))
+        portable_tree(tree_id='draft', enabled=False, default=False))
 
     with pytest.raises(ValueError) as rejected:
         assemble_snapshot_set([enabled, disabled], fingerprint='fp')
     assert 'enabled' in str(rejected.value)
 
 
-def test_snapshot_set_content_is_version_only_and_revision_hashes_it(conn):
-    main = build_snapshot_for_tree(conn, portable_tree())
+def test_snapshot_set_content_is_version_only_and_revision_hashes_it():
+    main = build_snapshot_for_tree(portable_tree())
     finance_raw = tree_dict('finance', enabled=True, departments=['财务部'])
     finance_raw.update(stored_catalog_runtime())
-    finance = build_snapshot_for_tree(conn, tree_from_dict(finance_raw))
+    finance = build_snapshot_for_tree(tree_from_dict(finance_raw))
 
     route_set = assemble_snapshot_set([finance, main], fingerprint='fp')
 
@@ -200,9 +227,11 @@ def test_snapshot_set_content_is_version_only_and_revision_hashes_it(conn):
     assert 'jev-secret' not in route_set.content
 
 
-def test_publisher_status_exposes_route_set_schema(conn, repo, app):
+def test_publisher_status_exposes_route_set_schema(repo, app):
     status = app.state.publisher.status()
 
+    # 发布器从 app.state.jev_api_key 注入 JEV 密钥（不读 SQLite/环境变量）。
+    assert app.state.snapshot_set.default_snapshot.jev.api_key == "jev-secret"
     assert set(status) == {
         'ready', 'stale', 'default_tree_id', 'enabled_tree_ids',
         'snapshot_revision', 'route_fingerprint', 'loaded_at', 'last_load_error',
@@ -216,8 +245,8 @@ def test_publisher_status_exposes_route_set_schema(conn, repo, app):
     assert status['last_load_error'] == ''
 
 
-def test_embedded_runtime_drives_snapshot_instead_of_database(conn):
-    snapshot = build_snapshot_for_tree(conn, portable_tree())
+def test_embedded_runtime_drives_snapshot_instead_of_database():
+    snapshot = build_snapshot_for_tree(portable_tree())
 
     assert set(snapshot.backends) == {"fast"}
     assert snapshot.backends["fast"].url == "http://json-only.test/v1/chat/completions"
@@ -232,39 +261,41 @@ def test_embedded_runtime_drives_snapshot_instead_of_database(conn):
     assert {period.name for period in snapshot.time_periods} == {"peak", "normal", "offpeak"}
 
 
-def test_matching_embedded_endpoints_reuse_stored_keys_without_serializing_them(conn):
+def test_matching_embedded_endpoints_never_reuse_stored_catalog_keys(conn):
+    """端点匹配的数据库已存密钥不得再进入内核快照：唯一密钥来源是显式入参。"""
     values = runtime_dict()
     values["backends"]["providers"][0]["base_url"] = "http://upstream.test/v1/"
     values["jev"]["id"] = "default"
     values["jev"]["base_url"] = "http://jev.test/"
     values["jev"]["model"] = "NeoHorse-Jev-4B"
 
-    snapshot = build_snapshot_for_tree(conn, portable_tree(values))
+    snapshot = build_snapshot_for_tree(portable_tree(values))
 
-    assert snapshot.backends["fast"].headers["Authorization"] == "Bearer upstream-secret"
-    assert snapshot.jev.api_key == "jev-secret"
+    assert snapshot.backends["fast"].headers == {}
+    assert snapshot.jev.api_key == ""
     assert "upstream-secret" not in snapshot.content
     assert "jev-secret" not in snapshot.content
 
 
-def test_mismatched_embedded_endpoints_use_environment_keys_only(conn, monkeypatch):
+def test_environment_keys_never_enter_snapshot_without_explicit_value(conn, monkeypatch):
+    """JEV/Provider 环境变量不再被装配读取：只有显式 ``jev_api_key`` 值生效。"""
     monkeypatch.setenv("JSON_PROVIDER_API_KEY", "json-provider-env-secret")
     monkeypatch.setenv("ROUTER_JEV_API_KEY", "json-jev-env-secret")
 
-    snapshot = build_snapshot_for_tree(conn, portable_tree())
+    snapshot = build_snapshot_for_tree(portable_tree())
 
-    assert snapshot.backends["fast"].headers["Authorization"] == "Bearer json-provider-env-secret"
-    assert snapshot.jev.api_key == "json-jev-env-secret"
+    assert snapshot.backends["fast"].headers == {}
+    assert snapshot.jev.api_key == ""
     assert "upstream-secret" not in snapshot.content
     assert "jev-secret" not in snapshot.content
 
 
 def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
-    """回归锁定：已删除的跨服务密钥回退不得复活。
+    """回归锁定：跨服务/数据库/环境密钥回退不得复活。
 
     画布选中服务 B，而只有服务 A 的 ``JEV_A_API_KEY`` 在环境里；B 自己的
-    ``JEV_B_API_KEY`` 未设置、数据库里 B 行的端点/模型又与画布不一致（已存密钥
-    不可复用）。快照必须得不到任何 JEV 密钥——尤其不能借用 A 的环境变量或已存密钥。
+    ``JEV_B_API_KEY`` 未设置、数据库里 B 行的端点/模型又与画布不一致。未显式
+    传入密钥时快照必须得不到任何 JEV 密钥——尤其不能借用 A 的环境变量或已存密钥。
     """
     monkeypatch.delenv("ROUTER_JEV_API_KEY", raising=False)
     monkeypatch.delenv("JEV_B_API_KEY", raising=False)
@@ -290,7 +321,7 @@ def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
         "state_template": runtime_dict()["jev"]["state_template"],
     }
 
-    snapshot = build_snapshot_for_tree(conn, portable_tree(values))
+    snapshot = build_snapshot_for_tree(portable_tree(values))
 
     # 画布按自己的内嵌快照运行（选中的是 B）。
     assert snapshot.tree.runtime.jev.id == "jev-b"
@@ -304,11 +335,10 @@ def test_jev_key_env_is_never_borrowed_from_another_service(conn, monkeypatch):
 
 
 def test_jev_key_env_is_never_replaced_by_the_global_router_variable(conn, monkeypatch):
-    """画布 ``jev.key_env`` 必须被原样使用，不得回退到全局 ``ROUTER_JEV_API_KEY``。
+    """画布 ``jev.key_env`` 不再被装配读取：全局 ``ROUTER_JEV_API_KEY`` 不得进入快照。
 
-    回归锁定：把 ``resolve_jev_settings`` 里 ``os.environ.get(service.key_env)``
-    改成硬编码 ``ROUTER_JEV_API_KEY`` 的突变目前会躲过整套测试；这里把
-    ``CUSTOM_JEV_KEY`` 置空、全局变量设成明文，快照必须拿不到任何密钥。
+    回归锁定：装配只接收显式 ``jev_api_key`` 值；这里把 ``CUSTOM_JEV_KEY`` 置空、
+    全局变量设成明文，快照必须拿不到任何密钥。
     """
     monkeypatch.delenv("CUSTOM_JEV_KEY", raising=False)
     monkeypatch.setenv("ROUTER_JEV_API_KEY", "global-router-jev-secret")
@@ -323,37 +353,37 @@ def test_jev_key_env_is_never_replaced_by_the_global_router_variable(conn, monke
         "state_template": runtime_dict()["jev"]["state_template"],
     }
 
-    snapshot = build_snapshot_for_tree(conn, portable_tree(values))
+    snapshot = build_snapshot_for_tree(portable_tree(values))
 
     assert snapshot.jev.base_url == "http://custom-jev.test"
     assert snapshot.jev.api_key == ""
     assert "global-router-jev-secret" not in snapshot.content
 
 
-def test_embedded_empty_catalog_rejects_model_even_when_database_has_it(conn):
+def test_embedded_empty_catalog_rejects_model_even_when_database_has_it():
     values = runtime_dict()
     values["backends"]["models"] = []
 
-    issues = tree_issues(conn, portable_tree(values))
+    issues = tree_issues(portable_tree(values))
 
     assert "unknown_model" in {issue.code for issue in issues}
 
 
-def test_embedded_null_jev_rejects_questions_even_when_database_has_jev(conn):
+def test_embedded_null_jev_rejects_questions_even_when_database_has_jev():
     raw = tree_dict()
     raw.update(runtime_dict(jev=None))
     tree = tree_from_dict(raw)
 
-    issues = tree_issues(conn, tree)
+    issues = tree_issues(tree)
 
     assert "decision_service_unavailable" in {issue.code for issue in issues}
 
 
 def test_graph_snapshot_does_not_change_when_db_catalog_changes(conn, repo):
     """严格自包含：数据库目录行怎么改都不改变活动画布快照。"""
-    app = SimpleNamespace(state=SimpleNamespace())
+    app = SimpleNamespace(state=SimpleNamespace(jev_api_key=""))
     publisher = SnapshotPublisher(app, repo)
-    first = publisher.refresh(conn)
+    first = publisher.refresh()
     with conn:
         conn.execute("INSERT INTO providers VALUES ('other', 'http://other.test/v1', '', 'openai', '')")
         conn.execute("INSERT INTO models VALUES ('changed-model', 'changed', 'other', '{}')")
@@ -361,20 +391,20 @@ def test_graph_snapshot_does_not_change_when_db_catalog_changes(conn, repo):
         conn.execute("UPDATE models SET upstream = 'changed' WHERE id = 'fast'")
         conn.execute("DELETE FROM jev_services")
         conn.execute("DELETE FROM time_periods")
-    second = publisher.refresh(conn)
+    second = publisher.refresh()
     assert second.content == first.content
     assert second.snapshot_revision == first.snapshot_revision
     assert second.default_snapshot.backends["fast"].upstream_name == "fast"
     assert app.state.snapshot_set is second
 
 
-def test_load_snapshot_set_uses_default_enabled_tree_not_non_default(conn, repo):
+def test_load_snapshot_set_uses_default_enabled_tree_not_non_default(repo):
     """非默认启用图也进路由集，但默认选图仍取默认图。"""
     raw = tree_dict("other", root=direct_graph("fast"))
     raw.update(stored_catalog_runtime())
     repo.create(tree_from_dict({**raw, "enabled": True, "default": False}))
 
-    route_set = load_snapshot_set(conn, repo)
+    route_set = load_snapshot_set(repo)
 
     assert sorted(route_set.snapshots) == ["main", "other"]
     assert route_set.default_tree_id == "main"
@@ -384,36 +414,33 @@ def test_load_snapshot_set_uses_default_enabled_tree_not_non_default(conn, repo)
 
 
 def test_no_active_tree_is_a_valid_empty_snapshot_set(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "control.db"), graph_dir=str(tmp_path / "routing-graph"))
-    conn = connect(settings.db_path)
-    migrate(conn)
-    repo = RoutingTreeRepo(settings.graph_dir)
+    """零启用图是合法空路由集：装配不打开 SQLite。"""
+    repo = RoutingTreeRepo(str(tmp_path / "routing-graph"))
     repo.initialize()
-    route_set = load_snapshot_set(conn, repo)
+    route_set = load_snapshot_set(repo)
     assert route_set.snapshots == {}
     assert route_set.default_tree_id is None
     assert route_set.default_snapshot is None
     assert route_set.department_tree_ids == {}
     assert route_set.snapshot_revision  # content hash of the empty route set
-    conn.close()
 
 
-def test_bad_new_file_keeps_old_snapshot_set_and_recovers_after_repair(conn, repo, app):
+def test_bad_new_file_keeps_old_snapshot_set_and_recovers_after_repair(repo, app):
     original = app.state.snapshot_set
     path = repo.root / "graphs" / "main.json"
     path.write_bytes(b"{broken")
     try:
         with pytest.raises(GraphStorageError):
-            app.state.publisher.refresh(conn)
+            app.state.publisher.refresh()
         assert app.state.snapshot_set is original
         assert app.state.publisher.status()["stale"] is True
     finally:
         path.write_bytes(graph_document_bytes(original.default_snapshot.tree))
-    app.state.publisher.refresh_if_changed(conn)
+    app.state.publisher.refresh_if_changed()
     assert app.state.publisher.status()["stale"] is False
 
 
-def test_corrupt_graph_file_marks_stale_and_recovers(conn, repo, app):
+def test_corrupt_graph_file_marks_stale_and_recovers(repo, app):
     """路由集扫描读失败：保留旧快照并报告 stale，修复后恢复。"""
     original = app.state.snapshot_set
     path = repo.root / "graphs" / "main.json"
@@ -421,7 +448,7 @@ def test_corrupt_graph_file_marks_stale_and_recovers(conn, repo, app):
     path.write_bytes(b"{broken")
 
     with pytest.raises(GraphStorageError, match="invalid graph document: main"):
-        app.state.publisher.refresh_if_changed(conn)
+        app.state.publisher.refresh_if_changed()
 
     assert app.state.snapshot_set is original
     status = app.state.publisher.status()
@@ -430,14 +457,14 @@ def test_corrupt_graph_file_marks_stale_and_recovers(conn, repo, app):
     assert "invalid graph document: main" in status["last_load_error"]
 
     path.write_bytes(content)
-    app.state.publisher.refresh_if_changed(conn)
+    app.state.publisher.refresh_if_changed()
     recovered = app.state.publisher.status()
     assert recovered["stale"] is False
     assert recovered["last_load_error"] == ""
     assert recovered["snapshot_revision"] == status["snapshot_revision"]
 
 
-def test_invalid_route_set_marks_stale_and_recovers(conn, repo, app):
+def test_invalid_route_set_marks_stale_and_recovers(repo, app):
     """集合不变量失败（有启用图但没有默认图）在装配边界转成存储错误。"""
     original = app.state.snapshot_set
     path = repo.root / "graphs" / "main.json"
@@ -447,7 +474,7 @@ def test_invalid_route_set_marks_stale_and_recovers(conn, repo, app):
     path.write_bytes(graph_document_bytes(tree_from_dict(raw)))
 
     with pytest.raises(GraphStorageError, match="invalid route set: no_default_tree"):
-        app.state.publisher.refresh_if_changed(conn)
+        app.state.publisher.refresh_if_changed()
 
     assert app.state.snapshot_set is original
     status = app.state.publisher.status()
@@ -456,14 +483,14 @@ def test_invalid_route_set_marks_stale_and_recovers(conn, repo, app):
     assert "no_default_tree" in status["last_load_error"]
 
     path.write_bytes(content)
-    app.state.publisher.refresh_if_changed(conn)
+    app.state.publisher.refresh_if_changed()
     recovered = app.state.publisher.status()
     assert recovered["stale"] is False
     assert recovered["last_load_error"] == ""
     assert recovered["snapshot_revision"] == status["snapshot_revision"]
 
 
-def test_publisher_prepare_maps_invalid_route_set_to_storage_error(conn, repo, app):
+def test_publisher_prepare_maps_invalid_route_set_to_storage_error(repo, app):
     """装配边界回归：``prepare()`` 必须把不变量损坏转成存储错误（503 路径）。
 
     ``assemble_snapshot_set()`` 保持纯函数语义（继续抛 ``RouteSetInvariantError``），
@@ -473,16 +500,16 @@ def test_publisher_prepare_maps_invalid_route_set_to_storage_error(conn, repo, a
     broken = portable_tree(enabled=True, default=False)
 
     with pytest.raises(GraphStorageError, match="invalid route set: no_default_tree"):
-        app.state.publisher.prepare(conn, [broken], "")
+        app.state.publisher.prepare([broken], "")
 
     with pytest.raises(RouteSetInvariantError) as invariant:
-        assemble_snapshot_set([build_snapshot_for_tree(conn, broken)], fingerprint="")
+        assemble_snapshot_set([build_snapshot_for_tree(broken)], fingerprint="")
     assert invariant.value.code == "no_default_tree"
 
 
-def test_publisher_publish_stamps_route_set_fingerprint(conn, repo, app):
+def test_publisher_publish_stamps_route_set_fingerprint(repo, app):
     """发布的路由集指纹必须等于发布时使用的指纹。"""
-    prepared = app.state.publisher.prepare(conn, [portable_tree()], "")
+    prepared = app.state.publisher.prepare([portable_tree()], "")
 
     published = app.state.publisher.publish(
         replace(prepared, fingerprint=repo.route_fingerprint()))
@@ -492,7 +519,7 @@ def test_publisher_publish_stamps_route_set_fingerprint(conn, repo, app):
     assert app.state.publisher.status()["route_fingerprint"] == repo.route_fingerprint()
 
 
-def test_worker_polls_once_and_skips_unchanged_fingerprint(conn, repo, app, monkeypatch):
+def test_worker_polls_once_and_skips_unchanged_fingerprint(repo, app, monkeypatch):
     calls = 0
     import router.routing.snapshot as snapshot_module
     original_load = snapshot_module.load_snapshot_set
@@ -566,8 +593,8 @@ def test_compile_graph_sorts_immutable_topology():
         compiled.nodes["extra"] = None
 
 
-def test_published_snapshot_compiles_after_enable_validation(conn, repo):
-    snapshot = load_snapshot_set(conn, repo).default_snapshot
+def test_published_snapshot_compiles_after_enable_validation(repo):
+    snapshot = load_snapshot_set(repo).default_snapshot
     compiled = snapshot.compiled
     assert isinstance(compiled, CompiledGraph)
     assert compiled.root is snapshot.tree.root
@@ -577,7 +604,7 @@ def test_published_snapshot_compiles_after_enable_validation(conn, repo):
     assert set(compiled.ports["target"]) == set()
 
 
-def test_invalid_active_graph_is_rejected_before_compilation(conn, repo, app):
+def test_invalid_active_graph_is_rejected_before_compilation(repo, app):
     original = app.state.snapshot_set
     raw = tree_dict(enabled=True, default=True)
     raw["root"]["nodes"].append(copy.deepcopy(raw["root"]["nodes"][1]))  # duplicate node id q
@@ -585,5 +612,5 @@ def test_invalid_active_graph_is_rejected_before_compilation(conn, repo, app):
     path.write_bytes(graph_document_bytes(tree_from_dict(raw)))
 
     with pytest.raises(GraphStorageError, match="duplicate_node_id"):
-        app.state.publisher.refresh(conn)
+        app.state.publisher.refresh()
     assert app.state.snapshot_set is original

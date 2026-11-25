@@ -494,8 +494,8 @@ def test_provider_key_tristate_and_headers(client, app):
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert "sk-secret-1" not in r.text
-    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers["Authorization"] == \
-        "Bearer sk-secret-1"
+    # 内核快照不持有 Provider Key：目录密钥状态只体现在管理 API 的派生字段里。
+    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers == {}
 
     # omitted -> kept
     r = put_with_confirmation(client, "/admin/providers/local", base)
@@ -503,8 +503,7 @@ def test_provider_key_tristate_and_headers(client, app):
     assert r.json()["provider"]["key_present"] is True
     assert r.json()["provider"]["key_source"] == "stored"
     assert client.get("/admin/providers").text.count("sk-secret-1") == 0
-    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers["Authorization"] == \
-        "Bearer sk-secret-1"
+    assert app.state.snapshot_set.default_snapshot.backends["qwen3-8b"].headers == {}
 
     # "" -> cleared
     r = put_with_confirmation(
@@ -528,20 +527,21 @@ def test_provider_key_source_env_and_stored_priority(client, app, monkeypatch):
         "provider": "envprov"}).status_code == 201
     _activate_provider_canvas(client, "http://e/v1", model="env-model",
                               provider="envprov", key_env="SR_TEST_KEY")
-    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
-        "Bearer env-secret"
+    # 内核快照不持有 Provider Key：任何密钥状态下 headers 都为空，密钥状态只在
+    # 管理 API 的 key_present/key_source 上体现。
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers == {}
     # a stored key wins over the environment (contract §5.3)
     stored = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": "stored-secret"})
     assert stored.status_code == 200, stored.text
-    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
-        "Bearer stored-secret"
+    assert stored.json()["provider"]["key_source"] == "stored"
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers == {}
     # clearing the stored key falls back to the env
     cleared = put_with_confirmation(client, "/admin/providers/envprov", {
         "base_url": "http://e/v1", "api_key": ""})
     assert cleared.status_code == 200, cleared.text
-    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers["Authorization"] == \
-        "Bearer env-secret"
+    assert cleared.json()["provider"]["key_source"] == "env"
+    assert app.state.snapshot_set.default_snapshot.backends["env-model"].headers == {}
 
 
 def test_put_provider_validation_and_audit(client):
@@ -980,8 +980,8 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
         conn.close()
 
     app = make_app(tmp_path)
-    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"] == \
-        "Bearer sk-json-secret"
+    # 内核快照不解析数据库已存密钥：即使目录里有端点匹配的密钥，headers 也为空。
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers == {}
     client = TestClient(app)
     preview = client.put(
         "/admin/providers/local", json={"base_url": "http://new-upstream.test/v1"})
@@ -989,8 +989,7 @@ def test_provider_endpoint_change_clears_stored_key_and_headers(tmp_path):
     # 未确认：画布与快照都不变。
     assert app.state.snapshot_set.default_snapshot.backends["fast"].url == \
         "http://json-only.test/v1/chat/completions"
-    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers["Authorization"] == \
-        "Bearer sk-json-secret"
+    assert app.state.snapshot_set.default_snapshot.backends["fast"].headers == {}
 
     response = client.put("/admin/providers/local", json={
         "base_url": "http://new-upstream.test/v1",

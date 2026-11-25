@@ -4,10 +4,10 @@ v4 文档自带 ``enabled`` / ``default`` / ``departments``，仓储只按文件
 本服务是生命周期的唯一写入方。
 
 - `create`：强制 ``enabled=False, default=False``（生命周期是服务端状态）→
-  画布自身完整校验（结构 + 启用级；`tree_issues`）→ 文档写入 → 审计；
+  画布自身完整校验（结构 + 启用级；`tree_issues`）→ 文档写入 → 审计回调；
   不发布快照。
 - `copy`：锁内读取源画布并做同一套完整校验（`tree_issues`）→ 文档写入
-  （副本强制关闭）→ 审计；不发布快照。
+  （副本强制关闭）→ 审计回调；不发布快照。
 - `update`：锁内按 root 优先合并已存 envelope → 部门补丁 → 画布自身完整校验
   （启用/未启用同一套）。启用图更新走 ``_commit_enabled_changes()``：重算并
   发布整个启用集合；纯草稿更新只写文件、不发布。
@@ -24,7 +24,7 @@ v4 文档自带 ``enabled`` / ``default`` / ``departments``，仓储只按文件
 所有启用集合写入共用一个助手 ``_commit_enabled_changes()``：校验写入树的启用级
 问题 → ``route_set_indices(candidate_enabled)``（部门冲突/默认图缺失绝不落盘）→
 ``stage_updates`` 只暂存实际写盘的图 → 提交 → ``publisher.prepare`` 候选快照 →
-指纹复核 → 审计 → 发布。失败时批次回滚并丢弃暂存文件。
+指纹复核 → 审计回调 → 发布。失败时批次回滚并丢弃暂存文件。
 
 发布是纯内存替换（`SnapshotPublisher.publish`），绝不改文件或数据库；
 服务抛出的异常由 API 层映射（ValidationFailed→422、GraphConflictError→409、
@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sqlite3
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 
@@ -50,7 +49,6 @@ from router.routing.route_set import RouteSetInvariantError, route_set_indices
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
 from router.routing.runtime import RUNTIME_FIELDS, runtime_to_dict
 from router.routing.tree import RoutingTree, tree_from_dict, tree_revision_of
-from router.store.repositories import ChangeRepo, now_iso
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
     GraphBatch,
@@ -127,16 +125,21 @@ class GraphPatch:
 
 
 class GraphService:
-    def __init__(self, conn: sqlite3.Connection, trees: RoutingTreeRepo, publisher):
-        self.conn = conn
+    def __init__(self, trees: RoutingTreeRepo, publisher, audit=None):
+        """``audit(action, detail)`` 为可选审计回调；``None`` 时不写审计。
+
+        内核不持有 SQLite：审计行由外围（API 层）注入的回调记录，服务只负责
+        在提交成功后调用它。
+        """
         self.trees = trees
         self.publisher = publisher
+        self.audit = audit
 
     # ── CRUD ────────────────────────────────────────────────────────────
     def create(self, tree: RoutingTree) -> RoutingTree:
         # 生命周期是服务端状态：新建图一律关闭、非默认（仓储只按给定文档落盘）。
         tree = dataclass_replace(tree, enabled=False, default=False)
-        issues = tree_issues(self.conn, tree)
+        issues = tree_issues(tree)
         if issues:
             raise ValidationFailed(issues)
         with self.publisher.locked():
@@ -163,7 +166,7 @@ class GraphService:
             if not isinstance(base_document_sha256, str) \
                     or not _SHA256_RE.fullmatch(base_document_sha256):
                 raise GraphConflictError(current.document_sha256)
-            issues = tree_issues(self.conn, tree)
+            issues = tree_issues(tree)
             if issues:
                 raise ValidationFailed(issues)
             if not current.enabled:
@@ -192,7 +195,7 @@ class GraphService:
             source = self.trees.get(tree_id)
             if source is None:
                 raise MissingError(f"unknown tree {tree_id}")
-            issues = tree_issues(self.conn, source)
+            issues = tree_issues(source)
             if issues:
                 raise ValidationFailed(issues)
             try:
@@ -218,7 +221,7 @@ class GraphService:
                 raise MissingError(f"unknown tree {tree_id}")
             if tree.enabled:
                 return
-            issues = tree_issues(self.conn, tree)
+            issues = tree_issues(tree)
             if issues:
                 raise ValidationFailed(issues)
             enabled = self.trees.enabled()
@@ -315,7 +318,7 @@ class GraphService:
         """
         with self.publisher.locked():
             for tree, _expected_sha in writes:
-                issues = tree_issues(self.conn, tree)
+                issues = tree_issues(tree)
                 if issues:
                     raise ValidationFailed(issues)
             try:
@@ -327,7 +330,7 @@ class GraphService:
                 batch.commit()
                 fingerprint = self.trees.route_fingerprint()
                 prepared = self.publisher.prepare(
-                    self.conn, self.trees.enabled(), fingerprint)
+                    self.trees.enabled(), fingerprint)
                 if self.trees.route_fingerprint() != fingerprint:
                     raise GraphChangedDuringLoad("route set changed during publish")
                 self._audit(action, detail)
@@ -394,8 +397,6 @@ class GraphService:
             batch.discard()
 
     def _audit(self, action: str, detail: dict) -> None:
-        try:
-            with self.conn:
-                ChangeRepo(self.conn).record(now_iso(), "tree", {"action": action, **detail})
-        except sqlite3.Error:
-            logger.exception("graph change committed but audit write failed: %s", action)
+        if self.audit is None:
+            return
+        self.audit(action, detail)
