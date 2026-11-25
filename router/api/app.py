@@ -65,7 +65,6 @@ from router.store.repositories import (
 from router.store.routing_trees import (
     GraphAlreadyExistsError,
     GraphConflictError,
-    GraphReadOnlyError,
     GraphStorageError,
 )
 from router.upstream.breaker import CircuitBreaker
@@ -244,10 +243,6 @@ def create_app(
             "code": "graph_already_exists",
             "tree_id": str(exc),
         }})
-
-    @app.exception_handler(GraphReadOnlyError)
-    async def graph_read_only_handler(request: Request, exc: GraphReadOnlyError):
-        return JSONResponse(status_code=503, content={"detail": {"code": "graph_read_only"}})
 
     @app.exception_handler(GraphStorageError)
     async def graph_storage_handler(request: Request, exc: GraphStorageError):

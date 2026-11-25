@@ -4,7 +4,12 @@
 
 English | [简体中文](README.zh-CN.md)
 
-RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/chat/completions`; a versioned decision graph selects the upstream model. Graphs are edited, validated, dry-run, saved and enabled in the built-in console.
+RoutePilot is an intelligent routing system built from one repository and shipped as **two deployable services**:
+
+- **`routepilot-core` (decision kernel)** — owns the versioned decision graphs, makes every routing decision (graph execution, decision service/JEV, reasonings, session affinity) and emits one self-contained decision event per real decision. It never calls a model upstream and holds no SQLite database, console or people data. Start it with `python -m router core`.
+- **`routepilot-console` (peripheral)** — the optional user-facing service: console, login/people, SQLite configuration catalog, graph-management proxy to the kernel, the standalone OpenAI-compatible `/v1/chat/completions` data plane and the volatile 20-event decision log. Start it with `python -m router peripheral`.
+
+Deploy both for a complete standalone service, or deploy only the kernel as the decision component behind APISIX + newapi (the 163 form). Graphs are edited, validated, dry-run, saved and enabled in the console; every graph request is authenticated by the peripheral and executed by the kernel.
 
 ![RoutePilot decision canvas](assets/routepilot/en/routing-canvas.png)
 
@@ -12,7 +17,8 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 
 | Area | Capability |
 |---|---|
-| Entry point | `POST /v1/chat/completions`, JSON and SSE, `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` response headers |
+| Services | Kernel (`python -m router core`) and optional peripheral (`python -m router peripheral`) from one image; the kernel owns the graph JSON and all decisions, the peripheral owns console/SQLite/execution |
+| Entry point | Peripheral `POST /v1/chat/completions` (standalone form) and kernel `POST /internal/v1/route-decision` (APISIX form); JSON and SSE; `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` response headers |
 | Routing policy | Visual decision graph: conditions, decision-service questions, logic gates, model targets |
 | Route set | Several decision graphs can be enabled at once; exactly one default graph serves public `/v1`, and department mappings let admin checks target a specific enabled graph |
 | Decision service | `choice` / `noul` / `score` questions, batched per wave, sent to a `systemone`-compatible service; the canvas snapshot fixes which service profile a graph runs with |
@@ -20,30 +26,49 @@ RoutePilot is an OpenAI-compatible routing proxy. Requests enter through `/v1/ch
 | Backend selection | Session affinity; random pick among a multi-model target's available models; Auto isolates circuit breaking and inflight per graph+model; fixed-model direct stays independent |
 | Portable canvases | Every saved v4 canvas embeds its lifecycle markers, departments and complete non-secret run configuration, so one JSON file restores it on an empty database |
 | Check routing | `/admin/try` executes the same graph and trace format without touching affinity, inflight counters or upstream models; it runs either the current draft or the active route set (optionally selected by department), and database drift is reported as hints only |
-| Operations | Request ledger, decision replay, confidence distribution, model/provider catalog, multi-service JEV catalog, time periods, audit history, role-based users |
+| Operations | Volatile 20-event decision log with eviction/replay, confidence distribution, model/provider catalog, non-secret multi-service JEV catalog, time periods, audit history, role-based users |
 | Console | Bilingual (zh/en) native ES Modules, no build step |
 
-## Request pipeline
+## Request chains
 
-```mermaid
-flowchart LR
-  C[Client] --> V["/v1/chat/completions"]
-  V --> G[Graph evaluator]
-  G <--> J["Decision service /v1/systemone"]
-  G --> T["Target selection<br/>priority · fallback"]
-  T --> A[Session affinity]
-  A --> L["random pick<br/>+ circuit breaker"]
-  L --> U[Upstream model]
-  G -. trace .-> R[(Request ledger)]
+**Standalone (kernel + peripheral).** The peripheral answers the OpenAI-compatible endpoint and asks the kernel for exactly one decision:
+
+```text
+client
+  → peripheral POST /v1/chat/completions
+  → kernel   POST /internal/v1/route-decision   (no user Authorization)
+  → peripheral rewrites the request model to the kernel's real model
+  → peripheral resolves the Provider Key from its own SQLite catalog
+  → model upstream
+  → peripheral passes JSON / SSE through
+
+kernel decision event → peripheral POST /internal/v1/decision-logs → in-memory deque(maxlen=20)
 ```
 
-1. Pick the graph from the active route set: public `/v1` always uses the default graph, while admin checks may select an enabled graph by department.
-2. Load that graph's immutable snapshot and evaluate request conditions (time period, text keywords).
+**Kernel behind APISIX + newapi (163 form).** APISIX keeps the original newapi chain and only asks the kernel which model to run:
+
+```text
+client
+  → APISIX Auto Route (model == "auto")
+  → forward-auth: original Authorization is validated by newapi, which injects the trusted department
+  → sr-auto-router asks kernel POST /internal/v1/route-decision WITHOUT Authorization
+  → APISIX rewrites only the JSON body `model` (and Content-Length)
+  → the original newapi upstream/plugins/Authorization execute that model
+  → APISIX passes JSON / SSE through
+```
+
+Fixed-model requests bypass the kernel entirely. If no valid decision is produced, APISIX returns 503 and never sends `auto` to newapi. The kernel never becomes a model upstream.
+
+Steps inside every decision (both forms, executed by the kernel):
+
+1. Pick the graph: an enabled graph by trusted department, else the default graph.
+2. Load that graph's compiled snapshot and evaluate request conditions (time period, text keywords).
 3. Activate the first question wave; all questions in one wave are merged into one decision-service call.
 4. Write numeric and `selected` ports, then re-evaluate downstream slot conditions and logic gates.
 5. Repeat wave by wave until no further question is activated.
 6. Select the highest-priority activated target; otherwise use `error_fallback`.
-7. Apply session affinity; on a miss, pick one of the target's available models at random, then proxy the request upstream.
+7. Apply session affinity; on a miss, pick one of the target's available models at random.
+8. Emit one self-contained decision event (best effort) with the full graph and trace.
 
 `unknown` never activates a question or target. A numeric comparison against an unknown value stays unknown.
 
@@ -51,31 +76,37 @@ flowchart LR
 
 | Layer | Path | Responsibility |
 |---|---|---|
-| API | `router/api/` | DTO parsing, exception-to-HTTP mapping, upstream proxy, presenters |
-| Control plane | `router/control/` | Write use cases for graphs and catalog entries, impact lists and confirmed canvas synchronization, enable validation |
+| Kernel app | `router/api/core_app.py`, `router/api/routes_decision.py` | `create_core_app()`: graph management `/internal/v1/trees*`, decision `/internal/v1/route-decision`, atomic batches `/internal/v1/graph-batches`, `/healthz`, `/readyz`; no SQLite/console/upstream |
+| Peripheral app | `router/api/app.py`, `router/api/routes_core_proxy.py` | `create_app()`: console, login/people, catalog APIs, graph-management proxy to the kernel, standalone `/v1` data plane, decision-event receiver |
+| Cross-service clients | `router/core_client.py`, `router/api/routes_v1.py`, `router/upstream/execution.py` | Kernel decision/management HTTP client; peripheral execution catalog join (decision model + Provider Key) |
+| Decision events | `router/decision_events.py`, `router/decision_log_sink.py`, `router/decision_log_store.py` | Self-contained event schema/validation, kernel best-effort async sink, peripheral 20-event memory log and replay projections |
+| API | `router/api/` | DTO parsing, exception-to-HTTP mapping, presenters |
+| Control plane | `router/control/` | Graph write use cases (kernel side), catalog writes with cross-service atomic graph batches and compensating rollback, impact lists, enable validation |
 | Routing domain | `router/routing/` | Graph model, validation, compiled topology, evaluator, scheduler, immutable route-set snapshots |
-| Decision service | `router/jev/` | `systemone` client, service settings, input window |
-| Upstream | `router/upstream/` | Fixed-model catalog (`model_id -> Backend`), proxy transport, circuit breaker and sync worker |
-| Storage | `router/store/` | SQLite schema/repositories, graph-file repository |
-| Console | `router/console/` | Bilingual native ES Module UI |
-| Runtime | `router/request_logging.py`, `router/maintenance.py` | Ledger queue/worker, session purge |
+| Decision service | `router/jev/` | `systemone` client, service settings (non-secret), input window |
+| Upstream | `router/upstream/` | Fixed-model catalog (`model_id -> Backend`), peripheral proxy transport and breaker, execution-catalog resolution |
+| Storage | `router/store/` | Peripheral SQLite schema/repositories, kernel graph-file repository |
+| Console | `router/console/` | Bilingual native ES Module UI (peripheral-only) |
+| Runtime entry | `router/__main__.py` | `python -m router core|peripheral` |
 
 Boundaries:
 
-- `router/routing/` and `router/upstream/` import neither FastAPI nor SQLite. `router/control/` and `router/store/` do not import `router.api`.
-- The API layer parses DTOs and maps exceptions; it does not write control-plane state. Account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
-- `GraphService` validates, prepares the candidate route set, writes lifecycle documents under the single-writer lock, re-checks the route fingerprint, publishes the complete enabled set, then records the audit entry. A stale draft returns 409.
-- `ConfigurationService` commits a catalog write and the canvases confirmed to be affected inside one application transaction: re-check the impact list under the write lock, validate every candidate document, stage/replace graph files (non-default enabled graphs first, the default graph last), re-check the route-set fingerprint, record the audit entry, then commit. A write that synchronizes at least one enabled graph republishes the whole enabled set; a draft-only sync publishes nothing; a stale confirmation returns 409 `graph_conflict` before any write.
+- The kernel is the only writer of the graph JSON directory (global design constraint); the peripheral never mounts or writes it. The peripheral is the only writer of its own SQLite database.
+- `router/routing/` and `router/upstream/` import neither FastAPI nor SQLite. `router/control/` and `router/store/` do not import `router.api`; the kernel app imports no `router.store.db`.
+- The kernel app overrides the `get_conn` dependency with `None`, so the same graph routes run without any SQLite connection; audit rows and catalog drift hints are peripheral-only concerns injected through the proxy.
+- The peripheral's API layer parses DTOs and maps exceptions; it does not write graph state. Account and session routes (`/admin/login`, `/admin/logout`, `/admin/users`, `/admin/me`) call `UserRepo`/`SessionRepo`/`ChangeRepo` directly.
+- `GraphService` (kernel) validates, prepares the candidate route set, writes lifecycle documents under the single-writer lock, re-checks the route fingerprint, publishes the complete enabled set, then records the audit entry. A stale draft returns 409.
+- A catalog write that can touch graphs commits in two phases: the peripheral re-checks the impact list, asks the kernel to atomically replace every confirmed canvas in one conditional batch (`POST /internal/v1/graph-batches`: baseline check → strict validation → route-set validation → one commit/publish), then commits its own SQLite rows. If the SQLite commit fails after the kernel committed, the peripheral compensates with a reverse batch built on the new base hashes; a failed compensation is a hard 503 `catalog_sync_diverged` (never a silent partial update). A write that synchronizes at least one enabled graph republishes the whole enabled set; a draft-only sync publishes nothing; a stale confirmation returns 409 `graph_conflict` before any write.
 - A catalog write that nothing references writes rows and audit only. It never rewrites canvases and never republishes the snapshot.
-- `compile_graph()` runs once per enabled graph in a published route set. The request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
-- The event loop only enqueues ledger rows into a bounded queue and a 20-entry ring; a 2-second flush projects the whitelisted ledger columns, pairs each request's captured graph snapshot with its trace, and writes both through `asyncio.to_thread`.
-- The breaker worker loads shared quarantine state at startup and syncs local changes every 30 seconds on a worker thread.
+- `compile_graph()` runs once per enabled graph in a published route set. The kernel request path reads `snapshot.require_compiled()` and never rebuilds indexes or opens SQLite.
+- Each real kernel decision builds one self-contained event and hands it to a bounded async queue (`Queue(1000)`): best-effort HTTP delivery with a short timeout, drop counters for observability, no disk retry and no effect on the decision response. `logging.type=disabled` makes the sink a no-op.
+- Session affinity and kernel scheduling/inflight counters are process-local; the peripheral has its own execution-side circuit breaker for upstream failures.
 
 ## Console
 
 ![Test](assets/routepilot/en/test.png)
 
-One `<script type="module">` entry per page, no application globals, no CommonJS.
+One `<script type="module">` entry per page, no application globals, no CommonJS. The console is served by the **peripheral** only (`/console/`); the kernel process has no static mount.
 
 | Page | Content |
 |---|---|
@@ -91,7 +122,7 @@ One `<script type="module">` entry per page, no application globals, no CommonJS
 - The decision-group toolbar shows every editing action directly: undo/redo, auto-layout, **Save**, New, Import, Export and (for an enabled group) **Disable**, next to **Check routing**, the primary button and the issue counter. Saving is the standalone **Save** button; the primary button only expresses enablement — **Enable** for a new or saved disabled group, **Enabled** (disabled) for an enabled group, **Saving…** while a save or enable is in flight. The core version operations are **Save** and **Enable**: saving an enabled graph takes effect for later requests immediately, saving a disabled draft leaves the running route set untouched, and enabling a graph with unsaved edits saves it first. **Disable** and **Set as default** are separate lifecycle controls. Several groups can be enabled at once and the selector marks the default graph; an enabled non-default group also offers **Set as default**. **Disable** is blocked for the default graph while another enabled group remains — switch the default first. Departments are edited in graph settings. The inspector's **Apply** only updates the local draft and never writes to the server.
 - Graph settings (inspector) select the JEV service from the database catalog and apply **JEV + its window** in one history step; **Refresh runtime config from database** rebuilds the draft's `backends`/`jev`/`jev_window`/`time_periods` from the catalog. Neither action writes the server.
 - On the Models page, **Connect models** is the default entry and a preset catalog onboards the provider and its models in one save. Model IDs are generated automatically. The preset dialog's Advanced holds only connection details and slot IDs; manual IDs, reasoning declarations, tiers, domains and provider protocol settings live in the custom form's Advanced.
-- The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, key, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The environment can create a `default` service from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` / `ROUTER_JEV_API_KEY`, but only once: it is seeded on a start where the catalog is empty, no environment seed has ever run, and the URL and model are both set. A first boot without them followed by a boot with them still seeds once; deleting every service and restarting never re-creates it.
+- The **Decision service** page is a catalog: the left side lists services, the right side edits the selected one (address, model, `key_env`, timeout, instructions, state template, input/context window) and tests it. The window belongs to the service, so a canvas always replaces JEV and window together. The catalog stores no key material — the JEV key belongs to the kernel environment (`ROUTER_JEV_API_KEY`); the peripheral Test button only works when the peripheral process happens to have that variable. The environment can create a `default` catalog entry from `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` (no key), but only once: it is seeded on a start where the catalog is empty, no environment seed has ever run, and the URL and model are both set. A first boot without them followed by a boot with them still seeds once; deleting every service and restarting never re-creates it.
 - Editing or deleting a model, provider or JEV service that a canvas references raises a two-step confirmation; a resource that no canvas references is written immediately. The first write returns 409 with every affected canvas (name, id, enabled, current `document_sha256`, usage); confirming sends those exact hashes back and the server synchronizes only the affected canvases. Model/JEV deletes that are still referenced need a replacement; a provider that a database model or a canvas model still references cannot be deleted at all. After a confirmed sync, reload every already-open canvas (or use **Refresh runtime config from database**) — open drafts are not updated in place.
 
 ### Model test chat
@@ -133,9 +164,21 @@ A draft routing check highlights the winning path wave by wave and can arrange t
 
 ![Calculation log](assets/routepilot/en/logs.png)
 
-Expanded rows show the calculation stages in order: input preparation, initial computation, per-wave JEV, candidates and final pick, model scheduling, execution result. Latency is decision time only — entering the router to selecting the model — and never includes upstream generation; upstream status and end-to-end totals stay in the gateway data plane and out of the routing console. A `routing_error` keeps the partial process up to the failure point: a schedule-stage failure keeps the scheduling snapshot (configured, registered, available, unavailable reasons, pre-selection inflight), and a failed JEV wave voids that round's candidates and falls to `error_fallback`. Records without a scheduling snapshot and restored ledger rows report the missing detail explicitly.
+The decision log is the peripheral's **volatile in-memory ring**: the kernel emits one complete `routepilot.decision` event per real decision (best effort), the peripheral validates it and keeps only the newest 20 events (`deque(maxlen=20)`). Nothing is written to SQLite, nothing survives a restart, and evicting or restarting is final — the 21st event drops the oldest one and its replay then returns 404. There is no graph-snapshot table and no ledger writer any more.
 
-SQLite keeps two kinds of rows. **Ledger rows** (`request_logs`) hold the whitelisted decision columns only — no request text, per-wave answers or node labels. **Request snapshots** are captured when the request is logged: the selected graph's complete canonical document plus the request trace, written as one content-addressed `graph_snapshots` row (SHA-256 over the canonical graph content; identical content from several requests reuses one row, and only real behaviour, layout or identity changes create a new version — `enabled`/`default`, revisions, `updated_at` and the document hash never split it) plus one `request_snapshots` row per request that references that graph and keeps its trace. The page reads the last 20 live records from an in-process ring; opening a record's log snapshot starts a read-only replay that reads the memory ring first and then the immutable SQLite rows — never the current graph file or the current route set. Changing the current graph or restarting the process therefore still replays the graph and trace captured at request time. Snapshot writes stay best-effort: a failed pair is retried on later flushes, and when no snapshot exists the page reports that it cannot load the log snapshot instead of faking history. This phase adds no automatic deletion or retention policy, so log capacity is driven by the number of distinct graph contents and retained requests, not by how often a graph is saved or enabled.
+Each event is self-contained: `schema_version` (`1`), `event_type` (`routepilot.decision`), `id` / `ts`, the request facts (text, requested model, trusted department, session hash), the **complete graph document actually used** (non-secret run configuration included), the decision values (status, logical/real model, target, graph/path selection reasons, fallback, stickiness, policy path, reasoning, timings), the JEV facts and answers, the full replay trace and node labels. It carries no Provider key, no JEV key, no `Authorization` and no graph-snapshot IDs; `key_env` names are allowed because they are not secrets. Only decisions are recorded — never newapi channel/billing, model-upstream state or token usage.
+
+Expanded rows show the calculation stages in order: input preparation, initial computation, per-wave JEV, candidates and final pick, model scheduling. Latency is decision time only — entering the kernel to selecting the model — and never includes upstream generation; upstream status and end-to-end totals stay in the gateway data plane and out of the routing console. A `routing_error` event keeps the partial process up to the failure point and still embeds the selected graph; requests rejected before graph selection (bad parameters) or with no current graph produce no replayable event.
+
+Replay pages keep working exactly as before: `routing.html?request=<decision id>` loads the event's own `graph` and `trace` through the existing `controller.loadTree()` / `rebuildTryRun()` path. Because the graph is embedded in the event, editing or deleting the current graph later does not change a retained replay. The page sends the list request to `GET /admin/requests/recent` (summaries only — a 20-event list never ships 20 full graphs) and the single replay to `GET /admin/requests/{id}/replay`.
+
+### Decision events and logging configuration
+
+The kernel decides the sink through its `config.json`:
+
+- `logging.type = "routepilot"` (default for the standalone form): send events asynchronously to `logging.url`, e.g. `http://console:8400/internal/v1/decision-logs`, with `timeout_ms` (default 1000). Delivery is best effort: bounded queue, short timeout, drop counters for observability, failures never affect the decision response.
+- `logging.type = "disabled"`: explicitly produce no event output (the kernel-only 163 deployment uses this). Decisions keep working and no event copies are kept inside the kernel.
+- VictoriaLogs is **not implemented** in this period; the event schema is fixed so a future `logging.type=victorialogs` adapter can serialize the same objects as JSON Lines.
 
 ## Decision graph
 
@@ -197,7 +240,7 @@ Conditions live on edges:
 
 ### Graph document
 
-A v4 document is a complete, portable canvas: its lifecycle markers (`enabled`/`default`), its department mapping (`departments`), the graph and its four required run fields. Lifecycle is persisted inside every document — there is no `ROUTER_GRAPH_DIR/current` pointer any more. New and copied documents are always saved with `enabled: false, default: false`, and importing only replaces the draft (it never changes lifecycle): saved as a new group an imported document is stored closed, while saving it into an existing group inherits that group's lifecycle (an enabled group stays enabled). The first graph enabled through the lifecycle API automatically becomes the default graph.
+A v4 document is a complete, portable canvas: its lifecycle markers (`enabled`/`default`), its department mapping (`departments`), the graph and its four required run fields. Lifecycle is persisted inside every document — there is no `current` pointer any more. New and copied documents are always saved with `enabled: false, default: false`, and importing only replaces the draft (it never changes lifecycle): saved as a new group an imported document is stored closed, while saving it into an existing group inherits that group's lifecycle (an enabled group stays enabled). The first graph enabled through the lifecycle API automatically becomes the default graph.
 
 ```json
 {
@@ -265,7 +308,7 @@ Every decision group is one v4 JSON file carrying `departments`, `enabled` and `
 
 ![Models](assets/routepilot/en/models.png)
 
-A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; when more than one is available, one is picked at random. The **catalog** (SQLite) is the management source for the console dropdowns and for fixed-model direct requests; each **enabled graph's canvas snapshot** is the only source for Auto routing.
+A model slot used by the graph maps to an upstream model id and a provider. A target can hold several slots; when more than one is available, one is picked at random. The **catalog** (peripheral SQLite) is the management source for the console dropdowns and for fixed-model direct requests; each **enabled graph's embedded canvas run configuration** is the only source for the kernel decision. In the APISIX form the kernel only returns the real model name; newapi executes it. In the standalone form the peripheral joins the kernel decision with its own catalog and Provider Key through `router/upstream/execution.py` — a model missing from the execution catalog, or a catalog provider/base URL that drifted from the kernel decision, returns 503 `execution_catalog_mismatch` without calling any upstream.
 
 Providers define the OpenAI-compatible base URL, API-key environment variable and reasoning dialect. Model profiles declare:
 
@@ -289,52 +332,48 @@ A provider API key never appears in a response: the projection exposes `key_pres
 
 ![Decision service settings (JEV)](assets/routepilot/en/jev.png)
 
-The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. The console page manages a **catalog of services**, not a single global configuration:
+The decision service exposes `POST /v1/systemone`; typical deployments use NeoHorse or vLLM. The kernel calls the service configured by the selected graph; the console page manages a **non-secret catalog of services**, not a single global configuration:
 
-- The list shows every service with its ID, model and endpoint. Create, edit and delete are per service; the window (`input_tokens` / `context_tokens`) belongs to the service together with its prompts, timeout, `key_env` and key.
-- **Test** calls `POST /admin/jev/{id}/test` and uses the database service configuration, not any graph's canvas snapshot. Canvas execution is checked by the routing check, which reports drift as hints.
-- A canvas selects one service (`jev.id` + `key_env`) and embeds its complete non-secret profile plus its window. JEV and window are replaced together whenever a canvas selects, refreshes or receives a server-side sync — mixing two services is not representable.
-- Only `key_env` (an environment-variable name) and the service URL/model are portable. The real `api_key` lives only in SQLite and is reused when the service `id`, `base_url` and `model` all still match; otherwise the service's `key_env` environment variable is read when a snapshot is built. A global `ROUTER_JEV_API_KEY` fallback does not exist; the seeded `default` service happens to use that variable name as its `key_env`.
+- The list shows every service with its ID, model and endpoint. Create, edit and delete are per service; the window (`input_tokens` / `context_tokens`) belongs to the service together with its prompts and timeout. The catalog stores **no key material** — `api_key` is an unknown field (422) and the old `key_present`/`key_source` states were removed with the v7 migration.
+- **The JEV key belongs to the kernel.** The kernel reads it only from the environment variable named by `config.json` `jev.api_key_env` (default `ROUTER_JEV_API_KEY`) and passes it directly to the JEV endpoint. The peripheral and its SQLite never see it, and there is no key input in the console.
+- **Test** calls `POST /admin/jev/{id}/test` with the catalog service configuration. It only proves connectivity when the peripheral process itself has the key in its environment (`ROUTER_JEV_API_KEY`); a split deployment has no peripheral JEV key, so use the routing check / kernel decision for real JEV evidence there.
+- A canvas selects one service (`jev.id` + `key_env`) and embeds its complete non-secret profile plus its window; `key_env` is kept as a schema-compatible environment-variable name and the catalog projection fixes it to `ROUTER_JEV_API_KEY`. JEV and window are replaced together whenever a canvas selects, refreshes or receives a server-side sync — mixing two services is not representable.
 - Deleting a service that a canvas references requires a replacement service, and synchronizes the affected canvases (JEV profile + window) after confirmation. Updating a referenced service is also confirmed and synchronized the same way.
 
 ## Access and operations
 
-- Email/password login, scrypt hashing, opaque bearer sessions.
-- `admin` can edit graphs, models, providers, JEV services and users; `viewer` is read-only.
+- Email/password login, scrypt hashing, opaque bearer sessions — all in the peripheral. The kernel exposes no login, people, session or `/admin/*` API.
+- `admin` can edit graphs (through the kernel proxy), models, providers, JEV services and users; `viewer` is read-only.
 - The last active admin cannot be demoted, disabled or deleted.
-- User and configuration changes are recorded in the audit log.
-- Graph files are content-addressed by SHA-256 for save conflicts and reload checks; the graph store keeps no version history — replacing the in-memory route set is not a persisted release. Historical replay instead uses the request-time snapshots in SQLite.
-- Control-plane state is SQLite (WAL); routing graphs are shared JSON files. Ledger writes run on a worker thread.
-- Session affinity and inflight counters are process-local.
+- User and configuration changes are recorded in the peripheral audit log.
+- Graph files are content-addressed by SHA-256 for save conflicts and reload checks; the graph store keeps no version history — replacing the in-memory route set is not a persisted release. Historical replay instead uses the graph embedded in each retained decision event.
+- Peripheral control-plane state is SQLite (WAL): people, sessions, providers, model catalog, non-secret JEV catalog, time periods and change records only. Routing graphs are JSON files owned by the kernel.
+- Session affinity and kernel scheduling/inflight counters are process-local; the peripheral execution breaker is process-local too.
 
-## Graph storage and replicas
+## Graph storage (kernel-owned)
 
-Graphs are not stored in SQLite. Each decision group is one v4 document at `ROUTER_GRAPH_DIR/graphs/{tree_id}.json`; lifecycle comes from the document's own `enabled`/`default` fields — the old `ROUTER_GRAPH_DIR/current` pointer is neither read nor written. Every document **must** carry its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`), because a saved canvas is the only runtime source for Auto routing. There is no `runtime:null` marker, no "save as legacy document" mode, and no server-side step that materializes configuration into an older file.
+Graphs are stored **only** as JSON files, never in SQLite, and only the kernel writes them. Each decision group is one v4 document at `<graphs.directory>/graphs/{tree_id}.json`; lifecycle comes from the document's own `enabled`/`default` fields — the old `current` pointer is neither read nor written, and there is no database fallback. Every document **must** carry its own run configuration (`backends`, `jev`, `jev_window`, `time_periods`), because a saved canvas is the only runtime source for a decision. The directory comes from `config.json` `graphs.directory` (`/data/graphs` in the standalone compose form, `/data/graph` on the 163 PVC — the existing persisted path is kept).
 
-- Single writer: the admin API. Other replicas run with `ROUTER_GRAPH_WRITER=false`, mount the directory read-only and reload every 2 seconds when the route fingerprint changes.
-- A replica validates and compiles **every** enabled graph before replacing the serving route set; any invalid enabled graph skips the publish, a previously published set keeps serving, and `/readyz` reports `stale: true` with `last_load_error` (not ready if no publish ever succeeded).
-- Enable/disable and default switches are ordinary document writes: non-default enabled graphs are staged first and the default graph last, then the complete enabled set is republished.
-- Writes are atomic through temporary files with mode `0600`.
-- Kubernetes: ReadWriteMany PVC for graph files; SQLite on local storage for the writer.
-- Docker: mount the same NFS export into every container.
-- All writer/reader containers must share the same numeric UID; mode `0600` files are not accessible through GID or `fsGroup` alone.
+- **Single writer: the kernel.** The peripheral never mounts or writes the directory; every graph change is proxied over HTTP to `/internal/v1/trees*`. A process manager must run exactly one kernel writer against one graph directory (the 163 Deployment uses `Recreate` and retires the old single-service workload before starting the kernel).
+- The kernel validates and compiles **every** enabled graph when it loads or publishes the route set; any invalid enabled graph skips the publish, a previously published set keeps serving, and `/readyz` reports `stale: true` with `last_load_error` (not ready if no publish ever succeeded).
+- Enable/disable, default switches and catalog-driven multi-graph updates are atomic: a conditional batch stages all candidate files, validates the resulting enabled set, then commits and republishes the complete enabled set; a failure rolls back the batch.
+- Writes are atomic through temporary files with mode `0600`; the kernel process (uid 10001 in the image) must own the directory.
+- Kubernetes: one ReadWriteOnce/ReadWriteMany PVC for the kernel graph directory (`/data/graph` on 163), `Recreate` strategy, no console deployment.
+- Docker standalone: named volume `core-graphs` for the kernel, separate `console-data` volume for peripheral SQLite.
 - A stale save returns 409 `graph_conflict`; imports only change the draft.
-- `/healthz` is liveness. `/readyz` reports route-set readiness and exposes `default_tree_id`, `enabled_tree_ids`, `snapshot_revision` and `route_fingerprint`; 503 means not ready, and a later reload failure keeps the existing route set with `"stale": true`.
-- The schema upgrades itself (see [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation)); there is no SQLite-to-graph export script any more — a canvas is moved by exporting/importing its JSON file.
+- Kernel `/healthz` is liveness; `/readyz` reports route-set readiness and exposes `default_tree_id`, `enabled_tree_ids`, `snapshot_revision` and `route_fingerprint`; 503 means not ready, and a later reload failure keeps the existing route set with `"stale": true`. Peripheral `/readyz` reports only its own SQLite state — an unreachable kernel is a data-plane error, not a readiness failure, so operators can still open the console.
+- The peripheral SQLite schema upgrades itself (see [Upgrading from a pre-split installation](#upgrading-from-a-pre-split-installation)); there is no SQLite-to-graph export script any more — a canvas is moved by exporting/importing its JSON file.
 
-## Upgrading from a pre-snapshot installation
+## Upgrading from a pre-split installation
 
-Two things change for an existing deployment.
+The core/peripheral split changes what each process owns. Do this in order:
 
-1. **The SQLite schema migrates automatically on first start.** Schema v5 upgrades to v6 inside one transaction: the old single-row `jev_config` becomes the `jev_services` service with id `default` (stored key, endpoint, model, prompts and timeout are preserved; the window is clamped to legal bounds), and the old table is dropped. Back up `router.db` (with `router.db-wal` / `router.db-shm`) before the upgrade; there is no path back to the old single-configuration layout. If the JEV catalog is empty and the environment seed has never run, `ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` create that `default` service once, with `ROUTER_JEV_API_KEY` stored as its key; `settings.jev_catalog_seeded` records the seed, so a later restart never re-creates a `default` service — not even after every service was deleted.
-2. **Every stored canvas must already be a full v4 snapshot.** The strict parser only accepts `sr-routing-graph` version 4 documents: in addition to the four run fields each file must carry `departments`, `enabled` and `default`. Before upgrading:
-
-   - back up `ROUTER_GRAPH_DIR` (the `graphs/*.json` files; a legacy `current` pointer is no longer read, so record which graph was active and discard it);
-   - on the **old** version, produce a full run snapshot for every group: open each decision group and save it once (or `PUT /admin/trees/{id}` with its document). The old version writes the effective run configuration into the file as a version-3 document;
-   - convert each `graphs/*.json` to v4 by hand: bump `version` to `4`, add `"departments": []`, and set `enabled`/`default` from the old reality (the previously active graph is `true`/`true`; every other graph is `false`/`false`). If the old instance can no longer be operated, add the four run fields as described in [Self-contained canvas JSON](#self-contained-canvas-json) at the same time;
-   - the resulting document must parse under the v4 rules in [Decision graph](#decision-graph) and the canvas's actual models, providers, JEV service and periods.
-
-A missed file is not silently repaired: startup logs `initial graph snapshot is unavailable`, `/readyz` reports not ready (or `stale`), `GET /admin/trees` answers 503 `graph_storage_error`, and `/v1` Auto routing has no route set (`no_valid_snapshot`) until the file is fixed. After a successful start, a v3 file is still only an invalid file — it is never adopted or migrated implicitly.
+1. **Back up everything first.** Copy the SQLite database (`router.db` with `router.db-wal` / `router.db-shm`) and the kernel graph directory (`graphs.directory`, holding `graphs/*.json`). Graph JSON stays the kernel fact source; switching deployment means mounting it into the kernel and making the kernel the only writer.
+2. **The SQLite schema migrates automatically on the peripheral's first start.** Schema v6 upgrades to v7 in one transaction and **drops** `request_logs`, `graph_snapshots`, `request_snapshots` and their indexes, and rebuilds `jev_services` from its explicit non-key columns (the JEV `api_key` column is gone). Historical decision logs are **not** migrated to the memory ring or VictoriaLogs — old records can no longer be replayed. A database older than schema v6 is refused; there is no path back to the single-service layout.
+3. **Move the JEV key out of SQLite.** The kernel reads it only from its environment (`ROUTER_JEV_API_KEY`, or the name in `config.json` `jev.api_key_env`). Set it in the kernel container/process; existing stored keys are not migrated and the old `ROUTER_JEV_*` seed variables do not create a key.
+4. **Deploy the two services** (or the kernel only behind APISIX): the kernel needs `config.json` + the graph directory + the JEV key; the peripheral needs `ROUTER_CORE_URL`, its SQLite path and the usual console settings. See [Quick start](#quick-start) and [Configuration](#configuration).
+5. **Re-publish graphs through the kernel** if the kernel cannot load the existing directory: startup logs `initial graph snapshot is unavailable`, kernel `/readyz` reports not ready (or `stale`), and `/internal/v1/trees` answers `graph_storage_error` until the file is fixed. Every stored canvas must already be a full v4 document (four run fields + `departments` + `enabled`/`default`); v3 files are rejected, never adopted or migrated implicitly.
+6. **Retire the old single-service workload** before the kernel starts, so only one process writes the graph directory (`scripts/docker/deploy-163.sh` deletes `deployment/routepilot` and `service/routepilot` first). The retired shared gateway credential and static RoutePilot upstream key are gone from code, deployment env and docs; APISIX-side leftovers are pruned by `scripts/apisix/patch_apisix_deployment.py`.
 
 ### Legacy profiles with non-finite numbers
 
@@ -437,13 +476,15 @@ Every saved canvas is a portable, immutable run snapshot: one file restores a de
 Rules:
 
 - **All four fields, always.** A document carrying only some of them (or none) is rejected with `graph_parse_error` when parsing, importing, saving or checking; there is no database fallback that fills the missing fields and no `runtime:null` control field / materialization step. Old documents are rejected, not upgraded in place.
-- **JEV and window are one unit.** `jev.id` selects the catalog service and `key_env` says how its key is resolved; `jev_window` belongs to that service. Selecting or synchronizing a JEV service replaces `jev` and `jev_window` together. When a raw `PUT /admin/trees/{id}` patch changes `jev.id`, it must also include the new service's `jev_window`; the request fails with 422 instead of inheriting the previous service's window.
+- **JEV and window are one unit.** `jev.id` selects the catalog service; `key_env` is the kernel environment-variable name the key is read from and is fixed to `ROUTER_JEV_API_KEY`; `jev_window` belongs to that service. Selecting or synchronizing a JEV service replaces `jev` and `jev_window` together. When a raw `PUT /admin/trees/{id}` patch changes `jev.id`, it must also include the new service's `jev_window`; the request fails with 422 instead of inheriting the previous service's window.
 - **No secrets, at any depth.** A provider carries `key_env` (an environment variable name) instead of a key, and `jev` never carries `api_key`. Secret and derived-key fields (`api_key`, `authorization`, `key_present`, `key_source`) are rejected wherever they appear inside the four fields, including nested objects and arrays below `backends.models[*].profile`. The match ignores case, `-` and `_` (`API-KEY` is the same as `api_key`) but only covers that fixed set, so ordinary metadata such as `monkey` or `keychain` is preserved. `profile` stays a free-form JSON metadata object otherwise: `capability`, `domains`, `tier` and later metadata are stored unchanged. A local server that needs no authentication may leave `key_env` empty.
 - **Validated at the file boundary.** Provider and model ids, provider references, profiles, reasoning declarations, the JEV service profile, the window and the periods are all validated while parsing.
 - **Lifecycle is required but not ordinary-save writable.** `enabled`/`default` are required document fields, but new/copied documents are always saved disabled and non-default, and importing only replaces the draft (a new group is stored closed, an existing group keeps its stored lifecycle); enable/disable/set-default go through the dedicated lifecycle endpoints, and an ordinary save can change `departments` but never lifecycle. `default: true` requires `enabled: true`.
 - **Part of the behaviour version.** The four run fields plus `departments` join `tree_revision` (and the console dirty/undo baseline); `enabled`/`default` join the route-set fingerprint and `snapshot_revision` instead. Canvas coordinates still do not affect behaviour.
 
-### Snapshot sources
+### Run-configuration snapshot sources
+
+"Snapshot" here means a canvas's embedded **run configuration** — the concept the graph editor has always had and keeps. It is unrelated to the removed decision-log `graph_snapshots` table.
 
 Only these actions create or change a canvas run snapshot:
 
@@ -451,20 +492,20 @@ Only these actions create or change a canvas run snapshot:
 2. **Import a complete JSON document** — the imported snapshot wins.
 3. **Select a model or JEV in the canvas** — the selected non-secret catalog entry is added/replaced in the draft; a JEV selection replaces profile and window atomically.
 4. **Refresh runtime from database** in graph settings.
-5. **Confirm a catalog impact list** — the server synchronizes the affected canvases after the administrator confirms.
+5. **Confirm a catalog impact list** — the peripheral asks the kernel to synchronize the affected canvases after the administrator confirms.
 
-A catalog write by itself never rewrites a canvas and never republishes a snapshot. Editing a target with a model ID already present in the snapshot does not overwrite its snapshot entry; drift is reported by the check hints and replaced only by an explicit refresh or a confirmed sync. Copying a group keeps the source group's snapshot and departments but forces it closed, and `POST /admin/try` inherits a stored canvas's snapshot when it is given `tree_id` (a full draft must carry all four fields itself; without `tree_id` and `root` the check runs against the published route set instead).
+A catalog write by itself never rewrites a canvas and never republishes a route set. Editing a target with a model ID already present in the snapshot does not overwrite its snapshot entry; drift is reported by the check hints and replaced only by an explicit refresh or a confirmed sync. Copying a group keeps the source group's snapshot and departments but forces it closed, and `POST /admin/try` inherits a stored canvas's snapshot when it is given `tree_id` (a full draft must carry all four fields itself; without `tree_id` and `root` the check runs against the published route set instead).
 
 ### Keys
 
-JSON never stores keys; the environment supplies them when a snapshot is built.
+JSON never stores keys, and each secret has exactly one owner:
 
-| Secret | Resolution order |
+| Secret | Owner and resolution order |
 |---|---|
-| Provider API key | The database provider's stored key **only when `name` and the normalized `base_url` both match**, otherwise none; then `os.environ[key_env]` |
-| Decision-service key | The database service's stored key **only when `id`, `base_url` and `model` all match**, otherwise none; then `os.environ[service.key_env]`. There is no global JEV-key fallback; the seeded `default` service uses `ROUTER_JEV_API_KEY` as its `key_env`. |
+| Provider API key | **Peripheral only.** The execution catalog resolves it for the standalone `/v1` data plane: the SQLite provider's stored key **only when `name` and the normalized `base_url` both match** the kernel decision, otherwise none; then `os.environ[key_env]` of the peripheral process. It never enters the kernel request, the decision event or any graph response. |
+| Decision-service (JEV) key | **Kernel only.** Read from the environment variable named by `config.json` `jev.api_key_env` (default `ROUTER_JEV_API_KEY`) and sent only to the JEV endpoint. There is no SQLite storage, no console input and no peripheral copy. |
 
-An endpoint change therefore never forwards an old key to the new address, environment keys are never written to SQLite or the JSON, derived authorization headers exist only in the in-memory snapshot, and no JSON file, API envelope or graph response contains a real key.
+An endpoint change therefore never forwards an old key to the new address; keys are never written to SQLite, the JSON files or any API envelope; derived authorization headers exist only in the process that owns the key; and the decision event can contain at most a `key_env` name, never a key value. The APISIX form needs no Provider key at all — newapi executes the routed model with the user's original credential.
 
 ### Catalog impact confirmation
 
@@ -476,7 +517,7 @@ Updating or deleting a model, provider or JEV service first scans every canvas. 
 
 Nothing is written in that state — database, files, audit and snapshot are untouched. The console shows the list; confirming retries the same request with `impact_confirmation = {"trees":[{"id","document_sha256"}, …]}` built from exactly those hashes. If a canvas changed in between, the server answers 409 `graph_conflict` with the **current** hash, and the console asks for a reload instead of applying a stale confirmation.
 
-After confirmation, one use case commits the catalog rows, all affected canvases and the audit row atomically: it re-checks the impact list under the single write lock, validates each candidate document, stages every file (non-default enabled graphs first, the default graph last), re-checks the route-set fingerprint and only then commits. A failure rolls the database back and restores every replaced file. The in-memory route set is republished only from a committed transaction and only when at least one synchronized canvas is an enabled graph; a draft-only sync publishes nothing.
+After confirmation, the write spans two stores. The peripheral re-checks the impact list, then asks the kernel to replace every confirmed canvas in **one conditional batch** (`POST /internal/v1/graph-batches`): verify all base `document_sha256` hashes, strictly validate every candidate, validate the resulting enabled set, commit one batch and publish. Only then does the peripheral commit its SQLite rows and audit. If that SQLite commit fails, the peripheral compensates with a reverse batch built on the new base hashes; a failed compensation returns 503 `catalog_sync_diverged` and logs a severe error instead of leaving a silent partial state. The route set is republished only when at least one synchronized canvas is an enabled graph; a draft-only sync publishes nothing.
 
 Update/delete semantics:
 
@@ -489,60 +530,58 @@ Update/delete semantics:
 
 ### Canvas-vs-catalog drift
 
-`POST /admin/try` compares the resources a canvas declares (providers, models, the JEV service and its window) with the database catalog and reports every difference or missing row as a hint (`code = "runtime_mismatch"`, `level = "hint"`, both canvas and database values in `params`). Hints never block the check and never change the execution configuration: the run still uses the canvas snapshot. Database resources the canvas does not declare are not conflicts and produce no hint. The console renders these hints under the routing-check result.
+`POST /admin/try` compares the resources a canvas declares (providers, models, the JEV service and its window) with the database catalog and reports every difference or missing row as a hint (`code = "runtime_mismatch"`, `level = "hint"`, both canvas and database values in `params`). Hints never block the check and never change the execution configuration: the run still uses the canvas snapshot. Database resources the canvas does not declare are not conflicts and produce no hint. The console renders these hints under the routing-check result. The kernel runs the dry run (it has no SQLite); the peripheral re-attaches these catalog hints to the kernel's answer — the only place the comparison can run after the split.
 
 ### Restoring from one file
 
-1. Start an instance with an empty database and an empty graph directory.
+1. Start the two services with an empty peripheral database and an empty kernel graph directory (or the kernel only, for the APISIX form).
 2. Import the JSON into a decision group (Decision groups page, or `POST /admin/trees`). Importing only replaces the draft, and saving it as a new group stores it closed; enable it from the toolbar or `POST /admin/trees/{id}/enable` — the first enabled graph becomes the default graph. (Importing into an existing enabled group and saving keeps it enabled.) Add departments in graph settings if this graph should serve a department.
 3. Run a routing check (`POST /admin/try`) against the draft to verify the graph, embedded model catalog, decision service, window and time periods. Run it with scope **Published route set** (and optionally a department) to verify which enabled graph is selected; `tree_id` / `graph_selection` report the evidence.
 4. Call `POST /v1/chat/completions` for Auto routing through the default graph, or open the model test chat (Auto-only, with an optional Department field) to verify an end-to-end reply.
-5. Provide keys through environment variables only: each provider's `key_env`, and the selected JEV service's `key_env` when its endpoint requires authentication.
+5. Provide keys through environment variables only: the kernel's JEV key (`ROUTER_JEV_API_KEY`) and, for standalone execution, each provider's `key_env` in the peripheral environment (or its stored SQLite key).
 
 `configs/default_routing_tree.json` is a minimal runnable example: one `local` provider, two models, the `default` decision-service profile and three time periods. It is a v4 document with `enabled: false, default: false, departments: []`: apply it through the admin API (for example `scripts/apply_default_routing_tree.py`), then enable it. The admin write path never accepts lifecycle from the payload: new and copied documents are always persisted as `enabled: false, default: false`, and importing only replaces the draft (saving into an existing group inherits that group's lifecycle). `configs/production_routing_tree.json` has the same shape with three models; replace the example base URLs and endpoints before deploying.
 
 The five demo cases in `configs/cases/case-*.json` are complete v4 documents with `kind`/`version`, no external `id`, `enabled: false, default: false, departments: []`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
 
-## Behind APISIX (department routing on 163)
+## Behind APISIX + newapi (department routing on 163)
 
-RoutePilot runs as a ClusterIP-only service behind the shared APISIX on 163 (`sandlake` namespace). Public `/v1` stays default-graph-only; department routing is a second entry point:
+On 163 only the **decision kernel** runs, as a ClusterIP-only `routepilot-core` service in the `sandlake` namespace. APISIX keeps its original newapi upstream; the kernel only answers "which real model should run".
 
 ```text
 client (department API key)
   → APISIX Auto route      vars: post_arg.model == "auto"   priority 1001/101
-  → forward-auth           GET http://sandlake-api…:8888/v1/models (Authorization)
+  → forward-auth           GET http://sandlake-api…:8888/v1/models with the ORIGINAL Authorization
   → X-SR-Department        injected by newapi from the already-validated token.Department
-  → sr-auto-router         priority 2001: strip client copies of the internal headers,
-                           rewrite URI to /internal/v1/chat/completions,
-                           drop Authorization, inject X-SR-Gateway-Token
-  → RoutePilot internal    POST /internal/v1/chat/completions (department-aware graph selection)
-  → graph executor          model rewritten, provider key = ROUTE_PILOT_UPSTREAM_API_KEY
-  → APISIX gateway         http://apisix-gateway.sandlake.svc.cluster.local/apiuser/v1
+  → sr-auto-router         priority 2001: strip client copies of the decision headers,
+                           ask the kernel WITHOUT the user credential,
+                           rewrite only the JSON body `model` and refresh Content-Length
+  → kernel                 POST /internal/v1/route-decision (department-aware graph selection)
+  → original newapi upstream  executes the routed real model with the user's original Authorization
+  → JSON / SSE passthrough
 ```
 
-Any other model on the same path is handled by the fixed route (priority 1000/100): it is deep-copied from the existing `/apiuser/*` route and goes straight to newapi with no RoutePilot involvement, so fixed models keep their original path and never loop back into routing.
-
-The internal endpoint requires `X-SR-Gateway-Token` and fails closed (`503 gateway_auth_not_configured`) when `ROUTER_GATEWAY_TOKEN` is unset; a wrong token is `401 gateway_unauthorized`. The token is compared in constant time and never logged. See the [backend API reference](docs/后端接口说明.md) §3.4.
+Any other model on the same path is handled by the fixed route (priority 1000/100): it is deep-copied from the existing `/apiuser/*` route and goes straight to newapi with no kernel involvement, so fixed models keep their original path and never loop back into routing. If the decision call fails, APISIX returns 503 and never sends `auto` to newapi. The kernel receives no `Authorization` and never calls a model upstream. The retired shared gateway credential and static RoutePilot upstream key no longer exist; network boundaries and the trusted department header replace them. See the [backend API reference](docs/后端接口说明.md) §3.4 for the decision contract.
 
 | Piece | Location |
 |---|---|
-| Cluster manifests (ClusterIP Service, NFS PVC, NetworkPolicy) | `scripts/docker/k8s-163/*.yaml` |
-| Build + deploy script (secrets from env only) | `scripts/docker/deploy-163.sh` |
-| Graph configuration (main/finance/legal/jev-smoke) | `scripts/configure_163_routepilot.py` |
+| Kernel-only cluster manifests (Deployment, ClusterIP Service, NFS PVC, NetworkPolicy, config ConfigMap) | `scripts/docker/k8s-163/*.yaml` |
+| Build + deploy script (only the kernel JEV secret comes from env) | `scripts/docker/deploy-163.sh` |
+| Graph configuration (main/finance/legal/jev-smoke) through the kernel API | `scripts/configure_163_routepilot.py` |
 | APISIX plugin | `scripts/apisix/sr-auto-router.lua` |
 | Plugin registration (idempotent; APISIX 3.15 registers via the `apisix.plugins` list) | `scripts/apisix/patch_apisix_deployment.py` |
 | Route publishing, shadow first then production | `scripts/apisix/configure_routepilot_routes.py` |
-| End-to-end acceptance matrix | `scripts/apisix/verify_routepilot_e2e.py` |
-| Manual local test stack (APISIX + RoutePilot, no newapi) | [APISIX local integration guide](docs/APISIX-本机联调部署.md) |
+| APISIX acceptance matrix and drills | `scripts/apisix/verify_routepilot_e2e.py` |
+| Manual local test stack (APISIX + kernel, no newapi) | [APISIX local integration guide](docs/APISIX-本机联调部署.md) |
+| Standalone two-service deployment | `scripts/docker/compose.yml`, `scripts/docker/core-config.json` |
 
 Split the rollout by what is actually verified:
 
-- **Done on 163 (2026-11-25):** the image `routepilot:amd64-e014ae2` is built and running (1/1), the ClusterIP Service, NFS PVC and NetworkPolicy are applied, the four graphs (`main` default, `finance`, `legal`, `jev-smoke`) are published, and direct requests to the in-pod internal endpoint were verified: 财务部 → `finance`/`department`, 法务部 → `legal`/`department`, unknown and empty department → `main`/`default`, each with the real upstream model and a real answer; a missing or wrong `X-SR-Gateway-Token` is rejected with 401.
-- **Fixed and verified offline only:** remote-failure redaction, the `nginx_config.envs` worker-token declaration, fail-closed drift detection on the shared APISIX objects, the route publish/delete/rollback state machine (all post-apply failures restore, restore failures are reported separately), E2E response ownership, forced model assertions, two-content-frame SSE evidence with a measurable gap, conditional ledger waits, `TreeUpsertIn`-whitelisted JEV graph writes with nested restore, fail-stop failure drills, core-failure gating (a failed model/case/internal-endpoint check never enters JEV or any drill), per-request-id persisted `client_disconnected` evidence (initial `incomplete` cannot pass), persistent drill backups under `/root/routepilot-backups/<timestamp>/drill.json` with an independent `--restore-drill-backup` entry point (generated-directory whitelist, shell quoting plus `realpath` review, every ordinary exception reduced to a safe label with a non-zero exit), real-JSON two-process restore evidence, restore to the *recorded* pre-drill default graph in both online and independent paths (a failed document PUT never skips the default restore), primary/restore/verification failures kept distinct, metadata-driven previous-container log detection, pre-scale old-pod log scan for the RoutePilot-down drill, and a final `--since-time` secret scan over the current and previous containers.
-- **Proven on 76 without newapi (2026-11-25):** a manually deployed docker stack (see [the local integration guide](docs/APISIX-本机联调部署.md)) ran APISIX 3.15 → forward-auth stand-in → `sr-auto-router` → RoutePilot internal endpoint → graph selection → a local vLLM model. Department routing (finance/legal/unknown), forged-header resistance, 401 for missing/bad keys, the public default-only route and live SSE (47 content frames, `[DONE]`) all matched the contract. This proves the APISIX→RoutePilot chain; the department header there comes from a test double, not newapi.
-- **Not executed yet (needs a maintenance window):** newapi release carrying `X-SR-Department` (out of scope for the review-fix plan), the shared APISIX patch (plugin registration + Lua mount + token env), shadow route publication, the full shadow matrix, and every failure/rollback drill. Until those run, the newapi-authenticated end-to-end gateway result is not claimed.
+- **Verified offline for the split:** the full `pytest` suite (including the real two-app `tests/test_service_split_e2e.py`), `npm run check:console`, `docker compose -f scripts/docker/compose.yml config`, and the static deployment tests over the kernel-only 163 manifests and build scripts. The kernel-only form is statically proven: no SQLite, no console, `logging.type=disabled`, `/data/graph` single-writer PVC, only the JEV secret.
+- **Not executed in this work (needs a maintenance window on shared 163/APISIX):** deploying `routepilot-core` to 163, the newapi release that injects `X-SR-Department`, the shared APISIX patch (plugin registration + Lua mount + retired-env pruning), shadow route publication, and the full APISIX acceptance matrix with its failure/rollback drills. No production publication is claimed.
+- **Local APISIX chain:** the previous single-service chain was proven on 76 before the split; the [local guide](docs/APISIX-本机联调部署.md) was rewritten for the decision-then-newapi chain but has not been re-executed after the split because this work installs nothing.
 
-Rollout order once the window is approved: release newapi → `patch_apisix_deployment.py --dry-run` then apply → `configure_routepilot_routes.py --mode shadow --dry-run` then publish → the shadow gate:
+Rollout order once the window is approved: apply the kernel-only manifests (`deploy-163.sh`) → publish graphs through the kernel API (`configure_163_routepilot.py`) → `patch_apisix_deployment.py --dry-run` then apply → `configure_routepilot_routes.py --mode shadow --dry-run` then publish → the shadow gate:
 
 ```bash
 python3 scripts/apisix/verify_routepilot_e2e.py \
@@ -551,91 +590,142 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
   --complete-shadow --include-disruptive
 ```
 
-The gate requires the exact shadow path, the SSH target for in-pod ledger/JEV evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`) can never be reported as complete. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
+The gate requires the exact shadow path, the SSH target for in-pod kernel decision evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`) can never be reported as complete. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
+
+### Known accepted residuals (split)
+
+- The peripheral JEV **Test connection** button is only meaningful when the peripheral process itself has `ROUTER_JEV_API_KEY`; a production split has no peripheral JEV key (the key belongs to the kernel).
+- The kernel scheduling circuit breaker no longer sees real model-upstream failures — by design, because the kernel produces no execution write-back. The standalone peripheral keeps its own execution-side breaker; the APISIX form lets newapi own retries/health.
+- A `routepilot-decision` upstream object may remain inert in the live etcd from the pre-split APISIX configuration; it is unreferenced and can be pruned manually later.
+- VictoriaLogs output is not implemented; the kernel-only 163 deployment uses `logging.type=disabled` rather than pretending decision events are persisted.
+- The peripheral console service is not deployed on 163 in this period.
 
 ## Quick start
 
 ```bash
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-
-# Local development, authentication disabled
-ROUTER_DB=/tmp/routepilot.db \
-ROUTER_GRAPH_DIR=/tmp/routepilot-graph \
-ROUTER_USER_AUTH=0 \
-.venv/bin/python -m router
 ```
 
-Console: `http://127.0.0.1:8400/console/`.
+**Standalone: kernel + peripheral.** The kernel reads `config.json` through `ROUTER_CONFIG` (start from `configs/core.example.json`, but point `graphs.directory` at a writable local directory and use `logging.type=disabled` unless a peripheral receiver is reachable); the peripheral needs `ROUTER_CORE_URL` and its SQLite path:
 
 ```bash
-# Protected deployment
-ROUTER_DB=/var/lib/routepilot/router.db \
-ROUTER_GRAPH_DIR=/var/lib/routepilot/graph \
-ROUTER_HOST=0.0.0.0 \
-ROUTER_PORT=8400 \
-ROUTER_ADMIN_EMAIL=admin@example.com \
-ROUTER_ADMIN_PASSWORD='change-me-now' \
-.venv/bin/python -m router
+# Terminal 1 — decision kernel (default port 8400)
+cat > /tmp/routepilot-core.json <<'EOF'
+{"server": {"host": "127.0.0.1", "port": 8400},
+ "graphs": {"directory": "/tmp/routepilot-graphs"},
+ "jev": {"api_key_env": "ROUTER_JEV_API_KEY"},
+ "logging": {"type": "disabled"}}
+EOF
+ROUTER_CONFIG=/tmp/routepilot-core.json \
+ROUTER_JEV_API_KEY='<jev-key>' \
+.venv/bin/python -m router core
+
+# Terminal 2 — peripheral console + standalone data plane (default port 8400)
+ROUTER_CORE_URL=http://127.0.0.1:8400 \
+ROUTER_DB=/tmp/routepilot.db \
+ROUTER_HOST=127.0.0.1 ROUTER_PORT=8401 \
+ROUTER_USER_AUTH=0 \
+.venv/bin/python -m router peripheral
 ```
 
-The first start against an empty users table seeds the admin account. An empty graph directory is a legal empty route set: `/readyz` is ready but `/v1` answers 503 `no_active_tree`. Create or import a canvas, then enable it; the first enabled graph becomes the default graph that serves public `/v1`. Existing installations: read [Upgrading from a pre-snapshot installation](#upgrading-from-a-pre-snapshot-installation) first.
+Console: `http://127.0.0.1:8401/console/`. The complete standalone form is composed in `scripts/docker/compose.yml` (kernel 8400 internal, console published on 8401, separate volumes).
+
+**Kernel only (behind APISIX + newapi).** This is the 163 form: no SQLite, no console, no model upstream, no decision-log receiver. Use a `config.json` with `logging.type=disabled` and the graph directory on a persistent volume:
+
+```bash
+ROUTER_CONFIG=/etc/routepilot/config.json \
+ROUTER_JEV_API_KEY='<jev-key>' \
+.venv/bin/python -m router core
+```
+
+The first peripheral start against an empty users table seeds the admin account. An empty graph directory is a legal empty route set: the kernel `/readyz` is ready, but decisions answer 503 `no_default_tree`/`no_active_tree` until a graph is enabled. Create or import a canvas through the console, then enable it; the first enabled graph becomes the default graph. Existing installations: read [Upgrading from a pre-split installation](#upgrading-from-a-pre-split-installation) first.
 
 ## Configuration
 
+The **kernel** is configured by `config.json` (path via `ROUTER_CONFIG`, default `config.json`). It contains no secret values; the JEV key is named by `jev.api_key_env` and supplied as an environment variable:
+
+```json
+{
+  "server": {"host": "0.0.0.0", "port": 8400},
+  "graphs": {"directory": "/data/graphs"},
+  "jev": {"api_key_env": "ROUTER_JEV_API_KEY"},
+  "logging": {
+    "type": "routepilot",
+    "url": "http://console:8400/internal/v1/decision-logs",
+    "timeout_ms": 1000
+  }
+}
+```
+
+| Kernel `config.json` field | Default | Purpose |
+|---|---|---|
+| `server.host` / `server.port` | `0.0.0.0` / `8400` | Kernel listener |
+| `graphs.directory` | `./routing-graph` | The **only** graph JSON directory; the kernel is its single writer (`/data/graphs` in compose, `/data/graph` on 163) |
+| `jev.api_key_env` | `ROUTER_JEV_API_KEY` | Environment-variable **name** holding the JEV key; never a key value |
+| `logging.type` | `disabled` | `routepilot` (send events to the peripheral receiver) or `disabled`; `victorialogs` is not implemented this period |
+| `logging.url` | — | Event receiver URL, required for `logging.type=routepilot` (http/https) |
+| `logging.timeout_ms` | `1000` | Per-event HTTP timeout, 1–10000 |
+
+Kernel environment: `ROUTER_CONFIG` (config path) and the JEV key variable named by `jev.api_key_env`. The kernel honours no `ROUTER_HOST/PORT/DB/GRAPH_DIR` variables and opens no SQLite.
+
+The **peripheral** uses environment variables:
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `ROUTER_DB` | `router.db` | SQLite control-plane database |
-| `ROUTER_GRAPH_DIR` | `./routing-graph` | Graph documents; lifecycle lives inside each document |
-| `ROUTER_GRAPH_WRITER` | `true` | Allow graph writes; run exactly one writer |
-| `ROUTER_HOST` | `127.0.0.1` | Listener host |
-| `ROUTER_GATEWAY_TOKEN` | empty | Shared gateway credential for `POST /internal/v1/chat/completions`; empty means the internal endpoint fails closed with 503 |
-| `ROUTER_PORT` | `8400` | Listener port |
-| `ROUTER_JEV_URL` | empty | One-time seed base URL for the `default` JEV service; used only on a start where the JEV catalog is empty and no environment seed has run yet, paired with `ROUTER_JEV_MODEL` |
-| `ROUTER_JEV_MODEL` | empty | One-time seed model for the `default` JEV service; paired with `ROUTER_JEV_URL` |
-| `ROUTER_JEV_API_KEY` | empty | Key stored for the one-time seeded `default` service (its `key_env` is `ROUTER_JEV_API_KEY`); not a global fallback |
-| `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout, seconds |
-| `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity |
+| `ROUTER_CORE_URL` | `http://127.0.0.1:8400` | Kernel base URL for graph management and decisions |
+| `ROUTER_CORE_TIMEOUT_SECONDS` | `60` | Kernel HTTP timeout |
+| `ROUTER_DB` | `router.db` | Peripheral SQLite: people, sessions, providers, model catalog, non-secret JEV catalog, time periods, change records |
+| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | Peripheral listener (published as 8401 in compose) |
+| `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout used by the JEV **test** endpoint |
+| `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | empty | One-time seed of the `default` non-secret JEV catalog entry; used together, only while the catalog is empty and never seeded before |
+| `ROUTER_JEV_API_KEY` | empty | Optional peripheral-only key for the JEV **test** button; the kernel always reads its own copy |
+| `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity (peripheral process) |
 | `ROUTER_USER_AUTH` | `true` | Console authentication |
-| `ROUTER_ADMIN_EMAIL` | `admin@test.com` | First-run admin email |
-| `ROUTER_ADMIN_PASSWORD` | seed value | First-run admin password |
+| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | seed values | First-run admin account |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | Console session lifetime |
 
 ## API
 
 Full field tables, request/response examples and the impact-confirmation flow live in the [backend API reference](docs/后端接口说明.md) (Chinese).
 
+- **Kernel:** `POST /internal/v1/route-decision`, `/internal/v1/trees*`, `/internal/v1/try`, `POST /internal/v1/graph-batches`, `/healthz`, `/readyz`. No auth middleware and no console; protect it with the network boundary. It is the only caller-facing component in the 163 form.
+- **Peripheral:** the console and `/admin/*` APIs, `POST /internal/v1/decision-logs` (kernel event receiver, no admin login), `GET /admin/requests/recent`, `GET /admin/requests/{id}/replay`, the standalone `POST /v1/chat/completions` and `/admin/test/chat/completions`.
 - `/v1/*`, `/healthz`, `/readyz` and `/console/*` need no auth; every other `/admin/*` route needs `Authorization: Bearer <token>`.
 - `POST /admin/login` is the only public admin endpoint: email and password exchange for a token. Sessions default to 168 hours; logout, a password change or deleting the user revokes them.
 - `viewer` can read only (`/admin/users*` is off-limits too); writes and user management need `admin`. With `ROUTER_USER_AUTH=0` everything is open and requests run as the service account.
 - Data-plane errors are `{"error":{"message":"<machine code>"}}`; admin errors are `{"detail": ...}`, where graph/config validation failures carry an Issue array.
-- `POST /v1/chat/completions` ignores the request `model` and always routes through the default graph of the enabled route set; the `x-sr-session-id` header drives stickiness, and an `x-sr-department` header is rejected with `400 department_header_not_allowed`. `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` report what actually happened.
-- `POST /admin/trees` must carry `backends`, `jev`, `jev_window` and `time_periods` together and accepts `departments`; new groups are always closed. `PUT` is a patch and must carry the current `base_document_sha256`, otherwise 409. Lifecycle is written only by `POST /admin/trees/{id}/enable`, `/disable` and `/default`; `departments` can also be written by `PUT /admin/trees/{id}/departments`.
+- `POST /v1/chat/completions` asks the kernel for a decision and always routes through the default graph of the kernel's enabled route set; the `x-sr-session-id` header drives stickiness, and an `x-sr-department` header is rejected with `400 department_header_not_allowed`. `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` report the kernel decision. A kernel decision whose model/provider the peripheral catalog cannot execute returns 503 `execution_catalog_mismatch` without calling any upstream.
+- `POST /admin/trees` must carry `backends`, `jev`, `jev_window` and `time_periods` together and accepts `departments`; new groups are always closed. `PUT` is a patch and must carry the current `base_document_sha256`, otherwise 409. Lifecycle is written only by `POST /admin/trees/{id}/enable`, `/disable` and `/default`; `departments` can also be written by `PUT /admin/trees/{id}/departments`. All of these are proxied to the kernel by the peripheral.
 
-| Method and path | Auth | Purpose |
-|---|---|---|
-| `POST /v1/chat/completions` | public | Routing entry; JSON or SSE |
-| `GET /healthz` / `GET /readyz` | public | Liveness / route-set readiness (`graph_status`) |
-| `POST /admin/login` / `POST /admin/logout` | public / signed in | Console session |
-| `GET /admin/me`, `POST /admin/me/password` | signed in | Current user, password change |
-| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | read / admin | Decision groups; create is always closed |
-| `PUT /admin/trees/{id}/departments` | admin | Department mapping for one group |
-| `POST /admin/trees/{id}/copy`, `/enable`, `/disable`, `/default` | admin | Copy and multi-graph lifecycle (first enable becomes default; default switch) |
-| `POST /admin/try` | admin | Routing check against a draft graph or the active route set (optional department) |
-| `POST /admin/test/chat/completions` | admin | Test chat; `model=auto` routes, anything else is a fixed direct call |
-| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | read / admin | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
-| `GET /admin/model-catalog`, `POST /admin/fetch-models` | read / admin | Provider presets, upstream model discovery |
-| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | read / admin | Providers; update previews a 409 impact list, delete is blocked while referenced |
-| `GET/POST /admin/jev`, `GET/PUT/DELETE /admin/jev/{id}` | read / admin | Multi-service JEV catalog (window belongs to each service) |
-| `POST /admin/jev/{id}/test` | admin | Test one catalog service with its database configuration |
-| `GET/PUT /admin/time-periods` | read / admin | Time periods |
-| `GET /admin/requests/recent`, `/requests/stats`, `/requests/{id}/snapshot` | viewer | Live request ring, logger stats, request snapshot |
-| `GET /admin/overview`, `GET /admin/changes` | viewer | Overview, audit history |
-| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | admin | Users |
+| Method and path | Service | Auth | Purpose |
+|---|---|---|---|
+| `POST /internal/v1/route-decision` | kernel | network boundary | One routing decision: real model, logical model, non-secret provider facts, tree/reasoning metadata |
+| `POST /internal/v1/graph-batches` | kernel | network boundary | Atomic conditional multi-graph replacement used by peripheral catalog writes |
+| `/internal/v1/trees*`, `/internal/v1/try` | kernel | network boundary | Graph management and dry-run (the peripheral proxies its `/admin/trees*`, `/admin/try` here) |
+| `GET /healthz` / `GET /readyz` | both | public | Liveness / readiness (kernel: route set + `stale`; peripheral: SQLite) |
+| `POST /v1/chat/completions` | peripheral | public | Standalone OpenAI-compatible data plane: kernel decision → peripheral Provider key → model upstream; JSON or SSE |
+| `POST /internal/v1/decision-logs` | peripheral | network boundary | Kernel decision-event receiver (validated, in-memory, max 20) |
+| `GET /admin/requests/recent`, `/requests/{id}/replay` | peripheral | viewer | Memory decision log list and single-event replay |
+| `POST /admin/login` / `POST /admin/logout` | peripheral | public / signed in | Console session |
+| `GET /admin/me`, `POST /admin/me/password` | peripheral | signed in | Current user, password change |
+| `GET/POST /admin/trees`, `GET/PUT /admin/trees/{id}` | peripheral proxy | read / admin | Decision groups; create is always closed |
+| `PUT /admin/trees/{id}/departments` | peripheral proxy | admin | Department mapping for one group |
+| `POST /admin/trees/{id}/copy`, `/enable`, `/disable`, `/default` | peripheral proxy | admin | Copy and multi-graph lifecycle (first enable becomes default; default switch) |
+| `POST /admin/try` | peripheral proxy | admin | Routing check against a draft graph or the active route set (optional department) |
+| `POST /admin/test/chat/completions` | peripheral | admin | Test chat; `model=auto` asks the kernel, anything else is a fixed direct call through the peripheral catalog |
+| `GET/POST /admin/models`, `GET/PUT/DELETE /admin/models/{id}` | peripheral | read / admin | Model registry; update/delete preview a 409 impact list and sync confirmed canvases |
+| `GET /admin/model-catalog`, `POST /admin/fetch-models` | peripheral | read / admin | Provider presets, upstream model discovery |
+| `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | peripheral | read / admin | Providers; update previews a 409 impact list, delete is blocked while referenced |
+| `GET/POST /admin/jev`, `GET/PUT/DELETE /admin/jev/{id}` | peripheral | read / admin | Non-secret multi-service JEV catalog (window belongs to each service) |
+| `POST /admin/jev/{id}/test` | peripheral | admin | Test one catalog service (needs a peripheral JEV key; see residuals) |
+| `GET/PUT /admin/time-periods` | peripheral | read / admin | Time periods |
+| `GET /admin/requests/stats`, `GET /admin/overview`, `GET /admin/changes` | peripheral | viewer | Memory-log stats/overview, audit history |
+| `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | peripheral | admin | Users |
 
 ### Errors
 
-Data-plane:
+Data-plane (peripheral `/v1`):
 
 | Status | Error `message` | Meaning |
 |---|---|---|
@@ -643,24 +733,30 @@ Data-plane:
 | 400 | `department_header_not_allowed` | Public `/v1` request carried `x-sr-department` |
 | 413 | `request_too_large` | Body exceeds 10 MiB |
 | 502 | `upstream_error` | Upstream 5xx or network failure |
-| 503 | `no_valid_snapshot` | No route set has ever been assembled |
+| 503 | `execution_catalog_mismatch` | Kernel decision names a model/provider the peripheral catalog cannot execute; no upstream call |
+| 503 | `no_valid_snapshot` | Kernel has never assembled a route set |
 | 503 | `no_active_tree` | Empty route set: no enabled decision group |
 | 503 | `no_default_tree` | Enabled graphs exist but none is the default graph |
 | 503 | `no_available_backend` | All backends of the selected target unavailable |
-| 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure |
+| 503 | `routing_failed` / `routing_invariant_violation` | Internal routing failure (kernel) |
+| 503 | `core_unavailable` | The peripheral cannot reach the kernel |
 
 Admin:
 
 | Status | Error | Meaning |
 |---|---|---|
 | 401 / 403 | `unauthorized…` / `forbidden…` | Not signed in / viewer write |
+| 404 | `unknown request` | Decision event evicted from the 20-event memory log or lost after a restart |
+| 404 | `unknown tree <id>` | Graph id does not exist in the kernel |
 | 409 | `default_graph_required` | Disabling the default graph while other graphs stay enabled |
 | 409 | `graph_conflict` | Baseline or impact-list document hash is stale |
 | 409 | `impact_confirmation_required` | Model/provider/JEV write affects canvases; confirm the listed document hashes |
 | 409 | `provider_referenced` | Provider still used by a database model or a canvas model |
 | 409 | string `tree <id> already exists` | Duplicate graph id (create/copy); plain string detail, no `code` |
 | 422 | Issue array | Graph/config validation failed |
-| 503 | `graph_read_only` / `graph_storage_error` | Reader replica / shared graph storage unreadable |
+| 503 | `graph_storage_error` | Kernel graph storage unreadable/write failed, or the loaded route set violates invariants |
+| 503 | `core_unavailable` | Kernel unreachable while proxying graph management |
+| 503 | `catalog_sync_diverged` | Kernel graph batch committed but the peripheral SQLite commit **and** its compensating batch failed; manual reconciliation required |
 | 502 | string | JEV test or upstream model discovery failed |
 
 Upstream 4xx responses pass through with their status and body; `/admin/test/chat/completions` additionally returns `404 unknown_model`, `422 invalid_model` and `400 invalid_department` (malformed trusted department header).
@@ -678,14 +774,15 @@ node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
 npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
-.venv/bin/python scripts/standalone_v4_smoke.py
+.venv/bin/python -m pytest -q tests/test_service_split_e2e.py -v
+docker compose -f scripts/docker/compose.yml config
 ```
 
-- `pytest` collects `tests/` only (`testpaths`), runs unit and FastAPI integration tests, starts no browser and does not collect `experiments/`.
+- `pytest` collects `tests/` only (`testpaths`), runs unit and FastAPI integration tests, starts no browser and does not collect `experiments/`. `tests/test_service_split_e2e.py` is the real two-app acceptance run: in-process kernel + peripheral over real HTTP, graph creation/enable through the peripheral proxy, `auto` decision, peripheral model execution, JSON/SSE, kernel event → peripheral memory log, recent/replay, 21st-event eviction, current-graph edits not affecting replays, restart clearing the log, and a log-sink failure not blocking decisions.
 - `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
 - `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
-- `scripts/i18n_dead_keys.py` reports unreferenced dictionary keys.
-- `scripts/standalone_v4_smoke.py` is the real end-to-end acceptance run: mock model/JEV servers plus real writer and read-only `python -m router` processes on fixed local ports against a throwaway temp database/graph directory, then verifies the public default-graph JSON/SSE path, `/admin/try` department selection, cross-graph same-model breaker isolation, default switching, the 409/503 lifecycle edges, stale recovery and replica route-set parity; it exits non-zero on failure and removes its temp workspace.
+- `docker compose -f scripts/docker/compose.yml config` statically validates the two-service standalone deployment (two services, separate volumes, healthchecks, no secret values).
+- `scripts/standalone_v4_smoke.py` is a **legacy pre-split** acceptance run (single-service writer/replica assumptions); it is kept for history and must not be used to validate the split. The split gates are `tests/test_service_split_e2e.py`, `scripts/docker/test_deploy_163.py` and `scripts/apisix/verify_routepilot_e2e.py` (against a real deployment).
 
 Experiments are standalone and excluded from the default run:
 
@@ -698,8 +795,8 @@ Experiments are standalone and excluded from the default run:
 
 ```
 router/
-  api/                 FastAPI routes, DTOs, exception mapping, proxy wiring, presenters
-  control/             catalog writes, impact lists, confirmed canvas sync and enable validation
+  api/                 FastAPI apps (core_app/create_app), routes, DTOs, exception mapping, proxy wiring, presenters
+  control/             kernel graph writes, cross-service catalog commits/compensation, impact lists, enable validation
   routing/
     graph/             graph model, validation, conditions, compiler, evaluator
     service.py         evaluate → schedule orchestration
@@ -710,12 +807,16 @@ router/
     route_set.py       route-set invariants: the default graph and department index
     tree.py            tree envelope codec and revision
     codec.py           strict field parsing helpers
-  request_logging.py   ledger queue/ring and worker-thread writes
-  jev/                 decision-service client, service catalog DTO, input window
-  upstream/            fixed-model catalog, proxy transport, circuit breaker + sync worker
-  store/               SQLite schema/repositories, graph-file repository
-  console/             bilingual native ES Module console
-configs/               example decision groups; configs/cases/ holds the five portable demo cases
+  decision_events.py   self-contained decision event schema, validation and projections
+  decision_log_sink.py kernel best-effort async event sink (routepilot / disabled)
+  decision_log_store.py peripheral deque(maxlen=20) event store
+  core_client.py       peripheral → kernel HTTP client (decision and management)
+  core_config.py       kernel config.json loader
+  jev/                 decision-service client, non-secret service catalog DTO, input window
+  upstream/            execution catalog join, proxy transport, breaker; provider catalog
+  store/               peripheral SQLite schema/repositories, kernel graph-file repository
+  console/             bilingual native ES Module console (peripheral-only)
+configs/               example decision groups + core.example.json; configs/cases/ holds the five portable demo cases
 docs/                  design and operations notes; 后端接口说明.md and 决策图规范.md are the reference docs
 tests/                 pytest suite and contract fixtures
 scripts/               Node contract tests, Playwright QA, deployment helpers

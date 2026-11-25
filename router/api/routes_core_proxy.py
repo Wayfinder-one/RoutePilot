@@ -1,9 +1,9 @@
 """Peripheral graph-management proxy to the decision kernel.
 
 The kernel owns the graph JSON and its management API (``/internal/v1/trees*``
-and ``/internal/v1/try``).  Task 8 mounts this router at ``/admin`` in place of
-the local tree routes; Task 6 ships it as an independently testable module while
-``create_app()`` keeps the old local mounts.
+and ``/internal/v1/try``).  ``create_app()`` mounts this router at ``/admin`` in
+place of the old local tree routes: the peripheral has no graph repository or
+publisher any more, so every graph request must cross this boundary.
 
 Design rules:
 

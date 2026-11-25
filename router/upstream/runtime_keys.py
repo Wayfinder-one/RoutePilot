@@ -1,7 +1,7 @@
 """熔断与 inflight 内部键的唯一构造入口。
 
-图内逻辑模型 ID 在响应 ``x-sr-model``、请求账本 ``model``、图文档、调度
-trace 与 ``RoutingDecision.model`` 里保持不变；只有 ``CircuitBreaker`` /
+图内逻辑模型 ID 在响应 ``x-sr-model``、决策事件 ``decision.model``、图文档、
+调度 trace 与 ``RoutingDecision.model`` 里保持不变；只有 ``CircuitBreaker`` /
 ``BreakerStore`` / ``LoadBalancer`` 的 inflight 计数使用这里的运行键。
 
 作用域由 ``RoutingSnapshot.tree_id`` 决定（跨副本稳定，不用进程 ID/对象

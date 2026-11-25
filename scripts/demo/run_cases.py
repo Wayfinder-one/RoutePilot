@@ -1927,7 +1927,7 @@ def build_readme(ev: Evidence, manifest: dict, meta: dict) -> str:
     add("> 熔断器语义：同一模型连续 3 次上游 5xx 打开；半开窗口 300s。"
         "复杂推理第 1-3 次由 ha-fail 承担（502），第 4 次熔断打开后由 ha-general 接管（200）；"
         "此时故障演练 target 唯一后端 ha-fail 仍在熔断中 → `503 no_available_backend`"
-        "（该 503 在路由阶段拒绝，不产生 request_logs 行，属实现语义）。")
+        "（该 503 在路由阶段拒绝，不产生决策事件，属实现语义）。")
     add("")
     add(shot_md(meta, "logs-detail.png", "计算日志详情：JEV 概率 / wave / 推理徽章 / 上游模型"))
     add("")
@@ -2090,7 +2090,7 @@ def build_readme(ev: Evidence, manifest: dict, meta: dict) -> str:
         "等 300s 自动半开恢复或重启服务后清 DB `breaker` 表。")
     add("- `/v1` 响应 body 的 `model` 字段是上游真实模型名（本实现透传上游 body），"
         "入站 `model=auto` 的路由结果看响应头 `x-sr-model`。")
-    add("- 503 `no_available_backend`（路由阶段拒绝）不落 request_logs；"
+    add("- 503 `no_available_backend`（路由阶段拒绝）不产生可回放决策事件；"
         "502 upstream_error 会落库并带 error_class/upstream_status。")
     add("- 多模态探针用的是本地生成的示意图；VL 模型对小字号文字偶有识别偏差，"
         "但形状/颜色已真实命中。")

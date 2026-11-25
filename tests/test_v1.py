@@ -384,11 +384,6 @@ def last_event(app):
     return app.test_sink.events[-1]
 
 
-async def flush(app):
-    """Kept as a no-op: execution results are discarded, there is no local queue."""
-    return None
-
-
 # ── selected direct / numeric AND / waves ──────────────────────────────
 
 
@@ -885,18 +880,8 @@ def test_stream_completion_releases_lease_and_records_usage(tmp_path):
     asyncio.run(scenario())
 
 
-def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path, monkeypatch):
-    """stream=true + 上游 5xx：JSON 502 返回、上游响应关闭一次、租约释放一次。"""
-    from router.routing import scheduler as scheduler_module
-
-    released = []
-    lease_release = scheduler_module.Lease.release
-
-    def counting_release(self):
-        released.append(self.model)
-        lease_release(self)
-
-    monkeypatch.setattr(scheduler_module.Lease, "release", counting_release)
+def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path):
+    """stream=true + 上游 5xx：JSON 502 返回、上游响应关闭一次、内核租约已释放。"""
     closes = []
 
     class ErrorStream(httpx.AsyncByteStream):
@@ -938,18 +923,8 @@ def test_stream_upstream_error_closes_response_and_releases_lease_once(tmp_path,
     asyncio.run(scenario())
 
 
-def test_stream_lease_is_held_while_the_body_is_iterated(tmp_path, monkeypatch):
-    """hand-off 后租约归 _relay 所有：第二个分片未到之前 inflight 必须仍为 1。"""
-    from router.routing import scheduler as scheduler_module
-
-    released = []
-    lease_release = scheduler_module.Lease.release
-
-    def counting_release(self):
-        released.append(self.model)
-        lease_release(self)
-
-    monkeypatch.setattr(scheduler_module.Lease, "release", counting_release)
+def test_stream_body_iterates_after_the_kernel_decision_returns(tmp_path):
+    """决策与执行分离：第二个分片未到之前 inflight 必须已是 0（租约归内核决策）。"""
     closes = []
     gate = None
 

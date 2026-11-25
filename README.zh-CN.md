@@ -4,7 +4,12 @@
 
 [English](README.md) | 简体中文
 
-RoutePilot 是兼容 OpenAI 协议的路由代理。请求从 `/v1/chat/completions` 进入，由带版本的决策图选择上游模型。决策图在内置控制台中编辑、校验、检查路由、保存与启用。
+RoutePilot 由同一仓库构建、以**两个可独立部署的服务**交付：
+
+- **`routepilot-core`（决策内核）** —— 持有带版本的决策图，完成每一次路由决策（图执行、决策服务/JEV、推理档位、会话粘性），并为每次真实决策产出一条自包含决策事件。它从不调用模型上游，也不持有 SQLite、控制台或人员数据。用 `python -m router core` 启动。
+- **`routepilot-console`（外围服务）** —— 可选的面向前端服务：控制台、登录/人员、SQLite 配置目录、图管理到内核的代理、standalone 兼容 OpenAI 的 `/v1/chat/completions` 数据面，以及易失的 20 条决策日志。用 `python -m router peripheral` 启动。
+
+两个服务一起部署即完整独立服务；只部署内核则作为 APISIX + newapi 之后的决策组件（163 形态）。决策图在内置控制台中编辑、校验、检查路由、保存与启用；所有图请求由外围鉴权后交给内核执行。
 
 ![RoutePilot 决策画布](assets/routepilot/zh/routing-canvas.png)
 
@@ -12,7 +17,8 @@ RoutePilot 是兼容 OpenAI 协议的路由代理。请求从 `/v1/chat/completi
 
 | 分类 | 能力 |
 |---|---|
-| 入口 | `POST /v1/chat/completions`，支持 JSON 与 SSE；响应头 `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` |
+| 服务形态 | 同一镜像提供内核（`python -m router core`）与可选外围（`python -m router peripheral`）；内核持有图 JSON 与全部决策，外围负责控制台/SQLite/执行 |
+| 入口 | 外围 `POST /v1/chat/completions`（standalone 形态）与内核 `POST /internal/v1/route-decision`（APISIX 形态），支持 JSON 与 SSE；响应头 `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` |
 | 路由策略 | 可视化决策图：输入条件、决策服务问题、逻辑门、模型目标 |
 | 路由集 | 可同时启用多张决策图；公开 `/v1` 只使用唯一默认图，部门映射让管理端检查命中指定的启用图 |
 | 决策服务 | `choice` / `noul` / `score` 三类问题，按波次合并调用 `systemone` 兼容服务；画布快照固定该图使用的服务档案 |
@@ -20,30 +26,49 @@ RoutePilot 是兼容 OpenAI 协议的路由代理。请求从 `/v1/chat/completi
 | 后端选择 | 会话粘性；多模型目标在可用模型中随机选择；Auto 按图与模型隔离熔断和 inflight；固定模型直连独立 |
 | 可移植画布 | 每份已保存的 v4 画布自带生命周期标记、部门与完整非密钥运行配置，单份 JSON 即可在空数据库实例上恢复 |
 | 检查路由 | 调用 `/admin/try`，复用同一图执行器与同一轨迹格式，不改变粘性、inflight 与上游模型；可检查当前草稿或当前生效路由集（可按部门选图），数据库差异只作为提示展示 |
-| 运维 | 请求账本、决策回放、置信度分布、模型/提供方目录、多服务 JEV 目录、时段、审计历史、角色化用户 |
+| 运维 | 易失的 20 条决策日志（淘汰/回放）、置信度分布、模型/提供方目录、非密钥多服务 JEV 目录、时段、审计历史、角色化用户 |
 | 控制台 | 中英双语原生 ES Modules，无构建步骤 |
 
-## 请求路由流程
+## 请求链路
 
-```mermaid
-flowchart LR
-  C[客户端] --> V["/v1/chat/completions"]
-  V --> G[图执行器]
-  G <--> J["决策服务 /v1/systemone"]
-  G --> T["目标选择<br/>优先级 · 兜底"]
-  T --> A[会话粘性]
-  A --> L["随机选择<br/>+ 熔断器"]
-  L --> U[上游模型]
-  G -. 轨迹 .-> R[(请求账本)]
+**独立形态（内核 + 外围）。** 外围对外提供兼容 OpenAI 的端点，并向内核索取唯一一次决策：
+
+```text
+客户端
+  → 外围 POST /v1/chat/completions
+  → 内核 POST /internal/v1/route-decision   （不携带用户 Authorization）
+  → 外围把请求 model 改写为内核给出的真实模型
+  → 外围从自己的 SQLite 目录解析 Provider Key
+  → 模型上游
+  → 外围透传 JSON / SSE
+
+内核决策事件 → 外围 POST /internal/v1/decision-logs → 内存 deque(maxlen=20)
 ```
 
-1. 从当前生效路由集选图：公开 `/v1` 固定使用默认图，管理端检查可按部门选择一张启用图。
-2. 载入该图的不可变快照，评估输入条件（时段、文本关键词）。
+**内核接入 APISIX + newapi（163 形态）。** APISIX 保留原 newapi 链路，只向内核询问该跑哪个模型：
+
+```text
+客户端
+  → APISIX Auto 路由（model == "auto"）
+  → forward-auth：原始 Authorization 由 newapi 校验，并注入可信部门
+  → sr-auto-router 不带 Authorization 调内核 POST /internal/v1/route-decision
+  → APISIX 只改写 JSON 请求体 `model`（并更新 Content-Length）
+  → 原 newapi upstream/插件/Authorization 执行该真实模型
+  → APISIX 透传 JSON / SSE
+```
+
+固定模型请求完全绕过内核。没有有效决策时 APISIX 返回 503，绝不把 `auto` 发给 newapi；内核不会成为模型上游。
+
+每次决策内部（两种形态都由内核执行）：
+
+1. 选图：按可信部门命中某张启用图，否则使用默认图。
+2. 载入该图的已编译快照，评估输入条件（时段、文本关键词）。
 3. 激活第一波问题；同一波内的问题合并为一次决策服务调用。
 4. 写入数值端口与 `selected` 端口，重新评估下游槽位条件与逻辑门。
 5. 逐波重复，直到没有新问题被激活。
 6. 选择优先级最高的已激活目标；否则使用 `error_fallback`。
-7. 应用会话粘性；没有粘性命中时，在目标的可用模型中随机选一个，向上游转发请求。
+7. 应用会话粘性；没有粘性命中时，在目标的可用模型中随机选一个。
+8. best-effort 产出一条自包含决策事件（内嵌完整图与 trace）。
 
 `unknown` 不会激活问题或目标；与 `unknown` 比较的数值条件保持 `unknown`。
 
@@ -51,31 +76,37 @@ flowchart LR
 
 | 层 | 路径 | 职责 |
 |---|---|---|
-| API | `router/api/` | DTO 解析、异常到 HTTP 映射、上游代理、展示层 |
-| 控制面 | `router/control/` | 图与目录的写用例、影响清单与确认后的画布同步、启用校验 |
+| 内核应用 | `router/api/core_app.py`、`router/api/routes_decision.py` | `create_core_app()`：图管理 `/internal/v1/trees*`、决策 `/internal/v1/route-decision`、原子批次 `/internal/v1/graph-batches`、`/healthz`、`/readyz`；无 SQLite/控制台/上游 |
+| 外围应用 | `router/api/app.py`、`router/api/routes_core_proxy.py` | `create_app()`：控制台、登录/人员、目录 API、图管理代理、standalone `/v1` 数据面、决策事件接收口 |
+| 跨服务客户端 | `router/core_client.py`、`router/api/routes_v1.py`、`router/upstream/execution.py` | 内核决策/管理 HTTP 客户端；外围执行目录 join（决策模型 + Provider Key） |
+| 决策事件 | `router/decision_events.py`、`router/decision_log_sink.py`、`router/decision_log_store.py` | 自包含事件 schema/校验、内核 best-effort 异步 sink、外围 20 条内存日志与回放投影 |
+| API | `router/api/` | DTO 解析、异常到 HTTP 映射、展示层 |
+| 控制面 | `router/control/` | 内核侧图写用例；带跨服务原子图批次与反向补偿的目录写、影响清单、启用校验 |
 | 路由领域 | `router/routing/` | 图模型、校验、编译后拓扑、求值器、调度、不可变路由集快照 |
-| 决策服务 | `router/jev/` | `systemone` 客户端、服务档案、输入窗口 |
-| 上游 | `router/upstream/` | 固定模型目录（`model_id -> Backend`）、代理传输、熔断器与同步 worker |
-| 存储 | `router/store/` | SQLite schema/仓储、共享图文件仓储 |
-| 控制台 | `router/console/` | 中英双语原生 ES Module 界面 |
-| 运行时 | `router/request_logging.py`、`router/maintenance.py` | 账本队列/worker、会话清理 |
+| 决策服务 | `router/jev/` | `systemone` 客户端、非密钥服务档案、输入窗口 |
+| 上游 | `router/upstream/` | 固定模型目录（`model_id -> Backend`）、外围代理传输与熔断器、执行目录解析 |
+| 存储 | `router/store/` | 外围 SQLite schema/仓储、内核图文件仓储 |
+| 控制台 | `router/console/` | 中英双语原生 ES Module 界面（仅外围） |
+| 运行时入口 | `router/__main__.py` | `python -m router core|peripheral` |
 
 边界约束：
 
-- `router/routing/` 与 `router/upstream/` 不导入 FastAPI，也不导入 SQLite；`router/control/` 与 `router/store/` 不导入 `router.api`。
-- API 层只做 DTO 解析与异常映射，不直接写控制面状态。账号与会话路由（`/admin/login`、`/admin/logout`、`/admin/users`、`/admin/me`）直接调用 `UserRepo`/`SessionRepo`/`ChangeRepo`。
-- `GraphService` 依次完成校验、构造候选路由集、在单写锁内写生命周期文档、复核路由集指纹、发布完整启用集合、记录审计；过期草稿返回 409。
-- `ConfigurationService` 在一个应用事务内提交「目录写 + 已确认受影响的画布」：在写锁内重算影响清单、校验每份候选文档、暂存/替换图文件（非默认启用图先写、默认图最后写）、复核路由集指纹、写审计，然后提交。同步集合里含任一启用图时重发布完整启用集合；只同步禁用草稿时不发布；过期确认在任何写入之前返回 409 `graph_conflict`。
-- 没有任何画布引用的目录写只写目录行与审计，不会重写画布，也不会重新发布快照。
-- `compile_graph()` 对每个已发布路由集里的每张启用图各执行一次；请求路径读取 `snapshot.require_compiled()`，不重建索引，不访问 SQLite。
-- 事件循环只把账本行写入有界队列与 20 条环形缓冲；每 2 秒 flush 一次，投影白名单账本列，并把每个请求捕获的图快照与 trace 配成一对，经 `asyncio.to_thread` 落库。
-- 熔断 worker 启动时载入共享隔离状态，之后每 30 秒在工作线程同步本地变更。
+- 内核是图 JSON 目录的唯一写者（全局设计约束）；外围从不挂载或写入该目录。外围是自己 SQLite 的唯一写者。
+- `router/routing/` 与 `router/upstream/` 不导入 FastAPI，也不导入 SQLite；`router/control/` 与 `router/store/` 不导入 `router.api`；内核应用不导入 `router.store.db`。
+- 内核应用把 `get_conn` 依赖覆盖成 `None`，同一批图路由在完全没有 SQLite 连接的情况下运行；审计行与目录差异提示是外围专属关注点，通过代理注入。
+- 外围 API 层只做 DTO 解析与异常映射，不写图状态。账号与会话路由（`/admin/login`、`/admin/logout`、`/admin/users`、`/admin/me`）直接调用 `UserRepo`/`SessionRepo`/`ChangeRepo`。
+- `GraphService`（内核）依次完成校验、构造候选路由集、在单写锁内写生命周期文档、复核路由集指纹、发布完整启用集合、记录审计；过期草稿返回 409。
+- 可能触及图的目录写分两阶段提交：外围重算影响清单，要求内核用**一个条件批次**原子替换全部已确认画布（`POST /internal/v1/graph-batches`：基线校验 → 严格校验 → 路由集校验 → 一次提交/发布），然后提交自己的 SQLite 行。若内核已提交而 SQLite 提交失败，外围按新的基线哈希发反向批次补偿；补偿失败是显式 503 `catalog_sync_diverged`（绝不静默留下部分更新）。同步集合里含任一启用图时重发布完整启用集合；只同步禁用草稿时不发布；过期确认在任何写入之前返回 409 `graph_conflict`。
+- 没有任何画布引用的目录写只写目录行与审计，不会重写画布，也不会重新发布路由集。
+- `compile_graph()` 对每个已发布路由集里的每张启用图各执行一次；内核请求路径读取 `snapshot.require_compiled()`，不重建索引，不访问 SQLite。
+- 每次真实决策构造一条自包含事件并交给有界异步队列（`Queue(1000)`）：短超时 best-effort HTTP 投递、丢弃计数只用于观测、不落盘重试、不影响决策响应。`logging.type=disabled` 时 sink 是 no-op。
+- 会话粘性与内核调度/inflight 计数为进程内状态；外围另有自己的执行侧熔断器。
 
 ## 控制台
 
 ![测试](assets/routepilot/zh/test.png)
 
-每个页面只有一个 `<script type="module">` 入口，无应用全局变量，无 CommonJS。
+每个页面只有一个 `<script type="module">` 入口，无应用全局变量，无 CommonJS。控制台只由**外围**提供（`/console/`）；内核进程没有静态资源挂载。
 
 | 页面 | 内容 |
 |---|---|
@@ -133,9 +164,21 @@ flowchart LR
 
 ![计算日志](assets/routepilot/zh/logs.png)
 
-展开行按阶段呈现计算过程：输入准备、初始计算、逐轮 JEV、候选与最终选择、模型调度、执行结果。耗时只统计决策阶段（进入路由到选出模型），不含上游生成；上游状态与端到端总耗时留在网关数据面，不进入智能路由的展示口径。`routing_error` 保留失败前的部分过程：调度阶段失败保留调度现场（配置、注册、可用、不可用原因、调度时 inflight）；JEV 波次失败则作废该轮候选并落入 `error_fallback`。缺少调度快照的记录与重启回填的账本行会明确说明缺失项。
+计算日志是外围的**易失内存环**：内核每次真实决策都产出一条完整的 `routepilot.decision` 事件（best-effort），外围校验后只保留最新 20 条（`deque(maxlen=20)`）。不写 SQLite、重启不恢复、淘汰即终结——第 21 条挤掉最旧一条，被挤掉的事件回放返回 404。图快照表与账本写入器都已不存在。
 
-SQLite 保存两类行。**账本行**（`request_logs`）只有白名单里的决策列——不含请求文本、逐轮答案与节点标签。**请求快照**在记录请求时捕获：当时选中图的完整 canonical 文档与本次 trace，图按 canonical 内容的 SHA-256 写成一行 `graph_snapshots`（同内容的多个请求复用同一行；只有行为、布局或身份实际变化才产生新图版本，`enabled`/`default`、revision、`updated_at` 与文档哈希不拆分图去重），每个请求一行 `request_snapshots` 引用该图并保存自己的 trace。页面从进程内环形缓冲读取最近 20 条实时记录；点开记录的日志快照进入只读回放，先读内存环、miss 后读不可变 SQLite 行——绝不读取当前图文件或当前路由集。因此当前图改变或进程重启后，回放仍是请求当时捕获的图与 trace。快照写入保持 best-effort：失败的图/trace 对会在后续 flush 重试；确实没有快照时页面提示无法加载日志快照，不用当前图伪造历史。本阶段没有自动删除或保留期策略：日志容量由不同图内容的数量与保留的请求数量决定，而不是保存/启用次数。
+每条事件都是自包含的：`schema_version`（`1`）、`event_type`（`routepilot.decision`）、`id` / `ts`、请求事实（文本、请求模型、可信部门、会话哈希）、**本次实际使用的完整图文档**（含非密钥运行配置）、决策值（状态、逻辑/真实模型、目标、选图与选路原因、兜底、粘性、策略路径、推理、耗时）、JEV 事实与答案、完整回放 trace 与节点标签。事件不含 Provider Key、JEV Key、`Authorization`，也不含图快照 ID；`key_env` 只是环境变量名，允许保留。事件只记录决策本身——绝不记录 newapi 渠道/计费、模型上游状态或 Token 用量。
+
+展开行按阶段呈现计算过程：输入准备、初始计算、逐轮 JEV、候选与最终选择、模型调度。耗时只统计决策阶段（进入内核到选出模型），不含上游生成；上游状态与端到端总耗时留在网关数据面，不进入智能路由的展示口径。`routing_error` 事件保留失败前的部分过程，并仍内嵌已选中的图；选图之前因参数非法被拒绝、或根本没有当前图的请求不会产生可回放事件。
+
+回放页面与以前完全一致：`routing.html?request=<决策 id>` 通过既有 `controller.loadTree()` / `rebuildTryRun()` 路径读取该事件自己的 `graph` 与 `trace`。由于图内嵌在事件里，事后修改或删除当前图不会改变仍保留在内存中的回放。页面列表请求走 `GET /admin/requests/recent`（只返回摘要——20 条列表不下发 20 份完整图），单条回放走 `GET /admin/requests/{id}/replay`。
+
+### 决策事件与日志配置
+
+内核通过 `config.json` 决定事件去向：
+
+- `logging.type = "routepilot"`（standalone 形态的默认值）：异步把事件发到 `logging.url`，例如 `http://console:8400/internal/v1/decision-logs`，`timeout_ms` 默认 1000。投递是 best-effort：有界队列、短超时、丢弃计数只用于观测，失败绝不影响决策响应。
+- `logging.type = "disabled"`：显式不输出事件（163 内核-only 部署使用）。决策照常工作，内核不保留任何事件副本。
+- 本期**未实现** VictoriaLogs；事件结构已固定，后续 `logging.type=victorialogs` 适配器可直接把同一对象序列化为 JSON Lines。
 
 ## 决策图
 
@@ -197,7 +240,7 @@ SQLite 保存两类行。**账本行**（`request_logs`）只有白名单里的�
 
 ### 图文档
 
-v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`default`）、部门映射（`departments`）、图结构加四个必填运行字段。生命周期持久化在每份文档里——不再有 `ROUTER_GRAPH_DIR/current` 指针。新建与复制的文档一律以 `enabled: false, default: false` 保存；导入只替换草稿内容、不改生命周期——作为新组保存时是关闭态，保存到已有组则继承该组已存的生命周期（已启用的组保持启用）。通过生命周期 API 启用的第一张图会自动成为默认图。
+v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`default`）、部门映射（`departments`）、图结构加四个必填运行字段。生命周期持久化在每份文档里——不再有 `current` 指针。新建与复制的文档一律以 `enabled: false, default: false` 保存；导入只替换草稿内容、不改生命周期——作为新组保存时是关闭态，保存到已有组则继承该组已存的生命周期（已启用的组保持启用）。通过生命周期 API 启用的第一张图会自动成为默认图。
 
 ```json
 {
@@ -265,7 +308,7 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
 
 ![模型](assets/routepilot/zh/models.png)
 
-决策图引用的模型槽位映射到上游模型 id 与提供方。一个目标可包含多个槽位；有多个可用模型时随机选择一个。**数据库目录**是控制台下拉框与固定模型直连的管理事实源；**每张启用图的画布快照**是 Auto 路由的唯一事实源。
+决策图引用的模型槽位映射到上游模型 id 与提供方。一个目标可包含多个槽位；有多个可用模型时随机选择一个。**数据库目录**（外围 SQLite）是控制台下拉框与固定模型直连的管理事实源；**每张启用图内嵌的画布运行配置**是内核决策的唯一事实源。APISIX 形态下内核只返回真实模型名，由 newapi 执行；standalone 形态下外围通过 `router/upstream/execution.py` 把内核决策与自己目录里的 Provider Key 组合——执行目录里缺少该逻辑模型、或目录提供方/base_url 与内核决策不一致时返回 503 `execution_catalog_mismatch`，不调用任何上游。
 
 提供方定义 OpenAI 兼容 base URL、API Key 环境变量与推理方言。模型 profile 声明：
 
@@ -289,52 +332,48 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
 
 ![决策服务设置（JEV）](assets/routepilot/zh/jev.png)
 
-决策服务提供 `POST /v1/systemone`，常见部署为 NeoHorse 或 vLLM。控制台页面管理的是**服务目录**，不是单一全局配置：
+决策服务提供 `POST /v1/systemone`，常见部署为 NeoHorse 或 vLLM。内核调用所选图配置的服务；控制台页面管理的是**非密钥服务目录**，不是单一全局配置：
 
-- 列表展示每个服务的 ID、模型与地址；新建、编辑、删除都按服务进行；窗口（`input_tokens` / `context_tokens`）与提示词、超时、`key_env` 和密钥一样属于该服务。
-- **测试**调用 `POST /admin/jev/{id}/test`，使用数据库里的服务配置而不是任何图的画布快照；画布自身的 JEV 由检查路由以提示形式报告差异。
-- 画布选择一个服务（`jev.id` + `key_env`）并内嵌其完整非密钥档案与窗口。画布在选择、刷新或服务端确认同步时总是成组替换 JEV 与窗口——不存在「两个服务混用」的形态。
-- 只有 `key_env`（环境变量名）与服务地址/模型是可移植的。真实 `api_key` 只存在 SQLite 中，仅当服务 `id`、`base_url`、`model` 全部仍匹配时复用；否则在构建快照时读取该服务 `key_env` 指向的环境变量。不存在全局 `ROUTER_JEV_API_KEY` 回退；播种的 `default` 服务恰好把该变量名作为自己的 `key_env`。
+- 列表展示每个服务的 ID、模型与地址；新建、编辑、删除都按服务进行；窗口（`input_tokens` / `context_tokens`）与提示词、超时一样属于该服务。目录**不存任何密钥材料**——`api_key` 是未知字段（422），旧的 `key_present`/`key_source` 状态已随 v7 迁移删除。
+- **JEV Key 属于内核。** 内核只从 `config.json` `jev.api_key_env` 指定的环境变量（默认 `ROUTER_JEV_API_KEY`）读取，并直接发给 JEV 端点。外围及其 SQLite 永远看不到它，控制台也没有密钥输入。
+- **测试**调用 `POST /admin/jev/{id}/test`，使用目录里的服务配置。只有外围进程自身环境里有该 Key（`ROUTER_JEV_API_KEY`）时它才证明连通性；分裂部署的外围没有 JEV Key，真实 JEV 证据应看检查路由 / 内核决策。
+- 画布选择一个服务（`jev.id` + `key_env`）并内嵌其完整非密钥档案与窗口；`key_env` 作为图文档 schema 兼容的环境变量名保留，目录投影固定为 `ROUTER_JEV_API_KEY`。画布在选择、刷新或服务端确认同步时总是成组替换 JEV 与窗口——不存在「两个服务混用」的形态。
 - 删除仍被画布引用的服务必须提供替代服务，确认后同步受影响画布的 JEV 档案与窗口；更新被引用的服务同样需要确认并同步。
 
 ## 账号与运维
 
-- 邮箱口令登录，scrypt 哈希，不透明 bearer 会话。
-- `admin` 可编辑图、模型、提供方、JEV 服务目录与用户；`viewer` 只读。
+- 邮箱口令登录，scrypt 哈希，不透明 bearer 会话——全部在外围。内核没有登录、人员、会话或 `/admin/*` API。
+- `admin` 可编辑图（经内核代理）、模型、提供方、JEV 服务目录与用户；`viewer` 只读。
 - 最后一个启用的管理员不能被降级、停用或删除。
-- 用户与配置变更写入审计日志。
-- 图文件以 SHA-256 内容寻址，用于保存冲突与重载校验；图存储不保留版本历史——替换内存路由集不是持久化发布历史。历史回放改用 SQLite 中请求时捕获的快照。
-- 控制面状态存于 SQLite（WAL）；路由图是共享 JSON 文件；账本写入在工作线程执行。
-- 会话粘性与 inflight 计数为进程内状态。
+- 用户与配置变更写入外围审计日志。
+- 图文件以 SHA-256 内容寻址，用于保存冲突与重载校验；图存储不保留版本历史——替换内存路由集不是持久化发布历史。历史回放改用每条保留决策事件内嵌的图。
+- 外围控制面状态存于 SQLite（WAL），只含人员、会话、提供方、模型目录、非密钥 JEV 目录、时段与变更记录；路由图是内核持有的 JSON 文件。
+- 会话粘性与内核调度/inflight 计数为进程内状态；外围执行侧熔断器同样是进程内状态。
 
-## 图存储与多副本
+## 图存储（内核独占）
 
-图不存于 SQLite。每个决策组是 `ROUTER_GRAPH_DIR/graphs/{tree_id}.json` 下的一份 v4 文档；生命周期来自文档自己的 `enabled`/`default` 字段——旧的 `ROUTER_GRAPH_DIR/current` 指针既不读取也不写入。每份文档**必须**自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），因为已保存画布是 Auto 路由唯一的运行时来源。不存在 `runtime:null` 标记、不存在「保存为旧文档」模式，也没有把配置物化进旧文件的服务端步骤。
+图**只**以 JSON 文件存储，永不进 SQLite，且只由内核写入。每个决策组是 `<graphs.directory>/graphs/{tree_id}.json` 下的一份 v4 文档；生命周期来自文档自己的 `enabled`/`default` 字段——旧的 `current` 指针既不读取也不写入，也没有数据库回退。每份文档**必须**自带运行配置（`backends`、`jev`、`jev_window`、`time_periods`），因为已保存画布是决策唯一的运行时来源。目录来自 `config.json` 的 `graphs.directory`（standalone compose 用 `/data/graphs`，163 PVC 沿用既有的 `/data/graph`）。
 
-- 单写者：管理面 API。其他副本设置 `ROUTER_GRAPH_WRITER=false`，只读挂载目录，路由集指纹变化时每 2 秒轮询重载。
-- 副本在替换服务路由集前校验并编译**每一张**启用图；任一启用图非法时保留旧路由集，`/readyz` 报告 `stale: true` 与 `last_load_error`。
-- 启停与默认切换就是普通的文档写入：非默认启用图先写、默认图最后写，然后重发布完整启用集合。
-- 写入通过临时文件原子替换，权限 `0600`。
-- Kubernetes：图文件使用 ReadWriteMany PVC；写者的 SQLite 使用本地存储。
-- Docker：把同一 NFS 导出挂载进所有容器。
-- 所有读写容器必须使用同一数值 UID；`0600` 文件无法仅靠 GID 或 `fsGroup` 访问。
+- **唯一写者：内核。** 外围从不挂载或写入该目录；所有图变更都经 HTTP 代理到 `/internal/v1/trees*`。进程管理必须保证同一图目录只有一个内核写者（163 Deployment 使用 `Recreate`，并在内核启动前退役旧单服务工作负载）。
+- 内核在载入或发布路由集时校验并编译**每一张**启用图；任一启用图非法时跳过发布，旧的已发布路由集继续服务，`/readyz` 报告 `stale: true` 与 `last_load_error`（若从未成功发布则未就绪）。
+- 启停、默认切换与目录驱动的多图更新都是原子的：条件批次暂存全部候选文件、校验结果启用集合，然后一次提交并重发布完整启用集合；失败回滚整批。
+- 写入通过临时文件原子替换，权限 `0600`；内核进程（镜像内 uid 10001）必须拥有该目录。
+- Kubernetes：内核图目录使用一个 ReadWriteOnce/ReadWriteMany PVC（163 为 `/data/graph`），`Recreate` 策略，不部署 console。
+- Docker standalone：内核使用 named volume `core-graphs`，外围 SQLite 使用独立的 `console-data` 卷。
 - 过期保存返回 409 `graph_conflict`；导入只改草稿。
-- `/healthz` 为存活探针；`/readyz` 报告路由集就绪状态并暴露 `default_tree_id`、`enabled_tree_ids`、`snapshot_revision` 与 `route_fingerprint`；503 表示未就绪，后续重载失败会保留现有路由集并标记 `"stale": true`。
-- schema 会自行升级（见[从旧版快照前安装升级](#从旧版快照前安装升级)）；不再提供 SQLite→图文件的导出脚本——迁移画布靠导出/导入 JSON 文件。
+- 内核 `/healthz` 为存活探针；`/readyz` 报告路由集就绪状态并暴露 `default_tree_id`、`enabled_tree_ids`、`snapshot_revision` 与 `route_fingerprint`；503 表示未就绪，后续重载失败会保留现有路由集并标记 `"stale": true`。外围 `/readyz` 只报告自己的 SQLite 状态——内核不可达是数据面错误而不是就绪失败，运维仍能打开控制台检查配置。
+- 外围 SQLite schema 会自行升级（见[从旧版单服务安装升级](#从旧版单服务安装升级)）；不再提供 SQLite→图文件的导出脚本——迁移画布靠导出/导入 JSON 文件。
 
-## 从旧版快照前安装升级
+## 从旧版单服务安装升级
 
-对既有部署，有两件变化。
+内核/外围拆分改变了每个进程拥有的东西。请按顺序执行：
 
-1. **SQLite schema 在首次启动时自动迁移。** schema v5 在一个事务内升级到 v6：旧的单行 `jev_config` 变成 id 为 `default` 的 `jev_services` 服务（已存密钥、端点、模型、提示词与超时保留；窗口被夹到合法范围），随后旧表被删除。升级前请备份 `router.db`（连同 `router.db-wal` / `router.db-shm`）；升级后没有回到旧单配置布局的路径。若 JEV 目录为空且从未用过环境种子，`ROUTER_JEV_URL` + `ROUTER_JEV_MODEL` 会一次性创建该 `default` 服务，`ROUTER_JEV_API_KEY` 作为它的密钥写入；`settings.jev_catalog_seeded` 会记录这次播种，因此之后的任何重启都不会再创建 `default` 服务——即使所有服务都已被删除。
-2. **每份已存画布必须已经是完整的 v4 快照。** 严格解析器只接受 `sr-routing-graph` version 4：除四个运行字段外，每份文件还必须带 `departments`、`enabled`、`default`。升级前：
-
-   - 备份 `ROUTER_GRAPH_DIR`（`graphs/*.json`；旧的 `current` 指针不再读取，请先记下当时生效的图再丢弃）；
-   - 在**旧版本**上为每个决策组生成完整运行快照：打开每个决策组并保存一次（或对其文档 `PUT /admin/trees/{id}`）。旧版本会把当时有效的运行配置写进文件（版本 3 文档）；
-   - 手工把每个 `graphs/*.json` 升级为 v4：`version` 改为 `4`，加入 `"departments": []`，并按旧现实设置 `enabled`/`default`（原活动图为 `true`/`true`，其余为 `false`/`false`）。如果旧实例已无法操作，同时按[自包含画布 JSON](#自包含画布-json)补齐四个运行字段；
-   - 结果必须通过[决策图](#决策图)的 v4 规则解析，并与画布实际引用的模型、提供方、JEV 服务和时段一致。
-
-漏改的文件不会被静默修复：启动时记录 `initial graph snapshot is unavailable`，`/readyz` 报告未就绪（或 `stale`），`GET /admin/trees` 返回 503 `graph_storage_error`，`/v1` Auto 路由没有可用路由集（`no_valid_snapshot`），直到文件修好。启动成功后，v3 文件仍然只是非法文件——永远不会被隐式接管或迁移。
+1. **先全部备份。** 复制 SQLite 数据库（`router.db` 连同 `router.db-wal` / `router.db-shm`）与内核图目录（`graphs.directory` 下的 `graphs/*.json`）。图 JSON 仍是内核事实源；切换部署就是把该目录挂载给内核，并确保只有内核一个写者。
+2. **SQLite schema 会在外围首次启动时自动迁移。** schema v6 在一个事务内升级到 v7，并**删除** `request_logs`、`graph_snapshots`、`request_snapshots` 及其索引，同时按显式非密钥列重建 `jev_services`（JEV `api_key` 列消失）。历史决策日志**不会**迁移到内存环或 VictoriaLogs——旧记录不再可回放。早于 schema v6 的数据库会被拒绝；不存在回到单服务布局的路径。
+3. **把 JEV Key 移出 SQLite。** 内核只从自己的环境变量读取（`ROUTER_JEV_API_KEY`，或 `config.json` `jev.api_key_env` 指定的名字）。在内核容器/进程里设置它；已存密钥不会迁移，旧的 `ROUTER_JEV_*` 播种变量也不会创建密钥。
+4. **部署两个服务**（或只部署内核接 APISIX）：内核需要 `config.json` + 图目录 + JEV Key；外围需要 `ROUTER_CORE_URL`、自己的 SQLite 路径与常规控制台配置。见[快速开始](#快速开始)与[配置项](#配置项)。
+5. **若内核无法载入既有目录，就通过内核 API 重新发布图**：启动日志会记录 `initial graph snapshot is unavailable`，内核 `/readyz` 报告未就绪（或 `stale`），`/internal/v1/trees` 在文件修好前返回 `graph_storage_error`。每份已存画布必须已经是完整 v4 文档（四个运行字段 + `departments` + `enabled`/`default`）；v3 文件会被拒绝，永远不会被隐式接管或迁移。
+6. **在内核启动前退役旧单服务工作负载**，保证只有一个进程写图目录（`scripts/docker/deploy-163.sh` 会先删除 `deployment/routepilot` 与 `service/routepilot`）。已退役的网关共享凭据与静态 RoutePilot 上游服务 Key 已从代码、部署环境与文档中移除；APISIX 侧残留由 `scripts/apisix/patch_apisix_deployment.py` 清理。
 
 ### 旧 profile 中的非 JSON 兼容数值
 
@@ -437,13 +476,15 @@ sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;
 规则：
 
 - **四个字段永远齐全。** 只带部分字段（或完全不带）的文档在解析、导入、保存、检查时都以 `graph_parse_error` 拒绝；不存在从数据库补齐缺字段的回退，也不存在 `runtime:null` 控制字段或物化步骤。旧文档被拒绝，不会被就地升级。
-- **JEV 与窗口是一个整体。** `jev.id` 选择目录服务，`key_env` 说明其密钥如何解析；`jev_window` 属于该服务。选择或同步 JEV 服务时，`jev` 与 `jev_window` 一起替换。原始 `PUT /admin/trees/{id}` 补丁若改变 `jev.id`，必须同时携带新服务的 `jev_window`；否则返回 422，不继承旧服务窗口。
+- **JEV 与窗口是一个整体。** `jev.id` 选择目录服务；`key_env` 是内核读取密钥的环境变量名，固定为 `ROUTER_JEV_API_KEY`；`jev_window` 属于该服务。选择或同步 JEV 服务时，`jev` 与 `jev_window` 一起替换。原始 `PUT /admin/trees/{id}` 补丁若改变 `jev.id`，必须同时携带新服务的 `jev_window`；否则返回 422，不继承旧服务窗口。
 - **不含密钥，且任意层级都拒绝。** 提供方只写 `key_env`（环境变量名），不写 Key；`jev` 不含 `api_key`。密钥与派生的密钥字段（`api_key`、`authorization`、`key_present`、`key_source`）出现在四个字段内部任意位置——包括 `backends.models[*].profile` 下的嵌套对象和数组——都会被拒绝。键名比较忽略大小写与 `-`/`_`（`API-KEY` 等同 `api_key`），但只覆盖这个固定集合，`monkey`、`keychain` 之类正常元数据照旧保留。除此之外 `profile` 仍是自由 JSON 元数据对象：`capability`、`domains`、`tier` 以及后续元数据原样保存。无需鉴权的本地服务可以把 `key_env` 留空。
 - **在文件边界校验。** 提供方与模型 id、提供方引用、profile、推理档位声明、JEV 服务档案、窗口与时段都在解析时校验。
 - **生命周期必填但普通保存不可写。** `enabled`/`default` 是必填文档字段，但新建/复制一律保存为关闭且非默认，导入只替换草稿（新组保存为关闭态，已有组保持已存生命周期）；启停与设为默认都走专用生命周期端点，普通保存可以改 `departments`，但永远不能改生命周期。`default: true` 必须同时 `enabled: true`。
 - **参与行为版本。** 四个运行字段加 `departments` 进入 `tree_revision`（以及控制台 dirty/undo 基线）；`enabled`/`default` 进入路由集指纹与 `snapshot_revision`。画布坐标仍不影响行为。
 
-### 快照来源
+### 运行配置快照来源
+
+这里的「快照」指画布内嵌的**运行配置**——图编辑器一直就有、本次继续保留的概念，与已删除的决策日志 `graph_snapshots` 表无关。
 
 只有以下操作会生成或修改画布运行快照：
 
@@ -451,20 +492,20 @@ sqlite3 router.db "SELECT id, profile FROM models WHERE json_valid(profile) = 0;
 2. **导入完整 JSON 文档** —— 以文件内快照为准。
 3. **在画布中选择模型或 JEV** —— 把所选目录项（非密钥）加入/替换当前草稿；选择 JEV 时档案与窗口原子替换。
 4. **图设置里的「从数据库刷新运行配置」**。
-5. **确认目录影响清单后** —— 服务端同步受影响的画布。
+5. **确认目录影响清单后** —— 外围要求内核同步受影响的画布。
 
-目录写入本身不会重写画布，也不会重新发布快照。target 编辑遇到快照已有的同 ID 模型不会覆盖其快照项；差异由检查提示报告，只有显式刷新或确认同步才替换。复制决策组保留源组快照与部门，但强制关闭；`POST /admin/try` 携带 `tree_id` 时继承已存画布快照（完整草稿必须自带四字段；既没有 `tree_id` 也没有 `root` 时改为检查当前生效路由集）。
+目录写入本身不会重写画布，也不会重新发布路由集。target 编辑遇到快照已有的同 ID 模型不会覆盖其快照项；差异由检查提示报告，只有显式刷新或确认同步才替换。复制决策组保留源组快照与部门，但强制关闭；`POST /admin/try` 携带 `tree_id` 时继承已存画布快照（完整草稿必须自带四字段；既没有 `tree_id` 也没有 `root` 时改为检查当前生效路由集）。
 
 ### 密钥
 
-JSON 从不保存密钥，环境在构建快照时提供。
+JSON 从不保存密钥，每种密钥只有一个归属：
 
-| 密钥 | 解析顺序 |
+| 密钥 | 归属与解析顺序 |
 |---|---|
-| 提供方 API Key | 仅当数据库提供方的 `name` 与规范化 `base_url` **都匹配**时复用其已存密钥，否则为空；再取 `os.environ[key_env]` |
-| 决策服务 Key | 仅当数据库服务的 `id`、`base_url` 与 `model` **都匹配**时复用其已存密钥，否则为空；再取 `os.environ[service.key_env]`。不存在全局 JEV Key 回退；播种的 `default` 服务用 `ROUTER_JEV_API_KEY` 作为自己的 `key_env`。 |
+| 提供方 API Key | **只属于外围。** 执行目录为 standalone `/v1` 数据面解析它：仅当 SQLite 提供方的 `name` 与规范化 `base_url` **都匹配**内核决策时复用其已存密钥，否则为空；再取外围进程的 `os.environ[key_env]`。它绝不进入内核请求、决策事件或任何图响应。 |
+| 决策服务（JEV）Key | **只属于内核。** 从 `config.json` `jev.api_key_env` 指定的环境变量（默认 `ROUTER_JEV_API_KEY`）读取，只发给 JEV 端点。没有 SQLite 存储、没有控制台输入、外围也没有副本。 |
 
-因此端点变化不会把旧密钥静默发往新地址；环境变量密钥不会被写进 SQLite 或 JSON；派生鉴权头只存在于内存快照；任何 JSON 文件、API 响应信封或图响应都不包含真实密钥。
+因此端点变化不会把旧密钥静默发往新地址；密钥不会被写进 SQLite、JSON 文件或任何 API 信封；派生鉴权头只存在于拥有该密钥的进程；决策事件里最多出现 `key_env` 名字，绝不包含密钥值。APISIX 形态完全不需要 Provider Key——newapi 用用户原始凭据执行选中的模型。
 
 ### 目录影响确认
 
@@ -476,7 +517,7 @@ JSON 从不保存密钥，环境在构建快照时提供。
 
 此状态下不写任何东西——数据库、文件、审计与快照都不变。控制台展示清单；确认后用这些哈希原样构造 `impact_confirmation = {"trees":[{"id","document_sha256"}, …]}` 重试同一请求。若期间画布已变化，服务端返回 409 `graph_conflict` 并报告**当前**哈希，控制台要求重新读取而不是应用过期确认。
 
-确认后由同一个用例原子提交目录行、全部受影响画布与审计行：在单写锁内重算影响清单、校验每份候选文档、暂存所有文件（非默认启用图先写、默认图最后写）、复核路由集指纹后才提交。任一失败都会回滚数据库并恢复所有已替换文件；内存路由集只在事务提交后、且同步集合里含任一启用图时才重发布，只同步禁用草稿时不发布。
+确认后的写入横跨两个存储。外围先重算影响清单，再要求内核用**一个条件批次**替换全部已确认画布（`POST /internal/v1/graph-batches`）：校验全部基线 `document_sha256`、严格校验每份候选、校验结果启用集合、提交一个批次并发布。之后外围才提交自己的 SQLite 行与审计。若该 SQLite 提交失败，外围按新的基线哈希发反向批次补偿；补偿失败返回 503 `catalog_sync_diverged` 并记录严重错误，绝不静默留下部分状态。同步集合里含任一启用图时才重发布路由集；只同步禁用草稿时不发布。
 
 更新/删除语义：
 
@@ -489,60 +530,58 @@ JSON 从不保存密钥，环境在构建快照时提供。
 
 ### 画布与目录差异
 
-`POST /admin/try` 会把画布声明的资源（provider、模型、JEV 服务及其窗口）与数据库目录逐字段比较，把差异或缺失行报告为提示（`code = "runtime_mismatch"`、`level = "hint"`，`params` 同时给出画布值与数据库值）。提示不阻止检查，也不改变执行配置：运行仍严格使用画布快照。数据库里存在但画布未声明的资源不算冲突，也不会产生提示。控制台在检查结果下方渲染这些提示。
+`POST /admin/try` 会把画布声明的资源（provider、模型、JEV 服务及其窗口）与数据库目录逐字段比较，把差异或缺失行报告为提示（`code = "runtime_mismatch"`、`level = "hint"`，`params` 同时给出画布值与数据库值）。提示不阻止检查，也不改变执行配置：运行仍严格使用画布快照。数据库里存在但画布未声明的资源不算冲突，也不会产生提示。检查由内核执行（内核没有 SQLite），外围把目录提示重新挂到内核响应上——这是拆分后唯一能跑该比较的位置。控制台在检查结果下方渲染这些提示。
 
 ### 用一份 JSON 恢复
 
-1. 启动一个空数据库、空图目录的实例。
+1. 启动空的外围数据库与空的内核图目录（APISIX 形态只需内部署内核）。
 2. 把 JSON 导入决策组（控制台「决策组」页，或 `POST /admin/trees`）。导入只替换草稿，作为新组保存时一定是关闭态；从顶栏或 `POST /admin/trees/{id}/enable` 启用它——第一张启用的图成为默认图。（导入到已有启用组再保存则保持启用。）若这张图要服务某个部门，在图设置里补部门。
 3. 对草稿执行检查路由（`POST /admin/try`），验证图、内嵌模型目录、决策服务、窗口与时段。把检查范围切到**当前生效路由集**（可填部门）验证选中的是哪张启用图；响应里的 `tree_id` / `graph_selection` 给出证据。
 4. 调用 `POST /v1/chat/completions` 走默认图的 Auto 路由，或打开模型测试对话（同样只走 Auto，可填部门）验证端到端回复。
-5. 只需为密钥配置环境变量：各提供方的 `key_env`，以及所选 JEV 服务端点需要鉴权时的 `key_env`。
+5. 只需为密钥配置环境变量：内核的 JEV Key（`ROUTER_JEV_API_KEY`）；standalone 执行时各提供方的 `key_env` 配置在外围环境（或存于外围 SQLite）。
 
 `configs/default_routing_tree.json` 是最小可运行示例：一个 `local` 提供方、两个模型、`default` 决策服务档案与三个时段。它是一份 `enabled: false, default: false, departments: []` 的 v4 文档：通过管理 API（例如 `scripts/apply_default_routing_tree.py`）应用后再启用。管理写路径从不接受载荷里的生命周期：新建与复制的文档一律以 `enabled: false, default: false` 落盘，导入只替换草稿（保存到已有组则继承其已存生命周期）。`configs/production_routing_tree.json` 形状相同、含三个模型；部署前替换示例 base URL 与端点。
 
 `configs/cases/case-*.json` 里的五个演示案例都是完整 v4 文档：带 `kind`/`version`，不含外部 `id`，`enabled: false, default: false, departments: []`，provider 为 `demo-tap`，JEV 服务为 `demo-jev`（窗口 `2048 / 4096`），并内嵌其 target 实际引用的全部模型。`scripts/demo/apply_cases.py` 是它们的部署入口：合并案例文件里的目录、播种多服务 JEV 目录与时段、部署五棵画布（不启用）并跑 dry-run。它绝不绕过影响确认——遇到 409 默认打印受影响画布并停止；`--confirm-sync` 才会用预览里的基线哈希显式重试同一批请求。`graph_conflict` 表示画布在预览后变化，重跑脚本即可。
 
-## 部署在 APISIX 之后（163 部门路由）
+## 部署在 APISIX + newapi 之后（163 部门路由）
 
-RoutePilot 以仅 ClusterIP 的形态部署在 163 共享 APISIX 之后（`sandlake` 命名空间）。公开 `/v1` 仍然只走默认图；部门路由是第二条入口：
+163 上只运行**决策内核**：`sandlake` 命名空间里的 `routepilot-core`，仅 ClusterIP。APISIX 保留原 newapi upstream，内核只回答「该跑哪个真实模型」。
 
 ```text
 客户端（带部门的 API Key）
   → APISIX Auto 路由        vars: post_arg.model == "auto"   priority 1001/101
-  → forward-auth           GET http://sandlake-api…:8888/v1/models（Authorization）
+  → forward-auth           GET http://sandlake-api…:8888/v1/models，携带原始 Authorization
   → X-SR-Department        由 newapi 用已校验的 token.Department 注入
-  → sr-auto-router         priority 2001：清掉客户端伪造的内部头、
-                           把 URI 改写到 /internal/v1/chat/completions、
-                           删除 Authorization、注入 X-SR-Gateway-Token
-  → RoutePilot 内部数据面   POST /internal/v1/chat/completions（按部门选图）
-  → 图执行器                改写 model，上游凭据用 ROUTE_PILOT_UPSTREAM_API_KEY
-  → APISIX 网关             http://apisix-gateway.sandlake.svc.cluster.local/apiuser/v1
+  → sr-auto-router         priority 2001：清掉客户端伪造的决策响应头、
+                           不带用户凭据调内核、只改写 JSON 请求体 `model`
+                           并刷新 Content-Length
+  → 内核                   POST /internal/v1/route-decision（按部门选图）
+  → 原 newapi upstream     用用户原始 Authorization 执行选中的真实模型
+  → 透传 JSON / SSE
 ```
 
-同一路径上的其他模型由 fixed 路由（priority 1000/100）处理：它从既有 `/apiuser/*` 路由深拷贝而来，直接打到 newapi，不经过 RoutePilot，因此固定模型保持原链路、不会再次进入路由形成循环。
-
-内部端点必须带 `X-SR-Gateway-Token`；服务端未配置 `ROUTER_GATEWAY_TOKEN` 时 fail closed（`503 gateway_auth_not_configured`），凭据错误返回 `401 gateway_unauthorized`。凭据用常量时间比较，不写日志。契约见[后端接口说明](docs/后端接口说明.md) §3.4。
+同一路径上的其他模型由 fixed 路由（priority 1000/100）处理：它从既有 `/apiuser/*` 路由深拷贝而来，直接打到 newapi，不经过内核，因此固定模型保持原链路、不会再次进入路由形成循环。决策调用失败时 APISIX 返回 503，绝不把 `auto` 发给 newapi。内核收不到 `Authorization`，也从不调用模型上游。已退役的网关共享凭据与静态 RoutePilot 上游服务 Key 不再存在，边界改由网络策略与可信部门头承担。决策契约见[后端接口说明](docs/后端接口说明.md) §3.4。
 
 | 组成 | 位置 |
 |---|---|
-| 集群清单（ClusterIP Service、NFS PVC、NetworkPolicy） | `scripts/docker/k8s-163/*.yaml` |
-| 构建与部署脚本（凭据只从环境变量读取） | `scripts/docker/deploy-163.sh` |
-| 图配置（main/finance/legal/jev-smoke） | `scripts/configure_163_routepilot.py` |
+| 内核-only 集群清单（Deployment、ClusterIP Service、NFS PVC、NetworkPolicy、config ConfigMap） | `scripts/docker/k8s-163/*.yaml` |
+| 构建与部署脚本（只有内核 JEV Secret 来自环境变量） | `scripts/docker/deploy-163.sh` |
+| 图配置（main/finance/legal/jev-smoke，经内核 API） | `scripts/configure_163_routepilot.py` |
 | APISIX 插件 | `scripts/apisix/sr-auto-router.lua` |
 | 插件注册（幂等；APISIX 3.15 通过 `apisix.plugins` 列表注册） | `scripts/apisix/patch_apisix_deployment.py` |
 | Route 发布（先影子、后生产） | `scripts/apisix/configure_routepilot_routes.py` |
-| 端到端验收矩阵 | `scripts/apisix/verify_routepilot_e2e.py` |
-| 手工本机联调栈（APISIX + RoutePilot，不依赖 newapi） | [APISIX 本机联调部署指南](docs/APISIX-本机联调部署.md) |
+| APISIX 验收矩阵与故障演练 | `scripts/apisix/verify_routepilot_e2e.py` |
+| 手工本机联调栈（APISIX + 内核，不依赖 newapi） | [APISIX 本机联调部署指南](docs/APISIX-本机联调部署.md) |
+| 双服务 standalone 部署 | `scripts/docker/compose.yml`、`scripts/docker/core-config.json` |
 
-按“已验证”与“未执行”分开记录：
+按「已验证」与「未执行」分开记录：
 
-- **163 上已完成（2026-11-25）**：镜像 `routepilot:amd64-e014ae2` 已构建并运行（1/1），ClusterIP Service、NFS PVC、NetworkPolicy 已应用，四张图（`main` 默认、`finance`、`legal`、`jev-smoke`）已发布；Pod 内直连内部端点实测：财务部→`finance`/`department`、法务部→`legal`/`department`、未知与空部门→`main`/`default`，均返回真实上游模型与真实答案；缺失或错误 `X-SR-Gateway-Token` 返回 401。
-- **仅完成离线验证**：远程失败脱敏、`nginx_config.envs` 让 worker 能读到网关 Token、共享 APISIX 对象漂移时 fail-closed、Route 发布/删除/回滚状态机（应用后任何异常都恢复，恢复失败单独报告）、E2E 响应所有权、强制模型断言、至少两个内容帧且有时延证据的 SSE、账号本条件等待、`TreeUpsertIn` 白名单的 JEV 图写回与嵌套恢复、fail-stop 故障演练、核心失败门禁（模型/case/内部端点失败不进入 JEV 或任何 drill）、按请求 ID 的持久化 `client_disconnected` 证据（初始 `incomplete` 不计通过）、`/root/routepilot-backups/<时间戳>/drill.json` 持久化备份与独立 `--restore-drill-backup` 恢复入口（只接受生成格式目录、shell 引用 + `realpath` 复核、所有普通异常安全非零）、真实 `drill.json` + 独立进程的恢复证据、在线与独立恢复都回到备份记录的原默认图（文档 PUT 失败不跳过默认图恢复）、primary/restore/verification 失败分别报告、基于 Pod 元数据的 previous 日志检测、RoutePilot 停机前的旧 Pod 日志扫描，以及运行结束后按 `--since-time` 对当前/上一容器做密钥扫描。
-- **已在 76 上脱离 newapi 验证（2026-11-25）**：按[本机联调部署指南](docs/APISIX-本机联调部署.md)手工拉起 docker 栈，跑通 APISIX 3.15 → forward-auth 替身 → `sr-auto-router` → RoutePilot 内部端点 → 部门选图 → 本机 vLLM 模型。财务/法务/未知部门选图、伪造部门头不可覆盖、无/错 Key 401、公开入口只用默认图、SSE 实时到达（47 个内容帧 + `[DONE]`）均符合契约。这证明的是 APISIX→RoutePilot 链路；部门头来自测试替身而不是 newapi。
-- **尚未执行（需要维护窗口）**：带 `X-SR-Department` 的 newapi 发布（不在本次修复计划范围内）、共享 APISIX 变更（插件注册 + Lua 挂载 + Token env）、shadow Route 发布、完整 shadow 矩阵以及全部故障/回滚演练。在这些执行之前，不声称经 newapi 鉴权的网关全链路已验证。
+- **拆分已完成的离线验证**：全量 `pytest`（含真实双 app 的 `tests/test_service_split_e2e.py`）、`npm run check:console`、`docker compose -f scripts/docker/compose.yml config`，以及覆盖内核-only 163 清单与构建脚本的部署静态测试。内核-only 形态已被静态证明：无 SQLite、无控制台、`logging.type=disabled`、`/data/graph` 单写者 PVC、只有 JEV 一个 Secret。
+- **本次未执行（需要共享 163/APISIX 维护窗口）**：把 `routepilot-core` 部署到 163、带 `X-SR-Department` 的 newapi 发布、共享 APISIX 变更（插件注册 + Lua 挂载 + 旧 env 清理）、shadow Route 发布，以及带故障/回滚演练的完整 APISIX 验收矩阵。本工作不声称任何生产发布。
+- **本机 APISIX 链路**：旧单服务链路曾在拆分前于 76 上验证；[本机联调指南](docs/APISIX-本机联调部署.md) 已按「先决策、再回 newapi」链路重写，但本次未重新执行（本工作不安装任何环境）。
 
-窗口批准后的顺序：发布 newapi → `patch_apisix_deployment.py --dry-run` 后正式执行 → `configure_routepilot_routes.py --mode shadow --dry-run` 后发布 → shadow 完整门禁：
+窗口批准后的顺序：应用内核-only 清单（`deploy-163.sh`）→ 经内核 API 发布图（`configure_163_routepilot.py`）→ `patch_apisix_deployment.py --dry-run` 后正式执行 → `configure_routepilot_routes.py --mode shadow --dry-run` 后发布 → shadow 完整门禁：
 
 ```bash
 python3 scripts/apisix/verify_routepilot_e2e.py \
@@ -551,91 +590,142 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
   --complete-shadow --include-disruptive
 ```
 
-完整门禁要求精确 shadow 路径、Pod 内账本/JEV 证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`）不能被表述为完整验收。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
+完整门禁要求精确 shadow 路径、Pod 内内核决策证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`）不能被表述为完整验收。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
+
+### 已知且接受的残留（拆分）
+
+- 外围 JEV **测试连接**按钮只有在外围进程自身配置了 `ROUTER_JEV_API_KEY` 时才有意义；生产分裂部署没有外围 JEV Key（Key 属于内核）。
+- 内核调度熔断不再感知真实模型上游失败——设计使然，因为内核不做执行结果回写。standalone 的外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
+- 分裂前 APISIX 配置里的 `routepilot-decision` upstream 对象可能仍以惰性形式留在现网 etcd；它已无引用，可后续手工删除。
+- VictoriaLogs 输出未实现；163 内核-only 部署使用 `logging.type=disabled`，而不是假装决策事件已持久化。
+- 本期 163 不部署外围控制台服务。
 
 ## 快速开始
 
 ```bash
 python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-
-# 本地开发：关闭登录
-ROUTER_DB=/tmp/routepilot.db \
-ROUTER_GRAPH_DIR=/tmp/routepilot-graph \
-ROUTER_USER_AUTH=0 \
-.venv/bin/python -m router
 ```
 
-控制台：`http://127.0.0.1:8400/console/`。
+**独立形态：内核 + 外围。** 内核通过 `ROUTER_CONFIG` 读取 `config.json`（可从 `configs/core.example.json` 起步，但要把 `graphs.directory` 指向本机可写目录，并且在没有外围接收口时使用 `logging.type=disabled`）；外围需要 `ROUTER_CORE_URL` 与自己的 SQLite 路径：
 
 ```bash
-# 带鉴权部署
-ROUTER_DB=/var/lib/routepilot/router.db \
-ROUTER_GRAPH_DIR=/var/lib/routepilot/graph \
-ROUTER_HOST=0.0.0.0 \
-ROUTER_PORT=8400 \
-ROUTER_ADMIN_EMAIL=admin@example.com \
-ROUTER_ADMIN_PASSWORD='change-me-now' \
-.venv/bin/python -m router
+# 终端 1 —— 决策内核（默认端口 8400）
+cat > /tmp/routepilot-core.json <<'EOF'
+{"server": {"host": "127.0.0.1", "port": 8400},
+ "graphs": {"directory": "/tmp/routepilot-graphs"},
+ "jev": {"api_key_env": "ROUTER_JEV_API_KEY"},
+ "logging": {"type": "disabled"}}
+EOF
+ROUTER_CONFIG=/tmp/routepilot-core.json \
+ROUTER_JEV_API_KEY='<jev-key>' \
+.venv/bin/python -m router core
+
+# 终端 2 —— 外围控制台 + standalone 数据面（默认端口 8400）
+ROUTER_CORE_URL=http://127.0.0.1:8400 \
+ROUTER_DB=/tmp/routepilot.db \
+ROUTER_HOST=127.0.0.1 ROUTER_PORT=8401 \
+ROUTER_USER_AUTH=0 \
+.venv/bin/python -m router peripheral
 ```
 
-首次对空用户表启动时写入管理员账号。空图目录是合法的空路由集：`/readyz` 就绪，但 `/v1` 返回 503 `no_active_tree`。路由前先新建或导入一份画布，再启用它；第一张启用的图成为服务公开 `/v1` 的默认图。既有部署请先读[从旧版快照前安装升级](#从旧版快照前安装升级)。
+控制台：`http://127.0.0.1:8401/console/`。完整 standalone 形态由 `scripts/docker/compose.yml` 组装（内核 8400 仅内部、console 发布 8401、状态卷分离）。
+
+**只部署内核（接 APISIX + newapi）。** 即 163 形态：无 SQLite、无控制台、无模型上游、无决策日志接收端。使用 `logging.type=disabled` 的 `config.json`，图目录挂持久卷：
+
+```bash
+ROUTER_CONFIG=/etc/routepilot/config.json \
+ROUTER_JEV_API_KEY='<jev-key>' \
+.venv/bin/python -m router core
+```
+
+外围首次对空用户表启动时写入管理员账号。空图目录是合法的空路由集：内核 `/readyz` 就绪，但在启用图之前决策会返回 503 `no_default_tree`/`no_active_tree`。通过控制台新建或导入画布后再启用；第一张启用的图成为默认图。既有部署请先读[从旧版单服务安装升级](#从旧版单服务安装升级)。
 
 ## 配置项
 
+**内核**由 `config.json` 配置（路径经 `ROUTER_CONFIG`，默认 `config.json`）。配置不含任何密钥值；JEV Key 的**环境变量名**由 `jev.api_key_env` 指定，值通过环境变量提供：
+
+```json
+{
+  "server": {"host": "0.0.0.0", "port": 8400},
+  "graphs": {"directory": "/data/graphs"},
+  "jev": {"api_key_env": "ROUTER_JEV_API_KEY"},
+  "logging": {
+    "type": "routepilot",
+    "url": "http://console:8400/internal/v1/decision-logs",
+    "timeout_ms": 1000
+  }
+}
+```
+
+| 内核 `config.json` 字段 | 默认值 | 说明 |
+|---|---|---|
+| `server.host` / `server.port` | `0.0.0.0` / `8400` | 内核监听地址/端口 |
+| `graphs.directory` | `./routing-graph` | **唯一**图 JSON 目录；内核是其单写者（compose 为 `/data/graphs`，163 为 `/data/graph`） |
+| `jev.api_key_env` | `ROUTER_JEV_API_KEY` | 存放 JEV Key 的**环境变量名**，不是密钥值 |
+| `logging.type` | `disabled` | `routepilot`（发往外围接收口）或 `disabled`；本期未实现 `victorialogs` |
+| `logging.url` | — | 事件接收地址；`logging.type=routepilot` 时必填（http/https） |
+| `logging.timeout_ms` | `1000` | 单条事件 HTTP 超时，范围 1–10000 |
+
+内核环境变量只有 `ROUTER_CONFIG`（配置路径）与 `jev.api_key_env` 指定的 JEV Key。内核不识别 `ROUTER_HOST/PORT/DB/GRAPH_DIR`，也不打开 SQLite。
+
+**外围**使用环境变量：
+
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `ROUTER_DB` | `router.db` | SQLite 控制面数据库 |
-| `ROUTER_GRAPH_DIR` | `./routing-graph` | 图文档；生命周期存在每份文档内 |
-| `ROUTER_GRAPH_WRITER` | `true` | 是否允许写图；只应有一个写者 |
-| `ROUTER_HOST` | `127.0.0.1` | 监听地址 |
-| `ROUTER_GATEWAY_TOKEN` | 空 | 内部端点 `POST /internal/v1/chat/completions` 的网关共享凭据；为空时该端点 fail closed 返回 503 |
-| `ROUTER_PORT` | `8400` | 监听端口 |
-| `ROUTER_JEV_URL` | 空 | 一次性播种 `default` JEV 服务的 base URL；仅当 JEV 目录为空且从未用过环境种子时，随 `ROUTER_JEV_MODEL` 一起生效 |
-| `ROUTER_JEV_MODEL` | 空 | 一次性播种 `default` JEV 服务的模型，与 `ROUTER_JEV_URL` 配对 |
-| `ROUTER_JEV_API_KEY` | 空 | 一次性播种的 `default` 服务存储的密钥（其 `key_env` 为 `ROUTER_JEV_API_KEY`）；不是全局回退 |
-| `ROUTER_JEV_TIMEOUT` | `10` | 决策服务超时（秒） |
-| `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量 |
+| `ROUTER_CORE_URL` | `http://127.0.0.1:8400` | 内核地址（图管理与决策） |
+| `ROUTER_CORE_TIMEOUT_SECONDS` | `60` | 内核 HTTP 超时 |
+| `ROUTER_DB` | `router.db` | 外围 SQLite：人员、会话、提供方、模型目录、非密钥 JEV 目录、时段、变更记录 |
+| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | 外围监听地址/端口（compose 发布为 8401） |
+| `ROUTER_JEV_TIMEOUT` | `10` | JEV **测试**端点使用的决策服务超时 |
+| `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | 空 | 一次性播种 `default` 非密钥 JEV 目录项；必须成对、仅在目录为空且从未播种时生效 |
+| `ROUTER_JEV_API_KEY` | 空 | 可选的外围本地 Key，仅供 JEV **测试**按钮；内核始终读自己的那份 |
+| `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量（外围进程） |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
-| `ROUTER_ADMIN_EMAIL` | `admin@test.com` | 首次启动的管理员邮箱 |
-| `ROUTER_ADMIN_PASSWORD` | 种子口令 | 首次启动的管理员口令 |
+| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值 | 首次启动的管理员账号 |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | 控制台会话有效期 |
 
 ## API
 
 完整字段、请求/响应示例与影响确认流程见[后端接口说明](docs/后端接口说明.md)。
 
+- **内核：** `POST /internal/v1/route-decision`、`/internal/v1/trees*`、`/internal/v1/try`、`POST /internal/v1/graph-batches`、`/healthz`、`/readyz`。没有鉴权中间件，也没有控制台；用网络边界保护它。163 形态下它是唯一的对外决策组件。
+- **外围：** 控制台与 `/admin/*` API、`POST /internal/v1/decision-logs`（内核事件接收口，无需管理面登录）、`GET /admin/requests/recent`、`GET /admin/requests/{id}/replay`、standalone `POST /v1/chat/completions` 与 `/admin/test/chat/completions`。
 - `/v1/*`、`/healthz`、`/readyz` 与 `/console/*` 不需要鉴权；其余 `/admin/*` 需要 `Authorization: Bearer <token>`。
 - `POST /admin/login` 是唯一公开的管理面端点：用邮箱与口令换 token；会话默认 168 小时，登出、改密或删用户会吊销会话。
 - `viewer` 只能读（`/admin/users*` 也不行）；所有写操作与用户管理需要 `admin`。`ROUTER_USER_AUTH=0` 时完全开放，按服务账号处理。
 - 数据面错误是 `{"error":{"message":"<机器码>"}}`；管理面错误是 `{"detail": ...}`，其中图/配置校验失败为 Issue 数组。
-- `POST /v1/chat/completions` 忽略请求里的 `model`，始终按启用路由集的默认图路由；请求头 `x-sr-session-id` 参与粘性，出现 `x-sr-department` 头会以 `400 department_header_not_allowed` 拒绝。响应头 `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` 说明实际结果。
-- `POST /admin/trees` 必须同时携带 `backends`、`jev`、`jev_window`、`time_periods`，并接受 `departments`；新建的组一律是关闭态。`PUT` 是补丁，且必须带当前 `base_document_sha256`，否则 409。生命周期只能由 `POST /admin/trees/{id}/enable`、`/disable`、`/default` 写入；`departments` 还可以走 `PUT /admin/trees/{id}/departments`。
+- `POST /v1/chat/completions` 先向内核索取决策，始终按内核启用路由集的默认图路由；请求头 `x-sr-session-id` 参与粘性，出现 `x-sr-department` 头会以 `400 department_header_not_allowed` 拒绝。响应头 `x-sr-model` / `x-sr-selection` / `x-sr-tree-id` / `x-sr-graph-selection` / `x-sr-reasoning*` 说明内核决策。若内核决策的模型/提供方在外围目录中无法执行，返回 503 `execution_catalog_mismatch`，不调用任何上游。
+- `POST /admin/trees` 必须同时携带 `backends`、`jev`、`jev_window`、`time_periods`，并接受 `departments`；新建的组一律是关闭态。`PUT` 是补丁，且必须带当前 `base_document_sha256`，否则 409。生命周期只能由 `POST /admin/trees/{id}/enable`、`/disable`、`/default` 写入；`departments` 还可以走 `PUT /admin/trees/{id}/departments`。以上全部由外围代理到内核。
 
-| 方法与路径 | 权限 | 用途 |
-|---|---|---|
-| `POST /v1/chat/completions` | 公开 | 路由入口；JSON 或 SSE |
-| `GET /healthz` / `GET /readyz` | 公开 | 存活探针 / 路由集就绪状态（`graph_status`） |
-| `POST /admin/login` / `POST /admin/logout` | 公开 / 登录用户 | 控制台会话 |
-| `GET /admin/me`、`POST /admin/me/password` | 登录用户 | 当前用户、修改口令 |
-| `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 读 / admin | 决策组；新建一律关闭 |
-| `PUT /admin/trees/{id}/departments` | admin | 单张图的部门映射 |
-| `POST /admin/trees/{id}/copy`、`/enable`、`/disable`、`/default` | admin | 复制与多图生命周期（第一张启用图自动默认；默认图切换） |
-| `POST /admin/try` | admin | 针对草稿图或当前生效路由集的检查路由（可选部门） |
-| `POST /admin/test/chat/completions` | admin | 模型测试对话；`model=auto` 走路由，其他值固定直连 |
-| `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 读 / admin | 模型注册表；更新/删除先返回 409 影响清单，确认后同步画布 |
-| `GET /admin/model-catalog`、`POST /admin/fetch-models` | 读 / admin | 提供方预设、上游模型发现 |
-| `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 读 / admin | 提供方；更新先返回 409 影响清单，仍被引用时不可删除 |
-| `GET/POST /admin/jev`、`GET/PUT/DELETE /admin/jev/{id}` | 读 / admin | 多服务 JEV 目录（窗口属于各服务） |
-| `POST /admin/jev/{id}/test` | admin | 用数据库配置测试单个目录服务 |
-| `GET/PUT /admin/time-periods` | 读 / admin | 时段 |
-| `GET /admin/requests/recent`、`/requests/stats`、`/requests/{id}/snapshot` | viewer | 实时请求环、logger 统计、请求快照 |
-| `GET /admin/overview`、`GET /admin/changes` | viewer | 概览、审计历史 |
-| `GET/POST /admin/users`、`PUT/DELETE /admin/users/{id}`、`POST /admin/users/{id}/password` | admin | 用户 |
+| 方法与路径 | 服务 | 权限 | 用途 |
+|---|---|---|---|
+| `POST /internal/v1/route-decision` | 内核 | 网络边界 | 一次路由决策：真实模型、逻辑模型、非密钥提供方信息、图/推理元数据 |
+| `POST /internal/v1/graph-batches` | 内核 | 网络边界 | 外围目录写使用的原子条件多图替换 |
+| `/internal/v1/trees*`、`/internal/v1/try` | 内核 | 网络边界 | 图管理与 dry-run（外围把自己的 `/admin/trees*`、`/admin/try` 代理到这里） |
+| `GET /healthz` / `GET /readyz` | 两者 | 公开 | 存活 / 就绪（内核：路由集 + `stale`；外围：SQLite） |
+| `POST /v1/chat/completions` | 外围 | 公开 | standalone 兼容 OpenAI 数据面：内核决策 → 外围 Provider Key → 模型上游；JSON 或 SSE |
+| `POST /internal/v1/decision-logs` | 外围 | 网络边界 | 内核决策事件接收口（校验后进内存，最多 20 条） |
+| `GET /admin/requests/recent`、`/requests/{id}/replay` | 外围 | viewer | 内存决策日志列表与单条事件回放 |
+| `POST /admin/login` / `POST /admin/logout` | 外围 | 公开 / 登录用户 | 控制台会话 |
+| `GET /admin/me`、`POST /admin/me/password` | 外围 | 登录用户 | 当前用户、修改口令 |
+| `GET/POST /admin/trees`、`GET/PUT /admin/trees/{id}` | 外围代理 | 读 / admin | 决策组；新建一律关闭 |
+| `PUT /admin/trees/{id}/departments` | 外围代理 | admin | 单张图的部门映射 |
+| `POST /admin/trees/{id}/copy`、`/enable`、`/disable`、`/default` | 外围代理 | admin | 复制与多图生命周期（第一张启用图自动默认；默认图切换） |
+| `POST /admin/try` | 外围代理 | admin | 针对草稿图或当前生效路由集的检查路由（可选部门） |
+| `POST /admin/test/chat/completions` | 外围 | admin | 模型测试对话；`model=auto` 问内核，其他值经外围目录固定直连 |
+| `GET/POST /admin/models`、`GET/PUT/DELETE /admin/models/{id}` | 外围 | 读 / admin | 模型注册表；更新/删除先返回 409 影响清单，确认后同步画布 |
+| `GET /admin/model-catalog`、`POST /admin/fetch-models` | 外围 | 读 / admin | 提供方预设、上游模型发现 |
+| `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 外围 | 读 / admin | 提供方；更新先返回 409 影响清单，仍被引用时不可删除 |
+| `GET/POST /admin/jev`、`GET/PUT/DELETE /admin/jev/{id}` | 外围 | 读 / admin | 非密钥多服务 JEV 目录（窗口属于各服务） |
+| `POST /admin/jev/{id}/test` | 外围 | admin | 测试单个目录服务（需要外围 JEV Key，见残留） |
+| `GET/PUT /admin/time-periods` | 外围 | 读 / admin | 时段 |
+| `GET /admin/requests/stats`、`GET /admin/overview`、`GET /admin/changes` | 外围 | viewer | 内存日志统计/概览、审计历史 |
+| `GET/POST /admin/users`、`PUT/DELETE /admin/users/{id}`、`POST /admin/users/{id}/password` | 外围 | admin | 用户 |
 
 ### 错误
 
-管理面与数据面的错误信封不同，见上。数据面：
+数据面（外围 `/v1`）：
 
 | 状态 | 错误 `message` | 含义 |
 |---|---|---|
@@ -643,24 +733,30 @@ ROUTER_ADMIN_PASSWORD='change-me-now' \
 | 400 | `department_header_not_allowed` | 公开 `/v1` 请求带了 `x-sr-department` |
 | 413 | `request_too_large` | 请求体超过 10 MiB |
 | 502 | `upstream_error` | 上游 5xx 或网络失败 |
-| 503 | `no_valid_snapshot` | 从未成功装配过路由集 |
+| 503 | `execution_catalog_mismatch` | 内核决策的模型/提供方无法用外围目录执行；不调用上游 |
+| 503 | `no_valid_snapshot` | 内核从未成功装配过路由集 |
 | 503 | `no_active_tree` | 空路由集：没有已启用决策组 |
 | 503 | `no_default_tree` | 有启用图但缺少默认图 |
 | 503 | `no_available_backend` | 所选目标的全部后端不可用 |
-| 503 | `routing_failed` / `routing_invariant_violation` | 路由内部失败 |
+| 503 | `routing_failed` / `routing_invariant_violation` | 路由内部失败（内核） |
+| 503 | `core_unavailable` | 外围无法连接内核 |
 
 管理面：
 
 | 状态 | 错误 | 含义 |
 |---|---|---|
 | 401 / 403 | `unauthorized…` / `forbidden…` | 未登录 / viewer 写操作 |
+| 404 | `unknown request` | 决策事件已被 20 条内存环淘汰或随重启丢失 |
+| 404 | `unknown tree <id>` | 内核里不存在该图 id |
 | 409 | `default_graph_required` | 仍有其它启用图时停用默认图 |
 | 409 | `graph_conflict` | 基线或影响清单的文档哈希已过期 |
 | 409 | `impact_confirmation_required` | 模型/提供方/JEV 写入影响画布，需确认清单里的文档哈希 |
 | 409 | `provider_referenced` | 提供方仍被数据库模型或画布模型引用 |
 | 409 | 字符串 `tree <id> already exists` | 图 id 重复（新建/复制）；`detail` 为纯字符串，无 `code` |
 | 422 | Issue 数组 | 图/配置校验失败 |
-| 503 | `graph_read_only` / `graph_storage_error` | 只读副本 / 共享图存储不可读 |
+| 503 | `graph_storage_error` | 内核图存储不可读/写入失败，或载入的路由集违反不变量 |
+| 503 | `core_unavailable` | 代理图管理时内核不可达 |
+| 503 | `catalog_sync_diverged` | 内核图批次已提交，但外围 SQLite 提交**及其**反向补偿批次都失败；需人工核对 |
 | 502 | 字符串 | JEV 测试或上游模型发现失败 |
 
 上游 4xx 响应按原状态码与响应体透传；`/admin/test/chat/completions` 另有 `404 unknown_model`、`422 invalid_model` 与 `400 invalid_department`（可信部门头解码失败）。
@@ -678,14 +774,15 @@ node --test scripts/console_graph_test.mjs scripts/console_draft_test.mjs \
 npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
-.venv/bin/python scripts/standalone_v4_smoke.py
+.venv/bin/python -m pytest -q tests/test_service_split_e2e.py -v
+docker compose -f scripts/docker/compose.yml config
 ```
 
-- `pytest` 只收集 `tests/`（`testpaths`），运行为单元与 FastAPI 集成测试，不启动浏览器，也不收集 `experiments/`。
+- `pytest` 只收集 `tests/`（`testpaths`），运行为单元与 FastAPI 集成测试，不启动浏览器，也不收集 `experiments/`。`tests/test_service_split_e2e.py` 是真实双 app 验收：进程内内核 + 外围走真实 HTTP，经外围代理建图/启用 → `auto` 决策 → 外围执行模型 → JSON/SSE → 内核事件写入外围内存日志 → recent/replay → 第 21 条淘汰 → 改当前图不影响旧回放 → 外围重启日志消失 → 日志 sink 故障不阻断决策。
 - `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
 - `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
-- `scripts/i18n_dead_keys.py` 报告未被引用的词典键。
-- `scripts/standalone_v4_smoke.py` 是真实端到端验收：用临时数据库与图目录，在固定本机端口上启动模拟模型/JEV 服务以及真实 `python -m router` 写者与只读副本进程，验证公开默认图 JSON/SSE 数据面、`/admin/try` 部门选图、跨图同模型熔断隔离、默认图切换、409/503 生命周期边界、stale 恢复与副本路由集一致性；失败时非零退出并清理临时工作区。
+- `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。
+- `scripts/standalone_v4_smoke.py` 是**拆分前的 legacy** 验收脚本（单服务写者/只读副本假设），仅作历史留存，不能用于验证拆分。拆分门禁是 `tests/test_service_split_e2e.py`、`scripts/docker/test_deploy_163.py` 与针对真实部署的 `scripts/apisix/verify_routepilot_e2e.py`。
 
 实验代码独立运行，不进入默认套件：
 
@@ -698,8 +795,8 @@ npm run check:console
 
 ```
 router/
-  api/                 FastAPI 路由、DTO、异常映射、代理装配、展示层
-  control/             目录写、影响清单、确认后的画布同步与启用校验
+  api/                 FastAPI 应用（core_app/create_app）、路由、DTO、异常映射、代理装配、展示层
+  control/             内核图写、跨服务目录提交/补偿、影响清单、启用校验
   routing/
     graph/             图模型、校验、条件、编译器、求值器
     service.py         求值 → 调度编排
@@ -710,12 +807,16 @@ router/
     route_set.py       路由集不变量：默认图与部门索引
     tree.py            树 envelope 编解码与 revision
     codec.py           严格字段解析助手
-  request_logging.py   账本队列/环形缓冲与工作线程写入
-  jev/                 决策服务客户端、服务目录 DTO、输入窗口
-  upstream/            固定模型目录、代理传输、熔断器 + 同步 worker
-  store/               SQLite schema/仓储、图文件仓储
-  console/             中英双语原生 ES Module 控制台
-configs/               示例决策组；configs/cases/ 为五份可移植演示案例
+  decision_events.py   自包含决策事件 schema、校验与投影
+  decision_log_sink.py 内核 best-effort 异步事件 sink（routepilot / disabled）
+  decision_log_store.py 外围 deque(maxlen=20) 事件存储
+  core_client.py       外围 → 内核 HTTP 客户端（决策与管理）
+  core_config.py       内核 config.json 加载器
+  jev/                 决策服务客户端、非密钥服务目录 DTO、输入窗口
+  upstream/            执行目录 join、代理传输、熔断器、提供方目录
+  store/               外围 SQLite schema/仓储、内核图文件仓储
+  console/             中英双语原生 ES Module 控制台（仅外围）
+configs/               示例决策组 + core.example.json；configs/cases/ 为五份可移植演示案例
 docs/                  设计与运维记录；后端接口说明.md、决策图规范.md 为对外参考
 tests/                 pytest 套件与契约 fixture
 scripts/               Node 契约测试、Playwright QA、部署脚本

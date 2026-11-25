@@ -10,11 +10,12 @@ module owns everything the console shows *about* that record and nothing else:
   the list/replay projections and the kernel decision trace.
 
 Outcome state names are the shared vocabulary in ``router.request_outcome``;
-this module re-exports the two the record presenter needs.
+this module imports only the one the record presenter reads (the kernel decision
+record owns ``OUTCOME_INCOMPLETE`` directly).
 """
 from __future__ import annotations
 
-from router.request_outcome import OUTCOME_INCOMPLETE, OUTCOME_ROUTING_ERROR
+from router.request_outcome import OUTCOME_ROUTING_ERROR
 from router.routing.graph.model import (
     ConditionNode,
     LogicNode,

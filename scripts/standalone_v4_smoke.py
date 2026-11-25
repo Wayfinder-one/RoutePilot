@@ -1,5 +1,26 @@
 #!/usr/bin/env python3
-"""RoutePilot v4 department-aware standalone routing smoke test.
+"""LEGACY (pre-split) RoutePilot v4 standalone routing smoke test — do not run.
+
+The single-service process this script exercises no longer exists: after the
+2026-11-25 core/peripheral split the repository starts two services
+(``python -m router core`` and ``python -m router peripheral``), the kernel owns
+the graph directory and the peripheral owns SQLite.  This script still assumes
+one ``python -m router`` writer plus a read-only replica sharing
+``ROUTER_DB`` / ``ROUTER_GRAPH_DIR``, and some of the behaviour it checks
+(request ledger, graph snapshots, replica route-set parity, upstream failures
+driving the kernel breaker) was deliberately removed or moved.
+
+It is kept for history only and refuses to run.  Current acceptance gates:
+
+* ``.venv/bin/python -m pytest -q`` including ``tests/test_service_split_e2e.py``
+* ``npm run check:console``
+* ``docker compose -f scripts/docker/compose.yml config``
+* ``scripts/docker/test_deploy_163.py`` (static kernel-only deployment checks)
+* ``scripts/apisix/verify_routepilot_e2e.py`` against a real APISIX deployment
+
+Original pre-split description (kept for reference)
+----------------------------------------------------
+RoutePilot v4 department-aware standalone routing smoke test.
 
 Usage
 -----
@@ -1378,14 +1399,32 @@ class Smoke:
         return 1
 
 
+#: Replacement gates for the split architecture; printed by the legacy guard.
+SPLIT_GATES = (
+    ".venv/bin/python -m pytest -q tests/test_service_split_e2e.py -v",
+    "npm run check:console",
+    "docker compose -f scripts/docker/compose.yml config",
+    ".venv/bin/python -m pytest -q scripts/docker/test_deploy_163.py",
+)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="RoutePilot v4 department-aware standalone routing smoke test")
+        description="LEGACY pre-split RoutePilot v4 standalone routing smoke test "
+                    "(refuses to run after the core/peripheral split)")
     parser.add_argument(
         "--keep", action="store_true",
-        help="keep the temp database/graph/log workspace for debugging")
+        help="kept for CLI compatibility; the legacy run is disabled")
     args = parser.parse_args(argv)
-    return Smoke(keep=args.keep).run()
+    print(
+        "ERROR: standalone_v4_smoke.py is a legacy pre-split acceptance script.\n"
+        "The single-service writer/replica layout it tests no longer exists after\n"
+        "the 2026-11-25 core/peripheral split; running it would report misleading\n"
+        "results. Use the split gates instead:\n  "
+        + "\n  ".join(SPLIT_GATES),
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":

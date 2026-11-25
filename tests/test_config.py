@@ -52,6 +52,9 @@ def test_user_auth_defaults_and_override(monkeypatch):
     assert settings.session_ttl_hours == 12
 
 
-def test_gateway_token_from_env(monkeypatch):
-    monkeypatch.setenv('ROUTER_GATEWAY_TOKEN', 'gateway-secret')
-    assert Settings.from_env().gateway_token == 'gateway-secret'
+def test_retired_gateway_token_is_not_read(monkeypatch):
+    """The split retires the shared gateway token: the env var must stay dead."""
+    monkeypatch.setenv("ROUTER_GATEWAY_TOKEN", "gateway-secret")
+    settings = Settings.from_env()
+    assert not hasattr(settings, "gateway_token")
+    assert "gateway-secret" not in repr(settings)

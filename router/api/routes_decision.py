@@ -27,11 +27,7 @@ from datetime import datetime
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from router.api.request_presenter import (
-    OUTCOME_INCOMPLETE,
-    OUTCOME_ROUTING_ERROR,
-    node_labels,
-)
+from router.api.request_presenter import OUTCOME_ROUTING_ERROR, node_labels
 # 部门 Header 的严格解码与请求体上限属于数据面共享校验语义：外围在转发前先做
 # 一次，内核仍独立校验（内核不信任外围入站校验）。
 from router.api.routes_v1 import MAX_BODY_BYTES, _last_user_text, decode_department
@@ -39,6 +35,7 @@ from router.api.trace_presenter import present_trace
 from router.decision_events import build_decision_event
 from router.jev.client import ChoiceAnswer
 from router.jev.serialization import answer_to_dict
+from router.request_outcome import OUTCOME_INCOMPLETE
 from router.routing.types import (
     NoActiveTreeError,
     NoAvailableBackend,
@@ -195,7 +192,7 @@ def provider_payload(runtime, provider_name: str) -> dict:
 async def read_decision_request(request: Request):
     """Validate one decision request and return ``(body, text, department, session_id)``.
 
-    Keeps the data-plane validation the internal chat endpoint always had:
+    Keeps the data-plane validation the kernel decision path always had:
     10 MiB body, JSON object, ``messages`` list, strictly decoded trusted
     department and the 256-char session id.  ``Authorization`` is deliberately
     not read: the kernel receives no user key.
