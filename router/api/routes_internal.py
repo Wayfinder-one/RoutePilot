@@ -1,26 +1,14 @@
-import hmac
+"""Internal endpoints of the decision kernel (``/internal/v1``).
 
-from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+The gateway-token handshake and the old chat forwarding are gone: APISIX and
+the peripheral authenticate the user *before* the decision sub-request, the
+kernel receives no user credential and never executes a model request.  This
+module keeps the single internal mount point by aggregating the decision
+router.
+"""
+from fastapi import APIRouter
 
-from router.api.routes_v1 import run_chat_completion
+from router.api.routes_decision import router as decision_router
 
 router = APIRouter()
-
-
-def _error(message, status_code):
-    return JSONResponse(
-        status_code=status_code,
-        content={'error': {'message': message}},
-    )
-
-
-@router.post('/chat/completions')
-async def internal_chat_completions(request: Request):
-    expected = request.app.state.settings.gateway_token
-    if not expected:
-        return _error('gateway_auth_not_configured', 503)
-    supplied = request.headers.get('x-sr-gateway-token', '')
-    if not supplied or not hmac.compare_digest(supplied, expected):
-        return _error('gateway_unauthorized', 401)
-    return await run_chat_completion(request, allow_department_header=True)
+router.include_router(decision_router)

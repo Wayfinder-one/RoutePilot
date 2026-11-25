@@ -118,7 +118,12 @@ def _first_wave_choice(decision):
 
 def _decision_record(decision, snapshot, text: str, reasoning_warning,
                      routing_ms: float, started: float) -> dict:
-    """Initial record for a completed routing decision (machine fields only)."""
+    """Initial record for a completed routing decision (machine fields only).
+
+    The trace is presented here (idempotently) so every consumer of the record —
+    the peripheral ledger and the kernel's decision event — gets exactly the
+    replay-ready events the console renders, without a second presentation step.
+    """
     first_wave = decision.waves[0] if decision.waves else None
     answer = _first_wave_choice(decision)
     return {
@@ -148,7 +153,7 @@ def _decision_record(decision, snapshot, text: str, reasoning_warning,
         "reasoning_warning": reasoning_warning,
         "routing_ms": routing_ms,
         "latency_ms": (time.monotonic() - started) * 1000.0,
-        "trace": list(decision.trace),
+        "trace": present_trace(list(decision.trace)),
         "node_labels": node_labels(snapshot),
         "upstream_model": None,
         "upstream_status": None,
@@ -206,7 +211,7 @@ def _routing_failure_record(snapshot, text, session_id, trace, *, error_class,
         "routing_ms": routing_ms,
         "latency_ms": total_ms,
         "total_ms": total_ms,
-        "trace": trace,
+        "trace": present_trace(list(trace)),
         "node_labels": node_labels(snapshot),
         "outcome_state": OUTCOME_ROUTING_ERROR,
         "error_class": error_class,
