@@ -35,6 +35,7 @@ from router.api.request_presenter import (
     present_record,
 )
 from router.api.trace_presenter import present_trace
+from router.decision_events import build_decision_event
 from router.jev.client import ChoiceAnswer
 from router.jev.serialization import answer_to_dict
 from router.routing.types import (
@@ -85,6 +86,30 @@ def decode_department(raw: str | None) -> str:
 
 def _error(message: str, status_code: int) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"message": message}})
+
+
+def log_decision_event(request, record: dict, snapshot, *,
+                       department: str, requested_model: str) -> None:
+    """Retain the local decision in the peripheral memory log (transitional).
+
+    Until the standalone peripheral routes through the kernel (Task 8), the
+    peripheral's own data plane still decides locally; this bridge builds the
+    same self-contained event the kernel emits and stores it in the volatile
+    20-event memory log so ``/admin/requests/recent`` and replay keep working.
+
+    Logging is best-effort by contract: a broken/over-limit event can never turn
+    a decision response into a 500.  Graphs rejected before selection produce no
+    replayable event (``snapshot is None``), exactly like the kernel.
+    """
+    store = getattr(request.app.state, "decision_logs", None)
+    if store is None or snapshot is None:
+        return
+    try:
+        store.add(build_decision_event(
+            record, snapshot, department=department,
+            requested_model=requested_model))
+    except Exception:  # noqa: BLE001 - the memory log must never affect the decision
+        logger.exception("decision log event dropped")
 
 
 def _json_response(result: ProxyResult) -> JSONResponse:
@@ -276,6 +301,11 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
     session_id = request.headers.get("x-sr-session-id", "").strip()
     if len(session_id) > 256:
         return _error("invalid_session_id", 400)
+    # 事件里的「请求模型」是事实字段：/v1 不按它选路，但内核事件仍记录原值。
+    # 非字符串（恶意 ``"model": {...}``、JSON ``NaN``）归一为空串，事件仍可校验。
+    event_requested_model = body.get("model", "auto")
+    if not isinstance(event_requested_model, str):
+        event_requested_model = ""
 
     fixed_model = None
     if use_requested_model:
@@ -308,6 +338,9 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             error_class=error_class, routing_ms=routing_ms, total_ms=total_ms,
         ))
         requestlog.enqueue(record, snapshot=snapshot)
+        log_decision_event(
+            request, record, snapshot, department=department,
+            requested_model=event_requested_model)
         return _error(error_class, status_code)
 
     # 公开数据面严格使用路由集默认图；管理端测试对话凭可信 Header 按部门选图。
@@ -414,6 +447,11 @@ async def run_chat_completion(request: Request, *, use_requested_model: bool = F
             "outcome_state": OUTCOME_INCOMPLETE,
         })
     requestlog.enqueue(record, snapshot=snapshot)
+    if fixed_model is None:
+        # 固定模型直连是管理目录测试，不是内核路由决策：生产内核不会为它发事件。
+        log_decision_event(
+            request, record, snapshot, department=department,
+            requested_model=event_requested_model)
     outcome = OutcomeRecorder(requestlog, record, started)
     headers = {"x-sr-model": decision.model, "x-sr-selection": decision.selection_reason}
     if fixed_model is None:

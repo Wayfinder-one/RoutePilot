@@ -1050,31 +1050,31 @@ body.is-try-running .rtc-stage.is-locked::after {
   font-size: 9px; font-weight: 700; letter-spacing: .04em; white-space: nowrap;
 }
 
-/* ── 日志快照（只读回放） ─────────────────────────────────────── */
+/* ── 决策回放（只读） ─────────────────────────────────────── */
 /* 画布只保留平移、缩放、小地图与选中；所有编辑入口在 CSS 层直接移除。 */
-body.is-log-snapshot .rtc-palette,
-body.is-log-snapshot .rtc-inspector,
-body.is-log-snapshot .rtc-actions,
-body.is-log-snapshot .rtc-issues-btn,
-body.is-log-snapshot #cvLifecycle { display: none; }
-/* 快照只读：默认不显示试算输入与样例；请求正文存在时把问题放回输入位（只读）。 */
-body.is-log-snapshot .rtc-try-row,
-body.is-log-snapshot .rtc-try-chips,
-body.is-log-snapshot .rtc-try-scope { display: none; }
-body.is-log-snapshot.has-snapshot-request .rtc-try-row { display: flex; }
-body.is-log-snapshot .rtc-try-ico,
-body.is-log-snapshot #cvTryRun { display: none; }
-body.is-log-snapshot .rtc-try-row input {
+body.is-log-replay .rtc-palette,
+body.is-log-replay .rtc-inspector,
+body.is-log-replay .rtc-actions,
+body.is-log-replay .rtc-issues-btn,
+body.is-log-replay #cvLifecycle { display: none; }
+/* 决策回放只读：默认不显示试算输入与样例；请求正文存在时把问题放回输入位（只读）。 */
+body.is-log-replay .rtc-try-row,
+body.is-log-replay .rtc-try-chips,
+body.is-log-replay .rtc-try-scope { display: none; }
+body.is-log-replay.has-replay-request .rtc-try-row { display: flex; }
+body.is-log-replay .rtc-try-ico,
+body.is-log-replay #cvTryRun { display: none; }
+body.is-log-replay .rtc-try-row input {
   background: var(--panel); color: var(--text-2); cursor: default;
 }
-body.is-log-snapshot .rtc-treeselect { pointer-events: none; }
-/* 锁定态在快照里是常态：用普通 grab 光标，禁用试算运行的进度脉冲。 */
-body.is-log-snapshot .rtc-stage.is-locked { cursor: grab; }
-body.is-log-snapshot .rtc-stage.is-locked .rtc-node { cursor: pointer; }
-body.is-log-snapshot .rtc-stage.is-locked .rtc-port,
-body.is-log-snapshot .rtc-stage.is-locked .rtc-edge-hit { cursor: grab; }
-body.is-log-snapshot .rtc-stage.is-locked::after { content: none; animation: none; }
-body.is-log-snapshot .rtc-stage.is-locked { box-shadow: var(--shadow); }
+body.is-log-replay .rtc-treeselect { pointer-events: none; }
+/* 锁定态在决策回放里是常态：用普通 grab 光标，禁用试算运行的进度脉冲。 */
+body.is-log-replay .rtc-stage.is-locked { cursor: grab; }
+body.is-log-replay .rtc-stage.is-locked .rtc-node { cursor: pointer; }
+body.is-log-replay .rtc-stage.is-locked .rtc-port,
+body.is-log-replay .rtc-stage.is-locked .rtc-edge-hit { cursor: grab; }
+body.is-log-replay .rtc-stage.is-locked::after { content: none; animation: none; }
+body.is-log-replay .rtc-stage.is-locked { box-shadow: var(--shadow); }
 
 /* ── toast / drag ghost ───────────────────────────────────────── */
 .rtc-toasts {

@@ -1,91 +1,88 @@
+"""Peripheral decision-log read API and the kernel event receiver.
+
+The peripheral keeps only the recent complete decision events in memory
+(``app.state.decision_logs``, ``deque(maxlen=20)``): there is no SQLite fallback
+and no graph snapshot table any more.  Everything here is a projection of those
+retained events:
+
+* ``GET /admin/requests/recent`` returns the list projection (no embedded graph);
+* ``GET /admin/requests/{id}/replay`` returns ``tree``/``trace``/``request`` all
+  read from the same retained event;
+* ``GET /admin/overview`` counts the retained events only;
+* ``GET /admin/changes`` keeps reading the peripheral change repository (it is
+  not a decision log);
+* ``POST /internal/v1/decision-logs`` is the kernel's event feed.  It is mounted
+  outside ``/admin`` on purpose: the kernel posts events without an admin login.
+
+Evicted or post-restart replays are 404: the memory log is deliberately volatile
+and never rebuilt from SQLite.
+"""
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from router.api.deps import get_conn
 from router.api.request_presenter import present_record
-from router.request_snapshots import REQUEST_FIELDS, canonical_graph_document
+from router.decision_events import replay_payload, summary_payload
 from router.store.repositories import ChangeRepo
 
 router = APIRouter()
+#: 内核 → 外围的事件接收口；由外围应用单独挂载到 ``/internal/v1``（不受 /admin 鉴权）。
+internal_router = APIRouter()
+
+#: 一条完整事件内嵌整张图；接收上限与数据面请求体一致，避免无界接收。
+MAX_DECISION_EVENT_BYTES = 10 * 1024 * 1024
+#: 与旧 request logger 相同的置信度分桶（概览只统计保留的事件）。
+CONF_BUCKETS = 5
 
 
-def _public_record(record: dict) -> dict:
-    """Present one ledger record and drop internal (``_``-prefixed) fields.
-
-    ``_graph_snapshot`` carries the whole graph document for the snapshot
-    endpoint; the list must never ship it.
-    """
-    present_record(record)
-    return {key: value for key, value in record.items() if not key.startswith("_")}
+@internal_router.post("/decision-logs")
+async def receive_decision_log(request: Request):
+    """Validate one kernel event and retain it in the in-memory log store."""
+    length = request.headers.get("content-length")
+    if length and length.isdigit() and int(length) > MAX_DECISION_EVENT_BYTES:
+        raise HTTPException(413, detail="request_too_large")
+    buffer = bytearray()
+    async for chunk in request.stream():
+        buffer.extend(chunk)
+        if len(buffer) > MAX_DECISION_EVENT_BYTES:
+            raise HTTPException(413, detail="request_too_large")
+    try:
+        event = json.loads(bytes(buffer))
+    except Exception:
+        raise HTTPException(400, detail="invalid_json") from None
+    if not isinstance(event, dict):
+        raise HTTPException(422, detail="invalid_decision_event")
+    try:
+        request.app.state.decision_logs.add(event)
+    except ValueError:
+        # 结构/版本/密钥校验失败的事件整体拒绝，不给最近列表留半条脏事件。
+        raise HTTPException(422, detail="invalid_decision_event") from None
+    return {"ok": True}
 
 
 @router.get("/requests/recent")
 def recent_requests(request: Request, limit: int = 20):
-    records = request.app.state.requestlog.recent_requests(limit)
-    return {"requests": [_public_record(record) for record in records]}
+    """Recent decision events, newest first, as page-ready summaries (no graph)."""
+    events = request.app.state.decision_logs.recent(limit)
+    return {"requests": [present_record(summary_payload(event)) for event in events]}
 
 
-@router.get("/requests/{request_id:path}/snapshot")
-def request_snapshot(request_id: str, request: Request, conn: sqlite3.Connection = Depends(get_conn)):
-    """Live snapshot from the memory ring, else the immutable SQLite rows."""
-    live = request.app.state.requestlog.snapshot_for(request_id)
-    if live is not None:
-        return live
-    row = conn.execute(
-        "SELECT s.graph_snapshot_id AS graph_snapshot_id, s.trace AS trace, "
-        "s.created_at AS snapshot_created_at, g.graph AS graph, "
-        "l.id AS id, l.ts AS ts, l.decision AS decision, "
-        "l.model AS model, l.target_id AS target_id, l.tree_id AS tree_id, "
-        "l.tree_revision AS tree_revision, l.snapshot_revision AS snapshot_revision, "
-        "l.selection_reason AS selection_reason, l.outcome_state AS outcome_state "
-        "FROM request_snapshots s "
-        "JOIN graph_snapshots g ON g.snapshot_id = s.graph_snapshot_id "
-        "LEFT JOIN request_logs l ON l.id = s.request_id "
-        "WHERE s.request_id = ?",
-        (request_id,),
-    ).fetchone()
-    if row is None:
+@router.get("/requests/{request_id:path}/replay")
+def request_replay(request_id: str, request: Request):
+    """One replay from the event's own graph/trace/request (never the current tree)."""
+    event = request.app.state.decision_logs.get(request_id)
+    if event is None:
         raise HTTPException(404, detail="unknown request")
-    try:
-        tree = json.loads(row["graph"])
-        trace = json.loads(row["trace"])
-    except (TypeError, ValueError):
-        # 损坏的快照不能被当成空图回放。
-        raise HTTPException(500, detail="request snapshot is corrupt") from None
-    if not isinstance(tree, dict):
-        raise HTTPException(500, detail="request snapshot is corrupt")
-    # 旧 v5 行存的是完整 envelope：出口用与写入相同的过滤函数去掉易变元数据，
-    # 历史 ID 不重算、历史图不删除。
-    tree = canonical_graph_document(tree)
-    source = {
-        "id": row["id"] if row["id"] is not None else request_id,
-        "ts": row["ts"] if row["ts"] is not None else row["snapshot_created_at"],
-        "decision": row["decision"],
-        "model": row["model"],
-        "target_id": row["target_id"],
-        "tree_id": row["tree_id"],
-        "tree_revision": row["tree_revision"],
-        "snapshot_revision": row["snapshot_revision"],
-        "selection_reason": row["selection_reason"],
-        "outcome_state": row["outcome_state"],
-    }
-    return {
-        "request_id": request_id,
-        "graph_snapshot_id": row["graph_snapshot_id"],
-        "tree": tree,
-        "trace": trace if isinstance(trace, list) else [],
-        "request": {key: source[key] for key in REQUEST_FIELDS if source.get(key) is not None},
-    }
+    return replay_payload(event)
 
 
 @router.get("/requests/stats")
 def request_stats(request: Request):
-    return request.app.state.requestlog.stats()
+    return request.app.state.decision_logs.stats()
 
 
 @router.get("/changes")
@@ -94,23 +91,42 @@ def get_changes(limit: int = 50, conn: sqlite3.Connection = Depends(get_conn)):
 
 
 @router.get("/overview")
-def get_overview(request: Request, days: int = 14, conn: sqlite3.Connection = Depends(get_conn)):
-    cutoff = (datetime.now().astimezone() - timedelta(days=days)).date().isoformat()
-    daily = [dict(row) for row in conn.execute(
-        "SELECT substr(ts, 1, 10) AS d, COUNT(*) AS count FROM request_logs "
-        "WHERE substr(ts, 1, 10) >= ? GROUP BY d ORDER BY d", (cutoff,)
-    )]
-    routes = [dict(row) for row in conn.execute(
-        "SELECT COALESCE(model, '(none)') AS model, COUNT(*) AS count FROM request_logs GROUP BY model ORDER BY count DESC"
-    )]
-    total = conn.execute("SELECT COUNT(*) FROM request_logs").fetchone()[0]
-    sticky = conn.execute("SELECT COUNT(*) FROM request_logs WHERE sticky_hit = 1").fetchone()[0]
-    requestlog = request.app.state.requestlog
+def get_overview(request: Request):
+    """Memory-only overview: counts/statistics over the retained events.
+
+    The old 14-day SQLite aggregate is gone (Task 9 removes the tables); the
+    overview now describes exactly the visible decision-log window.
+    """
+    events = request.app.state.decision_logs.recent(20)
+    daily: dict[str, int] = {}
+    routes: dict[str, int] = {}
+    confidence = [0] * CONF_BUCKETS
+    sticky = 0
+    for event in events:
+        day = str(event.get("ts") or "")[:10]
+        if day:
+            daily[day] = daily.get(day, 0) + 1
+        decision = event["decision"]
+        model = decision.get("model") or "(none)"
+        routes[model] = routes.get(model, 0) + 1
+        if decision.get("sticky_hit"):
+            sticky += 1
+        top = event["jev"].get("top")
+        if isinstance(top, (int, float)) and not isinstance(top, bool):
+            index = min(CONF_BUCKETS - 1, max(0, int(float(top) * CONF_BUCKETS)))
+            confidence[index] += 1
     return {
-        "daily": daily,
-        "routes": routes,
-        "total": total,
+        "daily": [{"d": day, "count": daily[day]} for day in sorted(daily)],
+        "routes": [
+            {"model": model, "count": count}
+            for model, count in sorted(routes.items(), key=lambda item: -item[1])
+        ],
+        "total": len(events),
         "sticky": sticky,
-        "confidence": requestlog.confidence_histogram(),
-        "confidence_since": requestlog.started_at,
+        "confidence": [
+            {"lo": index / CONF_BUCKETS, "hi": (index + 1) / CONF_BUCKETS,
+             "count": confidence[index]}
+            for index in range(CONF_BUCKETS)
+        ],
+        "confidence_since": request.app.state.decision_logs.started_at,
     }

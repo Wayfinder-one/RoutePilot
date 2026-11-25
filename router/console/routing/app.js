@@ -36,9 +36,9 @@ import {
 } from './tryrun.js';
 
 const $ = (sel, scope) => (scope || document).querySelector(sel);
-/* 日志快照：URL 带 ?request=<id> 时进入只读回放，不装配任何编辑入口。 */
-const SNAPSHOT_REQUEST = new URLSearchParams(window.location.search).get('request') || '';
-const isLogSnapshot = () => SNAPSHOT_REQUEST !== '';
+/* 决策回放：URL 带 ?request=<id> 时进入只读回放，不装配任何编辑入口。 */
+const REPLAY_REQUEST = new URLSearchParams(window.location.search).get('request') || '';
+const isLogReplay = () => REPLAY_REQUEST !== '';
 const clone = value => JSON.parse(JSON.stringify(value));
 const icon = (name, cls) =>
   '<svg class="rtc-ic' + (cls ? ' ' + cls : '') + '" aria-hidden="true"><use href="#ri-' + name + '"/></svg>';
@@ -483,8 +483,8 @@ function renderPalette() {
 
 /* ── 渲染：检查器（三分支由 inspector.js 生成） ──────────────── */
 function renderInspector() {
-  /* 快照只读：检查器不生成表单，避免出现任何可提交的编辑控件。 */
-  if (isLogSnapshot()) {
+  /* 决策回放只读：检查器不生成表单，避免出现任何可提交的编辑控件。 */
+  if (isLogReplay()) {
     const body = document.getElementById('cvInspectorBody');
     if (body) body.innerHTML = '';
     inspectorDirty = false;
@@ -810,7 +810,7 @@ function updateToolbar() {
   const defaultPill = $('#cvDefaultPill');
   if (defaultPill) {
     /* 只读日志回放不宣传实时生命周期（与隐藏 #cvLifecycle 同一原则）。 */
-    defaultPill.hidden = isLogSnapshot() || !(store.tree && store.tree.default);
+    defaultPill.hidden = isLogReplay() || !(store.tree && store.tree.default);
   }
   paintLifecycle();
   applyTryScope();
@@ -1498,7 +1498,7 @@ function bindStageCards() {
   nodesLayer.addEventListener('click', event => {
     const chip = event.target.closest('[data-cond-edge]');
     if (!chip) return;
-    if (store.tryRunning || isLogSnapshot()) return;
+    if (store.tryRunning || isLogReplay()) return;
     openCondPop(chip.dataset.condEdge);
   });
 }
@@ -1650,12 +1650,12 @@ function createKit() {
     render: () => app.render(),
     collapsePanels: () => app.collapsePanels(),
     updateToolbar: () => updateToolbar(),
-    readOnly: isLogSnapshot(),
+    readOnly: isLogReplay(),
   });
 }
 
-/* ── 日志快照 (只读回放) ────────────────────────────────────────── */
-function showSnapshotHeader(result) {
+/* ── 决策回放 (只读) ────────────────────────────────────────────── */
+function showReplayHeader(result) {
   const badge = $('#cvSnapshotBadge');
   if (badge) badge.hidden = false;
   const select = $('#cvTreeSelect');
@@ -1665,8 +1665,8 @@ function showSnapshotHeader(result) {
   }
 }
 
-/* 快照问题放回画布原有的「试算问题」输入位：只读展示本次请求正文。 */
-function showSnapshotRequest(result) {
+/* 回放问题放回画布原有的「试算问题」输入位：只读展示本次请求正文。 */
+function showReplayRequest(result) {
   const text = result && result.request ? String(result.request.text || '') : '';
   if (!text) return '';
   const input = $('#cvTryInput');
@@ -1675,30 +1675,31 @@ function showSnapshotRequest(result) {
     input.readOnly = true;
     input.title = text;
   }
-  document.body.classList.add('has-snapshot-request');
+  document.body.classList.add('has-replay-request');
   return text;
 }
 
-async function bootLogSnapshot() {
-  document.body.classList.add('is-log-snapshot');
+async function bootLogReplay() {
+  document.body.classList.add('is-log-replay');
   bindViewport();
   onLangChange(() => {
     if (!app.booted) return;
     refreshTryRun();
   });
   try {
+    /* 回放只读同一条决策事件里的树与 trace，不读当前图或任何快照表。 */
     const result = await api.get(
-      '/admin/requests/' + encodeURIComponent(SNAPSHOT_REQUEST) + '/snapshot');
+      '/admin/requests/' + encodeURIComponent(REPLAY_REQUEST) + '/replay');
     const tree = result && result.tree;
-    if (!tree || !tree.root) throw new Error('request snapshot has no graph');
+    if (!tree || !tree.root) throw new Error('decision log has no graph');
     controller.loadTree(tree, true);
-    showSnapshotHeader(result);
-    const snapshotText = showSnapshotRequest(result);
+    showReplayHeader(result);
+    const replayText = showReplayRequest(result);
     const replay = rebuildTryRun(result.trace || [], store.graph);
     replay.trace = Array.isArray(result.trace) ? result.trace : [];
     /* 回放对象带上请求正文：复制/导出等观察入口与普通试算保持同一字段。 */
-    replay.text = snapshotText;
-    if (snapshotText) replay.request = { text: snapshotText };
+    replay.text = replayText;
+    if (replayText) replay.request = { text: replayText };
     applyTryRun(replay);
     app.kit.setLocked(true);
     app.booted = true;
@@ -1752,7 +1753,7 @@ async function loadDraftTree() {
 
 async function boot() {
   createKit();
-  if (isLogSnapshot()) return bootLogSnapshot();
+  if (isLogReplay()) return bootLogReplay();
   bindEvents();
   renderPalette();
   /* 目录与决策组解耦：目录抖动不能清空已加载的草稿；只有「新建画布」需要目录。 */

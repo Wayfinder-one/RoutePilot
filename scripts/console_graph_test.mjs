@@ -1293,6 +1293,46 @@ test('calculation log detail shows the process inline and keeps technical facts 
   assert.doesNotMatch(logs, /SRTrace\./);
 });
 
+test('decision log replay reads the event, not a graph snapshot', () => {
+  const read = name => fs.readFileSync(new URL('../router/console/' + name, import.meta.url), 'utf8');
+  const logs = read('logs.js');
+  /* 列表行只认决策事件投影里的 replay_url；旧 snapshot_url 语义必须消失。 */
+  assert.match(logs, /record\.replay_url/, 'logs does not link the decision replay');
+  assert.doesNotMatch(logs, /snapshot_url/, 'logs still links the removed graph snapshot');
+
+  const app = read('routing/app.js');
+  /* ?request=<id> 仍复用同一画布，但内部语义统一为“决策回放”。 */
+  assert.match(app, /REPLAY_REQUEST/, 'app.js lost the replay request id');
+  assert.match(app, /isLogReplay/, 'app.js lost the read-only replay mode');
+  assert.match(app, /bootLogReplay/, 'app.js lost the replay boot path');
+  assert.doesNotMatch(app, /SNAPSHOT_REQUEST|isLogSnapshot|bootLogSnapshot/,
+    'app.js still uses log-snapshot names for decision replay');
+  /* 回放接口与数据来源：同一事件的 tree/trace 交给既有画布与试算回放。 */
+  assert.match(app, /'\/admin\/requests\/' \+ encodeURIComponent\(REPLAY_REQUEST\) \+ '\/replay'/,
+    'app.js does not load the decision replay endpoint');
+  assert.doesNotMatch(app, /\/snapshot'/, 'app.js still calls the removed snapshot endpoint');
+  assert.match(app, /controller\.loadTree\(tree, true\)/,
+    'replay no longer reuses controller.loadTree()');
+  assert.match(app, /rebuildTryRun\(result\.trace \|\| \[\], store\.graph\)/,
+    'replay no longer reuses rebuildTryRun()');
+  assert.match(app, /document\.body\.classList\.add\('is-log-replay'\)/,
+    'read-only replay body mode was not renamed');
+
+  const i18n = read('i18n.js');
+  /* 用户可见文案改为“决策回放”；图编辑器的“运行配置快照”不受影响。 */
+  for (const copy of ["'logs.snapshot': '决策回放'", "'logs.snapshot': 'Decision replay'",
+    "'cv.snapshotBadge': '决策回放 · 只读'",
+    "'cv.snapshotBadge': 'Decision replay · read-only'",
+    "'cv.snapshotLoadFail': '无法加载决策回放：{err}'",
+    "'cv.snapshotLoadFail': 'Cannot load the decision replay: {err}'"]) {
+    assert.equal(i18n.split(copy).length - 1, 1, 'missing replay copy: ' + copy);
+  }
+  for (const stale of ['查看图快照', '日志快照 · 只读', 'Log snapshot · read-only']) {
+    assert.equal(i18n.split(stale).length - 1, 0,
+      'stale log-snapshot copy still present: ' + stale);
+  }
+});
+
 function attachQuestion(tree, questionType) {
   tree.root.nodes.push({
     id: 'q-review', type: 'question', question_type: questionType,

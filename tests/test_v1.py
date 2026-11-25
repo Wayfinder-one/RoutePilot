@@ -1279,7 +1279,8 @@ def test_real_request_logs_a_graph_snapshot_index(tmp_path):
         record = recent(app)
         assert record["graph_snapshot_id"]
         assert record["_graph_snapshot"]["snapshot_id"] == record["graph_snapshot_id"]
-        assert record["snapshot_url"].startswith("/console/routing.html?request=")
+        # 决策日志页面不再从账本记录生成快照链接（回放入口只属于内存决策事件）。
+        assert "snapshot_url" not in record
         snapshot = app.state.requestlog.snapshot_for(record["id"])
         assert snapshot["tree"]["root"]["type"] == "graph"
         assert snapshot["trace"] == record["trace"]

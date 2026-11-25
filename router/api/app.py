@@ -19,6 +19,7 @@ from router.control.errors import (
     ValidationFailed,
 )
 from router.api.issue_presenter import issues_payload
+from router.decision_log_store import DecisionLogStore
 from router.jev.client import JevClient
 from router.jev.service import JevService
 from router.maintenance import MaintenanceWorker
@@ -201,6 +202,8 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         ModelScheduler(app.state.affinity, app.state.balancer),
     )
     app.state.requestlog = requestlog
+    # 决策日志只保存在内存：完整事件来自内核事件接收口，重启即清空（Global Constraint 5）。
+    app.state.decision_logs = DecisionLogStore()
 
     app.state.graph_repo = RoutingTreeRepo(settings.graph_dir, writer=settings.graph_writer)
     if settings.graph_writer:
@@ -296,6 +299,7 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
         app.mount("/console", StaticFiles(directory=CONSOLE_DIR, html=True), name="console")
 
     from router.api.routes_jev import router as jev_router
+    from router.api.routes_logs import internal_router as logs_internal_router
     from router.api.routes_logs import router as logs_router
     from router.api.routes_models import router as models_router
     from router.api.routes_test import router as test_router
@@ -312,6 +316,8 @@ def create_app(settings: Settings, *, transport: httpx.BaseTransport | None = No
     app.include_router(logs_router, prefix="/admin")
     app.include_router(users_router, prefix="/admin")
     app.include_router(test_router, prefix="/admin")
+    # 内核事件接收口：挂在 /admin 之外，内核无需管理面登录即可投递完整决策事件。
+    app.include_router(logs_internal_router, prefix="/internal/v1")
     app.include_router(internal_router, prefix="/internal/v1")
     app.include_router(v1_router, prefix="/v1")
     return app

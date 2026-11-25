@@ -19,7 +19,6 @@ the upstream transport); this module re-exports them for its display tables.
 from __future__ import annotations
 
 import time
-from urllib.parse import quote
 
 from router.request_outcome import (
     OUTCOME_CANCELLED,
@@ -94,14 +93,14 @@ def present_record(record: dict) -> dict:
 
     Ordered UI facts stay in the in-memory record, outside the SQLite ledger;
     this is idempotent so the outcome refresh can call it again.
+
+    The graph snapshot link and its revision are gone: a decision log summary
+    already carries its own ``replay_url`` (``routing.html?request=<id>``) and
+    the whole graph is read only by the single-event replay endpoint, never by
+    the list.  This presenter stays the one place the console's ordered display
+    facts are produced for both live records and decision-log summaries.
     """
     record["route_label"] = route_label(record)
-    # 快照链接只指向绘制画板；整图不随列表下发，打开链接时才读取。
-    if record.get("graph_snapshot_id"):
-        record["snapshot_url"] = "/console/routing.html?request=" + quote(
-            str(record.get("id") or ""), safe="")
-    else:
-        record.pop("snapshot_url", None)
     # 计算日志只呈现路由自己的决策成本：决策耗时（进入路由 → 选出模型，
     # 含决策模型耗时）与轮次。上游状态、端到端总耗时与 token 用量属于
     # 网关数据面，不进智能路由的展示口径（"智能路由只负责智能路由的事情"）。
@@ -114,7 +113,6 @@ def present_record(record: dict) -> dict:
         [_label("请求 ID", "Request ID"), _shown(record.get("id"))],
         [_label("决策组", "Decision group"), _shown(record.get("tree_id"))],
         [_label("决策组版本", "Tree revision"), _shown(record.get("tree_revision"))],
-        [_label("快照", "Snapshot"), _shown(record.get("snapshot_revision"))],
         [_label("策略路径", "Policy path"), _shown(record.get("policy_path"))],
         [_label("会话哈希", "Session hash"), _shown(record.get("session_hash"))],
         [_label("JEV 模型", "JEV model"), _shown(record.get("jev_model"))],

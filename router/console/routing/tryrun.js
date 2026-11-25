@@ -4,7 +4,7 @@
    绝不调用 RTGraph.evaluateCondition、也不读取 graph_scenarios 的 answers。
    卡片回写走 cards.js 已有的 data-live / data-slot / data-edge 契约；边回写走
    canvas.js 的 edgeEl() + class。试算只展示画布回放与结论，不再有执行轨迹抽屉；
-   日志快照复用同一套 rebuild()/apply()，通过 ``readOnly`` 关闭重跑/清除/整理。
+   决策回放复用同一套 rebuild()/apply()，通过 ``readOnly`` 关闭重跑/清除/整理。
 
    ES module：app.js 装配时调用 configureTryRun({ store, getKit, getBooted,
    change, toast, render, collapsePanels, updateToolbar, readOnly })；运行锁写回
@@ -26,7 +26,7 @@ const isBootedNow = () => !!(deps && typeof deps.getBooted === 'function' && dep
 const renderNow = () => { if (deps && typeof deps.render === 'function') deps.render(); };
 const toastNow = (message, tone) => { if (deps && typeof deps.toast === 'function') deps.toast(message, tone); };
 const updateToolbarNow = () => { if (deps && typeof deps.updateToolbar === 'function') deps.updateToolbar(); };
-/* 日志快照：只回放，不提供重跑/清除/整理等写入口。 */
+/* 决策回放：只回放，不提供重跑/清除/整理等写入口。 */
 const isReadOnly = () => !!(deps && deps.readOnly);
 const byId = id => document.getElementById(id);
 /* 画布上节点用中文显示名；抽屉里同样显示名称，原始 id 留在 tooltip。 */
@@ -666,7 +666,7 @@ function apply(replay) {
     return;
   }
   /* 路由集结果没有当前画布坐标：只渲染结论/事实，绝不 paint、也不清掉当前草稿
-     的静态图。草稿与日志快照继续回放到当前画布（逐字保留既有行为）。 */
+     的静态图。草稿与决策回放继续回放到当前画布（逐字保留既有行为）。 */
   const graph = replay.scope === 'route_set' ? null : graphNow();
   if (graph) {
     /* 先清旧回放样式：无图事件时只保留静态图，绝不能继承上一次回放的涂色。 */
@@ -889,7 +889,7 @@ function renderResult(replay) {
       esc(replay.error.message) + '</span></div>'
     : '';
   /* 路由集回放不属于当前草图：不提供「按波次整理」，否则会按另一张图的波次
-     改写当前草稿的节点位置。日志快照（只读）依旧不提供任何写入口。 */
+     改写当前草稿的节点位置。决策回放（只读）依旧不提供任何写入口。 */
   const wavesAction = !isReadOnly() && replay.scope !== 'route_set'
     ? '<button type="button" class="btn sm" id="cvTryWavesBtn" data-try-act="waves">' +
       esc(t('cv.tryWavesLayout')) + '</button>'

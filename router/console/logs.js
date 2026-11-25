@@ -125,11 +125,11 @@ function rowHtml(record, path, open) {
   const text = String(record.text || '').replace(/\s+/g, ' ').trim();
   const timestamp = fmtTime(record.ts);
   const clock = timestamp.split(' ')[0];
-  /* 快照链接放在折叠行上：不必展开就能直接回放当时的决策图。
+  /* 回放入口放在折叠行上：不必展开就能直接回放当时的决策图。
      它是这一行唯一的导航动作，做成带图示的实心浅色按钮，避免和右侧的
      纯文字耗时混在一起看不出来。 */
-  const snapshot = typeof record.snapshot_url === 'string' && record.snapshot_url
-    ? '<a class="lg-snap-btn" href="' + esc(record.snapshot_url) +
+  const replay = typeof record.replay_url === 'string' && record.replay_url
+    ? '<a class="lg-snap-btn" href="' + esc(record.replay_url) +
       '" title="' + esc(t('logs.snapshot')) + '" aria-label="' + esc(t('logs.snapshot')) +
       '"><span class="lg-snap-label">' + esc(t('logs.snapshot')) + '</span>' +
       '<svg class="lg-snap-ic" viewBox="0 0 16 16" aria-hidden="true" focusable="false">' +
@@ -141,7 +141,7 @@ function rowHtml(record, path, open) {
     '<span class="lg-text">' + (text ? esc(text) : esc(t('logs.noText'))) + '</span>' +
     chainHtml(path) + '<span class="lg-model">' + safe(record.model) + '</span>' +
     '<span class="lg-lat" title="' + esc(decisionTitle(record)) + '">' +
-    esc(ms(record.routing_ms)) + '</span>' + snapshot +
+    esc(ms(record.routing_ms)) + '</span>' + replay +
     '<button type="button" class="lg-chev" aria-expanded="' + open +
     '" aria-controls="detail-' + safe(record.id) + '" aria-label="' +
     esc(t(open ? 'logs.collapseRow' : 'logs.expandRow')) +
@@ -250,7 +250,7 @@ $('#filter').addEventListener('click', event => {
   render();
 });
 $('#list').addEventListener('click', event => {
-  /* 快照按钮自己导航，不能顺带折叠/展开这一行。 */
+  /* 决策回放按钮自己导航，不能顺带折叠/展开这一行。 */
   if (event.target.closest('.lg-snap-btn')) return;
   const row = event.target.closest('.lg-row');
   if (row) toggle(row.closest('.lg-item'));
