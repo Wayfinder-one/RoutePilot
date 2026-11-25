@@ -49,3 +49,42 @@ def test_internal_route_forwards_to_shared_executor(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert called['allow_department_header'] is True
     assert 'use_requested_model' not in called
+
+
+def test_internal_route_requires_gateway_token_even_when_authorization_present(tmp_path):
+    """A user Bearer token must never authenticate the internal endpoint."""
+    client = make_client(tmp_path, token='expected')
+    response = client.post(
+        '/internal/v1/chat/completions',
+        headers={'Authorization': 'Bearer user-key', 'X-SR-Gateway-Token': 'wrong'},
+        json={'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+    assert response.status_code == 401
+
+
+def test_internal_route_decodes_department_header(tmp_path, monkeypatch):
+    """The gateway-authenticated endpoint accepts the department header."""
+    client = make_client(tmp_path, token='expected')
+    seen = {}
+
+    async def spy(request, **kwargs):
+        seen['department'] = await request.json()
+        return JSONResponse({'ok': True})
+
+    monkeypatch.setattr('router.api.routes_internal.run_chat_completion', spy)
+    response = client.post(
+        '/internal/v1/chat/completions',
+        headers={'X-SR-Gateway-Token': 'expected', 'X-SR-Department': '%E8%B4%A2%E5%8A%A1%E9%83%A8'},
+        json={'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+    assert response.status_code == 200
+    assert seen['department']['model'] == 'auto'
+
+
+def test_public_v1_rejects_forged_department_header(tmp_path):
+    """The public /v1 entry must keep refusing X-SR-Department."""
+    client = make_client(tmp_path, token='expected')
+    response = client.post(
+        '/v1/chat/completions',
+        headers={'X-SR-Department': '%E8%B4%A2%E5%8A%A1%E9%83%A8'},
+        json={'model': 'auto', 'messages': [{'role': 'user', 'content': '你好'}]})
+    assert response.status_code == 400
+    assert response.json() == {'error': {'message': 'department_header_not_allowed'}}
