@@ -8,7 +8,12 @@ from fastapi.testclient import TestClient
 from router.api.app import create_app
 from router.store.db import connect
 from router.upstream.runtime_keys import tree_scope
-from tests.routing_fixtures import runtime_from_catalog, test_settings, tree_dict
+from tests.routing_fixtures import (
+    core_app_for,
+    runtime_from_catalog,
+    test_settings,
+    tree_dict,
+)
 
 TEXT = "今天天气怎么样"
 
@@ -35,7 +40,9 @@ def harness(tmp_path, *, streaming=False):
         return httpx.Response(200, json={"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
 
     transport = StreamingTransport() if streaming else httpx.MockTransport(handler)
-    app = create_app(test_settings(tmp_path), transport=transport)
+    app = create_app(
+        test_settings(tmp_path), transport=transport,
+        core_transport=core_app_for(tmp_path))
     return SimpleNamespace(app=app, client=TestClient(app), requests=transport.requests if streaming else requests)
 
 

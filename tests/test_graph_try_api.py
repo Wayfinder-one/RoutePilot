@@ -28,6 +28,7 @@ from router.store.db import connect
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.runtime_keys import tree_scope
 from tests.routing_fixtures import (
+    core_app_for,
     graph_dict,
     huge_chain_graph,
     runtime_dict,
@@ -66,6 +67,7 @@ def app(tmp_path):
         # 预置决策服务配置：graph 引擎要求 snapshot.jev 存在（网络调用由 FakeJev 接管）。
         test_settings(tmp_path, jev_url="http://jev.test", jev_model="d1-2B"),
         transport=httpx.MockTransport(handler),
+        core_transport=core_app_for(tmp_path),
     )
 
 

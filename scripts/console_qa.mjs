@@ -119,10 +119,13 @@ export let routerBase = '';
 
 let browser = null;
 let routerChild = null;
+let kernelChild = null;
 let mockServer = null;
 let routerPort = 0;
+let kernelPort = 0;
 export let tempDir = '';
 let routerLog = '';
+let kernelLog = '';
 let repoDbFingerprint = null;
 
 const pageErrors = [];
@@ -496,6 +499,85 @@ function capture(child) {
   if (child.stderr) child.stderr.on('data', append);
 }
 
+function captureKernel(child) {
+  const append = chunk => { kernelLog = (kernelLog + chunk.toString()).slice(-20000); };
+  if (child.stdout) child.stdout.on('data', append);
+  if (child.stderr) child.stderr.on('data', append);
+}
+
+/* 决策内核子进程：图 JSON 的唯一写者。外围目录写（模型/provider/JEV/时段）
+   现在通过 /internal/v1/graph-batches 提交，因此 QA 必须同时起内核并让外围
+   的 CoreClient 指向它（Task 7 的跨服务目录同步）。 */
+function kernelConfigPath() {
+  return path.join(tempDir, 'core.json');
+}
+
+function writeKernelConfig(port) {
+  fs.writeFileSync(kernelConfigPath(), JSON.stringify({
+    server: { host: '127.0.0.1', port },
+    graphs: { directory: path.join(tempDir, 'routing-graph') },
+    jev: { api_key_env: 'ROUTER_JEV_API_KEY' },
+    logging: { type: 'disabled' }
+  }));
+}
+
+const KERNEL_BOOT = [
+  'import uvicorn',
+  'from router.api.core_app import create_core_app',
+  'from router.core_config import CoreSettings',
+  'settings = CoreSettings.from_file(__import__("sys").argv[1])',
+  'uvicorn.run(create_core_app(settings), host=settings.host, port=settings.port, log_level="warning")',
+].join('\n');
+
+async function startKernel(port) {
+  writeKernelConfig(port);
+  const child = spawn(pythonExecutable(), ['-c', KERNEL_BOOT, kernelConfigPath()], {
+    cwd: ROOT,
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  kernelChild = child;
+  captureKernel(child);
+  child.on('exit', code => {
+    if (kernelChild === child) {
+      kernelChild = null;
+      kernelLog += `\n[kernel exited with code ${code}]`;
+    }
+  });
+
+  const deadline = Date.now() + 45000;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error('kernel exited during startup (code ' + child.exitCode + ')\n' + kernelLog);
+    }
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/readyz`, { signal: AbortSignal.timeout(1500) });
+      if (response.status === 200) return child;
+    } catch {
+      /* 还没起来，继续轮询 */
+    }
+    await new Promise(resolve => setTimeout(resolve, 200));
+  }
+  throw new Error('kernel did not become ready in 45s\n' + kernelLog);
+}
+
+async function stopKernel() {
+  const child = kernelChild;
+  if (!child) return;
+  kernelChild = null;
+  if (child.exitCode !== null) return;
+  await new Promise(resolve => {
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+    }, 5000);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    try { child.kill('SIGTERM'); } catch { clearTimeout(timer); resolve(); }
+  });
+}
+
 async function startRouter(port) {
   const child = spawn(pythonExecutable(), ['-m', 'router'], {
     cwd: ROOT,
@@ -506,6 +588,8 @@ async function startRouter(port) {
       ROUTER_HOST: '127.0.0.1',
       ROUTER_PORT: String(port),
       ROUTER_USER_AUTH: '0',
+      /* 目录写经内核：指向同一次 QA 启动的内核子进程（Task 7 跨服务同步）。 */
+      ROUTER_CORE_URL: `http://127.0.0.1:${kernelPort}`,
       /* 不设置 ROUTER_JEV_URL/MODEL：多 JEV 目录只由 bootstrap 用
          POST /admin/jev 显式创建（旧单配置 / 环境种子路径不再参与 QA）。 */
       PYTHONUNBUFFERED: '1'
@@ -1690,6 +1774,7 @@ async function teardown() {
         browser = null;
 }
       await stopRouter();
+      await stopKernel();
       if (mockServer) {
         await new Promise(resolve => mockServer.close(resolve));
         mockServer = null;
@@ -1731,6 +1816,8 @@ export async function runRegisteredCases() {
     repoDbFingerprint = repoDbSignature();
     mockServer = await startMock();
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rt-console-qa-'));
+    kernelPort = await freePort();
+    await startKernel(kernelPort);
     routerPort = await freePort();
     routerBase = `http://127.0.0.1:${routerPort}`;
     await startRouter(routerPort);

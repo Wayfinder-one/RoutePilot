@@ -9,12 +9,13 @@ from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.decision_fixtures import valid_event
-from tests.routing_fixtures import test_settings, tree_dict
+from tests.routing_fixtures import core_app_for, test_settings, tree_dict
 
 
 @pytest.fixture
 def client(tmp_path):
-    return TestClient(create_app(test_settings(tmp_path)))
+    return TestClient(create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path)))
 
 
 def _question_root():
@@ -183,7 +184,9 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
             "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
         })
 
-    app = create_app(settings, transport=httpx.MockTransport(handler))
+    app = create_app(
+        settings, transport=httpx.MockTransport(handler),
+        core_transport=core_app_for(tmp_path))
     with TestClient(app) as client:
         provider_payload = {
             "base_url": "http://upstream.test/v1", "key_env": "",
@@ -222,7 +225,9 @@ def test_live_decision_events_keep_request_secrets_out_of_the_memory_log(tmp_pat
             assert secret not in replay.text, f"memory decision log leaked {secret}"
 
     # 重启：内存日志清空，历史回放 404，不尝试从 SQLite 恢复。
-    restarted = create_app(settings, transport=httpx.MockTransport(handler))
+    restarted = create_app(
+        settings, transport=httpx.MockTransport(handler),
+        core_transport=core_app_for(tmp_path))
     with TestClient(restarted) as client:
         assert client.get(f"/admin/requests/{request_id}/replay").status_code == 404
         assert client.get("/admin/requests/recent").json() == {"requests": []}

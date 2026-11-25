@@ -37,9 +37,8 @@ import logging
 from dataclasses import dataclass
 
 from router.control.errors import ValidationFailed
-from router.control.graphs import graph_parse_failed
-from router.control.validation import enabled_tree_issues, tree_issues
-from router.routing.document import graph_document_bytes, parse_graph_document
+from router.control.graphs import candidate_document_issues
+from router.control.validation import enabled_tree_issues
 from router.routing.snapshot import PreparedRouteSet
 from router.routing.tree import RoutingTree
 from router.store.repositories import (
@@ -147,30 +146,10 @@ class ConfigurationService:
             raise ValidationFailed(issues)
 
     def _validate_candidate(self, tree: RoutingTree) -> None:
-        """严格校验一份候选画布，保证它写盘后仍能被仓库读回。
-
-        先做启用级 ``tree_issues``（能给出可定位的推理档位等 issue），再按
-        ``stage_updates`` 将会写出的字节做一次完整文档解析：启用级校验只看
-        target 的推理档位是否在画布声明的档位表里，不会用候选的 provider 推理
-        协议重新校验模型 profile；只靠它会让「provider 协议翻转后非启用候选
-        profile 非法」这类候选直接落盘，随后 ``trees.list()`` 抛
-        ``GraphStorageError``。
-        """
-        issues = tree_issues(tree)
+        """严格校验一份候选画布（与内核图批次的候选校验同一入口）。"""
+        issues = candidate_document_issues(tree)
         if issues:
             raise ValidationFailed(issues)
-        try:
-            # 校验「即将写出的字节」：仓储按给定 v4 文档原样落盘，生命周期字段
-            # 不再在写盘路径上归一，因此直接解析这份文档。
-            raw = graph_document_bytes(tree)
-            parse_graph_document(
-                raw,
-                tree_id=tree.id,
-                updated_at=tree.updated_at,
-                document_sha256=tree.document_sha256,
-            )
-        except (ValueError, TypeError) as exc:
-            raise ValidationFailed(graph_parse_failed(exc)) from exc
 
     def _prepared_snapshot_set(self) -> PreparedRouteSet:
         """构造覆盖完整启用集合的候选路由集（只发布前复核用，不含单图回退）。

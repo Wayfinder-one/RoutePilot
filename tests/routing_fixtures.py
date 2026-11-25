@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import httpx
+
 from router.config import Settings
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.window import DEFAULT_CONTEXT_TOKENS, DEFAULT_INPUT_TOKENS
@@ -277,3 +281,69 @@ def huge_chain_graph(count=1200):
             "target": f"n{index}", "target_port": "in_1",
         })
     return raw
+
+
+# --------------------------------------------------------------------------- #
+# 跨服务测试：进程内内核（Task 7 起目录写需要内核图批次）
+# --------------------------------------------------------------------------- #
+class _KernelTransport(httpx.AsyncBaseTransport):
+    """把内核 ASGI app 暴露成 ``CoreClient`` 可用的 in-process transport。
+
+    关闭时顺带关掉内核自建的 ``AsyncClient``：测试不启动内核 lifespan，避免
+    每个测试泄漏一个未关闭的 HTTP 客户端。
+    """
+
+    def __init__(self, app):
+        self.app = app
+        self._inner = httpx.ASGITransport(app=app)
+
+    async def handle_async_request(self, request):
+        return await self._inner.handle_async_request(request)
+
+    async def aclose(self):
+        await self._inner.aclose()
+        http = getattr(self.app.state, "http", None)
+        if http is not None:
+            await http.aclose()
+
+
+def default_graph_dir(base) -> str:
+    """``test_settings(base)`` 的图目录（与 ``create_app`` 共享同一目录）。"""
+    return str(Path(base) / "routing-graph")
+
+
+def core_app(base=None, *, graph_dir=None):
+    """A real ``create_core_app`` over the peripheral's graph directory."""
+    from router.api.core_app import create_core_app
+    from router.core_config import CoreSettings, LogSinkSettings
+
+    directory = str(graph_dir) if graph_dir is not None else default_graph_dir(base)
+    return create_core_app(CoreSettings(
+        graph_dir=directory, logging=LogSinkSettings(type="disabled")))
+
+
+def core_app_for(base=None, *, graph_dir=None, app=None) -> httpx.AsyncBaseTransport:
+    """In-process kernel transport for ``create_app(..., core_transport=...)``.
+
+    ``base`` is the directory passed to :func:`test_settings` (graph directory =
+    ``<base>/routing-graph``); pass ``graph_dir``/``app`` for custom layouts and
+    for tests that need to inject kernel-side faults.
+    """
+    kernel = app if app is not None else core_app(base, graph_dir=graph_dir)
+    return _KernelTransport(kernel)
+
+
+def wire_catalog_sync(app, transport) -> None:
+    """Production catalog-wiring for hand-built peripheral test apps.
+
+    ``create_app()`` sets ``app.state.core``/``catalog_sync_factory`` itself; a
+    test app mounting only some routers needs the same two attributes for the
+    migrated catalog routes (models/JEV/time-periods).
+    """
+    from router.control.remote_catalog_sync import RemoteCatalogSyncService
+    from router.core_client import CoreClient
+
+    app.state.core = CoreClient(
+        "http://core", http=httpx.AsyncClient(transport=transport))
+    app.state.catalog_sync_factory = lambda conn: RemoteCatalogSyncService(
+        conn, app.state.core)

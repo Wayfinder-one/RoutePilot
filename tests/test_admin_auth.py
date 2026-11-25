@@ -16,7 +16,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
-from tests.routing_fixtures import test_settings
+from tests.routing_fixtures import core_app_for, test_settings
 
 #: 旧静态 token 的字面值：移除后它不能通过任何校验。
 OLD_STATIC_TOKEN = {"Authorization": "Bearer sekret"}
@@ -26,7 +26,8 @@ def _client(tmp_path, **overrides) -> TestClient:
     return TestClient(create_app(
         test_settings(tmp_path, **overrides),
         transport=httpx.MockTransport(
-            lambda r: httpx.Response(200, json={"choices": []}))))
+            lambda r: httpx.Response(200, json={"choices": []})),
+        core_transport=core_app_for(tmp_path)))
 
 
 def _login(c: TestClient, email="admin@test.com",

@@ -44,6 +44,7 @@ from router.control.errors import (
     ValidationFailed,
 )
 from router.control.validation import tree_issues
+from router.routing.document import graph_document_bytes, parse_graph_document
 from router.routing.graph.validate import Issue
 from router.routing.route_set import RouteSetInvariantError, route_set_indices
 from router.routing.graph.model import canvas_to_dict, graph_to_dict
@@ -77,6 +78,35 @@ UNSET = _Unset()
 
 def graph_parse_failed(exc: Exception) -> list[Issue]:
     return [Issue("graph_parse_error", params={"detail": str(exc)})]
+
+
+def candidate_document_issues(tree: RoutingTree) -> list[Issue]:
+    """严格校验一份候选画布：启用级合法且写出的字节可被仓库原样读回。
+
+    先做启用级 ``tree_issues``（能给出可定位的推理档位/时段/JEV issue），再按
+    ``graph_document_bytes`` 即将写出的字节做一次完整 v4 文档解析。启用级校验
+    只看 target 的推理档位是否在画布声明的档位表里，不会用候选的 provider 推理
+    协议重新校验模型 profile；只靠它会让「provider 协议翻转后非启用候选 profile
+    非法」这类候选直接落盘，随后 ``trees.list()`` 抛 ``GraphStorageError``。
+
+    目录写（内核图批次）与本地配置写共用本入口，保证两侧的候选严格性一致。
+    """
+    issues = tree_issues(tree)
+    if issues:
+        return issues
+    try:
+        # 校验「即将写出的字节」：仓储按给定 v4 文档原样落盘，生命周期字段
+        # 不再在写盘路径上归一，因此直接解析这份文档。
+        raw = graph_document_bytes(tree)
+        parse_graph_document(
+            raw,
+            tree_id=tree.id,
+            updated_at=tree.updated_at,
+            document_sha256=tree.document_sha256,
+        )
+    except (ValueError, TypeError) as exc:
+        return graph_parse_failed(exc)
+    return []
 
 
 def _route_set_issue(exc: RouteSetInvariantError) -> Issue:

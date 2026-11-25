@@ -6,12 +6,14 @@
 1. 扫描全部画布得到影响清单，未携带确认的第一次写入返回 409
    ``impact_confirmation_required``（数据库、画布文件、审计、快照全不变）；
 2. 携带每个画布当前 ``document_sha256`` 的确认重试，由
-   ``CatalogSyncService`` 在单写锁 + 单数据库事务内写目录行、校验并原子替换
-   受影响画布、记录审计；同步集合里含任一启用图时重发布完整启用路由集。
+   ``RemoteCatalogSyncService`` 在 SQLite 写事务内写目录行，再用一次内核条件
+   图批次原子替换全部受影响画布，最后写审计并提交 SQLite；内核提交成功而
+   SQLite 失败时按原图与新基线哈希反向补偿，补偿失败显式为 503
+   ``catalog_sync_diverged``。
 
 哈希不匹配（过期确认）返回 409 ``graph_conflict`` 并报告当前哈希。确认后的
-提交还会在写锁内、事务内重算一次最新引用/影响（``recheck``）：路由层扫描之后
-新出现的画布/模型引用会变成 409，而不是漏同步。
+提交还会在 SQLite 写事务内重算一次最新引用/影响（``recheck``，从内核重新读取
+当前画布）：路由层扫描之后新出现的画布/模型引用会变成 409，而不是漏同步。
 
 provider 删除不提供隐式替换、也不可被确认绕过：只要数据库模型或**画布模型**
 仍引用它就拒绝；画布运行时目录里只有它的 provider 条目、没有任何模型引用时
@@ -30,8 +32,11 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from router.api.deps import get_conn, get_tree_repo
-from router.control.catalog_sync import CatalogSyncService
+from router.api.deps import (
+    catalog_service,
+    commit_catalog_write,
+    get_conn,
+)
 from router.control.errors import AlreadyExists, MissingError, ReferencedByError
 from router.control.impacts import (
     delete_model as delete_tree_model,
@@ -61,7 +66,6 @@ from router.store.repositories import (
     model_ids_using_provider,
     now_iso,
 )
-from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import parse_profile_text
 
 router = APIRouter()
@@ -213,11 +217,6 @@ def _runtime_model_entry(row: dict, provider_format: str) -> dict:
     }
 
 
-def _catalog_service(request: Request, conn: sqlite3.Connection,
-                     trees: RoutingTreeRepo) -> CatalogSyncService:
-    return CatalogSyncService(conn, trees, request.app.state.publisher)
-
-
 def _provider_entries(conn: sqlite3.Connection, names) -> list[dict]:
     entries = []
     for name in names:
@@ -254,14 +253,15 @@ def _provider_reference_error(used_by: list[str], canvas_models: list[dict],
     })
 
 
-def _provider_delete_blockers(conn, trees, name) -> ReferencedByError | None:
-    """provider 删除引用检查（路由层预览与锁内 recheck 共用同一规则）。
+def _provider_delete_blockers(conn, tree_list, name) -> ReferencedByError | None:
+    """provider 删除引用检查（路由层预览与 SQLite 事务内 recheck 共用同一规则）。
 
     只有数据库模型或**画布模型**引用 provider 时才阻塞：画布运行时目录里仅有
     它的 provider 条目（没有模型使用它）不影响删除，但影响清单仍完整列出。
+    ``tree_list`` 是调用方从内核读取的当前画布快照（``CoreClient.list_graphs``）。
     """
     used_by = model_ids_using_provider(conn, name)
-    impacts = provider_impacts(trees.list(), name)
+    impacts = provider_impacts(tree_list, name)
     canvas_models = _canvas_models_using_provider(impacts)
     if used_by or canvas_models:
         return _provider_reference_error(used_by, canvas_models, impacts)
@@ -329,10 +329,9 @@ class ModelDeleteIn(BaseModel):
 
 
 @router.post("/models", status_code=201)
-def post_model(
+async def post_model(
     body: ModelCreateIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     model_id = body.id.strip()
     if not _ID_RE.match(model_id):
@@ -360,17 +359,18 @@ def post_model(
         # 数据库里已无对应 provider 的模型（422 与路由层 ``_require_provider`` 一致）。
         _require_provider(c, provider)
 
-    # 新建模型不会影响任何已存画布（画布只引用已存在模型）→ 无候选。
-    _catalog_service(request, conn, trees).commit(
+    # 新建模型不会影响任何已存画布（画布只引用已存在模型）→ 无候选：纯 SQLite
+    # 写不调用内核图批次。
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=[], audit=audit, recheck=recheck)
     return {"ok": True, "model": _public_model(ModelRepo(conn).get(model_id), provider_row.get("reasoning_format") or "openai")}
 
 
 @router.put("/models/{model_id}")
-def put_model(
+async def put_model(
     model_id: str, body: ModelIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     existing = ModelRepo(conn).get(model_id)
     if existing is None:
@@ -383,7 +383,7 @@ def put_model(
     formats = _provider_formats(conn)
     profile = _validated_profile(body.profile, formats.get(effective_provider, "openai")) if body.profile is not None else None
 
-    tree_list = trees.list()
+    tree_list = await request.app.state.core.list_graphs()
     impacts = model_impacts(tree_list, model_id)
     require_confirmation(
         impacts, body.impact_confirmation,
@@ -422,18 +422,20 @@ def put_model(
             "profile": body.profile, "synced_trees": synced,
         })
 
-    def recheck(_conn):
-        # 写锁内、事务内、写目录行之前重算影响清单：路由层扫描之后新出现的
+    async def recheck(_conn):
+        # SQLite 写事务内、写目录行之前从内核重算影响清单：路由层扫描之后新出现的
         # 画布引用会让确认哈希不匹配 → 409，绝不带着过期名单提交。
         if provider is not None:
-            # 请求要换到的 provider 可能在路由层校验之后被删除：锁内重查，
+            # 请求要换到的 provider 可能在路由层校验之后被删除：事务内重查，
             # 绝不让数据库模型引用一个已不存在的 provider。
             _require_provider(_conn, provider)
         require_confirmation(
-            model_impacts(trees.list(), model_id), body.impact_confirmation,
+            model_impacts(await request.app.state.core.list_graphs(), model_id),
+            body.impact_confirmation,
             resource={"kind": "model", "id": model_id}, replacements=[])
 
-    _catalog_service(request, conn, trees).commit(
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     row = ModelRepo(conn).get(model_id)
     return {
@@ -445,11 +447,10 @@ def put_model(
 
 
 @router.delete("/models/{model_id}")
-def delete_model(
+async def delete_model(
     model_id: str, request: Request,
     body: ModelDeleteIn | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     existing = ModelRepo(conn).get(model_id)
     if existing is None:
@@ -466,7 +467,7 @@ def delete_model(
             raise HTTPException(422, detail="replacement_model_id 不能是模型自身")
 
     formats = _provider_formats(conn)
-    tree_list = trees.list()
+    tree_list = await request.app.state.core.list_graphs()
     impacts = model_impacts(tree_list, model_id)
     replacements = [
         {"id": row["id"], "upstream": row["upstream"], "provider": row["provider"]}
@@ -510,15 +511,15 @@ def delete_model(
             "synced_trees": synced,
         })
 
-    def recheck(_conn):
-        # 替代模型可能在路由层校验之后、加锁之前被删除：锁内重查，404 语义与
-        # 路由层一致（``unknown model {id}``），绝不把画布 target 换成一个数据库
-        # 里已不存在的模型。
+    async def recheck(_conn):
+        # 替代模型可能在路由层校验之后、SQLite 写事务之前被删除：事务内重查，
+        # 404 语义与路由层一致（``unknown model {id}``），绝不把画布 target 换成
+        # 一个数据库里已不存在的模型。
         if replacement_id is not None \
                 and ModelRepo(_conn).get(replacement_id) is None:
             raise MissingError(f"unknown model {replacement_id}")
         require_confirmation(
-            model_impacts(trees.list(), model_id),
+            model_impacts(await request.app.state.core.list_graphs(), model_id),
             body.impact_confirmation if body is not None else None,
             resource={"kind": "model", "id": model_id},
             replacements=[
@@ -527,7 +528,8 @@ def delete_model(
                 for row in ModelRepo(_conn).list() if row["id"] != model_id
             ])
 
-    _catalog_service(request, conn, trees).commit(
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     return {
         "ok": True,
@@ -575,10 +577,9 @@ class ProviderDeleteIn(BaseModel):
 
 
 @router.put("/providers/{name}")
-def put_provider(
+async def put_provider(
     name: str, body: ProviderIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     if not _ID_RE.match(name):
         raise HTTPException(422, detail="invalid provider name")
@@ -595,7 +596,7 @@ def put_provider(
         # 端点变了而请求未显式提供密钥：旧密钥不得静默跟随到新地址（spec §5）。
         api_key = ""
 
-    tree_list = trees.list()
+    tree_list = await request.app.state.core.list_graphs()
     impacts = provider_impacts(tree_list, name)
     require_confirmation(
         impacts, body.impact_confirmation,
@@ -632,12 +633,14 @@ def put_provider(
             "synced_trees": synced,
         })
 
-    def recheck(_conn):
+    async def recheck(_conn):
         require_confirmation(
-            provider_impacts(trees.list(), name), body.impact_confirmation,
+            provider_impacts(await request.app.state.core.list_graphs(), name),
+            body.impact_confirmation,
             resource={"kind": "provider", "name": name})
 
-    _catalog_service(request, conn, trees).commit(
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     return {
         "ok": True,
@@ -647,16 +650,16 @@ def put_provider(
 
 
 @router.delete("/providers/{name}")
-def delete_provider(
+async def delete_provider(
     name: str, request: Request,
     body: ProviderDeleteIn | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     # DTO 里的 impact_confirmation 只用于协议兼容，provider 删除不允许绕过检查。
     if ProviderRepo(conn).get(name) is None:
         raise MissingError(f"unknown provider {name}")
-    blocked = _provider_delete_blockers(conn, trees, name)
+    blocked = _provider_delete_blockers(
+        conn, await request.app.state.core.list_graphs(), name)
     if blocked is not None:
         raise blocked
 
@@ -669,14 +672,16 @@ def delete_provider(
             "action": "delete", "name": name, "synced_trees": [],
         })
 
-    def recheck(_conn):
-        # 路由层预览之后、加锁之前可能有画布/模型开始引用 provider；在写锁内
-        # 用同一规则重算一次，命中即 409 且数据库与审计都不变。
-        blocked = _provider_delete_blockers(_conn, trees, name)
+    async def recheck(_conn):
+        # 路由层预览之后、SQLite 写事务之前可能有画布/模型开始引用 provider；
+        # 在事务内用同一规则重算一次，命中即 409 且数据库与审计都不变。
+        blocked = _provider_delete_blockers(
+            _conn, await request.app.state.core.list_graphs(), name)
         if blocked is not None:
             raise blocked
 
-    _catalog_service(request, conn, trees).commit(
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=[], audit=audit, recheck=recheck)
     return {"ok": True, "deleted": name}
 

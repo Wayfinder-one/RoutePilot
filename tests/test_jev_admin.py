@@ -24,7 +24,12 @@ from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
 from router.store.routing_trees import RoutingTreeRepo
-from tests.routing_fixtures import portable_tree_dict, test_settings
+from tests.routing_fixtures import (
+    core_app_for,
+    portable_tree_dict,
+    test_settings,
+    wire_catalog_sync,
+)
 
 
 def _migrated(path):
@@ -55,6 +60,8 @@ def make_client(tmp_path, handler=None, requests=None):
     app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     app.state.http = httpx.AsyncClient(transport=transport)
     app.state.jev_client = JevClient(app.state.http)
+    # Task 7：目录写/图读取走内核；手工 app 装配同一份生产 wiring。
+    wire_catalog_sync(app, core_app_for(tmp_path))
     app.include_router(router, prefix="/admin")
     return TestClient(app), app
 
@@ -396,7 +403,11 @@ def test_test_endpoint_uses_database_config_not_active_canvas(tmp_path):
     repo.initialize()
     document = portable_tree_dict("portable")
     repo.create(tree_from_dict({**document, "enabled": True, "default": True}))
-    app = create_app(settings, transport=httpx.MockTransport(handler))
+    app = create_app(
+        settings,
+        transport=httpx.MockTransport(handler),
+        core_transport=core_app_for(tmp_path),
+    )
     client = TestClient(app)
 
     created = client.post("/admin/jev", json={

@@ -18,7 +18,7 @@ from router.maintenance import MaintenanceWorker
 from router.store.db import connect, migrate
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
                                        UserRepo)
-from tests.routing_fixtures import test_settings
+from tests.routing_fixtures import core_app_for, test_settings
 
 # --------------------------------------------------------------------------- #
 # Task 1：口令哈希 / email 规范化 / UserRepo / SessionRepo
@@ -729,7 +729,9 @@ def test_responses_never_contain_password_hash(tmp_path):
 def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
     """ROUTER_USER_AUTH=0 + 空 token = 2026-10-26 之前的行为：/admin 完全开放。"""
     db = str(tmp_path / "legacy.db")
-    c = TestClient(create_app(test_settings(tmp_path, db_path=db, user_auth=False)))
+    c = TestClient(create_app(
+        test_settings(tmp_path, db_path=db, user_auth=False),
+        core_transport=core_app_for(tmp_path)))
     assert c.get("/admin/models").status_code == 200
     assert c.put("/admin/time-periods", json={"periods": []}).status_code == 200
     assert c.get("/admin/users").json() == {"users": []}
@@ -748,7 +750,9 @@ def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
         conn.close()
 
     # 开放模式不看 Authorization 头（静态 token 已移除，也没有会话概念）
-    c2 = TestClient(create_app(test_settings(tmp_path, db_path=str(tmp_path / "legacy2.db"),
-                                             user_auth=False)))
+    c2 = TestClient(create_app(
+        test_settings(tmp_path, db_path=str(tmp_path / "legacy2.db"),
+                      user_auth=False),
+        core_transport=core_app_for(tmp_path)))
     assert c2.get("/admin/models",
                   headers={"Authorization": "Bearer whatever"}).status_code == 200

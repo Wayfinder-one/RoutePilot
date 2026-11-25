@@ -24,6 +24,7 @@ from router.routing.tree import tree_from_dict
 from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 from tests.routing_fixtures import (
     GRAPH_CANVAS,
+    core_app_for,
     graph_dict,
     huge_chain_graph,
     runtime_dict,
@@ -38,6 +39,8 @@ def app(tmp_path):
     return create_app(
         test_settings(tmp_path),
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"answers": {}})),
+        # Task 7：目录写（模型/provider/JEV/时段）经进程内内核，画布目录共享。
+        core_transport=core_app_for(tmp_path),
     )
 
 

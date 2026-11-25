@@ -12,6 +12,11 @@ single HTTP boundary between them:
 * ``admin_json`` forwards one graph-management call under ``/internal/v1`` and
   returns the kernel status code and JSON body untouched; the peripheral proxy
   returns them verbatim (409 conflicts, 422 issue arrays, 503 ``graph_*`` codes).
+* ``list_graphs`` reads the current documents for catalog impact scans;
+  ``replace_graph_batch`` writes one conditional multi-graph batch.  Both parse
+  the kernel contract at this boundary so no other module handles raw kernel
+  JSON, and both serialize/deserialize ``RoutingTree`` here: the repository, the
+  catalog sync service and the API routes keep working with domain objects.
 
 There are no retries and no local fallbacks: a failed kernel call is a failed
 peripheral call, and the caller decides how to expose it.
@@ -22,6 +27,8 @@ import logging
 from urllib.parse import quote
 
 import httpx
+
+from router.routing.tree import RoutingTree, tree_from_dict, tree_to_dict
 
 logger = logging.getLogger(__name__)
 
@@ -35,12 +42,45 @@ class CoreDecisionError(RuntimeError):
         self.payload = payload
 
 
+class CoreGraphError(RuntimeError):
+    """A failed kernel graph-management call; status and payload are preserved.
+
+    Raised by reads (``list_graphs``) and raw administration calls.  Any non-200
+    kernel answer keeps its status code and JSON body so the peripheral can map
+    the structured ``graph_*`` codes instead of inventing a new vocabulary.
+    """
+
+    def __init__(self, status_code: int, payload=None):
+        super().__init__(f"kernel graph call failed: {status_code}")
+        self.status_code = int(status_code)
+        self.payload = payload
+
+
+class CoreBatchError(CoreGraphError):
+    """A failed ``replace_graph_batch`` call (409 conflict / 422 issues / 503).
+
+    ``RemoteCatalogSyncService`` maps the structured kernel answer back to the
+    peripheral domain errors; the graph write either happened completely or not
+    at all (the kernel verifies every base hash before touching a file).
+    """
+
+    def __init__(self, status_code: int, payload=None):
+        super().__init__(status_code, payload)
+        self.args = (f"graph batch failed: {status_code}",)
+
+
 def _json_body(response: httpx.Response):
     """Decode a kernel reply; an intermediate proxy may answer non-JSON text."""
     try:
         return response.json()
     except ValueError:
         return {"detail": response.text}
+
+
+def _unavailable(exc: BaseException) -> CoreGraphError:
+    """Kernel unreachable/transport broken → the same 503 class as a 503 answer."""
+    return CoreGraphError(
+        503, {"detail": {"code": "core_unavailable", "message": str(exc)}})
 
 
 class CoreClient:
@@ -85,6 +125,65 @@ class CoreClient:
         response = await self.http.request(
             method, self.base_url + "/internal/v1" + path, **kwargs)
         return response.status_code, _json_body(response)
+
+    async def list_graphs(self) -> list[RoutingTree]:
+        """Read every current graph document from the kernel.
+
+        The documents keep the kernel's ``document_sha256`` so a catalog write
+        can use them as optimistic-concurrency baselines and as the original
+        bytes of a reverse batch.  Raises ``CoreGraphError`` for any non-200
+        kernel answer or a malformed tree list.
+        """
+        try:
+            status, body = await self.admin_json("GET", "/trees")
+        except httpx.HTTPError as exc:
+            raise _unavailable(exc) from exc
+        if status != 200:
+            raise CoreGraphError(status, body)
+        raw = body.get("trees") if isinstance(body, dict) else None
+        if not isinstance(raw, list):
+            raise CoreGraphError(
+                503, {"detail": {"code": "core_unavailable",
+                                 "message": "kernel tree list is not an array"}})
+        try:
+            return [tree_from_dict(item) for item in raw]
+        except (TypeError, ValueError) as exc:
+            raise CoreGraphError(
+                503, {"detail": {"code": "core_unavailable",
+                                 "message": f"invalid kernel tree document: {exc}"}}
+            ) from exc
+
+    async def replace_graph_batch(self, writes) -> dict:
+        """Atomically replace a conditional multi-graph batch in the kernel.
+
+        ``writes`` is a list of ``{"tree": RoutingTree, "base_document_sha256":
+        str}``: the ``RoutingTree`` objects are serialized **here** (the only
+        module that knows the kernel JSON contract).  Returns the kernel reply
+        ``{"trees": [tree_to_dict(document), ...]}`` whose documents carry the
+        new ``document_sha256`` the reverse batch must use.  Raises
+        ``CoreBatchError`` for any non-200 answer (the kernel guarantees it
+        either committed every candidate or touched no file).
+        """
+        payload = {"writes": [
+            {
+                "tree": tree_to_dict(write["tree"]),
+                "base_document_sha256": write["base_document_sha256"],
+            }
+            for write in writes
+        ]}
+        try:
+            status, body = await self.admin_json(
+                "POST", "/graph-batches", payload)
+        except httpx.HTTPError as exc:
+            raise CoreBatchError(503, {"detail": {
+                "code": "core_unavailable", "message": str(exc)}}) from exc
+        if status != 200:
+            raise CoreBatchError(status, body)
+        if not isinstance(body, dict):
+            raise CoreBatchError(503, {"detail": {
+                "code": "core_unavailable",
+                "message": "kernel graph-batch reply is not an object"}})
+        return body
 
     async def aclose(self) -> None:
         await self.http.aclose()

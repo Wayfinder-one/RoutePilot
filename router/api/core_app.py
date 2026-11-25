@@ -29,6 +29,7 @@ from fastapi.responses import JSONResponse
 
 from router.api.deps import get_conn
 from router.api.graph_errors import install_graph_error_handlers
+from router.api.routes_graph_batches import router as graph_batches_router
 from router.api.routes_internal import router as internal_router
 from router.api.routes_trees import router as trees_router
 from router.core_config import CoreSettings
@@ -117,4 +118,6 @@ def create_core_app(
     app.dependency_overrides[get_conn] = _kernel_connections
     app.include_router(internal_router, prefix="/internal/v1")
     app.include_router(trees_router, prefix="/internal/v1")
+    # 跨服务目录写的条件图批次：外围一次原子替换全部候选画布（设计 §6.2）。
+    app.include_router(graph_batches_router, prefix="/internal/v1")
     return app

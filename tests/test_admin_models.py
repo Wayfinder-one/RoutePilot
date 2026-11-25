@@ -24,6 +24,7 @@ from router.store.repositories import ModelRepo, ProviderRepo, seed_default
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.catalog import load_backends
 from tests.routing_fixtures import (
+    core_app_for,
     portable_tree_dict,
     runtime_for_models,
     test_settings,
@@ -36,7 +37,12 @@ OPENAI_REASONING = {"reasoning": {
 
 def make_app(tmp_path, handler=None):
     transport = httpx.MockTransport(handler) if handler is not None else None
-    return create_app(test_settings(tmp_path, db_path=str(tmp_path / "t.db")), transport=transport)
+    return create_app(
+        test_settings(tmp_path, db_path=str(tmp_path / "t.db")),
+        transport=transport,
+        # 跨服务目录写：进程内内核共享同一图目录（Task 7）。
+        core_transport=core_app_for(tmp_path),
+    )
 
 
 @pytest.fixture
@@ -843,37 +849,43 @@ def test_model_and_provider_dtos_reject_unknown_fields(client, method, path, pay
 # --------------------------------------------------------------------------- #
 # 确认后的目录写：预览是纯读（不占写锁），提交在 publish 写锁内原子完成
 # --------------------------------------------------------------------------- #
-def _instrument_publish_lock(app, monkeypatch):
-    """记录 publish 写锁的进入/退出顺序。"""
-    publisher = app.state.publisher
-    real_locked = publisher.locked
+def _instrument_catalog_transaction(app, monkeypatch):
+    """记录跨服务目录写的 SQLite 写事务进入/退出顺序。
+
+    跨服务后写锁由 SQLite ``BEGIN IMMEDIATE`` 承担（内核图写在内核批次内串行），
+    因此「提交在写事务内」的回归改为记录 ``write_transaction``；纯读的影响预览
+    不得开启写事务，也不得调用内核图批次。
+    """
+    from router.control import remote_catalog_sync as remote
+
     trace: list[str] = []
+    real_transaction = remote.write_transaction
 
     @contextmanager
-    def recording_locked():
-        trace.append("lock-enter")
+    def recording_transaction(conn):
+        trace.append("tx-enter")
         try:
-            with real_locked():
-                yield publisher
+            with real_transaction(conn):
+                yield conn
         finally:
-            trace.append("lock-exit")
+            trace.append("tx-exit")
 
-    monkeypatch.setattr(publisher, "locked", recording_locked)
+    monkeypatch.setattr(remote, "write_transaction", recording_transaction)
     return trace
 
 
-def test_delete_referenced_model_previews_without_lock_then_commits_under_lock(
+def test_delete_referenced_model_previews_without_transaction_then_commits(
         app, client, monkeypatch):
     root = _direct_graph((("qwen3-8b", None),))
     created = client.post("/admin/trees", json={
         "id": "ref-tree", "name": "Ref", "root": root, **_tree_runtime(root)})
     assert created.status_code == 201, created.text
-    trace = _instrument_publish_lock(app, monkeypatch)
+    trace = _instrument_catalog_transaction(app, monkeypatch)
 
     preview = client.delete("/admin/models/qwen3-8b")
 
     assert preview.status_code == 409
-    # 预览只扫描影响清单，不拿写锁（零写入的纯读阶段）。
+    # 预览只扫描影响清单，不开写事务（零写入的纯读阶段）。
     assert trace == []
 
     confirmed = client.request("DELETE", "/admin/models/qwen3-8b", json={
@@ -882,29 +894,38 @@ def test_delete_referenced_model_previews_without_lock_then_commits_under_lock(
     })
 
     assert confirmed.status_code == 200, confirmed.text
-    assert trace == ["lock-enter", "lock-exit"]
+    assert trace == ["tx-enter", "tx-exit"]
     assert confirmed.json()["synced_trees"] == ["ref-tree"]
 
 
-def test_delete_free_model_commits_catalog_write_under_the_publish_lock(
+def test_delete_free_model_commits_catalog_write_in_one_transaction_and_skips_batch(
         app, client, monkeypatch):
-    trace = _instrument_publish_lock(app, monkeypatch)
+    trace = _instrument_catalog_transaction(app, monkeypatch)
+    calls = {"count": 0}
+    real_batch = app.state.core.replace_graph_batch
+
+    async def spy_batch(writes):
+        calls["count"] += 1
+        return await real_batch(writes)
+
+    monkeypatch.setattr(app.state.core, "replace_graph_batch", spy_batch)
 
     response = client.delete("/admin/models/qwen3-32b")
 
     assert response.status_code == 200, response.text
     assert response.json()["synced_trees"] == []
-    # 无候选画布时仍走单写锁 + 单事务的目录写骨架。
-    assert trace == ["lock-enter", "lock-exit"]
+    # 无候选画布：SQLite 单写事务提交，绝不调用内核图批次。
+    assert trace == ["tx-enter", "tx-exit"]
+    assert calls["count"] == 0
 
 
-def test_provider_delete_rechecks_references_under_the_publish_lock(
+def test_provider_delete_rechecks_references_inside_the_write_transaction(
         app, client, monkeypatch):
-    """provider 删除的引用检查必须在写锁内、事务内重算（CRITICAL 2）。
+    """provider 删除的引用检查必须在 SQLite 写事务内、db_write 之前重算（CRITICAL 2）。
 
-    路由层扫描之后、加锁之前新建一幅引用该 provider 的画布：锁内 recheck 必须
-    返回 409 ``provider_referenced``，provider 行/审计/画布文件都不变；trace 同时
-    证明第二次「DB 模型引用检查」发生在 lock-enter 之后。
+    路由层扫描之后、写事务之前新建一幅引用该 provider 的画布：事务内 recheck
+    必须返回 409 ``provider_referenced``，provider 行/审计/画布文件都不变；
+    trace 同时证明第二次「DB 模型引用检查」发生在 tx-enter 之后。
     """
     assert client.put("/admin/providers/race-prov", json={
         "base_url": "http://race.test/v1"}).status_code == 200
@@ -912,7 +933,7 @@ def test_provider_delete_rechecks_references_under_the_publish_lock(
         p["name"]: p for p in client.get("/admin/providers").json()["providers"]}
     before_changes = len(client.get("/admin/changes").json()["changes"])
 
-    trace = _instrument_publish_lock(app, monkeypatch)
+    trace = _instrument_catalog_transaction(app, monkeypatch)
     real_impacts = routes_models.provider_impacts
     real_db_refs = routes_models.model_ids_using_provider
     raced = {"done": False}
@@ -949,11 +970,8 @@ def test_provider_delete_rechecks_references_under_the_publish_lock(
     assert detail["code"] == "provider_referenced"
     assert detail["models"] == []            # 数据库里没有模型引用它
     assert [item["id"] for item in detail["affected_trees"]] == ["race-canvas"]
-    # 路由层检查在锁外；锁内 recheck 的 DB 引用检查发生在 lock-enter 之后。
-    assert trace[:2] == ["db-ref-check", "lock-enter"]
-    assert trace[-1] == "lock-exit"
-    assert trace.count("db-ref-check") == 2
-    assert "db-ref-check" in trace[2:]
+    # 路由层检查在事务外；事务内 recheck 的 DB 引用检查发生在 tx-enter 之后。
+    assert trace == ["db-ref-check", "tx-enter", "db-ref-check", "tx-exit"]
     # 409 在 db_write 之前抛出：provider 行、审计、新画布都保持原值。
     assert {
         p["name"]: p for p in client.get("/admin/providers").json()["providers"]

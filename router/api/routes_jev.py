@@ -10,10 +10,11 @@
    且请求未带确认时返回 409 ``impact_confirmation_required``，携带受影响画布
    清单（含当前 ``document_sha256``）与删除可选的替代服务目录。此阶段数据库、
    审计、画布文件、快照都不变。
-2. 带确认重试时，由 ``CatalogSyncService`` 在单写锁 + 单数据库事务内重算影响
-   （``recheck``）、写目录行与审计行、严格校验候选画布并原子替换；同步集合里含
-   任一启用图时重发布完整启用路由集。确认哈希过期 → 409 ``graph_conflict``（报
-   告当前哈希）。
+2. 带确认重试时，由 ``RemoteCatalogSyncService`` 在 SQLite 写事务内重算影响
+   （``recheck``，从内核重新读取当前画布）、写目录行，再用一次内核条件图批次
+   原子替换全部候选画布，最后写审计并提交 SQLite；内核提交成功而 SQLite 失败
+   时按原图与新基线哈希反向补偿，补偿失败显式为 503 ``catalog_sync_diverged``。
+   确认哈希过期 → 409 ``graph_conflict``（报告当前哈希）。
 3. JEV 同步永远把服务快照与窗口一起替换；删除 JEV 时凡有画布引用都必须提供
    替代服务（确认后缺失 → 422，未知 → 404，自身 → 422），保证不留下无决策
    服务的问题节点。新建/更新/删除都在同一事务里写 ``changes`` 审计行
@@ -34,8 +35,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 
-from router.api.deps import get_conn, get_tree_repo
-from router.control.catalog_sync import CatalogSyncService
+from router.api.deps import (
+    catalog_service,
+    commit_catalog_write,
+    get_conn,
+)
 from router.control.errors import AlreadyExists, MissingError
 from router.control.impacts import (
     delete_jev as delete_tree_jev,
@@ -57,7 +61,6 @@ from router.jev.config import (
 from router.jev.service import JevService
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ChangeRepo, now_iso
-from router.store.routing_trees import RoutingTreeRepo
 
 router = APIRouter()
 
@@ -228,11 +231,6 @@ def _jev_replacements(conn: sqlite3.Connection, service_id: str) -> list[dict]:
     ]
 
 
-def _catalog_service(request: Request, conn: sqlite3.Connection,
-                     trees: RoutingTreeRepo) -> CatalogSyncService:
-    return CatalogSyncService(conn, trees, request.app.state.publisher)
-
-
 @router.get("/jev")
 def get_jev(conn: sqlite3.Connection = Depends(get_conn)):
     repo = JevServiceRepo(conn)
@@ -240,10 +238,9 @@ def get_jev(conn: sqlite3.Connection = Depends(get_conn)):
 
 
 @router.post("/jev", status_code=201)
-def post_jev(
+async def post_jev(
     body: JevServiceIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     _validate_api_key(body, allow_null=True)
     service = _service_from_body(body)
@@ -265,8 +262,10 @@ def post_jev(
 
     # 新建目录项不触发任何画布同步：已存画布可能早已声明了一个尚不存在的
     # jev.id（严格解析只校验结构），新建服务不会替它补齐快照，响应也没有
-    # synced_trees。目录行与审计仍走共享原子写路径（空候选 = 只写 DB）。
-    _catalog_service(request, conn, trees).commit(
+    # synced_trees。目录行与审计仍走共享原子写路径（空候选 = 只写 DB，不调用
+    # 内核图批次）。
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=[], audit=audit)
     return {"service": _public_service(conn, service)}
 
@@ -278,10 +277,9 @@ def get_jev_service(service_id: str, conn: sqlite3.Connection = Depends(get_conn
 
 
 @router.put("/jev/{service_id}")
-def put_jev_service(
+async def put_jev_service(
     service_id: str, body: JevServiceIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     repo = JevServiceRepo(conn)
     # 资源存在性先于请求体校验：未知服务始终是 404，而不是被 body 细节抢先报 422。
@@ -291,7 +289,7 @@ def put_jev_service(
     _validate_api_key(body, allow_null=False)
     service = _service_from_body(body, _defaults(existing))
 
-    tree_list = trees.list()
+    tree_list = await request.app.state.core.list_graphs()
     impacts = jev_impacts(tree_list, service_id)
     require_confirmation(
         impacts, body.impact_confirmation,
@@ -320,31 +318,32 @@ def put_jev_service(
             "synced_trees": synced,
         })
 
-    def recheck(_conn):
-        # 写锁内、事务内、写目录行之前重算影响清单：路由层扫描之后新出现的
-        # 画布引用会让确认哈希不匹配 → 409，绝不带着过期名单提交。
+    async def recheck(_conn):
+        # SQLite 写事务内、写目录行之前从内核重算影响清单：路由层扫描之后新出现
+        # 的画布引用会让确认哈希不匹配 → 409，绝不带着过期名单提交。
         require_confirmation(
-            jev_impacts(trees.list(), service_id), body.impact_confirmation,
+            jev_impacts(await request.app.state.core.list_graphs(), service_id),
+            body.impact_confirmation,
             resource={"kind": "jev", "id": service_id}, replacements=[])
 
-    _catalog_service(request, conn, trees).commit(
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     return {"service": _public_service(conn, service), "synced_trees": synced}
 
 
 @router.delete("/jev/{service_id}")
-def delete_jev_service(
+async def delete_jev_service(
     service_id: str, request: Request,
     body: JevDeleteIn | None = None,
     conn: sqlite3.Connection = Depends(get_conn),
-    trees: RoutingTreeRepo = Depends(get_tree_repo),
 ):
     repo = JevServiceRepo(conn)
     _require(repo, service_id)
     replacement_id = body.replacement_jev_id if body is not None else None
     confirmation = body.impact_confirmation if body is not None else None
 
-    tree_list = trees.list()
+    tree_list = await request.app.state.core.list_graphs()
     impacts = jev_impacts(tree_list, service_id)
     require_confirmation(
         impacts, confirmation,
@@ -382,21 +381,23 @@ def delete_jev_service(
             "replacement": replacement_id, "synced_trees": synced,
         })
 
-    def recheck(_conn):
-        # 路由层预览之后、加锁之前可能有新画布开始引用该服务；确认哈希必须与
-        # 锁内最新影响清单一致，否则 409 且数据库/审计/画布零写入。
+    async def recheck(_conn):
+        # 路由层预览之后、SQLite 写事务之前可能有新画布开始引用该服务；确认哈希
+        # 必须与事务内最新影响清单一致，否则 409 且数据库/审计/画布零写入。
         require_confirmation(
-            jev_impacts(trees.list(), service_id), confirmation,
+            jev_impacts(await request.app.state.core.list_graphs(), service_id),
+            confirmation,
             resource={"kind": "jev", "id": service_id},
             replacements=_jev_replacements(_conn, service_id))
         # 确认之后才校验替代服务（与路由层同一优先级）：替代服务可能在路由层
-        # 校验之后、加锁之前被删除；锁内重查，404 语义与路由层一致，
+        # 校验之后、事务之前被删除；事务内重查，404 语义与路由层一致，
         # 绝不让画布引用一个数据库里已不存在的替代服务。
         if replacement_id is not None \
                 and JevServiceRepo(_conn).get(replacement_id) is None:
             raise MissingError(f"unknown jev service {replacement_id}")
 
-    _catalog_service(request, conn, trees).commit(
+    await commit_catalog_write(
+        request, catalog_service(request, conn),
         db_write=db_write, candidates=candidates, audit=audit, recheck=recheck)
     return {
         "deleted": service_id,

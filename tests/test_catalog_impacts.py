@@ -18,19 +18,20 @@ from fastapi.testclient import TestClient
 
 from router.api import routes_jev, routes_models
 from router.api.app import create_app
-from router.control.config import ConfigurationService
 from router.control.impacts import provider_impacts
+from router.core_client import CoreBatchError
 from router.routing.graph.model import TargetNode
 from router.routing.tree import tree_from_dict
 from router.store.db import connect
 from router.store.jev_services import JevServiceRepo
 from router.store.repositories import ChangeRepo, ModelRepo, ProviderRepo
-from router.store.routing_trees import (
-    GraphBatch,
-    GraphChangedDuringLoad,
-    GraphStorageError,
+from router.store.routing_trees import GraphStorageError
+from tests.routing_fixtures import (
+    core_app,
+    core_app_for,
+    portable_tree_dict,
+    test_settings,
 )
-from tests.routing_fixtures import portable_tree_dict, test_settings
 
 ZERO_SHA = "0" * 64
 
@@ -139,7 +140,13 @@ def _fast_and_backup(runtime: dict) -> tuple[dict, dict]:
 
 @pytest.fixture
 def two_canvases(tmp_path):
-    app = create_app(test_settings(tmp_path))
+    # 跨服务目录写：真实 create_app + 进程内内核（共享同一图目录）。内核实例留在
+    # ``app.state.kernel_app`` 供故障注入用例（内核侧图写失败、临时文件清理）。
+    kernel = core_app(tmp_path)
+    app = create_app(
+        test_settings(tmp_path),
+        core_transport=core_app_for(tmp_path, app=kernel))
+    app.state.kernel_app = kernel
     client = TestClient(app)
 
     seed = portable_tree_dict("seed")
@@ -407,6 +414,11 @@ def test_delete_catalog_only_model_needs_no_replacement(two_canvases):
 # --------------------------------------------------------------------------- #
 def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
         two_canvases, monkeypatch):
+    """内核批次写第二份文件失败：内核回滚整批，SQLite/审计/发布集都不变。
+
+    跨服务后图写入在内核：故障注入点从外围仓储移到大内核仓储。内核批次自身
+    恢复已替换的第一份文件，外围 SQLite 写事务整体回滚，两者不会留下半批。
+    """
     app, client = two_canvases
     second = portable_tree_dict("second-fast")
     second["jev"]["id"] = "jev-b"
@@ -425,8 +437,8 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
         "main", "second-fast"}
     confirmation = confirmation_from(preview)
 
-    repo = app.state.graph_repo
-    real_replace = repo._replace_staged
+    kernel_repo = app.state.kernel_app.state.graph_repo
+    real_replace = kernel_repo._replace_staged
     calls = {"count": 0}
 
     def failing_replace(staged_path, path):
@@ -435,7 +447,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
             raise OSError("injected graph write failure")
         return real_replace(staged_path, path)
 
-    monkeypatch.setattr(repo, "_replace_staged", failing_replace)
+    monkeypatch.setattr(kernel_repo, "_replace_staged", failing_replace)
 
     response = client.put("/admin/models/fast", json={
         "upstream": "new-upstream", "impact_confirmation": confirmation})
@@ -443,7 +455,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
     assert response.status_code == 503, response.text
     assert response.json()["detail"]["code"] == "graph_storage_error"
     assert calls["count"] == 2
-    # 数据库 / 审计 / 快照 / 三个画布文件全部保持原值（含已替换的第一份文件）。
+    # 数据库 / 审计 / 快照 / 三个画布文件全部保持原值（含内核已替换的第一份）。
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
     assert app.state.snapshot_set.snapshot_revision == before_revision
@@ -452,7 +464,7 @@ def test_graph_write_failure_rolls_back_database_audit_snapshot_and_files(
 
 def test_candidate_validation_failure_writes_nothing(tmp_path):
     """provider 推理协议改为 openai 让画布的 null-wire 档位非法 → 422 全回滚。"""
-    app = create_app(test_settings(tmp_path))
+    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
     client = TestClient(app)
     assert client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1",
@@ -719,7 +731,7 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
     422 并整体回滚；fix 前它返回 200 把闭画布写成非法文档，随后
     ``repo.list()`` / ``GET /admin/trees`` 直接 503。
     """
-    app = create_app(test_settings(tmp_path))
+    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
     client = TestClient(app)
     assert client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1",
@@ -771,7 +783,7 @@ def test_dialect_flip_invalidating_closed_canvas_is_422_and_repo_stays_readable(
 def test_dialect_flip_invalidating_active_canvas_is_422_not_503(tmp_path):
     """CRITICAL 1（活动画布变体）：fix 前候选写盘后重读活动画布抛
     ``GraphStorageError`` → 503；严格候选校验必须在写盘前把它变成 422 并回滚。"""
-    app = create_app(test_settings(tmp_path))
+    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
     client = TestClient(app)
     assert client.put("/admin/providers/local", json={
         "base_url": "http://json-only.test/v1",
@@ -855,8 +867,11 @@ def test_canvas_appearing_between_route_scan_and_commit_returns_graph_conflict(
 
 def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
         two_canvases, monkeypatch):
-    """事务内基线门：影响清单生成后、``stage_updates`` 核对基线前画布被改写 →
-    409 ``graph_conflict``（报告当前哈希）且数据库/审计/快照全部回滚。"""
+    """影响清单生成后、内核批次核对基线前画布被改写 → 409 ``graph_conflict``。
+
+    跨服务后「暂存前基线门」由内核图批次承担：内核发现任一基线过期就整批拒绝，
+    SQLite 目录写事务回滚，审计/发布集不变。
+    """
     app, client = two_canvases
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
@@ -865,22 +880,21 @@ def test_canvas_mutated_between_impact_scan_and_stage_returns_graph_conflict(
     before_audit = _audit_count(app)
     before_revision = app.state.snapshot_set.snapshot_revision
 
-    real_validate = ConfigurationService._validate_candidate
+    real_batch = app.state.core.replace_graph_batch
     raced = {}
 
-    def racing_validate(self, candidate):
-        # 影响清单已生成、目录行已写（事务内）之后，另一个进程改写活动画布；
-        # 暂存的候选仍以旧 document_sha256 为基线。
+    async def racing_batch(writes):
+        # 目录行已在 SQLite 事务内写入、内核批次尚未执行时，另一个进程改写活动
+        # 画布；候选仍以旧 document_sha256 为基线。
         if not raced:
             current = app.state.graph_repo.get("main")
             replaced = app.state.graph_repo.update(
                 dataclass_replace(current, name="mutated-after-impacts"),
                 base_document_sha256=current.document_sha256)
             raced["sha"] = replaced.document_sha256
-        return real_validate(self, candidate)
+        return await real_batch(writes)
 
-    monkeypatch.setattr(ConfigurationService, "_validate_candidate",
-                        racing_validate)
+    monkeypatch.setattr(app.state.core, "replace_graph_batch", racing_batch)
 
     blocked = client.put("/admin/models/fast", json={
         "upstream": "new-upstream", "impact_confirmation": confirmation})
@@ -1441,35 +1455,26 @@ def _emulate_concurrent_default_switch(app, tree_id):
 
 
 def test_default_switch_racing_lock_acquisition_invalidates_stale_confirmation(
-        two_canvases, monkeypatch):
+        two_canvases):
     """v4：生命周期写会改写目标文件里的 enabled/default，确认哈希随之失效。
 
     v3 时代切换默认图只写 ``current`` 指针，画布字节不变；v4 文档自带生命周期
-    字段，因此「预览后、加锁前默认图被切换」必须 409 ``graph_conflict``（实际哈希
-    是写后的新哈希），客户端只能重新预览确认。重新确认后发布门仍必须在锁内重读
-    默认图：刚成为默认图的 other 必须被发布，而不是停留在旧的 main。
+    字段，因此「预览后、提交前默认图被切换」必须 409 ``graph_conflict``（实际哈希
+    是写后的新哈希），客户端只能重新预览确认。重新确认后内核写入活动画布，外围
+    快照刷新必须发布新的默认图，而不是停留在旧的 main。
+
+    跨服务后不再有「提交写锁」可插入并发动作：生命周期写发生在预览与确认之间，
+    过期确认会先被 SQLite 事务内的 recheck 拒绝。
     """
     app, client = two_canvases
-    publisher = app.state.publisher
-    real_locked = publisher.locked
-    enabled = {"done": False}
-
-    @contextmanager
-    def racing_locked():
-        # 候选已在路由层构造完（只含 other）；这里在拿到写锁之前完成 enable。
-        if not enabled["done"]:
-            enabled["done"] = True
-            _emulate_concurrent_default_switch(app, "other")
-        with real_locked():
-            yield publisher
-
-    monkeypatch.setattr(publisher, "locked", racing_locked)
-
     preview = client.put("/admin/models/backup", json={"upstream": "raced-upstream"})
     assert preview.status_code == 409, preview.text
     assert [item["id"] for item in preview.json()["detail"]["affected_trees"]] == [
         "other"]
     before_revision = app.state.snapshot_set.snapshot_revision
+
+    # 预览之后、确认之前：另一个副本切换默认图（写文件生命周期，不发布内存快照）。
+    _emulate_concurrent_default_switch(app, "other")
 
     stale = client.put("/admin/models/backup", json={
         "upstream": "raced-upstream",
@@ -1478,13 +1483,13 @@ def test_default_switch_racing_lock_acquisition_invalidates_stale_confirmation(
 
     assert stale.status_code == 409, stale.text
     assert stale.json()["detail"]["code"] == "graph_conflict"
-    # 实际哈希必须是 enable 改写后的新文档哈希，而不是客户端提交的旧哈希。
+    # 实际哈希必须是生命周期改写后的新文档哈希，而不是客户端提交的旧哈希。
     assert stale.json()["detail"]["actual_document_sha256"] == hashlib.sha256(
         _canvas_bytes(app, "other")).hexdigest()
     assert app.state.snapshot_set.snapshot_revision == before_revision
     assert _tree(app, "other").enabled is True
 
-    # 重新预览并确认：生命周期已稳定，发布门必须在写锁内识别出新活动画布。
+    # 重新预览并确认：生命周期已稳定，提交后发布新的默认图。
     preview = client.put("/admin/models/backup", json={"upstream": "raced-upstream"})
     assert preview.status_code == 409, preview.text
     response = client.put("/admin/models/backup", json={
@@ -1536,20 +1541,24 @@ def _db_action(app, action):
 
 
 def _race_before_lock(app, monkeypatch, action):
-    """在确认写的写锁获得之前执行一次副作用，模拟路由层校验与加锁之间的并发写。"""
-    publisher = app.state.publisher
-    real_locked = publisher.locked
+    """在确认写的 SQLite 写事务开启之前执行一次副作用。
+
+    跨服务后「写锁」是 SQLite 的 ``BEGIN IMMEDIATE``（内核图写由内核批次自己
+    串行）；路由层校验与事务内 recheck 之间的并发写用模块级 ``write_transaction``
+    的包装注入，语义与旧的 publish 锁等价：副作用发生在 recheck 之前。
+    """
+    from router.control import remote_catalog_sync as remote
+
+    real_transaction = remote.write_transaction
     done = {"value": False}
 
-    @contextmanager
-    def racing_locked():
+    def racing_write_transaction(conn):
         if not done["value"]:
             done["value"] = True
             action()
-        with real_locked():
-            yield publisher
+        return real_transaction(conn)
 
-    monkeypatch.setattr(publisher, "locked", racing_locked)
+    monkeypatch.setattr(remote, "write_transaction", racing_write_transaction)
     return done
 
 
@@ -1640,40 +1649,33 @@ def test_delete_jev_rechecks_replacement_under_lock(two_canvases, monkeypatch):
 # --------------------------------------------------------------------------- #
 # 18. 确认同步的提交后原子性：图批次 commit 之后的失败仍整体回滚
 # --------------------------------------------------------------------------- #
-def test_failure_after_graph_commit_restores_files_db_audit_and_snapshot(
+def test_snapshot_refresh_failure_after_commit_does_not_undo_committed_write(
         two_canvases, monkeypatch):
-    """图批次 commit 之后的快照构造/指纹复核失败：文件恢复、数据库回滚、不发布。"""
+    """内核已提交 + SQLite 已提交后的外围快照刷新失败：不回退、不报错。
+
+    跨服务后「图批次 commit 之后」的失败窗口只剩外围的派生快照刷新；内核与
+    SQLite 都已提交，此时再返回错误或回滚都会把已确认的写说成失败。刷新是
+    best-effort：记日志、由 reloader 重试，响应仍是 200。
+    """
     app, client = two_canvases
-    before = _canvas_state(app, ("main", "other"))
-    before_row = _db_row(app, "models", "id", "fast")
-    before_audit = _audit_count(app)
     before_revision = app.state.snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
-    publisher = app.state.publisher
-    real_publish = publisher.publish
-    published = []
-    monkeypatch.setattr(
-        publisher, "publish",
-        lambda prepared: published.append(prepared) or real_publish(prepared))
+    def fail_refresh():
+        raise GraphStorageError("injected snapshot refresh failure")
 
-    def fail_after_commit(self, _prepared):
-        raise GraphChangedDuringLoad(
-            "graph changed between document write and snapshot publish")
-
-    monkeypatch.setattr(ConfigurationService, "_recheck_fingerprint", fail_after_commit)
+    monkeypatch.setattr(app.state.publisher, "refresh_if_changed", fail_refresh)
 
     response = client.put("/admin/models/fast", json={
         "upstream": "new-upstream", "impact_confirmation": confirmation})
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"]["code"] == "graph_storage_error"
-    assert published == []
-    assert _db_row(app, "models", "id", "fast") == before_row
-    assert _audit_count(app) == before_audit
+    assert response.status_code == 200, response.text
+    assert _db_row(app, "models", "id", "fast")["upstream"] == "new-upstream"
+    assert _changes(app)[-1]["detail"]["action"] == "update"
+    assert _runtime_models(_tree(app, "main"))["fast"]["upstream"] == "new-upstream"
+    # 派生快照保持旧对象（刷新失败），reloader 之后会补上；无数据库/审计遗留。
     assert app.state.snapshot_set.snapshot_revision == before_revision
-    assert _canvas_state(app, ("main", "other")) == before
 
 
 def test_audit_failure_inside_transaction_rolls_back_everything(
@@ -1709,43 +1711,62 @@ def test_audit_failure_inside_transaction_rolls_back_everything(
     assert _canvas_state(app, ("main", "other")) == before
 
 
-def test_rollback_failure_returns_503_and_refreshes_after_db_rollback(
+def test_compensation_failure_is_503_catalog_sync_diverged_after_db_rollback(
         two_canvases, monkeypatch):
-    """图文件回滚失败：503，且 ``publisher.refresh`` 必须在数据库 ROLLBACK 之后。"""
+    """内核已提交但 SQLite 失败 → 反向批次补偿；补偿也失败必须显式 503。
+
+    语义：SQLite 已回滚（目录行/审计不存在），外围快照刷新发生在回滚之后；
+    ``catalog_sync_diverged`` 提示两侧可能不一致，绝不返回成功。
+    """
     app, client = two_canvases
     before_row = _db_row(app, "models", "id", "fast")
     before_audit = _audit_count(app)
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
-    def fail_after_commit(self, _prepared):
-        raise GraphChangedDuringLoad(
-            "graph changed between document write and snapshot publish")
-    monkeypatch.setattr(ConfigurationService, "_recheck_fingerprint", fail_after_commit)
+    real_batch = app.state.core.replace_graph_batch
+    calls = {"count": 0}
 
-    def failing_rollback(self):
-        raise GraphStorageError("injected graph rollback failure")
-    monkeypatch.setattr(GraphBatch, "rollback", failing_rollback)
+    async def batch_with_failing_compensation(writes):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return await real_batch(writes)
+        raise CoreBatchError(503)
+
+    monkeypatch.setattr(
+        app.state.core, "replace_graph_batch", batch_with_failing_compensation)
+
+    # 审计在 SQLite 事务内失败 → 内核已提交 → 反向补偿失败 → 分歧。
+    def failing_record(self, ts, kind, detail):
+        raise RuntimeError(f"injected audit failure for {kind}")
+
+    monkeypatch.setattr(ChangeRepo, "record", failing_record)
 
     publisher = app.state.publisher
-    real_refresh = publisher.refresh
-    seen = []
+    real_refresh = publisher.refresh_if_changed
+    db_state_seen = []
 
     def spy_refresh():
-        # 发布器刷新只重扫图目录、不打开 SQLite，因此回滚失败后的刷新与数据库
-        # 事务状态无关；这里只锁定「回滚失败后仍会重建内存快照」。
-        seen.append(True)
+        # 刷新发生在数据库 ROLLBACK 之后：新连接上读不到本次目录写。
+        probe = connect(app.state.settings.db_path)
+        try:
+            row = probe.execute(
+                "SELECT upstream FROM models WHERE id = 'fast'").fetchone()
+            db_state_seen.append(row["upstream"])
+        finally:
+            probe.close()
         return real_refresh()
 
-    monkeypatch.setattr(publisher, "refresh", spy_refresh)
+    monkeypatch.setattr(publisher, "refresh_if_changed", spy_refresh)
 
-    response = client.put("/admin/models/fast", json={
+    failing_client = TestClient(app, raise_server_exceptions=False)
+    response = failing_client.put("/admin/models/fast", json={
         "upstream": "new-upstream", "impact_confirmation": confirmation})
 
     assert response.status_code == 503, response.text
-    assert response.json()["detail"]["code"] == "graph_storage_error"
-    assert seen == [True]
-    # 数据库仍整体回滚；审计行不存在。文件回滚失败正是本夹具的注入点。
+    assert response.json()["detail"] == {"code": "catalog_sync_diverged"}
+    assert calls["count"] == 2
+    assert db_state_seen == [before_row["upstream"]]
     assert _db_row(app, "models", "id", "fast") == before_row
     assert _audit_count(app) == before_audit
 
@@ -1773,7 +1794,7 @@ def multi_graph_canvases(tmp_path):
 
     默认图不在受影响候选里，正是旧发布门（只看默认图是否被改写）漏发布的场景。
     """
-    app = create_app(test_settings(tmp_path))
+    app = create_app(test_settings(tmp_path), core_transport=core_app_for(tmp_path))
     client = TestClient(app)
     for tree_id, provider, base_url in (
         ("main", "main-local", "http://main-local.test/v1"),
@@ -1861,28 +1882,31 @@ def test_draft_only_catalog_sync_does_not_republish(multi_graph_canvases):
 # --------------------------------------------------------------------------- #
 # 20. 图批次暂存后的异常必须撤销暂存文件（隐藏临时文件不得泄漏）
 # --------------------------------------------------------------------------- #
-def test_stage_failure_before_batch_commit_discards_staged_temp_files(
+def test_kernel_batch_failure_leaves_no_staged_temp_files(
         two_canvases, monkeypatch):
-    """``stage_updates()`` 之后、批次交出之前的异常不得把暂存临时文件留在盘上。"""
+    """内核 ``GraphBatch`` 失败后不得把同目录暂存临时文件留在图目录里。
+
+    跨服务后暂存在内核侧；提交失败由内核回滚批次并丢弃暂存文件，外围 SQLite
+    事务回滚、发布集不变。
+    """
     app, client = two_canvases
-    repo = app.state.graph_repo
+    kernel_repo = app.state.kernel_app.state.graph_repo
     before = _canvas_state(app, ("main", "other"))
     before_revision = app.state.snapshot_set.snapshot_revision
     preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
     confirmation = confirmation_from(preview)
 
-    def fail_after_staging():
-        raise RuntimeError("injected failure after graph staging")
-    # 发布门在 stage_updates() 之后读取启用集合：这里注入异常，模拟暂存完成
-    # 但批次尚未交给外层事务时的失败窗口。
-    monkeypatch.setattr(repo, "enabled", fail_after_staging)
+    def failing_replace(staged_path, path):
+        raise OSError("injected failure after graph staging")
+    monkeypatch.setattr(kernel_repo, "_replace_staged", failing_replace)
 
-    with pytest.raises(RuntimeError, match="injected failure after graph staging"):
-        client.put("/admin/models/fast", json={
-            "upstream": "new-upstream", "impact_confirmation": confirmation})
+    response = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
 
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "graph_storage_error"
     # 暂存文件与已提交画布都没有残留；快照也未发布。
-    assert [path.name for path in repo.graphs.iterdir()
+    assert [path.name for path in kernel_repo.graphs.iterdir()
             if path.name.startswith(".")] == []
     assert _canvas_state(app, ("main", "other")) == before
     assert app.state.snapshot_set.snapshot_revision == before_revision

@@ -19,7 +19,11 @@ from router.control.errors import (
     ValidationFailed,
 )
 from router.api.issue_presenter import issues_payload
-from router.core_client import CoreClient
+from router.control.remote_catalog_sync import (
+    CatalogSyncDiverged,
+    RemoteCatalogSyncService,
+)
+from router.core_client import CoreClient, CoreGraphError
 from router.decision_log_store import DecisionLogStore
 from router.jev.client import JevClient
 from router.jev.service import JevService
@@ -54,6 +58,15 @@ from router.upstream.breaker_worker import BreakerSyncWorker
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 logger = logging.getLogger(__name__)
+
+
+def _catalog_sync_factory(client: CoreClient):
+    """Bind the cross-service catalog write use-case to a request's SQLite conn."""
+
+    def build(conn) -> RemoteCatalogSyncService:
+        return RemoteCatalogSyncService(conn, client)
+
+    return build
 
 
 def _admin_path(path: str) -> bool:
@@ -203,6 +216,9 @@ def create_app(
             timeout=settings.core_timeout_seconds, transport=core_transport),
         timeout_seconds=settings.core_timeout_seconds,
     )
+    # 目录写（模型 / provider / JEV / 时段）的跨服务事务：SQLite 单写事务 +
+    # 内核条件图批次 + 反向补偿。路由只做 DTO 与影响预览。
+    app.state.catalog_sync_factory = _catalog_sync_factory(app.state.core)
     app.state.breaker = CircuitBreaker()
     app.state.breaker_store = BreakerStore(settings.db_path)
     app.state.breaker_worker = BreakerSyncWorker(
@@ -286,6 +302,23 @@ def create_app(
             "code": "default_graph_required",
             "tree_id": exc.tree_id,
         }})
+
+    @app.exception_handler(CoreGraphError)
+    async def core_graph_error_handler(request: Request, exc: CoreGraphError):
+        """内核图管理面不可用：保留内核的结构化 detail（503 graph_* 码）。"""
+        payload = exc.payload if isinstance(exc.payload, dict) else {}
+        detail = payload.get("detail")
+        if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+            return JSONResponse(status_code=503, content={"detail": detail})
+        return JSONResponse(
+            status_code=503, content={"detail": {"code": "core_unavailable"}})
+
+    @app.exception_handler(CatalogSyncDiverged)
+    async def catalog_sync_diverged_handler(
+            request: Request, exc: CatalogSyncDiverged):
+        """SQLite 已回滚但内核补偿失败：显式 503，绝不返回成功。"""
+        return JSONResponse(status_code=503, content={
+            "detail": {"code": "catalog_sync_diverged"}})
 
     _install_admin_auth(app, settings)
 

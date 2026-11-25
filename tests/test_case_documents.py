@@ -34,7 +34,7 @@ from router.control.validation import tree_issues
 from router.routing.document import parse_graph_document
 from router.routing.graph.model import TargetNode
 from router.routing.tree import tree_from_dict
-from tests.routing_fixtures import test_settings
+from tests.routing_fixtures import core_app_for, test_settings
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CASES_DIR = REPO_ROOT / "configs" / "cases"
@@ -585,7 +585,8 @@ def test_case_runtime_deploys_through_the_real_admin_api(tmp_path):
     documents = module.load_case_documents(manifest["cases"])
     runtime = module.case_runtime(list(documents.values()))
 
-    client = TestClient(create_app(test_settings(tmp_path)))
+    client = TestClient(create_app(
+        test_settings(tmp_path), core_transport=core_app_for(tmp_path)))
     api = module.Api("http://testserver")
 
     def fake_raw(method, path, body=None, *, auth=True):

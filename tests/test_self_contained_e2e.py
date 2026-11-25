@@ -33,6 +33,7 @@ from router.store.repositories import SettingsRepo
 from router.store.routing_trees import RoutingTreeRepo
 from tests.routing_fixtures import (
     DEFAULT_INSTRUCTIONS,
+    core_app_for,
     DEFAULT_STATE_TEMPLATE,
     default_tree,
     portable_tree_dict,
@@ -174,7 +175,9 @@ def _instance(path, monkeypatch, documents=(), *, active_id: str | None = None):
             payload["default"] = is_active
             repo.create(tree_from_dict(payload))
     calls = {"jev": [], "upstream": []}
-    app = create_app(settings, transport=_mock_transport(calls))
+    app = create_app(
+        settings, transport=_mock_transport(calls),
+        core_transport=core_app_for(graph_dir=settings.graph_dir))
     return SimpleNamespace(
         settings=settings, app=app, client=TestClient(app), calls=calls)
 
@@ -190,7 +193,9 @@ def _instance_from_export(path, monkeypatch, tree_id: str, payload: bytes):
     repo.initialize()
     (repo.graphs / f"{tree_id}.json").write_bytes(payload)
     calls = {"jev": [], "upstream": []}
-    app = create_app(settings, transport=_mock_transport(calls))
+    app = create_app(
+        settings, transport=_mock_transport(calls),
+        core_transport=core_app_for(graph_dir=settings.graph_dir))
     return SimpleNamespace(
         settings=settings, app=app, client=TestClient(app), calls=calls)
 
@@ -302,7 +307,9 @@ def json_only(tmp_path, monkeypatch):
     _empty_database(settings.db_path)
     _install_document(settings, _portable_document())
     calls = {"jev": [], "upstream": []}
-    app = create_app(settings, transport=_mock_transport(calls))
+    app = create_app(
+        settings, transport=_mock_transport(calls),
+        core_transport=core_app_for(graph_dir=settings.graph_dir))
     return app, TestClient(app), settings, calls
 
 
@@ -432,7 +439,9 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     _empty_database(first.db_path)
     _install_document(first, _portable_document())
     calls_one = {"jev": [], "upstream": []}
-    app_one = create_app(first, transport=_mock_transport(calls_one))
+    app_one = create_app(
+        first, transport=_mock_transport(calls_one),
+        core_transport=core_app_for(graph_dir=first.graph_dir))
 
     exported = _export_bytes(first)
     assert b"api_key" not in exported
@@ -445,7 +454,9 @@ def test_exported_json_restores_in_a_second_empty_database(tmp_path, monkeypatch
     repo.initialize()
     (repo.graphs / "portable.json").write_bytes(exported)
     calls_two = {"jev": [], "upstream": []}
-    app_two = create_app(second, transport=_mock_transport(calls_two))
+    app_two = create_app(
+        second, transport=_mock_transport(calls_two),
+        core_transport=core_app_for(graph_dir=second.graph_dir))
 
     assert app_two.state.snapshot_set.default_snapshot.tree_revision == app_one.state.snapshot_set.default_snapshot.tree_revision
     assert app_two.state.snapshot_set.default_snapshot.content == app_one.state.snapshot_set.default_snapshot.content
@@ -768,7 +779,9 @@ def test_acceptance_whole_flow_never_leaks_secret_material(tmp_path, monkeypatch
     # 端点匹配的已存密钥：provider local（与画布 base_url/key_env 匹配）与 jev-a。
     _seed_secret_matching_catalog(settings)
     calls = {"jev": [], "upstream": []}
-    app = create_app(settings, transport=_mock_transport(calls))
+    app = create_app(
+        settings, transport=_mock_transport(calls),
+        core_transport=core_app_for(graph_dir=settings.graph_dir))
     client = TestClient(app)
 
     # 内核快照不持有 Provider Key，也不读数据库已存 JEV Key：密钥只来自环境变量。
