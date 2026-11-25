@@ -19,6 +19,10 @@
 - 新建、复制和导入图强制 `enabled: false、default: false`。普通保存不得修改生命周期。
 - 不新增依赖，不改 APISIX/token-factory 接口，不把密钥写入图 JSON、API 出参、浏览器持久化状态或日志。
 - 保留现有 JEV、SQLite、模型代理、SSE、粘性、熔断、推理改写、请求账本和管理 API，不做无关重构。
+- 用户版本操作只有“保存”和“启用”：启用图保存立即生效，未启用图保存不影响运行，启用使用最新保存版本；不提供独立的“发布”动作。
+- 内存只保留当前路由集，替换时不保留历史副本。保存/启停本身不写日志快照；持久化图快照只在请求记录时按 canonical 内容 SHA-256 去重，相同内容不得新增图行。
+- 历史回溯只依赖日志数据库中按请求保存的 trace、图快照引用和完整图；不得读取当前图文件或当前路由集来冒充历史。
+- 第一阶段不新增自动删除历史日志的策略。若以后增加保留期，必须先清理请求快照，再清理无任何保留请求引用的图快照。
 - 每个任务先写失败测试，再写最小实现；按任务提交。若并行修改与本任务冲突，停止并报告，不覆盖他人工作。
 - 最终必须通过 `.venv/bin/python -m pytest -q`、`npm run check:console`、`.venv/bin/python scripts/i18n_dead_keys.py` 和真实 standalone JSON/SSE 冒烟。
 
@@ -29,6 +33,7 @@
 - `router/routing/snapshot.py`：不可变 `RoutingSnapshotSet`、选图、候选构造、发布和状态。
 - `router/store/routing_trees.py`：图文件 CRUD、启用图扫描、路由集指纹与多文件批次。
 - `router/control/graphs.py`、`router/control/config.py`、`router/control/validation.py`：部门/生命周期写用例、默认切换事务、目录影响同步。
+- `router/request_logging.py`、`router/request_snapshots.py`、`router/api/routes_logs.py`：按内容去重的日志图快照、请求 trace 与纯日志回溯。
 - `router/api/routes_v1.py`、`router/api/routes_trees.py`、`router/api/app.py`：公开数据面、管理 API、应用状态装配。
 - `router/routing/types.py`：`NoDefaultTreeError`。
 - `router/console/routing/graph.js`：v4 纯函数契约、canonical、导入导出。
@@ -491,21 +496,28 @@ git commit -m "feat: scan enabled graph documents by department"
 
 ---
 
-### Task 3: 发布不可变 RoutingSnapshotSet
+### Task 3: 装配当前不可变路由集并锁定日志回溯
 
 **Files:**
 - Modify: `router/routing/snapshot.py`
 - Modify: `router/routing/reloader.py`
 - Modify: `router/api/app.py`
 - Modify: `router/control/validation.py`
+- Modify: `router/request_logging.py`
+- Modify: `router/request_snapshots.py`
+- Modify: `router/api/routes_logs.py`
 - Test: `tests/test_routing_snapshot.py`
 - Test: `tests/test_graph_reloader.py`
 - Test: `tests/test_app.py`
 - Test: `tests/test_jev_window.py`
+- Test: `tests/test_requestlog.py`
+- Test: `tests/test_admin.py`
 
 **Interfaces:**
 - Consumes: Task 2 的 `route_set_indices()`、`RouteSetInvariantError`、`repo.enabled()/route_fingerprint()`。
 - Produces: `RoutingSnapshotSet.select()`、`build_snapshot_set_for_trees()`、`load_snapshot_set()`、`PreparedRouteSet`、`app.state.snapshot_set`。
+
+`publish()` 仅表示当前内存对象的替换，不创建历史版本。日志侧必须保留 `graph_snapshots` 的 `INSERT OR IGNORE` 内容去重和 `request_snapshots` 的按请求引用，不得改成每次保存/启用都复制一份图。
 
 - [ ] **Step 1: 写选图与发布失败测试**
 
@@ -550,6 +562,26 @@ def test_snapshot_set_distinguishes_empty_and_missing_default(conn):
 ```
 
 把 `portable_tree(values=None, tree_id='main', enabled=True, default=True, departments=())` 调整为能生成这些用例的辅助函数，默认生成启用中的默认图。
+
+扩展 `tests/test_admin.py::test_request_recent_links_snapshot_and_endpoint_serves_tree_and_trace`：首次日志写入后，故意只改当前图文件，再重启并读取历史快照：
+
+```python
+current = repo.get('main')
+repo.update(
+    replace(current, name='后来的当前图'),
+    base_document_sha256=current.document_sha256,
+)
+```
+
+重启后的既有快照响应必须继续满足：
+
+```python
+assert body['tree']['name'] == '测试图'
+assert body['tree']['name'] != '后来的当前图'
+assert body['trace'] == trace
+```
+
+这条测试防止回溯读取当前文件。保留 `tests/test_requestlog.py` 中同内容两条请求只产生一行图、两条请求各自保留 trace 的断言，并增加部门内容变化会产生新 ID、仅 `enabled/default` 变化不会拆分 ID 的断言。
 
 - [ ] **Step 2: 运行测试，确认接口缺失**
 
@@ -634,18 +666,20 @@ Run:
 ```bash
 .venv/bin/python -m pytest -q \
   tests/test_routing_snapshot.py tests/test_graph_reloader.py \
-  tests/test_app.py tests/test_jev_window.py
+  tests/test_app.py tests/test_jev_window.py \
+  tests/test_requestlog.py tests/test_admin.py
 ```
-Expected: PASS；空路由集、默认图缺失、坏文件保留旧集合、恢复后清除 `stale`、未变指纹跳过重载均有覆盖。
+Expected: PASS；空路由集、默认图缺失、坏文件保留旧集合、恢复后清除 `stale`、未变指纹跳过重载均有覆盖；相同图只存一行，当前图变化和进程重启均不污染历史回放。
 
 - [ ] **Step 6: 提交**
 
 ```bash
 git add router/routing/snapshot.py router/routing/reloader.py \
   router/api/app.py router/control/validation.py \
+  router/request_logging.py router/request_snapshots.py router/api/routes_logs.py \
   tests/test_routing_snapshot.py tests/test_graph_reloader.py \
-  tests/test_app.py tests/test_jev_window.py
-git commit -m "feat: publish immutable department snapshot sets"
+  tests/test_app.py tests/test_jev_window.py tests/test_requestlog.py tests/test_admin.py
+git commit -m "feat: assemble current route sets and preserve log replay"
 ```
 
 ---
@@ -829,6 +863,29 @@ def test_departments_multi_enable_default_and_disable_rules(client):
 ```
 
 另写哈希过期测试：`base_document_sha256='0'*64` 必须返回 `409 graph_conflict` 且文件字节不变。
+
+增加保存/启用语义测试，防止“保存”退化成需要另点一次发布：
+
+```python
+def test_save_updates_enabled_graph_but_draft_save_does_not_publish(client, app):
+    create_portable_tree(client, 'main')
+    create_portable_tree(client, 'draft')
+    assert client.post('/admin/trees/main/enable').status_code == 200
+    before = app.state.snapshot_set
+
+    draft = client.get('/admin/trees/draft').json()['tree']
+    draft_payload = tree_dict('draft', sticky={'enabled': False, 'ttl_seconds': 90})
+    draft_payload['base_document_sha256'] = draft['document_sha256']
+    assert client.put('/admin/trees/draft', json=draft_payload).status_code == 200
+    assert app.state.snapshot_set is before
+
+    main = client.get('/admin/trees/main').json()['tree']
+    main_payload = tree_dict('main', enabled=True, default=True,
+                             sticky={'enabled': False, 'ttl_seconds': 60})
+    main_payload['base_document_sha256'] = main['document_sha256']
+    assert client.put('/admin/trees/main', json=main_payload).status_code == 200
+    assert app.state.snapshot_set.default_snapshot.tree.sticky.ttl_seconds == 60
+```
 
 - [ ] **Step 2: 运行测试，确认 404/接口缺失**
 
@@ -1228,6 +1285,8 @@ test('departments are behavior while enabled and default are lifecycle only', ()
 
 在 `scripts/console_qa/canvas.mjs` 增加真实浏览器场景：启用 `main` 后再启用 `finance`，两者均保持启用，`main` 为默认；点击 `finance` 的 `#cvDefault` 后，`finance.default === true`、`main.default === false` 且两者仍启用。立即再保存一次当前图，必须成功而不能出现 `graph_conflict`。最后停用 `main` 成功，再停用默认的 `finance`，路由集为空。
 
+同一场景锁定界面词汇：`#cvSave` 显示“保存/Save”，已启用图的主按钮为“已启用/Enabled”且禁用，未启用图显示“启用/Enable”；页面不得出现“发布/Publish”“保存并更新/Save and update”。启用有未保存修改的图时仍先调用保存，保存失败不得启用。
+
 - [ ] **Step 2: 运行测试，确认旧行为失败**
 
 Run:
@@ -1297,7 +1356,17 @@ async setDefault() {
 <button type="button" class="btn sm" id="cvDefault" data-i18n="cv.setDefault" hidden></button>
 ```
 
-`app.js` 的事件映射增加 `cvDefault: () => controller.setDefault()`，忙碌按钮集合加入 `cvDefault`。`updateToolbar()` 仅在 `store.tree && !store.tree.default` 时显示该按钮。顶栏另增默认状态 pill；现有四种生命周期文案保持不变。
+`app.js` 的事件映射增加 `cvDefault: () => controller.setDefault()`，忙碌按钮集合加入 `cvDefault`。`updateToolbar()` 仅在 `store.tree && !store.tree.default` 时显示该按钮。顶栏另增默认状态 pill；保留四种状态分类，但“unpublished”展示文案改为“有未保存修改/Unsaved changes”。
+
+主按钮只表达启用，不再兼任“保存并更新”：
+
+```javascript
+const primaryKey = store.saving ? 'cv.saving'
+  : enabled ? 'cv.published' : 'cv.enable';
+primary.disabled = !!store.tryRunning || !!store.saving || enabled;
+```
+
+`routing.html` 的保存按钮与 `app.js` 统一改用 `cv.save`，中英文文案为“保存/Save”。删除 `cv.publish`、`cv.publishUpdate` 和旧 `cv.saveDraft` 键；`controller.enable()` 仍在启用前保存脏草稿。
 
 `boot()` 改为下列选择，并同步把后续 `enabled/enabled.id` 引用改为 `preferred/preferred.id`：
 
@@ -1507,6 +1576,9 @@ Expected: 示例测试若仍有 v3 文件则 FAIL；文本列出必须在本次�
 - `/admin/try` 的 `department` 与实际路由集路径。
 - `x-sr-tree-id/x-sr-graph-selection`、公开 `/v1` 拒绝 `X-SR-Department`。
 - `graph_status.default_tree_id/enabled_tree_ids/snapshot_revision/route_fingerprint`。
+- 启用图保存立即生效、草稿保存不影响运行、启用使用最新保存版本；界面没有独立发布动作。
+- `request_logs`、`request_snapshots`、`graph_snapshots` 的职责，canonical 内容去重、生命周期字段不拆分去重，以及重启/当前图变化后的纯日志回溯。
+- 第一阶段不自动删除历史；未来保留期必须先清请求快照，再清无引用图快照。
 
 README 双语同步独立模式用法，不提前写第二阶段 `/internal/v1` 或 APISIX 部署命令。
 
@@ -1651,7 +1723,7 @@ curl -fsS -D /tmp/routepilot-v4-headers.txt \
   -H 'Content-Type: application/json' \
   -d '{"model":"auto","messages":[{"role":"user","content":"用一句话回答：1+1=?"}]}'
 
-curl -fsS -N http://127.0.0.1:8400/v1/chat/completions \
+curl -fsS -N http://127.0.0.1:18400/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"auto","stream":true,"messages":[{"role":"user","content":"逐字回答：你好"}]}'
 ```
@@ -1681,6 +1753,9 @@ Expected: 分别命中 `finance/legal/main/main`，`graph_selection` 分别为 `
 4. 停用 `finance` 后停用 `legal`，确认空路由集和公开 `/v1` 的 `503 no_active_tree`。
 5. 重新启用图后，将一张启用图写成非法 JSON；确认 `/readyz` 报告 `stale:true` 且旧集合仍服务。恢复文件后确认 `stale:false`。
 6. 重启第二个只读副本，确认路由集与写者一致。
+7. 对同一图连续发两次请求并 flush 日志，断言 `graph_snapshots` 只有一行、`request_snapshots` 有两行且引用同一 `graph_snapshot_id`；仅切换 `enabled/default` 后再发请求仍复用该 ID。
+8. 修改并保存当前图后读取旧请求的 `/snapshot`，再重启进程重读；两次都必须返回旧图与旧 trace，不得出现当前图内容。
+9. 页面只展示“保存/启用”版本语义，不存在发布按钮；启用图保存后的下一次请求使用新图，草稿保存后的下一次请求仍使用当前默认图。
 
 - [ ] **Step 5: 检查最终工作区与提交**
 
@@ -1709,6 +1784,8 @@ git push origin main
 - [ ] 公开 `/v1` 默认图 JSON/SSE 与管理端部门选图均通过真实调用。
 - [ ] 控制台部门、默认状态、试算、测试对话、导入导出与中英文文案完整。
 - [ ] 所有启用图目录同步、只读副本重载和 `stale` 恢复正确。
+- [ ] 保存/启用语义明确，无独立发布动作；内存不积累发布历史，相同图日志按内容去重。
+- [ ] 当前图变化与进程重启后，回溯仍只使用日志中的完整图和 trace。
 - [ ] 全量 pytest、Node/Playwright、i18n 和 `git diff --check` 全绿。
 - [ ] 未修改 163、APISIX、newapi、token-factory，未增加内部网关端点。
 - [ ] 未新增依赖、未泄露密钥、未保留临时产物，所有提交仅在 Gitee `main`。
