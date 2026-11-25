@@ -50,8 +50,15 @@ router = APIRouter()
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
-def _audit_writer(conn: sqlite3.Connection):
-    """审计回调：GraphService 不再持有 SQLite，由 API 层注入 ChangeRepo 写入。"""
+def _audit_writer(conn: sqlite3.Connection | None):
+    """审计回调：GraphService 不再持有 SQLite，由 API 层注入 ChangeRepo 写入。
+
+    ``conn is None`` 是内核契约（内核无 SQLite）：不注入审计回调，
+    ``GraphService(audit=None)`` 提交成功后直接跳过审计写入。
+    """
+    if conn is None:
+        return None
+
     def audit(action: str, detail: dict) -> None:
         try:
             with conn:
@@ -61,7 +68,8 @@ def _audit_writer(conn: sqlite3.Connection):
     return audit
 
 
-def _service(request: Request, conn: sqlite3.Connection, trees: RoutingTreeRepo) -> GraphService:
+def _service(request: Request, conn: sqlite3.Connection | None,
+             trees: RoutingTreeRepo) -> GraphService:
     return GraphService(
         trees, request.app.state.publisher, audit=_audit_writer(conn))
 
@@ -443,8 +451,11 @@ async def try_tree(
             raise HTTPException(422, detail=issues_payload(issues))
         # 启用级问题只作为 warnings 返回，不阻塞试算（spec §4.3）。
         # 画布快照与数据库目录的差异也是提示：只读比较、不改变执行配置（spec 保存/启用/检查）。
-        warnings = issues_payload(
-            tree_issues(tree) + runtime_mismatch_issues(conn, tree.runtime))
+        # 内核没有 SQLite 目录：conn is None 时只报画布自身的启用级问题。
+        checks = tree_issues(tree)
+        if conn is not None:
+            checks = checks + runtime_mismatch_issues(conn, tree.runtime)
+        warnings = issues_payload(checks)
         snapshot = _try_snapshot(request, tree)
     text = body.text
     if not isinstance(text, str):

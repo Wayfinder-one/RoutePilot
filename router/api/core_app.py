@@ -1,12 +1,18 @@
 """Standalone decision-kernel application factory.
 
-The kernel owns the graph JSON, graph execution/JEV selection and the decision
-event output.  It deliberately contains **none** of the peripheral
-capabilities: no SQLite (no migration/seed/catalog/breaker store), no
-``RequestLogger`` or maintenance worker, no console static mount, no
-users/providers/logs/admin routes and no model upstream execution
-(``UpstreamProxy`` is never constructed here).  The only HTTP client it holds is
-used by the configured JEV service and by the decision event sink.
+The kernel owns the graph JSON, graph management (create/update/enable/try),
+graph execution/JEV selection and the decision event output.  It deliberately
+contains **none** of the peripheral capabilities: no SQLite (no
+migration/seed/catalog/breaker store), no ``RequestLogger`` or maintenance
+worker, no console static mount, no users/providers/logs/admin routes and no
+model upstream execution (``UpstreamProxy`` is never constructed here).  The
+only HTTP client it holds is used by the configured JEV service and by the
+decision event sink.
+
+``graph management`` reuses the existing tree routes unchanged: the kernel
+overrides the ``get_conn`` dependency with a provider that yields ``None``, so
+the same handlers run without a SQLite connection (audit sink and database
+catalog hints are peripheral-only and simply absent).
 
 Wiring order follows ``create_app()``'s graph/JEV/routing part exactly; the
 peripheral-only pieces are simply absent.
@@ -21,8 +27,10 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from router.api.deps import get_conn
 from router.api.graph_errors import install_graph_error_handlers
 from router.api.routes_internal import router as internal_router
+from router.api.routes_trees import router as trees_router
 from router.core_config import CoreSettings
 from router.decision_log_sink import create_decision_sink
 from router.jev.client import JevClient
@@ -37,6 +45,16 @@ from router.store.routing_trees import GraphStorageError, RoutingTreeRepo
 from router.upstream.breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
+
+
+def _kernel_connections():
+    """Kernel ``get_conn`` override: graph management runs with no SQLite at all.
+
+    The tree routes keep their ``Depends(get_conn)`` contract; the kernel simply
+    resolves it to ``None`` so no database is ever opened, no audit row is
+    written and no catalog-drift hint is computed.
+    """
+    yield None
 
 
 def create_core_app(
@@ -95,5 +113,8 @@ def create_core_app(
         status = app.state.publisher.status()
         return JSONResponse(status_code=200 if status["ready"] else 503, content=status)
 
+    # 内核图管理：复用现有 trees/try 路由，conn 依赖固定解析为 None（无 SQLite）。
+    app.dependency_overrides[get_conn] = _kernel_connections
     app.include_router(internal_router, prefix="/internal/v1")
+    app.include_router(trees_router, prefix="/internal/v1")
     return app
