@@ -641,7 +641,7 @@ ROUTER_ADMIN_EMAIL='admin@example.com' ROUTER_ADMIN_PASSWORD='<strong-password>'
 
 外围进程运行**两个监听**：公开的控制台/`/admin`/`/v1` 监听（`ROUTER_HOST`/`ROUTER_PORT`），以及独立的内部监听（`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`，默认 `127.0.0.1:8402`），后者只提供内核事件通道的 `POST /internal/v1/decision-logs` 与 `/healthz`。compose 中内部监听是容器端口 8400，**不发布到主机**；内核应指向 `http://console:8400/internal/v1/decision-logs`。本机形态则把内核 `logging` 块设为 `{"type": "routepilot", "url": "http://127.0.0.1:8402/internal/v1/decision-logs", "timeout_ms": 1000}`。非 compose 部署必须用防火墙把内部端口限定为只允许内核主机访问。
 
-**管理员凭据是必填项，部署形态没有默认值。** compose 在未显式导出 `ROUTER_ADMIN_EMAIL` 与 `ROUTER_ADMIN_PASSWORD` 时拒绝启动；外围在非 loopback 绑定上使用内置种子值也会拒绝启动。内置种子值只用于像上面这样的纯本机 loopback 运行；任何实际部署都必须显式设置凭据。
+**管理员凭据是必填项，部署形态没有默认值。** compose 在未显式导出 `ROUTER_ADMIN_EMAIL` 与 `ROUTER_ADMIN_PASSWORD` 时拒绝启动。非 loopback 绑定下，`ROUTER_ADMIN_PASSWORD` 为空、纯空白、短于 8 个字符或等于内置种子口令时，外围同样拒绝启动（最短长度与用户 API 一致）；内置种子值只用于像上面这样的纯本机 loopback 运行，任何实际部署都必须显式设置凭据。若已有数据库仍接受内置默认管理员口令（或空口令），启动也会被拒绝：操作员必须先以 `ROUTER_HOST=127.0.0.1` 启动一次并通过控制台/用户 API 修改这些口令，或显式授权 `ROUTER_ADMIN_FORCE_RESET=1`——该模式会把这些账号的口令重置为 `ROUTER_ADMIN_PASSWORD` 并吊销它们的全部会话。
 
 **只部署内核（接 APISIX + newapi）。** 即 163 形态：无 SQLite、无控制台、无模型上游、无决策日志接收端。使用 `logging.type=disabled` 的 `config.json`，图目录挂持久卷：
 
@@ -696,7 +696,8 @@ ROUTER_JEV_API_KEY='<jev-key>' \
 | `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | 空 | 一次性播种 `default` 非密钥 JEV 目录项；必须成对、仅在目录为空且从未播种时生效 |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量（外围进程） |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
-| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值（仅 loopback） | 首次启动的管理员账号；**compose 部署必须显式提供（没有默认值），非 loopback 绑定使用内置值会被拒绝启动** |
+| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值（仅 loopback） | 首次启动的管理员账号；**compose 部署必须显式提供（没有默认值）；非 loopback 绑定下口令至少 8 个字符且不得是内置默认值** |
+| `ROUTER_ADMIN_FORCE_RESET` | `false` | 显式授权一次性重置仍接受内置默认口令或空口令的既有 active 账号（改为 `ROUTER_ADMIN_PASSWORD` 并吊销其会话）；仅非 loopback 绑定生效 |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | 控制台会话有效期 |
 
 外围进程**不读取** `ROUTER_JEV_API_KEY`：该变量只属于内核进程（见内核配置），控制台「测试连接」由内核带 Key 执行（I6）。

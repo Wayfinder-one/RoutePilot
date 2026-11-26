@@ -38,11 +38,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from router import auth
 from router.api.issue_presenter import issues_payload
 from router.api.routes_core_proxy import router as core_proxy_router
 from router.config import (
     DEFAULT_ADMIN_PASSWORD,
     LOOPBACK_HOSTS,
+    MIN_ADMIN_PASSWORD_LENGTH,
     Settings,
 )
 from router.control.errors import (
@@ -89,28 +91,101 @@ def _catalog_sync_factory(client: CoreClient):
     return build
 
 
-def _guard_default_admin(settings: Settings) -> None:
-    """C1: refuse the publicly-known default admin password on a non-loopback bind.
+#: C2：旧数据库里属于「公开凭据」的密码值。空口令是 C1 隐患被持久化后的形态，
+#: 与公开已知的默认口令同等危险 —— 任何 active 用户的哈希只要仍接受其中之一，
+#: 非 loopback 绑定上就存在一个公开可登录的管理入口。
+PUBLIC_ADMIN_PASSWORDS = (DEFAULT_ADMIN_PASSWORD, "")
+
+
+def _is_loopback_bind(settings: Settings) -> bool:
+    return settings.host.strip().lower() in LOOPBACK_HOSTS
+
+
+def _guard_admin_credentials(settings: Settings) -> None:
+    """C1: refuse weak or publicly-known admin passwords on a non-loopback bind.
 
     The seed values exist only so ``python -m router`` on this machine works out
-    of the box.  A deployment (compose binds ``0.0.0.0``) must provide an explicit
-    ``ROUTER_ADMIN_PASSWORD``; silently seeding ``1qaz@WSX`` on a reachable
-    listener is a critical security defect.  The check keys on the **password**
-    only: changing the email while keeping the public password must not pass.
+    of the box.  A deployment (compose binds ``0.0.0.0``) must provide an
+    explicit ``ROUTER_ADMIN_PASSWORD``: silently seeding ``1qaz@WSX`` — or an
+    empty/whitespace-only/short password — on a reachable listener is a critical
+    security defect.  The checks key on the **password** only: changing the email
+    while keeping the public password must not pass.  The minimum length is the
+    same constant the user-creation API enforces (``MIN_ADMIN_PASSWORD_LENGTH``),
+    so a deployment cannot start with a password the console would reject.
     """
     if not settings.user_auth:
         return
-    if settings.host.strip().lower() in LOOPBACK_HOSTS:
+    if _is_loopback_bind(settings):
         return
-    if settings.admin_password != DEFAULT_ADMIN_PASSWORD:
+    password = settings.admin_password
+    if not password.strip():
+        reason = "is empty or whitespace-only"
+    elif len(password) < MIN_ADMIN_PASSWORD_LENGTH:
+        reason = f"is shorter than {MIN_ADMIN_PASSWORD_LENGTH} characters"
+    elif password == DEFAULT_ADMIN_PASSWORD:
+        reason = "is the publicly-known default password"
+    else:
         return
     raise RuntimeError(
-        "refusing to start the peripheral console with the publicly-known "
-        f"default admin password on non-loopback host {settings.host!r}: "
-        "change ROUTER_ADMIN_PASSWORD to an explicit value (ROUTER_ADMIN_EMAIL "
-        "may also be overridden; or bind ROUTER_HOST to 127.0.0.1 for "
-        "local-only use)"
+        "refusing to start the peripheral console on non-loopback host "
+        f"{settings.host!r}: ROUTER_ADMIN_PASSWORD {reason}; it must be an "
+        f"explicit value of at least {MIN_ADMIN_PASSWORD_LENGTH} characters "
+        "that is not the publicly-known default (ROUTER_ADMIN_EMAIL may also "
+        "be overridden; or bind ROUTER_HOST to 127.0.0.1 for local-only use)"
     )
+
+
+def _stale_admin_users(conn) -> list[dict]:
+    """Active users whose stored hash still accepts a publicly-known password."""
+    return [
+        user for user in UserRepo(conn).list()
+        if user["status"] == "active"
+        and any(auth.verify_password(password, user["password_hash"])
+                for password in PUBLIC_ADMIN_PASSWORDS)
+    ]
+
+
+def _remediate_stale_admin_credentials(conn, settings: Settings) -> None:
+    """C2: an old database must not keep a public (default or empty) password.
+
+    ``UserRepo.seed_admin()`` only seeds an empty ``users`` table, so an existing
+    volume keeps whatever hash it stored — a database seeded by an old version
+    keeps ``admin@test.com`` / ``1qaz@WSX`` (or, after the C1 hazard, an empty
+    password) forever.  On a non-loopback bind the only acceptable end state is
+    that no active user accepts a publicly-known password: without explicit
+    authorization refuse to start (operator changes the password locally);
+    with ``ROUTER_ADMIN_FORCE_RESET=1`` rotate those accounts to the validated
+    ``admin_password`` and revoke all their sessions.
+    """
+    if not settings.user_auth:
+        return
+    if _is_loopback_bind(settings):
+        return
+    stale = _stale_admin_users(conn)
+    if not stale:
+        return
+    emails = [user["email"] for user in stale]
+    if not settings.admin_force_reset:
+        raise RuntimeError(
+            "refusing to start the peripheral console on non-loopback host "
+            f"{settings.host!r}: the existing database still accepts a "
+            "publicly-known or empty admin password for: "
+            f"{', '.join(emails)}. Remediate by either (a) starting once with "
+            "ROUTER_HOST=127.0.0.1 and changing the affected password through "
+            "the console or the user API, or (b) setting "
+            "ROUTER_ADMIN_FORCE_RESET=1 and restarting: the listed accounts' "
+            "passwords are reset to ROUTER_ADMIN_PASSWORD and all their "
+            "sessions are revoked"
+        )
+    repo = UserRepo(conn)
+    sessions = SessionRepo(conn)
+    for user in stale:
+        repo.set_password(user["id"], settings.admin_password)
+        sessions.delete_for_user(user["id"])
+    logger.critical(
+        "ROUTER_ADMIN_FORCE_RESET=1: reset the password of %s and revoked all "
+        "their sessions (the stored hash still accepted a publicly-known or "
+        "empty password)", ", ".join(emails))
 
 
 def _admin_path(path: str) -> bool:
@@ -227,13 +302,18 @@ def create_app(
     receiver app; standalone callers (and tests) may omit it and get a fresh
     store.
     """
-    _guard_default_admin(settings)
+    # C1 first: a start must never accept a weak/default admin password, and a
+    # forced stale-account reset below must target a validated password.
+    _guard_admin_credentials(settings)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
         seed_default(conn)
         if settings.user_auth:
             UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
+        # C2: seed_admin is a no-op on a non-empty users table, so an old volume
+        # can still hold a publicly-known password; inspect the actual rows.
+        _remediate_stale_admin_credentials(conn, settings)
         _seed_jev(conn, settings)
     finally:
         conn.close()

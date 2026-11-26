@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,6 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
+from router.config import (
+    DEFAULT_ADMIN_PASSWORD,
+    MIN_ADMIN_PASSWORD_LENGTH,
+    Settings,
+)
 from router.jev.service import JevService
 from router.routing.document import graph_document_bytes, parse_graph_document
 from router.routing.graph.model import TargetNode
@@ -16,7 +22,12 @@ from router.control.runtime import enable_context_for_runtime
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
-from router.store.repositories import SettingsRepo, seed_default
+from router.store.repositories import (
+    SessionRepo,
+    SettingsRepo,
+    UserRepo,
+    seed_default,
+)
 from router.store.routing_trees import RoutingTreeRepo
 from router.upstream.runtime_keys import runtime_model_key, tree_scope
 from tests.routing_fixtures import (
@@ -412,6 +423,199 @@ def test_default_admin_guard_does_not_fire_when_console_auth_is_off(tmp_path):
     )
     app = create_app(settings)
     assert app.state.settings.user_auth is False
+
+
+# ---------------------------------------------------------------------------
+# C1 补充：非 loopback 绑定拒绝「空 / 空白 / 短」口令（不只默认口令）。
+# 这些用例在旧代码上会启动成功并可用空口令登录（见 fix-h 报告 RED 证据）。
+# ---------------------------------------------------------------------------
+
+def _legacy_user_db(tmp_path, users, *, name="legacy.db"):
+    """迁移 + 预置用户行，模拟上一版本/手写部署留下的 SQLite 卷。
+
+    ``users`` 是 ``(email, password, role)`` 列表；返回数据库路径。
+    """
+    db_path = str(tmp_path / name)
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        seed_default(conn)
+        repo = UserRepo(conn)
+        for email, password, role in users:
+            repo.create(email, password, role=role)
+    finally:
+        conn.close()
+    return db_path
+
+
+def test_empty_admin_password_is_refused_on_a_non_loopback_bind(tmp_path):
+    """C1: 空 env 口令 + 旧库里已用空口令播种的管理员都必须启动即拒。"""
+    db_path = _legacy_user_db(
+        tmp_path, [("admin@test.com", "", "admin")], name="empty.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="")
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "ROUTER_ADMIN_PASSWORD" in message
+    assert f"at least {MIN_ADMIN_PASSWORD_LENGTH} characters" in message
+    assert "0.0.0.0" in message
+
+
+@pytest.mark.parametrize("password", ["   ", "        ", "\t \n", "short7",
+                                     "1234567"])
+def test_weak_admin_password_is_refused_on_a_non_loopback_bind(
+        tmp_path, password):
+    """空白（含恰好 8 个空格）与短于 8 字符的口令都不能通过启动守卫。"""
+    settings = test_settings(
+        tmp_path, host="0.0.0.0", user_auth=True, admin_password=password)
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "ROUTER_ADMIN_PASSWORD" in message
+    assert f"at least {MIN_ADMIN_PASSWORD_LENGTH} characters" in message
+    assert "0.0.0.0" in message
+
+
+def test_non_loopback_bind_with_a_strong_password_serves_a_real_login(tmp_path):
+    """正向对照：显式强口令 + 空库在非 loopback 上照常启动并可真实登录。"""
+    settings = test_settings(
+        tmp_path, host="0.0.0.0", user_auth=True,
+        admin_email="ops@example.com", admin_password="explicit-strong-pass")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        response = client.post("/admin/login", json={
+            "email": "ops@example.com",
+            "password": "explicit-strong-pass",
+        })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["user"]["email"] == "ops@example.com"
+    assert body["user"]["role"] == "admin"
+
+
+# ---------------------------------------------------------------------------
+# C2：旧 SQLite 卷里仍接受公开默认口令（或空口令）的管理员账号 —— 非
+# loopback 启动必须拒绝，除非操作员显式授权 ROUTER_ADMIN_FORCE_RESET=1。
+# ---------------------------------------------------------------------------
+
+def test_stale_default_admin_password_refuses_a_non_loopback_bind(tmp_path):
+    """C2: 重启换了强 env 口令也不能掩盖旧库里公开默认口令仍可登录的事实。"""
+    db_path = _legacy_user_db(
+        tmp_path, [("admin@test.com", DEFAULT_ADMIN_PASSWORD, "admin")])
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password")
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    # 发现事实（邮箱列表）+ 两条修复路径 + 点名的环境变量。
+    assert "admin@test.com" in message
+    assert "ROUTER_HOST=127.0.0.1" in message
+    assert "ROUTER_ADMIN_FORCE_RESET" in message
+    assert "ROUTER_ADMIN_PASSWORD" in message
+    assert "revoked" in message
+
+
+def test_force_reset_rotates_the_stale_default_admin_and_revokes_sessions(
+        tmp_path, caplog):
+    """显式授权后：旧默认口令 401、新 env 口令 200、旧会话 401、普通账号不动。"""
+    db_path = str(tmp_path / "stale.db")
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        seed_default(conn)
+        repo = UserRepo(conn)
+        admin = repo.create(
+            "admin@test.com", DEFAULT_ADMIN_PASSWORD, role="admin")
+        repo.create("viewer@example.com", "ordinary-secret-1", role="viewer")
+        stale_token, _ = SessionRepo(conn).create(admin["id"], 168)
+    finally:
+        conn.close()
+
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password", admin_force_reset=True)
+    with caplog.at_level(logging.CRITICAL, logger="router.api.app"):
+        app = create_app(settings)
+
+    reset_warnings = [record.getMessage() for record in caplog.records
+                      if record.levelno >= logging.CRITICAL]
+    assert any("admin@test.com" in message for message in reset_warnings), (
+        reset_warnings)
+
+    with TestClient(app) as client:
+        old_default = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": DEFAULT_ADMIN_PASSWORD})
+        assert old_default.status_code == 401, old_default.text
+        new_password = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": "new-strong-password"})
+        assert new_password.status_code == 200, new_password.text
+        # 重置之前签发的会话必须已被撤销。
+        revoked = client.get("/admin/me", headers={
+            "Authorization": f"Bearer {stale_token}"})
+        assert revoked.status_code == 401, revoked.text
+        # 普通（非默认）口令的账号不得被重置。
+        untouched = client.post("/admin/login", json={
+            "email": "viewer@example.com",
+            "password": "ordinary-secret-1"})
+        assert untouched.status_code == 200, untouched.text
+
+
+def test_stale_empty_password_refuses_a_non_loopback_bind(tmp_path):
+    """C2: 旧库把空口令持久化后，即便新 env 口令很强也必须先拒绝启动。"""
+    db_path = _legacy_user_db(
+        tmp_path, [("admin@test.com", "", "admin")], name="stale-empty.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password")
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "admin@test.com" in message
+    assert "ROUTER_ADMIN_FORCE_RESET" in message
+    assert "ROUTER_HOST=127.0.0.1" in message
+
+
+def test_force_reset_clears_a_persisted_empty_password(tmp_path):
+    """C1 隐患落进旧库时同样处理：空口令 401，新 env 口令 200。"""
+    db_path = _legacy_user_db(
+        tmp_path, [("admin@test.com", "", "admin")], name="empty-reset.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password", admin_force_reset=True)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        empty = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": ""})
+        assert empty.status_code == 401, empty.text
+        new_password = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": "new-strong-password"})
+        assert new_password.status_code == 200, new_password.text
+
+
+def test_force_reset_with_an_unsafe_password_still_refuses_startup(tmp_path):
+    """授权重置标志不能绕过 C1：重置目标口令本身必须强。"""
+    db_path = _legacy_user_db(
+        tmp_path, [("admin@test.com", DEFAULT_ADMIN_PASSWORD, "admin")],
+        name="bad-reset.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="short7", admin_force_reset=True)
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "ROUTER_ADMIN_PASSWORD" in message
+    assert f"at least {MIN_ADMIN_PASSWORD_LENGTH} characters" in message
+
+
+def test_force_reset_flag_is_read_from_the_environment(monkeypatch):
+    """C2 的授权开关必须走既有的 ``_flag`` 解析（env 名固定）。"""
+    monkeypatch.setenv("ROUTER_ADMIN_FORCE_RESET", "1")
+    assert Settings.from_env().admin_force_reset is True
+    monkeypatch.setenv("ROUTER_ADMIN_FORCE_RESET", "0")
+    assert Settings.from_env().admin_force_reset is False
 
 
 def test_peripheral_does_not_mount_the_kernel_jev_test(tmp_path):

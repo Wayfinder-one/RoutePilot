@@ -9,6 +9,10 @@ from dataclasses import dataclass
 DEFAULT_ADMIN_EMAIL = "admin@test.com"
 DEFAULT_ADMIN_PASSWORD = "1qaz@WSX"
 
+#: 用户口令最小长度（唯一来源）。控制台创建用户/改密（Pydantic ``min_length``）
+#: 与管理员启动守卫必须共用这个数字，禁止各自写死 8。
+MIN_ADMIN_PASSWORD_LENGTH = 8
+
 #: 允许使用默认管理员凭据的绑定主机（仅本机回环）。
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
@@ -39,6 +43,9 @@ class Settings:
     user_auth: bool = True
     admin_email: str = DEFAULT_ADMIN_EMAIL
     admin_password: str = DEFAULT_ADMIN_PASSWORD
+    #: C2：显式授权把旧库里仍接受公开默认/空口令的管理员账号重置为
+    #: ``admin_password`` 并吊销其会话（仅在非 loopback 绑定启动时生效）。
+    admin_force_reset: bool = False
     session_ttl_hours: int = 168
     # 决策内核的内部 API（图管理 + 决策）；外围不再直接写图 JSON。
     core_url: str = "http://127.0.0.1:8400"
@@ -63,6 +70,7 @@ class Settings:
                 "ROUTER_ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL),
             admin_password=os.environ.get(
                 "ROUTER_ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD),
+            admin_force_reset=_flag("ROUTER_ADMIN_FORCE_RESET"),
             session_ttl_hours=int(os.environ.get("ROUTER_SESSION_TTL_HOURS", "168")),
             core_url=os.environ.get("ROUTER_CORE_URL", "http://127.0.0.1:8400"),
             core_timeout_seconds=float(

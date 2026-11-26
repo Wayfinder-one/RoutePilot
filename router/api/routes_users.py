@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from router import auth
 from router.api.deps import get_conn
+from router.config import MIN_ADMIN_PASSWORD_LENGTH
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
                                        UserRepo, write_transaction)
 
@@ -95,12 +96,12 @@ class LoginIn(BaseModel):
 
 class PasswordChangeIn(BaseModel):
     old_password: str
-    new_password: str = Field(min_length=8)
+    new_password: str = Field(min_length=MIN_ADMIN_PASSWORD_LENGTH)
 
 
 class UserCreateIn(BaseModel):
     email: str
-    password: str = Field(min_length=8)
+    password: str = Field(min_length=MIN_ADMIN_PASSWORD_LENGTH)
     role: Literal["admin", "viewer"] = "viewer"
 
     @field_validator("email")
@@ -123,7 +124,7 @@ class UserUpdateIn(BaseModel):
 
 
 class UserPasswordIn(BaseModel):
-    new_password: str = Field(min_length=8)
+    new_password: str = Field(min_length=MIN_ADMIN_PASSWORD_LENGTH)
 
 
 # --------------------------------------------------------------------------- #

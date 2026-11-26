@@ -46,6 +46,11 @@ if ! ssh "$TARGET" "cd '$STAGING' && docker build -t '$CORE_REPO:$TAG' -t '$CONS
 fi
 
 echo "==> image self-test (kernel core on 18400, console peripheral on 18401, then removed)"
+# I3: throwaway, container-local admin credentials for the console self-test.
+# The image binds ROUTER_HOST=0.0.0.0, so create_app() refuses to start without
+# an explicit non-default admin password of at least 8 characters; the container
+# is removed right after the health probe and these credentials are never used
+# by a real deployment.
 ssh "$TARGET" "docker rm -f routepilot-selftest-core routepilot-selftest-console >/dev/null 2>&1 || true; \
  docker run -d --rm --name routepilot-selftest-core \
       -p 127.0.0.1:18400:8400 \
@@ -54,6 +59,8 @@ ssh "$TARGET" "docker rm -f routepilot-selftest-core routepilot-selftest-console
  && docker run -d --rm --name routepilot-selftest-console \
       -p 127.0.0.1:18401:8400 \
       -e ROUTER_DB=/data/routepilot.db \
+      -e ROUTER_ADMIN_EMAIL=selftest@routepilot.invalid \
+      -e ROUTER_ADMIN_PASSWORD=routepilot-selftest-pass \
       '$CONSOLE_REPO:$TAG' peripheral \
  && for i in \$(seq 1 30); do \
       curl -fsS -m 2 http://127.0.0.1:18400/healthz >/dev/null 2>&1 \
