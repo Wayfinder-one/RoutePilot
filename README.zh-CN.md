@@ -373,7 +373,7 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
 3. **把 JEV Key 移出 SQLite。** 内核只从自己的环境变量读取（`ROUTER_JEV_API_KEY`，或 `config.json` `jev.api_key_env` 指定的名字）。在内核容器/进程里设置它；已存密钥不会迁移，旧的 `ROUTER_JEV_*` 播种变量也不会创建密钥。
 4. **部署两个服务**（或只部署内核接 APISIX）：内核需要 `config.json` + 图目录 + JEV Key；外围需要 `ROUTER_CORE_URL`、自己的 SQLite 路径与常规控制台配置。见[快速开始](#快速开始)与[配置项](#配置项)。
 5. **若内核无法载入既有目录，就通过内核 API 重新发布图**：启动日志会记录 `initial graph snapshot is unavailable`，内核 `/readyz` 报告未就绪（或 `stale`），`/internal/v1/trees` 在文件修好前返回 `graph_storage_error`。每份已存画布必须已经是完整 v4 文档（四个运行字段 + `departments` + `enabled`/`default`）；v3 文件会被拒绝，永远不会被隐式接管或迁移。
-6. **在内核启动前退役旧单服务工作负载**，保证只有一个进程写图目录（`scripts/docker/deploy-163.sh` 会先删除 `deployment/routepilot` 与 `service/routepilot`）。已退役的网关共享凭据与静态 RoutePilot 上游服务 Key 已从代码、部署环境与文档中移除；APISIX 侧残留由 `scripts/apisix/patch_apisix_deployment.py` 清理。
+6. **在内核启动前退役旧单服务工作负载**，保证只有一个进程写图目录。已退役的网关共享凭据与静态 RoutePilot 上游服务 Key 已从代码、部署环境与文档中移除。
 
 ### 旧 profile 中的非 JSON 兼容数值
 
@@ -544,58 +544,11 @@ JSON 从不保存密钥，每种密钥只有一个归属：
 
 `configs/cases/case-*.json` 里的五个演示案例都是完整 v4 文档：带 `kind`/`version`，不含外部 `id`，`enabled: false, default: false, departments: []`，provider 为 `demo-tap`，JEV 服务为 `demo-jev`（窗口 `2048 / 4096`），并内嵌其 target 实际引用的全部模型。`scripts/demo/apply_cases.py` 是它们的部署入口：合并案例文件里的目录、播种多服务 JEV 目录与时段、部署五棵画布（不启用）并跑 dry-run。它绝不绕过影响确认——遇到 409 默认打印受影响画布并停止；`--confirm-sync` 才会用预览里的基线哈希显式重试同一批请求。`graph_conflict` 表示画布在预览后变化，重跑脚本即可。
 
-## 部署在 APISIX + newapi 之后（163 部门路由）
+## APISIX + newapi 形态（内部发行）
 
-163 上只运行**决策内核**：`sandlake` 命名空间里的 `routepilot-core`，仅 ClusterIP。APISIX 保留原 newapi upstream，内核只回答「该跑哪个真实模型」。
-
-```text
-客户端（带部门的 API Key）
-  → APISIX Auto 路由        vars: post_arg.model == "auto"   priority 1001/101
-  → forward-auth           GET http://sandlake-api…:8888/v1/models，携带原始 Authorization
-  → X-SR-Department        由 newapi 用已校验的 token.Department 注入
-  → sr-auto-router         priority 2001：清掉客户端伪造的决策响应头、
-                           不带用户凭据调内核、只改写 JSON 请求体 `model`
-                           并刷新 Content-Length
-  → 内核                   POST /internal/v1/route-decision（按部门选图）
-  → 原 newapi upstream     用用户原始 Authorization 执行选中的真实模型
-  → 透传 JSON / SSE
-```
-
-同一路径上的其他模型由 fixed 路由（priority 1000/100）处理：它从既有 `/apiuser/*` 路由深拷贝而来，直接打到 newapi，不经过内核，因此固定模型保持原链路、不会再次进入路由形成循环。决策调用失败时 APISIX 返回 503，绝不把 `auto` 发给 newapi。内核收不到 `Authorization`，也从不调用模型上游。已退役的网关共享凭据与静态 RoutePilot 上游服务 Key 不再存在，边界改由网络策略与可信部门头承担。决策契约见[后端接口说明](docs/后端接口说明.md) §3.4。
-
-| 组成 | 位置 |
-|---|---|
-| 内核-only 集群清单（Deployment、ClusterIP Service、NFS PVC、NetworkPolicy、config ConfigMap） | `scripts/docker/k8s-163/*.yaml` |
-| 构建与部署脚本（只有内核 JEV Secret 来自环境变量） | `scripts/docker/deploy-163.sh` |
-| 图配置（main/finance/legal/jev-smoke，经内核 API） | `scripts/configure_163_routepilot.py` |
-| APISIX 插件 | `scripts/apisix/sr-auto-router.lua` |
-| 插件注册（幂等；APISIX 3.15 通过 `apisix.plugins` 列表注册） | `scripts/apisix/patch_apisix_deployment.py` |
-| Route 发布（先影子、后生产） | `scripts/apisix/configure_routepilot_routes.py` |
-| APISIX 验收矩阵与故障演练 | `scripts/apisix/verify_routepilot_e2e.py` |
-| 手工本机联调栈（APISIX + 内核，不依赖 newapi） | [APISIX 本机联调部署指南](docs/APISIX-本机联调部署.md) |
-| 双服务 standalone 部署 | `scripts/docker/compose.yml`、`scripts/docker/core-config.json` |
-
-按「已验证」与「未执行」分开记录：
-
-- **拆分已完成的离线验证**：全量 `pytest`（含真实双 app 的 `tests/test_service_split_e2e.py`）、`npm run check:console`、`ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y docker compose -f scripts/docker/compose.yml config`，以及覆盖内核-only 163 清单与构建脚本的部署静态测试。内核-only 形态已被静态证明：无 SQLite、无控制台、`logging.type=disabled`、`/data/graph` 单写者 PVC、只有 JEV 一个 Secret。
-- **本次未执行（需要共享 163/APISIX 维护窗口）**：把 `routepilot-core` 部署到 163、带 `X-SR-Department` 的 newapi 发布、共享 APISIX 变更（插件注册 + Lua 挂载 + 旧 env 清理）、shadow Route 发布，以及带故障/回滚演练的完整 APISIX 验收矩阵。本工作不声称任何生产发布。
-- **本机 APISIX 链路**：旧单服务链路曾在拆分前于 76 上验证；[本机联调指南](docs/APISIX-本机联调部署.md) 已按「先决策、再回 newapi」链路重写，但本次未重新执行（本工作不安装任何环境）。
-
-窗口批准后的顺序：应用内核-only 清单（`deploy-163.sh`）→ 经内核 API 发布图（`configure_163_routepilot.py`）→ `patch_apisix_deployment.py --dry-run` 后正式执行 → `configure_routepilot_routes.py --mode shadow --dry-run` 后发布 → shadow 完整门禁：
-
-```bash
-python3 scripts/apisix/verify_routepilot_e2e.py \
-  --base-path /routepilot-smoke/chat/completions \
-  --ssh-target root@192.168.95.163 \
-  --complete-shadow --include-disruptive
-```
-
-完整门禁要求精确 shadow 路径、Pod 内内核决策证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`，即 `--diagnostic`）不能被表述为完整验收。上游隔离探针属于该门禁：如果内核 Pod 的出站连接无法观测（`/proc/net/tcp*` 不可读），该用例按失败处理而不是通过；只有显式 `--diagnostic` 才降级为带 `observed: false` 的降级证据。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
-
-### APISIX 发布残留（拆分）
-
-- 分裂前 APISIX 配置里的 `routepilot-decision` upstream 对象可能仍以惰性形式留在现网 etcd；它已无引用，可后续手工删除。
-- 本期 163 不部署外围控制台服务。
+APISIX + newapi 部署形态——`auto` 路由插件、其 newapi forward-auth 集成、内核-only
+集群清单与影子验收演练——由内部发行维护，不在本仓库发布。本仓库提供独立形态：
+决策内核 + 可选外围，以及 `scripts/docker/` 下的通用容器文件。
 
 ## 已知限制（拆分）
 
@@ -606,7 +559,7 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
 - **VictoriaLogs 输出适配器未实现。** `logging.type` 只支持 `routepilot` 与 `disabled`；事件结构已固定，供将来 `logging.type=victorialogs` 适配器序列化同一批对象。
 - **过期控制台会话不再自动清理。** 外围应用已不再接入旧的 `MaintenanceWorker`（计划 Task 8），过期 `user_sessions` 行会留在 SQLite，直到人工清理。
 - **旧的短（非空白）管理员口令不会自动被判定为公开凭据。** 启动门（以及 `ROUTER_ADMIN_FORCE_RESET=1`）只把「公开已知 / 空白 / 纯空白」口令当作已泄露：内置默认口令、空串，以及**只由 1–16 个连续空格组成的纯空格值**（仅空格字符，不含制表符等其它空白字符——例如 8 个制表符的历史口令不会命中这个有界扫描）。而当前 API 策略对新建/重置口令会拒绝任何纯空白值（空格、制表符或其它空白字符）。旧库里非空白但短于当前 8 字符下限的口令**不**像空/默认口令那样可被轻易猜到，因此不会拦截启动；运维应主动轮换这类账号。更长的或其它花样的纯空白历史口令同样不在自动扫描范围内。
-- **APISIX 插件契约只由静态测试保证。** Lua 源码契约与 Route/ConfigMap 结构由静态测试（`scripts/apisix/test_sr_auto_router.py`）检查，本迭代未在真实 APISIX/OpenResty 运行时验证；真实链路验收留给部署窗口（design §11 非目标）。
+- **APISIX + newapi 部署形态不在本仓库。** 其插件契约、集群清单与验收演练由内部发行维护；本公开树只包含独立的内核 + 外围形态。
 
 ## 快速开始
 
@@ -797,12 +750,12 @@ ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y \
   docker compose -f scripts/docker/compose.yml config
 ```
 
-- `pytest` 收集 `tests/`、`scripts/apisix/` 与 `scripts/docker/`（`pyproject.toml` 的 `testpaths`），运行单元、服务拆分与部署静态测试，不启动浏览器，也不收集 `experiments/`。`tests/test_service_split_e2e.py` 是真实双 app 验收：进程内内核 + 外围走真实 HTTP，经外围代理建图/启用 → `auto` 决策 → 外围执行模型 → JSON/SSE → 内核事件写入外围内存日志 → recent/replay → 第 21 条淘汰 → 改当前图不影响旧回放 → 外围重启日志消失 → 日志 sink 故障不阻断决策。
+- `pytest` 收集 `tests/`（`pyproject.toml` 的 `testpaths`），运行单元与服务拆分测试，不启动浏览器，也不收集 `experiments/`。`tests/test_service_split_e2e.py` 是真实双 app 验收：进程内内核 + 外围走真实 HTTP，经外围代理建图/启用 → `auto` 决策 → 外围执行模型 → JSON/SSE → 内核事件写入外围内存日志 → recent/replay → 第 21 条淘汰 → 改当前图不影响旧回放 → 外围重启日志消失 → 日志 sink 故障不阻断决策。
 - `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
 - `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
 - `.venv/bin/python scripts/i18n_dead_keys.py` 列出控制台词典中已无页面引用的 key（存在死 key 时 exit 1），用于删除无用翻译；它是 CI lint，不属于 Playwright 矩阵。
 - `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。它要求环境里有 `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD`：缺失时 compose 拒绝渲染，这正是默认凭据护栏的预期行为。
-- `scripts/standalone_v4_smoke.py` 是**拆分前的 legacy** 验收脚本（单服务写者/只读副本假设），仅作历史留存，不能用于验证拆分。拆分门禁是 `tests/test_service_split_e2e.py`、`scripts/docker/test_deploy_163.py` 与针对真实部署的 `scripts/apisix/verify_routepilot_e2e.py`。
+- `scripts/standalone_v4_smoke.py` 是**拆分前的 legacy** 验收脚本（单服务写者/只读副本假设），仅作历史留存，不能用于验证拆分。拆分门禁是 `tests/test_service_split_e2e.py`。
 
 实验代码独立运行，不进入默认套件：
 

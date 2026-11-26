@@ -373,7 +373,7 @@ The core/peripheral split changes what each process owns. Do this in order:
 3. **Move the JEV key out of SQLite.** The kernel reads it only from its environment (`ROUTER_JEV_API_KEY`, or the name in `config.json` `jev.api_key_env`). Set it in the kernel container/process; existing stored keys are not migrated and the old `ROUTER_JEV_*` seed variables do not create a key.
 4. **Deploy the two services** (or the kernel only behind APISIX): the kernel needs `config.json` + the graph directory + the JEV key; the peripheral needs `ROUTER_CORE_URL`, its SQLite path and the usual console settings. See [Quick start](#quick-start) and [Configuration](#configuration).
 5. **Re-publish graphs through the kernel** if the kernel cannot load the existing directory: startup logs `initial graph snapshot is unavailable`, kernel `/readyz` reports not ready (or `stale`), and `/internal/v1/trees` answers `graph_storage_error` until the file is fixed. Every stored canvas must already be a full v4 document (four run fields + `departments` + `enabled`/`default`); v3 files are rejected, never adopted or migrated implicitly.
-6. **Retire the old single-service workload** before the kernel starts, so only one process writes the graph directory (`scripts/docker/deploy-163.sh` deletes `deployment/routepilot` and `service/routepilot` first). The retired shared gateway credential and static RoutePilot upstream key are gone from code, deployment env and docs; APISIX-side leftovers are pruned by `scripts/apisix/patch_apisix_deployment.py`.
+6. **Retire the old single-service workload** before the kernel starts, so only one process writes the graph directory. The retired shared gateway credential and static RoutePilot upstream key are gone from code, deployment env and docs.
 
 ### Legacy profiles with non-finite numbers
 
@@ -544,58 +544,14 @@ Update/delete semantics:
 
 The five demo cases in `configs/cases/case-*.json` are complete v4 documents with `kind`/`version`, no external `id`, `enabled: false, default: false, departments: []`, provider `demo-tap`, JEV service `demo-jev` (window `2048 / 4096`) and every model their targets reference. `scripts/demo/apply_cases.py` is their deployment entry point: it merges the catalogs from the case files, seeds the multi-service JEV catalog and time periods, deploys the five canvases (without enabling them) and runs the dry-runs. It never bypasses impact confirmation — a 409 prints the affected canvases and stops by default; `--confirm-sync` explicitly retries the same requests with the previewed baseline hashes. A `graph_conflict` means a canvas changed after the preview: re-run the script.
 
-## Behind APISIX + newapi (department routing on 163)
+## Behind APISIX + newapi (internal distribution)
 
-On 163 only the **decision kernel** runs, as a ClusterIP-only `routepilot-core` service in the `sandlake` namespace. APISIX keeps its original newapi upstream; the kernel only answers "which real model should run".
-
-```text
-client (department API key)
-  → APISIX Auto route      vars: post_arg.model == "auto"   priority 1001/101
-  → forward-auth           GET http://sandlake-api…:8888/v1/models with the ORIGINAL Authorization
-  → X-SR-Department        injected by newapi from the already-validated token.Department
-  → sr-auto-router         priority 2001: strip client copies of the decision headers,
-                           ask the kernel WITHOUT the user credential,
-                           rewrite only the JSON body `model` and refresh Content-Length
-  → kernel                 POST /internal/v1/route-decision (department-aware graph selection)
-  → original newapi upstream  executes the routed real model with the user's original Authorization
-  → JSON / SSE passthrough
-```
-
-Any other model on the same path is handled by the fixed route (priority 1000/100): it is deep-copied from the existing `/apiuser/*` route and goes straight to newapi with no kernel involvement, so fixed models keep their original path and never loop back into routing. If the decision call fails, APISIX returns 503 and never sends `auto` to newapi. The kernel receives no `Authorization` and never calls a model upstream. The retired shared gateway credential and static RoutePilot upstream key no longer exist; network boundaries and the trusted department header replace them. See the [backend API reference](docs/后端接口说明.md) §3.4 for the decision contract.
-
-| Piece | Location |
-|---|---|
-| Kernel-only cluster manifests (Deployment, ClusterIP Service, NFS PVC, NetworkPolicy, config ConfigMap) | `scripts/docker/k8s-163/*.yaml` |
-| Build + deploy script (only the kernel JEV secret comes from env) | `scripts/docker/deploy-163.sh` |
-| Graph configuration (main/finance/legal/jev-smoke) through the kernel API | `scripts/configure_163_routepilot.py` |
-| APISIX plugin | `scripts/apisix/sr-auto-router.lua` |
-| Plugin registration (idempotent; APISIX 3.15 registers via the `apisix.plugins` list) | `scripts/apisix/patch_apisix_deployment.py` |
-| Route publishing, shadow first then production | `scripts/apisix/configure_routepilot_routes.py` |
-| APISIX acceptance matrix and drills | `scripts/apisix/verify_routepilot_e2e.py` |
-| Manual local test stack (APISIX + kernel, no newapi) | [APISIX local integration guide](docs/APISIX-本机联调部署.md) |
-| Standalone two-service deployment | `scripts/docker/compose.yml`, `scripts/docker/core-config.json` |
-
-Split the rollout by what is actually verified:
-
-- **Verified offline for the split:** the full `pytest` suite (including the real two-app `tests/test_service_split_e2e.py`), `npm run check:console`, `ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y docker compose -f scripts/docker/compose.yml config`, and the static deployment tests over the kernel-only 163 manifests and build scripts. The kernel-only form is statically proven: no SQLite, no console, `logging.type=disabled`, `/data/graph` single-writer PVC, only the JEV secret.
-- **Not executed in this work (needs a maintenance window on shared 163/APISIX):** deploying `routepilot-core` to 163, the newapi release that injects `X-SR-Department`, the shared APISIX patch (plugin registration + Lua mount + retired-env pruning), shadow route publication, and the full APISIX acceptance matrix with its failure/rollback drills. No production publication is claimed.
-- **Local APISIX chain:** the previous single-service chain was proven on 76 before the split; the [local guide](docs/APISIX-本机联调部署.md) was rewritten for the decision-then-newapi chain but has not been re-executed after the split because this work installs nothing.
-
-Rollout order once the window is approved: apply the kernel-only manifests (`deploy-163.sh`) → publish graphs through the kernel API (`configure_163_routepilot.py`) → `patch_apisix_deployment.py --dry-run` then apply → `configure_routepilot_routes.py --mode shadow --dry-run` then publish → the shadow gate:
-
-```bash
-python3 scripts/apisix/verify_routepilot_e2e.py \
-  --base-path /routepilot-smoke/chat/completions \
-  --ssh-target root@192.168.95.163 \
-  --complete-shadow --include-disruptive
-```
-
-The gate requires the exact shadow path, the SSH target for in-pod kernel decision evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`, i.e. `--diagnostic`) can never be reported as complete. The upstream-isolation probe is part of that gate: when the kernel pod's outbound connections cannot be observed (`/proc/net/tcp*` unreadable), the case fails instead of passing; only an explicit `--diagnostic` run downgrades it to degraded evidence with `observed: false`. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
-
-### APISIX rollout residuals (split)
-
-- A `routepilot-decision` upstream object may remain inert in the live etcd from the pre-split APISIX configuration; it is unreferenced and can be pruned manually later.
-- The peripheral console service is not deployed on 163 in this period.
+The APISIX + newapi deployment form — the `auto` route plugin, its newapi
+forward-auth integration, the kernel-only cluster manifests and the shadow
+acceptance drills — is maintained in the internal distribution and is not
+published in this repository. This repository ships the standalone form: the
+decision kernel plus the optional console, with the generic container files in
+`scripts/docker/`.
 
 ## Known limitations (split)
 
@@ -606,7 +562,7 @@ The gate requires the exact shadow path, the SSH target for in-pod kernel decisi
 - **VictoriaLogs output adapter is not implemented.** `logging.type` supports only `routepilot` and `disabled`; the event schema is fixed so a future `logging.type=victorialogs` adapter can serialize the same objects.
 - **Expired console sessions are no longer purged automatically.** The old `MaintenanceWorker` is no longer wired into the peripheral app (plan Task 8), so expired `user_sessions` rows accumulate in SQLite until manual cleanup.
 - **Legacy short non-whitespace admin passwords are not auto-flagged.** The startup gate (and `ROUTER_ADMIN_FORCE_RESET=1`) only treats publicly-known, blank and whitespace-only passwords as compromised: the built-in default, the empty string, and **space runs of 1–16 spaces** (space characters only — a legacy password made of tabs or other whitespace, for example eight tabs, is not flagged by this bounded scan). Any whitespace-only password (spaces, tabs or any other whitespace) is rejected by the current API policy for new and reset passwords going forward. A legacy non-whitespace password shorter than the current 8-character minimum is **not** guessable the way a blank/default password is, so it does not block startup; operators should rotate such accounts deliberately. Longer or exotic whitespace-only legacies are likewise out of the automatic scan's scope.
-- **The APISIX plugin contract is proven by static tests only.** The Lua source contract and the Route/ConfigMap structure are checked statically (`scripts/apisix/test_sr_auto_router.py`); this iteration did not validate them on a real APISIX/OpenResty runtime. End-to-end verification is deferred to the deployment window (design §11 non-goal).
+- **The APISIX + newapi deployment form is not part of this repository.** Its plugin contract, cluster manifests and acceptance drills are maintained in the internal distribution; this public tree ships only the standalone kernel + console form.
 
 ## Quick start
 
@@ -797,12 +753,12 @@ ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y \
   docker compose -f scripts/docker/compose.yml config
 ```
 
-- `pytest` collects `tests/`, `scripts/apisix/` and `scripts/docker/` (`testpaths` in `pyproject.toml`), runs unit, service-split and deployment static tests, starts no browser and does not collect `experiments/`. `tests/test_service_split_e2e.py` is the real two-app acceptance run: in-process kernel + peripheral over real HTTP, graph creation/enable through the peripheral proxy, `auto` decision, peripheral model execution, JSON/SSE, kernel event → peripheral memory log, recent/replay, 21st-event eviction, current-graph edits not affecting replays, restart clearing the log, and a log-sink failure not blocking decisions.
+- `pytest` collects `tests/` (`testpaths` in `pyproject.toml`), runs the unit and service-split suites, starts no browser and does not collect `experiments/`. `tests/test_service_split_e2e.py` is the real two-app acceptance run: in-process kernel + peripheral over real HTTP, graph creation/enable through the peripheral proxy, `auto` decision, peripheral model execution, JSON/SSE, kernel event → peripheral memory log, recent/replay, 21st-event eviction, current-graph edits not affecting replays, restart clearing the log, and a log-sink failure not blocking decisions.
 - `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
 - `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
 - `.venv/bin/python scripts/i18n_dead_keys.py` lists console-dictionary keys that no page references (exit code 1 when any exist) so dead translations can be deleted; it is a CI lint and is not part of the Playwright matrix.
 - `docker compose -f scripts/docker/compose.yml config` statically validates the two-service standalone deployment (two services, separate volumes, healthchecks, no secret values). It requires `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD` in the environment: without them compose refuses to render, which is the intended default-credential guard.
-- `scripts/standalone_v4_smoke.py` is a **legacy pre-split** acceptance run (single-service writer/replica assumptions); it is kept for history and must not be used to validate the split. The split gates are `tests/test_service_split_e2e.py`, `scripts/docker/test_deploy_163.py` and `scripts/apisix/verify_routepilot_e2e.py` (against a real deployment).
+- `scripts/standalone_v4_smoke.py` is a **legacy pre-split** acceptance run (single-service writer/replica assumptions); it is kept for history and must not be used to validate the split. The split gate is `tests/test_service_split_e2e.py`.
 
 Experiments are standalone and excluded from the default run:
 
