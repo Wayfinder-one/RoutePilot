@@ -693,11 +693,17 @@ class StatefulKernelTransport:
     def __init__(self, *graphs):
         self.documents = {item.id: item for item in graphs}
         self.calls: list[tuple[str, str]] = []
+        #: 每次 graph-batches 的 writes（正向批次 + 反向补偿都记录）。
+        self.batch_writes: list[list[dict]] = []
         self.batch_failures: list[BaseException] = []
+        #: 直接以 HTTP 答案失败（如内核 500 ``graph_batch_committed``）。
+        self.batch_answers: list[httpx.Response] = []
         # 传输失败前内核是否已经提交（模拟「请求已送达、响应丢失」）。
         self.commit_before_failure = False
         # 提交前只应用第一份写（模拟无法解释的部分状态）。
         self.partial_commit_before_failure = False
+        # 失败后、probe 之前执行（模拟第三方在窗口内改图）。
+        self.after_failure = None
         # 失败后让 probe（GET /trees）也失败。
         self.fail_reads_after_failure = False
         self.fail_reads = False
@@ -711,11 +717,20 @@ class StatefulKernelTransport:
                 "trees": [tree_to_dict(item) for item in self.documents.values()]})
         if request.url.path == "/internal/v1/graph-batches":
             writes = json.loads(request.content)["writes"]
+            self.batch_writes.append(writes)
+            if self.batch_answers:
+                answer = self.batch_answers.pop(0)
+                if self.commit_before_failure:
+                    self._apply(writes,
+                                partial=self.partial_commit_before_failure)
+                return answer
             if self.batch_failures:
                 failure = self.batch_failures.pop(0)
                 if self.commit_before_failure:
                     self._apply(writes,
                                 partial=self.partial_commit_before_failure)
+                if self.after_failure is not None:
+                    self.after_failure(self)
                 if self.fail_reads_after_failure:
                     self.fail_reads = True
                 raise failure
@@ -803,6 +818,11 @@ async def test_unknown_transport_failure_compensates_a_committed_batch(conn):
     assert caught.value.uncertain is True
     assert transport.tree_read_count() == 2        # 原图读取 + 状态 probe
     assert transport.batch_count() == 2            # 候选批次 + 反向补偿批次
+    # 补偿批次：原图内容 + probe 到的新基线（= 候选文档哈希）。
+    reverse = transport.batch_writes[1]
+    assert reverse[0]["base_document_sha256"] == document_sha(
+        replace(old, name="v2"))
+    assert reverse[0]["tree"] == tree_to_dict(old)
     restored = transport.documents["main"]
     assert document_sha(restored) == old.document_sha256
     assert restored.name == old.name
@@ -880,3 +900,69 @@ async def test_unknown_transport_failure_with_mixed_state_is_explicit_divergence
 
     assert transport.batch_count() == 1            # 不尝试用局部状态补偿
     assert _db_rows(conn, "catalog_writes") == []
+
+
+def _third_party_edit(transport):
+    """模拟补偿窗口内第三方图 CRUD：候选图变成既非原图也非候选的第三哈希。"""
+    current = transport.documents["main"]
+    edited = replace(current, name="edited-by-someone-else")
+    transport.documents["main"] = replace(
+        edited, document_sha256=document_sha(edited))
+
+
+@async_test
+async def test_probe_third_hash_is_explicit_divergence_without_compensation(conn):
+    """内核已提交后又被第三方改成第三哈希：既不能当未提交，也不能乱补偿。"""
+    old = document_tree("main")
+    transport = StatefulKernelTransport(old)
+    transport.commit_before_failure = True
+    transport.after_failure = _third_party_edit
+    transport.batch_failures.append(httpx.ReadTimeout("response lost"))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CatalogSyncDiverged, match="catalog_sync_diverged"):
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(old, name="v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert transport.tree_read_count() == 2        # 探测执行了
+    assert transport.batch_count() == 1            # 第三态：不尝试用局部状态补偿
+    assert transport.documents["main"].name == "edited-by-someone-else"
+    assert _db_rows(conn, "catalog_writes") == []
+    assert _db_rows(conn, "audit") == []
+
+
+@async_test
+async def test_kernel_500_graph_batch_committed_is_compensated_after_probe(conn):
+    """内核提交后响应构造失败（500 graph_batch_committed）：探测并反向补偿。"""
+    old = document_tree("main")
+    transport = StatefulKernelTransport(old)
+    transport.commit_before_failure = True
+    transport.batch_answers.append(httpx.Response(500, json={"detail": {
+        "code": "graph_batch_committed",
+        "message": "graph batch committed but the response failed",
+    }}))
+    client = kernel_client(transport)
+    try:
+        with pytest.raises(CoreBatchError) as caught:
+            await RemoteCatalogSyncService(conn, client).commit(
+                db_write=write_catalog_row,
+                candidates=[replace(old, name="v2")],
+                audit=record_audit,
+            )
+    finally:
+        await client.aclose()
+
+    assert caught.value.status_code == 500
+    assert caught.value.uncertain is True
+    assert transport.tree_read_count() == 2        # 原图读取 + 状态 probe
+    assert transport.batch_count() == 2            # 候选批次 + 反向补偿批次
+    restored = transport.documents["main"]
+    assert document_sha(restored) == old.document_sha256
+    assert restored.name == old.name
+    assert _db_rows(conn, "catalog_writes") == []
+    assert _db_rows(conn, "audit") == []

@@ -22,13 +22,33 @@ request order; each document carries its new ``document_sha256`` so the
 peripheral can compensate with the new base hashes when its SQLite commit
 fails afterwards.
 
+Post-commit failures never pretend the batch was not committed:
+
+* ``batch.discard()`` is cleanup only — its failure is logged and the successful
+  answer continues (the files are committed, the staged temporaries are leaked
+  at worst);
+* the answer is built from the in-memory candidates plus the SHA-256 of the
+  bytes that were committed, **not** from a fresh ``repo.get()`` read, so a
+  read/serialization hiccup after the commit cannot produce a generic 500;
+* if building the answer still fails unexpectedly, the route answers 500 with
+  ``{"detail": {"code": "graph_batch_committed", ...}}`` — an explicit
+  "committed but unconfirmed" signal that makes ``CoreClient`` probe and
+  compensate instead of rolling SQLite back as if nothing had been written.
+
+A batch rollback failure (the commit itself failed *and* the original files
+could not be restored) is likewise reported as 500
+``graph_batch_rollback_failed`` instead of 503 ``graph_storage_error``: the
+kernel state is unknown, not definitely unchanged.
+
 ``writes: []`` is an explicit no-op success: the peripheral never sends an
 empty batch (pure SQLite catalog writes skip it), so treating it as a no-op
 keeps the wire contract total instead of inventing an error case.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+from dataclasses import replace
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -37,12 +57,17 @@ from pydantic import BaseModel, ConfigDict
 from router.api.issue_presenter import issues_payload
 from router.control.errors import ValidationFailed
 from router.control.graphs import candidate_document_issues, graph_parse_failed
+from router.routing.document import graph_document_bytes
 from router.routing.graph.validate import Issue
-from router.routing.tree import RoutingTree, tree_from_dict, tree_to_dict
+from router.routing.tree import (
+    RoutingTree,
+    tree_from_dict,
+    tree_revision_of,
+    tree_to_dict,
+)
 from router.store.routing_trees import (
     GraphBatch,
     GraphConflictError,
-    GraphStorageError,
     RoutingTreeRepo,
 )
 
@@ -123,18 +148,43 @@ def _resulting_enabled(repo: RoutingTreeRepo,
 
 
 def _restore_batch(batch: GraphBatch | None, publisher) -> None:
-    """提交失败后恢复本批次已替换的文件；回滚失败时刷新快照并保持 503 语义。"""
+    """提交失败后恢复本批次已替换的文件。
+
+    回滚成功 = 文件确定恢复为原内容，保留原状态码（如 503
+    ``graph_storage_error``）让外围确定「未提交」。回滚失败 = 文件可能是半新
+    半旧，内核状态未知：先尽力刷新快照，再以 500
+    ``graph_batch_rollback_failed`` 显式上报，**不能**伪装成「未提交」。
+    """
     if batch is None:
         return
     try:
         batch.rollback()
-    except GraphStorageError:
+    except Exception:
         logger.exception("kernel graph batch rollback failed")
         try:
             publisher.refresh()
         except Exception:  # noqa: BLE001 - 回滚失败后的尽力刷新
             logger.exception("kernel snapshot refresh after rollback failure failed")
-        raise
+        raise HTTPException(500, detail={
+            "code": "graph_batch_rollback_failed",
+            "message": (
+                "graph batch failed and its files could not be restored; "
+                "kernel graph state is unknown"),
+        })
+
+
+def _committed_documents(updates: list[tuple[RoutingTree, str]]
+                         ) -> list[RoutingTree]:
+    """提交后的内存文档：候选内容 + 已提交字节的 SHA-256（不重读文件）。"""
+    committed: list[RoutingTree] = []
+    for candidate, _base in updates:
+        content = graph_document_bytes(candidate)
+        committed.append(replace(
+            candidate,
+            tree_revision=tree_revision_of(candidate),
+            document_sha256=hashlib.sha256(content).hexdigest(),
+        ))
+    return committed
 
 
 @router.post("/graph-batches")
@@ -170,7 +220,25 @@ def replace_graph_batch(body: GraphBatchIn, request: Request):
         except BaseException:
             _restore_batch(batch, publisher)
             raise
-        batch.discard()
-        committed = [repo.get(candidate.id) for candidate, _base in updates]
-
-    return {"trees": [tree_to_dict(tree) for tree in committed]}
+        # 以下全是提交后的步骤：失败绝不能再产生「未提交」的答案。
+        try:
+            batch.discard()
+        except Exception:  # noqa: BLE001 - discard 只是清理暂存文件
+            logger.exception(
+                "kernel graph batch discard failed after commit; the batch is "
+                "committed and the response is unaffected")
+        try:
+            committed = _committed_documents(updates)
+            return {"trees": [tree_to_dict(tree) for tree in committed]}
+        except Exception as exc:  # noqa: BLE001 - 提交后必须显式回答不确定
+            logger.critical(
+                "kernel graph batch %s was committed and published, but its "
+                "response could not be built: %s",
+                [candidate.id for candidate, _base in updates], exc,
+                exc_info=exc)
+            raise HTTPException(500, detail={
+                "code": "graph_batch_committed",
+                "message": (
+                    "graph batch was committed and published but its response "
+                    f"could not be built: {exc}"),
+            }) from exc

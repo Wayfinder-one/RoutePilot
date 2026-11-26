@@ -25,11 +25,17 @@
 正向图写由内核基线的 ``document_sha256`` 校验（409 整批拒绝），但补偿窗口内的跨进程
 交错仍会以 ``catalog_sync_diverged`` 暴露为需要人工核对的显式分歧。
 
-**传输失败歧义**：内核批次请求的 ``httpx`` 失败分两类。``ConnectError`` /
-``ConnectTimeout`` / pool/protocol 准备失败 = 请求确定未发出，内核未变，只需回滚
-SQLite；读超时、连接中断等 = 内核状态未知（请求可能已提交、响应丢失），必须
-``list_graphs()`` 探测：候选已提交则用原图 + 探测到的新基线补偿，未提交则不补偿，
-探测也失败则显式 ``catalog_sync_diverged``。
+**提交状态歧义**：内核批次请求失败分三类。``ConnectError`` / ``ConnectTimeout`` /
+pool/protocol 准备失败 = 请求确定未发出，内核未变，只需回滚 SQLite；读超时、连接
+中断，以及内核的 5xx / ``graph_batch_committed`` 答案（提交后响应构造失败）= 内核
+状态未知（请求可能已提交、响应丢失），必须 ``list_graphs()`` 做**三态**探测：
+
+- 全部候选仍是**原图哈希** → 确定未提交：SQLite 已回滚，不补偿；
+- 全部候选已是**候选哈希** → 已提交：用原图 + 探测到的新基线补偿；
+- 其他任何情况（混合态，或第三方在窗口内改成第三哈希 / 删除）→ 显式
+  ``CatalogSyncDiverged`` 并记录每图状态，绝不静默当未提交。
+
+探测本身失败同样显式 ``catalog_sync_diverged``。
 
 异常映射保持既有目录写契约：
 - 内核 409 ``graph_conflict`` → ``GraphConflictError(actual)`` → 409；
@@ -224,8 +230,9 @@ class RemoteCatalogSyncService:
                     domain = _domain_error(exc)
                     if domain is not None:
                         raise domain from exc
-                    # 传输层无法区分「未发出」与「已提交但响应丢失」：先让
-                    # SQLite 事务回滚，事务之外再 probe/补偿。
+                    # 未映射的答案（读超时/连接中断、5xx、graph_batch_committed）
+                    # 无法证明内核未提交：先让 SQLite 事务回滚，事务之外再
+                    # probe/补偿。只有内核已核实的提交前拒绝才是确定未提交。
                     kernel_uncertain = bool(getattr(exc, "uncertain", False))
                     raise
                 kernel_committed = True
@@ -262,20 +269,24 @@ class RemoteCatalogSyncService:
             self, candidates: list[RoutingTree],
             originals: dict[str, RoutingTree],
             cause: BaseException) -> None:
-        """内核批次传输失败后的状态探测（请求可能已提交、响应丢失）。
+        """内核批次状态不确定后的**三态**探测（提交可能已发生、答案丢失）。
 
-        用内核当前文档的 ``document_sha256`` 对比「候选即将写出的字节」：
-        - 全部候选已提交 → 用原图 + 探测到的当前基线调用反向批次恢复；
-        - 全部候选未提交 → 内核未变，只需已完成的 SQLite 回滚；
-        - 部分已提交（内核批次是原子的，正常不会出现）或探测失败 → 无法确认
-          两侧一致，抛 ``CatalogSyncDiverged``。
+        对每份候选同时比较「当前内核文档哈希」与**原图哈希**、**候选哈希**：
+
+        - 全部仍是原图哈希 → 确定未提交：内核未变，SQLite 已回滚，不补偿；
+        - 全部已是候选哈希 → 已提交：用原图 + 探测到的新基线调用反向批次恢复；
+        - 其他任何情况（混合态，或第三方把某张图改成第三种哈希 / 删除）→
+          无法确认两侧一致：记录每图状态并以 ``CatalogSyncDiverged`` 上报。
+
+        只判断「是否等于候选哈希」会把第三态误判成未提交（评审 I3）：内核提交
+        后第三方 CRUD 改了图，探测到的哈希既不是原图也不是候选，绝不能静默返回。
         """
         try:
             current = {tree.id: tree for tree in await self.client.list_graphs()}
         except Exception as probe_error:  # noqa: BLE001 - 探测失败即无法确认
             logger.critical(
-                "catalog sync cannot determine kernel state after an ambiguous "
-                "graph-batch transport failure (graphs: %s)",
+                "catalog sync cannot determine kernel state after an uncertain "
+                "graph-batch commit (graphs: %s)",
                 [candidate.id for candidate in candidates],
                 exc_info=probe_error)
             raise CatalogSyncDiverged("catalog_sync_diverged") from probe_error
@@ -284,32 +295,47 @@ class RemoteCatalogSyncService:
                 graph_document_bytes(candidate)).hexdigest()
             for candidate in candidates
         }
-        committed = [
-            candidate for candidate in candidates
-            if current.get(candidate.id) is not None
-            and current[candidate.id].document_sha256 == expected[candidate.id]
-        ]
-        if not committed:
-            logger.warning(
-                "graph-batch transport failure happened before commit; kernel "
-                "graphs are unchanged (graphs: %s)",
-                [candidate.id for candidate in candidates])
-            return
-        if len(committed) != len(candidates):
-            committed_ids = {candidate.id for candidate in committed}
-            logger.critical(
-                "ambiguous kernel graph state after transport failure: committed "
-                "%s, not committed %s",
-                sorted(committed_ids),
-                sorted(candidate.id for candidate in candidates
-                       if candidate.id not in committed_ids))
-            raise CatalogSyncDiverged("catalog_sync_diverged") from cause
-        new_hashes = {
-            candidate.id: current[candidate.id].document_sha256
+        # 候选的 ``document_sha256`` 就是提交前原文档的哈希（_load_originals
+        # 已逐份核对）；这里以显式读到的原图文档为准。
+        original_hashes = {
+            candidate.id: originals[candidate.id].document_sha256
             for candidate in candidates
         }
-        await self._restore_after_kernel_commit(
-            candidates, originals, new_hashes, cause)
+        current_hashes = {
+            candidate.id: (
+                current[candidate.id].document_sha256
+                if current.get(candidate.id) is not None else None)
+            for candidate in candidates
+        }
+        if all(current_hashes[tree_id] == original_hashes[tree_id]
+               for tree_id in original_hashes):
+            logger.warning(
+                "uncertain graph-batch answer (%s) but every kernel graph still "
+                "holds its original document; nothing to compensate (graphs: %s)",
+                cause, sorted(original_hashes))
+            return
+        if all(current_hashes[tree_id] == expected[tree_id]
+               for tree_id in expected):
+            new_hashes = {
+                candidate.id: current_hashes[candidate.id]
+                for candidate in candidates
+            }
+            await self._restore_after_kernel_commit(
+                candidates, originals, new_hashes, cause)
+            return
+        detail = ", ".join(
+            f"{tree_id}="
+            + ("original" if actual == original_hashes[tree_id]
+               else "candidate" if actual == expected[tree_id]
+               else f"third-state {actual}")
+            for tree_id, actual in current_hashes.items())
+        logger.critical(
+            "kernel graph state is neither all-original nor all-candidate after "
+            "an uncertain graph-batch commit; refusing to guess (per graph: %s)",
+            detail, exc_info=cause)
+        raise CatalogSyncDiverged(
+            "catalog_sync_diverged: kernel graph state is mixed or changed by a "
+            f"third party ({detail})") from cause
 
     async def _restore_after_kernel_commit(
             self, candidates: list[RoutingTree],

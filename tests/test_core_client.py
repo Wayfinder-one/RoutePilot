@@ -17,7 +17,7 @@ import json
 import httpx
 import pytest
 
-from router.core_client import CoreClient, CoreDecisionError
+from router.core_client import CoreBatchError, CoreClient, CoreDecisionError
 from tests.decision_fixtures import async_test, decision_payload
 
 
@@ -164,3 +164,89 @@ async def test_client_keeps_the_configured_base_url_and_timeout():
     finally:
         await client.http.aclose()
     assert status == 200
+
+
+# --------------------------------------------------------------------------- #
+# 图批次分类：只有「确定未提交」的答案才 uncertain=False
+# --------------------------------------------------------------------------- #
+async def _replace_batch_error(handler) -> CoreBatchError:
+    client = make_client(handler)
+    try:
+        with pytest.raises(CoreBatchError) as caught:
+            await client.replace_graph_batch([])
+    finally:
+        await client.http.aclose()
+    return caught.value
+
+
+@pytest.mark.parametrize(("status", "payload", "expected_uncertain"), [
+    # 提交前的确定性拒绝：内核整批拒绝且一个文件都没动。
+    (409, {"detail": {"code": "graph_conflict",
+                      "actual_document_sha256": "f" * 64}}, False),
+    (422, {"detail": [{"code": "reasoning_unsupported"}]}, False),
+    (503, {"detail": {"code": "graph_storage_error", "message": "x"}}, False),
+    (503, {"detail": {"code": "core_unavailable", "message": "x"}}, False),
+    # 5xx：请求可能已经提交，答案与提交状态不确定。
+    (500, {"detail": {"code": "graph_batch_committed",
+                      "message": "response failed"}}, True),
+    (500, {"detail": {"code": "graph_storage_error", "message": "x"}}, True),
+    (502, {"detail": {"code": "bad_gateway"}}, True),
+    (504, {}, True),
+    # 未知 503 码不是已验证的提交前拒绝：按不确定处理，进入探测。
+    (503, {"detail": {"code": "unexpected_code"}}, True),
+])
+@async_test
+async def test_replace_graph_batch_classifies_definite_vs_uncertain_answers(
+        status, payload, expected_uncertain):
+    async def handler(request):
+        return httpx.Response(status, json=payload)
+
+    exc = await _replace_batch_error(handler)
+
+    assert exc.status_code == status
+    assert exc.payload == payload
+    assert exc.uncertain is expected_uncertain
+
+
+@async_test
+async def test_replace_graph_batch_non_json_503_is_uncertain():
+    """代理返回非 JSON 503 时无法确认内核状态：必须进入探测。"""
+
+    async def handler(request):
+        return httpx.Response(503, text="upstream connect error")
+
+    exc = await _replace_batch_error(handler)
+
+    assert exc.status_code == 503
+    assert exc.uncertain is True
+
+
+@async_test
+async def test_replace_graph_batch_malformed_200_means_committed_but_unconfirmed():
+    """内核 200 却给出无法解析的成功载荷：批次已提交，但外围无法确认。"""
+
+    async def handler(request):
+        return httpx.Response(200, text="not a json object")
+
+    exc = await _replace_batch_error(handler)
+
+    assert exc.uncertain is True
+    assert exc.payload["detail"]["code"] == "graph_batch_committed"
+
+
+@pytest.mark.parametrize(("failure", "expected_uncertain"), [
+    (httpx.ConnectError("connection refused"), False),
+    (httpx.ConnectTimeout("connect timeout"), False),
+    (httpx.ReadTimeout("response lost"), True),
+    (httpx.RemoteProtocolError("connection dropped"), True),
+])
+@async_test
+async def test_replace_graph_batch_transport_classification(failure,
+                                                            expected_uncertain):
+    async def handler(request):
+        raise failure
+
+    exc = await _replace_batch_error(handler)
+
+    assert exc.status_code == 503
+    assert exc.uncertain is expected_uncertain

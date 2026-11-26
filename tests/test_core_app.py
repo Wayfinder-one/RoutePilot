@@ -11,6 +11,7 @@ Every assertion here is a kernel boundary held by the core/peripheral split:
 * the configured ``logging.routepilot`` sink is wired to the kernel's HTTP
   client, so one decision really produces one event POST.
 """
+import hashlib
 import json
 from urllib.parse import quote
 
@@ -19,7 +20,9 @@ from fastapi.testclient import TestClient
 
 from router.api.core_app import create_core_app
 from router.core_config import CoreSettings, LogSinkSettings
-from router.routing.tree import tree_from_dict
+from router.routing.document import graph_document_bytes
+from router.routing.tree import tree_from_dict, tree_to_dict
+from router.store.routing_trees import GraphBatch, GraphStorageError, RoutingTreeRepo
 from tests.decision_fixtures import core_settings
 from tests.routing_fixtures import tree_dict
 
@@ -343,3 +346,135 @@ def test_kernel_try_dry_run_without_sqlite(tmp_path, monkeypatch):
     assert route_set.json()["outcome"]["model"] == "fast"
     assert route_set.json()["graph_selection"] == "default"
     assert sink.events == []
+
+
+# --------------------------------------------------------------------------- #
+# 图批次提交后的失败语义：已提交的批次绝不能回答「未提交」
+# --------------------------------------------------------------------------- #
+def _batch_candidate(app, tree_id, *, name):
+    """基于内核当前文档构造候选画布（只改行为字段，保留基线哈希）。"""
+    document = tree_to_dict(app.state.graph_repo.get(tree_id))
+    document["name"] = name
+    return tree_from_dict(document)
+
+
+def _batch_payload(app, *candidates):
+    current = {tree.id: tree for tree in app.state.graph_repo.list()}
+    return {"writes": [
+        {"tree": tree_to_dict(candidate),
+         "base_document_sha256": current[candidate.id].document_sha256}
+        for candidate in candidates
+    ]}
+
+
+def test_kernel_batch_cleanup_failure_still_answers_the_committed_trees(
+        tmp_path, monkeypatch):
+    """``batch.discard()`` 只是清理：失败也必须返回成功响应与已提交哈希。"""
+    app = create_core_app(
+        core_settings(tmp_path), transport=httpx.MockTransport(forbidden_http))
+    publish_enabled_graph(app, "main", upstream="real-fast")
+    candidate = _batch_candidate(app, "main", name="main-v2")
+    payload = _batch_payload(app, candidate)
+
+    def failing_discard(self):
+        raise OSError("staged-file cleanup failed")
+
+    monkeypatch.setattr(GraphBatch, "discard", failing_discard)
+    response = TestClient(app).post("/internal/v1/graph-batches", json=payload)
+
+    assert response.status_code == 200, response.text
+    trees = response.json()["trees"]
+    assert [(item["id"], item["name"]) for item in trees] == [("main", "main-v2")]
+    content = (app.state.graph_repo.graphs / "main.json").read_bytes()
+    assert content == graph_document_bytes(candidate)
+    assert trees[0]["document_sha256"] == hashlib.sha256(content).hexdigest()
+    # 发布集也已切换：内核运行状态与已提交文件一致。
+    assert app.state.snapshot_set.default_snapshot.tree.name == "main-v2"
+
+
+def test_kernel_batch_response_failure_reports_committed_not_not_committed(
+        tmp_path, monkeypatch):
+    """响应构造在提交后失败：显式 500 ``graph_batch_committed``，绝非普通 500。"""
+    app = create_core_app(
+        core_settings(tmp_path), transport=httpx.MockTransport(forbidden_http))
+    publish_enabled_graph(app, "main", upstream="real-fast")
+    candidate = _batch_candidate(app, "main", name="main-v2")
+    payload = _batch_payload(app, candidate)
+
+    from router.api import routes_graph_batches
+
+    def failing_tree_to_dict(tree):
+        raise RuntimeError("response serialization failed")
+
+    monkeypatch.setattr(routes_graph_batches, "tree_to_dict", failing_tree_to_dict)
+    response = TestClient(app).post("/internal/v1/graph-batches", json=payload)
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "graph_batch_committed"
+    assert detail["message"]
+    # 文件确实已提交（真实字节），发布集也已切换：外围探测即可发现并补偿。
+    content = (app.state.graph_repo.graphs / "main.json").read_bytes()
+    assert content == graph_document_bytes(candidate)
+    assert app.state.snapshot_set.default_snapshot.tree.name == "main-v2"
+
+
+def test_kernel_batch_pre_commit_rejections_write_nothing(tmp_path):
+    """提交前拒绝（过期基线 409 / 非法候选 422）不落盘、不换发布集。"""
+    app = create_core_app(
+        core_settings(tmp_path), transport=httpx.MockTransport(forbidden_http))
+    publish_enabled_graph(app, "main", upstream="real-fast")
+    path = app.state.graph_repo.graphs / "main.json"
+    before = path.read_bytes()
+    before_set = app.state.snapshot_set
+    candidate = _batch_candidate(app, "main", name="main-v2")
+    stale_payload = {"writes": [{
+        "tree": tree_to_dict(candidate), "base_document_sha256": "0" * 64}]}
+
+    stale = TestClient(app).post(
+        "/internal/v1/graph-batches", json=stale_payload)
+
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "graph_conflict"
+    assert path.read_bytes() == before
+    assert app.state.snapshot_set is before_set
+
+    current = app.state.graph_repo.get("main")
+    invalid_document = tree_to_dict(current)
+    for node in invalid_document["root"]["nodes"]:
+        if node["type"] == "target":
+            node["models"] = [{"model": "fast", "reasoning": "unsupported-level"}]
+    invalid = TestClient(app).post("/internal/v1/graph-batches", json={"writes": [{
+        "tree": invalid_document,
+        "base_document_sha256": current.document_sha256}]})
+
+    assert invalid.status_code == 422, invalid.text
+    assert invalid.json()["detail"]
+    assert path.read_bytes() == before
+    assert app.state.snapshot_set is before_set
+
+
+def test_kernel_batch_rollback_failure_is_unknown_not_not_committed(
+        tmp_path, monkeypatch):
+    """提交失败且回滚也失败：文件可能半新半旧，不能回答 503「未提交」。"""
+    app = create_core_app(
+        core_settings(tmp_path), transport=httpx.MockTransport(forbidden_http))
+    publish_enabled_graph(app, "main", upstream="real-fast")
+    candidate = _batch_candidate(app, "main", name="main-v2")
+    payload = _batch_payload(app, candidate)
+
+    def failing_replace(staged_path, path):
+        raise OSError("graph file replace failed")
+
+    def failing_rollback(self):
+        raise GraphStorageError("rollback failed")
+
+    monkeypatch.setattr(
+        RoutingTreeRepo, "_replace_staged", staticmethod(failing_replace))
+    monkeypatch.setattr(GraphBatch, "rollback", failing_rollback)
+    response = TestClient(app).post("/internal/v1/graph-batches", json=payload)
+
+    assert response.status_code == 500, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "graph_batch_rollback_failed"
+    assert detail["message"]
