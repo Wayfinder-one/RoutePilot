@@ -605,6 +605,7 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
 - **内核调度熔断不再感知上游执行失败。** 它只观察决策：设计上内核不做执行结果回写。standalone 外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
 - **VictoriaLogs 输出适配器未实现。** `logging.type` 只支持 `routepilot` 与 `disabled`；事件结构已固定，供将来 `logging.type=victorialogs` 适配器序列化同一批对象。
 - **过期控制台会话不再自动清理。** 外围应用已不再接入旧的 `MaintenanceWorker`（计划 Task 8），过期 `user_sessions` 行会留在 SQLite，直到人工清理。
+- **旧的短（非空白）管理员口令不会自动被判定为公开凭据。** 启动门（以及 `ROUTER_ADMIN_FORCE_RESET=1`）只把「公开已知 / 空白 / 纯空白」口令当作已泄露：内置默认口令、空串，以及 1–16 个字符的纯空白值。旧库里非空白但短于当前 8 字符下限的口令**不**像空/默认口令那样可被轻易猜到，因此不会拦截启动；运维应主动轮换这类账号。更长的或其它花样的纯空白历史口令同样不在自动扫描范围内。
 - **APISIX 插件契约只由静态测试保证。** Lua 源码契约与 Route/ConfigMap 结构由静态测试（`scripts/apisix/test_sr_auto_router.py`）检查，本迭代未在真实 APISIX/OpenResty 运行时验证；真实链路验收留给部署窗口（design §11 非目标）。
 
 ## 快速开始
@@ -641,7 +642,7 @@ ROUTER_ADMIN_EMAIL='admin@example.com' ROUTER_ADMIN_PASSWORD='<strong-password>'
 
 外围进程运行**两个监听**：公开的控制台/`/admin`/`/v1` 监听（`ROUTER_HOST`/`ROUTER_PORT`），以及独立的内部监听（`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`，默认 `127.0.0.1:8402`），后者只提供内核事件通道的 `POST /internal/v1/decision-logs` 与 `/healthz`。compose 中内部监听是容器端口 8400，**不发布到主机**；内核应指向 `http://console:8400/internal/v1/decision-logs`。本机形态则把内核 `logging` 块设为 `{"type": "routepilot", "url": "http://127.0.0.1:8402/internal/v1/decision-logs", "timeout_ms": 1000}`。非 compose 部署必须用防火墙把内部端口限定为只允许内核主机访问。
 
-**管理员凭据是必填项，部署形态没有默认值。** compose 在未显式导出 `ROUTER_ADMIN_EMAIL` 与 `ROUTER_ADMIN_PASSWORD` 时拒绝启动。非 loopback 绑定下，`ROUTER_ADMIN_PASSWORD` 为空、纯空白、短于 8 个字符或等于内置种子口令时，外围同样拒绝启动（最短长度与用户 API 一致）；内置种子值只用于像上面这样的纯本机 loopback 运行，任何实际部署都必须显式设置凭据。若已有数据库仍接受内置默认管理员口令（或空口令），启动也会被拒绝：操作员必须先以 `ROUTER_HOST=127.0.0.1` 启动一次并通过控制台/用户 API 修改这些口令，或显式授权 `ROUTER_ADMIN_FORCE_RESET=1`——该模式会把这些账号的口令重置为 `ROUTER_ADMIN_PASSWORD` 并吊销它们的全部会话。
+**管理员凭据是必填项，部署形态没有默认值。** compose 在未显式导出 `ROUTER_ADMIN_EMAIL` 与 `ROUTER_ADMIN_PASSWORD` 时拒绝启动。非 loopback 绑定下，`ROUTER_ADMIN_PASSWORD` 为空、纯空白、短于 8 个字符或等于内置种子口令时，外围同样拒绝启动（与用户 API 共用同一套策略 `router/password_policy.py`）；内置种子值只用于像上面这样的纯本机 loopback 运行，任何实际部署都必须显式设置凭据。若已有数据库仍接受内置默认管理员口令、空口令或纯空白口令，启动也会被拒绝：操作员必须先以 `ROUTER_HOST=127.0.0.1` 启动一次并通过控制台/用户 API 修改这些口令，或显式授权 `ROUTER_ADMIN_FORCE_RESET=1`——该模式会在**一个批次事务**里把这些账号的口令重置为 `ROUTER_ADMIN_PASSWORD` 并吊销它们的全部会话。这个旧账号检查是**严格只读的 preflight**，在破坏性的 v6→v7 迁移**之前**执行：被拒绝的启动不会动旧库和它的决策日志。只有公开已知、空与纯空白口令会被当作公开凭据；策略细节见[已知限制](#已知限制拆分)。
 
 **只部署内核（接 APISIX + newapi）。** 即 163 形态：无 SQLite、无控制台、无模型上游、无决策日志接收端。使用 `logging.type=disabled` 的 `config.json`，图目录挂持久卷：
 
@@ -697,7 +698,7 @@ ROUTER_JEV_API_KEY='<jev-key>' \
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量（外围进程） |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
 | `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值（仅 loopback） | 首次启动的管理员账号；**compose 部署必须显式提供（没有默认值）；非 loopback 绑定下口令至少 8 个字符且不得是内置默认值** |
-| `ROUTER_ADMIN_FORCE_RESET` | `false` | 显式授权一次性重置仍接受内置默认口令或空口令的既有 active 账号（改为 `ROUTER_ADMIN_PASSWORD` 并吊销其会话）；仅非 loopback 绑定生效 |
+| `ROUTER_ADMIN_FORCE_RESET` | `false` | 显式授权一次性、整批原子的重置：仍接受内置默认口令、空口令或纯空白口令的既有 active 账号改为 `ROUTER_ADMIN_PASSWORD` 并吊销其会话；仅非 loopback 绑定生效 |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | 控制台会话有效期 |
 
 外围进程**不读取** `ROUTER_JEV_API_KEY`：该变量只属于内核进程（见内核配置），控制台「测试连接」由内核带 Key 执行（I6）。

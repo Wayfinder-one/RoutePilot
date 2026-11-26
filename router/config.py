@@ -9,9 +9,14 @@ from dataclasses import dataclass
 DEFAULT_ADMIN_EMAIL = "admin@test.com"
 DEFAULT_ADMIN_PASSWORD = "1qaz@WSX"
 
-#: 用户口令最小长度（唯一来源）。控制台创建用户/改密（Pydantic ``min_length``）
-#: 与管理员启动守卫必须共用这个数字，禁止各自写死 8。
-MIN_ADMIN_PASSWORD_LENGTH = 8
+#: 用户口令最小长度：唯一来源在 ``router.password_policy``，这里 re-export 以
+#: 保持既有的 ``from router.config import MIN_ADMIN_PASSWORD_LENGTH`` 不变
+#: （启动守卫 / 用户 API / 测试都依赖这个公开名，数字只定义一次）。
+#: import 必须放在 DEFAULT_ADMIN_PASSWORD 之后：password_policy 反过来从本
+#: 模块读取公开默认口令，两个导入顺序都要能完成初始化。
+from router.password_policy import (  # noqa: E402
+    MIN_PASSWORD_LENGTH as MIN_ADMIN_PASSWORD_LENGTH,
+)
 
 #: 允许使用默认管理员凭据的绑定主机（仅本机回环）。
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})

@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from router import auth
 from router.api.app import create_app
 from router.config import (
     DEFAULT_ADMIN_PASSWORD,
@@ -40,6 +42,7 @@ from tests.routing_fixtures import (
     test_settings,
     tree_dict,
 )
+from tests.test_db import build_v6_database, create_v6_jev_service
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 JEV_ENV = {"jev_url": "http://jev.test", "jev_model": "NeoHorse-Jev-4B"}
@@ -678,3 +681,319 @@ def test_peripheral_does_not_mount_the_kernel_jev_test(tmp_path):
     response = TestClient(app).post("/internal/v1/jev-test", json={
         "base_url": "http://jev.test", "model": "m", "text": "t"})
     assert response.status_code == 404, response.text
+
+
+# ---------------------------------------------------------------------------
+# 第四轮复审 Important 1：v6→v7 是破坏性迁移，未授权的 stale admin 必须在
+# 任何迁移/种子/写入之前拒绝（只读 preflight）。旧实现先 migrate 再拒绝，
+# 拒绝时 request_logs/graph_snapshots/request_snapshots 已被删、jev_services
+# 的 api_key 已丢。
+# ---------------------------------------------------------------------------
+
+def _build_v6_with_stale_admin(tmp_path, password, *, name="v6-stale.db"):
+    """真实 v6 库 + 一条 active admin + 三张日志表/旧 JEV 密钥各一行。"""
+    db_path = str(tmp_path / name)
+    conn = build_v6_database(db_path)
+    try:
+        UserRepo(conn).create("admin@test.com", password, role="admin")
+        conn.execute(
+            "INSERT INTO request_logs (id, ts, decision) VALUES "
+            "('old-request', '2026-01-01T00:00:00+08:00', 'route')")
+        conn.execute(
+            "INSERT INTO graph_snapshots "
+            "(snapshot_id, tree_id, snapshot_revision, graph, created_at) "
+            "VALUES ('snap-1', 'main', 'r1', '{}', "
+            "'2026-01-01T00:00:00+08:00')")
+        conn.execute(
+            "INSERT INTO request_snapshots "
+            "(request_id, graph_snapshot_id, trace, created_at) "
+            "VALUES ('req-1', 'snap-1', '{}', '2026-01-01T00:00:00+08:00')")
+        create_v6_jev_service(conn)
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def _v6_state(db_path):
+    """用裸连接读 v6 库：不跑 WAL pragma、不写任何东西。"""
+    conn = sqlite3.connect(db_path)
+    try:
+        version = conn.execute(
+            "SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(jev_services)")}
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("request_logs", "graph_snapshots", "request_snapshots")
+        }
+        api_key = conn.execute(
+            "SELECT api_key FROM jev_services WHERE id = 'j1'").fetchone()[0]
+        admin_hash = conn.execute(
+            "SELECT password_hash FROM users WHERE email = 'admin@test.com'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return {"version": version, "tables": tables, "columns": columns,
+            "counts": counts, "api_key": api_key, "admin_hash": admin_hash}
+
+
+def _assert_v6_untouched(db_path):
+    state = _v6_state(db_path)
+    assert state["version"] == 6
+    assert {"request_logs", "graph_snapshots", "request_snapshots"} \
+        <= state["tables"]
+    assert state["columns"] and "api_key" in state["columns"]
+    assert state["counts"] == {
+        "request_logs": 1, "graph_snapshots": 1, "request_snapshots": 1}
+    assert state["api_key"] == "old-secret"
+    return state
+
+
+def test_refused_stale_admin_leaves_a_v6_database_untouched(tmp_path):
+    """Important 1: 拒绝启动时 v6 库必须原封不动（迁移根本不能开始）。"""
+    db_path = _build_v6_with_stale_admin(tmp_path, DEFAULT_ADMIN_PASSWORD)
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password")
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "admin@test.com" in message
+    assert "ROUTER_HOST=127.0.0.1" in message
+    assert "ROUTER_ADMIN_FORCE_RESET" in message
+
+    state = _assert_v6_untouched(db_path)
+    # 未授权的启动也不得偷偷重置口令。
+    assert auth.verify_password(
+        DEFAULT_ADMIN_PASSWORD, state["admin_hash"]) is True
+
+
+def test_authorized_force_reset_still_migrates_a_v6_database(tmp_path):
+    """Important 1 正向对照：显式授权后 v6→v7 照常完成并重置旧默认口令。"""
+    db_path = _build_v6_with_stale_admin(
+        tmp_path, DEFAULT_ADMIN_PASSWORD, name="v6-reset.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password", admin_force_reset=True)
+    app = create_app(settings)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 7
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        assert not ({"request_logs", "graph_snapshots",
+                     "request_snapshots"} & tables)
+        columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(jev_services)")}
+        assert "api_key" not in columns
+    finally:
+        conn.close()
+
+    with TestClient(app) as client:
+        old = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": DEFAULT_ADMIN_PASSWORD})
+        assert old.status_code == 401, old.text
+        new = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": "new-strong-password"})
+        assert new.status_code == 200, new.text
+
+
+# ---------------------------------------------------------------------------
+# 第四轮复审 Important 2：纯空白口令也是「信息为零」的公开凭据。
+# ---------------------------------------------------------------------------
+
+def test_whitespace_only_legacy_admin_password_refuses_before_migration(
+        tmp_path):
+    """旧库把 8 个空格持久化后，非 loopback 启动必须拒绝且不迁移。"""
+    db_path = _build_v6_with_stale_admin(
+        tmp_path, "        ", name="v6-whitespace.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password")
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "admin@test.com" in message
+    assert "ROUTER_ADMIN_FORCE_RESET" in message
+    state = _assert_v6_untouched(db_path)
+    assert auth.verify_password("        ", state["admin_hash"]) is True
+
+
+def test_force_reset_clears_a_persisted_whitespace_password(tmp_path):
+    """显式授权后：8 空格口令 401、旧会话 401、新 env 口令 200。"""
+    db_path = str(tmp_path / "whitespace-reset.db")
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        seed_default(conn)
+        admin = UserRepo(conn).create("admin@test.com", "        ",
+                                      role="admin")
+        stale_token, _ = SessionRepo(conn).create(admin["id"], 168)
+    finally:
+        conn.close()
+
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password", admin_force_reset=True)
+    app = create_app(settings)
+    with TestClient(app) as client:
+        blank = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": "        "})
+        assert blank.status_code == 401, blank.text
+        revoked = client.get("/admin/me", headers={
+            "Authorization": f"Bearer {stale_token}"})
+        assert revoked.status_code == 401, revoked.text
+        new = client.post("/admin/login", json={
+            "email": "admin@test.com", "password": "new-strong-password"})
+        assert new.status_code == 200, new.text
+
+
+def test_legacy_short_non_whitespace_password_is_not_auto_flagged(tmp_path):
+    """策略决定：旧的短（非空白）口令不像空白/默认口令那样公开可知，不拦启动。
+
+    启动门只拦「公开已知 / 空白 / 纯空白」；操作员应主动轮换旧的短口令。
+    """
+    db_path = _legacy_user_db(
+        tmp_path, [("admin@test.com", "1234567", "admin")],
+        name="short-legacy.db")
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password")
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.post("/admin/login", json={
+            "email": "admin@test.com",
+            "password": "1234567"}).status_code == 200
+
+
+def test_preflight_scan_is_read_only_and_tolerates_old_schemas(tmp_path):
+    """preflight 辅助：只读、缺库/缺表返回空、缺 status 列时按 active 处理。"""
+    from router.api.app import _preflight_stale_admin_users
+
+    missing = str(tmp_path / "does-not-exist.db")
+    assert _preflight_stale_admin_users(missing) == []
+    assert not Path(missing).exists(), "preflight 不得创建数据库文件"
+
+    # 有文件但没有 users 表（例如更旧的库/别的 SQLite）。
+    other = str(tmp_path / "other.db")
+    conn = sqlite3.connect(other)
+    conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+    assert _preflight_stale_admin_users(other) == []
+
+    # 非常旧的 users 表没有 status 列：所有行都当作 active。
+    legacy = str(tmp_path / "legacy-schema.db")
+    conn = sqlite3.connect(legacy)
+    conn.execute(
+        "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, "
+        "password_hash TEXT NOT NULL)")
+    conn.execute("INSERT INTO users VALUES ('old', 'old@test.com', ?)",
+                 (auth.hash_password(DEFAULT_ADMIN_PASSWORD),))
+    conn.commit()
+    conn.close()
+    stale = _preflight_stale_admin_users(legacy)
+    assert [user["email"] for user in stale] == ["old@test.com"]
+    assert auth.verify_password(
+        DEFAULT_ADMIN_PASSWORD, stale[0]["password_hash"]) is True
+
+    # v7 库：只报 active 且接受公开口令的行；强口令/disabled 不报。
+    db_path = str(tmp_path / "v7.db")
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        repo = UserRepo(conn)
+        repo.create("stale@test.com", DEFAULT_ADMIN_PASSWORD, role="admin")
+        repo.create("strong@test.com", "strong-enough-1", role="admin")
+        disabled = repo.create(
+            "disabled@test.com", DEFAULT_ADMIN_PASSWORD, role="admin")
+        repo.update(disabled["id"], status="disabled")
+    finally:
+        conn.close()
+    assert [user["email"] for user in _preflight_stale_admin_users(db_path)] \
+        == ["stale@test.com"]
+
+
+# ---------------------------------------------------------------------------
+# 第四轮复审 Minor：多账号强制重置必须是整批原子（不是逐账号事务）。
+# ---------------------------------------------------------------------------
+
+def test_force_reset_is_batch_atomic_across_multiple_stale_accounts(tmp_path):
+    """第二个账号吊销会话失败时，第一个账号也必须回滚；修好后重试两个都重置。"""
+    db_path = str(tmp_path / "batch-atomic.db")
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        seed_default(conn)
+        repo = UserRepo(conn)
+        first = repo.create("first@test.com", DEFAULT_ADMIN_PASSWORD,
+                            role="admin")
+        second = repo.create("second@test.com", DEFAULT_ADMIN_PASSWORD,
+                             role="viewer")
+        SessionRepo(conn).create(first["id"], 168)
+        SessionRepo(conn).create(second["id"], 168)
+        # 固定处理顺序：旧实现逐账号提交，first 先成功、second 失败会留下半状态。
+        conn.execute(
+            "UPDATE users SET created_at = '2026-01-01T00:00:00+08:00' "
+            "WHERE id = ?", (first["id"],))
+        conn.execute(
+            "UPDATE users SET created_at = '2026-01-02T00:00:00+08:00' "
+            "WHERE id = ?", (second["id"],))
+        before = {user["id"]: user["password_hash"] for user in repo.list()}
+        conn.execute(
+            "CREATE TRIGGER fail_second_session_delete "
+            "BEFORE DELETE ON user_sessions "
+            f"WHEN OLD.user_id = '{second['id']}' "
+            "BEGIN SELECT RAISE(ABORT, 'second session revoke failed'); END")
+        conn.commit()
+    finally:
+        conn.close()
+
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password", admin_force_reset=True)
+    with pytest.raises(Exception) as excinfo:
+        create_app(settings)
+    assert "second session revoke failed" in str(excinfo.value)
+
+    conn = connect(db_path)
+    try:
+        hashes = {row["id"]: row["password_hash"]
+                  for row in conn.execute("SELECT id, password_hash FROM users")}
+        assert hashes == before, "整批重置必须回滚：任何账号都不得被改掉"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM user_sessions").fetchone()[0] == 2
+        conn.execute("DROP TRIGGER fail_second_session_delete")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 修好触发器后重试：整批成功，两个账号的口令都换、会话都吊销。
+    app = create_app(settings)
+    conn = connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM user_sessions").fetchone()[0] == 0
+        assert auth.verify_password(
+            DEFAULT_ADMIN_PASSWORD,
+            UserRepo(conn).get_by_email("first@test.com")["password_hash"]
+        ) is False
+        assert auth.verify_password(
+            DEFAULT_ADMIN_PASSWORD,
+            UserRepo(conn).get_by_email("second@test.com")["password_hash"]
+        ) is False
+    finally:
+        conn.close()
+    with TestClient(app) as client:
+        for email in ("first@test.com", "second@test.com"):
+            assert client.post("/admin/login", json={
+                "email": email,
+                "password": DEFAULT_ADMIN_PASSWORD}).status_code == 401
+            assert client.post("/admin/login", json={
+                "email": email,
+                "password": "new-strong-password"}).status_code == 200

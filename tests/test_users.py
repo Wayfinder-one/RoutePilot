@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from router import auth
 from router.api.app import create_app
+from router.config import DEFAULT_ADMIN_PASSWORD
 from router.maintenance import MaintenanceWorker
 from router.store.db import connect, migrate
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
@@ -760,3 +761,152 @@ def test_login_without_user_auth_flag_is_legacy_open(tmp_path):
         core_transport=core_app_for(tmp_path)))
     assert c2.get("/admin/models",
                   headers={"Authorization": "Bearer whatever"}).status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# 第四轮复审 Important 2：统一口令策略（router.password_policy）。
+# 纯空白口令和空/默认口令一样是「信息为零」的公开凭据：启动守卫、DTO
+# （创建/自助改密/管理员重置）与旧库 stale 扫描必须共用同一判断。
+# --------------------------------------------------------------------------- #
+
+def test_password_policy_is_the_single_source_of_the_minimum_length():
+    from router import config, password_policy
+    assert password_policy.MIN_PASSWORD_LENGTH == 8
+    assert config.MIN_ADMIN_PASSWORD_LENGTH == password_policy.MIN_PASSWORD_LENGTH
+
+
+@pytest.mark.parametrize("password", [
+    "", " ", "        ", "\t\t\t\t\t\t\t\t", " \t\n", "short7", None, 12345678,
+])
+def test_password_policy_error_rejects_blank_short_and_non_strings(password):
+    from router.password_policy import password_policy_error
+    error = password_policy_error(password)
+    assert isinstance(error, str) and error, (password, error)
+
+
+@pytest.mark.parametrize("password", ["abcdefgh", "1qaz@WSX", " valid pass 1 "])
+def test_password_policy_error_accepts_well_formed_strings(password):
+    from router.password_policy import password_policy_error
+    # 公开默认口令由启动守卫单独拒绝；策略本身只检查「形状是否可用」。
+    assert password_policy_error(password) is None
+
+
+def test_public_password_candidates_cover_default_blank_and_bounded_whitespace():
+    from router import password_policy
+    assert DEFAULT_ADMIN_PASSWORD in password_policy.PUBLIC_PASSWORDS
+    assert "" in password_policy.PUBLIC_PASSWORDS
+    # 空白枚举有界（1..16）：更长的纯空白旧口令不在自动识别范围（见 README）。
+    for length in range(1, 17):
+        assert " " * length in password_policy.PUBLIC_PASSWORDS
+    assert " " * 17 not in password_policy.PUBLIC_PASSWORDS
+    assert "abcdefgh" not in password_policy.PUBLIC_PASSWORDS
+    assert password_policy.is_public_password(DEFAULT_ADMIN_PASSWORD)
+    assert password_policy.is_public_password("        ")
+    assert not password_policy.is_public_password("abcdefgh")
+
+
+def test_weak_stored_password_helper_detects_public_legacy_hashes():
+    from router import password_policy
+    for password in (DEFAULT_ADMIN_PASSWORD, "", " ", "        ", " " * 16):
+        assert password_policy.is_weak_stored_password(
+            auth.hash_password(password)) is True, password
+    # 非公开可知的口令（强口令、旧的短口令、超界的长纯空白）不自动拦截。
+    for password in ("abcdefgh", "1234567", " " * 17):
+        assert password_policy.is_weak_stored_password(
+            auth.hash_password(password)) is False, password
+    assert password_policy.is_weak_stored_password("nonsense") is False
+
+
+@pytest.mark.parametrize("password", ["        ", "\t\t\t\t\t\t\t\t", " " * 12])
+def test_user_create_rejects_whitespace_only_password(tmp_path, password):
+    c = api_client(tmp_path)
+    r = c.post("/admin/users", json={"email": "ws@test.com",
+                                     "password": password},
+               headers=admin_headers(c))
+    assert r.status_code == 422, r.text
+    # 正向对照：8 字符非空白口令照常创建。
+    ok = c.post("/admin/users", json={"email": "ws@test.com",
+                                      "password": "abcdefgh"},
+                headers=admin_headers(c))
+    assert ok.status_code == 201, ok.text
+
+
+def test_admin_password_reset_rejects_whitespace_only_password(tmp_path):
+    c = api_client(tmp_path)
+    headers = admin_headers(c)
+    user = create_user(c, "member@test.com", "member-pass-1")
+    r = c.post(f"/admin/users/{user['id']}/password",
+               json={"new_password": "        "}, headers=headers)
+    assert r.status_code == 422, r.text
+    # 被拒请求不写任何东西：旧口令仍可登录。
+    assert c.post("/admin/login", json={
+        "email": "member@test.com",
+        "password": "member-pass-1"}).status_code == 200
+
+
+def test_self_password_change_rejects_whitespace_only_password(tmp_path):
+    c = api_client(tmp_path)
+    headers = bearer(login(c))
+    r = c.post("/admin/me/password", json={
+        "old_password": DEFAULT_ADMIN_PASSWORD,
+        "new_password": "        "}, headers=headers)
+    assert r.status_code == 422, r.text
+    # 旧口令与会话都仍然有效。
+    assert c.get("/admin/me", headers=headers).status_code == 200
+    assert c.post("/admin/login", json={
+        "email": "admin@test.com",
+        "password": DEFAULT_ADMIN_PASSWORD}).status_code == 200
+
+
+def test_password_policy_and_config_import_in_either_order():
+    """这两个模块互相导入（config re-export 长度、policy 读默认口令），两个入口
+    顺序都必须能完成初始化。子进程隔离，避免 pytest 已导入过模块掩盖问题。"""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for code in (
+        "import router.config; import router.password_policy",
+        "import router.password_policy; import router.config",
+    ):
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=root,
+            capture_output=True, text=True)
+        assert result.returncode == 0, (code, result.stderr)
+
+
+def test_reset_passwords_and_sessions_batch_primitive(conn):
+    """批量改密 + 吊销会话：序列/映射两种入参、返回更新行数、空批次 no-op。"""
+    repo = UserRepo(conn)
+    first = repo.create("multi1@test.com", "old-pass-1", role="admin")
+    second = repo.create("multi2@test.com", "old-pass-2")
+    SessionRepo(conn).create(first["id"], 168)
+    SessionRepo(conn).create(second["id"], 168)
+
+    assert repo.reset_passwords_and_sessions([
+        (first["id"], "new-pass-1"),
+        (second["id"], "new-pass-2"),
+    ]) == 2
+    assert conn.execute("SELECT COUNT(*) FROM user_sessions").fetchone()[0] == 0
+    assert auth.verify_password(
+        "new-pass-1", repo.get(first["id"])["password_hash"]) is True
+    assert auth.verify_password(
+        "new-pass-2", repo.get(second["id"])["password_hash"]) is True
+
+    # 映射形式等价（单一实现，避免两套批量语义）。
+    SessionRepo(conn).create(first["id"], 168)
+    assert repo.reset_passwords_and_sessions(
+        {first["id"]: "new-pass-3"}) == 1
+    assert auth.verify_password(
+        "new-pass-3", repo.get(first["id"])["password_hash"]) is True
+
+    # 单账号方法委托给批量原语（同一事务形状）。
+    SessionRepo(conn).create(second["id"], 168)
+    assert repo.reset_password_and_sessions(second["id"], "new-pass-4") is True
+    assert conn.execute("SELECT COUNT(*) FROM user_sessions").fetchone()[0] == 0
+    assert auth.verify_password(
+        "new-pass-4", repo.get(second["id"])["password_hash"]) is True
+
+    # 空批次什么都不做（启动扫描没有 stale 账号时不会打开写事务）。
+    assert repo.reset_passwords_and_sessions([]) == 0

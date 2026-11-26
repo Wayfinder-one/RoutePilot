@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from router import auth
 from router.api.deps import get_conn
-from router.config import MIN_ADMIN_PASSWORD_LENGTH
+from router.password_policy import MIN_PASSWORD_LENGTH, password_policy_error
 from router.store.repositories import (ChangeRepo, EmailExists, SessionRepo,
                                        UserRepo, write_transaction)
 
@@ -85,6 +85,17 @@ def _normalize_validated_email(value: str) -> str:
     return email
 
 
+def _validated_password(value: str) -> str:
+    """统一的写入口令校验（422）：与启动守卫、旧库 stale 扫描共用同一策略。
+
+    纯空白（哪怕 8 个空格、长度达标）也是「信息为零」的公开凭据，不能写进库。
+    """
+    error = password_policy_error(value)
+    if error is not None:
+        raise ValueError(error)
+    return value
+
+
 # --------------------------------------------------------------------------- #
 # Request bodies
 # --------------------------------------------------------------------------- #
@@ -96,18 +107,28 @@ class LoginIn(BaseModel):
 
 class PasswordChangeIn(BaseModel):
     old_password: str
-    new_password: str = Field(min_length=MIN_ADMIN_PASSWORD_LENGTH)
+    new_password: str = Field(min_length=MIN_PASSWORD_LENGTH)
+
+    @field_validator("new_password")
+    @classmethod
+    def _new_password(cls, value: str) -> str:
+        return _validated_password(value)
 
 
 class UserCreateIn(BaseModel):
     email: str
-    password: str = Field(min_length=MIN_ADMIN_PASSWORD_LENGTH)
+    password: str = Field(min_length=MIN_PASSWORD_LENGTH)
     role: Literal["admin", "viewer"] = "viewer"
 
     @field_validator("email")
     @classmethod
     def _email(cls, value: str) -> str:
         return _normalize_validated_email(value)
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, value: str) -> str:
+        return _validated_password(value)
 
 
 class UserUpdateIn(BaseModel):
@@ -124,7 +145,12 @@ class UserUpdateIn(BaseModel):
 
 
 class UserPasswordIn(BaseModel):
-    new_password: str = Field(min_length=MIN_ADMIN_PASSWORD_LENGTH)
+    new_password: str = Field(min_length=MIN_PASSWORD_LENGTH)
+
+    @field_validator("new_password")
+    @classmethod
+    def _new_password(cls, value: str) -> str:
+        return _validated_password(value)
 
 
 # --------------------------------------------------------------------------- #

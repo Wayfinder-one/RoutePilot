@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
@@ -319,24 +320,51 @@ class UserRepo:
             )
         return cursor.rowcount > 0
 
+    def reset_passwords_and_sessions(
+        self,
+        accounts: Iterable[tuple[str, str]] | Mapping[str, str],
+    ) -> int:
+        """Rotate several accounts' passwords and revoke their sessions atomically.
+
+        ``accounts`` is an iterable of ``(user_id, password)`` pairs (a
+        ``{user_id: password}`` mapping is accepted too).  The whole batch runs
+        inside ONE ``BEGIN IMMEDIATE`` transaction: multi-account startup
+        remediation must not leave a partially fixed database when one account
+        fails, otherwise the next start no longer sees the already-reset rows as
+        stale while the remaining rows (and their live sessions) are untouched.
+
+        Hashes are computed before the transaction starts (no scrypt work while
+        holding the write lock).  Returns the number of updated user rows.
+        """
+        pairs = list(accounts.items()) if isinstance(accounts, Mapping) \
+            else list(accounts)
+        if not pairs:
+            return 0
+        updates = [(user_id, auth.hash_password(password))
+                   for user_id, password in pairs]
+        now = now_iso()
+        updated = 0
+        with write_transaction(self.conn):
+            for user_id, password_hash in updates:
+                cursor = self.conn.execute(
+                    "UPDATE users SET password_hash = ?, updated_at = ? "
+                    "WHERE id = ?", (password_hash, now, user_id),
+                )
+                updated += cursor.rowcount
+                self.conn.execute(
+                    "DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+        return updated
+
     def reset_password_and_sessions(self, user_id: str, password: str) -> bool:
         """Rotate one account's password and revoke its sessions atomically.
 
         Startup remediation (C2) must never leave a half state: if the password
         were rotated but the old sessions survived a later failure, the next
         start would no longer see the account as stale and the pre-reset bearer
-        tokens would keep working.  Both writes therefore share one ``BEGIN
-        IMMEDIATE`` transaction.
+        tokens would keep working.  Delegates to the batch primitive so single-
+        and multi-account resets share one transaction shape.
         """
-        password_hash = auth.hash_password(password)
-        with write_transaction(self.conn):
-            cursor = self.conn.execute(
-                "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
-                (password_hash, now_iso(), user_id),
-            )
-            self.conn.execute(
-                "DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
-        return cursor.rowcount > 0
+        return self.reset_passwords_and_sessions([(user_id, password)]) > 0
 
     def delete(self, user_id: str) -> bool:
         with transaction(self.conn):
