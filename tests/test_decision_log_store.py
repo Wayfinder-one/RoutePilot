@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
+from router.api.internal_app import create_internal_app, create_service_apps
 from router.decision_events import build_decision_event, replay_payload, summary_payload
 from router.decision_log_store import STORE_LIMIT, DecisionLogStore
 from router.routing.tree import tree_from_dict
@@ -36,6 +37,22 @@ def _event(event_id, *, ts="2026-11-25T10:00:00+08:00", model="fast",
 
 def _receive(client, event):
     return client.post("/internal/v1/decision-logs", json=event)
+
+
+def _service_apps(tmp_path, **overrides):
+    """Public console app + internal receiver app sharing one decision-log store."""
+    settings = test_settings(tmp_path, **overrides)
+    return create_service_apps(settings)
+
+
+def _clients(tmp_path, **overrides):
+    public_app, internal_app = _service_apps(tmp_path, **overrides)
+    return public_app, internal_app, TestClient(public_app), TestClient(internal_app)
+
+
+def _internal_client_for(public_app):
+    """Internal receiver app over the public app's store (for split_app fixtures)."""
+    return TestClient(create_internal_app(public_app.state.decision_logs))
 
 
 def test_store_keeps_only_twenty_complete_events():
@@ -88,17 +105,17 @@ def test_store_rejects_structurally_incomplete_events():
 
 
 def test_receiver_rejects_incomplete_events_and_keeps_the_log_readable(tmp_path):
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app)
-    assert _receive(client, _event("good-before-probe")).status_code == 200
+    public_app, _, public_client, internal_client = _clients(tmp_path)
+    assert _receive(internal_client, _event("good-before-probe")).status_code == 200
     # 坏事件：422 且不进入 deque，已保留事件与读取端点都不受影响。
     probe = {"schema_version": 1, "event_type": "routepilot.decision", "graph": {}}
-    assert _receive(client, probe).status_code == 422
-    listed = client.get("/admin/requests/recent")
+    assert _receive(internal_client, probe).status_code == 422
+    listed = public_client.get("/admin/requests/recent")
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["requests"]] == ["good-before-probe"]
-    assert client.get("/admin/requests/good-before-probe/replay").status_code == 200
-    assert [event["id"] for event in app.state.decision_logs.recent()] == [
+    assert public_client.get(
+        "/admin/requests/good-before-probe/replay").status_code == 200
+    assert [event["id"] for event in public_app.state.decision_logs.recent()] == [
         "good-before-probe"]
 
 
@@ -151,48 +168,46 @@ def test_replay_projection_is_the_complete_single_event():
 
 
 def test_receiver_stores_the_event_without_admin_login(tmp_path):
-    settings = test_settings(tmp_path, user_auth=True)
-    client = TestClient(create_app(settings))
-    # 管理面需要登录，但内核的日志接收口在 /admin 之外，必须能直接写入。
-    assert client.get("/admin/requests/recent").status_code == 401
+    _, _, public_client, internal_client = _clients(tmp_path, user_auth=True)
+    # 管理面需要登录；接收口在独立内部监听上，内核投递时不带管理面会话。
+    assert public_client.get("/admin/requests/recent").status_code == 401
     event = _event("from-kernel")
-    response = _receive(client, event)
+    response = _receive(internal_client, event)
     assert response.status_code == 200, response.text
-    assert client.post("/admin/login", json={
+    assert public_client.post("/admin/login", json={
         "email": "admin@test.com", "password": "1qaz@WSX"}).status_code == 200
-    token = client.post("/admin/login", json={
+    token = public_client.post("/admin/login", json={
         "email": "admin@test.com", "password": "1qaz@WSX"}).json()["token"]
-    listed = client.get(
+    listed = public_client.get(
         "/admin/requests/recent", headers={"Authorization": f"Bearer {token}"}).json()
     assert [item["id"] for item in listed["requests"]] == ["from-kernel"]
 
 
 def test_receiver_rejects_malformed_events_without_storing(tmp_path, monkeypatch):
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app)
-    assert client.post(
+    public_app, _, _, internal_client = _clients(tmp_path)
+    assert internal_client.post(
         "/internal/v1/decision-logs", content=b"{not json",
         headers={"content-type": "application/json"}).status_code == 400
-    assert client.post("/internal/v1/decision-logs", json=[]).status_code == 422
-    assert client.post(
+    assert internal_client.post(
+        "/internal/v1/decision-logs", json=[]).status_code == 422
+    assert internal_client.post(
         "/internal/v1/decision-logs", json={"event_type": "routepilot.other"}
     ).status_code == 422
     secret = _event("secret-event")
     secret["graph"]["jev"]["api_key"] = "must-not-enter-the-log"
-    assert _receive(client, secret).status_code == 422
-    assert app.state.decision_logs.recent() == []
+    assert _receive(internal_client, secret).status_code == 422
+    assert public_app.state.decision_logs.recent() == []
     # 请求大小上限：内核事件内嵌整图，但不能成为无界接收器。
     monkeypatch.setattr("router.api.routes_logs.MAX_DECISION_EVENT_BYTES", 32)
-    assert _receive(client, _event("too-large")).status_code == 413
-    assert app.state.decision_logs.recent() == []
+    assert _receive(internal_client, _event("too-large")).status_code == 413
+    assert public_app.state.decision_logs.recent() == []
 
 
 def test_recent_returns_summaries_with_presenter_fields(tmp_path):
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app)
+    _, _, public_client, internal_client = _clients(tmp_path)
     for index in range(2):
-        assert _receive(client, _event(f"recent-{index}")).status_code == 200
-    response = client.get("/admin/requests/recent")
+        assert _receive(internal_client, _event(f"recent-{index}")).status_code == 200
+    response = public_client.get("/admin/requests/recent")
     assert response.status_code == 200
     body = response.json()
     assert [item["id"] for item in body["requests"]] == ["recent-1", "recent-0"]
@@ -215,10 +230,12 @@ def test_replay_serves_the_events_own_graph_after_the_current_graph_moved(tmp_pa
     repo.create(tree_from_dict(tree_dict("main", enabled=True, default=True)))
     app = split_app_for(settings=settings)
     client = TestClient(app)
+    internal_client = _internal_client_for(app)
 
     logged = _event("old-graph")
     logged["graph"]["name"] = "日志里的旧图"
-    assert _receive(client, logged).status_code == 200
+    # 内核事件只投递到独立内部监听，绝不经过公开控制台监听。
+    assert _receive(internal_client, logged).status_code == 200
 
     # 当前图后来被修改（经外围代理写入内核）：历史回放仍只读日志事件里的旧图。
     current = client.get("/admin/trees/main").json()["tree"]
@@ -239,22 +256,23 @@ def test_replay_serves_the_events_own_graph_after_the_current_graph_moved(tmp_pa
 
 
 def test_evicted_and_unknown_replays_are_404(tmp_path):
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app)
+    _, _, public_client, internal_client = _clients(tmp_path)
     for index in range(21):
-        assert _receive(client, _event(f"e{index}")).status_code == 200
-    assert client.get("/admin/requests/e0/replay").status_code == 404
-    assert client.get("/admin/requests/e1/replay").status_code == 200
-    missing = client.get("/admin/requests/never-existed/replay")
+        assert _receive(internal_client, _event(f"e{index}")).status_code == 200
+    assert public_client.get("/admin/requests/e0/replay").status_code == 404
+    assert public_client.get("/admin/requests/e1/replay").status_code == 200
+    missing = public_client.get("/admin/requests/never-existed/replay")
     assert missing.status_code == 404
     assert missing.json() == {"detail": "unknown request"}
 
 
 def test_restart_clears_the_memory_decision_logs(tmp_path):
     settings = test_settings(tmp_path)
-    first = TestClient(create_app(settings))
-    assert _receive(first, _event("volatile")).status_code == 200
-    assert first.get("/admin/requests/volatile/replay").status_code == 200
+    public_app, internal_app = create_service_apps(settings)
+    first_public = TestClient(public_app)
+    first_internal = TestClient(internal_app)
+    assert _receive(first_internal, _event("volatile")).status_code == 200
+    assert first_public.get("/admin/requests/volatile/replay").status_code == 200
     # 同一目录、同一数据库重启：日志只存在内存，重启即清空，绝不从 SQLite 恢复。
     restarted = TestClient(create_app(settings))
     assert restarted.get("/admin/requests/recent").json() == {"requests": []}
@@ -264,10 +282,10 @@ def test_restart_clears_the_memory_decision_logs(tmp_path):
 def test_decision_log_store_has_no_sqlite_log_tables(tmp_path):
     """v7 迁移删除了三张旧日志表：内存事件没有任何 SQLite 落点。"""
     settings = test_settings(tmp_path)
-    app = create_app(settings)
-    client = TestClient(app)
+    _, internal_app = create_service_apps(settings)
+    internal_client = TestClient(internal_app)
     for index in range(20):
-        assert _receive(client, _event(f"mem-{index}")).status_code == 200
+        assert _receive(internal_client, _event(f"mem-{index}")).status_code == 200
     conn = connect(settings.db_path)
     try:
         tables = {row[0] for row in conn.execute(
@@ -278,15 +296,14 @@ def test_decision_log_store_has_no_sqlite_log_tables(tmp_path):
 
 
 def test_overview_only_counts_the_retained_events(tmp_path):
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app)
+    _, _, public_client, internal_client = _clients(tmp_path)
     for event in (
         _event("d1", ts="2026-11-24T10:00:00+08:00", model="fast", sticky_hit=1),
         _event("d2", ts="2026-11-25T10:00:00+08:00", model="fast"),
         _event("d3", ts="2026-11-25T11:00:00+08:00", model="strong", top=0.2),
     ):
-        assert _receive(client, event).status_code == 200
-    overview = client.get("/admin/overview").json()
+        assert _receive(internal_client, event).status_code == 200
+    overview = public_client.get("/admin/overview").json()
     assert overview["total"] == 3
     assert overview["sticky"] == 1
     assert overview["daily"] == [
@@ -297,20 +314,39 @@ def test_overview_only_counts_the_retained_events(tmp_path):
     assert sum(bucket["count"] for bucket in overview["confidence"]) == 3
     # 第 21 条淘汰最旧事件后，统计只覆盖当前保留的 20 条。
     for index in range(19):
-        assert _receive(client, _event(f"roll-{index}")).status_code == 200
-    retained = client.get("/admin/overview").json()
+        assert _receive(internal_client, _event(f"roll-{index}")).status_code == 200
+    retained = public_client.get("/admin/overview").json()
     assert retained["total"] == 20
     assert retained["daily"] == [{"d": "2026-11-25", "count": 20}]
 
-    stats = client.get("/admin/requests/stats").json()
+    stats = public_client.get("/admin/requests/stats").json()
     assert stats["ring_size"] == 20
     assert stats["ring_limit"] == 20
 
 
 def test_changes_still_reads_the_peripheral_repository(tmp_path):
-    app = create_app(test_settings(tmp_path))
-    client = TestClient(app)
-    assert client.get("/admin/changes").json() == {"changes": []}
+    _, _, public_client, _ = _clients(tmp_path)
+    assert public_client.get("/admin/changes").json() == {"changes": []}
+
+
+def test_receiver_is_isolated_on_the_internal_listener(tmp_path):
+    """I5: the kernel feed lives on its own app/listener, never on the console."""
+    public_app, internal_app, public_client, internal_client = _clients(tmp_path)
+    # 公开控制台监听上根本没有接收口：路径级隔离，而不是靠 401 挡。
+    assert public_client.post(
+        "/internal/v1/decision-logs", json=_event("host-injection")).status_code == 404
+    assert public_client.get("/internal/v1/decision-logs").status_code == 404
+    # 内部监听只有接收口和 /healthz：没有控制台、没有 /admin、没有 /v1。
+    assert internal_client.get("/healthz").json() == {"ok": True}
+    assert internal_client.get("/console/index.html").status_code == 404
+    assert internal_client.get("/admin/requests/recent").status_code == 404
+    assert internal_client.get("/v1/models").status_code == 404
+    # 两个应用共享同一个内存 store：公开面仍能读内部接收的事件。
+    assert public_app.state.decision_logs is internal_app.state.decision_logs
+    assert _receive(internal_client, _event("from-kernel")).status_code == 200
+    listed = public_client.get("/admin/requests/recent").json()["requests"]
+    assert [item["id"] for item in listed] == ["from-kernel"]
+    assert public_client.get("/admin/requests/from-kernel/replay").status_code == 200
 
 
 # ---------------------------------------------------------------------------

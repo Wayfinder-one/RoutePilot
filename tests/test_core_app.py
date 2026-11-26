@@ -187,7 +187,7 @@ def test_core_app_delivers_one_decision_event_to_the_configured_sink(tmp_path):
         graph_dir=str(tmp_path / "graphs"),
         logging=LogSinkSettings(
             type="routepilot",
-            url="http://console:8401/internal/v1/decision-logs",
+            url="http://console:8400/internal/v1/decision-logs",
             timeout_ms=100,
         ),
     )
@@ -200,7 +200,7 @@ def test_core_app_delivers_one_decision_event_to_the_configured_sink(tmp_path):
         })
         assert response.status_code == 200
     assert len(posts) == 1
-    assert str(posts[0].url) == "http://console:8401/internal/v1/decision-logs"
+    assert str(posts[0].url) == "http://console:8400/internal/v1/decision-logs"
     event = json.loads(posts[0].content)
     assert event["event_type"] == "routepilot.decision"
     assert event["graph"]["id"] == "main"

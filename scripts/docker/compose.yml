@@ -5,11 +5,18 @@
 #   core    — owns the graph JSON directory; reads the JEV key from its env and
 #             sends decision events to the console; never calls a model upstream.
 #   console — console/SQLite/standalone model data plane; graph admin is proxied
-#             to the kernel.  Published on host port 8401.
+#             to the kernel.  It runs two listeners (C1/I5):
+#               * public: 8401 in-container, published ONLY on host loopback
+#                 (127.0.0.1:8401 by default) — console, /admin and /v1;
+#               * internal: 8400 in-container, never published — the kernel's
+#                 decision-event receiver (POST /internal/v1/decision-logs).
+#             The kernel reaches it as http://console:8400 (see core-config.json).
 #
-# Only non-secret values are interpolated.  Put the kernel JEV key in the
-# shell/CI secret store (compose reads it from the environment), never in this
-# file; see env.compose.example.
+# Secrets: the kernel JEV key and the console admin credentials are required
+# from the shell/CI secret store.  `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD`
+# use `${VAR:?message}`, so `docker compose up` refuses to start when they are
+# missing — this deployment never seeds the publicly-known default admin.
+# Only non-secret values are interpolated in this file; see env.compose.example.
 name: routepilot
 
 services:
@@ -37,15 +44,27 @@ services:
     environment:
       ROUTER_CORE_URL: http://core:8400
       ROUTER_DB: /data/routepilot.db
+      # Public console listener: the only listener published to the host.
+      ROUTER_HOST: 0.0.0.0
+      ROUTER_PORT: "8401"
+      # Kernel event receiver: separate internal listener, container-only (I5).
+      ROUTER_INTERNAL_HOST: 0.0.0.0
+      ROUTER_INTERNAL_PORT: "8400"
+      # Mandatory explicit administrator credentials (C1): no defaults.
+      ROUTER_ADMIN_EMAIL: "${ROUTER_ADMIN_EMAIL:?set ROUTER_ADMIN_EMAIL}"
+      ROUTER_ADMIN_PASSWORD: "${ROUTER_ADMIN_PASSWORD:?set ROUTER_ADMIN_PASSWORD}"
     ports:
-      - "8401:8400"
+      # Loopback-only by default.  Operators who deliberately expose the console
+      # to another host must change the bind address and accept the risk.
+      - "127.0.0.1:8401:8401"
     volumes:
       - console-data:/data
     depends_on:
       core:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8400/healthz', timeout=2).status == 200 else 1)"]
+      # Probes the public listener; the internal 8400 health is not published.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8401/healthz', timeout=2).status == 200 else 1)"]
       interval: 15s
       timeout: 3s
       start_period: 10s

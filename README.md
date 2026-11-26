@@ -577,7 +577,7 @@ Any other model on the same path is handled by the fixed route (priority 1000/10
 
 Split the rollout by what is actually verified:
 
-- **Verified offline for the split:** the full `pytest` suite (including the real two-app `tests/test_service_split_e2e.py`), `npm run check:console`, `docker compose -f scripts/docker/compose.yml config`, and the static deployment tests over the kernel-only 163 manifests and build scripts. The kernel-only form is statically proven: no SQLite, no console, `logging.type=disabled`, `/data/graph` single-writer PVC, only the JEV secret.
+- **Verified offline for the split:** the full `pytest` suite (including the real two-app `tests/test_service_split_e2e.py`), `npm run check:console`, `ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y docker compose -f scripts/docker/compose.yml config`, and the static deployment tests over the kernel-only 163 manifests and build scripts. The kernel-only form is statically proven: no SQLite, no console, `logging.type=disabled`, `/data/graph` single-writer PVC, only the JEV secret.
 - **Not executed in this work (needs a maintenance window on shared 163/APISIX):** deploying `routepilot-core` to 163, the newapi release that injects `X-SR-Department`, the shared APISIX patch (plugin registration + Lua mount + retired-env pruning), shadow route publication, and the full APISIX acceptance matrix with its failure/rollback drills. No production publication is claimed.
 - **Local APISIX chain:** the previous single-service chain was proven on 76 before the split; the [local guide](docs/APISIX-本机联调部署.md) was rewritten for the decision-then-newapi chain but has not been re-executed after the split because this work installs nothing.
 
@@ -600,7 +600,7 @@ The gate requires the exact shadow path, the SSH target for in-pod kernel decisi
 ## Known limitations (split)
 
 - **Cross-service catalog commit crash window.** A catalog write commits the kernel graph batch first and the peripheral SQLite rows second. A SIGKILL between the two commits leaves the kernel graphs ahead of SQLite until the next catalog write; kernel graphs are the base of that next batch, and standalone execution fails closed with 503 `execution_catalog_mismatch` until both sides agree. There is no crash recovery in this iteration — a deliberate non-goal.
-- **Decision-log receiver is network-boundary-only.** `POST /internal/v1/decision-logs` has no shared token; isolate it with the network boundary. The receiver accepts at most 10 MiB per event and retains 20 events in memory (the 21st evicts the oldest, and a restart clears the log).
+- **Decision-log receiver is network-boundary-only, now on its own listener.** `POST /internal/v1/decision-logs` has no shared token, but it is served only by the peripheral's separate internal listener (`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`, default `127.0.0.1:8402`; container port 8400 in compose, never published) while the public console port answers 404 for it. Firewall that internal port in non-compose deployments. The receiver accepts at most 10 MiB per event and retains 20 events in memory (the 21st evicts the oldest, and a restart clears the log).
 - **Peripheral JEV test needs a peripheral key.** The console's "Test connection" only works when the peripheral process itself is explicitly configured with `ROUTER_JEV_API_KEY`; in the split deployment that key lives only in the kernel, so the button reports a missing key unless the value is deliberately duplicated.
 - **Kernel scheduling breaker no longer sees upstream execution.** It observes decisions only: there is no execution write-back by design. The standalone peripheral keeps its own execution-side breaker; the APISIX form lets newapi own retries and channel health.
 - **VictoriaLogs output adapter is not implemented.** `logging.type` supports only `routepilot` and `disabled`; the event schema is fixed so a future `logging.type=victorialogs` adapter can serialize the same objects.
@@ -627,15 +627,20 @@ ROUTER_CONFIG=/tmp/routepilot-core.json \
 ROUTER_JEV_API_KEY='<jev-key>' \
 .venv/bin/python -m router core
 
-# Terminal 2 — peripheral console + standalone data plane (default port 8400)
+# Terminal 2 — peripheral: public console 8401 + internal event listener 8402
 ROUTER_CORE_URL=http://127.0.0.1:8400 \
 ROUTER_DB=/tmp/routepilot.db \
 ROUTER_HOST=127.0.0.1 ROUTER_PORT=8401 \
-ROUTER_USER_AUTH=0 \
+ROUTER_INTERNAL_HOST=127.0.0.1 ROUTER_INTERNAL_PORT=8402 \
+ROUTER_ADMIN_EMAIL='admin@example.com' ROUTER_ADMIN_PASSWORD='<strong-password>' \
 .venv/bin/python -m router peripheral
 ```
 
-Console: `http://127.0.0.1:8401/console/`. The complete standalone form is composed in `scripts/docker/compose.yml` (kernel 8400 internal, console published on 8401, separate volumes).
+Console: `http://127.0.0.1:8401/console/`. The complete standalone form is composed in `scripts/docker/compose.yml` (kernel 8400 internal, console public port published only on `127.0.0.1:8401`, separate volumes).
+
+The peripheral process runs **two listeners**: the public console/`/admin`/`/v1` listener (`ROUTER_HOST`/`ROUTER_PORT`) and a separate internal listener (`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`, `127.0.0.1:8402` by default) that serves only `POST /internal/v1/decision-logs` and `/healthz` for the kernel event feed. In compose the internal listener is container port 8400 and is **not published**; point the kernel at `http://console:8400/internal/v1/decision-logs`. For the local layout above set the kernel `logging` block to `{"type": "routepilot", "url": "http://127.0.0.1:8402/internal/v1/decision-logs", "timeout_ms": 1000}`. In a non-compose deployment, firewall the internal port so only the kernel host can reach it.
+
+**Admin credentials are required and have no deployment defaults.** Compose refuses to start unless `ROUTER_ADMIN_EMAIL` and `ROUTER_ADMIN_PASSWORD` are exported explicitly, and the peripheral refuses to start with the built-in seed values on a non-loopback bind. The built-in seed values exist only for loopback-only local runs like the one above; always set explicit credentials.
 
 **Kernel only (behind APISIX + newapi).** This is the 163 form: no SQLite, no console, no model upstream, no decision-log receiver. Use a `config.json` with `logging.type=disabled` and the graph directory on a persistent volume:
 
@@ -664,7 +669,7 @@ The **kernel** is configured by `config.json` (path via `ROUTER_CONFIG`, default
 }
 ```
 
-The sample URL is the compose peripheral service name (`console:8400`), matching `configs/core.example.json` and `scripts/docker/core-config.json`. In the Quick start layout the peripheral is published on 8401, so use `http://127.0.0.1:8401/internal/v1/decision-logs`; when no receiver is reachable keep `logging.type=disabled`.
+The sample URL targets the compose peripheral service's **internal** listener (`console:8400`), matching `configs/core.example.json` and `scripts/docker/core-config.json`; that container port is never published. In the local Quick start layout the console's internal listener defaults to `127.0.0.1:8402`, so use `http://127.0.0.1:8402/internal/v1/decision-logs`; the public 8401 console port answers 404 for the receiver. When no receiver is reachable keep `logging.type=disabled`.
 
 | Kernel `config.json` field | Default | Purpose |
 |---|---|---|
@@ -684,13 +689,14 @@ The **peripheral** uses environment variables:
 | `ROUTER_CORE_URL` | `http://127.0.0.1:8400` | Kernel base URL for graph management and decisions |
 | `ROUTER_CORE_TIMEOUT_SECONDS` | `60` | Kernel HTTP timeout |
 | `ROUTER_DB` | `router.db` | Peripheral SQLite: people, sessions, providers, model catalog, non-secret JEV catalog, time periods, change records |
-| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | Peripheral listener (published as 8401 in compose) |
+| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | Public peripheral listener: console, `/admin`, `/v1` (compose publishes only `127.0.0.1:8401`) |
+| `ROUTER_INTERNAL_HOST` / `ROUTER_INTERNAL_PORT` | `127.0.0.1` / `8402` | Internal kernel event-receiver listener: only `/internal/v1/decision-logs` + `/healthz`, never published (compose: container port 8400) |
 | `ROUTER_JEV_TIMEOUT` | `10` | Decision-service timeout used by the JEV **test** endpoint |
 | `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | empty | One-time seed of the `default` non-secret JEV catalog entry; used together, only while the catalog is empty and never seeded before |
 | `ROUTER_JEV_API_KEY` | empty | Optional peripheral-only key for the JEV **test** button; the kernel always reads its own copy |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | Session-affinity LRU capacity (peripheral process) |
 | `ROUTER_USER_AUTH` | `true` | Console authentication |
-| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | seed values | First-run admin account |
+| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | seed values (loopback only) | First-run admin account; **required explicitly in the compose deployment (no defaults), and the built-in values are refused on a non-loopback bind** |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | Console session lifetime |
 
 ## API
@@ -783,14 +789,15 @@ npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 .venv/bin/python -m pytest -q tests/test_service_split_e2e.py -v
-docker compose -f scripts/docker/compose.yml config
+ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y \
+  docker compose -f scripts/docker/compose.yml config
 ```
 
 - `pytest` collects `tests/`, `scripts/apisix/` and `scripts/docker/` (`testpaths` in `pyproject.toml`), runs unit, service-split and deployment static tests, starts no browser and does not collect `experiments/`. `tests/test_service_split_e2e.py` is the real two-app acceptance run: in-process kernel + peripheral over real HTTP, graph creation/enable through the peripheral proxy, `auto` decision, peripheral model execution, JSON/SSE, kernel event → peripheral memory log, recent/replay, 21st-event eviction, current-graph edits not affecting replays, restart clearing the log, and a log-sink failure not blocking decisions.
 - `node --test` runs the ES-module suites: graph/canonical behavior, draft state, the runtime helpers used by graph settings and impact confirmation, and the cross-runtime contract fixtures (`tests/fixtures/graph_contracts.json`).
 - `npm run check:console` runs all Node test suites and the Playwright acceptance matrix against a temporary database, mock decision service and mock upstream. Screenshots are off by default; `QA_SCREENSHOTS=1` regenerates them. `QA_ONLY=<regex>` selects cases; a page module runs standalone, e.g. `node scripts/console_qa/canvas.mjs`. Set `CHROME=/path/to/chrome` when Chromium is not in the default cache.
 - `.venv/bin/python scripts/i18n_dead_keys.py` lists console-dictionary keys that no page references (exit code 1 when any exist) so dead translations can be deleted; it is a CI lint and is not part of the Playwright matrix.
-- `docker compose -f scripts/docker/compose.yml config` statically validates the two-service standalone deployment (two services, separate volumes, healthchecks, no secret values).
+- `docker compose -f scripts/docker/compose.yml config` statically validates the two-service standalone deployment (two services, separate volumes, healthchecks, no secret values). It requires `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD` in the environment: without them compose refuses to render, which is the intended default-credential guard.
 - `scripts/standalone_v4_smoke.py` is a **legacy pre-split** acceptance run (single-service writer/replica assumptions); it is kept for history and must not be used to validate the split. The split gates are `tests/test_service_split_e2e.py`, `scripts/docker/test_deploy_163.py` and `scripts/apisix/verify_routepilot_e2e.py` (against a real deployment).
 
 Experiments are standalone and excluded from the default run:

@@ -16,7 +16,7 @@ def test_core_settings_load_routepilot_sink(tmp_path):
         "jev": {"api_key_env": "ROUTER_JEV_API_KEY"},
         "logging": {
             "type": "routepilot",
-            "url": "http://console:8401/internal/v1/decision-logs",
+            "url": "http://console:8400/internal/v1/decision-logs",
             "timeout_ms": 1000,
         },
     }))

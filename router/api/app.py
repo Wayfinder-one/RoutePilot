@@ -11,7 +11,10 @@ The peripheral owns everything user-facing and execution-related:
 * the standalone data plane (``/v1/chat/completions``): ask the kernel for a
   decision, resolve the Provider Key from peripheral SQLite and execute the
   model request; fixed-model admin test chat resolves the catalog directly;
-* the decision-event receiver and the volatile 20-event memory log.
+* the volatile 20-event memory log (``/admin/requests/*``).  The kernel's
+  decision-event receiver is NOT mounted here: it lives on the separate internal
+  listener (``router.api.internal_app``) so external console clients can never
+  inject or poison decision logs (I5).
 
 Deliberately absent (kernel-owned): graph JSON, routing/JEV execution, decision
 events production and model upstream calls during a decision.  The peripheral
@@ -37,7 +40,12 @@ from fastapi.staticfiles import StaticFiles
 
 from router.api.issue_presenter import issues_payload
 from router.api.routes_core_proxy import router as core_proxy_router
-from router.config import Settings
+from router.config import (
+    DEFAULT_ADMIN_EMAIL,
+    DEFAULT_ADMIN_PASSWORD,
+    LOOPBACK_HOSTS,
+    Settings,
+)
 from router.control.errors import (
     AlreadyExists,
     DefaultGraphRequired,
@@ -80,6 +88,30 @@ def _catalog_sync_factory(client: CoreClient):
         return RemoteCatalogSyncService(conn, client)
 
     return build
+
+
+def _guard_default_admin(settings: Settings) -> None:
+    """C1: refuse publicly-known default admin credentials on a non-loopback bind.
+
+    The seed values exist only so ``python -m router`` on this machine works out
+    of the box.  A deployment (compose binds ``0.0.0.0``) must provide explicit
+    ``ROUTER_ADMIN_EMAIL`` / ``ROUTER_ADMIN_PASSWORD``; silently seeding
+    ``admin@test.com`` / ``1qaz@WSX`` on a reachable listener is a critical
+    security defect.
+    """
+    if not settings.user_auth:
+        return
+    if settings.host.strip().lower() in LOOPBACK_HOSTS:
+        return
+    if (settings.admin_email, settings.admin_password) != (
+            DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD):
+        return
+    raise RuntimeError(
+        "refusing to start the peripheral console with the publicly-known "
+        f"default admin credentials on non-loopback host {settings.host!r}: "
+        "set ROUTER_ADMIN_EMAIL and ROUTER_ADMIN_PASSWORD to explicit values "
+        "(or bind ROUTER_HOST to 127.0.0.1 for local-only use)"
+    )
 
 
 def _admin_path(path: str) -> bool:
@@ -187,8 +219,16 @@ def create_app(
     *,
     transport: httpx.BaseTransport | None = None,
     core_transport: httpx.AsyncBaseTransport | None = None,
+    decision_logs: DecisionLogStore | None = None,
 ) -> FastAPI:
-    """Build the peripheral service: no graph ownership, no local routing."""
+    """Build the peripheral service: no graph ownership, no local routing.
+
+    ``decision_logs`` lets :func:`router.api.internal_app.create_service_apps`
+    share one memory store between the public console app and the internal
+    receiver app; standalone callers (and tests) may omit it and get a fresh
+    store.
+    """
+    _guard_default_admin(settings)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
@@ -228,7 +268,9 @@ def create_app(
     app.state.breaker = CircuitBreaker()
     app.state.jev_client = JevClient(app.state.http)
     # 决策日志只保存在内存：完整事件来自内核事件接收口，重启即清空（Global Constraint 5）。
-    app.state.decision_logs = DecisionLogStore()
+    # 生产进程通过 create_service_apps 传入与内部监听共享的 store；独立使用时自建。
+    app.state.decision_logs = (
+        decision_logs if decision_logs is not None else DecisionLogStore())
 
     @app.exception_handler(GraphConflictError)
     async def graph_conflict_handler(request: Request, exc: GraphConflictError):
@@ -325,7 +367,6 @@ def create_app(
         app.mount("/console", StaticFiles(directory=CONSOLE_DIR, html=True), name="console")
 
     from router.api.routes_jev import router as jev_router
-    from router.api.routes_logs import internal_router as logs_internal_router
     from router.api.routes_logs import router as logs_router
     from router.api.routes_models import router as models_router
     from router.api.routes_test import router as test_router
@@ -341,9 +382,9 @@ def create_app(
     app.include_router(logs_router, prefix="/admin")
     app.include_router(users_router, prefix="/admin")
     app.include_router(test_router, prefix="/admin")
-    # 内核事件接收口：挂在 /admin 之外，内核无需管理面登录即可投递完整决策事件。
+    # I5：内核事件接收口刻意不挂在这里。它只存在于独立内部监听
+    # （router.api.internal_app），公开控制台监听上该路径是 404。
     # 决策端点（/internal/v1/route-decision）只属于内核：外围不挂载它；
     # 外围与内核的 HTTP 边界是 app.state.core（CoreClient）。
-    app.include_router(logs_internal_router, prefix="/internal/v1")
     app.include_router(v1_router, prefix="/v1")
     return app

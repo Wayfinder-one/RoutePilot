@@ -122,6 +122,7 @@ let routerChild = null;
 let kernelChild = null;
 let mockServer = null;
 let routerPort = 0;
+let internalPort = 0;
 let kernelPort = 0;
 export let tempDir = '';
 let routerLog = '';
@@ -507,8 +508,8 @@ function captureKernel(child) {
 
 /* 决策内核子进程：图 JSON 的唯一写者。外围目录写（模型/provider/JEV/时段）
    通过 /internal/v1/graph-batches 提交，决策事件由内核 best-effort POST 到
-   外围的 /internal/v1/decision-logs（Task 8 的完整双服务调用链），因此 QA 必须
-   同时起内核并让两边互相指向。 */
+   外围独立内部监听上的 /internal/v1/decision-logs（Task 8 的完整双服务调用链），
+   因此 QA 必须同时起内核、并为外围分配一个与公开端口不同的内部端口。 */
 function kernelConfigPath() {
   return path.join(tempDir, 'core.json');
 }
@@ -518,10 +519,11 @@ function writeKernelConfig(port) {
     server: { host: '127.0.0.1', port },
     graphs: { directory: path.join(tempDir, 'routing-graph') },
     jev: { api_key_env: 'ROUTER_JEV_API_KEY' },
-    /* 决策事件 → 外围内存日志（最近 20 条回放来自这里）。 */
+    /* 决策事件 → 外围内存日志（最近 20 条回放来自这里）。内部接收口与
+       公开控制台监听分离：事件只投递到 internalPort，公开端口上 404。 */
     logging: {
       type: 'routepilot',
-      url: `http://127.0.0.1:${routerPort}/internal/v1/decision-logs`,
+      url: `http://127.0.0.1:${internalPort}/internal/v1/decision-logs`,
       timeout_ms: 1000
     }
   }));
@@ -590,6 +592,9 @@ async function startRouter(port) {
       ROUTER_GRAPH_DIR: path.join(tempDir, 'routing-graph'),
       ROUTER_HOST: '127.0.0.1',
       ROUTER_PORT: String(port),
+      /* 内核事件接收专用内部监听：不发布、不暴露给 QA 的公开 base。 */
+      ROUTER_INTERNAL_HOST: '127.0.0.1',
+      ROUTER_INTERNAL_PORT: String(internalPort),
       ROUTER_USER_AUTH: '0',
       /* 目录写经内核：指向同一次 QA 启动的内核子进程（Task 7 跨服务同步）。 */
       ROUTER_CORE_URL: `http://127.0.0.1:${kernelPort}`,
@@ -1832,8 +1837,12 @@ export async function runRegisteredCases() {
     mockServer = await startMock();
     tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'rt-console-qa-'));
     kernelPort = await freePort();
-    /* 内核配置里的日志接收 URL 需要外围端口，因此先分配两个端口再启动内核。 */
+    /* 内核配置里的日志接收 URL 需要外围内部端口，因此先分配端口再启动内核。 */
     routerPort = await freePort();
+    internalPort = await freePort();
+    while (internalPort === routerPort || internalPort === kernelPort) {
+      internalPort = await freePort();
+    }
     routerBase = `http://127.0.0.1:${routerPort}`;
     await startKernel(kernelPort);
     await startRouter(routerPort);

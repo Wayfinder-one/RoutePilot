@@ -577,7 +577,7 @@ JSON 从不保存密钥，每种密钥只有一个归属：
 
 按「已验证」与「未执行」分开记录：
 
-- **拆分已完成的离线验证**：全量 `pytest`（含真实双 app 的 `tests/test_service_split_e2e.py`）、`npm run check:console`、`docker compose -f scripts/docker/compose.yml config`，以及覆盖内核-only 163 清单与构建脚本的部署静态测试。内核-only 形态已被静态证明：无 SQLite、无控制台、`logging.type=disabled`、`/data/graph` 单写者 PVC、只有 JEV 一个 Secret。
+- **拆分已完成的离线验证**：全量 `pytest`（含真实双 app 的 `tests/test_service_split_e2e.py`）、`npm run check:console`、`ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y docker compose -f scripts/docker/compose.yml config`，以及覆盖内核-only 163 清单与构建脚本的部署静态测试。内核-only 形态已被静态证明：无 SQLite、无控制台、`logging.type=disabled`、`/data/graph` 单写者 PVC、只有 JEV 一个 Secret。
 - **本次未执行（需要共享 163/APISIX 维护窗口）**：把 `routepilot-core` 部署到 163、带 `X-SR-Department` 的 newapi 发布、共享 APISIX 变更（插件注册 + Lua 挂载 + 旧 env 清理）、shadow Route 发布，以及带故障/回滚演练的完整 APISIX 验收矩阵。本工作不声称任何生产发布。
 - **本机 APISIX 链路**：旧单服务链路曾在拆分前于 76 上验证；[本机联调指南](docs/APISIX-本机联调部署.md) 已按「先决策、再回 newapi」链路重写，但本次未重新执行（本工作不安装任何环境）。
 
@@ -600,7 +600,7 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
 ## 已知限制（拆分）
 
 - **跨服务目录提交的崩溃窗口。** 目录写先提交内核图批次、再提交外围 SQLite 行。若在两次提交之间被 SIGKILL，内核图会领先 SQLite，直到下一次目录写才对齐；内核图是下一批次的基线，而对齐前 standalone 执行会以 503 `execution_catalog_mismatch` 失败关闭。本迭代不做崩溃恢复——这是有意的非目标。
-- **决策日志接收口只靠网络边界保护。** `POST /internal/v1/decision-logs` 没有共享 Token，需用网络策略隔离；接收口单条事件上限 10 MiB，只在内存保留 20 条（第 21 条淘汰最旧一条，重启即清空）。
+- **决策日志接收口只靠网络边界保护，但已独立监听。** `POST /internal/v1/decision-logs` 没有共享 Token，但它只由外围的独立内部监听提供（`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`，默认 `127.0.0.1:8402`；compose 中为容器端口 8400，永不发布），公开控制台端口对该路径返回 404。非 compose 部署必须用防火墙限制该内部端口的来源。接收口单条事件上限 10 MiB，只在内存保留 20 条（第 21 条淘汰最旧一条，重启即清空）。
 - **外围 JEV「测试连接」需要外围 Key。** 只有外围进程自身显式配置 `ROUTER_JEV_API_KEY` 时按钮才有效；拆分部署中该 Key 只在内核，因此不刻意复制 Key 时按钮会报缺少 Key。
 - **内核调度熔断不再感知上游执行失败。** 它只观察决策：设计上内核不做执行结果回写。standalone 外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
 - **VictoriaLogs 输出适配器未实现。** `logging.type` 只支持 `routepilot` 与 `disabled`；事件结构已固定，供将来 `logging.type=victorialogs` 适配器序列化同一批对象。
@@ -627,15 +627,20 @@ ROUTER_CONFIG=/tmp/routepilot-core.json \
 ROUTER_JEV_API_KEY='<jev-key>' \
 .venv/bin/python -m router core
 
-# 终端 2 —— 外围控制台 + standalone 数据面（默认端口 8400）
+# 终端 2 —— 外围：公开控制台 8401 + 内部事件监听 8402
 ROUTER_CORE_URL=http://127.0.0.1:8400 \
 ROUTER_DB=/tmp/routepilot.db \
 ROUTER_HOST=127.0.0.1 ROUTER_PORT=8401 \
-ROUTER_USER_AUTH=0 \
+ROUTER_INTERNAL_HOST=127.0.0.1 ROUTER_INTERNAL_PORT=8402 \
+ROUTER_ADMIN_EMAIL='admin@example.com' ROUTER_ADMIN_PASSWORD='<strong-password>' \
 .venv/bin/python -m router peripheral
 ```
 
-控制台：`http://127.0.0.1:8401/console/`。完整 standalone 形态由 `scripts/docker/compose.yml` 组装（内核 8400 仅内部、console 发布 8401、状态卷分离）。
+控制台：`http://127.0.0.1:8401/console/`。完整 standalone 形态由 `scripts/docker/compose.yml` 组装（内核 8400 仅内部、console 公开端口只发布到 `127.0.0.1:8401`、状态卷分离）。
+
+外围进程运行**两个监听**：公开的控制台/`/admin`/`/v1` 监听（`ROUTER_HOST`/`ROUTER_PORT`），以及独立的内部监听（`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`，默认 `127.0.0.1:8402`），后者只提供内核事件通道的 `POST /internal/v1/decision-logs` 与 `/healthz`。compose 中内部监听是容器端口 8400，**不发布到主机**；内核应指向 `http://console:8400/internal/v1/decision-logs`。本机形态则把内核 `logging` 块设为 `{"type": "routepilot", "url": "http://127.0.0.1:8402/internal/v1/decision-logs", "timeout_ms": 1000}`。非 compose 部署必须用防火墙把内部端口限定为只允许内核主机访问。
+
+**管理员凭据是必填项，部署形态没有默认值。** compose 在未显式导出 `ROUTER_ADMIN_EMAIL` 与 `ROUTER_ADMIN_PASSWORD` 时拒绝启动；外围在非 loopback 绑定上使用内置种子值也会拒绝启动。内置种子值只用于像上面这样的纯本机 loopback 运行；任何实际部署都必须显式设置凭据。
 
 **只部署内核（接 APISIX + newapi）。** 即 163 形态：无 SQLite、无控制台、无模型上游、无决策日志接收端。使用 `logging.type=disabled` 的 `config.json`，图目录挂持久卷：
 
@@ -664,7 +669,7 @@ ROUTER_JEV_API_KEY='<jev-key>' \
 }
 ```
 
-示例地址是 compose 中 peripheral 服务名（`console:8400`），与 `configs/core.example.json`、`scripts/docker/core-config.json` 一致。快速开始形态下外围发布在 8401，应使用 `http://127.0.0.1:8401/internal/v1/decision-logs`；没有可达接收口时保持 `logging.type=disabled`。
+示例地址指向 compose 中 peripheral 服务的**内部**监听（`console:8400`），与 `configs/core.example.json`、`scripts/docker/core-config.json` 一致；该容器端口永不发布。本机快速开始形态下外围内部监听默认为 `127.0.0.1:8402`，应使用 `http://127.0.0.1:8402/internal/v1/decision-logs`；公开的 8401 控制台端口对该路径返回 404。没有可达接收口时保持 `logging.type=disabled`。
 
 | 内核 `config.json` 字段 | 默认值 | 说明 |
 |---|---|---|
@@ -684,13 +689,14 @@ ROUTER_JEV_API_KEY='<jev-key>' \
 | `ROUTER_CORE_URL` | `http://127.0.0.1:8400` | 内核地址（图管理与决策） |
 | `ROUTER_CORE_TIMEOUT_SECONDS` | `60` | 内核 HTTP 超时 |
 | `ROUTER_DB` | `router.db` | 外围 SQLite：人员、会话、提供方、模型目录、非密钥 JEV 目录、时段、变更记录 |
-| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | 外围监听地址/端口（compose 发布为 8401） |
+| `ROUTER_HOST` / `ROUTER_PORT` | `127.0.0.1` / `8400` | 外围公开监听：控制台、`/admin`、`/v1`（compose 只发布 `127.0.0.1:8401`） |
+| `ROUTER_INTERNAL_HOST` / `ROUTER_INTERNAL_PORT` | `127.0.0.1` / `8402` | 内核事件接收专用内部监听：只有 `/internal/v1/decision-logs` 与 `/healthz`，永不发布（compose：容器端口 8400） |
 | `ROUTER_JEV_TIMEOUT` | `10` | JEV **测试**端点使用的决策服务超时 |
 | `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | 空 | 一次性播种 `default` 非密钥 JEV 目录项；必须成对、仅在目录为空且从未播种时生效 |
 | `ROUTER_JEV_API_KEY` | 空 | 可选的外围本地 Key，仅供 JEV **测试**按钮；内核始终读自己的那份 |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量（外围进程） |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
-| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值 | 首次启动的管理员账号 |
+| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值（仅 loopback） | 首次启动的管理员账号；**compose 部署必须显式提供（没有默认值），非 loopback 绑定使用内置值会被拒绝启动** |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | 控制台会话有效期 |
 
 ## API
@@ -783,14 +789,15 @@ npm install
 npm run check:console
 .venv/bin/python scripts/i18n_dead_keys.py
 .venv/bin/python -m pytest -q tests/test_service_split_e2e.py -v
-docker compose -f scripts/docker/compose.yml config
+ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y \
+  docker compose -f scripts/docker/compose.yml config
 ```
 
 - `pytest` 收集 `tests/`、`scripts/apisix/` 与 `scripts/docker/`（`pyproject.toml` 的 `testpaths`），运行单元、服务拆分与部署静态测试，不启动浏览器，也不收集 `experiments/`。`tests/test_service_split_e2e.py` 是真实双 app 验收：进程内内核 + 外围走真实 HTTP，经外围代理建图/启用 → `auto` 决策 → 外围执行模型 → JSON/SSE → 内核事件写入外围内存日志 → recent/replay → 第 21 条淘汰 → 改当前图不影响旧回放 → 外围重启日志消失 → 日志 sink 故障不阻断决策。
 - `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
 - `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
 - `.venv/bin/python scripts/i18n_dead_keys.py` 列出控制台词典中已无页面引用的 key（存在死 key 时 exit 1），用于删除无用翻译；它是 CI lint，不属于 Playwright 矩阵。
-- `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。
+- `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。它要求环境里有 `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD`：缺失时 compose 拒绝渲染，这正是默认凭据护栏的预期行为。
 - `scripts/standalone_v4_smoke.py` 是**拆分前的 legacy** 验收脚本（单服务写者/只读副本假设），仅作历史留存，不能用于验证拆分。拆分门禁是 `tests/test_service_split_e2e.py`、`scripts/docker/test_deploy_163.py` 与针对真实部署的 `scripts/apisix/verify_routepilot_e2e.py`。
 
 实验代码独立运行，不进入默认套件：

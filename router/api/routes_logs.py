@@ -12,7 +12,10 @@ retained events:
 * ``GET /admin/changes`` keeps reading the peripheral change repository (it is
   not a decision log);
 * ``POST /internal/v1/decision-logs`` is the kernel's event feed.  It is mounted
-  outside ``/admin`` on purpose: the kernel posts events without an admin login.
+  only on the peripheral's separate internal listener
+  (``router.api.internal_app``), outside ``/admin`` on purpose: the kernel posts
+  events without an admin login, and the public console listener answers 404 for
+  this path.
 
 Evicted or post-restart replays are 404: the memory log is deliberately volatile
 and never rebuilt from SQLite.

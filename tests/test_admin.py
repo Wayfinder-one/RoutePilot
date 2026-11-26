@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
+from router.api.internal_app import create_internal_app
 from router.jev.service import JevService
 from router.routing.tree import tree_from_dict
 from router.store.db import connect, migrate
@@ -124,8 +125,12 @@ def test_restart_never_restores_decision_logs_from_sqlite(tmp_path):
         conn.close()
 
 
-def _receive_event(client, event):
-    return client.post("/internal/v1/decision-logs", json=event)
+def _receive_event(app, event):
+    """Deliver one kernel event via the internal receiver over the app's store."""
+    internal = getattr(app, "test_internal", None) or create_internal_app(
+        app.state.decision_logs)
+    with TestClient(internal) as client:
+        return client.post("/internal/v1/decision-logs", json=event)
 
 
 def test_recent_decision_log_links_replay_and_serves_the_events_own_graph(tmp_path):
@@ -133,7 +138,7 @@ def test_recent_decision_log_links_replay_and_serves_the_events_own_graph(tmp_pa
     event = valid_event(id="logged-event")
     event["graph"]["name"] = "日志里的旧图"
     with TestClient(app) as client:
-        assert _receive_event(client, event).status_code == 200
+        assert _receive_event(app, event).status_code == 200
         listed = client.get("/admin/requests/recent").json()["requests"][0]
         # 列表只给摘要与回放入口：不再有 snapshot_url / graph_snapshot_id。
         assert listed["id"] == "logged-event"
@@ -163,7 +168,7 @@ def test_replay_url_encodes_decision_id(tmp_path):
     app = create_app(test_settings(tmp_path))
     event = valid_event(id="id with/space?")
     with TestClient(app) as client:
-        assert _receive_event(client, event).status_code == 200
+        assert _receive_event(app, event).status_code == 200
         listed = client.get("/admin/requests/recent").json()["requests"][0]
         assert listed["replay_url"] == "/console/routing.html?request=id%20with%2Fspace%3F"
         assert client.get("/admin/requests/id%20with%2Fspace%3F/replay").status_code == 200

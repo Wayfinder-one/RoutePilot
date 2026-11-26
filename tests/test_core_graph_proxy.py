@@ -18,7 +18,8 @@ Pinned contract:
   failure can never fail the proxied write;
 * the real ``create_app`` wires ``app.state.core`` on its own HTTP client (the
   browser ``transport`` is not reused), closes it in the lifespan, stops mounting
-  the kernel decision endpoint but keeps the decision-log receiver.
+  the kernel decision endpoint, and moves the decision-log receiver off the
+  public listener onto the peripheral's internal app.
 """
 import json
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from router.api.app import _install_admin_auth, create_app
+from router.api.internal_app import create_internal_app
 from router.api.routes_core_proxy import router as core_proxy_router
 from router.config import Settings
 from router.core_client import CoreClient
@@ -430,9 +432,12 @@ def test_peripheral_does_not_mount_the_kernel_decision_endpoint(tmp_path):
         "/internal/v1/route-decision",
         json={"model": "auto", "messages": [{"role": "user", "content": "你好"}]})
     assert decision.status_code == 404
-    # The decision-log receiver stays mounted outside /admin: the kernel posts
-    # complete events to the peripheral without an admin login.
-    received = client.post("/internal/v1/decision-logs", json=valid_event())
+    # I5: the decision-log receiver is not on the public console listener at all;
+    # the kernel posts to the peripheral's separate internal listener.
+    assert client.post(
+        "/internal/v1/decision-logs", json=valid_event()).status_code == 404
+    internal = TestClient(create_internal_app(app.state.decision_logs))
+    received = internal.post("/internal/v1/decision-logs", json=valid_event())
     assert received.status_code == 200
     assert received.json() == {"ok": True}
 

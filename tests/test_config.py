@@ -7,6 +7,11 @@ def test_defaults():
     assert settings.graph_dir == "./routing-graph"
     assert settings.graph_writer is True
     assert settings.port == 8400
+    # C1/I5: the peripheral's public listener and its kernel-only internal
+    # event receiver are separate listeners with separate settings.
+    assert settings.host == "127.0.0.1"
+    assert settings.internal_host == "127.0.0.1"
+    assert settings.internal_port == 8402
     assert settings.jev_url == ""
     assert settings.jev_model == ""
     assert settings.jev_timeout == 10.0
@@ -19,6 +24,9 @@ def test_env_override(monkeypatch):
     monkeypatch.setenv("ROUTER_GRAPH_DIR", "/tmp/routing-graph")
     monkeypatch.setenv("ROUTER_GRAPH_WRITER", "0")
     monkeypatch.setenv("ROUTER_PORT", "9000")
+    monkeypatch.setenv("ROUTER_HOST", "0.0.0.0")
+    monkeypatch.setenv("ROUTER_INTERNAL_PORT", "9002")
+    monkeypatch.setenv("ROUTER_INTERNAL_HOST", "10.0.0.7")
     monkeypatch.setenv("ROUTER_JEV_URL", "http://jev.test")
     monkeypatch.setenv("ROUTER_JEV_MODEL", "NeoHorse-Jev-4B")
     monkeypatch.setenv("ROUTER_JEV_API_KEY", "secret")
@@ -29,6 +37,9 @@ def test_env_override(monkeypatch):
     assert settings.graph_dir == "/tmp/routing-graph"
     assert settings.graph_writer is False
     assert settings.port == 9000
+    assert settings.host == "0.0.0.0"
+    assert settings.internal_port == 9002
+    assert settings.internal_host == "10.0.0.7"
     assert settings.jev_url == "http://jev.test"
     assert settings.jev_model == "NeoHorse-Jev-4B"
     assert settings.jev_api_key == "secret"

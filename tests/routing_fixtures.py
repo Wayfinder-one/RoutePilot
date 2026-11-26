@@ -362,15 +362,18 @@ def split_app(base=None, *, kernel=None, settings=None, transport=None,
     kernel app itself stays reachable from tests as ``app.test_kernel`` (never
     read by the application itself).
     """
-    from router.api.app import create_app
+    from router.api.internal_app import create_service_apps
 
     settings = settings if settings is not None else test_settings(base)
     if core_transport is None:
         core_transport = core_app_for(
             graph_dir=settings.graph_dir, app=kernel)
-    app = create_app(
+    # Mirror the production wiring: the public console app and the internal
+    # event receiver are two apps sharing one decision-log store.
+    app, internal = create_service_apps(
         settings, transport=transport, core_transport=core_transport)
     app.test_kernel = kernel
+    app.test_internal = internal
     return app
 
 
@@ -450,19 +453,24 @@ def seed_execution_catalog(conn, *, provider="local",
 
 
 def deliver_decision_events(peripheral, sink) -> list[dict]:
-    """Feed captured kernel events into the peripheral's receiver endpoint.
+    """Feed captured kernel events into the peripheral's internal receiver.
 
-    Equivalent to the kernel sink's real POST (which the dedicated end-to-end
-    test exercises with live lifespans); the receiver contract is identical.
+    Equivalent to the kernel sink's real POST to the internal listener (which the
+    dedicated end-to-end test exercises with live lifespans); the public console
+    app itself no longer mounts the receiver path.
     """
     from fastapi.testclient import TestClient
 
-    client = TestClient(peripheral)
+    from router.api.internal_app import create_internal_app
+
+    internal = getattr(peripheral, "test_internal", None)
+    receiver = internal or create_internal_app(peripheral.state.decision_logs)
     received = []
-    for event in sink.events:
-        response = client.post("/internal/v1/decision-logs", json=event)
-        assert response.status_code == 200, response.text
-        received.append(event)
+    with TestClient(receiver) as client:
+        for event in sink.events:
+            response = client.post("/internal/v1/decision-logs", json=event)
+            assert response.status_code == 200, response.text
+            received.append(event)
     return received
 
 

@@ -344,3 +344,44 @@ def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
     assert response.status_code == 503, response.text
     assert response.json()["detail"] == "target 'safe' has no available backend"
     assert handler.jev_paths == ["/v1/systemone"]
+
+
+# ---------------------------------------------------------------------------
+# C1：公开已知的默认管理员凭据只允许出现在 loopback 绑定上；非 loopback
+# 绑定必须显式提供 ROUTER_ADMIN_EMAIL / ROUTER_ADMIN_PASSWORD。
+# ---------------------------------------------------------------------------
+
+def test_default_admin_credentials_are_refused_on_a_non_loopback_bind(tmp_path):
+    settings = test_settings(tmp_path, host="0.0.0.0", user_auth=True)
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "ROUTER_ADMIN_EMAIL" in message
+    assert "ROUTER_ADMIN_PASSWORD" in message
+    assert "0.0.0.0" in message
+
+
+def test_explicit_admin_credentials_are_allowed_on_a_non_loopback_bind(tmp_path):
+    settings = test_settings(
+        tmp_path, host="0.0.0.0", user_auth=True,
+        admin_email="ops@example.com", admin_password="explicit-strong-pass",
+    )
+    app = create_app(settings)
+    assert app.state.settings.admin_email == "ops@example.com"
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+def test_default_admin_credentials_stay_allowed_on_loopback(tmp_path, host):
+    settings = test_settings(tmp_path, host=host, user_auth=True)
+    app = create_app(settings)
+    assert app.state.settings.host == host
+
+
+def test_default_admin_guard_does_not_fire_when_console_auth_is_off(tmp_path):
+    """No admin is seeded without user auth: a non-loopback still must not trip."""
+    settings = test_settings(
+        tmp_path, host="0.0.0.0", user_auth=False,
+        admin_email="admin@test.com", admin_password="1qaz@WSX",
+    )
+    app = create_app(settings)
+    assert app.state.settings.user_auth is False

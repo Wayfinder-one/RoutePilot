@@ -33,6 +33,7 @@ import httpx
 
 from router.api.app import create_app
 from router.api.core_app import create_core_app
+from router.api.internal_app import create_service_apps
 from router.core_config import CoreSettings, LogSinkSettings
 from router.store.db import connect, migrate
 from tests.decision_fixtures import async_test
@@ -133,7 +134,7 @@ def _kernel_http(upstream_calls, fail_sink):
         if request.url.host == EVENT_SINK_HOST:
             if fail_sink:
                 raise httpx.ConnectError("peripheral log sink is down", request=request)
-            return await httpx.ASGITransport(app=_STACK.peripheral).handle_async_request(request)
+            return await httpx.ASGITransport(app=_STACK.internal).handle_async_request(request)
         raise AssertionError(
             f"kernel made an external (non-sink) request: {request.method} {request.url}")
 
@@ -142,6 +143,7 @@ def _kernel_http(upstream_calls, fail_sink):
 
 class _StackHolder:
     peripheral = None
+    internal = None
 
 
 _STACK = _StackHolder()
@@ -164,21 +166,28 @@ async def two_service_stack(tmp_path, *, sink_fails=False):
         ),
         transport=_kernel_http(calls, sink_fails),
     )
-    peripheral = create_app(
+    # I5: the kernel event feed goes to the dedicated internal listener; the
+    # public console app shares the same in-memory decision-log store but does
+    # not mount the receiver at all.
+    peripheral, internal = create_service_apps(
         settings, transport=upstream_transport(calls),
         core_transport=httpx.ASGITransport(app=kernel))
     _STACK.peripheral = peripheral
+    _STACK.internal = internal
     try:
         async with kernel.router.lifespan_context(kernel):
-            async with peripheral.router.lifespan_context(peripheral):
-                async with httpx.AsyncClient(
-                        transport=httpx.ASGITransport(app=peripheral),
-                        base_url=PERIPHERAL_ORIGIN) as client:
-                    yield SimpleNamespace(
-                        settings=settings, kernel=kernel,
-                        peripheral=peripheral, client=client, calls=calls)
+            async with internal.router.lifespan_context(internal):
+                async with peripheral.router.lifespan_context(peripheral):
+                    async with httpx.AsyncClient(
+                            transport=httpx.ASGITransport(app=peripheral),
+                            base_url=PERIPHERAL_ORIGIN) as client:
+                        yield SimpleNamespace(
+                            settings=settings, kernel=kernel,
+                            peripheral=peripheral, internal=internal,
+                            client=client, calls=calls)
     finally:
         _STACK.peripheral = None
+        _STACK.internal = None
 
 
 async def wait_for_events(peripheral, count, *, timeout=5.0):
@@ -235,7 +244,11 @@ async def test_peripheral_proxy_decision_execution_and_event_replay(tmp_path):
         assert stack.calls[0]["authorization"] == f"Bearer {PROVIDER_SECRET}"
         assert stack.calls[0]["url"] == UPSTREAM_ORIGIN + "/v1/chat/completions"
 
-        # 3. 内核把完整事件投递到外围接收口，最近列表与回放都来自这条事件。
+        # 3. 内核把完整事件投递到外围的内部接收口，最近列表与回放都来自这条事件。
+        #    公开控制台监听上不挂接收口：外部客户端无法注入/污染日志。
+        assert (await client.post(
+            "/internal/v1/decision-logs", json={})).status_code == 404
+        assert (await client.get("/internal/v1/decision-logs")).status_code == 404
         await wait_for_events(stack.peripheral, 1)
         recent = (await client.get("/admin/requests/recent")).json()["requests"]
         assert len(recent) == 1
