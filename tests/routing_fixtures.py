@@ -474,14 +474,18 @@ def deliver_decision_events(peripheral, sink) -> list[dict]:
     return received
 
 
-def core_app_for(base=None, *, graph_dir=None, app=None) -> httpx.AsyncBaseTransport:
+def core_app_for(base=None, *, graph_dir=None, app=None,
+                 transport=None) -> httpx.AsyncBaseTransport:
     """In-process kernel transport for ``create_app(..., core_transport=...)``.
 
     ``base`` is the directory passed to :func:`test_settings` (graph directory =
     ``<base>/routing-graph``); pass ``graph_dir``/``app`` for custom layouts and
-    for tests that need to inject kernel-side faults.
+    for tests that need to inject kernel-side faults.  ``transport`` is the
+    kernel's own HTTP transport (JEV / decision-event calls), which lets a test
+    observe requests the kernel — not the peripheral — makes.
     """
-    kernel = app if app is not None else core_app(base, graph_dir=graph_dir)
+    kernel = app if app is not None else core_app(
+        base, graph_dir=graph_dir, transport=transport)
     return _KernelTransport(kernel)
 
 

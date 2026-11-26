@@ -17,7 +17,6 @@ from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.api.routes_jev import router
-from router.jev.client import JevClient
 from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.jev.window import MAX_TOKENS, MIN_CONTEXT_TOKENS, MIN_INPUT_TOKENS
 from router.routing.snapshot import SnapshotPublisher
@@ -39,7 +38,14 @@ def _migrated(path):
     conn.close()
 
 
-def make_client(tmp_path, handler=None, requests=None):
+def make_client(tmp_path, handler=None, requests=None, *, core_transport=None):
+    """手工外围 app + 进程内内核（I6：JEV 试连由内核做）。
+
+    ``handler``/``requests`` 观察的是**内核**的 JEV HTTP 调用：同一份
+    ``MockTransport`` 既交给内核（``core_app_for(..., transport=...)``），也挂在
+    外围自己的 ``app.state.http`` 上——外围若绕过内核自己发起 JEV 调用，测试就
+    能在 ``requests`` 里看到（并可用 ``app.state.http.post`` 故障注入证伪）。
+    """
     path = str(tmp_path / "v3.db")
     _migrated(path)
 
@@ -60,9 +66,10 @@ def make_client(tmp_path, handler=None, requests=None):
     app.state.snapshot_set = None
     app.state.publisher = SnapshotPublisher(app, app.state.graph_repo)
     app.state.http = httpx.AsyncClient(transport=transport)
-    app.state.jev_client = JevClient(app.state.http)
     # Task 7：目录写/图读取走内核；手工 app 装配同一份生产 wiring。
-    wire_catalog_sync(app, core_app_for(tmp_path))
+    wire_catalog_sync(
+        app, core_transport if core_transport is not None
+        else core_app_for(tmp_path, transport=transport))
     app.include_router(router, prefix="/admin")
     return TestClient(app), app
 
@@ -325,9 +332,18 @@ def test_impact_confirmation_is_irrelevant_without_affected_canvases(tmp_path):
 
 
 # ── 连接测试：用数据库服务配置，不读活动画布 ──────────────────────────
-def test_test_endpoint_calls_real_configured_http_service(tmp_path):
+def test_test_endpoint_calls_real_configured_http_service(tmp_path, monkeypatch):
+    # I6：连接测试的 JEV 凭据只属于内核。外围环境里即使没有 Key，试连也由内核
+    # 用它自己的环境变量发起，所以这里清掉变量只验证“请求确实由内核发出”。
+    monkeypatch.delenv("ROUTER_JEV_API_KEY", raising=False)
     requests = []
-    client, _ = make_client(tmp_path, requests=requests)
+    client, app = make_client(tmp_path, requests=requests)
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("peripheral must not call JEV itself")
+
+    # 外围自己的 HTTP client 绝不能再发起 JEV 调用：内核做试连。
+    app.state.http.post = forbidden
     client.post("/admin/jev", json=service_payload(
         base_url="http://jev.test", model="NeoHorse-Jev-4B", timeout_seconds=5,
         instructions=DEFAULT_INSTRUCTIONS, state_template=DEFAULT_STATE_TEMPLATE))
@@ -337,9 +353,10 @@ def test_test_endpoint_calls_real_configured_http_service(tmp_path):
     assert response.json()["probabilities"] == {"a": 0.4, "b": 0.6}
     assert response.json()["usage"]["input_tokens"] == 10
 
+    # 请求由内核 transport 收到（外围 transport 若被调用，上面的注入会先失败）。
     assert len(requests) == 1
     assert requests[0].url == "http://jev.test/v1/systemone"
-    # 外围连接测试没有 JEV 密钥通道：不发送 Authorization（密钥只在核心里）。
+    # 内核环境里没有 Key：不发送 Authorization；密钥只在核心里。
     assert "authorization" not in requests[0].headers
     body = json.loads(requests[0].content)
     assert body["model"] == "NeoHorse-Jev-4B"
@@ -351,6 +368,27 @@ def test_test_endpoint_calls_real_configured_http_service(tmp_path):
         "候选 A": "用于验证决策服务连通性的第一个候选。",
         "候选 B": "用于验证决策服务连通性的第二个候选。",
     }
+
+
+def test_test_endpoint_is_503_when_the_kernel_is_unreachable(tmp_path):
+    def connect_error(request):
+        raise httpx.ConnectError("kernel down", request=request)
+
+    client, _app = make_client(
+        tmp_path, core_transport=httpx.MockTransport(connect_error))
+    client.post("/admin/jev", json=service_payload())
+    response = client.post("/admin/jev/jev-a/test", json={"text": "测试连接"})
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {"code": "core_unavailable"}
+
+
+def test_test_endpoint_is_503_without_a_core_client(tmp_path):
+    client, app = make_client(tmp_path)
+    client.post("/admin/jev", json=service_payload())
+    del app.state.core
+    response = client.post("/admin/jev/jev-a/test", json={"text": "测试连接"})
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {"code": "core_unavailable"}
 
 
 def test_test_endpoint_uses_database_config_not_active_canvas(tmp_path):
@@ -372,7 +410,9 @@ def test_test_endpoint_uses_database_config_not_active_canvas(tmp_path):
     app = create_app(
         settings,
         transport=httpx.MockTransport(handler),
-        core_transport=core_app_for(tmp_path),
+        # I6：JEV 试连由内核发出，handler 必须挂在内核自己的 transport 上。
+        core_transport=core_app_for(
+            tmp_path, transport=httpx.MockTransport(handler)),
     )
     client = TestClient(app)
 

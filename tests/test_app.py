@@ -132,7 +132,7 @@ def test_graph_tree_with_questions_without_service_config_is_not_ready(tmp_path)
 
 def test_environment_jev_service_is_seeded_once(tmp_path):
     """空目录首次启动：环境 URL/model/api_key 创建 ``default`` 服务。"""
-    settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B", jev_api_key="secret")
+    settings = test_settings(tmp_path, jev_url="http://jev.test", jev_model="NeoHorse-Jev-4B")
     app = split_app_for(settings=settings)
     # 无启用图：内核路由集为空；种子只写外围数据库目录，不进入运行快照。
     assert kernel_state(app).snapshot_set.snapshots == {}
@@ -385,3 +385,11 @@ def test_default_admin_guard_does_not_fire_when_console_auth_is_off(tmp_path):
     )
     app = create_app(settings)
     assert app.state.settings.user_auth is False
+
+
+def test_peripheral_does_not_mount_the_kernel_jev_test(tmp_path):
+    """I6: the credentialed JEV test belongs to the kernel internal listener."""
+    app = split_app_for(tmp_path)
+    response = TestClient(app).post("/internal/v1/jev-test", json={
+        "base_url": "http://jev.test", "model": "m", "text": "t"})
+    assert response.status_code == 404, response.text

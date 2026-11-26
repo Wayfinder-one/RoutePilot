@@ -15,6 +15,10 @@ def test_defaults():
     assert settings.jev_url == ""
     assert settings.jev_model == ""
     assert settings.jev_timeout == 10.0
+    # I6: the JEV key belongs to the kernel only; the peripheral Settings must not
+    # expose any key value or even the kernel's env-var name.
+    assert not hasattr(settings, "jev_api_key")
+    assert not hasattr(settings, "jev_api_key_env")
     assert settings.session_max_entries == 10000
     assert not hasattr(settings, "tagger")
 
@@ -29,6 +33,7 @@ def test_env_override(monkeypatch):
     monkeypatch.setenv("ROUTER_INTERNAL_HOST", "10.0.0.7")
     monkeypatch.setenv("ROUTER_JEV_URL", "http://jev.test")
     monkeypatch.setenv("ROUTER_JEV_MODEL", "NeoHorse-Jev-4B")
+    # I6: the peripheral never reads the kernel's JEV key.
     monkeypatch.setenv("ROUTER_JEV_API_KEY", "secret")
     monkeypatch.setenv("ROUTER_JEV_TIMEOUT", "4.5")
     monkeypatch.setenv("ROUTER_SESSION_MAX_ENTRIES", "123")
@@ -42,7 +47,8 @@ def test_env_override(monkeypatch):
     assert settings.internal_host == "10.0.0.7"
     assert settings.jev_url == "http://jev.test"
     assert settings.jev_model == "NeoHorse-Jev-4B"
-    assert settings.jev_api_key == "secret"
+    assert not hasattr(settings, "jev_api_key")
+    assert "secret" not in repr(settings)
     assert settings.jev_timeout == 4.5
     assert settings.session_max_entries == 123
 

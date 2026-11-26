@@ -281,5 +281,25 @@ class CoreClient:
                 }}, uncertain=True)
         return body
 
+    async def jev_test(self, payload: dict) -> dict:
+        """Ask the kernel to run one credentialed JEV connection test (I6).
+
+        ``payload`` carries only the **non-secret** catalog service description
+        and the probe text: the key never crosses this boundary because only the
+        kernel holds it (its own ``jev.api_key_env`` environment variable).  The
+        kernel status/body are preserved: 422 (invalid service values), 502 (JEV
+        failure) and 503 (kernel unavailable) reach the peripheral route, which
+        maps them onto its public contract.
+        """
+        try:
+            status, body = await self.admin_json("POST", "/jev-test", payload)
+        except httpx.HTTPError as exc:
+            raise _unavailable(exc) from exc
+        if status != 200:
+            raise CoreGraphError(status, body)
+        if not isinstance(body, dict):
+            raise CoreGraphError(502, {"detail": "kernel JEV test reply is not an object"})
+        return body
+
     async def aclose(self) -> None:
         await self.http.aclose()

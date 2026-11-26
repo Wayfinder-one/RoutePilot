@@ -59,7 +59,6 @@ from router.control.remote_catalog_sync import (
 )
 from router.core_client import CoreClient, CoreGraphError
 from router.decision_log_store import DecisionLogStore
-from router.jev.client import JevClient
 from router.jev.service import JevService
 from router.store.db import connect, migrate
 from router.store.jev_services import JevServiceRepo
@@ -184,7 +183,7 @@ def _seed_jev(conn, settings: Settings) -> None:
     """boot 种子：环境配置只在整个生命周期内创建一次 ``default`` 服务。
 
     种子只写非密钥目录字段：JEV 密钥由内核从 ``ROUTER_JEV_API_KEY`` 读取，
-    v7 起不再写入 SQLite（``settings.jev_api_key`` 仅留给本进程连接测试）。
+    v7 起不再写入 SQLite；外围进程也没有任何 JEV 密钥或密钥通道（I6）。
 
     - 目录里已有任何服务就完全跳过（数据库目录是事实源，不覆盖管理结果）。
     - 只有从未用环境种子初始化过（``settings`` 表的 ``jev_catalog_seeded``
@@ -265,8 +264,8 @@ def create_app(
     # 内核条件图批次 + 反向补偿。路由只做 DTO 与影响预览。
     app.state.catalog_sync_factory = _catalog_sync_factory(app.state.core)
     # 外围执行层的上游熔断（只记录本进程的上游执行结果，不参与内核调度）。
+    # JEV 调用（含连接测试）只属于内核：外围没有 JEV 客户端，也没有密钥。
     app.state.breaker = CircuitBreaker()
-    app.state.jev_client = JevClient(app.state.http)
     # 决策日志只保存在内存：完整事件来自内核事件接收口，重启即清空（Global Constraint 5）。
     # 生产进程通过 create_service_apps 传入与内部监听共享的 store；独立使用时自建。
     app.state.decision_logs = (

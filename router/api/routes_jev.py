@@ -24,6 +24,8 @@
 ``api_key`` 是未知字段（422），``key_source``/``key_present`` 派生状态已删除；
 真实密钥只由内核从 ``ROUTER_JEV_API_KEY`` 环境变量读取。目录投影里的
 ``key_env`` 固定为该环境变量名，仅供图文档/画布运行配置 schema 兼容。
+连接测试（``POST /admin/jev/{id}/test``）同样不碰密钥：外围只把非密钥服务
+描述代理到内核 ``POST /internal/v1/jev-test``，由内核带自己的 Key 执行（I6）。
 
 旧单配置形态（单配置 PUT、单一 test 端点、独立 window 读写入口）已删除，
 不保留兼容层。
@@ -48,13 +50,7 @@ from router.control.impacts import (
     require_confirmation,
     sync_jev,
 )
-from router.jev.client import (
-    ChoiceAnswer,
-    DecisionQuestion,
-    JevCandidate,
-    JevClient,
-    JevError,
-)
+from router.core_client import CoreGraphError
 from router.jev.config import (
     DEFAULT_INSTRUCTIONS,
     DEFAULT_STATE_TEMPLATE,
@@ -371,36 +367,33 @@ async def test_jev_service(
     service_id: str, body: JevTestIn, request: Request,
     conn: sqlite3.Connection = Depends(get_conn),
 ):
-    """用数据库目录里的服务配置试连：不读取任何图的画布快照。
+    """用数据库目录里的服务配置请内核试连：不读取任何图的画布快照。
 
-    JEV 密钥属于内核：外围进程只在显式配置了 ``settings.jev_api_key`` 时带上它
-    （分裂部署的外围容器没有该环境变量），绝不再读 SQLite 或页面输入。
+    I6：JEV 密钥只属于内核。外围只把**非密钥**服务描述转发到内核的
+    ``POST /internal/v1/jev-test``，由内核用它自己环境变量里的 Key 调用 JEV
+    端点；外围进程既不构造 ``JevSettings``，也不注入任何密钥。
+    没有内核客户端（手工装配的 app）时直接 503，绝不退回外围自行试连。
     """
     repo = JevServiceRepo(conn)
     service = _require(repo, service_id)
-    settings = service.settings(
-        api_key=getattr(request.app.state.settings, "jev_api_key", ""))
     text = body.text if "text" in body.model_fields_set else "请选择一个候选以验证决策服务。"
     if not isinstance(text, str) or len(text) > 10000:
         raise HTTPException(422, detail="text must be a string of at most 10000 characters")
-    candidates = (
-        JevCandidate("a", "候选 A", "用于验证决策服务连通性的第一个候选。"),
-        JevCandidate("b", "候选 B", "用于验证决策服务连通性的第二个候选。"),
-    )
-    client = getattr(request.app.state, "jev_client", None) or JevClient(request.app.state.http)
-    try:
-        question = DecisionQuestion("choice", settings.instructions, candidates)
-        answers = await client.choose_many(settings, text, {"route": question})
-        answer = answers["route"]
-        if not isinstance(answer, ChoiceAnswer):
-            raise HTTPException(502, detail="JEV route answer is not choice")
-    except JevError as exc:
-        raise HTTPException(502, detail=str(exc)) from exc
-    return {
-        "selected_key": answer.selected_key,
-        "probabilities": answer.probabilities,
-        "p_top": answer.p_top,
-        "margin": answer.margin,
-        "usage": answer.usage,
-        "duration_ms": answer.duration_ms,
+    core = getattr(request.app.state, "core", None)
+    if core is None:
+        raise HTTPException(503, detail={"code": "core_unavailable"})
+    payload = {
+        "base_url": service.base_url,
+        "model": service.model,
+        "instructions": service.instructions,
+        "state_template": service.state_template,
+        "timeout_seconds": service.timeout_seconds,
+        "text": text,
     }
+    try:
+        return await core.jev_test(payload)
+    except CoreGraphError as exc:
+        detail = exc.payload.get("detail") if isinstance(exc.payload, dict) else None
+        if exc.status_code in (422, 502):
+            raise HTTPException(exc.status_code, detail=detail) from exc
+        raise HTTPException(503, detail={"code": "core_unavailable"}) from exc

@@ -32,10 +32,8 @@ class Settings:
     internal_port: int = 8402
     jev_url: str = ""
     jev_model: str = ""
-    jev_api_key: str = ""
-    # 内核 JEV Key 的环境变量名（与 CoreSettings.jev_api_key_env 同义）；
-    # 图运行装配只读该变量，不再从 SQLite 解析已存密钥。
-    jev_api_key_env: str = "ROUTER_JEV_API_KEY"
+    # I6：JEV Key 只属于内核（CoreSettings.jev_api_key_env / 内核进程环境变量），
+    # 外围 Settings 不读取、也不持有任何 JEV 密钥或密钥变量名。
     jev_timeout: float = 10.0
     session_max_entries: int = 10000
     user_auth: bool = True
@@ -58,7 +56,6 @@ class Settings:
             internal_port=int(os.environ.get("ROUTER_INTERNAL_PORT", "8402")),
             jev_url=os.environ.get("ROUTER_JEV_URL", ""),
             jev_model=os.environ.get("ROUTER_JEV_MODEL", ""),
-            jev_api_key=os.environ.get("ROUTER_JEV_API_KEY", ""),
             jev_timeout=float(os.environ.get("ROUTER_JEV_TIMEOUT", "10")),
             session_max_entries=int(os.environ.get("ROUTER_SESSION_MAX_ENTRIES", "10000")),
             user_auth=_flag("ROUTER_USER_AUTH", True),

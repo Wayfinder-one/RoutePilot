@@ -16,10 +16,12 @@ import json
 from urllib.parse import quote
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from router.api.core_app import create_core_app
 from router.core_config import CoreSettings, LogSinkSettings
+from router.jev.config import DEFAULT_INSTRUCTIONS, DEFAULT_STATE_TEMPLATE
 from router.routing.document import graph_document_bytes
 from router.routing.tree import tree_from_dict, tree_to_dict
 from router.store.routing_trees import GraphBatch, GraphStorageError, RoutingTreeRepo
@@ -478,3 +480,116 @@ def test_kernel_batch_rollback_failure_is_unknown_not_not_committed(
     detail = response.json()["detail"]
     assert detail["code"] == "graph_batch_rollback_failed"
     assert detail["message"]
+
+
+# --------------------------------------------------------------------------- #
+# I6: the kernel-side JEV connection test (the only place that holds the key)
+# --------------------------------------------------------------------------- #
+def _jev_http(requests, *, status=200, body=None):
+    """Kernel-side JEV transport: records every request the kernel really sends."""
+
+    async def transport(request):
+        requests.append(request)
+        if body is not None:
+            return httpx.Response(status, json=body)
+        return httpx.Response(status, json={
+            "answers": {"route": {
+                "type": "choice",
+                "probabilities": {"候选 A": 0.4, "候选 B": 0.6},
+            }},
+            "usage": {"input_tokens": 10, "output_tokens": 0},
+        })
+
+    return httpx.MockTransport(transport)
+
+
+JEV_TEST_BODY = {
+    "base_url": "http://jev.test",
+    "model": "NeoHorse-Jev-4B",
+    "instructions": DEFAULT_INSTRUCTIONS,
+    "state_template": DEFAULT_STATE_TEMPLATE,
+    "timeout_seconds": 5,
+    "text": "测试连接",
+}
+
+
+def test_core_jev_test_uses_the_kernel_environment_key(tmp_path, monkeypatch):
+    """I6: the kernel's JEV-test endpoint reads the key only from its env var."""
+    monkeypatch.setenv("ROUTER_JEV_API_KEY", "kernel-secret")
+    requests = []
+    app = create_core_app(
+        core_settings(tmp_path), transport=_jev_http(requests))
+
+    response = TestClient(app).post("/internal/v1/jev-test", json=JEV_TEST_BODY)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["selected_key"] == "b"
+    assert body["probabilities"] == {"a": 0.4, "b": 0.6}
+    assert body["p_top"] == 0.6
+    assert body["margin"] == pytest.approx(0.2)
+    assert body["usage"]["input_tokens"] == 10
+    assert isinstance(body["duration_ms"], (int, float))
+
+    assert len(requests) == 1
+    assert str(requests[0].url) == "http://jev.test/v1/systemone"
+    assert requests[0].headers["authorization"] == "Bearer kernel-secret"
+    wire = json.loads(requests[0].content)
+    assert set(wire) == {"model", "state", "questions"}
+    assert wire["model"] == "NeoHorse-Jev-4B"
+    assert set(wire["questions"]) == {"route"}
+    assert wire["questions"]["route"]["criteria"] == {
+        "候选 A": "用于验证决策服务连通性的第一个候选。",
+        "候选 B": "用于验证决策服务连通性的第二个候选。",
+    }
+    assert b"kernel-secret" not in requests[0].content
+
+
+def test_core_jev_test_sends_no_authorization_without_the_environment_key(
+        tmp_path, monkeypatch):
+    monkeypatch.delenv("ROUTER_JEV_API_KEY", raising=False)
+    requests = []
+    app = create_core_app(
+        core_settings(tmp_path), transport=_jev_http(requests))
+
+    response = TestClient(app).post("/internal/v1/jev-test", json=JEV_TEST_BODY)
+
+    assert response.status_code == 200, response.text
+    assert len(requests) == 1
+    assert "authorization" not in requests[0].headers
+
+
+def test_core_jev_test_rejects_secret_or_invalid_bodies_before_calling_jev(
+        tmp_path):
+    """The request body is non-secret only: api_key is an unknown field (422)."""
+    requests = []
+    app = create_core_app(
+        core_settings(tmp_path), transport=_jev_http(requests))
+    client = TestClient(app)
+
+    with_key = client.post(
+        "/internal/v1/jev-test", json={**JEV_TEST_BODY, "api_key": "leak"})
+    assert with_key.status_code == 422, with_key.text
+    assert "Extra inputs are not permitted" in with_key.text
+
+    too_long = client.post(
+        "/internal/v1/jev-test", json={**JEV_TEST_BODY, "text": "x" * 10001})
+    assert too_long.status_code == 422, too_long.text
+    invalid_model = client.post(
+        "/internal/v1/jev-test", json={**JEV_TEST_BODY, "model": ""})
+    assert invalid_model.status_code == 422, invalid_model.text
+    invalid_timeout = client.post(
+        "/internal/v1/jev-test", json={**JEV_TEST_BODY, "timeout_seconds": 0})
+    assert invalid_timeout.status_code == 422, invalid_timeout.text
+    assert requests == []
+
+
+def test_core_jev_test_maps_jev_failures_to_502(tmp_path):
+    requests = []
+    app = create_core_app(
+        core_settings(tmp_path), transport=_jev_http(requests, status=500))
+    response = TestClient(app).post("/internal/v1/jev-test", json=JEV_TEST_BODY)
+
+    assert response.status_code == 502, response.text
+    assert "JEV returned HTTP 500" in response.json()["detail"]
+    assert len(requests) == 1

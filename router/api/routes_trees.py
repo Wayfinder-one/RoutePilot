@@ -373,7 +373,8 @@ def draft_tree(body: TryIn, stored: RoutingTree | None) -> RoutingTree:
 def _try_snapshot(request: Request, tree: RoutingTree):
     """草稿快照：运行配置完全来自草稿 envelope / 已存画布，不读数据库目录。
 
-    JEV Key 只来自应用启动时注入的 ``app.state.jev_api_key``。
+    JEV Key 只来自内核进程启动时从内核环境变量解析的 ``app.state.jev_api_key``
+    （本路由只挂在内核应用上；外围的 /admin/try 是内核代理）。
     """
     return build_snapshot(
         tree=tree,
