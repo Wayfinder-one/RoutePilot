@@ -4,8 +4,9 @@ import os
 from dataclasses import dataclass
 
 
-#: 公开已知的默认管理员凭据：只在 loopback 本机绑定上允许作为种子值；
-#: 任何非 loopback 绑定（如容器里的 0.0.0.0）都必须在启动时显式覆盖。
+#: 首次部署的默认管理员凭据：未设置 ROUTER_ADMIN_EMAIL / ROUTER_ADMIN_PASSWORD
+#: 时直接写入新库，容器里的 0.0.0.0 绑定也一样可用。生产可显式覆盖；
+#: 旧库若仍保留**另一套**公开口令，由启动时的 stale 账号扫描处理。
 DEFAULT_ADMIN_EMAIL = "admin@test.com"
 DEFAULT_ADMIN_PASSWORD = "1qaz@WSX"
 

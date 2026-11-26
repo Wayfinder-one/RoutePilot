@@ -12,11 +12,11 @@
 #                 decision-event receiver (POST /internal/v1/decision-logs).
 #             The kernel reaches it as http://console:8400 (see core-config.json).
 #
-# Secrets: the kernel JEV key and the console admin credentials are required
-# from the shell/CI secret store.  `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD`
-# use `${VAR:?message}`, so `docker compose up` refuses to start when they are
-# missing — this deployment never seeds the publicly-known default admin.
-# Only non-secret values are interpolated in this file; see env.compose.example.
+# Secrets: the kernel JEV key comes from the shell/CI secret store.  The console
+# seeds the built-in first-deployment admin (admin@test.com / 1qaz@WSX) when
+# ROUTER_ADMIN_EMAIL / ROUTER_ADMIN_PASSWORD are not set; a private deployment
+# overrides them explicitly.  Only non-secret values are interpolated here; see
+# env.compose.example.
 name: routepilot
 
 services:
@@ -51,8 +51,8 @@ services:
       ROUTER_INTERNAL_HOST: 0.0.0.0
       ROUTER_INTERNAL_PORT: "8400"
       # Mandatory explicit administrator credentials (C1): no defaults.
-      ROUTER_ADMIN_EMAIL: "${ROUTER_ADMIN_EMAIL:?set ROUTER_ADMIN_EMAIL}"
-      ROUTER_ADMIN_PASSWORD: "${ROUTER_ADMIN_PASSWORD:?set ROUTER_ADMIN_PASSWORD}"
+      ROUTER_ADMIN_EMAIL: "${ROUTER_ADMIN_EMAIL:-admin@test.com}"
+      ROUTER_ADMIN_PASSWORD: "${ROUTER_ADMIN_PASSWORD:-1qaz@WSX}"
     ports:
       # Loopback-only by default.  Operators who deliberately expose the console
       # to another host must change the bind address and accept the risk.

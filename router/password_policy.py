@@ -76,21 +76,30 @@ _POLICY_DIGEST = hashlib.sha256(
 
 
 def stored_credentials_fingerprint(
-        users: Iterable[Mapping[str, object]]) -> str:
+        users: Iterable[Mapping[str, object]], *,
+        exempt_password: str | None = None) -> str:
     """Fingerprint of the stored credentials a weak-password scan depends on.
 
     ``users`` 必须恰好是「status 为 active」的用户行（至少含 ``id`` 与
     ``password_hash``）：它们是 :func:`is_weak_stored_password` 的唯一输入。
-    输出对排序后的 ``(id, password_hash)`` 对做 SHA-256，因此与行顺序无关；
-    任一账号增删、状态变化或哈希改动都会改变指纹，只有逐字节相同的历史结论
-    才会被缓存采信。
+    ``exempt_password`` 是本次部署显式配置的管理员口令（见
+    :func:`is_weak_stored_password`）：它同样参与指纹，否则「默认口令部署」
+    留下的 clean 结论会在换成自定义口令后被误用。输出对排序后的
+    ``(id, password_hash)`` 对做 SHA-256，因此与行顺序无关；任一账号增删、
+    状态变化、哈希改动或豁免口令变化都会改变指纹。
     """
     pairs = sorted(
         (str(user.get("id") or ""), str(user.get("password_hash") or ""))
         for user in users
     )
     digest = hashlib.sha256(
-        b"router.admin-weak-scan.v1\x00" + _POLICY_DIGEST.encode("ascii"))
+        b"router.admin-weak-scan.v2\x00" + _POLICY_DIGEST.encode("ascii"))
+    if exempt_password is None:
+        digest.update(b"\x00exempt:none")
+    else:
+        encoded = exempt_password.encode("utf-8")
+        digest.update(b"\x00exempt:" + str(len(encoded)).encode("ascii")
+                      + b":" + encoded)
     for user_id, password_hash in pairs:
         digest.update(b"\x00" + user_id.encode("utf-8"))
         digest.update(b"\x00" + password_hash.encode("utf-8"))
@@ -128,8 +137,15 @@ def is_public_password(value: object, stored_hash: str | None = None) -> bool:
 def is_weak_stored_password(
     stored_hash: object,
     verify: Callable[[str, str], bool] = auth.verify_password,
+    *,
+    exempt_password: str | None = None,
 ) -> bool:
-    """True when ``stored_hash`` accepts any publicly-known/blank password.
+    """True when ``stored_hash`` accepts a publicly-known/blank password.
+
+    ``exempt_password`` 是本次部署**显式配置**的管理员口令：内置默认凭据
+    （``admin@test.com / 1qaz@WSX``）在首次部署时就是期望口令，因此当它等于
+    部署配置时不算 stale；换过自定义口令的部署仍会把旧默认口令判为 stale，
+    空/纯空白也永远判为 stale。
 
     ``verify`` 是 ``(password, stored_hash) -> bool`` 的注入点（默认
     :func:`router.auth.verify_password`），批量扫描时便于测试替身；生产调用
@@ -137,5 +153,9 @@ def is_weak_stored_password(
     """
     if not isinstance(stored_hash, str) or not stored_hash:
         return False
+    candidates = _PUBLIC_PASSWORD_CANDIDATES
+    if exempt_password is not None:
+        candidates = tuple(candidate for candidate in candidates
+                           if candidate != exempt_password)
     return any(verify(candidate, stored_hash)
-               for candidate in _PUBLIC_PASSWORD_CANDIDATES)
+               for candidate in candidates)

@@ -558,7 +558,7 @@ APISIX + newapi 部署形态——`auto` 路由插件、其 newapi forward-auth 
 - **内核调度熔断不再感知上游执行失败。** 它只观察决策：设计上内核不做执行结果回写。standalone 外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
 - **VictoriaLogs 输出适配器未实现。** `logging.type` 只支持 `routepilot` 与 `disabled`；事件结构已固定，供将来 `logging.type=victorialogs` 适配器序列化同一批对象。
 - **过期控制台会话不再自动清理。** 外围应用已不再接入旧的 `MaintenanceWorker`（计划 Task 8），过期 `user_sessions` 行会留在 SQLite，直到人工清理。
-- **旧的短（非空白）管理员口令不会自动被判定为公开凭据。** 启动门（以及 `ROUTER_ADMIN_FORCE_RESET=1`）只把「公开已知 / 空白 / 纯空白」口令当作已泄露：内置默认口令、空串，以及**只由 1–16 个连续空格组成的纯空格值**（仅空格字符，不含制表符等其它空白字符——例如 8 个制表符的历史口令不会命中这个有界扫描）。而当前 API 策略对新建/重置口令会拒绝任何纯空白值（空格、制表符或其它空白字符）。旧库里非空白但短于当前 8 字符下限的口令**不**像空/默认口令那样可被轻易猜到，因此不会拦截启动；运维应主动轮换这类账号。更长的或其它花样的纯空白历史口令同样不在自动扫描范围内。
+- **旧的短（非空白）管理员口令不会自动被判定为公开凭据。** 启动门（以及 `ROUTER_ADMIN_FORCE_RESET=1`）只把「公开已知（当前配置的 `ROUTER_ADMIN_PASSWORD` 除外）/ 空白 / 纯空白」口令当作已泄露：换过自定义口令后仍留在旧库里的内置默认口令、空串，以及**只由 1–16 个连续空格组成的纯空格值**（仅空格字符，不含制表符等其它空白字符——例如 8 个制表符的历史口令不会命中这个有界扫描）。而当前 API 策略对新建/重置口令会拒绝任何纯空白值（空格、制表符或其它空白字符）。旧库里非空白但短于当前 8 字符下限的口令**不**像空/默认口令那样可被轻易猜到，因此不会拦截启动；运维应主动轮换这类账号。更长的或其它花样的纯空白历史口令同样不在自动扫描范围内。
 - **APISIX + newapi 部署形态不在本仓库。** 其插件契约、集群清单与验收演练由内部发行维护；本公开树只包含独立的内核 + 外围形态。
 
 ## 快速开始
@@ -595,7 +595,7 @@ ROUTER_ADMIN_EMAIL='admin@example.com' ROUTER_ADMIN_PASSWORD='<strong-password>'
 
 外围进程运行**两个监听**：公开的控制台/`/admin`/`/v1` 监听（`ROUTER_HOST`/`ROUTER_PORT`），以及独立的内部监听（`ROUTER_INTERNAL_HOST`/`ROUTER_INTERNAL_PORT`，默认 `127.0.0.1:8402`），后者只提供内核事件通道的 `POST /internal/v1/decision-logs` 与 `/healthz`。compose 中内部监听是容器端口 8400，**不发布到主机**；内核应指向 `http://console:8400/internal/v1/decision-logs`。本机形态则把内核 `logging` 块设为 `{"type": "routepilot", "url": "http://127.0.0.1:8402/internal/v1/decision-logs", "timeout_ms": 1000}`。非 compose 部署必须用防火墙把内部端口限定为只允许内核主机访问。
 
-**管理员凭据是必填项，部署形态没有默认值。** compose 在未显式导出 `ROUTER_ADMIN_EMAIL` 与 `ROUTER_ADMIN_PASSWORD` 时拒绝启动。非 loopback 绑定下，`ROUTER_ADMIN_PASSWORD` 为空、纯空白、短于 8 个字符或等于内置种子口令时，外围同样拒绝启动（与用户 API 共用同一套策略 `router/password_policy.py`）；内置种子值只用于像上面这样的纯本机 loopback 运行，任何实际部署都必须显式设置凭据。若已有数据库仍接受内置默认管理员口令、空口令或纯空格口令，启动也会被拒绝：操作员必须先以 `ROUTER_HOST=127.0.0.1` 启动一次并通过控制台/用户 API 修改这些口令，或显式授权 `ROUTER_ADMIN_FORCE_RESET=1`——该模式会在**一个批次事务**里把这些账号的口令重置为 `ROUTER_ADMIN_PASSWORD` 并吊销它们的全部会话。这个旧账号检查是**严格只读的 preflight**，在破坏性的 v6→v7 迁移**之前**执行：被拒绝的启动不会动旧库和它的决策日志。只有公开已知、空与纯空白口令会被当作公开凭据；策略细节见[已知限制](#已知限制拆分)。
+**首次部署默认写入 `admin@test.com` / `1qaz@WSX`。** 不设置 `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` 时，任何绑定（包括容器里的 `0.0.0.0`）都直接使用这组默认值，compose 形态同样有默认值。非 loopback 绑定下只守卫口令的**形状**：空、纯空白或短于 8 个字符会拒绝启动（与用户 API 共用 `router/password_policy.py`）。私有部署可显式覆盖这两个变量；若旧库仍接受**不是**当前 `ROUTER_ADMIN_PASSWORD` 的公开/空白口令，启动会被拒绝，操作员可本机改密，或显式授权 `ROUTER_ADMIN_FORCE_RESET=1` 把这些账号批量重置为 `ROUTER_ADMIN_PASSWORD` 并吊销会话。该检查是**严格只读 preflight**，位于破坏性的 v6→v7 迁移**之前**：被拒绝的启动不会动旧库和决策日志；细节见[已知限制](#已知限制拆分)。
 
 **只部署内核（接 APISIX + newapi）。** 即 163 形态：无 SQLite、无控制台、无模型上游、无决策日志接收端。使用 `logging.type=disabled` 的 `config.json`，图目录挂持久卷：
 
@@ -650,8 +650,8 @@ ROUTER_JEV_API_KEY='<jev-key>' \
 | `ROUTER_JEV_URL` / `ROUTER_JEV_MODEL` | 空 | 一次性播种 `default` 非密钥 JEV 目录项；必须成对、仅在目录为空且从未播种时生效 |
 | `ROUTER_SESSION_MAX_ENTRIES` | `10000` | 会话粘性 LRU 容量（外围进程） |
 | `ROUTER_USER_AUTH` | `true` | 控制台登录开关 |
-| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | 种子值（仅 loopback） | 首次启动的管理员账号；**compose 部署必须显式提供（没有默认值）；非 loopback 绑定下口令至少 8 个字符且不得是内置默认值** |
-| `ROUTER_ADMIN_FORCE_RESET` | `false` | 显式授权一次性、整批原子的重置：仍接受内置默认口令、空口令或纯空格口令的既有 active 账号改为 `ROUTER_ADMIN_PASSWORD` 并吊销其会话；仅非 loopback 绑定生效 |
+| `ROUTER_ADMIN_EMAIL` / `ROUTER_ADMIN_PASSWORD` | `admin@test.com` / `1qaz@WSX` | 首次启动的管理员账号；内置默认值在所有绑定上都可用，私有部署请覆盖两者；非 loopback 绑定下口令仍需至少 8 个字符且不能是纯空白 |
+| `ROUTER_ADMIN_FORCE_RESET` | `false` | 显式授权一次性、整批原子的重置：仍接受「非当前 `ROUTER_ADMIN_PASSWORD` 的公开口令」、空口令或纯空格口令的既有 active 账号改为 `ROUTER_ADMIN_PASSWORD` 并吊销其会话；仅非 loopback 绑定生效 |
 | `ROUTER_SESSION_TTL_HOURS` | `168` | 控制台会话有效期 |
 
 外围进程**不读取** `ROUTER_JEV_API_KEY`：该变量只属于内核进程（见内核配置），控制台「测试连接」由内核带 Key 执行（I6）。
@@ -754,7 +754,7 @@ ROUTER_ADMIN_EMAIL=x ROUTER_ADMIN_PASSWORD=y \
 - `node --test` 运行 ES Module 套件：图与 canonical 行为、草稿状态、图设置与影响确认用到的运行配置纯函数、跨运行时契约 fixture（`tests/fixtures/graph_contracts.json`）。
 - `npm run check:console` 运行全部 Node 测试套件，并在临时数据库、模拟决策服务与模拟上游上运行 Playwright 验收矩阵。截图默认关闭，`QA_SCREENSHOTS=1` 重新生成。`QA_ONLY=<正则>` 选择用例；单个页面模块可独立运行，例如 `node scripts/console_qa/canvas.mjs`。Chromium 不在默认缓存时设置 `CHROME=/path/to/chrome`。
 - `.venv/bin/python scripts/i18n_dead_keys.py` 列出控制台词典中已无页面引用的 key（存在死 key 时 exit 1），用于删除无用翻译；它是 CI lint，不属于 Playwright 矩阵。
-- `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。它要求环境里有 `ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD`：缺失时 compose 拒绝渲染，这正是默认凭据护栏的预期行为。
+- `docker compose -f scripts/docker/compose.yml config` 静态校验双服务 standalone 部署（两个服务、状态卷分离、健康检查、不输出密钥值）。`ROUTER_ADMIN_EMAIL`/`ROUTER_ADMIN_PASSWORD` 缺失时使用内置默认值，不再拒绝渲染。
 - `scripts/standalone_v4_smoke.py` 是**拆分前的 legacy** 验收脚本（单服务写者/只读副本假设），仅作历史留存，不能用于验证拆分。拆分门禁是 `tests/test_service_split_e2e.py`。
 
 实验代码独立运行，不进入默认套件：

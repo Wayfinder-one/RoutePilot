@@ -787,7 +787,7 @@ def test_password_policy_error_rejects_blank_short_and_non_strings(password):
 @pytest.mark.parametrize("password", ["abcdefgh", "1qaz@WSX", " valid pass 1 "])
 def test_password_policy_error_accepts_well_formed_strings(password):
     from router.password_policy import password_policy_error
-    # 公开默认口令由启动守卫单独拒绝；策略本身只检查「形状是否可用」。
+    # 策略本身只检查「形状是否可用」；默认口令是否可用由部署配置决定。
     assert password_policy_error(password) is None
 
 
@@ -817,6 +817,23 @@ def test_weak_stored_password_helper_detects_public_legacy_hashes():
     assert password_policy.is_weak_stored_password("nonsense") is False
 
 
+def test_weak_scan_exempts_only_the_configured_password():
+    """默认口令部署不把自带口令判 stale；空/空白与「另一套旧默认」仍然拦。"""
+    from router import password_policy
+
+    default_hash = auth.hash_password(DEFAULT_ADMIN_PASSWORD)
+    assert password_policy.is_weak_stored_password(default_hash) is True
+    assert password_policy.is_weak_stored_password(
+        default_hash, exempt_password=DEFAULT_ADMIN_PASSWORD) is False
+    # 空/纯空白永远 stale，即使配置的正是默认口令。
+    blank_hash = auth.hash_password("")
+    assert password_policy.is_weak_stored_password(
+        blank_hash, exempt_password=DEFAULT_ADMIN_PASSWORD) is True
+    # 已换自定义口令的部署：旧默认口令仍是 stale。
+    assert password_policy.is_weak_stored_password(
+        default_hash, exempt_password="custom-strong-pass") is True
+
+
 def test_scan_cache_fingerprint_is_order_independent_and_hash_sensitive():
     """启动扫描缓存指纹：只由 active 用户的 ``(id, hash)`` 决定（顺序无关）。"""
     from router import password_policy
@@ -837,6 +854,9 @@ def test_scan_cache_fingerprint_is_order_independent_and_hash_sensitive():
         rows[:1])
     assert password_policy.stored_credentials_fingerprint([]) == \
         password_policy.stored_credentials_fingerprint([])
+    # 豁免口令（本次部署的管理员口令）变化也必须让旧 clean 结论失效。
+    assert fingerprint != password_policy.stored_credentials_fingerprint(
+        rows, exempt_password="another-admin-pass")
 
 
 @pytest.mark.parametrize("password", ["        ", "\t\t\t\t\t\t\t\t", " " * 12])

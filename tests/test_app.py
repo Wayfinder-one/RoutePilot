@@ -361,18 +361,23 @@ def test_try_through_app_composition_target_without_backend_is_503(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# C1：公开已知的默认管理员凭据只允许出现在 loopback 绑定上；非 loopback
-# 绑定必须显式提供 ROUTER_ADMIN_EMAIL / ROUTER_ADMIN_PASSWORD。
+# C1：首次部署默认凭据 admin@test.com / 1qaz@WSX 在非 loopback 绑定上直接可用；
+# 只有空/纯空白/过短的口令才会被启动守卫拒绝。
 # ---------------------------------------------------------------------------
 
-def test_default_admin_credentials_are_refused_on_a_non_loopback_bind(tmp_path):
+def test_default_admin_credentials_are_allowed_on_a_non_loopback_bind(tmp_path):
     settings = test_settings(tmp_path, host="0.0.0.0", user_auth=True)
-    with pytest.raises(RuntimeError) as excinfo:
-        create_app(settings)
-    message = str(excinfo.value)
-    assert "ROUTER_ADMIN_EMAIL" in message
-    assert "ROUTER_ADMIN_PASSWORD" in message
-    assert "0.0.0.0" in message
+    app = create_app(settings)
+    assert app.state.settings.admin_email == "admin@test.com"
+    assert app.state.settings.admin_password == DEFAULT_ADMIN_PASSWORD
+
+
+def test_default_admin_credentials_survive_a_restart(tmp_path):
+    """默认口令播种后，非 loopback 的第二次启动不能被 stale 扫描拦住。"""
+    settings = test_settings(tmp_path, host="0.0.0.0", user_auth=True)
+    create_app(settings)
+    app = create_app(settings)
+    assert app.state.settings.admin_password == DEFAULT_ADMIN_PASSWORD
 
 
 def test_explicit_admin_credentials_are_allowed_on_a_non_loopback_bind(tmp_path):
@@ -384,21 +389,14 @@ def test_explicit_admin_credentials_are_allowed_on_a_non_loopback_bind(tmp_path)
     assert app.state.settings.admin_email == "ops@example.com"
 
 
-def test_default_admin_password_is_refused_even_with_a_custom_email(tmp_path):
-    """自定义邮箱 + 公开默认密码在非 loopback 绑定上仍必须拒绝。
-
-    旧守卫要求邮箱和密码**同时**为默认值才拒绝：操作员只要改掉邮箱、保留
-    ``1qaz@WSX`` 就能把一个公开已知口令暴露在可达监听上。
-    """
+def test_default_admin_password_is_allowed_with_a_custom_email(tmp_path):
+    """默认口令本身是首次部署的期望值；改邮箱不影响它可用。"""
     settings = test_settings(
         tmp_path, host="0.0.0.0", user_auth=True,
         admin_email="ops@example.com", admin_password="1qaz@WSX",
     )
-    with pytest.raises(RuntimeError) as excinfo:
-        create_app(settings)
-    message = str(excinfo.value)
-    assert "ROUTER_ADMIN_PASSWORD" in message
-    assert "0.0.0.0" in message
+    app = create_app(settings)
+    assert app.state.settings.admin_email == "ops@example.com"
 
 
 def test_custom_admin_password_is_allowed_with_the_default_email(tmp_path):
@@ -995,9 +993,9 @@ def _count_weak_scans(monkeypatch):
     calls = []
     real = password_policy.is_weak_stored_password
 
-    def counting(stored_hash):
+    def counting(stored_hash, **kwargs):
         calls.append(stored_hash)
-        return real(stored_hash)
+        return real(stored_hash, **kwargs)
 
     monkeypatch.setattr(password_policy, "is_weak_stored_password", counting)
     return calls

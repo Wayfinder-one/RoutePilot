@@ -55,7 +55,6 @@ from router import password_policy
 from router.api.issue_presenter import issues_payload
 from router.api.routes_core_proxy import router as core_proxy_router
 from router.config import (
-    DEFAULT_ADMIN_PASSWORD,
     LOOPBACK_HOSTS,
     Settings,
 )
@@ -149,7 +148,7 @@ def _active_credential_rows(conn) -> list[dict] | None:
     return _active_users(rows)
 
 
-def _remember_clean_scan(conn) -> None:
+def _remember_clean_scan(conn, *, exempt_password: str | None = None) -> None:
     """Persist the fingerprint of a scan that proved the stored hashes clean.
 
     只在 clean 分支调用：stale 分支只会拒绝启动或强制重置，绝不写入「干净」
@@ -162,7 +161,8 @@ def _remember_clean_scan(conn) -> None:
         with transaction(conn):
             SettingsRepo(conn).set(
                 _WEAK_SCAN_SETTING,
-                password_policy.stored_credentials_fingerprint(rows))
+                password_policy.stored_credentials_fingerprint(
+                    rows, exempt_password=exempt_password))
     except sqlite3.Error:
         logger.warning("could not store the admin credential scan cache; the "
                        "next start will rescan", exc_info=True)
@@ -182,16 +182,15 @@ def _is_loopback_bind(settings: Settings) -> bool:
 
 
 def _guard_admin_credentials(settings: Settings) -> None:
-    """C1: refuse weak or publicly-known admin passwords on a non-loopback bind.
+    """Refuse unusable admin passwords on a non-loopback bind.
 
-    The seed values exist only so ``python -m router`` on this machine works out
-    of the box.  A deployment (compose binds ``0.0.0.0``) must provide an
-    explicit ``ROUTER_ADMIN_PASSWORD``: silently seeding ``1qaz@WSX`` — or an
-    empty/whitespace-only/short password — on a reachable listener is a critical
-    security defect.  The checks key on the **password** only: changing the email
-    while keeping the public password must not pass.  Shape checks come from the
-    shared :mod:`router.password_policy` (the same rule the user API enforces),
-    so a deployment cannot start with a password the console would reject.
+    First deployment deliberately seeds the built-in
+    ``admin@test.com / 1qaz@WSX`` credentials when no env override is given,
+    so the product is usable out of the box; only the *shape* is guarded here
+    (empty, whitespace-only or shorter than the shared minimum).  A deployment
+    that wants a private password still sets ``ROUTER_ADMIN_PASSWORD``; a
+    legacy database that keeps a *different* public password is handled by the
+    stale-account scan, which exempts exactly the configured password.
     """
     if not settings.user_auth:
         return
@@ -199,21 +198,20 @@ def _guard_admin_credentials(settings: Settings) -> None:
         return
     password = settings.admin_password
     reason = password_policy.password_policy_error(password)
-    if reason is None and password == DEFAULT_ADMIN_PASSWORD:
-        reason = "is the publicly-known default password"
     if reason is None:
         return
     raise RuntimeError(
         "refusing to start the peripheral console on non-loopback host "
-        f"{settings.host!r}: ROUTER_ADMIN_PASSWORD {reason}; it must be an "
-        f"explicit value of at least {password_policy.MIN_PASSWORD_LENGTH} "
-        "characters that is not the publicly-known default "
-        "(ROUTER_ADMIN_EMAIL may also be overridden; or bind ROUTER_HOST to "
-        "127.0.0.1 for local-only use)"
+        f"{settings.host!r}: ROUTER_ADMIN_PASSWORD {reason}; it must be a value "
+        f"of at least {password_policy.MIN_PASSWORD_LENGTH} characters that is "
+        "not empty or whitespace-only (the built-in default is admin@test.com "
+        "/ 1qaz@WSX; override ROUTER_ADMIN_EMAIL / ROUTER_ADMIN_PASSWORD for a "
+        "private deployment)"
     )
 
 
-def _preflight_stale_admin_users(db_path: str) -> list[dict]:
+def _preflight_stale_admin_users(
+        db_path: str, *, exempt_password: str | None = None) -> list[dict]:
     """C2 preflight: strictly read-only stale-account scan *before* migrating.
 
     The v6→v7 migration is destructive (it drops the SQLite decision logs and
@@ -263,14 +261,16 @@ def _preflight_stale_admin_users(db_path: str) -> list[dict]:
         active = _active_users(rows)
         if {"id", "password_hash"} <= columns:
             cached = _read_weak_scan_cache(conn)
-            fingerprint = password_policy.stored_credentials_fingerprint(active)
+            fingerprint = password_policy.stored_credentials_fingerprint(
+                active, exempt_password=exempt_password)
             if cached == fingerprint:
                 return []
     finally:
         conn.close()
     return [
         user for user in active
-        if password_policy.is_weak_stored_password(user.get("password_hash"))
+        if password_policy.is_weak_stored_password(
+            user.get("password_hash"), exempt_password=exempt_password)
     ]
 
 
@@ -281,7 +281,8 @@ def _stale_admin_runtime_error(
     return RuntimeError(
         "refusing to start the peripheral console on non-loopback host "
         f"{settings.host!r}: the existing database still accepts a "
-        "publicly-known, blank or whitespace-only admin password for: "
+        "publicly-known (other than the configured ROUTER_ADMIN_PASSWORD), "
+        "blank or whitespace-only admin password for: "
         f"{emails}. Remediate by either (a) starting once with "
         "ROUTER_HOST=127.0.0.1 and changing the affected password through "
         "the console or the user API, or (b) setting "
@@ -310,13 +311,14 @@ def _guard_stale_admin_credentials(settings: Settings) -> list[dict] | None:
         return None
     if _is_loopback_bind(settings):
         return None
-    stale = _preflight_stale_admin_users(settings.db_path)
+    stale = _preflight_stale_admin_users(
+        settings.db_path, exempt_password=settings.admin_password)
     if stale and not settings.admin_force_reset:
         raise _stale_admin_runtime_error(settings, stale)
     return stale
 
 
-def _stale_admin_users(conn) -> list[dict]:
+def _stale_admin_users(conn, *, exempt_password: str | None = None) -> list[dict]:
     """Active users whose stored hash accepts a public/blank/whitespace password.
 
     ``status`` missing (hand-made pre-status schema) means active: the migration
@@ -325,7 +327,8 @@ def _stale_admin_users(conn) -> list[dict]:
     """
     return [
         user for user in _active_users(UserRepo(conn).list())
-        if password_policy.is_weak_stored_password(user.get("password_hash"))
+        if password_policy.is_weak_stored_password(
+            user.get("password_hash"), exempt_password=exempt_password)
     ]
 
 
@@ -358,16 +361,19 @@ def _remediate_stale_admin_credentials(
     if stale is None:
         credentials = _active_credential_rows(conn)
         if credentials is not None and _read_weak_scan_cache(conn) == \
-                password_policy.stored_credentials_fingerprint(credentials):
+                password_policy.stored_credentials_fingerprint(
+                    credentials, exempt_password=settings.admin_password):
             return
-        stale = _stale_admin_users(conn)
+        stale = _stale_admin_users(
+            conn, exempt_password=settings.admin_password)
         if not stale:
-            _remember_clean_scan(conn)
+            _remember_clean_scan(
+                conn, exempt_password=settings.admin_password)
             return
     elif not stale:
         # The preflight holds a read-only connection (no write before migrating),
         # so persist the clean fingerprint here, after migration.
-        _remember_clean_scan(conn)
+        _remember_clean_scan(conn, exempt_password=settings.admin_password)
         return
     emails = [user.get("email") for user in stale]
     if not settings.admin_force_reset:
@@ -499,8 +505,8 @@ def create_app(
     receiver app; standalone callers (and tests) may omit it and get a fresh
     store.
     """
-    # C1 first: a start must never accept a weak/default admin password, and a
-    # forced stale-account reset below must target a validated password.
+    # C1 first: a start must never accept an unusable (blank/short) admin
+    # password; the built-in default is a legal first-deployment value.
     _guard_admin_credentials(settings)
     # C2 preflight BEFORE any write: the v6→v7 migration is destructive, so an
     # unauthorized start must be refused while the old database is still intact.
