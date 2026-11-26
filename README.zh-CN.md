@@ -605,6 +605,7 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
 - **内核调度熔断不再感知上游执行失败。** 它只观察决策：设计上内核不做执行结果回写。standalone 外围保留自己的执行侧熔断；APISIX 形态由 newapi 负责重试与渠道健康。
 - **VictoriaLogs 输出适配器未实现。** `logging.type` 只支持 `routepilot` 与 `disabled`；事件结构已固定，供将来 `logging.type=victorialogs` 适配器序列化同一批对象。
 - **过期控制台会话不再自动清理。** 外围应用已不再接入旧的 `MaintenanceWorker`（计划 Task 8），过期 `user_sessions` 行会留在 SQLite，直到人工清理。
+- **APISIX 插件契约只由静态测试保证。** Lua 源码契约与 Route/ConfigMap 结构由静态测试（`scripts/apisix/test_sr_auto_router.py`）检查，本迭代未在真实 APISIX/OpenResty 运行时验证；真实链路验收留给部署窗口（design §11 非目标）。
 
 ## 快速开始
 
@@ -733,7 +734,7 @@ ROUTER_JEV_API_KEY='<jev-key>' \
 | `GET /admin/model-catalog`、`POST /admin/fetch-models` | 外围 | 读 / admin | 提供方预设、上游模型发现 |
 | `GET /admin/providers`、`PUT/DELETE /admin/providers/{name}` | 外围 | 读 / admin | 提供方；更新先返回 409 影响清单，仍被引用时不可删除 |
 | `GET/POST /admin/jev`、`GET/PUT/DELETE /admin/jev/{id}` | 外围 | 读 / admin | 非密钥多服务 JEV 目录（窗口属于各服务） |
-| `POST /admin/jev/{id}/test` | 外围 | admin | 测试单个目录服务（需要外围 JEV Key，见残留） |
+| `POST /admin/jev/{id}/test` | 外围 | admin | 测试单个目录服务（外围代理，内核带 Key 执行） |
 | `GET/PUT /admin/time-periods` | 外围 | 读 / admin | 时段 |
 | `GET /admin/requests/stats`、`GET /admin/overview`、`GET /admin/changes` | 外围 | viewer | 内存日志统计/概览、审计历史 |
 | `GET/POST /admin/users`、`PUT/DELETE /admin/users/{id}`、`POST /admin/users/{id}/password` | 外围 | admin | 用户 |

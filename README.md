@@ -605,6 +605,7 @@ The gate requires the exact shadow path, the SSH target for in-pod kernel decisi
 - **Kernel scheduling breaker no longer sees upstream execution.** It observes decisions only: there is no execution write-back by design. The standalone peripheral keeps its own execution-side breaker; the APISIX form lets newapi own retries and channel health.
 - **VictoriaLogs output adapter is not implemented.** `logging.type` supports only `routepilot` and `disabled`; the event schema is fixed so a future `logging.type=victorialogs` adapter can serialize the same objects.
 - **Expired console sessions are no longer purged automatically.** The old `MaintenanceWorker` is no longer wired into the peripheral app (plan Task 8), so expired `user_sessions` rows accumulate in SQLite until manual cleanup.
+- **The APISIX plugin contract is proven by static tests only.** The Lua source contract and the Route/ConfigMap structure are checked statically (`scripts/apisix/test_sr_auto_router.py`); this iteration did not validate them on a real APISIX/OpenResty runtime. End-to-end verification is deferred to the deployment window (design §11 non-goal).
 
 ## Quick start
 
@@ -733,7 +734,7 @@ Full field tables, request/response examples and the impact-confirmation flow li
 | `GET /admin/model-catalog`, `POST /admin/fetch-models` | peripheral | read / admin | Provider presets, upstream model discovery |
 | `GET /admin/providers`, `PUT/DELETE /admin/providers/{name}` | peripheral | read / admin | Providers; update previews a 409 impact list, delete is blocked while referenced |
 | `GET/POST /admin/jev`, `GET/PUT/DELETE /admin/jev/{id}` | peripheral | read / admin | Non-secret multi-service JEV catalog (window belongs to each service) |
-| `POST /admin/jev/{id}/test` | peripheral | admin | Test one catalog service (needs a peripheral JEV key; see residuals) |
+| `POST /admin/jev/{id}/test` | peripheral | admin | Test one catalog service (proxied; the kernel runs it with its own key) |
 | `GET/PUT /admin/time-periods` | peripheral | read / admin | Time periods |
 | `GET /admin/requests/stats`, `GET /admin/overview`, `GET /admin/changes` | peripheral | viewer | Memory-log stats/overview, audit history |
 | `GET/POST /admin/users`, `PUT/DELETE /admin/users/{id}`, `POST /admin/users/{id}/password` | peripheral | admin | Users |
