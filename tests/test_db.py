@@ -198,8 +198,32 @@ def graph_tree_root():
     })
 
 
-def build_v1_database(path):
-    """v1 库：基础表 + routing_trees + 没有 ``waves`` 列的 ``request_logs``。"""
+def legacy_tree_root():
+    """v1/v2 时代淘汰的旧格式路由配置：``root`` 里没有 ``type == "graph"``。
+
+    历史驱动在 v1→v2 与 v2→v3 之前会拒绝这种库（旧格式无法被新图运行时读取），
+    要求运维显式导出后 ``DELETE FROM routing_trees``；升级链必须保留该保护。
+    """
+    return json.dumps({
+        "id": "main", "name": "旧配置", "enabled": False,
+        "root": {"config": {"model": "qwen3-8b", "upstream": "http://old-upstream"}},
+    })
+
+
+def insert_routing_tree(conn, *, root=None, tree_id="main"):
+    """按 v1/v2 的显式列名插入一行图配置（默认是合法 ``graph`` 文档）。"""
+    conn.execute(
+        "INSERT INTO routing_trees (id, name, enabled, root, tree_revision, updated_at) "
+        "VALUES (?, ?, 0, ?, ?, '2026-11-01T10:00:00+08:00')",
+        (tree_id, "主图", graph_tree_root() if root is None else root, "r" * 64),
+    )
+
+
+def build_v1_database(path, *, routing_root=None):
+    """v1 库：基础表 + routing_trees + 没有 ``waves`` 列的 ``request_logs``。
+
+    ``routing_root`` 给定时按显式列插入一行图配置（用于构造旧格式遗留库）。
+    """
     conn = connect(path)
     _create_common_tables(conn)
     conn.execute(ROUTING_TREES_DDL)
@@ -208,12 +232,14 @@ def build_v1_database(path):
     conn.execute(V1_REQUEST_LOGS_DDL)
     conn.execute(V6_REQUEST_LOGS_INDEX_DDL)
     conn.execute("INSERT INTO schema_migrations VALUES (1)")
+    if routing_root is not None:
+        insert_routing_tree(conn, root=routing_root)
     conn.commit()
     return conn
 
 
-def build_v2_database(path):
-    conn = build_v1_database(path)
+def build_v2_database(path, *, routing_root=None):
+    conn = build_v1_database(path, routing_root=routing_root)
     conn.execute("ALTER TABLE request_logs ADD COLUMN waves INTEGER")
     conn.execute("UPDATE schema_migrations SET version = 2")
     conn.commit()
@@ -377,6 +403,97 @@ def test_v1_database_upgrades_through_full_chain_to_v7(tmp_path):
     assert schema_version(conn) == 7
     assert schema_versions(conn) == [1, 2, 3, 4, 5, 6, 7]
     conn.close()
+
+
+def test_v2_legitimate_graph_upgrades_through_full_chain_to_v7(tmp_path):
+    """v2 老库 + 合法 ``root.type == "graph"`` 图配置：一路升到 v7。"""
+    path = str(tmp_path / "v2.db")
+    root = graph_tree_root()
+    old = build_v2_database(path, routing_root=root)
+    assert "waves" in column_names(old, "request_logs")
+    old.close()
+
+    conn = connect(path)
+    migrate(conn)
+
+    assert schema_versions(conn) == [2, 3, 4, 5, 6, 7]
+    assert schema_version(conn) == SCHEMA_VERSION == 7
+    assert conn.execute(
+        "SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
+    conn.close()
+
+
+def _assert_legacy_guard_rejected(conn, *, expected_version):
+    """旧格式图配置必须挡住升级：报错点名 reset、版本不前进、旧 schema 还在。"""
+    versions_before = schema_versions(conn)
+    tables_before = table_names(conn)
+    with pytest.raises(RuntimeError, match="legacy routing trees") as excinfo:
+        migrate(conn)
+    assert schema_version(conn) == expected_version
+    assert schema_versions(conn) == versions_before
+    # 拒绝发生在任何升级步骤之前：旧 schema 原样保留，没有 v7 标记。
+    assert table_names(conn) == tables_before
+    assert "jev_services" not in tables_before
+    assert "graph_snapshots" not in tables_before
+    return str(excinfo.value)
+
+
+def test_v1_legacy_graph_document_blocks_upgrade_before_v2(tmp_path):
+    """v1 库里的旧格式 routing config：历史驱动在 v1→v2 前拒绝（先导出/重置）。"""
+    path = str(tmp_path / "v1-legacy.db")
+    root = legacy_tree_root()
+    old = build_v1_database(path, routing_root=root)
+    old.close()
+
+    conn = connect(path)
+    message = _assert_legacy_guard_rejected(conn, expected_version=1)
+    assert "DELETE FROM routing_trees" in message
+    assert "main" in message
+    # v1 schema 仍完整：没有 waves 列，routing_trees 的旧文档未被改写。
+    assert "waves" not in column_names(conn, "request_logs")
+    assert conn.execute(
+        "SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
+    conn.close()
+
+
+def test_v2_legacy_graph_document_blocks_upgrade_before_v3(tmp_path):
+    """v2 库里的旧格式 routing config：历史驱动在 v2→v3 前同样拒绝。"""
+    path = str(tmp_path / "v2-legacy.db")
+    root = legacy_tree_root()
+    old = build_v2_database(path, routing_root=root)
+    old.close()
+
+    conn = connect(path)
+    message = _assert_legacy_guard_rejected(conn, expected_version=2)
+    assert "DELETE FROM routing_trees" in message
+    # v2 schema（含 waves）仍在，且没有被记上 v3。
+    assert "waves" in column_names(conn, "request_logs")
+    assert 3 not in schema_versions(conn)
+    conn.close()
+
+
+def test_legacy_tree_ids_reports_only_non_graph_documents(tmp_path):
+    """``legacy_tree_ids`` 按历史实现识别：缺失/无 ``root.type == "graph"`` 都是遗留。"""
+    from router.store.db import legacy_tree_ids
+
+    conn = build_v1_database(str(tmp_path / "trees.db"))
+    insert_routing_tree(conn, tree_id="graph", root=graph_tree_root())
+    insert_routing_tree(conn, tree_id="legacy", root=legacy_tree_root())
+    insert_routing_tree(conn, tree_id="bad-json", root="{not-json")
+    conn.execute(
+        "INSERT INTO routing_trees (id, name, enabled, root, tree_revision, updated_at) "
+        "VALUES ('null-root', '空', 0, NULL, NULL, NULL)")
+    conn.commit()
+
+    assert legacy_tree_ids(conn) == ["bad-json", "legacy", "null-root"]
+
+    # 历史库没有 routing_trees 表时返回空列表（不因缺表崩溃）。
+    plain = connect(str(tmp_path / "plain.db"))
+    plain.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+    plain.commit()
+    assert legacy_tree_ids(plain) == []
+    conn.close()
+    plain.close()
 
 
 def test_v3_database_upgrades_to_v7_and_drops_config_revisions(tmp_path):

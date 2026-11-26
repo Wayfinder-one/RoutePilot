@@ -11,6 +11,7 @@ and the stored JEV key is discarded.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from router.jev.window import (
@@ -175,6 +176,31 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+def legacy_tree_ids(conn: sqlite3.Connection) -> list[str]:
+    """Historical ``routing_trees`` ids that still hold the pre-graph document shape.
+
+    The old driver refused to continue the chain while such rows existed: the new
+    graph runtime cannot read them, and silently rewriting them would lose the
+    operator's routing configuration.  A row is legacy unless its ``root`` column
+    parses as a JSON object carrying ``root.type == "graph"`` (unparsable JSON,
+    plain config objects and missing ``root`` all count as legacy).
+    """
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'routing_trees'"
+    ).fetchone() is None:
+        return []
+    legacy = []
+    for row in conn.execute("SELECT id, root FROM routing_trees ORDER BY id"):
+        # 位置索引同时兼容 connect() 的 sqlite3.Row 与裸 sqlite3.Connection 的行元组。
+        try:
+            root_type = json.loads(row[1]).get("root", {}).get("type")
+        except (ValueError, AttributeError, IndexError, TypeError):
+            root_type = None
+        if root_type != "graph":
+            legacy.append(row[0])
+    return legacy
 
 
 def _table_names(conn: sqlite3.Connection) -> set[str]:
@@ -350,16 +376,34 @@ def _upgrade_v6_to_v7(conn: sqlite3.Connection) -> None:
 
 
 #: One entry per historical step: target version → (function, tables that must
-#: already exist before the step runs).  The guards mirror the original
-#: sequential driver: a malformed/partially-built database is rejected instead of
-#: being silently rewritten.
+#: already exist before the step runs, whether the step must reject pre-graph
+#: ``routing_trees`` documents).  The guards mirror the original sequential
+#: driver: a malformed/partially-built database is rejected instead of being
+#: silently rewritten, and the historically guarded v1→v2 / v2→v3 steps also
+#: refuse old routing configs the graph runtime cannot read (explicit reset).
 _UPGRADE_STEPS = {
-    2: (_upgrade_v1_to_v2, {"routing_trees", "request_logs"}),
-    3: (_upgrade_v2_to_v3, {"routing_trees", "request_logs"}),
-    4: (_upgrade_v3_to_v4, {"request_logs", "settings"}),
-    5: (_upgrade_v4_to_v5, {"request_logs"}),
-    6: (_upgrade_v5_to_v6, set()),
+    2: (_upgrade_v1_to_v2, {"routing_trees", "request_logs"}, True),
+    3: (_upgrade_v2_to_v3, {"routing_trees", "request_logs"}, True),
+    4: (_upgrade_v3_to_v4, {"request_logs", "settings"}, False),
+    5: (_upgrade_v4_to_v5, {"request_logs"}, False),
+    6: (_upgrade_v5_to_v6, set(), False),
 }
+
+
+def _reject_legacy_routing_trees(conn: sqlite3.Connection) -> None:
+    """Refuse to continue while the old-format routing configs are still stored.
+
+    Historical driver behaviour: the operator must explicitly export/reset those
+    rows; the migration never guesses whether the old config can be discarded.
+    """
+    legacy = legacy_tree_ids(conn)
+    if not legacy:
+        return
+    raise RuntimeError(
+        "legacy routing trees require explicit reset; back up the database, then "
+        "DELETE FROM routing_trees if these old routing configs are no longer needed: "
+        + ", ".join(legacy)
+    )
 
 
 def migrate(conn: sqlite3.Connection) -> None:
@@ -379,9 +423,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     # Continuous chain: v(applied)→…→v6 one transaction (and one
     # ``schema_migrations`` row) per step, then the destructive v6→v7 cleanup.
     for version in range(applied + 1, SCHEMA_VERSION):
-        step, required = _UPGRADE_STEPS[version]
+        step, required, reject_legacy_trees = _UPGRADE_STEPS[version]
         if not required <= tables:
             raise RuntimeError("unsupported database contents; use a new database")
+        if reject_legacy_trees:
+            _reject_legacy_routing_trees(conn)
         _in_transaction(conn, lambda step=step: step(conn))
         tables = _table_names(conn)
     if "jev_services" not in tables:
