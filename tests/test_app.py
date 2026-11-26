@@ -734,10 +734,13 @@ def _v6_state(db_path):
         admin_hash = conn.execute(
             "SELECT password_hash FROM users WHERE email = 'admin@test.com'"
         ).fetchone()[0]
+        settings_rows = [tuple(row) for row in conn.execute(
+            "SELECT key, value FROM settings ORDER BY key")]
     finally:
         conn.close()
     return {"version": version, "tables": tables, "columns": columns,
-            "counts": counts, "api_key": api_key, "admin_hash": admin_hash}
+            "counts": counts, "api_key": api_key, "admin_hash": admin_hash,
+            "settings": settings_rows}
 
 
 def _assert_v6_untouched(db_path):
@@ -749,6 +752,9 @@ def _assert_v6_untouched(db_path):
     assert state["counts"] == {
         "request_logs": 1, "graph_snapshots": 1, "request_snapshots": 1}
     assert state["api_key"] == "old-secret"
+    # Residual 1b(iv)：preflight 是严格只读的，迁移前的拒绝不得写入任何
+    # settings 行（尤其不能写扫描缓存）。
+    assert state["settings"] == [], "拒绝启动不得在迁移前写 settings"
     return state
 
 
@@ -791,6 +797,12 @@ def test_authorized_force_reset_still_migrates_a_v6_database(tmp_path):
         columns = {row[1] for row in conn.execute(
             "PRAGMA table_info(jev_services)")}
         assert "api_key" not in columns
+        # Residual 1b：preflight 不能写（迁移前只读），迁移后的可写连接负责把
+        # 重置后的 clean 结论落进 settings 缓存。
+        cached = conn.execute(
+            "SELECT value FROM settings WHERE key = 'admin_weak_scan_state'"
+        ).fetchone()
+        assert cached is not None, "重置成功后的 clean 指纹必须在迁移后写入"
     finally:
         conn.close()
 
@@ -917,6 +929,196 @@ def test_preflight_scan_is_read_only_and_tolerates_old_schemas(tmp_path):
         conn.close()
     assert [user["email"] for user in _preflight_stale_admin_users(db_path)] \
         == ["stale@test.com"]
+
+
+def test_stale_scan_tolerates_a_users_table_without_status(tmp_path):
+    """Residual 3：缺 status 列的（手工/极旧）用户表按 active 处理，不抛 KeyError。
+
+    preflight 一直容忍这种表；post-migration 扫描（``_stale_admin_users``）也必须
+    同样防御——迁移链本身不会补 status 列。
+    """
+    from router.api.app import _stale_admin_users
+
+    conn = connect(str(tmp_path / "hand-made.db"))
+    try:
+        conn.execute(
+            "CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT NOT NULL, "
+            "password_hash TEXT NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO users VALUES ('stale', 'stale@test.com', ?, "
+            "'2026-01-01T00:00:00+08:00')",
+            (auth.hash_password(DEFAULT_ADMIN_PASSWORD),))
+        conn.execute(
+            "INSERT INTO users VALUES ('strong', 'strong@test.com', ?, "
+            "'2026-01-01T00:00:00+08:00')",
+            (auth.hash_password("strong-password-1"),))
+        conn.commit()
+        stale = _stale_admin_users(conn)
+    finally:
+        conn.close()
+    assert [user["email"] for user in stale] == ["stale@test.com"]
+    assert stale[0]["status"] == "active", "缺列时扫描按 active 处理"
+
+
+# ---------------------------------------------------------------------------
+# 第四轮复审 Residual 1：非 loopback 启动对同一批哈希只扫描一次，并把「已证实
+# clean」的指纹写进 settings，后续启动在哈希逐字节相同时跳过整轮 scrypt 扫描。
+# 任何口令/账号变化 → 指纹变化 → 重扫；stale 结论永不落缓存。
+# ---------------------------------------------------------------------------
+
+def _account_db(tmp_path, accounts, *, name="accounts.db"):
+    """v7 库 + 给定 ``(email, password, role)`` 账号（直接落库，绕过启动）。"""
+    db_path = str(tmp_path / name)
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        seed_default(conn)
+        for email, password, role in accounts:
+            UserRepo(conn).create(email, password, role=role)
+    finally:
+        conn.close()
+    return db_path
+
+
+def _non_loopback_settings(tmp_path, db_path, **overrides):
+    values = dict(
+        db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password")
+    values.update(overrides)
+    return test_settings(tmp_path, **values)
+
+
+def _count_weak_scans(monkeypatch):
+    """统计 ``is_weak_stored_password`` 调用（每个被扫描的 active 账号一次）。"""
+    from router import password_policy
+
+    calls = []
+    real = password_policy.is_weak_stored_password
+
+    def counting(stored_hash):
+        calls.append(stored_hash)
+        return real(stored_hash)
+
+    monkeypatch.setattr(password_policy, "is_weak_stored_password", counting)
+    return calls
+
+
+def test_clean_scan_cache_skips_scrypt_on_the_second_non_loopback_start(
+        tmp_path, monkeypatch):
+    """Residual 1b(i)：两次连续的非 loopback clean 启动，第二次 0 次扫描。"""
+    db_path = _account_db(tmp_path, [
+        ("admin@test.com", "strong-password-1", "admin"),
+        ("viewer@test.com", "strong-password-2", "viewer"),
+    ])
+    settings = _non_loopback_settings(tmp_path, db_path)
+    calls = _count_weak_scans(monkeypatch)
+
+    create_app(settings)
+    assert len(calls) == 2, "首次启动应扫描两个 active 账号"
+    conn = connect(db_path)
+    try:
+        cached = SettingsRepo(conn).get("admin_weak_scan_state")
+    finally:
+        conn.close()
+    assert cached, "clean 扫描结论必须写入 settings 指纹缓存"
+
+    calls.clear()
+    create_app(settings)
+    assert calls == [], "第二次启动必须命中 clean 指纹缓存，不做任何 scrypt 扫描"
+
+
+def test_credential_change_invalidates_the_clean_scan_cache(
+        tmp_path, monkeypatch):
+    """Residual 1b(ii)：改口令 / 直接插入 stale 账号都会让缓存失效并重扫。"""
+    db_path = _account_db(
+        tmp_path, [("admin@test.com", "strong-password-1", "admin")])
+    settings = _non_loopback_settings(tmp_path, db_path)
+    calls = _count_weak_scans(monkeypatch)
+    create_app(settings)
+    assert len(calls) == 1
+
+    # 改一条口令（哈希变化）→ 缓存失效 → 重扫；仍 clean → 缓存更新。
+    conn = connect(db_path)
+    try:
+        admin = UserRepo(conn).get_by_email("admin@test.com")
+        UserRepo(conn).set_password(admin["id"], "another-strong-pass")
+    finally:
+        conn.close()
+    calls.clear()
+    create_app(settings)
+    assert len(calls) == 1, "口令哈希变化后必须重新扫描"
+    calls.clear()
+    create_app(settings)
+    assert calls == [], "重扫 clean 后缓存更新，第三次启动再次跳过"
+
+    # 直接插入一个 stale 账号（绕过 API）→ 指纹变化 → 重扫并拒绝启动。
+    conn = connect(db_path)
+    try:
+        UserRepo(conn).create("late@test.com", DEFAULT_ADMIN_PASSWORD)
+    finally:
+        conn.close()
+    calls.clear()
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    assert "late@test.com" in str(excinfo.value)
+    assert calls, "缓存失效后必须重扫，才能发现新插入的 stale 账号"
+
+
+def test_force_reset_reuses_the_preflight_scan(tmp_path, monkeypatch):
+    """Residual 1a/1b(iii)：授权重置路径只扫描一次，重置后写入 clean 指纹。"""
+    db_path = _account_db(tmp_path, [
+        ("first@test.com", DEFAULT_ADMIN_PASSWORD, "admin"),
+        ("second@test.com", "        ", "viewer"),
+    ])
+    settings = _non_loopback_settings(
+        tmp_path, db_path, admin_force_reset=True)
+    calls = _count_weak_scans(monkeypatch)
+    app = create_app(settings)
+    assert len(calls) == 2, \
+        "两个 stale 账号各扫描一次；post-migration 复用 preflight 结果，不得重扫"
+
+    conn = connect(db_path)
+    try:
+        assert SettingsRepo(conn).get("admin_weak_scan_state"), \
+            "重置后的 clean 结论必须落缓存（post-reset 哈希 = 已验证的 env 口令）"
+        for email in ("first@test.com", "second@test.com"):
+            assert auth.verify_password(
+                "new-strong-password",
+                UserRepo(conn).get_by_email(email)["password_hash"]) is True
+    finally:
+        conn.close()
+    with TestClient(app) as client:
+        assert client.post("/admin/login", json={
+            "email": "first@test.com",
+            "password": DEFAULT_ADMIN_PASSWORD}).status_code == 401
+        assert client.post("/admin/login", json={
+            "email": "first@test.com",
+            "password": "new-strong-password"}).status_code == 200
+
+
+def test_guard_returns_the_preflight_result_or_none_when_it_did_not_scan(
+        tmp_path):
+    """Residual 1a 契约：loopback / user_auth off → None（没有扫描）；非 loopback
+    → preflight 列表（``[]`` 表示已证实干净）。"""
+    from router.api.app import _guard_stale_admin_credentials
+
+    db_path = _account_db(
+        tmp_path, [("admin@test.com", "strong-password-1", "admin")])
+    assert _guard_stale_admin_credentials(
+        test_settings(tmp_path, db_path=db_path)) is None
+    assert _guard_stale_admin_credentials(
+        test_settings(tmp_path, db_path=db_path, user_auth=True,
+                      host="0.0.0.0",
+                      admin_password="new-strong-password")) == []
+
+    stale_db = _account_db(
+        tmp_path, [("stale@test.com", DEFAULT_ADMIN_PASSWORD, "admin")],
+        name="stale.db")
+    with pytest.raises(RuntimeError):
+        _guard_stale_admin_credentials(
+            test_settings(tmp_path, db_path=stale_db, user_auth=True,
+                          host="0.0.0.0",
+                          admin_password="new-strong-password"))
 
 
 # ---------------------------------------------------------------------------

@@ -817,6 +817,28 @@ def test_weak_stored_password_helper_detects_public_legacy_hashes():
     assert password_policy.is_weak_stored_password("nonsense") is False
 
 
+def test_scan_cache_fingerprint_is_order_independent_and_hash_sensitive():
+    """启动扫描缓存指纹：只由 active 用户的 ``(id, hash)`` 决定（顺序无关）。"""
+    from router import password_policy
+
+    rows = [{"id": "a", "password_hash": "h1"},
+            {"id": "b", "password_hash": "h2"}]
+    fingerprint = password_policy.stored_credentials_fingerprint(rows)
+    assert len(fingerprint) == 64
+    assert fingerprint == password_policy.stored_credentials_fingerprint(
+        list(reversed(rows)))
+    assert fingerprint == password_policy.stored_credentials_fingerprint(
+        [dict(row) for row in rows])
+    # 任一哈希变化、账号增删都必须改变指纹（否则旧 clean 结论会被误用）。
+    assert fingerprint != password_policy.stored_credentials_fingerprint(
+        [{"id": "a", "password_hash": "h1"},
+         {"id": "b", "password_hash": "different"}])
+    assert fingerprint != password_policy.stored_credentials_fingerprint(
+        rows[:1])
+    assert password_policy.stored_credentials_fingerprint([]) == \
+        password_policy.stored_credentials_fingerprint([])
+
+
 @pytest.mark.parametrize("password", ["        ", "\t\t\t\t\t\t\t\t", " " * 12])
 def test_user_create_rejects_whitespace_only_password(tmp_path, password):
     c = api_client(tmp_path)

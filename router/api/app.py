@@ -26,6 +26,16 @@ Readiness reflects peripheral state only (SQLite migrated).  An unreachable
 kernel is a data-plane/management error, never a readiness failure: the
 peripheral stays healthy so operators can still open the console and inspect the
 configuration while the kernel is being restarted.
+
+Startup hardening (C1/C2) lives below: ``create_app`` refuses a weak admin
+credential before migrating.  The C2 stale-account scan costs up to 18 scrypt
+verifications per active user, so a non-loopback start (a) reuses the read-only
+preflight result in the post-migration remediation instead of scanning twice,
+and (b) memoizes a **clean** result in the ``settings`` row
+``admin_weak_scan_state`` as a fingerprint of the active users'
+``(id, password_hash)`` pairs.  A later start skips the scrypt scan only when
+that fingerprint is byte-identical; any password, row, status or policy change
+invalidates it (no stale/refusal result is ever cached).
 """
 from __future__ import annotations
 
@@ -82,6 +92,80 @@ from router.upstream.breaker import CircuitBreaker
 
 CONSOLE_DIR = Path(__file__).parent.parent / "console"
 logger = logging.getLogger(__name__)
+
+#: ``settings`` 键：非 loopback 启动时旧库弱口令扫描的结论缓存。值是对 active
+#: 用户 ``(id, password_hash)`` 排序对的 SHA-256（见
+#: :func:`router.password_policy.stored_credentials_fingerprint`）。**只有 clean
+#: 结果才写入**：读到相同指纹就跳过每账号最多 18 次 scrypt 的扫描。
+_WEAK_SCAN_SETTING = "admin_weak_scan_state"
+
+
+def _active_users(rows: list[dict]) -> list[dict]:
+    """Active-only filter; a users table without ``status`` has no disabled rows.
+
+    手工/极旧库的 ``users`` 表可能没有 ``status`` 列：迁移链不补这个列，此时
+    所有行都按 active 处理（与 preflight 的历史行为一致），不能让一条记录把
+    启动变成 KeyError。
+    """
+    active = []
+    for user in rows:
+        user.setdefault("status", "active")
+        if user["status"] == "active":
+            active.append(user)
+    return active
+
+
+def _read_weak_scan_cache(conn) -> str | None:
+    """Clean-scan fingerprint stored in ``settings``, ``None`` when unavailable.
+
+    任何读取失败（fresh DB/旧库没有 ``settings`` 表、连接异常）都当作「没有
+    缓存」：调用方继续做真实扫描，行为与没有缓存时完全一致。
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?",
+            (_WEAK_SCAN_SETTING,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return None if row is None else str(row[0])
+
+
+def _active_credential_rows(conn) -> list[dict] | None:
+    """One cheap SELECT: ``id``/``password_hash`` of the active users.
+
+    Returns ``None`` when the table has no ``id``/``password_hash`` column and
+    therefore cannot be fingerprinted (no cache, scan as today).
+    """
+    try:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    except sqlite3.Error:
+        return None
+    if not {"id", "password_hash"} <= columns:
+        return None
+    selected = [column for column in ("id", "password_hash", "status")
+                if column in columns]
+    rows = [dict(row) for row in conn.execute(
+        f"SELECT {', '.join(selected)} FROM users")]
+    return _active_users(rows)
+
+
+def _remember_clean_scan(conn) -> None:
+    """Persist the fingerprint of a scan that proved the stored hashes clean.
+
+    只在 clean 分支调用：stale 分支只会拒绝启动或强制重置，绝不写入「干净」
+    结论。缓存只是性能优化，写入失败不影响启动（下一次启动重新扫描）。
+    """
+    rows = _active_credential_rows(conn)
+    if rows is None:
+        return
+    try:
+        with transaction(conn):
+            SettingsRepo(conn).set(
+                _WEAK_SCAN_SETTING,
+                password_policy.stored_credentials_fingerprint(rows))
+    except sqlite3.Error:
+        logger.warning("could not store the admin credential scan cache; the "
+                       "next start will rescan", exc_info=True)
 
 
 def _catalog_sync_factory(client: CoreClient):
@@ -144,6 +228,15 @@ def _preflight_stale_admin_users(db_path: str) -> list[dict]:
       no disabled accounts, so every row counts as active.  Only the columns
       that actually exist are selected.
 
+    Scan cache: when a ``settings`` table exists, ``admin_weak_scan_state`` is
+    read first.  If it equals the fingerprint of the current active users'
+    ``(id, password_hash)`` pairs, a previous start already verified exactly
+    these hashes as clean, so the 18-scrypt-per-user scan is skipped entirely
+    (``[]``).  This connection is read-only (nothing may be written before
+    migrating), so the cache is only read here; the writable post-migration
+    connection refreshes it via :func:`_remember_clean_scan`.  A missing table,
+    key or ``id``/``password_hash`` column means "no cache", i.e. scan as today.
+
     Nothing is migrated/seeded/written through this connection.  SQLite may
     still create its empty WAL sidecar files (``-wal``/``-shm``) when the
     database is in WAL mode; row/page content is not modified.
@@ -167,17 +260,18 @@ def _preflight_stale_admin_users(db_path: str) -> list[dict]:
             return []
         rows = [dict(row) for row in conn.execute(
             f"SELECT {', '.join(selected)} FROM users ORDER BY rowid")]
+        active = _active_users(rows)
+        if {"id", "password_hash"} <= columns:
+            cached = _read_weak_scan_cache(conn)
+            fingerprint = password_policy.stored_credentials_fingerprint(active)
+            if cached == fingerprint:
+                return []
     finally:
         conn.close()
-    stale = []
-    for user in rows:
-        # 缺 status 列的旧表没有「停用」概念：所有行都按 active 处理。
-        user.setdefault("status", "active")
-        if user["status"] != "active":
-            continue
-        if password_policy.is_weak_stored_password(user.get("password_hash")):
-            stale.append(user)
-    return stale
+    return [
+        user for user in active
+        if password_policy.is_weak_stored_password(user.get("password_hash"))
+    ]
 
 
 def _stale_admin_runtime_error(
@@ -197,33 +291,46 @@ def _stale_admin_runtime_error(
     )
 
 
-def _guard_stale_admin_credentials(settings: Settings) -> None:
+def _guard_stale_admin_credentials(settings: Settings) -> list[dict] | None:
     """C2 preflight: refuse before the destructive v6→v7 migration runs.
 
     Only decides "refuse before touching the database": with
     ``ROUTER_ADMIN_FORCE_RESET=1`` (or no stale account) the caller proceeds to
-    migrate/seed/remediate exactly as before, and the post-migration scan below
+    migrate/seed/remediate exactly as before, and the post-migration remediation
     remains the authority for the authorized reset path.
+
+    Returns the stale users the preflight found (``[]`` also covers a clean
+    scan-cache hit, i.e. "already verified clean") so :func:`create_app` can
+    hand the result to :func:`_remediate_stale_admin_credentials` instead of
+    scanning every active user's hash twice per start.  Returns ``None`` when no
+    scan was performed at all (loopback bind / ``user_auth`` off): callers must
+    not treat ``None`` as "clean".
     """
     if not settings.user_auth:
-        return
+        return None
     if _is_loopback_bind(settings):
-        return
+        return None
     stale = _preflight_stale_admin_users(settings.db_path)
     if stale and not settings.admin_force_reset:
         raise _stale_admin_runtime_error(settings, stale)
+    return stale
 
 
 def _stale_admin_users(conn) -> list[dict]:
-    """Active users whose stored hash accepts a public/blank/whitespace password."""
+    """Active users whose stored hash accepts a public/blank/whitespace password.
+
+    ``status`` missing (hand-made pre-status schema) means active: the migration
+    chain never adds that column, so the defensive ``.get`` keeps such a database
+    from crashing the scan with a KeyError.
+    """
     return [
-        user for user in UserRepo(conn).list()
-        if user["status"] == "active"
-        and password_policy.is_weak_stored_password(user["password_hash"])
+        user for user in _active_users(UserRepo(conn).list())
+        if password_policy.is_weak_stored_password(user.get("password_hash"))
     ]
 
 
-def _remediate_stale_admin_credentials(conn, settings: Settings) -> None:
+def _remediate_stale_admin_credentials(
+        conn, settings: Settings, *, stale: list[dict] | None = None) -> None:
     """C2: an old database must not keep a public (default/blank/space) password.
 
     ``UserRepo.seed_admin()`` only seeds an empty ``users`` table, so an existing
@@ -234,15 +341,35 @@ def _remediate_stale_admin_credentials(conn, settings: Settings) -> None:
     password: without explicit authorization refuse to start (operator changes
     the password locally); with ``ROUTER_ADMIN_FORCE_RESET=1`` rotate those
     accounts to the validated ``admin_password`` and revoke all their sessions.
+
+    ``stale`` is the preflight result computed seconds earlier by
+    :func:`_guard_stale_admin_credentials`: the migration never touches
+    ``users``, and ``seed_admin`` only writes the already-validated env
+    password, so within one start that list cannot go stale — passing it skips
+    the second 18-scrypt-per-user scan.  ``None`` means "no preflight result"
+    (callers other than :func:`create_app`); the scan then happens here, still
+    cache-aware.  An empty list means "the preflight already proved these hashes
+    clean", in which case only the clean-scan cache is refreshed.
     """
     if not settings.user_auth:
         return
     if _is_loopback_bind(settings):
         return
-    stale = _stale_admin_users(conn)
-    if not stale:
+    if stale is None:
+        credentials = _active_credential_rows(conn)
+        if credentials is not None and _read_weak_scan_cache(conn) == \
+                password_policy.stored_credentials_fingerprint(credentials):
+            return
+        stale = _stale_admin_users(conn)
+        if not stale:
+            _remember_clean_scan(conn)
+            return
+    elif not stale:
+        # The preflight holds a read-only connection (no write before migrating),
+        # so persist the clean fingerprint here, after migration.
+        _remember_clean_scan(conn)
         return
-    emails = [user["email"] for user in stale]
+    emails = [user.get("email") for user in stale]
     if not settings.admin_force_reset:
         raise _stale_admin_runtime_error(settings, stale)
     # C2 整批原子：所有账号的改密 + 会话吊销在同一个 BEGIN IMMEDIATE 事务里。
@@ -250,10 +377,12 @@ def _remediate_stale_admin_credentials(conn, settings: Settings) -> None:
     # 把它们判为 stale，旧 token 也可能已经失效而账号状态不一致。
     UserRepo(conn).reset_passwords_and_sessions(
         [(user["id"], settings.admin_password) for user in stale])
+    # 重置后的哈希就是已通过 env 守卫的 ``admin_password``：无需再跑一次扫描。
+    _remember_clean_scan(conn)
     logger.critical(
         "ROUTER_ADMIN_FORCE_RESET=1: reset the password of %s and revoked all "
         "their sessions (the stored hash still accepted a publicly-known, "
-        "blank or whitespace-only password)", ", ".join(emails))
+        "blank or whitespace-only password)", ", ".join(str(email) for email in emails))
 
 
 def _admin_path(path: str) -> bool:
@@ -375,8 +504,9 @@ def create_app(
     _guard_admin_credentials(settings)
     # C2 preflight BEFORE any write: the v6→v7 migration is destructive, so an
     # unauthorized start must be refused while the old database is still intact.
-    # The scan is strictly read-only and a no-op for loopback / user_auth=False.
-    _guard_stale_admin_credentials(settings)
+    # The scan is strictly read-only, cache-aware and a no-op for loopback /
+    # user_auth=False; its result is reused below so no hash is scanned twice.
+    stale_admin_users = _guard_stale_admin_credentials(settings)
     conn = connect(settings.db_path)
     try:
         migrate(conn)
@@ -385,7 +515,10 @@ def create_app(
             UserRepo(conn).seed_admin(settings.admin_email, settings.admin_password)
         # C2: seed_admin is a no-op on a non-empty users table, so an old volume
         # can still hold a publicly-known password; inspect the actual rows.
-        _remediate_stale_admin_credentials(conn, settings)
+        # The preflight list is authoritative for this start (migration does not
+        # touch users; seed_admin only writes the validated env password).
+        _remediate_stale_admin_credentials(
+            conn, settings, stale=stale_admin_users)
         _seed_jev(conn, settings)
     finally:
         conn.close()

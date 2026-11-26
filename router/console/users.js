@@ -36,7 +36,10 @@ function errTextFor(e) {
   if (low.includes('not found')) return t('users.notFound');
   if (low.includes('yourself') || low.includes('your own') || low.includes('self')) return t('users.selfDeleteHint');
   if (low.includes('email') && (low.includes('valid') || low.includes('invalid'))) return t('users.emailInvalid');
-  if (low.includes('password')) return t('users.pwdShort');
+  /* 纯空白口令的 422 detail 是 "is empty or whitespace-only"：它比长度错误更
+     具体，先判断，否则会被笼统地显示成「至少 8 位」，误导用户去加长空格。 */
+  if (low.includes('whitespace') || low.includes('blank')) return t('users.pwdWhitespace');
+  if (low.includes('password') || low.includes('at least 8')) return t('users.pwdShort');
   return raw;
 }
 function fmtStamp(ts) {

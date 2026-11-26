@@ -19,6 +19,14 @@
 或其它花样的纯空白历史口令不在自动识别范围（见 README「已知限制」），
 运维应主动轮换它们——它们不像空/默认口令那样广为人知。
 
+扫描缓存（``stored_credentials_fingerprint``）：非 loopback 启动时旧库扫描是
+每个 active 账号最多 18 次 scrypt 校验，因此 ``router.api.app`` 把「这批
+active 用户的 ``(id, password_hash)`` 已证实干净」这一结论的指纹写进 ``settings``
+表（``admin_weak_scan_state``），下次启动指纹逐字节一致就跳过扫描。指纹前缀
+绑定候选集合的摘要，所以增删/改动候选会让所有旧缓存自动失效；任何账号增删、
+状态变化或口令哈希改动也会改变指纹。它只短路「输入哈希与上次完全相同」的
+扫描，不是口令黑名单的替代，也不缓存 stale 结论（只有 clean 结果才落库）。
+
 注意模块导入方向：``router.config`` 从本模块 re-export
 ``MIN_ADMIN_PASSWORD_LENGTH``，而本模块从 ``router.config`` 读取
 ``DEFAULT_ADMIN_PASSWORD``。两边都在交叉导入之前定义好对方需要的属性，
@@ -27,7 +35,8 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import hashlib
+from collections.abc import Callable, Iterable, Mapping
 
 from router import auth
 
@@ -55,6 +64,37 @@ _PUBLIC_PASSWORD_CANDIDATES: tuple[str, ...] = (
 
 #: 全部「公开已知 / 信息为零」的口令（只读集合，供调用方枚举/判断）。
 PUBLIC_PASSWORDS = frozenset(_PUBLIC_PASSWORD_CANDIDATES)
+
+#: 扫描缓存指纹的策略前缀：候选集合本身的 SHA-256。候选集合是
+#: :func:`is_weak_stored_password` 的完整判定输入之一，改动它（包括
+#: ``DEFAULT_ADMIN_PASSWORD``）就必须让所有旧缓存失效，否则新策略会被旧结论
+#: 静默跳过。
+_POLICY_DIGEST = hashlib.sha256(
+    b"\x00".join(candidate.encode("utf-8")
+                 for candidate in _PUBLIC_PASSWORD_CANDIDATES)
+).hexdigest()
+
+
+def stored_credentials_fingerprint(
+        users: Iterable[Mapping[str, object]]) -> str:
+    """Fingerprint of the stored credentials a weak-password scan depends on.
+
+    ``users`` 必须恰好是「status 为 active」的用户行（至少含 ``id`` 与
+    ``password_hash``）：它们是 :func:`is_weak_stored_password` 的唯一输入。
+    输出对排序后的 ``(id, password_hash)`` 对做 SHA-256，因此与行顺序无关；
+    任一账号增删、状态变化或哈希改动都会改变指纹，只有逐字节相同的历史结论
+    才会被缓存采信。
+    """
+    pairs = sorted(
+        (str(user.get("id") or ""), str(user.get("password_hash") or ""))
+        for user in users
+    )
+    digest = hashlib.sha256(
+        b"router.admin-weak-scan.v1\x00" + _POLICY_DIGEST.encode("ascii"))
+    for user_id, password_hash in pairs:
+        digest.update(b"\x00" + user_id.encode("utf-8"))
+        digest.update(b"\x00" + password_hash.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def password_policy_error(password: object) -> str | None:
