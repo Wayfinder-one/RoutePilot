@@ -1,8 +1,12 @@
-"""SQLite schema: fresh v7 install, destructive v6→v7 upgrade, version guards.
+"""SQLite schema: fresh v7 install, continuous v1→v7 upgrade chain, version guards.
 
 v7 removes the SQLite decision log/snapshot tables and the JEV ``api_key``
-column.  The v6 fixture builders below embed the retired DDL literally: they are
-test-only history, and production code keeps no old DDL after the upgrade.
+column (design §9).  Databases written by older builds are upgraded in place
+through the sequential v1→v2→…→v6 chain followed by the destructive v6→v7
+cleanup, so an existing installation never has to be reset.
+
+The v1–v6 builders below embed the retired DDL literally: they are test-only
+history, and production code keeps no old DDL beyond the upgrade steps.
 """
 import json
 import sqlite3
@@ -90,12 +94,62 @@ V6_JEV_SERVICES_DDL = """
     )
     """
 
+# v1 的 ``request_logs`` 还没有 v2 增加的 ``waves`` 列。
+WAVES_LINE = "        waves INTEGER,\n"
+V1_REQUEST_LOGS_DDL = V6_REQUEST_LOGS_DDL.replace(WAVES_LINE, "")
+
+#: v1/v2 的图配置表（v7 外围不再读它，但历史库里有；升级链不得销毁已有数据）。
+ROUTING_TREES_DDL = """
+    CREATE TABLE routing_trees (
+        id TEXT PRIMARY KEY, name TEXT, enabled INTEGER, root TEXT,
+        tree_revision TEXT, updated_at TEXT
+    )
+    """
+ROUTING_TREES_SINGLE_ENABLED_INDEX_DDL = (
+    "CREATE UNIQUE INDEX idx_routing_trees_single_enabled "
+    "ON routing_trees(enabled) WHERE enabled = 1"
+)
+ROUTING_TREES_UPDATED_INDEX_DDL = (
+    "CREATE INDEX idx_routing_trees_updated ON routing_trees(updated_at, id)"
+)
+
+#: v3 的退役配置修订账本（v3→v4 删除；有未导出数据时拒绝升级）。
+CONFIG_REVISIONS_DDL = (
+    "CREATE TABLE config_revisions ("
+    "id INTEGER PRIMARY KEY, kind TEXT NOT NULL, sha256 TEXT NOT NULL, "
+    "content TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(kind, sha256))",
+    "CREATE INDEX idx_config_revisions_kind ON config_revisions(kind, id)",
+)
+
+#: v5 的单例 JEV 配置表（v5→v6 把这一行搬进 ``jev_services``）。
+LEGACY_JEV_CONFIG_DDL = """
+    CREATE TABLE jev_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        base_url TEXT NOT NULL,
+        model TEXT NOT NULL,
+        api_key TEXT NOT NULL DEFAULT '',
+        timeout_seconds REAL NOT NULL,
+        instructions TEXT NOT NULL,
+        state_template TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """
+
 DECISION_LOG_TABLES = frozenset({"request_logs", "graph_snapshots", "request_snapshots"})
 DECISION_LOG_INDEXES = frozenset({"idx_request_logs_ts", "idx_request_snapshots_graph"})
 V7_JEV_COLUMNS = frozenset({
     "id", "base_url", "model", "key_env", "timeout_seconds", "instructions",
     "state_template", "input_tokens", "context_tokens", "updated_at",
 })
+
+
+def _create_common_tables(conn):
+    """各历史版本共有的基础表（不含 v6/v7 的 ``jev_services``）。"""
+    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
+    for statement in SCHEMA:
+        if statement == JEV_SERVICES_DDL:
+            continue
+        conn.execute(statement)
 
 
 def create_v6_decision_log_tables(conn):
@@ -120,14 +174,92 @@ def create_v6_jev_service(conn, *, service_id="j1", api_key="old-secret",
     )
 
 
-def build_v6_database(path):
-    """真实 v6 库：当前 schema 去掉 v7 增量，保留三张日志表与带 api_key 的 JEV 表。"""
+def insert_legacy_jev_config(conn, *, api_key="old-secret",
+                             base_url="http://old-jev.test/", model="NeoHorse-Jev-4B"):
+    """插入 v5 的单例 JEV 配置行（旧密钥只存在于旧数据库列）。"""
+    conn.execute(
+        "INSERT INTO jev_config (id, base_url, model, api_key, timeout_seconds, "
+        "instructions, state_template, updated_at) VALUES "
+        "(1, ?, ?, ?, 7.5, '请选择最匹配的模型。', '【请求】\n{request}', "
+        "'2026-11-01T10:00:00+08:00')",
+        (base_url, model, api_key),
+    )
+
+
+def graph_tree_root():
+    """v1/v2 时代的一张普通图配置（``root.type == "graph"``）。"""
+    return json.dumps({
+        "id": "main", "name": "主图", "enabled": False, "timezone": "Asia/Shanghai",
+        "sticky": {"enabled": False, "ttl_seconds": 1800},
+        "root": {
+            "id": "root", "type": "graph", "nodes": [{"id": "start", "type": "start"}],
+            "edges": [], "error_fallback": None,
+        },
+    })
+
+
+def build_v1_database(path):
+    """v1 库：基础表 + routing_trees + 没有 ``waves`` 列的 ``request_logs``。"""
     conn = connect(path)
-    conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
-    for statement in SCHEMA:
-        if statement == JEV_SERVICES_DDL:
-            continue
+    _create_common_tables(conn)
+    conn.execute(ROUTING_TREES_DDL)
+    conn.execute(ROUTING_TREES_SINGLE_ENABLED_INDEX_DDL)
+    conn.execute(ROUTING_TREES_UPDATED_INDEX_DDL)
+    conn.execute(V1_REQUEST_LOGS_DDL)
+    conn.execute(V6_REQUEST_LOGS_INDEX_DDL)
+    conn.execute("INSERT INTO schema_migrations VALUES (1)")
+    conn.commit()
+    return conn
+
+
+def build_v2_database(path):
+    conn = build_v1_database(path)
+    conn.execute("ALTER TABLE request_logs ADD COLUMN waves INTEGER")
+    conn.execute("UPDATE schema_migrations SET version = 2")
+    conn.commit()
+    return conn
+
+
+def build_v3_database(path):
+    """v3 库：基础表 + ``request_logs`` + 退役的 ``config_revisions`` 账本。"""
+    conn = connect(path)
+    _create_common_tables(conn)
+    conn.execute(V6_REQUEST_LOGS_DDL)
+    conn.execute(V6_REQUEST_LOGS_INDEX_DDL)
+    for statement in CONFIG_REVISIONS_DDL:
         conn.execute(statement)
+    conn.execute("INSERT INTO schema_migrations VALUES (3)")
+    conn.commit()
+    return conn
+
+
+def build_v4_database(path):
+    """v4 库：基础表 + ``request_logs`` + 旧单例 ``jev_config``（无快照表）。"""
+    conn = connect(path)
+    _create_common_tables(conn)
+    conn.execute(V6_REQUEST_LOGS_DDL)
+    conn.execute(V6_REQUEST_LOGS_INDEX_DDL)
+    conn.execute(LEGACY_JEV_CONFIG_DDL)
+    conn.execute("INSERT INTO schema_migrations VALUES (4)")
+    conn.commit()
+    return conn
+
+
+def build_v5_database(path):
+    """v5 库：v4 + 请求图快照表；``jev_services`` 尚未出现。"""
+    conn = build_v4_database(path)
+    conn.execute(V6_GRAPH_SNAPSHOTS_DDL)
+    conn.execute(V6_REQUEST_SNAPSHOTS_DDL)
+    conn.execute(V6_REQUEST_SNAPSHOTS_INDEX_DDL)
+    conn.execute("UPDATE schema_migrations SET version = 5")
+    conn.commit()
+    return conn
+
+
+def build_v6_database(path):
+    """真实 v6 库：基础表 + 带 ``api_key`` 的 ``jev_services`` + 三张日志表。"""
+    conn = connect(path)
+    _create_common_tables(conn)
     conn.execute(V6_JEV_SERVICES_DDL)
     create_v6_decision_log_tables(conn)
     conn.execute("INSERT INTO schema_migrations VALUES (6)")
@@ -152,6 +284,14 @@ def index_names(conn):
 
 def schema_version(conn):
     return conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+
+
+def schema_versions(conn):
+    return [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
+
+
+def all_dump(conn):
+    return "\n".join(conn.iterdump())
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +336,162 @@ def test_fresh_install_records_v7_and_keeps_provider_secrets(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# continuous upgrade chain v1 → … → v6 → v7
+# --------------------------------------------------------------------------- #
+def test_v1_database_upgrades_through_full_chain_to_v7(tmp_path):
+    """v1 老库一次 ``migrate()`` 走完 v1→…→v6→v7，且每一步都记录自己的版本行。"""
+    path = str(tmp_path / "v1.db")
+    root = graph_tree_root()
+    old = build_v1_database(path)
+    assert "waves" not in column_names(old, "request_logs")
+    old.execute(
+        "INSERT INTO routing_trees (id, name, enabled, root, tree_revision, updated_at) "
+        "VALUES ('main', '主图', 0, ?, ?, '2026-11-01T10:00:00+08:00')",
+        (root, "r" * 64),
+    )
+    old.execute(
+        "INSERT INTO request_logs (id, ts, decision, model, outcome_state) "
+        "VALUES ('old-row', '2026-11-01T10:00:00+08:00', 'route', 'qwen3-8b', 'completed')")
+    old.commit()
+    old.close()
+
+    conn = connect(path)
+    migrate(conn)
+
+    # v1→v2 补 waves、v2→v3 记账、v3→v4 删 config_revisions、v4→v5 建快照表、
+    # v5→v6 建 JEV 目录、v6→v7 清理：每一步都留下自己的 schema_migrations 行。
+    assert schema_versions(conn) == [1, 2, 3, 4, 5, 6, 7]
+    assert schema_version(conn) == SCHEMA_VERSION == 7
+    tables = table_names(conn)
+    assert not DECISION_LOG_TABLES & tables
+    assert not DECISION_LOG_INDEXES & index_names(conn)
+    assert "jev_services" in tables
+    assert column_names(conn, "jev_services") == V7_JEV_COLUMNS
+    # v1 没有 jev_config，因此 v5→v6 建出的是空目录，v7 只做去密钥重建。
+    assert conn.execute("SELECT COUNT(*) FROM jev_services").fetchone()[0] == 0
+    # 历史图配置表不属于 v7 清理范围：链上不得销毁已有数据。
+    assert conn.execute(
+        "SELECT root FROM routing_trees WHERE id = 'main'").fetchone()[0] == root
+    # 重复迁移幂等：版本不涨、非密钥行不动。
+    migrate(conn)
+    assert schema_version(conn) == 7
+    assert schema_versions(conn) == [1, 2, 3, 4, 5, 6, 7]
+    conn.close()
+
+
+def test_v3_database_upgrades_to_v7_and_drops_config_revisions(tmp_path):
+    path = str(tmp_path / "v3.db")
+    old = build_v3_database(path)
+    assert old.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 0
+    old.close()
+
+    conn = connect(path)
+    migrate(conn)
+
+    assert schema_versions(conn) == [3, 4, 5, 6, 7]
+    assert schema_version(conn) == 7
+    objects = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    assert "config_revisions" not in objects
+    assert "idx_config_revisions_kind" not in objects
+    assert not DECISION_LOG_TABLES & table_names(conn)
+    assert column_names(conn, "jev_services") == V7_JEV_COLUMNS
+    migrate(conn)
+    assert schema_version(conn) == 7
+    conn.close()
+
+
+def test_v3_upgrade_refuses_nonempty_config_revisions(tmp_path):
+    """v3→v4 的「先导出再删」保护仍然生效：拒绝时不越级、不丢数据。"""
+    path = str(tmp_path / "v3.db")
+    old = build_v3_database(path)
+    old.execute(
+        "INSERT INTO config_revisions (kind, sha256, content, created_at) "
+        "VALUES ('tree', ?, '{\"root\":1}', '2026-11-01T10:00:00+08:00')",
+        ("a" * 64,),
+    )
+    old.commit()
+    old.close()
+
+    conn = connect(path)
+    with pytest.raises(RuntimeError, match="export"):
+        migrate(conn)
+    assert schema_version(conn) == 3
+    assert conn.execute("SELECT COUNT(*) FROM config_revisions").fetchone()[0] == 1
+    # 事务回滚：v3 之后没有任何步骤落库（快照表都没有建）。
+    assert "graph_snapshots" not in table_names(conn)
+    assert "jev_services" not in table_names(conn)
+    conn.close()
+
+
+def test_v4_to_v5_step_adds_snapshots_and_keeps_request_logs(tmp_path):
+    """v4→v5 的效果在 v7 已不可见（快照表随后被删除），这里直接验证该步本身。"""
+    import router.store.db as db_module
+
+    conn = build_v4_database(str(tmp_path / "v4.db"))
+    conn.execute(
+        "INSERT INTO request_logs (id, ts, decision, model) "
+        "VALUES ('old-row', '2026-11-01T10:00:00+08:00', 'route', 'qwen3-8b')")
+    conn.commit()
+
+    db_module._upgrade_v4_to_v5(conn)
+    conn.commit()
+
+    assert {"graph_snapshots", "request_snapshots"} <= table_names(conn)
+    assert "idx_request_snapshots_graph" in index_names(conn)
+    assert schema_version(conn) == 5
+    assert conn.execute(
+        "SELECT model FROM request_logs WHERE id = 'old-row'").fetchone()[0] == "qwen3-8b"
+    conn.close()
+
+
+def test_v5_database_upgrades_to_v7_and_strips_jev_secret(tmp_path):
+    """v5 单例 jev_config → v6 ``default`` 服务 → v7 去掉密钥但保留非密钥配置。"""
+    path = str(tmp_path / "v5.db")
+    old = build_v5_database(path)
+    insert_legacy_jev_config(old)
+    old.execute("INSERT INTO settings VALUES ('jev_input_tokens', '2048')")
+    old.execute("INSERT INTO settings VALUES ('jev_context_tokens', '8192')")
+    old.execute(
+        "INSERT INTO request_logs (id, ts, decision, model) "
+        "VALUES ('legacy-row', '2026-11-01T10:00:00+08:00', 'route', 'qwen3-8b')")
+    old.execute(
+        "INSERT INTO graph_snapshots (snapshot_id, tree_id, snapshot_revision, graph, created_at) "
+        "VALUES ('g1', 'main', 'r1', '{}', '2026-11-01T10:00:00+08:00')")
+    old.execute(
+        "INSERT INTO request_snapshots (request_id, graph_snapshot_id, trace, created_at) "
+        "VALUES ('legacy-row', 'g1', '[]', '2026-11-01T10:00:00+08:00')")
+    old.commit()
+    old.close()
+
+    conn = connect(path)
+    migrate(conn)
+
+    assert schema_versions(conn) == [5, 6, 7]
+    assert schema_version(conn) == 7
+    assert not DECISION_LOG_TABLES & table_names(conn)
+    assert not DECISION_LOG_INDEXES & index_names(conn)
+    assert "jev_config" not in table_names(conn)
+    row = dict(conn.execute("SELECT * FROM jev_services").fetchone())
+    assert row["id"] == "default"
+    # 端点按 v5→v6 的规范化规则落库（strip + 去掉末尾 `/`）。
+    assert row["base_url"] == "http://old-jev.test"
+    assert row["model"] == "NeoHorse-Jev-4B"
+    assert row["key_env"] == "ROUTER_JEV_API_KEY"
+    assert row["timeout_seconds"] == 7.5
+    assert row["instructions"] == "请选择最匹配的模型。"
+    assert row["state_template"] == "【请求】\n{request}"
+    assert (row["input_tokens"], row["context_tokens"]) == (2048, 8192)
+    assert row["updated_at"] == "2026-11-01T10:00:00+08:00"
+    assert column_names(conn, "jev_services") == V7_JEV_COLUMNS
+    assert "old-secret" not in json.dumps(row, ensure_ascii=False)
+    assert "old-secret" not in all_dump(conn)
+    migrate(conn)
+    assert schema_version(conn) == 7
+    assert conn.execute("SELECT COUNT(*) FROM jev_services").fetchone()[0] == 1
+    conn.close()
+
+
+# --------------------------------------------------------------------------- #
 # v6 → v7
 # --------------------------------------------------------------------------- #
 def test_v6_upgrade_preserves_jev_config_but_drops_secret_and_logs(tmp_path):
@@ -215,6 +511,7 @@ def test_v6_upgrade_preserves_jev_config_but_drops_secret_and_logs(tmp_path):
 
     migrate(conn)
 
+    assert schema_versions(conn) == [6, 7]
     assert not DECISION_LOG_TABLES & table_names(conn)
     assert not DECISION_LOG_INDEXES & index_names(conn)
     assert schema_version(conn) == 7
@@ -227,6 +524,7 @@ def test_v6_upgrade_preserves_jev_config_but_drops_secret_and_logs(tmp_path):
     assert "api_key" not in row.keys()
     assert column_names(conn, "jev_services") == V7_JEV_COLUMNS
     assert "old-secret" not in json.dumps(dict(row))
+    assert "old-secret" not in all_dump(conn)
     # 重复迁移幂等：版本不涨、非密钥行不动。
     migrate(conn)
     assert schema_version(conn) == 7
@@ -316,10 +614,10 @@ def test_v6_database_without_jev_services_is_rejected(tmp_path):
     conn.close()
 
 
-@pytest.mark.parametrize("version", [1, 2, 3, 4, 5])
-def test_older_schema_versions_are_rejected_not_migrated(tmp_path, version):
-    """v6 之前的历史库不做隐式升级：旧决策日志不迁移，必须显式重置/导出。"""
-    path = str(tmp_path / f"v{version}.db")
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_versioned_database_without_expected_tables_is_rejected(tmp_path, version):
+    """残缺的历史库不猜内容：缺该版本应有的表就拒绝，不落任何升级步骤。"""
+    path = str(tmp_path / f"junk-v{version}.db")
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
     conn.execute("INSERT INTO schema_migrations VALUES (?)", (version,))
@@ -339,7 +637,7 @@ def test_future_schema_version_is_rejected(tmp_path):
     path = str(tmp_path / "future.db")
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY)")
-    conn.execute("INSERT INTO schema_migrations VALUES (19)")
+    conn.execute("INSERT INTO schema_migrations VALUES (8)")
     conn.execute("CREATE TABLE keyword_groups (name TEXT PRIMARY KEY, words TEXT NOT NULL)")
     conn.commit()
     conn.close()
