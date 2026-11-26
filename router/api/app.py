@@ -178,10 +178,10 @@ def _remediate_stale_admin_credentials(conn, settings: Settings) -> None:
             "sessions are revoked"
         )
     repo = UserRepo(conn)
-    sessions = SessionRepo(conn)
     for user in stale:
-        repo.set_password(user["id"], settings.admin_password)
-        sessions.delete_for_user(user["id"])
+        # C2 原子性：重置密码与吊销会话必须在同一事务里完成，否则「密码已换、
+        # 会话未吊销」的中间态会让下次启动不再把这行判为 stale，旧 token 继续有效。
+        repo.reset_password_and_sessions(user["id"], settings.admin_password)
     logger.critical(
         "ROUTER_ADMIN_FORCE_RESET=1: reset the password of %s and revoked all "
         "their sessions (the stored hash still accepted a publicly-known or "

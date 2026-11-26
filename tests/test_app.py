@@ -618,6 +618,60 @@ def test_force_reset_flag_is_read_from_the_environment(monkeypatch):
     assert Settings.from_env().admin_force_reset is False
 
 
+def test_force_reset_is_atomic_when_session_revocation_fails(tmp_path):
+    """C2 原子性：吊销会话失败时密码重置必须一起回滚，不能留下半状态。
+
+    ``set_password`` 与 ``delete_for_user`` 若各写一个事务，第二步失败会留下
+    「密码已换、旧会话仍在」的中间态；下次启动不再把这行判为 stale，旧 token
+    继续有效。这里用 SQLite 触发器让会话删除失败，断言两件事都没发生，且再次
+    启动仍然拒绝（说明这行依旧是 stale）。
+    """
+    db_path = str(tmp_path / "atomic.db")
+    conn = connect(db_path)
+    try:
+        migrate(conn)
+        seed_default(conn)
+        repo = UserRepo(conn)
+        admin = repo.create(
+            "admin@test.com", DEFAULT_ADMIN_PASSWORD, role="admin")
+        SessionRepo(conn).create(admin["id"], 168)
+        before_hash = repo.get(admin["id"])["password_hash"]
+        conn.execute(
+            "CREATE TRIGGER fail_session_delete BEFORE DELETE ON user_sessions "
+            "BEGIN SELECT RAISE(ABORT, 'session revoke failed'); END")
+        conn.commit()
+    finally:
+        conn.close()
+
+    settings = test_settings(
+        tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+        admin_password="new-strong-password", admin_force_reset=True)
+    with pytest.raises(Exception) as excinfo:
+        create_app(settings)
+    assert "session revoke failed" in str(excinfo.value)
+
+    conn = connect(db_path)
+    try:
+        after_hash = conn.execute(
+            "SELECT password_hash FROM users WHERE id = ?",
+            (admin["id"],)).fetchone()["password_hash"]
+        assert after_hash == before_hash, "密码不得在会话吊销失败时被改掉"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM user_sessions WHERE user_id = ?",
+            (admin["id"],)).fetchone()[0] == 1
+        conn.execute("DROP TRIGGER fail_session_delete")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 仍是 stale：没有授权标志的下一次启动必须继续拒绝，而不是悄悄放行旧 token。
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(test_settings(
+            tmp_path, db_path=db_path, host="0.0.0.0", user_auth=True,
+            admin_password="new-strong-password"))
+    assert "admin@test.com" in str(excinfo.value)
+
+
 def test_peripheral_does_not_mount_the_kernel_jev_test(tmp_path):
     """I6: the credentialed JEV test belongs to the kernel internal listener."""
     app = split_app_for(tmp_path)

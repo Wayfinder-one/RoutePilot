@@ -319,6 +319,25 @@ class UserRepo:
             )
         return cursor.rowcount > 0
 
+    def reset_password_and_sessions(self, user_id: str, password: str) -> bool:
+        """Rotate one account's password and revoke its sessions atomically.
+
+        Startup remediation (C2) must never leave a half state: if the password
+        were rotated but the old sessions survived a later failure, the next
+        start would no longer see the account as stale and the pre-reset bearer
+        tokens would keep working.  Both writes therefore share one ``BEGIN
+        IMMEDIATE`` transaction.
+        """
+        password_hash = auth.hash_password(password)
+        with write_transaction(self.conn):
+            cursor = self.conn.execute(
+                "UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?",
+                (password_hash, now_iso(), user_id),
+            )
+            self.conn.execute(
+                "DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+        return cursor.rowcount > 0
+
     def delete(self, user_id: str) -> bool:
         with transaction(self.conn):
             cursor = self.conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
