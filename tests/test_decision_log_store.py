@@ -5,12 +5,17 @@ Global Constraint 4/5/6：内核只输出事件；外围把通过校验的完整
 同一条事件里的 ``graph``/``trace``/``request``，不依赖当前图或任何快照表。
 """
 
+import sys
+import threading
+import time
+from collections import deque
+
 import pytest
 from fastapi.testclient import TestClient
 
 from router.api.app import create_app
 from router.decision_events import build_decision_event, replay_payload, summary_payload
-from router.decision_log_store import DecisionLogStore
+from router.decision_log_store import STORE_LIMIT, DecisionLogStore
 from router.routing.tree import tree_from_dict
 from router.store.db import connect
 from router.store.routing_trees import RoutingTreeRepo
@@ -306,3 +311,191 @@ def test_changes_still_reads_the_peripheral_repository(tmp_path):
     app = create_app(test_settings(tmp_path))
     client = TestClient(app)
     assert client.get("/admin/changes").json() == {"changes": []}
+
+
+# ---------------------------------------------------------------------------
+# I4：add() 在事件循环接收端执行，recent()/get()/stats() 在 FastAPI 线程池执行；
+# 第 21 条淘汰最旧事件时，读迭代可能撞上写淘汰而抛
+# ``RuntimeError: deque mutated during iteration``。以下测试覆盖真实并发读写。
+# ---------------------------------------------------------------------------
+
+
+class _MutationWindowDeque(deque):
+    """在迭代窗口中间打开一次真实可被并发 append 命中的空档。
+
+    旧实现直接迭代 ``store._events``（无锁）：另一个线程在这个空档里 append
+    并淘汰最旧事件，CPython 下一次 ``next()`` 就会抛
+    ``RuntimeError: deque mutated during iteration``。新实现把整个读取投影放在
+    store 锁内，写线程在窗口期间被挡住，因此迭代器不会失效。
+
+    这是对私有 ``_events`` 的测试探针（生产代码无此子类）：它把旧竞态放大成
+    确定性复现，因为 20 条小 deque 的纯 C 迭代窗口短到难以稳定命中。
+    """
+
+    def __init__(self, *, maxlen=None):
+        super().__init__(maxlen=maxlen)
+        self.mutation_window = threading.Event()
+
+    def _window(self, iterator):
+        first = next(iterator)  # 先取一条，再让写线程执行 append + 淘汰
+        self.mutation_window.set()
+        time.sleep(0.2)
+        yield first
+        yield from iterator  # 旧实现：这里抛 deque mutated during iteration
+
+    def __iter__(self):
+        return self._window(super().__iter__())
+
+    def __reversed__(self):
+        return self._window(super().__reversed__())
+
+
+def _install_mutation_window(store):
+    """把 store 的 deque 换成带窗口探针的同语义 deque（仍是 maxlen=20）。"""
+    window = _MutationWindowDeque(maxlen=STORE_LIMIT)
+    # 构造阶段用 C 层 extend，避免触发探针自身（探针只在读取投影时开门）。
+    deque.extend(window, store._events)
+    store._events = window
+    return window
+
+
+def _append_until(window, store, first, stop):
+    assert window.mutation_window.wait(timeout=5.0), "reader never entered its window"
+    for index in range(first, stop):
+        store.add(valid_event(id=f"w{index:03d}"))
+
+
+def _run_pair(reader, writer):
+    reader_thread = threading.Thread(target=reader, name="store-reader")
+    writer_thread = threading.Thread(target=writer, name="store-writer")
+    reader_thread.start()
+    writer_thread.start()
+    reader_thread.join(10.0)
+    writer_thread.join(10.0)
+    assert not reader_thread.is_alive(), "reader deadlocked"
+    assert not writer_thread.is_alive(), "writer deadlocked"
+
+
+def test_recent_projection_is_synchronised_with_concurrent_appends():
+    """旧实现：写线程在迭代窗口内 append/淘汰 → list(reversed()) 抛 RuntimeError。"""
+    store = DecisionLogStore()
+    for index in range(10):
+        store.add(valid_event(id=f"e{index:03d}"))
+    window = _install_mutation_window(store)
+    errors, snapshots = [], []
+
+    def reader():
+        try:
+            snapshots.append(store.recent())
+        except BaseException as exc:  # noqa: BLE001 - 旧实现抛 RuntimeError
+            errors.append(exc)
+
+    _run_pair(
+        reader,
+        lambda: _append_until(window, store, first=10, stop=40),
+    )
+    assert errors == [], f"recent() raced with add(): {errors!r}"
+    # 锁保护下的读取得到稳定快照：只含读取开始前保留的事件，且仍是 20 条上限内。
+    assert [event["id"] for event in snapshots[0]] == [
+        f"e{index:03d}" for index in range(9, -1, -1)]
+    # 读锁释放后写入才生效：之后的读取看到最新 20 条（新→旧）。
+    assert [event["id"] for event in store.recent()] == [
+        f"w{index:03d}" for index in range(39, 19, -1)]
+
+
+def test_get_projection_is_synchronised_with_concurrent_appends():
+    """旧实现的 get() 用生成器 next(...) 逐条迭代，最容易被写淘汰打中。"""
+    store = DecisionLogStore()
+    for index in range(10):
+        store.add(valid_event(id=f"e{index:03d}"))
+    window = _install_mutation_window(store)
+    errors, results = [], []
+
+    def reader():
+        try:
+            # 未知 ID 迫使 get() 走完整个 deque，正好跨过窗口里的淘汰。
+            results.append(store.get("missing-id"))
+        except BaseException as exc:  # noqa: BLE001 - 旧实现抛 RuntimeError
+            errors.append(exc)
+
+    _run_pair(
+        reader,
+        lambda: _append_until(window, store, first=10, stop=40),
+    )
+    assert errors == [], f"get() raced with add(): {errors!r}"
+    assert results == [None]
+
+
+def test_concurrent_readers_and_writer_never_raise_or_tear_snapshots():
+    """真实多线程压力：4 个读线程持续 recent()/get()/stats()，1 个写线程追加淘汰。
+
+    旧实现没有锁，读者会撞上 ``deque mutated during iteration``；修好后每个
+    recent() 都是稳定快照：≤20 条、严格新→旧、且是连续的一段保留窗口。
+    """
+    store = DecisionLogStore()
+    for index in range(STORE_LIMIT):
+        store.add(valid_event(id=f"{index:06d}"))
+
+    errors: list[BaseException] = []
+    violations: list[str] = []
+    stop = threading.Event()
+    reader_count = 4
+    writer_total = 400
+    barrier = threading.Barrier(reader_count + 1)
+    previous_switch = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # 放大线程切换，让旧竞态在压力下稳定暴露
+    try:
+        def reader():
+            try:
+                barrier.wait(timeout=10.0)
+            except threading.BrokenBarrierError:
+                return
+            while not stop.is_set():
+                try:
+                    events = store.recent()
+                    stats = store.stats()
+                    store.get(f"{0:06d}")
+                    store.get("missing-id")
+                except BaseException as exc:  # noqa: BLE001 - 旧实现抛 RuntimeError
+                    errors.append(exc)
+                    return
+                ids = [event["id"] for event in events]
+                if len(ids) > STORE_LIMIT:
+                    violations.append(f"recent() returned {len(ids)} events")
+                expected = [] if not ids else [
+                    f"{number:06d}"
+                    for number in range(int(ids[0]), int(ids[0]) - len(ids), -1)]
+                if ids != expected:
+                    violations.append(f"torn snapshot: {ids[:3]}...{ids[-3:]}")
+                if stats["ring_size"] != STORE_LIMIT or stats["ring_limit"] != STORE_LIMIT:
+                    violations.append(f"inconsistent stats: {stats}")
+
+        def writer():
+            try:
+                barrier.wait(timeout=10.0)
+            except threading.BrokenBarrierError:
+                return
+            try:
+                for index in range(STORE_LIMIT, STORE_LIMIT + writer_total):
+                    store.add(valid_event(id=f"{index:06d}"))
+            finally:
+                stop.set()
+
+        threads = [threading.Thread(target=reader, name=f"store-reader-{index}")
+                   for index in range(reader_count)]
+        writer_thread = threading.Thread(target=writer, name="store-writer")
+        for thread in threads:
+            thread.start()
+        writer_thread.start()
+        for thread in threads:
+            thread.join(30.0)
+        writer_thread.join(30.0)
+        assert all(not thread.is_alive() for thread in threads), "readers deadlocked"
+        assert not writer_thread.is_alive(), "writer deadlocked"
+    finally:
+        stop.set()
+        sys.setswitchinterval(previous_switch)
+
+    assert errors == [], f"concurrent read/write raised: {errors!r}"
+    assert violations == [], f"inconsistent snapshots: {violations[:5]!r}"
+    assert store.stats()["ring_size"] == STORE_LIMIT
