@@ -41,7 +41,6 @@ from fastapi.staticfiles import StaticFiles
 from router.api.issue_presenter import issues_payload
 from router.api.routes_core_proxy import router as core_proxy_router
 from router.config import (
-    DEFAULT_ADMIN_EMAIL,
     DEFAULT_ADMIN_PASSWORD,
     LOOPBACK_HOSTS,
     Settings,
@@ -55,6 +54,7 @@ from router.control.errors import (
 )
 from router.control.remote_catalog_sync import (
     CatalogSyncDiverged,
+    CatalogWriteNotApplied,
     RemoteCatalogSyncService,
 )
 from router.core_client import CoreClient, CoreGraphError
@@ -90,26 +90,26 @@ def _catalog_sync_factory(client: CoreClient):
 
 
 def _guard_default_admin(settings: Settings) -> None:
-    """C1: refuse publicly-known default admin credentials on a non-loopback bind.
+    """C1: refuse the publicly-known default admin password on a non-loopback bind.
 
     The seed values exist only so ``python -m router`` on this machine works out
-    of the box.  A deployment (compose binds ``0.0.0.0``) must provide explicit
-    ``ROUTER_ADMIN_EMAIL`` / ``ROUTER_ADMIN_PASSWORD``; silently seeding
-    ``admin@test.com`` / ``1qaz@WSX`` on a reachable listener is a critical
-    security defect.
+    of the box.  A deployment (compose binds ``0.0.0.0``) must provide an explicit
+    ``ROUTER_ADMIN_PASSWORD``; silently seeding ``1qaz@WSX`` on a reachable
+    listener is a critical security defect.  The check keys on the **password**
+    only: changing the email while keeping the public password must not pass.
     """
     if not settings.user_auth:
         return
     if settings.host.strip().lower() in LOOPBACK_HOSTS:
         return
-    if (settings.admin_email, settings.admin_password) != (
-            DEFAULT_ADMIN_EMAIL, DEFAULT_ADMIN_PASSWORD):
+    if settings.admin_password != DEFAULT_ADMIN_PASSWORD:
         return
     raise RuntimeError(
         "refusing to start the peripheral console with the publicly-known "
-        f"default admin credentials on non-loopback host {settings.host!r}: "
-        "set ROUTER_ADMIN_EMAIL and ROUTER_ADMIN_PASSWORD to explicit values "
-        "(or bind ROUTER_HOST to 127.0.0.1 for local-only use)"
+        f"default admin password on non-loopback host {settings.host!r}: "
+        "change ROUTER_ADMIN_PASSWORD to an explicit value (ROUTER_ADMIN_EMAIL "
+        "may also be overridden; or bind ROUTER_HOST to 127.0.0.1 for "
+        "local-only use)"
     )
 
 
@@ -335,6 +335,21 @@ def create_app(
         """SQLite 已回滚但内核补偿失败：显式 503，绝不返回成功。"""
         return JSONResponse(status_code=503, content={
             "detail": {"code": "catalog_sync_diverged"}})
+
+    @app.exception_handler(CatalogWriteNotApplied)
+    async def catalog_write_not_applied_handler(
+            request: Request, exc: CatalogWriteNotApplied):
+        """探测证明内核未应用本批：503 目录写失败，可安全重试。
+
+        ``graph_batch_committed`` 只对「已提交但未确认」诚实；这里的事实相反
+        （每张画布仍是原图，SQLite 已回滚），因此不能复用那个 code。
+        """
+        return JSONResponse(status_code=503, content={"detail": {
+            "code": "catalog_write_failed",
+            "message": (
+                "the kernel did not apply the catalog's graph batch: the "
+                "peripheral SQLite write was rolled back, safe to retry"),
+        }})
 
     _install_admin_auth(app, settings)
 

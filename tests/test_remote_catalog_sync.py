@@ -30,6 +30,7 @@ from router.api.core_app import create_core_app
 from router.control.errors import ValidationFailed
 from router.control.remote_catalog_sync import (
     CatalogSyncDiverged,
+    CatalogWriteNotApplied,
     CoreBatchError,
     RemoteCatalogSyncService,
 )
@@ -832,7 +833,11 @@ async def test_unknown_transport_failure_compensates_a_committed_batch(conn):
 
 @async_test
 async def test_unknown_transport_failure_without_commit_skips_compensation(conn):
-    """未知状态但 probe 证明候选未提交：只需 SQLite 回滚，不补偿。"""
+    """未知状态但 probe 证明候选未提交：只需 SQLite 回滚，不补偿。
+
+    probe 结论必须随异常传出（``CatalogWriteNotApplied``，``uncertain=False``）：
+    原样重抛 incoming 的不确定错误会让 HTTP 层把它误报成「已提交但未确认」。
+    """
     old = document_tree("main")
     transport = StatefulKernelTransport(old)
     transport.batch_failures.append(httpx.ReadTimeout("response lost"))
@@ -847,7 +852,9 @@ async def test_unknown_transport_failure_without_commit_skips_compensation(conn)
     finally:
         await client.aclose()
 
-    assert caught.value.uncertain is True
+    assert isinstance(caught.value, CatalogWriteNotApplied)
+    assert caught.value.status_code == 503
+    assert caught.value.uncertain is False
     assert transport.tree_read_count() == 2        # probe 执行了
     assert transport.batch_count() == 1            # 没有反向批次
     assert document_sha(transport.documents["main"]) == old.document_sha256

@@ -1754,6 +1754,88 @@ def test_compensation_failure_is_503_catalog_sync_diverged_after_db_rollback(
     assert _audit_count(app) == before_audit
 
 
+def test_probe_proving_not_committed_is_503_catalog_write_failed(
+        two_canvases, monkeypatch):
+    """探测证明内核未提交：503 ``catalog_write_failed``，不能复用 ``graph_batch_committed``。
+
+    ``graph_batch_committed`` 只对「已提交但未确认」诚实。内核答案不确定、而
+    三态探测随后看到每张画布仍是原图时，内核根本没应用本批；外围 SQLite 已
+    回滚，这个失败是可安全重试的目录写失败，不是一次「已提交」事件。
+    """
+    app, client = two_canvases
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_canvases = _canvas_state(app, ("main", "other"))
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    async def committed_but_lost_answer(_writes):
+        # 内核答案自称已提交（500 graph_batch_committed），但故障注入下什么都没写：
+        # 外围 probe 会看到全原图 → 证明未提交。
+        raise CoreBatchError(500, {"detail": {
+            "code": "graph_batch_committed",
+            "message": "injected committed-but-lost answer"}}, uncertain=True)
+
+    monkeypatch.setattr(
+        app.state.core, "replace_graph_batch", committed_but_lost_answer)
+
+    response = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert response.status_code == 503, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "catalog_write_failed", detail
+    assert "did not apply" in detail["message"]
+    # 「已提交但未确认」/「两侧可能分歧」的码都不得用于已证明未提交的场景。
+    assert detail["code"] not in {"graph_batch_committed", "catalog_sync_diverged"}
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+    assert _canvas_state(app, ("main", "other")) == before_canvases
+
+
+def test_committed_batch_with_successful_compensation_keeps_its_code(
+        two_canvases, monkeypatch):
+    """已提交并成功反向补偿：语义不变，仍是 503 ``graph_batch_committed``。
+
+    这条路径与「探测证明未提交」相反（内核确实提交过，只是响应丢失），修复
+    第 4 项时不得一起改掉：补偿成功后内核画布已恢复原图，但对外仍须如实报告
+    「提交但未确认」而不是可安全重试的目录写失败。
+    """
+    app, client = two_canvases
+    before_row = _db_row(app, "models", "id", "fast")
+    before_audit = _audit_count(app)
+    before_canvases = _canvas_state(app, ("main", "other"))
+    preview = client.put("/admin/models/fast", json={"upstream": "new-upstream"})
+    confirmation = confirmation_from(preview)
+
+    real_batch = app.state.core.replace_graph_batch
+    calls = {"count": 0}
+
+    async def commit_then_lose_answer(writes):
+        calls["count"] += 1
+        reply = await real_batch(writes)
+        if calls["count"] == 1:
+            # 第一次：真实提交后响应丢失（500 graph_batch_committed）。
+            raise CoreBatchError(500, {"detail": {
+                "code": "graph_batch_committed",
+                "message": "injected lost success answer"}}, uncertain=True)
+        # 第二次：反向补偿批次，正常落盘恢复原图。
+        return reply
+
+    monkeypatch.setattr(
+        app.state.core, "replace_graph_batch", commit_then_lose_answer)
+
+    response = client.put("/admin/models/fast", json={
+        "upstream": "new-upstream", "impact_confirmation": confirmation})
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "graph_batch_committed"
+    assert calls["count"] == 2                       # 候选批次 + 反向补偿
+    assert _canvas_state(app, ("main", "other")) == before_canvases
+    assert _db_row(app, "models", "id", "fast") == before_row
+    assert _audit_count(app) == before_audit
+
+
 # --------------------------------------------------------------------------- #
 # 19. 目录影响同步：必须重建「完整启用集合」路由集（多启用图）
 # --------------------------------------------------------------------------- #

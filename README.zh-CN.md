@@ -369,7 +369,7 @@ v4 文档就是完整、可移植的画布：生命周期标记（`enabled`/`def
 内核/外围拆分改变了每个进程拥有的东西。请按顺序执行：
 
 1. **先全部备份。** 复制 SQLite 数据库（`router.db` 连同 `router.db-wal` / `router.db-shm`）与内核图目录（`graphs.directory` 下的 `graphs/*.json`）。图 JSON 仍是内核事实源；切换部署就是把该目录挂载给内核，并确保只有内核一个写者。
-2. **SQLite schema 会在外围首次启动时自动迁移。** schema v6 在一个事务内升级到 v7，并**删除** `request_logs`、`graph_snapshots`、`request_snapshots` 及其索引，同时按显式非密钥列重建 `jev_services`（JEV `api_key` 列消失）。历史决策日志**不会**迁移到内存环或 VictoriaLogs——旧记录不再可回放。早于 schema v6 的数据库会被拒绝；不存在回到单服务布局的路径。
+2. **SQLite schema 会在外围首次启动时自动迁移。** 任何受支持的历史 schema（v1–v6）都会在一次启动内按步骤依次升级到 v7，每一步一个事务；最后的 v6→v7 步骤是破坏性的：**删除** `request_logs`、`graph_snapshots`、`request_snapshots` 及其索引（决策日志/快照与已存 JEV Key 一并丢弃，见设计 §9），同时按显式非密钥列重建 `jev_services`（JEV `api_key` 列消失）。历史决策日志**不会**迁移到内存环或 VictoriaLogs——旧记录不再可回放。只有过新的 schema，或内容未知/损坏的数据库会被拒绝；不存在回到单服务布局的路径。v7 步骤会销毁数据，第 1 步的备份因此仍然必要。
 3. **把 JEV Key 移出 SQLite。** 内核只从自己的环境变量读取（`ROUTER_JEV_API_KEY`，或 `config.json` `jev.api_key_env` 指定的名字）。在内核容器/进程里设置它；已存密钥不会迁移，旧的 `ROUTER_JEV_*` 播种变量也不会创建密钥。
 4. **部署两个服务**（或只部署内核接 APISIX）：内核需要 `config.json` + 图目录 + JEV Key；外围需要 `ROUTER_CORE_URL`、自己的 SQLite 路径与常规控制台配置。见[快速开始](#快速开始)与[配置项](#配置项)。
 5. **若内核无法载入既有目录，就通过内核 API 重新发布图**：启动日志会记录 `initial graph snapshot is unavailable`，内核 `/readyz` 报告未就绪（或 `stale`），`/internal/v1/trees` 在文件修好前返回 `graph_storage_error`。每份已存画布必须已经是完整 v4 文档（四个运行字段 + `departments` + `enabled`/`default`）；v3 文件会被拒绝，永远不会被隐式接管或迁移。

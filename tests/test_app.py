@@ -370,6 +370,33 @@ def test_explicit_admin_credentials_are_allowed_on_a_non_loopback_bind(tmp_path)
     assert app.state.settings.admin_email == "ops@example.com"
 
 
+def test_default_admin_password_is_refused_even_with_a_custom_email(tmp_path):
+    """自定义邮箱 + 公开默认密码在非 loopback 绑定上仍必须拒绝。
+
+    旧守卫要求邮箱和密码**同时**为默认值才拒绝：操作员只要改掉邮箱、保留
+    ``1qaz@WSX`` 就能把一个公开已知口令暴露在可达监听上。
+    """
+    settings = test_settings(
+        tmp_path, host="0.0.0.0", user_auth=True,
+        admin_email="ops@example.com", admin_password="1qaz@WSX",
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        create_app(settings)
+    message = str(excinfo.value)
+    assert "ROUTER_ADMIN_PASSWORD" in message
+    assert "0.0.0.0" in message
+
+
+def test_custom_admin_password_is_allowed_with_the_default_email(tmp_path):
+    """只把默认密码换掉就足够：公开口令才是要拒绝的东西，默认邮箱不是。"""
+    settings = test_settings(
+        tmp_path, host="0.0.0.0", user_auth=True,
+        admin_password="explicit-strong-pass",
+    )
+    app = create_app(settings)
+    assert app.state.settings.admin_password == "explicit-strong-pass"
+
+
 @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
 def test_default_admin_credentials_stay_allowed_on_loopback(tmp_path, host):
     settings = test_settings(tmp_path, host=host, user_auth=True)

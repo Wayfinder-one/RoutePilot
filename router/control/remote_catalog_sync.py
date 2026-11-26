@@ -30,7 +30,9 @@ pool/protocol 准备失败 = 请求确定未发出，内核未变，只需回滚
 中断，以及内核的 5xx / ``graph_batch_committed`` 答案（提交后响应构造失败）= 内核
 状态未知（请求可能已提交、响应丢失），必须 ``list_graphs()`` 做**三态**探测：
 
-- 全部候选仍是**原图哈希** → 确定未提交：SQLite 已回滚，不补偿；
+- 全部候选仍是**原图哈希** → 确定未提交：SQLite 已回滚，不补偿，抛
+  ``CatalogWriteNotApplied``（HTTP 503 ``catalog_write_failed``，可安全重试；
+  不能用 ``graph_batch_committed`` 报告「已提交但未确认」）；
 - 全部候选已是**候选哈希** → 已提交：用原图 + 探测到的新基线补偿；
 - 其他任何情况（混合态，或第三方在窗口内改成第三哈希 / 删除）→ 显式
   ``CatalogSyncDiverged`` 并记录每图状态，绝不静默当未提交。
@@ -41,6 +43,7 @@ pool/protocol 准备失败 = 请求确定未发出，内核未变，只需回滚
 - 内核 409 ``graph_conflict`` → ``GraphConflictError(actual)`` → 409；
 - 内核 422 Issue 数组 → ``ValidationFailed`` → 422；
 - 内核 503 ``graph_storage_error`` → ``GraphStorageError`` → 503；
+- 探测证明内核未提交 → ``CatalogWriteNotApplied`` → 503 ``catalog_write_failed``；
 - 内核不可用 → ``CoreGraphError``/``CoreBatchError`` 由 app 级处理器映射为 503。
 """
 from __future__ import annotations
@@ -63,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CatalogSyncDiverged",
+    "CatalogWriteNotApplied",
     "CoreBatchError",
     "RemoteCatalogSyncService",
 ]
@@ -74,6 +78,21 @@ class CatalogSyncDiverged(RuntimeError):
     这是「目录写失败但图已改、且补偿也失败」的显式信号：部署需要人工核对内核
     图目录与 SQLite 目录。调用方绝不能把它当成功，也不能覆盖成普通错误。
     """
+
+
+class CatalogWriteNotApplied(CoreBatchError):
+    """探测已证明内核未提交本批：目录写失败且可安全重试（HTTP 503）。
+
+    ``graph_batch_committed`` 只对「内核已提交、只是响应无法确认」诚实。三态
+    探测看到每张候选仍是原图时，内核根本没有应用本批；外围 SQLite 已回滚，
+    此时复用那个 code 会误导调用方。由 app 级处理器映射为显式的
+    ``catalog_write_failed``（不是成功、也不是两侧分歧）。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            503, {"detail": {"code": "catalog_write_failed"}},
+            uncertain=False)
 
 
 #: Attribute that keeps the per-loop commit coordinator on the event loop object
@@ -313,7 +332,10 @@ class RemoteCatalogSyncService:
                 "uncertain graph-batch answer (%s) but every kernel graph still "
                 "holds its original document; nothing to compensate (graphs: %s)",
                 cause, sorted(original_hashes))
-            return
+            # 探测已给出结论：内核未提交。原样重抛「不确定」的 CoreBatchError
+            # （如 500 graph_batch_committed）会把它错误地报告成「已提交但未
+            # 确认」；用专门的异常让 HTTP 层映射为可重试的目录写失败。
+            raise CatalogWriteNotApplied() from cause
         if all(current_hashes[tree_id] == expected[tree_id]
                for tree_id in expected):
             new_hashes = {
