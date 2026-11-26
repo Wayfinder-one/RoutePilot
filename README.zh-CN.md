@@ -590,7 +590,7 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
   --complete-shadow --include-disruptive
 ```
 
-完整门禁要求精确 shadow 路径、Pod 内内核决策证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`）不能被表述为完整验收。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
+完整门禁要求精确 shadow 路径、Pod 内内核决策证据所需的 SSH 目标、必填模型变量，以及显式传入破坏性演练；`COMPLETE_REQUIRED` 全部通过才输出 `ok: true`，诊断运行（`profile: diagnostic`，即 `--diagnostic`）不能被表述为完整验收。上游隔离探针属于该门禁：如果内核 Pod 的出站连接无法观测（`/proc/net/tcp*` 不可读），该用例按失败处理而不是通过；只有显式 `--diagnostic` 才降级为带 `observed: false` 的降级证据。上游中途断流演练目前因缺少可控故障上游而明确失败，门禁因此保持红色而不是跳过。只有完整 shadow 报告全绿后才另行制定 production 计划；本次工作明确不包含生产发布。
 
 ### APISIX 发布残留（拆分）
 

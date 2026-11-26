@@ -590,7 +590,7 @@ python3 scripts/apisix/verify_routepilot_e2e.py \
   --complete-shadow --include-disruptive
 ```
 
-The gate requires the exact shadow path, the SSH target for in-pod kernel decision evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`) can never be reported as complete. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
+The gate requires the exact shadow path, the SSH target for in-pod kernel decision evidence, the forced model variables, and explicit destructive drills; every name in `COMPLETE_REQUIRED` must pass, so a diagnostic run (`profile: diagnostic`, i.e. `--diagnostic`) can never be reported as complete. The upstream-isolation probe is part of that gate: when the kernel pod's outbound connections cannot be observed (`/proc/net/tcp*` unreadable), the case fails instead of passing; only an explicit `--diagnostic` run downgrades it to degraded evidence with `observed: false`. The upstream mid-stream-EOF drill currently fails explicitly because no controlled fault upstream exists, which keeps the gate red instead of skipping it. Only after a clean complete-shadow report should a separate production plan be written; production publication is explicitly not part of this work.
 
 ### APISIX rollout residuals (split)
 
